@@ -1,5 +1,5 @@
 use std::fs;
-use std::os::unix::fs::PermissionsExt; // For setting executable permissions
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
 

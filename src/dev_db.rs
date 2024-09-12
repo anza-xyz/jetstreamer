@@ -1,14 +1,22 @@
-use std::process::{exit, Stdio};
+use std::process::Stdio;
+
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
     process::Command,
-    sync::oneshot,
+    sync::mpsc,
 };
-use tracing::{error, info};
 
-pub async fn spawn_click_house() -> Result<impl std::future::Future<Output = Result<(), ()>>, String>
-{
+pub async fn spawn_click_house() -> Result<
+    (
+        mpsc::Receiver<()>,
+        impl std::future::Future<Output = Result<(), ()>>,
+    ),
+    String,
+> {
     tracing::info!("Spawning local ClickHouse server...");
+
+    // Create a channel to signal when ClickHouse is ready
+    let (ready_tx, ready_rx) = mpsc::channel(1);
 
     // Build the command using `tokio::process::Command` for async support
     let mut clickhouse_command = Command::new("clickhouse")
@@ -31,31 +39,30 @@ pub async fn spawn_click_house() -> Result<impl std::future::Future<Output = Res
     // Wrap stdout in an async BufReader to read line by line
     let mut reader = BufReader::new(stdout).lines();
 
-    // Create a oneshot channel to signal when we see "Ready to accept connections"
-    let (tx, rx) = oneshot::channel();
-
     // Spawn a task to monitor the ClickHouse output for the "Ready to accept connections" message
     tokio::spawn(async move {
         while let Ok(Some(line)) = reader.next_line().await {
             tracing::info!("ClickHouse output: {}", line);
 
-            // Check for the "Ready to accept connections" message
-            if line.contains("Ready to accept connections") {
+            // Check for the exact "Ready for connections." message
+            if line.trim().contains("Ready for connections.") {
                 tracing::info!("ClickHouse is ready to accept connections.");
-                let _ = tx.send(()); // Signal that ClickHouse is ready
+
+                // Send the readiness signal through the channel
+                if let Err(err) = ready_tx.send(()).await {
+                    tracing::error!("Failed to send readiness signal: {}", err);
+                }
                 break;
             }
         }
+
+        tracing::warn!("ClickHouse stdout stream ended without readiness signal.");
     });
 
-    // Wait for the readiness signal
-    rx.await
-        .map_err(|_| "Failed to receive ready signal".to_string())?;
+    tracing::info!("Waiting for ClickHouse process to be ready.");
 
-    tracing::info!("ClickHouse process is fully ready.");
-
-    // Return a future that waits for the ClickHouse process to complete
-    Ok(async move {
+    // Return the receiver side of the channel and the future for the ClickHouse process
+    Ok((ready_rx, async move {
         let status = clickhouse_command.wait().await;
 
         match status {
@@ -68,5 +75,5 @@ pub async fn spawn_click_house() -> Result<impl std::future::Future<Output = Res
                 Err(())
             }
         }
-    })
+    }))
 }

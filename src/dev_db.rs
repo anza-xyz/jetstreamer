@@ -1,6 +1,6 @@
 use std::process::{exit, Command, Stdio};
 
-pub fn spawn_click_house() {
+pub async fn spawn_click_house() {
     tracing::info!("spawning local ClickHouse server...");
     // Build the command to run the ClickHouse binary
     let clickhouse_command = Command::new("clickhouse")

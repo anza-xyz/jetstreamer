@@ -4,6 +4,7 @@ use std::path::Path;
 use std::process::Command;
 
 fn main() {
+    println!("cargo:rerun-if-changed=bin/clickhouse");
     let bin_dir = Path::new("bin");
     let clickhouse_binary = bin_dir.join("clickhouse");
 

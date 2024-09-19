@@ -43,42 +43,35 @@ pub async fn spawn_click_house() -> Result<
     let mut stdout_reader = BufReader::new(stdout).lines();
     let mut stderr_reader = BufReader::new(stderr).lines();
 
-    // Create a span for ClickHouse logs
-    let clickhouse_span = tracing::info_span!("clickhouse");
-
     // Spawn a task to monitor both stdout and stderr for the "Ready for connections." message
     tokio::spawn(async move {
+        let mut ready_signal_sent = false;
+
         loop {
             tokio::select! {
                 line = stdout_reader.next_line() => {
                     if let Ok(Some(line)) = line {
-                        // Log stdout inside the clickhouse span
-                        let _guard = clickhouse_span.enter();
-                        tracing::info!("{}", line);
+                        println!("{}", line);
                     }
                 }
                 line = stderr_reader.next_line() => {
                     if let Ok(Some(line)) = line {
-                        // Log stderr inside the clickhouse span
-                        let _guard = clickhouse_span.enter();
-                        tracing::info!("{}", line);
+                        eprintln!("{}", line);
 
-                        // Check for "Ready for connections" message
-                        if line.contains("Ready for connections") {
+                        // Check for "Ready for connections" message, ignoring extra formatting or invisible chars
+                        if !ready_signal_sent && line.contains("Ready for connections") {
                             tracing::info!("ClickHouse is ready to accept connections.");
 
                             // Send the readiness signal through the channel
                             if let Err(err) = ready_tx.send(()).await {
                                 tracing::error!("Failed to send readiness signal: {}", err);
                             }
-                            break;
+                            ready_signal_sent = true;
                         }
                     }
                 }
             }
         }
-
-        tracing::warn!("ClickHouse stdout/stderr stream ended without readiness signal.");
     });
 
     tracing::info!("Waiting for ClickHouse process to be ready.");

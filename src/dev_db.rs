@@ -18,10 +18,9 @@ pub async fn spawn_click_house() -> Result<
     // Create a channel to signal when ClickHouse is ready
     let (ready_tx, ready_rx) = mpsc::channel(1);
 
-    // Build the command using `tokio::process::Command` for async support
-    let mut clickhouse_command = Command::new("clickhouse")
+    let mut clickhouse_command = Command::new("./clickhouse")
         .arg("server")
-        .current_dir("./bin")
+        .current_dir("bin")
         .stdout(Stdio::piped()) // Redirect stdout to capture logs
         .stderr(Stdio::inherit()) // Inherit stderr
         .spawn()

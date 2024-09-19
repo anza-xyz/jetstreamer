@@ -8,6 +8,7 @@ async fn main() {
     let _ = dotenvy::from_path(".env");
 
     if env::var("DEV_MODE").is_ok() {
+        tracing::info!("dev mode is enabled");
         // Spawn the ClickHouse process and await the readiness signal
         let (mut ready_rx, clickhouse_future) = dev_db::spawn_click_house().await.unwrap();
 
@@ -24,4 +25,7 @@ async fn main() {
 
     // "hello world" is logged at the end of the `main` function, regardless of DEV_MODE
     tracing::info!("hello world");
+    loop {
+        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+    }
 }

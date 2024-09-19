@@ -1,10 +1,10 @@
 use std::process::Stdio;
-
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
     process::Command,
     sync::mpsc,
 };
+use tracing;
 
 pub async fn spawn_click_house() -> Result<
     (
@@ -22,40 +22,63 @@ pub async fn spawn_click_house() -> Result<
         .arg("server")
         .current_dir("bin")
         .stdout(Stdio::piped()) // Redirect stdout to capture logs
-        .stderr(Stdio::inherit()) // Inherit stderr
+        .stderr(Stdio::piped()) // Also capture stderr
         .spawn()
         .map_err(|err| {
             tracing::error!("Failed to start the ClickHouse process: {}", err);
             err.to_string()
         })?;
 
-    // Get the stdout stream
+    // Capture stdout and stderr
     let stdout = clickhouse_command
         .stdout
         .take()
         .expect("Failed to capture stdout");
+    let stderr = clickhouse_command
+        .stderr
+        .take()
+        .expect("Failed to capture stderr");
 
-    // Wrap stdout in an async BufReader to read line by line
-    let mut reader = BufReader::new(stdout).lines();
+    // Create a combined reader for stdout and stderr
+    let mut stdout_reader = BufReader::new(stdout).lines();
+    let mut stderr_reader = BufReader::new(stderr).lines();
 
-    // Spawn a task to monitor the ClickHouse output for the "Ready to accept connections" message
+    // Create a span for ClickHouse logs
+    let clickhouse_span = tracing::info_span!("clickhouse");
+
+    // Spawn a task to monitor both stdout and stderr for the "Ready for connections." message
     tokio::spawn(async move {
-        while let Ok(Some(line)) = reader.next_line().await {
-            tracing::info!("ClickHouse output: {}", line);
-
-            // Check for the exact "Ready for connections." message
-            if line.trim().contains("Ready for connections.") {
-                tracing::info!("ClickHouse is ready to accept connections.");
-
-                // Send the readiness signal through the channel
-                if let Err(err) = ready_tx.send(()).await {
-                    tracing::error!("Failed to send readiness signal: {}", err);
+        loop {
+            tokio::select! {
+                line = stdout_reader.next_line() => {
+                    if let Ok(Some(line)) = line {
+                        // Log stdout inside the clickhouse span
+                        let _guard = clickhouse_span.enter();
+                        tracing::info!("{}", line);
+                    }
                 }
-                break;
+                line = stderr_reader.next_line() => {
+                    if let Ok(Some(line)) = line {
+                        // Log stderr inside the clickhouse span
+                        let _guard = clickhouse_span.enter();
+                        tracing::info!("{}", line);
+
+                        // Check for "Ready for connections" message
+                        if line.contains("Ready for connections") {
+                            tracing::info!("ClickHouse is ready to accept connections.");
+
+                            // Send the readiness signal through the channel
+                            if let Err(err) = ready_tx.send(()).await {
+                                tracing::error!("Failed to send readiness signal: {}", err);
+                            }
+                            break;
+                        }
+                    }
+                }
             }
         }
 
-        tracing::warn!("ClickHouse stdout stream ended without readiness signal.");
+        tracing::warn!("ClickHouse stdout/stderr stream ended without readiness signal.");
     });
 
     tracing::info!("Waiting for ClickHouse process to be ready.");

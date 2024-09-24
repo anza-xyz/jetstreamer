@@ -4,7 +4,6 @@ use tokio::{
     process::Command,
     sync::mpsc,
 };
-use tracing;
 
 pub async fn spawn_click_house() -> Result<
     (
@@ -13,7 +12,7 @@ pub async fn spawn_click_house() -> Result<
     ),
     String,
 > {
-    tracing::info!("Spawning local ClickHouse server...");
+    log::info!("Spawning local ClickHouse server...");
 
     // Create a channel to signal when ClickHouse is ready
     let (ready_tx, ready_rx) = mpsc::channel(1);
@@ -25,7 +24,7 @@ pub async fn spawn_click_house() -> Result<
         .stderr(Stdio::piped()) // Also capture stderr
         .spawn()
         .map_err(|err| {
-            tracing::error!("Failed to start the ClickHouse process: {}", err);
+            log::error!("Failed to start the ClickHouse process: {}", err);
             err.to_string()
         })?;
 
@@ -60,11 +59,11 @@ pub async fn spawn_click_house() -> Result<
 
                         // Check for "Ready for connections" message, ignoring extra formatting or invisible chars
                         if !ready_signal_sent && line.contains("Ready for connections") {
-                            tracing::info!("ClickHouse is ready to accept connections.");
+                            log::info!("ClickHouse is ready to accept connections.");
 
                             // Send the readiness signal through the channel
                             if let Err(err) = ready_tx.send(()).await {
-                                tracing::error!("Failed to send readiness signal: {}", err);
+                                log::error!("Failed to send readiness signal: {}", err);
                             }
                             ready_signal_sent = true;
                         }
@@ -74,7 +73,7 @@ pub async fn spawn_click_house() -> Result<
         }
     });
 
-    tracing::info!("Waiting for ClickHouse process to be ready.");
+    log::info!("Waiting for ClickHouse process to be ready.");
 
     // Return the receiver side of the channel and the future for the ClickHouse process
     Ok((ready_rx, async move {
@@ -82,11 +81,11 @@ pub async fn spawn_click_house() -> Result<
 
         match status {
             Ok(status) => {
-                tracing::info!("ClickHouse exited with status: {}", status);
+                log::info!("ClickHouse exited with status: {}", status);
                 Ok(())
             }
             Err(err) => {
-                tracing::error!("Failed to wait on the ClickHouse process: {}", err);
+                log::error!("Failed to wait on the ClickHouse process: {}", err);
                 Err(())
             }
         }

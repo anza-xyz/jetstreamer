@@ -11,13 +11,13 @@ crate-type = ["cdylib", "rlib"]
 [workspace.dependencies]
 dotenvy = "0.15"
 tokio = { version = "1", features = ["full"] }
-tracing = "0.1"
-tracing-subscriber = "0.3"
+log = "0.4"
 solana-geyser-plugin-interface = "1.18"
+solana-logger = "2.0"
 
 [dependencies]
 dotenvy.workspace = true
 tokio.workspace = true
-tracing.workspace = true
-tracing-subscriber.workspace = true
+log.workspace = true
 solana-geyser-plugin-interface.workspace = true
+solana-logger.workspace = true

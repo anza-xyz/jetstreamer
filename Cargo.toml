@@ -9,14 +9,12 @@ edition = "2021"
 crate-type = ["cdylib", "rlib"]
 
 [workspace.dependencies]
-dotenvy = "0.15"
 tokio = { version = "1", features = ["full"] }
 log = "0.4"
 solana-geyser-plugin-interface = "1.18"
 solana-logger = "2.0"
 
 [dependencies]
-dotenvy.workspace = true
 tokio.workspace = true
 log.workspace = true
 solana-geyser-plugin-interface.workspace = true

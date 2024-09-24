@@ -1,10 +1,18 @@
+[workspace]
+
 [package]
 name = "solira"
 version = "0.1.0"
 edition = "2021"
 
-[dependencies]
+[workspace.dependencies]
 dotenvy = "0.15"
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = "0.3"
+
+[dependencies]
+dotenvy.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

@@ -13,9 +13,11 @@ dotenvy = "0.15"
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = "0.3"
+solana-geyser-plugin-interface = "1.18"
 
 [dependencies]
 dotenvy.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+solana-geyser-plugin-interface.workspace = true

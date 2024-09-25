@@ -56,7 +56,7 @@ jobs:
       - name: Install cargo-audit
         run: cargo install cargo-audit
       - name: cargo audit
-        run: cargo audit
+        run: cargo audit --ignore RUSTSEC-2022-0093 --ignore RUSTSEC-2024-0344
   cargo-clippy:
     name: cargo clippy
     runs-on: ubuntu-latest

@@ -2765,6 +2765,7 @@ name = "solira"
 version = "0.1.0"
 dependencies = [
  "log",
+ "once_cell",
  "solana-geyser-plugin-interface",
  "solana-logger 2.0.10",
  "tokio",

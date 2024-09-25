@@ -7,6 +7,24 @@ use tokio::{
 
 use crate::SoliraError;
 
+fn process_log_line(line: impl AsRef<str>) {
+    let line = line.as_ref();
+    if line.len() > 41 {
+        match &line[41..] {
+            ln if ln.starts_with("<Information>") => {
+                log::info!("{}", &ln[14..])
+            }
+            ln if ln.starts_with("<Trace>") => log::trace!("{}", &ln[8..]),
+            ln if ln.starts_with("<Error>") => log::error!("{}", &ln[8..]),
+            ln if ln.starts_with("<Debug>") => log::debug!("{}", &ln[8..]),
+            ln if ln.starts_with("<Warning>") => log::warn!("{}", &ln[10..]),
+            _ => log::info!("{}", line),
+        }
+    } else {
+        log::info!("{}", line);
+    }
+}
+
 pub async fn spawn_click_house() -> Result<
     (
         mpsc::Receiver<()>,
@@ -51,12 +69,12 @@ pub async fn spawn_click_house() -> Result<
             tokio::select! {
                 line = stdout_reader.next_line() => {
                     if let Ok(Some(line)) = line {
-                        println!("{}", line);
+                        process_log_line(line);
                     }
                 }
                 line = stderr_reader.next_line() => {
                     if let Ok(Some(line)) = line {
-                        eprintln!("{}", line);
+                        process_log_line(&line);
 
                         // Check for "Ready for connections" message, ignoring extra formatting or invisible chars
                         if !ready_signal_sent && line.contains("Ready for connections") {

@@ -1,0 +1,59 @@
+name: Rust
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+jobs:
+  cargo-check:
+    name: cargo check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Rust Toolchain
+        run: curl https://sh.rustup.rs -sSf | sh -s -- -y
+      - name: cargo check
+        run: cargo check --workspace --all-features
+  cargo-test:
+    name: cargo test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Rust Toolchain
+        run: curl https://sh.rustup.rs -sSf | sh -s -- -y
+      - name: cargo test
+        run: cargo test --workspace --all-features
+  cargo-fmt:
+    name: cargo fmt
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Rust Toolchain
+        run: curl https://sh.rustup.rs -sSf | sh -s -- -y
+      - name: cargo fmt
+        run: cargo fmt -- --check
+  cargo-doc:
+    name: cargo doc
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Rust Toolchain
+        run: curl https://sh.rustup.rs -sSf | sh -s -- -y
+      - name: cargo doc
+        run: cargo doc --workspace --all-features
+  cargo-audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Rust Toolchain
+        run: curl https://sh.rustup.rs -sSf | sh -s -- -y
+      - name: Install cargo-audit
+        run: cargo install cargo-audit
+      - name: cargo audit
+        run: cargo audit

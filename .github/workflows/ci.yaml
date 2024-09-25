@@ -57,3 +57,13 @@ jobs:
         run: cargo install cargo-audit
       - name: cargo audit
         run: cargo audit
+  cargo-clippy:
+    name: cargo clippy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Rust Toolchain
+        run: curl https://sh.rustup.rs -sSf | sh -s -- -y
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-features

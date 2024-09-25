@@ -1,9 +1,14 @@
 name: Rust
+
+concurrency:
+  group: check-rust-${{ github.ref }}
+  cancel-in-progress: true
+
 on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
+
 jobs:
   cargo-check:
     name: cargo check
@@ -15,6 +20,7 @@ jobs:
         run: curl https://sh.rustup.rs -sSf | sh -s -- -y
       - name: cargo check
         run: cargo check --workspace --all-features
+
   cargo-test:
     name: cargo test
     runs-on: ubuntu-latest
@@ -25,6 +31,7 @@ jobs:
         run: curl https://sh.rustup.rs -sSf | sh -s -- -y
       - name: cargo test
         run: cargo test --workspace --all-features
+
   cargo-fmt:
     name: cargo fmt
     runs-on: ubuntu-latest
@@ -35,6 +42,7 @@ jobs:
         run: curl https://sh.rustup.rs -sSf | sh -s -- -y
       - name: cargo fmt
         run: cargo fmt -- --check
+
   cargo-doc:
     name: cargo doc
     runs-on: ubuntu-latest
@@ -45,6 +53,7 @@ jobs:
         run: curl https://sh.rustup.rs -sSf | sh -s -- -y
       - name: cargo doc
         run: cargo doc --workspace --all-features
+
   cargo-audit:
     name: cargo audit
     runs-on: ubuntu-latest
@@ -58,6 +67,7 @@ jobs:
       - name: cargo audit
         # these are ignored upstream and patched manually by the build process
         run: cargo audit --ignore RUSTSEC-2022-0093 --ignore RUSTSEC-2024-0344
+
   cargo-clippy:
     name: cargo clippy
     runs-on: ubuntu-latest
@@ -68,3 +78,24 @@ jobs:
         run: curl https://sh.rustup.rs -sSf | sh -s -- -y
       - name: cargo clippy
         run: cargo clippy --workspace --all-features
+
+  cargo-fix:
+    name: cargo fix
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Rust Toolchain
+        run: curl https://sh.rustup.rs -sSf | sh -s -- -y
+      - name: cargo fix --workspace
+        run: |
+          # Run cargo fix on the project
+          cargo fix --workspace
+
+          # Check for local git changes
+          if ! git diff --exit-code; then
+              echo "There are local changes after running 'cargo fix --workspace' ❌"
+              exit 1
+          else
+              echo "No changes detected after running 'cargo fix --workspace' ✅"
+          fi

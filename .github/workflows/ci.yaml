@@ -56,6 +56,7 @@ jobs:
       - name: Install cargo-audit
         run: cargo install cargo-audit
       - name: cargo audit
+        # these are ignored upstream and patched manually by the build process
         run: cargo audit --ignore RUSTSEC-2022-0093 --ignore RUSTSEC-2024-0344
   cargo-clippy:
     name: cargo clippy

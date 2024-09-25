@@ -5,12 +5,14 @@ use tokio::{
     sync::mpsc,
 };
 
+use crate::SoliraError;
+
 pub async fn spawn_click_house() -> Result<
     (
         mpsc::Receiver<()>,
         impl std::future::Future<Output = Result<(), ()>>,
     ),
-    String,
+    SoliraError,
 > {
     log::info!("Spawning local ClickHouse server...");
 
@@ -24,8 +26,7 @@ pub async fn spawn_click_house() -> Result<
         .stderr(Stdio::piped()) // Also capture stderr
         .spawn()
         .map_err(|err| {
-            log::error!("Failed to start the ClickHouse process: {}", err);
-            err.to_string()
+            SoliraError::ClickHouseError(format!("Failed to start the ClickHouse process: {}", err))
         })?;
 
     // Capture stdout and stderr

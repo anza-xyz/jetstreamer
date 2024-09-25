@@ -1,5 +1,6 @@
 use solana_geyser_plugin_interface::geyser_plugin_interface::{
-    GeyserPlugin, GeyserPluginError, Result,
+    GeyserPlugin, GeyserPluginError, ReplicaAccountInfoVersions, ReplicaBlockInfoVersions,
+    ReplicaTransactionInfoVersions, Result,
 };
 use std::{cell::RefCell, error::Error};
 use tokio::runtime::Runtime;
@@ -45,6 +46,7 @@ impl GeyserPlugin for Solira {
 
     fn on_load(&mut self, _config_file: &str, _is_reload: bool) -> Result<()> {
         solana_logger::setup_with_default("info");
+        log::info!("solira loading...");
 
         TOKIO_RUNTIME.with(|rt_cell| {
             let rt = rt_cell.borrow();
@@ -57,11 +59,48 @@ impl GeyserPlugin for Solira {
                 if ready_rx.recv().await.is_some() {
                     log::info!("ClickHouse initialization complete.");
                     rt.spawn(clickhouse_future);
+                    log::info!("solira loaded");
                     Ok(())
                 } else {
                     Err(SoliraError::ClickHouseInitializationFailed.into())
                 }
             })
         })
+    }
+
+    fn on_unload(&mut self) {
+        log::info!("solira unloading...");
+    }
+
+    fn notify_block_metadata(&self, _blockinfo: ReplicaBlockInfoVersions) -> Result<()> {
+        log::info!("got block metadata");
+        Ok(())
+    }
+
+    fn update_account(
+        &self,
+        _account: ReplicaAccountInfoVersions,
+        _slot: u64,
+        _is_startup: bool,
+    ) -> Result<()> {
+        log::info!("got account update");
+        Ok(())
+    }
+
+    fn notify_transaction(
+        &self,
+        _transaction: ReplicaTransactionInfoVersions,
+        _slot: u64,
+    ) -> Result<()> {
+        log::info!("got transaction");
+        Ok(())
+    }
+
+    fn transaction_notifications_enabled(&self) -> bool {
+        true
+    }
+
+    fn account_data_notifications_enabled(&self) -> bool {
+        true
     }
 }

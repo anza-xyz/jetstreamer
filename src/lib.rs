@@ -4,7 +4,7 @@ use solana_geyser_plugin_interface::geyser_plugin_interface::{
 use std::{cell::RefCell, error::Error};
 use tokio::runtime::Runtime;
 
-pub mod db;
+pub mod clickhouse;
 
 thread_local! {
     static TOKIO_RUNTIME: RefCell<Runtime> = RefCell::new(Runtime::new().unwrap());
@@ -50,7 +50,7 @@ impl GeyserPlugin for Solira {
             let rt = rt_cell.borrow();
             rt.block_on(async {
                 let (mut ready_rx, clickhouse_future) =
-                    db::spawn_click_house().await.map_err(|e| {
+                    clickhouse::spawn_click_house().await.map_err(|e| {
                         GeyserPluginError::from(SoliraError::ClickHouseError(e.to_string()))
                     })?;
 

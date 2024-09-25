@@ -3,7 +3,7 @@ use std::time::Duration;
 use solana_geyser_plugin_interface::geyser_plugin_interface::GeyserPlugin;
 use solira::*;
 
-pub mod db;
+pub mod clickhouse;
 
 fn main() {
     log::info!("solira launched in local dev mode");

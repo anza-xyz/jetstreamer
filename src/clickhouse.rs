@@ -18,7 +18,7 @@ fn process_log_line(line: impl AsRef<str>) {
             ln if ln.starts_with("<Error>") => log::error!("{}", &ln[8..]),
             ln if ln.starts_with("<Debug>") => log::debug!("{}", &ln[8..]),
             ln if ln.starts_with("<Warning>") => log::warn!("{}", &ln[10..]),
-            _ => log::info!("{}", line),
+            _ => log::warn!("{}", line),
         }
     } else {
         log::info!("{}", line);

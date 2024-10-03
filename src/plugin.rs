@@ -2,6 +2,7 @@ use agave_geyser_plugin_interface::geyser_plugin_interface::{
     GeyserPlugin, GeyserPluginError, ReplicaAccountInfoVersions, ReplicaBlockInfoVersions,
     ReplicaTransactionInfoVersions, Result,
 };
+use solana_program::pubkey::Pubkey;
 use std::{cell::RefCell, error::Error};
 use tokio::runtime::Runtime;
 
@@ -79,11 +80,22 @@ impl GeyserPlugin for Solira {
 
     fn update_account(
         &self,
-        _account: ReplicaAccountInfoVersions,
-        _slot: u64,
+        account: ReplicaAccountInfoVersions,
+        slot: u64,
         _is_startup: bool,
     ) -> Result<()> {
-        log::info!("got account update");
+        let pubkey_bytes = match account {
+            ReplicaAccountInfoVersions::V0_0_1(account_info) => account_info.pubkey,
+            ReplicaAccountInfoVersions::V0_0_2(account_info) => account_info.pubkey,
+            ReplicaAccountInfoVersions::V0_0_3(account_info) => account_info.pubkey,
+        };
+
+        println!(
+            "account {:?} updated at slot {}!",
+            Pubkey::try_from(pubkey_bytes).unwrap(),
+            slot
+        );
+
         Ok(())
     }
 

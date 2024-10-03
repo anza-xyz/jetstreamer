@@ -4,9 +4,9 @@ use solana_logger::setup_with_default;
 use solana_rpc::optimistically_confirmed_bank_tracker::SlotNotification;
 use solana_test_validator::TestValidatorGenesis;
 use std::{
+    env,
     path::PathBuf,
-    sync::Arc,
-    sync::{atomic::AtomicBool, RwLock},
+    sync::{atomic::AtomicBool, Arc, RwLock},
 };
 
 fn main() {
@@ -16,8 +16,8 @@ fn main() {
     // Initialize the Solana test validator
     let test_validator = TestValidatorGenesis::default().start();
 
-    // Path to the solira plugin config file (you need to ensure this path is correct)
-    let plugin_config_file = PathBuf::from("plugin_config.json");
+    let out_dir = env::var("OUT_DIR").expect("OUT_DIR not set");
+    let plugin_config_file = PathBuf::from(format!("{}/plugin_config.json", out_dir));
 
     // Channel to receive slot notifications
     let (slot_sender, slot_receiver) = unbounded::<SlotNotification>();

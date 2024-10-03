@@ -1,9 +1,27 @@
-use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
+use std::{env, fs};
 
 fn main() {
+    // Get the OUT_DIR and shared library path
+    let out_dir = env::var("OUT_DIR").expect("OUT_DIR not set");
+    let lib_path = format!("{}/libsolira.so", out_dir);
+
+    // Read the template file
+    let template_path = Path::new("plugin_config.template.json");
+    let template =
+        fs::read_to_string(&template_path).expect("Failed to read plugin_config.template.json");
+
+    // Replace the placeholder with the actual library path
+    let config = template.replace("{{LIB_PATH}}", &lib_path);
+
+    // Write the final config to OUT_DIR
+    let config_path = Path::new(&out_dir).join("plugin_config.json");
+    fs::write(config_path, config).expect("Failed to write plugin_config.json");
+
+    println!("cargo:rerun-if-changed=plugin_config.template.json");
+
     println!("cargo:rerun-if-changed=bin/clickhouse");
     let bin_dir = Path::new("bin");
     let clickhouse_binary = bin_dir.join("clickhouse");

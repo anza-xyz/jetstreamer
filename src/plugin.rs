@@ -15,7 +15,7 @@ thread_local! {
 #[derive(Clone, Debug, Default)]
 pub struct Solira;
 
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SoliraError {
     ClickHouseError(String),
     ClickHouseInitializationFailed,
@@ -49,24 +49,29 @@ impl GeyserPlugin for Solira {
         solana_logger::setup_with_default("info");
         log::info!("solira loading...");
 
-        TOKIO_RUNTIME.with(|rt_cell| {
-            let rt = rt_cell.borrow();
-            rt.block_on(async {
-                let (mut ready_rx, clickhouse_future) =
-                    clickhouse::spawn_click_house().await.map_err(|e| {
-                        GeyserPluginError::from(SoliraError::ClickHouseError(e.to_string()))
-                    })?;
+        TOKIO_RUNTIME
+            .with(|rt_cell| {
+                let rt = rt_cell.borrow();
+                rt.block_on(async {
+                    let (mut ready_rx, clickhouse_future) =
+                        clickhouse::spawn_click_house()
+                            .await
+                            .map_err(|e| SoliraError::ClickHouseError(e.to_string()))?;
 
-                if ready_rx.recv().await.is_some() {
-                    log::info!("ClickHouse initialization complete.");
-                    rt.spawn(clickhouse_future);
-                    log::info!("solira loaded");
-                    Ok(())
-                } else {
-                    Err(SoliraError::ClickHouseInitializationFailed.into())
-                }
+                    if ready_rx.recv().await.is_some() {
+                        log::info!("ClickHouse initialization complete.");
+                        rt.spawn(clickhouse_future);
+                        log::info!("solira loaded");
+                        Ok(())
+                    } else {
+                        Err(SoliraError::ClickHouseInitializationFailed)
+                    }
+                })
             })
-        })
+            .map_err(|e| {
+                log::error!("Error loading solira: {:?}", e);
+                GeyserPluginError::from(e)
+            })
     }
 
     fn on_unload(&mut self) {
@@ -90,7 +95,7 @@ impl GeyserPlugin for Solira {
             ReplicaAccountInfoVersions::V0_0_3(account_info) => account_info.pubkey,
         };
 
-        println!(
+        log::info!(
             "account {:?} updated at slot {}!",
             Pubkey::try_from(pubkey_bytes).unwrap(),
             slot

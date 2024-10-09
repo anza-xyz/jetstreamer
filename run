@@ -4,4 +4,4 @@ cargo build
 cp target/debug/libsolira.dylib bin/
 cp plugin_config.json bin/
 cd bin
-solana-test-validator -r --geyser-plugin-config plugin_config.json
+CLICOLOR_FORCE=1 solana-test-validator -r --geyser-plugin-config plugin_config.json --log 2>&1 | grep --color=always --line-buffered "solira"

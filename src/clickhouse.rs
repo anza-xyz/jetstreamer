@@ -39,7 +39,6 @@ pub async fn spawn_click_house() -> Result<
 
     let mut clickhouse_command = Command::new("./clickhouse")
         .arg("server")
-        .current_dir("bin")
         .stdout(Stdio::piped()) // Redirect stdout to capture logs
         .stderr(Stdio::piped()) // Also capture stderr
         .spawn()

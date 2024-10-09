@@ -1,0 +1,7 @@
+#!/bin/sh
+set -e
+cargo build
+cp target/debug/libsolira.dylib bin/
+cp plugin_config.json bin/
+cd bin
+solana-test-validator -r --geyser-plugin-config plugin_config.json

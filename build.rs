@@ -1,43 +1,21 @@
+use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
-use std::{env, fs};
 
 fn main() {
-    // Get the OUT_DIR and shared library path
-    let out_dir = env::var("OUT_DIR").expect("OUT_DIR not set");
-    let out_dir = Path::new(&out_dir)
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap();
-    let lib_path = out_dir.join("libsolira.dylib");
-
-    // Read the template file
-    let template_path = Path::new("plugin_config.template.json");
-    let template =
-        fs::read_to_string(&template_path).expect("Failed to read plugin_config.template.json");
-
-    // Replace the placeholder with the actual library path
-    let config = template.replace("{{LIB_PATH}}", &lib_path.display().to_string());
-
-    // Write the final config to OUT_DIR
-    let config_path = out_dir.join("plugin_config.json");
-    fs::write(config_path, config).expect("Failed to write plugin_config.json");
-
-    println!("cargo:rerun-if-changed=plugin_config.template.json");
-
-    println!("cargo:rerun-if-changed=bin/clickhouse");
     let bin_dir = Path::new("bin");
-    let clickhouse_binary = bin_dir.join("clickhouse");
-
     // Check if the bin directory exists, create it if it doesn't
     if !bin_dir.exists() {
         println!("Creating bin directory...");
         fs::create_dir(bin_dir).expect("Failed to create bin directory");
     }
+
+    std::fs::copy("plugin_config.json", bin_dir.join("plugin_config.json")).unwrap();
+    println!("cargo:rerun_if-changed=plugin_config.json");
+
+    println!("cargo:rerun-if-changed=bin/clickhouse");
+    let clickhouse_binary = bin_dir.join("clickhouse");
 
     // Check if the ClickHouse binary exists
     if !clickhouse_binary.exists() {

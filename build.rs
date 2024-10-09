@@ -6,7 +6,14 @@ use std::{env, fs};
 fn main() {
     // Get the OUT_DIR and shared library path
     let out_dir = env::var("OUT_DIR").expect("OUT_DIR not set");
-    let lib_path = format!("{}/libsolira.so", out_dir);
+    let out_dir = Path::new(&out_dir)
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap();
+    let lib_path = out_dir.join("libsolira.dylib");
 
     // Read the template file
     let template_path = Path::new("plugin_config.template.json");
@@ -14,10 +21,10 @@ fn main() {
         fs::read_to_string(&template_path).expect("Failed to read plugin_config.template.json");
 
     // Replace the placeholder with the actual library path
-    let config = template.replace("{{LIB_PATH}}", &lib_path);
+    let config = template.replace("{{LIB_PATH}}", &lib_path.display().to_string());
 
     // Write the final config to OUT_DIR
-    let config_path = Path::new(&out_dir).join("plugin_config.json");
+    let config_path = out_dir.join("plugin_config.json");
     fs::write(config_path, config).expect("Failed to write plugin_config.json");
 
     println!("cargo:rerun-if-changed=plugin_config.template.json");

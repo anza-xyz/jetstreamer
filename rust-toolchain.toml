@@ -1,1 +1,2 @@
-toolchain.channel = "stable"
+[toolchain]
+channel = "1.75.0" # agave 1.18.25

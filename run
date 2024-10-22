@@ -1,15 +1,15 @@
 #!/bin/sh
 set -e
 cargo build
-cp target/debug/libsolira.dylib bin/
+cp target/debug/libsolira.so bin/
 cp plugin_config.json bin/
 cd bin
-# solana-test-validator --geyser-plugin-config plugin_config.json --log
-solana-validator \
-    --identity ~/validator-keypair.json \
-    --entrypoint entrypoint.mainnet-beta.solana.com:8001 \
-    \ #--ledger ~/solana-ledger \
-    --rpc-port 8899 \
-    --geyser-plugin-config plugin_config.json \
-    --no-voting \
-    --limit-ledger-size
+solana-test-validator --geyser-plugin-config plugin_config.json --log
+# solana-validator \
+#     --identity ~/validator-keypair.json \
+#     --entrypoint entrypoint.mainnet-beta.solana.com:8001 \
+#     \ #--ledger ~/solana-ledger \
+#     --rpc-port 8899 \
+#     --geyser-plugin-config plugin_config.json \
+#     --no-voting \
+#     --limit-ledger-size

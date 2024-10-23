@@ -1,9 +1,16 @@
 #!/bin/sh
 set -e
-cargo build
-cp target/debug/libsolira.so bin/
+cargo build --release
 cp plugin_config.json bin/
-cd bin
+if [[ "$OSTYPE" == "darwin"* ]]; then
+  cp target/release/libsolira.dylib bin/
+  cd bin
+  awk '{gsub("{{ext}}", "dylib")}1' plugin_config.json > plugin_config.tmp && mv plugin_config.tmp plugin_config.json
+else
+  cp target/release/libsolira.so bin/
+  cd bin
+  awk '{gsub("{{ext}}", "so")}1' plugin_config.json > plugin_config.tmp && mv plugin_config.tmp plugin_config.json
+fi
 solana-test-validator --geyser-plugin-config plugin_config.json --log
 # solana-validator \
 #     --identity ~/validator-keypair.json \

@@ -12,7 +12,7 @@ on:
 jobs:
   cargo-check:
     name: cargo check
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04-8core
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -23,7 +23,7 @@ jobs:
 
   cargo-test:
     name: cargo test
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04-8core
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -45,7 +45,7 @@ jobs:
 
   cargo-doc:
     name: cargo doc
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04-8core
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -70,7 +70,7 @@ jobs:
 
   cargo-clippy:
     name: cargo clippy
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04-8core
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -81,7 +81,7 @@ jobs:
 
   cargo-fix:
     name: cargo fix
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04-8core
     steps:
       - name: Checkout
         uses: actions/checkout@v4

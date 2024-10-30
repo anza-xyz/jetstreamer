@@ -1,9 +1,11 @@
 [workspace]
+members = ["geyser-replay"]
 
 [package]
 name = "solira"
 version = "0.1.0"
 edition = "2021"
+authors = ["sam0x17"]
 
 [package.metadata.docs.rs]
 targets = ["x86_64-unknown-linux-gnu"]

@@ -1,5 +1,5 @@
 {
-  "libpath": "libsolira.{{ext}}",
+  "libpath": "{{full-path}}/libsolira.{{ext}}",
   "name": "GeyserPluginSolira",
   "clickhouse": {
     "host": "127.0.0.1",

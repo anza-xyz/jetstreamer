@@ -23,6 +23,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         println!("Header bytes: {:?}", header);
 
         let geyser_config_files = &[std::path::PathBuf::from(args().nth(2).unwrap())];
+        println!("Geyser config files: {:?}", geyser_config_files);
 
         let (confirmed_bank_sender, confirmed_bank_receiver) = unbounded();
         // drop(confirmed_bank_sender);

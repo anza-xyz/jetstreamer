@@ -1,6 +1,6 @@
 #!/bin/sh
-set -e
-cargo build --release
+set -ex
+cargo build --release -p geyser-replay -p solira
 cp plugin_config.json bin/
 if [[ "$OSTYPE" == "darwin"* ]]; then
   cp target/release/libsolira.dylib bin/
@@ -11,7 +11,15 @@ else
   cd bin
   awk '{gsub("{{ext}}", "so")}1' plugin_config.json > plugin_config.tmp && mv plugin_config.tmp plugin_config.json
 fi
-solana-test-validator --geyser-plugin-config plugin_config.json --log
+awk "{gsub(\"{{full-path}}\", \"$PWD\")}1" plugin_config.json > plugin_config.tmp && mv plugin_config.tmp plugin_config.json
+cat plugin_config.json
+echo "A"
+cp ../target/release/geyser-replay .
+echo "B"
+cp ~/Downloads/epoch-0.car .
+echo "C"
+./geyser-replay epoch-0.car `pwd`/plugin-config.json
+#solana-test-validator --geyser-plugin-config plugin_config.json --log
 # solana-validator \
 #     --identity ~/validator-keypair.json \
 #     --entrypoint entrypoint.mainnet-beta.solana.com:8001 \

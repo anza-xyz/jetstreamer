@@ -16,9 +16,9 @@ cat plugin_config.json
 echo "A"
 cp ../target/release/geyser-replay .
 echo "B"
-cp ~/Downloads/epoch-0.car .
+cp ~/Downloads/epoch-100.car .
 echo "C"
-./geyser-replay epoch-0.car `pwd`/plugin_config.json
+./geyser-replay epoch-100.car `pwd`/plugin_config.json
 #solana-test-validator --geyser-plugin-config plugin_config.json --log
 # solana-validator \
 #     --identity ~/validator-keypair.json \

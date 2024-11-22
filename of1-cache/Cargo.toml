@@ -8,3 +8,4 @@ keywords = ["solana", "CAR", "cache", "old", "faithful"]
 description = "Manages a cache of old faithful Solana CAR files using a combination of in-memory and on-disk storage"
 
 [dependencies]
+memmap2 = "0.9"

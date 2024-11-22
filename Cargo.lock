@@ -2818,6 +2818,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "memmap2"
+version = "0.9.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fd3f7eed9d3848f8b98834af67102b720745c4ec028fcd0aa0239277e7de374f"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "memoffset"
 version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3177,6 +3186,9 @@ dependencies = [
 [[package]]
 name = "of1-cache"
 version = "0.1.0"
+dependencies = [
+ "memmap2 0.9.5",
+]
 
 [[package]]
 name = "oid-registry"
@@ -4631,7 +4643,7 @@ dependencies = [
  "lazy_static",
  "log",
  "lz4",
- "memmap2",
+ "memmap2 0.5.10",
  "modular-bitfield",
  "num_cpus",
  "num_enum",
@@ -4773,7 +4785,7 @@ dependencies = [
  "bytemuck",
  "bytemuck_derive",
  "log",
- "memmap2",
+ "memmap2 0.5.10",
  "modular-bitfield",
  "num_enum",
  "rand 0.8.5",
@@ -5943,7 +5955,7 @@ dependencies = [
  "libc",
  "log",
  "lz4",
- "memmap2",
+ "memmap2 0.5.10",
  "mockall",
  "modular-bitfield",
  "num-derive",
@@ -6050,7 +6062,7 @@ dependencies = [
  "lazy_static",
  "libsecp256k1",
  "log",
- "memmap2",
+ "memmap2 0.5.10",
  "num-derive",
  "num-traits",
  "num_enum",

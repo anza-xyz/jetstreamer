@@ -3175,6 +3175,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "of1-cache"
+version = "0.1.0"
+
+[[package]]
 name = "oid-registry"
 version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -2,7 +2,7 @@ use std::process::Stdio;
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
     process::Command,
-    sync::mpsc,
+    sync::{mpsc, OnceCell},
 };
 
 use crate::plugin::SoliraError;
@@ -25,7 +25,9 @@ fn process_log_line(line: impl AsRef<str>) {
     }
 }
 
-pub async fn spawn_click_house() -> Result<
+static CLICKHOUSE_PROCESS: OnceCell<u32> = OnceCell::const_new();
+
+pub async fn start() -> Result<
     (
         mpsc::Receiver<()>,
         impl std::future::Future<Output = Result<(), ()>>,
@@ -95,6 +97,9 @@ pub async fn spawn_click_house() -> Result<
 
     // Return the receiver side of the channel and the future for the ClickHouse process
     Ok((ready_rx, async move {
+        CLICKHOUSE_PROCESS
+            .set(clickhouse_command.id().unwrap())
+            .unwrap();
         let status = clickhouse_command.wait().await;
 
         match status {
@@ -108,4 +113,41 @@ pub async fn spawn_click_house() -> Result<
             }
         }
     }))
+}
+
+pub async fn stop() {
+    if let Some(&pid) = CLICKHOUSE_PROCESS.get() {
+        log::info!("Stopping ClickHouse process with PID: {}", pid);
+
+        let status = Command::new("pkill")
+            .arg("-2") // Signal 2: SIGINT
+            .arg("-P") // Match the parent PID
+            .arg(pid.to_string())
+            .status();
+
+        match status.await {
+            Ok(exit_status) if exit_status.success() => {
+                log::info!("ClickHouse process with PID {} stopped gracefully.", pid);
+            }
+            Ok(exit_status) => {
+                log::warn!(
+                    "pkill executed, but ClickHouse process might not have stopped. Exit status: {}",
+                    exit_status
+                );
+            }
+            Err(err) => {
+                log::error!("Failed to execute pkill for PID {}: {}", pid, err);
+            }
+        }
+    } else {
+        log::warn!("ClickHouse process PID not found in CLICKHOUSE_PROCESS.");
+    }
+}
+
+pub fn stop_sync() {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(stop());
 }

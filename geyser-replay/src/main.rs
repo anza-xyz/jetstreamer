@@ -54,7 +54,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             let nodes = reader.read_until_block()?;
             // println!("Nodes: {:?}", nodes.get_cids());
             let block = nodes.get_block()?;
-            println!("Slot: {:?}", block.slot);
+            // println!("Slot: {:?}", block.slot);
             // println!("Raw node: {:?}", raw_node);
             let mut entry_index: usize = 0;
             let mut this_block_executed_transaction_count: u64 = 0;
@@ -211,11 +211,11 @@ fn main() -> Result<(), Box<dyn Error>> {
                     node::Node::Subset(_subset) => {
                         // println!("___ Subset: {:?}", subset);
                     }
-                    node::Node::Epoch(epoch) => {
-                        println!("___ Epoch: {:?}", epoch);
+                    node::Node::Epoch(_epoch) => {
+                        // println!("___ Epoch: {:?}", epoch);
                     }
                     node::Node::Rewards(rewards) => {
-                        println!("___ Rewards: {:?}", node_with_cid.get_cid());
+                        // println!("___ Rewards: {:?}", node_with_cid.get_cid());
                         // println!("___ Next items: {:?}", rewards.data.next);
 
                         #[allow(clippy::overly_complex_bool_expr)]
@@ -234,7 +234,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                         }
                     }
                     node::Node::DataFrame(_) => {
-                        println!("___ DataFrame: {:?}", node_with_cid.get_cid());
+                        // println!("___ DataFrame: {:?}", node_with_cid.get_cid());
                     }
                 }
                 Ok(())

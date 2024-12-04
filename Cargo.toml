@@ -1,5 +1,5 @@
 [workspace]
-members = ["geyser-replay", "of1-cache"]
+members = ["geyser-replay", "of1"]
 
 [package]
 name = "solira"

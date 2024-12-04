@@ -1,6 +1,7 @@
 #![recursion_limit = "512"]
 
 pub mod block;
+pub mod client;
 pub mod dataframe;
 pub mod entry;
 pub mod epoch;

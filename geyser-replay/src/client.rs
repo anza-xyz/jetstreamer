@@ -82,4 +82,32 @@ impl CarClient {
 
         Ok(response)
     }
+
+    fn epoch(&self, epoch: usize) -> InitialQuery {
+        InitialQuery {
+            client: self,
+            epoch,
+        }
+    }
+}
+
+struct InitialQuery<'a> {
+    client: &'a CarClient,
+    epoch: usize,
+}
+
+impl<'a> InitialQuery<'a> {
+    fn block(&self, block: usize) -> BlockQuery {
+        BlockQuery {
+            client: self.client,
+            epoch: self.epoch,
+            block,
+        }
+    }
+}
+
+struct BlockQuery<'a> {
+    client: &'a CarClient,
+    epoch: usize,
+    block: usize,
 }

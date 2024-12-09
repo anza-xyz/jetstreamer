@@ -1,5 +1,6 @@
 #!/bin/sh
 set -ex
+pkill clickhouse || echo ""
 cargo build --release -p geyser-replay -p solira
 cp plugin_config.json bin/
 if [[ "$OSTYPE" == "darwin"* ]]; then

@@ -7,24 +7,25 @@ license = "AFFERO-3.0"
 description = "A utility that allows replaying ranges of Solana blocks, even back to genesis, over a geyser plugin using Old Faithful"
 
 [dependencies]
-base64 = { workspace = true }
-bincode = { workspace = true }
-cid = { workspace = true }
-crc = { workspace = true }
-crossbeam-channel = { workspace = true }
-fnv = { workspace = true }
-multihash = { workspace = true }
-prost_011 = { workspace = true }
+base64.workspace = true
+bincode.workspace = true
+cid.workspace = true
+crc.workspace = true
+crossbeam-channel.workspace = true
+fnv.workspace = true
+multihash.workspace = true
+prost_011.workspace = true
 reqwest.workspace = true
 serde = { workspace = true, features = ["derive"] }
-serde_cbor = { workspace = true }
-serde_json = { workspace = true }
-solana-accounts-db = { workspace = true }
-solana-entry = { workspace = true }
-solana-geyser-plugin-manager = { workspace = true }
-solana-rpc = { workspace = true }
-solana-runtime = { workspace = true }
-solana-sdk = { workspace = true }
-solana-storage-proto = { workspace = true }
-solana-transaction-status = { workspace = true }
-zstd = { workspace = true }
+serde_cbor.workspace = true
+serde_json.workspace = true
+solana-accounts-db.workspace = true
+solana-entry.workspace = true
+solana-geyser-plugin-manager.workspace = true
+solana-rpc.workspace = true
+solana-runtime.workspace = true
+solana-sdk.workspace = true
+solana-storage-proto.workspace = true
+solana-transaction-status.workspace = true
+zstd.workspace = true
+url.workspace = true

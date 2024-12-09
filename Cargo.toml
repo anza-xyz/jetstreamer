@@ -35,6 +35,7 @@ const-hex = "1.12"
 crc = "3"
 crossbeam-channel = "0.5"
 fnv = "1.0"
+url = "2"
 multihash = "0.19"
 prost = { package = "prost", version = "0.13" }
 prost_011 = { package = "prost", version = "0.11" }

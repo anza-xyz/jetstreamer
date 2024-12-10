@@ -111,3 +111,21 @@ struct BlockQuery<'a> {
     epoch: usize,
     block: usize,
 }
+
+impl<'a> BlockQuery<'a> {
+    fn transaction(&self, tx_index: usize) -> TransactionQuery {
+        TransactionQuery {
+            client: self.client,
+            epoch: self.epoch,
+            block: self.block,
+            tx_index,
+        }
+    }
+}
+
+struct TransactionQuery<'a> {
+    client: &'a CarClient,
+    epoch: usize,
+    block: usize,
+    tx_index: usize,
+}

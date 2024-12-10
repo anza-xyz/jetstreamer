@@ -29,3 +29,4 @@ solana-storage-proto.workspace = true
 solana-transaction-status.workspace = true
 zstd.workspace = true
 url.workspace = true
+tokio-stream.workspace = true

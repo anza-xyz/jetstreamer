@@ -7,12 +7,15 @@ use std::ops::{Bound, RangeBounds};
 
 use reqwest::{
     header::{HeaderValue, RANGE},
-    Url,
+    Response, Url,
 };
+use tokio_stream::{Stream, StreamExt};
 use url::ParseError;
 
+use crate::block::Block;
+
 /// Determines the buffer size to use when streaming data over the network.
-const BUFFER_SIZE: usize = 64 * 1024; // 64KB
+const BUFFER_SIZE: u64 = 64 * 1024; // 64KB
 
 /// An error that occurred while interacting with the Old Faithful archive
 #[derive(Debug)]
@@ -48,11 +51,11 @@ impl CarClient {
 
     /// Internal helper function used to stream the specified range of bytes from the specified
     /// path, evaluated against the base path.
-    async fn get_range(
+    async fn get_byte_range(
         &self,
         path: &str,
-        range: impl RangeBounds<usize>,
-    ) -> Result<reqwest::Response, reqwest::Error> {
+        range: impl RangeBounds<u64>,
+    ) -> Result<Response, reqwest::Error> {
         // Construct the full URL by joining the base URL and the path
         let url = self
             .base_url
@@ -83,49 +86,30 @@ impl CarClient {
         Ok(response)
     }
 
-    fn epoch(&self, epoch: usize) -> InitialQuery {
-        InitialQuery {
-            client: self,
-            epoch,
-        }
+    /// Gets the block at the specified slot number from OF1, returning an error if the block
+    /// has not been indexed yet or if a network error occurred
+    pub async fn get_block(&self, slot: u64) -> Result<Block, reqwest::Error> {
+        todo!()
     }
-}
 
-struct InitialQuery<'a> {
-    client: &'a CarClient,
-    epoch: usize,
-}
+    /// Returns an async stream of blocks within the specified slot range
+    pub async fn get_blocks(
+        &self,
+        slot_range: impl RangeBounds<u64>,
+    ) -> impl Stream<Item = Result<Block, reqwest::Error>> + '_ {
+        // Determine the start and end of the range
+        let start = match slot_range.start_bound() {
+            std::ops::Bound::Included(&start) => start,
+            std::ops::Bound::Excluded(&start) => start + 1,
+            std::ops::Bound::Unbounded => 0, // Default start
+        };
+        let end = match slot_range.end_bound() {
+            std::ops::Bound::Included(&end) => end + 1,
+            std::ops::Bound::Excluded(&end) => end,
+            std::ops::Bound::Unbounded => u64::MAX, // Default end
+        };
 
-impl<'a> InitialQuery<'a> {
-    fn block(&self, block: usize) -> BlockQuery {
-        BlockQuery {
-            client: self.client,
-            epoch: self.epoch,
-            block,
-        }
+        // Create an async stream of blocks
+        tokio_stream::iter(start..end).then(move |slot| self.get_block(slot))
     }
-}
-
-struct BlockQuery<'a> {
-    client: &'a CarClient,
-    epoch: usize,
-    block: usize,
-}
-
-impl<'a> BlockQuery<'a> {
-    fn transaction(&self, tx_index: usize) -> TransactionQuery {
-        TransactionQuery {
-            client: self.client,
-            epoch: self.epoch,
-            block: self.block,
-            tx_index,
-        }
-    }
-}
-
-struct TransactionQuery<'a> {
-    client: &'a CarClient,
-    epoch: usize,
-    block: usize,
-    tx_index: usize,
 }

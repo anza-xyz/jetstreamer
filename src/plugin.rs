@@ -15,6 +15,7 @@ thread_local! {
     static SLOT_NUM: RefCell<u64> = RefCell::new(0);
     static PROCESSED_SLOTS: RefCell<u64> = RefCell::new(0);
     static NUM_VOTES: RefCell<u64> = RefCell::new(0);
+    static COMPUTE_CONSUMED: RefCell<u128> = RefCell::new(0);
 }
 
 #[derive(Clone, Debug, Default)]
@@ -91,21 +92,24 @@ impl GeyserPlugin for Solira {
             ReplicaBlockInfoVersions::V0_0_4(block_info) => block_info.slot,
         };
         SLOT_NUM.set(slot);
-        PROCESSED_SLOTS.with_borrow_mut(|slots| {
-            PROCESSED_TRANSACTIONS.with_borrow(|txs| {
-                NUM_VOTES.with_borrow(|votes| {
-                    *slots += 1;
-                    log::info!(
-                        "at slot {}, have processed {} transactions  ({} vote, {} non-vote) across {} slots",
-                        slot,
-                        &*txs.separate_with_commas(),
-                        &*votes.separate_with_commas(),
-                        &(*txs - *votes).separate_with_commas(),
-                        &*slots.separate_with_commas(),
-                    );
-                });
-            });
+        let processed_slots = PROCESSED_SLOTS.with_borrow_mut(|slots| {
+            *slots += 1;
+            *slots
         });
+        if processed_slots % 100 == 0 {
+            let processed_txs = PROCESSED_TRANSACTIONS.with_borrow(|txs| *txs);
+            let num_votes = NUM_VOTES.with_borrow(|votes| *votes);
+            let compute_consumed = COMPUTE_CONSUMED.with_borrow(|compute| *compute);
+            log::info!(
+                "at slot {}, processed {} transactions  ({} vote, {} non-vote) consuming {} CU across {} slots",
+                slot,
+                processed_txs.separate_with_commas(),
+                num_votes.separate_with_commas(),
+                (processed_txs - num_votes).separate_with_commas(),
+                compute_consumed.separate_with_commas(),
+                processed_slots.separate_with_commas(),
+            );
+        }
         Ok(())
     }
 
@@ -143,11 +147,21 @@ impl GeyserPlugin for Solira {
                         *votes += 1;
                     });
                 }
+                if let Some(consumed) = tx.transaction_status_meta.compute_units_consumed {
+                    COMPUTE_CONSUMED.with_borrow_mut(|compute| {
+                        *compute += u128::from(consumed);
+                    });
+                }
             }
             ReplicaTransactionInfoVersions::V0_0_2(tx) => {
                 if tx.is_vote {
                     NUM_VOTES.with_borrow_mut(|votes| {
                         *votes += 1;
+                    });
+                }
+                if let Some(consumed) = tx.transaction_status_meta.compute_units_consumed {
+                    COMPUTE_CONSUMED.with_borrow_mut(|compute| {
+                        *compute += u128::from(consumed);
                     });
                 }
             }

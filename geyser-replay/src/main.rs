@@ -16,9 +16,10 @@ use {
 fn main() -> Result<(), Box<dyn Error>> {
     let file_path = args().nth(1).expect("no file given");
     let _started_at = std::time::Instant::now();
+    let file = std::fs::File::open(&file_path)?;
     let mut item_index = 0;
     {
-        let mut reader = node::NodeReader::new(file_path.clone())?;
+        let mut reader = node::NodeReader::new(file)?;
         let header = reader.read_raw_header()?;
         println!("Header bytes: {:?}", header);
 

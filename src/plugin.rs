@@ -93,14 +93,14 @@ impl GeyserPlugin for Solira {
         PROCESSED_SLOTS.with_borrow_mut(|slots| {
             PROCESSED_TRANSACTIONS.with_borrow(|txs| {
                 *slots += 1;
-                if *slots % 500 == 0 || *slots == 1 {
-                    log::info!(
-                        "at slot {}, have processed {} transactions across {} slots",
-                        slot,
-                        &*txs.separate_with_commas(),
-                        &*slots.separate_with_commas(),
-                    );
-                }
+                //if *slots % 50 == 0 || *slots == 1 {
+                log::info!(
+                    "at slot {}, have processed {} transactions across {} slots",
+                    slot,
+                    &*txs.separate_with_commas(),
+                    &*slots.separate_with_commas(),
+                );
+                //}
             });
         });
         Ok(())

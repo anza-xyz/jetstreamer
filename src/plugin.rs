@@ -14,6 +14,7 @@ thread_local! {
     static PROCESSED_TRANSACTIONS: RefCell<u64> = RefCell::new(0);
     static SLOT_NUM: RefCell<u64> = RefCell::new(0);
     static PROCESSED_SLOTS: RefCell<u64> = RefCell::new(0);
+    static NUM_VOTES: RefCell<u64> = RefCell::new(0);
 }
 
 #[derive(Clone, Debug, Default)]
@@ -92,15 +93,17 @@ impl GeyserPlugin for Solira {
         SLOT_NUM.set(slot);
         PROCESSED_SLOTS.with_borrow_mut(|slots| {
             PROCESSED_TRANSACTIONS.with_borrow(|txs| {
-                *slots += 1;
-                //if *slots % 50 == 0 || *slots == 1 {
-                log::info!(
-                    "at slot {}, have processed {} transactions across {} slots",
-                    slot,
-                    &*txs.separate_with_commas(),
-                    &*slots.separate_with_commas(),
-                );
-                //}
+                NUM_VOTES.with_borrow(|votes| {
+                    *slots += 1;
+                    log::info!(
+                        "at slot {}, have processed {} transactions  ({} vote, {} non-vote) across {} slots",
+                        slot,
+                        &*txs.separate_with_commas(),
+                        &*votes.separate_with_commas(),
+                        &(*txs - *votes).separate_with_commas(),
+                        &*slots.separate_with_commas(),
+                    );
+                });
             });
         });
         Ok(())
@@ -129,10 +132,26 @@ impl GeyserPlugin for Solira {
 
     fn notify_transaction(
         &self,
-        _transaction: ReplicaTransactionInfoVersions,
+        transaction: ReplicaTransactionInfoVersions,
         _slot: u64,
     ) -> Result<()> {
         // log::info!("got transaction");
+        match transaction {
+            ReplicaTransactionInfoVersions::V0_0_1(tx) => {
+                if tx.is_vote {
+                    NUM_VOTES.with_borrow_mut(|votes| {
+                        *votes += 1;
+                    });
+                }
+            }
+            ReplicaTransactionInfoVersions::V0_0_2(tx) => {
+                if tx.is_vote {
+                    NUM_VOTES.with_borrow_mut(|votes| {
+                        *votes += 1;
+                    });
+                }
+            }
+        }
         PROCESSED_TRANSACTIONS.with_borrow_mut(|tx_count| {
             *tx_count += 1;
         });
@@ -144,6 +163,10 @@ impl GeyserPlugin for Solira {
     }
 
     fn account_data_notifications_enabled(&self) -> bool {
+        true
+    }
+
+    fn entry_notifications_enabled(&self) -> bool {
         true
     }
 }

@@ -3,30 +3,17 @@ name = "geyser-replay"
 version = "0.1.0"
 edition = "2021"
 authors = ["sam0x17"]
-license = "AFFERO-3.0"
+license = "MIT"
 description = "A utility that allows replaying ranges of Solana blocks, even back to genesis, over a geyser plugin using Old Faithful"
 
 [dependencies]
-base64.workspace = true
-bincode.workspace = true
-cid.workspace = true
-crc.workspace = true
+of1.workspace = true
 crossbeam-channel.workspace = true
-fnv.workspace = true
-multihash.workspace = true
-prost_011.workspace = true
-reqwest.workspace = true
-serde = { workspace = true, features = ["derive"] }
-serde_cbor.workspace = true
-serde_json.workspace = true
-solana-accounts-db.workspace = true
-solana-entry.workspace = true
-solana-geyser-plugin-manager.workspace = true
 solana-rpc.workspace = true
 solana-runtime.workspace = true
 solana-sdk.workspace = true
+solana-geyser-plugin-manager.workspace = true
 solana-storage-proto.workspace = true
 solana-transaction-status.workspace = true
-zstd.workspace = true
-url.workspace = true
-tokio-stream.workspace = true
+prost_011.workspace = true
+solana-entry.workspace = true

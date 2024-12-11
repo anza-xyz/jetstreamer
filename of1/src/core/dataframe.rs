@@ -1,5 +1,5 @@
 use {
-    crate::{node::Kind, utils::Buffer},
+    crate::core::{node::Kind, utils::Buffer},
     cid::Cid,
     std::{error::Error, vec::Vec},
 };

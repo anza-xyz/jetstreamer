@@ -1,5 +1,5 @@
 use {
-    crate::node::Kind,
+    crate::core::node::Kind,
     cid::Cid,
     std::{error::Error, vec::Vec},
 };

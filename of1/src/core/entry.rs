@@ -1,5 +1,5 @@
 use {
-    crate::{
+    crate::core::{
         node::Kind,
         utils::{self, Hash},
     },

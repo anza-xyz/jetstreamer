@@ -1,5 +1,5 @@
 use {
-    crate::{block, dataframe, entry, epoch, rewards, subset, transaction, utils},
+    crate::core::{block, dataframe, entry, epoch, rewards, subset, transaction, utils},
     cid::Cid,
     core::hash::Hasher,
     crc::{Crc, CRC_64_GO_ISO},

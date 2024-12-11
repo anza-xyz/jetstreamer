@@ -14,6 +14,7 @@ targets = ["x86_64-unknown-linux-gnu"]
 crate-type = ["cdylib", "rlib"]
 
 [workspace.dependencies]
+of1 = { version = "0.1.0", path = "of1" }
 tokio = { version = "1", features = ["full"] }
 log = "0.4"
 agave-geyser-plugin-interface = "2.1.0"

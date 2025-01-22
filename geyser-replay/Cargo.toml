@@ -7,7 +7,7 @@ license = "MIT"
 description = "A utility that allows replaying ranges of Solana blocks, even back to genesis, over a geyser plugin using Old Faithful"
 
 [dependencies]
-of1.workspace = true
+demo-rust-ipld-car.workspace = true
 crossbeam-channel.workspace = true
 solana-rpc.workspace = true
 solana-runtime.workspace = true

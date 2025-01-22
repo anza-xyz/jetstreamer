@@ -1,5 +1,5 @@
 [workspace]
-members = ["geyser-replay", "of1"]
+members = ["geyser-replay"]
 
 [package]
 name = "solira"
@@ -14,12 +14,12 @@ targets = ["x86_64-unknown-linux-gnu"]
 crate-type = ["cdylib", "rlib"]
 
 [workspace.dependencies]
-of1 = { version = "0.1.0", path = "of1" }
+demo-rust-ipld-car = { git = "https://github.com/rpcpool/yellowstone-faithful.git" }
 tokio = { version = "1", features = ["full"] }
 log = "0.4"
-agave-geyser-plugin-interface = "2.1.0"
-solana-logger = "2.1.0"
-solana-program = "2.1.0"
+agave-geyser-plugin-interface = "2"
+solana-logger = "2"
+solana-program = "2"
 once_cell = "1"
 serde_json = "1"
 
@@ -43,14 +43,14 @@ prost_011 = { package = "prost", version = "0.11" }
 protobuf-src = "1.1"
 serde = "1.0"
 serde_cbor = "0.11"
-solana-accounts-db = "2.1.5"
-solana-entry = "2.1.5"
-solana-geyser-plugin-manager = "2.1.5"
-solana-rpc = "2.1.5"
-solana-runtime = "2.1.5"
-solana-sdk = "2.1.5"
-solana-storage-proto = "2.1.5"
-solana-transaction-status = "2.1.5"
+solana-accounts-db = "2"
+solana-entry = "2"
+solana-geyser-plugin-manager = "2"
+solana-rpc = "2"
+solana-runtime = "2"
+solana-sdk = "2"
+solana-storage-proto = "2"
+solana-transaction-status = "2"
 tonic = "0.12"
 tonic-build = "0.12"
 tracing = "0.1"

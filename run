@@ -15,7 +15,7 @@ fi
 awk "{gsub(\"{{full-path}}\", \"$PWD\")}1" plugin_config.json > plugin_config.tmp && mv plugin_config.tmp plugin_config.json
 cat plugin_config.json
 cp ../target/release/geyser-replay .
-./geyser-replay ~/Downloads/epoch-600.car `pwd`/plugin_config.json
+./geyser-replay ~/Downloads/epoch-681.car `pwd`/plugin_config.json
 #solana-test-validator --geyser-plugin-config plugin_config.json --log
 # solana-validator \
 #     --identity ~/validator-keypair.json \

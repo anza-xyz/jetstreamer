@@ -19,6 +19,5 @@ prost_011.workspace = true
 solana-entry.workspace = true
 reqwest.workspace = true
 tokio.workspace = true
-backoff.workspace = true
-futures.workspace = true
 anyhow.workspace = true
+rangemap.workspace = true

@@ -1,8 +1,6 @@
-use backoff::{future::retry, ExponentialBackoff};
+use rangemap::RangeMap;
 use reqwest::Client;
-use std::collections::HashMap;
 use tokio::sync::mpsc;
-use tokio::sync::mpsc::Sender;
 use tokio::task;
 use tokio::task::JoinHandle;
 
@@ -46,7 +44,7 @@ async fn fetch_slot_with_range(
     }
 }
 
-pub async fn build_epochs_index() -> anyhow::Result<HashMap<u64, u64>> {
+pub async fn build_epochs_index() -> anyhow::Result<RangeMap<u64, u64>> {
     let client = Client::new();
     let (tx, mut rx) = mpsc::unbounded_channel();
     let (stop_tx, mut stop_rx) = mpsc::unbounded_channel();
@@ -54,16 +52,14 @@ pub async fn build_epochs_index() -> anyhow::Result<HashMap<u64, u64>> {
     let mut handles: Vec<JoinHandle<()>> = Vec::new();
 
     let index_fut = tokio::spawn(async move {
-        let mut index = HashMap::new();
+        let mut index = RangeMap::new();
 
         while let Some((epoch, start_slot, end_slot)) = rx.recv().await {
             println!(
                 "Epoch: {}, start_slot: {}, end_slot: {}",
                 epoch, start_slot, end_slot
             );
-            for slot in start_slot..=end_slot {
-                index.insert(slot, epoch);
-            }
+            index.insert(start_slot..(end_slot + 1), epoch);
         }
         index
     });
@@ -92,29 +88,24 @@ pub async fn build_epochs_index() -> anyhow::Result<HashMap<u64, u64>> {
         } else {
             handles.push(handle);
         }
-        std::thread::sleep(std::time::Duration::from_millis(1));
+        //std::thread::sleep(std::time::Duration::from_millis(1));
+        //std::thread::yield_now();
     }
 
     drop(tx);
-    let handles_len = handles.len();
-    for (i, handle) in handles.into_iter().enumerate() {
-        println!("waiting for {} handles", handles_len - (i + 1));
+    for handle in handles {
         handle.await?;
     }
 
     let index = index_fut.await?;
 
-    let min_slot = index.keys().min().unwrap();
-    let max_slot = index.keys().max().unwrap();
+    let min_slot = &index.first_range_value().unwrap().0.start;
+    let max_slot = &index.last_range_value().unwrap().0.end - 1;
     let min_epoch = index.get(min_slot).unwrap();
-    let max_epoch = index.get(max_slot).unwrap();
+    let max_epoch = index.get(&max_slot).unwrap();
     println!(
-        "Epochs index built: {} slots from slot {} to slot {} (epochs {} to {})",
-        index.len(),
-        min_slot,
-        max_slot,
-        min_epoch,
-        max_epoch,
+        "Epochs index built from slot {} to slot {} (epochs {} to {})",
+        min_slot, max_slot, min_epoch, max_epoch,
     );
 
     Ok(index)

@@ -1838,11 +1838,10 @@ name = "geyser-replay"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "backoff",
  "crossbeam-channel",
  "demo-rust-ipld-car",
- "futures 0.1.31",
  "prost",
+ "rangemap",
  "reqwest 0.12.4",
  "solana-entry",
  "solana-geyser-plugin-manager",
@@ -3958,6 +3957,12 @@ checksum = "6f97cdb2a36ed4183de61b2f824cc45c9f1037f28afe0a322e9fff4c108b5aaa"
 dependencies = [
  "rand_core 0.6.4",
 ]
+
+[[package]]
+name = "rangemap"
+version = "1.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f60fcc7d6849342eff22c4350c8b9a989ee8ceabc4b481253e8946b9fe83d684"
 
 [[package]]
 name = "rayon"

@@ -1837,9 +1837,11 @@ dependencies = [
 name = "geyser-replay"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "backoff",
  "crossbeam-channel",
  "demo-rust-ipld-car",
+ "futures 0.1.31",
  "prost",
  "reqwest 0.12.4",
  "solana-entry",

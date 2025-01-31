@@ -1,107 +1,73 @@
-use backoff::{future::retry, Error as BackoffError, ExponentialBackoff};
-use reqwest::{Client, StatusCode};
+use backoff::{future::retry, ExponentialBackoff};
+use reqwest::Client;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
-use tokio::task::JoinSet;
+use tokio::sync::mpsc;
+use tokio::task;
 
 const BASE_URL: &str = "https://files.old-faithful.net";
-const RANGE_BYTES: usize = 64; // Allow room for longer slot numbers
+const RANGE_PADDING: usize = 64;
 
-/// Builds an epoch index mapping slots to epoch numbers.
-pub async fn build_epochs_index() -> Result<HashMap<u64, u64>, reqwest::Error> {
-    let client = Arc::new(Client::new());
-    let mut tasks = JoinSet::new();
-    let mut epoch = 0;
+async fn fetch_slot_range(epoch: u64, client: Arc<Client>) -> Option<(u64, u64, u64)> {
+    let url = format!("{}/{}/{}.slots.txt", BASE_URL, epoch, epoch);
+    let backoff = ExponentialBackoff::default();
 
-    loop {
-        let client_clone = client.clone();
-        let epoch_number = epoch;
+    let result = retry(backoff, || async {
+        let head_range = format!("bytes=0-{}", RANGE_PADDING);
+        let tail_range = format!("bytes=-{}", RANGE_PADDING);
 
-        tasks.spawn(async move { scan_epoch(client_clone, epoch_number).await });
+        let first_slot = fetch_slot_with_range(&url, &head_range, &client).await?;
+        let last_slot = fetch_slot_with_range(&url, &tail_range, &client).await?;
 
-        epoch += 1;
+        Ok((epoch, first_slot, last_slot))
+    })
+    .await;
 
-        // Check if we hit a 404, stopping the loop
-        if fetch_slot(&client, epoch_number, 0).await.is_err() {
-            break;
-        }
-    }
-
-    let mut final_index = HashMap::new();
-    while let Some(res) = tasks.join_next().await {
-        if let Ok(Some(epoch_index)) = res {
-            final_index.extend(epoch_index);
-        }
-    }
-
-    Ok(final_index)
+    result.ok()
 }
 
-/// Attempts to fetch the first and last slot of an epoch.
-async fn scan_epoch(client: Arc<Client>, epoch: u64) -> Option<HashMap<u64, u64>> {
-    let url = format!("{}/{}/{}.slots.txt", BASE_URL, epoch, epoch);
+async fn fetch_slot_with_range(url: &str, range: &str, client: &Client) -> Option<u64> {
+    let response = client.get(url).header("Range", range).send().await.ok()?;
 
-    let first_slot = fetch_slot(&client, epoch, 0).await.ok()?;
-    let last_slot = fetch_slot(&client, epoch, RANGE_BYTES as u64).await.ok()?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        return None;
+    }
+
+    let text = response.text().await.ok()?;
+    text.lines().next()?.trim().parse::<u64>().ok()
+}
+
+pub async fn build_epochs_index() -> anyhow::Result<HashMap<u64, u64>> {
+    let client = Arc::new(Client::new());
+    let (tx, mut rx) = mpsc::channel(100);
+
+    let mut handles = Vec::new();
+
+    for epoch in 0u64.. {
+        let client = client.clone();
+        let tx = tx.clone();
+
+        let handle = task::spawn(async move {
+            if let Some((epoch, start_slot, end_slot)) = fetch_slot_range(epoch, client).await {
+                let _ = tx.send((epoch, start_slot, end_slot)).await;
+            } else {
+                drop(tx);
+            }
+        });
+
+        handles.push(handle);
+    }
+
+    drop(tx);
+    let _ = futures::future::join_all(handles).await;
 
     let mut index = HashMap::new();
-    index.insert(first_slot, epoch);
-    index.insert(last_slot, epoch);
 
-    Some(index)
-}
-
-use backoff::{future::retry, Error as BackoffError, ExponentialBackoff};
-use reqwest::{Client, StatusCode};
-use std::time::Duration;
-
-pub enum FetchSlotError {
-    NotFound(reqwest::Error),
-    OtherReqwest(reqwest::Error),
-    EmptyResponse,
-    InvalidSlotNumber,
-    BackoffError,
-}
-
-impl From<BackoffError<reqwest::Error>> for FetchSlotError {
-    fn from(e: BackoffError<reqwest::Error>) -> Self {
-        match e {
-            BackoffError::Permanent(e) => FetchSlotError::NotFound(e),
-            BackoffError::Transient { err, .. } => FetchSlotError::OtherReqwest(err),
+    while let Some((epoch, start_slot, end_slot)) = rx.recv().await {
+        for slot in start_slot..=end_slot {
+            index.insert(slot, epoch);
         }
     }
-}
 
-impl From<reqwest::Error> for FetchSlotError {
-    fn from(e: reqwest::Error) -> Self {
-        match e.status() {
-            Some(StatusCode::NOT_FOUND) => FetchSlotError::NotFound(e),
-            _ => FetchSlotError::OtherReqwest(e),
-        }
-    }
-}
-
-/// Fetches a slot number from a file using an HTTP range request.
-async fn fetch_slot(client: &Client, epoch: u64, range_start: u64) -> Result<u64, FetchSlotError> {
-    let url = format!(
-        "https://files.old-faithful.net/{}/{}.slots.txt",
-        epoch, epoch
-    );
-    let backoff = ExponentialBackoff {
-        initial_interval: Duration::from_millis(500),
-        max_interval: Duration::from_secs(10),
-        max_elapsed_time: Some(Duration::from_secs(60)),
-        ..ExponentialBackoff::default()
-    };
-    let response = retry(backoff, || async {
-        client
-            .get(&url)
-            .header(
-                "Range",
-                format!("bytes={}-{}", range_start, range_start + 64),
-            )
-            .send()
-    });
-    todo!()
+    Ok(index)
 }

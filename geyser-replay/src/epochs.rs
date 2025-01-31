@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::task;
+use tokio::task::JoinHandle;
 
 const BASE_URL: &str = "https://files.old-faithful.net";
 const RANGE_PADDING: usize = 64;
@@ -16,8 +17,12 @@ async fn fetch_slot_range(epoch: u64, client: Arc<Client>) -> Option<(u64, u64, 
         let head_range = format!("bytes=0-{}", RANGE_PADDING);
         let tail_range = format!("bytes=-{}", RANGE_PADDING);
 
-        let first_slot = fetch_slot_with_range(&url, &head_range, &client).await?;
-        let last_slot = fetch_slot_with_range(&url, &tail_range, &client).await?;
+        let first_slot = fetch_slot_with_range(&url, &head_range, client.clone())
+            .await
+            .ok_or("Failed to fetch first slot")?;
+        let last_slot = fetch_slot_with_range(&url, &tail_range, client.clone())
+            .await
+            .ok_or("Failed to fetch last slot")?;
 
         Ok((epoch, first_slot, last_slot))
     })
@@ -26,7 +31,7 @@ async fn fetch_slot_range(epoch: u64, client: Arc<Client>) -> Option<(u64, u64, 
     result.ok()
 }
 
-async fn fetch_slot_with_range(url: &str, range: &str, client: &Client) -> Option<u64> {
+async fn fetch_slot_with_range(url: &str, range: &str, client: Arc<Client>) -> Option<u64> {
     let response = client.get(url).header("Range", range).send().await.ok()?;
 
     if response.status() == reqwest::StatusCode::NOT_FOUND {
@@ -41,7 +46,7 @@ pub async fn build_epochs_index() -> anyhow::Result<HashMap<u64, u64>> {
     let client = Arc::new(Client::new());
     let (tx, mut rx) = mpsc::channel(100);
 
-    let mut handles = Vec::new();
+    let mut handles: Vec<JoinHandle<()>> = Vec::new();
 
     for epoch in 0u64.. {
         let client = client.clone();
@@ -59,7 +64,9 @@ pub async fn build_epochs_index() -> anyhow::Result<HashMap<u64, u64>> {
     }
 
     drop(tx);
-    let _ = futures::future::join_all(handles).await;
+    for handle in handles {
+        let _ = handle.await;
+    }
 
     let mut index = HashMap::new();
 

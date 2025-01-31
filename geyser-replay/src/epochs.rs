@@ -2,6 +2,7 @@ use backoff::{future::retry, ExponentialBackoff};
 use reqwest::Client;
 use std::collections::HashMap;
 use tokio::sync::mpsc;
+use tokio::sync::mpsc::Sender;
 use tokio::task;
 use tokio::task::JoinHandle;
 
@@ -10,24 +11,17 @@ const RANGE_PADDING: usize = 11; // current slot sizes are around 9 bytes
 
 async fn fetch_slot_range(epoch: u64, client: &Client) -> Option<(u64, u64, u64)> {
     let url = format!("{}/{}/{}.slots.txt", BASE_URL, epoch, epoch);
-    let backoff = ExponentialBackoff::default();
+    let head_range = format!("bytes=0-{}", RANGE_PADDING);
+    let tail_range = format!("bytes=-{}", RANGE_PADDING);
 
-    let result = retry(backoff, || async {
-        let head_range = format!("bytes=0-{}", RANGE_PADDING);
-        let tail_range = format!("bytes=-{}", RANGE_PADDING);
+    let Some(first_slot) = fetch_slot_with_range(true, &url, &head_range, &client).await else {
+        return None;
+    };
+    let Some(last_slot) = fetch_slot_with_range(false, &url, &tail_range, &client).await else {
+        return None;
+    };
 
-        let first_slot = fetch_slot_with_range(true, &url, &head_range, &client)
-            .await
-            .ok_or("Failed to fetch first slot")?;
-        let last_slot = fetch_slot_with_range(false, &url, &tail_range, &client)
-            .await
-            .ok_or("Failed to fetch last slot")?;
-
-        Ok((epoch, first_slot, last_slot))
-    })
-    .await;
-
-    result.ok()
+    Some((epoch, first_slot, last_slot))
 }
 
 async fn fetch_slot_with_range(
@@ -39,7 +33,9 @@ async fn fetch_slot_with_range(
     println!("Fetching: {} with range: {}", url, range);
     let response = client.get(url).header("Range", range).send().await.ok()?;
 
-    if response.status() == reqwest::StatusCode::NOT_FOUND {
+    if response.status() != reqwest::StatusCode::PARTIAL_CONTENT
+        && response.status() != reqwest::StatusCode::OK
+    {
         return None;
     }
     let text = response.text().await.ok()?;
@@ -53,7 +49,7 @@ async fn fetch_slot_with_range(
 pub async fn build_epochs_index() -> anyhow::Result<HashMap<u64, u64>> {
     let client = Client::new();
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let (stop_tx, mut stop_rx) = mpsc::channel(1);
+    let (stop_tx, mut stop_rx) = mpsc::unbounded_channel();
 
     let mut handles: Vec<JoinHandle<()>> = Vec::new();
 
@@ -74,6 +70,7 @@ pub async fn build_epochs_index() -> anyhow::Result<HashMap<u64, u64>> {
 
     for epoch in 0u64.. {
         if stop_rx.try_recv().is_ok() {
+            stop_rx.close();
             break;
         }
 
@@ -85,22 +82,23 @@ pub async fn build_epochs_index() -> anyhow::Result<HashMap<u64, u64>> {
             if let Some((epoch, start_slot, end_slot)) = fetch_slot_range(epoch, &client).await {
                 let _ = tx.send((epoch, start_slot, end_slot));
             } else {
-                println!("No more epochs to fetch, stopping...");
-                std::process::exit(1);
-                let _ = stop_tx.send(()).await;
+                println!("Epoch: {} not found", epoch);
+                let _ = stop_tx.send(epoch);
             }
         });
 
-        if epoch % 16 == 0 {
+        if epoch % 100 == 0 {
             handle.await?;
-            std::thread::sleep(std::time::Duration::from_millis(1));
         } else {
             handles.push(handle);
         }
+        std::thread::sleep(std::time::Duration::from_millis(1));
     }
 
     drop(tx);
-    for handle in handles {
+    let handles_len = handles.len();
+    for (i, handle) in handles.into_iter().enumerate() {
+        println!("waiting for {} handles", handles_len - (i + 1));
         handle.await?;
     }
 

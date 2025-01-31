@@ -17,3 +17,6 @@ solana-storage-proto.workspace = true
 solana-transaction-status.workspace = true
 prost_011.workspace = true
 solana-entry.workspace = true
+reqwest.workspace = true
+tokio.workspace = true
+backoff.workspace = true

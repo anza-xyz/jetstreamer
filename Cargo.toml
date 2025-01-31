@@ -57,6 +57,7 @@ tracing = "0.1"
 zstd = "0.13"
 thousands = "0.2"
 tokio-stream = { version = "0", features = ["full"] }
+backoff = { version = "0", features = ["tokio"]}
 
 [dependencies]
 tokio.workspace = true

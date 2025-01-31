@@ -28,7 +28,7 @@ async fn fetch_slot_with_range(
     range: &str,
     client: &Client,
 ) -> Option<u64> {
-    println!("Fetching: {} with range: {}", url, range);
+    //println!("Fetching: {} with range: {}", url, range);
     let response = client.get(url).header("Range", range).send().await.ok()?;
 
     if response.status() != reqwest::StatusCode::PARTIAL_CONTENT
@@ -55,10 +55,10 @@ pub async fn build_epochs_index() -> anyhow::Result<RangeMap<u64, u64>> {
         let mut index = RangeMap::new();
 
         while let Some((epoch, start_slot, end_slot)) = rx.recv().await {
-            println!(
-                "Epoch: {}, start_slot: {}, end_slot: {}",
-                epoch, start_slot, end_slot
-            );
+            // println!(
+            //     "Epoch: {}, start_slot: {}, end_slot: {}",
+            //     epoch, start_slot, end_slot
+            // );
             index.insert(start_slot..(end_slot + 1), epoch);
         }
         index
@@ -78,17 +78,17 @@ pub async fn build_epochs_index() -> anyhow::Result<RangeMap<u64, u64>> {
             if let Some((epoch, start_slot, end_slot)) = fetch_slot_range(epoch, &client).await {
                 let _ = tx.send((epoch, start_slot, end_slot));
             } else {
-                println!("Epoch: {} not found", epoch);
+                //println!("Epoch: {} not found", epoch);
                 let _ = stop_tx.send(epoch);
             }
         });
 
-        if epoch % 100 == 0 {
-            handle.await?;
-        } else {
-            handles.push(handle);
-        }
-        //std::thread::sleep(std::time::Duration::from_millis(1));
+        // if epoch % 100 == 0 {
+        //     handle.await?;
+        // } else {
+        handles.push(handle);
+        //}
+        std::thread::sleep(std::time::Duration::from_millis(2));
         //std::thread::yield_now();
     }
 

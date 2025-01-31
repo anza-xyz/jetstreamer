@@ -14,7 +14,7 @@ use {
     },
 };
 
-#[tokio::main]
+#[tokio::main(worker_threads = 100)]
 async fn main() -> Result<(), Box<dyn Error>> {
     println!("building epochs index");
     let _cache = epochs::build_epochs_index().await?;

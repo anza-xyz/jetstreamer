@@ -7,7 +7,7 @@ use tokio::task;
 use tokio::task::JoinHandle;
 
 const BASE_URL: &str = "https://files.old-faithful.net";
-const RANGE_PADDING: usize = 64;
+const RANGE_PADDING: usize = 256;
 
 async fn fetch_slot_range(epoch: u64, client: Arc<Client>) -> Option<(u64, u64, u64)> {
     let url = format!("{}/{}/{}.slots.txt", BASE_URL, epoch, epoch);
@@ -20,9 +20,11 @@ async fn fetch_slot_range(epoch: u64, client: Arc<Client>) -> Option<(u64, u64, 
         let first_slot = fetch_slot_with_range(&url, &head_range, client.clone())
             .await
             .ok_or("Failed to fetch first slot")?;
+        println!("first slot: {}", first_slot);
         let last_slot = fetch_slot_with_range(&url, &tail_range, client.clone())
             .await
             .ok_or("Failed to fetch last slot")?;
+        println!("last slot: {}", last_slot);
 
         Ok((epoch, first_slot, last_slot))
     })
@@ -32,6 +34,7 @@ async fn fetch_slot_range(epoch: u64, client: Arc<Client>) -> Option<(u64, u64, 
 }
 
 async fn fetch_slot_with_range(url: &str, range: &str, client: Arc<Client>) -> Option<u64> {
+    println!("fetching slot with range: {} {}", range, url);
     let response = client.get(url).header("Range", range).send().await.ok()?;
 
     if response.status() == reqwest::StatusCode::NOT_FOUND {
@@ -44,11 +47,11 @@ async fn fetch_slot_with_range(url: &str, range: &str, client: Arc<Client>) -> O
 
 pub async fn build_epochs_index() -> anyhow::Result<HashMap<u64, u64>> {
     let client = Arc::new(Client::new());
-    let (tx, mut rx) = mpsc::channel(100);
+    let (tx, mut rx) = mpsc::channel(10);
 
     let mut handles: Vec<JoinHandle<()>> = Vec::new();
 
-    for epoch in 0u64.. {
+    for epoch in 0..u64::MAX {
         let client = client.clone();
         let tx = tx.clone();
 

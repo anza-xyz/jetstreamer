@@ -1,6 +1,7 @@
 use {
     crossbeam_channel::unbounded,
     demo_rust_ipld_car::{node, utils},
+    geyser_replay::epochs,
     solana_rpc::optimistically_confirmed_bank_tracker::SlotNotification,
     solana_runtime::bank::KeyedRewardsAndNumPartitions,
     solana_sdk::{reward_info::RewardInfo, reward_type::RewardType},
@@ -13,7 +14,11 @@ use {
     },
 };
 
-fn main() -> Result<(), Box<dyn Error>> {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn Error>> {
+    println!("building epochs index");
+    let _cache = epochs::build_epochs_index().await?;
+    println!("built epochs index");
     let file_path = args().nth(1).expect("no file given");
     let _started_at = std::time::Instant::now();
     let file = std::fs::File::open(&file_path)?;

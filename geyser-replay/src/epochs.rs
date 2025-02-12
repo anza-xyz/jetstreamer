@@ -123,6 +123,9 @@ pub async fn fetch_epoch_stream(
     )))
 }
 
+#[cfg(test)]
+use tokio::io::AsyncReadExt;
+
 #[tokio::test(worker_threads = 32, flavor = "multi_thread")]
 async fn test_build_epoch_index() {
     let client = Client::new();
@@ -131,4 +134,14 @@ async fn test_build_epoch_index() {
     let cache = build_epochs_index(&client).await.unwrap();
     println!("built epochs index in {:?}", start.elapsed());
     assert!(cache.len() > 710);
+}
+
+#[tokio::test]
+async fn test_fetch_epoch_stream() {
+    let client = Client::new();
+    let stream = fetch_epoch_stream(670, &client).await.unwrap();
+    // read first 100 MB of the stream
+    let mut buf = vec![0u8; 1024];
+    stream.take(1024).read_exact(&mut buf).await.unwrap();
+    assert_eq!(buf[0], 58);
 }

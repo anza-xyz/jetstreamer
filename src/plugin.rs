@@ -187,6 +187,7 @@ impl GeyserPlugin for Solira {
 }
 
 pub trait SolscanUrl {
+    /// Returns the Solscan URL associated with `self`
     fn solscan_url(&self) -> String;
 }
 

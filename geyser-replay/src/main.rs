@@ -2,6 +2,7 @@ use {
     crossbeam_channel::unbounded,
     demo_rust_ipld_car::{node, utils},
     geyser_replay::epochs,
+    reqwest::Client,
     solana_rpc::optimistically_confirmed_bank_tracker::SlotNotification,
     solana_runtime::bank::KeyedRewardsAndNumPartitions,
     solana_sdk::{reward_info::RewardInfo, reward_type::RewardType},
@@ -14,11 +15,12 @@ use {
     },
 };
 
-#[tokio::main(worker_threads = 16)]
+#[tokio::main(worker_threads = 32)]
 async fn main() -> Result<(), Box<dyn Error>> {
+    let client = Client::new();
     println!("building epochs index");
     let start = std::time::Instant::now();
-    let _cache = epochs::build_epochs_index().await?;
+    let _cache = epochs::build_epochs_index(&client).await?;
     println!("built epochs index in {:?}", start.elapsed());
     let file_path = args().nth(1).expect("no file given");
     let _started_at = std::time::Instant::now();

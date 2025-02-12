@@ -43,8 +43,7 @@ async fn fetch_slot_with_range(
     }
 }
 
-pub async fn build_epochs_index() -> anyhow::Result<RangeMap<u64, u64>> {
-    let client = Client::new();
+pub async fn build_epochs_index(client: &Client) -> anyhow::Result<RangeMap<u64, u64>> {
     let (tx, mut rx) = mpsc::unbounded_channel();
     let (stop_tx, mut stop_rx) = mpsc::unbounded_channel();
 

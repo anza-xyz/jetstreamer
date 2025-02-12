@@ -1,5 +1,7 @@
+use futures_util::TryStreamExt;
 use rangemap::RangeMap;
 use reqwest::Client;
+use tokio::io::{AsyncRead, BufReader};
 use tokio::sync::mpsc;
 use tokio::task;
 use tokio::task::JoinHandle;
@@ -7,22 +9,28 @@ use tokio::task::JoinHandle;
 const BASE_URL: &str = "https://files.old-faithful.net";
 const RANGE_PADDING: usize = 11; // current slot sizes are around 9 bytes
 
-async fn fetch_slot_range(epoch: u64, client: &Client) -> Option<(u64, u64, u64)> {
+async fn fetch_epoch_slot_range(epoch: u64, client: &Client) -> Option<(u64, u64, u64)> {
     let url = format!("{}/{}/{}.slots.txt", BASE_URL, epoch, epoch);
     let head_range = format!("bytes=0-{}", RANGE_PADDING);
     let tail_range = format!("bytes=-{}", RANGE_PADDING);
 
-    let Some(first_slot) = fetch_slot_with_range(true, &url, &head_range, &client).await else {
+    let Some(first_slot) =
+        fetch_epoch_slot_txt_with_http_range(true, &url, &head_range, &client).await
+    else {
         return None;
     };
-    let Some(last_slot) = fetch_slot_with_range(false, &url, &tail_range, &client).await else {
+    let Some(last_slot) =
+        fetch_epoch_slot_txt_with_http_range(false, &url, &tail_range, &client).await
+    else {
         return None;
     };
 
     Some((epoch, first_slot, last_slot))
 }
 
-async fn fetch_slot_with_range(
+/// Fetches the slots.txt file from the Old Faithful network and extracts the first or last
+/// slot based on the `first` parameter.
+async fn fetch_epoch_slot_txt_with_http_range(
     first: bool,
     url: &str,
     range: &str,
@@ -43,6 +51,7 @@ async fn fetch_slot_with_range(
     }
 }
 
+/// Builds an index of epochs to slot ranges based on the Old Faithful network.
 pub async fn build_epochs_index(client: &Client) -> anyhow::Result<RangeMap<u64, u64>> {
     let (tx, mut rx) = mpsc::unbounded_channel();
     let (stop_tx, mut stop_rx) = mpsc::unbounded_channel();
@@ -53,10 +62,6 @@ pub async fn build_epochs_index(client: &Client) -> anyhow::Result<RangeMap<u64,
         let mut index = RangeMap::new();
 
         while let Some((epoch, start_slot, end_slot)) = rx.recv().await {
-            // println!(
-            //     "Epoch: {}, start_slot: {}, end_slot: {}",
-            //     epoch, start_slot, end_slot
-            // );
             index.insert(start_slot..(end_slot + 1), epoch);
         }
         index
@@ -73,7 +78,9 @@ pub async fn build_epochs_index(client: &Client) -> anyhow::Result<RangeMap<u64,
         let client = client.clone();
 
         let handle = task::spawn(async move {
-            if let Some((epoch, start_slot, end_slot)) = fetch_slot_range(epoch, &client).await {
+            if let Some((epoch, start_slot, end_slot)) =
+                fetch_epoch_slot_range(epoch, &client).await
+            {
                 let _ = tx.send((epoch, start_slot, end_slot));
             } else {
                 let _ = stop_tx.send(epoch);
@@ -100,4 +107,18 @@ pub async fn build_epochs_index(client: &Client) -> anyhow::Result<RangeMap<u64,
     );
 
     Ok(index)
+}
+
+/// Fetches a network stream pointing to the specified epoch CAR file in Old Faithful.
+pub async fn fetch_epoch_stream(
+    epoch: u64,
+    client: &Client,
+) -> reqwest::Result<impl AsyncRead + Unpin> {
+    let url = format!("{}/{}/epoch-{}.car", BASE_URL, epoch, epoch);
+    let response = client.get(&url).send().await?;
+    let stream = response.bytes_stream();
+
+    Ok(BufReader::new(tokio_util::io::StreamReader::new(
+        stream.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)),
+    )))
 }

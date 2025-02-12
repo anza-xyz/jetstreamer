@@ -149,6 +149,7 @@ impl GeyserPlugin for Solira {
                 }
                 if let Some(consumed) = tx.transaction_status_meta.compute_units_consumed {
                     COMPUTE_CONSUMED.with_borrow_mut(|compute| {
+                        println!("consumed: {}", consumed);
                         *compute += u128::from(consumed);
                     });
                 }
@@ -161,6 +162,10 @@ impl GeyserPlugin for Solira {
                 }
                 if let Some(consumed) = tx.transaction_status_meta.compute_units_consumed {
                     COMPUTE_CONSUMED.with_borrow_mut(|compute| {
+                        let signature = tx.signature.to_string();
+                        println!("Transaction Hash: {}", signature);
+                        println!("Solscan URL: https://solscan.io/tx/{}", signature);
+                        println!("consumed: {}", consumed);
                         *compute += u128::from(consumed);
                     });
                 }

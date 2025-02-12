@@ -162,10 +162,6 @@ impl GeyserPlugin for Solira {
                 }
                 if let Some(consumed) = tx.transaction_status_meta.compute_units_consumed {
                     COMPUTE_CONSUMED.with_borrow_mut(|compute| {
-                        let signature = tx.signature.to_string();
-                        println!("Transaction Hash: {}", signature);
-                        println!("Solscan URL: https://solscan.io/tx/{}", signature);
-                        println!("consumed: {}", consumed);
                         *compute += u128::from(consumed);
                     });
                 }
@@ -187,5 +183,22 @@ impl GeyserPlugin for Solira {
 
     fn entry_notifications_enabled(&self) -> bool {
         true
+    }
+}
+
+pub trait SolscanUrl {
+    fn solscan_url(&self) -> String;
+}
+
+impl<'a> SolscanUrl for ReplicaTransactionInfoVersions<'a> {
+    fn solscan_url(&self) -> String {
+        match self {
+            ReplicaTransactionInfoVersions::V0_0_1(tx) => {
+                format!("https://solscan.io/tx/{}", tx.signature)
+            }
+            ReplicaTransactionInfoVersions::V0_0_2(tx) => {
+                format!("https://solscan.io/tx/{}", tx.signature)
+            }
+        }
     }
 }

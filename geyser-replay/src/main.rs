@@ -1,8 +1,8 @@
 use {
     crossbeam_channel::unbounded,
     demo_rust_ipld_car::{node, utils},
-    geyser_replay::epochs,
-    reqwest::Client,
+    geyser_replay::{epochs, epochs_sync::fetch_epoch_stream},
+    reqwest::{blocking, Client},
     solana_rpc::optimistically_confirmed_bank_tracker::SlotNotification,
     solana_runtime::bank::KeyedRewardsAndNumPartitions,
     solana_sdk::{reward_info::RewardInfo, reward_type::RewardType},
@@ -18,16 +18,20 @@ use {
 #[tokio::main(worker_threads = 32)]
 async fn main() -> Result<(), Box<dyn Error>> {
     let client = Client::new();
+    let blocking_client = blocking::Client::new();
     println!("building epochs index");
     let start = std::time::Instant::now();
     let _cache = epochs::build_epochs_index(&client).await?;
     println!("built epochs index in {:?}", start.elapsed());
-    let file_path = args().nth(1).expect("no file given");
+    let epoch_num = args().nth(1).expect("no epoch number given");
+    let epoch_num = epoch_num
+        .parse::<u64>()
+        .expect("failed to parse epoch number");
+    let stream = fetch_epoch_stream(epoch_num, &blocking_client)?;
     let _started_at = std::time::Instant::now();
-    let file = std::fs::File::open(&file_path)?;
     let mut item_index = 0;
     {
-        let mut reader = node::NodeReader::new(file)?;
+        let mut reader = node::NodeReader::new(stream)?;
         let header = reader.read_raw_header()?;
         println!("Header bytes: {:?}", header);
 

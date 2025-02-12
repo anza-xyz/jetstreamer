@@ -6,7 +6,7 @@ use tokio::sync::mpsc;
 use tokio::task;
 use tokio::task::JoinHandle;
 
-const BASE_URL: &str = "https://files.old-faithful.net";
+pub const BASE_URL: &str = "https://files.old-faithful.net";
 const RANGE_PADDING: usize = 11; // current slot sizes are around 9 bytes
 
 async fn fetch_epoch_slot_range(epoch: u64, client: &Client) -> Option<(u64, u64, u64)> {
@@ -110,7 +110,7 @@ pub async fn build_epochs_index(client: &Client) -> anyhow::Result<RangeMap<u64,
 }
 
 /// Fetches a network stream pointing to the specified epoch CAR file in Old Faithful.
-pub async fn fetch_epoch_stream(
+pub async fn fetch_epoch_stream_async(
     epoch: u64,
     client: &Client,
 ) -> reqwest::Result<impl AsyncRead + Unpin> {
@@ -137,9 +137,9 @@ async fn test_build_epoch_index() {
 }
 
 #[tokio::test]
-async fn test_fetch_epoch_stream() {
+async fn test_fetch_epoch_stream_async() {
     let client = Client::new();
-    let stream = fetch_epoch_stream(670, &client).await.unwrap();
+    let stream = fetch_epoch_stream_async(670, &client).await.unwrap();
     // read first 100 MB of the stream
     let mut buf = vec![0u8; 1024];
     stream.take(1024).read_exact(&mut buf).await.unwrap();

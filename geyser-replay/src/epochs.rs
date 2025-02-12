@@ -28,7 +28,6 @@ async fn fetch_slot_with_range(
     range: &str,
     client: &Client,
 ) -> Option<u64> {
-    //println!("Fetching: {} with range: {}", url, range);
     let response = client.get(url).header("Range", range).send().await.ok()?;
 
     if response.status() != reqwest::StatusCode::PARTIAL_CONTENT

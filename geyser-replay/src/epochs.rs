@@ -122,3 +122,13 @@ pub async fn fetch_epoch_stream(
         stream.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)),
     )))
 }
+
+#[tokio::test(worker_threads = 32, flavor = "multi_thread")]
+async fn test_build_epoch_index() {
+    let client = Client::new();
+    println!("building epochs index");
+    let start = std::time::Instant::now();
+    let cache = build_epochs_index(&client).await.unwrap();
+    println!("built epochs index in {:?}", start.elapsed());
+    assert!(cache.len() > 710);
+}

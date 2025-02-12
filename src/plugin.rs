@@ -3,7 +3,7 @@ use agave_geyser_plugin_interface::geyser_plugin_interface::{
     ReplicaTransactionInfoVersions, Result,
 };
 use solana_program::pubkey::Pubkey;
-use std::{cell::RefCell, error::Error};
+use std::{cell::RefCell, error::Error, time::Instant};
 use thousands::Separable;
 use tokio::runtime::Runtime;
 
@@ -16,6 +16,7 @@ thread_local! {
     static PROCESSED_SLOTS: RefCell<u64> = RefCell::new(0);
     static NUM_VOTES: RefCell<u64> = RefCell::new(0);
     static COMPUTE_CONSUMED: RefCell<u128> = RefCell::new(0);
+    static START_TIME: std::cell::RefCell<Option<Instant>> = std::cell::RefCell::new(None);
 }
 
 #[derive(Clone, Debug, Default)]
@@ -98,18 +99,29 @@ impl GeyserPlugin for Solira {
         });
         if processed_slots % 100 == 0 {
             let processed_txs = PROCESSED_TRANSACTIONS.with_borrow(|txs| *txs);
-            let num_votes = NUM_VOTES.with_borrow(|votes| *votes);
+            // let num_votes = NUM_VOTES.with_borrow(|votes| *votes);
             let compute_consumed = COMPUTE_CONSUMED.with_borrow(|compute| *compute);
+
+            let overall_tps = START_TIME.with(|start_time| {
+                let mut start_time = start_time.borrow_mut();
+                if start_time.is_none() {
+                    *start_time = Some(Instant::now());
+                }
+                let elapsed = start_time.unwrap().elapsed().as_secs_f64();
+                processed_txs as f64 / elapsed
+            });
+
             log::info!(
-                "at slot {}, processed {} transactions  ({} vote, {} non-vote) consuming {} CU across {} slots",
+                "at slot {}, processed {} transactions consuming {} CU across {} slots | Overall TPS: {:.2}",
                 slot,
                 processed_txs.separate_with_commas(),
-                num_votes.separate_with_commas(),
-                (processed_txs - num_votes).separate_with_commas(),
-                compute_consumed.separate_with_commas(),
+                /*num_votes.separate_with_commas(),
+                (processed_txs - num_votes).separate_with_commas(),*/                compute_consumed.separate_with_commas(),
                 processed_slots.separate_with_commas(),
+                overall_tps
             );
         }
+
         Ok(())
     }
 

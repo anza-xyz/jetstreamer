@@ -78,18 +78,11 @@ pub async fn build_epochs_index() -> anyhow::Result<RangeMap<u64, u64>> {
             if let Some((epoch, start_slot, end_slot)) = fetch_slot_range(epoch, &client).await {
                 let _ = tx.send((epoch, start_slot, end_slot));
             } else {
-                //println!("Epoch: {} not found", epoch);
                 let _ = stop_tx.send(epoch);
             }
         });
-
-        // if epoch % 100 == 0 {
-        //     handle.await?;
-        // } else {
         handles.push(handle);
-        //}
-        std::thread::sleep(std::time::Duration::from_millis(2));
-        //std::thread::yield_now();
+        std::thread::sleep(std::time::Duration::from_millis(1));
     }
 
     drop(tx);

@@ -35,7 +35,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
         println!("Geyser config files: {:?}", geyser_config_files);
 
         let (confirmed_bank_sender, confirmed_bank_receiver) = unbounded();
-        // drop(confirmed_bank_sender);
         let service =
             solana_geyser_plugin_manager::geyser_plugin_service::GeyserPluginService::new(
                 confirmed_bank_receiver,

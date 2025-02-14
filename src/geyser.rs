@@ -1,8 +1,7 @@
 use agave_geyser_plugin_interface::geyser_plugin_interface::{
-    GeyserPlugin, GeyserPluginError, ReplicaAccountInfoVersions, ReplicaBlockInfoVersions,
-    ReplicaTransactionInfoVersions, Result,
+    GeyserPlugin, GeyserPluginError, ReplicaBlockInfoVersions, ReplicaTransactionInfoVersions,
+    Result,
 };
-use solana_program::pubkey::Pubkey;
 use std::{cell::RefCell, error::Error, time::Instant};
 use thousands::Separable;
 use tokio::runtime::Runtime;
@@ -86,12 +85,14 @@ impl GeyserPlugin for Solira {
     }
 
     fn notify_block_metadata(&self, blockinfo: ReplicaBlockInfoVersions) -> Result<()> {
+        // println!("got block");
         let slot = match blockinfo {
             ReplicaBlockInfoVersions::V0_0_1(block_info) => block_info.slot,
             ReplicaBlockInfoVersions::V0_0_2(block_info) => block_info.slot,
             ReplicaBlockInfoVersions::V0_0_3(block_info) => block_info.slot,
             ReplicaBlockInfoVersions::V0_0_4(block_info) => block_info.slot,
         };
+        // println!("slot number: {}", slot);
         SLOT_NUM.set(slot);
         let processed_slots = PROCESSED_SLOTS.with_borrow_mut(|slots| {
             *slots += 1;
@@ -121,27 +122,6 @@ impl GeyserPlugin for Solira {
                 overall_tps
             );
         }
-
-        Ok(())
-    }
-
-    fn update_account(
-        &self,
-        account: ReplicaAccountInfoVersions,
-        slot: u64,
-        _is_startup: bool,
-    ) -> Result<()> {
-        let pubkey_bytes = match account {
-            ReplicaAccountInfoVersions::V0_0_1(account_info) => account_info.pubkey,
-            ReplicaAccountInfoVersions::V0_0_2(account_info) => account_info.pubkey,
-            ReplicaAccountInfoVersions::V0_0_3(account_info) => account_info.pubkey,
-        };
-
-        log::info!(
-            "account {:?} updated at slot {}!",
-            Pubkey::try_from(pubkey_bytes).unwrap(),
-            slot
-        );
 
         Ok(())
     }

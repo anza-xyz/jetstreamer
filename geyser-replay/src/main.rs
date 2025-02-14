@@ -1,7 +1,7 @@
 use {
     crossbeam_channel::unbounded,
     demo_rust_ipld_car::{node, utils},
-    geyser_replay::{epochs, epochs_sync::fetch_epoch_stream},
+    geyser_replay::epochs_sync::fetch_epoch_stream,
     reqwest::{blocking, Client},
     solana_rpc::optimistically_confirmed_bank_tracker::SlotNotification,
     solana_runtime::bank::KeyedRewardsAndNumPartitions,
@@ -17,12 +17,12 @@ use {
 
 #[tokio::main(worker_threads = 32)]
 async fn main() -> Result<(), Box<dyn Error>> {
-    let client = Client::new();
+    let _client = Client::new();
     let blocking_client = blocking::Client::new();
-    println!("building epochs index");
-    let start = std::time::Instant::now();
-    let _cache = epochs::build_epochs_index(&client).await?;
-    println!("built epochs index in {:?}", start.elapsed());
+    // println!("building epochs index");
+    // let start = std::time::Instant::now();
+    // let _cache = epochs::build_epochs_index(&client).await?;
+    // println!("built epochs index in {:?}", start.elapsed());
     let epoch_num = args().nth(1).expect("no epoch number given");
     let epoch_num = epoch_num
         .parse::<u64>()

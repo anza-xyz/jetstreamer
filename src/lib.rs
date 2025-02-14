@@ -1,7 +1,7 @@
 pub mod clickhouse;
-pub mod plugin;
+pub mod geyser;
 
-pub use plugin::Solira;
+pub use geyser::Solira;
 
 use agave_geyser_plugin_interface::geyser_plugin_interface::GeyserPlugin;
 

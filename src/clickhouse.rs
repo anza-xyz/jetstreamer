@@ -5,7 +5,7 @@ use tokio::{
     sync::{mpsc, OnceCell},
 };
 
-use crate::plugin::SoliraError;
+use crate::geyser::SoliraError;
 
 fn process_log_line(line: impl AsRef<str>) {
     let line = line.as_ref();

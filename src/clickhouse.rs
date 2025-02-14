@@ -75,6 +75,10 @@ pub async fn start() -> Result<
                 }
                 line = stderr_reader.next_line() => {
                     if let Ok(Some(line)) = line {
+                        if line.ends_with("Updating DNS cache") || line.ends_with("Updated DNS cache") {
+                            // Ignore DNS cache update messages
+                            continue;
+                        }
                         process_log_line(&line);
 
                         // Check for "Ready for connections" message, ignoring extra formatting or invisible chars

@@ -154,13 +154,6 @@ impl GeyserPlugin for Solira {
                 }
                 if let Some(consumed) = tx.transaction_status_meta.compute_units_consumed {
                     COMPUTE_CONSUMED.with_borrow_mut(|compute| {
-                        if *compute > 0 {
-                            println!(
-                                "found compute: {} at slot {}",
-                                consumed,
-                                SLOT_NUM.with_borrow(|slot| *slot)
-                            );
-                        }
                         *compute += u128::from(consumed);
                     });
                 }

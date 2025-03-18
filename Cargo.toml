@@ -57,7 +57,7 @@ tonic = "0.12"
 tonic-build = "0.12"
 tracing = "0.1"
 zstd = "0.13"
-thousands = "0.2"
+thousands = "0"
 tokio-stream = { version = "0", features = ["full"] }
 rangemap = "1"
 

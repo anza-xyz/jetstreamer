@@ -3,7 +3,7 @@ use std::{fmt::Display, ops::Range};
 use reqwest::Client;
 use thiserror::Error;
 
-use crate::slot_cache::{fetch_epoch_stream_async, SlotCache};
+use crate::slot_cache::fetch_epoch_stream_async;
 
 #[derive(Debug, Error)]
 pub enum GeyserReplayError {
@@ -25,7 +25,7 @@ impl From<reqwest::Error> for GeyserReplayError {
 }
 
 pub async fn process_slot_range(
-    slot_range: Range<u64>,
+    _slot_range: Range<u64>,
     epoch_range: Range<u64>,
     client: Client,
 ) -> Result<(), GeyserReplayError> {
@@ -34,7 +34,7 @@ pub async fn process_slot_range(
         .enumerate()
     {
         tracing::info!("Processing epoch {}", epoch_num);
-        let stream = stream.await?;
+        let _stream = stream.await?;
     }
     Ok(())
 }
@@ -68,11 +68,11 @@ impl Clone for MessageAddressLoaderFromTxMeta {
     }
 }
 
-#[test]
-fn test_process_slot_range() {
+#[tokio::test]
+async fn test_process_slot_range() {
     let client = reqwest::Client::new();
     let slot_range = 700..705;
     let epoch_range = 700..705;
-    let result = process_slot_range(slot_range, epoch_range, client);
+    let result = process_slot_range(slot_range, epoch_range, client).await;
     assert!(result.is_ok());
 }

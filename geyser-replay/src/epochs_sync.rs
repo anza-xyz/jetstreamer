@@ -3,7 +3,12 @@ use std::io::{BufReader, Read};
 
 /// Fetches a network stream pointing to the specified epoch CAR file in Old Faithful.
 pub fn fetch_epoch_stream(epoch: u64, client: &Client) -> reqwest::Result<impl Read> {
-    let url = format!("{}/{}/epoch-{}.car", crate::epochs::BASE_URL, epoch, epoch);
+    let url = format!(
+        "{}/{}/epoch-{}.car",
+        crate::slot_cache::BASE_URL,
+        epoch,
+        epoch
+    );
     let response = client.get(&url).send()?;
     let reader = BufReader::new(response);
 

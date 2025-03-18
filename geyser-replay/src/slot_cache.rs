@@ -9,6 +9,8 @@ use tokio::task::JoinHandle;
 pub const BASE_URL: &str = "https://files.old-faithful.net";
 const RANGE_PADDING: usize = 11; // current slot sizes are around 9 bytes
 
+pub type SlotCache = RangeMap<u64, u64>;
+
 async fn fetch_epoch_slot_range(epoch: u64, client: &Client) -> Option<(u64, u64, u64)> {
     let url = format!("{}/{}/{}.slots.txt", BASE_URL, epoch, epoch);
     let head_range = format!("bytes=0-{}", RANGE_PADDING);

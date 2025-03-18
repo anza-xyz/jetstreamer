@@ -43,8 +43,8 @@ multihash = "0.19"
 prost = { package = "prost", version = "0.13" }
 prost_011 = { package = "prost", version = "0.11" }
 protobuf-src = "1.1"
-serde = "1.0"
-serde_cbor = "0.11"
+serde = "1"
+serde_cbor = "0"
 solana-accounts-db = "2"
 solana-entry = "2"
 solana-geyser-plugin-manager = "2"

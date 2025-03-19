@@ -138,13 +138,13 @@ pub struct AsyncNodeReader<R: AsyncRead> {
 }
 
 impl<R: AsyncRead + Unpin> AsyncNodeReader<R> {
-    pub fn new(reader: R) -> Result<AsyncNodeReader<R>, Box<dyn Error>> {
+    pub fn new(reader: R) -> AsyncNodeReader<R> {
         let node_reader = AsyncNodeReader {
             reader,
             header: vec![],
             item_index: 0,
         };
-        Ok(node_reader)
+        node_reader
     }
 
     pub async fn read_raw_header(&mut self) -> Result<Vec<u8>, Box<dyn Error>> {
@@ -229,7 +229,7 @@ async fn test_async_node_reader() {
     use crate::epochs_async::fetch_epoch_stream;
     let client = reqwest::Client::new();
     let stream = fetch_epoch_stream(670, &client).await.unwrap();
-    let mut reader = AsyncNodeReader::new(stream).unwrap();
+    let mut reader = AsyncNodeReader::new(stream);
     let nodes = reader.read_until_block().await.unwrap();
     assert_eq!(nodes.len(), 117);
 }

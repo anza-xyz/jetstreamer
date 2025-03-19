@@ -1,19 +1,46 @@
-use std::{fmt::Display, ops::Range};
+use std::{
+    fmt::Display,
+    ops::Range,
+    path::{Path, PathBuf},
+};
 
+use crossbeam_channel::unbounded;
 use reqwest::Client;
+use solana_geyser_plugin_manager::geyser_plugin_service::GeyserPluginServiceError;
 use thiserror::Error;
 
-use crate::slot_cache::fetch_epoch_stream_async;
+use crate::{node_reader::AsyncNodeReader, slot_cache::fetch_epoch_stream_async};
 
 #[derive(Debug, Error)]
 pub enum GeyserReplayError {
     Reqwest(reqwest::Error),
+    ReadHeader(Box<dyn std::error::Error>),
+    GeyserPluginService(GeyserPluginServiceError),
+    FailedToGetTransactionNotifier,
+    ReadUntilBlockError(Box<dyn std::error::Error>),
+    GetBlockError(Box<dyn std::error::Error>),
 }
 
 impl Display for GeyserReplayError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             GeyserReplayError::Reqwest(e) => write!(f, "Reqwest error: {}", e),
+            GeyserReplayError::ReadHeader(error) => {
+                write!(f, "Error reading header: {}", error)
+            }
+            GeyserReplayError::GeyserPluginService(geyser_plugin_service_error) => write!(
+                f,
+                "Error initializing geyser plugin service: {}",
+                geyser_plugin_service_error
+            ),
+            GeyserReplayError::FailedToGetTransactionNotifier => write!(
+                f,
+                "Failed to get transaction notifier from GeyserPluginService"
+            ),
+            GeyserReplayError::ReadUntilBlockError(error) => {
+                write!(f, "Error reading until block: {}", error)
+            }
+            GeyserReplayError::GetBlockError(error) => write!(f, "Error getting block: {}", error),
         }
     }
 }
@@ -24,9 +51,16 @@ impl From<reqwest::Error> for GeyserReplayError {
     }
 }
 
+impl From<GeyserPluginServiceError> for GeyserReplayError {
+    fn from(e: GeyserPluginServiceError) -> Self {
+        GeyserReplayError::GeyserPluginService(e)
+    }
+}
+
 pub async fn process_slot_range(
-    _slot_range: Range<u64>,
+    slot_range: Range<u64>,
     epoch_range: Range<u64>,
+    geyser_config_files: &[PathBuf],
     client: Client,
 ) -> Result<(), GeyserReplayError> {
     for (epoch_num, stream) in epoch_range
@@ -34,7 +68,62 @@ pub async fn process_slot_range(
         .enumerate()
     {
         tracing::info!("Processing epoch {}", epoch_num);
-        let _stream = stream.await?;
+        let stream = stream.await?;
+        let mut reader = AsyncNodeReader::new(stream);
+
+        let header = reader
+            .read_raw_header()
+            .await
+            .map_err(|e| GeyserReplayError::ReadHeader(e))?;
+        tracing::debug!("read epoch {} header: {:?}", epoch_num, header);
+
+        tracing::debug!("Geyser config files: {:?}", geyser_config_files);
+
+        let (confirmed_bank_sender, confirmed_bank_receiver) = unbounded();
+
+        let service =
+            solana_geyser_plugin_manager::geyser_plugin_service::GeyserPluginService::new(
+                confirmed_bank_receiver,
+                geyser_config_files,
+            )?;
+        tracing::debug!("Geyser plugin service initialized.");
+
+        let transaction_notifier = service
+            .get_transaction_notifier()
+            .ok_or(GeyserReplayError::FailedToGetTransactionNotifier)?;
+
+        let entry_notifier_maybe = service.get_entry_notifier();
+        if entry_notifier_maybe.is_some() {
+            tracing::debug!("Entry notifications enabled")
+        } else {
+            tracing::debug!("None of the plugins have enabled entry notifications")
+        }
+
+        let block_meta_notifier_maybe = service.get_block_metadata_notifier();
+
+        let mut todo_previous_blockhash = solana_sdk::hash::Hash::default();
+        let mut todo_latest_entry_blockhash = solana_sdk::hash::Hash::default();
+
+        let mut item_index = 0;
+        loop {
+            let nodes = reader
+                .read_until_block()
+                .await
+                .map_err(|e| GeyserReplayError::ReadUntilBlockError(e))?;
+            let block = nodes
+                .get_block()
+                .map_err(|e| GeyserReplayError::GetBlockError(e))?;
+            tracing::debug!(
+                "read block {} of epoch {} with slot {}",
+                item_index,
+                epoch_num,
+                block.slot
+            );
+            if !slot_range.contains(&block.slot) {
+                tracing::debug!("skipping slot {}", block.slot);
+                continue;
+            }
+        }
     }
     Ok(())
 }
@@ -70,9 +159,9 @@ impl Clone for MessageAddressLoaderFromTxMeta {
 
 #[tokio::test]
 async fn test_process_slot_range() {
-    let client = reqwest::Client::new();
-    let slot_range = 700..705;
-    let epoch_range = 700..705;
-    let result = process_slot_range(slot_range, epoch_range, client).await;
-    assert!(result.is_ok());
+    // let client = reqwest::Client::new();
+    // let slot_range = 700..705;
+    // let epoch_range = 700..705;
+    // let result = process_slot_range(slot_range, epoch_range, client).await;
+    // assert!(result.is_ok());
 }

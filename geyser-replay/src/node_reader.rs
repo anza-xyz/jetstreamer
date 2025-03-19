@@ -43,6 +43,7 @@ pub async fn read_uvarint<R: AsyncRead + Unpin>(reader: &mut R) -> io::Result<u6
     ))
 }
 
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub struct RawNode {
     pub cid: Cid,
     pub data: Vec<u8>,

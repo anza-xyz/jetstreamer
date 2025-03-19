@@ -1958,12 +1958,14 @@ dependencies = [
  "crossbeam-channel",
  "demo-rust-ipld-car",
  "futures-util",
+ "log",
  "multihash",
  "prost",
  "rangemap",
  "reqwest 0.12.15",
  "solana-entry",
  "solana-geyser-plugin-manager",
+ "solana-logger",
  "solana-rpc",
  "solana-runtime",
  "solana-sdk",
@@ -1972,7 +1974,6 @@ dependencies = [
  "thiserror 2.0.12",
  "tokio",
  "tokio-util 0.7.14",
- "tracing",
 ]
 
 [[package]]

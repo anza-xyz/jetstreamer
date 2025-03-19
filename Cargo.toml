@@ -56,7 +56,6 @@ solana-storage-proto = "2"
 solana-transaction-status = "2"
 tonic = "0"
 tonic-build = "0"
-tracing = "0"
 zstd = "0"
 thousands = "0"
 tokio-stream = { version = "0", features = ["full"] }

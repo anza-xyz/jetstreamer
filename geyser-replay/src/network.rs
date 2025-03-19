@@ -1,5 +1,8 @@
 use std::{
-    collections::HashSet, fmt::Display, ops::Range, path::{Path, PathBuf}
+    collections::HashSet,
+    fmt::Display,
+    ops::Range,
+    path::{Path, PathBuf},
 };
 
 use crossbeam_channel::unbounded;
@@ -160,7 +163,7 @@ pub async fn process_slot_range(
 
 							let as_native_metadata: solana_transaction_status::TransactionStatusMeta =
 								metadata.try_into()?;
-							
+
 							let dummy_address_loader = MessageAddressLoaderFromTxMeta::new(as_native_metadata.clone());
 
 							let sanitized_tx = match  parsed.version() {

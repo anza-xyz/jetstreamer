@@ -1953,9 +1953,11 @@ name = "geyser-replay"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "cid",
  "crossbeam-channel",
  "demo-rust-ipld-car",
  "futures-util",
+ "multihash",
  "prost",
  "rangemap",
  "reqwest 0.12.15",

@@ -25,3 +25,5 @@ anyhow.workspace = true
 rangemap.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+cid.workspace = true
+multihash.workspace = true

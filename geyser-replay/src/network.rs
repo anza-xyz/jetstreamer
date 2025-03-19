@@ -1,10 +1,9 @@
 use std::{
-    fmt::Display,
-    ops::Range,
-    path::{Path, PathBuf},
+    collections::HashSet, fmt::Display, ops::Range, path::{Path, PathBuf}
 };
 
 use crossbeam_channel::unbounded;
+use demo_rust_ipld_car::utils;
 use reqwest::Client;
 use solana_geyser_plugin_manager::geyser_plugin_service::GeyserPluginServiceError;
 use thiserror::Error;
@@ -19,6 +18,7 @@ pub enum GeyserReplayError {
     FailedToGetTransactionNotifier,
     ReadUntilBlockError(Box<dyn std::error::Error>),
     GetBlockError(Box<dyn std::error::Error>),
+    NodeSeekError(Box<dyn std::error::Error>),
 }
 
 impl Display for GeyserReplayError {
@@ -41,6 +41,13 @@ impl Display for GeyserReplayError {
                 write!(f, "Error reading until block: {}", error)
             }
             GeyserReplayError::GetBlockError(error) => write!(f, "Error getting block: {}", error),
+            GeyserReplayError::NodeSeekError(error) => {
+                write!(
+                    f,
+                    "Error seeking to or reading data from next node: {}",
+                    error
+                )
+            }
         }
     }
 }
@@ -123,6 +130,78 @@ pub async fn process_slot_range(
                 tracing::debug!("skipping slot {}", block.slot);
                 continue;
             }
+            let mut entry_index: usize = 0;
+            let mut this_block_executed_transaction_count: u64 = 0;
+            let mut this_block_entry_count: u64 = 0;
+            let mut this_block_rewards: solana_storage_proto::convert::generated::Rewards =
+                solana_storage_proto::convert::generated::Rewards::default();
+
+            nodes
+                .each(|node_with_cid| -> Result<(), Box<dyn std::error::Error>> {
+                    item_index += 1;
+                    let node = node_with_cid.get_node();
+
+                    use demo_rust_ipld_car::node::Node::*;
+                    match node {
+                        Transaction(tx) => {
+                            let parsed = tx.as_parsed()?;
+                            let reassembled_metadata =
+                                nodes.reassemble_dataframes(tx.metadata.clone())?;
+
+                            let decompressed = utils::decompress_zstd(reassembled_metadata.clone())?;
+
+                            let metadata: solana_storage_proto::convert::generated::TransactionStatusMeta =
+                                prost_011::Message::decode(decompressed.as_slice()).map_err(|err| {
+                                    Box::new(std::io::Error::new(
+                                        std::io::ErrorKind::Other,
+                                        std::format!("Error decoding metadata: {:?}", err),
+                                    ))
+                                })?;
+
+							let as_native_metadata: solana_transaction_status::TransactionStatusMeta =
+								metadata.try_into()?;
+							
+							let dummy_address_loader = MessageAddressLoaderFromTxMeta::new(as_native_metadata.clone());
+
+							let sanitized_tx = match  parsed.version() {
+								solana_sdk::transaction::TransactionVersion::Number(_)=> {
+									let message_hash = parsed.verify_and_hash_message()?;
+									let versioned_sanitized_tx= solana_sdk::transaction::SanitizedVersionedTransaction::try_from(parsed)?;
+									solana_sdk::transaction::SanitizedTransaction::try_new(
+										versioned_sanitized_tx,
+										message_hash,
+										false,
+										dummy_address_loader,
+										&HashSet::default(),
+									)
+								},
+								solana_sdk::transaction::TransactionVersion::Legacy(_legacy)=> {
+									solana_sdk::transaction::SanitizedTransaction::try_from_legacy_transaction(
+										parsed.into_legacy_transaction().unwrap(),
+										&HashSet::default(),
+									)
+								},
+							}?;
+
+							transaction_notifier
+							.notify_transaction(
+								block.slot,
+								tx.index.unwrap() as usize,
+								sanitized_tx.signature(),
+								&as_native_metadata,
+								&sanitized_tx,
+							);
+                        }
+                        Entry(entry) => todo!(),
+                        Block(block) => todo!(),
+                        Subset(subset) => todo!(),
+                        Epoch(epoch) => todo!(),
+                        Rewards(rewards) => todo!(),
+                        DataFrame(data_frame) => todo!(),
+                    }
+                    Ok(())
+                })
+                .map_err(|e| GeyserReplayError::NodeSeekError(e))?;
         }
     }
     Ok(())

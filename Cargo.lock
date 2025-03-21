@@ -1953,7 +1953,7 @@ name = "geyser-replay"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "base64 0.12.3",
+ "base64 0.22.1",
  "cid",
  "crossbeam-channel",
  "demo-rust-ipld-car",
@@ -1963,6 +1963,7 @@ dependencies = [
  "prost",
  "rangemap",
  "reqwest 0.12.15",
+ "rseek",
  "solana-entry",
  "solana-geyser-plugin-manager",
  "solana-logger",
@@ -4484,6 +4485,18 @@ dependencies = [
  "libc",
  "rtoolbox",
  "windows-sys 0.48.0",
+]
+
+[[package]]
+name = "rseek"
+version = "0.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f531b135b792fa4a46031c4139c3dd5b604988999becd129fe01cb30637c947a"
+dependencies = [
+ "bytes",
+ "futures 0.3.31",
+ "reqwest 0.12.15",
+ "tokio",
 ]
 
 [[package]]

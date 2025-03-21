@@ -29,3 +29,4 @@ multihash.workspace = true
 base64.workspace = true
 solana-logger.workspace = true
 log.workspace = true
+rseek.workspace = true

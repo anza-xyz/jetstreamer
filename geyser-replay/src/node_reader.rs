@@ -228,7 +228,7 @@ impl<R: AsyncRead + Unpin> AsyncNodeReader<R> {
 async fn test_async_node_reader() {
     use crate::epochs_async::fetch_epoch_stream;
     let client = reqwest::Client::new();
-    let stream = fetch_epoch_stream(670, &client).await.unwrap();
+    let stream = fetch_epoch_stream(670, &client).await;
     let mut reader = AsyncNodeReader::new(stream);
     let nodes = reader.read_until_block().await.unwrap();
     assert_eq!(nodes.len(), 117);

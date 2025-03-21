@@ -333,12 +333,11 @@ impl Clone for MessageAddressLoaderFromTxMeta {
 
 #[tokio::test]
 async fn test_firehose() {
-    /*
     solana_logger::setup_with_default("debug");
     let client = reqwest::Client::new();
     let slot_range = 302400602..304991999;
     let epoch_range = 700..705;
     let channel = firehose(slot_range, epoch_range, None, client)
         .await
-        .unwrap();*/
+        .unwrap();
 }

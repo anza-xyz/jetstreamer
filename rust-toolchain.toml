@@ -1,2 +1,2 @@
 [toolchain]
-channel = "1.81.0" # agave 2.1.5
+channel = "1.85.1" # 1.81.0 ~ agave 2.1.5

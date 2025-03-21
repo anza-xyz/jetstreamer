@@ -60,6 +60,7 @@ zstd = "0"
 thousands = "0"
 tokio-stream = { version = "0", features = ["full"] }
 rangemap = "1"
+rseek = "0"
 
 [dependencies]
 tokio.workspace = true

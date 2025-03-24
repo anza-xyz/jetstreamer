@@ -337,7 +337,7 @@ async fn test_firehose() {
     let client = reqwest::Client::new();
     let slot_range = 302400602..304991999;
     let epoch_range = 700..705;
-    let channel = firehose(slot_range, epoch_range, None, client)
+    firehose(slot_range, epoch_range, None, client)
         .await
         .unwrap();
 }

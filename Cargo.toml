@@ -16,7 +16,6 @@ crate-type = ["cdylib", "rlib"]
 [workspace.dependencies]
 demo-rust-ipld-car = { git = "https://github.com/rpcpool/yellowstone-faithful.git" }
 tokio = { version = "1", features = ["full"] }
-tokio-util = { version = "0", features = ["full"] }
 futures-util = "0"
 log = "0"
 agave-geyser-plugin-interface = "2"

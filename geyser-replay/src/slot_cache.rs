@@ -1,7 +1,5 @@
-use futures_util::TryStreamExt;
 use rangemap::RangeMap;
 use reqwest::Client;
-use tokio::io::{AsyncRead, BufReader};
 use tokio::sync::mpsc;
 use tokio::task;
 use tokio::task::JoinHandle;
@@ -111,23 +109,6 @@ pub async fn build_epochs_index(client: &Client) -> anyhow::Result<RangeMap<u64,
     Ok(index)
 }
 
-/// Fetches a network stream pointing to the specified epoch CAR file in Old Faithful.
-pub async fn fetch_epoch_stream_async(
-    epoch: u64,
-    client: &Client,
-) -> reqwest::Result<impl AsyncRead + Unpin> {
-    let url = format!("{}/{}/epoch-{}.car", BASE_URL, epoch, epoch);
-    let response = client.get(&url).send().await?;
-    let stream = response.bytes_stream();
-
-    Ok(BufReader::new(tokio_util::io::StreamReader::new(
-        stream.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)),
-    )))
-}
-
-#[cfg(test)]
-use tokio::io::AsyncReadExt;
-
 #[tokio::test(worker_threads = 32, flavor = "multi_thread")]
 async fn test_build_epoch_index() {
     let client = Client::new();
@@ -136,14 +117,4 @@ async fn test_build_epoch_index() {
     let cache = build_epochs_index(&client).await.unwrap();
     println!("built epochs index in {:?}", start.elapsed());
     assert!(cache.len() > 710);
-}
-
-#[tokio::test]
-async fn test_fetch_epoch_stream_async() {
-    let client = Client::new();
-    let stream = fetch_epoch_stream_async(670, &client).await.unwrap();
-    // read first 100 MB of the stream
-    let mut buf = vec![0u8; 1024];
-    stream.take(1024).read_exact(&mut buf).await.unwrap();
-    assert_eq!(buf[0], 58);
 }

@@ -8,7 +8,7 @@ use solana_sdk::{reward_info::RewardInfo, reward_type::RewardType};
 use std::{collections::HashSet, fmt::Display, ops::Range, path::PathBuf};
 use thiserror::Error;
 
-use crate::{node_reader::AsyncNodeReader, slot_cache::fetch_epoch_stream_async};
+use crate::{epochs_async::fetch_epoch_stream, node_reader::AsyncNodeReader};
 
 #[derive(Debug, Error)]
 pub enum GeyserReplayError {
@@ -104,11 +104,11 @@ pub async fn firehose(
 
     // for each epoch
     for (epoch_num, stream) in epoch_range
-        .map(|epoch| fetch_epoch_stream_async(epoch, &client))
+        .map(|epoch| fetch_epoch_stream(epoch, &client))
         .enumerate()
     {
         log::info!("Processing epoch {}", epoch_num);
-        let stream = stream.await?;
+        let stream = stream.await;
         let mut reader = AsyncNodeReader::new(stream);
 
         let header = reader

@@ -6,7 +6,7 @@ use std::{
     error::Error,
     io::{self},
 };
-use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeek};
 
 const MAX_VARINT_LEN_64: usize = 10;
 
@@ -131,13 +131,13 @@ impl RawNode {
     }
 }
 
-pub struct AsyncNodeReader<R: AsyncRead> {
+pub struct AsyncNodeReader<R: AsyncRead + AsyncSeek> {
     reader: R,
     header: Vec<u8>,
     item_index: u64,
 }
 
-impl<R: AsyncRead + Unpin> AsyncNodeReader<R> {
+impl<R: AsyncRead + Unpin + AsyncSeek> AsyncNodeReader<R> {
     pub fn new(reader: R) -> AsyncNodeReader<R> {
         let node_reader = AsyncNodeReader {
             reader,

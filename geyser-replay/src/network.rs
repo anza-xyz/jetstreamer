@@ -136,6 +136,10 @@ pub async fn firehose(
                 epoch_num,
                 block.slot
             );
+            if block.slot > slot_range.end {
+                log::debug!("slot range exceeded {}", block.slot);
+                break;
+            }
             if !slot_range.contains(&block.slot) {
                 log::debug!("skipping slot {}", block.slot);
                 continue;
@@ -335,8 +339,8 @@ impl Clone for MessageAddressLoaderFromTxMeta {
 async fn test_firehose() {
     solana_logger::setup_with_default("debug");
     let client = reqwest::Client::new();
-    let slot_range = 302400602..304991999;
-    let epoch_range = 700..705;
+    let slot_range = 302400000..(302400000 + 10);
+    let epoch_range = 700..701;
     firehose(slot_range, epoch_range, None, client)
         .await
         .unwrap();

@@ -122,7 +122,20 @@ pub async fn firehose(
 
         // for each item in each block
         let mut item_index = 0;
+        let mut current_slot = None;
         loop {
+            if let Some(mut current_slot) = current_slot {
+                if current_slot + 1 < slot_range.start {
+                    let diff = slot_range.start - current_slot;
+                    log::debug!("skipping slot {}+{}", current_slot, diff);
+                    for _ in 0..diff {
+                        current_slot += 1;
+                        reader.skip_next();
+                    }
+                    current_slot = None;
+                    continue;
+                }
+            }
             let nodes = reader
                 .read_until_block()
                 .await

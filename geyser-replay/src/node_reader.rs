@@ -1,12 +1,13 @@
 use cid::Cid;
 use demo_rust_ipld_car::node::{parse_any_from_cbordata, Node, NodeWithCid, NodesWithCids};
 use demo_rust_ipld_car::utils;
+use std::io::SeekFrom;
 use std::vec::Vec;
 use std::{
     error::Error,
     io::{self},
 };
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeek};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt};
 
 const MAX_VARINT_LEN_64: usize = 10;
 
@@ -165,6 +166,29 @@ impl<R: AsyncRead + Unpin + AsyncSeek> AsyncNodeReader<R> {
 
         let clone = header.clone();
         Ok(clone.as_slice().to_owned())
+    }
+
+    pub async fn skip_next(&mut self) -> Result<(), Box<dyn Error>> {
+        if self.header.is_empty() {
+            self.read_raw_header().await?;
+        };
+
+        // Read and decode the uvarint prefix (length of CID + data)
+        let section_size = read_uvarint(&mut self.reader).await?;
+
+        if section_size > utils::MAX_ALLOWED_SECTION_SIZE as u64 {
+            return Err(Box::new(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "Section size too long".to_owned(),
+            )));
+        }
+
+        // skip item
+        self.reader
+            .seek(SeekFrom::Current(section_size as i64))
+            .await?;
+
+        Ok(())
     }
 
     #[allow(clippy::should_implement_trait)]

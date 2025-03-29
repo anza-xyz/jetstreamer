@@ -19,6 +19,7 @@ pub enum GeyserReplayError {
     ReadUntilBlockError(Box<dyn std::error::Error>),
     GetBlockError(Box<dyn std::error::Error>),
     NodeDecodingError(usize, Box<dyn std::error::Error>),
+    SkipBlockError(Box<dyn std::error::Error>),
 }
 
 impl Display for GeyserReplayError {
@@ -47,6 +48,9 @@ impl Display for GeyserReplayError {
                     "Error seeking, reading data from, or decoding data for data node {}: {}",
                     item_index, error
                 )
+            }
+            GeyserReplayError::SkipBlockError(error) => {
+                write!(f, "Error skipping block: {}", error)
             }
         }
     }
@@ -122,17 +126,21 @@ pub async fn firehose(
 
         // for each item in each block
         let mut item_index = 0;
-        let mut current_slot = None;
+        let mut current_slot: Option<u64> = None;
         loop {
-            if let Some(mut current_slot) = current_slot {
-                if current_slot + 1 < slot_range.start {
-                    let diff = slot_range.start - current_slot;
-                    log::debug!("skipping slot {}+{}", current_slot, diff);
+            if let Some(current) = &mut current_slot {
+                if *current + 1 < slot_range.start {
+                    let target = slot_range.start - 1;
+                    let diff = slot_range.start - *current;
+                    log::debug!("skipping slots {}-{}", current, target);
                     for _ in 0..diff {
-                        current_slot += 1;
-                        reader.skip_next();
+                        log::debug!("skipping slot {}", current);
+                        reader
+                            .skip_next()
+                            .await
+                            .map_err(|e| GeyserReplayError::SkipBlockError(e))?;
+                        *current += 1;
                     }
-                    current_slot = None;
                     continue;
                 }
             }
@@ -149,6 +157,7 @@ pub async fn firehose(
                 epoch_num,
                 block.slot
             );
+            current_slot = Some(block.slot);
             if block.slot > slot_range.end {
                 log::debug!("slot range exceeded {}", block.slot);
                 break;
@@ -352,7 +361,7 @@ impl Clone for MessageAddressLoaderFromTxMeta {
 async fn test_firehose() {
     solana_logger::setup_with_default("debug");
     let client = reqwest::Client::new();
-    let slot_range = 302400000..(302400000 + 10);
+    let slot_range = (302400000 + 1000)..(302400000 + 1000 + 10);
     let epoch_range = 700..701;
     firehose(slot_range, epoch_range, None, client)
         .await

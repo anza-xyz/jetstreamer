@@ -2,6 +2,8 @@ use reqwest::Client;
 use rseek::Seekable;
 use tokio::io::{AsyncRead, AsyncSeek};
 
+use crate::node_reader::Len;
+
 /// Fetches a network stream pointing to the specified epoch CAR file in Old Faithful.
 pub async fn fetch_epoch_stream(epoch: u64, client: &Client) -> impl AsyncRead + AsyncSeek + Len {
     let client = client.clone();
@@ -19,8 +21,6 @@ pub async fn fetch_epoch_stream(epoch: u64, client: &Client) -> impl AsyncRead +
 
 #[cfg(test)]
 use tokio::io::AsyncReadExt;
-
-use crate::node_reader::Len;
 
 #[tokio::test]
 async fn test_fetch_epoch_stream() {

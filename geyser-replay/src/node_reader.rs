@@ -135,18 +135,15 @@ impl RawNode {
 }
 
 pub trait Len {
-    fn len(&self) -> usize;
+    fn len(&self) -> u64;
 }
 
 impl<F> Len for Seekable<F>
 where
     F: Fn() -> RequestBuilder + Send + Sync + 'static,
 {
-    fn len(&self) -> usize {
-        self.file_size()
-            .unwrap_or_else(|_| 0)
-            .try_into()
-            .unwrap_or(0)
+    fn len(&self) -> u64 {
+        self.file_size().unwrap_or(0)
     }
 }
 
@@ -156,7 +153,7 @@ pub struct AsyncNodeReader<R: AsyncRead + AsyncSeek + Len> {
     item_index: u64,
 }
 
-impl<R: AsyncRead + Unpin + AsyncSeek> AsyncNodeReader<R> {
+impl<R: AsyncRead + Unpin + AsyncSeek + Len> AsyncNodeReader<R> {
     pub fn new(reader: R) -> AsyncNodeReader<R> {
         let node_reader = AsyncNodeReader {
             reader,

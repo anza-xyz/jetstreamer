@@ -1,6 +1,8 @@
 use cid::Cid;
 use demo_rust_ipld_car::node::{parse_any_from_cbordata, Node, NodeWithCid, NodesWithCids};
 use demo_rust_ipld_car::utils;
+use reqwest::RequestBuilder;
+use rseek::Seekable;
 use std::io::SeekFrom;
 use std::vec::Vec;
 use std::{
@@ -132,7 +134,23 @@ impl RawNode {
     }
 }
 
-pub struct AsyncNodeReader<R: AsyncRead + AsyncSeek> {
+pub trait Len {
+    fn len(&self) -> usize;
+}
+
+impl<F> Len for Seekable<F>
+where
+    F: Fn() -> RequestBuilder + Send + Sync + 'static,
+{
+    fn len(&self) -> usize {
+        self.file_size()
+            .unwrap_or_else(|_| 0)
+            .try_into()
+            .unwrap_or(0)
+    }
+}
+
+pub struct AsyncNodeReader<R: AsyncRead + AsyncSeek + Len> {
     reader: R,
     header: Vec<u8>,
     item_index: u64,

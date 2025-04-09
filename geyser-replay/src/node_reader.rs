@@ -261,6 +261,71 @@ impl<R: AsyncRead + Unpin + AsyncSeek + Len> AsyncNodeReader<R> {
     pub fn get_item_index(&self) -> u64 {
         self.item_index
     }
+
+    pub async fn find_block_with_slot(
+        &mut self,
+        target_slot: u64,
+    ) -> Result<Option<RawNode>, Box<dyn Error>> {
+        if self.header.is_empty() {
+            self.read_raw_header().await?;
+        }
+
+        let file_len = self.reader.len() as u64;
+        let mut low = 0;
+        let mut high = file_len;
+
+        while low < high {
+            let mid = (low + high) / 2;
+
+            // Seek to the middle of the file (could land inside a block)
+            self.reader.seek(SeekFrom::Start(mid)).await?;
+
+            // Skip any partial data by trying to read and discard a node
+            // If it fails, shift forward a little and try again
+            let mut found_valid = false;
+            for _ in 0..3 {
+                let pos = self.reader.stream_position().await?;
+                if let Ok(_) = read_uvarint(&mut self.reader).await {
+                    if let Ok(section_size) = read_uvarint(&mut self.reader).await {
+                        if section_size > utils::MAX_ALLOWED_SECTION_SIZE as u64 {
+                            break;
+                        }
+
+                        let mut buf = vec![0u8; section_size as usize];
+                        if self.reader.read_exact(&mut buf).await.is_ok() {
+                            let mut cursor = io::Cursor::new(buf);
+                            if let Ok(node) = RawNode::from_cursor(&mut cursor).await {
+                                if let Ok(parsed) = node.parse() {
+                                    if let Some(block) = parsed.get_block() {
+                                        let slot = block.slot;
+                                        if slot == target_slot {
+                                            return Ok(Some(node));
+                                        } else if slot < target_slot {
+                                            low = pos + section_size; // start after this block
+                                        } else {
+                                            high = mid; // try earlier
+                                        }
+                                        found_valid = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // seek forward a bit and try again
+                self.reader.seek(SeekFrom::Current(64)).await?;
+            }
+
+            if !found_valid {
+                // Could not decode a valid block even after 3 attempts; give up
+                break;
+            }
+        }
+
+        Ok(None)
+    }
 }
 
 #[tokio::test]

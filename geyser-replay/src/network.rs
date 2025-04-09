@@ -177,7 +177,7 @@ pub async fn firehose(
                     item_index += 1;
                     let node = node_with_cid.get_node();
 
-                    use demo_rust_ipld_car::node::Node::*;
+                    use crate::node::Node::*;
                     match node {
                         Transaction(tx) => {
                             let parsed = tx.as_parsed()?;

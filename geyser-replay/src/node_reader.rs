@@ -1,5 +1,5 @@
+use crate::node::{parse_any_from_cbordata, Node, NodeWithCid, NodesWithCids};
 use cid::Cid;
-use demo_rust_ipld_car::node::{parse_any_from_cbordata, Node, NodeWithCid, NodesWithCids};
 use demo_rust_ipld_car::utils;
 use reqwest::RequestBuilder;
 use rseek::Seekable;
@@ -9,7 +9,7 @@ use std::{
     error::Error,
     io::{self},
 };
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt, BufReader};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt};
 
 const MAX_VARINT_LEN_64: usize = 10;
 

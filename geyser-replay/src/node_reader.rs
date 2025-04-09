@@ -9,7 +9,7 @@ use std::{
     error::Error,
     io::{self},
 };
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt, BufReader};
 
 const MAX_VARINT_LEN_64: usize = 10;
 
@@ -262,69 +262,141 @@ impl<R: AsyncRead + Unpin + AsyncSeek + Len> AsyncNodeReader<R> {
         self.item_index
     }
 
-    pub async fn find_block_with_slot(
-        &mut self,
-        target_slot: u64,
-    ) -> Result<Option<RawNode>, Box<dyn Error>> {
+    /// Scans forward from the current position until a valid block is found.
+    /// Leaves the reader positioned at the start of the valid block.
+    pub async fn skip_until_valid_block(&mut self) -> Result<(), Box<dyn Error>> {
         if self.header.is_empty() {
+            log::debug!("Reading header before scanning for block");
+            self.read_raw_header().await?;
+        }
+
+        const BUFFER_SIZE: usize = 64 * 1024;
+
+        loop {
+            let pos = self.reader.stream_position().await?;
+            log::debug!("Scanning for valid block at offset {}", pos);
+
+            let mut buffer = vec![0u8; BUFFER_SIZE];
+            let bytes_read = self.reader.read(&mut buffer).await?;
+
+            if bytes_read == 0 {
+                return Err("End of file reached before finding valid block".into());
+            }
+
+            for offset in 0..bytes_read {
+                let slice = &buffer[offset..];
+                let mut cursor = io::Cursor::new(slice.to_vec());
+
+                let maybe_block = async {
+                    let _ = read_uvarint(&mut cursor).await.ok()?;
+                    let section_size = read_uvarint(&mut cursor).await.ok()?;
+                    if section_size > utils::MAX_ALLOWED_SECTION_SIZE as u64 {
+                        return None;
+                    }
+
+                    let mut section = vec![0u8; section_size as usize];
+                    cursor.read_exact(&mut section).await.ok()?;
+
+                    let mut node_cursor = io::Cursor::new(section);
+                    let raw_node = RawNode::from_cursor(&mut node_cursor).await.ok()?;
+                    let parsed = raw_node.parse().ok()?;
+
+                    if parsed.is_block() {
+                        Some(())
+                    } else {
+                        None
+                    }
+                }
+                .await;
+
+                if maybe_block.is_some() {
+                    let target_pos = pos + offset as u64;
+                    log::debug!("Found valid block at offset {}", target_pos);
+                    self.reader.seek(SeekFrom::Start(target_pos)).await?;
+                    return Ok(());
+                }
+            }
+
+            log::debug!(
+            "No valid block found in window starting at {} (read {} bytes), sliding forward by 1 byte",
+            pos,
+            bytes_read
+        );
+
+            if bytes_read == 1 {
+                return Err("Unable to continue scanning (read only 1 byte)".into());
+            }
+
+            self.reader
+                .seek(SeekFrom::Current(-(bytes_read as i64 - 1)))
+                .await?;
+        }
+    }
+
+    pub async fn seek_to_slot(&mut self, target_slot: u64) -> Result<bool, Box<dyn Error>> {
+        log::debug!("Seeking to slot {}", target_slot);
+        log::debug!("Current position: {}", self.reader.stream_position().await?);
+
+        if self.header.is_empty() {
+            log::debug!("Reading header");
             self.read_raw_header().await?;
         }
 
         let file_len = self.reader.len() as u64;
-        let mut low = 0;
+        log::debug!("File length: {}", file_len);
+
+        let mut low = file_len / 4;
         let mut high = file_len;
+
+        log::debug!("Initial low: {}, high: {}", low, high);
 
         while low < high {
             let mid = (low + high) / 2;
-
-            // Seek to the middle of the file (could land inside a block)
+            log::debug!("Seeking to midpoint: {}", mid);
             self.reader.seek(SeekFrom::Start(mid)).await?;
 
-            // Skip any partial data by trying to read and discard a node
-            // If it fails, shift forward a little and try again
             let mut found_valid = false;
             for _ in 0..3 {
                 let pos = self.reader.stream_position().await?;
-                if let Ok(_) = read_uvarint(&mut self.reader).await {
-                    if let Ok(section_size) = read_uvarint(&mut self.reader).await {
-                        if section_size > utils::MAX_ALLOWED_SECTION_SIZE as u64 {
+                log::debug!("Trying block at pos {}", pos);
+
+                match self.read_until_block().await {
+                    Ok(nodes) => match nodes.get_block() {
+                        Ok(block) => {
+                            let slot = block.slot;
+                            log::debug!("Found block with slot {}", slot);
+
+                            if slot == target_slot {
+                                self.reader.seek(SeekFrom::Start(pos)).await?;
+                                return Ok(true);
+                            } else if slot < target_slot {
+                                low = pos + 1;
+                            } else {
+                                high = mid;
+                            }
+
+                            found_valid = true;
                             break;
                         }
-
-                        let mut buf = vec![0u8; section_size as usize];
-                        if self.reader.read_exact(&mut buf).await.is_ok() {
-                            let mut cursor = io::Cursor::new(buf);
-                            if let Ok(node) = RawNode::from_cursor(&mut cursor).await {
-                                if let Ok(parsed) = node.parse() {
-                                    if let Some(block) = parsed.get_block() {
-                                        let slot = block.slot;
-                                        if slot == target_slot {
-                                            return Ok(Some(node));
-                                        } else if slot < target_slot {
-                                            low = pos + section_size; // start after this block
-                                        } else {
-                                            high = mid; // try earlier
-                                        }
-                                        found_valid = true;
-                                        break;
-                                    }
-                                }
-                            }
+                        Err(e) => {
+                            log::debug!("Expected block, got error: {}", e);
                         }
+                    },
+                    Err(e) => {
+                        log::debug!("Error decoding block: {}", e);
                     }
                 }
 
-                // seek forward a bit and try again
                 self.reader.seek(SeekFrom::Current(64)).await?;
             }
 
             if !found_valid {
-                // Could not decode a valid block even after 3 attempts; give up
+                log::debug!("Failed to find a valid block near {}", mid);
                 break;
             }
         }
 
-        Ok(None)
+        Ok(false)
     }
 }
 
@@ -336,4 +408,33 @@ async fn test_async_node_reader() {
     let mut reader = AsyncNodeReader::new(stream);
     let nodes = reader.read_until_block().await.unwrap();
     assert_eq!(nodes.len(), 117);
+}
+
+#[tokio::test]
+async fn test_skip_until_valid_block() {
+    solana_logger::setup_with_default("debug");
+    use crate::epochs_async::fetch_epoch_stream;
+    let client = reqwest::Client::new();
+    let stream = fetch_epoch_stream(670, &client).await;
+    let mut reader = AsyncNodeReader::new(stream);
+    reader.skip_until_valid_block().await.unwrap();
+    reader
+        .reader
+        .seek(SeekFrom::Start(reader.reader.len() / 2))
+        .await
+        .unwrap();
+    let _nodes = reader.read_until_block().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_seek_to_slot() {
+    solana_logger::setup_with_default("debug");
+    log::debug!("Starting test_seek_to_slot");
+    use crate::epochs_async::fetch_epoch_stream;
+    let client = reqwest::Client::new();
+    let stream = fetch_epoch_stream(670, &client).await;
+    let mut reader = AsyncNodeReader::new(stream);
+    assert_eq!(reader.seek_to_slot(100).await.unwrap(), false);
+    //let nodes = reader.read_until_block().await.unwrap();
+    //assert_eq!(nodes.len(), 117);
 }

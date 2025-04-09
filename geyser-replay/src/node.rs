@@ -256,7 +256,7 @@ impl Node {
 
 // parse_any_from_cbordata parses any CBOR data into either a Epoch, Subset, Block, Rewards, Entry, or Transaction
 pub fn parse_any_from_cbordata(data: Vec<u8>) -> Result<Node, Box<dyn Error>> {
-    let decoded_data: serde_cbor::Value = serde_cbor::from_slice(&data).unwrap();
+    let decoded_data: serde_cbor::Value = serde_cbor::from_slice(&data)?;
     // Process the decoded data
     // println!("Data: {:?}", decoded_data);
     let cloned_data = decoded_data.clone();
@@ -271,7 +271,13 @@ pub fn parse_any_from_cbordata(data: Vec<u8>) -> Result<Node, Box<dyn Error>> {
             // );
 
             // based on the kind, we can decode the rest of the data
-            match Kind::from_u64(*kind as u64).unwrap() {
+            let Some(kind) = Kind::from_u64(*kind as u64) else {
+                return Err(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    std::format!("Invalid kind: {:?}", kind),
+                )));
+            };
+            match kind {
                 Kind::Transaction => {
                     let transaction = transaction::Transaction::from_cbor(cloned_data)?;
                     return Ok(Node::Transaction(transaction));

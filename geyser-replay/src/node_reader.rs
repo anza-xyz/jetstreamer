@@ -266,16 +266,17 @@ impl<R: AsyncRead + Unpin + AsyncSeek + Len> AsyncNodeReader<R> {
         use std::sync::Arc;
         use tokio::task::JoinSet;
 
-        const NUM_CORES: usize = 32;
+        const NUM_CORES: usize = 16;
         let chunk_size = buffer.len() / NUM_CORES;
         let buffer: Arc<[u8]> = Arc::from(buffer); // Makes it an Arc<[u8]> for safety
 
         let mut tasks = JoinSet::new();
 
+        // TODO: do a sliding window with 1 byte offset for each thread instead of regions
         for i in 0..NUM_CORES {
             let buffer = Arc::clone(&buffer);
             let start = i * chunk_size;
-            let end = ((i + 2) * chunk_size).min(buffer.len()); // overlap into the next chunk
+            let end = buffer.len(); // overlap into the next chunk
 
             tasks.spawn(async move {
                 let local_buf = &buffer[start..end];
@@ -309,9 +310,7 @@ impl<R: AsyncRead + Unpin + AsyncSeek + Len> AsyncNodeReader<R> {
                         return Some(start + local_offset);
                     }
 
-                    if offset % 512 == 0 {
-                        tokio::task::yield_now().await;
-                    }
+                    tokio::task::yield_now().await;
                 }
 
                 None

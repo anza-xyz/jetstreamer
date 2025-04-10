@@ -262,6 +262,71 @@ impl<R: AsyncRead + Unpin + AsyncSeek + Len> AsyncNodeReader<R> {
         self.item_index
     }
 
+    pub async fn scan_window_in_chunks(buffer: &[u8]) -> Result<Option<usize>, Box<dyn Error>> {
+        use std::sync::Arc;
+        use tokio::task::JoinSet;
+
+        const NUM_CORES: usize = 32;
+        let chunk_size = buffer.len() / NUM_CORES;
+        let buffer: Arc<[u8]> = Arc::from(buffer); // Makes it an Arc<[u8]> for safety
+
+        let mut tasks = JoinSet::new();
+
+        for i in 0..NUM_CORES {
+            let buffer = Arc::clone(&buffer);
+            let start = i * chunk_size;
+            let end = ((i + 2) * chunk_size).min(buffer.len()); // overlap into the next chunk
+
+            tasks.spawn(async move {
+                let local_buf = &buffer[start..end];
+                for offset in 0..local_buf.len() {
+                    let slice = &local_buf[offset..];
+                    let mut cursor = std::io::Cursor::new(slice);
+
+                    let maybe_block = async {
+                        let section_size = read_uvarint(&mut cursor).await.ok()?;
+                        if section_size > utils::MAX_ALLOWED_SECTION_SIZE as u64 {
+                            return None;
+                        }
+
+                        let mut section = vec![0u8; section_size as usize];
+                        cursor.read_exact(&mut section).await.ok()?;
+
+                        let mut node_cursor = std::io::Cursor::new(section);
+                        let raw_node = RawNode::from_cursor(&mut node_cursor).await.ok()?;
+                        let parsed = raw_node.parse().ok()?;
+
+                        log::debug!("Parsed node in thread {}: {}", i, raw_node.cid);
+                        if parsed.is_block() {
+                            Some(offset)
+                        } else {
+                            None
+                        }
+                    }
+                    .await;
+
+                    if let Some(local_offset) = maybe_block {
+                        return Some(start + local_offset);
+                    }
+
+                    if offset % 512 == 0 {
+                        tokio::task::yield_now().await;
+                    }
+                }
+
+                None
+            });
+        }
+
+        while let Some(res) = tasks.join_next().await {
+            if let Ok(Some(offset)) = res {
+                return Ok(Some(offset));
+            }
+        }
+
+        Ok(None)
+    }
+
     /// Scans forward from the current position until a valid block is found.
     /// Leaves the reader positioned at the start of the valid block.
     pub async fn skip_until_valid_block(&mut self) -> Result<(), Box<dyn Error>> {
@@ -284,49 +349,10 @@ impl<R: AsyncRead + Unpin + AsyncSeek + Len> AsyncNodeReader<R> {
                 return Err("End of file reached before finding valid block".into());
             }
 
-            for offset in 0..bytes_read {
-                //log::debug!("Checking offset {}+{}", start_pos, offset);
-                let slice = &window[offset..bytes_read];
-                let mut cursor = io::Cursor::new(slice);
-
-                let maybe_block = async {
-                    //let _ = read_uvarint(&mut cursor).await.ok()?; // skip CID version
-                    let section_size = read_uvarint(&mut cursor).await.ok()?;
-                    if section_size > utils::MAX_ALLOWED_SECTION_SIZE as u64 {
-                        return None;
-                    }
-
-                    let mut section = vec![0u8; section_size as usize];
-                    cursor.read_exact(&mut section).await.ok()?;
-
-                    let mut node_cursor = io::Cursor::new(section);
-                    let raw_node = RawNode::from_cursor(&mut node_cursor).await.ok()?;
-                    //log::debug!("D. raw_node: {:?}", raw_node.cid);
-                    let parsed = raw_node.parse();
-                    let Ok(parsed) = parsed else {
-                        //let parsed = parsed.unwrap_err();
-                        //log::warn!("Error parsing node: {:?}", parsed);
-                        return None;
-                    };
-                    //log::debug!("E. parsed: {:?}", parsed.is_block());
-
-                    if parsed.is_block() {
-                        Some(parsed)
-                    } else {
-                        None
-                    }
-                }
-                .await;
-
-                if let Some(block) = maybe_block {
-                    log::debug!("Found valid block at offset {}", start_pos + offset as u64);
-                    log::debug!("slot num: {}", block.get_block().unwrap().slot);
-                    self.reader
-                        .seek(SeekFrom::Start(start_pos + offset as u64))
-                        .await?;
-                    return Ok(());
-                }
-            }
+            Self::scan_window_in_chunks(&window).await.map_err(|e| {
+                log::error!("Error scanning window: {}", e);
+                e
+            })?;
 
             if bytes_read < WINDOW_SIZE {
                 return Err("Reached EOF without finding valid block".into());

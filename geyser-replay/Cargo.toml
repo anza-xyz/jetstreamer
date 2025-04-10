@@ -32,4 +32,3 @@ rseek.workspace = true
 crc.workspace = true
 serde_cbor.workspace = true
 fnv.workspace = true
-rayon.workspace = true

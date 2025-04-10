@@ -1964,7 +1964,6 @@ dependencies = [
  "multihash",
  "prost",
  "rangemap",
- "rayon",
  "reqwest 0.12.15",
  "rseek",
  "serde_cbor",

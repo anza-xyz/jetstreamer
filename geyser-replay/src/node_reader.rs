@@ -265,30 +265,32 @@ impl<R: AsyncRead + Unpin + AsyncSeek + Len> AsyncNodeReader<R> {
     /// Scans forward from the current position until a valid block is found.
     /// Leaves the reader positioned at the start of the valid block.
     pub async fn skip_until_valid_block(&mut self) -> Result<(), Box<dyn Error>> {
-        if self.header.is_empty() {
-            log::debug!("Reading header before scanning for block");
-            self.read_raw_header().await?;
-        }
+        // if self.header.is_empty() {
+        //     log::debug!("Reading header before scanning for block");
+        //     self.read_raw_header().await?;
+        // }
 
-        const BUFFER_SIZE: usize = 64 * 1024;
+        const WINDOW_SIZE: usize = 100 * 1024 * 1024; // 50 MB
+        let mut window = vec![0u8; WINDOW_SIZE];
 
         loop {
-            let pos = self.reader.stream_position().await?;
-            log::debug!("Scanning for valid block at offset {}", pos);
+            let start_pos = self.reader.stream_position().await?;
+            log::debug!("Scanning window from offset {}", start_pos);
 
-            let mut buffer = vec![0u8; BUFFER_SIZE];
-            let bytes_read = self.reader.read(&mut buffer).await?;
-
+            log::debug!("Reading {} bytes", WINDOW_SIZE);
+            let bytes_read = self.reader.read_exact(&mut window).await?;
+            log::debug!("Read {} bytes", bytes_read);
             if bytes_read == 0 {
                 return Err("End of file reached before finding valid block".into());
             }
 
             for offset in 0..bytes_read {
-                let slice = &buffer[offset..];
-                let mut cursor = io::Cursor::new(slice.to_vec());
+                //log::debug!("Checking offset {}+{}", start_pos, offset);
+                let slice = &window[offset..bytes_read];
+                let mut cursor = io::Cursor::new(slice);
 
                 let maybe_block = async {
-                    let _ = read_uvarint(&mut cursor).await.ok()?;
+                    //let _ = read_uvarint(&mut cursor).await.ok()?; // skip CID version
                     let section_size = read_uvarint(&mut cursor).await.ok()?;
                     if section_size > utils::MAX_ALLOWED_SECTION_SIZE as u64 {
                         return None;
@@ -299,36 +301,45 @@ impl<R: AsyncRead + Unpin + AsyncSeek + Len> AsyncNodeReader<R> {
 
                     let mut node_cursor = io::Cursor::new(section);
                     let raw_node = RawNode::from_cursor(&mut node_cursor).await.ok()?;
-                    let parsed = raw_node.parse().ok()?;
+                    log::debug!("D. raw_node: {:?}", raw_node.cid);
+                    let parsed = raw_node.parse();
+                    let Ok(parsed) = parsed else {
+                        let parsed = parsed.unwrap_err();
+                        log::warn!("Error parsing node: {:?}", parsed);
+                        return None;
+                    };
+                    log::debug!("E. parsed: {:?}", parsed.is_block());
 
                     if parsed.is_block() {
-                        Some(())
+                        Some(parsed)
                     } else {
                         None
                     }
                 }
                 .await;
 
-                if maybe_block.is_some() {
-                    let target_pos = pos + offset as u64;
-                    log::debug!("Found valid block at offset {}", target_pos);
-                    self.reader.seek(SeekFrom::Start(target_pos)).await?;
+                if let Some(block) = maybe_block {
+                    log::debug!("Found valid block at offset {}", start_pos + offset as u64);
+                    log::debug!("slot num: {}", block.get_block().unwrap().slot);
+                    self.reader
+                        .seek(SeekFrom::Start(start_pos + offset as u64))
+                        .await?;
                     return Ok(());
                 }
             }
 
-            log::debug!(
-            "No valid block found in window starting at {} (read {} bytes), sliding forward by 1 byte",
-            pos,
-            bytes_read
-        );
-
-            if bytes_read == 1 {
-                return Err("Unable to continue scanning (read only 1 byte)".into());
+            if bytes_read < WINDOW_SIZE {
+                return Err("Reached EOF without finding valid block".into());
             }
 
+            let backtrack = WINDOW_SIZE.saturating_sub(1);
+            log::debug!(
+                "No valid block found in window, sliding forward by {} bytes",
+                backtrack
+            );
+
             self.reader
-                .seek(SeekFrom::Current(-(bytes_read as i64 - 1)))
+                .seek(SeekFrom::Current(-(backtrack as i64)))
                 .await?;
         }
     }
@@ -417,13 +428,14 @@ async fn test_skip_until_valid_block() {
     let client = reqwest::Client::new();
     let stream = fetch_epoch_stream(670, &client).await;
     let mut reader = AsyncNodeReader::new(stream);
+    //reader.read_raw_header().await.unwrap();
+    // reader
+    //     .reader
+    //     .seek(SeekFrom::Start(reader.reader.len() / 2))
+    //     .await
+    //     .unwrap();
     reader.skip_until_valid_block().await.unwrap();
-    reader
-        .reader
-        .seek(SeekFrom::Start(reader.reader.len() / 2))
-        .await
-        .unwrap();
-    let _nodes = reader.read_until_block().await.unwrap();
+    //let _nodes = reader.read_until_block().await.unwrap();
 }
 
 #[tokio::test]

@@ -301,14 +301,14 @@ impl<R: AsyncRead + Unpin + AsyncSeek + Len> AsyncNodeReader<R> {
 
                     let mut node_cursor = io::Cursor::new(section);
                     let raw_node = RawNode::from_cursor(&mut node_cursor).await.ok()?;
-                    log::debug!("D. raw_node: {:?}", raw_node.cid);
+                    //log::debug!("D. raw_node: {:?}", raw_node.cid);
                     let parsed = raw_node.parse();
                     let Ok(parsed) = parsed else {
-                        let parsed = parsed.unwrap_err();
-                        log::warn!("Error parsing node: {:?}", parsed);
+                        //let parsed = parsed.unwrap_err();
+                        //log::warn!("Error parsing node: {:?}", parsed);
                         return None;
                     };
-                    log::debug!("E. parsed: {:?}", parsed.is_block());
+                    //log::debug!("E. parsed: {:?}", parsed.is_block());
 
                     if parsed.is_block() {
                         Some(parsed)

@@ -1,8 +1,10 @@
 use crate::node::{parse_any_from_cbordata, Node, NodeWithCid, NodesWithCids};
 use cid::Cid;
+use demo_rust_ipld_car::subset::Subset;
 use demo_rust_ipld_car::utils;
 use reqwest::RequestBuilder;
 use rseek::Seekable;
+use std::collections::HashMap;
 use std::io::SeekFrom;
 use std::vec::Vec;
 use std::{
@@ -150,6 +152,8 @@ where
 pub struct AsyncNodeReader<R: AsyncRead + AsyncSeek + Len> {
     reader: R,
     header: Vec<u8>,
+    // // Map of CIDs to their offsets and lengths
+    cid_offset_index: HashMap<Cid, (u64, u64)>,
     item_index: u64,
 }
 
@@ -158,9 +162,105 @@ impl<R: AsyncRead + Unpin + AsyncSeek + Len> AsyncNodeReader<R> {
         let node_reader = AsyncNodeReader {
             reader,
             header: vec![],
+            cid_offset_index: HashMap::new(),
             item_index: 0,
         };
         node_reader
+    }
+
+    /// Return (and lazily build) the CID → (offset, size) index embedded at the
+    /// end of the CAR file.  Uses ≤ 100 MiB of RAM and one seek.
+    ///
+    /// # Errors
+    /// * if the 100 MiB window does not contain the multihash index marker
+    /// * if the index blob is malformed
+    pub async fn cid_offset_index(&mut self) -> Result<&HashMap<Cid, (u64, u64)>, Box<dyn Error>> {
+        // Already populated?
+        if !self.cid_offset_index.is_empty() {
+            return Ok(&self.cid_offset_index);
+        }
+
+        /* ── 1.  read last WINDOW bytes into memory ─────────────────────────── */
+        const WINDOW: u64 = 30 * 1024 * 1024; // 100 MiB
+        let file_len = self.reader.len();
+        let start = file_len.saturating_sub(WINDOW);
+        let tail_len = file_len - start;
+        log::info!("Reading last {} bytes from file", tail_len);
+
+        self.reader.seek(SeekFrom::Start(start)).await?;
+        let mut buf = vec![0u8; tail_len as usize];
+        self.reader.read_exact(&mut buf).await?;
+        log::info!("Read {} bytes", buf.len());
+
+        /* ── 2.  locate multicodec marker 0x0400 / 0x0401 ───────────────────── */
+        fn decode_uvarint_slice(slice: &[u8]) -> Option<(u64, usize)> {
+            let mut x = 0u64;
+            let mut s = 0u32;
+            for (i, &b) in slice.iter().enumerate().take(10) {
+                if b < 0x80 {
+                    return Some((x | ((b as u64) << s), i + 1));
+                }
+                x |= ((b & 0x7f) as u64) << s;
+                s += 7;
+            }
+            None
+        }
+
+        let mut idx_rel = None;
+        let mut pos = 0;
+        while pos < buf.len() {
+            if let Some((val, len)) = decode_uvarint_slice(&buf[pos..]) {
+                println!("val: {:#x}, len: {}", val, len);
+                if val == 0x0400 || val == 0x0401 {
+                    idx_rel = Some(pos);
+                    break;
+                }
+            }
+            pos += 1;
+        }
+        let idx_rel = idx_rel.ok_or("multihash index not found in 100 MiB window")?;
+        println!("idx_rel: {}", idx_rel);
+        let mut cur = std::io::Cursor::new(&buf[idx_rel..]);
+
+        // consume codec varint
+        log::info!("Codec varint: {:#x}", buf[idx_rel]);
+        let (codec, codec_len) = decode_uvarint_slice(&buf[idx_rel..]).unwrap();
+        if codec != 0x0400 && codec != 0x0401 {
+            return Err("unexpected index codec".into());
+        }
+        log::info!("Codec: {:#x}, codec_len: {}", codec, codec_len);
+        cur.set_position(codec_len as u64);
+        log::info!("entering while loop");
+        /* ── 3. parse buckets into the hash‑map ─────────────────────────────── */
+        while (cur.position() as usize) < buf[idx_rel..].len() {
+            let mut w4 = [0u8; 4];
+            cur.read_exact(&mut w4).await?;
+            let width = u32::from_le_bytes(w4) as usize; // digest + 16
+
+            let mut c8 = [0u8; 8];
+            cur.read_exact(&mut c8).await?;
+            let count = u64::from_le_bytes(c8);
+
+            let digest_len = width - 16; // offset+size=16
+            for _ in 0..count {
+                let mut digest = vec![0u8; digest_len];
+                cur.read_exact(&mut digest).await?;
+
+                let mut off_buf = [0u8; 8];
+                cur.read_exact(&mut off_buf).await?;
+                let offset = u64::from_le_bytes(off_buf);
+
+                let mut sz_buf = [0u8; 8];
+                cur.read_exact(&mut sz_buf).await?;
+                let size = u64::from_le_bytes(sz_buf);
+
+                let mh = multihash::Multihash::from_bytes(&digest)?;
+                let cid = cid::Cid::new_v1(0x55, mh); // synthetic “raw” CID
+                self.cid_offset_index.insert(cid, (offset, size));
+            }
+        }
+
+        Ok(&self.cid_offset_index)
     }
 
     pub async fn read_raw_header(&mut self) -> Result<Vec<u8>, Box<dyn Error>> {
@@ -260,6 +360,65 @@ impl<R: AsyncRead + Unpin + AsyncSeek + Len> AsyncNodeReader<R> {
 
     pub fn get_item_index(&self) -> u64 {
         self.item_index
+    }
+
+    /// Return all Subset nodes referenced by the Epoch in this CAR.
+    pub async fn get_subsets(
+        &mut self,
+    ) -> Result<Vec<demo_rust_ipld_car::subset::Subset>, Box<dyn std::error::Error>>
+    where
+        R: Unpin,
+    {
+        use demo_rust_ipld_car::{epoch, subset};
+        use serde_cbor::Value;
+
+        // ── 1. Read / cache CAR header and decode it as CBOR map ────────────
+        if self.header.is_empty() {
+            self.read_raw_header().await?;
+        };
+        let header_cbor: Value = serde_cbor::from_slice(&self.header)?;
+
+        // header_cbor must be a CBOR map
+        let header_map = if let Value::Map(m) = header_cbor {
+            m
+        } else {
+            return Err("CAR header is not a CBOR map".into());
+        };
+
+        // Extract "roots" key (array of links)
+        let roots_val = header_map
+            .iter()
+            .find_map(|(k, v)| match k {
+                Value::Text(s) if s == "roots" => Some(v),
+                _ => None,
+            })
+            .ok_or("CAR header missing \"roots\" key")?;
+
+        let roots_arr = if let Value::Array(arr) = roots_val {
+            arr
+        } else {
+            return Err("\"roots\" is not an array".into());
+        };
+
+        if roots_arr.is_empty() {
+            return Err("CAR header \"roots\" array is empty".into());
+        }
+
+        log::info!("roots: {:#?}", roots_arr);
+
+        // Helpers ------------------------------------------------------------
+        fn cid_from_link(val: &Value) -> Result<cid::Cid, Box<dyn std::error::Error>> {
+            if let Value::Bytes(b) = val {
+                if b.first() == Some(&0) {
+                    return Ok(cid::Cid::try_from(b[1..].to_vec())?);
+                }
+            }
+            Err("invalid DAG‑CBOR link encoding".into())
+        }
+
+        // TODO
+
+        todo!()
     }
 
     pub async fn og(&mut self) -> Result<(), Box<dyn Error>> {
@@ -511,6 +670,15 @@ impl<R: AsyncRead + Unpin + AsyncSeek + Len> AsyncNodeReader<R> {
     }
 }
 
+fn cid_from_cbor_link(val: &serde_cbor::Value) -> Result<cid::Cid, Box<dyn std::error::Error>> {
+    if let serde_cbor::Value::Bytes(b) = val {
+        if b.first() == Some(&0) {
+            return Ok(cid::Cid::try_from(b[1..].to_vec())?);
+        }
+    }
+    Err("invalid DAG‑CBOR link encoding".into())
+}
+
 #[tokio::test]
 async fn test_async_node_reader() {
     use crate::epochs_async::fetch_epoch_stream;
@@ -549,4 +717,17 @@ async fn test_seek_to_slot() {
     assert_eq!(reader.seek_to_slot(100).await.unwrap(), false);
     //let nodes = reader.read_until_block().await.unwrap();
     //assert_eq!(nodes.len(), 117);
+}
+
+#[tokio::test]
+async fn read_first_subset() {
+    solana_logger::setup_with_default("debug");
+    use crate::{epochs_async::fetch_epoch_stream, node_reader::AsyncNodeReader};
+
+    let client = reqwest::Client::new();
+    let stream = fetch_epoch_stream(670, &client).await;
+    let mut rdr = AsyncNodeReader::new(stream);
+
+    rdr.cid_offset_index().await.unwrap();
+    log::info!("CID offset index: {:#?}", rdr.cid_offset_index);
 }

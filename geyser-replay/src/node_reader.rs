@@ -2,6 +2,7 @@ use crate::node::{parse_any_from_cbordata, Node, NodeWithCid, NodesWithCids};
 use cid::Cid;
 use demo_rust_ipld_car::subset::Subset;
 use demo_rust_ipld_car::utils;
+use multihash::Multihash;
 use reqwest::RequestBuilder;
 use rseek::Seekable;
 use std::collections::HashMap;
@@ -168,32 +169,25 @@ impl<R: AsyncRead + Unpin + AsyncSeek + Len> AsyncNodeReader<R> {
         node_reader
     }
 
-    /// Return (and lazily build) the CID → (offset, size) index embedded at the
-    /// end of the CAR file.  Uses ≤ 100 MiB of RAM and one seek.
-    ///
-    /// # Errors
-    /// * if the 100 MiB window does not contain the multihash index marker
-    /// * if the index blob is malformed
+    /// Lazily build CID → (offset, size) map by parsing the embedded multihash
+    /// index at the tail of the CAR file.
     pub async fn cid_offset_index(&mut self) -> Result<&HashMap<Cid, (u64, u64)>, Box<dyn Error>> {
-        // Already populated?
         if !self.cid_offset_index.is_empty() {
             return Ok(&self.cid_offset_index);
         }
 
-        /* ── 1.  read last WINDOW bytes into memory ─────────────────────────── */
-        const WINDOW: u64 = 30 * 1024 * 1024; // 100 MiB
+        /* 1. read last WINDOW bytes --------------------------------------------------- */
+        const WINDOW: u64 = 100 * 1024 * 1024;
         let file_len = self.reader.len();
         let start = file_len.saturating_sub(WINDOW);
         let tail_len = file_len - start;
-        log::info!("Reading last {} bytes from file", tail_len);
 
         self.reader.seek(SeekFrom::Start(start)).await?;
         let mut buf = vec![0u8; tail_len as usize];
         self.reader.read_exact(&mut buf).await?;
-        log::info!("Read {} bytes", buf.len());
 
-        /* ── 2.  locate multicodec marker 0x0400 / 0x0401 ───────────────────── */
-        fn decode_uvarint_slice(slice: &[u8]) -> Option<(u64, usize)> {
+        /* helper: decode unsigned varint from slice ----------------------------------- */
+        fn uvarint(slice: &[u8]) -> Option<(u64, usize)> {
             let mut x = 0u64;
             let mut s = 0u32;
             for (i, &b) in slice.iter().enumerate().take(10) {
@@ -206,56 +200,135 @@ impl<R: AsyncRead + Unpin + AsyncSeek + Len> AsyncNodeReader<R> {
             None
         }
 
+        /* 2. scan BACKWARDS for last 0x0400 / 0x0401 marker --------------------------- */
+        /* ── locate true index start by validating width field ─────────────── */
         let mut idx_rel = None;
-        let mut pos = 0;
-        while pos < buf.len() {
-            if let Some((val, len)) = decode_uvarint_slice(&buf[pos..]) {
-                println!("val: {:#x}, len: {}", val, len);
-                if val == 0x0400 || val == 0x0401 {
+        let tail = &buf; // just a rename
+
+        let mut pos = tail.len();
+        while pos > 0 {
+            pos -= 1;
+
+            // decode varint at this byte
+            if let Some((codec, len_codec)) = uvarint(&tail[pos..]) {
+                if codec != 0x0400 && codec != 0x0401 {
+                    continue;
+                }
+
+                // offset after codec varint
+                let mut offset = pos + len_codec;
+                // skip hash_function_code if 0x0401
+                if codec == 0x0401 {
+                    if let Some((_, len_hash)) = uvarint(&tail[offset..]) {
+                        offset += len_hash;
+                    } else {
+                        continue; // truncated, keep scanning
+                    }
+                }
+
+                // need 4 bytes for width
+                if offset + 4 > tail.len() {
+                    continue;
+                }
+                let width =
+                    u32::from_le_bytes(tail[offset..offset + 4].try_into().unwrap()) as usize;
+
+                // validate width limits
+                let ok = if codec == 0x0400 {
+                    width >= 8 && width <= 72
+                } else {
+                    width >= 16 && width <= 80
+                };
+                if ok {
                     idx_rel = Some(pos);
-                    break;
+                    break; // first *valid* marker from the end
                 }
             }
-            pos += 1;
         }
-        let idx_rel = idx_rel.ok_or("multihash index not found in 100 MiB window")?;
-        println!("idx_rel: {}", idx_rel);
-        let mut cur = std::io::Cursor::new(&buf[idx_rel..]);
+        let idx_rel = idx_rel.ok_or("index marker not found in 100 MiB window")?;
+        let idx_abs = start + idx_rel as u64;
 
-        // consume codec varint
-        log::info!("Codec varint: {:#x}", buf[idx_rel]);
-        let (codec, codec_len) = decode_uvarint_slice(&buf[idx_rel..]).unwrap();
-        if codec != 0x0400 && codec != 0x0401 {
-            return Err("unexpected index codec".into());
-        }
-        log::info!("Codec: {:#x}, codec_len: {}", codec, codec_len);
+        /* 3. re‑read from idx_abs to EOF so we have the whole index -------------------- */
+        let index_len = file_len - idx_abs;
+        self.reader.seek(SeekFrom::Start(idx_abs)).await?;
+        let mut buf = vec![0u8; index_len as usize];
+        self.reader.read_exact(&mut buf).await?;
+        let mut cur = std::io::Cursor::new(&buf[..]);
+
+        /* 4. consume codec varint (0x0400/0x0401) ------------------------------------- */
+        let (codec, codec_len) = uvarint(cur.get_ref()).unwrap();
         cur.set_position(codec_len as u64);
-        log::info!("entering while loop");
-        /* ── 3. parse buckets into the hash‑map ─────────────────────────────── */
-        while (cur.position() as usize) < buf[idx_rel..].len() {
+
+        /* for 0x0401 there is an extra hash_function_code varint ---------------------- */
+        if codec == 0x0401 {
+            let (_, hash_len) = uvarint(&cur.get_ref()[cur.position() as usize..]).unwrap();
+            cur.set_position(cur.position() + hash_len as u64);
+        }
+
+        /* 5. parse buckets ------------------------------------------------------------ */
+        let mut bucket_no = 0;
+        while (cur.position() as usize) < buf.len() {
+            bucket_no += 1;
+
+            // --- bucket header ---------------------------------------------------
             let mut w4 = [0u8; 4];
-            cur.read_exact(&mut w4).await?;
-            let width = u32::from_le_bytes(w4) as usize; // digest + 16
+            if cur.read_exact(&mut w4).await.is_err() {
+                break;
+            }
+            let width = u32::from_le_bytes(w4) as usize;
 
             let mut c8 = [0u8; 8];
-            cur.read_exact(&mut c8).await?;
+            if cur.read_exact(&mut c8).await.is_err() {
+                break;
+            }
             let count = u64::from_le_bytes(c8);
 
-            let digest_len = width - 16; // offset+size=16
+            let (digest_len, has_size) = if codec == 0x0400 {
+                if width < 8 {
+                    // offset only
+                    log::warn!("bucket {bucket_no}: width < 8, aborting index parse");
+                    break;
+                }
+                (width - 8, false)
+            } else {
+                if width < 16 {
+                    // offset + size
+                    log::warn!("bucket {bucket_no}: width < 16, aborting index parse");
+                    break;
+                }
+                (width - 16, true)
+            };
+
+            if digest_len == 0 || digest_len > 64 {
+                log::warn!("bucket {bucket_no}: digest_len {digest_len} invalid, aborting");
+                break;
+            }
+
+            // --- bucket entries --------------------------------------------------
             for _ in 0..count {
                 let mut digest = vec![0u8; digest_len];
-                cur.read_exact(&mut digest).await?;
+                if cur.read_exact(&mut digest).await.is_err() {
+                    break;
+                }
 
                 let mut off_buf = [0u8; 8];
-                cur.read_exact(&mut off_buf).await?;
+                if cur.read_exact(&mut off_buf).await.is_err() {
+                    break;
+                }
                 let offset = u64::from_le_bytes(off_buf);
 
-                let mut sz_buf = [0u8; 8];
-                cur.read_exact(&mut sz_buf).await?;
-                let size = u64::from_le_bytes(sz_buf);
+                let size = if has_size {
+                    let mut sz_buf = [0u8; 8];
+                    if cur.read_exact(&mut sz_buf).await.is_err() {
+                        break;
+                    }
+                    u64::from_le_bytes(sz_buf)
+                } else {
+                    0
+                };
 
                 let mh = multihash::Multihash::from_bytes(&digest)?;
-                let cid = cid::Cid::new_v1(0x55, mh); // synthetic “raw” CID
+                let cid = cid::Cid::new_v1(0x55, mh);
                 self.cid_offset_index.insert(cid, (offset, size));
             }
         }

@@ -171,26 +171,41 @@ impl<R: AsyncRead + Unpin + AsyncSeek + Len> AsyncNodeReader<R> {
 
     /// Lazily build CID → (offset, size) map by parsing the embedded multihash
     /// index at the tail of the CAR file.
-    pub async fn cid_offset_index(&mut self) -> Result<&HashMap<Cid, (u64, u64)>, Box<dyn Error>> {
+    pub async fn cid_offset_index(
+        &mut self,
+    ) -> Result<&std::collections::HashMap<cid::Cid, (u64, u64)>, Box<dyn std::error::Error>> {
+        use cid::Cid;
+        use multihash::Multihash;
+        use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
+
         if !self.cid_offset_index.is_empty() {
+            log::info!(
+                "cid_offset_index: cache hit ({} entries)",
+                self.cid_offset_index.len()
+            );
             return Ok(&self.cid_offset_index);
         }
 
-        /* 1. read last WINDOW bytes --------------------------------------------------- */
+        /* ── 1. load last WINDOW bytes ─────────────────────────────────────────── */
         const WINDOW: u64 = 100 * 1024 * 1024;
         let file_len = self.reader.len();
         let start = file_len.saturating_sub(WINDOW);
         let tail_len = file_len - start;
+        log::info!(
+            "cid_offset_index: reading tail ({} B) from {}",
+            tail_len,
+            start
+        );
 
         self.reader.seek(SeekFrom::Start(start)).await?;
-        let mut buf = vec![0u8; tail_len as usize];
-        self.reader.read_exact(&mut buf).await?;
+        let mut tail = vec![0u8; tail_len as usize];
+        self.reader.read_exact(&mut tail).await?;
 
-        /* helper: decode unsigned varint from slice ----------------------------------- */
-        fn uvarint(slice: &[u8]) -> Option<(u64, usize)> {
+        /* helper: unsigned‑varint decode from slice */
+        fn uvarint(buf: &[u8]) -> Option<(u64, usize)> {
             let mut x = 0u64;
             let mut s = 0u32;
-            for (i, &b) in slice.iter().enumerate().take(10) {
+            for (i, &b) in buf.iter().enumerate().take(10) {
                 if b < 0x80 {
                     return Some((x | ((b as u64) << s), i + 1));
                 }
@@ -200,77 +215,82 @@ impl<R: AsyncRead + Unpin + AsyncSeek + Len> AsyncNodeReader<R> {
             None
         }
 
-        /* 2. scan BACKWARDS for last 0x0400 / 0x0401 marker --------------------------- */
-        /* ── locate true index start by validating width field ─────────────── */
+        /* ── 2. scan BACKWARDS for the *valid* 0x0400 / 0x0401 marker ─────────── */
         let mut idx_rel = None;
-        let tail = &buf; // just a rename
-
-        let mut pos = tail.len();
-        while pos > 0 {
-            pos -= 1;
-
-            // decode varint at this byte
+        for pos in (0..tail.len()).rev() {
             if let Some((codec, len_codec)) = uvarint(&tail[pos..]) {
                 if codec != 0x0400 && codec != 0x0401 {
                     continue;
                 }
 
-                // offset after codec varint
-                let mut offset = pos + len_codec;
-                // skip hash_function_code if 0x0401
+                // advance past codec (+ hash_function for 0x0401)
+                let mut off = pos + len_codec;
                 if codec == 0x0401 {
-                    if let Some((_, len_hash)) = uvarint(&tail[offset..]) {
-                        offset += len_hash;
+                    // hash_function_code
+                    if let Some((_, len_hash)) = uvarint(&tail[off..]) {
+                        off += len_hash;
                     } else {
-                        continue; // truncated, keep scanning
+                        continue;
+                    }
+                    // digest_size
+                    if let Some((_, len_dsz)) = uvarint(&tail[off..]) {
+                        off += len_dsz;
+                    } else {
+                        continue;
                     }
                 }
 
-                // need 4 bytes for width
-                if offset + 4 > tail.len() {
+                // need width (4 bytes)
+                if off + 4 > tail.len() {
                     continue;
                 }
-                let width =
-                    u32::from_le_bytes(tail[offset..offset + 4].try_into().unwrap()) as usize;
+                let width = u32::from_le_bytes(tail[off..off + 4].try_into().unwrap()) as usize;
 
-                // validate width limits
-                let ok = if codec == 0x0400 {
-                    width >= 8 && width <= 72
-                } else {
-                    width >= 16 && width <= 80
-                };
-                if ok {
-                    idx_rel = Some(pos);
-                    break; // first *valid* marker from the end
+                // sanity: width limits
+                let min = if codec == 0x0400 { 8 } else { 16 };
+                let max = min + 64;
+                if !(min + 1..=max).contains(&width) {
+                    continue;
                 }
+
+                idx_rel = Some(pos);
+                log::info!("cid_offset_index: marker 0x{:x} at tail +{}", codec, pos);
+                break;
             }
         }
-        let idx_rel = idx_rel.ok_or("index marker not found in 100 MiB window")?;
+        let idx_rel = idx_rel.ok_or("index marker not found in 100 MiB window")?;
         let idx_abs = start + idx_rel as u64;
 
-        /* 3. re‑read from idx_abs to EOF so we have the whole index -------------------- */
+        /* ── 3. read full index from idx_abs to EOF ───────────────────────────── */
         let index_len = file_len - idx_abs;
+        log::info!(
+            "cid_offset_index: reading index ({} B) @ {}",
+            index_len,
+            idx_abs
+        );
         self.reader.seek(SeekFrom::Start(idx_abs)).await?;
         let mut buf = vec![0u8; index_len as usize];
         self.reader.read_exact(&mut buf).await?;
         let mut cur = std::io::Cursor::new(&buf[..]);
 
-        /* 4. consume codec varint (0x0400/0x0401) ------------------------------------- */
-        let (codec, codec_len) = uvarint(cur.get_ref()).unwrap();
-        cur.set_position(codec_len as u64);
-
-        /* for 0x0401 there is an extra hash_function_code varint ---------------------- */
+        /* ── 4. consume codec varint (+hash) ─────────────────────────────────── */
+        let (codec, len_codec) = uvarint(cur.get_ref()).unwrap();
+        cur.set_position(len_codec as u64);
         if codec == 0x0401 {
-            let (_, hash_len) = uvarint(&cur.get_ref()[cur.position() as usize..]).unwrap();
-            cur.set_position(cur.position() + hash_len as u64);
+            // hash_function_code
+            let (_, len_hash) = uvarint(&cur.get_ref()[cur.position() as usize..]).unwrap();
+            cur.set_position(cur.position() + len_hash as u64);
+            // digest_size
+            let (_, len_dsz) = uvarint(&cur.get_ref()[cur.position() as usize..]).unwrap();
+            cur.set_position(cur.position() + len_dsz as u64);
         }
+        log::info!("cid_offset_index: parsing buckets (codec 0x{:x})", codec);
 
-        /* 5. parse buckets ------------------------------------------------------------ */
-        let mut bucket_no = 0;
+        /* ── 5. bucket loop ──────────────────────────────────────────────────── */
+        let mut bucket_no = 0u64;
         while (cur.position() as usize) < buf.len() {
             bucket_no += 1;
 
-            // --- bucket header ---------------------------------------------------
             let mut w4 = [0u8; 4];
             if cur.read_exact(&mut w4).await.is_err() {
                 break;
@@ -283,29 +303,18 @@ impl<R: AsyncRead + Unpin + AsyncSeek + Len> AsyncNodeReader<R> {
             }
             let count = u64::from_le_bytes(c8);
 
-            let (digest_len, has_size) = if codec == 0x0400 {
-                if width < 8 {
-                    // offset only
-                    log::warn!("bucket {bucket_no}: width < 8, aborting index parse");
+            let min = if codec == 0x0400 { 8 } else { 16 };
+            let digest_len = match width.checked_sub(min) {
+                Some(d) if d != 0 && d <= 64 => d,
+                _ => {
+                    log::info!("bucket {bucket_no}: width {width} invalid, stop");
                     break;
                 }
-                (width - 8, false)
-            } else {
-                if width < 16 {
-                    // offset + size
-                    log::warn!("bucket {bucket_no}: width < 16, aborting index parse");
-                    break;
-                }
-                (width - 16, true)
             };
+            let has_size = codec == 0x0401;
+            log::info!("bucket {bucket_no}: count={count} digest_len={digest_len}");
 
-            if digest_len == 0 || digest_len > 64 {
-                log::warn!("bucket {bucket_no}: digest_len {digest_len} invalid, aborting");
-                break;
-            }
-
-            // --- bucket entries --------------------------------------------------
-            for _ in 0..count {
+            for entry in 0..count {
                 let mut digest = vec![0u8; digest_len];
                 if cur.read_exact(&mut digest).await.is_err() {
                     break;
@@ -327,12 +336,21 @@ impl<R: AsyncRead + Unpin + AsyncSeek + Len> AsyncNodeReader<R> {
                     0
                 };
 
-                let mh = multihash::Multihash::from_bytes(&digest)?;
-                let cid = cid::Cid::new_v1(0x55, mh);
+                // add to map
+                let cid = Cid::new_v1(0x55, Multihash::from_bytes(&digest)?);
                 self.cid_offset_index.insert(cid, (offset, size));
+
+                if entry < 3 || entry + 1 == count {
+                    // sample a few entries for visibility
+                    log::info!("  [{entry:>4}/{count}] offset={offset} size={size}");
+                }
             }
         }
 
+        log::info!(
+            "cid_offset_index: finished with {} CIDs",
+            self.cid_offset_index.len()
+        );
         Ok(&self.cid_offset_index)
     }
 

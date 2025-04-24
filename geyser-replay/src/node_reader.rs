@@ -171,6 +171,8 @@ impl<R: AsyncRead + Unpin + AsyncSeek + Len> AsyncNodeReader<R> {
     /// Uses `next_parsed()` for maximum throughput (no second parse pass).
     /// Build a `[slot | offset | size]` index quickly.
     /// Requires that `self.reader` is already wrapped in a `BufReader`.
+    /// Build a block-only index `[u64 slot] [u64 offset] [u64 size]`.
+    /// Re-uses a single buffer to avoid per-block allocations.
     pub async fn build_index<P>(&mut self, idx_path: P) -> Result<(), Box<dyn std::error::Error>>
     where
         P: AsRef<std::path::Path>,
@@ -178,15 +180,15 @@ impl<R: AsyncRead + Unpin + AsyncSeek + Len> AsyncNodeReader<R> {
         use tokio::fs::File;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        /* 1. ensure the CAR header has been consumed */
+        /* ── 1. make sure the CAR header has been consumed ───────────────────── */
         if self.header.is_empty() {
             self.read_raw_header().await?;
         }
 
-        /* 2. output file */
+        /* ── 2. output file ──────────────────────────────────────────────────── */
         let mut out = File::create(idx_path).await?;
 
-        /* 3. helper: read varint **and** return byte-length */
+        /* ── 3. helper: read varint and return its byte-length ───────────────── */
         async fn read_uvarint_len<R: AsyncReadExt + Unpin>(
             r: &mut R,
         ) -> std::io::Result<(u64, u64)> {
@@ -194,7 +196,6 @@ impl<R: AsyncRead + Unpin + AsyncSeek + Len> AsyncNodeReader<R> {
             let mut s = 0u32;
             let mut buf = [0u8; 1];
             let mut n = 0u64;
-
             loop {
                 r.read_exact(&mut buf).await?;
                 n += 1;
@@ -213,40 +214,52 @@ impl<R: AsyncRead + Unpin + AsyncSeek + Len> AsyncNodeReader<R> {
             }
         }
 
-        /* 4. main loop */
-        let mut offset = self.reader.stream_position().await?; // once
+        /* ── 4. streaming loop ──────────────────────────────────────────────── */
+        let mut buf: Vec<u8> = Vec::with_capacity(64 * 1024); // reusable scratch
+        let mut offset = self.reader.stream_position().await?; // current file pos
         let mut blocks = 0u64;
 
         loop {
             let start_off = offset;
 
-            /* size + how many bytes the varint took */
+            /* size of the section + how long the varint was */
             let (section_size, varint_len) = match read_uvarint_len(&mut self.reader).await {
                 Ok(v) => v,
                 Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
                 Err(e) => return Err(e.into()),
             };
 
-            /* read section bytes */
-            let mut bytes = vec![0u8; section_size as usize];
-            self.reader.read_exact(&mut bytes).await?;
+            /* ensure buffer big enough, then read */
+            if buf.len() < section_size as usize {
+                buf.resize(section_size as usize, 0);
+            }
+            self.reader
+                .read_exact(&mut buf[..section_size as usize])
+                .await?;
 
-            offset += varint_len + section_size; // advance for next loop
+            offset += varint_len + section_size; // next loop starts here
 
-            /* parse only once */
-            let mut cur = std::io::Cursor::new(bytes);
+            /* parse exactly once */
+            let bytes_vec = (&buf[..section_size as usize]).to_vec(); // <-- make Vec<u8>
+            let mut cur = std::io::Cursor::new(bytes_vec); // Cursor<Vec<u8>>
             let raw = crate::node_reader::RawNode::from_cursor(&mut cur).await?;
+
             if let crate::node::Node::Block(b) = raw.parse()? {
                 blocks += 1;
-                /* [slot | offset | size] */
+
+                /* slot | offset | size  */
                 out.write_all(&b.slot.to_le_bytes()).await?;
                 out.write_all(&start_off.to_le_bytes()).await?;
                 out.write_all(&(varint_len + section_size).to_le_bytes())
                     .await?;
 
-                //if blocks % 1_000 == 0 {
-                log::info!("build_index: {} blocks indexed", blocks);
-                //}
+                log::info!(
+                    "build_index: Block slot={} @ {} ({} B) – {} indexed",
+                    b.slot,
+                    start_off,
+                    section_size + varint_len,
+                    blocks
+                );
             }
         }
 

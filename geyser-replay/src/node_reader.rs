@@ -1,8 +1,6 @@
 use crate::node::{parse_any_from_cbordata, Node, NodeWithCid, NodesWithCids};
 use cid::Cid;
-use demo_rust_ipld_car::subset::Subset;
 use demo_rust_ipld_car::utils;
-use multihash::Multihash;
 use reqwest::RequestBuilder;
 use rseek::Seekable;
 use std::collections::HashMap;
@@ -154,7 +152,7 @@ pub struct AsyncNodeReader<R: AsyncRead + AsyncSeek + Len> {
     reader: R,
     header: Vec<u8>,
     // // Map of CIDs to their offsets and lengths
-    cid_offset_index: HashMap<Cid, (u64, u64)>,
+    _cid_offset_index: HashMap<Cid, (u64, u64)>,
     item_index: u64,
 }
 
@@ -163,71 +161,72 @@ impl<R: AsyncRead + Unpin + AsyncSeek + Len> AsyncNodeReader<R> {
         let node_reader = AsyncNodeReader {
             reader,
             header: vec![],
-            cid_offset_index: HashMap::new(),
+            _cid_offset_index: HashMap::new(),
             item_index: 0,
         };
         node_reader
     }
 
-    /// Build an index containing **only block records**.
-    /// Each record is 24 B:
-    ///     [u64 slot] [u64 file_offset] [u64 section_size]
+    /// Build a block-only index: `[u64 slot] [u64 offset] [u64 size]`.
+    /// Uses `next_parsed()` for maximum throughput (no second parse pass).
     pub async fn build_index<P>(&mut self, idx_path: P) -> Result<(), Box<dyn std::error::Error>>
     where
         P: AsRef<std::path::Path>,
     {
+        use std::io;
         use tokio::fs::File;
-        use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom};
+        use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 
-        /* ensure we consumed the CAR header */
+        /* 1. ensure CAR header has been consumed */
         if self.header.is_empty() {
             self.read_raw_header().await?;
         }
 
-        /* open target index file */
+        /* 2. open output file */
         let mut out = File::create(idx_path).await?;
 
-        /* stream sections */
-        let mut offset = self.reader.stream_position().await?; // after header
+        /* 3. stream nodes with next_parsed() */
         let mut written = 0u64;
 
         loop {
-            let start = offset;
+            let start_off = self.reader.stream_position().await?; // before reading node
 
-            // section size (varint) — EOF -> done
-            let section_size = match crate::node_reader::read_uvarint(&mut self.reader).await {
-                Ok(sz) => sz,
-                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-                Err(e) => return Err(e.into()),
+            let node_res = self.next_parsed().await;
+            let end_off = self.reader.stream_position().await?; // right after node
+
+            let node = match node_res {
+                Ok(n) => n,
+                Err(e) => {
+                    // clean EOF → done; other errors → propagate
+                    if let Some(ioe) = e.downcast_ref::<io::Error>() {
+                        if ioe.kind() == io::ErrorKind::UnexpectedEof {
+                            break;
+                        }
+                    }
+                    return Err(e);
+                }
             };
 
-            // read section
-            let mut item = vec![0u8; section_size as usize];
-            self.reader.read_exact(&mut item).await?;
-            offset = self.reader.stream_position().await?;
-            let section_len = offset - start;
-
-            /* parse node */
-            let mut cur = std::io::Cursor::new(item);
-            let raw = crate::node_reader::RawNode::from_cursor(&mut cur).await?;
-            if let crate::node::Node::Block(b) = raw.parse()? {
-                // write record: slot | offset | size
+            /* only index Block nodes */
+            if let crate::node::Node::Block(b) = node.get_node() {
+                let size = end_off - start_off;
                 out.write_all(&b.slot.to_le_bytes()).await?;
-                out.write_all(&start.to_le_bytes()).await?;
-                out.write_all(&(section_len as u64).to_le_bytes()).await?;
+                out.write_all(&start_off.to_le_bytes()).await?;
+                out.write_all(&(size as u64).to_le_bytes()).await?;
                 written += 1;
+
                 log::info!(
-                    "build_index: Block slot={} @ {} ({} B) -- {} written",
+                    "build_index: Block slot={} @ {} ({} B) – {} indexed",
                     b.slot,
-                    start,
-                    section_len,
+                    start_off,
+                    size,
                     written
                 );
             }
         }
 
         out.flush().await?;
-        log::info!("build_index: finished – {} block records", written);
+        log::info!("build_index: finished – {} Block records written", written);
         Ok(())
     }
 

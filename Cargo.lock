@@ -4493,9 +4493,9 @@ dependencies = [
 
 [[package]]
 name = "rseek"
-version = "0.1.5"
+version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "abfae1727183cb7dc9cee63700697054ae38547200c905d656a4585d216570d6"
+checksum = "b27e0490e6dd67560a9f513b57660e228b8cb68f4833865b9a5edfeff8e4c635"
 dependencies = [
  "bytes",
  "futures 0.3.31",

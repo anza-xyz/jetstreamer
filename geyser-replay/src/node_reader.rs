@@ -178,7 +178,6 @@ impl<R: AsyncRead + Unpin + AsyncSeek + Len> AsyncNodeReader<R> {
         use multihash::Multihash;
         use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
 
-        /* return cache if already built */
         if !self.cid_offset_index.is_empty() {
             log::info!(
                 "cid_offset_index: cache hit ({} entries)",
@@ -187,56 +186,45 @@ impl<R: AsyncRead + Unpin + AsyncSeek + Len> AsyncNodeReader<R> {
             return Ok(&self.cid_offset_index);
         }
 
-        /* ────────────────────────────────────────────────────────────────────
-        1.  Read first 4 bytes to see whether we have a CAR-v2 wrapper
-        ──────────────────────────────────────────────────────────────────── */
+        /* ── 1. read first 4 B to detect CAR v2 wrapper ──────────────────── */
         let mut magic4 = [0u8; 4];
         self.reader.seek(SeekFrom::Start(0)).await?;
         self.reader.read_exact(&mut magic4).await?;
 
         let (index_offset, index_size) = if &magic4 == b"\x0a\x8a\x4d\x54" {
-            /* ── Fast path : CAR v2 ───────────────────────────────────────── */
+            /* fast path — CAR v2 */
             let mut prag = [0u8; 40];
             self.reader.seek(SeekFrom::Start(0)).await?;
             self.reader.read_exact(&mut prag).await?;
-            let index_off = u64::from_le_bytes(prag[24..32].try_into().unwrap());
-            let index_sz = u64::from_le_bytes(prag[32..40].try_into().unwrap());
-            log::info!(
-                "cid_offset_index: CAR-v2 index @ {} ({} B)",
-                index_off,
-                index_sz
-            );
-            (index_off, index_sz)
+            let off = u64::from_le_bytes(prag[24..32].try_into().unwrap());
+            let sz = u64::from_le_bytes(prag[32..40].try_into().unwrap());
+            log::info!("cid_offset_index: CAR-v2 index @ {off} ({sz} B)");
+            (off, sz)
         } else {
-            /* ── Fallback : scan last ≤128 MiB for a valid index marker ──── */
-            const WINDOW: u64 = 128 * 1024 * 1024;
+            /* fallback — scan last ≤128 MiB for 0x0400/0x0401 marker */
+            const WIN: u64 = 128 * 1024 * 1024;
             let file_len = self.reader.len();
-            let start = file_len.saturating_sub(WINDOW);
+            let start = file_len.saturating_sub(WIN);
             let tail_len = file_len - start;
-            log::info!(
-                "cid_offset_index: scanning tail {} B for index marker",
-                tail_len
-            );
 
             self.reader.seek(SeekFrom::Start(start)).await?;
             let mut tail = vec![0u8; tail_len as usize];
             self.reader.read_exact(&mut tail).await?;
 
-            /* tiny uvarint helper */
             fn uvar(slice: &[u8]) -> Option<(u64, usize)> {
-                let mut x = 0u64;
-                let mut s = 0u32;
+                let mut x = 0;
+                let mut s = 0;
                 for (i, &b) in slice.iter().enumerate().take(10) {
                     if b < 0x80 {
-                        return Some((x | ((b as u64) << s), i + 1));
-                    }
+                        return Some(((x | ((b as u64) << s)), i + 1));
+                    };
                     x |= ((b & 0x7f) as u64) << s;
                     s += 7;
                 }
                 None
             }
 
-            let mut marker_pos = None;
+            let mut marker = None;
             for pos in (0..tail.len()).rev() {
                 let (codec, len) = match uvar(&tail[pos..]) {
                     Some(v) => v,
@@ -246,7 +234,6 @@ impl<R: AsyncRead + Unpin + AsyncSeek + Len> AsyncNodeReader<R> {
                     continue;
                 }
 
-                /* Skip header fields to peek at width */
                 let mut off = pos + len;
                 if codec == 0x0401 {
                     if let Some((_, l)) = uvar(&tail[off..]) {
@@ -265,34 +252,28 @@ impl<R: AsyncRead + Unpin + AsyncSeek + Len> AsyncNodeReader<R> {
                 }
                 let width = u32::from_le_bytes(tail[off..off + 4].try_into().unwrap()) as usize;
                 let min = if codec == 0x0400 { 8 } else { 16 };
-                let max = min + 64;
-                if width < min || width > max {
+                if width < min || width > min + 64 {
                     continue;
-                } // unrealistic
+                }
 
-                marker_pos = Some(pos);
-                log::info!("cid_offset_index: marker 0x{:x} at tail +{}", codec, pos);
+                marker = Some((codec, pos));
                 break;
             }
-            let rel = marker_pos.ok_or("cid_offset_index: index marker not found")?;
-            let index_off = start + rel as u64;
-            let index_sz = file_len - index_off;
-            log::info!("cid_offset_index: index @ {} ({} B)", index_off, index_sz);
-            (index_off, index_sz)
+            let (codec, pos) = marker.ok_or("cid_offset_index: index marker not found")?;
+            let off = start + pos as u64;
+            let sz = file_len - off;
+            log::info!("cid_offset_index: marker 0x{codec:x} @ {off} ({sz} B)");
+            (off, sz)
         };
 
-        /* ────────────────────────────────────────────────────────────────────
-        2.  Read the index blob
-        ──────────────────────────────────────────────────────────────────── */
+        /* ── 2. read index blob ───────────────────────────────────────────── */
         let mut buf = vec![0u8; index_size as usize];
         self.reader.seek(SeekFrom::Start(index_offset)).await?;
         self.reader.read_exact(&mut buf).await?;
         let mut cur = std::io::Cursor::new(&buf[..]);
 
-        /* uvarint helper reused */
         fn uvar(mut s: &[u8]) -> Option<(u64, usize)> {
-            let mut x = 0u64;
-            let mut sh = 0u32;
+            let (mut x, mut sh) = (0u64, 0u32);
             for i in 0..10 {
                 let b = *s.get(0)?;
                 s = &s[1..];
@@ -305,9 +286,8 @@ impl<R: AsyncRead + Unpin + AsyncSeek + Len> AsyncNodeReader<R> {
             None
         }
 
-        /* 3. codec header ---------------------------------------------------- */
-        let (codec, len_codec) = uvar(cur.get_ref()).unwrap();
-        cur.set_position(len_codec as u64);
+        let (codec, l0) = uvar(cur.get_ref()).unwrap();
+        cur.set_position(l0 as u64);
         if codec == 0x0401 {
             let (_, l1) = uvar(&cur.get_ref()[cur.position() as usize..]).unwrap();
             cur.set_position(cur.position() + l1 as u64);
@@ -317,7 +297,7 @@ impl<R: AsyncRead + Unpin + AsyncSeek + Len> AsyncNodeReader<R> {
         let min_fixed = if codec == 0x0400 { 8 } else { 16 };
         let has_size = codec == 0x0401;
 
-        /* 4. buckets --------------------------------------------------------- */
+        /* ── 3. buckets ───────────────────────────────────────────────────── */
         let mut bucket = 0u64;
         while (cur.position() as usize) < buf.len() {
             bucket += 1;
@@ -326,6 +306,7 @@ impl<R: AsyncRead + Unpin + AsyncSeek + Len> AsyncNodeReader<R> {
                 break;
             }
             let width = u32::from_le_bytes(w4) as usize;
+
             let mut c8 = [0u8; 8];
             if cur.read_exact(&mut c8).await.is_err() {
                 break;
@@ -333,37 +314,39 @@ impl<R: AsyncRead + Unpin + AsyncSeek + Len> AsyncNodeReader<R> {
             let count = u64::from_le_bytes(c8);
 
             let digest_len = match width.checked_sub(min_fixed) {
-                Some(d) if d > 0 && d <= 64 => d,
+                Some(d) if d <= 64 => d, // allow 0-length digests
                 _ => {
-                    log::info!("bucket {bucket}: bad width {width}, stop");
+                    log::info!("bucket {bucket}: width {width} invalid, stop");
                     break;
                 }
             };
-            log::info!("bucket {bucket}: count={count}, digest_len={digest_len}");
+            log::info!("bucket {bucket}: count={count} digest_len={digest_len}");
 
             for _ in 0..count {
-                let mut dig = vec![0u8; digest_len];
-                if cur.read_exact(&mut dig).await.is_err() {
-                    break;
-                }
+                let digest = if digest_len > 0 {
+                    let mut d = vec![0u8; digest_len];
+                    cur.read_exact(&mut d).await?;
+                    d
+                } else {
+                    Vec::new()
+                };
+
                 let mut offb = [0u8; 8];
-                if cur.read_exact(&mut offb).await.is_err() {
-                    break;
-                }
+                cur.read_exact(&mut offb).await?;
                 let offset = u64::from_le_bytes(offb);
 
                 let size = if has_size {
                     let mut szb = [0u8; 8];
-                    if cur.read_exact(&mut szb).await.is_err() {
-                        break;
-                    }
+                    cur.read_exact(&mut szb).await?;
                     u64::from_le_bytes(szb)
                 } else {
                     0
                 };
 
-                let cid = Cid::new_v1(0x55, Multihash::from_bytes(&dig)?);
-                self.cid_offset_index.insert(cid, (offset, size));
+                if !digest.is_empty() {
+                    let cid = Cid::new_v1(0x55, Multihash::from_bytes(&digest)?);
+                    self.cid_offset_index.insert(cid, (offset, size));
+                }
             }
         }
 

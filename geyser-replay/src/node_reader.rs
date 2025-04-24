@@ -245,7 +245,7 @@ impl<R: AsyncRead + Unpin + AsyncSeek + Len> AsyncNodeReader<R> {
                     .await?;
 
                 //if blocks % 1_000 == 0 {
-                log::info!("build_index: {} blocks indexed…", blocks);
+                log::info!("build_index: {} blocks indexed", blocks);
                 //}
             }
         }

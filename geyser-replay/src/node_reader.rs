@@ -169,11 +169,11 @@ impl<R: AsyncRead + Unpin + AsyncSeek + Len> AsyncNodeReader<R> {
         node_reader
     }
 
-    /// Stream the entire CAR and write a CID-offset-size index.
-    /// Every record is:
-    /// ```text
-    /// [u32 little-endian CID_len] [CID_len bytes] [u64 offset] [u64 size]
-    /// ```
+    /// Stream the entire CAR and write an index file with:
+    /// [u32 len] [CID bytes] [u64 offset] [u64 size] [u8 kind_code]
+    ///
+    /// Kind-codes:
+    /// 0=Transaction 1=Entry 2=Block 3=Subset 4=Epoch 5=Rewards 6=DataFrame
     pub async fn build_index<P>(&mut self, idx_path: P) -> Result<(), Box<dyn std::error::Error>>
     where
         P: AsRef<std::path::Path>,
@@ -181,49 +181,64 @@ impl<R: AsyncRead + Unpin + AsyncSeek + Len> AsyncNodeReader<R> {
         use tokio::fs::File;
         use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom};
 
-        /* 1. make sure CAR header is consumed */
+        /* ensure CAR header consumed */
         if self.header.is_empty() {
             self.read_raw_header().await?;
         }
 
-        /* 2. open index file for writing */
+        /* open index file */
         let mut out = File::create(idx_path).await?;
 
-        /* 3. stream every IPLD block */
+        /* stream all sections */
         let mut offset = self.reader.stream_position().await?; // after header
 
         loop {
-            let start_of_section = offset;
+            let start = offset;
 
-            // read section size (varint); EOF -> done
+            /* section size (varint) */
             let section_size = match crate::node_reader::read_uvarint(&mut self.reader).await {
                 Ok(sz) => sz,
                 Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
                 Err(e) => return Err(e.into()),
             };
 
-            // read whole section into a Vec<u8>
+            /* read section bytes */
             let mut item = vec![0u8; section_size as usize];
             self.reader.read_exact(&mut item).await?;
-            offset = self.reader.stream_position().await?; // for next loop
-            let section_len = offset - start_of_section; // section size on disk
+            offset = self.reader.stream_position().await?;
+            let section_len = offset - start;
 
-            /* extract CID */
-            let mut cur = std::io::Cursor::new(item); // **move** the Vec
-            let raw_node = crate::node_reader::RawNode::from_cursor(&mut cur).await?; // async version
-            let cid_bytes = raw_node.cid.to_bytes();
+            /* CID + node kind */
+            let mut cur = std::io::Cursor::new(item);
+            let raw = crate::node_reader::RawNode::from_cursor(&mut cur).await?;
+            let cid_bytes = raw.cid.to_bytes();
             let cid_len = cid_bytes.len() as u32;
 
-            /* write one record: len | cid | offset | size */
-            log::info!("build_index: writing index record");
-            log::info!("  cid_len: {}", cid_len);
-            log::info!("  cid: {}", raw_node.cid);
-            log::info!("  offset: {}", start_of_section);
-            log::info!("  size: {}", section_len);
+            let (kind_code, kind_str) = match raw.parse()? {
+                crate::node::Node::Transaction(_) => (0u8, "Transaction"),
+                crate::node::Node::Entry(_) => (1u8, "Entry"),
+                crate::node::Node::Block(_) => (2u8, "Block"),
+                crate::node::Node::Subset(_) => (3u8, "Subset"),
+                crate::node::Node::Epoch(_) => (4u8, "Epoch"),
+                crate::node::Node::Rewards(_) => (5u8, "Rewards"),
+                crate::node::Node::DataFrame(_) => (6u8, "DataFrame"),
+            };
+
+            /* log */
+            log::info!(
+                "build_index: {:>9} @ {} ({} B) CID={}",
+                kind_str,
+                start,
+                section_len,
+                raw.cid
+            );
+
+            /* write record */
             out.write_all(&cid_len.to_le_bytes()).await?;
             out.write_all(&cid_bytes).await?;
-            out.write_all(&start_of_section.to_le_bytes()).await?;
+            out.write_all(&start.to_le_bytes()).await?;
             out.write_all(&(section_len as u64).to_le_bytes()).await?;
+            out.write_all(&[kind_code]).await?;
         }
 
         out.flush().await?;

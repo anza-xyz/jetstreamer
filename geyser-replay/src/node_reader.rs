@@ -169,198 +169,66 @@ impl<R: AsyncRead + Unpin + AsyncSeek + Len> AsyncNodeReader<R> {
         node_reader
     }
 
-    /// Lazily build CID → (offset, size) map by parsing the embedded multihash
-    /// index at the tail of the CAR file.
-    pub async fn cid_offset_index(
-        &mut self,
-    ) -> Result<&std::collections::HashMap<cid::Cid, (u64, u64)>, Box<dyn std::error::Error>> {
-        use cid::Cid;
-        use multihash::Multihash;
-        use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
+    /// Stream the entire CAR and write a CID-offset-size index.
+    /// Every record is:
+    /// ```text
+    /// [u32 little-endian CID_len] [CID_len bytes] [u64 offset] [u64 size]
+    /// ```
+    pub async fn build_index<P>(&mut self, idx_path: P) -> Result<(), Box<dyn std::error::Error>>
+    where
+        P: AsRef<std::path::Path>,
+    {
+        use tokio::fs::File;
+        use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom};
 
-        if !self.cid_offset_index.is_empty() {
-            log::info!(
-                "cid_offset_index: cache hit ({} entries)",
-                self.cid_offset_index.len()
-            );
-            return Ok(&self.cid_offset_index);
+        /* 1. make sure CAR header is consumed */
+        if self.header.is_empty() {
+            self.read_raw_header().await?;
         }
 
-        /* ── 1. detect wrapper ─────────────────────────────────────────────── */
-        let mut magic4 = [0u8; 4];
-        self.reader.seek(SeekFrom::Start(0)).await?;
-        self.reader.read_exact(&mut magic4).await?;
+        /* 2. open index file for writing */
+        let mut out = File::create(idx_path).await?;
 
-        fn uvar(mut s: &[u8]) -> Option<(u64, usize)> {
-            let (mut x, mut sh) = (0u64, 0u32);
-            for i in 0..10 {
-                let b = *s.get(0)?;
-                s = &s[1..];
-                if b < 0x80 {
-                    return Some((x | ((b as u64) << sh), i + 1));
-                }
-                x |= ((b & 0x7f) as u64) << sh;
-                sh += 7;
-            }
-            None
-        }
+        /* 3. stream every IPLD block */
+        let mut offset = self.reader.stream_position().await?; // after header
 
-        let (index_offset, index_size) = if &magic4 == b"\x0a\x8a\x4d\x54" {
-            /* CAR v2 fast path */
-            let mut prag = [0u8; 40];
-            self.reader.seek(SeekFrom::Start(0)).await?;
-            self.reader.read_exact(&mut prag).await?;
-            let off = u64::from_le_bytes(prag[24..32].try_into().unwrap());
-            let sz = u64::from_le_bytes(prag[32..40].try_into().unwrap());
-            log::info!("cid_offset_index: CAR-v2 index @ {off} ({sz} B)");
-            (off, sz)
-        } else {
-            /* fallback : scan last ≤128 MiB for a VALID marker */
-            const WIN: u64 = 1024 * 1024 * 1024;
-            let file_len = self.reader.len();
-            let start = file_len.saturating_sub(WIN);
-            let tail_len = file_len - start;
+        loop {
+            let start_of_section = offset;
 
-            self.reader.seek(SeekFrom::Start(start)).await?;
-            let mut tail = vec![0u8; tail_len as usize];
-            self.reader.read_exact(&mut tail).await?;
-
-            let mut marker = None;
-            for pos in (0..tail.len()).rev() {
-                /* candidate codec varint */
-                let (codec, len_c) = match uvar(&tail[pos..]) {
-                    Some(v) => v,
-                    None => continue,
-                };
-                if codec != 0x0400 && codec != 0x0401 {
-                    continue;
-                }
-
-                /* skip header extras */
-                let mut off = pos + len_c;
-                if codec == 0x0401 {
-                    if let Some((_, l)) = uvar(&tail[off..]) {
-                        off += l;
-                    } else {
-                        continue;
-                    }
-                    if let Some((_, l)) = uvar(&tail[off..]) {
-                        off += l;
-                    } else {
-                        continue;
-                    }
-                }
-                if off + 12 > tail.len() {
-                    continue;
-                }
-
-                /* peek first bucket’s width / count */
-                let width = u32::from_le_bytes(tail[off..off + 4].try_into().unwrap()) as usize;
-                let count = u64::from_le_bytes(tail[off + 4..off + 12].try_into().unwrap());
-
-                let min = if codec == 0x0400 { 8 } else { 16 };
-                if width < min || width > min + 64 {
-                    continue;
-                }
-
-                /* bytes required */
-                let bytes_needed = match count.checked_mul(width as u64) {
-                    Some(b) => b,
-                    None => continue, // overflow
-                };
-                let header_bytes = (off + 12) as u64;
-                let abs_start = start + pos as u64;
-                if abs_start + header_bytes + bytes_needed > file_len {
-                    continue;
-                }
-
-                /* bucket sane → accept */
-                marker = Some((codec, pos));
-                break;
-            }
-            let (codec, pos) = marker.ok_or("cid_offset_index: index marker not found")?;
-            let off = start + pos as u64;
-            let sz = file_len - off;
-            log::info!("cid_offset_index: marker 0x{codec:x} @ {off} ({sz} B)");
-            (off, sz)
-        };
-
-        /* ── 2. load index blob ────────────────────────────────────────────── */
-        let mut buf = vec![0u8; index_size as usize];
-        self.reader.seek(SeekFrom::Start(index_offset)).await?;
-        self.reader.read_exact(&mut buf).await?;
-        let mut cur = std::io::Cursor::new(&buf[..]);
-
-        let (codec, l0) = uvar(cur.get_ref()).unwrap();
-        cur.set_position(l0 as u64);
-        if codec == 0x0401 {
-            let (_, l1) = uvar(&cur.get_ref()[cur.position() as usize..]).unwrap();
-            cur.set_position(cur.position() + l1 as u64);
-            let (_, l2) = uvar(&cur.get_ref()[cur.position() as usize..]).unwrap();
-            cur.set_position(cur.position() + l2 as u64);
-        }
-        let min_fixed = if codec == 0x0400 { 8 } else { 16 };
-        let has_size = codec == 0x0401;
-
-        /* ── 3 bucket loop ────────────────────────────────────────────────── */
-        let mut bucket_no = 0u64;
-        while (cur.position() as usize) < buf.len() {
-            bucket_no += 1;
-
-            let mut w4 = [0u8; 4];
-            if cur.read_exact(&mut w4).await.is_err() {
-                break;
-            }
-            let width = u32::from_le_bytes(w4) as usize;
-
-            let mut c8 = [0u8; 8];
-            if cur.read_exact(&mut c8).await.is_err() {
-                break;
-            }
-            let count = u64::from_le_bytes(c8);
-
-            let digest_len = match width.checked_sub(min_fixed) {
-                Some(d) if d <= 64 => d, // allow 0
-                _ => {
-                    log::info!("bucket {bucket_no}: bad width {width}");
-                    break;
-                }
+            // read section size (varint); EOF -> done
+            let section_size = match crate::node_reader::read_uvarint(&mut self.reader).await {
+                Ok(sz) => sz,
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                Err(e) => return Err(e.into()),
             };
-            log::info!("bucket {bucket_no}: count={count}, digest_len={digest_len}");
 
-            for _ in 0..count {
-                let digest = if digest_len > 0 {
-                    let mut d = vec![0u8; digest_len];
-                    cur.read_exact(&mut d).await?;
-                    d
-                } else {
-                    Vec::new()
-                };
+            // read whole section into a Vec<u8>
+            let mut item = vec![0u8; section_size as usize];
+            self.reader.read_exact(&mut item).await?;
+            offset = self.reader.stream_position().await?; // for next loop
+            let section_len = offset - start_of_section; // section size on disk
 
-                let mut offb = [0u8; 8];
-                cur.read_exact(&mut offb).await?;
-                let offset = u64::from_le_bytes(offb);
+            /* extract CID */
+            let mut cur = std::io::Cursor::new(item); // **move** the Vec
+            let raw_node = crate::node_reader::RawNode::from_cursor(&mut cur).await?; // async version
+            let cid_bytes = raw_node.cid.to_bytes();
+            let cid_len = cid_bytes.len() as u32;
 
-                let size = if has_size {
-                    let mut szb = [0u8; 8];
-                    cur.read_exact(&mut szb).await?;
-                    u64::from_le_bytes(szb)
-                } else {
-                    0
-                };
-
-                if !digest.is_empty() {
-                    let cid = Cid::new_v1(0x55, Multihash::from_bytes(&digest)?);
-                    self.cid_offset_index.insert(cid, (offset, size));
-                }
-            }
+            /* write one record: len | cid | offset | size */
+            log::info!("build_index: writing index record");
+            log::info!("  cid_len: {}", cid_len);
+            log::info!("  cid: {}", raw_node.cid);
+            log::info!("  offset: {}", start_of_section);
+            log::info!("  size: {}", section_len);
+            out.write_all(&cid_len.to_le_bytes()).await?;
+            out.write_all(&cid_bytes).await?;
+            out.write_all(&start_of_section.to_le_bytes()).await?;
+            out.write_all(&(section_len as u64).to_le_bytes()).await?;
         }
 
-        log::info!(
-            "cid_offset_index: parsed {} CIDs",
-            self.cid_offset_index.len()
-        );
-        Ok(&self.cid_offset_index)
+        out.flush().await?;
+        log::info!("build_index: finished writing index");
+        Ok(())
     }
 
     pub async fn read_raw_header(&mut self) -> Result<Vec<u8>, Box<dyn Error>> {
@@ -820,7 +688,7 @@ async fn test_seek_to_slot() {
 }
 
 #[tokio::test]
-async fn read_first_subset() {
+async fn test_build_index() {
     solana_logger::setup_with_default("debug");
     use crate::{epochs_async::fetch_epoch_stream, node_reader::AsyncNodeReader};
 
@@ -828,6 +696,5 @@ async fn read_first_subset() {
     let stream = fetch_epoch_stream(670, &client).await;
     let mut rdr = AsyncNodeReader::new(stream);
 
-    rdr.cid_offset_index().await.unwrap();
-    log::info!("CID offset index: {:#?}", rdr.cid_offset_index);
+    rdr.build_index("./index.idx").await.unwrap();
 }

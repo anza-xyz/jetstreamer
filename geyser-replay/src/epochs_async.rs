@@ -27,7 +27,7 @@ pub async fn fetch_epoch_stream(epoch: u64, client: &Client) -> impl AsyncRead +
     })
     .await;
 
-    BufReader::with_capacity(64 * 1024 * 1024, seekable)
+    BufReader::with_capacity(8 * 1024 * 1024, seekable)
 }
 
 /* ── Tests ──────────────────────────────────────────────────────────────── */

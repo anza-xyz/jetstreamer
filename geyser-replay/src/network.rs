@@ -5,11 +5,14 @@ use solana_geyser_plugin_manager::geyser_plugin_service::GeyserPluginServiceErro
 use solana_rpc::optimistically_confirmed_bank_tracker::SlotNotification;
 use solana_runtime::bank::KeyedRewardsAndNumPartitions;
 use solana_sdk::{reward_info::RewardInfo, reward_type::RewardType};
+use std::collections::HashMap;
+use std::path::Path;
 use std::{collections::HashSet, fmt::Display, ops::Range, path::PathBuf};
 use thiserror::Error;
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
+use crate::slot_cache::build_epochs_index;
 use crate::{epochs_async::fetch_epoch_stream, node_reader::AsyncNodeReader};
 
 #[derive(Debug, Error)]
@@ -477,7 +480,50 @@ where
     Ok(())
 }
 
-#[tokio::test]
+pub async fn build_missing_indexes(
+    idx_dir: impl AsRef<Path>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let idx_dir = idx_dir.as_ref();
+    if !idx_dir.exists() {
+        log::info!("Creating index directory: {:?}", idx_dir);
+        std::fs::create_dir_all(&idx_dir)?;
+    } else {
+        log::info!("Index directory already exists: {:?}", idx_dir);
+    }
+
+    let client = Client::new();
+
+    // Build the slot->epoch index
+    log::info!("building slot->epoch index");
+    let start = std::time::Instant::now();
+    let slot_to_epoch = build_epochs_index(&client).await.unwrap();
+    log::info!("built slot->epoch index in {:?}", start.elapsed());
+
+    // Build the epoch->slot index
+    log::info!("building epoch->slot index");
+    let start = std::time::Instant::now();
+    let epoch_to_slot: HashMap<u64, Range<u64>> = slot_to_epoch
+        .iter()
+        .map(|(slot_range, epoch)| {
+            let epoch = *epoch;
+            let slot_range = slot_range.clone();
+            (epoch, slot_range)
+        })
+        .collect();
+    log::info!("built epoch->slot index in {:?}", start.elapsed());
+    assert_eq!(epoch_to_slot.get(&773).unwrap().start, 333935999);
+    assert_eq!(epoch_to_slot.get(&773).unwrap().end, 334368000);
+
+    // for epoch in 670..=700 {
+    //     let idx_path = idx_dir.join(format!("epoch-{}.idx", epoch));
+    //     if !idx_path.exists() {
+    //         build_index(&reqwest::Client::new(), epoch, &idx_path).await?;
+    //     }
+    // }
+    Ok(())
+}
+
+#[tokio::test(worker_threads = 32, flavor = "multi_thread")]
 async fn test_firehose() {
     solana_logger::setup_with_default("debug");
     let client = reqwest::Client::new();
@@ -488,13 +534,20 @@ async fn test_firehose() {
         .unwrap();
 }
 
-#[tokio::test]
-async fn test_build_index() {
-    solana_logger::setup_with_default("info,geyser_replay::node_reader=debug");
-
-    let client = reqwest::Client::new();
-    let _ = std::fs::remove_file("./../bin/index.idx");
-    build_index(&client, 670, "./../bin/index.idx")
-        .await
-        .unwrap();
+#[tokio::test(worker_threads = 32, flavor = "multi_thread")]
+async fn test_build_missing_indexes() {
+    solana_logger::setup_with_default("info");
+    let idx_dir = PathBuf::from("./src/index");
+    build_missing_indexes(&idx_dir).await.unwrap();
 }
+
+// #[tokio::test]
+// async fn test_build_index() {
+//     solana_logger::setup_with_default("info,geyser_replay::node_reader=debug");
+
+//     let client = reqwest::Client::new();
+//     let _ = std::fs::remove_file("./../bin/index.idx");
+//     build_index(&client, 670, "./../bin/index.idx")
+//         .await
+//         .unwrap();
+// }

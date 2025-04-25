@@ -101,9 +101,12 @@ pub async fn build_epochs_index(client: &Client) -> anyhow::Result<RangeMap<u64,
     let max_slot = &index.last_range_value().unwrap().0.end - 1;
     let min_epoch = index.get(min_slot).unwrap();
     let max_epoch = index.get(&max_slot).unwrap();
-    println!(
+    log::info!(
         "Epochs index built from slot {} to slot {} (epochs {} to {})",
-        min_slot, max_slot, min_epoch, max_epoch,
+        min_slot,
+        max_slot,
+        min_epoch,
+        max_epoch,
     );
 
     Ok(index)
@@ -112,9 +115,9 @@ pub async fn build_epochs_index(client: &Client) -> anyhow::Result<RangeMap<u64,
 #[tokio::test(worker_threads = 32, flavor = "multi_thread")]
 async fn test_build_epoch_index() {
     let client = Client::new();
-    println!("building epochs index");
+    log::info!("building epochs index");
     let start = std::time::Instant::now();
     let cache = build_epochs_index(&client).await.unwrap();
-    println!("built epochs index in {:?}", start.elapsed());
+    log::info!("built epochs index in {:?}", start.elapsed());
     assert!(cache.len() > 710);
 }

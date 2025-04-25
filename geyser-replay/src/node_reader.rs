@@ -144,7 +144,7 @@ where
     F: Fn() -> RequestBuilder + Send + Sync + 'static,
 {
     fn len(&self) -> u64 {
-        self.file_size().unwrap_or(0)
+        self.file_size.unwrap_or(0)
     }
 }
 

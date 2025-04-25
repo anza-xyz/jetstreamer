@@ -59,7 +59,7 @@ zstd = "0"
 thousands = "0"
 tokio-stream = { version = "0", features = ["full"] }
 rangemap = "1"
-rseek = "0"
+rseek = { version = "0.2", path = "../rseek" }
 
 [dependencies]
 tokio.workspace = true

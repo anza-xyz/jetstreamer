@@ -4493,14 +4493,13 @@ dependencies = [
 
 [[package]]
 name = "rseek"
-version = "0.1.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "963a9f70225bbfe6de2d628bec38867e2f788ed44105ff8bf6598dbe275ad995"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "futures 0.3.31",
  "reqwest 0.12.15",
  "tokio",
+ "tokio-util 0.7.15",
 ]
 
 [[package]]

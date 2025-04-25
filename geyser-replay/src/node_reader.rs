@@ -155,12 +155,12 @@ pub struct AsyncNodeReader<R: AsyncRead + AsyncSeek + Len> {
 
 impl<R: AsyncRead + Unpin + AsyncSeek + Len> AsyncNodeReader<R> {
     pub fn new(reader: R) -> AsyncNodeReader<R> {
-        let node_reader = AsyncNodeReader {
+        
+        AsyncNodeReader {
             reader,
             header: vec![],
             item_index: 0,
-        };
-        node_reader
+        }
     }
 
     pub async fn read_raw_header(&mut self) -> Result<Vec<u8>, Box<dyn Error>> {

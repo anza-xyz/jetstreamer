@@ -123,7 +123,7 @@ pub async fn firehose(
         let header = reader
             .read_raw_header()
             .await
-            .map_err(|e| GeyserReplayError::ReadHeader(e))?;
+            .map_err(GeyserReplayError::ReadHeader)?;
         log::debug!("read epoch {} header: {:?}", epoch_num, header);
 
         let mut todo_previous_blockhash = solana_sdk::hash::Hash::default();
@@ -143,7 +143,7 @@ pub async fn firehose(
                         reader
                             .skip_next()
                             .await
-                            .map_err(|e| GeyserReplayError::SkipBlockError(e))?;
+                            .map_err(GeyserReplayError::SkipBlockError)?;
                         *current += 1;
                     }
                     continue;
@@ -152,10 +152,10 @@ pub async fn firehose(
             let nodes = reader
                 .read_until_block()
                 .await
-                .map_err(|e| GeyserReplayError::ReadUntilBlockError(e))?;
+                .map_err(GeyserReplayError::ReadUntilBlockError)?;
             let block = nodes
                 .get_block()
-                .map_err(|e| GeyserReplayError::GetBlockError(e))?;
+                .map_err(GeyserReplayError::GetBlockError)?;
             log::debug!(
                 "read block {} of epoch {} with slot {}",
                 item_index,
@@ -376,7 +376,7 @@ pub async fn build_index<P>(
 where
     P: AsRef<std::path::Path>,
 {
-    let stream = fetch_epoch_stream(epoch, &client).await;
+    let stream = fetch_epoch_stream(epoch, client).await;
     let mut node_reader = AsyncNodeReader::new(stream);
 
     /* ── 1. make sure the CAR header has been consumed ───────────────────── */
@@ -438,7 +438,7 @@ where
         offset += varint_len + section_size; // next loop starts here
 
         /* parse exactly once */
-        let bytes_vec = (&buf[..section_size as usize]).to_vec(); // <-- make Vec<u8>
+        let bytes_vec = buf[..section_size as usize].to_vec(); // <-- make Vec<u8>
         let mut cur = std::io::Cursor::new(bytes_vec); // Cursor<Vec<u8>>
         let raw = crate::node_reader::RawNode::from_cursor(&mut cur).await?;
 
@@ -486,7 +486,7 @@ pub async fn build_missing_indexes(
     let idx_dir = idx_dir.as_ref();
     if !idx_dir.exists() {
         log::info!("Creating index directory: {:?}", idx_dir);
-        std::fs::create_dir_all(&idx_dir)?;
+        std::fs::create_dir_all(idx_dir)?;
     } else {
         log::info!("Index directory already exists: {:?}", idx_dir);
     }

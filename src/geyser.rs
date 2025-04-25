@@ -10,12 +10,12 @@ use crate::clickhouse;
 
 thread_local! {
     static TOKIO_RUNTIME: RefCell<Runtime> = RefCell::new(Runtime::new().unwrap());
-    static PROCESSED_TRANSACTIONS: RefCell<u64> = RefCell::new(0);
-    static SLOT_NUM: RefCell<u64> = RefCell::new(0);
-    static PROCESSED_SLOTS: RefCell<u64> = RefCell::new(0);
-    static NUM_VOTES: RefCell<u64> = RefCell::new(0);
-    static COMPUTE_CONSUMED: RefCell<u128> = RefCell::new(0);
-    static START_TIME: std::cell::RefCell<Option<Instant>> = std::cell::RefCell::new(None);
+    static PROCESSED_TRANSACTIONS: RefCell<u64> = const { RefCell::new(0) };
+    static SLOT_NUM: RefCell<u64> = const { RefCell::new(0) };
+    static PROCESSED_SLOTS: RefCell<u64> = const { RefCell::new(0) };
+    static NUM_VOTES: RefCell<u64> = const { RefCell::new(0) };
+    static COMPUTE_CONSUMED: RefCell<u128> = const { RefCell::new(0) };
+    static START_TIME: std::cell::RefCell<Option<Instant>> = const { std::cell::RefCell::new(None) };
 }
 
 #[derive(Clone, Debug, Default)]
@@ -183,7 +183,7 @@ pub trait SolscanUrl {
     fn solscan_url(&self) -> String;
 }
 
-impl<'a> SolscanUrl for ReplicaTransactionInfoVersions<'a> {
+impl SolscanUrl for ReplicaTransactionInfoVersions<'_> {
     fn solscan_url(&self) -> String {
         match self {
             ReplicaTransactionInfoVersions::V0_0_1(tx) => {

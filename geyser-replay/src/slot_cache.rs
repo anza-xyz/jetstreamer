@@ -17,12 +17,12 @@ async fn fetch_epoch_slot_range(epoch: u64, client: &Client) -> Option<(u64, u64
     let tail_range = format!("bytes=-{}", RANGE_PADDING);
 
     let Some(first_slot) =
-        fetch_epoch_slot_txt_with_http_range(true, &url, &head_range, &client).await
+        fetch_epoch_slot_txt_with_http_range(true, &url, &head_range, client).await
     else {
         return None;
     };
     let Some(last_slot) =
-        fetch_epoch_slot_txt_with_http_range(false, &url, &tail_range, &client).await
+        fetch_epoch_slot_txt_with_http_range(false, &url, &tail_range, client).await
     else {
         return None;
     };

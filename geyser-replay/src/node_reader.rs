@@ -254,12 +254,21 @@ impl<R: AsyncRead + Unpin + AsyncSeek + Len> AsyncNodeReader<R> {
                     .await?;
 
                 log::info!(
-                    "build_index: Block slot={} @ {} ({} B) – {} indexed",
+                    "build_index: Block slot={} @ {} ({} B) - {} indexed",
                     b.slot,
                     start_off,
                     section_size + varint_len,
                     blocks
                 );
+            }
+            if let crate::node::Node::Epoch(e) = raw.parse()? {
+                log::info!(
+                    "build_index: Epoch: {:?} @ {} ({} B)",
+                    e.subsets,
+                    start_off,
+                    section_size + varint_len
+                );
+                panic!("epoch found!");
             }
         }
 

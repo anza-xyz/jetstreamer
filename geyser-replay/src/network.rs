@@ -511,8 +511,8 @@ pub async fn build_missing_indexes(
         })
         .collect();
     log::info!("built epoch->slot index in {:?}", start.elapsed());
-    assert_eq!(epoch_to_slot.get(&773).unwrap().start, 333935999);
-    assert_eq!(epoch_to_slot.get(&773).unwrap().end, 334368000);
+    assert_eq!(epoch_to_slot.get(&772).unwrap().start, 333504000);
+    assert_eq!(epoch_to_slot.get(&772).unwrap().end, 333935999);
 
     // for epoch in 670..=700 {
     //     let idx_path = idx_dir.join(format!("epoch-{}.idx", epoch));

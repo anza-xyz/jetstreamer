@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use rangemap::RangeMap;
 use reqwest::Client;
 use tokio::sync::mpsc;
@@ -38,16 +40,39 @@ async fn fetch_epoch_slot_txt_with_http_range(
 ) -> Option<u64> {
     let response = client.get(url).header("Range", range).send().await.ok()?;
 
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        return None;
+    }
+
     if response.status() != reqwest::StatusCode::PARTIAL_CONTENT
         && response.status() != reqwest::StatusCode::OK
     {
-        return None;
+        std::thread::sleep(Duration::from_millis(100));
     }
-    let text = response.text().await.ok()?;
+    let Ok(text) = response.text().await else {
+        log::warn!("Failed to read response text");
+        return None;
+    };
     if first {
-        text.trim().lines().next()?.trim().parse::<u64>().ok()
+        let Some(first_line) = text.trim().lines().next() else {
+            log::warn!("Failed to read first line");
+            return None;
+        };
+        let Ok(parsed) = first_line.trim().parse::<u64>() else {
+            log::warn!("Failed to parse first line");
+            return None;
+        };
+        Some(parsed)
     } else {
-        text.trim().lines().last()?.trim().parse::<u64>().ok()
+        let Some(last_line) = text.trim().lines().last() else {
+            log::warn!("Failed to read last line");
+            return None;
+        };
+        let Ok(parsed) = last_line.trim().parse::<u64>() else {
+            log::warn!("Failed to parse last line");
+            return None;
+        };
+        Some(parsed)
     }
 }
 
@@ -67,9 +92,15 @@ pub async fn build_epochs_index(client: &Client) -> anyhow::Result<RangeMap<u64,
         index
     });
 
+    let mut first_bad_epoch = u64::MAX;
     for epoch in 0u64.. {
-        if stop_rx.try_recv().is_ok() {
-            stop_rx.close();
+        if let Ok(bad_epoch) = stop_rx.try_recv() {
+            if bad_epoch < first_bad_epoch {
+                first_bad_epoch = bad_epoch;
+            }
+        }
+
+        if epoch >= first_bad_epoch {
             break;
         }
 
@@ -89,6 +120,8 @@ pub async fn build_epochs_index(client: &Client) -> anyhow::Result<RangeMap<u64,
         handles.push(handle);
         std::thread::sleep(std::time::Duration::from_millis(1));
     }
+
+    stop_rx.close();
 
     drop(tx);
     for handle in handles {

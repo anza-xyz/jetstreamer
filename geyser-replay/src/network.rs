@@ -520,16 +520,13 @@ pub async fn build_missing_indexes(
     let current_epoch = current_epoch(&client).await?;
     log::info!("Current Mainnet epoch: {}", current_epoch);
 
-    let (
-        old_faithful_max_epoch,
-        old_faithful_max_epoch_first_slot,
-        old_faithful_max_epoch_last_slot,
-    ) = latest_old_faithful_epoch(&client, Some(current_epoch)).await?;
+    let (of1_last_epoch, of1_last_epoch_first_slot, of1_last_epoch_last_slot) =
+        latest_old_faithful_epoch(&client, Some(current_epoch)).await?;
     log::info!(
         "Latest Old Faithful epoch: {} (slots {}-{})",
-        old_faithful_max_epoch,
-        old_faithful_max_epoch_first_slot,
-        old_faithful_max_epoch_last_slot
+        of1_last_epoch,
+        of1_last_epoch_first_slot,
+        of1_last_epoch_last_slot
     );
 
     // for epoch in 670..=700 {

@@ -460,15 +460,6 @@ where
                 blocks
             );
         }
-        if let crate::node::Node::Epoch(e) = raw.parse()? {
-            log::info!(
-                "build_index: Epoch: {:?} @ {} ({} B)",
-                e.subsets,
-                start_off,
-                section_size + varint_len
-            );
-            panic!("epoch found!");
-        }
     }
 
     out.flush().await?;

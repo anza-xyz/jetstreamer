@@ -1,18 +1,17 @@
 use crossbeam_channel::{unbounded, Receiver};
 use demo_rust_ipld_car::utils;
+use rayon::prelude::*;
 use reqwest::Client;
 use solana_geyser_plugin_manager::geyser_plugin_service::GeyserPluginServiceError;
 use solana_rpc::optimistically_confirmed_bank_tracker::SlotNotification;
 use solana_runtime::bank::KeyedRewardsAndNumPartitions;
 use solana_sdk::{reward_info::RewardInfo, reward_type::RewardType};
-use std::collections::HashMap;
 use std::path::Path;
 use std::{collections::HashSet, fmt::Display, ops::Range, path::PathBuf};
 use thiserror::Error;
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
-use crate::slot_cache::build_epochs_index;
 use crate::{epochs_async::fetch_epoch_stream, node_reader::AsyncNodeReader};
 
 #[derive(Debug, Error)]
@@ -471,6 +470,23 @@ where
     Ok(())
 }
 
+/// Queries the current epoch from mainnet
+pub async fn current_epoch() -> Result<u64, Box<dyn std::error::Error>> {
+    let client = reqwest::Client::new();
+    let url = "https://api.mainnet-beta.solana.com";
+    let request_body = r#"{"jsonrpc":"2.0","id":1,"method":"getEpochInfo","params":[]}"#;
+    let response = client
+        .post(url)
+        .header("Content-Type", "application/json")
+        .body(request_body)
+        .send()
+        .await?;
+    let text = response.text().await?;
+    let epoch_info: serde_json::Value = serde_json::from_str(&text).unwrap();
+    let epoch = epoch_info["result"]["epoch"].as_u64().unwrap();
+    Ok(epoch)
+}
+
 pub async fn build_missing_indexes(
     idx_dir: impl AsRef<Path>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -482,28 +498,8 @@ pub async fn build_missing_indexes(
         log::info!("Index directory already exists: {:?}", idx_dir);
     }
 
-    let client = Client::new();
-
-    // Build the slot->epoch index
-    log::info!("building slot->epoch index");
-    let start = std::time::Instant::now();
-    let slot_to_epoch = build_epochs_index(&client).await.unwrap();
-    log::info!("built slot->epoch index in {:?}", start.elapsed());
-
-    // Build the epoch->slot index
-    log::info!("building epoch->slot index");
-    let start = std::time::Instant::now();
-    let epoch_to_slot: HashMap<u64, Range<u64>> = slot_to_epoch
-        .iter()
-        .map(|(slot_range, epoch)| {
-            let epoch = *epoch;
-            let slot_range = slot_range.clone();
-            (epoch, slot_range)
-        })
-        .collect();
-    log::info!("built epoch->slot index in {:?}", start.elapsed());
-    assert_eq!(epoch_to_slot.get(&772).unwrap().start, 333504000);
-    assert_eq!(epoch_to_slot.get(&772).unwrap().end, 333935999);
+    let current_epoch = current_epoch().await?;
+    log::info!("Current mainnet epoch: {}", current_epoch);
 
     // for epoch in 670..=700 {
     //     let idx_path = idx_dir.join(format!("epoch-{}.idx", epoch));

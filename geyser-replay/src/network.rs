@@ -6,6 +6,7 @@ use solana_geyser_plugin_manager::geyser_plugin_service::GeyserPluginServiceErro
 use solana_rpc::optimistically_confirmed_bank_tracker::SlotNotification;
 use solana_runtime::bank::KeyedRewardsAndNumPartitions;
 use solana_sdk::{reward_info::RewardInfo, reward_type::RewardType};
+use std::io::SeekFrom;
 use std::path::Path;
 use std::{collections::HashSet, fmt::Display, ops::Range, path::PathBuf};
 use thiserror::Error;
@@ -372,6 +373,7 @@ pub async fn build_index<P>(
     client: &reqwest::Client,
     epoch: u64,
     idx_path: P,
+    start_offset: Option<u64>,
 ) -> Result<(), Box<dyn std::error::Error>>
 where
     P: AsRef<std::path::Path>,
@@ -385,7 +387,11 @@ where
     }
 
     /* ── 2. output file ──────────────────────────────────────────────────── */
-    let mut out = File::create(idx_path).await?;
+    let mut out = File::options()
+        .create(true)
+        .append(true)
+        .open(idx_path)
+        .await?;
 
     /* ── 3. helper: read varint and return its byte-length ───────────────── */
     async fn read_uvarint_len<R: AsyncReadExt + Unpin>(r: &mut R) -> std::io::Result<(u64, u64)> {
@@ -414,6 +420,16 @@ where
     /* ── 4. streaming loop ──────────────────────────────────────────────── */
     let mut buf: Vec<u8> = Vec::with_capacity(64 * 1024); // reusable scratch
     let mut offset = node_reader.reader.stream_position().await?; // current file pos
+    if let Some(start_offset) = start_offset {
+        offset = start_offset;
+        // seek to start_offset if it was specified
+        log::info!(
+            "(Epoch = {}) Seeking to start offset: {}",
+            epoch,
+            start_offset
+        );
+        node_reader.reader.seek(SeekFrom::Start(offset)).await?;
+    }
     let mut blocks = 0u64;
 
     loop {
@@ -506,6 +522,24 @@ pub async fn latest_old_faithful_epoch(
     }
 }
 
+pub async fn get_latest_index_line(
+    idx_path: impl AsRef<Path>,
+) -> Result<(u64, u64, u64), Box<dyn std::error::Error>> {
+    let idx_path = idx_path.as_ref();
+    if !idx_path.exists() {
+        return Err(format!("Index file does not exist: {:?}", idx_path).into());
+    }
+    let mut file = File::open(idx_path).await?;
+    let mut buf = vec![0u8; 24];
+    file.seek(SeekFrom::End(-24)).await?;
+    file.read_exact(&mut buf).await?;
+
+    let slot = u64::from_le_bytes(buf[0..8].try_into().unwrap());
+    let offset = u64::from_le_bytes(buf[8..16].try_into().unwrap());
+    let size = u64::from_le_bytes(buf[16..24].try_into().unwrap());
+    Ok((slot, offset, size))
+}
+
 pub async fn build_missing_indexes(
     idx_dir: impl AsRef<Path>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -542,22 +576,46 @@ pub async fn build_missing_indexes(
             tokio::runtime::Runtime::new().unwrap().block_on(async {
                 let client = Client::new();
                 let idx_path = idx_dir.join(format!("epoch-{}.idx", epoch));
-                if !idx_path.exists() {
-                    log::info!("Building index for epoch {}", epoch);
-                    std::thread::sleep(std::time::Duration::from_secs(10));
-                    build_index(&client, epoch, &idx_path).await.unwrap();
+                let (epoch, start_slot, end_slot) =
+                    fetch_epoch_slot_range(epoch, &client).await.unwrap();
+                if idx_path.exists() {
+                    let Ok((last_slot, last_offset, last_size)) =
+                        get_latest_index_line(&idx_path).await
+                    else {
+                        log::error!("Failed to get last index line for epoch {}", epoch);
+                        log::info!("Building index for epoch {} from scratch", epoch);
+                        build_index(&client, epoch, &idx_path, None).await.unwrap();
+                        log::info!("Finished building index for epoch {}", epoch);
+                        return;
+                    };
+
+                    let offset = last_offset + last_size;
+                    if last_slot < end_slot {
+                        log::info!(
+                            "Building index for epoch {} from offset: {} (slots {}-{})",
+                            epoch,
+                            offset,
+                            last_slot,
+                            end_slot
+                        );
+                        build_index(&client, epoch, &idx_path, Some(offset))
+                            .await
+                            .unwrap();
+                    } else {
+                        log::info!(
+                            "Full index already exists for epoch {} (slots {}-{})",
+                            epoch,
+                            start_slot,
+                            end_slot
+                        );
+                    }
                 } else {
-                    log::info!("Index for epoch {} already exists", epoch);
+                    log::info!("Building index for epoch {} from scratch", epoch);
+                    build_index(&client, epoch, &idx_path, None).await.unwrap();
                 }
+                log::info!("Finished building index for epoch {}", epoch);
             });
         });
-
-    // for epoch in 670..=700 {
-    //     let idx_path = idx_dir.join(format!("epoch-{}.idx", epoch));
-    //     if !idx_path.exists() {
-    //         build_index(&reqwest::Client::new(), epoch, &idx_path).await?;
-    //     }
-    // }
     Ok(())
 }
 

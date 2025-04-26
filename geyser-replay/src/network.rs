@@ -451,14 +451,16 @@ where
             out.write_all(&(varint_len + section_size).to_le_bytes())
                 .await?;
 
-            log::info!(
-                "build_index: Epoch={} Block slot={} @ {} ({} B) - {} indexed",
-                epoch,
-                b.slot,
-                start_off,
-                section_size + varint_len,
-                blocks
-            );
+            if b.slot % 1000 == 0 {
+                log::info!(
+                    "build_index: Epoch={} Block slot={} @ {} ({} B) - {} indexed",
+                    epoch,
+                    b.slot,
+                    start_off,
+                    section_size + varint_len,
+                    blocks
+                );
+            }
         }
     }
 
@@ -507,6 +509,10 @@ pub async fn latest_old_faithful_epoch(
 pub async fn build_missing_indexes(
     idx_dir: impl AsRef<Path>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(24)
+        .build_global()
+        .unwrap();
     let idx_dir = idx_dir.as_ref();
     if !idx_dir.exists() {
         log::info!("Creating index directory: {:?}", idx_dir);
@@ -528,6 +534,23 @@ pub async fn build_missing_indexes(
         of1_last_epoch_first_slot,
         of1_last_epoch_last_slot
     );
+
+    (0..of1_last_epoch)
+        .into_iter()
+        .par_bridge()
+        .for_each(|epoch| {
+            tokio::runtime::Runtime::new().unwrap().block_on(async {
+                let client = Client::new();
+                let idx_path = idx_dir.join(format!("epoch-{}.idx", epoch));
+                if !idx_path.exists() {
+                    log::info!("Building index for epoch {}", epoch);
+                    std::thread::sleep(std::time::Duration::from_secs(10));
+                    build_index(&client, epoch, &idx_path).await.unwrap();
+                } else {
+                    log::info!("Index for epoch {} already exists", epoch);
+                }
+            });
+        });
 
     // for epoch in 670..=700 {
     //     let idx_path = idx_dir.join(format!("epoch-{}.idx", epoch));

@@ -12,6 +12,7 @@ use thiserror::Error;
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
+use crate::slot_cache::fetch_epoch_slot_range;
 use crate::{epochs_async::fetch_epoch_stream, node_reader::AsyncNodeReader};
 
 #[derive(Debug, Error)]
@@ -471,8 +472,7 @@ where
 }
 
 /// Queries the current epoch from mainnet
-pub async fn current_epoch() -> Result<u64, Box<dyn std::error::Error>> {
-    let client = reqwest::Client::new();
+pub async fn current_epoch(client: &Client) -> Result<u64, Box<dyn std::error::Error>> {
     let url = "https://api.mainnet-beta.solana.com";
     let request_body = r#"{"jsonrpc":"2.0","id":1,"method":"getEpochInfo","params":[]}"#;
     let response = client
@@ -487,6 +487,23 @@ pub async fn current_epoch() -> Result<u64, Box<dyn std::error::Error>> {
     Ok(epoch)
 }
 
+pub async fn latest_old_faithful_epoch(
+    client: &Client,
+    epoch: Option<u64>,
+) -> Result<(u64, u64, u64), Box<dyn std::error::Error>> {
+    let mut epoch = if let Some(epoch) = epoch {
+        epoch
+    } else {
+        current_epoch(client).await?
+    };
+    loop {
+        if let Some(res) = fetch_epoch_slot_range(epoch, client).await {
+            return Ok(res);
+        }
+        epoch -= 1;
+    }
+}
+
 pub async fn build_missing_indexes(
     idx_dir: impl AsRef<Path>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -498,8 +515,22 @@ pub async fn build_missing_indexes(
         log::info!("Index directory already exists: {:?}", idx_dir);
     }
 
-    let current_epoch = current_epoch().await?;
-    log::info!("Current mainnet epoch: {}", current_epoch);
+    let client = Client::new();
+
+    let current_epoch = current_epoch(&client).await?;
+    log::info!("Current Mainnet epoch: {}", current_epoch);
+
+    let (
+        old_faithful_max_epoch,
+        old_faithful_max_epoch_first_slot,
+        old_faithful_max_epoch_last_slot,
+    ) = latest_old_faithful_epoch(&client, Some(current_epoch)).await?;
+    log::info!(
+        "Latest Old Faithful epoch: {} (slots {}-{})",
+        old_faithful_max_epoch,
+        old_faithful_max_epoch_first_slot,
+        old_faithful_max_epoch_last_slot
+    );
 
     // for epoch in 670..=700 {
     //     let idx_path = idx_dir.join(format!("epoch-{}.idx", epoch));

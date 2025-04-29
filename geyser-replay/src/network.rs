@@ -630,7 +630,7 @@ async fn test_firehose() {
         .unwrap();
 }
 
-#[tokio::test(worker_threads = 32, flavor = "multi_thread")]
+#[tokio::test(worker_threads = 64, flavor = "multi_thread")]
 async fn test_build_missing_indexes() {
     solana_logger::setup_with_default("info");
     let idx_dir = PathBuf::from("./src/index");

@@ -544,7 +544,7 @@ pub async fn build_missing_indexes(
     idx_dir: impl AsRef<Path>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     rayon::ThreadPoolBuilder::new()
-        .num_threads(24)
+        .num_threads(32)
         .build_global()
         .unwrap();
     let idx_dir = idx_dir.as_ref();

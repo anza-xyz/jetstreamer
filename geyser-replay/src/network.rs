@@ -467,7 +467,7 @@ where
             out.write_all(&(varint_len + section_size).to_le_bytes())
                 .await?;
 
-            if b.slot % 1 == 0 {
+            if b.slot % 100 == 0 {
                 log::info!(
                     "build_index: Epoch={} Block slot={} @ {} ({} B) - {} indexed",
                     epoch,

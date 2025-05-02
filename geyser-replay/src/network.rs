@@ -629,21 +629,3 @@ async fn test_firehose() {
         .await
         .unwrap();
 }
-
-#[tokio::test(worker_threads = 64, flavor = "multi_thread")]
-async fn test_build_missing_indexes() {
-    solana_logger::setup_with_default("info");
-    let idx_dir = PathBuf::from("./src/index");
-    build_missing_indexes(&idx_dir).await.unwrap();
-}
-
-// #[tokio::test]
-// async fn test_build_index() {
-//     solana_logger::setup_with_default("info,geyser_replay::node_reader=debug");
-
-//     let client = reqwest::Client::new();
-//     let _ = std::fs::remove_file("./../bin/index.idx");
-//     build_index(&client, 670, "./../bin/index.idx")
-//         .await
-//         .unwrap();
-// }

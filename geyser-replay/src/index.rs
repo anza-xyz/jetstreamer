@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use geyser_replay::network::build_missing_indexes;
+use geyser_replay::firehose::build_missing_indexes;
 
 #[tokio::main(worker_threads = 64, flavor = "multi_thread")]
 async fn main() {

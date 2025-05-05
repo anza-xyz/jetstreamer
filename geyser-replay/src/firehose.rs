@@ -356,17 +356,3 @@ impl Clone for MessageAddressLoaderFromTxMeta {
         }
     }
 }
-
-#[tokio::test(worker_threads = 32, flavor = "multi_thread")]
-async fn test_firehose() {
-    solana_logger::setup_with_default("debug");
-    let client = reqwest::Client::new();
-    //let slot_range = (302400000 + 1000)..(302400000 + 1000 + 10);
-    let slot_range = 302400000..302400010;
-    // let epoch_range = 700..701;
-    let epoch_range = 700..700;
-    let receiver = firehose(slot_range, epoch_range, None, client)
-        .await
-        .unwrap();
-    receiver.recv().unwrap();
-}

@@ -1,7 +1,6 @@
-use crate::epochs::fetch_epoch_stream;
+use crate::epochs::{epoch_exists, epoch_to_slot_range, fetch_epoch_stream};
 use crate::node::Node;
 use crate::node_reader::AsyncNodeReader;
-use crate::slot_cache::fetch_epoch_slot_range;
 use rayon::prelude::*;
 use reqwest::Client;
 use std::io::SeekFrom;
@@ -161,8 +160,9 @@ pub async fn latest_old_faithful_epoch(
         current_epoch(client).await?
     };
     loop {
-        if let Some(res) = fetch_epoch_slot_range(epoch, client).await {
-            return Ok(res);
+        if epoch_exists(epoch, client).await {
+            let (start_slot, end_slot) = epoch_to_slot_range(epoch);
+            return Ok((epoch, start_slot, end_slot));
         }
         epoch -= 1;
     }
@@ -222,8 +222,7 @@ pub async fn build_missing_indexes(
             tokio::runtime::Runtime::new().unwrap().block_on(async {
                 let client = Client::new();
                 let idx_path = idx_dir.join(format!("epoch-{}.idx", epoch));
-                let (epoch, start_slot, end_slot) =
-                    fetch_epoch_slot_range(epoch, &client).await.unwrap();
+                let (start_slot, end_slot) = epoch_to_slot_range(epoch);
                 if idx_path.exists() {
                     let Ok((last_slot, last_offset, last_size)) =
                         get_latest_index_line(&idx_path).await

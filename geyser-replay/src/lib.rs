@@ -3,4 +3,3 @@ pub mod firehose;
 pub mod index;
 pub mod node;
 pub mod node_reader;
-pub mod slot_cache;

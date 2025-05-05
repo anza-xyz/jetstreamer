@@ -1,7 +1,7 @@
 use {
     crossbeam_channel::unbounded,
     demo_rust_ipld_car::{node, utils},
-    geyser_replay::epochs_sync::fetch_epoch_stream,
+    geyser_replay::{epochs_async::fetch_epoch_stream, network, node::Node},
     reqwest::{blocking, Client},
     solana_rpc::optimistically_confirmed_bank_tracker::SlotNotification,
     solana_runtime::bank::KeyedRewardsAndNumPartitions,
@@ -17,22 +17,17 @@ use {
 
 #[tokio::main(worker_threads = 32)]
 async fn main() -> Result<(), Box<dyn Error>> {
-    let _client = Client::new();
-    let blocking_client = blocking::Client::new();
-    // println!("building epochs index");
-    // let start = std::time::Instant::now();
-    // let _cache = epochs::build_epochs_index(&client).await?;
-    // println!("built epochs index in {:?}", start.elapsed());
+    let client = Client::new();
     let epoch_num = args().nth(1).expect("no epoch number given");
     let epoch_num = epoch_num
         .parse::<u64>()
         .expect("failed to parse epoch number");
-    let stream = fetch_epoch_stream(epoch_num, &blocking_client)?;
+    let stream = fetch_epoch_stream(epoch_num, &client).await;
     let _started_at = std::time::Instant::now();
     let mut item_index = 0;
     {
-        let mut reader = node::NodeReader::new(stream)?;
-        let header = reader.read_raw_header()?;
+        let mut reader = geyser_replay::node_reader::AsyncNodeReader::new(stream);
+        let header = reader.read_raw_header().await?;
         println!("Header bytes: {:?}", header);
 
         let geyser_config_files = &[std::path::PathBuf::from(args().nth(2).unwrap())];
@@ -63,7 +58,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let mut todo_previous_blockhash = solana_sdk::hash::Hash::default();
         let mut todo_latest_entry_blockhash = solana_sdk::hash::Hash::default();
         loop {
-            let nodes = reader.read_until_block()?;
+            let nodes = reader.read_until_block().await?;
             // println!("Nodes: {:?}", nodes.get_cids());
             let block = nodes.get_block()?;
             // println!("Slot: {:?}", block.slot);
@@ -78,7 +73,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 let node = node_with_cid.get_node();
 
                 match node {
-                    node::Node::Transaction(transaction) => {
+                    Node::Transaction(transaction) => {
                         let parsed = transaction.as_parsed()?;
 
                         {
@@ -146,7 +141,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         //     return Ok(());
                         // }
                     }
-                    node::Node::Entry(_entry) => {
+                    Node::Entry(_entry) => {
                         todo_latest_entry_blockhash = solana_sdk::hash::Hash::from(_entry.hash.to_bytes());
                         this_block_executed_transaction_count += _entry.transactions.len() as u64;
                         this_block_entry_count += 1;
@@ -166,7 +161,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             .notify_entry(block.slot, entry_index  ,&entry_summary, starting_transaction_index);
                         entry_index+=1;
                     }
-                    node::Node::Block(_block) => {
+                    Node::Block(_block) => {
                         // println!("___ Block: {:?}", block);
                         let notification = SlotNotification::Root((block.slot, block.meta.parent_slot));
                         confirmed_bank_sender.send(notification).unwrap();
@@ -220,13 +215,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         }
                         todo_previous_blockhash = todo_latest_entry_blockhash;
                     }
-                    node::Node::Subset(_subset) => {
+                    Node::Subset(_subset) => {
                         // println!("___ Subset: {:?}", subset);
                     }
-                    node::Node::Epoch(_epoch) => {
+                    Node::Epoch(_epoch) => {
                         // println!("___ Epoch: {:?}", epoch);
                     }
-                    node::Node::Rewards(rewards) => {
+                    Node::Rewards(rewards) => {
                         // println!("___ Rewards: {:?}", node_with_cid.get_cid());
                         // println!("___ Next items: {:?}", rewards.data.next);
 
@@ -245,7 +240,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             })?;
                         }
                     }
-                    node::Node::DataFrame(_) => {
+                    Node::DataFrame(_) => {
                         // println!("___ DataFrame: {:?}", node_with_cid.get_cid());
                     }
                 }

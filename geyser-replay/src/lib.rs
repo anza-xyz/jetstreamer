@@ -1,6 +1,6 @@
-pub mod epochs_async;
-pub mod epochs_sync;
-pub mod network;
+pub mod epochs;
+pub mod firehose;
+pub mod index;
 pub mod node;
 pub mod node_reader;
 pub mod slot_cache;

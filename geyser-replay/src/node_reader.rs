@@ -155,7 +155,6 @@ pub struct AsyncNodeReader<R: AsyncRead + AsyncSeek + Len> {
 
 impl<R: AsyncRead + Unpin + AsyncSeek + Len> AsyncNodeReader<R> {
     pub fn new(reader: R) -> AsyncNodeReader<R> {
-        
         AsyncNodeReader {
             reader,
             header: vec![],
@@ -274,7 +273,7 @@ pub fn cid_from_cbor_link(val: &serde_cbor::Value) -> Result<cid::Cid, Box<dyn s
 
 #[tokio::test]
 async fn test_async_node_reader() {
-    use crate::epochs_async::fetch_epoch_stream;
+    use crate::epochs::fetch_epoch_stream;
     let client = reqwest::Client::new();
     let stream = fetch_epoch_stream(670, &client).await;
     let mut reader = AsyncNodeReader::new(stream);

@@ -14,7 +14,7 @@ use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 use crate::slot_cache::fetch_epoch_slot_range;
-use crate::{epochs_async::fetch_epoch_stream, node_reader::AsyncNodeReader};
+use crate::{epochs::fetch_epoch_stream, node_reader::AsyncNodeReader};
 
 #[derive(Debug, Error)]
 pub enum GeyserReplayError {

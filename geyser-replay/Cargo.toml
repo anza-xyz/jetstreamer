@@ -5,6 +5,15 @@ edition = "2021"
 authors = ["sam0x17"]
 license = "MIT"
 description = "A utility that allows replaying ranges of Solana blocks, even back to genesis, over a geyser plugin using Old Faithful"
+default-run = "geyser-replay"
+
+[[bin]]
+name = "geyser-replay"
+path = "src/main.rs"
+
+[[bin]]
+name = "build-index"
+path = "src/index.rs"
 
 [dependencies]
 demo-rust-ipld-car.workspace = true

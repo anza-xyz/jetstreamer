@@ -1,7 +1,7 @@
-use geyser_replay::epochs::fetch_epoch_stream;
-use geyser_replay::node::Node;
-use geyser_replay::node_reader::AsyncNodeReader;
-use geyser_replay::slot_cache::fetch_epoch_slot_range;
+use crate::epochs::fetch_epoch_stream;
+use crate::node::Node;
+use crate::node_reader::AsyncNodeReader;
+use crate::slot_cache::fetch_epoch_slot_range;
 use rayon::prelude::*;
 use reqwest::Client;
 use std::io::SeekFrom;
@@ -102,7 +102,7 @@ where
         /* parse exactly once */
         let bytes_vec = buf[..section_size as usize].to_vec(); // <-- make Vec<u8>
         let mut cur = std::io::Cursor::new(bytes_vec); // Cursor<Vec<u8>>
-        let raw = geyser_replay::node_reader::RawNode::from_cursor(&mut cur).await?;
+        let raw = crate::node_reader::RawNode::from_cursor(&mut cur).await?;
 
         if let Node::Block(b) = raw.parse()? {
             blocks += 1;
@@ -263,11 +263,4 @@ pub async fn build_missing_indexes(
             });
         });
     Ok(())
-}
-
-#[tokio::main(worker_threads = 64, flavor = "multi_thread")]
-async fn main() {
-    solana_logger::setup_with_default("info");
-    let idx_dir = std::path::PathBuf::from("./src/index");
-    build_missing_indexes(&idx_dir).await.unwrap();
 }

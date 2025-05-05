@@ -13,7 +13,7 @@ path = "src/main.rs"
 
 [[bin]]
 name = "build-index"
-path = "src/index.rs"
+path = "src/index_bin.rs"
 
 [dependencies]
 demo-rust-ipld-car.workspace = true

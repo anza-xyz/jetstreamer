@@ -8,7 +8,10 @@ use solana_sdk::{reward_info::RewardInfo, reward_type::RewardType};
 use std::{collections::HashSet, fmt::Display, ops::Range, path::PathBuf};
 use thiserror::Error;
 
-use crate::{epochs::fetch_epoch_stream, node_reader::AsyncNodeReader};
+use crate::{
+    epochs::{fetch_epoch_stream, slot_to_epoch},
+    node_reader::AsyncNodeReader,
+};
 
 #[derive(Debug, Error)]
 pub enum GeyserReplayError {
@@ -70,7 +73,6 @@ impl From<GeyserPluginServiceError> for GeyserReplayError {
 
 pub async fn firehose(
     slot_range: Range<u64>,
-    epoch_range: Range<u64>,
     geyser_config_files: Option<&[PathBuf]>,
     client: Client,
 ) -> Result<Receiver<SlotNotification>, GeyserReplayError> {
@@ -105,6 +107,8 @@ pub async fn firehose(
     } else {
         log::debug!("None of the plugins have enabled entry notifications")
     }
+
+    let epoch_range = slot_to_epoch(slot_range.start)..=slot_to_epoch(slot_range.end);
 
     // for each epoch
     for (epoch_num, stream) in epoch_range

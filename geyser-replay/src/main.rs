@@ -18,10 +18,11 @@ use {
 #[tokio::main(worker_threads = 32)]
 async fn main() -> Result<(), Box<dyn Error>> {
     let client = Client::new();
-    let epoch_num = args().nth(1).expect("no epoch number given");
-    let epoch_num = epoch_num
-        .parse::<u64>()
-        .expect("failed to parse epoch number");
+    let slot_range = args().nth(1).expect("no slot range given");
+    let (slot_a, slot_b) = slot_range
+        .split_once(':')
+        .expect("failed to parse slot range, expected format: <start>:<end>");
+
     let stream = fetch_epoch_stream(epoch_num, &client).await;
     let _started_at = std::time::Instant::now();
     let mut item_index = 0;

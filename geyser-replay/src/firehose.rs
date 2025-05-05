@@ -74,7 +74,7 @@ impl From<GeyserPluginServiceError> for GeyserReplayError {
 pub async fn firehose(
     slot_range: Range<u64>,
     geyser_config_files: Option<&[PathBuf]>,
-    client: Client,
+    client: &Client,
 ) -> Result<Receiver<SlotNotification>, GeyserReplayError> {
     log::info!("starting firehose...");
     let (confirmed_bank_sender, confirmed_bank_receiver) = unbounded();
@@ -266,12 +266,12 @@ pub async fn firehose(
 									// convert this_block_rewards to rewards
 									for this_block_reward in this_block_rewards.rewards.iter() {
 										let reward: RewardInfo = RewardInfo{
-											reward_type: match this_block_reward.reward_type {
+											reward_type: match this_block_reward.reward_type  - 1 { // -1 because of protobuf
 												0 => RewardType::Fee,
 												1 => RewardType::Rent,
 												2 => RewardType::Staking,
 												3 => RewardType::Voting,
-												_ => panic!("___ not supported reward type"),
+												typ => panic!("___ not supported reward type {}", typ),
 											},
 											lamports: this_block_reward.lamports,
 											post_balance: this_block_reward.post_balance,

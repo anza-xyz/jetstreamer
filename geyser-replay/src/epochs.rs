@@ -90,3 +90,11 @@ fn test_slot_to_epoch() {
     assert_eq!(slot_to_epoch(332640000), 770);
     assert_eq!(slot_to_epoch(333071999), 770);
 }
+
+#[test]
+fn test_epoch_to_slot_range() {
+    assert_eq!(epoch_to_slot_range(0), (0, 431999));
+    assert_eq!(epoch_to_slot_range(1), (432000, 863999));
+    assert_eq!(epoch_to_slot_range(2), (864000, 1295999));
+    assert_eq!(epoch_to_slot_range(3), (1296000, 1727999));
+}

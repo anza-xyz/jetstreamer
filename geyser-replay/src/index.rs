@@ -1,6 +1,6 @@
 use crate::epochs::{epoch_exists, epoch_to_slot_range, fetch_epoch_stream};
 use crate::node::Node;
-use crate::node_reader::AsyncNodeReader;
+use crate::node_reader::NodeReader;
 use rayon::prelude::*;
 use reqwest::Client;
 use std::io::SeekFrom;
@@ -24,7 +24,7 @@ where
     P: AsRef<std::path::Path>,
 {
     let stream = fetch_epoch_stream(epoch, client).await;
-    let mut node_reader = AsyncNodeReader::new(stream);
+    let mut node_reader = NodeReader::new(stream);
 
     /* ── 1. make sure the CAR header has been consumed ───────────────────── */
     if node_reader.header.is_empty() {

@@ -10,7 +10,7 @@ use thiserror::Error;
 
 use crate::{
     epochs::{fetch_epoch_stream, slot_to_epoch},
-    node_reader::AsyncNodeReader,
+    node_reader::NodeReader,
 };
 
 #[derive(Debug, Error)]
@@ -123,7 +123,7 @@ pub async fn firehose(
         log::info!("Firehose entering epoch {}", epoch_num);
         assert_eq!(epoch_num as u64, slot_to_epoch(slot_range.start));
         let stream = stream.await;
-        let mut reader = AsyncNodeReader::new(stream);
+        let mut reader = NodeReader::new(stream);
 
         let header = reader
             .read_raw_header()

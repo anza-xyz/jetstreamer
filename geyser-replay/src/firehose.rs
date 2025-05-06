@@ -109,13 +109,19 @@ pub async fn firehose(
     }
 
     let epoch_range = slot_to_epoch(slot_range.start)..=slot_to_epoch(slot_range.end);
+    log::info!(
+        "Slot range: {} (epoch {}) ... {} (epoch {})",
+        slot_range.start,
+        slot_to_epoch(slot_range.start),
+        slot_range.end,
+        slot_to_epoch(slot_range.end)
+    );
 
     // for each epoch
-    for (epoch_num, stream) in epoch_range
-        .map(|epoch| fetch_epoch_stream(epoch, &client))
-        .enumerate()
+    for (epoch_num, stream) in epoch_range.map(|epoch| (epoch, fetch_epoch_stream(epoch, &client)))
     {
-        log::info!("Processing epoch {}", epoch_num);
+        log::info!("Firehose entering epoch {}", epoch_num);
+        assert_eq!(epoch_num as u64, slot_to_epoch(slot_range.start));
         let stream = stream.await;
         let mut reader = AsyncNodeReader::new(stream);
 

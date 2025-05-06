@@ -2,16 +2,24 @@ use {geyser_replay::firehose::firehose, reqwest::Client, std::env::args};
 
 #[tokio::main(worker_threads = 32)]
 async fn main() {
+    solana_logger::setup_with_default("info");
     let client = Client::new();
-    let slot_range = args().nth(1).expect("no slot range given");
-    let (slot_a, slot_b) = slot_range
-        .split_once(':')
-        .expect("failed to parse slot range, expected format: <start>:<end>");
-    let slot_a: u64 = slot_a.parse().expect("failed to parse first slot");
-    let slot_b: u64 = slot_b.parse().expect("failed to parse second slot");
-    let slot_range = slot_a..(slot_b + 1);
+    let first_arg = args().nth(1).expect("no first argument given");
+    let slot_range = if first_arg.contains(':') {
+        let (slot_a, slot_b) = first_arg
+            .split_once(':')
+            .expect("failed to parse slot range, expected format: <start>:<end> or a single epoch");
+        let slot_a: u64 = slot_a.parse().expect("failed to parse first slot");
+        let slot_b: u64 = slot_b.parse().expect("failed to parse second slot");
+        slot_a..(slot_b + 1)
+    } else {
+        let epoch: u64 = first_arg.parse().expect("failed to parse epoch");
+        log::info!("Epoch: {}", epoch);
+        let (start_slot, end_slot) = geyser_replay::epochs::epoch_to_slot_range(epoch);
+        start_slot..(end_slot + 1)
+    };
     let geyser_config_files = &[std::path::PathBuf::from(args().nth(2).unwrap())];
-    println!("Geyser config files: {:?}", geyser_config_files);
+    log::info!("Geyser config files: {:?}", geyser_config_files);
     firehose(slot_range, Some(geyser_config_files), &client)
         .await
         .unwrap();

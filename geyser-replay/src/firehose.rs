@@ -96,6 +96,7 @@ pub async fn firehose(
     client: &Client,
 ) -> Result<Receiver<SlotNotification>, GeyserReplayError> {
     log::info!("starting firehose...");
+    let start_time = std::time::Instant::now();
     let (confirmed_bank_sender, confirmed_bank_receiver) = unbounded();
     let mut entry_notifier_maybe = None;
     let mut block_meta_notifier_maybe = None;
@@ -138,13 +139,13 @@ pub async fn firehose(
 
     let mut slot_offset_index = SlotOffsetIndex::new(slot_offset_index_path)?;
 
-    log::info!("starting firehose 🚒...");
+    log::info!("🚒 starting firehose...");
 
     // for each epoch
+    let mut current_slot: Option<u64> = None;
     for (epoch_num, stream) in epoch_range.map(|epoch| (epoch, fetch_epoch_stream(epoch, &client)))
     {
         log::info!("entering epoch {}", epoch_num);
-        assert_eq!(epoch_num as u64, slot_to_epoch(slot_range.start));
         let stream = stream.await;
         let mut reader = NodeReader::new(stream);
 
@@ -165,16 +166,35 @@ pub async fn firehose(
 
         // for each item in each block
         let mut item_index = 0;
-        let mut current_slot: Option<u64> = None;
         loop {
-            let nodes = reader
+            let mut nodes = reader
                 .read_until_block()
                 .await
                 .map_err(GeyserReplayError::ReadUntilBlockError)?;
+            // ignore epoch and subset nodes at end of car file
+            loop {
+                if nodes.0.is_empty() {
+                    break;
+                }
+                if let Some(node) = nodes.0.last() {
+                    if node.get_node().is_epoch() {
+                        log::debug!("skipping epoch node for epoch {}", epoch_num);
+                        nodes.0.pop();
+                    } else if node.get_node().is_subset() {
+                        nodes.0.pop();
+                    } else if node.get_node().is_block() {
+                        break;
+                    }
+                }
+            }
+            if nodes.0.is_empty() {
+                log::info!("reached end of epoch {}", epoch_num);
+                break;
+            }
             let block = nodes
                 .get_block()
                 .map_err(GeyserReplayError::GetBlockError)?;
-            log::info!(
+            log::debug!(
                 "read {} items from epoch {}, now at slot {}",
                 item_index,
                 epoch_num,
@@ -184,10 +204,7 @@ pub async fn firehose(
                 assert_eq!(block.slot, slot_range.start);
             }
             current_slot = Some(block.slot);
-            if block.slot > slot_range.end {
-                log::info!("slot range exceeded {}", block.slot);
-                break;
-            }
+
             if !slot_range.contains(&block.slot) {
                 unreachable!("entered out-of-bounds slot {}", block.slot);
             }
@@ -348,6 +365,19 @@ pub async fn firehose(
                     Ok(())
                 })
                 .map_err(|e| GeyserReplayError::NodeDecodingError(item_index, e))?;
+            if block.slot == slot_range.end - 1 {
+                let finish_time = std::time::Instant::now();
+                let elapsed = finish_time.duration_since(start_time);
+                log::info!("processed slot {}", block.slot);
+                log::info!(
+                    "processed {} slots across {} epochs in {} seconds.",
+                    slot_range.end - slot_range.start,
+                    slot_to_epoch(slot_range.end) + 1 - slot_to_epoch(slot_range.start),
+                    elapsed.as_secs_f32()
+                );
+                log::info!("🚒 firehose finished.");
+                break;
+            }
         }
     }
     Ok(confirmed_bank_receiver)

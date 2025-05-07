@@ -255,7 +255,17 @@ impl<R: AsyncRead + Unpin + AsyncSeek + Len> NodeReader<R> {
     pub async fn read_until_block(&mut self) -> Result<NodesWithCids, Box<dyn Error>> {
         let mut nodes = NodesWithCids::new();
         loop {
-            let node = self.next_parsed().await?;
+            let node = match self.next_parsed().await {
+                Ok(node) => node,
+                Err(e)
+                    if e.downcast_ref::<io::Error>().map_or(false, |io_err| {
+                        io_err.kind() == io::ErrorKind::UnexpectedEof
+                    }) =>
+                {
+                    break
+                }
+                Err(e) => return Err(e),
+            };
             if node.get_node().is_block() {
                 nodes.push(node);
                 break;

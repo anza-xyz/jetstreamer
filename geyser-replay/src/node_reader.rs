@@ -1,3 +1,6 @@
+use crate::epochs::slot_to_epoch;
+use crate::firehose::GeyserReplayError;
+use crate::index::SlotOffsetIndex;
 use crate::node::{parse_any_from_cbordata, Node, NodeWithCid, NodesWithCids};
 use cid::Cid;
 use demo_rust_ipld_car::utils;
@@ -182,25 +185,30 @@ impl<R: AsyncRead + Unpin + AsyncSeek + Len> NodeReader<R> {
         Ok(clone.as_slice().to_owned())
     }
 
-    pub async fn skip_next(&mut self) -> Result<(), Box<dyn Error>> {
+    pub async fn seek_to_slot(
+        &mut self,
+        slot: u64,
+        index: &mut SlotOffsetIndex,
+    ) -> Result<(), GeyserReplayError> {
         if self.header.is_empty() {
-            self.read_raw_header().await?;
+            self.read_raw_header()
+                .await
+                .map_err(|e| GeyserReplayError::SeekToSlotError(e))?;
         };
 
-        // Read and decode the uvarint prefix (length of CID + data)
-        let section_size = read_uvarint(&mut self.reader).await?;
+        let epoch = slot_to_epoch(slot);
 
-        if section_size > utils::MAX_ALLOWED_SECTION_SIZE as u64 {
-            return Err(Box::new(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "Section size too long".to_owned(),
-            )));
-        }
-
-        // skip item
+        let offset = index.get_offset(slot).await?;
+        log::info!(
+            "Seeking to slot {} in epoch {} @ offset {}",
+            slot,
+            epoch,
+            offset
+        );
         self.reader
-            .seek(SeekFrom::Current(section_size as i64))
-            .await?;
+            .seek(SeekFrom::Start(offset))
+            .await
+            .map_err(|e| GeyserReplayError::SeekToSlotError(Box::new(e)))?;
 
         Ok(())
     }

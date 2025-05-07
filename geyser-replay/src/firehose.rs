@@ -5,11 +5,17 @@ use solana_geyser_plugin_manager::geyser_plugin_service::GeyserPluginServiceErro
 use solana_rpc::optimistically_confirmed_bank_tracker::SlotNotification;
 use solana_runtime::bank::KeyedRewardsAndNumPartitions;
 use solana_sdk::{reward_info::RewardInfo, reward_type::RewardType};
-use std::{collections::HashSet, fmt::Display, ops::Range, path::PathBuf};
+use std::{
+    collections::HashSet,
+    fmt::Display,
+    ops::Range,
+    path::{Path, PathBuf},
+};
 use thiserror::Error;
 
 use crate::{
-    epochs::{fetch_epoch_stream, slot_to_epoch},
+    epochs::{epoch_to_slot_range, fetch_epoch_stream, slot_to_epoch},
+    index::{SlotOffsetIndex, SlotOffsetIndexError},
     node_reader::NodeReader,
 };
 
@@ -22,7 +28,8 @@ pub enum GeyserReplayError {
     ReadUntilBlockError(Box<dyn std::error::Error>),
     GetBlockError(Box<dyn std::error::Error>),
     NodeDecodingError(usize, Box<dyn std::error::Error>),
-    SkipBlockError(Box<dyn std::error::Error>),
+    SlotOffsetIndexError(SlotOffsetIndexError),
+    SeekToSlotError(Box<dyn std::error::Error>),
 }
 
 impl Display for GeyserReplayError {
@@ -52,8 +59,13 @@ impl Display for GeyserReplayError {
                     item_index, error
                 )
             }
-            GeyserReplayError::SkipBlockError(error) => {
-                write!(f, "Error skipping block: {}", error)
+            GeyserReplayError::SlotOffsetIndexError(slot_offset_index_error) => write!(
+                f,
+                "Error getting info from slot offset index: {}",
+                slot_offset_index_error
+            ),
+            GeyserReplayError::SeekToSlotError(error) => {
+                write!(f, "Error seeking to slot: {}", error)
             }
         }
     }
@@ -71,9 +83,16 @@ impl From<GeyserPluginServiceError> for GeyserReplayError {
     }
 }
 
+impl From<SlotOffsetIndexError> for GeyserReplayError {
+    fn from(e: SlotOffsetIndexError) -> Self {
+        GeyserReplayError::SlotOffsetIndexError(e)
+    }
+}
+
 pub async fn firehose(
     slot_range: Range<u64>,
     geyser_config_files: Option<&[PathBuf]>,
+    slot_offset_index_path: impl AsRef<Path>,
     client: &Client,
 ) -> Result<Receiver<SlotNotification>, GeyserReplayError> {
     log::info!("starting firehose...");
@@ -82,7 +101,7 @@ pub async fn firehose(
     let mut block_meta_notifier_maybe = None;
     let mut transaction_notifier_maybe = None;
     if let Some(geyser_config_files) = geyser_config_files {
-        log::debug!("Geyser config files: {:?}", geyser_config_files);
+        log::debug!("geyser config files: {:?}", geyser_config_files);
 
         let service =
             solana_geyser_plugin_manager::geyser_plugin_service::GeyserPluginService::new(
@@ -99,23 +118,27 @@ pub async fn firehose(
         entry_notifier_maybe = service.get_entry_notifier();
         block_meta_notifier_maybe = service.get_block_metadata_notifier();
 
-        log::debug!("Geyser plugin service initialized.");
+        log::debug!("geyser plugin service initialized.");
     }
 
     if entry_notifier_maybe.is_some() {
-        log::debug!("Entry notifications enabled")
+        log::debug!("entry notifications enabled")
     } else {
-        log::debug!("None of the plugins have enabled entry notifications")
+        log::debug!("none of the plugins have enabled entry notifications")
     }
 
     let epoch_range = slot_to_epoch(slot_range.start)..=slot_to_epoch(slot_range.end);
     log::info!(
-        "Slot range: {} (epoch {}) ... {} (epoch {})",
+        "slot range: {} (epoch {}) ... {} (epoch {})",
         slot_range.start,
         slot_to_epoch(slot_range.start),
         slot_range.end,
         slot_to_epoch(slot_range.end)
     );
+
+    let mut slot_offset_index = SlotOffsetIndex::new(slot_offset_index_path)?;
+
+    log::info!("starting firehose 🚒...");
 
     // for each epoch
     for (epoch_num, stream) in epoch_range.map(|epoch| (epoch, fetch_epoch_stream(epoch, &client)))
@@ -134,26 +157,16 @@ pub async fn firehose(
         let mut todo_previous_blockhash = solana_sdk::hash::Hash::default();
         let mut todo_latest_entry_blockhash = solana_sdk::hash::Hash::default();
 
+        if slot_range.start > epoch_to_slot_range(epoch_num).0 {
+            reader
+                .seek_to_slot(slot_range.start, &mut slot_offset_index)
+                .await?;
+        }
+
         // for each item in each block
         let mut item_index = 0;
         let mut current_slot: Option<u64> = None;
         loop {
-            if let Some(current) = &mut current_slot {
-                if *current + 1 < slot_range.start {
-                    let target = slot_range.start - 1;
-                    let diff = slot_range.start - *current;
-                    log::debug!("skipping slots {}-{}", current, target);
-                    for _ in 0..diff {
-                        log::debug!("skipping slot {}", current);
-                        reader
-                            .skip_next()
-                            .await
-                            .map_err(GeyserReplayError::SkipBlockError)?;
-                        *current += 1;
-                    }
-                    continue;
-                }
-            }
             let nodes = reader
                 .read_until_block()
                 .await
@@ -161,20 +174,22 @@ pub async fn firehose(
             let block = nodes
                 .get_block()
                 .map_err(GeyserReplayError::GetBlockError)?;
-            log::debug!(
-                "read block {} of epoch {} with slot {}",
+            log::info!(
+                "read {} items from epoch {}, now at slot {}",
                 item_index,
                 epoch_num,
                 block.slot
             );
+            if current_slot.is_none() {
+                assert_eq!(block.slot, slot_range.start);
+            }
             current_slot = Some(block.slot);
             if block.slot > slot_range.end {
-                log::debug!("slot range exceeded {}", block.slot);
+                log::info!("slot range exceeded {}", block.slot);
                 break;
             }
             if !slot_range.contains(&block.slot) {
-                log::debug!("skipping slot {}", block.slot);
-                continue;
+                unreachable!("entered out-of-bounds slot {}", block.slot);
             }
             let mut entry_index: usize = 0;
             let mut this_block_executed_transaction_count: u64 = 0;

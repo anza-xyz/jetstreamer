@@ -5,6 +5,7 @@ use crate::node_reader::NodeReader;
 use rayon::prelude::*;
 use reqwest::Client;
 use std::collections::HashMap;
+use std::fmt::Display;
 use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
 use tokio::fs::File;
@@ -16,10 +17,49 @@ pub struct SlotOffsetIndex {
     data: HashMap<u64, u64>,
 }
 
+#[derive(Debug)]
+pub enum SlotOffsetIndexError {
+    IndexDirNotFound(PathBuf),
+    EpochIndexFileNotFound(PathBuf),
+    SlotNotFound(u64, PathBuf),
+    NetworkError(Box<dyn std::error::Error>),
+    IoError(std::io::Error, PathBuf),
+}
+
+impl Display for SlotOffsetIndexError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SlotOffsetIndexError::EpochIndexFileNotFound(path) => {
+                write!(f, "epoch index file not found: {}", path.display())
+            }
+            SlotOffsetIndexError::SlotNotFound(slot, path) => {
+                write!(
+                    f,
+                    "slot {} not found in index file: {}",
+                    slot,
+                    path.display()
+                )
+            }
+            SlotOffsetIndexError::NetworkError(err) => write!(f, "{}", err),
+            SlotOffsetIndexError::IndexDirNotFound(path) => {
+                write!(f, "index directory does not exist: {}", path.display())
+            }
+            SlotOffsetIndexError::IoError(error, path) => write!(
+                f,
+                "an IO error occurred trying to read from {}: {}",
+                path.display(),
+                error
+            ),
+        }
+    }
+}
+
 impl SlotOffsetIndex {
-    pub fn new(index_dir: impl AsRef<Path>) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn new(index_dir: impl AsRef<Path>) -> Result<Self, SlotOffsetIndexError> {
         if !index_dir.as_ref().exists() {
-            return Err(format!("index directory does not exist: {:?}", index_dir.as_ref()).into());
+            return Err(SlotOffsetIndexError::IndexDirNotFound(
+                index_dir.as_ref().to_path_buf(),
+            ));
         }
         Ok(Self {
             index_dir: index_dir.as_ref().to_path_buf(),
@@ -30,14 +70,18 @@ impl SlotOffsetIndex {
     pub async fn load_index_file(
         &mut self,
         idx_path: impl AsRef<Path>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<(), SlotOffsetIndexError> {
         let idx_path = idx_path.as_ref();
         if !idx_path.exists() {
-            return Err(format!("index file does not exist: {}", idx_path.display()).into());
+            return Err(SlotOffsetIndexError::EpochIndexFileNotFound(
+                idx_path.to_path_buf(),
+            ));
         }
         let file_name = idx_path.file_name().unwrap().to_str().unwrap();
         log::info!("Loading slot offset index file: {}...", file_name);
-        let file = File::open(&idx_path).await?;
+        let file = File::open(&idx_path)
+            .await
+            .map_err(|e| SlotOffsetIndexError::IoError(e, idx_path.to_path_buf()))?;
         let mut file = tokio::io::BufReader::new(file);
         let mut buf = vec![0u8; 24];
         let mut i = 0;
@@ -51,25 +95,20 @@ impl SlotOffsetIndex {
         Ok(())
     }
 
-    pub async fn get_offset(&mut self, slot: u64) -> Result<u64, Box<dyn std::error::Error>> {
+    pub async fn get_offset(&mut self, slot: u64) -> Result<u64, SlotOffsetIndexError> {
         if let Some(offset) = self.data.get(&slot) {
             return Ok(*offset);
         }
         let epoch = slot_to_epoch(slot);
         let idx_path = self.index_dir.join(format!("epoch-{}.idx", epoch));
         if !idx_path.exists() {
-            return Err(format!("slot index file does not exist: {:?}", idx_path).into());
+            return Err(SlotOffsetIndexError::EpochIndexFileNotFound(idx_path));
         }
         self.load_index_file(&idx_path).await?;
         if let Some(offset) = self.data.get(&slot) {
             return Ok(*offset);
         }
-        Err(format!(
-            "Slot {} not found in index {}, possible that leader missed this slot",
-            slot,
-            idx_path.display()
-        )
-        .into())
+        Err(SlotOffsetIndexError::SlotNotFound(slot, idx_path))
     }
 }
 
@@ -295,15 +334,21 @@ pub async fn build_missing_indexes(
     Ok(())
 }
 
+pub fn get_index_dir() -> PathBuf {
+    std::env::var("SOLIRA_OFFSET_CACHE_DIR")
+        .unwrap_or_else(|_| {
+            if PathBuf::from("./geyser_replay").exists() {
+                "./geyser-replay/src/index".to_string()
+            } else {
+                "./src/index".to_string()
+            }
+        })
+        .into()
+}
+
 #[tokio::test]
 async fn test_slot_offset_index() {
-    let cache_dir = std::env::var("SOLIRA_OFFSET_CACHE_DIR").unwrap_or_else(|_| {
-        if PathBuf::from("./geyser_replay").exists() {
-            "./geyser-replay/src/index".to_string()
-        } else {
-            "./src/index".to_string()
-        }
-    });
+    let cache_dir = get_index_dir();
     let mut index = SlotOffsetIndex::new(cache_dir).unwrap();
     assert_eq!(index.get_offset(123456).await.unwrap(), 1218137096);
     assert_eq!(index.get_offset(123456789).await.unwrap(), 384461630701);

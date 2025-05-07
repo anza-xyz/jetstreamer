@@ -1,9 +1,14 @@
-use {geyser_replay::firehose::firehose, reqwest::Client, std::env::args};
+use {
+    geyser_replay::{firehose::firehose, index::get_index_dir},
+    reqwest::Client,
+    std::env::args,
+};
 
 #[tokio::main(worker_threads = 32)]
 async fn main() {
     solana_logger::setup_with_default("info");
     let client = Client::new();
+    let index_dir = get_index_dir();
     let first_arg = args().nth(1).expect("no first argument given");
     let slot_range = if first_arg.contains(':') {
         let (slot_a, slot_b) = first_arg
@@ -14,13 +19,14 @@ async fn main() {
         slot_a..(slot_b + 1)
     } else {
         let epoch: u64 = first_arg.parse().expect("failed to parse epoch");
-        log::info!("Epoch: {}", epoch);
+        log::info!("epoch: {}", epoch);
         let (start_slot, end_slot) = geyser_replay::epochs::epoch_to_slot_range(epoch);
-        start_slot..(end_slot + 1)
+        start_slot..end_slot
     };
     let geyser_config_files = &[std::path::PathBuf::from(args().nth(2).unwrap())];
-    log::info!("Geyser config files: {:?}", geyser_config_files);
-    firehose(slot_range, Some(geyser_config_files), &client)
+    log::info!("slot index dir: {:?}", index_dir);
+    log::info!("geyser config files: {:?}", geyser_config_files);
+    firehose(slot_range, Some(geyser_config_files), index_dir, &client)
         .await
         .unwrap();
 }

@@ -1,12 +1,76 @@
-use crate::epochs::{epoch_exists, epoch_to_slot_range, fetch_epoch_stream};
+use crate::epochs::{epoch_exists, epoch_to_slot_range, fetch_epoch_stream, slot_to_epoch};
 use crate::node::Node;
 use crate::node_reader::NodeReader;
 use rayon::prelude::*;
 use reqwest::Client;
+use std::collections::HashMap;
 use std::io::SeekFrom;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+
+#[derive(Clone, PartialEq, Eq, Default)]
+pub struct SlotOffsetIndex {
+    index_dir: PathBuf,
+    data: HashMap<u64, u64>,
+}
+
+impl SlotOffsetIndex {
+    pub fn new(index_dir: impl AsRef<Path>) -> Result<Self, Box<dyn std::error::Error>> {
+        if !index_dir.as_ref().exists() {
+            return Err(format!("index directory does not exist: {:?}", index_dir.as_ref()).into());
+        }
+        Ok(Self {
+            index_dir: index_dir.as_ref().to_path_buf(),
+            data: HashMap::new(),
+        })
+    }
+
+    pub async fn load_index_file(
+        &mut self,
+        idx_path: impl AsRef<Path>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let idx_path = idx_path.as_ref();
+        if !idx_path.exists() {
+            return Err(format!("index file does not exist: {}", idx_path.display()).into());
+        }
+        let file_name = idx_path.file_name().unwrap().to_str().unwrap();
+        log::info!("Loading slot offset index file: {}...", file_name);
+        let file = File::open(&idx_path).await?;
+        let mut file = tokio::io::BufReader::new(file);
+        let mut buf = vec![0u8; 24];
+        let mut i = 0;
+        while file.read_exact(&mut buf).await.is_ok() {
+            let slot = u64::from_le_bytes(buf[0..8].try_into().unwrap());
+            let offset = u64::from_le_bytes(buf[8..16].try_into().unwrap());
+            self.data.insert(slot, offset);
+            i += 1;
+        }
+        log::info!("Loaded {} slot offset index entries from {}.", i, file_name);
+        Ok(())
+    }
+
+    pub async fn get_offset(&mut self, slot: u64) -> Result<u64, Box<dyn std::error::Error>> {
+        if let Some(offset) = self.data.get(&slot) {
+            return Ok(*offset);
+        }
+        let epoch = slot_to_epoch(slot);
+        let idx_path = self.index_dir.join(format!("epoch-{}.idx", epoch));
+        if !idx_path.exists() {
+            return Err(format!("slot index file does not exist: {:?}", idx_path).into());
+        }
+        self.load_index_file(&idx_path).await?;
+        if let Some(offset) = self.data.get(&slot) {
+            return Ok(*offset);
+        }
+        Err(format!(
+            "Slot {} not found in index {}, possible that leader missed this slot",
+            slot,
+            idx_path.display()
+        )
+        .into())
+    }
+}
 
 /// Build a block-only index: `[u64 slot] [u64 offset] [u64 size]`.
 ///
@@ -262,4 +326,35 @@ pub async fn build_missing_indexes(
             });
         });
     Ok(())
+}
+
+#[tokio::test]
+async fn test_slot_offset_index() {
+    let cache_dir = std::env::var("SOLIRA_OFFSET_CACHE_DIR").unwrap_or_else(|_| {
+        if PathBuf::from("./geyser_replay").exists() {
+            "./geyser-replay/src/index".to_string()
+        } else {
+            "./src/index".to_string()
+        }
+    });
+    let mut index = SlotOffsetIndex::new(cache_dir).unwrap();
+    assert_eq!(index.get_offset(123456).await.unwrap(), 1218137096);
+    assert_eq!(index.get_offset(123456789).await.unwrap(), 384461630701);
+    let start = index.get_offset(334368000).await.unwrap();
+    assert_eq!(start, 69224); // will cross epoch boundary at i = 1
+    for i in 1..1000 {
+        let slot = 334367999 + i;
+        match slot {
+            334368004 | 334368005 | 334368008 | 334368009 | 334368010 | 334368011 | 334368080
+            | 334368081 | 334368082 | 334368083 | 334368108 | 334368109 | 334368112 | 334368113
+            | 334368114 | 334368115 | 334368128 | 334368129 | 334368130 | 334368131 | 334368180
+            | 334368181 | 334368182 | 334368183 | 334368236 | 334368237 | 334368238 | 334368239
+            | 334368248 | 334368249 | 334368250 | 334368251 | 334368276 | 334368277 | 334368278
+            | 334368279 | 334368500 | 334368501 | 334368502 | 334368503 | 334368644 | 334368645
+            | 334368646 | 334368647 => {
+                index.get_offset(slot).await.unwrap_err();
+            }
+            _ => assert!(index.get_offset(334367999 + i).await.unwrap() >= start),
+        }
+    }
 }

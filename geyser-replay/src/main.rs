@@ -30,32 +30,3 @@ async fn main() {
         .await
         .unwrap();
 }
-
-pub struct MessageAddressLoaderFromTxMeta {
-    pub tx_meta: solana_transaction_status::TransactionStatusMeta,
-}
-
-impl MessageAddressLoaderFromTxMeta {
-    pub fn new(tx_meta: solana_transaction_status::TransactionStatusMeta) -> Self {
-        MessageAddressLoaderFromTxMeta { tx_meta }
-    }
-}
-
-impl solana_sdk::message::AddressLoader for MessageAddressLoaderFromTxMeta {
-    fn load_addresses(
-        self,
-        _lookups: &[solana_sdk::message::v0::MessageAddressTableLookup],
-    ) -> Result<solana_sdk::message::v0::LoadedAddresses, solana_sdk::message::AddressLoaderError>
-    {
-        Ok(self.tx_meta.loaded_addresses.clone())
-    }
-}
-
-// implement clone for MessageAddressLoaderFromTxMeta
-impl Clone for MessageAddressLoaderFromTxMeta {
-    fn clone(&self) -> Self {
-        MessageAddressLoaderFromTxMeta {
-            tx_meta: self.tx_meta.clone(),
-        }
-    }
-}

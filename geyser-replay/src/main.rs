@@ -4,7 +4,7 @@ use {
     std::env::args,
 };
 
-#[tokio::main(worker_threads = 32)]
+#[tokio::main(flavor = "multi_thread")]
 async fn main() {
     solana_logger::setup_with_default("info");
     let client = Client::new();

@@ -61,6 +61,7 @@ tokio-stream = { version = "0", features = ["full"] }
 rangemap = "1"
 rseek = ">= 0.2"
 rayon = "1"
+clickhouse = ">= 0.13"
 
 [dependencies]
 tokio.workspace = true
@@ -71,3 +72,4 @@ solana-program.workspace = true
 once_cell.workspace = true
 serde_json.workspace = true
 thousands.workspace = true
+clickhouse.workspace = true

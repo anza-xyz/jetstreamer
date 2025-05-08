@@ -1,4 +1,5 @@
 pub mod clickhouse;
+pub mod codec;
 pub mod geyser;
 pub mod ipc;
 pub mod plugin;

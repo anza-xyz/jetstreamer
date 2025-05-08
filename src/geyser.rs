@@ -51,6 +51,14 @@ impl From<SoliraError> for GeyserPluginError {
     }
 }
 
+fn ipc_send(msg: SoliraMessage) {
+    IPC_TX.with(|cell| {
+        if let Some(tx) = cell.get() {
+            let _ = tx.send(msg); // drop errors if channel is full / no receivers
+        }
+    });
+}
+
 impl GeyserPlugin for Solira {
     fn name(&self) -> &'static str {
         "GeyserPluginSolira"

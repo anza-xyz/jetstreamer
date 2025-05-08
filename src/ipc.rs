@@ -1,17 +1,11 @@
+use agave_geyser_plugin_interface::geyser_plugin_interface::ReplicaTransactionInfoVersions;
 use interprocess::local_socket::{tokio::prelude::*, GenericNamespaced, ListenerOptions, ToNsName};
 use serde::Serialize;
 use tokio::{io::AsyncWriteExt, sync::broadcast, task::JoinHandle};
 
 #[derive(Serialize, Clone)]
 pub enum SoliraMessage {
-    Block {
-        slot: u64,
-    },
-    Tx {
-        slot: u64,
-        sig: String,
-        cu: Option<u64>,
-    },
+    Transaction { slot: u64 },
 }
 
 pub type Tx = broadcast::Sender<SoliraMessage>;

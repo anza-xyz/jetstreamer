@@ -85,14 +85,12 @@ impl GeyserPlugin for Solira {
     }
 
     fn notify_block_metadata(&self, blockinfo: ReplicaBlockInfoVersions) -> Result<()> {
-        // println!("got block");
         let slot = match blockinfo {
             ReplicaBlockInfoVersions::V0_0_1(block_info) => block_info.slot,
             ReplicaBlockInfoVersions::V0_0_2(block_info) => block_info.slot,
             ReplicaBlockInfoVersions::V0_0_3(block_info) => block_info.slot,
             ReplicaBlockInfoVersions::V0_0_4(block_info) => block_info.slot,
         };
-        // println!("slot number: {}", slot);
         SLOT_NUM.set(slot);
         let processed_slots = PROCESSED_SLOTS.with_borrow_mut(|slots| {
             *slots += 1;
@@ -116,8 +114,7 @@ impl GeyserPlugin for Solira {
                 "at slot {}, processed {} transactions consuming {} CU across {} slots | Overall TPS: {:.2}",
                 slot,
                 processed_txs.separate_with_commas(),
-                /*num_votes.separate_with_commas(),
-                (processed_txs - num_votes).separate_with_commas(),*/                compute_consumed.separate_with_commas(),
+                compute_consumed.separate_with_commas(),
                 processed_slots.separate_with_commas(),
                 overall_tps
             );
@@ -131,7 +128,6 @@ impl GeyserPlugin for Solira {
         transaction: ReplicaTransactionInfoVersions,
         _slot: u64,
     ) -> Result<()> {
-        // log::info!("got transaction");
         match transaction {
             ReplicaTransactionInfoVersions::V0_0_1(tx) => {
                 if tx.is_vote {

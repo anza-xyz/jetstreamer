@@ -1,5 +1,6 @@
 pub mod clickhouse;
 pub mod geyser;
+pub mod plugin;
 
 pub use geyser::Solira;
 

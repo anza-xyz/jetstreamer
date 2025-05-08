@@ -3,7 +3,7 @@ use serde::Serialize;
 use tokio::{io::AsyncWriteExt, sync::broadcast, task::JoinHandle};
 
 #[derive(Serialize, Clone)]
-pub enum IpcMsg {
+pub enum SoliraMessage {
     Block {
         slot: u64,
     },
@@ -14,8 +14,8 @@ pub enum IpcMsg {
     },
 }
 
-pub type Tx = broadcast::Sender<IpcMsg>;
-pub type Rx = broadcast::Receiver<IpcMsg>;
+pub type Tx = broadcast::Sender<SoliraMessage>;
+pub type Rx = broadcast::Receiver<SoliraMessage>;
 pub type Error = Box<dyn std::error::Error + Send + Sync + 'static>;
 
 pub async fn spawn_socket_server(tx: Tx) -> Result<JoinHandle<()>, Error> {

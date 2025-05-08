@@ -2,11 +2,14 @@ use agave_geyser_plugin_interface::geyser_plugin_interface::{
     GeyserPlugin, GeyserPluginError, ReplicaBlockInfoVersions, ReplicaTransactionInfoVersions,
     Result,
 };
+use once_cell::unsync::OnceCell;
 use std::{cell::RefCell, error::Error, time::Instant};
 use thousands::Separable;
 use tokio::runtime::Runtime;
+use tokio::sync::broadcast;
 
 use crate::clickhouse;
+use crate::ipc::SoliraMessage;
 
 thread_local! {
     static TOKIO_RUNTIME: RefCell<Runtime> = RefCell::new(Runtime::new().unwrap());
@@ -16,6 +19,8 @@ thread_local! {
     static NUM_VOTES: RefCell<u64> = const { RefCell::new(0) };
     static COMPUTE_CONSUMED: RefCell<u128> = const { RefCell::new(0) };
     static START_TIME: std::cell::RefCell<Option<Instant>> = const { RefCell::new(None) };
+    static IPC_TX:     OnceCell<broadcast::Sender<SoliraMessage>> = OnceCell::new();
+    static IPC_TASK:   OnceCell<tokio::task::JoinHandle<()>>    = OnceCell::new();
 }
 
 #[derive(Clone, Debug, Default)]
@@ -66,10 +71,21 @@ impl GeyserPlugin for Solira {
                     if ready_rx.recv().await.is_some() {
                         log::info!("ClickHouse initialization complete.");
                         rt.spawn(clickhouse_future);
-                        START_TIME.with(|start_time| {
-                            let mut start_time = start_time.borrow_mut();
-                            *start_time = Some(Instant::now());
+
+                        log::info!("setting up IPC bridge...");
+                        let (tx, _rx) = broadcast::channel::<SoliraMessage>(16_384);
+                        let handle = crate::ipc::spawn_socket_server(tx.clone())
+                            .await
+                            .map_err(|e| SoliraError::ClickHouseError(e.to_string()))?;
+                        IPC_TX.with(|cell| {
+                            let _ = cell.set(tx);
                         });
+                        IPC_TASK.with(|cell| {
+                            let _ = cell.set(handle);
+                        });
+                        log::info!("IPC bridge initialized.");
+
+                        START_TIME.with(|st| *st.borrow_mut() = Some(Instant::now()));
                         log::info!("solira loaded");
                         Ok(())
                     } else {

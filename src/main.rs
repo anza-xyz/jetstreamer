@@ -5,10 +5,10 @@ use geyser_replay::index::get_index_dir;
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
     solana_logger::setup_with_default("info");
-    let client = reqwest::Client::new();
+    let _client = reqwest::Client::new();
     let index_dir = get_index_dir();
     let first_arg = args().nth(1).expect("no first argument given");
-    let slot_range = if first_arg.contains(':') {
+    let _slot_range = if first_arg.contains(':') {
         let (slot_a, slot_b) = first_arg
             .split_once(':')
             .expect("failed to parse slot range, expected format: <start>:<end> or a single epoch");

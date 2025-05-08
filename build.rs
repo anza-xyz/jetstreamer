@@ -1,7 +1,8 @@
-use std::fs;
+use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::{env, fs};
 
 fn main() {
     let bin_dir = Path::new("bin");
@@ -13,6 +14,32 @@ fn main() {
 
     std::fs::copy("plugin_config.json", bin_dir.join("plugin_config.json")).unwrap();
     println!("cargo:rerun_if-changed=plugin_config.json");
+
+    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+    let artifact_dir = out_dir
+        .parent() // build/{pkg}-{hash}/out  → build/{pkg}-{hash}
+        .and_then(|p| p.parent()) // build/{pkg}-{hash}   → build
+        .and_then(|p| p.parent()) // build                 → {profile}
+        .ok_or("failed to derive artifact dir")
+        .unwrap();
+    let mut cfg = String::new();
+    fs::File::open("plugin_config.json")
+        .unwrap()
+        .read_to_string(&mut cfg)
+        .unwrap();
+    let ext = if cfg!(target_os = "macos") {
+        "dylib"
+    } else {
+        "so"
+    };
+    cfg = cfg.replace("{{ext}}", ext);
+    cfg = cfg.replace(
+        "{{full-path}}",
+        &artifact_dir.canonicalize().unwrap().to_string_lossy(),
+    );
+    let cfg_path = artifact_dir.join("plugin_config.json");
+    let mut f = fs::File::create(&cfg_path).unwrap();
+    f.write_all(cfg.as_bytes()).unwrap();
 
     println!("cargo:rerun-if-changed=bin/clickhouse");
     let clickhouse_binary = bin_dir.join("clickhouse");

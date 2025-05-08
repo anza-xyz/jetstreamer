@@ -107,6 +107,7 @@ pub async fn firehose(
         let service =
             solana_geyser_plugin_manager::geyser_plugin_service::GeyserPluginService::new(
                 confirmed_bank_receiver.clone(),
+                true,
                 geyser_config_files,
             )?;
 

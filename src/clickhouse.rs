@@ -9,8 +9,9 @@ use crate::geyser::SoliraError;
 
 fn process_log_line(line: impl AsRef<str>) {
     let line = line.as_ref();
-    if line.len() > 41 {
-        match &line[41..] {
+    let prefix_len = "2025.05.07 20:25:31.905655 [ 3286299 ] {} ".len();
+    if line.len() > prefix_len {
+        match &line[prefix_len..] {
             ln if ln.starts_with("<Information>") => {
                 log::info!("{}", &ln[14..])
             }

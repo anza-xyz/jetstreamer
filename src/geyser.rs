@@ -15,7 +15,8 @@ thread_local! {
     static PROCESSED_SLOTS: RefCell<u64> = const { RefCell::new(0) };
     static NUM_VOTES: RefCell<u64> = const { RefCell::new(0) };
     static COMPUTE_CONSUMED: RefCell<u128> = const { RefCell::new(0) };
-    static START_TIME: std::cell::RefCell<Option<Instant>> = const { std::cell::RefCell::new(None) };
+    static START_TIME: std::cell::RefCell<Option<Instant>> = const { RefCell::new(None) };
+
 }
 
 #[derive(Clone, Debug, Default)]
@@ -66,6 +67,10 @@ impl GeyserPlugin for Solira {
                     if ready_rx.recv().await.is_some() {
                         log::info!("ClickHouse initialization complete.");
                         rt.spawn(clickhouse_future);
+                        START_TIME.with(|start_time| {
+                            let mut start_time = start_time.borrow_mut();
+                            *start_time = Some(Instant::now());
+                        });
                         log::info!("solira loaded");
                         Ok(())
                     } else {

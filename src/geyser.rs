@@ -16,7 +16,6 @@ thread_local! {
     static NUM_VOTES: RefCell<u64> = const { RefCell::new(0) };
     static COMPUTE_CONSUMED: RefCell<u128> = const { RefCell::new(0) };
     static START_TIME: std::cell::RefCell<Option<Instant>> = const { RefCell::new(None) };
-
 }
 
 #[derive(Clone, Debug, Default)]

@@ -5,13 +5,10 @@ pub use agave_geyser_plugin_interface::geyser_plugin_interface::ReplicaTransacti
 use ::clickhouse::Client;
 
 pub trait Plugin {
-    /// If true, this plugin must process transactions in order sequentially
-    const ORDER_DEPENDENT: bool = false;
-
     /// The name of this [`Plugin`]
     ///
     /// Used for logging and debugging purposes.
-    fn name() -> &'static str;
+    fn name(&self) -> &'static str;
 
     /// Called by Solira whenever a transaction is received from the firehose.
     ///

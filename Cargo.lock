@@ -4520,6 +4520,7 @@ dependencies = [
  "url 2.5.4",
  "wasm-bindgen",
  "wasm-bindgen-futures",
+ "wasm-streams",
  "web-sys",
  "webpki-roots 0.25.4",
  "winreg",
@@ -8625,8 +8626,10 @@ version = "0.1.0"
 dependencies = [
  "agave-geyser-plugin-interface",
  "clickhouse",
+ "geyser-replay",
  "log",
  "once_cell",
+ "reqwest 0.11.27",
  "serde_json",
  "solana-logger",
  "solana-program",

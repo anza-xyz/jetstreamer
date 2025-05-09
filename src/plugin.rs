@@ -1,46 +1,91 @@
 use ::clickhouse::Client;
-use agave_geyser_plugin_interface::geyser_plugin_interface::GeyserPluginError;
+use bincode;
 use interprocess::local_socket::{tokio::prelude::*, GenericNamespaced, ToNsName};
+use tokio::io::{AsyncReadExt, BufReader};
 
-use crate::bridge::{Block, Transaction};
+use crate::{
+    bridge::{Block, Transaction},
+    ipc::SoliraMessage,
+};
 
 pub trait Plugin: Send + Sync + 'static {
-    /// The name of this [`Plugin`]
-    ///
-    /// Used for logging and debugging purposes.
     fn name(&self) -> &'static str;
-
-    /// Called by Solira whenever a transaction is received from the firehose.
-    ///
-    /// `db` contains a reference to the ClickHouse database client.
     fn on_transaction(
         &mut self,
         db: &Client,
         transaction: Transaction,
-    ) -> Result<(), GeyserPluginError>;
-
-    /// Called by Solira whenever a new block is received from the firehose.
-    ///
-    /// This will precede the `on_transaction` call for each transaction in the block.
-    fn on_block(&mut self, db: &Client, block: Block) -> Result<(), GeyserPluginError>;
+    ) -> Result<(), Box<dyn std::error::Error>>;
+    fn on_block(&mut self, db: &Client, block: Block) -> Result<(), Box<dyn std::error::Error>>;
 }
 
 pub struct PluginRunner {
     plugins: Vec<Box<dyn Plugin>>,
+    clickhouse_dsn: String,
+    socket_name: String,
 }
 
 impl PluginRunner {
-    pub fn new() -> Self {
+    pub fn new(clickhouse_dsn: impl Into<String>) -> Self {
         Self {
             plugins: Vec::new(),
+            clickhouse_dsn: clickhouse_dsn.into(),
+            socket_name: "solira.sock".into(),
         }
     }
 
-    pub fn register_plugin<P: Plugin>(&mut self, plugin: P) {
+    pub fn socket_name(mut self, name: impl Into<String>) -> Self {
+        self.socket_name = name.into();
+        self
+    }
+
+    pub fn register<P: Plugin>(&mut self, plugin: P) {
         self.plugins.push(Box::new(plugin));
     }
 
-    pub async fn run(&mut self) -> Result<(), GeyserPluginError> {
-        todo!()
+    /// Dial the IPC socket and forward every message to every plugin.
+    pub async fn run(mut self) -> Result<(), Box<dyn std::error::Error>> {
+        // Shared ClickHouse client
+        let db = Client::default().with_url(&self.clickhouse_dsn);
+
+        // Connect to the domain socket
+        let ns_name = self.socket_name.to_ns_name::<GenericNamespaced>()?;
+        let stream: LocalSocketStream = LocalSocketStream::connect(ns_name).await?;
+        let mut reader = BufReader::new(stream);
+
+        loop {
+            // ── length-prefix (u32 little-endian) ─────────────────────────
+            let mut len_buf = [0u8; 4];
+            if reader.read_exact(&mut len_buf).await.is_err() {
+                break; // EOF
+            }
+            let len = u32::from_le_bytes(len_buf) as usize;
+
+            // ── payload ──────────────────────────────────────────────────
+            let mut buf = vec![0u8; len];
+            reader.read_exact(&mut buf).await?;
+
+            // ── decode ───────────────────────────────────────────────────
+            let msg: SoliraMessage = bincode::deserialize(&buf)?;
+
+            // ── dispatch ─────────────────────────────────────────────────
+            match msg {
+                SoliraMessage::Block(block) => {
+                    for p in &mut self.plugins {
+                        if let Err(e) = p.on_block(&db, block.clone()) {
+                            log::error!("plugin {} on_block error: {e}", p.name());
+                        }
+                    }
+                }
+                SoliraMessage::Transaction(tx) => {
+                    for p in &mut self.plugins {
+                        if let Err(e) = p.on_transaction(&db, tx.clone()) {
+                            log::error!("plugin {} on_transaction error: {e}", p.name());
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
     }
 }

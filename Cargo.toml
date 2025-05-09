@@ -80,3 +80,4 @@ interprocess.workspace = true
 serde.workspace = true
 solana-sdk.workspace = true
 ctrlc.workspace = true
+bincode.workspace = true

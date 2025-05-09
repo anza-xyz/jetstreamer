@@ -8661,6 +8661,7 @@ name = "solira"
 version = "0.1.0"
 dependencies = [
  "agave-geyser-plugin-interface",
+ "bincode",
  "clickhouse",
  "ctrlc",
  "geyser-replay",

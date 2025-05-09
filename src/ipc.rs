@@ -1,10 +1,10 @@
 use interprocess::local_socket::{tokio::prelude::*, GenericNamespaced, ListenerOptions, ToNsName};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::{io::AsyncWriteExt, sync::broadcast, task::JoinHandle};
 
 use crate::bridge::{Block, Transaction};
 
-#[derive(Serialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 pub enum SoliraMessage {
     Transaction(Transaction),
     Block(Block),
@@ -35,13 +35,14 @@ pub async fn spawn_socket_server(tx: Tx) -> Result<JoinHandle<()>, Error> {
 
 async fn handle_client(mut stream: LocalSocketStream, mut rx: Rx) {
     while let Ok(msg) = rx.recv().await {
-        if let Ok(json) = serde_json::to_string(&msg) {
-            if stream.write_all(json.as_bytes()).await.is_err()
-                || stream.write_all(b"\n").await.is_err()
-            {
-                log::info!("IPC client disconnected");
-                break;
-            }
+        // Serialize with v1 API
+        let bytes = bincode::serialize(&msg).expect("bincode serialize");
+
+        // Length-prefix (u32 LE)
+        let len = (bytes.len() as u32).to_le_bytes();
+        if stream.write_all(&len).await.is_err() || stream.write_all(&bytes).await.is_err() {
+            log::info!("IPC client disconnected");
+            break;
         }
     }
 }

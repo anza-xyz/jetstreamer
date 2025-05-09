@@ -1,25 +1,24 @@
-//! Turn a `ReplicaTransactionInfoVersions` into an owned, Serde-friendly blob.
-//! ```
-//! Everything here works equally with serde_json / rmp-serde / postcard.
+//! Bridge between Geyser and the plugin interface.
 
-use agave_geyser_plugin_interface::geyser_plugin_interface::ReplicaTransactionInfoVersions;
+use std::str::FromStr;
+
+use agave_geyser_plugin_interface::geyser_plugin_interface::{
+    ReplicaBlockInfoVersions, ReplicaTransactionInfoVersions,
+};
 use serde::{Deserialize, Serialize};
-use solana_sdk::{signature::Signature, transaction::VersionedTransaction};
+use solana_sdk::{hash::Hash, signature::Signature, transaction::VersionedTransaction};
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct Transaction {
     pub slot: u64,
     pub signature: Signature,
     pub is_vote: bool,
-    pub tx: VersionedTransaction, // already derives Serde (with `serde` feature)
+    pub tx: VersionedTransaction,
     pub cu: Option<u64>,
 }
 
 impl Transaction {
-    pub fn from_replica(
-        slot: u64, // slot is supplied by Geyser callback
-        info: ReplicaTransactionInfoVersions<'_>,
-    ) -> Self {
+    pub fn from_replica(slot: u64, info: ReplicaTransactionInfoVersions<'_>) -> Self {
         match info {
             ReplicaTransactionInfoVersions::V0_0_1(v) => Self {
                 slot,
@@ -37,6 +36,45 @@ impl Transaction {
                 is_vote: v.is_vote,
                 tx: v.transaction.clone().to_versioned_transaction(),
                 cu: v.transaction_status_meta.compute_units_consumed,
+            },
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct Block {
+    pub slot: u64,
+    pub parent_slot: u64,
+    pub block_hash: Hash,
+    pub block_height: Option<u64>,
+}
+
+impl Block {
+    pub fn from_replica(info: ReplicaBlockInfoVersions) -> Self {
+        match info {
+            ReplicaBlockInfoVersions::V0_0_1(b) => Self {
+                slot: b.slot,
+                parent_slot: b.slot.saturating_sub(1), // might be wrong
+                block_hash: Hash::from_str(b.blockhash).unwrap(),
+                block_height: b.block_height,
+            },
+            ReplicaBlockInfoVersions::V0_0_2(b) => Self {
+                slot: b.slot,
+                parent_slot: b.parent_slot,
+                block_hash: Hash::from_str(b.blockhash).unwrap(),
+                block_height: b.block_height,
+            },
+            ReplicaBlockInfoVersions::V0_0_3(b) => Self {
+                slot: b.slot,
+                parent_slot: b.parent_slot,
+                block_hash: Hash::from_str(b.blockhash).unwrap(),
+                block_height: b.block_height,
+            },
+            ReplicaBlockInfoVersions::V0_0_4(b) => Self {
+                slot: b.slot,
+                parent_slot: b.parent_slot,
+                block_hash: Hash::from_str(b.blockhash).unwrap(),
+                block_height: b.block_height,
             },
         }
     }

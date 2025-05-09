@@ -8661,6 +8661,7 @@ dependencies = [
  "serde_json",
  "solana-logger",
  "solana-program",
+ "solana-sdk",
  "thousands",
  "tokio",
 ]

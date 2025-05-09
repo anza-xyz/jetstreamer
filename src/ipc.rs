@@ -1,4 +1,3 @@
-use agave_geyser_plugin_interface::geyser_plugin_interface::ReplicaTransactionInfoVersions;
 use interprocess::local_socket::{tokio::prelude::*, GenericNamespaced, ListenerOptions, ToNsName};
 use serde::Serialize;
 use tokio::{io::AsyncWriteExt, sync::broadcast, task::JoinHandle};

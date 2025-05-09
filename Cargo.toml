@@ -77,3 +77,4 @@ geyser-replay.workspace = true
 reqwest.workspace = true
 interprocess.workspace = true
 serde.workspace = true
+solana-sdk.workspace = true

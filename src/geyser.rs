@@ -190,7 +190,7 @@ impl GeyserPlugin for Solira {
             *tx_count += 1;
         });
         let tx = Transaction::from_replica(slot, transaction);
-        ipc_send(SoliraMessage::Transaction { slot, tx });
+        ipc_send(SoliraMessage::Transaction(tx));
         Ok(())
     }
 

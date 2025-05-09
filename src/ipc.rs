@@ -6,7 +6,7 @@ use crate::bridge::{Block, Transaction};
 
 #[derive(Serialize, Clone)]
 pub enum SoliraMessage {
-    Transaction { slot: u64, tx: Transaction },
+    Transaction(Transaction),
     Block(Block),
 }
 

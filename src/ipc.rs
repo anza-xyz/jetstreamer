@@ -2,11 +2,12 @@ use interprocess::local_socket::{tokio::prelude::*, GenericNamespaced, ListenerO
 use serde::Serialize;
 use tokio::{io::AsyncWriteExt, sync::broadcast, task::JoinHandle};
 
-use crate::bridge::Transaction;
+use crate::bridge::{Block, Transaction};
 
 #[derive(Serialize, Clone)]
 pub enum SoliraMessage {
     Transaction { slot: u64, tx: Transaction },
+    Block(Block),
 }
 
 pub type Tx = broadcast::Sender<SoliraMessage>;

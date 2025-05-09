@@ -8,7 +8,7 @@ use thousands::Separable;
 use tokio::runtime::Runtime;
 use tokio::sync::broadcast;
 
-use crate::bridge::Transaction;
+use crate::bridge::{Block, Transaction};
 use crate::clickhouse;
 use crate::ipc::SoliraMessage;
 
@@ -148,6 +148,9 @@ impl GeyserPlugin for Solira {
                 overall_tps
             );
         }
+
+        let blk = Block::from_replica(blockinfo);
+        ipc_send(SoliraMessage::Block(blk));
 
         Ok(())
     }

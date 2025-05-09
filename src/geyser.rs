@@ -6,11 +6,11 @@ use once_cell::unsync::OnceCell;
 use std::{cell::RefCell, error::Error, time::Instant};
 use thousands::Separable;
 use tokio::runtime::Runtime;
-use tokio::sync::broadcast;
+use tokio::sync::mpsc;
 
 use crate::bridge::{Block, Transaction};
 use crate::clickhouse;
-use crate::ipc::SoliraMessage;
+use crate::ipc::{spawn_socket_server, SoliraMessage};
 
 thread_local! {
     static TOKIO_RUNTIME: RefCell<Runtime> = RefCell::new(Runtime::new().unwrap());
@@ -20,7 +20,7 @@ thread_local! {
     static NUM_VOTES: RefCell<u64> = const { RefCell::new(0) };
     static COMPUTE_CONSUMED: RefCell<u128> = const { RefCell::new(0) };
     static START_TIME: std::cell::RefCell<Option<Instant>> = const { RefCell::new(None) };
-    static IPC_TX:     OnceCell<broadcast::Sender<SoliraMessage>> = OnceCell::new();
+    static IPC_TX: OnceCell<mpsc::UnboundedSender<SoliraMessage>> = OnceCell::new();
     static IPC_TASK:   OnceCell<tokio::task::JoinHandle<()>>    = OnceCell::new();
 }
 
@@ -55,7 +55,7 @@ impl From<SoliraError> for GeyserPluginError {
 pub fn ipc_send(msg: SoliraMessage) {
     IPC_TX.with(|cell| {
         if let Some(tx) = cell.get() {
-            let _ = tx.send(msg); // drop errors if channel is full / no receivers
+            let _ = tx.send(msg); // unbounded, will only OOM if producer outruns disk
         }
     });
 }
@@ -82,13 +82,13 @@ impl GeyserPlugin for Solira {
                         rt.spawn(clickhouse_future);
 
                         log::info!("setting up IPC bridge...");
-                        let (tx, _rx) = broadcast::channel::<SoliraMessage>(16_384);
-                        let handle = crate::ipc::spawn_socket_server(tx.clone())
+                        let (tx, rx) = mpsc::unbounded_channel::<SoliraMessage>();
+                        let handle = spawn_socket_server(rx)
                             .await
                             .map_err(|e| SoliraError::ClickHouseError(e.to_string()))?;
                         IPC_TX.with(|cell| {
                             let _ = cell.set(tx);
-                        });
+                        }); // <- inside `with`
                         IPC_TASK.with(|cell| {
                             let _ = cell.set(handle);
                         });

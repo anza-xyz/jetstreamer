@@ -1,6 +1,12 @@
+use std::sync::Arc;
+
 use interprocess::local_socket::{tokio::prelude::*, GenericNamespaced, ListenerOptions, ToNsName};
 use serde::{Deserialize, Serialize};
-use tokio::{io::AsyncWriteExt, sync::broadcast, task::JoinHandle};
+use tokio::{
+    io::AsyncWriteExt,
+    sync::{broadcast, mpsc, Mutex},
+    task::JoinHandle,
+};
 
 use crate::bridge::{Block, Transaction};
 
@@ -14,35 +20,48 @@ pub type Tx = broadcast::Sender<SoliraMessage>;
 pub type Rx = broadcast::Receiver<SoliraMessage>;
 pub type Error = Box<dyn std::error::Error + Send + Sync + 'static>;
 
-pub async fn spawn_socket_server(tx: Tx) -> Result<JoinHandle<()>, Error> {
+pub async fn spawn_socket_server(
+    mut rx: mpsc::UnboundedReceiver<SoliraMessage>,
+) -> Result<JoinHandle<()>, Box<dyn std::error::Error + Send + Sync + 'static>> {
     let name = "solira.sock".to_ns_name::<GenericNamespaced>()?;
+    let listener = ListenerOptions::new().name(name).create_tokio()?;
 
-    let listener: LocalSocketListener = ListenerOptions::new().name(name).create_tokio()?; // async listener (sync = create_sync)
+    // Shared list of live sockets
+    let clients: Arc<Mutex<Vec<LocalSocketStream>>> = Arc::new(Mutex::new(Vec::new()));
 
-    Ok(tokio::spawn(async move {
-        loop {
-            let stream = match listener.accept().await {
-                Ok(s) => s,
-                Err(e) => {
-                    log::error!("IPC accept error: {e}");
-                    continue;
+    // Accept loop – adds sockets to the list
+    {
+        let clients = clients.clone();
+        tokio::spawn(async move {
+            loop {
+                match listener.accept().await {
+                    Ok(stream) => {
+                        clients.lock().await.push(stream); // no `?`
+                    }
+                    Err(e) => log::error!("IPC accept error: {e}"),
                 }
-            };
-            tokio::spawn(handle_client(stream, tx.subscribe()));
+            }
+        });
+    }
+
+    // Writer loop – one for all clients; slowest client back-pressures the producer
+    Ok(tokio::spawn(async move {
+        while let Some(msg) = rx.recv().await {
+            let bytes = bincode::serialize(&msg).expect("serialize");
+            let len = (bytes.len() as u32).to_le_bytes();
+
+            let mut to_remove = Vec::new();
+
+            let mut list = clients.lock().await; // await, no ?
+            for (idx, stream) in list.iter_mut().enumerate() {
+                if stream.write_all(&len).await.is_err() || stream.write_all(&bytes).await.is_err()
+                {
+                    to_remove.push(idx);
+                }
+            }
+            for idx in to_remove.into_iter().rev() {
+                list.remove(idx);
+            }
         }
     }))
-}
-
-async fn handle_client(mut stream: LocalSocketStream, mut rx: Rx) {
-    while let Ok(msg) = rx.recv().await {
-        // Serialize with v1 API
-        let bytes = bincode::serialize(&msg).expect("bincode serialize");
-
-        // Length-prefix (u32 LE)
-        let len = (bytes.len() as u32).to_le_bytes();
-        if stream.write_all(&len).await.is_err() || stream.write_all(&bytes).await.is_err() {
-            log::info!("IPC client disconnected");
-            break;
-        }
-    }
 }

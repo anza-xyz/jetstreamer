@@ -8,6 +8,7 @@ use thousands::Separable;
 use tokio::runtime::Runtime;
 use tokio::sync::broadcast;
 
+use crate::bridge::Transaction;
 use crate::clickhouse;
 use crate::ipc::SoliraMessage;
 
@@ -51,7 +52,7 @@ impl From<SoliraError> for GeyserPluginError {
     }
 }
 
-fn ipc_send(msg: SoliraMessage) {
+pub fn ipc_send(msg: SoliraMessage) {
     IPC_TX.with(|cell| {
         if let Some(tx) = cell.get() {
             let _ = tx.send(msg); // drop errors if channel is full / no receivers
@@ -154,7 +155,7 @@ impl GeyserPlugin for Solira {
     fn notify_transaction(
         &self,
         transaction: ReplicaTransactionInfoVersions,
-        _slot: u64,
+        slot: u64,
     ) -> Result<()> {
         match transaction {
             ReplicaTransactionInfoVersions::V0_0_1(tx) => {
@@ -165,7 +166,6 @@ impl GeyserPlugin for Solira {
                 }
                 if let Some(consumed) = tx.transaction_status_meta.compute_units_consumed {
                     COMPUTE_CONSUMED.with_borrow_mut(|compute| {
-                        println!("consumed: {}", consumed);
                         *compute += u128::from(consumed);
                     });
                 }
@@ -186,6 +186,8 @@ impl GeyserPlugin for Solira {
         PROCESSED_TRANSACTIONS.with_borrow_mut(|tx_count| {
             *tx_count += 1;
         });
+        let tx = Transaction::from_replica(slot, transaction);
+        ipc_send(SoliraMessage::Transaction { slot, tx });
         Ok(())
     }
 

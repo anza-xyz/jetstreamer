@@ -83,6 +83,10 @@ impl PluginRunner {
                         }
                     }
                 }
+                SoliraMessage::Exit => {
+                    log::info!("received exit message from solira, shutting down...");
+                    break;
+                }
             }
         }
 

@@ -14,6 +14,7 @@ use crate::bridge::{Block, Transaction};
 pub enum SoliraMessage {
     Transaction(Transaction),
     Block(Block),
+    Exit,
 }
 
 pub type Tx = broadcast::Sender<SoliraMessage>;

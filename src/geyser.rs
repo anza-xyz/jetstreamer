@@ -22,6 +22,7 @@ thread_local! {
     static START_TIME: std::cell::RefCell<Option<Instant>> = const { RefCell::new(None) };
     static IPC_TX: OnceCell<mpsc::UnboundedSender<SoliraMessage>> = OnceCell::new();
     static IPC_TASK:   OnceCell<tokio::task::JoinHandle<()>>    = OnceCell::new();
+    static EXIT: RefCell<bool> = const { RefCell::new(false) };
 }
 
 #[derive(Clone, Debug, Default)]
@@ -118,6 +119,9 @@ impl GeyserPlugin for Solira {
     }
 
     fn notify_block_metadata(&self, blockinfo: ReplicaBlockInfoVersions) -> Result<()> {
+        if exiting() {
+            return Ok(());
+        }
         let slot = match blockinfo {
             ReplicaBlockInfoVersions::V0_0_1(block_info) => block_info.slot,
             ReplicaBlockInfoVersions::V0_0_2(block_info) => block_info.slot,
@@ -164,6 +168,9 @@ impl GeyserPlugin for Solira {
         transaction: ReplicaTransactionInfoVersions,
         slot: u64,
     ) -> Result<()> {
+        if exiting() {
+            return Ok(());
+        }
         match transaction {
             ReplicaTransactionInfoVersions::V0_0_1(tx) => {
                 if tx.is_vote {
@@ -211,15 +218,25 @@ impl GeyserPlugin for Solira {
     }
 }
 
+#[inline(always)]
+fn exiting() -> bool {
+    EXIT.with(|exit| *exit.borrow())
+}
+
+#[inline(always)]
 fn unload() {
     log::info!("solira unloading...");
+    EXIT.with(|exit| {
+        *exit.borrow_mut() = true;
+    });
+    ipc_send(SoliraMessage::Exit);
     log::info!("stopping ClickHouse...");
     clickhouse::stop_sync();
     log::info!("done.");
     log::info!("stopping IPC bridge...");
     IPC_TASK.with(|cell| {
         if let Some(handle) = cell.get() {
-            handle.abort();
+            handle.abort(); // kills writer + accept loops
         }
     });
     log::info!("done.");

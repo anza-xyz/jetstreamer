@@ -23,3 +23,7 @@ pub trait Plugin {
     /// This will precede the `on_transaction` call for each transaction in the block.
     fn on_block(&mut self, db: &Client, block: Block) -> Result<(), GeyserPluginError>;
 }
+
+pub struct PluginRunner {
+    plugins: Vec<Box<dyn Plugin>>,
+}

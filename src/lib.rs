@@ -15,13 +15,6 @@ use agave_geyser_plugin_interface::geyser_plugin_interface::GeyserPlugin;
 #[no_mangle]
 #[allow(improper_ctypes_definitions)]
 pub unsafe extern "C" fn _create_plugin() -> *mut dyn GeyserPlugin {
-    ctrlc::set_handler(|| {
-        log::info!("Ctrl-C received — exiting cleanly.");
-        #[cfg(unix)]
-        let _ = std::fs::remove_file("/tmp/solira.sock");
-        std::process::exit(0);
-    })
-    .unwrap();
     let plugin: Box<dyn GeyserPlugin> = Box::new(Solira);
     Box::into_raw(plugin)
 }

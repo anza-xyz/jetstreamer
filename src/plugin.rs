@@ -1,9 +1,10 @@
 use ::clickhouse::Client;
 use agave_geyser_plugin_interface::geyser_plugin_interface::GeyserPluginError;
+use interprocess::local_socket::{tokio::prelude::*, GenericNamespaced, ToNsName};
 
 use crate::bridge::{Block, Transaction};
 
-pub trait Plugin {
+pub trait Plugin: Send + Sync + 'static {
     /// The name of this [`Plugin`]
     ///
     /// Used for logging and debugging purposes.
@@ -26,4 +27,20 @@ pub trait Plugin {
 
 pub struct PluginRunner {
     plugins: Vec<Box<dyn Plugin>>,
+}
+
+impl PluginRunner {
+    pub fn new() -> Self {
+        Self {
+            plugins: Vec::new(),
+        }
+    }
+
+    pub fn register_plugin<P: Plugin>(&mut self, plugin: P) {
+        self.plugins.push(Box::new(plugin));
+    }
+
+    pub async fn run(&mut self) -> Result<(), GeyserPluginError> {
+        todo!()
+    }
 }

@@ -96,6 +96,11 @@ impl GeyserPlugin for Solira {
 
                         START_TIME.with(|st| *st.borrow_mut() = Some(Instant::now()));
                         log::info!("solira loaded");
+
+                        ctrlc::set_handler(|| {
+                            unload();
+                        })
+                        .unwrap();
                         Ok(())
                     } else {
                         Err(SoliraError::ClickHouseInitializationFailed)
@@ -109,8 +114,7 @@ impl GeyserPlugin for Solira {
     }
 
     fn on_unload(&mut self) {
-        log::info!("solira unloading...");
-        clickhouse::stop_sync();
+        unload();
     }
 
     fn notify_block_metadata(&self, blockinfo: ReplicaBlockInfoVersions) -> Result<()> {
@@ -205,6 +209,28 @@ impl GeyserPlugin for Solira {
     fn entry_notifications_enabled(&self) -> bool {
         true
     }
+}
+
+fn unload() {
+    log::info!("solira unloading...");
+    log::info!("stopping ClickHouse...");
+    clickhouse::stop_sync();
+    log::info!("done.");
+    log::info!("stopping IPC bridge...");
+    IPC_TASK.with(|cell| {
+        if let Some(handle) = cell.get() {
+            handle.abort();
+        }
+    });
+    log::info!("done.");
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    log::info!("clearing domain socket...");
+    std::fs::remove_file("/tmp/solira.sock").unwrap_or_else(|_| {
+        log::warn!("failed to remove domain socket");
+    });
+    log::info!("done.");
+    log::info!("solira successfully unloaded.");
+    std::process::exit(0);
 }
 
 pub trait SolscanUrl {

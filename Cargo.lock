@@ -2849,6 +2849,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "indoc"
+version = "2.0.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f4c7245a08504955605670dbf141fceab975f15ca21570696aebe9d2e71576bd"
+
+[[package]]
 name = "inout"
 version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8665,6 +8671,7 @@ dependencies = [
  "clickhouse",
  "ctrlc",
  "geyser-replay",
+ "indoc",
  "interprocess",
  "log",
  "once_cell",
@@ -8675,6 +8682,27 @@ dependencies = [
  "solana-program",
  "solana-sdk",
  "thousands",
+ "tokio",
+]
+
+[[package]]
+name = "solira-build-cdylib"
+version = "0.1.0"
+dependencies = [
+ "solira",
+]
+
+[[package]]
+name = "solira-runner"
+version = "0.1.0"
+dependencies = [
+ "geyser-replay",
+ "log",
+ "reqwest 0.12.15",
+ "serde_json",
+ "solana-logger",
+ "solira-build-cdylib",
+ "tempfile",
  "tokio",
 ]
 

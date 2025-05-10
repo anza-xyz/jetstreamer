@@ -1,5 +1,6 @@
 pub mod bridge;
 pub mod clickhouse;
+pub mod config;
 pub mod geyser;
 pub mod ipc;
 pub mod plugin;

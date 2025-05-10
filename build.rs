@@ -22,6 +22,8 @@ fn main() {
         .and_then(|p| p.parent()) // build                 → {profile}
         .ok_or("failed to derive artifact dir")
         .unwrap();
+    println!("cargo:env=OUT_DIR={}", out_dir.display());
+    println!("cargo:env=ARTIFACT_DIR={}", artifact_dir.display());
     let mut cfg = String::new();
     fs::File::open("plugin_config.json")
         .unwrap()

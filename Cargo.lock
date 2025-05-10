@@ -8666,6 +8666,27 @@ dependencies = [
 name = "solira"
 version = "0.1.0"
 dependencies = [
+ "geyser-replay",
+ "log",
+ "reqwest 0.12.15",
+ "serde_json",
+ "solana-logger",
+ "solira-build-cdylib",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "solira-build-cdylib"
+version = "0.1.0"
+dependencies = [
+ "solira-core",
+]
+
+[[package]]
+name = "solira-core"
+version = "0.1.0"
+dependencies = [
  "agave-geyser-plugin-interface",
  "bincode",
  "clickhouse",
@@ -8683,27 +8704,6 @@ dependencies = [
  "solana-sdk",
  "tempfile",
  "thousands",
- "tokio",
-]
-
-[[package]]
-name = "solira-build-cdylib"
-version = "0.1.0"
-dependencies = [
- "solira",
-]
-
-[[package]]
-name = "solira-runner"
-version = "0.1.0"
-dependencies = [
- "geyser-replay",
- "log",
- "reqwest 0.12.15",
- "serde_json",
- "solana-logger",
- "solira-build-cdylib",
- "tempfile",
  "tokio",
 ]
 

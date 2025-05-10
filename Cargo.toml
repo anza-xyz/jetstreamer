@@ -1,5 +1,5 @@
 [workspace]
-members = ["geyser-replay", "solira-build-cdylib", "solira-runner"]
+members = ["geyser-replay", "solira-build-cdylib", "solira-core"]
 
 [package]
 name = "solira"
@@ -7,15 +7,9 @@ version = "0.1.0"
 edition = "2021"
 authors = ["sam0x17"]
 
-[package.metadata.docs.rs]
-targets = ["x86_64-unknown-linux-gnu"]
-
-[lib]
-crate-type = ["cdylib", "rlib"]
-
 [workspace.dependencies]
 geyser-replay = { path = "geyser-replay", version = "0.1.0" }
-solira = { path = ".", version = "0.1.0" }
+solira-core = { path = "solira-core", version = "0.1.0" }
 demo-rust-ipld-car = { git = "https://github.com/rpcpool/yellowstone-faithful.git" }
 tokio = { version = "1", features = ["full"] }
 futures-util = "0"
@@ -68,21 +62,13 @@ indoc = "2"
 tempfile = "3"
 
 [dependencies]
-tokio.workspace = true
-log.workspace = true
-agave-geyser-plugin-interface.workspace = true
-solana-logger.workspace = true
-solana-program.workspace = true
-once_cell.workspace = true
-serde_json.workspace = true
-thousands.workspace = true
-clickhouse.workspace = true
-geyser-replay.workspace = true
-reqwest.workspace = true
-interprocess.workspace = true
-serde.workspace = true
-solana-sdk.workspace = true
-ctrlc.workspace = true
-bincode.workspace = true
-indoc.workspace = true
 tempfile.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+solana-logger.workspace = true
+log.workspace = true
+reqwest.workspace = true
+geyser-replay.workspace = true
+
+[build-dependencies]
+solira-build-cdylib = { path = "solira-build-cdylib", version = "0.1.0" }

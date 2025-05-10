@@ -1,55 +1,65 @@
-use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::{env, fs};
+//! This script runs after Cargo has built all **build-dependencies**. The helper crate
+//! `force_solira_cdylib` is a build-dependency that links to `libsolira` as a *dylib*, which
+//! forces Cargo to emit `libsolira.{so|dylib|dll}` **before** this script executes.
+
+use std::{
+    env, fs,
+    path::{Path, PathBuf},
+};
 
 fn main() {
-    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+    // Where Cargo places this crate’s build artefacts
+    let out_dir = PathBuf::from(env::var_os("OUT_DIR").unwrap());
 
-    println!("cargo:rerun-if-changed=bin/clickhouse");
-    let clickhouse_binary = out_dir.join("clickhouse");
+    // These env-vars tell us the target triple & profile
+    let target = env::var("TARGET").unwrap(); // e.g. x86_64-unknown-linux-gnu
 
-    // Check if the ClickHouse binary exists
-    if !clickhouse_binary.exists() {
-        println!("ClickHouse binary not found. Downloading ClickHouse...");
+    // ── find target/<triple>/<profile>/deps ────────────────────────────────
+    let mut deps_dir = out_dir.clone();
+    for _ in 0..3 {
+        deps_dir.pop();
+    } // .../target/<triple>/<profile>
+    deps_dir.push("deps");
 
-        // Run the curl command to download and install ClickHouse
-        let status = Command::new("sh")
-            .arg("-c")
-            .arg("curl https://clickhouse.com/ | sh")
-            .current_dir(&out_dir)
-            .status()
-            .expect("Failed to download and install ClickHouse");
-
-        if !status.success() {
-            panic!("ClickHouse installation failed with status: {}", status);
-        }
-
-        // Mark the ClickHouse binary as executable
-        if clickhouse_binary.exists() {
-            println!("Setting ClickHouse binary as executable...");
-            let mut permissions = fs::metadata(&clickhouse_binary)
-                .expect("Failed to get ClickHouse binary metadata")
-                .permissions();
-            permissions.set_mode(0o755); // rwxr-xr-x
-            fs::set_permissions(&clickhouse_binary, permissions)
-                .expect("Failed to set ClickHouse binary as executable");
-        } else {
-            panic!("ClickHouse binary was not downloaded correctly.");
-        }
+    // platform-specific prefix / extension for shared libraries
+    let (prefix, ext) = if target.contains("windows") {
+        ("", "dll")
+    } else if target.contains("apple") {
+        ("lib", "dylib")
     } else {
-        println!("ClickHouse binary already exists. Skipping installation.");
-    }
+        ("lib", "so")
+    };
+    let stem_prefix = format!("{prefix}solira"); // "libsolira" or "solira"
 
-    let embed_clickhouse_rs = Path::new(&out_dir).join("embed_clickhouse.rs");
+    // ── locate the cdylib built for solira ─────────────────────────────────
+    let cdylib_path = fs::read_dir(&deps_dir)
+        .expect("deps dir missing")
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .find(|p| {
+            p.extension().map(|x| x == ext).unwrap_or(false)
+                && p.file_stem()
+                    .and_then(|s| s.to_str())
+                    .map(|s| s.starts_with(&stem_prefix))
+                    .unwrap_or(false)
+        })
+        .expect(
+            "libsolira.* not found – is `force_solira_cdylib` \
+                 listed in [build-dependencies]?",
+        );
+
+    // ── write <OUT_DIR>/embed.rs with the bytes of the cdylib ──────────────
+    let embed_rs = Path::new(&out_dir).join("embed.rs");
     fs::write(
-        &embed_clickhouse_rs,
+        &embed_rs,
         format!(
-            "/// Raw bytes of clickhouse binary ({} bytes)\n\
-             pub const CLICKHOUSE_BINARY: &[u8] = include_bytes!(r#\"{}\"#);\n",
-            fs::metadata(&clickhouse_binary).unwrap().len(),
-            clickhouse_binary.display()
+            "/// Raw bytes of libsolira ({} bytes)\n\
+             pub const SOLIRA_CDYLIB: &[u8] = include_bytes!(r#\"{}\"#);\n",
+            fs::metadata(&cdylib_path).unwrap().len(),
+            cdylib_path.display()
         ),
     )
     .unwrap();
+
+    // Re-run script only if it itself changes
+    println!("cargo:rerun-if-changed=build.rs");
 }

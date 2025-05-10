@@ -1,6 +1,8 @@
-use std::process::Stdio;
+use std::{os::unix::fs::PermissionsExt, process::Stdio};
+use tempfile::NamedTempFile;
 use tokio::{
-    io::{AsyncBufReadExt, BufReader},
+    fs::File,
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::Command,
     sync::{mpsc, OnceCell},
 };
@@ -28,6 +30,8 @@ fn process_log_line(line: impl AsRef<str>) {
 
 static CLICKHOUSE_PROCESS: OnceCell<u32> = OnceCell::const_new();
 
+include!(concat!(env!("OUT_DIR"), "/embed_clickhouse.rs")); // raw bytes for clickhouse binary
+
 pub async fn start() -> Result<
     (
         mpsc::Receiver<()>,
@@ -37,10 +41,30 @@ pub async fn start() -> Result<
 > {
     log::info!("Spawning local ClickHouse server...");
 
+    // write clickhouse binary to a temp file
+    let clickhouse_path = NamedTempFile::with_suffix("-clickhouse")
+        .unwrap()
+        .into_temp_path()
+        .keep()
+        .unwrap();
+    log::info!("Writing ClickHouse binary to: {:?}", clickhouse_path);
+    File::create(&clickhouse_path)
+        .await
+        .unwrap()
+        .write_all(CLICKHOUSE_BINARY)
+        .await
+        .unwrap();
+    // executable permission for Unix
+    #[cfg(unix)]
+    std::fs::set_permissions(&clickhouse_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    log::info!("ClickHouse binary written and permissions set.");
+
     // Create a channel to signal when ClickHouse is ready
     let (ready_tx, ready_rx) = mpsc::channel(1);
 
-    let mut clickhouse_command = Command::new("./clickhouse")
+    std::fs::create_dir_all("./bin").unwrap();
+    std::env::set_current_dir("./bin").unwrap();
+    let mut clickhouse_command = Command::new(clickhouse_path)
         .arg("server")
         .stdout(Stdio::piped()) // Redirect stdout to capture logs
         .stderr(Stdio::piped()) // Also capture stderr

@@ -8681,6 +8681,7 @@ dependencies = [
  "solana-logger",
  "solana-program",
  "solana-sdk",
+ "tempfile",
  "thousands",
  "tokio",
 ]

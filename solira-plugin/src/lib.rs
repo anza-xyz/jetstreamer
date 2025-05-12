@@ -1,5 +1,6 @@
 pub mod bridge;
 pub mod ipc;
+pub mod plugins;
 
 use ::clickhouse::Client;
 use bincode;

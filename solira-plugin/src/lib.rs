@@ -41,8 +41,8 @@ impl PluginRunner {
         self
     }
 
-    pub fn register<P: Plugin>(&mut self, plugin: P) {
-        self.plugins.push(Box::new(plugin));
+    pub fn register(&mut self, plugin: Box<dyn Plugin>) {
+        self.plugins.push(plugin);
     }
 
     /// Dial the IPC socket and forward every message to every plugin.

@@ -1,7 +1,7 @@
 use core::ops::Range;
 use geyser_replay::{firehose::firehose, index::get_index_dir};
 use serde_json::json;
-use solira_plugin::Plugin;
+use solira_plugin::{Plugin, PluginRunner};
 use std::{fs::File, io::Write, os::unix::fs::PermissionsExt, path::PathBuf};
 use tempfile::NamedTempFile;
 
@@ -79,7 +79,22 @@ impl SoliraRunner {
         log::info!("slot index dir: {:?}", index_dir);
         let slot_range = self.slot_range.unwrap_or_default();
         log::info!("geyser config files: {:?}", geyser_config_files);
-        firehose(slot_range, Some(geyser_config_files), index_dir, &client).await?;
+        firehose(
+            slot_range,
+            Some(geyser_config_files),
+            index_dir,
+            &client,
+            async {
+                let mut plugin_runner =
+                    PluginRunner::new("localhost:8123").socket_name("solira.sock");
+                for plugin in self.plugins {
+                    plugin_runner.register(plugin);
+                }
+                log::info!("spawning plugin runner...");
+                plugin_runner.run().await.unwrap();
+            },
+        )
+        .await?;
         Ok(())
     }
 }

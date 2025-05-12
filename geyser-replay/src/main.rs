@@ -26,7 +26,13 @@ async fn main() {
     let geyser_config_files = &[std::path::PathBuf::from(args().nth(2).unwrap())];
     log::info!("slot index dir: {:?}", index_dir);
     log::info!("geyser config files: {:?}", geyser_config_files);
-    firehose(slot_range, Some(geyser_config_files), index_dir, &client)
-        .await
-        .unwrap();
+    firehose(
+        slot_range,
+        Some(geyser_config_files),
+        index_dir,
+        &client,
+        async {},
+    )
+    .await
+    .unwrap();
 }

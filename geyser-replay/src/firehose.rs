@@ -8,6 +8,7 @@ use solana_sdk::{reward_info::RewardInfo, reward_type::RewardType};
 use std::{
     collections::HashSet,
     fmt::Display,
+    future::Future,
     ops::Range,
     path::{Path, PathBuf},
 };
@@ -94,6 +95,7 @@ pub async fn firehose(
     geyser_config_files: Option<&[PathBuf]>,
     slot_offset_index_path: impl AsRef<Path>,
     client: &Client,
+    on_load: impl Future<Output = ()> + Send + 'static,
 ) -> Result<Receiver<SlotNotification>, GeyserReplayError> {
     log::info!("starting firehose...");
     let start_time = std::time::Instant::now();
@@ -139,6 +141,11 @@ pub async fn firehose(
     );
 
     let mut slot_offset_index = SlotOffsetIndex::new(slot_offset_index_path)?;
+
+    log::info!("running on_load...");
+    tokio::task::spawn(async move {
+        on_load.await;
+    });
 
     log::info!("🚒 starting firehose...");
 

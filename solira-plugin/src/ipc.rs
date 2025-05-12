@@ -1,10 +1,10 @@
 use std::sync::Arc;
 
-use interprocess::local_socket::{tokio::prelude::*, GenericNamespaced, ListenerOptions, ToNsName};
+use interprocess::local_socket::{GenericNamespaced, ListenerOptions, ToNsName, tokio::prelude::*};
 use serde::{Deserialize, Serialize};
 use tokio::{
     io::AsyncWriteExt,
-    sync::{broadcast, mpsc, Mutex},
+    sync::{Mutex, broadcast, mpsc},
     task::JoinHandle,
 };
 
@@ -12,7 +12,7 @@ use crate::bridge::{Block, Transaction};
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 pub enum SoliraMessage {
-    Transaction(Transaction),
+    Transaction(Transaction, u32),
     Block(Block),
     Exit,
 }

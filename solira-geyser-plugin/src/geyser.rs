@@ -25,6 +25,7 @@ thread_local! {
     static IPC_TX: OnceCell<mpsc::UnboundedSender<SoliraMessage>> = OnceCell::new();
     static IPC_TASK:   OnceCell<tokio::task::JoinHandle<()>>    = OnceCell::new();
     static EXIT: RefCell<bool> = const { RefCell::new(false) };
+    static TX_INDEX: RefCell<u32> = const { RefCell::new(0) };
 }
 
 #[derive(Clone, Debug, Default)]
@@ -124,6 +125,9 @@ impl GeyserPlugin for Solira {
         if exiting() {
             return Ok(());
         }
+        TX_INDEX.with_borrow_mut(|index| {
+            *index = 0;
+        });
         let slot = match blockinfo {
             ReplicaBlockInfoVersions::V0_0_1(block_info) => block_info.slot,
             ReplicaBlockInfoVersions::V0_0_2(block_info) => block_info.slot,
@@ -203,7 +207,10 @@ impl GeyserPlugin for Solira {
             *tx_count += 1;
         });
         let tx = Transaction::from_replica(slot, transaction);
-        ipc_send(SoliraMessage::Transaction(tx));
+        TX_INDEX.with_borrow_mut(|index| {
+            ipc_send(SoliraMessage::Transaction(tx, *index));
+            *index += 1;
+        });
         Ok(())
     }
 

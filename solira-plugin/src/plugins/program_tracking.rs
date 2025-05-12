@@ -1,17 +1,21 @@
+use std::collections::HashMap;
+
 use clickhouse::{Client, Row};
 use futures_util::FutureExt;
 use serde::{Deserialize, Serialize};
-use solana_sdk::pubkey::Pubkey;
+use solana_sdk::{instruction::CompiledInstruction, message::VersionedMessage, pubkey::Pubkey};
 
 use crate::{
     Plugin, PluginFuture,
     bridge::{Block, Transaction},
 };
 
-#[derive(Row, Deserialize, Serialize)]
+#[derive(Row, Deserialize, Serialize, Copy, Clone, Debug, PartialEq, Eq, Hash)]
 struct ProgramEvent {
     pub slot: u64,
+    pub tx_index: u32,
     pub program_id: Pubkey,
+    pub count: u32,
 }
 
 pub struct ProgramTrackingPlugin {}
@@ -21,30 +25,46 @@ impl Plugin for ProgramTrackingPlugin {
         "Program Tracking"
     }
 
-    fn on_transaction<'a>(&mut self, db: &Client, transaction: Transaction) -> PluginFuture<'a> {
+    fn on_transaction<'a>(
+        &mut self,
+        db: Client,
+        transaction: Transaction,
+        tx_index: u32,
+    ) -> PluginFuture<'a> {
         async move {
-            // db.insert("program_events")?;
-            let program_ids = match transaction.tx.message {
-                solana_sdk::message::VersionedMessage::Legacy(message) => message
-                    .program_ids()
-                    .into_iter()
-                    .cloned()
-                    .collect::<Vec<_>>(),
-                solana_sdk::message::VersionedMessage::V0(_message) => todo!(),
+            let mut insert = db.insert("program_invocation")?;
+            let (account_keys, instructions) = match transaction.tx.message {
+                VersionedMessage::Legacy(msg) => (msg.account_keys, msg.instructions),
+                VersionedMessage::V0(msg) => (msg.account_keys, msg.instructions),
             };
-            for program_id in program_ids {
+            let program_ids = instructions
+                .iter()
+                .map(|ix: &CompiledInstruction| account_keys[ix.program_id_index as usize])
+                .collect::<Vec<_>>();
+            let mut counts = HashMap::new();
+            for program_id in program_ids.into_iter() {
+                *counts.entry(program_id).or_insert(0) += 1;
+            }
+            for (program_id, count) in counts {
                 let row = ProgramEvent {
                     slot: transaction.slot,
                     program_id,
+                    tx_index,
+                    count,
                 };
-                //db.insert("program_events", row)?;
+                insert.write(&row).await?;
             }
+            insert.end().await?;
             Ok(())
         }
         .boxed()
     }
 
-    fn on_block<'a>(&mut self, db: &Client, block: Block) -> PluginFuture<'a> {
-        todo!()
+    fn on_block<'a>(&mut self, _db: Client, _block: Block) -> PluginFuture<'a> {
+        async move {
+            log::info!("ProgramTrackingPlugin: on_block");
+            Ok(())
+        }
+        .boxed()
     }
 }

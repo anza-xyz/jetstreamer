@@ -21,8 +21,13 @@ pub type PluginFuture<'a> = BoxFuture<'a, Result<(), Box<dyn std::error::Error>>
 
 pub trait Plugin: Send + Sync + 'static {
     fn name(&self) -> &'static str;
-    fn on_transaction<'a>(&mut self, db: &Client, transaction: Transaction) -> PluginFuture<'a>;
-    fn on_block<'a>(&mut self, db: &Client, block: Block) -> PluginFuture<'a>;
+    fn on_transaction<'a>(
+        &mut self,
+        db: Client,
+        transaction: Transaction,
+        tx_index: u32,
+    ) -> PluginFuture<'a>;
+    fn on_block<'a>(&mut self, db: Client, block: Block) -> PluginFuture<'a>;
 }
 
 pub struct PluginRunner {
@@ -54,12 +59,16 @@ impl PluginRunner {
         // Shared ClickHouse client
         let db = Client::default()
             .with_url(&self.clickhouse_dsn)
-            .with_database("solira");
+            .with_database("solira")
+            .with_option("async_insert", "1")
+            .with_option("wait_for_async_insert", "0");
 
         // Connect to the domain socket
         let ns_name = self.socket_name.to_ns_name::<GenericNamespaced>()?;
         let stream: LocalSocketStream = LocalSocketStream::connect(ns_name).await?;
         let mut reader = BufReader::new(stream);
+
+        log::info!("plugin runner loaded, waiting for transactions...");
 
         loop {
             // ── length-prefix (u32 little-endian) ─────────────────────────
@@ -80,14 +89,14 @@ impl PluginRunner {
             match msg {
                 SoliraMessage::Block(block) => {
                     for p in &mut self.plugins {
-                        if let Err(e) = p.on_block(&db, block.clone()).await {
+                        if let Err(e) = p.on_block(db.clone(), block.clone()).await {
                             log::error!("plugin {} on_block error: {e}", p.name());
                         }
                     }
                 }
-                SoliraMessage::Transaction(tx) => {
+                SoliraMessage::Transaction(tx, tx_index) => {
                     for p in &mut self.plugins {
-                        if let Err(e) = p.on_transaction(&db, tx.clone()).await {
+                        if let Err(e) = p.on_transaction(db.clone(), tx.clone(), tx_index).await {
                             log::error!("plugin {} on_transaction error: {e}", p.name());
                         }
                     }

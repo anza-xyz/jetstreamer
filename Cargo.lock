@@ -8732,6 +8732,7 @@ dependencies = [
  "agave-geyser-plugin-interface",
  "bincode",
  "clickhouse",
+ "futures-util",
  "interprocess",
  "log",
  "serde",

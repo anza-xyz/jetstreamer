@@ -2,6 +2,8 @@ pub mod bridge;
 pub mod ipc;
 pub mod plugins;
 
+use std::pin::Pin;
+
 use ::clickhouse::Client;
 use bincode;
 use interprocess::local_socket::{GenericNamespaced, ToNsName, tokio::prelude::*};
@@ -12,14 +14,15 @@ use crate::{
     ipc::SoliraMessage,
 };
 
+pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+/// Used to work around the fact that `async fn` cannot be used in an object-safe trait.
+pub type PluginFuture<'a> = BoxFuture<'a, Result<(), Box<dyn std::error::Error>>>;
+
 pub trait Plugin: Send + Sync + 'static {
     fn name(&self) -> &'static str;
-    fn on_transaction(
-        &mut self,
-        db: &Client,
-        transaction: Transaction,
-    ) -> Result<(), Box<dyn std::error::Error>>;
-    fn on_block(&mut self, db: &Client, block: Block) -> Result<(), Box<dyn std::error::Error>>;
+    fn on_transaction<'a>(&mut self, db: &Client, transaction: Transaction) -> PluginFuture<'a>;
+    fn on_block<'a>(&mut self, db: &Client, block: Block) -> PluginFuture<'a>;
 }
 
 pub struct PluginRunner {
@@ -49,7 +52,9 @@ impl PluginRunner {
     /// Dial the IPC socket and forward every message to every plugin.
     pub async fn run(mut self) -> Result<(), Box<dyn std::error::Error>> {
         // Shared ClickHouse client
-        let db = Client::default().with_url(&self.clickhouse_dsn);
+        let db = Client::default()
+            .with_url(&self.clickhouse_dsn)
+            .with_database("solira");
 
         // Connect to the domain socket
         let ns_name = self.socket_name.to_ns_name::<GenericNamespaced>()?;
@@ -75,14 +80,14 @@ impl PluginRunner {
             match msg {
                 SoliraMessage::Block(block) => {
                     for p in &mut self.plugins {
-                        if let Err(e) = p.on_block(&db, block.clone()) {
+                        if let Err(e) = p.on_block(&db, block.clone()).await {
                             log::error!("plugin {} on_block error: {e}", p.name());
                         }
                     }
                 }
                 SoliraMessage::Transaction(tx) => {
                     for p in &mut self.plugins {
-                        if let Err(e) = p.on_transaction(&db, tx.clone()) {
+                        if let Err(e) = p.on_transaction(&db, tx.clone()).await {
                             log::error!("plugin {} on_transaction error: {e}", p.name());
                         }
                     }

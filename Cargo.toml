@@ -1,5 +1,5 @@
 [workspace]
-members = ["geyser-replay", "solira-build-cdylib", "solira-core"]
+members = ["geyser-replay", "solira-build-cdylib", "solira-core", "solira-plugin"]
 
 [package]
 name = "solira"
@@ -10,6 +10,7 @@ authors = ["sam0x17"]
 [workspace.dependencies]
 geyser-replay = { path = "geyser-replay", version = "0.1.0" }
 solira-core = { path = "solira-core", version = "0.1.0" }
+solira-plugin = { path = "solira-plugin", version = "0.1.0" }
 demo-rust-ipld-car = { git = "https://github.com/rpcpool/yellowstone-faithful.git" }
 tokio = { version = "1", features = ["full"] }
 futures-util = "0"
@@ -69,6 +70,7 @@ solana-logger.workspace = true
 log.workspace = true
 reqwest.workspace = true
 geyser-replay.workspace = true
+solira-plugin.workspace = true
 
 [build-dependencies]
 solira-build-cdylib = { path = "solira-build-cdylib", version = "0.1.0" }

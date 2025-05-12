@@ -8672,6 +8672,7 @@ dependencies = [
  "serde_json",
  "solana-logger",
  "solira-build-cdylib",
+ "solira-plugin",
  "tempfile",
  "tokio",
 ]
@@ -8702,8 +8703,24 @@ dependencies = [
  "solana-logger",
  "solana-program",
  "solana-sdk",
+ "solira-plugin",
  "tempfile",
  "thousands",
+ "tokio",
+]
+
+[[package]]
+name = "solira-plugin"
+version = "0.1.0"
+dependencies = [
+ "agave-geyser-plugin-interface",
+ "bincode",
+ "clickhouse",
+ "interprocess",
+ "log",
+ "serde",
+ "solana-logger",
+ "solana-sdk",
  "tokio",
 ]
 

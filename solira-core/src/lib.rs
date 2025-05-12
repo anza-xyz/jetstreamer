@@ -1,9 +1,5 @@
-pub mod bridge;
 pub mod clickhouse;
-pub mod config;
 pub mod geyser;
-pub mod ipc;
-pub mod plugins;
 
 use agave_geyser_plugin_interface::geyser_plugin_interface::GeyserPlugin;
 

@@ -1,6 +1,9 @@
+pub mod bridge;
+pub mod ipc;
+
 use ::clickhouse::Client;
 use bincode;
-use interprocess::local_socket::{tokio::prelude::*, GenericNamespaced, ToNsName};
+use interprocess::local_socket::{GenericNamespaced, ToNsName, tokio::prelude::*};
 use tokio::io::{AsyncReadExt, BufReader};
 
 use crate::{

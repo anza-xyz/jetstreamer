@@ -1,0 +1,15 @@
+[package]
+name = "solira-plugin"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+agave-geyser-plugin-interface.workspace = true
+solana-logger.workspace = true
+serde.workspace = true
+solana-sdk.workspace = true
+tokio.workspace = true
+interprocess.workspace = true
+log.workspace = true
+bincode.workspace = true
+clickhouse.workspace = true

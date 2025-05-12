@@ -8,9 +8,11 @@ use thousands::Separable;
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
 
-use crate::bridge::{Block, Transaction};
 use crate::clickhouse;
-use crate::ipc::{spawn_socket_server, SoliraMessage};
+use solira_plugin::{
+    bridge::{Block, Transaction},
+    ipc::{SoliraMessage, spawn_socket_server},
+};
 
 thread_local! {
     static TOKIO_RUNTIME: RefCell<Runtime> = RefCell::new(Runtime::new().unwrap());

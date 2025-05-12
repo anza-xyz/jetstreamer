@@ -4,4 +4,4 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-solira-core.workspace = true
+solira-geyser-plugin.workspace = true

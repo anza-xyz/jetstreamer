@@ -1,5 +1,5 @@
 [workspace]
-members = ["geyser-replay", "solira-build-cdylib", "solira-core", "solira-plugin"]
+members = ["geyser-replay", "solira-build-cdylib", "solira-geyser-plugin", "solira-plugin"]
 
 [package]
 name = "solira"
@@ -9,7 +9,7 @@ authors = ["sam0x17"]
 
 [workspace.dependencies]
 geyser-replay = { path = "geyser-replay", version = "0.1.0" }
-solira-core = { path = "solira-core", version = "0.1.0" }
+solira-geyser-plugin = { path = "solira-geyser-plugin", version = "0.1.0" }
 solira-plugin = { path = "solira-plugin", version = "0.1.0" }
 demo-rust-ipld-car = { git = "https://github.com/rpcpool/yellowstone-faithful.git" }
 tokio = { version = "1", features = ["full"] }

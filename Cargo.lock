@@ -8681,11 +8681,11 @@ dependencies = [
 name = "solira-build-cdylib"
 version = "0.1.0"
 dependencies = [
- "solira-core",
+ "solira-geyser-plugin",
 ]
 
 [[package]]
-name = "solira-core"
+name = "solira-geyser-plugin"
 version = "0.1.0"
 dependencies = [
  "agave-geyser-plugin-interface",

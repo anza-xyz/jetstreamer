@@ -4,7 +4,7 @@ use tokio::{
     fs::File,
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::Command,
-    sync::{mpsc, OnceCell},
+    sync::{OnceCell, mpsc},
 };
 
 use crate::geyser::SoliraError;
@@ -21,7 +21,7 @@ fn process_log_line(line: impl AsRef<str>) {
             ln if ln.starts_with("<Error>") => log::error!("{}", &ln[8..]),
             ln if ln.starts_with("<Debug>") => log::debug!("{}", &ln[8..]),
             ln if ln.starts_with("<Warning>") => log::warn!("{}", &ln[10..]),
-            _ => log::warn!("{}", line),
+            _ => log::debug!("{}", line),
         }
     } else {
         log::info!("{}", line);

@@ -86,7 +86,7 @@ impl SoliraRunner {
             &client,
             async {
                 let mut plugin_runner =
-                    PluginRunner::new("localhost:8123").socket_name("solira.sock");
+                    PluginRunner::new("http://localhost:8123").socket_name("solira.sock");
                 for plugin in self.plugins {
                     plugin_runner.register(plugin);
                 }

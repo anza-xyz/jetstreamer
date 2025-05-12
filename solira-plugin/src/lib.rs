@@ -56,7 +56,14 @@ impl PluginRunner {
 
     /// Dial the IPC socket and forward every message to every plugin.
     pub async fn run(mut self) -> Result<(), Box<dyn std::error::Error>> {
-        // Shared ClickHouse client
+        log::info!("connecting to ClickHouse at {}", self.clickhouse_dsn);
+        let db = Client::default().with_url(&self.clickhouse_dsn);
+        log::info!("checking if database exists + creating if it does not...");
+        db.query("CREATE DATABASE IF NOT EXISTS solira")
+            .execute()
+            .await?;
+        log::info!("done.");
+        log::info!("connecting to ClickHouse at {}", self.clickhouse_dsn);
         let db = Client::default()
             .with_url(&self.clickhouse_dsn)
             .with_database("solira")

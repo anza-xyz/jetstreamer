@@ -14,7 +14,7 @@ use crate::{
 struct ProgramEvent {
     pub slot: u64,
     pub tx_index: u32,
-    pub program_id: Pubkey,
+    // pub program_id: Pubkey,
     pub count: u32,
 }
 
@@ -32,7 +32,7 @@ impl Plugin for ProgramTrackingPlugin {
         tx_index: u32,
     ) -> PluginFuture<'a> {
         async move {
-            let mut insert = db.insert("program_invocation")?;
+            let mut insert = db.insert("program_invocations")?;
             let (account_keys, instructions) = match transaction.tx.message {
                 VersionedMessage::Legacy(msg) => (msg.account_keys, msg.instructions),
                 VersionedMessage::V0(msg) => (msg.account_keys, msg.instructions),
@@ -48,21 +48,34 @@ impl Plugin for ProgramTrackingPlugin {
             for (program_id, count) in counts {
                 let row = ProgramEvent {
                     slot: transaction.slot,
-                    program_id,
+                    // program_id,
                     tx_index,
                     count,
                 };
-                insert.write(&row).await?;
+                insert.write(&row).await.unwrap();
             }
-            insert.end().await?;
+            insert.end().await.unwrap();
             Ok(())
         }
         .boxed()
     }
 
-    fn on_block<'a>(&mut self, _db: Client, _block: Block) -> PluginFuture<'a> {
+    fn on_block<'a>(&mut self, db: Client, block: Block) -> PluginFuture<'a> {
         async move {
-            log::info!("ProgramTrackingPlugin: on_block");
+            log::info!("ProgramTrackingPlugin: on_block {}", block.slot);
+            db.query(
+                r#"
+                CREATE TABLE IF NOT EXISTS program_invocations (
+                    slot       UInt64,
+                    tx_index   UInt32,
+                    count      UInt32,
+                ) 
+                ENGINE = MergeTree()
+                ORDER BY (slot, tx_index)
+                "#,
+            )
+            .execute()
+            .await?;
             Ok(())
         }
         .boxed()

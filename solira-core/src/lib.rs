@@ -3,9 +3,7 @@ pub mod clickhouse;
 pub mod config;
 pub mod geyser;
 pub mod ipc;
-pub mod plugin;
-
-pub use geyser::Solira;
+pub mod plugins;
 
 use agave_geyser_plugin_interface::geyser_plugin_interface::GeyserPlugin;
 
@@ -16,6 +14,6 @@ use agave_geyser_plugin_interface::geyser_plugin_interface::GeyserPlugin;
 #[unsafe(no_mangle)]
 #[allow(improper_ctypes_definitions)]
 pub unsafe extern "C" fn _create_plugin() -> *mut dyn GeyserPlugin {
-    let plugin: Box<dyn GeyserPlugin> = Box::new(Solira);
+    let plugin: Box<dyn GeyserPlugin> = Box::new(geyser::Solira);
     Box::into_raw(plugin)
 }

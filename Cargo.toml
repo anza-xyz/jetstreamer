@@ -56,7 +56,7 @@ tokio-stream = { version = "0", features = ["full"] }
 rangemap = "1"
 rseek = ">= 0.2"
 rayon = "1"
-clickhouse = ">= 0.13"
+clickhouse = { version = ">= 0.13", features = ["uuid", "time", "lz4", "watch", "inserter"] }
 interprocess = { version = "2", features = ["tokio"] }
 ctrlc = "3"
 indoc = "2"

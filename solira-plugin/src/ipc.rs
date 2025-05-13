@@ -22,7 +22,7 @@ pub type Rx = broadcast::Receiver<SoliraMessage>;
 pub type Error = Box<dyn std::error::Error + Send + Sync + 'static>;
 
 pub async fn spawn_socket_server(
-    mut rx: mpsc::UnboundedReceiver<SoliraMessage>,
+    mut rx: mpsc::Receiver<SoliraMessage>,
 ) -> Result<JoinHandle<()>, Box<dyn std::error::Error + Send + Sync + 'static>> {
     let name = "solira.sock".to_ns_name::<GenericNamespaced>()?;
     let listener = ListenerOptions::new().name(name).create_tokio()?;
@@ -37,7 +37,7 @@ pub async fn spawn_socket_server(
             loop {
                 match listener.accept().await {
                     Ok(stream) => {
-                        clients.lock().await.push(stream); // no `?`
+                        clients.lock().await.push(stream);
                     }
                     Err(e) => log::error!("IPC accept error: {e}"),
                 }

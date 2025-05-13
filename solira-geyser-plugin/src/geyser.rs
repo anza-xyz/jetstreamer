@@ -2,6 +2,7 @@ use agave_geyser_plugin_interface::geyser_plugin_interface::{
     GeyserPlugin, GeyserPluginError, ReplicaBlockInfoVersions, ReplicaTransactionInfoVersions,
     Result,
 };
+use mpsc::Sender;
 use once_cell::unsync::OnceCell;
 use std::{cell::RefCell, error::Error, time::Instant};
 use thousands::Separable;
@@ -22,8 +23,8 @@ thread_local! {
     static NUM_VOTES: RefCell<u64> = const { RefCell::new(0) };
     static COMPUTE_CONSUMED: RefCell<u128> = const { RefCell::new(0) };
     static START_TIME: std::cell::RefCell<Option<Instant>> = const { RefCell::new(None) };
-    static IPC_TX: OnceCell<mpsc::UnboundedSender<SoliraMessage>> = OnceCell::new();
-    static IPC_TASK:   OnceCell<tokio::task::JoinHandle<()>>    = OnceCell::new();
+    static IPC_TX: OnceCell<Sender<SoliraMessage>> = OnceCell::new();
+    static IPC_TASK: OnceCell<tokio::task::JoinHandle<()>>    = OnceCell::new();
     static EXIT: RefCell<bool> = const { RefCell::new(false) };
     static TX_INDEX: RefCell<u32> = const { RefCell::new(0) };
 }
@@ -57,9 +58,16 @@ impl From<SoliraError> for GeyserPluginError {
 }
 
 pub fn ipc_send(msg: SoliraMessage) {
+    if exiting() {
+        return;
+    }
     IPC_TX.with(|cell| {
         if let Some(tx) = cell.get() {
-            let _ = tx.send(msg); // unbounded, will only OOM if producer outruns disk
+            if let Err(err) = tx.blocking_send(msg) {
+                panic!("IPC channel error: {:?}", err);
+            }
+        } else {
+            log::error!("IPC channel not initialized!");
         }
     });
 }
@@ -86,7 +94,7 @@ impl GeyserPlugin for Solira {
                         rt.spawn(clickhouse_future);
 
                         log::info!("setting up IPC bridge...");
-                        let (tx, rx) = mpsc::unbounded_channel::<SoliraMessage>();
+                        let (tx, rx) = mpsc::channel::<SoliraMessage>(1000);
                         let handle = spawn_socket_server(rx)
                             .await
                             .map_err(|e| SoliraError::ClickHouseError(e.to_string()))?;

@@ -4,7 +4,12 @@ use agave_geyser_plugin_interface::geyser_plugin_interface::{
 };
 use mpsc::Sender;
 use once_cell::unsync::OnceCell;
-use std::{cell::RefCell, error::Error, time::Instant};
+use std::{
+    cell::RefCell,
+    error::Error,
+    sync::atomic::{AtomicBool, AtomicU64},
+    time::Instant,
+};
 use thousands::Separable;
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
@@ -17,17 +22,18 @@ use solira_plugin::{
 
 thread_local! {
     static TOKIO_RUNTIME: RefCell<Runtime> = RefCell::new(Runtime::new().unwrap());
-    static PROCESSED_TRANSACTIONS: RefCell<u64> = const { RefCell::new(0) };
-    static SLOT_NUM: RefCell<u64> = const { RefCell::new(0) };
-    static PROCESSED_SLOTS: RefCell<u64> = const { RefCell::new(0) };
-    static NUM_VOTES: RefCell<u64> = const { RefCell::new(0) };
     static COMPUTE_CONSUMED: RefCell<u128> = const { RefCell::new(0) };
     static START_TIME: std::cell::RefCell<Option<Instant>> = const { RefCell::new(None) };
     static IPC_TX: OnceCell<Sender<SoliraMessage>> = OnceCell::new();
     static IPC_TASK: OnceCell<tokio::task::JoinHandle<()>> = OnceCell::new();
-    static EXIT: RefCell<bool> = const { RefCell::new(false) };
     static TX_INDEX: RefCell<u32> = const { RefCell::new(0) };
 }
+
+static EXIT: AtomicBool = AtomicBool::new(false);
+static PROCESSED_TRANSACTIONS: AtomicU64 = AtomicU64::new(0);
+static SLOT_NUM: AtomicU64 = AtomicU64::new(0);
+static PROCESSED_SLOTS: AtomicU64 = AtomicU64::new(0);
+static NUM_VOTES: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug, Default)]
 pub struct Solira;
@@ -141,13 +147,10 @@ impl GeyserPlugin for Solira {
             ReplicaBlockInfoVersions::V0_0_3(block_info) => block_info.slot,
             ReplicaBlockInfoVersions::V0_0_4(block_info) => block_info.slot,
         };
-        SLOT_NUM.set(slot);
-        let processed_slots = PROCESSED_SLOTS.with_borrow_mut(|slots| {
-            *slots += 1;
-            *slots
-        });
-        if processed_slots % 100 == 0 {
-            let processed_txs = PROCESSED_TRANSACTIONS.with_borrow(|txs| *txs);
+        SLOT_NUM.store(slot, std::sync::atomic::Ordering::SeqCst);
+        let processed_slots = PROCESSED_SLOTS.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        if processed_slots % 10 == 0 {
+            let processed_txs = PROCESSED_TRANSACTIONS.load(std::sync::atomic::Ordering::SeqCst);
             // let num_votes = NUM_VOTES.with_borrow(|votes| *votes);
             let compute_consumed = COMPUTE_CONSUMED.with_borrow(|compute| *compute);
 
@@ -187,9 +190,7 @@ impl GeyserPlugin for Solira {
         match transaction {
             ReplicaTransactionInfoVersions::V0_0_1(tx) => {
                 if tx.is_vote {
-                    NUM_VOTES.with_borrow_mut(|votes| {
-                        *votes += 1;
-                    });
+                    NUM_VOTES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 }
                 if let Some(consumed) = tx.transaction_status_meta.compute_units_consumed {
                     COMPUTE_CONSUMED.with_borrow_mut(|compute| {
@@ -199,9 +200,7 @@ impl GeyserPlugin for Solira {
             }
             ReplicaTransactionInfoVersions::V0_0_2(tx) => {
                 if tx.is_vote {
-                    NUM_VOTES.with_borrow_mut(|votes| {
-                        *votes += 1;
-                    });
+                    NUM_VOTES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 }
                 if let Some(consumed) = tx.transaction_status_meta.compute_units_consumed {
                     COMPUTE_CONSUMED.with_borrow_mut(|compute| {
@@ -210,9 +209,7 @@ impl GeyserPlugin for Solira {
                 }
             }
         }
-        PROCESSED_TRANSACTIONS.with_borrow_mut(|tx_count| {
-            *tx_count += 1;
-        });
+        PROCESSED_TRANSACTIONS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let tx = Transaction::from_replica(slot, transaction);
         TX_INDEX.with_borrow_mut(|index| {
             ipc_send(SoliraMessage::Transaction(tx, *index));
@@ -236,7 +233,7 @@ impl GeyserPlugin for Solira {
 
 #[inline(always)]
 fn exiting() -> bool {
-    EXIT.with(|exit| *exit.borrow())
+    EXIT.load(std::sync::atomic::Ordering::SeqCst)
 }
 
 fn stop_ipc_bridge() {
@@ -251,9 +248,7 @@ fn stop_ipc_bridge() {
 
 fn stop_tx_queue() {
     log::info!("stopping queueing of transactions...");
-    EXIT.with(|exit| {
-        *exit.borrow_mut() = true;
-    });
+    EXIT.store(true, std::sync::atomic::Ordering::SeqCst);
     log::info!("queueing of transactions has stopped.");
 }
 
@@ -280,16 +275,12 @@ fn clear_domain_socket() {
 #[inline(always)]
 fn unload() {
     log::info!("solira unloading...");
-    send_exit_signal_to_clients();
-    std::thread::sleep(std::time::Duration::from_secs(3));
     stop_tx_queue();
-    std::thread::sleep(std::time::Duration::from_secs(3));
+    log::info!("exiting: {:?}", exiting());
+    send_exit_signal_to_clients();
     stop_ipc_bridge();
-    std::thread::sleep(std::time::Duration::from_secs(3));
     stop_clickhouse();
-    std::thread::sleep(std::time::Duration::from_secs(3));
     clear_domain_socket();
-    std::thread::sleep(std::time::Duration::from_secs(3));
     log::info!("exiting geyser plugin process...");
     std::process::exit(0);
 }

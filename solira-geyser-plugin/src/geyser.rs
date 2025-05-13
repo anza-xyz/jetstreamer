@@ -58,13 +58,14 @@ impl From<SoliraError> for GeyserPluginError {
 }
 
 pub fn ipc_send(msg: SoliraMessage) {
-    if exiting() {
-        return;
-    }
     IPC_TX.with(|cell| {
         if let Some(tx) = cell.get() {
+            let is_exit = msg == SoliraMessage::Exit;
             if let Err(err) = tx.blocking_send(msg) {
                 panic!("IPC channel error: {:?}", err);
+            }
+            if is_exit {
+                log::info!("sent exit signal to clients");
             }
         }
     });
@@ -238,29 +239,58 @@ fn exiting() -> bool {
     EXIT.with(|exit| *exit.borrow())
 }
 
-#[inline(always)]
-fn unload() {
-    log::info!("solira unloading...");
-    ipc_send(SoliraMessage::Exit);
-    EXIT.with(|exit| {
-        *exit.borrow_mut() = true;
-    });
+fn stop_ipc_bridge() {
     log::info!("stopping IPC bridge...");
     IPC_TASK.with(|cell| {
         if let Some(handle) = cell.get() {
             handle.abort(); // kills writer + accept loops
         }
     });
-    log::info!("done.");
+    log::info!("IPC bridge stopped.");
+}
+
+fn stop_tx_queue() {
+    log::info!("stopping queueing of transactions...");
+    EXIT.with(|exit| {
+        *exit.borrow_mut() = true;
+    });
+    log::info!("queueing of transactions has stopped.");
+}
+
+fn send_exit_signal_to_clients() {
+    log::info!("sending exit signal to clients...");
+    ipc_send(SoliraMessage::Exit);
+    log::info!("exit signal sent to clients.");
+}
+
+fn stop_clickhouse() {
     log::info!("stopping ClickHouse...");
     clickhouse::stop_sync();
-    log::info!("done.");
+    log::info!("ClickHouse stopped.");
+}
+
+fn clear_domain_socket() {
     log::info!("clearing domain socket...");
     std::fs::remove_file("/tmp/solira.sock").unwrap_or_else(|_| {
         log::warn!("failed to remove domain socket");
     });
-    log::info!("done.");
-    log::info!("solira successfully unloaded.");
+    log::info!("domain socket cleared.");
+}
+
+#[inline(always)]
+fn unload() {
+    log::info!("solira unloading...");
+    send_exit_signal_to_clients();
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    stop_tx_queue();
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    stop_ipc_bridge();
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    stop_clickhouse();
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    clear_domain_socket();
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    log::info!("exiting geyser plugin process...");
     std::process::exit(0);
 }
 

@@ -8711,6 +8711,7 @@ dependencies = [
  "geyser-replay",
  "indoc",
  "interprocess",
+ "libc",
  "log",
  "once_cell",
  "reqwest 0.12.15",

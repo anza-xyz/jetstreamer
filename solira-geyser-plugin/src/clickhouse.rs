@@ -64,14 +64,25 @@ pub async fn start() -> Result<
 
     std::fs::create_dir_all("./bin").unwrap();
     std::env::set_current_dir("./bin").unwrap();
-    let mut clickhouse_command = Command::new(clickhouse_path)
-        .arg("server")
-        .stdout(Stdio::piped()) // Redirect stdout to capture logs
-        .stderr(Stdio::piped()) // Also capture stderr
-        .spawn()
-        .map_err(|err| {
-            SoliraError::ClickHouseError(format!("Failed to start the ClickHouse process: {}", err))
-        })?;
+    let mut clickhouse_command = unsafe {
+        Command::new(clickhouse_path)
+            .arg("server")
+            //.arg("--async_insert_queue_flush_on_shutdown=1")
+            .stdout(Stdio::piped()) // Redirect stdout to capture logs
+            .stderr(Stdio::piped()) // Also capture stderr
+            .pre_exec(|| {
+                // safety: setsid() can't fail if we're child of a real process
+                libc::setsid();
+                Ok(())
+            })
+            .spawn()
+            .map_err(|err| {
+                SoliraError::ClickHouseError(format!(
+                    "Failed to start the ClickHouse process: {}",
+                    err
+                ))
+            })?
+    };
 
     // Capture stdout and stderr
     let stdout = clickhouse_command
@@ -148,11 +159,7 @@ pub async fn stop() {
     if let Some(&pid) = CLICKHOUSE_PROCESS.get() {
         log::info!("Stopping ClickHouse process with PID: {}", pid);
 
-        let status = Command::new("pkill")
-            .arg("-2") // Signal 2: SIGINT
-            .arg("-P") // Match the parent PID
-            .arg(pid.to_string())
-            .status();
+        let status = Command::new("kill").arg(pid.to_string()).status();
 
         match status.await {
             Ok(exit_status) if exit_status.success() => {

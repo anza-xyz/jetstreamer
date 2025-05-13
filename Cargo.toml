@@ -61,6 +61,7 @@ interprocess = { version = "2", features = ["tokio"] }
 ctrlc = "3"
 indoc = "2"
 tempfile = "3"
+libc = "0"
 
 [dependencies]
 tempfile.workspace = true

@@ -62,7 +62,6 @@ impl Plugin for ProgramTrackingPlugin {
 
     fn on_block<'a>(&mut self, db: Client, block: Block) -> PluginFuture<'a> {
         async move {
-            log::info!("ProgramTrackingPlugin: on_block {}", block.slot);
             db.query(
                 r#"
                 CREATE TABLE IF NOT EXISTS program_invocations (

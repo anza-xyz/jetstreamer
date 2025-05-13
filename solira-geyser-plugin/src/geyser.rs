@@ -94,7 +94,7 @@ impl GeyserPlugin for Solira {
                         rt.spawn(clickhouse_future);
 
                         log::info!("setting up IPC bridge...");
-                        let (tx, rx) = mpsc::channel::<SoliraMessage>(1000);
+                        let (tx, rx) = mpsc::channel::<SoliraMessage>(1);
                         let handle = spawn_socket_server(rx)
                             .await
                             .map_err(|e| SoliraError::ClickHouseError(e.to_string()))?;

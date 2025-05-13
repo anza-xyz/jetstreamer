@@ -286,7 +286,6 @@ pub async fn build_missing_indexes(
     );
 
     (0..of1_last_epoch)
-        .into_iter()
         .par_bridge()
         .for_each(|epoch| {
             tokio::runtime::Runtime::new().unwrap().block_on(async {

@@ -151,7 +151,7 @@ pub async fn firehose(
 
     // for each epoch
     let mut current_slot: Option<u64> = None;
-    for (epoch_num, stream) in epoch_range.map(|epoch| (epoch, fetch_epoch_stream(epoch, &client)))
+    for (epoch_num, stream) in epoch_range.map(|epoch| (epoch, fetch_epoch_stream(epoch, client)))
     {
         log::info!("entering epoch {}", epoch_num);
         let stream = stream.await;

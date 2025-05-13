@@ -5,7 +5,6 @@ pub mod plugins;
 use std::pin::Pin;
 
 use ::clickhouse::Client;
-use bincode;
 use futures_util::FutureExt;
 use interprocess::local_socket::{GenericNamespaced, ToNsName, tokio::prelude::*};
 use tokio::io::{AsyncReadExt, BufReader};

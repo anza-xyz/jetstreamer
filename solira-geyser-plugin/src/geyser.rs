@@ -24,8 +24,8 @@ thread_local! {
     static TOKIO_RUNTIME: RefCell<Runtime> = RefCell::new(Runtime::new().unwrap());
     static COMPUTE_CONSUMED: RefCell<u128> = const { RefCell::new(0) };
     static START_TIME: std::cell::RefCell<Option<Instant>> = const { RefCell::new(None) };
-    static IPC_TX: OnceCell<Sender<SoliraMessage>> = OnceCell::new();
-    static IPC_TASK: OnceCell<tokio::task::JoinHandle<()>> = OnceCell::new();
+    static IPC_TX: OnceCell<Sender<SoliraMessage>> = const { OnceCell::new() };
+    static IPC_TASK: OnceCell<tokio::task::JoinHandle<()>> = const { OnceCell::new() };
     static TX_INDEX: RefCell<u32> = const { RefCell::new(0) };
 }
 

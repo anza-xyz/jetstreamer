@@ -139,6 +139,9 @@ impl RawNode {
 
 pub trait Len {
     fn len(&self) -> u64;
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 impl<F> Len for Seekable<F>
@@ -193,7 +196,7 @@ impl<R: AsyncRead + Unpin + AsyncSeek + Len> NodeReader<R> {
         if self.header.is_empty() {
             self.read_raw_header()
                 .await
-                .map_err(|e| GeyserReplayError::SeekToSlotError(e))?;
+                .map_err(GeyserReplayError::SeekToSlotError)?;
         };
 
         let epoch = slot_to_epoch(slot);
@@ -258,9 +261,8 @@ impl<R: AsyncRead + Unpin + AsyncSeek + Len> NodeReader<R> {
             let node = match self.next_parsed().await {
                 Ok(node) => node,
                 Err(e)
-                    if e.downcast_ref::<io::Error>().map_or(false, |io_err| {
-                        io_err.kind() == io::ErrorKind::UnexpectedEof
-                    }) =>
+                    if e.downcast_ref::<io::Error>()
+                        .is_some_and(|io_err| io_err.kind() == io::ErrorKind::UnexpectedEof) =>
                 {
                     break
                 }

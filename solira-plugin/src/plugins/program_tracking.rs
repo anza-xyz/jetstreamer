@@ -52,6 +52,7 @@ impl Plugin for ProgramTrackingPlugin {
                     tx_index,
                     count,
                 };
+                // log::info!("{:?}", row);
                 insert.write(&row).await.unwrap();
             }
             insert.end().await.unwrap();

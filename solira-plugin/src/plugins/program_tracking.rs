@@ -14,7 +14,7 @@ use crate::{
 struct ProgramEvent {
     pub slot: u64,
     pub tx_index: u32,
-    // pub program_id: Pubkey,
+    pub program_id: Pubkey,
     pub count: u32,
 }
 
@@ -48,7 +48,7 @@ impl Plugin for ProgramTrackingPlugin {
             for (program_id, count) in counts {
                 let row = ProgramEvent {
                     slot: transaction.slot,
-                    // program_id,
+                    program_id,
                     tx_index,
                     count,
                 };
@@ -71,12 +71,13 @@ impl Plugin for ProgramTrackingPlugin {
             db.query(
                 r#"
                 CREATE TABLE IF NOT EXISTS program_invocations (
-                    slot       UInt64,
-                    tx_index   UInt32,
-                    count      UInt32,
+                    slot        UInt64,
+                    program_id  FixedString(32),
+                    tx_index    UInt32,
+                    count       UInt32,
                 ) 
                 ENGINE = MergeTree()
-                ORDER BY (slot, tx_index)
+                ORDER BY (slot, count, program_id, tx_index)
                 "#,
             )
             .execute()

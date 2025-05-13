@@ -276,12 +276,11 @@ fn clear_domain_socket() {
 fn unload() {
     log::info!("solira unloading...");
     stop_tx_queue();
-    log::info!("exiting: {:?}", exiting());
     send_exit_signal_to_clients();
     stop_ipc_bridge();
     stop_clickhouse();
     clear_domain_socket();
-    log::info!("exiting geyser plugin process...");
+    log::info!("solira has successfully unloaded.");
     std::process::exit(0);
 }
 

@@ -151,7 +151,7 @@ impl GeyserPlugin for Solira {
         let processed_slots = PROCESSED_SLOTS.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
         if processed_slots % 10 == 0 {
             let processed_txs = PROCESSED_TRANSACTIONS.load(std::sync::atomic::Ordering::SeqCst);
-            // let num_votes = NUM_VOTES.with_borrow(|votes| *votes);
+            let num_votes = NUM_VOTES.load(std::sync::atomic::Ordering::SeqCst);
             let compute_consumed = COMPUTE_CONSUMED.with_borrow(|compute| *compute);
 
             let overall_tps = START_TIME.with(|start_time| {
@@ -164,9 +164,10 @@ impl GeyserPlugin for Solira {
             });
 
             log::info!(
-                "at slot {}, processed {} transactions consuming {} CU across {} slots | Overall TPS: {:.2}",
+                "at slot {}, processed {} txs ({} vote) consuming {} CU across {} slots | Overall TPS: {:.2}",
                 slot,
                 processed_txs.separate_with_commas(),
+                num_votes.separate_with_commas(),
                 compute_consumed.separate_with_commas(),
                 processed_slots.separate_with_commas(),
                 overall_tps

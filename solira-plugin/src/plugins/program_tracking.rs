@@ -60,8 +60,14 @@ impl Plugin for ProgramTrackingPlugin {
         .boxed()
     }
 
-    fn on_block<'a>(&mut self, db: Client, block: Block) -> PluginFuture<'a> {
+    fn on_block<'a>(&mut self, _db: Client, _block: Block) -> PluginFuture<'a> {
+        async move { Ok(()) }.boxed()
+    }
+
+    fn on_load<'a>(&mut self, db: Client) -> PluginFuture<'a> {
         async move {
+            log::info!("Program Tracking Plugin loaded.");
+            log::info!("Creating program_invocations table if it does not exist...");
             db.query(
                 r#"
                 CREATE TABLE IF NOT EXISTS program_invocations (
@@ -75,6 +81,15 @@ impl Plugin for ProgramTrackingPlugin {
             )
             .execute()
             .await?;
+            log::info!("done.");
+            Ok(())
+        }
+        .boxed()
+    }
+
+    fn on_exit<'a>(&mut self, _db: Client) -> PluginFuture<'a> {
+        async move {
+            log::info!("Program Tracking Plugin unloading...");
             Ok(())
         }
         .boxed()

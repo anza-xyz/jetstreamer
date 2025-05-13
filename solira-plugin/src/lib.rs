@@ -6,6 +6,7 @@ use std::pin::Pin;
 
 use ::clickhouse::Client;
 use bincode;
+use futures_util::FutureExt;
 use interprocess::local_socket::{GenericNamespaced, ToNsName, tokio::prelude::*};
 use tokio::io::{AsyncReadExt, BufReader};
 
@@ -28,6 +29,12 @@ pub trait Plugin: Send + Sync + 'static {
         tx_index: u32,
     ) -> PluginFuture<'a>;
     fn on_block<'a>(&mut self, db: Client, block: Block) -> PluginFuture<'a>;
+    fn on_load<'a>(&mut self, _db: Client) -> PluginFuture<'a> {
+        async move { Ok(()) }.boxed()
+    }
+    fn on_exit<'a>(&mut self, _db: Client) -> PluginFuture<'a> {
+        async move { Ok(()) }.boxed()
+    }
 }
 
 pub struct PluginRunner {
@@ -75,6 +82,12 @@ impl PluginRunner {
         let stream: LocalSocketStream = LocalSocketStream::connect(ns_name).await?;
         let mut reader = BufReader::new(stream);
 
+        for p in &mut self.plugins {
+            if let Err(e) = p.on_load(db.clone()).await {
+                log::error!("plugin {} on_load error: {e}", p.name());
+            }
+        }
+
         log::info!("plugin runner loaded, waiting for transactions...");
 
         loop {
@@ -109,7 +122,12 @@ impl PluginRunner {
                     }
                 }
                 SoliraMessage::Exit => {
-                    log::info!("received exit message from solira, shutting down...");
+                    log::info!("received exit message from solira, shutting down plugin runner...");
+                    for p in &mut self.plugins {
+                        if let Err(e) = p.on_exit(db.clone()).await {
+                            log::error!("plugin {} on_exit error: {e}", p.name());
+                        }
+                    }
                     break;
                 }
             }

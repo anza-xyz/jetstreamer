@@ -66,8 +66,6 @@ pub fn ipc_send(msg: SoliraMessage) {
             if let Err(err) = tx.blocking_send(msg) {
                 panic!("IPC channel error: {:?}", err);
             }
-        } else {
-            log::error!("IPC channel not initialized!");
         }
     });
 }
@@ -243,13 +241,10 @@ fn exiting() -> bool {
 #[inline(always)]
 fn unload() {
     log::info!("solira unloading...");
+    ipc_send(SoliraMessage::Exit);
     EXIT.with(|exit| {
         *exit.borrow_mut() = true;
     });
-    ipc_send(SoliraMessage::Exit);
-    log::info!("stopping ClickHouse...");
-    clickhouse::stop_sync();
-    log::info!("done.");
     log::info!("stopping IPC bridge...");
     IPC_TASK.with(|cell| {
         if let Some(handle) = cell.get() {
@@ -257,7 +252,9 @@ fn unload() {
         }
     });
     log::info!("done.");
-    std::thread::sleep(std::time::Duration::from_secs(2));
+    log::info!("stopping ClickHouse...");
+    clickhouse::stop_sync();
+    log::info!("done.");
     log::info!("clearing domain socket...");
     std::fs::remove_file("/tmp/solira.sock").unwrap_or_else(|_| {
         log::warn!("failed to remove domain socket");

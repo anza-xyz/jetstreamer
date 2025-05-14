@@ -6,6 +6,8 @@ edition = "2024"
 [dependencies]
 agave-geyser-plugin-interface.workspace = true
 solana-logger.workspace = true
+solana-system-program.workspace = true
+solana-vote-program.workspace = true
 serde.workspace = true
 solana-sdk.workspace = true
 tokio.workspace = true

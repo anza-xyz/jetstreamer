@@ -164,10 +164,10 @@ impl GeyserPlugin for Solira {
             });
 
             log::info!(
-                "at slot {}, processed {} txs ({} vote) consuming {} CU across {} slots | Overall TPS: {:.2}",
+                "at slot {}, processed {} txs ({} non-vote) consuming {} CU across {} slots | Overall TPS: {:.2}",
                 slot,
                 processed_txs.separate_with_commas(),
-                num_votes.separate_with_commas(),
+                (processed_txs - num_votes).separate_with_commas(),
                 compute_consumed.separate_with_commas(),
                 processed_slots.separate_with_commas(),
                 overall_tps
@@ -190,9 +190,6 @@ impl GeyserPlugin for Solira {
         }
         match transaction {
             ReplicaTransactionInfoVersions::V0_0_1(tx) => {
-                if tx.is_vote {
-                    NUM_VOTES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                }
                 if let Some(consumed) = tx.transaction_status_meta.compute_units_consumed {
                     COMPUTE_CONSUMED.with_borrow_mut(|compute| {
                         *compute += u128::from(consumed);
@@ -200,9 +197,6 @@ impl GeyserPlugin for Solira {
                 }
             }
             ReplicaTransactionInfoVersions::V0_0_2(tx) => {
-                if tx.is_vote {
-                    NUM_VOTES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                }
                 if let Some(consumed) = tx.transaction_status_meta.compute_units_consumed {
                     COMPUTE_CONSUMED.with_borrow_mut(|compute| {
                         *compute += u128::from(consumed);
@@ -212,6 +206,9 @@ impl GeyserPlugin for Solira {
         }
         PROCESSED_TRANSACTIONS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let tx = Transaction::from_replica(slot, transaction);
+        if tx.is_vote {
+            NUM_VOTES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
         TX_INDEX.with_borrow_mut(|index| {
             ipc_send(SoliraMessage::Transaction(tx, *index));
             *index += 1;

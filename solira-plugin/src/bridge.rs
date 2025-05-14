@@ -23,7 +23,18 @@ impl Transaction {
             ReplicaTransactionInfoVersions::V0_0_1(v) => Self {
                 slot,
                 signature: *v.signature,
-                is_vote: v.is_vote,
+                is_vote: {
+                    // temporary fix until https://github.com/anza-xyz/agave/pull/6230
+                    let msg = v.transaction.message();
+                    let instructions = msg.instructions();
+                    let account_keys = msg.account_keys();
+                    if account_keys.len() > 0 && instructions.len() > 0 {
+                        account_keys[instructions[0].program_id_index as usize]
+                            == solana_vote_program::id()
+                    } else {
+                        false
+                    }
+                },
                 tx: v
                     .transaction // SanitizedTransaction<'_>
                     .clone() // -> owned SanitizedTransaction
@@ -33,7 +44,18 @@ impl Transaction {
             ReplicaTransactionInfoVersions::V0_0_2(v) => Self {
                 slot,
                 signature: *v.signature,
-                is_vote: v.is_vote,
+                is_vote: {
+                    // temporary fix until https://github.com/anza-xyz/agave/pull/6230
+                    let msg = v.transaction.message();
+                    let instructions = msg.instructions();
+                    let account_keys = msg.account_keys();
+                    if account_keys.len() > 0 && instructions.len() > 0 {
+                        account_keys[instructions[0].program_id_index as usize]
+                            == solana_vote_program::id()
+                    } else {
+                        false
+                    }
+                },
                 tx: v.transaction.clone().to_versioned_transaction(),
                 cu: v.transaction_status_meta.compute_units_consumed,
             },

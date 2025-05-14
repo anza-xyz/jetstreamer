@@ -8559,6 +8559,7 @@ dependencies = [
  "solana-hash",
  "solana-instruction",
  "solana-keypair",
+ "solana-metrics",
  "solana-packet",
  "solana-program-runtime",
  "solana-pubkey",
@@ -8739,6 +8740,8 @@ dependencies = [
  "serde",
  "solana-logger",
  "solana-sdk",
+ "solana-system-program",
+ "solana-vote-program",
  "tokio",
 ]
 

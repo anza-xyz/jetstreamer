@@ -12,7 +12,7 @@ use crate::{
 
 #[derive(Row, Deserialize, Serialize, Copy, Clone, Debug, PartialEq, Eq, Hash)]
 struct ProgramEvent {
-    pub slot: u16,
+    pub slot: u32,
     pub program_id: Pubkey,
     pub count: u32,
     pub min_cus: u32, // need to still use u32 because a single transaction can be up to 1.4M CUs
@@ -72,14 +72,14 @@ impl Plugin for ProgramTrackingPlugin {
         .boxed()
     }
 
-    fn on_block<'a>(&'a mut self, db: Client, _block: Block) -> PluginFuture<'a> {
+    fn on_block<'a>(&'a mut self, db: Client, block: Block) -> PluginFuture<'a> {
         async move {
             let mut insert = db.insert("program_invocations")?;
             let mut invocations = 0;
             for (program_id, stats) in self.slot_data.iter() {
                 invocations += stats.count;
                 let row = ProgramEvent {
-                    slot: _block.slot as u16,
+                    slot: block.slot as u32,
                     program_id: *program_id,
                     count: stats.count,
                     min_cus: stats.min_cus,
@@ -109,7 +109,7 @@ impl Plugin for ProgramTrackingPlugin {
             db.query(
                 r#"
                 CREATE TABLE IF NOT EXISTS program_invocations (
-                    slot        UInt16,
+                    slot        UInt32,
                     program_id  FixedString(32),
                     count       UInt32,
                     min_cus     UInt32,

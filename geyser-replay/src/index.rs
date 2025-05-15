@@ -285,61 +285,67 @@ pub async fn build_missing_indexes(
         of1_last_epoch_last_slot
     );
 
-    (0..of1_last_epoch)
-        .par_bridge()
-        .for_each(|epoch| {
-            tokio::runtime::Runtime::new().unwrap().block_on(async {
-                let client = Client::new();
-                let idx_path = idx_dir.join(format!("epoch-{}.idx", epoch));
-                let (start_slot, end_slot) = epoch_to_slot_range(epoch);
-                if idx_path.exists() {
-                    let Ok((last_slot, last_offset, last_size)) =
-                        get_latest_index_line(&idx_path).await
-                    else {
-                        log::error!("Failed to get last index line for epoch {}", epoch);
-                        log::info!("Building index for epoch {} from scratch", epoch);
-                        build_index(&client, epoch, &idx_path, None).await.unwrap();
-                        log::info!("Finished building index for epoch {}", epoch);
-                        return;
-                    };
-
-                    let offset = last_offset + last_size;
-                    if last_slot < end_slot {
-                        log::info!(
-                            "Building index for epoch {} from offset: {} (slots {}-{})",
-                            epoch,
-                            offset,
-                            last_slot,
-                            end_slot
-                        );
-                        build_index(&client, epoch, &idx_path, Some(offset))
-                            .await
-                            .unwrap();
-                    } else {
-                        log::info!(
-                            "Full index already exists for epoch {} (slots {}-{})",
-                            epoch,
-                            start_slot,
-                            end_slot
-                        );
-                    }
-                } else {
+    (0..of1_last_epoch).par_bridge().for_each(|epoch| {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let client = Client::new();
+            let idx_path = idx_dir.join(format!("epoch-{}.idx", epoch));
+            let (start_slot, end_slot) = epoch_to_slot_range(epoch);
+            if idx_path.exists() {
+                let Ok((last_slot, last_offset, last_size)) =
+                    get_latest_index_line(&idx_path).await
+                else {
+                    log::error!("Failed to get last index line for epoch {}", epoch);
                     log::info!("Building index for epoch {} from scratch", epoch);
                     build_index(&client, epoch, &idx_path, None).await.unwrap();
+                    log::info!("Finished building index for epoch {}", epoch);
+                    return;
+                };
+
+                let offset = last_offset + last_size;
+                if last_slot < end_slot {
+                    log::info!(
+                        "Building index for epoch {} from offset: {} (slots {}-{})",
+                        epoch,
+                        offset,
+                        last_slot,
+                        end_slot
+                    );
+                    build_index(&client, epoch, &idx_path, Some(offset))
+                        .await
+                        .unwrap();
+                } else {
+                    log::info!(
+                        "Full index already exists for epoch {} (slots {}-{})",
+                        epoch,
+                        start_slot,
+                        end_slot
+                    );
                 }
-                log::info!("Finished building index for epoch {}", epoch);
-            });
+            } else {
+                log::info!("Building index for epoch {} from scratch", epoch);
+                build_index(&client, epoch, &idx_path, None).await.unwrap();
+            }
+            log::info!("Finished building index for epoch {}", epoch);
         });
+    });
     Ok(())
 }
 
 pub fn get_index_dir() -> PathBuf {
     std::env::var("SOLIRA_OFFSET_CACHE_DIR")
         .unwrap_or_else(|_| {
-            if PathBuf::from("./geyser_replay").exists() {
-                "./geyser-replay/src/index".to_string()
+            if PathBuf::from("./bin").exists() {
+                if PathBuf::from("../geyser_replay").exists() {
+                    "../geyser-replay/src/index".to_string()
+                } else {
+                    "./src/index".to_string()
+                }
             } else {
-                "./src/index".to_string()
+                if PathBuf::from("./geyser_replay").exists() {
+                    "./geyser-replay/src/index".to_string()
+                } else {
+                    "./src/index".to_string()
+                }
             }
         })
         .into()

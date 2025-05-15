@@ -64,6 +64,7 @@ pub async fn start() -> Result<
 
     std::fs::create_dir_all("./bin").unwrap();
     std::env::set_current_dir("./bin").unwrap();
+    std::thread::sleep(std::time::Duration::from_secs(1));
     let mut clickhouse_command = unsafe {
         Command::new(clickhouse_path)
             .arg("server")

@@ -35,10 +35,7 @@ impl Transaction {
                         false
                     }
                 },
-                tx: v
-                    .transaction // SanitizedTransaction<'_>
-                    .clone() // -> owned SanitizedTransaction
-                    .to_versioned_transaction(), // -> VersionedTransaction
+                tx: v.transaction.to_versioned_transaction(),
                 cu: v.transaction_status_meta.compute_units_consumed,
             },
             ReplicaTransactionInfoVersions::V0_0_2(v) => Self {
@@ -56,7 +53,7 @@ impl Transaction {
                         false
                     }
                 },
-                tx: v.transaction.clone().to_versioned_transaction(),
+                tx: v.transaction.to_versioned_transaction(),
                 cu: v.transaction_status_meta.compute_units_consumed,
             },
         }

@@ -22,16 +22,16 @@ pub type PluginFuture<'a> = BoxFuture<'a, Result<(), Box<dyn std::error::Error>>
 pub trait Plugin: Send + Sync + 'static {
     fn name(&self) -> &'static str;
     fn on_transaction<'a>(
-        &mut self,
+        &'a mut self,
         db: Client,
         transaction: Transaction,
         tx_index: u32,
     ) -> PluginFuture<'a>;
-    fn on_block<'a>(&mut self, db: Client, block: Block) -> PluginFuture<'a>;
-    fn on_load<'a>(&mut self, _db: Client) -> PluginFuture<'a> {
+    fn on_block<'a>(&'a mut self, db: Client, block: Block) -> PluginFuture<'a>;
+    fn on_load<'a>(&'a mut self, _db: Client) -> PluginFuture<'a> {
         async move { Ok(()) }.boxed()
     }
-    fn on_exit<'a>(&mut self, _db: Client) -> PluginFuture<'a> {
+    fn on_exit<'a>(&'a mut self, _db: Client) -> PluginFuture<'a> {
         async move { Ok(()) }.boxed()
     }
 }

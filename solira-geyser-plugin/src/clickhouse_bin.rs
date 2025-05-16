@@ -1,5 +1,7 @@
 use solira::clickhouse::*;
 
+// TODO: pull clickhouse into its own crate
+
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
     solana_logger::setup_with_default("info");

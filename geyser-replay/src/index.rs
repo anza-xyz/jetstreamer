@@ -334,7 +334,7 @@ pub async fn build_missing_indexes(
 pub fn get_index_dir() -> PathBuf {
     std::env::var("SOLIRA_OFFSET_CACHE_DIR")
         .unwrap_or_else(|_| {
-            if PathBuf::from("./bin").exists() {
+            if PathBuf::from("./clickhouse").exists() {
                 if PathBuf::from("../geyser_replay").exists() {
                     "../geyser-replay/src/index".to_string()
                 } else {

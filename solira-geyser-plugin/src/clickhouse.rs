@@ -32,6 +32,35 @@ static CLICKHOUSE_PROCESS: OnceCell<u32> = OnceCell::const_new();
 
 include!(concat!(env!("OUT_DIR"), "/embed_clickhouse.rs")); // raw bytes for clickhouse binary
 
+pub async fn start_client() {
+    let clickhouse_path = NamedTempFile::with_suffix("-clickhouse")
+        .unwrap()
+        .into_temp_path()
+        .keep()
+        .unwrap();
+    log::info!("Writing ClickHouse binary to: {:?}", clickhouse_path);
+    File::create(&clickhouse_path)
+        .await
+        .unwrap()
+        .write_all(CLICKHOUSE_BINARY)
+        .await
+        .unwrap();
+    // executable permission for Unix
+    #[cfg(unix)]
+    std::fs::set_permissions(&clickhouse_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    log::info!("ClickHouse binary written and permissions set.");
+
+    std::env::set_current_dir("./bin").unwrap();
+
+    // let clickhouse take over the current process
+    Command::new(clickhouse_path)
+        .arg("client")
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("Failed to start ClickHouse client process");
+}
+
 pub async fn start() -> Result<
     (
         mpsc::Receiver<()>,

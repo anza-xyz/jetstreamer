@@ -14,6 +14,10 @@ name = "solira"
 name = "clickhouse-server"
 path = "src/clickhouse_server_bin.rs"
 
+[[bin]]
+name = "clickhouse-client"
+path = "src/clickhouse_client_bin.rs"
+
 [dependencies]
 tokio.workspace = true
 log.workspace = true

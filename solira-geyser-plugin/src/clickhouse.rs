@@ -104,6 +104,7 @@ pub async fn start() -> Result<
         let mut ready_signal_sent = false;
 
         loop {
+            let mut other_pid: Option<u32> = None;
             tokio::select! {
                 line = stdout_reader.next_line() => {
                     if let Ok(Some(line)) = line {
@@ -127,6 +128,16 @@ pub async fn start() -> Result<
                                 log::error!("Failed to send readiness signal: {}", err);
                             }
                             ready_signal_sent = true;
+                        } else if line.contains("DB::Server::run() @") {
+                            log::warn!("ClickHouse server is already running, gracefully shutting down and restarting.");
+                        } else if line.contains("PID: ") {
+                            // Extract the PID from the line
+                            println!("ClickHouse PID: |{}|", line);
+                            if let Some(pid_str) = line.split_whitespace().nth(1) {
+                                if let Ok(pid) = pid_str.parse::<u32>() {
+                                    other_pid = Some(pid);
+                                }
+                            }
                         }
                     }
                 }

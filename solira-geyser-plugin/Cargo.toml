@@ -10,6 +10,10 @@ targets = ["x86_64-unknown-linux-gnu"]
 crate-type = ["cdylib", "rlib"]
 name = "solira"
 
+[[bin]]
+name = "clickhouse"
+path = "src/clickhouse_bin.rs"
+
 [dependencies]
 tokio.workspace = true
 log.workspace = true

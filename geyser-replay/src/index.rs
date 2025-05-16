@@ -334,18 +334,18 @@ pub async fn build_missing_indexes(
 pub fn get_index_dir() -> PathBuf {
     std::env::var("SOLIRA_OFFSET_CACHE_DIR")
         .unwrap_or_else(|_| {
-            if PathBuf::from("./geyser-replay/src/index").exists() {
-                "./geyser-replay/src/index".to_string()
-            } else if PathBuf::from("./src/index").exists() {
-                "./src/index".to_string()
-            } else if PathBuf::from("../geyser-replay/src/index").exists() {
-                "../geyser-replay/src/index".to_string()
-            } else if PathBuf::from("../src/index").exists() {
-                "../src/index".to_string()
-            } else if PathBuf::from("./index").exists() {
-                "./index".to_string()
+            if PathBuf::from("geyser-replay/src/index").exists() {
+                "geyser-replay/src/index".to_string()
+            } else if PathBuf::from("src/index").exists() {
+                "src/index".to_string()
+            } else if PathBuf::from("geyser-replay/src/index").exists() {
+                "geyser-replay/src/index".to_string()
+            } else if PathBuf::from("src/index").exists() {
+                "src/index".to_string()
+            } else if PathBuf::from("index").exists() {
+                "index".to_string()
             } else {
-                "./src/index".to_string()
+                "geyser-replay/src/index".to_string()
             }
         })
         .into()

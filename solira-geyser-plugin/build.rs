@@ -5,8 +5,6 @@ use std::{env, fs};
 
 fn main() {
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
-
-    println!("cargo:rerun-if-changed=bin/clickhouse");
     let clickhouse_binary = out_dir.join("clickhouse");
 
     // Check if the ClickHouse binary exists

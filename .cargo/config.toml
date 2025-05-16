@@ -1,0 +1,2 @@
+[alias]
+clickhouse = "run --release -p solira-geyser-plugin --bin clickhouse"

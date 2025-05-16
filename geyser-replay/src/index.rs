@@ -332,8 +332,8 @@ pub async fn build_missing_indexes(
 }
 
 pub fn get_index_dir() -> PathBuf {
-    std::env::var("SOLIRA_OFFSET_CACHE_DIR")
-        .unwrap_or_else(|_| {
+    PathBuf::from(
+        std::env::var("SOLIRA_OFFSET_CACHE_DIR").unwrap_or_else(|_| {
             log::info!("SOLIRA_OFFSET_CACHE_DIR not set, using default");
             log::info!("current dir: {:?}", std::env::current_dir());
             if PathBuf::from("geyser-replay/src/index").exists() {
@@ -355,8 +355,10 @@ pub fn get_index_dir() -> PathBuf {
                 log::info!("Falling back to index dir: geyser-replay/src/index");
                 "geyser-replay/src/index".to_string()
             }
-        })
-        .into()
+        }),
+    )
+    .canonicalize()
+    .unwrap()
 }
 
 #[tokio::test]

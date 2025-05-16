@@ -141,7 +141,7 @@ pub async fn start() -> Result<
                             {
                                 log::error!("Failed to send SIGTERM to ClickHouse process: {}", err);
                             }
-                            log::info!("ClickHouse process with PID {} killed.", other_pid);
+                            log::warn!("ClickHouse process with PID {} killed.", other_pid);
                             log::warn!("Please re-launch.");
                             std::process::exit(0);
                         } else if line.contains("PID: ") {

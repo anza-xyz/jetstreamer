@@ -332,33 +332,21 @@ pub async fn build_missing_indexes(
 }
 
 pub fn get_index_dir() -> PathBuf {
-    PathBuf::from(
-        std::env::var("SOLIRA_OFFSET_CACHE_DIR").unwrap_or_else(|_| {
-            log::info!("SOLIRA_OFFSET_CACHE_DIR not set, using default");
-            log::info!("current dir: {:?}", std::env::current_dir());
-            if PathBuf::from("geyser-replay/src/index").exists() {
-                log::info!("Using index dir: geyser-replay/src/index");
-                "geyser-replay/src/index".to_string()
-            } else if PathBuf::from("src/index").exists() {
-                log::info!("Using index dir: src/index");
-                "src/index".to_string()
-            } else if PathBuf::from("geyser-replay/src/index").exists() {
-                log::info!("Using index dir: geyser-replay/src/index");
-                "geyser-replay/src/index".to_string()
-            } else if PathBuf::from("src/index").exists() {
-                log::info!("Using index dir: src/index");
-                "src/index".to_string()
-            } else if PathBuf::from("index").exists() {
-                log::info!("Using index dir: index");
-                "index".to_string()
-            } else {
-                log::info!("Falling back to index dir: geyser-replay/src/index");
-                "geyser-replay/src/index".to_string()
-            }
-        }),
-    )
-    .canonicalize()
-    .unwrap()
+    if let Ok(dir) = std::env::var("SOLIRA_OFFSET_CACHE_DIR") {
+        return PathBuf::from(dir).canonicalize().unwrap();
+    }
+    // List of candidate directories, in order
+    const CANDIDATES: [&str; 3] = ["geyser-replay/src/index", "src/index", "index"];
+    for candidate in CANDIDATES.iter() {
+        let path = PathBuf::from(candidate);
+        if path.exists() {
+            return path.canonicalize().unwrap();
+        }
+    }
+    // Fallback to default
+    PathBuf::from("geyser-replay/src/index")
+        .canonicalize()
+        .unwrap()
 }
 
 #[tokio::test]

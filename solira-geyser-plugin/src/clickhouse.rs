@@ -102,9 +102,8 @@ pub async fn start() -> Result<
     // Spawn a task to monitor both stdout and stderr for the "Ready for connections." message
     tokio::spawn(async move {
         let mut ready_signal_sent = false;
-
+        let mut other_pid: Option<u32> = None;
         loop {
-            let mut other_pid: Option<u32> = None;
             tokio::select! {
                 line = stdout_reader.next_line() => {
                     if let Ok(Some(line)) = line {
@@ -130,9 +129,22 @@ pub async fn start() -> Result<
                             ready_signal_sent = true;
                         } else if line.contains("DB::Server::run() @") {
                             log::warn!("ClickHouse server is already running, gracefully shutting down and restarting.");
+                            let Some(other_pid) = other_pid else {
+                                panic!("Failed to find the PID of the running ClickHouse server.");
+                            };
+                            if let Err(err) = Command::new("kill")
+                                .arg("-s")
+                                .arg("SIGTERM")
+                                .arg(other_pid.to_string())
+                                .status()
+                                .await
+                            {
+                                log::error!("Failed to send SIGTERM to ClickHouse process: {}", err);
+                            }
+                            log::info!("ClickHouse process with PID {} killed.", other_pid);
+                            log::warn!("Please re-launch.");
+                            stop().await;
                         } else if line.contains("PID: ") {
-                            // Extract the PID from the line
-                            println!("ClickHouse PID: |{}|", line);
                             if let Some(pid_str) = line.split_whitespace().nth(1) {
                                 if let Ok(pid) = pid_str.parse::<u32>() {
                                     other_pid = Some(pid);

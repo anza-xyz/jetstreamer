@@ -52,6 +52,8 @@ pub async fn start_client() -> Result<(), Box<dyn std::error::Error>> {
 
     std::env::set_current_dir("./bin").unwrap();
 
+    std::thread::sleep(std::time::Duration::from_secs(1));
+
     // let clickhouse take over the current process
     Command::new(clickhouse_path)
         .arg("client")

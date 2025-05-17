@@ -32,7 +32,7 @@ static CLICKHOUSE_PROCESS: OnceCell<u32> = OnceCell::const_new();
 
 include!(concat!(env!("OUT_DIR"), "/embed_clickhouse.rs")); // raw bytes for clickhouse binary
 
-pub async fn start_client() {
+pub async fn start_client() -> Result<(), Box<dyn std::error::Error>> {
     let clickhouse_path = NamedTempFile::with_suffix("-clickhouse")
         .unwrap()
         .into_temp_path()
@@ -55,10 +55,15 @@ pub async fn start_client() {
     // let clickhouse take over the current process
     Command::new(clickhouse_path)
         .arg("client")
+        .arg("--host=localhost")
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .spawn()
-        .expect("Failed to start ClickHouse client process");
+        .expect("Failed to start ClickHouse client process")
+        .wait()
+        .await?;
+
+    Ok(())
 }
 
 pub async fn start() -> Result<

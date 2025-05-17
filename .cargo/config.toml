@@ -1,2 +1,3 @@
 [alias]
 clickhouse-server = "run --release -p solira-geyser-plugin --bin clickhouse-server"
+clickhouse-client = "run --release -p solira-geyser-plugin --bin clickhouse-client"

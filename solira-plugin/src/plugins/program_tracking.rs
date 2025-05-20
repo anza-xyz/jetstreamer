@@ -75,9 +75,9 @@ impl Plugin for ProgramTrackingPlugin {
     fn on_block<'a>(&'a mut self, db: Client, block: Block) -> PluginFuture<'a> {
         async move {
             let mut insert = db.insert("program_invocations")?;
-            let mut invocations = 0;
+            //let mut invocations = 0;
             for (program_id, stats) in self.slot_data.iter() {
-                invocations += stats.count;
+                // invocations += stats.count;
                 let row = ProgramEvent {
                     slot: block.slot as u32,
                     program_id: *program_id,

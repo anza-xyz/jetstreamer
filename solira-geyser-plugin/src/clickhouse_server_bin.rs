@@ -11,7 +11,7 @@ async fn main() {
     .unwrap();
     let (mut ready_rx, clickhouse_future) = start().await.unwrap();
     log::info!("Waiting for ClickHouse to be ready...");
-    if let Some(_) = ready_rx.recv().await {
+    if ready_rx.recv().await.is_some() {
         log::info!("ClickHouse is ready!");
     }
     // Wait for the ClickHouse process to finish

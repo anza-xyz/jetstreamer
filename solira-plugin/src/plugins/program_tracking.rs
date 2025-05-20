@@ -38,12 +38,12 @@ impl Plugin for ProgramTrackingPlugin {
         "Program Tracking"
     }
 
-    fn on_transaction<'a>(
-        &'a mut self,
+    fn on_transaction(
+        &mut self,
         _db: Client,
         transaction: Transaction,
         _tx_index: u32,
-    ) -> PluginFuture<'a> {
+    ) -> PluginFuture<'_> {
         async move {
             let (account_keys, instructions) = match transaction.tx.message {
                 VersionedMessage::Legacy(msg) => (msg.account_keys, msg.instructions),
@@ -72,7 +72,7 @@ impl Plugin for ProgramTrackingPlugin {
         .boxed()
     }
 
-    fn on_block<'a>(&'a mut self, db: Client, block: Block) -> PluginFuture<'a> {
+    fn on_block(&mut self, db: Client, block: Block) -> PluginFuture<'_> {
         async move {
             let mut insert = db.insert("program_invocations")?;
             //let mut invocations = 0;
@@ -102,7 +102,7 @@ impl Plugin for ProgramTrackingPlugin {
         .boxed()
     }
 
-    fn on_load<'a>(&'a mut self, db: Client) -> PluginFuture<'a> {
+    fn on_load(&mut self, db: Client) -> PluginFuture<'_> {
         async move {
             log::info!("Program Tracking Plugin loaded.");
             log::info!("Creating program_invocations table if it does not exist...");
@@ -128,7 +128,7 @@ impl Plugin for ProgramTrackingPlugin {
         .boxed()
     }
 
-    fn on_exit<'a>(&'a mut self, _db: Client) -> PluginFuture<'a> {
+    fn on_exit(&mut self, _db: Client) -> PluginFuture<'_> {
         async move {
             log::info!("Program Tracking Plugin unloading...");
             Ok(())

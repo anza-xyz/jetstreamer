@@ -28,7 +28,7 @@ impl Transaction {
                     let msg = v.transaction.message();
                     let instructions = msg.instructions();
                     let account_keys = msg.account_keys();
-                    if account_keys.len() > 0 && instructions.len() > 0 {
+                    if !account_keys.is_empty() && !instructions.is_empty() {
                         account_keys[instructions[0].program_id_index as usize]
                             == solana_vote_program::id()
                     } else {
@@ -46,7 +46,7 @@ impl Transaction {
                     let msg = v.transaction.message();
                     let instructions = msg.instructions();
                     let account_keys = msg.account_keys();
-                    if account_keys.len() > 0 && instructions.len() > 0 {
+                    if !account_keys.is_empty() && !instructions.is_empty() {
                         account_keys[instructions[0].program_id_index as usize]
                             == solana_vote_program::id()
                     } else {

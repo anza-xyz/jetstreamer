@@ -89,14 +89,14 @@ impl Plugin for ProgramTrackingPlugin {
                 // log::info!("{:?}", row);
                 insert.write(&row).await.unwrap();
             }
-            let num = self.slot_data.len();
+            //let num = self.slot_data.len();
             self.slot_data.clear();
             insert.end().await.unwrap();
-            log::info!(
+            /*log::info!(
                 "Inserted {} slot-specific program stat records spanning {} program invocations",
                 num,
                 invocations
-            );
+            );*/
             Ok(())
         }
         .boxed()

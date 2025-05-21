@@ -2,6 +2,7 @@ use agave_geyser_plugin_interface::geyser_plugin_interface::{
     GeyserPlugin, GeyserPluginError, ReplicaBlockInfoVersions, ReplicaTransactionInfoVersions,
     Result,
 };
+use geyser_replay::epochs::slot_to_epoch;
 use mpsc::Sender;
 use once_cell::unsync::OnceCell;
 use std::{
@@ -163,9 +164,12 @@ impl GeyserPlugin for Solira {
                 processed_txs as f64 / elapsed
             });
 
+            let epoch = slot_to_epoch(slot);
+
             log::info!(
-                "at slot {}, processed {} txs ({} non-vote) consuming {} CU across {} slots | Overall TPS: {:.2}",
+                "at slot {} epoch {}, processed {} txs ({} non-vote) consuming {} CU across {} slots | AVG TPS: {:.2}",
                 slot,
+                epoch,
                 processed_txs.separate_with_commas(),
                 (processed_txs - num_votes).separate_with_commas(),
                 compute_consumed.separate_with_commas(),

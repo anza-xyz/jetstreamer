@@ -112,7 +112,7 @@ impl SoliraRunner {
                     slot_to_epoch(slot),
                     err
                 );
-                let slot = slot.saturating_sub(slot);
+                let slot = slot.saturating_sub(1);
                 slot_range = slot..slot_range.end;
                 log::warn!(
                     "restarting from slot {}..{}",

@@ -1,8 +1,12 @@
 use core::ops::Range;
-use geyser_replay::{firehose::firehose, index::get_index_dir};
+use geyser_replay::{
+    epochs::slot_to_epoch,
+    firehose::{firehose, GeyserReplayError},
+    index::get_index_dir,
+};
 use serde_json::json;
 use solira_plugin::{Plugin, PluginRunner};
-use std::{fs::File, io::Write, os::unix::fs::PermissionsExt, path::PathBuf};
+use std::{fs::File, future::Future, io::Write, os::unix::fs::PermissionsExt, path::PathBuf};
 use tempfile::NamedTempFile;
 
 include!(concat!(env!("OUT_DIR"), "/embed.rs")); // brings in SOLIRA_CDYLIB
@@ -70,32 +74,50 @@ impl SoliraRunner {
         self
     }
 
-    pub async fn run(self) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn run(self) -> Result<(), GeyserReplayError> {
         solana_logger::setup_with_default(&self.log_level);
         let geyser_config_files: &[PathBuf] = &self.geyser_config_files;
         log::debug!("GeyserPluginService config: {:?}", geyser_config_files);
         let client = reqwest::Client::new();
         let index_dir = self.index_dir;
         log::info!("slot index dir: {:?}", index_dir);
-        let slot_range = self.slot_range.unwrap_or_default();
+        let mut slot_range = self.slot_range.unwrap_or_default();
         log::info!("geyser config files: {:?}", geyser_config_files);
-        firehose(
-            slot_range,
-            Some(geyser_config_files),
-            index_dir,
-            &client,
-            async {
-                let mut plugin_runner =
-                    PluginRunner::new("http://localhost:8123").socket_name("solira.sock");
-                for plugin in self.plugins {
-                    plugin_runner.register(plugin);
-                }
-                log::info!("spawning plugin runner...");
-                plugin_runner.run().await.unwrap();
-            },
-        )
-        .await?;
-        Ok(())
+        let mut plugin_runner =
+            PluginRunner::new("http://localhost:8123").socket_name("solira.sock");
+        for plugin in self.plugins {
+            plugin_runner.register(plugin);
+        }
+        let fut = async move {
+            plugin_runner.run().await.unwrap();
+            Ok(())
+        };
+        loop {
+            if let Err((err, slot)) = firehose(
+                slot_range.clone(),
+                Some(geyser_config_files),
+                &index_dir,
+                &client,
+                fut,
+            )
+            .await
+            {
+                // handle error or break if needed
+                log::error!(
+                    "🔥🔥🔥 firehose encountered an error at slot {} in epoch {}: {}",
+                    slot,
+                    slot_to_epoch(slot),
+                    err
+                );
+                let slot = slot.saturating_sub(slot);
+                slot_range = slot..slot_range.end;
+                log::warn!(
+                    "restarting from slot {}..{}",
+                    slot_range.start,
+                    slot_range.end
+                );
+            }
+        }
     }
 }
 

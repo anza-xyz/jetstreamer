@@ -2,7 +2,7 @@ pub mod bridge;
 pub mod ipc;
 pub mod plugins;
 
-use std::pin::Pin;
+use std::{pin::Pin, sync::Mutex};
 
 use ::clickhouse::Client;
 use futures_util::FutureExt;
@@ -14,7 +14,7 @@ use crate::{
     ipc::SoliraMessage,
 };
 
-pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
 
 /// Used to work around the fact that `async fn` cannot be used in an object-safe trait.
 pub type PluginFuture<'a> = BoxFuture<'a, Result<(), Box<dyn std::error::Error>>>;
@@ -34,18 +34,33 @@ pub trait Plugin: Send + Sync + 'static {
     fn on_exit(&mut self, _db: Client) -> PluginFuture<'_> {
         async move { Ok(()) }.boxed()
     }
+
+    fn clone_plugin(&self) -> Box<dyn Plugin>;
 }
 
 pub struct PluginRunner {
-    plugins: Vec<Box<dyn Plugin>>,
+    plugins: Mutex<Vec<Box<dyn Plugin>>>,
     clickhouse_dsn: String,
     socket_name: String,
+}
+
+impl Clone for PluginRunner {
+    fn clone(&self) -> Self {
+        Self {
+            plugins: {
+                let plugins = self.plugins.lock().unwrap();
+                Mutex::new(plugins.iter().map(|p| p.clone_plugin()).collect::<Vec<_>>())
+            },
+            clickhouse_dsn: self.clickhouse_dsn.clone(),
+            socket_name: self.socket_name.clone(),
+        }
+    }
 }
 
 impl PluginRunner {
     pub fn new(clickhouse_dsn: impl Into<String>) -> Self {
         Self {
-            plugins: Vec::new(),
+            plugins: Mutex::new(Vec::new()),
             clickhouse_dsn: clickhouse_dsn.into(),
             socket_name: "solira.sock".into(),
         }
@@ -57,11 +72,11 @@ impl PluginRunner {
     }
 
     pub fn register(&mut self, plugin: Box<dyn Plugin>) {
-        self.plugins.push(plugin);
+        self.plugins.lock().unwrap().push(plugin);
     }
 
     /// Dial the IPC socket and forward every message to every plugin.
-    pub async fn run(mut self) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn run(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         log::info!("connecting to ClickHouse at {}", self.clickhouse_dsn);
         let db = Client::default().with_url(&self.clickhouse_dsn);
         log::info!("checking if database exists + creating if it does not...");
@@ -77,11 +92,15 @@ impl PluginRunner {
             .with_option("wait_for_async_insert", "0");
 
         // Connect to the domain socket
-        let ns_name = self.socket_name.to_ns_name::<GenericNamespaced>()?;
+        let ns_name = self.socket_name.clone().to_ns_name::<GenericNamespaced>()?;
         let stream: LocalSocketStream = LocalSocketStream::connect(ns_name).await?;
         let mut reader = BufReader::new(stream);
 
-        for p in &mut self.plugins {
+        // plugin set is locked while the plugin runner is running
+        let mut guard = self.plugins.lock().unwrap();
+        let mut plugins: Vec<Box<dyn Plugin>> = std::mem::take(&mut *guard);
+
+        for p in plugins.iter_mut() {
             if let Err(e) = p.on_load(db.clone()).await {
                 log::error!("plugin {} on_load error: {e}", p.name());
             }
@@ -107,14 +126,14 @@ impl PluginRunner {
             // ── dispatch ─────────────────────────────────────────────────
             match msg {
                 SoliraMessage::Block(block) => {
-                    for p in &mut self.plugins {
+                    for p in plugins.iter_mut() {
                         if let Err(e) = p.on_block(db.clone(), block.clone()).await {
                             log::error!("plugin {} on_block error: {e}", p.name());
                         }
                     }
                 }
                 SoliraMessage::Transaction(tx, tx_index) => {
-                    for p in &mut self.plugins {
+                    for p in plugins.iter_mut() {
                         if let Err(e) = p.on_transaction(db.clone(), tx.clone(), tx_index).await {
                             log::error!("plugin {} on_transaction error: {e}", p.name());
                         }
@@ -122,7 +141,7 @@ impl PluginRunner {
                 }
                 SoliraMessage::Exit => {
                     log::info!("received exit message from solira, shutting down plugin runner...");
-                    for p in &mut self.plugins {
+                    for p in plugins.iter_mut() {
                         if let Err(e) = p.on_exit(db.clone()).await {
                             log::error!("plugin {} on_exit error: {e}", p.name());
                         }
@@ -131,6 +150,9 @@ impl PluginRunner {
                 }
             }
         }
+
+        // put the plugins back in the mutex
+        self.plugins.lock().unwrap().extend(plugins);
 
         Ok(())
     }

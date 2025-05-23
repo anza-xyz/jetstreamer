@@ -31,6 +31,7 @@ pub enum GeyserReplayError {
     NodeDecodingError(usize, Box<dyn std::error::Error>),
     SlotOffsetIndexError(SlotOffsetIndexError),
     SeekToSlotError(Box<dyn std::error::Error>),
+    OnLoadError(Box<dyn std::error::Error>),
 }
 
 impl Display for GeyserReplayError {
@@ -68,6 +69,7 @@ impl Display for GeyserReplayError {
             GeyserReplayError::SeekToSlotError(error) => {
                 write!(f, "Error seeking to slot: {}", error)
             }
+            GeyserReplayError::OnLoadError(error) => write!(f, "Error on load: {}", error),
         }
     }
 }
@@ -95,8 +97,10 @@ pub async fn firehose(
     geyser_config_files: Option<&[PathBuf]>,
     slot_offset_index_path: impl AsRef<Path>,
     client: &Client,
-    on_load: impl Future<Output = ()> + Send + 'static,
-) -> Result<Receiver<SlotNotification>, GeyserReplayError> {
+    on_load: impl Future<Output = Result<(), Box<dyn std::error::Error + 'static + Send>>>
+        + Send
+        + 'static,
+) -> Result<Receiver<SlotNotification>, (GeyserReplayError, u64)> {
     log::info!("starting firehose...");
     let start_time = std::time::Instant::now();
     let (confirmed_bank_sender, confirmed_bank_receiver) = unbounded();
@@ -111,12 +115,14 @@ pub async fn firehose(
                 confirmed_bank_receiver.clone(),
                 true,
                 geyser_config_files,
-            )?;
+            )
+            .map_err(|e| (e.into(), slot_range.start))?;
 
         transaction_notifier_maybe = Some(
             service
                 .get_transaction_notifier()
-                .ok_or(GeyserReplayError::FailedToGetTransactionNotifier)?,
+                .ok_or(GeyserReplayError::FailedToGetTransactionNotifier)
+                .map_err(|e| (e.into(), slot_range.start))?,
         );
 
         entry_notifier_maybe = service.get_entry_notifier();
@@ -140,12 +146,11 @@ pub async fn firehose(
         slot_to_epoch(slot_range.end)
     );
 
-    let mut slot_offset_index = SlotOffsetIndex::new(slot_offset_index_path)?;
+    let mut slot_offset_index =
+        SlotOffsetIndex::new(slot_offset_index_path).map_err(|e| (e.into(), slot_range.start))?;
 
     log::info!("running on_load...");
-    tokio::task::spawn(async move {
-        on_load.await;
-    });
+    tokio::task::spawn(on_load);
 
     log::info!("🚒 starting firehose...");
 
@@ -159,7 +164,8 @@ pub async fn firehose(
         let header = reader
             .read_raw_header()
             .await
-            .map_err(GeyserReplayError::ReadHeader)?;
+            .map_err(GeyserReplayError::ReadHeader)
+            .map_err(|e| (e.into(), current_slot.unwrap_or(slot_range.start)))?;
         log::debug!("read epoch {} header: {:?}", epoch_num, header);
 
         let mut todo_previous_blockhash = solana_sdk::hash::Hash::default();
@@ -168,7 +174,8 @@ pub async fn firehose(
         if slot_range.start > epoch_to_slot_range(epoch_num).0 {
             reader
                 .seek_to_slot(slot_range.start, &mut slot_offset_index)
-                .await?;
+                .await
+                .map_err(|e| (e.into(), current_slot.unwrap_or(slot_range.start)))?;
         }
 
         // for each item in each block
@@ -177,7 +184,8 @@ pub async fn firehose(
             let mut nodes = reader
                 .read_until_block()
                 .await
-                .map_err(GeyserReplayError::ReadUntilBlockError)?;
+                .map_err(GeyserReplayError::ReadUntilBlockError)
+                .map_err(|e| (e.into(), current_slot.unwrap_or(slot_range.start)))?;
             // ignore epoch and subset nodes at end of car file
             loop {
                 if nodes.0.is_empty() {
@@ -200,7 +208,8 @@ pub async fn firehose(
             }
             let block = nodes
                 .get_block()
-                .map_err(GeyserReplayError::GetBlockError)?;
+                .map_err(GeyserReplayError::GetBlockError)
+                .map_err(|e| (e.into(), current_slot.unwrap_or(slot_range.start)))?;
             log::debug!(
                 "read {} items from epoch {}, now at slot {}",
                 item_index,
@@ -371,7 +380,7 @@ pub async fn firehose(
                     }
                     Ok(())
                 })
-                .map_err(|e| GeyserReplayError::NodeDecodingError(item_index, e))?;
+                .map_err(|e| GeyserReplayError::NodeDecodingError(item_index, e)).map_err(|e| (e.into(), current_slot.unwrap_or(slot_range.start)))?;
             if block.slot == slot_range.end - 1 {
                 let finish_time = std::time::Instant::now();
                 let elapsed = finish_time.duration_since(start_time);

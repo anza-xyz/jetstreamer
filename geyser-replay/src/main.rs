@@ -31,7 +31,7 @@ async fn main() {
         Some(geyser_config_files),
         index_dir,
         &client,
-        async {},
+        async { Ok(()) },
     )
     .await
     .unwrap();

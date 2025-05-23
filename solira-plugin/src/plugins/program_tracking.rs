@@ -28,7 +28,7 @@ struct ProgramStats {
     pub total_cus: u32,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct ProgramTrackingPlugin {
     slot_data: HashMap<Pubkey, ProgramStats>,
 }
@@ -134,5 +134,9 @@ impl Plugin for ProgramTrackingPlugin {
             Ok(())
         }
         .boxed()
+    }
+
+    fn clone_plugin(&self) -> Box<dyn Plugin> {
+        Box::new(self.clone())
     }
 }

@@ -2,7 +2,11 @@ pub mod bridge;
 pub mod ipc;
 pub mod plugins;
 
-use std::{pin::Pin, sync::Mutex};
+use std::{
+    fmt::Display,
+    pin::Pin,
+    sync::{Arc, Mutex},
+};
 
 use ::clickhouse::Client;
 use futures_util::FutureExt;
@@ -14,7 +18,7 @@ use crate::{
     ipc::SoliraMessage,
 };
 
-pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
+pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// Used to work around the fact that `async fn` cannot be used in an object-safe trait.
 pub type PluginFuture<'a> = BoxFuture<'a, Result<(), Box<dyn std::error::Error>>>;
@@ -76,7 +80,7 @@ impl PluginRunner {
     }
 
     /// Dial the IPC socket and forward every message to every plugin.
-    pub async fn run(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn run(self: Arc<Self>) -> Result<(), PluginRunnerError> {
         log::info!("connecting to ClickHouse at {}", self.clickhouse_dsn);
         let db = Client::default().with_url(&self.clickhouse_dsn);
         log::info!("checking if database exists + creating if it does not...");
@@ -92,13 +96,21 @@ impl PluginRunner {
             .with_option("wait_for_async_insert", "0");
 
         // Connect to the domain socket
-        let ns_name = self.socket_name.clone().to_ns_name::<GenericNamespaced>()?;
-        let stream: LocalSocketStream = LocalSocketStream::connect(ns_name).await?;
+        let ns_name = self
+            .socket_name
+            .clone()
+            .to_ns_name::<GenericNamespaced>()
+            .map_err(|e| PluginRunnerError::UnsupportedSocketName(e.to_string()))?;
+        let stream: LocalSocketStream = LocalSocketStream::connect(ns_name)
+            .await
+            .map_err(|e| PluginRunnerError::SocketConnectError(e.to_string()))?;
         let mut reader = BufReader::new(stream);
 
         // plugin set is locked while the plugin runner is running
-        let mut guard = self.plugins.lock().unwrap();
-        let mut plugins: Vec<Box<dyn Plugin>> = std::mem::take(&mut *guard);
+        let mut plugins: Vec<Box<dyn Plugin>> = {
+            let mut guard = self.plugins.lock().unwrap();
+            std::mem::take(&mut *guard)
+        };
 
         for p in plugins.iter_mut() {
             if let Err(e) = p.on_load(db.clone()).await {
@@ -118,7 +130,10 @@ impl PluginRunner {
 
             // ── payload ──────────────────────────────────────────────────
             let mut buf = vec![0u8; len];
-            reader.read_exact(&mut buf).await?;
+            reader
+                .read_exact(&mut buf)
+                .await
+                .map_err(|e| PluginRunnerError::PayloadReadError(e.to_string()))?;
 
             // ── decode ───────────────────────────────────────────────────
             let msg: SoliraMessage = bincode::deserialize(&buf)?;
@@ -155,5 +170,50 @@ impl PluginRunner {
         self.plugins.lock().unwrap().extend(plugins);
 
         Ok(())
+    }
+}
+
+// ensure that PluginRunnerError is Send + Sync + 'static
+trait _CanSend: Send + Sync + 'static {}
+impl _CanSend for PluginRunnerError {}
+
+#[derive(Debug, thiserror::Error)]
+pub enum PluginRunnerError {
+    UnsupportedSocketName(String),
+    SocketConnectError(String),
+    PayloadReadError(String),
+    ClickhouseError(clickhouse::error::Error),
+    Bincode(bincode::Error),
+}
+
+impl Display for PluginRunnerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PluginRunnerError::UnsupportedSocketName(s) => {
+                write!(f, "unsupported domain socket name: {}", s)
+            }
+            PluginRunnerError::ClickhouseError(error) => {
+                write!(f, "clickhouse error: {}", error)
+            }
+            PluginRunnerError::SocketConnectError(s) => {
+                write!(f, "failed to connect to domain socket: {}", s)
+            }
+            PluginRunnerError::PayloadReadError(s) => {
+                write!(f, "failed to read payload bytes from domain socket: {}", s)
+            }
+            PluginRunnerError::Bincode(error) => write!(f, "bincode error: {}", error),
+        }
+    }
+}
+
+impl From<clickhouse::error::Error> for PluginRunnerError {
+    fn from(error: clickhouse::error::Error) -> Self {
+        PluginRunnerError::ClickhouseError(error)
+    }
+}
+
+impl From<bincode::Error> for PluginRunnerError {
+    fn from(error: bincode::Error) -> Self {
+        PluginRunnerError::Bincode(error)
     }
 }

@@ -97,7 +97,7 @@ pub async fn firehose(
     geyser_config_files: Option<&[PathBuf]>,
     slot_offset_index_path: impl AsRef<Path>,
     client: &Client,
-    on_load: impl Future<Output = Result<(), Box<dyn std::error::Error + 'static + Send>>>
+    on_load: impl Future<Output = Result<(), Box<dyn std::error::Error + Send + 'static>>>
         + Send
         + 'static,
 ) -> Result<Receiver<SlotNotification>, (GeyserReplayError, u64)> {

@@ -8766,6 +8766,7 @@ dependencies = [
  "solana-sdk",
  "solana-system-program",
  "solana-vote-program",
+ "thiserror 2.0.12",
  "tokio",
 ]
 

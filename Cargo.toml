@@ -1,5 +1,5 @@
 [workspace]
-members = ["geyser-replay", "solira-build-cdylib", "solira-geyser-plugin", "solira-plugin"]
+members = ["geyser-replay", "solira-geyser-plugin", "solira-build-cdylib", "solira-plugin"]
 
 [package]
 name = "solira"

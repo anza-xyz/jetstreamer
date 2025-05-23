@@ -6,7 +6,7 @@ use geyser_replay::{
 };
 use serde_json::json;
 use solira_plugin::{Plugin, PluginRunner};
-use std::{fs::File, future::Future, io::Write, os::unix::fs::PermissionsExt, path::PathBuf};
+use std::{fs::File, io::Write, os::unix::fs::PermissionsExt, path::PathBuf, sync::Arc};
 use tempfile::NamedTempFile;
 
 include!(concat!(env!("OUT_DIR"), "/embed.rs")); // brings in SOLIRA_CDYLIB
@@ -88,17 +88,20 @@ impl SoliraRunner {
         for plugin in self.plugins {
             plugin_runner.register(plugin);
         }
-        let fut = async move {
-            plugin_runner.run().await.unwrap();
-            Ok(())
-        };
+        let plugin_runner = Arc::new(plugin_runner);
         loop {
+            let runner = plugin_runner.clone();
             if let Err((err, slot)) = firehose(
                 slot_range.clone(),
                 Some(geyser_config_files),
                 &index_dir,
                 &client,
-                fut,
+                async move {
+                    runner
+                        .run() // see below: run takes self: Arc<Self>
+                        .await
+                        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + 'static>)
+                },
             )
             .await
             {

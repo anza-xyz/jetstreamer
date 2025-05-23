@@ -16,3 +16,4 @@ log.workspace = true
 bincode.workspace = true
 clickhouse.workspace = true
 futures-util.workspace = true
+thiserror.workspace = true

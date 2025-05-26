@@ -81,7 +81,7 @@ impl SoliraRunner {
         let client = reqwest::Client::new();
         let index_dir = self.index_dir;
         log::info!("slot index dir: {:?}", index_dir);
-        let mut slot_range = self.slot_range.unwrap_or_default();
+        let slot_range = self.slot_range.unwrap_or_default();
         log::info!("geyser config files: {:?}", geyser_config_files);
         let mut plugin_runner =
             PluginRunner::new("http://localhost:8123").socket_name("solira.sock");
@@ -107,18 +107,12 @@ impl SoliraRunner {
             {
                 // handle error or break if needed
                 log::error!(
-                    "🔥🔥🔥 firehose encountered an error at slot {} in epoch {}: {}",
+                    "🔥🔥🔥 firehose encountered a fatal error at slot {} in epoch {}: {}",
                     slot,
                     slot_to_epoch(slot),
                     err
                 );
-                let slot = slot.saturating_sub(1);
-                slot_range = slot..slot_range.end;
-                log::warn!(
-                    "restarting from slot {}..{}",
-                    slot_range.start,
-                    slot_range.end
-                );
+                break Err(err);
             }
         }
     }

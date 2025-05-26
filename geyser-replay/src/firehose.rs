@@ -93,7 +93,7 @@ impl From<SlotOffsetIndexError> for GeyserReplayError {
 }
 
 pub async fn firehose(
-    slot_range: Range<u64>,
+    mut slot_range: Range<u64>,
     geyser_config_files: Option<&[PathBuf]>,
     slot_offset_index_path: impl AsRef<Path>,
     client: &Client,
@@ -136,103 +136,130 @@ pub async fn firehose(
     } else {
         log::debug!("none of the plugins have enabled entry notifications")
     }
-
-    let epoch_range = slot_to_epoch(slot_range.start)..=slot_to_epoch(slot_range.end);
-    log::info!(
-        "slot range: {} (epoch {}) ... {} (epoch {})",
-        slot_range.start,
-        slot_to_epoch(slot_range.start),
-        slot_range.end,
-        slot_to_epoch(slot_range.end)
-    );
-
-    let mut slot_offset_index =
-        SlotOffsetIndex::new(slot_offset_index_path).map_err(|e| (e.into(), slot_range.start))?;
-
     log::info!("running on_load...");
     tokio::task::spawn(on_load);
+    let mut skip_until_index = None;
+    // let mut triggered = false;
+    loop {
+        if let Err((err, slot)) = async {
+            let epoch_range = slot_to_epoch(slot_range.start)..=slot_to_epoch(slot_range.end);
+            log::info!(
+                "slot range: {} (epoch {}) ... {} (epoch {})",
+                slot_range.start,
+                slot_to_epoch(slot_range.start),
+                slot_range.end,
+                slot_to_epoch(slot_range.end)
+            );
 
-    log::info!("🚒 starting firehose...");
+            let mut slot_offset_index = SlotOffsetIndex::new(slot_offset_index_path.as_ref())
+                            .map_err(|e| (GeyserReplayError::SlotOffsetIndexError(e), slot_range.start))?;
 
-    // for each epoch
-    let mut current_slot: Option<u64> = None;
-    for (epoch_num, stream) in epoch_range.map(|epoch| (epoch, fetch_epoch_stream(epoch, client))) {
-        log::info!("entering epoch {}", epoch_num);
-        let stream = stream.await;
-        let mut reader = NodeReader::new(stream);
+            log::info!("🚒 starting firehose...");
 
-        let header = reader
-            .read_raw_header()
-            .await
-            .map_err(GeyserReplayError::ReadHeader)
-            .map_err(|e| (e.into(), current_slot.unwrap_or(slot_range.start)))?;
-        log::debug!("read epoch {} header: {:?}", epoch_num, header);
+            // for each epoch
+            let mut current_slot: Option<u64> = None;
+            for (epoch_num, stream) in
+                epoch_range.map(|epoch| (epoch, fetch_epoch_stream(epoch, client)))
+            {
+                log::info!("entering epoch {}", epoch_num);
+                let stream = stream.await;
+                let mut reader = NodeReader::new(stream);
 
-        let mut todo_previous_blockhash = solana_sdk::hash::Hash::default();
-        let mut todo_latest_entry_blockhash = solana_sdk::hash::Hash::default();
+                let header = reader
+                    .read_raw_header()
+                    .await
+                    .map_err(GeyserReplayError::ReadHeader)
+                    .map_err(|e| (e.into(), current_slot.unwrap_or(slot_range.start)))?;
+                log::debug!("read epoch {} header: {:?}", epoch_num, header);
 
-        if slot_range.start > epoch_to_slot_range(epoch_num).0 {
-            reader
-                .seek_to_slot(slot_range.start, &mut slot_offset_index)
-                .await
-                .map_err(|e| (e.into(), current_slot.unwrap_or(slot_range.start)))?;
-        }
+                let mut todo_previous_blockhash = solana_sdk::hash::Hash::default();
+                let mut todo_latest_entry_blockhash = solana_sdk::hash::Hash::default();
 
-        // for each item in each block
-        let mut item_index = 0;
-        loop {
-            let mut nodes = reader
-                .read_until_block()
-                .await
-                .map_err(GeyserReplayError::ReadUntilBlockError)
-                .map_err(|e| (e.into(), current_slot.unwrap_or(slot_range.start)))?;
-            // ignore epoch and subset nodes at end of car file
-            loop {
-                if nodes.0.is_empty() {
-                    break;
+                if slot_range.start > epoch_to_slot_range(epoch_num).0 {
+                    reader
+                        .seek_to_slot(slot_range.start, &mut slot_offset_index)
+                        .await
+                        .map_err(|e| (e.into(), current_slot.unwrap_or(slot_range.start)))?;
                 }
-                if let Some(node) = nodes.0.last() {
-                    if node.get_node().is_epoch() {
-                        log::debug!("skipping epoch node for epoch {}", epoch_num);
-                        nodes.0.pop();
-                    } else if node.get_node().is_subset() {
-                        nodes.0.pop();
-                    } else if node.get_node().is_block() {
+
+                // for each item in each block
+                let mut item_index = 0;
+                let mut displayed_skip_message = false;
+                loop {
+                    let mut nodes = reader
+                        .read_until_block()
+                        .await
+                        .map_err(GeyserReplayError::ReadUntilBlockError)
+                        .map_err(|e| (e.into(), current_slot.unwrap_or(slot_range.start)))?;
+                    // ignore epoch and subset nodes at end of car file
+                    loop {
+                        if nodes.0.is_empty() {
+                            break;
+                        }
+                        if let Some(node) = nodes.0.last() {
+                            if node.get_node().is_epoch() {
+                                log::debug!("skipping epoch node for epoch {}", epoch_num);
+                                nodes.0.pop();
+                            } else if node.get_node().is_subset() {
+                                nodes.0.pop();
+                            } else if node.get_node().is_block() {
+                                break;
+                            }
+                        }
+                    }
+                    if nodes.0.is_empty() {
+                        log::info!("reached end of epoch {}", epoch_num);
                         break;
                     }
-                }
-            }
-            if nodes.0.is_empty() {
-                log::info!("reached end of epoch {}", epoch_num);
-                break;
-            }
-            let block = nodes
-                .get_block()
-                .map_err(GeyserReplayError::GetBlockError)
-                .map_err(|e| (e.into(), current_slot.unwrap_or(slot_range.start)))?;
-            log::debug!(
-                "read {} items from epoch {}, now at slot {}",
-                item_index,
-                epoch_num,
-                block.slot
-            );
-            if current_slot.is_none() {
-                assert_eq!(block.slot, slot_range.start);
-            }
-            current_slot = Some(block.slot);
+                    let block = nodes
+                        .get_block()
+                        .map_err(GeyserReplayError::GetBlockError)
+                        .map_err(|e| (e.into(), current_slot.unwrap_or(slot_range.start)))?;
+                    log::debug!(
+                        "read {} items from epoch {}, now at slot {}",
+                        item_index,
+                        epoch_num,
+                        block.slot
+                    );
+                    if current_slot.is_none() {
+                        assert_eq!(block.slot, slot_range.start);
+                    }
+                    current_slot = Some(block.slot);
 
-            if !slot_range.contains(&block.slot) {
-                unreachable!("entered out-of-bounds slot {}", block.slot);
-            }
-            let mut entry_index: usize = 0;
-            let mut this_block_executed_transaction_count: u64 = 0;
-            let mut this_block_entry_count: u64 = 0;
-            let mut this_block_rewards: solana_storage_proto::convert::generated::Rewards =
-                solana_storage_proto::convert::generated::Rewards::default();
+                    if !slot_range.contains(&block.slot) {
+                        unreachable!("entered out-of-bounds slot {}", block.slot);
+                    }
+                    let mut entry_index: usize = 0;
+                    let mut this_block_executed_transaction_count: u64 = 0;
+                    let mut this_block_entry_count: u64 = 0;
+                    let mut this_block_rewards: solana_storage_proto::convert::generated::Rewards =
+                        solana_storage_proto::convert::generated::Rewards::default();
 
-            nodes
+                    nodes
                 .each(|node_with_cid| -> Result<(), Box<dyn std::error::Error>> {
                     item_index += 1;
+                    // if item_index == 100000 && !triggered {
+                    //     log::info!("simulating error");
+                    //     triggered = true;
+                    //     return Err(Box::new(GeyserReplayError::NodeDecodingError(item_index, 
+                    //         Box::new(std::io::Error::new(
+                    //             std::io::ErrorKind::Other,
+                    //             "simulated error",
+                    //         )),
+                    //     )));
+                    // }
+                    if let Some(skip) = skip_until_index {
+                        if item_index < skip {
+                            if !displayed_skip_message {
+                                log::info!("skipping until index {} (at {})", skip, item_index);
+                                displayed_skip_message = true;
+                            }
+                            return Ok(());
+                        } else {
+                            log::info!("reached target index {}, resuming...", skip);
+                            skip_until_index = None;
+                        }
+                    }
                     let node = node_with_cid.get_node();
 
                     use crate::node::Node::*;
@@ -381,19 +408,44 @@ pub async fn firehose(
                     Ok(())
                 })
                 .map_err(|e| GeyserReplayError::NodeDecodingError(item_index, e)).map_err(|e| (e.into(), current_slot.unwrap_or(slot_range.start)))?;
-            if block.slot == slot_range.end - 1 {
-                let finish_time = std::time::Instant::now();
-                let elapsed = finish_time.duration_since(start_time);
-                log::info!("processed slot {}", block.slot);
-                log::info!(
-                    "processed {} slots across {} epochs in {} seconds.",
-                    slot_range.end - slot_range.start,
-                    slot_to_epoch(slot_range.end) + 1 - slot_to_epoch(slot_range.start),
-                    elapsed.as_secs_f32()
-                );
-                log::info!("🚒 firehose finished.");
-                break;
+                    if block.slot == slot_range.end - 1 {
+                        let finish_time = std::time::Instant::now();
+                        let elapsed = finish_time.duration_since(start_time);
+                        log::info!("processed slot {}", block.slot);
+                        log::info!(
+                            "processed {} slots across {} epochs in {} seconds.",
+                            slot_range.end - slot_range.start,
+                            slot_to_epoch(slot_range.end) + 1 - slot_to_epoch(slot_range.start),
+                            elapsed.as_secs_f32()
+                        );
+                        log::info!("🚒 firehose finished.");
+                        break;
+                    }
+                }
             }
+            Ok(())
+        }.await {
+            log::error!(
+                "🔥🔥🔥 firehose encountered an error at slot {} in epoch {}:",
+                slot,
+                slot_to_epoch(slot)
+            );
+            log::error!("{}", err);
+            let item_index = match err {
+                GeyserReplayError::NodeDecodingError(item_index, _) => item_index,
+                _ => 0,
+            };
+            slot_range = (slot.saturating_sub(1))..slot_range.end;
+            log::warn!(
+                "restarting from slot {} at index {}..{}",
+                slot_range.start,
+                item_index,
+                slot_range.end
+            );
+            skip_until_index = Some(item_index);
+        } else {
+            log::info!("🧑‍🚒 firehose completed successfully.");
+            break;
         }
     }
     Ok(confirmed_bank_receiver)

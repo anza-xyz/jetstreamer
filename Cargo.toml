@@ -77,3 +77,10 @@ solira-plugin.workspace = true
 
 [build-dependencies]
 solira-build-cdylib = { path = "solira-build-cdylib", version = "0.1.0" }
+
+[profile.release]
+lto = true
+codegen-units = 1
+
+[profile.release.package."*"]
+opt-level = 3

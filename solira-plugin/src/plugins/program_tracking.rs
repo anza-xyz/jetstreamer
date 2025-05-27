@@ -116,8 +116,8 @@ impl Plugin for ProgramTrackingPlugin {
                     max_cus     UInt32,
                     total_cus   UInt32,
                 ) 
-                ENGINE = MergeTree()
-                ORDER BY (slot, count, total_cus)
+                ENGINE = ReplacingMergeTree(slot)
+                ORDER BY (slot, program_id)
                 "#,
             )
             .execute()

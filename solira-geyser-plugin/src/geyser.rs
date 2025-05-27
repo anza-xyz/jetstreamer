@@ -2,7 +2,7 @@ use agave_geyser_plugin_interface::geyser_plugin_interface::{
     GeyserPlugin, GeyserPluginError, ReplicaBlockInfoVersions, ReplicaTransactionInfoVersions,
     Result,
 };
-use geyser_replay::epochs::slot_to_epoch;
+use geyser_replay::epochs::{epoch_to_slot_range, slot_to_epoch};
 use mpsc::Sender;
 use once_cell::unsync::OnceCell;
 use std::{
@@ -166,10 +166,16 @@ impl GeyserPlugin for Solira {
 
             let epoch = slot_to_epoch(slot);
 
+            let (epoch_start_slot, epoch_end_slot) = epoch_to_slot_range(epoch);
+            let percent = (slot - epoch_start_slot) as f64
+                / (epoch_end_slot - epoch_start_slot) as f64
+                * 100.0;
+
             log::info!(
-                "at slot {} epoch {}, processed {} txs ({} non-vote) consuming {} CU across {} slots | AVG TPS: {:.2}",
+                "at slot {} epoch {} ({:.2}%), processed {} txs ({} non-vote) consuming {} CU across {} slots | AVG TPS: {:.2}",
                 slot,
                 epoch,
+                percent,
                 processed_txs.separate_with_commas(),
                 (processed_txs - num_votes).separate_with_commas(),
                 compute_consumed.separate_with_commas(),

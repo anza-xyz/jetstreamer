@@ -93,7 +93,7 @@ impl From<SlotOffsetIndexError> for GeyserReplayError {
 }
 
 pub async fn firehose(
-    mut slot_range: Range<u64>,
+    slot_range: Range<u64>,
     geyser_config_files: Option<&[PathBuf]>,
     slot_offset_index_path: impl AsRef<Path>,
     client: &Client,
@@ -435,7 +435,6 @@ pub async fn firehose(
                 GeyserReplayError::NodeDecodingError(item_index, _) => item_index,
                 _ => 0,
             };
-            slot_range = (slot.saturating_sub(1))..slot_range.end;
             log::warn!(
                 "restarting from slot {} at index {}..{}",
                 slot_range.start,

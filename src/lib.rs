@@ -17,6 +17,7 @@ pub struct SoliraRunner {
     slot_range: Option<Range<u64>>,
     index_dir: PathBuf,
     geyser_config_files: Vec<PathBuf>,
+    spawn_clickhouse: bool,
 }
 
 impl Default for SoliraRunner {
@@ -27,6 +28,7 @@ impl Default for SoliraRunner {
             slot_range: Default::default(),
             index_dir: get_index_dir(),
             geyser_config_files: Vec::new(),
+            spawn_clickhouse: true,
         }
     }
 }
@@ -53,7 +55,9 @@ impl SoliraRunner {
     }
 
     pub fn parse_cli_args(mut self) -> Result<Self, Box<dyn std::error::Error>> {
-        self.slot_range = Some(parse_cli_args()?);
+        let config = parse_cli_args()?;
+        self.slot_range = Some(config.slot_range);
+        self.spawn_clickhouse = config.spawn_clickhouse;
         Ok(self)
     }
 
@@ -64,7 +68,7 @@ impl SoliraRunner {
 
     pub async fn with_automatic_geyser_config(mut self) -> Self {
         // TODO: customization of clickhouse config and have plugin respect this
-        let geyser_config = setup_geyser().await.unwrap();
+        let geyser_config = setup_geyser(self.spawn_clickhouse).await.unwrap();
         self.geyser_config_files.push(geyser_config);
         self
     }
@@ -120,7 +124,7 @@ impl SoliraRunner {
 
 /// Sets up the environment for the Solira geyser plugin, returning the path of an ephemeral
 /// geyser plugin config file pointing to a copy of the Solira geyser plugin shared library.
-pub async fn setup_geyser() -> Result<PathBuf, Box<dyn std::error::Error>> {
+pub async fn setup_geyser(spawn_clickhouse: bool) -> Result<PathBuf, Box<dyn std::error::Error>> {
     // materialize libsolira.{so|dylib|dll} on disk
     let cdylib_path = {
         // pick an extension for this OS
@@ -150,11 +154,7 @@ pub async fn setup_geyser() -> Result<PathBuf, Box<dyn std::error::Error>> {
             "libpath": cdylib_path,
             "name":    "GeyserPluginSolira",
             "clickhouse": {
-                "host": "127.0.0.1",
-                "port": 8123,
-                "database": "default",
-                "username": "default",
-                "password": ""
+                "spawn": spawn_clickhouse,
             },
             "log_level": "info"
         });
@@ -166,7 +166,13 @@ pub async fn setup_geyser() -> Result<PathBuf, Box<dyn std::error::Error>> {
     Ok(cfg_path)
 }
 
-pub fn parse_cli_args() -> Result<Range<u64>, Box<dyn std::error::Error>> {
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Config {
+    pub slot_range: Range<u64>,
+    pub spawn_clickhouse: bool,
+}
+
+pub fn parse_cli_args() -> Result<Config, Box<dyn std::error::Error>> {
     let first_arg = std::env::args().nth(1).expect("no first argument given");
     let slot_range = if first_arg.contains(':') {
         let (slot_a, slot_b) = first_arg
@@ -181,5 +187,11 @@ pub fn parse_cli_args() -> Result<Range<u64>, Box<dyn std::error::Error>> {
         let (start_slot, end_slot) = geyser_replay::epochs::epoch_to_slot_range(epoch);
         start_slot..end_slot
     };
-    Ok(slot_range)
+    let spawn_clickhouse = std::env::var("SOLIRA_NO_CLICKHOUSE")
+        .map(|v| v != "1" && v != "true" && v != "t")
+        .unwrap_or(true);
+    Ok(Config {
+        slot_range,
+        spawn_clickhouse,
+    })
 }

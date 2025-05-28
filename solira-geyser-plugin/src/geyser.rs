@@ -83,46 +83,62 @@ impl GeyserPlugin for Solira {
         "GeyserPluginSolira"
     }
 
-    fn on_load(&mut self, _config_file: &str, _is_reload: bool) -> Result<()> {
+    fn on_load(&mut self, config_file: &str, _is_reload: bool) -> Result<()> {
         solana_logger::setup_with_default("info");
         log::info!("solira loading...");
-
+        let config_raw_json =
+            std::fs::read_to_string(config_file).map_err(|e| GeyserPluginError::from(e))?;
+        let config_json = serde_json::from_str::<serde_json::Value>(&config_raw_json)
+            .map_err(|e| GeyserPluginError::ConfigFileReadError { msg: e.to_string() })?;
+        log::info!("config file loaded: {:#?}", config_file);
+        let spawn_clickhouse = config_json
+            .get("clickhouse")
+            .unwrap()
+            .get("spawn")
+            .unwrap()
+            .as_bool()
+            .unwrap_or(true);
         TOKIO_RUNTIME
             .with(|rt_cell| {
                 let rt = rt_cell.borrow();
                 rt.block_on(async {
-                    let (mut ready_rx, clickhouse_future) = clickhouse::start()
-                        .await
-                        .map_err(|e| SoliraError::ClickHouseError(e.to_string()))?;
-
-                    if ready_rx.recv().await.is_some() {
-                        log::info!("ClickHouse initialization complete.");
-                        rt.spawn(clickhouse_future);
-
-                        log::info!("setting up IPC bridge...");
-                        let (tx, rx) = mpsc::channel::<SoliraMessage>(1);
-                        let handle = spawn_socket_server(rx)
+                    if spawn_clickhouse {
+                        log::info!("automatic ClickHouse spawning enabled, starting ClickHouse...");
+                        let (mut ready_rx, clickhouse_future) = clickhouse::start()
                             .await
                             .map_err(|e| SoliraError::ClickHouseError(e.to_string()))?;
-                        IPC_TX.with(|cell| {
-                            let _ = cell.set(tx);
-                        }); // <- inside `with`
-                        IPC_TASK.with(|cell| {
-                            let _ = cell.set(handle);
-                        });
-                        log::info!("IPC bridge initialized.");
 
-                        START_TIME.with(|st| *st.borrow_mut() = Some(Instant::now()));
-                        log::info!("solira loaded");
-
-                        ctrlc::set_handler(|| {
-                            unload();
-                        })
-                        .unwrap();
-                        Ok(())
+                        if ready_rx.recv().await.is_some() {
+                            log::info!("ClickHouse initialization complete.");
+                            rt.spawn(clickhouse_future);
+                        } else {
+                            return Err(SoliraError::ClickHouseInitializationFailed);
+                        }
                     } else {
-                        Err(SoliraError::ClickHouseInitializationFailed)
+                        log::info!("automatic ClickHouse spawning disabled, skipping ClickHouse initialization.");
                     }
+
+                    log::info!("setting up IPC bridge...");
+                    let (tx, rx) = mpsc::channel::<SoliraMessage>(1);
+                    let handle = spawn_socket_server(rx)
+                        .await
+                        .map_err(|e| SoliraError::ClickHouseError(e.to_string()))?;
+                    IPC_TX.with(|cell| {
+                        let _ = cell.set(tx);
+                    }); // <- inside `with`
+                    IPC_TASK.with(|cell| {
+                        let _ = cell.set(handle);
+                    });
+                    log::info!("IPC bridge initialized.");
+
+                    START_TIME.with(|st| *st.borrow_mut() = Some(Instant::now()));
+                    log::info!("solira loaded");
+
+                    ctrlc::set_handler(|| {
+                        unload();
+                    })
+                    .unwrap();
+                    Ok(())
                 })
             })
             .map_err(|e| {

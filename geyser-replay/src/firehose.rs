@@ -1,5 +1,6 @@
 use crossbeam_channel::{unbounded, Receiver, Sender};
-use demo_rust_ipld_car::utils;
+use demo_rust_ipld_car::{entry, utils};
+use rayon::prelude::*;
 use reqwest::Client;
 use solana_geyser_plugin_manager::{
     block_metadata_notifier_interface::BlockMetadataNotifier,
@@ -145,16 +146,37 @@ pub async fn firehose(
     }
     log::info!("running on_load...");
     tokio::task::spawn(on_load);
-    firehose_thread(
-        slot_range,
-        slot_offset_index_path,
-        transaction_notifier_maybe,
-        entry_notifier_maybe,
-        block_meta_notifier_maybe,
-        confirmed_bank_sender,
-        &client,
-    )
-    .await?;
+
+    let slot_offset_index_path = Arc::new(slot_offset_index_path.as_ref().to_owned());
+    let slot_range = Arc::new(slot_range);
+    let transaction_notifier_maybe = Arc::new(transaction_notifier_maybe);
+    let entry_notifier_maybe = Arc::new(entry_notifier_maybe);
+    let block_meta_notifier_maybe = Arc::new(block_meta_notifier_maybe);
+    let confirmed_bank_sender = Arc::new(confirmed_bank_sender);
+
+    (0..10).par_bridge().for_each(|s| {
+        let slot_range = (*slot_range).clone();
+        let transaction_notifier_maybe = (*transaction_notifier_maybe).clone();
+        let entry_notifier_maybe = (*entry_notifier_maybe).clone();
+        let block_meta_notifier_maybe = (*block_meta_notifier_maybe).clone();
+        let confirmed_bank_sender = (*confirmed_bank_sender).clone();
+
+        let slot_offset_index_path = slot_offset_index_path.as_ref().to_owned();
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            firehose_thread(
+                slot_range,
+                slot_offset_index_path,
+                transaction_notifier_maybe,
+                entry_notifier_maybe,
+                block_meta_notifier_maybe,
+                confirmed_bank_sender,
+                &client,
+            )
+            .await
+            .unwrap();
+        });
+    });
+
     Ok(confirmed_bank_receiver)
 }
 

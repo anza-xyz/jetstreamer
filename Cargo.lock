@@ -2111,6 +2111,7 @@ dependencies = [
  "serde_json",
  "solana-entry",
  "solana-geyser-plugin-manager",
+ "solana-ledger",
  "solana-logger",
  "solana-rpc",
  "solana-runtime",

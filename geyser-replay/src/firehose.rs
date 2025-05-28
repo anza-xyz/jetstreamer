@@ -1,8 +1,15 @@
-use crossbeam_channel::{unbounded, Receiver};
+use crossbeam_channel::{unbounded, Receiver, Sender};
 use demo_rust_ipld_car::utils;
 use reqwest::Client;
-use solana_geyser_plugin_manager::geyser_plugin_service::GeyserPluginServiceError;
-use solana_rpc::optimistically_confirmed_bank_tracker::SlotNotification;
+use solana_geyser_plugin_manager::{
+    block_metadata_notifier_interface::BlockMetadataNotifier,
+    geyser_plugin_service::GeyserPluginServiceError,
+};
+use solana_ledger::entry_notifier_interface::EntryNotifier;
+use solana_rpc::{
+    optimistically_confirmed_bank_tracker::SlotNotification,
+    transaction_notifier_interface::TransactionNotifier,
+};
 use solana_runtime::bank::KeyedRewardsAndNumPartitions;
 use solana_sdk::{reward_info::RewardInfo, reward_type::RewardType};
 use std::{
@@ -11,6 +18,7 @@ use std::{
     future::Future,
     ops::Range,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 use thiserror::Error;
 
@@ -102,7 +110,6 @@ pub async fn firehose(
         + 'static,
 ) -> Result<Receiver<SlotNotification>, (GeyserReplayError, u64)> {
     log::info!("starting firehose...");
-    let start_time = std::time::Instant::now();
     let (confirmed_bank_sender, confirmed_bank_receiver) = unbounded();
     let mut entry_notifier_maybe = None;
     let mut block_meta_notifier_maybe = None;
@@ -138,6 +145,29 @@ pub async fn firehose(
     }
     log::info!("running on_load...");
     tokio::task::spawn(on_load);
+    firehose_thread(
+        slot_range,
+        slot_offset_index_path,
+        transaction_notifier_maybe,
+        entry_notifier_maybe,
+        block_meta_notifier_maybe,
+        confirmed_bank_sender,
+        &client,
+    )
+    .await?;
+    Ok(confirmed_bank_receiver)
+}
+
+async fn firehose_thread(
+    slot_range: Range<u64>,
+    slot_offset_index_path: impl AsRef<Path>,
+    transaction_notifier_maybe: Option<Arc<dyn TransactionNotifier + Send + Sync + 'static>>,
+    entry_notifier_maybe: Option<Arc<dyn EntryNotifier + Send + Sync + 'static>>,
+    block_meta_notifier_maybe: Option<Arc<dyn BlockMetadataNotifier + Send + Sync + 'static>>,
+    confirmed_bank_sender: Sender<SlotNotification>,
+    client: &Client,
+) -> Result<(), (GeyserReplayError, u64)> {
+    let start_time = std::time::Instant::now();
     let mut skip_until_index = None;
     // let mut triggered = false;
     loop {
@@ -447,7 +477,7 @@ pub async fn firehose(
             break;
         }
     }
-    Ok(confirmed_bank_receiver)
+    Ok(())
 }
 
 pub struct MessageAddressLoaderFromTxMeta {

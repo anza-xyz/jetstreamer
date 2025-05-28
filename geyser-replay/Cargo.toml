@@ -24,6 +24,7 @@ solana-sdk.workspace = true
 solana-geyser-plugin-manager.workspace = true
 solana-storage-proto.workspace = true
 solana-transaction-status.workspace = true
+solana-ledger.workspace = true
 prost_011.workspace = true
 solana-entry.workspace = true
 reqwest.workspace = true

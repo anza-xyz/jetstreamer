@@ -3,16 +3,12 @@ use agave_geyser_plugin_interface::geyser_plugin_interface::{
     Result,
 };
 use core::ops::Range;
-use geyser_replay::{
-    epochs::{epoch_to_slot_range, slot_to_epoch},
-    firehose::generate_subranges,
-};
+use geyser_replay::{epochs::slot_to_epoch, firehose::generate_subranges};
 use mpsc::Sender;
 use once_cell::unsync::OnceCell;
 use rangemap::RangeMap;
 use std::{
     cell::RefCell,
-    collections::HashMap,
     error::Error,
     sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
     time::Instant,
@@ -33,8 +29,6 @@ thread_local! {
     static START_TIME: std::cell::RefCell<Option<Instant>> = RefCell::new(None);
     static IPC_TX: OnceCell<Sender<SoliraMessage>> = OnceCell::new();
     static IPC_TASK: OnceCell<tokio::task::JoinHandle<()>> = OnceCell::new();
-    static SLOT_RANGE: OnceCell<Range<u64>> = OnceCell::new();
-    static THREAD_INFO: OnceCell<RangeMap<u64, ThreadInfo>> = OnceCell::new();
 }
 
 static EXIT: AtomicBool = AtomicBool::new(false);
@@ -42,6 +36,10 @@ static PROCESSED_TRANSACTIONS: AtomicU64 = AtomicU64::new(0);
 static PROCESSED_SLOTS: AtomicU64 = AtomicU64::new(0);
 static NUM_VOTES: AtomicU64 = AtomicU64::new(0);
 static SOLIRA_THREADS: AtomicU8 = AtomicU8::new(0);
+
+static SLOT_RANGE: once_cell::sync::OnceCell<Range<u64>> = once_cell::sync::OnceCell::new();
+static THREAD_INFO: once_cell::sync::OnceCell<RangeMap<u64, ThreadInfo>> =
+    once_cell::sync::OnceCell::new();
 
 #[derive(Clone, Debug, Default)]
 pub struct Solira;
@@ -75,8 +73,8 @@ impl From<SoliraError> for GeyserPluginError {
 struct ThreadInfo {
     thread_id: u8,
     slot_range: (u64, u64),
-    current_slot: u64,
-    current_tx_index: u32,
+    // current_slot: u64,
+    //current_tx_index: u32,
 }
 
 pub fn ipc_send(msg: SoliraMessage) {
@@ -148,36 +146,33 @@ impl GeyserPlugin for Solira {
             .unwrap();
         let slot_range = parse_range(slot_range).unwrap();
         log::info!("solira slot range: {:?}", slot_range);
+        SLOT_RANGE.set(slot_range.clone()).unwrap();
 
         // init subranges + thread info
         let sub_ranges = generate_subranges(&slot_range, threads);
         log::info!("solira slot sub-ranges: {:?}", sub_ranges);
-        THREAD_INFO.with(|cell| {
-            let mut thread_info_map = RangeMap::new();
-            sub_ranges
-                .iter()
-                .enumerate()
-                .map(|(i, range)| ThreadInfo {
-                    thread_id: i as u8,
-                    slot_range: (range.start, range.end),
-                    current_slot: range.start,
-                    current_tx_index: 0,
-                })
-                .for_each(|info| {
-                    thread_info_map.insert(info.slot_range.0..info.slot_range.1 + 1, info);
-                    // Ensure that the range is fully covered since we can't use RangeInclusive
-                    assert!(
-                        thread_info_map.get(&info.slot_range.0).unwrap().thread_id
-                            == info.thread_id
-                    );
-                    assert!(
-                        thread_info_map.get(&info.slot_range.1).unwrap().thread_id
-                            == info.thread_id
-                    );
-                });
-            log::info!("thread info map: {:#?}", thread_info_map);
-            cell.set(thread_info_map).unwrap();
-        });
+        let mut thread_info_map = RangeMap::new();
+        sub_ranges
+            .iter()
+            .enumerate()
+            .map(|(i, range)| ThreadInfo {
+                thread_id: i as u8,
+                slot_range: (range.start, range.end),
+                // current_slot: range.start,
+                // current_tx_index: 0,
+            })
+            .for_each(|info| {
+                thread_info_map.insert(info.slot_range.0..info.slot_range.1 + 1, info);
+                // Ensure that the range is fully covered since we can't use RangeInclusive
+                assert!(
+                    thread_info_map.get(&info.slot_range.0).unwrap().thread_id == info.thread_id
+                );
+                assert!(
+                    thread_info_map.get(&info.slot_range.1).unwrap().thread_id == info.thread_id
+                );
+            });
+        log::info!("thread info map: {:#?}", thread_info_map);
+        THREAD_INFO.set(thread_info_map).unwrap();
 
         // start tokio runtime + spawn clickhouse if enabled + initialize IPC bridge
         TOKIO_RUNTIME
@@ -264,13 +259,17 @@ impl GeyserPlugin for Solira {
 
             let epoch = slot_to_epoch(slot);
 
-            let (epoch_start_slot, epoch_end_slot) = epoch_to_slot_range(epoch);
-            let percent = (slot - epoch_start_slot) as f64
-                / (epoch_end_slot - epoch_start_slot) as f64
+            let overall_slot_range = SLOT_RANGE.get().unwrap();
+            let percent = processed_slots as f64
+                / (overall_slot_range.end - overall_slot_range.start) as f64
                 * 100.0;
 
+            let range_map = THREAD_INFO.get().unwrap();
+            let thread_info = range_map.get(&slot).unwrap();
+
             log::info!(
-                "at slot {} epoch {} ({:.2}%), processed {} txs ({} non-vote) consuming {} CU across {} slots | AVG TPS: {:.2}",
+                "thread {} at slot {} epoch {} ({:.2}% overall), processed {} txs ({} non-vote) using {} CU across {} slots | AVG TPS: {:.2}",
+                thread_info.thread_id,
                 slot,
                 epoch,
                 percent,

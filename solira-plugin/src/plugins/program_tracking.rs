@@ -30,7 +30,7 @@ struct ProgramStats {
 
 #[derive(Debug, Default, Clone)]
 pub struct ProgramTrackingPlugin {
-    slot_data: HashMap<Pubkey, ProgramStats>,
+    slot_data: HashMap<u64, HashMap<Pubkey, ProgramStats>>,
 }
 
 impl Plugin for ProgramTrackingPlugin {
@@ -54,9 +54,10 @@ impl Plugin for ProgramTrackingPlugin {
                 .map(|ix: &CompiledInstruction| account_keys[ix.program_id_index as usize])
                 .collect::<Vec<_>>();
             let total_cu = transaction.cu.unwrap_or(0) as u32;
+            let slot_data = self.slot_data.entry(transaction.slot).or_default();
             for program_id in program_ids.iter() {
                 let this_program_cu = total_cu / program_ids.len() as u32;
-                let stats = self.slot_data.entry(*program_id).or_insert(ProgramStats {
+                let stats = slot_data.entry(*program_id).or_insert(ProgramStats {
                     min_cus: u32::MAX,
                     max_cus: 0,
                     total_cus: 0,
@@ -75,9 +76,8 @@ impl Plugin for ProgramTrackingPlugin {
     fn on_block(&mut self, db: Client, block: Block) -> PluginFuture<'_> {
         async move {
             let mut insert = db.insert("program_invocations")?;
-            //let mut invocations = 0;
-            for (program_id, stats) in self.slot_data.iter() {
-                // invocations += stats.count;
+            let slot_data = self.slot_data.entry(block.slot).or_default();
+            for (program_id, stats) in slot_data.iter() {
                 let row = ProgramEvent {
                     slot: block.slot as u32,
                     program_id: *program_id,
@@ -86,17 +86,10 @@ impl Plugin for ProgramTrackingPlugin {
                     max_cus: stats.max_cus,
                     total_cus: stats.total_cus,
                 };
-                // log::info!("{:?}", row);
                 insert.write(&row).await.unwrap();
             }
-            //let num = self.slot_data.len();
-            self.slot_data.clear();
+            self.slot_data.remove(&block.slot);
             insert.end().await.unwrap();
-            /*log::info!(
-                "Inserted {} slot-specific program stat records spanning {} program invocations",
-                num,
-                invocations
-            );*/
             Ok(())
         }
         .boxed()

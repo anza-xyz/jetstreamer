@@ -39,3 +39,4 @@ indoc.workspace = true
 tempfile.workspace = true
 solira-plugin.workspace = true
 libc.workspace = true
+rangemap.workspace = true

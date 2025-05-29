@@ -9,8 +9,10 @@ use geyser_replay::{
 };
 use mpsc::Sender;
 use once_cell::unsync::OnceCell;
+use rangemap::RangeMap;
 use std::{
     cell::RefCell,
+    collections::HashMap,
     error::Error,
     sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
     time::Instant,
@@ -27,17 +29,16 @@ use solira_plugin::{
 
 thread_local! {
     static TOKIO_RUNTIME: RefCell<Runtime> = RefCell::new(Runtime::new().unwrap());
-    static COMPUTE_CONSUMED: RefCell<u128> = const { RefCell::new(0) };
-    static START_TIME: std::cell::RefCell<Option<Instant>> = const { RefCell::new(None) };
-    static IPC_TX: OnceCell<Sender<SoliraMessage>> = const { OnceCell::new() };
-    static IPC_TASK: OnceCell<tokio::task::JoinHandle<()>> = const { OnceCell::new() };
-    static SLOT_RANGE: OnceCell<Range<u64>> = const { OnceCell::new() };
-    static SLOT_SUB_RANGES: OnceCell<Vec<Range<u64>>> = const { OnceCell::new() };
+    static COMPUTE_CONSUMED: RefCell<u128> = RefCell::new(0);
+    static START_TIME: std::cell::RefCell<Option<Instant>> = RefCell::new(None);
+    static IPC_TX: OnceCell<Sender<SoliraMessage>> = OnceCell::new();
+    static IPC_TASK: OnceCell<tokio::task::JoinHandle<()>> = OnceCell::new();
+    static SLOT_RANGE: OnceCell<Range<u64>> = OnceCell::new();
+    static THREAD_INFO: OnceCell<RangeMap<u64, ThreadInfo>> = OnceCell::new();
 }
 
 static EXIT: AtomicBool = AtomicBool::new(false);
 static PROCESSED_TRANSACTIONS: AtomicU64 = AtomicU64::new(0);
-static SLOT_NUM: AtomicU64 = AtomicU64::new(0);
 static PROCESSED_SLOTS: AtomicU64 = AtomicU64::new(0);
 static NUM_VOTES: AtomicU64 = AtomicU64::new(0);
 static SOLIRA_THREADS: AtomicU8 = AtomicU8::new(0);
@@ -68,6 +69,14 @@ impl From<SoliraError> for GeyserPluginError {
     fn from(err: SoliraError) -> Self {
         GeyserPluginError::Custom(Box::new(err))
     }
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+struct ThreadInfo {
+    thread_id: u8,
+    slot_range: (u64, u64),
+    current_slot: u64,
+    current_tx_index: u32,
 }
 
 pub fn ipc_send(msg: SoliraMessage) {
@@ -108,6 +117,7 @@ impl GeyserPlugin for Solira {
         solana_logger::setup_with_default("info");
         log::info!("solira loading...");
 
+        // process config
         let config_raw_json =
             std::fs::read_to_string(config_file).map_err(|e| GeyserPluginError::from(e))?;
         let config_json = serde_json::from_str::<serde_json::Value>(&config_raw_json)
@@ -138,13 +148,38 @@ impl GeyserPlugin for Solira {
             .unwrap();
         let slot_range = parse_range(slot_range).unwrap();
         log::info!("solira slot range: {:?}", slot_range);
-        if threads > 1 {
-            let sub_ranges = generate_subranges(&slot_range, threads);
-            log::info!("solira slot sub-ranges: {:?}", sub_ranges);
-            SLOT_SUB_RANGES.with(|cell| {
-                cell.set(sub_ranges).unwrap();
-            });
-        }
+
+        // init subranges + thread info
+        let sub_ranges = generate_subranges(&slot_range, threads);
+        log::info!("solira slot sub-ranges: {:?}", sub_ranges);
+        THREAD_INFO.with(|cell| {
+            let mut thread_info_map = RangeMap::new();
+            sub_ranges
+                .iter()
+                .enumerate()
+                .map(|(i, range)| ThreadInfo {
+                    thread_id: i as u8,
+                    slot_range: (range.start, range.end),
+                    current_slot: range.start,
+                    current_tx_index: 0,
+                })
+                .for_each(|info| {
+                    thread_info_map.insert(info.slot_range.0..info.slot_range.1 + 1, info);
+                    // Ensure that the range is fully covered since we can't use RangeInclusive
+                    assert!(
+                        thread_info_map.get(&info.slot_range.0).unwrap().thread_id
+                            == info.thread_id
+                    );
+                    assert!(
+                        thread_info_map.get(&info.slot_range.1).unwrap().thread_id
+                            == info.thread_id
+                    );
+                });
+            log::info!("thread info map: {:#?}", thread_info_map);
+            cell.set(thread_info_map).unwrap();
+        });
+
+        // start tokio runtime + spawn clickhouse if enabled + initialize IPC bridge
         TOKIO_RUNTIME
             .with(|rt_cell| {
                 let rt = rt_cell.borrow();
@@ -211,8 +246,8 @@ impl GeyserPlugin for Solira {
             ReplicaBlockInfoVersions::V0_0_3(block_info) => block_info.slot,
             ReplicaBlockInfoVersions::V0_0_4(block_info) => block_info.slot,
         };
-        SLOT_NUM.store(slot, Ordering::SeqCst);
         let processed_slots = PROCESSED_SLOTS.fetch_add(1, Ordering::SeqCst) + 1;
+
         if processed_slots % 10 == 0 {
             let processed_txs = PROCESSED_TRANSACTIONS.load(Ordering::SeqCst);
             let num_votes = NUM_VOTES.load(Ordering::SeqCst);

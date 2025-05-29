@@ -1,5 +1,5 @@
 use crossbeam_channel::{unbounded, Receiver, Sender};
-use demo_rust_ipld_car::{entry, utils};
+use demo_rust_ipld_car::utils;
 use rayon::prelude::*;
 use reqwest::Client;
 use solana_geyser_plugin_manager::{
@@ -109,7 +109,14 @@ pub async fn firehose(
     on_load: impl Future<Output = Result<(), Box<dyn std::error::Error + Send + 'static>>>
         + Send
         + 'static,
+    threads: u8,
 ) -> Result<Receiver<SlotNotification>, (GeyserReplayError, u64)> {
+    if threads == 0 {
+        return Err((
+            GeyserReplayError::OnLoadError("Number of threads must be greater than 0".into()),
+            slot_range.start,
+        ));
+    }
     log::info!("starting firehose...");
     let (confirmed_bank_sender, confirmed_bank_receiver) = unbounded();
     let mut entry_notifier_maybe = None;
@@ -154,28 +161,53 @@ pub async fn firehose(
     let block_meta_notifier_maybe = Arc::new(block_meta_notifier_maybe);
     let confirmed_bank_sender = Arc::new(confirmed_bank_sender);
 
-    (0..10).par_bridge().for_each(|s| {
-        let slot_range = (*slot_range).clone();
-        let transaction_notifier_maybe = (*transaction_notifier_maybe).clone();
-        let entry_notifier_maybe = (*entry_notifier_maybe).clone();
-        let block_meta_notifier_maybe = (*block_meta_notifier_maybe).clone();
-        let confirmed_bank_sender = (*confirmed_bank_sender).clone();
+    // divide slot_range into n subranges
+    let threads = threads as u64;
+    let subranges = (0..threads)
+        .map(|i| {
+            let start = if i == 0 {
+                slot_range.start
+            } else {
+                slot_range.start + (slot_range.end - slot_range.start) * i / threads + 1
+            };
+            let end = if i == threads - 1 {
+                slot_range.end
+            } else {
+                slot_range.start + (slot_range.end - slot_range.start) * (i + 1) / threads
+            };
+            start..end
+        })
+        .collect::<Vec<_>>();
+    if threads > 1 {
+        log::info!("⚡ thread sub-ranges: {:?}", subranges);
+    }
 
-        let slot_offset_index_path = slot_offset_index_path.as_ref().to_owned();
-        tokio::runtime::Runtime::new().unwrap().block_on(async {
-            firehose_thread(
-                slot_range,
-                slot_offset_index_path,
-                transaction_notifier_maybe,
-                entry_notifier_maybe,
-                block_meta_notifier_maybe,
-                confirmed_bank_sender,
-                &client,
-            )
-            .await
-            .unwrap();
+    subranges
+        .into_iter()
+        .enumerate()
+        .par_bridge()
+        .for_each(|(i, slot_range)| {
+            let transaction_notifier_maybe = (*transaction_notifier_maybe).clone();
+            let entry_notifier_maybe = (*entry_notifier_maybe).clone();
+            let block_meta_notifier_maybe = (*block_meta_notifier_maybe).clone();
+            let confirmed_bank_sender = (*confirmed_bank_sender).clone();
+
+            let slot_offset_index_path = slot_offset_index_path.as_ref().to_owned();
+            tokio::runtime::Runtime::new().unwrap().block_on(async {
+                firehose_thread(
+                    slot_range,
+                    slot_offset_index_path,
+                    transaction_notifier_maybe,
+                    entry_notifier_maybe,
+                    block_meta_notifier_maybe,
+                    confirmed_bank_sender,
+                    &client,
+                    if threads > 1 { Some(i) } else { None },
+                )
+                .await
+                .unwrap();
+            });
         });
-    });
 
     Ok(confirmed_bank_receiver)
 }
@@ -188,14 +220,21 @@ async fn firehose_thread(
     block_meta_notifier_maybe: Option<Arc<dyn BlockMetadataNotifier + Send + Sync + 'static>>,
     confirmed_bank_sender: Sender<SlotNotification>,
     client: &Client,
+    thread_index: Option<usize>,
 ) -> Result<(), (GeyserReplayError, u64)> {
     let start_time = std::time::Instant::now();
+    let log_target = if let Some(thread_index) = thread_index {
+        format!("{}::{}", module_path!(), thread_index)
+    } else {
+        module_path!().to_string()
+    };
     let mut skip_until_index = None;
     // let mut triggered = false;
     loop {
         if let Err((err, slot)) = async {
             let epoch_range = slot_to_epoch(slot_range.start)..=slot_to_epoch(slot_range.end);
             log::info!(
+                target: &log_target,
                 "slot range: {} (epoch {}) ... {} (epoch {})",
                 slot_range.start,
                 slot_to_epoch(slot_range.start),
@@ -206,14 +245,14 @@ async fn firehose_thread(
             let mut slot_offset_index = SlotOffsetIndex::new(slot_offset_index_path.as_ref())
                             .map_err(|e| (GeyserReplayError::SlotOffsetIndexError(e), slot_range.start))?;
 
-            log::info!("🚒 starting firehose...");
+            log::info!(target: &log_target, "🚒 starting firehose...");
 
             // for each epoch
             let mut current_slot: Option<u64> = None;
             for (epoch_num, stream) in
                 epoch_range.map(|epoch| (epoch, fetch_epoch_stream(epoch, client)))
             {
-                log::info!("entering epoch {}", epoch_num);
+                log::info!(target: &log_target, "entering epoch {}", epoch_num);
                 let stream = stream.await;
                 let mut reader = NodeReader::new(stream);
 
@@ -222,7 +261,7 @@ async fn firehose_thread(
                     .await
                     .map_err(GeyserReplayError::ReadHeader)
                     .map_err(|e| (e.into(), current_slot.unwrap_or(slot_range.start)))?;
-                log::debug!("read epoch {} header: {:?}", epoch_num, header);
+                log::debug!(target: &log_target, "read epoch {} header: {:?}", epoch_num, header);
 
                 let mut todo_previous_blockhash = solana_sdk::hash::Hash::default();
                 let mut todo_latest_entry_blockhash = solana_sdk::hash::Hash::default();

@@ -32,6 +32,7 @@ async fn main() {
         index_dir,
         &client,
         async { Ok(()) },
+        1,
     )
     .await
     .unwrap();

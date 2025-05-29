@@ -106,6 +106,10 @@ impl SoliraRunner {
                         .await
                         .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + 'static>)
                 },
+                std::env::var("SOLIRA_THREADS")
+                    .ok()
+                    .and_then(|s| s.parse::<u8>().ok())
+                    .unwrap_or(1),
             )
             .await
             {

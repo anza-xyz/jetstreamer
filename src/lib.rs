@@ -14,10 +14,9 @@ include!(concat!(env!("OUT_DIR"), "/embed.rs")); // brings in SOLIRA_CDYLIB
 pub struct SoliraRunner {
     log_level: String,
     plugins: Vec<Box<dyn Plugin>>,
-    slot_range: Option<Range<u64>>,
     index_dir: PathBuf,
     geyser_config_files: Vec<PathBuf>,
-    spawn_clickhouse: bool,
+    config: Config,
 }
 
 impl Default for SoliraRunner {
@@ -25,10 +24,13 @@ impl Default for SoliraRunner {
         Self {
             log_level: "info".to_string(),
             plugins: Vec::new(),
-            slot_range: Default::default(),
             index_dir: get_index_dir(),
             geyser_config_files: Vec::new(),
-            spawn_clickhouse: true,
+            config: Config {
+                threads: 1,
+                slot_range: 0..0,
+                spawn_clickhouse: true,
+            },
         }
     }
 }
@@ -50,14 +52,12 @@ impl SoliraRunner {
     }
 
     pub fn with_slot_range(mut self, slot_range: Range<u64>) -> Self {
-        self.slot_range = Some(slot_range);
+        self.config.slot_range = slot_range;
         self
     }
 
     pub fn parse_cli_args(mut self) -> Result<Self, Box<dyn std::error::Error>> {
-        let config = parse_cli_args()?;
-        self.slot_range = Some(config.slot_range);
-        self.spawn_clickhouse = config.spawn_clickhouse;
+        self.config = parse_cli_args()?;
         Ok(self)
     }
 
@@ -66,9 +66,8 @@ impl SoliraRunner {
         self
     }
 
-    pub async fn with_automatic_geyser_config(mut self) -> Self {
-        // TODO: customization of clickhouse config and have plugin respect this
-        let geyser_config = setup_geyser(self.spawn_clickhouse).await.unwrap();
+    pub async fn with_solira_geyser_config(mut self) -> Self {
+        let geyser_config = setup_geyser(&self.config).await.unwrap();
         self.geyser_config_files.push(geyser_config);
         self
     }
@@ -85,7 +84,7 @@ impl SoliraRunner {
         let client = reqwest::Client::new();
         let index_dir = self.index_dir;
         log::info!("slot index dir: {:?}", index_dir);
-        let slot_range = self.slot_range.unwrap_or_default();
+        let slot_range = self.config.slot_range;
         log::info!("geyser config files: {:?}", geyser_config_files);
         let mut plugin_runner =
             PluginRunner::new("http://localhost:8123").socket_name("solira.sock");
@@ -93,6 +92,8 @@ impl SoliraRunner {
             plugin_runner.register(plugin);
         }
         let plugin_runner = Arc::new(plugin_runner);
+        let threads = self.config.threads;
+        log::info!("using {} threads for processing", threads);
         loop {
             let runner = plugin_runner.clone();
             if let Err((err, slot)) = firehose(
@@ -106,10 +107,7 @@ impl SoliraRunner {
                         .await
                         .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + 'static>)
                 },
-                std::env::var("SOLIRA_THREADS")
-                    .ok()
-                    .and_then(|s| s.parse::<u8>().ok())
-                    .unwrap_or(1),
+                threads,
             )
             .await
             {
@@ -128,7 +126,7 @@ impl SoliraRunner {
 
 /// Sets up the environment for the Solira geyser plugin, returning the path of an ephemeral
 /// geyser plugin config file pointing to a copy of the Solira geyser plugin shared library.
-pub async fn setup_geyser(spawn_clickhouse: bool) -> Result<PathBuf, Box<dyn std::error::Error>> {
+pub async fn setup_geyser(config: &Config) -> Result<PathBuf, Box<dyn std::error::Error>> {
     // materialize libsolira.{so|dylib|dll} on disk
     let cdylib_path = {
         // pick an extension for this OS
@@ -158,7 +156,11 @@ pub async fn setup_geyser(spawn_clickhouse: bool) -> Result<PathBuf, Box<dyn std
             "libpath": cdylib_path,
             "name":    "GeyserPluginSolira",
             "clickhouse": {
-                "spawn": spawn_clickhouse,
+                "spawn": config.spawn_clickhouse,
+            },
+            "solira": {
+                "threads": config.threads,
+                "slot_range": format!("{:?}", config.slot_range),
             },
             "log_level": "info"
         });
@@ -172,7 +174,11 @@ pub async fn setup_geyser(spawn_clickhouse: bool) -> Result<PathBuf, Box<dyn std
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Config {
+    /// Number of silmultaneous firehose streams to spawn
+    pub threads: u8,
+    /// The range of slots to process, inclusive of the start and end slot.
     pub slot_range: Range<u64>,
+    /// Whether to spawn a local ClickHouse server for the geyser plugin.
     pub spawn_clickhouse: bool,
 }
 
@@ -194,7 +200,12 @@ pub fn parse_cli_args() -> Result<Config, Box<dyn std::error::Error>> {
     let spawn_clickhouse = std::env::var("SOLIRA_NO_CLICKHOUSE")
         .map(|v| v != "1" && v != "true" && v != "t")
         .unwrap_or(true);
+    let threads = std::env::var("SOLIRA_THREADS")
+        .ok()
+        .and_then(|s| s.parse::<u8>().ok())
+        .unwrap_or(1);
     Ok(Config {
+        threads,
         slot_range,
         spawn_clickhouse,
     })

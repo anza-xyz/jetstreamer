@@ -7,7 +7,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_log_level("info")
         .parse_cli_args()?
         .with_plugin(Box::new(ProgramTrackingPlugin::default()))
-        .with_automatic_geyser_config()
+        .with_solira_geyser_config()
         .await
         .run()
         .await?)

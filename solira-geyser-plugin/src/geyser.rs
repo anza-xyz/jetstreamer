@@ -2,13 +2,17 @@ use agave_geyser_plugin_interface::geyser_plugin_interface::{
     GeyserPlugin, GeyserPluginError, ReplicaBlockInfoVersions, ReplicaTransactionInfoVersions,
     Result,
 };
-use geyser_replay::epochs::{epoch_to_slot_range, slot_to_epoch};
+use core::ops::Range;
+use geyser_replay::{
+    epochs::{epoch_to_slot_range, slot_to_epoch},
+    firehose::generate_subranges,
+};
 use mpsc::Sender;
 use once_cell::unsync::OnceCell;
 use std::{
     cell::RefCell,
     error::Error,
-    sync::atomic::{AtomicBool, AtomicU64},
+    sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
     time::Instant,
 };
 use thousands::Separable;
@@ -27,7 +31,8 @@ thread_local! {
     static START_TIME: std::cell::RefCell<Option<Instant>> = const { RefCell::new(None) };
     static IPC_TX: OnceCell<Sender<SoliraMessage>> = const { OnceCell::new() };
     static IPC_TASK: OnceCell<tokio::task::JoinHandle<()>> = const { OnceCell::new() };
-    static TX_INDEX: RefCell<u32> = const { RefCell::new(0) };
+    static SLOT_RANGE: OnceCell<Range<u64>> = const { OnceCell::new() };
+    static SLOT_SUB_RANGES: OnceCell<Vec<Range<u64>>> = const { OnceCell::new() };
 }
 
 static EXIT: AtomicBool = AtomicBool::new(false);
@@ -35,6 +40,7 @@ static PROCESSED_TRANSACTIONS: AtomicU64 = AtomicU64::new(0);
 static SLOT_NUM: AtomicU64 = AtomicU64::new(0);
 static PROCESSED_SLOTS: AtomicU64 = AtomicU64::new(0);
 static NUM_VOTES: AtomicU64 = AtomicU64::new(0);
+static SOLIRA_THREADS: AtomicU8 = AtomicU8::new(0);
 
 #[derive(Clone, Debug, Default)]
 pub struct Solira;
@@ -78,6 +84,21 @@ pub fn ipc_send(msg: SoliraMessage) {
     });
 }
 
+fn parse_range(slot_range: impl AsRef<str>) -> Option<Range<u64>> {
+    let range_str = slot_range.as_ref();
+    if range_str.is_empty() {
+        return None;
+    }
+    let parts: Vec<&str> = range_str.split("..").collect();
+    if parts.len() != 2 {
+        log::error!("Invalid slot range format: {}", range_str);
+        return None;
+    }
+    let start = parts[0].parse::<u64>().ok()?;
+    let end = parts[1].parse::<u64>().ok()?;
+    Some(start..end)
+}
+
 impl GeyserPlugin for Solira {
     fn name(&self) -> &'static str {
         "GeyserPluginSolira"
@@ -86,6 +107,7 @@ impl GeyserPlugin for Solira {
     fn on_load(&mut self, config_file: &str, _is_reload: bool) -> Result<()> {
         solana_logger::setup_with_default("info");
         log::info!("solira loading...");
+
         let config_raw_json =
             std::fs::read_to_string(config_file).map_err(|e| GeyserPluginError::from(e))?;
         let config_json = serde_json::from_str::<serde_json::Value>(&config_raw_json)
@@ -98,6 +120,31 @@ impl GeyserPlugin for Solira {
             .unwrap()
             .as_bool()
             .unwrap_or(true);
+        let threads = config_json
+            .get("solira")
+            .unwrap()
+            .get("threads")
+            .unwrap()
+            .as_u64()
+            .unwrap_or(1) as u8;
+        log::info!("solira threads: {}", threads);
+        SOLIRA_THREADS.store(threads, Ordering::SeqCst);
+        let slot_range = config_json
+            .get("solira")
+            .unwrap()
+            .get("slot_range")
+            .unwrap()
+            .as_str()
+            .unwrap();
+        let slot_range = parse_range(slot_range).unwrap();
+        log::info!("solira slot range: {:?}", slot_range);
+        if threads > 1 {
+            let sub_ranges = generate_subranges(&slot_range, threads);
+            log::info!("solira slot sub-ranges: {:?}", sub_ranges);
+            SLOT_SUB_RANGES.with(|cell| {
+                cell.set(sub_ranges).unwrap();
+            });
+        }
         TOKIO_RUNTIME
             .with(|rt_cell| {
                 let rt = rt_cell.borrow();
@@ -155,20 +202,20 @@ impl GeyserPlugin for Solira {
         if exiting() {
             return Ok(());
         }
-        TX_INDEX.with_borrow_mut(|index| {
-            *index = 0;
-        });
+        // TX_INDEX.with_borrow_mut(|index| {
+        //     *index = 0;
+        // });
         let slot = match blockinfo {
             ReplicaBlockInfoVersions::V0_0_1(block_info) => block_info.slot,
             ReplicaBlockInfoVersions::V0_0_2(block_info) => block_info.slot,
             ReplicaBlockInfoVersions::V0_0_3(block_info) => block_info.slot,
             ReplicaBlockInfoVersions::V0_0_4(block_info) => block_info.slot,
         };
-        SLOT_NUM.store(slot, std::sync::atomic::Ordering::SeqCst);
-        let processed_slots = PROCESSED_SLOTS.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        SLOT_NUM.store(slot, Ordering::SeqCst);
+        let processed_slots = PROCESSED_SLOTS.fetch_add(1, Ordering::SeqCst) + 1;
         if processed_slots % 10 == 0 {
-            let processed_txs = PROCESSED_TRANSACTIONS.load(std::sync::atomic::Ordering::SeqCst);
-            let num_votes = NUM_VOTES.load(std::sync::atomic::Ordering::SeqCst);
+            let processed_txs = PROCESSED_TRANSACTIONS.load(Ordering::SeqCst);
+            let num_votes = NUM_VOTES.load(Ordering::SeqCst);
             let compute_consumed = COMPUTE_CONSUMED.with_borrow(|compute| *compute);
 
             let overall_tps = START_TIME.with(|start_time| {
@@ -235,10 +282,8 @@ impl GeyserPlugin for Solira {
         if tx.is_vote {
             NUM_VOTES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
-        TX_INDEX.with_borrow_mut(|index| {
-            ipc_send(SoliraMessage::Transaction(tx, *index));
-            *index += 1;
-        });
+        // TODO: tx index
+        ipc_send(SoliraMessage::Transaction(tx, 0));
         Ok(())
     }
 

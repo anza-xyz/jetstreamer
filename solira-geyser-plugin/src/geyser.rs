@@ -10,7 +10,10 @@ use rangemap::RangeMap;
 use std::{
     cell::RefCell,
     error::Error,
-    sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
+    sync::{
+        Mutex,
+        atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
+    },
     time::Instant,
 };
 use thousands::Separable;
@@ -25,8 +28,6 @@ use solira_plugin::{
 
 thread_local! {
     static TOKIO_RUNTIME: RefCell<Runtime> = RefCell::new(Runtime::new().unwrap());
-    static COMPUTE_CONSUMED: RefCell<u128> = RefCell::new(0);
-    static START_TIME: std::cell::RefCell<Option<Instant>> = RefCell::new(None);
     static IPC_TX: OnceCell<Sender<SoliraMessage>> = OnceCell::new();
     static IPC_TASK: OnceCell<tokio::task::JoinHandle<()>> = OnceCell::new();
 }
@@ -37,6 +38,9 @@ static PROCESSED_SLOTS: AtomicU64 = AtomicU64::new(0);
 static NUM_VOTES: AtomicU64 = AtomicU64::new(0);
 static SOLIRA_THREADS: AtomicU8 = AtomicU8::new(0);
 
+static COMPUTE_CONSUMED: Mutex<u128> = Mutex::new(0);
+
+static START_TIME: once_cell::sync::OnceCell<Instant> = once_cell::sync::OnceCell::new();
 static SLOT_RANGE: once_cell::sync::OnceCell<Range<u64>> = once_cell::sync::OnceCell::new();
 static THREAD_INFO: once_cell::sync::OnceCell<RangeMap<u64, ThreadInfo>> =
     once_cell::sync::OnceCell::new();
@@ -208,7 +212,7 @@ impl GeyserPlugin for Solira {
                     });
                     log::info!("IPC bridge initialized.");
 
-                    START_TIME.with(|st| *st.borrow_mut() = Some(Instant::now()));
+                    START_TIME.set(Instant::now()).unwrap();
                     log::info!("solira loaded");
 
                     ctrlc::set_handler(|| {
@@ -246,16 +250,13 @@ impl GeyserPlugin for Solira {
         if processed_slots % 10 == 0 {
             let processed_txs = PROCESSED_TRANSACTIONS.load(Ordering::SeqCst);
             let num_votes = NUM_VOTES.load(Ordering::SeqCst);
-            let compute_consumed = COMPUTE_CONSUMED.with_borrow(|compute| *compute);
+            let compute_consumed = COMPUTE_CONSUMED.lock().unwrap().clone();
 
-            let overall_tps = START_TIME.with(|start_time| {
-                let mut start_time = start_time.borrow_mut();
-                if start_time.is_none() {
-                    *start_time = Some(Instant::now());
-                }
-                let elapsed = start_time.unwrap().elapsed().as_secs_f64();
+            let overall_tps = {
+                let start_time = START_TIME.get().unwrap();
+                let elapsed = start_time.elapsed().as_secs_f64();
                 processed_txs as f64 / elapsed
-            });
+            };
 
             let epoch = slot_to_epoch(slot);
 
@@ -298,16 +299,12 @@ impl GeyserPlugin for Solira {
         match transaction {
             ReplicaTransactionInfoVersions::V0_0_1(tx) => {
                 if let Some(consumed) = tx.transaction_status_meta.compute_units_consumed {
-                    COMPUTE_CONSUMED.with_borrow_mut(|compute| {
-                        *compute += u128::from(consumed);
-                    });
+                    *COMPUTE_CONSUMED.lock().unwrap() += u128::from(consumed);
                 }
             }
             ReplicaTransactionInfoVersions::V0_0_2(tx) => {
                 if let Some(consumed) = tx.transaction_status_meta.compute_units_consumed {
-                    COMPUTE_CONSUMED.with_borrow_mut(|compute| {
-                        *compute += u128::from(consumed);
-                    });
+                    *COMPUTE_CONSUMED.lock().unwrap() += u128::from(consumed);
                 }
             }
         }

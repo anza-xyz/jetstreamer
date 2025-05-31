@@ -80,7 +80,7 @@ solira-plugin.workspace = true
 solira-build-cdylib = { path = "solira-build-cdylib", version = "0.1.0" }
 
 [profile.release]
-lto = true
+lto = "fat"
 codegen-units = 1
 
 [profile.release.package."*"]

@@ -247,7 +247,7 @@ impl GeyserPlugin for Solira {
         };
         let processed_slots = PROCESSED_SLOTS.fetch_add(1, Ordering::SeqCst) + 1;
 
-        if processed_slots % 10 == 0 {
+        if processed_slots % 100 == 0 {
             let processed_txs = PROCESSED_TRANSACTIONS.load(Ordering::SeqCst);
             let num_votes = NUM_VOTES.load(Ordering::SeqCst);
             let compute_consumed = COMPUTE_CONSUMED.lock().unwrap().clone();

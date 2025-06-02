@@ -260,20 +260,25 @@ impl GeyserPlugin for Solira {
 
             let epoch = slot_to_epoch(slot);
 
-            let overall_slot_range = SLOT_RANGE.get().unwrap();
-            let percent = processed_slots as f64
-                / (overall_slot_range.end - overall_slot_range.start) as f64
-                * 100.0;
+            // let overall_slot_range = SLOT_RANGE.get().unwrap();
+            // let percent = processed_slots as f64
+            //     / (overall_slot_range.end - overall_slot_range.start) as f64
+            //     * 100.0;
 
             let range_map = THREAD_INFO.get().unwrap();
             let thread_info = range_map.get(&slot).unwrap();
 
+            let thread_percent = {
+                let thread_range = thread_info.slot_range;
+                (slot - thread_range.0) as f64 / (thread_range.1 - thread_range.0) as f64 * 100.0
+            };
+
             log::info!(
-                "thread {} at slot {} epoch {} ({:.2}% overall), processed {} txs ({} non-vote) using {} CU across {} slots | AVG TPS: {:.2}",
+                "thread {} at slot {} epoch {} ({:.2}%), processed {} txs ({} non-vote) using {} CU across {} slots | AVG TPS: {:.2}",
                 thread_info.thread_id,
                 slot,
                 epoch,
-                percent,
+                thread_percent,
                 processed_txs.separate_with_commas(),
                 (processed_txs - num_votes).separate_with_commas(),
                 compute_consumed.separate_with_commas(),

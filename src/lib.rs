@@ -94,33 +94,32 @@ impl SoliraRunner {
         let plugin_runner = Arc::new(plugin_runner);
         let threads = self.config.threads;
         log::info!("using {} threads for processing", threads);
-        loop {
-            let runner = plugin_runner.clone();
-            if let Err((err, slot)) = firehose(
-                slot_range.clone(),
-                Some(geyser_config_files),
-                &index_dir,
-                &client,
-                async move {
-                    runner
-                        .run() // see below: run takes self: Arc<Self>
-                        .await
-                        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + 'static>)
-                },
-                threads,
-            )
-            .await
-            {
-                // handle error or break if needed
-                log::error!(
-                    "🔥🔥🔥 firehose encountered a fatal error at slot {} in epoch {}: {}",
-                    slot,
-                    slot_to_epoch(slot),
-                    err
-                );
-                break Err(err);
-            }
+        let runner = plugin_runner.clone();
+        if let Err((err, slot)) = firehose(
+            slot_range.clone(),
+            Some(geyser_config_files),
+            &index_dir,
+            &client,
+            async move {
+                runner
+                    .run() // see below: run takes self: Arc<Self>
+                    .await
+                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + 'static>)
+            },
+            threads,
+        )
+        .await
+        {
+            // handle error or break if needed
+            log::error!(
+                "🔥🔥🔥 firehose encountered a fatal error at slot {} in epoch {}: {}",
+                slot,
+                slot_to_epoch(slot),
+                err
+            );
+            return Err(err);
         }
+        Ok(())
     }
 }
 

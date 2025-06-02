@@ -36,7 +36,7 @@ static EXIT: AtomicBool = AtomicBool::new(false);
 static PROCESSED_TRANSACTIONS: AtomicU64 = AtomicU64::new(0);
 static PROCESSED_SLOTS: AtomicU64 = AtomicU64::new(0);
 static NUM_VOTES: AtomicU64 = AtomicU64::new(0);
-static SOLIRA_THREADS: AtomicU8 = AtomicU8::new(0);
+static COMPLETE_THREADS: AtomicU8 = AtomicU8::new(0);
 
 static COMPUTE_CONSUMED: Mutex<u128> = Mutex::new(0);
 
@@ -117,6 +117,11 @@ impl GeyserPlugin for Solira {
 
     fn on_load(&mut self, config_file: &str, _is_reload: bool) -> Result<()> {
         solana_logger::setup_with_default("info");
+        if SLOT_RANGE.get().is_some() {
+            log::info!("done, exiting...");
+            unload();
+            return Ok(());
+        }
         log::info!("solira loading...");
 
         // process config
@@ -140,7 +145,6 @@ impl GeyserPlugin for Solira {
             .as_u64()
             .unwrap_or(1) as u8;
         log::info!("solira threads: {}", threads);
-        SOLIRA_THREADS.store(threads, Ordering::SeqCst);
         let slot_range = config_json
             .get("solira")
             .unwrap()
@@ -247,7 +251,10 @@ impl GeyserPlugin for Solira {
         };
         let processed_slots = PROCESSED_SLOTS.fetch_add(1, Ordering::SeqCst) + 1;
 
-        if processed_slots % 100 == 0 {
+        let range_map = THREAD_INFO.get().unwrap();
+        let thread_info = range_map.get(&slot).unwrap();
+
+        if slot >= thread_info.slot_range.1 - 1 || processed_slots % 100 == 0 {
             let processed_txs = PROCESSED_TRANSACTIONS.load(Ordering::SeqCst);
             let num_votes = NUM_VOTES.load(Ordering::SeqCst);
             let compute_consumed = COMPUTE_CONSUMED.lock().unwrap().clone();
@@ -264,9 +271,6 @@ impl GeyserPlugin for Solira {
             // let percent = processed_slots as f64
             //     / (overall_slot_range.end - overall_slot_range.start) as f64
             //     * 100.0;
-
-            let range_map = THREAD_INFO.get().unwrap();
-            let thread_info = range_map.get(&slot).unwrap();
 
             let thread_percent = {
                 let thread_range = thread_info.slot_range;
@@ -289,6 +293,29 @@ impl GeyserPlugin for Solira {
 
         let blk = Block::from_replica(blockinfo);
         ipc_send(SoliraMessage::Block(blk));
+
+        if slot >= thread_info.slot_range.1 - 1 {
+            log::info!(
+                "thread {} finished processing slot {} and has completed its work",
+                thread_info.thread_id,
+                slot
+            );
+
+            let complete_threads = COMPLETE_THREADS.fetch_add(1, Ordering::SeqCst) + 1;
+            let solira_threads = range_map.len() as u8;
+            if complete_threads >= solira_threads {
+                log::info!(
+                    "all {} threads have completed their work, unloading solira...",
+                    solira_threads
+                );
+                unload();
+            } else {
+                log::info!(
+                    "waiting for {} more threads to complete their work",
+                    solira_threads - complete_threads
+                );
+            }
+        }
 
         Ok(())
     }

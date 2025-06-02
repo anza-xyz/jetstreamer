@@ -193,7 +193,7 @@ pub async fn firehose(
                 .unwrap();
             });
         });
-
+    log::info!("🚒 firehose finished successfully.");
     Ok(confirmed_bank_receiver)
 }
 
@@ -494,7 +494,7 @@ async fn firehose_thread(
                             slot_to_epoch(slot_range.end) + 1 - slot_to_epoch(slot_range.start),
                             elapsed.as_secs_f32()
                         );
-                        log::info!("🚒 firehose finished.");
+                        log::info!("a 🚒 firehose thread finished completed its work.");
                         break;
                     }
                 }
@@ -519,7 +519,6 @@ async fn firehose_thread(
             );
             skip_until_index = Some(item_index);
         } else {
-            log::info!("🧑‍🚒 firehose completed successfully.");
             break;
         }
     }

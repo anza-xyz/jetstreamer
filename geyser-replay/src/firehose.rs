@@ -512,10 +512,9 @@ async fn firehose_thread(
                 _ => 0,
             };
             log::warn!(
-                "restarting from slot {} at index {}..{}",
-                slot_range.start,
+                "restarting from slot {} at index {}",
+                slot,
                 item_index,
-                slot_range.end
             );
             skip_until_index = Some(item_index);
         } else {

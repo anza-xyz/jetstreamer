@@ -22,12 +22,20 @@ use tokio::sync::mpsc;
 
 use crate::clickhouse;
 use solira_plugin::{
+    Plugin,
     bridge::{Block, Transaction},
     ipc::{SoliraMessage, spawn_socket_server},
+    plugins::program_tracking::ProgramTrackingPlugin,
 };
 
 thread_local! {
     static TOKIO_RUNTIME: RefCell<Runtime> = RefCell::new(Runtime::new().unwrap());
+    static DB_CLIENT: RefCell<::clickhouse::Client> = RefCell::new(::clickhouse::Client::default()
+            .with_url("http://localhost:8123")
+            .with_database("solira")
+            .with_option("async_insert", "1")
+            .with_option("wait_for_async_insert", "0"));
+    static PLUGIN: RefCell<ProgramTrackingPlugin> = RefCell::new(ProgramTrackingPlugin::default());
 }
 static IPC_TX: once_cell::sync::OnceCell<Sender<SoliraMessage>> = once_cell::sync::OnceCell::new();
 static IPC_TASK: once_cell::sync::OnceCell<tokio::task::JoinHandle<()>> =
@@ -116,14 +124,41 @@ impl From<SoliraError> for GeyserPluginError {
 }
 
 pub fn ipc_send(msg: SoliraMessage) {
-    let tx = IPC_TX.get().expect("IPC_TX not initialized");
-    let is_exit = msg == SoliraMessage::Exit;
-    if let Err(err) = tx.blocking_send(msg) {
-        panic!("IPC channel error: {:?}", err);
-    }
-    if is_exit {
-        log::info!("sent exit signal to clients");
-    }
+    DB_CLIENT.with(|db| {
+        let db = db.borrow();
+        PLUGIN.with(|plugin| {
+            let plugin = plugin.borrow();
+            TOKIO_RUNTIME.with(|rt_cell| {
+                let rt = rt_cell.borrow();
+                match msg {
+                    SoliraMessage::Transaction(tx, tx_index) => {
+                        if let Err(e) = rt.block_on(plugin.on_transaction(db.clone(), tx, tx_index))
+                        {
+                            log::error!("plugin {} on_transaction error: {}", plugin.name(), e);
+                        }
+                    }
+                    SoliraMessage::Block(block) => {
+                        if let Err(e) = rt.block_on(plugin.on_block(db.clone(), block)) {
+                            log::error!("plugin {} on_block error: {}", plugin.name(), e);
+                        }
+                    }
+                    SoliraMessage::Exit => {
+                        if let Err(e) = rt.block_on(plugin.on_exit(db.clone())) {
+                            log::error!("plugin {} on_exit error: {}", plugin.name(), e);
+                        }
+                    }
+                }
+            });
+        });
+    });
+    // let tx = IPC_TX.get().expect("IPC_TX not initialized");
+    // let is_exit = msg == SoliraMessage::Exit;
+    // if let Err(err) = tx.blocking_send(msg) {
+    //     panic!("IPC channel error: {:?}", err);
+    // }
+    // if is_exit {
+    //     log::info!("sent exit signal to clients");
+    // }
 }
 
 fn parse_range(slot_range: impl AsRef<str>) -> Option<Range<u64>> {
@@ -216,9 +251,10 @@ impl GeyserPlugin for Solira {
                 rt.block_on(async {
                     if spawn_clickhouse {
                         log::info!("automatic ClickHouse spawning enabled, starting ClickHouse...");
-                        let (mut ready_rx, clickhouse_future) = clickhouse::start()
-                            .await
+                        let start_result = clickhouse::start().await
                             .map_err(|e| SoliraError::ClickHouseError(e.to_string()))?;
+
+                        let (mut ready_rx, clickhouse_future) = start_result;
 
                         if ready_rx.recv().await.is_some() {
                             log::info!("ClickHouse initialization complete.");
@@ -238,7 +274,11 @@ impl GeyserPlugin for Solira {
                     IPC_TX.set(tx).unwrap();
                     IPC_TASK.set(handle).unwrap();
                     log::info!("IPC bridge initialized.");
-
+                    log::info!("initializing program tracking plugin...");
+                    let db = DB_CLIENT.with_borrow(|db| db.clone());
+                    let plugin = PLUGIN.with_borrow(|plugin| plugin.clone());
+                    plugin.on_load(db).await.unwrap();
+                    log::info!("program tracking plugin initialized.");
                     START_TIME.set(Instant::now()).unwrap();
                     log::info!("solira loaded");
 

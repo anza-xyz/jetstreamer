@@ -117,6 +117,9 @@ pub async fn firehose(
             slot_range.start,
         ));
     }
+    let _ = rayon::ThreadPoolBuilder::new()
+        .num_threads(threads as usize)
+        .build_global();
     log::info!("starting firehose...");
     let (confirmed_bank_sender, confirmed_bank_receiver) = unbounded();
     let mut entry_notifier_maybe = None;

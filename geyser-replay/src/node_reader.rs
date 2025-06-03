@@ -1,6 +1,6 @@
 use crate::epochs::slot_to_epoch;
 use crate::firehose::GeyserReplayError;
-use crate::index::SlotOffsetIndex;
+use crate::index::{SlotOffsetIndex, SlotOffsetIndexError};
 use crate::node::{parse_any_from_cbordata, Node, NodeWithCid, NodesWithCids};
 use cid::Cid;
 use demo_rust_ipld_car::utils;
@@ -193,6 +193,14 @@ impl<R: AsyncRead + Unpin + AsyncSeek + Len> NodeReader<R> {
         slot: u64,
         index: &mut SlotOffsetIndex,
     ) -> Result<(), GeyserReplayError> {
+        self.seek_to_slot_inner(slot, index).await
+    }
+
+    async fn seek_to_slot_inner(
+        &mut self,
+        slot: u64,
+        index: &mut SlotOffsetIndex,
+    ) -> Result<(), GeyserReplayError> {
         if self.header.is_empty() {
             self.read_raw_header()
                 .await
@@ -201,7 +209,13 @@ impl<R: AsyncRead + Unpin + AsyncSeek + Len> NodeReader<R> {
 
         let epoch = slot_to_epoch(slot);
 
-        let offset = index.get_offset(slot).await?;
+        let res = index.get_offset(slot).await;
+        if let Err(SlotOffsetIndexError::SlotNotFound(..)) = res {
+            log::warn!("Slot {} not found in index, seeking to next slot", slot);
+            // Box the recursive call to avoid infinitely sized future
+            return Box::pin(self.seek_to_slot_inner(slot + 1, index)).await;
+        }
+        let offset = res?;
         log::info!(
             "Seeking to slot {} in epoch {} @ offset {}",
             slot,

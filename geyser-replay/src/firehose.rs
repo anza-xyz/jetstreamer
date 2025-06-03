@@ -297,9 +297,6 @@ async fn firehose_thread(
                         epoch_num,
                         block.slot
                     );
-                    if current_slot.is_none() {
-                        assert_eq!(block.slot, slot_range.start);
-                    }
                     current_slot = Some(block.slot);
 
                     if !slot_range.contains(&block.slot) {

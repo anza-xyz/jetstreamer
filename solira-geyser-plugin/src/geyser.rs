@@ -12,9 +12,10 @@ use std::{
     error::Error,
     sync::{
         Mutex,
-        atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering},
     },
     time::Instant,
+    u64,
 };
 use thousands::Separable;
 use tokio::runtime::Runtime;
@@ -42,8 +43,49 @@ static COMPUTE_CONSUMED: Mutex<u128> = Mutex::new(0);
 
 static START_TIME: once_cell::sync::OnceCell<Instant> = once_cell::sync::OnceCell::new();
 static SLOT_RANGE: once_cell::sync::OnceCell<Range<u64>> = once_cell::sync::OnceCell::new();
-static THREAD_INFO: once_cell::sync::OnceCell<RangeMap<u64, ThreadInfo>> =
-    once_cell::sync::OnceCell::new();
+
+static THREAD_CURRENT_SLOT: [AtomicU64; 256] = [const { AtomicU64::new(u64::MAX) }; 256];
+static THREAD_SLOT_RANGE_START: [AtomicU64; 256] = [const { AtomicU64::new(u64::MAX) }; 256];
+static THREAD_SLOT_RANGE_END: [AtomicU64; 256] = [const { AtomicU64::new(u64::MAX) }; 256];
+static THREAD_CURRENT_TX_INDEX: [AtomicU32; 256] = [const { AtomicU32::new(u32::MAX) }; 256];
+static THREAD_INFO: once_cell::sync::OnceCell<RangeMap<u64, u8>> = once_cell::sync::OnceCell::new();
+
+pub fn thread_current_slot(thread_id: u8) -> u64 {
+    THREAD_CURRENT_SLOT[thread_id as usize].load(Ordering::SeqCst)
+}
+
+pub fn thread_bump_current_slot(thread_id: u8) -> u64 {
+    THREAD_CURRENT_SLOT[thread_id as usize].fetch_add(1, Ordering::SeqCst) + 1
+}
+
+pub fn thread_set_current_slot(thread_id: u8, slot: u64) {
+    THREAD_CURRENT_SLOT[thread_id as usize].store(slot, Ordering::SeqCst);
+}
+
+pub fn thread_slot_range_start(thread_id: u8) -> u64 {
+    THREAD_SLOT_RANGE_START[thread_id as usize].load(Ordering::SeqCst)
+}
+
+pub fn thread_slot_range_end(thread_id: u8) -> u64 {
+    THREAD_SLOT_RANGE_END[thread_id as usize].load(Ordering::SeqCst)
+}
+
+pub fn thread_current_tx_index(thread_id: u8) -> u32 {
+    THREAD_CURRENT_TX_INDEX[thread_id as usize].load(Ordering::SeqCst)
+}
+
+pub fn thread_set_slot_range(thread_id: u8, start: u64, end: u64) {
+    THREAD_SLOT_RANGE_START[thread_id as usize].store(start, Ordering::SeqCst);
+    THREAD_SLOT_RANGE_END[thread_id as usize].store(end, Ordering::SeqCst);
+}
+
+pub fn thread_bump_tx_index(thread_id: u8) -> u32 {
+    THREAD_CURRENT_TX_INDEX[thread_id as usize].fetch_add(1, Ordering::SeqCst) + 1
+}
+
+pub fn thread_set_current_tx_index(thread_id: u8, index: u32) {
+    THREAD_CURRENT_TX_INDEX[thread_id as usize].store(index, Ordering::SeqCst);
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct Solira;
@@ -71,14 +113,6 @@ impl From<SoliraError> for GeyserPluginError {
     fn from(err: SoliraError) -> Self {
         GeyserPluginError::Custom(Box::new(err))
     }
-}
-
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
-struct ThreadInfo {
-    thread_id: u8,
-    slot_range: (u64, u64),
-    // current_slot: u64,
-    //current_tx_index: u32,
 }
 
 pub fn ipc_send(msg: SoliraMessage) {
@@ -160,25 +194,21 @@ impl GeyserPlugin for Solira {
         let sub_ranges = generate_subranges(&slot_range, threads);
         log::info!("solira slot sub-ranges: {:?}", sub_ranges);
         let mut thread_info_map = RangeMap::new();
-        sub_ranges
-            .iter()
-            .enumerate()
-            .map(|(i, range)| ThreadInfo {
-                thread_id: i as u8,
-                slot_range: (range.start, range.end),
-                // current_slot: range.start,
-                // current_tx_index: 0,
-            })
-            .for_each(|info| {
-                thread_info_map.insert(info.slot_range.0..info.slot_range.1 + 1, info);
-                // Ensure that the range is fully covered since we can't use RangeInclusive
-                assert!(
-                    thread_info_map.get(&info.slot_range.0).unwrap().thread_id == info.thread_id
-                );
-                assert!(
-                    thread_info_map.get(&info.slot_range.1).unwrap().thread_id == info.thread_id
-                );
-            });
+        sub_ranges.iter().enumerate().for_each(|(i, range)| {
+            let thread_id = i as u8;
+            let mut thread_slot_range = range.start..range.end + 1;
+            let thread_current_slot = range.start;
+
+            thread_info_map.insert(thread_slot_range.clone(), thread_id);
+            thread_slot_range.end -= 1;
+            thread_set_slot_range(thread_id, thread_slot_range.start, thread_slot_range.end);
+            thread_set_current_slot(thread_id, thread_current_slot);
+            thread_set_current_tx_index(thread_id, 0);
+
+            // Ensure that the range is fully covered since we can't use RangeInclusive
+            assert!(*thread_info_map.get(&thread_slot_range.start).unwrap() == thread_id);
+            assert!(*thread_info_map.get(&thread_slot_range.end).unwrap() == thread_id);
+        });
         log::info!("thread info map: {:#?}", thread_info_map);
         THREAD_INFO.set(thread_info_map).unwrap();
 
@@ -252,9 +282,11 @@ impl GeyserPlugin for Solira {
         let processed_slots = PROCESSED_SLOTS.fetch_add(1, Ordering::SeqCst) + 1;
 
         let range_map = THREAD_INFO.get().unwrap();
-        let thread_info = range_map.get(&slot).unwrap();
+        let thread_id = *range_map.get(&slot).unwrap();
+        let thread_slot_range_end = thread_slot_range_end(thread_id);
+        thread_set_current_slot(thread_id, slot);
 
-        if slot >= thread_info.slot_range.1 - 1 || processed_slots % 100 == 0 {
+        if slot >= thread_slot_range_end || processed_slots % 100 == 0 {
             let processed_txs = PROCESSED_TRANSACTIONS.load(Ordering::SeqCst);
             let num_votes = NUM_VOTES.load(Ordering::SeqCst);
             let compute_consumed = COMPUTE_CONSUMED.lock().unwrap().clone();
@@ -272,14 +304,16 @@ impl GeyserPlugin for Solira {
             //     / (overall_slot_range.end - overall_slot_range.start) as f64
             //     * 100.0;
 
+            let thread_slot_range_start = thread_slot_range_start(thread_id);
             let thread_percent = {
-                let thread_range = thread_info.slot_range;
-                (slot - thread_range.0) as f64 / (thread_range.1 - thread_range.0) as f64 * 100.0
+                (slot - thread_slot_range_start) as f64
+                    / (thread_slot_range_end - thread_slot_range_start) as f64
+                    * 100.0
             };
 
             log::info!(
-                "thread {} at slot {} epoch {} ({:.2}%), processed {} txs ({} non-vote) using {} CU across {} slots | AVG TPS: {:.2}",
-                thread_info.thread_id,
+                "thread {} at slot {} epoch {} ({:.2}%), processed {} txs ({} non-vote) using {} CU across {} slots | AVG TPS: {:.3}",
+                thread_id,
                 slot,
                 epoch,
                 thread_percent,
@@ -294,10 +328,10 @@ impl GeyserPlugin for Solira {
         let blk = Block::from_replica(blockinfo);
         ipc_send(SoliraMessage::Block(blk));
 
-        if slot >= thread_info.slot_range.1 - 1 {
+        if slot >= thread_slot_range_end {
             log::info!(
                 "thread {} finished processing slot {} and has completed its work",
-                thread_info.thread_id,
+                thread_id,
                 slot
             );
 
@@ -345,8 +379,13 @@ impl GeyserPlugin for Solira {
         if tx.is_vote {
             NUM_VOTES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
-        // TODO: tx index
-        ipc_send(SoliraMessage::Transaction(tx, 0));
+        let thread_id = *THREAD_INFO
+            .get()
+            .unwrap()
+            .get(&slot)
+            .expect("thread id not found for slot");
+        let thread_current_tx_index = thread_bump_tx_index(thread_id);
+        ipc_send(SoliraMessage::Transaction(tx, thread_current_tx_index));
         Ok(())
     }
 

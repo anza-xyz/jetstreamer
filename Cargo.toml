@@ -65,6 +65,7 @@ ctrlc = "3"
 indoc = "2"
 tempfile = "3"
 libc = "0"
+dashmap = "6.1.0"
 
 [dependencies]
 tempfile.workspace = true

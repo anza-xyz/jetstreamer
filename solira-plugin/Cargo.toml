@@ -17,3 +17,6 @@ bincode.workspace = true
 clickhouse.workspace = true
 futures-util.workspace = true
 thiserror.workspace = true
+rayon.workspace = true
+dashmap.workspace = true
+once_cell.workspace = true

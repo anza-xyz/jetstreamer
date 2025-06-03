@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 
 use clickhouse::{Client, Row};
+use dashmap::DashMap;
 use futures_util::FutureExt;
+use once_cell::sync::OnceCell;
 use serde::{Deserialize, Serialize};
 use solana_sdk::{instruction::CompiledInstruction, message::VersionedMessage, pubkey::Pubkey};
 
@@ -9,6 +11,8 @@ use crate::{
     Plugin, PluginFuture,
     bridge::{Block, Transaction},
 };
+
+static DATA: OnceCell<DashMap<u64, HashMap<Pubkey, ProgramStats>>> = OnceCell::new();
 
 #[derive(Row, Deserialize, Serialize, Copy, Clone, Debug, PartialEq, Eq, Hash)]
 struct ProgramEvent {
@@ -29,9 +33,7 @@ struct ProgramStats {
 }
 
 #[derive(Debug, Default, Clone)]
-pub struct ProgramTrackingPlugin {
-    slot_data: HashMap<u64, HashMap<Pubkey, ProgramStats>>,
-}
+pub struct ProgramTrackingPlugin;
 
 impl Plugin for ProgramTrackingPlugin {
     fn name(&self) -> &'static str {
@@ -39,7 +41,7 @@ impl Plugin for ProgramTrackingPlugin {
     }
 
     fn on_transaction(
-        &mut self,
+        &self,
         _db: Client,
         transaction: Transaction,
         _tx_index: u32,
@@ -54,7 +56,8 @@ impl Plugin for ProgramTrackingPlugin {
                 .map(|ix: &CompiledInstruction| account_keys[ix.program_id_index as usize])
                 .collect::<Vec<_>>();
             let total_cu = transaction.cu.unwrap_or(0) as u32;
-            let slot_data = self.slot_data.entry(transaction.slot).or_default();
+            let data = DATA.get().expect("DATA should be initialized");
+            let mut slot_data = data.entry(transaction.slot).or_default();
             for program_id in program_ids.iter() {
                 let this_program_cu = total_cu / program_ids.len() as u32;
                 let stats = slot_data.entry(*program_id).or_insert(ProgramStats {
@@ -73,10 +76,11 @@ impl Plugin for ProgramTrackingPlugin {
         .boxed()
     }
 
-    fn on_block(&mut self, db: Client, block: Block) -> PluginFuture<'_> {
+    fn on_block(&self, db: Client, block: Block) -> PluginFuture<'_> {
         async move {
             let mut insert = db.insert("program_invocations")?;
-            let slot_data = self.slot_data.entry(block.slot).or_default();
+            let data = DATA.get().expect("DATA should be initialized");
+            let slot_data = data.entry(block.slot).or_default();
             for (program_id, stats) in slot_data.iter() {
                 let row = ProgramEvent {
                     slot: block.slot as u32,
@@ -88,14 +92,16 @@ impl Plugin for ProgramTrackingPlugin {
                 };
                 insert.write(&row).await.unwrap();
             }
-            self.slot_data.remove(&block.slot);
+            drop(slot_data); // drop the reference to allow removal
+            data.remove(&block.slot);
             insert.end().await.unwrap();
             Ok(())
         }
         .boxed()
     }
 
-    fn on_load(&mut self, db: Client) -> PluginFuture<'_> {
+    fn on_load(&self, db: Client) -> PluginFuture<'_> {
+        DATA.get_or_init(|| DashMap::new());
         async move {
             log::info!("Program Tracking Plugin loaded.");
             log::info!("Creating program_invocations table if it does not exist...");
@@ -121,7 +127,7 @@ impl Plugin for ProgramTrackingPlugin {
         .boxed()
     }
 
-    fn on_exit(&mut self, _db: Client) -> PluginFuture<'_> {
+    fn on_exit(&self, _db: Client) -> PluginFuture<'_> {
         async move {
             log::info!("Program Tracking Plugin unloading...");
             Ok(())

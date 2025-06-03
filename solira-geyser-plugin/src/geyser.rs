@@ -32,7 +32,6 @@ thread_local! {
     static TOKIO_RUNTIME: RefCell<Runtime> = RefCell::new(Runtime::new().unwrap());
     static DB_CLIENT: RefCell<::clickhouse::Client> = RefCell::new(::clickhouse::Client::default()
             .with_url("http://localhost:8123")
-            .with_database("solira")
             .with_option("async_insert", "1")
             .with_option("wait_for_async_insert", "0"));
     static PLUGIN: RefCell<ProgramTrackingPlugin> = RefCell::new(ProgramTrackingPlugin::default());

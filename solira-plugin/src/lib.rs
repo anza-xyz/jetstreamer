@@ -82,16 +82,15 @@ impl PluginRunner {
     /// Dial the IPC socket and forward every message to every plugin.
     pub async fn run(self: Arc<Self>) -> Result<(), PluginRunnerError> {
         log::info!("connecting to ClickHouse at {}", self.clickhouse_dsn);
-        let db = Client::default().with_url(&self.clickhouse_dsn);
-        log::info!("checking if database exists + creating if it does not...");
-        db.query("CREATE DATABASE IF NOT EXISTS solira")
-            .execute()
-            .await?;
-        log::info!("done.");
+        // let db = Client::default().with_url(&self.clickhouse_dsn);
+        // log::info!("checking if database exists + creating if it does not...");
+        // db.query("CREATE DATABASE IF NOT EXISTS solira")
+        //     .execute()
+        //     .await?;
+        // log::info!("done.");
         log::info!("connecting to ClickHouse at {}", self.clickhouse_dsn);
         let db = Client::default()
             .with_url(&self.clickhouse_dsn)
-            .with_database("solira")
             .with_option("async_insert", "1")
             .with_option("wait_for_async_insert", "0");
 

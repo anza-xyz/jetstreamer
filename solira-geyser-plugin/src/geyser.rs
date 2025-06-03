@@ -5,7 +5,6 @@ use agave_geyser_plugin_interface::geyser_plugin_interface::{
 use core::ops::Range;
 use geyser_replay::{epochs::slot_to_epoch, firehose::generate_subranges};
 use mpsc::Sender;
-use once_cell::unsync::OnceCell;
 use rangemap::RangeMap;
 use std::{
     cell::RefCell,
@@ -29,9 +28,10 @@ use solira_plugin::{
 
 thread_local! {
     static TOKIO_RUNTIME: RefCell<Runtime> = RefCell::new(Runtime::new().unwrap());
-    static IPC_TX: OnceCell<Sender<SoliraMessage>> = OnceCell::new();
-    static IPC_TASK: OnceCell<tokio::task::JoinHandle<()>> = OnceCell::new();
 }
+static IPC_TX: once_cell::sync::OnceCell<Sender<SoliraMessage>> = once_cell::sync::OnceCell::new();
+static IPC_TASK: once_cell::sync::OnceCell<tokio::task::JoinHandle<()>> =
+    once_cell::sync::OnceCell::new();
 
 static EXIT: AtomicBool = AtomicBool::new(false);
 static PROCESSED_TRANSACTIONS: AtomicU64 = AtomicU64::new(0);
@@ -116,17 +116,14 @@ impl From<SoliraError> for GeyserPluginError {
 }
 
 pub fn ipc_send(msg: SoliraMessage) {
-    IPC_TX.with(|cell| {
-        if let Some(tx) = cell.get() {
-            let is_exit = msg == SoliraMessage::Exit;
-            if let Err(err) = tx.blocking_send(msg) {
-                panic!("IPC channel error: {:?}", err);
-            }
-            if is_exit {
-                log::info!("sent exit signal to clients");
-            }
-        }
-    });
+    let tx = IPC_TX.get().expect("IPC_TX not initialized");
+    let is_exit = msg == SoliraMessage::Exit;
+    if let Err(err) = tx.blocking_send(msg) {
+        panic!("IPC channel error: {:?}", err);
+    }
+    if is_exit {
+        log::info!("sent exit signal to clients");
+    }
 }
 
 fn parse_range(slot_range: impl AsRef<str>) -> Option<Range<u64>> {
@@ -238,12 +235,8 @@ impl GeyserPlugin for Solira {
                     let handle = spawn_socket_server(rx)
                         .await
                         .map_err(|e| SoliraError::ClickHouseError(e.to_string()))?;
-                    IPC_TX.with(|cell| {
-                        let _ = cell.set(tx);
-                    }); // <- inside `with`
-                    IPC_TASK.with(|cell| {
-                        let _ = cell.set(handle);
-                    });
+                    IPC_TX.set(tx).unwrap();
+                    IPC_TASK.set(handle).unwrap();
                     log::info!("IPC bridge initialized.");
 
                     START_TIME.set(Instant::now()).unwrap();
@@ -409,11 +402,9 @@ fn exiting() -> bool {
 
 fn stop_ipc_bridge() {
     log::info!("stopping IPC bridge...");
-    IPC_TASK.with(|cell| {
-        if let Some(handle) = cell.get() {
-            handle.abort(); // kills writer + accept loops
-        }
-    });
+    if let Some(handle) = IPC_TASK.get() {
+        handle.abort(); // kills writer + accept loops
+    }
     log::info!("IPC bridge stopped.");
 }
 

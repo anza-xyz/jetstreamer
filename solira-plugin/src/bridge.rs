@@ -15,6 +15,7 @@ pub struct Transaction {
     pub is_vote: bool,
     pub tx: VersionedTransaction,
     pub cu: Option<u64>,
+    pub success: bool,
 }
 
 impl Transaction {
@@ -37,6 +38,7 @@ impl Transaction {
                 },
                 tx: v.transaction.to_versioned_transaction(),
                 cu: v.transaction_status_meta.compute_units_consumed,
+                success: v.transaction_status_meta.status.is_ok(),
             },
             ReplicaTransactionInfoVersions::V0_0_2(v) => Self {
                 slot,
@@ -55,6 +57,7 @@ impl Transaction {
                 },
                 tx: v.transaction.to_versioned_transaction(),
                 cu: v.transaction_status_meta.compute_units_consumed,
+                success: v.transaction_status_meta.status.is_ok(),
             },
         }
     }

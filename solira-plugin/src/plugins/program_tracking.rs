@@ -114,7 +114,7 @@ impl Plugin for ProgramTrackingPlugin {
                     min_cus     UInt32,
                     max_cus     UInt32,
                     total_cus   UInt32,
-                ) 
+                )
                 ENGINE = ReplacingMergeTree(slot)
                 ORDER BY (slot, program_id)
                 "#,

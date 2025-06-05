@@ -4,7 +4,7 @@ members = ["geyser-replay", "solira-geyser-plugin", "solira-build-cdylib", "soli
 [package]
 name = "solira"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 authors = ["sam0x17"]
 
 [workspace.dependencies]
@@ -78,7 +78,7 @@ geyser-replay.workspace = true
 solira-plugin.workspace = true
 
 [build-dependencies]
-solira-build-cdylib = { path = "solira-build-cdylib", version = "0.1.0" }
+solira-build-cdylib = { path = "solira-build-cdylib", version = "0.1.0", features = ["link-solira"] }
 
 [profile.release]
 lto = "fat"

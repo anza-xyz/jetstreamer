@@ -1,7 +1,7 @@
 [package]
 name = "geyser-replay"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 authors = ["sam0x17"]
 license = "MIT"
 description = "A utility that allows replaying ranges of Solana blocks, even back to genesis, over a geyser plugin using Old Faithful"

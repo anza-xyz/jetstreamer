@@ -3,5 +3,12 @@ name = "solira-build-cdylib"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+test = false
+doc = false
+
+[features]
+link-solira = []
+
 [dependencies]
 solira-geyser-plugin.workspace = true

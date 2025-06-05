@@ -30,6 +30,7 @@ solana-entry.workspace = true
 reqwest.workspace = true
 tokio.workspace = true
 futures-util.workspace = true
+serde = { workspace = true, features = ["derive"] }
 anyhow.workspace = true
 rangemap.workspace = true
 thiserror.workspace = true

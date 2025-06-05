@@ -1,5 +1,7 @@
 use reqwest::Client;
 use rseek::Seekable;
+use serde::Deserialize;
+use std::fmt;
 use tokio::io::{AsyncRead, AsyncSeek, BufReader};
 
 use crate::node_reader::Len;
@@ -46,6 +48,69 @@ pub async fn fetch_epoch_stream(epoch: u64, client: &Client) -> impl AsyncRead +
     BufReader::with_capacity(8 * 1024 * 1024, seekable)
 }
 
+#[derive(Debug)]
+pub enum SlotTimestampError {
+    Transport(reqwest::Error),
+    Decode(serde_json::Error),
+    Rpc(Option<serde_json::Value>),
+    NoBlockTime,
+}
+impl fmt::Display for SlotTimestampError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SlotTimestampError::Transport(e) => write!(f, "RPC transport error: {e}"),
+            SlotTimestampError::Decode(e) => write!(f, "RPC decode error: {e}"),
+            SlotTimestampError::Rpc(e) => write!(f, "RPC error: {:?}", e),
+            SlotTimestampError::NoBlockTime => write!(f, "No blockTime found in getBlock result"),
+        }
+    }
+}
+impl std::error::Error for SlotTimestampError {}
+
+/// Get the true Unix timestamp (seconds since epoch, UTC) for a Solana slot.
+/// Uses the validator RPC getBlock method, returns Ok(timestamp) or Err(reason).
+pub async fn get_slot_timestamp(
+    slot: u64,
+    rpc_url: &str,
+    client: &Client,
+) -> Result<u64, SlotTimestampError> {
+    #[derive(Deserialize)]
+    struct BlockResult {
+        #[serde(rename = "blockTime")]
+        block_time: Option<u64>,
+    }
+    #[derive(Deserialize)]
+    struct RpcResponse {
+        result: Option<BlockResult>,
+        error: Option<serde_json::Value>,
+    }
+
+    let req = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "getBlock",
+        "params": [slot, { "maxSupportedTransactionVersion": 0 }],
+    });
+
+    let resp = client
+        .post(rpc_url)
+        .json(&req)
+        .send()
+        .await
+        .map_err(SlotTimestampError::Transport)?;
+
+    let text = resp.text().await.map_err(SlotTimestampError::Transport)?;
+    let resp_val: RpcResponse = serde_json::from_str(&text).map_err(SlotTimestampError::Decode)?;
+
+    if resp_val.error.is_some() {
+        return Err(SlotTimestampError::Rpc(resp_val.error));
+    }
+    resp_val
+        .result
+        .and_then(|r| r.block_time)
+        .ok_or(SlotTimestampError::NoBlockTime)
+}
+
 /* ── Tests ──────────────────────────────────────────────────────────────── */
 #[cfg(test)]
 mod tests {
@@ -66,6 +131,19 @@ mod tests {
         stream.seek(std::io::SeekFrom::End(-1024)).await.unwrap();
         stream.read_exact(&mut buf).await.unwrap();
         assert_eq!(buf[1], 1);
+    }
+
+    #[tokio::test]
+    async fn test_get_slot_timestamp() {
+        // well-known public Solana RPC, slot 246446651 occurred in Apr 2024
+        let client = reqwest::Client::new();
+        let rpc_url = "https://api.mainnet-beta.solana.com";
+        let slot = 246446651u64;
+        let ts = get_slot_timestamp(slot, rpc_url, &client)
+            .await
+            .expect("should get a timestamp for valid slot");
+        // Unix timestamp should be after 2023, plausibility check (> 1672531200 = Jan 1, 2023)
+        assert!(ts > 1672531200, "timestamp was {}", ts);
     }
 }
 

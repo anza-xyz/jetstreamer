@@ -109,7 +109,7 @@ impl Plugin for ProgramTrackingPlugin {
     }
 
     fn on_load(&self, db: Client) -> PluginFuture<'_> {
-        DATA.get_or_init(|| DashMap::new());
+        DATA.get_or_init(DashMap::new);
         async move {
             log::info!("Program Tracking Plugin loaded.");
             log::info!("Creating program_invocations table if it does not exist...");

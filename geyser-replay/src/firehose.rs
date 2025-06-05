@@ -140,7 +140,7 @@ pub async fn firehose(
             service
                 .get_transaction_notifier()
                 .ok_or(GeyserReplayError::FailedToGetTransactionNotifier)
-                .map_err(|e| (e.into(), slot_range.start))?,
+                .map_err(|e| (e, slot_range.start))?,
         );
 
         entry_notifier_maybe = service.get_entry_notifier();
@@ -189,7 +189,7 @@ pub async fn firehose(
                     entry_notifier_maybe,
                     block_meta_notifier_maybe,
                     confirmed_bank_sender,
-                    &client,
+                    client,
                     if threads > 1 { Some(i) } else { None },
                 )
                 .await
@@ -248,7 +248,7 @@ async fn firehose_thread(
                     .read_raw_header()
                     .await
                     .map_err(GeyserReplayError::ReadHeader)
-                    .map_err(|e| (e.into(), current_slot.unwrap_or(slot_range.start)))?;
+                    .map_err(|e| (e, current_slot.unwrap_or(slot_range.start)))?;
                 log::debug!(target: &log_target, "read epoch {} header: {:?}", epoch_num, header);
 
                 let mut todo_previous_blockhash = solana_sdk::hash::Hash::default();
@@ -258,7 +258,7 @@ async fn firehose_thread(
                     reader
                         .seek_to_slot(slot_range.start, &mut slot_offset_index)
                         .await
-                        .map_err(|e| (e.into(), current_slot.unwrap_or(slot_range.start)))?;
+                        .map_err(|e| (e, current_slot.unwrap_or(slot_range.start)))?;
                 }
 
                 // for each item in each block
@@ -269,7 +269,7 @@ async fn firehose_thread(
                         .read_until_block()
                         .await
                         .map_err(GeyserReplayError::ReadUntilBlockError)
-                        .map_err(|e| (e.into(), current_slot.unwrap_or(slot_range.start)))?;
+                        .map_err(|e| (e, current_slot.unwrap_or(slot_range.start)))?;
                     // ignore epoch and subset nodes at end of car file
                     loop {
                         if nodes.0.is_empty() {
@@ -293,7 +293,7 @@ async fn firehose_thread(
                     let block = nodes
                         .get_block()
                         .map_err(GeyserReplayError::GetBlockError)
-                        .map_err(|e| (e.into(), current_slot.unwrap_or(slot_range.start)))?;
+                        .map_err(|e| (e, current_slot.unwrap_or(slot_range.start)))?;
                     log::debug!(
                         "read {} items from epoch {}, now at slot {}",
                         item_index,
@@ -483,7 +483,7 @@ async fn firehose_thread(
                     }
                     Ok(())
                 })
-                .map_err(|e| GeyserReplayError::NodeDecodingError(item_index, e)).map_err(|e| (e.into(), current_slot.unwrap_or(slot_range.start)))?;
+                .map_err(|e| GeyserReplayError::NodeDecodingError(item_index, e)).map_err(|e| (e, current_slot.unwrap_or(slot_range.start)))?;
                     if block.slot == slot_range.end - 1 {
                         let finish_time = std::time::Instant::now();
                         let elapsed = finish_time.duration_since(start_time);

@@ -34,7 +34,7 @@ thread_local! {
             .with_url("http://localhost:8123")
             .with_option("async_insert", "1")
             .with_option("wait_for_async_insert", "0"));
-    static PLUGIN: RefCell<ProgramTrackingPlugin> = RefCell::new(ProgramTrackingPlugin::default());
+    static PLUGIN: RefCell<ProgramTrackingPlugin> = const { RefCell::new(ProgramTrackingPlugin) };
 }
 static IPC_TX: once_cell::sync::OnceCell<Sender<SoliraMessage>> = once_cell::sync::OnceCell::new();
 static IPC_TASK: once_cell::sync::OnceCell<tokio::task::JoinHandle<()>> =
@@ -191,7 +191,7 @@ impl GeyserPlugin for Solira {
 
         // process config
         let config_raw_json =
-            std::fs::read_to_string(config_file).map_err(|e| GeyserPluginError::from(e))?;
+            std::fs::read_to_string(config_file).map_err(GeyserPluginError::from)?;
         let config_json = serde_json::from_str::<serde_json::Value>(&config_raw_json)
             .map_err(|e| GeyserPluginError::ConfigFileReadError { msg: e.to_string() })?;
         log::info!("config file loaded: {:#?}", config_file);
@@ -321,7 +321,7 @@ impl GeyserPlugin for Solira {
         if slot >= thread_slot_range_end || processed_slots % 100 == 0 {
             let processed_txs = PROCESSED_TRANSACTIONS.load(Ordering::SeqCst);
             let num_votes = NUM_VOTES.load(Ordering::SeqCst);
-            let compute_consumed = COMPUTE_CONSUMED.lock().unwrap().clone();
+            let compute_consumed = *COMPUTE_CONSUMED.lock().unwrap();
 
             let overall_tps = {
                 let start_time = START_TIME.get().unwrap();

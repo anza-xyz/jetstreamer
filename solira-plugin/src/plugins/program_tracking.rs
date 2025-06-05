@@ -19,6 +19,7 @@ struct ProgramEvent {
     pub slot: u32,
     pub program_id: Pubkey,
     pub count: u32,
+    pub error_count: u32,
     pub min_cus: u32, // need to still use u32 because a single transaction can be up to 1.4M CUs
     pub max_cus: u32,
     pub total_cus: u32, // 32 bits is enough for total CU within a block since max is 48M CUs
@@ -27,6 +28,7 @@ struct ProgramEvent {
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 struct ProgramStats {
     pub count: u32,
+    pub error_count: u32,
     pub min_cus: u32,
     pub max_cus: u32,
     pub total_cus: u32,
@@ -58,6 +60,7 @@ impl Plugin for ProgramTrackingPlugin {
             let total_cu = transaction.cu.unwrap_or(0) as u32;
             let data = DATA.get().expect("DATA should be initialized");
             let mut slot_data = data.entry(transaction.slot).or_default();
+            let errored = !transaction.success;
             for program_id in program_ids.iter() {
                 let this_program_cu = total_cu / program_ids.len() as u32;
                 let stats = slot_data.entry(*program_id).or_insert(ProgramStats {
@@ -65,11 +68,15 @@ impl Plugin for ProgramTrackingPlugin {
                     max_cus: 0,
                     total_cus: 0,
                     count: 0,
+                    error_count: 0,
                 });
                 stats.min_cus = stats.min_cus.min(this_program_cu);
                 stats.max_cus = stats.max_cus.max(this_program_cu);
                 stats.total_cus += this_program_cu;
                 stats.count += 1;
+                if errored {
+                    stats.error_count += 1;
+                }
             }
             Ok(())
         }
@@ -86,6 +93,7 @@ impl Plugin for ProgramTrackingPlugin {
                     slot: block.slot as u32,
                     program_id: *program_id,
                     count: stats.count,
+                    error_count: stats.error_count,
                     min_cus: stats.min_cus,
                     max_cus: stats.max_cus,
                     total_cus: stats.total_cus,
@@ -111,9 +119,10 @@ impl Plugin for ProgramTrackingPlugin {
                     slot        UInt32,
                     program_id  FixedString(32),
                     count       UInt32,
+                    error_count UInt32,
                     min_cus     UInt32,
                     max_cus     UInt32,
-                    total_cus   UInt32,
+                    total_cus   UInt32
                 )
                 ENGINE = ReplacingMergeTree(slot)
                 ORDER BY (slot, program_id)

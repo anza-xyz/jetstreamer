@@ -1,4 +1,4 @@
-use crossbeam_channel::{unbounded, Receiver, Sender};
+use crossbeam_channel::{Receiver, Sender, unbounded};
 use demo_rust_ipld_car::utils;
 use rayon::prelude::*;
 use reqwest::Client;
@@ -107,8 +107,8 @@ pub async fn firehose(
     slot_offset_index_path: impl AsRef<Path>,
     client: &Client,
     on_load: impl Future<Output = Result<(), Box<dyn std::error::Error + Send + 'static>>>
-        + Send
-        + 'static,
+    + Send
+    + 'static,
     threads: u8,
 ) -> Result<Receiver<SlotNotification>, (GeyserReplayError, u64)> {
     if threads == 0 {

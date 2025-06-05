@@ -1,7 +1,7 @@
 use core::ops::Range;
 use geyser_replay::{
     epochs::slot_to_epoch,
-    firehose::{firehose, GeyserReplayError},
+    firehose::{GeyserReplayError, firehose},
     index::get_index_dir,
 };
 use serde_json::json;

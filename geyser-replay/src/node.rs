@@ -1,7 +1,7 @@
 use {
     cid::Cid,
     core::hash::Hasher,
-    crc::{Crc, CRC_64_GO_ISO},
+    crc::{CRC_64_GO_ISO, Crc},
     demo_rust_ipld_car::{block, dataframe, entry, epoch, rewards, subset, transaction, utils},
     fnv::FnvHasher,
     std::{

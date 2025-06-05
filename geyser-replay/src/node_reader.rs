@@ -1,7 +1,7 @@
 use crate::epochs::slot_to_epoch;
 use crate::firehose::GeyserReplayError;
 use crate::index::{SlotOffsetIndex, SlotOffsetIndexError};
-use crate::node::{parse_any_from_cbordata, Node, NodeWithCid, NodesWithCids};
+use crate::node::{Node, NodeWithCid, NodesWithCids, parse_any_from_cbordata};
 use cid::Cid;
 use demo_rust_ipld_car::utils;
 use reqwest::RequestBuilder;
@@ -278,7 +278,7 @@ impl<R: AsyncRead + Unpin + AsyncSeek + Len> NodeReader<R> {
                     if e.downcast_ref::<io::Error>()
                         .is_some_and(|io_err| io_err.kind() == io::ErrorKind::UnexpectedEof) =>
                 {
-                    break
+                    break;
                 }
                 Err(e) => return Err(e),
             };

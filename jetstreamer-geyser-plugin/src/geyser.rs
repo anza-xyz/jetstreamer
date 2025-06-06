@@ -21,10 +21,10 @@ use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
 
 use crate::clickhouse;
-use jetstreamr_plugin::{
+use jetstreamer_plugin::{
     Plugin,
     bridge::{Block, Transaction},
-    ipc::{JetstreamrMessage, spawn_socket_server},
+    ipc::{JetstreamerMessage, spawn_socket_server},
     plugins::program_tracking::ProgramTrackingPlugin,
 };
 
@@ -36,7 +36,7 @@ thread_local! {
             .with_option("wait_for_async_insert", "0"));
     static PLUGIN: RefCell<ProgramTrackingPlugin> = const { RefCell::new(ProgramTrackingPlugin) };
 }
-static IPC_TX: once_cell::sync::OnceCell<Sender<JetstreamrMessage>> =
+static IPC_TX: once_cell::sync::OnceCell<Sender<JetstreamerMessage>> =
     once_cell::sync::OnceCell::new();
 static IPC_TASK: once_cell::sync::OnceCell<tokio::task::JoinHandle<()>> =
     once_cell::sync::OnceCell::new();
@@ -96,34 +96,34 @@ pub fn thread_set_current_tx_index(thread_id: u8, index: u32) {
 }
 
 #[derive(Clone, Debug, Default)]
-pub struct Jetstreamr;
+pub struct Jetstreamer;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum JetstreamrError {
+pub enum JetstreamerError {
     ClickHouseError(String),
     ClickHouseInitializationFailed,
 }
 
-impl Error for JetstreamrError {}
+impl Error for JetstreamerError {}
 
-impl std::fmt::Display for JetstreamrError {
+impl std::fmt::Display for JetstreamerError {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
-            JetstreamrError::ClickHouseError(msg) => write!(f, "ClickHouse error: {}", msg),
-            JetstreamrError::ClickHouseInitializationFailed => {
+            JetstreamerError::ClickHouseError(msg) => write!(f, "ClickHouse error: {}", msg),
+            JetstreamerError::ClickHouseInitializationFailed => {
                 write!(f, "ClickHouse initialization failed")
             }
         }
     }
 }
 
-impl From<JetstreamrError> for GeyserPluginError {
-    fn from(err: JetstreamrError) -> Self {
+impl From<JetstreamerError> for GeyserPluginError {
+    fn from(err: JetstreamerError) -> Self {
         GeyserPluginError::Custom(Box::new(err))
     }
 }
 
-pub fn ipc_send(msg: JetstreamrMessage) {
+pub fn ipc_send(msg: JetstreamerMessage) {
     DB_CLIENT.with(|db| {
         let db = db.borrow();
         PLUGIN.with(|plugin| {
@@ -131,18 +131,18 @@ pub fn ipc_send(msg: JetstreamrMessage) {
             TOKIO_RUNTIME.with(|rt_cell| {
                 let rt = rt_cell.borrow();
                 match msg {
-                    JetstreamrMessage::Transaction(tx, tx_index) => {
+                    JetstreamerMessage::Transaction(tx, tx_index) => {
                         if let Err(e) = rt.block_on(plugin.on_transaction(db.clone(), tx, tx_index))
                         {
                             log::error!("plugin {} on_transaction error: {}", plugin.name(), e);
                         }
                     }
-                    JetstreamrMessage::Block(block) => {
+                    JetstreamerMessage::Block(block) => {
                         if let Err(e) = rt.block_on(plugin.on_block(db.clone(), block)) {
                             log::error!("plugin {} on_block error: {}", plugin.name(), e);
                         }
                     }
-                    JetstreamrMessage::Exit => {
+                    JetstreamerMessage::Exit => {
                         if let Err(e) = rt.block_on(plugin.on_exit(db.clone())) {
                             log::error!("plugin {} on_exit error: {}", plugin.name(), e);
                         }
@@ -152,7 +152,7 @@ pub fn ipc_send(msg: JetstreamrMessage) {
         });
     });
     // let tx = IPC_TX.get().expect("IPC_TX not initialized");
-    // let is_exit = msg == JetstreamrMessage::Exit;
+    // let is_exit = msg == JetstreamerMessage::Exit;
     // if let Err(err) = tx.blocking_send(msg) {
     //     panic!("IPC channel error: {:?}", err);
     // }
@@ -176,9 +176,9 @@ fn parse_range(slot_range: impl AsRef<str>) -> Option<Range<u64>> {
     Some(start..end)
 }
 
-impl GeyserPlugin for Jetstreamr {
+impl GeyserPlugin for Jetstreamer {
     fn name(&self) -> &'static str {
-        "GeyserPluginJetstreamr"
+        "GeyserPluginJetstreamer"
     }
 
     fn on_load(&mut self, config_file: &str, _is_reload: bool) -> Result<()> {
@@ -188,7 +188,7 @@ impl GeyserPlugin for Jetstreamr {
             unload();
             return Ok(());
         }
-        log::info!("jetstreamr loading...");
+        log::info!("jetstreamer loading...");
 
         // process config
         let config_raw_json =
@@ -204,27 +204,27 @@ impl GeyserPlugin for Jetstreamr {
             .as_bool()
             .unwrap_or(true);
         let threads = config_json
-            .get("jetstreamr")
+            .get("jetstreamer")
             .unwrap()
             .get("threads")
             .unwrap()
             .as_u64()
             .unwrap_or(1) as u8;
-        log::info!("jetstreamr threads: {}", threads);
+        log::info!("jetstreamer threads: {}", threads);
         let slot_range = config_json
-            .get("jetstreamr")
+            .get("jetstreamer")
             .unwrap()
             .get("slot_range")
             .unwrap()
             .as_str()
             .unwrap();
         let slot_range = parse_range(slot_range).unwrap();
-        log::info!("jetstreamr slot range: {:?}", slot_range);
+        log::info!("jetstreamer slot range: {:?}", slot_range);
         SLOT_RANGE.set(slot_range.clone()).unwrap();
 
         // init subranges + thread info
         let sub_ranges = generate_subranges(&slot_range, threads);
-        log::info!("jetstreamr slot sub-ranges: {:?}", sub_ranges);
+        log::info!("jetstreamer slot sub-ranges: {:?}", sub_ranges);
         let mut thread_info_map = RangeMap::new();
         sub_ranges.iter().enumerate().for_each(|(i, range)| {
             let thread_id = i as u8;
@@ -252,7 +252,7 @@ impl GeyserPlugin for Jetstreamr {
                     if spawn_clickhouse {
                         log::info!("automatic ClickHouse spawning enabled, starting ClickHouse...");
                         let start_result = clickhouse::start().await
-                            .map_err(|e| JetstreamrError::ClickHouseError(e.to_string()))?;
+                            .map_err(|e| JetstreamerError::ClickHouseError(e.to_string()))?;
 
                         let (mut ready_rx, clickhouse_future) = start_result;
 
@@ -260,17 +260,17 @@ impl GeyserPlugin for Jetstreamr {
                             log::info!("ClickHouse initialization complete.");
                             rt.spawn(clickhouse_future);
                         } else {
-                            return Err(JetstreamrError::ClickHouseInitializationFailed);
+                            return Err(JetstreamerError::ClickHouseInitializationFailed);
                         }
                     } else {
                         log::info!("automatic ClickHouse spawning disabled, skipping ClickHouse initialization.");
                     }
 
                     log::info!("setting up IPC bridge...");
-                    let (tx, rx) = mpsc::channel::<JetstreamrMessage>(1);
+                    let (tx, rx) = mpsc::channel::<JetstreamerMessage>(1);
                     let handle = spawn_socket_server(rx)
                         .await
-                        .map_err(|e| JetstreamrError::ClickHouseError(e.to_string()))?;
+                        .map_err(|e| JetstreamerError::ClickHouseError(e.to_string()))?;
                     IPC_TX.set(tx).unwrap();
                     IPC_TASK.set(handle).unwrap();
                     log::info!("IPC bridge initialized.");
@@ -280,7 +280,7 @@ impl GeyserPlugin for Jetstreamr {
                     plugin.on_load(db).await.unwrap();
                     log::info!("program tracking plugin initialized.");
                     START_TIME.set(Instant::now()).unwrap();
-                    log::info!("jetstreamr loaded");
+                    log::info!("jetstreamer loaded");
 
                     ctrlc::set_handler(|| {
                         unload();
@@ -290,7 +290,7 @@ impl GeyserPlugin for Jetstreamr {
                 })
             })
             .map_err(|e| {
-                log::error!("Error loading jetstreamr: {:?}", e);
+                log::error!("Error loading jetstreamer: {:?}", e);
                 GeyserPluginError::from(e)
             })
     }
@@ -359,7 +359,7 @@ impl GeyserPlugin for Jetstreamr {
         }
 
         let blk = Block::from_replica(blockinfo);
-        ipc_send(JetstreamrMessage::Block(blk));
+        ipc_send(JetstreamerMessage::Block(blk));
 
         if slot >= thread_slot_range_end {
             log::info!(
@@ -369,17 +369,17 @@ impl GeyserPlugin for Jetstreamr {
             );
 
             let complete_threads = COMPLETE_THREADS.fetch_add(1, Ordering::SeqCst) + 1;
-            let jetstreamr_threads = range_map.len() as u8;
-            if complete_threads >= jetstreamr_threads {
+            let jetstreamer_threads = range_map.len() as u8;
+            if complete_threads >= jetstreamer_threads {
                 log::info!(
-                    "all {} threads have completed their work, unloading jetstreamr...",
-                    jetstreamr_threads
+                    "all {} threads have completed their work, unloading jetstreamer...",
+                    jetstreamer_threads
                 );
                 unload();
             } else {
                 log::info!(
                     "waiting for {} more threads to complete their work",
-                    jetstreamr_threads - complete_threads
+                    jetstreamer_threads - complete_threads
                 );
             }
         }
@@ -418,7 +418,7 @@ impl GeyserPlugin for Jetstreamr {
             .get(&slot)
             .expect("thread id not found for slot");
         let thread_current_tx_index = thread_bump_tx_index(thread_id);
-        ipc_send(JetstreamrMessage::Transaction(tx, thread_current_tx_index));
+        ipc_send(JetstreamerMessage::Transaction(tx, thread_current_tx_index));
         Ok(())
     }
 
@@ -456,7 +456,7 @@ fn stop_tx_queue() {
 
 fn send_exit_signal_to_clients() {
     log::info!("sending exit signal to clients...");
-    ipc_send(JetstreamrMessage::Exit);
+    ipc_send(JetstreamerMessage::Exit);
     log::info!("exit signal sent to clients.");
 }
 
@@ -468,7 +468,7 @@ fn stop_clickhouse() {
 
 fn clear_domain_socket() {
     log::info!("clearing domain socket...");
-    std::fs::remove_file("/tmp/jetstreamr.sock").unwrap_or_else(|_| {
+    std::fs::remove_file("/tmp/jetstreamer.sock").unwrap_or_else(|_| {
         log::warn!("failed to remove domain socket");
     });
     log::info!("domain socket cleared.");
@@ -476,13 +476,13 @@ fn clear_domain_socket() {
 
 #[inline(always)]
 fn unload() {
-    log::info!("jetstreamr unloading...");
+    log::info!("jetstreamer unloading...");
     stop_tx_queue();
     send_exit_signal_to_clients();
     stop_ipc_bridge();
     stop_clickhouse();
     clear_domain_socket();
-    log::info!("jetstreamr has successfully unloaded.");
+    log::info!("jetstreamer has successfully unloaded.");
     std::process::exit(0);
 }
 

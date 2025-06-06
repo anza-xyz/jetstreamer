@@ -1,4 +1,4 @@
-use jetstreamr::clickhouse::*;
+use jetstreamer::clickhouse::*;
 
 // TODO: pull clickhouse into its own crate
 

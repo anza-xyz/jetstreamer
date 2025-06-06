@@ -11,20 +11,20 @@ use tokio::{
 use crate::bridge::{Block, Transaction};
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
-pub enum JetstreamrMessage {
+pub enum JetstreamerMessage {
     Transaction(Transaction, u32),
     Block(Block),
     Exit,
 }
 
-pub type Tx = broadcast::Sender<JetstreamrMessage>;
-pub type Rx = broadcast::Receiver<JetstreamrMessage>;
+pub type Tx = broadcast::Sender<JetstreamerMessage>;
+pub type Rx = broadcast::Receiver<JetstreamerMessage>;
 pub type Error = Box<dyn std::error::Error + Send + Sync + 'static>;
 
 pub async fn spawn_socket_server(
-    mut rx: mpsc::Receiver<JetstreamrMessage>,
+    mut rx: mpsc::Receiver<JetstreamerMessage>,
 ) -> Result<JoinHandle<()>, Box<dyn std::error::Error + Send + Sync + 'static>> {
-    let name = "jetstreamr.sock".to_ns_name::<GenericNamespaced>()?;
+    let name = "jetstreamer.sock".to_ns_name::<GenericNamespaced>()?;
     let listener = ListenerOptions::new().name(name).create_tokio()?;
 
     // Shared list of live sockets

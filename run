@@ -1,14 +1,14 @@
 #!/bin/sh
 set -ex
 pkill clickhouse || echo ""
-cargo build --release -p geyser-replay -p jetstreamr
+cargo build --release -p geyser-replay -p jetstreamer
 cp plugin_config.json bin/
 if [[ "$OSTYPE" == "darwin"* ]]; then
-  cp target/release/libjetstreamr.dylib bin/
+  cp target/release/libjetstreamer.dylib bin/
   cd bin
   awk '{gsub("{{ext}}", "dylib")}1' plugin_config.json > plugin_config.tmp && mv plugin_config.tmp plugin_config.json
 else
-  cp target/release/libjetstreamr.so bin/
+  cp target/release/libjetstreamer.so bin/
   cd bin
   awk '{gsub("{{ext}}", "so")}1' plugin_config.json > plugin_config.tmp && mv plugin_config.tmp plugin_config.json
 fi

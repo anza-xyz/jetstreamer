@@ -1,6 +1,6 @@
 {
-  "libpath": "{{full-path}}/libjetstreamr.{{ext}}",
-  "name": "GeyserPluginJetstreamr",
+  "libpath": "{{full-path}}/libjetstreamer.{{ext}}",
+  "name": "GeyserPluginJetstreamer",
   "clickhouse": {
     "host": "127.0.0.1",
     "port": 8123,

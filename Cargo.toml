@@ -1,16 +1,16 @@
 [workspace]
-members = ["geyser-replay", "jetstreamr-geyser-plugin", "jetstreamr-build-cdylib", "jetstreamr-plugin"]
+members = ["geyser-replay", "jetstreamer-geyser-plugin", "jetstreamer-build-cdylib", "jetstreamer-plugin"]
 
 [package]
-name = "jetstreamr"
+name = "jetstreamer"
 version = "0.1.0"
 edition = "2024"
 authors = ["sam0x17"]
 
 [workspace.dependencies]
 geyser-replay = { path = "geyser-replay", version = "0.1.0" }
-jetstreamr-geyser-plugin = { path = "jetstreamr-geyser-plugin", version = "0.1.0" }
-jetstreamr-plugin = { path = "jetstreamr-plugin", version = "0.1.0" }
+jetstreamer-geyser-plugin = { path = "jetstreamer-geyser-plugin", version = "0.1.0" }
+jetstreamer-plugin = { path = "jetstreamer-plugin", version = "0.1.0" }
 demo-rust-ipld-car = { git = "https://github.com/rpcpool/yellowstone-faithful.git" }
 tokio = { version = "1", features = ["full"] }
 futures-util = "0"
@@ -75,10 +75,10 @@ solana-logger.workspace = true
 log.workspace = true
 reqwest.workspace = true
 geyser-replay.workspace = true
-jetstreamr-plugin.workspace = true
+jetstreamer-plugin.workspace = true
 
 [build-dependencies]
-jetstreamr-build-cdylib = { path = "jetstreamr-build-cdylib", version = "0.1.0", features = ["link-jetstreamr"] }
+jetstreamer-build-cdylib = { path = "jetstreamer-build-cdylib", version = "0.1.0", features = ["link-jetstreamer"] }
 
 [profile.release]
 lto = "fat"

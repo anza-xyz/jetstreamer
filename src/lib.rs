@@ -4,14 +4,14 @@ use geyser_replay::{
     firehose::{GeyserReplayError, firehose},
     index::get_index_dir,
 };
-use jetstreamr_plugin::{Plugin, PluginRunner};
+use jetstreamer_plugin::{Plugin, PluginRunner};
 use serde_json::json;
 use std::{fs::File, io::Write, os::unix::fs::PermissionsExt, path::PathBuf, sync::Arc};
 use tempfile::NamedTempFile;
 
-include!(concat!(env!("OUT_DIR"), "/embed.rs")); // brings in JETSTREAMR_CDYLIB
+include!(concat!(env!("OUT_DIR"), "/embed.rs")); // brings in JETSTREAMER_CDYLIB
 
-pub struct JetstreamrRunner {
+pub struct JetstreamerRunner {
     log_level: String,
     plugins: Vec<Box<dyn Plugin>>,
     index_dir: PathBuf,
@@ -19,7 +19,7 @@ pub struct JetstreamrRunner {
     config: Config,
 }
 
-impl Default for JetstreamrRunner {
+impl Default for JetstreamerRunner {
     fn default() -> Self {
         Self {
             log_level: "info".to_string(),
@@ -35,7 +35,7 @@ impl Default for JetstreamrRunner {
     }
 }
 
-impl JetstreamrRunner {
+impl JetstreamerRunner {
     pub fn new() -> Self {
         Self::default()
     }
@@ -66,7 +66,7 @@ impl JetstreamrRunner {
         self
     }
 
-    pub async fn with_jetstreamr_geyser_config(mut self) -> Self {
+    pub async fn with_jetstreamer_geyser_config(mut self) -> Self {
         let geyser_config = setup_geyser(&self.config).await.unwrap();
         self.geyser_config_files.push(geyser_config);
         self
@@ -87,7 +87,7 @@ impl JetstreamrRunner {
         let slot_range = self.config.slot_range;
         log::info!("geyser config files: {:?}", geyser_config_files);
         let mut plugin_runner =
-            PluginRunner::new("http://localhost:8123").socket_name("jetstreamr.sock");
+            PluginRunner::new("http://localhost:8123").socket_name("jetstreamer.sock");
         for plugin in self.plugins {
             plugin_runner.register(plugin);
         }
@@ -123,10 +123,10 @@ impl JetstreamrRunner {
     }
 }
 
-/// Sets up the environment for the Jetstreamr geyser plugin, returning the path of an ephemeral
-/// geyser plugin config file pointing to a copy of the Jetstreamr geyser plugin shared library.
+/// Sets up the environment for the Jetstreamer geyser plugin, returning the path of an ephemeral
+/// geyser plugin config file pointing to a copy of the Jetstreamer geyser plugin shared library.
 pub async fn setup_geyser(config: &Config) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    // materialize libjetstreamr.{so|dylib|dll} on disk
+    // materialize libjetstreamer.{so|dylib|dll} on disk
     let cdylib_path = {
         // pick an extension for this OS
         let ext = if cfg!(target_os = "windows") {
@@ -138,10 +138,10 @@ pub async fn setup_geyser(config: &Config) -> Result<PathBuf, Box<dyn std::error
         };
 
         // create a temp file with that suffix and write the bytes
-        let file = NamedTempFile::with_suffix(format!("-jetstreamr.{ext}"))?
+        let file = NamedTempFile::with_suffix(format!("-jetstreamer.{ext}"))?
             .into_temp_path()
             .keep()?;
-        File::create(&file)?.write_all(JETSTREAMR_CDYLIB)?;
+        File::create(&file)?.write_all(JETSTREAMER_CDYLIB)?;
         // executable permission for Unix
         #[cfg(unix)]
         std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755))?;
@@ -153,18 +153,18 @@ pub async fn setup_geyser(config: &Config) -> Result<PathBuf, Box<dyn std::error
     let cfg_path = {
         let cfg = json!({
             "libpath": cdylib_path,
-            "name":    "GeyserPluginJetstreamr",
+            "name":    "GeyserPluginJetstreamer",
             "clickhouse": {
                 "spawn": config.spawn_clickhouse,
             },
-            "jetstreamr": {
+            "jetstreamer": {
                 "threads": config.threads,
                 "slot_range": format!("{:?}", config.slot_range),
             },
             "log_level": "info"
         });
         println!("GeyserPluginService config: {:?}", cfg);
-        let tmp = NamedTempFile::with_suffix("-jetstreamr-plugin-config.json")?.into_temp_path();
+        let tmp = NamedTempFile::with_suffix("-jetstreamer-plugin-config.json")?.into_temp_path();
         serde_json::to_writer_pretty(&File::create(&tmp)?, &cfg)?;
         tmp.keep()? // same lifetime rule
     };
@@ -196,10 +196,10 @@ pub fn parse_cli_args() -> Result<Config, Box<dyn std::error::Error>> {
         let (start_slot, end_slot) = geyser_replay::epochs::epoch_to_slot_range(epoch);
         start_slot..end_slot
     };
-    let spawn_clickhouse = std::env::var("JETSTREAMR_NO_CLICKHOUSE")
+    let spawn_clickhouse = std::env::var("JETSTREAMER_NO_CLICKHOUSE")
         .map(|v| v != "1" && v != "true" && v != "t")
         .unwrap_or(true);
-    let threads = std::env::var("JETSTREAMR_THREADS")
+    let threads = std::env::var("JETSTREAMER_THREADS")
         .ok()
         .and_then(|s| s.parse::<u8>().ok())
         .unwrap_or(1);

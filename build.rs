@@ -1,6 +1,6 @@
 //! This script runs after Cargo has built all **build-dependencies**. The helper crate
-//! `jetstreamr-build-cdylib` is a build-dependency that links to `libjetstreamr` as a *dylib*, which
-//! forces Cargo to emit `libjetstreamr.{so|dylib|dll}` **before** this script executes.
+//! `jetstreamer-build-cdylib` is a build-dependency that links to `libjetstreamer` as a *dylib*, which
+//! forces Cargo to emit `libjetstreamer.{so|dylib|dll}` **before** this script executes.
 
 use std::{
     env, fs,
@@ -29,9 +29,9 @@ fn main() {
     } else {
         ("lib", "so")
     };
-    let stem_prefix = format!("{prefix}jetstreamr"); // "libjetstreamr" or "jetstreamr"
+    let stem_prefix = format!("{prefix}jetstreamer"); // "libjetstreamer" or "jetstreamer"
 
-    // ── locate the cdylib built for jetstreamr ─────────────────────────────────
+    // ── locate the cdylib built for jetstreamer ─────────────────────────────────
     let cdylib_path = fs::read_dir(&deps_dir)
         .expect("deps dir missing")
         .filter_map(|e| e.ok().map(|e| e.path()))
@@ -43,7 +43,7 @@ fn main() {
                     .unwrap_or(false)
         })
         .expect(
-            "libjetstreamr.* not found – is `force_jetstreamr_cdylib` \
+            "libjetstreamer.* not found – is `force_jetstreamer_cdylib` \
                  listed in [build-dependencies]?",
         );
 
@@ -52,8 +52,8 @@ fn main() {
     fs::write(
         &embed_rs,
         format!(
-            "/// Raw bytes of libjetstreamr ({} bytes)\n\
-             pub const JETSTREAMR_CDYLIB: &[u8] = include_bytes!(r#\"{}\"#);\n",
+            "/// Raw bytes of libjetstreamer ({} bytes)\n\
+             pub const JETSTREAMER_CDYLIB: &[u8] = include_bytes!(r#\"{}\"#);\n",
             fs::metadata(&cdylib_path).unwrap().len(),
             cdylib_path.display()
         ),

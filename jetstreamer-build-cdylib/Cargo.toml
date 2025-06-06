@@ -1,5 +1,5 @@
 [package]
-name = "jetstreamr-build-cdylib"
+name = "jetstreamer-build-cdylib"
 version = "0.1.0"
 edition = "2024"
 
@@ -8,7 +8,7 @@ test = false
 doc = false
 
 [features]
-link-jetstreamr = []
+link-jetstreamer = []
 
 [dependencies]
-jetstreamr-geyser-plugin.workspace = true
+jetstreamer-geyser-plugin.workspace = true

@@ -1,10 +1,10 @@
-# Jetstreamr
+# Jetstreamer
 
 ## Historical Info
 
 | Epoch | Slot        | Comment |
 |-------|-------------|--------------------------------------------------|
-| 0-156 | 0-?         | Incompatible with modern Geyser plugins / Jetstreamr |
-| 157+  | ?           | Compatible with modern Geyser plugins / Jetstreamr   |
+| 0-156 | 0-?         | Incompatible with modern Geyser plugins / Jetstreamer |
+| 157+  | ?           | Compatible with modern Geyser plugins / Jetstreamer   |
 | 0-449 | 0-194184610 | CU tracking not available (reported as 0)        |
 | 450+  | 194184611+  | CU tracking available                            |

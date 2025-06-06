@@ -7,7 +7,7 @@ use tokio::{
     sync::{OnceCell, mpsc},
 };
 
-use crate::geyser::JetstreamrError;
+use crate::geyser::JetstreamerError;
 
 fn process_log_line(line: impl AsRef<str>) {
     let line = line.as_ref();
@@ -77,7 +77,7 @@ pub async fn start() -> Result<
         mpsc::Receiver<()>,
         impl std::future::Future<Output = Result<(), ()>>,
     ),
-    JetstreamrError,
+    JetstreamerError,
 > {
     log::info!("Spawning local ClickHouse server...");
 
@@ -118,7 +118,7 @@ pub async fn start() -> Result<
             })
             .spawn()
             .map_err(|err| {
-                JetstreamrError::ClickHouseError(format!(
+                JetstreamerError::ClickHouseError(format!(
                     "Failed to start the ClickHouse process: {}",
                     err
                 ))

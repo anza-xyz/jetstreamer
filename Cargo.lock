@@ -2934,12 +2934,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4a5f13b858c8d314ee3e8f639011f7ccefe71f97f96e50151fb991f267928e2c"
 
 [[package]]
-name = "jetstreamr"
+name = "jetstreamer"
 version = "0.1.0"
 dependencies = [
  "geyser-replay",
- "jetstreamr-build-cdylib",
- "jetstreamr-plugin",
+ "jetstreamer-build-cdylib",
+ "jetstreamer-plugin",
  "log",
  "reqwest 0.12.19",
  "serde_json",
@@ -2949,14 +2949,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "jetstreamr-build-cdylib"
+name = "jetstreamer-build-cdylib"
 version = "0.1.0"
 dependencies = [
- "jetstreamr-geyser-plugin",
+ "jetstreamer-geyser-plugin",
 ]
 
 [[package]]
-name = "jetstreamr-geyser-plugin"
+name = "jetstreamer-geyser-plugin"
 version = "0.1.0"
 dependencies = [
  "agave-geyser-plugin-interface",
@@ -2966,7 +2966,7 @@ dependencies = [
  "geyser-replay",
  "indoc",
  "interprocess",
- "jetstreamr-plugin",
+ "jetstreamer-plugin",
  "libc",
  "log",
  "once_cell",
@@ -2983,7 +2983,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "jetstreamr-plugin"
+name = "jetstreamer-plugin"
 version = "0.1.0"
 dependencies = [
  "agave-geyser-plugin-interface",

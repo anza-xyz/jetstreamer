@@ -1,5 +1,5 @@
 //! This script runs after Cargo has built all **build-dependencies**. The helper crate
-//! `force_solira_cdylib` is a build-dependency that links to `libsolira` as a *dylib*, which
+//! `solira-build-cdylib` is a build-dependency that links to `libsolira` as a *dylib*, which
 //! forces Cargo to emit `libsolira.{so|dylib|dll}` **before** this script executes.
 
 use std::{

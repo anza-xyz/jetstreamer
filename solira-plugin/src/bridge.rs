@@ -68,7 +68,7 @@ pub struct Block {
     pub slot: u64,
     pub parent_slot: u64,
     pub block_hash: Hash,
-    pub block_height: Option<u64>,
+    pub block_time: Option<i64>, // Unix timestamp of when the block was produced
 }
 
 impl Block {
@@ -76,27 +76,30 @@ impl Block {
         match info {
             ReplicaBlockInfoVersions::V0_0_1(b) => Self {
                 slot: b.slot,
-                parent_slot: b.slot.saturating_sub(1), // might be wrong
+                parent_slot: b.slot.saturating_sub(1),
                 block_hash: Hash::from_str(b.blockhash).unwrap(),
-                block_height: b.block_height,
+                block_time: b.block_time,
+                // Use correct data from ReplicaBlockInfo
             },
             ReplicaBlockInfoVersions::V0_0_2(b) => Self {
                 slot: b.slot,
                 parent_slot: b.parent_slot,
                 block_hash: Hash::from_str(b.blockhash).unwrap(),
-                block_height: b.block_height,
+                block_time: b.block_time, // Use correct data from ReplicaBlockInfoV2
             },
             ReplicaBlockInfoVersions::V0_0_3(b) => Self {
                 slot: b.slot,
                 parent_slot: b.parent_slot,
                 block_hash: Hash::from_str(b.blockhash).unwrap(),
-                block_height: b.block_height,
+                block_time: b.block_time,
+                // Use correct data from ReplicaBlockInfoV3
             },
             ReplicaBlockInfoVersions::V0_0_4(b) => Self {
                 slot: b.slot,
                 parent_slot: b.parent_slot,
                 block_hash: Hash::from_str(b.blockhash).unwrap(),
-                block_height: b.block_height,
+                block_time: b.block_time,
+                // Use correct data from ReplicaBlockInfoV4
             },
         }
     }

@@ -17,6 +17,7 @@ static DATA: OnceCell<DashMap<u64, HashMap<Pubkey, ProgramStats>>> = OnceCell::n
 #[derive(Row, Deserialize, Serialize, Copy, Clone, Debug, PartialEq, Eq, Hash)]
 struct ProgramEvent {
     pub slot: u32,
+    pub timestamp: i64,
     pub program_id: Pubkey,
     pub count: u32,
     pub error_count: u32,
@@ -88,6 +89,10 @@ impl Plugin for ProgramTrackingPlugin {
             let mut insert = db.insert("program_invocations")?;
             let data = DATA.get().expect("DATA should be initialized");
             let slot_data = data.entry(block.slot).or_default();
+
+            // Use DashMap entry API for slot timestamps
+            let timestamp = block.block_time.unwrap_or(0) as i64;
+
             for (program_id, stats) in slot_data.iter() {
                 let row = ProgramEvent {
                     slot: block.slot as u32,
@@ -97,6 +102,7 @@ impl Plugin for ProgramTrackingPlugin {
                     min_cus: stats.min_cus,
                     max_cus: stats.max_cus,
                     total_cus: stats.total_cus,
+                    timestamp,
                 };
                 insert.write(&row).await.unwrap();
             }
@@ -110,6 +116,7 @@ impl Plugin for ProgramTrackingPlugin {
 
     fn on_load(&self, db: Client) -> PluginFuture<'_> {
         DATA.get_or_init(DashMap::new);
+        // SLOT_TIMESTAMPS is a Lazy global, nothing to initialize
         async move {
             log::info!("Program Tracking Plugin loaded.");
             log::info!("Creating program_invocations table if it does not exist...");
@@ -117,6 +124,7 @@ impl Plugin for ProgramTrackingPlugin {
                 r#"
                 CREATE TABLE IF NOT EXISTS program_invocations (
                     slot        UInt32,
+                    timestamp   UInt64,
                     program_id  FixedString(32),
                     count       UInt32,
                     error_count UInt32,

@@ -1,6 +1,6 @@
 {
-  "libpath": "{{full-path}}/libsolira.{{ext}}",
-  "name": "GeyserPluginSolira",
+  "libpath": "{{full-path}}/libjetstreamr.{{ext}}",
+  "name": "GeyserPluginJetstreamr",
   "clickhouse": {
     "host": "127.0.0.1",
     "port": 8123,

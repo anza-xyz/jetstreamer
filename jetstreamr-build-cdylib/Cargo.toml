@@ -1,5 +1,5 @@
 [package]
-name = "solira-build-cdylib"
+name = "jetstreamr-build-cdylib"
 version = "0.1.0"
 edition = "2024"
 
@@ -8,7 +8,7 @@ test = false
 doc = false
 
 [features]
-link-solira = []
+link-jetstreamr = []
 
 [dependencies]
-solira-geyser-plugin.workspace = true
+jetstreamr-geyser-plugin.workspace = true

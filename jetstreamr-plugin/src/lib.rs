@@ -15,7 +15,7 @@ use tokio::io::{AsyncReadExt, BufReader};
 
 use crate::{
     bridge::{Block, Transaction},
-    ipc::SoliraMessage,
+    ipc::JetstreamrMessage,
 };
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -66,7 +66,7 @@ impl PluginRunner {
         Self {
             plugins: Mutex::new(Vec::new()),
             clickhouse_dsn: clickhouse_dsn.into(),
-            socket_name: "solira.sock".into(),
+            socket_name: "jetstreamr.sock".into(),
         }
     }
 
@@ -84,7 +84,7 @@ impl PluginRunner {
         log::info!("connecting to ClickHouse at {}", self.clickhouse_dsn);
         // let db = Client::default().with_url(&self.clickhouse_dsn);
         // log::info!("checking if database exists + creating if it does not...");
-        // db.query("CREATE DATABASE IF NOT EXISTS solira")
+        // db.query("CREATE DATABASE IF NOT EXISTS jetstreamr")
         //     .execute()
         //     .await?;
         // log::info!("done.");
@@ -135,26 +135,26 @@ impl PluginRunner {
                 .map_err(|e| PluginRunnerError::PayloadReadError(e.to_string()))?;
 
             // ── decode ───────────────────────────────────────────────────
-            let msg: SoliraMessage = bincode::deserialize(&buf)?;
+            let msg: JetstreamrMessage = bincode::deserialize(&buf)?;
 
             // ── dispatch ─────────────────────────────────────────────────
             match msg {
-                SoliraMessage::Block(block) => {
+                JetstreamrMessage::Block(block) => {
                     for p in plugins.iter_mut() {
                         if let Err(e) = p.on_block(db.clone(), block.clone()).await {
                             log::error!("plugin {} on_block error: {e}", p.name());
                         }
                     }
                 }
-                SoliraMessage::Transaction(tx, tx_index) => {
+                JetstreamrMessage::Transaction(tx, tx_index) => {
                     for p in plugins.iter_mut() {
                         if let Err(e) = p.on_transaction(db.clone(), tx.clone(), tx_index).await {
                             log::error!("plugin {} on_transaction error: {e}", p.name());
                         }
                     }
                 }
-                SoliraMessage::Exit => {
-                    log::info!("received exit message from solira, shutting down plugin runner...");
+                JetstreamrMessage::Exit => {
+                    log::info!("received exit message from jetstreamr, shutting down plugin runner...");
                     for p in plugins.iter_mut() {
                         if let Err(e) = p.on_exit(db.clone()).await {
                             log::error!("plugin {} on_exit error: {e}", p.name());

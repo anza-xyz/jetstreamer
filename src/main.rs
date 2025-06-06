@@ -1,13 +1,13 @@
-use solira::SoliraRunner;
-use solira_plugin::plugins::program_tracking::ProgramTrackingPlugin;
+use jetstreamr::JetstreamrRunner;
+use jetstreamr_plugin::plugins::program_tracking::ProgramTrackingPlugin;
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    Ok(SoliraRunner::default()
+    Ok(JetstreamrRunner::default()
         .with_log_level("info")
         .parse_cli_args()?
         .with_plugin(Box::new(ProgramTrackingPlugin))
-        .with_solira_geyser_config()
+        .with_jetstreamr_geyser_config()
         .await
         .run()
         .await?)

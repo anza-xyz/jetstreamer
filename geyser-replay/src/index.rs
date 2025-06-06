@@ -332,7 +332,7 @@ pub async fn build_missing_indexes(
 }
 
 pub fn get_index_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("SOLIRA_OFFSET_CACHE_DIR") {
+    if let Ok(dir) = std::env::var("JETSTREAMR_OFFSET_CACHE_DIR") {
         return PathBuf::from(dir).canonicalize().unwrap();
     }
     // List of candidate directories, in order

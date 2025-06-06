@@ -1,4 +1,4 @@
-use solira::clickhouse::*;
+use jetstreamr::clickhouse::*;
 
 // TODO: pull clickhouse into its own crate
 

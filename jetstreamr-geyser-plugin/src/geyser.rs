@@ -21,10 +21,10 @@ use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
 
 use crate::clickhouse;
-use solira_plugin::{
+use jetstreamr_plugin::{
     Plugin,
     bridge::{Block, Transaction},
-    ipc::{SoliraMessage, spawn_socket_server},
+    ipc::{JetstreamrMessage, spawn_socket_server},
     plugins::program_tracking::ProgramTrackingPlugin,
 };
 
@@ -36,7 +36,8 @@ thread_local! {
             .with_option("wait_for_async_insert", "0"));
     static PLUGIN: RefCell<ProgramTrackingPlugin> = const { RefCell::new(ProgramTrackingPlugin) };
 }
-static IPC_TX: once_cell::sync::OnceCell<Sender<SoliraMessage>> = once_cell::sync::OnceCell::new();
+static IPC_TX: once_cell::sync::OnceCell<Sender<JetstreamrMessage>> =
+    once_cell::sync::OnceCell::new();
 static IPC_TASK: once_cell::sync::OnceCell<tokio::task::JoinHandle<()>> =
     once_cell::sync::OnceCell::new();
 
@@ -95,34 +96,34 @@ pub fn thread_set_current_tx_index(thread_id: u8, index: u32) {
 }
 
 #[derive(Clone, Debug, Default)]
-pub struct Solira;
+pub struct Jetstreamr;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SoliraError {
+pub enum JetstreamrError {
     ClickHouseError(String),
     ClickHouseInitializationFailed,
 }
 
-impl Error for SoliraError {}
+impl Error for JetstreamrError {}
 
-impl std::fmt::Display for SoliraError {
+impl std::fmt::Display for JetstreamrError {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
-            SoliraError::ClickHouseError(msg) => write!(f, "ClickHouse error: {}", msg),
-            SoliraError::ClickHouseInitializationFailed => {
+            JetstreamrError::ClickHouseError(msg) => write!(f, "ClickHouse error: {}", msg),
+            JetstreamrError::ClickHouseInitializationFailed => {
                 write!(f, "ClickHouse initialization failed")
             }
         }
     }
 }
 
-impl From<SoliraError> for GeyserPluginError {
-    fn from(err: SoliraError) -> Self {
+impl From<JetstreamrError> for GeyserPluginError {
+    fn from(err: JetstreamrError) -> Self {
         GeyserPluginError::Custom(Box::new(err))
     }
 }
 
-pub fn ipc_send(msg: SoliraMessage) {
+pub fn ipc_send(msg: JetstreamrMessage) {
     DB_CLIENT.with(|db| {
         let db = db.borrow();
         PLUGIN.with(|plugin| {
@@ -130,18 +131,18 @@ pub fn ipc_send(msg: SoliraMessage) {
             TOKIO_RUNTIME.with(|rt_cell| {
                 let rt = rt_cell.borrow();
                 match msg {
-                    SoliraMessage::Transaction(tx, tx_index) => {
+                    JetstreamrMessage::Transaction(tx, tx_index) => {
                         if let Err(e) = rt.block_on(plugin.on_transaction(db.clone(), tx, tx_index))
                         {
                             log::error!("plugin {} on_transaction error: {}", plugin.name(), e);
                         }
                     }
-                    SoliraMessage::Block(block) => {
+                    JetstreamrMessage::Block(block) => {
                         if let Err(e) = rt.block_on(plugin.on_block(db.clone(), block)) {
                             log::error!("plugin {} on_block error: {}", plugin.name(), e);
                         }
                     }
-                    SoliraMessage::Exit => {
+                    JetstreamrMessage::Exit => {
                         if let Err(e) = rt.block_on(plugin.on_exit(db.clone())) {
                             log::error!("plugin {} on_exit error: {}", plugin.name(), e);
                         }
@@ -151,7 +152,7 @@ pub fn ipc_send(msg: SoliraMessage) {
         });
     });
     // let tx = IPC_TX.get().expect("IPC_TX not initialized");
-    // let is_exit = msg == SoliraMessage::Exit;
+    // let is_exit = msg == JetstreamrMessage::Exit;
     // if let Err(err) = tx.blocking_send(msg) {
     //     panic!("IPC channel error: {:?}", err);
     // }
@@ -175,9 +176,9 @@ fn parse_range(slot_range: impl AsRef<str>) -> Option<Range<u64>> {
     Some(start..end)
 }
 
-impl GeyserPlugin for Solira {
+impl GeyserPlugin for Jetstreamr {
     fn name(&self) -> &'static str {
-        "GeyserPluginSolira"
+        "GeyserPluginJetstreamr"
     }
 
     fn on_load(&mut self, config_file: &str, _is_reload: bool) -> Result<()> {
@@ -187,7 +188,7 @@ impl GeyserPlugin for Solira {
             unload();
             return Ok(());
         }
-        log::info!("solira loading...");
+        log::info!("jetstreamr loading...");
 
         // process config
         let config_raw_json =
@@ -203,27 +204,27 @@ impl GeyserPlugin for Solira {
             .as_bool()
             .unwrap_or(true);
         let threads = config_json
-            .get("solira")
+            .get("jetstreamr")
             .unwrap()
             .get("threads")
             .unwrap()
             .as_u64()
             .unwrap_or(1) as u8;
-        log::info!("solira threads: {}", threads);
+        log::info!("jetstreamr threads: {}", threads);
         let slot_range = config_json
-            .get("solira")
+            .get("jetstreamr")
             .unwrap()
             .get("slot_range")
             .unwrap()
             .as_str()
             .unwrap();
         let slot_range = parse_range(slot_range).unwrap();
-        log::info!("solira slot range: {:?}", slot_range);
+        log::info!("jetstreamr slot range: {:?}", slot_range);
         SLOT_RANGE.set(slot_range.clone()).unwrap();
 
         // init subranges + thread info
         let sub_ranges = generate_subranges(&slot_range, threads);
-        log::info!("solira slot sub-ranges: {:?}", sub_ranges);
+        log::info!("jetstreamr slot sub-ranges: {:?}", sub_ranges);
         let mut thread_info_map = RangeMap::new();
         sub_ranges.iter().enumerate().for_each(|(i, range)| {
             let thread_id = i as u8;
@@ -251,7 +252,7 @@ impl GeyserPlugin for Solira {
                     if spawn_clickhouse {
                         log::info!("automatic ClickHouse spawning enabled, starting ClickHouse...");
                         let start_result = clickhouse::start().await
-                            .map_err(|e| SoliraError::ClickHouseError(e.to_string()))?;
+                            .map_err(|e| JetstreamrError::ClickHouseError(e.to_string()))?;
 
                         let (mut ready_rx, clickhouse_future) = start_result;
 
@@ -259,17 +260,17 @@ impl GeyserPlugin for Solira {
                             log::info!("ClickHouse initialization complete.");
                             rt.spawn(clickhouse_future);
                         } else {
-                            return Err(SoliraError::ClickHouseInitializationFailed);
+                            return Err(JetstreamrError::ClickHouseInitializationFailed);
                         }
                     } else {
                         log::info!("automatic ClickHouse spawning disabled, skipping ClickHouse initialization.");
                     }
 
                     log::info!("setting up IPC bridge...");
-                    let (tx, rx) = mpsc::channel::<SoliraMessage>(1);
+                    let (tx, rx) = mpsc::channel::<JetstreamrMessage>(1);
                     let handle = spawn_socket_server(rx)
                         .await
-                        .map_err(|e| SoliraError::ClickHouseError(e.to_string()))?;
+                        .map_err(|e| JetstreamrError::ClickHouseError(e.to_string()))?;
                     IPC_TX.set(tx).unwrap();
                     IPC_TASK.set(handle).unwrap();
                     log::info!("IPC bridge initialized.");
@@ -279,7 +280,7 @@ impl GeyserPlugin for Solira {
                     plugin.on_load(db).await.unwrap();
                     log::info!("program tracking plugin initialized.");
                     START_TIME.set(Instant::now()).unwrap();
-                    log::info!("solira loaded");
+                    log::info!("jetstreamr loaded");
 
                     ctrlc::set_handler(|| {
                         unload();
@@ -289,7 +290,7 @@ impl GeyserPlugin for Solira {
                 })
             })
             .map_err(|e| {
-                log::error!("Error loading solira: {:?}", e);
+                log::error!("Error loading jetstreamr: {:?}", e);
                 GeyserPluginError::from(e)
             })
     }
@@ -358,7 +359,7 @@ impl GeyserPlugin for Solira {
         }
 
         let blk = Block::from_replica(blockinfo);
-        ipc_send(SoliraMessage::Block(blk));
+        ipc_send(JetstreamrMessage::Block(blk));
 
         if slot >= thread_slot_range_end {
             log::info!(
@@ -368,17 +369,17 @@ impl GeyserPlugin for Solira {
             );
 
             let complete_threads = COMPLETE_THREADS.fetch_add(1, Ordering::SeqCst) + 1;
-            let solira_threads = range_map.len() as u8;
-            if complete_threads >= solira_threads {
+            let jetstreamr_threads = range_map.len() as u8;
+            if complete_threads >= jetstreamr_threads {
                 log::info!(
-                    "all {} threads have completed their work, unloading solira...",
-                    solira_threads
+                    "all {} threads have completed their work, unloading jetstreamr...",
+                    jetstreamr_threads
                 );
                 unload();
             } else {
                 log::info!(
                     "waiting for {} more threads to complete their work",
-                    solira_threads - complete_threads
+                    jetstreamr_threads - complete_threads
                 );
             }
         }
@@ -417,7 +418,7 @@ impl GeyserPlugin for Solira {
             .get(&slot)
             .expect("thread id not found for slot");
         let thread_current_tx_index = thread_bump_tx_index(thread_id);
-        ipc_send(SoliraMessage::Transaction(tx, thread_current_tx_index));
+        ipc_send(JetstreamrMessage::Transaction(tx, thread_current_tx_index));
         Ok(())
     }
 
@@ -455,7 +456,7 @@ fn stop_tx_queue() {
 
 fn send_exit_signal_to_clients() {
     log::info!("sending exit signal to clients...");
-    ipc_send(SoliraMessage::Exit);
+    ipc_send(JetstreamrMessage::Exit);
     log::info!("exit signal sent to clients.");
 }
 
@@ -467,7 +468,7 @@ fn stop_clickhouse() {
 
 fn clear_domain_socket() {
     log::info!("clearing domain socket...");
-    std::fs::remove_file("/tmp/solira.sock").unwrap_or_else(|_| {
+    std::fs::remove_file("/tmp/jetstreamr.sock").unwrap_or_else(|_| {
         log::warn!("failed to remove domain socket");
     });
     log::info!("domain socket cleared.");
@@ -475,13 +476,13 @@ fn clear_domain_socket() {
 
 #[inline(always)]
 fn unload() {
-    log::info!("solira unloading...");
+    log::info!("jetstreamr unloading...");
     stop_tx_queue();
     send_exit_signal_to_clients();
     stop_ipc_bridge();
     stop_clickhouse();
     clear_domain_socket();
-    log::info!("solira has successfully unloaded.");
+    log::info!("jetstreamr has successfully unloaded.");
     std::process::exit(0);
 }
 

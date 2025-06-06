@@ -2934,6 +2934,79 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4a5f13b858c8d314ee3e8f639011f7ccefe71f97f96e50151fb991f267928e2c"
 
 [[package]]
+name = "jetstreamr"
+version = "0.1.0"
+dependencies = [
+ "geyser-replay",
+ "jetstreamr-build-cdylib",
+ "jetstreamr-plugin",
+ "log",
+ "reqwest 0.12.19",
+ "serde_json",
+ "solana-logger",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "jetstreamr-build-cdylib"
+version = "0.1.0"
+dependencies = [
+ "jetstreamr-geyser-plugin",
+]
+
+[[package]]
+name = "jetstreamr-geyser-plugin"
+version = "0.1.0"
+dependencies = [
+ "agave-geyser-plugin-interface",
+ "bincode",
+ "clickhouse",
+ "ctrlc",
+ "geyser-replay",
+ "indoc",
+ "interprocess",
+ "jetstreamr-plugin",
+ "libc",
+ "log",
+ "once_cell",
+ "rangemap",
+ "reqwest 0.12.19",
+ "serde",
+ "serde_json",
+ "solana-logger",
+ "solana-program",
+ "solana-sdk",
+ "tempfile",
+ "thousands",
+ "tokio",
+]
+
+[[package]]
+name = "jetstreamr-plugin"
+version = "0.1.0"
+dependencies = [
+ "agave-geyser-plugin-interface",
+ "bincode",
+ "clickhouse",
+ "dashmap 6.1.0",
+ "futures-util",
+ "geyser-replay",
+ "interprocess",
+ "log",
+ "once_cell",
+ "rayon",
+ "reqwest 0.12.19",
+ "serde",
+ "solana-logger",
+ "solana-sdk",
+ "solana-system-program",
+ "solana-vote-program",
+ "thiserror 2.0.12",
+ "tokio",
+]
+
+[[package]]
 name = "jni"
 version = "0.21.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8722,79 +8795,6 @@ dependencies = [
  "subtle",
  "thiserror 2.0.12",
  "zeroize",
-]
-
-[[package]]
-name = "solira"
-version = "0.1.0"
-dependencies = [
- "geyser-replay",
- "log",
- "reqwest 0.12.19",
- "serde_json",
- "solana-logger",
- "solira-build-cdylib",
- "solira-plugin",
- "tempfile",
- "tokio",
-]
-
-[[package]]
-name = "solira-build-cdylib"
-version = "0.1.0"
-dependencies = [
- "solira-geyser-plugin",
-]
-
-[[package]]
-name = "solira-geyser-plugin"
-version = "0.1.0"
-dependencies = [
- "agave-geyser-plugin-interface",
- "bincode",
- "clickhouse",
- "ctrlc",
- "geyser-replay",
- "indoc",
- "interprocess",
- "libc",
- "log",
- "once_cell",
- "rangemap",
- "reqwest 0.12.19",
- "serde",
- "serde_json",
- "solana-logger",
- "solana-program",
- "solana-sdk",
- "solira-plugin",
- "tempfile",
- "thousands",
- "tokio",
-]
-
-[[package]]
-name = "solira-plugin"
-version = "0.1.0"
-dependencies = [
- "agave-geyser-plugin-interface",
- "bincode",
- "clickhouse",
- "dashmap 6.1.0",
- "futures-util",
- "geyser-replay",
- "interprocess",
- "log",
- "once_cell",
- "rayon",
- "reqwest 0.12.19",
- "serde",
- "solana-logger",
- "solana-sdk",
- "solana-system-program",
- "solana-vote-program",
- "thiserror 2.0.12",
- "tokio",
 ]
 
 [[package]]

@@ -124,7 +124,7 @@ impl Plugin for ProgramTrackingPlugin {
                 r#"
                 CREATE TABLE IF NOT EXISTS program_invocations (
                     slot        UInt32,
-                    timestamp   UInt64,
+                    timestamp   DateTime('UTC'),
                     program_id  FixedString(32),
                     count       UInt32,
                     error_count UInt32,

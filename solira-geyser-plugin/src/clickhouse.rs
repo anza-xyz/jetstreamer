@@ -15,7 +15,9 @@ fn process_log_line(line: impl AsRef<str>) {
     if line.len() > prefix_len {
         match &line[prefix_len..] {
             ln if ln.starts_with("<Information>") => {
-                log::info!("{}", &ln[14..])
+                if !ln[14..].trim().is_empty() {
+                    log::info!("{}", &ln[14..])
+                }
             }
             ln if ln.starts_with("<Trace>") => log::trace!("{}", &ln[8..]),
             ln if ln.starts_with("<Error>") => log::error!("{}", &ln[8..]),
@@ -24,7 +26,9 @@ fn process_log_line(line: impl AsRef<str>) {
             _ => log::debug!("{}", line),
         }
     } else {
-        log::info!("{}", line);
+        if !line.trim().is_empty() {
+            log::info!("{}", line);
+        }
     }
 }
 

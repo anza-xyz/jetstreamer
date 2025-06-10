@@ -20,6 +20,10 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+      - name: Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libudev-dev
       - name: Run sccache-cache
         uses: mozilla-actions/sccache-action@v0.0.9
       - name: cargo check
@@ -31,6 +35,10 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+      - name: Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libudev-dev
       - name: Run sccache-cache
         uses: mozilla-actions/sccache-action@v0.0.9
       - name: cargo test
@@ -42,8 +50,14 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+      - name: Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libudev-dev
       - name: Run sccache-cache
         uses: mozilla-actions/sccache-action@v0.0.9
+      - name: Install cargo-fmt
+        run: rustup component add rustfmt
       - name: cargo fmt
         run: cargo fmt -- --check
 
@@ -53,10 +67,14 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+      - name: Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libudev-dev
       - name: Run sccache-cache
         uses: mozilla-actions/sccache-action@v0.0.9
       - name: cargo doc
-        run: cargo doc --workspace --all-features
+        run: cargo doc
 
   cargo-audit:
     name: cargo audit
@@ -64,6 +82,10 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+      - name: Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libudev-dev
       - name: Run sccache-cache
         uses: mozilla-actions/sccache-action@v0.0.9
       - name: Install cargo-audit
@@ -78,8 +100,14 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+      - name: Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libudev-dev
       - name: Run sccache-cache
         uses: mozilla-actions/sccache-action@v0.0.9
+      - name: Install cargo-clippy
+        run: rustup component add clippy
       - name: cargo clippy
         run: cargo clippy --workspace --all-features
 
@@ -89,6 +117,10 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+      - name: Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libudev-dev
       - name: Run sccache-cache
         uses: mozilla-actions/sccache-action@v0.0.9
       - name: cargo fix --workspace

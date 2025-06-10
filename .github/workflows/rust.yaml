@@ -25,7 +25,7 @@ jobs:
           sudp apt-get update
           sudo apt-get install -y libudev
       - name: Run sccache-cache
-        uses: mozilla-actions/sccache-action@@v0.0.9
+        uses: mozilla-actions/sccache-action@v0.0.9
       - name: cargo check
         run: cargo check --workspace --all-features
 
@@ -40,7 +40,7 @@ jobs:
           sudp apt-get update
           sudo apt-get install -y libudev
       - name: Run sccache-cache
-        uses: mozilla-actions/sccache-action@@v0.0.9
+        uses: mozilla-actions/sccache-action@v0.0.9
       - name: cargo test
         run: cargo test --workspace --all-features
 
@@ -55,7 +55,7 @@ jobs:
           sudp apt-get update
           sudo apt-get install -y libudev
       - name: Run sccache-cache
-        uses: mozilla-actions/sccache-action@@v0.0.9
+        uses: mozilla-actions/sccache-action@v0.0.9
       - name: Install cargo-fmt
         run: rustup component add rustfmt
       - name: cargo fmt
@@ -72,7 +72,7 @@ jobs:
           sudp apt-get update
           sudo apt-get install -y libudev
       - name: Run sccache-cache
-        uses: mozilla-actions/sccache-action@@v0.0.9
+        uses: mozilla-actions/sccache-action@v0.0.9
       - name: cargo doc
         run: cargo doc --workspace --all-features
 
@@ -87,7 +87,7 @@ jobs:
           sudp apt-get update
           sudo apt-get install -y libudev
       - name: Run sccache-cache
-        uses: mozilla-actions/sccache-action@@v0.0.9
+        uses: mozilla-actions/sccache-action@v0.0.9
       - name: Install cargo-audit
         run: cargo install cargo-audit
       - name: cargo audit
@@ -105,7 +105,7 @@ jobs:
           sudp apt-get update
           sudo apt-get install -y libudev
       - name: Run sccache-cache
-        uses: mozilla-actions/sccache-action@@v0.0.9
+        uses: mozilla-actions/sccache-action@v0.0.9
       - name: cargo clippy
         run: cargo clippy --workspace --all-features
 
@@ -120,7 +120,7 @@ jobs:
           sudp apt-get update
           sudo apt-get install -y libudev
       - name: Run sccache-cache
-        uses: mozilla-actions/sccache-action@@v0.0.9
+        uses: mozilla-actions/sccache-action@v0.0.9
       - name: cargo fix --workspace
         run: |
           # Run cargo fix on the project

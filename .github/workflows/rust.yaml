@@ -21,7 +21,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
       - name: Run sccache-cache
-        uses: mozilla-actions/sccache-action@v0.0.6
+        uses: mozilla-actions/sccache-action@v0
       - name: cargo check
         run: cargo check --workspace --all-features
 
@@ -32,7 +32,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
       - name: Run sccache-cache
-        uses: mozilla-actions/sccache-action@v0.0.6
+        uses: mozilla-actions/sccache-action@v0
       - name: cargo test
         run: cargo test --workspace --all-features
 
@@ -43,7 +43,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
       - name: Run sccache-cache
-        uses: mozilla-actions/sccache-action@v0.0.6
+        uses: mozilla-actions/sccache-action@v0
       - name: cargo fmt
         run: cargo fmt -- --check
 
@@ -54,7 +54,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
       - name: Run sccache-cache
-        uses: mozilla-actions/sccache-action@v0.0.6
+        uses: mozilla-actions/sccache-action@v0
       - name: cargo doc
         run: cargo doc --workspace --all-features
 
@@ -65,7 +65,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
       - name: Run sccache-cache
-        uses: mozilla-actions/sccache-action@v0.0.6
+        uses: mozilla-actions/sccache-action@v0
       - name: Install cargo-audit
         run: cargo install cargo-audit
       - name: cargo audit
@@ -79,7 +79,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
       - name: Run sccache-cache
-        uses: mozilla-actions/sccache-action@v0.0.6
+        uses: mozilla-actions/sccache-action@v0
       - name: cargo clippy
         run: cargo clippy --workspace --all-features
 
@@ -90,7 +90,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
       - name: Run sccache-cache
-        uses: mozilla-actions/sccache-action@v0.0.6
+        uses: mozilla-actions/sccache-action@v0
       - name: cargo fix --workspace
         run: |
           # Run cargo fix on the project

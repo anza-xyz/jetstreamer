@@ -20,6 +20,10 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+      - name: Dependencies
+        run: |
+          sudp apt-get update
+          sudo apt-get install -y libudev
       - name: Run sccache-cache
         uses: mozilla-actions/sccache-action@v0
       - name: cargo check
@@ -31,6 +35,10 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+      - name: Dependencies
+        run: |
+          sudp apt-get update
+          sudo apt-get install -y libudev
       - name: Run sccache-cache
         uses: mozilla-actions/sccache-action@v0
       - name: cargo test
@@ -42,6 +50,10 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+      - name: Dependencies
+        run: |
+          sudp apt-get update
+          sudo apt-get install -y libudev
       - name: Run sccache-cache
         uses: mozilla-actions/sccache-action@v0
       - name: cargo fmt
@@ -53,6 +65,10 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+      - name: Dependencies
+        run: |
+          sudp apt-get update
+          sudo apt-get install -y libudev
       - name: Run sccache-cache
         uses: mozilla-actions/sccache-action@v0
       - name: cargo doc
@@ -64,6 +80,10 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+      - name: Dependencies
+        run: |
+          sudp apt-get update
+          sudo apt-get install -y libudev
       - name: Run sccache-cache
         uses: mozilla-actions/sccache-action@v0
       - name: Install cargo-audit
@@ -78,6 +98,10 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+      - name: Dependencies
+        run: |
+          sudp apt-get update
+          sudo apt-get install -y libudev
       - name: Run sccache-cache
         uses: mozilla-actions/sccache-action@v0
       - name: cargo clippy
@@ -89,6 +113,10 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+      - name: Dependencies
+        run: |
+          sudp apt-get update
+          sudo apt-get install -y libudev
       - name: Run sccache-cache
         uses: mozilla-actions/sccache-action@v0
       - name: cargo fix --workspace

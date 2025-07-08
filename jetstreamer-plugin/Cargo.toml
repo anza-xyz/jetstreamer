@@ -22,3 +22,5 @@ dashmap.workspace = true
 once_cell.workspace = true
 geyser-replay.workspace = true
 reqwest.workspace = true
+futures.workspace = true
+sha2.workspace = true

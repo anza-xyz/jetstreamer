@@ -14,6 +14,7 @@ jetstreamer-plugin = { path = "jetstreamer-plugin", version = "0.1.0" }
 demo-rust-ipld-car = { git = "https://github.com/rpcpool/yellowstone-faithful.git" }
 tokio = { version = "1", features = ["full"] }
 futures-util = "0"
+futures = "0"
 log = "0"
 agave-geyser-plugin-interface = "2"
 solana-logger = "2"
@@ -51,6 +52,7 @@ solana-storage-proto = "2"
 solana-transaction-status = "2"
 solana-system-program = "2"
 solana-vote-program = "2"
+sha2 = "0.10"
 tonic = "0"
 tonic-build = "0"
 zstd = "0"

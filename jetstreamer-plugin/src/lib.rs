@@ -7,6 +7,7 @@ use std::{fmt::Display, pin::Pin, sync::Arc};
 use ::clickhouse::{Client, Row};
 use futures_util::FutureExt;
 use interprocess::local_socket::{GenericNamespaced, ToNsName, tokio::prelude::*};
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, BufReader};
 
 use crate::{
@@ -21,10 +22,24 @@ pub type PluginFuture<'a> = BoxFuture<'a, Result<(), Box<dyn std::error::Error>>
 
 pub trait Plugin: Send + Sync + 'static {
     fn name(&self) -> &'static str;
+
     /// Bump this when plugin schema or semantics change.
-    fn version(&self) -> u32 {
+    fn version(&self) -> u16 {
         1
     }
+
+    /// A unique identifier for the plugin, derived from the Sha256 hash of its name folded
+    /// into a u16 to save space, can be overridden if you get a collision with another plugin,
+    /// but this is unlikely.
+    fn id(&self) -> u16 {
+        let hash = Sha256::digest(self.name());
+        let mut res = 1u16;
+        for byte in hash {
+            res = res.wrapping_mul(31).wrapping_add(byte as u16);
+        }
+        res
+    }
+
     fn on_transaction(
         &self,
         db: Client,
@@ -138,17 +153,15 @@ impl PluginRunner {
 
         // Insert plugin metadata into jetstreamer_plugins table
         #[derive(Row, serde::Serialize)]
-        struct PluginRow<'a> {
-            id: u32,
-            name: &'a str,
-            version: u32,
+        struct PluginRow {
+            id: u16,
+            version: u16,
         }
         let mut insert = db.insert("jetstreamer_plugins")?;
-        for (i, p) in self.plugins.iter().enumerate() {
+        for p in self.plugins.iter() {
             insert
                 .write(&PluginRow {
-                    id: i as u32,
-                    name: p.name(),
+                    id: p.id(),
                     version: p.version(),
                 })
                 .await?;
@@ -161,8 +174,10 @@ impl PluginRunner {
             }
         }
 
-        log::info!("plugin runner loaded, waiting for transactions...");
+        // cache plugin IDs to avoid recalculating them on every message
+        let plugin_ids = self.plugins.iter().map(|p| p.id()).collect::<Vec<_>>();
 
+        log::info!("plugin runner loaded, waiting for transactions...");
         loop {
             // ── length-prefix (u32 little-endian) ─────────────────────────
             let mut len_buf = [0u8; 4];
@@ -182,46 +197,54 @@ impl PluginRunner {
             let msg: JetstreamerMessage = bincode::deserialize(&buf)?;
 
             // ── dispatch ─────────────────────────────────────────────────
-            match msg {
-                JetstreamerMessage::Block(block) => {
-                    for (id, p) in self.plugins.iter().enumerate() {
-                        if let Err(e) = p.on_block(db.clone(), block.clone()).await {
-                            log::error!("plugin {} on_block error: {e}", p.name());
+            futures::future::join_all(self.plugins.iter().enumerate().map(|(i, plugin)| {
+                let plugin_id = plugin_ids[i];
+                let db = db.clone();
+                let msg = msg.clone();
+                async move {
+                    match msg {
+                        JetstreamerMessage::Block(block) => {
+                            if let Err(e) = plugin.on_block(db.clone(), block.clone()).await {
+                                log::error!("plugin {} on_block error: {e}", plugin.name());
+                            }
+                            #[derive(Row, serde::Serialize)]
+                            struct PluginSlotRow {
+                                plugin_id: u16,
+                                slot: u64,
+                            }
+                            let mut insert = db.insert("jetstreamer_plugin_slots")?;
+                            insert
+                                .write(&PluginSlotRow {
+                                    plugin_id,
+                                    slot: block.slot,
+                                })
+                                .await?;
+                            insert.end().await?;
                         }
-                        #[derive(Row, serde::Serialize)]
-                        struct PluginSlotRow {
-                            plugin_id: u32,
-                            slot: u64,
+                        JetstreamerMessage::Transaction(tx, tx_index) => {
+                            if let Err(e) = plugin
+                                .on_transaction(db.clone(), tx.clone(), tx_index)
+                                .await
+                            {
+                                log::error!("plugin {} on_transaction error: {e}", plugin.name());
+                            }
                         }
-                        let mut insert = db.insert("jetstreamer_plugin_slots")?;
-                        insert
-                            .write(&PluginSlotRow {
-                                plugin_id: id as u32,
-                                slot: block.slot,
-                            })
-                            .await?;
-                        insert.end().await?;
+                        JetstreamerMessage::Exit => {
+                            if let Err(e) = plugin.on_exit(db.clone()).await {
+                                log::error!("plugin {} on_exit error: {e}", plugin.name());
+                            }
+                        }
                     }
+                    Ok::<(), PluginRunnerError>(())
                 }
-                JetstreamerMessage::Transaction(tx, tx_index) => {
-                    for p in self.plugins.iter() {
-                        if let Err(e) = p.on_transaction(db.clone(), tx.clone(), tx_index).await {
-                            log::error!("plugin {} on_transaction error: {e}", p.name());
-                        }
-                    }
-                }
-                JetstreamerMessage::Exit => {
-                    log::info!(
-                        "received exit message from jetstreamer, shutting down plugin runner..."
-                    );
-                    for p in self.plugins.iter() {
-                        if let Err(e) = p.on_exit(db.clone()).await {
-                            log::error!("plugin {} on_exit error: {e}", p.name());
-                        }
-                    }
-                    break;
-                }
-            }
+            }))
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()?;
+
+            // if let JetstreamerMessage::Exit = msg {
+            //     break;
+            // }
         }
 
         Ok(())

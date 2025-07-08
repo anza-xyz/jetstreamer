@@ -2,11 +2,7 @@ pub mod bridge;
 pub mod ipc;
 pub mod plugins;
 
-use std::{
-    fmt::Display,
-    pin::Pin,
-    sync::{Arc, Mutex},
-};
+use std::{fmt::Display, pin::Pin, sync::Arc};
 
 use ::clickhouse::{Client, Row};
 use futures_util::FutureExt;
@@ -47,7 +43,7 @@ pub trait Plugin: Send + Sync + 'static {
 }
 
 pub struct PluginRunner {
-    plugins: Mutex<Vec<Box<dyn Plugin>>>,
+    plugins: Arc<Vec<Box<dyn Plugin>>>,
     clickhouse_dsn: String,
     socket_name: String,
 }
@@ -56,8 +52,12 @@ impl Clone for PluginRunner {
     fn clone(&self) -> Self {
         Self {
             plugins: {
-                let plugins = self.plugins.lock().unwrap();
-                Mutex::new(plugins.iter().map(|p| p.clone_plugin()).collect::<Vec<_>>())
+                Arc::new(
+                    self.plugins
+                        .iter()
+                        .map(|p| p.clone_plugin())
+                        .collect::<Vec<_>>(),
+                )
             },
             clickhouse_dsn: self.clickhouse_dsn.clone(),
             socket_name: self.socket_name.clone(),
@@ -68,7 +68,7 @@ impl Clone for PluginRunner {
 impl PluginRunner {
     pub fn new(clickhouse_dsn: impl Into<String>) -> Self {
         Self {
-            plugins: Mutex::new(Vec::new()),
+            plugins: Arc::new(Vec::new()),
             clickhouse_dsn: clickhouse_dsn.into(),
             socket_name: "jetstreamer.sock".into(),
         }
@@ -80,7 +80,9 @@ impl PluginRunner {
     }
 
     pub fn register(&mut self, plugin: Box<dyn Plugin>) {
-        self.plugins.lock().unwrap().push(plugin);
+        Arc::get_mut(&mut self.plugins)
+            .expect("cannot register plugins after the runner has started!")
+            .push(plugin);
     }
 
     /// Dial the IPC socket and forward every message to every plugin.
@@ -141,12 +143,6 @@ impl PluginRunner {
             .map_err(|e| PluginRunnerError::SocketConnectError(e.to_string()))?;
         let mut reader = BufReader::new(stream);
 
-        // plugin set is locked while the plugin runner is running
-        let mut plugins: Vec<Box<dyn Plugin>> = {
-            let mut guard = self.plugins.lock().unwrap();
-            std::mem::take(&mut *guard)
-        };
-
         // Insert plugin metadata into jetstreamer_plugins table
         #[derive(Row, serde::Serialize)]
         struct PluginRow<'a> {
@@ -155,7 +151,7 @@ impl PluginRunner {
             version: u32,
         }
         let mut insert = db.insert("jetstreamer_plugins")?;
-        for (i, p) in plugins.iter().enumerate() {
+        for (i, p) in self.plugins.iter().enumerate() {
             insert
                 .write(&PluginRow {
                     id: i as u32,
@@ -166,7 +162,7 @@ impl PluginRunner {
         }
         insert.end().await?;
 
-        for p in plugins.iter_mut() {
+        for p in self.plugins.iter() {
             if let Err(e) = p.on_load(db.clone()).await {
                 log::error!("plugin {} on_load error: {e}", p.name());
             }
@@ -195,7 +191,7 @@ impl PluginRunner {
             // ── dispatch ─────────────────────────────────────────────────
             match msg {
                 JetstreamerMessage::Block(block) => {
-                    for (id, p) in plugins.iter_mut().enumerate() {
+                    for (id, p) in self.plugins.iter().enumerate() {
                         if let Err(e) = p.on_block(db.clone(), block.clone()).await {
                             log::error!("plugin {} on_block error: {e}", p.name());
                         }
@@ -215,7 +211,7 @@ impl PluginRunner {
                     }
                 }
                 JetstreamerMessage::Transaction(tx, tx_index) => {
-                    for p in plugins.iter_mut() {
+                    for p in self.plugins.iter() {
                         if let Err(e) = p.on_transaction(db.clone(), tx.clone(), tx_index).await {
                             log::error!("plugin {} on_transaction error: {e}", p.name());
                         }
@@ -225,7 +221,7 @@ impl PluginRunner {
                     log::info!(
                         "received exit message from jetstreamer, shutting down plugin runner..."
                     );
-                    for p in plugins.iter_mut() {
+                    for p in self.plugins.iter() {
                         if let Err(e) = p.on_exit(db.clone()).await {
                             log::error!("plugin {} on_exit error: {e}", p.name());
                         }
@@ -234,9 +230,6 @@ impl PluginRunner {
                 }
             }
         }
-
-        // put the plugins back in the mutex
-        self.plugins.lock().unwrap().extend(plugins);
 
         Ok(())
     }

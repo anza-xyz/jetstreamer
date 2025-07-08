@@ -8,7 +8,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use ::clickhouse::Client;
+use ::clickhouse::{Client, Row};
 use futures_util::FutureExt;
 use interprocess::local_socket::{GenericNamespaced, ToNsName, tokio::prelude::*};
 use tokio::io::{AsyncReadExt, BufReader};
@@ -25,6 +25,10 @@ pub type PluginFuture<'a> = BoxFuture<'a, Result<(), Box<dyn std::error::Error>>
 
 pub trait Plugin: Send + Sync + 'static {
     fn name(&self) -> &'static str;
+    /// Bump this when plugin schema or semantics change.
+    fn version(&self) -> u32 {
+        1
+    }
     fn on_transaction(
         &self,
         db: Client,
@@ -94,6 +98,38 @@ impl PluginRunner {
             .with_option("async_insert", "1")
             .with_option("wait_for_async_insert", "0");
 
+        // Initialize plugin management tables
+        db.query(
+            r#"CREATE TABLE IF NOT EXISTS jetstreamer_slot_status (
+                slot UInt64
+            ) ENGINE = ReplacingMergeTree
+            ORDER BY slot"#,
+        )
+        .execute()
+        .await?;
+
+        db.query(
+            r#"CREATE TABLE IF NOT EXISTS jetstreamer_plugins (
+                id UInt32,
+                name String,
+                version UInt32
+            ) ENGINE = ReplacingMergeTree
+            ORDER BY id"#,
+        )
+        .execute()
+        .await?;
+
+        db.query(
+            r#"CREATE TABLE IF NOT EXISTS jetstreamer_plugin_slots (
+                plugin_id UInt32,
+                slot UInt64,
+                indexed_at DateTime('UTC') DEFAULT now()
+            ) ENGINE = ReplacingMergeTree
+            ORDER BY (plugin_id, slot)"#,
+        )
+        .execute()
+        .await?;
+
         // Connect to the domain socket
         let ns_name = self
             .socket_name
@@ -110,6 +146,25 @@ impl PluginRunner {
             let mut guard = self.plugins.lock().unwrap();
             std::mem::take(&mut *guard)
         };
+
+        // Insert plugin metadata into jetstreamer_plugins table
+        #[derive(Row, serde::Serialize)]
+        struct PluginRow<'a> {
+            id: u32,
+            name: &'a str,
+            version: u32,
+        }
+        let mut insert = db.insert("jetstreamer_plugins")?;
+        for (i, p) in plugins.iter().enumerate() {
+            insert
+                .write(&PluginRow {
+                    id: i as u32,
+                    name: p.name(),
+                    version: p.version(),
+                })
+                .await?;
+        }
+        insert.end().await?;
 
         for p in plugins.iter_mut() {
             if let Err(e) = p.on_load(db.clone()).await {
@@ -140,10 +195,23 @@ impl PluginRunner {
             // ── dispatch ─────────────────────────────────────────────────
             match msg {
                 JetstreamerMessage::Block(block) => {
-                    for p in plugins.iter_mut() {
+                    for (id, p) in plugins.iter_mut().enumerate() {
                         if let Err(e) = p.on_block(db.clone(), block.clone()).await {
                             log::error!("plugin {} on_block error: {e}", p.name());
                         }
+                        #[derive(Row, serde::Serialize)]
+                        struct PluginSlotRow {
+                            plugin_id: u32,
+                            slot: u64,
+                        }
+                        let mut insert = db.insert("jetstreamer_plugin_slots")?;
+                        insert
+                            .write(&PluginSlotRow {
+                                plugin_id: id as u32,
+                                slot: block.slot,
+                            })
+                            .await?;
+                        insert.end().await?;
                     }
                 }
                 JetstreamerMessage::Transaction(tx, tx_index) => {

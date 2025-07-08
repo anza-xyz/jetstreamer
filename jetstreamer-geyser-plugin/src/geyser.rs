@@ -152,13 +152,13 @@ pub fn ipc_send(msg: JetstreamerMessage) {
     //     });
     // });
     let tx = IPC_TX.get().expect("IPC_TX not initialized");
-    // let is_exit = msg == JetstreamerMessage::Exit;
-    // if let Err(err) = tx.blocking_send(msg) {
-    //     panic!("IPC channel error: {:?}", err);
-    // }
-    // if is_exit {
-    //     log::info!("sent exit signal to clients");
-    // }
+    let is_exit = msg == JetstreamerMessage::Exit;
+    if let Err(err) = tx.blocking_send(msg) {
+        panic!("IPC channel error: {:?}", err);
+    }
+    if is_exit {
+        log::info!("sent exit signal to clients");
+    }
 }
 
 fn parse_range(slot_range: impl AsRef<str>) -> Option<Range<u64>> {

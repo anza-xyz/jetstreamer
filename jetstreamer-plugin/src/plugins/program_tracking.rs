@@ -39,10 +39,12 @@ struct ProgramStats {
 pub struct ProgramTrackingPlugin;
 
 impl Plugin for ProgramTrackingPlugin {
+    #[inline(always)]
     fn name(&self) -> &'static str {
         "Program Tracking"
     }
 
+    #[inline(always)]
     fn on_transaction(
         &self,
         _db: Client,
@@ -84,6 +86,7 @@ impl Plugin for ProgramTrackingPlugin {
         .boxed()
     }
 
+    #[inline(always)]
     fn on_block(&self, db: Client, block: Block) -> PluginFuture<'_> {
         async move {
             let mut insert = db.insert("program_invocations")?;
@@ -114,6 +117,7 @@ impl Plugin for ProgramTrackingPlugin {
         .boxed()
     }
 
+    #[inline(always)]
     fn on_load(&self, db: Client) -> PluginFuture<'_> {
         DATA.get_or_init(DashMap::new);
         // SLOT_TIMESTAMPS is a Lazy global, nothing to initialize
@@ -144,6 +148,7 @@ impl Plugin for ProgramTrackingPlugin {
         .boxed()
     }
 
+    #[inline(always)]
     fn on_exit(&self, _db: Client) -> PluginFuture<'_> {
         async move {
             log::info!("Program Tracking Plugin unloading...");
@@ -152,6 +157,7 @@ impl Plugin for ProgramTrackingPlugin {
         .boxed()
     }
 
+    #[inline(always)]
     fn clone_plugin(&self) -> Box<dyn Plugin> {
         Box::new(self.clone())
     }

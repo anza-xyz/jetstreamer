@@ -177,6 +177,8 @@ impl PluginRunner {
         // cache plugin IDs to avoid recalculating them on every message
         let plugin_ids = self.plugins.iter().map(|p| p.id()).collect::<Vec<_>>();
 
+        let fast_path = self.plugins.len() == 1;
+
         log::info!("plugin runner loaded, waiting for transactions...");
         loop {
             // ── length-prefix (u32 little-endian) ─────────────────────────
@@ -197,50 +199,23 @@ impl PluginRunner {
             let msg: JetstreamerMessage = bincode::deserialize(&buf)?;
 
             // ── dispatch ─────────────────────────────────────────────────
-            futures::future::join_all(self.plugins.iter().enumerate().map(|(i, plugin)| {
-                let plugin_id = plugin_ids[i];
-                let db = db.clone();
-                let msg = msg.clone();
-                async move {
-                    match msg {
-                        JetstreamerMessage::Block(block) => {
-                            if let Err(e) = plugin.on_block(db.clone(), block.clone()).await {
-                                log::error!("plugin {} on_block error: {e}", plugin.name());
-                            }
-                            #[derive(Row, serde::Serialize)]
-                            struct PluginSlotRow {
-                                plugin_id: u16,
-                                slot: u64,
-                            }
-                            let mut insert = db.insert("jetstreamer_plugin_slots")?;
-                            insert
-                                .write(&PluginSlotRow {
-                                    plugin_id,
-                                    slot: block.slot,
-                                })
-                                .await?;
-                            insert.end().await?;
-                        }
-                        JetstreamerMessage::Transaction(tx, tx_index) => {
-                            if let Err(e) = plugin
-                                .on_transaction(db.clone(), tx.clone(), tx_index)
-                                .await
-                            {
-                                log::error!("plugin {} on_transaction error: {e}", plugin.name());
-                            }
-                        }
-                        JetstreamerMessage::Exit => {
-                            if let Err(e) = plugin.on_exit(db.clone()).await {
-                                log::error!("plugin {} on_exit error: {e}", plugin.name());
-                            }
-                        }
-                    }
-                    Ok::<(), PluginRunnerError>(())
-                }
-            }))
-            .await
-            .into_iter()
-            .collect::<Result<Vec<_>, _>>()?;
+            if fast_path {
+                // fast path for single-plugin setups
+                let plugin = &self.plugins[0];
+                let plugin_id = plugin_ids[0];
+                handle_message(plugin.as_ref(), db.clone(), msg, plugin_id).await?;
+            } else {
+                // multi-plugin setup, use futures to handle messages concurrently
+                futures::future::join_all(self.plugins.iter().enumerate().map(|(i, plugin)| {
+                    let plugin_id = plugin_ids[i];
+                    let db = db.clone();
+                    let msg = msg.clone();
+                    async move { handle_message(plugin.as_ref(), db, msg, plugin_id).await }
+                }))
+                .await
+                .into_iter()
+                .collect::<Result<Vec<_>, _>>()?;
+            }
 
             // if let JetstreamerMessage::Exit = msg {
             //     break;
@@ -249,6 +224,49 @@ impl PluginRunner {
 
         Ok(())
     }
+}
+
+#[inline(always)]
+async fn handle_message(
+    plugin: &dyn Plugin,
+    db: Client,
+    msg: JetstreamerMessage,
+    plugin_id: u16,
+) -> Result<(), PluginRunnerError> {
+    match msg {
+        JetstreamerMessage::Block(block) => {
+            if let Err(e) = plugin.on_block(db.clone(), block.clone()).await {
+                log::error!("plugin {} on_block error: {e}", plugin.name());
+            }
+            #[derive(Row, serde::Serialize)]
+            struct PluginSlotRow {
+                plugin_id: u16,
+                slot: u64,
+            }
+            let mut insert = db.insert("jetstreamer_plugin_slots")?;
+            insert
+                .write(&PluginSlotRow {
+                    plugin_id,
+                    slot: block.slot,
+                })
+                .await?;
+            insert.end().await?;
+        }
+        JetstreamerMessage::Transaction(tx, tx_index) => {
+            if let Err(e) = plugin
+                .on_transaction(db.clone(), tx.clone(), tx_index)
+                .await
+            {
+                log::error!("plugin {} on_transaction error: {e}", plugin.name());
+            }
+        }
+        JetstreamerMessage::Exit => {
+            if let Err(e) = plugin.on_exit(db.clone()).await {
+                log::error!("plugin {} on_exit error: {e}", plugin.name());
+            }
+        }
+    }
+    Ok(())
 }
 
 // ensure that PluginRunnerError is Send + Sync + 'static

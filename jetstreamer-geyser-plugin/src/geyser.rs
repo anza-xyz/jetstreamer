@@ -22,10 +22,10 @@ use tokio::sync::mpsc;
 
 use crate::clickhouse;
 use jetstreamer_plugin::{
-    Plugin,
+    // Plugin,
     bridge::{Block, Transaction},
     ipc::{JetstreamerMessage, spawn_socket_server},
-    plugins::program_tracking::ProgramTrackingPlugin,
+    // plugins::program_tracking::ProgramTrackingPlugin,
 };
 
 thread_local! {
@@ -34,7 +34,7 @@ thread_local! {
             .with_url("http://localhost:8123")
             .with_option("async_insert", "1")
             .with_option("wait_for_async_insert", "0"));
-    static PLUGIN: RefCell<ProgramTrackingPlugin> = const { RefCell::new(ProgramTrackingPlugin) };
+    // static PLUGIN: RefCell<ProgramTrackingPlugin> = const { RefCell::new(ProgramTrackingPlugin) };
 }
 static IPC_TX: once_cell::sync::OnceCell<Sender<JetstreamerMessage>> =
     once_cell::sync::OnceCell::new();
@@ -124,41 +124,41 @@ impl From<JetstreamerError> for GeyserPluginError {
 }
 
 pub fn ipc_send(msg: JetstreamerMessage) {
-    DB_CLIENT.with(|db| {
-        let db = db.borrow();
-        PLUGIN.with(|plugin| {
-            let plugin = plugin.borrow();
-            TOKIO_RUNTIME.with(|rt_cell| {
-                let rt = rt_cell.borrow();
-                match msg {
-                    JetstreamerMessage::Transaction(tx, tx_index) => {
-                        if let Err(e) = rt.block_on(plugin.on_transaction(db.clone(), tx, tx_index))
-                        {
-                            log::error!("plugin {} on_transaction error: {}", plugin.name(), e);
-                        }
-                    }
-                    JetstreamerMessage::Block(block) => {
-                        if let Err(e) = rt.block_on(plugin.on_block(db.clone(), block)) {
-                            log::error!("plugin {} on_block error: {}", plugin.name(), e);
-                        }
-                    }
-                    JetstreamerMessage::Exit => {
-                        if let Err(e) = rt.block_on(plugin.on_exit(db.clone())) {
-                            log::error!("plugin {} on_exit error: {}", plugin.name(), e);
-                        }
-                    }
-                }
-            });
-        });
-    });
-    // let tx = IPC_TX.get().expect("IPC_TX not initialized");
-    // let is_exit = msg == JetstreamerMessage::Exit;
-    // if let Err(err) = tx.blocking_send(msg) {
-    //     panic!("IPC channel error: {:?}", err);
-    // }
-    // if is_exit {
-    //     log::info!("sent exit signal to clients");
-    // }
+    // DB_CLIENT.with(|db| {
+    //     let db = db.borrow();
+    //     PLUGIN.with(|plugin| {
+    //         let plugin = plugin.borrow();
+    //         TOKIO_RUNTIME.with(|rt_cell| {
+    //             let rt = rt_cell.borrow();
+    //             match msg {
+    //                 JetstreamerMessage::Transaction(tx, tx_index) => {
+    //                     if let Err(e) = rt.block_on(plugin.on_transaction(db.clone(), tx, tx_index))
+    //                     {
+    //                         log::error!("plugin {} on_transaction error: {}", plugin.name(), e);
+    //                     }
+    //                 }
+    //                 JetstreamerMessage::Block(block) => {
+    //                     if let Err(e) = rt.block_on(plugin.on_block(db.clone(), block)) {
+    //                         log::error!("plugin {} on_block error: {}", plugin.name(), e);
+    //                     }
+    //                 }
+    //                 JetstreamerMessage::Exit => {
+    //                     if let Err(e) = rt.block_on(plugin.on_exit(db.clone())) {
+    //                         log::error!("plugin {} on_exit error: {}", plugin.name(), e);
+    //                     }
+    //                 }
+    //             }
+    //         });
+    //     });
+    // });
+    let tx = IPC_TX.get().expect("IPC_TX not initialized");
+    let is_exit = msg == JetstreamerMessage::Exit;
+    if let Err(err) = tx.blocking_send(msg) {
+        panic!("IPC channel error: {:?}", err);
+    }
+    if is_exit {
+        log::info!("sent exit signal to clients");
+    }
 }
 
 fn parse_range(slot_range: impl AsRef<str>) -> Option<Range<u64>> {
@@ -274,11 +274,11 @@ impl GeyserPlugin for Jetstreamer {
                     IPC_TX.set(tx).unwrap();
                     IPC_TASK.set(handle).unwrap();
                     log::info!("IPC bridge initialized.");
-                    log::info!("initializing program tracking plugin...");
-                    let db = DB_CLIENT.with_borrow(|db| db.clone());
-                    let plugin = PLUGIN.with_borrow(|plugin| plugin.clone());
-                    plugin.on_load(db).await.unwrap();
-                    log::info!("program tracking plugin initialized.");
+                    // log::info!("initializing program tracking plugin...");
+                    // let db = DB_CLIENT.with_borrow(|db| db.clone());
+                    // let plugin = PLUGIN.with_borrow(|plugin| plugin.clone());
+                    // plugin.on_load(db).await.unwrap();
+                    // log::info!("program tracking plugin initialized.");
                     START_TIME.set(Instant::now()).unwrap();
                     log::info!("jetstreamer loaded");
 

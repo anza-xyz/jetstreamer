@@ -22,7 +22,7 @@ pub type Rx = broadcast::Receiver<JetstreamerMessage>;
 pub type Error = Box<dyn std::error::Error + Send + Sync + 'static>;
 
 pub async fn spawn_socket_server(
-    mut rx: mpsc::Receiver<JetstreamerMessage>,
+    mut receiver: mpsc::Receiver<JetstreamerMessage>,
 ) -> Result<JoinHandle<()>, Box<dyn std::error::Error + Send + Sync + 'static>> {
     let name = "jetstreamer.sock".to_ns_name::<GenericNamespaced>()?;
     let listener = ListenerOptions::new().name(name).create_tokio()?;
@@ -47,7 +47,7 @@ pub async fn spawn_socket_server(
 
     // Writer loop – one for all clients; slowest client back-pressures the producer
     Ok(tokio::spawn(async move {
-        while let Some(msg) = rx.recv().await {
+        while let Some(msg) = receiver.recv().await {
             let bytes = bincode::serialize(&msg).expect("serialize");
             let len = (bytes.len() as u32).to_le_bytes();
 

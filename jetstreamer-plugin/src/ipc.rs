@@ -4,7 +4,7 @@ use interprocess::local_socket::{GenericNamespaced, ListenerOptions, ToNsName, t
 use serde::{Deserialize, Serialize};
 use tokio::{
     io::AsyncWriteExt,
-    sync::{Mutex, broadcast, mpsc},
+    sync::{Mutex, mpsc},
     task::JoinHandle,
 };
 
@@ -17,20 +17,18 @@ pub enum JetstreamerMessage {
     Exit,
 }
 
-pub type Tx = broadcast::Sender<JetstreamerMessage>;
-pub type Rx = broadcast::Receiver<JetstreamerMessage>;
 pub type Error = Box<dyn std::error::Error + Send + Sync + 'static>;
 
 pub async fn spawn_socket_server(
     mut receiver: mpsc::Receiver<JetstreamerMessage>,
-) -> Result<JoinHandle<()>, Box<dyn std::error::Error + Send + Sync + 'static>> {
-    let name = "jetstreamer.sock".to_ns_name::<GenericNamespaced>()?;
+    socket_id: usize,
+) -> Result<JoinHandle<()>, Error> {
+    let socket_name = format!("jetstreamer_{}.sock", socket_id);
+    let name = socket_name.to_ns_name::<GenericNamespaced>()?;
     let listener = ListenerOptions::new().name(name).create_tokio()?;
 
-    // Shared list of live sockets
     let clients: Arc<Mutex<Vec<LocalSocketStream>>> = Arc::new(Mutex::new(Vec::new()));
 
-    // Accept loop – adds sockets to the list
     {
         let clients = clients.clone();
         tokio::spawn(async move {
@@ -39,13 +37,12 @@ pub async fn spawn_socket_server(
                     Ok(stream) => {
                         clients.lock().await.push(stream);
                     }
-                    Err(e) => log::error!("IPC accept error: {e}"),
+                    Err(e) => log::error!("IPC accept error on socket {}: {e}", socket_id),
                 }
             }
         });
     }
 
-    // Writer loop – one for all clients; slowest client back-pressures the producer
     Ok(tokio::spawn(async move {
         while let Some(msg) = receiver.recv().await {
             let bytes = bincode::serialize(&msg).expect("serialize");
@@ -53,7 +50,7 @@ pub async fn spawn_socket_server(
 
             let mut to_remove = Vec::new();
 
-            let mut list = clients.lock().await; // await, no ?
+            let mut list = clients.lock().await;
             for (idx, stream) in list.iter_mut().enumerate() {
                 if stream.write_all(&len).await.is_err() || stream.write_all(&bytes).await.is_err()
                 {

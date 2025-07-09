@@ -36,9 +36,9 @@ thread_local! {
             .with_option("wait_for_async_insert", "0"));
     // static PLUGIN: RefCell<ProgramTrackingPlugin> = const { RefCell::new(ProgramTrackingPlugin) };
 }
-static IPC_SENDER: once_cell::sync::OnceCell<Sender<JetstreamerMessage>> =
+static IPC_SENDERS: once_cell::sync::OnceCell<Vec<Sender<JetstreamerMessage>>> =
     once_cell::sync::OnceCell::new();
-static IPC_TASK: once_cell::sync::OnceCell<tokio::task::JoinHandle<()>> =
+static IPC_TASKS: once_cell::sync::OnceCell<Vec<tokio::task::JoinHandle<()>>> =
     once_cell::sync::OnceCell::new();
 
 static EXIT: AtomicBool = AtomicBool::new(false);
@@ -123,37 +123,11 @@ impl From<JetstreamerError> for GeyserPluginError {
     }
 }
 
-pub fn ipc_send(msg: JetstreamerMessage) {
-    // DB_CLIENT.with(|db| {
-    //     let db = db.borrow();
-    //     PLUGIN.with(|plugin| {
-    //         let plugin = plugin.borrow();
-    //         TOKIO_RUNTIME.with(|rt_cell| {
-    //             let rt = rt_cell.borrow();
-    //             match msg {
-    //                 JetstreamerMessage::Transaction(tx, tx_index) => {
-    //                     if let Err(e) = rt.block_on(plugin.on_transaction(db.clone(), tx, tx_index))
-    //                     {
-    //                         log::error!("plugin {} on_transaction error: {}", plugin.name(), e);
-    //                     }
-    //                 }
-    //                 JetstreamerMessage::Block(block) => {
-    //                     if let Err(e) = rt.block_on(plugin.on_block(db.clone(), block)) {
-    //                         log::error!("plugin {} on_block error: {}", plugin.name(), e);
-    //                     }
-    //                 }
-    //                 JetstreamerMessage::Exit => {
-    //                     if let Err(e) = rt.block_on(plugin.on_exit(db.clone())) {
-    //                         log::error!("plugin {} on_exit error: {}", plugin.name(), e);
-    //                     }
-    //                 }
-    //             }
-    //         });
-    //     });
-    // });
-    let tx = IPC_SENDER.get().expect("IPC_TX not initialized");
+pub fn ipc_send(thread_id: usize, msg: JetstreamerMessage) {
+    let senders = IPC_SENDERS.get().expect("IPC_SENDERS not initialized");
+    let sender = &senders[thread_id];
     let is_exit = msg == JetstreamerMessage::Exit;
-    if let Err(err) = tx.blocking_send(msg) {
+    if let Err(err) = sender.blocking_send(msg) {
         panic!("IPC channel error: {:?}", err);
     }
     if is_exit {
@@ -266,14 +240,22 @@ impl GeyserPlugin for Jetstreamer {
                         log::info!("automatic ClickHouse spawning disabled, skipping ClickHouse initialization.");
                     }
 
-                    log::info!("setting up IPC bridge...");
-                    let (sender, receiver) = mpsc::channel::<JetstreamerMessage>(1);
-                    let handle = spawn_socket_server(receiver)
-                        .await
-                        .map_err(|e| JetstreamerError::ClickHouseError(e.to_string()))?;
-                    IPC_SENDER.set(sender).unwrap();
-                    IPC_TASK.set(handle).unwrap();
-                    log::info!("IPC bridge initialized.");
+                    log::info!("setting up IPC bridges...");
+                    let mut ipc_senders = Vec::new();
+                    let mut ipc_tasks = Vec::new();
+
+                    for socket_id in 0..threads {
+                        let (sender, receiver) = mpsc::channel::<JetstreamerMessage>(1024);
+                        let handle = spawn_socket_server(receiver, socket_id as usize)
+                            .await
+                            .map_err(|e| JetstreamerError::ClickHouseError(e.to_string()))?;
+                        ipc_senders.push(sender);
+                        ipc_tasks.push(handle);
+                    }
+
+                    IPC_SENDERS.set(ipc_senders).unwrap();
+                    IPC_TASKS.set(ipc_tasks).unwrap();
+                    log::info!("IPC bridges initialized.");
                     // log::info!("initializing program tracking plugin...");
                     // let db = DB_CLIENT.with_borrow(|db| db.clone());
                     // let plugin = PLUGIN.with_borrow(|plugin| plugin.clone());
@@ -359,7 +341,7 @@ impl GeyserPlugin for Jetstreamer {
         }
 
         let blk = Block::from_replica(blockinfo);
-        ipc_send(JetstreamerMessage::Block(blk));
+        ipc_send(thread_id as usize, JetstreamerMessage::Block(blk));
 
         if slot >= thread_slot_range_end {
             log::info!(
@@ -418,7 +400,10 @@ impl GeyserPlugin for Jetstreamer {
             .get(&slot)
             .expect("thread id not found for slot");
         let thread_current_tx_index = thread_bump_tx_index(thread_id);
-        ipc_send(JetstreamerMessage::Transaction(tx, thread_current_tx_index));
+        ipc_send(
+            thread_id as usize,
+            JetstreamerMessage::Transaction(tx, thread_current_tx_index),
+        );
         Ok(())
     }
 
@@ -441,11 +426,13 @@ fn exiting() -> bool {
 }
 
 fn stop_ipc_bridge() {
-    log::info!("stopping IPC bridge...");
-    if let Some(handle) = IPC_TASK.get() {
-        handle.abort(); // kills writer + accept loops
+    log::info!("stopping IPC bridges...");
+    if let Some(handles) = IPC_TASKS.get() {
+        for handle in handles {
+            handle.abort(); // kills writer + accept loops
+        }
     }
-    log::info!("IPC bridge stopped.");
+    log::info!("IPC bridges stopped.");
 }
 
 fn stop_tx_queue() {
@@ -456,7 +443,10 @@ fn stop_tx_queue() {
 
 fn send_exit_signal_to_clients() {
     log::info!("sending exit signal to clients...");
-    ipc_send(JetstreamerMessage::Exit);
+    let senders = IPC_SENDERS.get().expect("IPC_SENDERS not initialized");
+    for (thread_id, _) in senders.iter().enumerate() {
+        ipc_send(thread_id, JetstreamerMessage::Exit);
+    }
     log::info!("exit signal sent to clients.");
 }
 

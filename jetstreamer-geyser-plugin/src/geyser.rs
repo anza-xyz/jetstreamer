@@ -36,7 +36,7 @@ thread_local! {
             .with_option("wait_for_async_insert", "0"));
     // static PLUGIN: RefCell<ProgramTrackingPlugin> = const { RefCell::new(ProgramTrackingPlugin) };
 }
-static IPC_TX: once_cell::sync::OnceCell<Sender<JetstreamerMessage>> =
+static IPC_SENDER: once_cell::sync::OnceCell<Sender<JetstreamerMessage>> =
     once_cell::sync::OnceCell::new();
 static IPC_TASK: once_cell::sync::OnceCell<tokio::task::JoinHandle<()>> =
     once_cell::sync::OnceCell::new();
@@ -151,7 +151,7 @@ pub fn ipc_send(msg: JetstreamerMessage) {
     //         });
     //     });
     // });
-    let tx = IPC_TX.get().expect("IPC_TX not initialized");
+    let tx = IPC_SENDER.get().expect("IPC_TX not initialized");
     let is_exit = msg == JetstreamerMessage::Exit;
     if let Err(err) = tx.blocking_send(msg) {
         panic!("IPC channel error: {:?}", err);
@@ -267,11 +267,11 @@ impl GeyserPlugin for Jetstreamer {
                     }
 
                     log::info!("setting up IPC bridge...");
-                    let (tx, rx) = mpsc::channel::<JetstreamerMessage>(1);
-                    let handle = spawn_socket_server(rx)
+                    let (sender, receiver) = mpsc::channel::<JetstreamerMessage>(1);
+                    let handle = spawn_socket_server(receiver)
                         .await
                         .map_err(|e| JetstreamerError::ClickHouseError(e.to_string()))?;
-                    IPC_TX.set(tx).unwrap();
+                    IPC_SENDER.set(sender).unwrap();
                     IPC_TASK.set(handle).unwrap();
                     log::info!("IPC bridge initialized.");
                     // log::info!("initializing program tracking plugin...");

@@ -244,7 +244,7 @@ impl GeyserPlugin for Jetstreamer {
                     let mut ipc_tasks = Vec::new();
 
                     for socket_id in 0..threads {
-                        let (sender, receiver): (Sender<JetstreamerMessage>, Receiver<JetstreamerMessage>) = bounded(1024);
+                        let (sender, receiver): (Sender<JetstreamerMessage>, Receiver<JetstreamerMessage>) = bounded(1);
                         let handle = spawn_socket_server(receiver, socket_id as usize)
                             .await
                             .map_err(|e| JetstreamerError::ClickHouseError(e.to_string()))?;

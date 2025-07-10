@@ -3,7 +3,7 @@ use std::sync::Arc;
 use crossbeam_channel::Receiver;
 use interprocess::local_socket::{GenericNamespaced, ListenerOptions, ToNsName, tokio::prelude::*};
 use serde::{Deserialize, Serialize};
-use tokio::{io::AsyncWriteExt, sync::Mutex, task::JoinHandle};
+use tokio::{io::AsyncWriteExt, sync::RwLock, task::JoinHandle};
 
 use crate::bridge::{Block, Transaction};
 
@@ -24,7 +24,7 @@ pub async fn spawn_socket_server(
     let name = socket_name.to_ns_name::<GenericNamespaced>()?;
     let listener = ListenerOptions::new().name(name).create_tokio()?;
 
-    let clients: Arc<Mutex<Vec<LocalSocketStream>>> = Arc::new(Mutex::new(Vec::new()));
+    let clients: Arc<RwLock<Vec<LocalSocketStream>>> = Arc::new(RwLock::new(Vec::new()));
 
     {
         let clients = clients.clone();
@@ -32,7 +32,7 @@ pub async fn spawn_socket_server(
             loop {
                 match listener.accept().await {
                     Ok(stream) => {
-                        clients.lock().await.push(stream);
+                        clients.write().await.push(stream);
                     }
                     Err(e) => log::error!("IPC accept error on socket {}: {e}", socket_id),
                 }
@@ -47,7 +47,7 @@ pub async fn spawn_socket_server(
 
             let mut to_remove = Vec::new();
 
-            let mut list = clients.lock().await;
+            let mut list = clients.write().await;
             for (idx, stream) in list.iter_mut().enumerate() {
                 if stream.write_all(&len).await.is_err() || stream.write_all(&bytes).await.is_err()
                 {

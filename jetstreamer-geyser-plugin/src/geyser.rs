@@ -4,7 +4,6 @@ use agave_geyser_plugin_interface::geyser_plugin_interface::{
 };
 use core::ops::Range;
 use geyser_replay::{epochs::slot_to_epoch, firehose::generate_subranges};
-use mpsc::Sender;
 use rangemap::RangeMap;
 use std::{
     cell::RefCell,
@@ -18,9 +17,9 @@ use std::{
 };
 use thousands::Separable;
 use tokio::runtime::Runtime;
-use tokio::sync::mpsc;
 
 use crate::clickhouse;
+use crossbeam_channel::{Receiver, Sender, bounded};
 use jetstreamer_plugin::{
     // Plugin,
     bridge::{Block, Transaction},
@@ -127,8 +126,8 @@ pub fn ipc_send(thread_id: usize, msg: JetstreamerMessage) {
     let senders = IPC_SENDERS.get().expect("IPC_SENDERS not initialized");
     let sender = &senders[thread_id];
     let is_exit = msg == JetstreamerMessage::Exit;
-    if let Err(err) = sender.blocking_send(msg) {
-        panic!("IPC channel error: {:?}", err);
+    if let Err(err) = sender.send(msg) {
+        log::error!("failed to send IPC message: {}", err);
     }
     if is_exit {
         log::info!("sent exit signal to client socket {}", thread_id);
@@ -245,7 +244,7 @@ impl GeyserPlugin for Jetstreamer {
                     let mut ipc_tasks = Vec::new();
 
                     for socket_id in 0..threads {
-                        let (sender, receiver) = mpsc::channel::<JetstreamerMessage>(1024);
+                        let (sender, receiver): (Sender<JetstreamerMessage>, Receiver<JetstreamerMessage>) = bounded(1024);
                         let handle = spawn_socket_server(receiver, socket_id as usize)
                             .await
                             .map_err(|e| JetstreamerError::ClickHouseError(e.to_string()))?;

@@ -24,3 +24,4 @@ geyser-replay.workspace = true
 reqwest.workspace = true
 futures.workspace = true
 sha2.workspace = true
+crossbeam-channel.workspace = true

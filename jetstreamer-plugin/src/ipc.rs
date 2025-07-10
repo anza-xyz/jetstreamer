@@ -1,12 +1,9 @@
 use std::sync::Arc;
 
+use crossbeam_channel::Receiver;
 use interprocess::local_socket::{GenericNamespaced, ListenerOptions, ToNsName, tokio::prelude::*};
 use serde::{Deserialize, Serialize};
-use tokio::{
-    io::AsyncWriteExt,
-    sync::{Mutex, mpsc},
-    task::JoinHandle,
-};
+use tokio::{io::AsyncWriteExt, sync::Mutex, task::JoinHandle};
 
 use crate::bridge::{Block, Transaction};
 
@@ -20,7 +17,7 @@ pub enum JetstreamerMessage {
 pub type Error = Box<dyn std::error::Error + Send + Sync + 'static>;
 
 pub async fn spawn_socket_server(
-    mut receiver: mpsc::Receiver<JetstreamerMessage>,
+    receiver: Receiver<JetstreamerMessage>,
     socket_id: usize,
 ) -> Result<JoinHandle<()>, Error> {
     let socket_name = format!("jetstreamer_{}.sock", socket_id);
@@ -44,7 +41,7 @@ pub async fn spawn_socket_server(
     }
 
     Ok(tokio::spawn(async move {
-        while let Some(msg) = receiver.recv().await {
+        while let Ok(msg) = receiver.recv() {
             let bytes = bincode::serialize(&msg).expect("serialize");
             let len = (bytes.len() as u32).to_le_bytes();
 

@@ -131,7 +131,7 @@ pub fn ipc_send(thread_id: usize, msg: JetstreamerMessage) {
         panic!("IPC channel error: {:?}", err);
     }
     if is_exit {
-        log::info!("sent exit signal to clients");
+        log::info!("sent exit signal to client socket {}", thread_id);
     }
 }
 
@@ -456,12 +456,16 @@ fn stop_clickhouse() {
     log::info!("ClickHouse stopped.");
 }
 
-fn clear_domain_socket() {
-    log::info!("clearing domain socket...");
-    std::fs::remove_file("/tmp/jetstreamer.sock").unwrap_or_else(|_| {
-        log::warn!("failed to remove domain socket");
-    });
-    log::info!("domain socket cleared.");
+fn clear_domain_sockets() {
+    log::info!("clearing domain sockets...");
+    let senders = IPC_SENDERS.get().expect("IPC_SENDERS not initialized");
+    for socket_id in 0..senders.len() {
+        let socket_path = format!("/tmp/jetstreamer_{}.sock", socket_id);
+        std::fs::remove_file(&socket_path).unwrap_or_else(|_| {
+            log::warn!("failed to remove domain socket: {}", socket_path);
+        });
+    }
+    log::info!("domain sockets cleared.");
 }
 
 #[inline(always)]
@@ -471,7 +475,7 @@ fn unload() {
     send_exit_signal_to_clients();
     stop_ipc_bridge();
     stop_clickhouse();
-    clear_domain_socket();
+    clear_domain_sockets();
     log::info!("jetstreamer has successfully unloaded.");
     std::process::exit(0);
 }

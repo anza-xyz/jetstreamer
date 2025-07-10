@@ -46,15 +46,18 @@ pub async fn spawn_socket_server(
             let bytes = bincode::serialize(&msg).expect("serialize");
             let len = (bytes.len() as u32).to_le_bytes();
 
-            let mut list = clients.write().await;
-            for (idx, stream) in list.iter_mut().enumerate() {
+            let list = clients.read().await;
+            for (idx, mut stream) in list.iter().enumerate() {
                 if stream.write_all(&len).await.is_err() || stream.write_all(&bytes).await.is_err()
                 {
                     to_remove.push(idx);
                 }
             }
-            for idx in to_remove.drain(..).rev() {
-                list.remove(idx);
+            if !to_remove.is_empty() {
+                let mut list = clients.write().await;
+                for idx in to_remove.drain(..).rev() {
+                    list.remove(idx);
+                }
             }
         }
     }))

@@ -41,11 +41,10 @@ pub async fn spawn_socket_server(
     }
 
     Ok(tokio::spawn(async move {
+        let mut to_remove = Vec::new();
         while let Ok(msg) = receiver.recv() {
             let bytes = bincode::serialize(&msg).expect("serialize");
             let len = (bytes.len() as u32).to_le_bytes();
-
-            let mut to_remove = Vec::new();
 
             let mut list = clients.write().await;
             for (idx, stream) in list.iter_mut().enumerate() {
@@ -54,7 +53,7 @@ pub async fn spawn_socket_server(
                     to_remove.push(idx);
                 }
             }
-            for idx in to_remove.into_iter().rev() {
+            for idx in to_remove.drain(..).rev() {
                 list.remove(idx);
             }
         }

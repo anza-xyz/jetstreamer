@@ -102,7 +102,7 @@ impl RawNode {
         if digest_length > 64 {
             return Err(Box::new(std::io::Error::new(
                 std::io::ErrorKind::Other,
-                "Digest length too long".to_owned(),
+                format!("Digest length too long, position={}", cursor.position()),
             )));
         }
 

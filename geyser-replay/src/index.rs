@@ -310,9 +310,10 @@ pub async fn build_missing_indexes(
                         last_slot,
                         end_slot
                     );
-                    build_index(&client, epoch, &idx_path, Some(offset))
-                        .await
-                        .unwrap();
+                    if let Err(e) = build_index(&client, epoch, &idx_path, Some(offset)).await {
+                        log::error!("Failed to build index for epoch {}: {}", epoch, e);
+                        return;
+                    }
                 } else {
                     log::info!(
                         "Full index already exists for epoch {} (slots {}-{})",

@@ -18,7 +18,6 @@ clickhouse.workspace = true
 futures-util.workspace = true
 thiserror.workspace = true
 rayon.workspace = true
-dashmap.workspace = true
 once_cell.workspace = true
 geyser-replay.workspace = true
 reqwest.workspace = true

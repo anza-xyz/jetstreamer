@@ -93,7 +93,7 @@ impl Plugin for ProgramTrackingPlugin {
     #[inline(always)]
     fn on_block(&self, db: Client, block: Block) -> PluginFuture<'_> {
         async move {
-            let mut insert = db.insert("program_invocations")?;
+            let mut rows = Vec::new();
 
             DATA.with(|data| {
                 let mut data = data.borrow_mut();
@@ -101,7 +101,7 @@ impl Plugin for ProgramTrackingPlugin {
                     let timestamp = block.block_time.unwrap_or(0) as i64;
 
                     for (program_id, stats) in slot_data.iter() {
-                        let row = ProgramEvent {
+                        rows.push(ProgramEvent {
                             slot: block.slot as u32,
                             program_id: *program_id,
                             count: stats.count,
@@ -110,13 +110,19 @@ impl Plugin for ProgramTrackingPlugin {
                             max_cus: stats.max_cus,
                             total_cus: stats.total_cus,
                             timestamp,
-                        };
-                        futures::executor::block_on(insert.write(&row)).unwrap();
+                        });
                     }
                 }
             });
 
-            insert.end().await.unwrap();
+            if !rows.is_empty() {
+                let mut insert = db.insert("program_invocations")?;
+                for row in rows {
+                    insert.write(&row).await.unwrap();
+                }
+                insert.end().await.unwrap();
+            }
+
             Ok(())
         }
         .boxed()

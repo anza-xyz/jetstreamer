@@ -1,9 +1,7 @@
 use std::collections::HashMap;
 
 use clickhouse::{Client, Row};
-use dashmap::DashMap;
 use futures_util::FutureExt;
-use once_cell::sync::OnceCell;
 use serde::{Deserialize, Serialize};
 use solana_sdk::{instruction::CompiledInstruction, message::VersionedMessage, pubkey::Pubkey};
 
@@ -12,7 +10,9 @@ use crate::{
     bridge::{Block, Transaction},
 };
 
-static DATA: OnceCell<DashMap<u64, HashMap<Pubkey, ProgramStats>>> = OnceCell::new();
+thread_local! {
+    static DATA: std::cell::RefCell<HashMap<u64, HashMap<Pubkey, ProgramStats>>> = std::cell::RefCell::new(HashMap::new());
+}
 
 #[derive(Row, Deserialize, Serialize, Copy, Clone, Debug, PartialEq, Eq, Hash)]
 struct ProgramEvent {
@@ -61,26 +61,30 @@ impl Plugin for ProgramTrackingPlugin {
                 .map(|ix: &CompiledInstruction| account_keys[ix.program_id_index as usize])
                 .collect::<Vec<_>>();
             let total_cu = transaction.cu.unwrap_or(0) as u32;
-            let data = DATA.get().expect("DATA should be initialized");
-            let mut slot_data = data.entry(transaction.slot).or_default();
-            let errored = !transaction.success;
-            for program_id in program_ids.iter() {
-                let this_program_cu = total_cu / program_ids.len() as u32;
-                let stats = slot_data.entry(*program_id).or_insert(ProgramStats {
-                    min_cus: u32::MAX,
-                    max_cus: 0,
-                    total_cus: 0,
-                    count: 0,
-                    error_count: 0,
-                });
-                stats.min_cus = stats.min_cus.min(this_program_cu);
-                stats.max_cus = stats.max_cus.max(this_program_cu);
-                stats.total_cus += this_program_cu;
-                stats.count += 1;
-                if errored {
-                    stats.error_count += 1;
+
+            DATA.with(|data| {
+                let mut data = data.borrow_mut();
+                let slot_data = data.entry(transaction.slot).or_default();
+
+                for program_id in program_ids.iter() {
+                    let this_program_cu = total_cu / program_ids.len() as u32;
+                    let stats = slot_data.entry(*program_id).or_insert(ProgramStats {
+                        min_cus: u32::MAX,
+                        max_cus: 0,
+                        total_cus: 0,
+                        count: 0,
+                        error_count: 0,
+                    });
+                    stats.min_cus = stats.min_cus.min(this_program_cu);
+                    stats.max_cus = stats.max_cus.max(this_program_cu);
+                    stats.total_cus += this_program_cu;
+                    stats.count += 1;
+                    if !transaction.success {
+                        stats.error_count += 1;
+                    }
                 }
-            }
+            });
+
             Ok(())
         }
         .boxed()
@@ -90,27 +94,28 @@ impl Plugin for ProgramTrackingPlugin {
     fn on_block(&self, db: Client, block: Block) -> PluginFuture<'_> {
         async move {
             let mut insert = db.insert("program_invocations")?;
-            let data = DATA.get().expect("DATA should be initialized");
-            let slot_data = data.entry(block.slot).or_default();
 
-            // Use DashMap entry API for slot timestamps
-            let timestamp = block.block_time.unwrap_or(0) as i64;
+            DATA.with(|data| {
+                let mut data = data.borrow_mut();
+                if let Some(slot_data) = data.remove(&block.slot) {
+                    let timestamp = block.block_time.unwrap_or(0) as i64;
 
-            for (program_id, stats) in slot_data.iter() {
-                let row = ProgramEvent {
-                    slot: block.slot as u32,
-                    program_id: *program_id,
-                    count: stats.count,
-                    error_count: stats.error_count,
-                    min_cus: stats.min_cus,
-                    max_cus: stats.max_cus,
-                    total_cus: stats.total_cus,
-                    timestamp,
-                };
-                insert.write(&row).await.unwrap();
-            }
-            drop(slot_data); // drop the reference to allow removal
-            data.remove(&block.slot);
+                    for (program_id, stats) in slot_data.iter() {
+                        let row = ProgramEvent {
+                            slot: block.slot as u32,
+                            program_id: *program_id,
+                            count: stats.count,
+                            error_count: stats.error_count,
+                            min_cus: stats.min_cus,
+                            max_cus: stats.max_cus,
+                            total_cus: stats.total_cus,
+                            timestamp,
+                        };
+                        futures::executor::block_on(insert.write(&row)).unwrap();
+                    }
+                }
+            });
+
             insert.end().await.unwrap();
             Ok(())
         }
@@ -119,7 +124,8 @@ impl Plugin for ProgramTrackingPlugin {
 
     #[inline(always)]
     fn on_load(&self, db: Client) -> PluginFuture<'_> {
-        DATA.get_or_init(DashMap::new);
+        // Remove invalid `get_or_init` call in `on_load`
+        DATA.with(|_| {});
         // SLOT_TIMESTAMPS is a Lazy global, nothing to initialize
         async move {
             log::info!("Program Tracking Plugin loaded.");

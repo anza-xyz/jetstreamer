@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{cell::RefCell, collections::HashMap};
 
 use clickhouse::{Client, Row};
 use futures_util::FutureExt;
@@ -11,7 +11,7 @@ use crate::{
 };
 
 thread_local! {
-    static DATA: std::cell::RefCell<HashMap<u64, HashMap<Pubkey, ProgramStats>>> = std::cell::RefCell::new(HashMap::new());
+    static DATA: RefCell<HashMap<u64, HashMap<Pubkey, ProgramStats>>> = RefCell::new(HashMap::new());
 }
 
 #[derive(Row, Deserialize, Serialize, Copy, Clone, Debug, PartialEq, Eq, Hash)]

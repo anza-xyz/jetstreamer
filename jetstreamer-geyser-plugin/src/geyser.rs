@@ -162,7 +162,7 @@ pub fn ipc_send(thread_id: usize, msg: JetstreamerMessage) {
 
     let result: std::result::Result<(), IpcSendError> = if is_exit {
         sender
-            .send_timeout(msg, Duration::from_millis(100))
+            .send_timeout(msg, Duration::from_millis(500))
             .map_err(|e| e.into())
     } else {
         sender.send(msg).map_err(|e| e.into())

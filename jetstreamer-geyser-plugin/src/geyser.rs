@@ -5,6 +5,7 @@ use agave_geyser_plugin_interface::geyser_plugin_interface::{
 use core::ops::Range;
 use geyser_replay::{epochs::slot_to_epoch, firehose::generate_subranges};
 use rangemap::RangeMap;
+use std::time::Duration;
 use std::{
     cell::RefCell,
     error::Error,
@@ -19,7 +20,7 @@ use thousands::Separable;
 use tokio::runtime::Runtime;
 
 use crate::clickhouse;
-use crossbeam_channel::{Receiver, Sender, bounded};
+use crossbeam_channel::{Receiver, SendError, SendTimeoutError, Sender, bounded};
 use jetstreamer_plugin::{
     // Plugin,
     bridge::{Block, Transaction},
@@ -122,13 +123,55 @@ impl From<JetstreamerError> for GeyserPluginError {
     }
 }
 
+#[derive(Debug)]
+pub enum IpcSendError {
+    Timeout,
+    Disconnected,
+    Other(String),
+}
+
+impl std::fmt::Display for IpcSendError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            IpcSendError::Timeout => write!(f, "Timeout occurred"),
+            IpcSendError::Disconnected => write!(f, "Sender disconnected"),
+            IpcSendError::Other(msg) => write!(f, "Other error: {}", msg),
+        }
+    }
+}
+
+impl From<SendTimeoutError<JetstreamerMessage>> for IpcSendError {
+    fn from(err: SendTimeoutError<JetstreamerMessage>) -> Self {
+        match err {
+            SendTimeoutError::Timeout(_) => IpcSendError::Timeout,
+            SendTimeoutError::Disconnected(_) => IpcSendError::Disconnected,
+        }
+    }
+}
+
+impl From<SendError<JetstreamerMessage>> for IpcSendError {
+    fn from(err: SendError<JetstreamerMessage>) -> Self {
+        IpcSendError::Other(err.to_string())
+    }
+}
+
 pub fn ipc_send(thread_id: usize, msg: JetstreamerMessage) {
     let senders = IPC_SENDERS.get().expect("IPC_SENDERS not initialized");
     let sender = &senders[thread_id];
     let is_exit = msg == JetstreamerMessage::Exit;
-    if let Err(err) = sender.send(msg) {
+
+    let result: std::result::Result<(), IpcSendError> = if is_exit {
+        sender
+            .send_timeout(msg, Duration::from_millis(100))
+            .map_err(|e| e.into())
+    } else {
+        sender.send(msg).map_err(|e| e.into())
+    };
+
+    if let Err(err) = result {
         log::error!("failed to send IPC message: {}", err);
     }
+
     if is_exit {
         log::info!("sent exit signal to client socket {}", thread_id);
     }

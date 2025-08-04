@@ -461,9 +461,7 @@ fn clear_domain_sockets() {
     let senders = IPC_SENDERS.get().expect("IPC_SENDERS not initialized");
     for socket_id in 0..senders.len() {
         let socket_path = format!("/tmp/jetstreamer_{}.sock", socket_id);
-        std::fs::remove_file(&socket_path).unwrap_or_else(|_| {
-            log::warn!("failed to remove domain socket: {}", socket_path);
-        });
+        let _ = std::fs::remove_file(&socket_path);
     }
     log::info!("domain sockets cleared.");
 }

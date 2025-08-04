@@ -153,6 +153,9 @@ impl PluginRunner {
 
             let plugins = self.plugins.clone();
             let db = db.clone();
+            for plugin in plugins.iter() {
+                plugin.on_load(db.clone()).await.unwrap();
+            }
 
             let handle = tokio::spawn(async move {
                 let stream: LocalSocketStream = LocalSocketStream::connect(ns_name)

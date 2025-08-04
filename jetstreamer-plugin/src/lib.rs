@@ -60,6 +60,7 @@ pub trait Plugin: Send + Sync + 'static {
 pub struct PluginRunner {
     plugins: Arc<Vec<Box<dyn Plugin>>>,
     clickhouse_dsn: String,
+    num_threads: usize, // New field to store the number of threads
     socket_name: String,
 }
 
@@ -75,29 +76,31 @@ impl Clone for PluginRunner {
                 )
             },
             clickhouse_dsn: self.clickhouse_dsn.clone(),
+            num_threads: self.num_threads,
             socket_name: self.socket_name.clone(),
         }
     }
 }
 
 impl PluginRunner {
-    pub fn new(clickhouse_dsn: impl Into<String>) -> Self {
+    pub fn new(clickhouse_dsn: impl Into<String>, num_threads: usize) -> Self {
         Self {
             plugins: Arc::new(Vec::new()),
             clickhouse_dsn: clickhouse_dsn.into(),
-            socket_name: "jetstreamer.sock".into(),
+            num_threads, // Initialize the number of threads
+            socket_name: String::new(),
         }
-    }
-
-    pub fn socket_name(mut self, name: impl Into<String>) -> Self {
-        self.socket_name = name.into();
-        self
     }
 
     pub fn register(&mut self, plugin: Box<dyn Plugin>) {
         Arc::get_mut(&mut self.plugins)
             .expect("cannot register plugins after the runner has started!")
             .push(plugin);
+    }
+
+    pub fn socket_name(mut self, name: impl Into<String>) -> Self {
+        self.socket_name = name.into();
+        self
     }
 
     /// Dial the IPC socket and forward every message to every plugin.
@@ -140,87 +143,68 @@ impl PluginRunner {
         .execute()
         .await?;
 
-        // Connect to the domain socket
-        let ns_name = self
-            .socket_name
-            .clone()
-            .to_ns_name::<GenericNamespaced>()
-            .map_err(|e| PluginRunnerError::UnsupportedSocketName(e.to_string()))?;
-        let stream: LocalSocketStream = LocalSocketStream::connect(ns_name)
+        let mut handles = Vec::new();
+
+        for thread_num in 0..self.num_threads {
+            let socket_name = format!("jetstreamer_{}.sock", thread_num);
+            let ns_name = socket_name
+                .to_ns_name::<GenericNamespaced>()
+                .map_err(|e| PluginRunnerError::UnsupportedSocketName(e.to_string()))?;
+
+            let plugins = self.plugins.clone();
+            let db = db.clone();
+
+            let handle = tokio::spawn(async move {
+                let stream: LocalSocketStream = LocalSocketStream::connect(ns_name)
+                    .await
+                    .map_err(|e| PluginRunnerError::SocketConnectError(e.to_string()))?;
+                let mut reader = BufReader::new(stream);
+
+                let plugin_ids = plugins.iter().map(|p| p.id()).collect::<Vec<_>>();
+                let fast_path = plugins.len() == 1;
+
+                loop {
+                    let mut len_buf = [0u8; 4];
+                    if reader.read_exact(&mut len_buf).await.is_err() {
+                        break; // EOF
+                    }
+                    let len = u32::from_le_bytes(len_buf) as usize;
+
+                    let mut buf = vec![0u8; len];
+                    reader
+                        .read_exact(&mut buf)
+                        .await
+                        .map_err(|e| PluginRunnerError::PayloadReadError(e.to_string()))?;
+
+                    let msg: JetstreamerMessage = bincode::deserialize(&buf)?;
+
+                    if fast_path {
+                        let plugin = &plugins[0];
+                        let plugin_id = plugin_ids[0];
+                        handle_message(plugin.as_ref(), db.clone(), msg, plugin_id).await?;
+                    } else {
+                        futures::future::join_all(plugins.iter().enumerate().map(|(i, plugin)| {
+                            let plugin_id = plugin_ids[i];
+                            let db = db.clone();
+                            let msg = msg.clone();
+                            async move { handle_message(plugin.as_ref(), db, msg, plugin_id).await }
+                        }))
+                        .await
+                        .into_iter()
+                        .collect::<Result<Vec<_>, _>>()?;
+                    }
+                }
+
+                Ok::<(), PluginRunnerError>(())
+            });
+
+            handles.push(handle);
+        }
+
+        futures::future::join_all(handles)
             .await
-            .map_err(|e| PluginRunnerError::SocketConnectError(e.to_string()))?;
-        let mut reader = BufReader::new(stream);
-
-        // Insert plugin metadata into jetstreamer_plugins table
-        #[derive(Row, serde::Serialize)]
-        struct PluginRow {
-            id: u16,
-            version: u16,
-        }
-        let mut insert = db.insert("jetstreamer_plugins")?;
-        for p in self.plugins.iter() {
-            insert
-                .write(&PluginRow {
-                    id: p.id(),
-                    version: p.version(),
-                })
-                .await?;
-        }
-        insert.end().await?;
-
-        for p in self.plugins.iter() {
-            if let Err(e) = p.on_load(db.clone()).await {
-                log::error!("plugin {} on_load error: {e}", p.name());
-            }
-        }
-
-        // cache plugin IDs to avoid recalculating them on every message
-        let plugin_ids = self.plugins.iter().map(|p| p.id()).collect::<Vec<_>>();
-
-        let fast_path = self.plugins.len() == 1;
-
-        log::info!("plugin runner loaded, waiting for transactions...");
-        loop {
-            // ── length-prefix (u32 little-endian) ─────────────────────────
-            let mut len_buf = [0u8; 4];
-            if reader.read_exact(&mut len_buf).await.is_err() {
-                break; // EOF
-            }
-            let len = u32::from_le_bytes(len_buf) as usize;
-
-            // ── payload ──────────────────────────────────────────────────
-            let mut buf = vec![0u8; len];
-            reader
-                .read_exact(&mut buf)
-                .await
-                .map_err(|e| PluginRunnerError::PayloadReadError(e.to_string()))?;
-
-            // ── decode ───────────────────────────────────────────────────
-            let msg: JetstreamerMessage = bincode::deserialize(&buf)?;
-
-            // ── dispatch ─────────────────────────────────────────────────
-            if fast_path {
-                // fast path for single-plugin setups
-                let plugin = &self.plugins[0];
-                let plugin_id = plugin_ids[0];
-                handle_message(plugin.as_ref(), db.clone(), msg, plugin_id).await?;
-            } else {
-                // multi-plugin setup, use futures to handle messages concurrently
-                futures::future::join_all(self.plugins.iter().enumerate().map(|(i, plugin)| {
-                    let plugin_id = plugin_ids[i];
-                    let db = db.clone();
-                    let msg = msg.clone();
-                    async move { handle_message(plugin.as_ref(), db, msg, plugin_id).await }
-                }))
-                .await
-                .into_iter()
-                .collect::<Result<Vec<_>, _>>()?;
-            }
-
-            // if let JetstreamerMessage::Exit = msg {
-            //     break;
-            // }
-        }
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()?;
 
         Ok(())
     }
@@ -311,5 +295,11 @@ impl From<clickhouse::error::Error> for PluginRunnerError {
 impl From<bincode::Error> for PluginRunnerError {
     fn from(error: bincode::Error) -> Self {
         PluginRunnerError::Bincode(error)
+    }
+}
+
+impl From<tokio::task::JoinError> for PluginRunnerError {
+    fn from(error: tokio::task::JoinError) -> Self {
+        PluginRunnerError::SocketConnectError(format!("Thread join error: {error}"))
     }
 }

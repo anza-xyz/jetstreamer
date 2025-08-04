@@ -86,13 +86,13 @@ impl JetstreamerRunner {
         log::info!("slot index dir: {:?}", index_dir);
         let slot_range = self.config.slot_range;
         log::info!("geyser config files: {:?}", geyser_config_files);
+        let threads = self.config.threads as usize;
         let mut plugin_runner =
-            PluginRunner::new("http://localhost:8123").socket_name("jetstreamer.sock");
+            PluginRunner::new("http://localhost:8123", threads).socket_name("jetstreamer.sock");
         for plugin in self.plugins {
             plugin_runner.register(plugin);
         }
         let plugin_runner = Arc::new(plugin_runner);
-        let threads = self.config.threads;
         log::info!("using {} threads for processing", threads);
         let runner = plugin_runner.clone();
         if let Err((err, slot)) = firehose(
@@ -106,7 +106,7 @@ impl JetstreamerRunner {
                     .await
                     .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + 'static>)
             },
-            threads,
+            threads.try_into().unwrap(),
         )
         .await
         {

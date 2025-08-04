@@ -160,17 +160,13 @@ pub fn ipc_send(thread_id: usize, msg: JetstreamerMessage) {
     let sender = &senders[thread_id];
     let is_exit = msg == JetstreamerMessage::Exit;
 
-    let result: std::result::Result<(), IpcSendError> = if is_exit {
+    let _: std::result::Result<(), IpcSendError> = if is_exit {
         sender
-            .send_timeout(msg, Duration::from_millis(500))
+            .send_timeout(msg, Duration::from_millis(50))
             .map_err(|e| e.into())
     } else {
         sender.send(msg).map_err(|e| e.into())
     };
-
-    if let Err(err) = result {
-        log::error!("failed to send IPC message: {}", err);
-    }
 
     if is_exit {
         log::info!("sent exit signal to client socket {}", thread_id);

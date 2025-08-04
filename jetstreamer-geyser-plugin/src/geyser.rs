@@ -444,6 +444,7 @@ fn send_exit_signal_to_clients() {
     log::info!("sending exit signal to clients...");
     let senders = IPC_SENDERS.get().expect("IPC_SENDERS not initialized");
     for (thread_id, _) in senders.iter().enumerate() {
+        log::info!("sending exit signal to client socket {}", thread_id);
         ipc_send(thread_id, JetstreamerMessage::Exit);
     }
     log::info!("exit signal sent to clients.");

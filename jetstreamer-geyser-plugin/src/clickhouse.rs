@@ -25,10 +25,8 @@ fn process_log_line(line: impl AsRef<str>) {
             ln if ln.starts_with("<Warning>") => log::warn!("{}", &ln[10..]),
             _ => log::debug!("{}", line),
         }
-    } else {
-        if !line.trim().is_empty() {
-            log::info!("{}", line);
-        }
+    } else if !line.trim().is_empty() {
+        log::info!("{}", line);
     }
 }
 

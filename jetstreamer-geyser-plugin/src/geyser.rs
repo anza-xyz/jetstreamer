@@ -338,11 +338,7 @@ impl GeyserPlugin for Jetstreamer {
         let last_slot = thread_current_slot(thread_id);
         let increment = if last_slot == u64::MAX {
             1
-        } else if slot > last_slot {
-            slot - last_slot
-        } else {
-            0
-        };
+        } else { slot.saturating_sub(last_slot) };
         let processed_slots = if increment > 0 {
             PROCESSED_SLOTS.fetch_add(increment, Ordering::SeqCst) + increment
         } else {

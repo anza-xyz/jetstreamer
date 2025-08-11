@@ -98,7 +98,7 @@ impl Plugin for ProgramTrackingPlugin {
             DATA.with(|data| {
                 let mut data = data.borrow_mut();
                 if let Some(slot_data) = data.remove(&block.slot) {
-                    let timestamp = block.block_time.unwrap_or(0) as i64;
+                    let timestamp = block.block_time.unwrap_or(0);
 
                     for (program_id, stats) in slot_data.iter() {
                         rows.push(ProgramEvent {

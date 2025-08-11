@@ -241,12 +241,12 @@ impl GeyserPlugin for Jetstreamer {
         sub_ranges.iter().enumerate().for_each(|(i, range)| {
             let thread_id = i as u8;
             let mut thread_slot_range = range.start..range.end + 1;
-            let thread_current_slot = range.start;
+            let initial_current_slot = range.start.checked_sub(1).unwrap_or(u64::MAX);
 
             thread_info_map.insert(thread_slot_range.clone(), thread_id);
             thread_slot_range.end -= 1;
             thread_set_slot_range(thread_id, thread_slot_range.start, thread_slot_range.end);
-            thread_set_current_slot(thread_id, thread_current_slot);
+            thread_set_current_slot(thread_id, initial_current_slot);
             thread_set_current_tx_index(thread_id, 0);
 
             // Ensure that the range is fully covered since we can't use RangeInclusive
@@ -332,12 +332,24 @@ impl GeyserPlugin for Jetstreamer {
             ReplicaBlockInfoVersions::V0_0_3(block_info) => block_info.slot,
             ReplicaBlockInfoVersions::V0_0_4(block_info) => block_info.slot,
         };
-        let processed_slots = PROCESSED_SLOTS.fetch_add(1, Ordering::SeqCst) + 1;
 
         let range_map = THREAD_INFO.get().unwrap();
         let thread_id = *range_map.get(&slot).unwrap();
-        let thread_slot_range_end = thread_slot_range_end(thread_id);
+        let last_slot = thread_current_slot(thread_id);
+        let increment = if last_slot == u64::MAX {
+            1
+        } else if slot > last_slot {
+            slot - last_slot
+        } else {
+            0
+        };
+        let processed_slots = if increment > 0 {
+            PROCESSED_SLOTS.fetch_add(increment, Ordering::SeqCst) + increment
+        } else {
+            PROCESSED_SLOTS.load(Ordering::SeqCst)
+        };
         thread_set_current_slot(thread_id, slot);
+        let thread_slot_range_end = thread_slot_range_end(thread_id);
 
         if slot >= thread_slot_range_end || processed_slots % 100 == 0 {
             let processed_txs = PROCESSED_TRANSACTIONS.load(Ordering::SeqCst);

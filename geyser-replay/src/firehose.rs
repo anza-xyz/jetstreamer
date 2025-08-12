@@ -526,17 +526,15 @@ async fn firehose_thread(
 
 pub fn generate_subranges(slot_range: &Range<u64>, threads: u8) -> Vec<Range<u64>> {
     let threads = threads as u64;
+    let total = slot_range.end - slot_range.start;
+
     (0..threads)
         .map(|i| {
-            let start = if i == 0 {
-                slot_range.start
-            } else {
-                slot_range.start + (slot_range.end - slot_range.start) * i / threads + 1
-            };
+            let start = slot_range.start + total * i / threads;
             let end = if i == threads - 1 {
                 slot_range.end
             } else {
-                slot_range.start + (slot_range.end - slot_range.start) * (i + 1) / threads
+                slot_range.start + total * (i + 1) / threads
             };
             start..end
         })

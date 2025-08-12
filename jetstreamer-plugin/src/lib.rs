@@ -184,7 +184,7 @@ impl PluginRunner {
                     if fast_path {
                         let plugin = &plugins[0];
                         let plugin_id = plugin_ids[0];
-                        handle_message(plugin.as_ref(), db.clone(), msg, plugin_id).await?;
+                        handle_message(plugin.as_ref(), db.clone(), msg.clone(), plugin_id).await?;
                     } else {
                         futures::future::join_all(plugins.iter().enumerate().map(|(i, plugin)| {
                             let plugin_id = plugin_ids[i];
@@ -195,6 +195,10 @@ impl PluginRunner {
                         .await
                         .into_iter()
                         .collect::<Result<Vec<_>, _>>()?;
+                    }
+
+                    if matches!(msg, JetstreamerMessage::Exit) {
+                        break;
                     }
                 }
 

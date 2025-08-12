@@ -240,18 +240,17 @@ impl GeyserPlugin for Jetstreamer {
         let mut thread_info_map = RangeMap::new();
         sub_ranges.iter().enumerate().for_each(|(i, range)| {
             let thread_id = i as u8;
-            let mut thread_slot_range = range.start..range.end + 1;
+            let inclusive_end = range.end - 1;
             let initial_current_slot = range.start.checked_sub(1).unwrap_or(u64::MAX);
 
-            thread_info_map.insert(thread_slot_range.clone(), thread_id);
-            thread_slot_range.end -= 1;
-            thread_set_slot_range(thread_id, thread_slot_range.start, thread_slot_range.end);
+            thread_info_map.insert(range.clone(), thread_id);
+            thread_set_slot_range(thread_id, range.start, inclusive_end);
             thread_set_current_slot(thread_id, initial_current_slot);
             thread_set_current_tx_index(thread_id, 0);
 
             // Ensure that the range is fully covered since we can't use RangeInclusive
-            assert!(*thread_info_map.get(&thread_slot_range.start).unwrap() == thread_id);
-            assert!(*thread_info_map.get(&thread_slot_range.end).unwrap() == thread_id);
+            assert!(*thread_info_map.get(&range.start).unwrap() == thread_id);
+            assert!(*thread_info_map.get(&inclusive_end).unwrap() == thread_id);
         });
         log::info!("thread info map: {:#?}", thread_info_map);
         THREAD_INFO.set(thread_info_map).unwrap();
@@ -338,7 +337,9 @@ impl GeyserPlugin for Jetstreamer {
         let last_slot = thread_current_slot(thread_id);
         let increment = if last_slot == u64::MAX {
             1
-        } else { slot.saturating_sub(last_slot) };
+        } else {
+            slot.saturating_sub(last_slot)
+        };
         let processed_slots = if increment > 0 {
             PROCESSED_SLOTS.fetch_add(increment, Ordering::SeqCst) + increment
         } else {
@@ -395,6 +396,7 @@ impl GeyserPlugin for Jetstreamer {
                 thread_id,
                 slot
             );
+            ipc_send(thread_id as usize, JetstreamerMessage::Exit);
 
             let complete_threads = COMPLETE_THREADS.fetch_add(1, Ordering::SeqCst) + 1;
             let jetstreamer_threads = range_map.len() as u8;

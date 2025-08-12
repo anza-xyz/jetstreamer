@@ -14,7 +14,6 @@ use std::{
         atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering},
     },
     time::Instant,
-    u64,
 };
 use thousands::Separable;
 use tokio::runtime::Runtime;

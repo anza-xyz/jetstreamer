@@ -237,7 +237,7 @@ async fn firehose_thread(
 
             // for each epoch
             let mut current_slot: Option<u64> = None;
-            for (epoch_num, stream) in
+            'epoch_loop: for (epoch_num, stream) in
                 epoch_range.map(|epoch| (epoch, fetch_epoch_stream(epoch, client)))
             {
                 log::info!(target: &log_target, "entering epoch {}", epoch_num);
@@ -300,11 +300,20 @@ async fn firehose_thread(
                         epoch_num,
                         block.slot
                     );
-                    current_slot = Some(block.slot);
-
-                    if !slot_range.contains(&block.slot) {
-                        unreachable!("entered out-of-bounds slot {}", block.slot);
+                    let slot = block.slot;
+                    if slot >= slot_range.end {
+                        log::info!("reached end of slot range at slot {}", slot);
+                        break 'epoch_loop;
                     }
+                    if slot < slot_range.start {
+                        log::warn!(
+                            "encountered slot {} before start of range {}, skipping",
+                            slot,
+                            slot_range.start
+                        );
+                        continue;
+                    }
+                    current_slot = Some(slot);
                     let mut entry_index: usize = 0;
                     let mut this_block_executed_transaction_count: u64 = 0;
                     let mut this_block_entry_count: u64 = 0;
@@ -495,7 +504,7 @@ async fn firehose_thread(
                             elapsed.as_secs_f32()
                         );
                         log::info!("a 🚒 firehose thread finished completed its work.");
-                        break;
+                        break 'epoch_loop;
                     }
                 }
             }

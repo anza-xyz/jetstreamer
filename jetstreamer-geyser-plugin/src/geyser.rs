@@ -9,6 +9,7 @@ use std::time::Duration;
 use std::{
     cell::RefCell,
     error::Error,
+    sync::Arc,
     sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering},
     time::Instant,
 };
@@ -45,24 +46,34 @@ impl std::fmt::Display for DurationFormatter {
     }
 }
 
-use crossbeam_channel::{Receiver, SendError, SendTimeoutError, Sender, bounded};
+use crossbeam_channel::{SendError, SendTimeoutError};
 use jetstreamer_plugin::{
-    // Plugin,
     bridge::{Block, Transaction},
-    ipc::{JetstreamerMessage, spawn_socket_server},
-    // plugins::program_tracking::ProgramTrackingPlugin,
+    ipc::JetstreamerMessage,
 };
+
+#[cfg(feature = "plugin-runner")]
+use crossbeam_channel::{Receiver, Sender, bounded};
+
+#[cfg(feature = "plugin-runner")]
+use jetstreamer_plugin::ipc::spawn_socket_server;
+
+#[cfg(not(feature = "plugin-runner"))]
+use jetstreamer_plugin::{Plugin, plugins::program_tracking::ProgramTrackingPlugin};
 
 thread_local! {
     static TOKIO_RUNTIME: RefCell<Runtime> = RefCell::new(Runtime::new().unwrap());
-    static DB_CLIENT: RefCell<::clickhouse::Client> = RefCell::new(::clickhouse::Client::default()
+    static DB_CLIENT: RefCell<Arc<::clickhouse::Client>> = RefCell::new(Arc::new(::clickhouse::Client::default()
             .with_url("http://localhost:8123")
             .with_option("async_insert", "1")
-            .with_option("wait_for_async_insert", "0"));
-    // static PLUGIN: RefCell<ProgramTrackingPlugin> = const { RefCell::new(ProgramTrackingPlugin) };
+            .with_option("wait_for_async_insert", "0")));
+    #[cfg(not(feature = "plugin-runner"))]
+    static PLUGIN: RefCell<ProgramTrackingPlugin> = const { RefCell::new(ProgramTrackingPlugin) };
 }
+#[cfg(feature = "plugin-runner")]
 static IPC_SENDERS: once_cell::sync::OnceCell<Vec<Sender<JetstreamerMessage>>> =
     once_cell::sync::OnceCell::new();
+#[cfg(feature = "plugin-runner")]
 static IPC_TASKS: once_cell::sync::OnceCell<Vec<tokio::task::JoinHandle<()>>> =
     once_cell::sync::OnceCell::new();
 
@@ -81,39 +92,48 @@ static THREAD_SLOT_RANGE_END: [AtomicU64; 256] = [const { AtomicU64::new(u64::MA
 static THREAD_CURRENT_TX_INDEX: [AtomicU32; 256] = [const { AtomicU32::new(u32::MAX) }; 256];
 static THREAD_INFO: once_cell::sync::OnceCell<RangeMap<u64, u8>> = once_cell::sync::OnceCell::new();
 
+#[inline(always)]
 pub fn thread_current_slot(thread_id: u8) -> u64 {
     THREAD_CURRENT_SLOT[thread_id as usize].load(Ordering::SeqCst)
 }
 
+#[inline(always)]
 pub fn thread_bump_current_slot(thread_id: u8) -> u64 {
     THREAD_CURRENT_SLOT[thread_id as usize].fetch_add(1, Ordering::SeqCst) + 1
 }
 
+#[inline(always)]
 pub fn thread_set_current_slot(thread_id: u8, slot: u64) {
     THREAD_CURRENT_SLOT[thread_id as usize].store(slot, Ordering::SeqCst);
 }
 
+#[inline(always)]
 pub fn thread_slot_range_start(thread_id: u8) -> u64 {
     THREAD_SLOT_RANGE_START[thread_id as usize].load(Ordering::SeqCst)
 }
 
+#[inline(always)]
 pub fn thread_slot_range_end(thread_id: u8) -> u64 {
     THREAD_SLOT_RANGE_END[thread_id as usize].load(Ordering::SeqCst)
 }
 
+#[inline(always)]
 pub fn thread_current_tx_index(thread_id: u8) -> u32 {
     THREAD_CURRENT_TX_INDEX[thread_id as usize].load(Ordering::SeqCst)
 }
 
+#[inline(always)]
 pub fn thread_set_slot_range(thread_id: u8, start: u64, end: u64) {
     THREAD_SLOT_RANGE_START[thread_id as usize].store(start, Ordering::SeqCst);
     THREAD_SLOT_RANGE_END[thread_id as usize].store(end, Ordering::SeqCst);
 }
 
+#[inline(always)]
 pub fn thread_bump_tx_index(thread_id: u8) -> u32 {
     THREAD_CURRENT_TX_INDEX[thread_id as usize].fetch_add(1, Ordering::SeqCst) + 1
 }
 
+#[inline(always)]
 pub fn thread_set_current_tx_index(thread_id: u8, index: u32) {
     THREAD_CURRENT_TX_INDEX[thread_id as usize].store(index, Ordering::SeqCst);
 }
@@ -178,21 +198,40 @@ impl From<SendError<JetstreamerMessage>> for IpcSendError {
     }
 }
 
+#[inline(always)]
+#[allow(unused_variables)]
 pub fn ipc_send(thread_id: usize, msg: JetstreamerMessage) {
-    let senders = IPC_SENDERS.get().expect("IPC_SENDERS not initialized");
-    let sender = &senders[thread_id];
-    let is_exit = msg == JetstreamerMessage::Exit;
+    #[cfg(feature = "plugin-runner")]
+    {
+        let senders = IPC_SENDERS.get().expect("IPC_SENDERS not initialized");
+        let sender = &senders[thread_id];
+        let is_exit = msg == JetstreamerMessage::Exit;
 
-    let _: std::result::Result<(), IpcSendError> = if is_exit {
-        sender
-            .send_timeout(msg, Duration::from_millis(50))
-            .map_err(|e| e.into())
-    } else {
-        sender.send(msg).map_err(|e| e.into())
-    };
+        let _: std::result::Result<(), IpcSendError> = if is_exit {
+            sender
+                .send_timeout(msg, Duration::from_millis(50))
+                .map_err(|e| e.into())
+        } else {
+            sender.send(msg).map_err(|e| e.into())
+        };
 
-    if is_exit {
-        log::info!("sent exit signal to client socket {}", thread_id);
+        if is_exit {
+            log::info!("sent exit signal to client socket {}", thread_id);
+        }
+    }
+    #[cfg(not(feature = "plugin-runner"))]
+    {
+        PLUGIN.with_borrow(|plugin| {
+            DB_CLIENT.with_borrow(|db| {
+                TOKIO_RUNTIME.with_borrow(|rt| {
+                    rt.block_on(async move {
+                        jetstreamer_plugin::handle_message(plugin, db.clone(), msg, plugin.id())
+                            .await
+                            .unwrap()
+                    });
+                });
+            });
+        });
     }
 }
 
@@ -300,27 +339,35 @@ impl GeyserPlugin for Jetstreamer {
                         log::info!("automatic ClickHouse spawning disabled, skipping ClickHouse initialization.");
                     }
 
-                    log::info!("setting up IPC bridges...");
-                    let mut ipc_senders = Vec::new();
-                    let mut ipc_tasks = Vec::new();
+                    #[cfg(feature = "plugin-runner")]
+                    {
+                        log::info!("setting up IPC bridges...");
+                        let mut ipc_senders = Vec::new();
+                        let mut ipc_tasks = Vec::new();
 
-                    for socket_id in 0..threads {
-                        let (sender, receiver): (Sender<JetstreamerMessage>, Receiver<JetstreamerMessage>) = bounded(1);
-                        let handle = spawn_socket_server(receiver, socket_id as usize)
-                            .await
-                            .map_err(|e| JetstreamerError::ClickHouseError(e.to_string()))?;
-                        ipc_senders.push(sender);
-                        ipc_tasks.push(handle);
+                        for socket_id in 0..threads {
+                            let (sender, receiver): (Sender<JetstreamerMessage>, Receiver<JetstreamerMessage>) = bounded(1);
+                            let handle = spawn_socket_server(receiver, socket_id as usize)
+                                .await
+                                .map_err(|e| JetstreamerError::ClickHouseError(e.to_string()))?;
+                            ipc_senders.push(sender);
+                            ipc_tasks.push(handle);
+                        }
+
+                        IPC_SENDERS.set(ipc_senders).unwrap();
+                        IPC_TASKS.set(ipc_tasks).unwrap();
+                        log::info!("IPC bridges initialized.");
                     }
 
-                    IPC_SENDERS.set(ipc_senders).unwrap();
-                    IPC_TASKS.set(ipc_tasks).unwrap();
-                    log::info!("IPC bridges initialized.");
-                    // log::info!("initializing program tracking plugin...");
-                    // let db = DB_CLIENT.with_borrow(|db| db.clone());
-                    // let plugin = PLUGIN.with_borrow(|plugin| plugin.clone());
-                    // plugin.on_load(db).await.unwrap();
-                    // log::info!("program tracking plugin initialized.");
+                    #[cfg(not(feature = "plugin-runner"))]
+                    {
+                        log::info!("initializing program tracking plugin...");
+                        let db = DB_CLIENT.with_borrow(|db| db.clone());
+                        let plugin = PLUGIN.with_borrow(|plugin| plugin.clone());
+                        plugin.on_load(db).await.unwrap();
+                        log::info!("program tracking plugin initialized.");
+                    }
+
                     START_TIME.set(Instant::now()).unwrap();
                     log::info!("jetstreamer loaded");
 
@@ -345,9 +392,6 @@ impl GeyserPlugin for Jetstreamer {
         if exiting() {
             return Ok(());
         }
-        // TX_INDEX.with_borrow_mut(|index| {
-        //     *index = 0;
-        // });
         let slot = match blockinfo {
             ReplicaBlockInfoVersions::V0_0_1(block_info) => block_info.slot,
             ReplicaBlockInfoVersions::V0_0_2(block_info) => block_info.slot,
@@ -426,6 +470,7 @@ impl GeyserPlugin for Jetstreamer {
         }
 
         let blk = Block::from_replica(blockinfo);
+
         ipc_send(thread_id as usize, JetstreamerMessage::Block(blk));
 
         if slot >= thread_slot_range_end {
@@ -501,6 +546,8 @@ fn exiting() -> bool {
     EXIT.load(std::sync::atomic::Ordering::SeqCst)
 }
 
+#[cfg(feature = "plugin-runner")]
+#[inline(always)]
 fn stop_ipc_bridge() {
     log::info!("stopping IPC bridges...");
     if let Some(handles) = IPC_TASKS.get() {
@@ -511,12 +558,15 @@ fn stop_ipc_bridge() {
     log::info!("IPC bridges stopped.");
 }
 
+#[inline(always)]
 fn stop_tx_queue() {
     log::info!("stopping queueing of transactions...");
     EXIT.store(true, std::sync::atomic::Ordering::SeqCst);
     log::info!("queueing of transactions has stopped.");
 }
 
+#[cfg(feature = "plugin-runner")]
+#[inline]
 fn send_exit_signal_to_clients() {
     log::info!("sending exit signal to clients...");
     let senders = IPC_SENDERS.get().expect("IPC_SENDERS not initialized");
@@ -527,12 +577,15 @@ fn send_exit_signal_to_clients() {
     log::info!("exit signal sent to clients.");
 }
 
+#[inline(always)]
 fn stop_clickhouse() {
     log::info!("stopping ClickHouse...");
     clickhouse::stop_sync();
     log::info!("ClickHouse stopped.");
 }
 
+#[cfg(feature = "plugin-runner")]
+#[inline(always)]
 fn clear_domain_sockets() {
     log::info!("clearing domain sockets...");
     let senders = IPC_SENDERS.get().expect("IPC_SENDERS not initialized");
@@ -547,9 +600,12 @@ fn clear_domain_sockets() {
 fn unload() {
     log::info!("jetstreamer unloading...");
     stop_tx_queue();
+    #[cfg(feature = "plugin-runner")]
     send_exit_signal_to_clients();
+    #[cfg(feature = "plugin-runner")]
     stop_ipc_bridge();
     stop_clickhouse();
+    #[cfg(feature = "plugin-runner")]
     clear_domain_sockets();
     log::info!("jetstreamer has successfully unloaded.");
     std::process::exit(0);

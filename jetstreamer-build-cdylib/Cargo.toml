@@ -9,6 +9,7 @@ doc = false
 
 [features]
 link-jetstreamer = []
+plugin-runner = ["jetstreamer-geyser-plugin/plugin-runner"]
 
 [dependencies]
 jetstreamer-geyser-plugin.workspace = true

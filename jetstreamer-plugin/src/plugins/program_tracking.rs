@@ -1,4 +1,4 @@
-use std::{cell::RefCell, collections::HashMap};
+use std::{cell::RefCell, collections::HashMap, sync::Arc};
 
 use clickhouse::{Client, Row};
 use futures_util::FutureExt;
@@ -47,7 +47,7 @@ impl Plugin for ProgramTrackingPlugin {
     #[inline(always)]
     fn on_transaction(
         &self,
-        _db: Client,
+        _db: Arc<Client>,
         transaction: Transaction,
         _tx_index: u32,
     ) -> PluginFuture<'_> {
@@ -91,7 +91,7 @@ impl Plugin for ProgramTrackingPlugin {
     }
 
     #[inline(always)]
-    fn on_block(&self, db: Client, block: Block) -> PluginFuture<'_> {
+    fn on_block(&self, db: Arc<Client>, block: Block) -> PluginFuture<'_> {
         async move {
             let mut rows = Vec::new();
 
@@ -129,7 +129,7 @@ impl Plugin for ProgramTrackingPlugin {
     }
 
     #[inline(always)]
-    fn on_load(&self, db: Client) -> PluginFuture<'_> {
+    fn on_load(&self, db: Arc<Client>) -> PluginFuture<'_> {
         // Remove invalid `get_or_init` call in `on_load`
         DATA.with(|_| {});
         // SLOT_TIMESTAMPS is a Lazy global, nothing to initialize
@@ -161,7 +161,7 @@ impl Plugin for ProgramTrackingPlugin {
     }
 
     #[inline(always)]
-    fn on_exit(&self, _db: Client) -> PluginFuture<'_> {
+    fn on_exit(&self, _db: Arc<Client>) -> PluginFuture<'_> {
         async move {
             log::info!("Program Tracking Plugin unloading...");
             Ok(())

@@ -42,15 +42,15 @@ pub trait Plugin: Send + Sync + 'static {
 
     fn on_transaction(
         &self,
-        db: Client,
+        db: Arc<Client>,
         transaction: Transaction,
         tx_index: u32,
     ) -> PluginFuture<'_>;
-    fn on_block(&self, db: Client, block: Block) -> PluginFuture<'_>;
-    fn on_load(&self, _db: Client) -> PluginFuture<'_> {
+    fn on_block(&self, db: Arc<Client>, block: Block) -> PluginFuture<'_>;
+    fn on_load(&self, _db: Arc<Client>) -> PluginFuture<'_> {
         async move { Ok(()) }.boxed()
     }
-    fn on_exit(&self, _db: Client) -> PluginFuture<'_> {
+    fn on_exit(&self, _db: Arc<Client>) -> PluginFuture<'_> {
         async move { Ok(()) }.boxed()
     }
 
@@ -144,8 +144,10 @@ impl PluginRunner {
         .await?;
 
         let mut handles = Vec::new();
+        let db = Arc::new(db);
 
         for thread_num in 0..self.num_threads {
+            let db = db.clone();
             let socket_name = format!("jetstreamer_{}.sock", thread_num);
             let ns_name = socket_name
                 .to_ns_name::<GenericNamespaced>()
@@ -218,9 +220,9 @@ impl PluginRunner {
 }
 
 #[inline(always)]
-async fn handle_message(
+pub async fn handle_message(
     plugin: &dyn Plugin,
-    db: Client,
+    db: Arc<Client>,
     msg: JetstreamerMessage,
     plugin_id: u16,
 ) -> Result<(), PluginRunnerError> {

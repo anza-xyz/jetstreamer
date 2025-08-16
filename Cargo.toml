@@ -81,6 +81,9 @@ jetstreamer-plugin.workspace = true
 [build-dependencies]
 jetstreamer-build-cdylib = { path = "jetstreamer-build-cdylib", version = "0.1.0", features = ["link-jetstreamer"] }
 
+[features]
+plugin-runner = ["jetstreamer-build-cdylib/plugin-runner"]
+
 [profile.release]
 lto = "fat"
 codegen-units = 1

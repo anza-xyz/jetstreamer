@@ -9,10 +9,7 @@ use std::time::Duration;
 use std::{
     cell::RefCell,
     error::Error,
-    sync::{
-        Mutex,
-        atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering},
-    },
+    sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering},
     time::Instant,
 };
 use thousands::Separable;
@@ -45,8 +42,6 @@ static PROCESSED_TRANSACTIONS: AtomicU64 = AtomicU64::new(0);
 static PROCESSED_SLOTS: AtomicU64 = AtomicU64::new(0);
 static NUM_VOTES: AtomicU64 = AtomicU64::new(0);
 static COMPLETE_THREADS: AtomicU8 = AtomicU8::new(0);
-
-static COMPUTE_CONSUMED: Mutex<u128> = Mutex::new(0);
 
 static START_TIME: once_cell::sync::OnceCell<Instant> = once_cell::sync::OnceCell::new();
 static SLOT_RANGE: once_cell::sync::OnceCell<Range<u64>> = once_cell::sync::OnceCell::new();
@@ -350,7 +345,6 @@ impl GeyserPlugin for Jetstreamer {
         if slot >= thread_slot_range_end || processed_slots % 100 == 0 {
             let processed_txs = PROCESSED_TRANSACTIONS.load(Ordering::SeqCst);
             let num_votes = NUM_VOTES.load(Ordering::SeqCst);
-            let compute_consumed = *COMPUTE_CONSUMED.lock().unwrap();
 
             let overall_tps = {
                 let start_time = START_TIME.get().unwrap();
@@ -360,28 +354,28 @@ impl GeyserPlugin for Jetstreamer {
 
             let epoch = slot_to_epoch(slot);
 
-            // let overall_slot_range = SLOT_RANGE.get().unwrap();
-            // let percent = processed_slots as f64
-            //     / (overall_slot_range.end - overall_slot_range.start) as f64
-            //     * 100.0;
+            let overall_slot_range = SLOT_RANGE.get().unwrap();
+            let overall_total_slots = overall_slot_range.end - overall_slot_range.start;
+            let overall_percent = processed_slots as f64 / overall_total_slots as f64 * 100.0;
 
             let thread_slot_range_start = thread_slot_range_start(thread_id);
-            let thread_percent = {
-                (slot - thread_slot_range_start) as f64
-                    / (thread_slot_range_end - thread_slot_range_start) as f64
-                    * 100.0
-            };
+            let thread_total_slots = thread_slot_range_end - thread_slot_range_start + 1;
+            let thread_slots_processed = slot - thread_slot_range_start + 1;
+            let thread_percent = thread_slots_processed as f64 / thread_total_slots as f64 * 100.0;
 
             log::info!(
-                "thread {} at slot {} epoch {} ({:.2}%), processed {} txs ({} non-vote) using {} CU across {} slots | AVG TPS: {:.3}",
+                "thread {} {}::{} | {}/{} ({:.2}%) | overall {}/{} ({:.2}%) | {} txs ({} non-vote) | AVG TPS: {:.3}",
                 thread_id,
-                slot,
                 epoch,
+                slot,
+                thread_slots_processed.separate_with_commas(),
+                thread_total_slots.separate_with_commas(),
                 thread_percent,
+                processed_slots.separate_with_commas(),
+                overall_total_slots.separate_with_commas(),
+                overall_percent,
                 processed_txs.separate_with_commas(),
                 (processed_txs - num_votes).separate_with_commas(),
-                compute_consumed.separate_with_commas(),
-                processed_slots.separate_with_commas(),
                 overall_tps
             );
         }
@@ -425,18 +419,6 @@ impl GeyserPlugin for Jetstreamer {
     ) -> Result<()> {
         if exiting() {
             return Ok(());
-        }
-        match transaction {
-            ReplicaTransactionInfoVersions::V0_0_1(tx) => {
-                if let Some(consumed) = tx.transaction_status_meta.compute_units_consumed {
-                    *COMPUTE_CONSUMED.lock().unwrap() += u128::from(consumed);
-                }
-            }
-            ReplicaTransactionInfoVersions::V0_0_2(tx) => {
-                if let Some(consumed) = tx.transaction_status_meta.compute_units_consumed {
-                    *COMPUTE_CONSUMED.lock().unwrap() += u128::from(consumed);
-                }
-            }
         }
         PROCESSED_TRANSACTIONS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let tx = Transaction::from_replica(slot, transaction);

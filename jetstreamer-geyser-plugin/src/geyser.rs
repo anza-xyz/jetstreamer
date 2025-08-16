@@ -16,6 +16,35 @@ use thousands::Separable;
 use tokio::runtime::Runtime;
 
 use crate::clickhouse;
+
+/// Formats a duration in a human-readable way without allocating
+struct DurationFormatter {
+    duration: Duration,
+}
+
+impl DurationFormatter {
+    fn new(duration: Duration) -> Self {
+        Self { duration }
+    }
+}
+
+impl std::fmt::Display for DurationFormatter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let total_seconds = self.duration.as_secs();
+        let hours = total_seconds / 3600;
+        let minutes = (total_seconds % 3600) / 60;
+        let seconds = total_seconds % 60;
+
+        if hours > 0 {
+            write!(f, "{}h {}m {}s", hours, minutes, seconds)
+        } else if minutes > 0 {
+            write!(f, "{}m {}s", minutes, seconds)
+        } else {
+            write!(f, "{}s", seconds)
+        }
+    }
+}
+
 use crossbeam_channel::{Receiver, SendError, SendTimeoutError, Sender, bounded};
 use jetstreamer_plugin::{
     // Plugin,
@@ -358,13 +387,28 @@ impl GeyserPlugin for Jetstreamer {
             let overall_total_slots = overall_slot_range.end - overall_slot_range.start;
             let overall_percent = processed_slots as f64 / overall_total_slots as f64 * 100.0;
 
+            // Calculate estimated time remaining
+            let estimated_time_remaining = {
+                let start_time = START_TIME.get().unwrap();
+                let elapsed = start_time.elapsed();
+                if overall_percent > 0.0 {
+                    let estimated_total_duration =
+                        elapsed.as_secs_f64() / (overall_percent / 100.0);
+                    let remaining_duration =
+                        Duration::from_secs_f64(estimated_total_duration - elapsed.as_secs_f64());
+                    DurationFormatter::new(remaining_duration)
+                } else {
+                    DurationFormatter::new(Duration::ZERO)
+                }
+            };
+
             let thread_slot_range_start = thread_slot_range_start(thread_id);
             let thread_total_slots = thread_slot_range_end - thread_slot_range_start + 1;
             let thread_slots_processed = slot - thread_slot_range_start + 1;
             let thread_percent = thread_slots_processed as f64 / thread_total_slots as f64 * 100.0;
 
             log::info!(
-                "thread {} {}::{} | {}/{} ({:.2}%) | overall {}/{} ({:.2}%) | {} txs ({} non-vote) | AVG TPS: {:.3}",
+                "thread {} {}::{} | {}/{} ({:.2}%) | overall {}/{} ({:.2}%) | {} txs ({} non-vote) | AVG TPS: {:.3} | ETA: {}",
                 thread_id,
                 epoch,
                 slot,
@@ -376,7 +420,8 @@ impl GeyserPlugin for Jetstreamer {
                 overall_percent,
                 processed_txs.separate_with_commas(),
                 (processed_txs - num_votes).separate_with_commas(),
-                overall_tps
+                overall_tps,
+                estimated_time_remaining
             );
         }
 

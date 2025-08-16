@@ -85,8 +85,10 @@ jetstreamer-build-cdylib = { path = "jetstreamer-build-cdylib", version = "0.1.0
 plugin-runner = ["jetstreamer-build-cdylib/plugin-runner"]
 
 [profile.release]
-lto = "fat"
+lto = true
 codegen-units = 1
+opt-level = 3
 
 [profile.release.package."*"]
 opt-level = 3
+codegen-units = 1

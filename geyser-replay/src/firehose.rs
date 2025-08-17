@@ -1,6 +1,5 @@
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use demo_rust_ipld_car::utils;
-use rayon::prelude::*;
 use reqwest::Client;
 use solana_geyser_plugin_manager::{
     block_metadata_notifier_interface::BlockMetadataNotifier,
@@ -117,9 +116,6 @@ pub async fn firehose(
             slot_range.start,
         ));
     }
-    let _ = rayon::ThreadPoolBuilder::new()
-        .num_threads(threads as usize)
-        .build_global();
     log::info!("starting firehose...");
     let (confirmed_bank_sender, confirmed_bank_receiver) = unbounded();
     let mut entry_notifier_maybe = None;
@@ -170,18 +166,19 @@ pub async fn firehose(
         log::info!("⚡ thread sub-ranges: {:?}", subranges);
     }
 
-    subranges
-        .into_iter()
-        .enumerate()
-        .par_bridge()
-        .for_each(|(i, slot_range)| {
-            let transaction_notifier_maybe = (*transaction_notifier_maybe).clone();
-            let entry_notifier_maybe = (*entry_notifier_maybe).clone();
-            let block_meta_notifier_maybe = (*block_meta_notifier_maybe).clone();
-            let confirmed_bank_sender = (*confirmed_bank_sender).clone();
+    let mut handles = Vec::new();
 
-            let slot_offset_index_path = slot_offset_index_path.as_ref().to_owned();
-            tokio::runtime::Runtime::new().unwrap().block_on(async {
+    for (i, slot_range) in subranges.into_iter().enumerate() {
+        let transaction_notifier_maybe = (*transaction_notifier_maybe).clone();
+        let entry_notifier_maybe = (*entry_notifier_maybe).clone();
+        let block_meta_notifier_maybe = (*block_meta_notifier_maybe).clone();
+        let confirmed_bank_sender = (*confirmed_bank_sender).clone();
+        let slot_offset_index_path = slot_offset_index_path.as_ref().to_owned();
+        let client = client.clone();
+
+        let handle = std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async {
                 firehose_thread(
                     slot_range,
                     slot_offset_index_path,
@@ -189,13 +186,20 @@ pub async fn firehose(
                     entry_notifier_maybe,
                     block_meta_notifier_maybe,
                     confirmed_bank_sender,
-                    client,
+                    &client,
                     if threads > 1 { Some(i) } else { None },
                 )
                 .await
                 .unwrap();
             });
         });
+        handles.push(handle);
+    }
+
+    // Wait for all threads to complete
+    for handle in handles {
+        handle.join().unwrap();
+    }
     log::info!("🚒 firehose finished successfully.");
     Ok(confirmed_bank_receiver)
 }

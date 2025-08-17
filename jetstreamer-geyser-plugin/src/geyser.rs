@@ -438,8 +438,12 @@ impl GeyserPlugin for Jetstreamer {
                 if overall_percent > 0.0 {
                     let estimated_total_duration =
                         elapsed.as_secs_f64() / (overall_percent / 100.0);
-                    let remaining_duration =
-                        Duration::from_secs_f64(estimated_total_duration - elapsed.as_secs_f64());
+                    let remaining_seconds = estimated_total_duration - elapsed.as_secs_f64();
+                    let remaining_duration = if remaining_seconds > 0.0 {
+                        Duration::from_secs_f64(remaining_seconds)
+                    } else {
+                        Duration::ZERO
+                    };
                     DurationFormatter::new(remaining_duration)
                 } else {
                     DurationFormatter::new(Duration::ZERO)

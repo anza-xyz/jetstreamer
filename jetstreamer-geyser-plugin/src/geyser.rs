@@ -32,11 +32,14 @@ impl DurationFormatter {
 impl std::fmt::Display for DurationFormatter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let total_seconds = self.duration.as_secs();
-        let hours = total_seconds / 3600;
+        let days = total_seconds / 86400;
+        let hours = (total_seconds % 86400) / 3600;
         let minutes = (total_seconds % 3600) / 60;
         let seconds = total_seconds % 60;
 
-        if hours > 0 {
+        if days > 0 {
+            write!(f, "{}d {}h {}m", days, hours, minutes)
+        } else if hours > 0 {
             write!(f, "{}h {}m {}s", hours, minutes, seconds)
         } else if minutes > 0 {
             write!(f, "{}m {}s", minutes, seconds)
@@ -405,10 +408,23 @@ impl GeyserPlugin for Jetstreamer {
         let increment = if last_slot == u64::MAX {
             1
         } else {
-            slot.saturating_sub(last_slot)
+            // Only count as increment if this slot is after the last one
+            if slot > last_slot {
+                slot - last_slot
+            } else {
+                0
+            }
         };
         let processed_slots = if increment > 0 {
-            PROCESSED_SLOTS.fetch_add(increment, Ordering::SeqCst) + increment
+            let new_total = PROCESSED_SLOTS.fetch_add(increment, Ordering::SeqCst) + increment;
+            // Debug log when we see large increments that might indicate an issue
+            if increment > 1000 {
+                log::warn!(
+                    "Large slot increment detected: thread {} jumped from {} to {} (increment: {})",
+                    thread_id, last_slot, slot, increment
+                );
+            }
+            new_total
         } else {
             PROCESSED_SLOTS.load(Ordering::SeqCst)
         };
@@ -429,45 +445,71 @@ impl GeyserPlugin for Jetstreamer {
 
             let overall_slot_range = SLOT_RANGE.get().unwrap();
             let overall_total_slots = overall_slot_range.end - overall_slot_range.start;
+            // processed_slots counts individual slot progressions across all threads
+            // overall_total_slots is the total slot range being processed
+            // These are the same value, so progress should never exceed 100%
             let overall_percent = processed_slots as f64 / overall_total_slots as f64 * 100.0;
 
             // Calculate estimated time remaining based on slowest thread
-            let estimated_time_remaining = {
-                let start_time = START_TIME.get().unwrap();
-                let elapsed = start_time.elapsed();
+            let start_time = START_TIME.get().unwrap();
+            let elapsed = start_time.elapsed();
 
-                // Find the slowest thread (minimum progress percentage)
-                let mut slowest_progress = 100.0f64;
+            // Find the slowest thread (minimum progress percentage)
+            let mut slowest_progress = 100.0f64;
+            let mut slowest_thread_id = 255u8;
+            let mut active_threads = 0u32;
 
-                for thread_id in 0u8..=255 {
-                    let current_slot =
-                        THREAD_CURRENT_SLOT[thread_id as usize].load(Ordering::SeqCst);
-                    let range_start =
-                        THREAD_SLOT_RANGE_START[thread_id as usize].load(Ordering::SeqCst);
-                    let range_end =
-                        THREAD_SLOT_RANGE_END[thread_id as usize].load(Ordering::SeqCst);
+            for thread_id in 0u8..=255 {
+                let current_slot = THREAD_CURRENT_SLOT[thread_id as usize].load(Ordering::SeqCst);
+                let range_start =
+                    THREAD_SLOT_RANGE_START[thread_id as usize].load(Ordering::SeqCst);
+                let range_end = THREAD_SLOT_RANGE_END[thread_id as usize].load(Ordering::SeqCst);
 
-                    // Skip threads that haven't been initialized or are inactive
-                    if current_slot == u64::MAX || range_start == u64::MAX || range_end == u64::MAX
-                    {
-                        continue;
-                    }
-
-                    let thread_total_slots = range_end - range_start + 1;
-                    let thread_slots_processed = if current_slot >= range_start {
-                        current_slot - range_start + 1
-                    } else {
-                        0
-                    };
-                    let thread_progress =
-                        thread_slots_processed as f64 / thread_total_slots as f64 * 100.0;
-
-                    if thread_progress < slowest_progress {
-                        slowest_progress = thread_progress;
-                    }
+                // Skip threads that haven't been initialized or are inactive
+                if current_slot == u64::MAX || range_start == u64::MAX || range_end == u64::MAX {
+                    continue;
                 }
 
-                if slowest_progress > 0.0 {
+                active_threads += 1;
+                let thread_total_slots = range_end - range_start + 1;
+                let thread_slots_processed = if current_slot == u64::MAX {
+                    // Thread hasn't started yet
+                    0
+                } else if current_slot < range_start {
+                    // Thread is at its initial position (range_start - 1)
+                    0
+                } else {
+                    // Thread has processed slots from range_start to current_slot (inclusive)
+                    (current_slot - range_start + 1).min(thread_total_slots)
+                };
+                let thread_progress =
+                    thread_slots_processed as f64 / thread_total_slots as f64 * 100.0;
+
+                // Sanity check for thread progress
+                if thread_progress > 100.0 {
+                    log::warn!(
+                        "Thread {} has invalid progress: {:.2}% ({} processed / {} total, current_slot: {}, range: {}..{})",
+                        thread_id,
+                        thread_progress,
+                        thread_slots_processed,
+                        thread_total_slots,
+                        current_slot,
+                        range_start,
+                        range_end
+                    );
+                    continue;
+                }
+
+                if thread_progress < slowest_progress {
+                    slowest_progress = thread_progress;
+                    slowest_thread_id = thread_id;
+                }
+            }
+
+            let estimated_time_remaining = {
+                // Only calculate ETA if we have meaningful progress (at least 0.1%)
+                // to avoid extremely inflated estimates from tiny progress values
+                if slowest_progress >= 0.1 && active_threads > 0 {
                     let estimated_total_duration =
                         elapsed.as_secs_f64() / (slowest_progress / 100.0);
                     let remaining_seconds = estimated_total_duration - elapsed.as_secs_f64();
@@ -488,7 +530,7 @@ impl GeyserPlugin for Jetstreamer {
             let thread_percent = thread_slots_processed as f64 / thread_total_slots as f64 * 100.0;
 
             log::info!(
-                "thread {} {}::{} | {}/{} ({:.2}%) | overall {}/{} ({:.2}%) | {} txs ({} non-vote) | AVG TPS: {:.3} | ETA: {}",
+                "thread {} {}::{} | {}/{} ({:.2}%) | overall {}/{} ({:.2}%) | {} txs ({} non-vote) | AVG TPS: {:.3} | ETA: {} (slowest: T{}@{:.1}%)",
                 thread_id,
                 epoch,
                 slot,
@@ -501,7 +543,9 @@ impl GeyserPlugin for Jetstreamer {
                 processed_txs.separate_with_commas(),
                 (processed_txs - num_votes).separate_with_commas(),
                 overall_tps,
-                estimated_time_remaining
+                estimated_time_remaining,
+                slowest_thread_id,
+                slowest_progress
             );
         }
 

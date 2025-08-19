@@ -431,13 +431,45 @@ impl GeyserPlugin for Jetstreamer {
             let overall_total_slots = overall_slot_range.end - overall_slot_range.start;
             let overall_percent = processed_slots as f64 / overall_total_slots as f64 * 100.0;
 
-            // Calculate estimated time remaining
+            // Calculate estimated time remaining based on slowest thread
             let estimated_time_remaining = {
                 let start_time = START_TIME.get().unwrap();
                 let elapsed = start_time.elapsed();
-                if overall_percent > 0.0 {
+
+                // Find the slowest thread (minimum progress percentage)
+                let mut slowest_progress = 100.0f64;
+
+                for thread_id in 0u8..=255 {
+                    let current_slot =
+                        THREAD_CURRENT_SLOT[thread_id as usize].load(Ordering::SeqCst);
+                    let range_start =
+                        THREAD_SLOT_RANGE_START[thread_id as usize].load(Ordering::SeqCst);
+                    let range_end =
+                        THREAD_SLOT_RANGE_END[thread_id as usize].load(Ordering::SeqCst);
+
+                    // Skip threads that haven't been initialized or are inactive
+                    if current_slot == u64::MAX || range_start == u64::MAX || range_end == u64::MAX
+                    {
+                        continue;
+                    }
+
+                    let thread_total_slots = range_end - range_start + 1;
+                    let thread_slots_processed = if current_slot >= range_start {
+                        current_slot - range_start + 1
+                    } else {
+                        0
+                    };
+                    let thread_progress =
+                        thread_slots_processed as f64 / thread_total_slots as f64 * 100.0;
+
+                    if thread_progress < slowest_progress {
+                        slowest_progress = thread_progress;
+                    }
+                }
+
+                if slowest_progress > 0.0 {
                     let estimated_total_duration =
-                        elapsed.as_secs_f64() / (overall_percent / 100.0);
+                        elapsed.as_secs_f64() / (slowest_progress / 100.0);
                     let remaining_seconds = estimated_total_duration - elapsed.as_secs_f64();
                     let remaining_duration = if remaining_seconds > 0.0 {
                         Duration::from_secs_f64(remaining_seconds)

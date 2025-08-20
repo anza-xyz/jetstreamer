@@ -228,9 +228,16 @@ pub fn ipc_send(thread_id: usize, msg: JetstreamerMessage) {
             DB_CLIENT.with_borrow(|db| {
                 TOKIO_RUNTIME.with_borrow(|rt| {
                     rt.block_on(async move {
-                        jetstreamer_plugin::handle_message(plugin, db.clone(), msg, plugin.id())
+                        if let Err(e) = jetstreamer_plugin::handle_message(plugin, db.clone(), msg, plugin.id())
                             .await
-                            .unwrap()
+                        {
+                            // Don't panic on ClickHouse connection errors during shutdown
+                            if exiting() {
+                                log::debug!("Ignoring ClickHouse error during shutdown: {}", e);
+                            } else {
+                                log::error!("ClickHouse error: {}", e);
+                            }
+                        }
                     });
                 });
             });
@@ -367,7 +374,10 @@ impl GeyserPlugin for Jetstreamer {
                         log::info!("initializing program tracking plugin...");
                         let db = DB_CLIENT.with_borrow(|db| db.clone());
                         let plugin = PLUGIN.with_borrow(|plugin| plugin.clone());
-                        plugin.on_load(db).await.unwrap();
+                        if let Err(e) = plugin.on_load(db).await {
+                            log::error!("Failed to initialize plugin: {}", e);
+                            return Err(JetstreamerError::ClickHouseError(e.to_string()));
+                        }
                         log::info!("program tracking plugin initialized.");
                     }
 

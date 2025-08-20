@@ -228,8 +228,9 @@ pub fn ipc_send(thread_id: usize, msg: JetstreamerMessage) {
             DB_CLIENT.with_borrow(|db| {
                 TOKIO_RUNTIME.with_borrow(|rt| {
                     rt.block_on(async move {
-                        if let Err(e) = jetstreamer_plugin::handle_message(plugin, db.clone(), msg, plugin.id())
-                            .await
+                        if let Err(e) =
+                            jetstreamer_plugin::handle_message(plugin, db.clone(), msg, plugin.id())
+                                .await
                         {
                             // Don't panic on ClickHouse connection errors during shutdown
                             if exiting() {
@@ -431,7 +432,10 @@ impl GeyserPlugin for Jetstreamer {
             if increment > 1000 {
                 log::warn!(
                     "Large slot increment detected: thread {} jumped from {} to {} (increment: {})",
-                    thread_id, last_slot, slot, increment
+                    thread_id,
+                    last_slot,
+                    slot,
+                    increment
                 );
             }
             new_total
@@ -517,9 +521,8 @@ impl GeyserPlugin for Jetstreamer {
             }
 
             let estimated_time_remaining = {
-                // Only calculate ETA if we have meaningful progress (at least 0.1%)
-                // to avoid extremely inflated estimates from tiny progress values
-                if slowest_progress >= 0.1 && active_threads > 0 {
+                // Calculate ETA based on slowest thread progress
+                if slowest_progress > 0.0 && active_threads > 0 {
                     let estimated_total_duration =
                         elapsed.as_secs_f64() / (slowest_progress / 100.0);
                     let remaining_seconds = estimated_total_duration - elapsed.as_secs_f64();

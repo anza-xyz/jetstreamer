@@ -420,11 +420,8 @@ impl GeyserPlugin for Jetstreamer {
             1
         } else {
             // Only count as increment if this slot is after the last one
-            if slot > last_slot {
-                slot - last_slot
-            } else {
-                0
-            }
+            // Each notification represents ONE slot processed, regardless of gaps
+            if slot > last_slot { 1 } else { 0 }
         };
         let processed_slots = if increment > 0 {
             let new_total = PROCESSED_SLOTS.fetch_add(increment, Ordering::SeqCst) + increment;
@@ -517,6 +514,23 @@ impl GeyserPlugin for Jetstreamer {
                 // Skip threads with 0% progress for ETA calculation to avoid restart artifacts
                 // These threads might be restarting due to network errors and temporarily show 0%
                 if thread_progress <= 0.0 {
+                    log::debug!(
+                        "Excluding thread {} from ETA calculation: 0% progress (current_slot: {}, range: {}..{})",
+                        thread_id,
+                        current_slot,
+                        range_start,
+                        range_end
+                    );
+                    continue;
+                }
+
+                // Also skip threads with very low progress that might be restart artifacts
+                if thread_progress < 0.01 {
+                    log::debug!(
+                        "Excluding thread {} from ETA calculation: very low progress {:.3}%",
+                        thread_id,
+                        thread_progress
+                    );
                     continue;
                 }
 

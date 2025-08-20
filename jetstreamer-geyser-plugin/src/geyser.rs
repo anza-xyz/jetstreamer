@@ -416,12 +416,30 @@ impl GeyserPlugin for Jetstreamer {
         let range_map = THREAD_INFO.get().unwrap();
         let thread_id = *range_map.get(&slot).unwrap();
         let last_slot = thread_current_slot(thread_id);
+
         let increment = if last_slot == u64::MAX {
             1
+        } else if slot > last_slot {
+            // Normal forward progress - count 1 slot
+            1
+        } else if slot <= last_slot {
+            // Thread has restarted or is replaying - check if we need to adjust overall count
+            // If thread went backwards significantly, we may have double-counted slots
+            if last_slot - slot > 1000 {
+                log::warn!(
+                    "Thread {} restarted: went from slot {} back to {} (gap: {})",
+                    thread_id,
+                    last_slot,
+                    slot,
+                    last_slot - slot
+                );
+                // Note: We don't subtract from PROCESSED_SLOTS here because we can't be sure
+                // exactly how many slots were double-counted without complex state tracking.
+                // This is a design limitation that should be addressed in future versions.
+            }
+            0
         } else {
-            // Only count as increment if this slot is after the last one
-            // Each notification represents ONE slot processed, regardless of gaps
-            if slot > last_slot { 1 } else { 0 }
+            0
         };
         let processed_slots = if increment > 0 {
             let new_total = PROCESSED_SLOTS.fetch_add(increment, Ordering::SeqCst) + increment;
@@ -511,29 +529,6 @@ impl GeyserPlugin for Jetstreamer {
                     continue;
                 }
 
-                // Skip threads with 0% progress for ETA calculation to avoid restart artifacts
-                // These threads might be restarting due to network errors and temporarily show 0%
-                if thread_progress <= 0.0 {
-                    log::debug!(
-                        "Excluding thread {} from ETA calculation: 0% progress (current_slot: {}, range: {}..{})",
-                        thread_id,
-                        current_slot,
-                        range_start,
-                        range_end
-                    );
-                    continue;
-                }
-
-                // Also skip threads with very low progress that might be restart artifacts
-                if thread_progress < 0.01 {
-                    log::debug!(
-                        "Excluding thread {} from ETA calculation: very low progress {:.3}%",
-                        thread_id,
-                        thread_progress
-                    );
-                    continue;
-                }
-
                 if thread_progress < slowest_progress {
                     slowest_progress = thread_progress;
                     slowest_thread_id = thread_id;
@@ -542,22 +537,9 @@ impl GeyserPlugin for Jetstreamer {
 
             let estimated_time_remaining = {
                 // Calculate ETA based on slowest thread progress
-                // If slowest_progress is still 100.0, it means we filtered out all threads
-                // (likely due to restarts), so fall back to overall progress
-                if slowest_progress < 100.0 && slowest_progress > 0.0 && active_threads > 0 {
+                if slowest_progress > 0.0 && active_threads > 0 {
                     let estimated_total_duration =
                         elapsed.as_secs_f64() / (slowest_progress / 100.0);
-                    let remaining_seconds = estimated_total_duration - elapsed.as_secs_f64();
-                    let remaining_duration = if remaining_seconds > 0.0 {
-                        Duration::from_secs_f64(remaining_seconds)
-                    } else {
-                        Duration::ZERO
-                    };
-                    DurationFormatter::new(remaining_duration)
-                } else if overall_percent > 0.0 {
-                    // Fallback to overall progress if no valid thread progress is available
-                    let estimated_total_duration =
-                        elapsed.as_secs_f64() / (overall_percent / 100.0);
                     let remaining_seconds = estimated_total_duration - elapsed.as_secs_f64();
                     let remaining_duration = if remaining_seconds > 0.0 {
                         Duration::from_secs_f64(remaining_seconds)
@@ -583,14 +565,8 @@ impl GeyserPlugin for Jetstreamer {
             };
             let thread_percent = thread_slots_processed as f64 / thread_total_slots as f64 * 100.0;
 
-            let eta_description = if slowest_progress < 100.0 && slowest_progress > 0.0 {
-                format!("slowest: T{}@{:.1}%", slowest_thread_id, slowest_progress)
-            } else {
-                format!("overall: {:.1}%", overall_percent)
-            };
-
             log::info!(
-                "T{} {}:{} | {}/{} ({:.2}%) | overall {}/{} ({:.2}%) | {} txs ({} non-vote) | TPS: {:.3} | ETA: {} ({})",
+                "T{} {}:{} | {}/{} ({:.2}%) | overall {}/{} ({:.2}%) | {} txs ({} non-vote) | TPS: {:.3} | ETA: {} (slowest: T{}@{:.1}%)",
                 thread_id,
                 epoch,
                 slot,
@@ -604,7 +580,8 @@ impl GeyserPlugin for Jetstreamer {
                 (processed_txs - num_votes).separate_with_commas(),
                 overall_tps,
                 estimated_time_remaining,
-                eta_description
+                slowest_thread_id,
+                slowest_progress
             );
         }
 

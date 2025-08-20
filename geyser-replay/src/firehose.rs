@@ -205,7 +205,7 @@ pub async fn firehose(
 }
 
 async fn firehose_thread(
-    slot_range: Range<u64>,
+    mut slot_range: Range<u64>,
     slot_offset_index_path: impl AsRef<Path>,
     transaction_notifier_maybe: Option<Arc<dyn TransactionNotifier + Send + Sync + 'static>>,
     entry_notifier_maybe: Option<Arc<dyn EntryNotifier + Send + Sync + 'static>>,
@@ -529,6 +529,8 @@ async fn firehose_thread(
                 slot,
                 item_index,
             );
+            // Update slot range to resume from the failed slot, not the original start
+            slot_range.start = slot;
             skip_until_index = Some(item_index);
         } else {
             break;

@@ -559,9 +559,12 @@ impl GeyserPlugin for Jetstreamer {
             let thread_slots_processed = if slot < thread_slot_range_start {
                 // Thread is at its initial position (range_start - 1) due to restart
                 0
+            } else if slot > range_end {
+                // Thread has completed its range
+                thread_total_slots
             } else {
-                // Thread has processed slots from range_start to current slot (inclusive)
-                (slot - thread_slot_range_start + 1).min(thread_total_slots)
+                // Thread has processed slots from range_start to current slot (exclusive)
+                slot - thread_slot_range_start + 1
             };
             let thread_percent = thread_slots_processed as f64 / thread_total_slots as f64 * 100.0;
 
@@ -589,7 +592,7 @@ impl GeyserPlugin for Jetstreamer {
 
         ipc_send(thread_id as usize, JetstreamerMessage::Block(blk));
 
-        if slot >= range_end {
+        if slot > range_end {
             log::info!(
                 "thread {} finished processing slot {} and has completed its work",
                 thread_id,
@@ -618,7 +621,7 @@ impl GeyserPlugin for Jetstreamer {
                     let current_slot = thread_current_slot(*thread_id);
                     let range_start = thread_slot_range_start(*thread_id);
                     let range_end = thread_slot_range_end(*thread_id);
-                    if current_slot < range_end - 1 {
+                    if current_slot <= range_end {
                         log::info!(
                             "Thread {} incomplete: current_slot={}, range={}..{}, progress={:.2}%",
                             thread_id,
@@ -627,9 +630,11 @@ impl GeyserPlugin for Jetstreamer {
                             range_end,
                             if current_slot == u64::MAX {
                                 0.0
+                            } else if current_slot > range_end {
+                                100.0
                             } else {
                                 (current_slot - range_start + 1) as f64
-                                    / (range_end - range_start) as f64
+                                    / (range_end - range_start + 1) as f64
                                     * 100.0
                             }
                         );

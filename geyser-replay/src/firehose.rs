@@ -224,7 +224,7 @@ async fn firehose_thread(
     // let mut triggered = false;
     loop {
         if let Err((err, slot)) = async {
-            let epoch_range = slot_to_epoch(slot_range.start)..=slot_to_epoch(slot_range.end);
+            let epoch_range = slot_to_epoch(slot_range.start)..=slot_to_epoch(slot_range.end - 1);
             log::info!(
                 target: &log_target,
                 "slot range: {} (epoch {}) ... {} (epoch {})",

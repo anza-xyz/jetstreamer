@@ -458,9 +458,9 @@ impl GeyserPlugin for Jetstreamer {
             PROCESSED_SLOTS.load(Ordering::SeqCst)
         };
         thread_set_current_slot(thread_id, slot);
-        let thread_slot_range_end = thread_slot_range_end(thread_id);
+        let range_end = thread_slot_range_end(thread_id);
 
-        if slot >= thread_slot_range_end || processed_slots % 100 == 0 {
+        if slot >= range_end || processed_slots % 100 == 0 {
             let processed_txs = PROCESSED_TRANSACTIONS.load(Ordering::SeqCst);
             let num_votes = NUM_VOTES.load(Ordering::SeqCst);
 
@@ -553,7 +553,7 @@ impl GeyserPlugin for Jetstreamer {
             };
 
             let thread_slot_range_start = thread_slot_range_start(thread_id);
-            let thread_total_slots = thread_slot_range_end - thread_slot_range_start + 1;
+            let thread_total_slots = range_end - thread_slot_range_start + 1;
 
             // Use consistent logic for both ETA and display calculations
             let thread_slots_processed = if slot < thread_slot_range_start {
@@ -589,7 +589,7 @@ impl GeyserPlugin for Jetstreamer {
 
         ipc_send(thread_id as usize, JetstreamerMessage::Block(blk));
 
-        if slot >= thread_slot_range_end {
+        if slot >= range_end {
             log::info!(
                 "thread {} finished processing slot {} and has completed its work",
                 thread_id,
@@ -612,6 +612,29 @@ impl GeyserPlugin for Jetstreamer {
                     "waiting for {} more threads to complete their work",
                     jetstreamer_threads - complete_threads
                 );
+
+                // Debug: Log status of incomplete threads
+                for (_slot, thread_id) in range_map.iter() {
+                    let current_slot = thread_current_slot(*thread_id);
+                    let range_start = thread_slot_range_start(*thread_id);
+                    let range_end = thread_slot_range_end(*thread_id);
+                    if current_slot < range_end - 1 {
+                        log::info!(
+                            "Thread {} incomplete: current_slot={}, range={}..{}, progress={:.2}%",
+                            thread_id,
+                            current_slot,
+                            range_start,
+                            range_end,
+                            if current_slot == u64::MAX {
+                                0.0
+                            } else {
+                                (current_slot - range_start + 1) as f64
+                                    / (range_end - range_start) as f64
+                                    * 100.0
+                            }
+                        );
+                    }
+                }
             }
         }
 

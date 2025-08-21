@@ -542,18 +542,46 @@ async fn firehose_thread(
 pub fn generate_subranges(slot_range: &Range<u64>, threads: u8) -> Vec<Range<u64>> {
     let threads = threads as u64;
     let total = slot_range.end - slot_range.start;
+    let slots_per_thread = total / threads;
+    let remainder = total % threads;
 
-    (0..threads)
+    let ranges: Vec<Range<u64>> = (0..threads)
         .map(|i| {
-            let start = slot_range.start + total * i / threads;
-            let end = if i == threads - 1 {
-                slot_range.end
-            } else {
-                slot_range.start + total * (i + 1) / threads
-            };
+            // Distribute remainder slots to the first `remainder` threads
+            let extra_slot = if i < remainder { 1 } else { 0 };
+            let start = slot_range.start + i * slots_per_thread + i.min(remainder);
+            let end = start + slots_per_thread + extra_slot;
             start..end
         })
-        .collect::<Vec<_>>()
+        .collect();
+
+    // Verify that ranges cover all slots exactly
+    let total_covered: u64 = ranges.iter().map(|r| r.end - r.start).sum();
+    assert_eq!(
+        total_covered, total,
+        "Range generation failed: {} threads should cover {} slots but only cover {}",
+        threads, total, total_covered
+    );
+
+    // Verify no gaps between ranges
+    for i in 1..ranges.len() {
+        assert_eq!(
+            ranges[i - 1].end,
+            ranges[i].start,
+            "Gap found between thread {} (ends at {}) and thread {} (starts at {})",
+            i - 1,
+            ranges[i - 1].end,
+            i,
+            ranges[i].start
+        );
+    }
+
+    log::info!(
+        "Generated {} thread ranges covering {} slots total",
+        threads,
+        total_covered
+    );
+    ranges
 }
 
 pub struct MessageAddressLoaderFromTxMeta {

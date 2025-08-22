@@ -85,6 +85,10 @@ static PROCESSED_TRANSACTIONS: AtomicU64 = AtomicU64::new(0);
 static PROCESSED_SLOTS: AtomicU64 = AtomicU64::new(0);
 static NUM_VOTES: AtomicU64 = AtomicU64::new(0);
 static COMPLETE_THREADS: AtomicU8 = AtomicU8::new(0);
+static THREAD_COMPLETED: [AtomicBool; 256] = {
+    const INIT: AtomicBool = AtomicBool::new(false);
+    [INIT; 256]
+};
 
 static START_TIME: once_cell::sync::OnceCell<Instant> = once_cell::sync::OnceCell::new();
 static SLOT_RANGE: once_cell::sync::OnceCell<Range<u64>> = once_cell::sync::OnceCell::new();
@@ -593,51 +597,55 @@ impl GeyserPlugin for Jetstreamer {
         ipc_send(thread_id as usize, JetstreamerMessage::Block(blk));
 
         if slot > range_end {
-            log::info!(
-                "thread {} finished processing slot {} and has completed its work",
-                thread_id,
-                slot
-            );
-            ipc_send(thread_id as usize, JetstreamerMessage::Exit);
-
-            let complete_threads = COMPLETE_THREADS.fetch_add(1, Ordering::SeqCst) + 1;
-            let jetstreamer_threads = range_map.len() as u8;
-            let total_slots = {
-                let slot_range = SLOT_RANGE.get().unwrap();
-                slot_range.end - slot_range.start
-            };
-
-            if complete_threads >= jetstreamer_threads || processed_slots >= total_slots {
-                log::info!("all work has completed, unloading jetstreamer...");
-                unload();
-            } else {
+            // Only mark thread as complete if it hasn't been marked before
+            if !THREAD_COMPLETED[thread_id as usize].swap(true, Ordering::SeqCst) {
                 log::info!(
-                    "waiting for {} more threads to complete their work",
-                    jetstreamer_threads - complete_threads
+                    "thread {} finished processing slot {} and has completed its work",
+                    thread_id,
+                    slot
                 );
+                ipc_send(thread_id as usize, JetstreamerMessage::Exit);
 
-                // Debug: Log status of incomplete threads
-                for (_slot, thread_id) in range_map.iter() {
-                    let current_slot = thread_current_slot(*thread_id);
-                    let range_start = thread_slot_range_start(*thread_id);
-                    let range_end = thread_slot_range_end(*thread_id);
-                    if current_slot <= range_end {
-                        log::info!(
-                            "Thread {} incomplete: current_slot={}, range={}..{}, progress={:.2}%",
-                            thread_id,
-                            current_slot,
-                            range_start,
-                            range_end,
-                            if current_slot == u64::MAX {
-                                0.0
-                            } else if current_slot > range_end {
-                                100.0
-                            } else {
-                                (current_slot - range_start + 1) as f64
-                                    / (range_end - range_start + 1) as f64
-                                    * 100.0
-                            }
-                        );
+                let complete_threads = COMPLETE_THREADS.fetch_add(1, Ordering::SeqCst) + 1;
+                let jetstreamer_threads = range_map.len() as u8;
+                let total_slots = {
+                    let slot_range = SLOT_RANGE.get().unwrap();
+                    slot_range.end - slot_range.start
+                };
+
+                if complete_threads >= jetstreamer_threads || processed_slots >= total_slots {
+                    log::info!("all work has completed, unloading jetstreamer...");
+                    unload();
+                } else {
+                    log::info!(
+                        "waiting for {} more threads to complete their work",
+                        jetstreamer_threads - complete_threads
+                    );
+
+                    // Debug: Log status of incomplete threads
+                    for (_slot, thread_id) in range_map.iter() {
+                        let current_slot = thread_current_slot(*thread_id);
+                        let range_start = thread_slot_range_start(*thread_id);
+                        let range_end = thread_slot_range_end(*thread_id);
+                        // Only log if thread hasn't been marked complete
+                        if !THREAD_COMPLETED[*thread_id as usize].load(Ordering::SeqCst) {
+                            log::info!(
+                                "Thread {} incomplete: current_slot={}, range={}..{}, progress={:.2}%",
+                                thread_id,
+                                current_slot,
+                                range_start,
+                                range_end,
+                                if current_slot == u64::MAX {
+                                    0.0
+                                } else if current_slot > range_end {
+                                    100.0
+                                } else {
+                                    (current_slot - range_start + 1) as f64
+                                        / (range_end - range_start + 1) as f64
+                                        * 100.0
+                                }
+                            );
+                        }
                     }
                 }
             }

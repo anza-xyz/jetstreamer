@@ -608,12 +608,8 @@ impl GeyserPlugin for Jetstreamer {
 
                 let complete_threads = COMPLETE_THREADS.fetch_add(1, Ordering::SeqCst) + 1;
                 let jetstreamer_threads = range_map.len() as u8;
-                let total_slots = {
-                    let slot_range = SLOT_RANGE.get().unwrap();
-                    slot_range.end - slot_range.start
-                };
 
-                if complete_threads >= jetstreamer_threads || processed_slots >= total_slots {
+                if complete_threads >= jetstreamer_threads {
                     log::info!("all work has completed, unloading jetstreamer...");
                     unload();
                 } else {

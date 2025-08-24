@@ -85,6 +85,7 @@ static PROCESSED_TRANSACTIONS: AtomicU64 = AtomicU64::new(0);
 static PROCESSED_SLOTS: AtomicU64 = AtomicU64::new(0);
 static NUM_VOTES: AtomicU64 = AtomicU64::new(0);
 static COMPLETE_THREADS: AtomicU8 = AtomicU8::new(0);
+static CLICKHOUSE_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
 static START_TIME: once_cell::sync::OnceCell<Instant> = once_cell::sync::OnceCell::new();
 static SLOT_RANGE: once_cell::sync::OnceCell<Range<u64>> = once_cell::sync::OnceCell::new();
@@ -334,17 +335,23 @@ impl GeyserPlugin for Jetstreamer {
                 let rt = rt_cell.borrow();
                 rt.block_on(async {
                     if spawn_clickhouse {
-                        log::info!("automatic ClickHouse spawning enabled, starting ClickHouse...");
-                        let start_result = clickhouse::start().await
-                            .map_err(|e| JetstreamerError::ClickHouseError(e.to_string()))?;
-
-                        let (mut ready_rx, clickhouse_future) = start_result;
-
-                        if ready_rx.recv().await.is_some() {
-                            log::info!("ClickHouse initialization complete.");
-                            rt.spawn(clickhouse_future);
+                        // Check if ClickHouse has already been initialized
+                        if CLICKHOUSE_INITIALIZED.load(Ordering::Relaxed) {
+                            log::info!("ClickHouse already initialized, skipping spawn.");
                         } else {
-                            return Err(JetstreamerError::ClickHouseInitializationFailed);
+                            log::info!("automatic ClickHouse spawning enabled, starting ClickHouse...");
+                            let start_result = clickhouse::start().await
+                                .map_err(|e| JetstreamerError::ClickHouseError(e.to_string()))?;
+
+                            let (mut ready_rx, clickhouse_future) = start_result;
+
+                            if ready_rx.recv().await.is_some() {
+                                log::info!("ClickHouse initialization complete.");
+                                rt.spawn(clickhouse_future);
+                                CLICKHOUSE_INITIALIZED.store(true, Ordering::Relaxed);
+                            } else {
+                                return Err(JetstreamerError::ClickHouseInitializationFailed);
+                            }
                         }
                     } else {
                         log::info!("automatic ClickHouse spawning disabled, skipping ClickHouse initialization.");

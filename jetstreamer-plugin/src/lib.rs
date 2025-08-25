@@ -116,7 +116,9 @@ impl PluginRunner {
             r#"CREATE TABLE IF NOT EXISTS jetstreamer_slot_status (
                 slot UInt64,
                 transaction_count UInt32 DEFAULT 0,
-                indexed_at DateTime('UTC') DEFAULT now()
+                thread_num UInt8 DEFAULT 0,
+                indexed_at DateTime('UTC') DEFAULT now(),
+                UNIQUE INDEX idx_slot (slot)
             ) ENGINE = ReplacingMergeTree
             ORDER BY slot"#,
         )
@@ -127,7 +129,8 @@ impl PluginRunner {
             r#"CREATE TABLE IF NOT EXISTS jetstreamer_plugins (
                 id UInt32,
                 name String,
-                version UInt32
+                version UInt32,
+                UNIQUE INDEX idx_plugin_id (id)
             ) ENGINE = ReplacingMergeTree
             ORDER BY id"#,
         )
@@ -206,12 +209,14 @@ impl PluginRunner {
                         struct SlotStatusRow {
                             slot: u64,
                             transaction_count: u32,
+                            thread_num: u8,
                         }
                         let mut insert = db.insert("jetstreamer_slot_status").unwrap();
                         insert
                             .write(&SlotStatusRow {
                                 slot: blk.slot,
                                 transaction_count: *transaction_count,
+                                thread_num: thread_num as u8,
                             })
                             .await
                             .unwrap();

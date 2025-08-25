@@ -213,12 +213,6 @@ impl PluginRunner {
                             thread_num: u8,
                         }
 
-                        // Optional lightweight diagnostics: set JETSTREAMER_DEBUG_SLOT_STATUS=1
-                        // to log first few insertion attempts and any errors.
-                        static LOGGED: std::sync::atomic::AtomicU32 =
-                            std::sync::atomic::AtomicU32::new(0);
-                        let debug = std::env::var("JETSTREAMER_DEBUG_SLOT_STATUS").is_ok();
-
                         match db.insert("jetstreamer_slot_status") {
                             Ok(mut insert) => {
                                 if let Err(e) = insert
@@ -243,17 +237,14 @@ impl PluginRunner {
                                         thread_num,
                                         e
                                     );
-                                } else if debug {
-                                    let c =
-                                        LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                    log::info!(
-                                        "slot_status inserted slot={} txs={} thread={} (sample #{})",
-                                        blk.slot,
-                                        transaction_count,
-                                        thread_num,
-                                        c + 1
-                                    );
-                                }
+                                } /*else {
+                                log::info!(
+                                "slot_status inserted slot={} txs={} thread={}",
+                                blk.slot,
+                                transaction_count,
+                                thread_num,
+                                );
+                                }*/
                             }
                             Err(e) => {
                                 log::error!(

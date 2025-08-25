@@ -258,6 +258,10 @@ impl PluginRunner {
                     }
 
                     if matches!(msg, JetstreamerMessage::Exit) {
+                        log::info!(
+                            "plugin runner thread {} received exit message, shutting down",
+                            thread_num
+                        );
                         break;
                     }
                 }

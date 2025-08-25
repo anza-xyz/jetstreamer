@@ -605,7 +605,7 @@ impl GeyserPlugin for Jetstreamer {
 
         ipc_send(thread_id as usize, JetstreamerMessage::Block(blk));
 
-        if slot > range_end {
+        if slot >= range_end {
             log::info!(
                 "thread {} finished processing slot {} and has completed its work",
                 thread_id,

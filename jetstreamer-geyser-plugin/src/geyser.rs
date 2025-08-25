@@ -608,6 +608,8 @@ impl GeyserPlugin for Jetstreamer {
             JetstreamerMessage::Block(blk, thread_current_tx_index(thread_id) + 1),
         );
 
+        thread_set_current_tx_index(thread_id, 0);
+
         if slot >= range_end {
             log::info!(
                 "thread {} finished processing slot {} and has completed its work",

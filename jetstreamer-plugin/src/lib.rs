@@ -229,7 +229,6 @@ pub async fn handle_message(
     match msg {
         JetstreamerMessage::Block(block) => {
             let slot = block.slot;
-            log::info!("plugin {} handling block {}", plugin.name(), slot);
             if let Err(e) = plugin.on_block(db.clone(), block).await {
                 log::error!("plugin {} on_block error: {e}", plugin.name());
             }
@@ -238,9 +237,14 @@ pub async fn handle_message(
                 plugin_id: u16,
                 slot: u64,
             }
-            let mut insert = db.insert("jetstreamer_plugin_slots")?;
-            insert.write(&PluginSlotRow { plugin_id, slot }).await?;
-            insert.end().await?;
+            log::info!("Recording slot {} for plugin {}", slot, plugin.name());
+            let mut insert = db.insert("jetstreamer_plugin_slots").unwrap();
+            insert
+                .write(&PluginSlotRow { plugin_id, slot })
+                .await
+                .unwrap();
+            insert.end().await.unwrap();
+            log::info!("Recorded slot {} for plugin {}", slot, plugin.name());
         }
         JetstreamerMessage::Transaction(tx, tx_index) => {
             if let Err(e) = plugin.on_transaction(db.clone(), tx, tx_index).await {

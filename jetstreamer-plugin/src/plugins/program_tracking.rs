@@ -17,13 +17,14 @@ thread_local! {
 #[derive(Row, Deserialize, Serialize, Copy, Clone, Debug, PartialEq, Eq, Hash)]
 struct ProgramEvent {
     pub slot: u32,
-    pub timestamp: i64,
+    // Stored as ClickHouse DateTime('UTC') -> UInt32 seconds; we clamp Solana i64.
+    pub timestamp: u32,
     pub program_id: Pubkey,
     pub count: u32,
     pub error_count: u32,
-    pub min_cus: u32, // need to still use u32 because a single transaction can be up to 1.4M CUs
+    pub min_cus: u32,
     pub max_cus: u32,
-    pub total_cus: u32, // 32 bits is enough for total CU within a block since max is 48M CUs
+    pub total_cus: u32,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
@@ -98,7 +99,14 @@ impl Plugin for ProgramTrackingPlugin {
             DATA.with(|data| {
                 let mut data = data.borrow_mut();
                 if let Some(slot_data) = data.remove(&block.slot) {
-                    let timestamp = block.block_time.unwrap_or(0);
+                    let raw_ts = block.block_time.unwrap_or(0);
+                    let timestamp: u32 = if raw_ts < 0 {
+                        0
+                    } else if raw_ts > u32::MAX as i64 {
+                        u32::MAX
+                    } else {
+                        raw_ts as u32
+                    };
 
                     for (program_id, stats) in slot_data.iter() {
                         rows.push(ProgramEvent {
@@ -136,6 +144,7 @@ impl Plugin for ProgramTrackingPlugin {
         async move {
             log::info!("Program Tracking Plugin loaded.");
             log::info!("Creating program_invocations table if it does not exist...");
+            // Ensure table exists with native DateTime('UTC') timestamp column.
             db.query(
                 r#"
                 CREATE TABLE IF NOT EXISTS program_invocations (

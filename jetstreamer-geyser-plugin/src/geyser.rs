@@ -68,8 +68,8 @@ thread_local! {
     static TOKIO_RUNTIME: RefCell<Runtime> = RefCell::new(Runtime::new().unwrap());
     static DB_CLIENT: RefCell<Arc<::clickhouse::Client>> = RefCell::new(Arc::new(::clickhouse::Client::default()
             .with_url("http://localhost:8123")
-            .with_option("async_insert", "1")
-            .with_option("wait_for_async_insert", "0")));
+            .with_option("async_insert", "0")
+            .with_option("wait_for_async_insert", "1")));
     #[cfg(not(feature = "plugin-runner"))]
     static PLUGIN: RefCell<ProgramTrackingPlugin> = const { RefCell::new(ProgramTrackingPlugin) };
 }

@@ -112,6 +112,9 @@ impl PluginRunner {
             .with_option("wait_for_async_insert", "0");
 
         // Initialize plugin management tables
+        // NOTE: Include thread_num in ORDER BY so each thread's status row per slot is retained.
+        // Previously ORDER BY slot alone caused logical last-write-wins behavior under ReplacingMergeTree
+        // making per-thread rows appear "missing" when querying.
         db.query(
             r#"CREATE TABLE IF NOT EXISTS jetstreamer_slot_status (
                 slot UInt64,
@@ -119,7 +122,7 @@ impl PluginRunner {
                 thread_num UInt8 DEFAULT 0,
                 indexed_at DateTime('UTC') DEFAULT now()
             ) ENGINE = ReplacingMergeTree
-            ORDER BY slot"#,
+            ORDER BY (slot, thread_num)"#,
         )
         .execute()
         .await?;
@@ -209,16 +212,60 @@ impl PluginRunner {
                             transaction_count: u32,
                             thread_num: u8,
                         }
-                        let mut insert = db.insert("jetstreamer_slot_status").unwrap();
-                        insert
-                            .write(&SlotStatusRow {
-                                slot: blk.slot,
-                                transaction_count: *transaction_count,
-                                thread_num: thread_num as u8,
-                            })
-                            .await
-                            .unwrap();
-                        insert.end().await.unwrap();
+
+                        // Optional lightweight diagnostics: set JETSTREAMER_DEBUG_SLOT_STATUS=1
+                        // to log first few insertion attempts and any errors.
+                        static LOGGED: std::sync::atomic::AtomicU32 =
+                            std::sync::atomic::AtomicU32::new(0);
+                        let debug = std::env::var("JETSTREAMER_DEBUG_SLOT_STATUS").is_ok();
+
+                        match db.insert("jetstreamer_slot_status") {
+                            Ok(mut insert) => {
+                                if let Err(e) = insert
+                                    .write(&SlotStatusRow {
+                                        slot: blk.slot,
+                                        transaction_count: *transaction_count,
+                                        thread_num: thread_num as u8,
+                                    })
+                                    .await
+                                {
+                                    log::error!(
+                                        "slot_status write error slot={} thread={} err={}",
+                                        blk.slot,
+                                        thread_num,
+                                        e
+                                    );
+                                }
+                                if let Err(e) = insert.end().await {
+                                    log::error!(
+                                        "slot_status end error slot={} thread={} err={}",
+                                        blk.slot,
+                                        thread_num,
+                                        e
+                                    );
+                                } else if debug {
+                                    let c =
+                                        LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    if c < 20 {
+                                        log::info!(
+                                            "slot_status inserted slot={} txs={} thread={} (sample #{})",
+                                            blk.slot,
+                                            transaction_count,
+                                            thread_num,
+                                            c + 1
+                                        );
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                log::error!(
+                                    "slot_status inserter init failed slot={} thread={} err={}",
+                                    blk.slot,
+                                    thread_num,
+                                    e
+                                );
+                            }
+                        }
                     }
 
                     if matches!(msg, JetstreamerMessage::Exit) {

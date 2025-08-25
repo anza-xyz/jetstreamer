@@ -229,7 +229,6 @@ pub fn ipc_send(thread_id: usize, msg: JetstreamerMessage) {
             DB_CLIENT.with_borrow(|db| {
                 TOKIO_RUNTIME.with_borrow(|rt| {
                     rt.block_on(async move {
-                        log::error!("DOING IT!!!");
                         if let Err(e) =
                             jetstreamer_plugin::handle_message(plugin, db.clone(), msg, plugin.id())
                                 .await

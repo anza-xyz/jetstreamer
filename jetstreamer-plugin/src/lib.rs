@@ -226,10 +226,10 @@ pub async fn handle_message(
     msg: JetstreamerMessage,
     plugin_id: u16,
 ) -> Result<(), PluginRunnerError> {
-    log::error!("GOT A MESSAGE!!!");
     match msg {
         JetstreamerMessage::Block(block) => {
             let slot = block.slot;
+            log::info!("plugin {} handling block {}", plugin.name(), slot);
             if let Err(e) = plugin.on_block(db.clone(), block).await {
                 log::error!("plugin {} on_block error: {e}", plugin.name());
             }

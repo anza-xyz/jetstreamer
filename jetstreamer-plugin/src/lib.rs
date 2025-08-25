@@ -117,8 +117,7 @@ impl PluginRunner {
                 slot UInt64,
                 transaction_count UInt32 DEFAULT 0,
                 thread_num UInt8 DEFAULT 0,
-                indexed_at DateTime('UTC') DEFAULT now(),
-                UNIQUE INDEX idx_slot (slot)
+                indexed_at DateTime('UTC') DEFAULT now()
             ) ENGINE = ReplacingMergeTree
             ORDER BY slot"#,
         )
@@ -129,8 +128,7 @@ impl PluginRunner {
             r#"CREATE TABLE IF NOT EXISTS jetstreamer_plugins (
                 id UInt32,
                 name String,
-                version UInt32,
-                UNIQUE INDEX idx_plugin_id (id)
+                version UInt32
             ) ENGINE = ReplacingMergeTree
             ORDER BY id"#,
         )
@@ -258,7 +256,6 @@ pub async fn handle_message(
             }
             #[derive(Row, serde::Serialize)]
             struct PluginSlotRow {
-                // Match ClickHouse schema: plugin_id UInt32
                 plugin_id: u32,
                 slot: u64,
             }

@@ -112,17 +112,17 @@ impl PluginRunner {
             .with_option("wait_for_async_insert", "1");
 
         // Initialize plugin management tables
-        // NOTE: Include thread_num in ORDER BY so each thread's status row per slot is retained.
+        // NOTE: Include thread_id in ORDER BY so each thread's status row per slot is retained.
         // Previously ORDER BY slot alone caused logical last-write-wins behavior under ReplacingMergeTree
         // making per-thread rows appear "missing" when querying.
         db.query(
             r#"CREATE TABLE IF NOT EXISTS jetstreamer_slot_status (
                 slot UInt64,
                 transaction_count UInt32 DEFAULT 0,
-                thread_num UInt8 DEFAULT 0,
+                thread_id UInt8 DEFAULT 0,
                 indexed_at DateTime('UTC') DEFAULT now()
             ) ENGINE = ReplacingMergeTree
-            ORDER BY (slot, thread_num)"#,
+            ORDER BY (slot, thread_id)"#,
         )
         .execute()
         .await?;
@@ -152,9 +152,9 @@ impl PluginRunner {
         let mut handles = Vec::new();
         let db = Arc::new(db);
 
-        for thread_num in 0..self.num_threads {
+        for thread_id in 0..self.num_threads {
             let db = db.clone();
-            let socket_name = format!("jetstreamer_{}.sock", thread_num);
+            let socket_name = format!("jetstreamer_{}.sock", thread_id);
             let ns_name = socket_name
                 .to_ns_name::<GenericNamespaced>()
                 .map_err(|e| PluginRunnerError::UnsupportedSocketName(e.to_string()))?;
@@ -210,7 +210,7 @@ impl PluginRunner {
                         struct SlotStatusRow {
                             slot: u64,
                             transaction_count: u32,
-                            thread_num: u8,
+                            thread_id: u8,
                         }
 
                         match db.insert("jetstreamer_slot_status") {
@@ -219,14 +219,14 @@ impl PluginRunner {
                                     .write(&SlotStatusRow {
                                         slot: blk.slot,
                                         transaction_count: *transaction_count,
-                                        thread_num: thread_num as u8,
+                                        thread_id: thread_id as u8,
                                     })
                                     .await
                                 {
                                     log::error!(
                                         "slot_status write error slot={} thread={} err={}",
                                         blk.slot,
-                                        thread_num,
+                                        thread_id,
                                         e
                                     );
                                 }
@@ -234,7 +234,7 @@ impl PluginRunner {
                                     log::error!(
                                         "slot_status end error slot={} thread={} err={}",
                                         blk.slot,
-                                        thread_num,
+                                        thread_id,
                                         e
                                     );
                                 } /*else {
@@ -242,7 +242,7 @@ impl PluginRunner {
                                 "slot_status inserted slot={} txs={} thread={}",
                                 blk.slot,
                                 transaction_count,
-                                thread_num,
+                                thread_id,
                                 );
                                 }*/
                             }
@@ -250,7 +250,7 @@ impl PluginRunner {
                                 log::error!(
                                     "slot_status inserter init failed slot={} thread={} err={}",
                                     blk.slot,
-                                    thread_num,
+                                    thread_id,
                                     e
                                 );
                             }
@@ -260,7 +260,7 @@ impl PluginRunner {
                     if matches!(msg, JetstreamerMessage::Exit) {
                         log::info!(
                             "plugin runner thread {} received exit message, shutting down",
-                            thread_num
+                            thread_id
                         );
                         break;
                     }

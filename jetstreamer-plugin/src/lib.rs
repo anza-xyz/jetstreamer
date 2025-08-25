@@ -246,15 +246,13 @@ impl PluginRunner {
                                 } else if debug {
                                     let c =
                                         LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                    if c < 20 {
-                                        log::info!(
-                                            "slot_status inserted slot={} txs={} thread={} (sample #{})",
-                                            blk.slot,
-                                            transaction_count,
-                                            thread_num,
-                                            c + 1
-                                        );
-                                    }
+                                    log::info!(
+                                        "slot_status inserted slot={} txs={} thread={} (sample #{})",
+                                        blk.slot,
+                                        transaction_count,
+                                        thread_num,
+                                        c + 1
+                                    );
                                 }
                             }
                             Err(e) => {

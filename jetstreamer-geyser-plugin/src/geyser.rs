@@ -603,7 +603,10 @@ impl GeyserPlugin for Jetstreamer {
 
         let blk = Block::from_replica(blockinfo);
 
-        ipc_send(thread_id as usize, JetstreamerMessage::Block(blk));
+        ipc_send(
+            thread_id as usize,
+            JetstreamerMessage::Block(blk, thread_current_tx_index(thread_id) + 1),
+        );
 
         if slot >= range_end {
             log::info!(

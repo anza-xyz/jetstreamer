@@ -114,7 +114,9 @@ impl PluginRunner {
         // Initialize plugin management tables
         db.query(
             r#"CREATE TABLE IF NOT EXISTS jetstreamer_slot_status (
-                slot UInt64
+                slot UInt64,
+                transaction_count UInt32 DEFAULT 0,
+                indexed_at DateTime('UTC') DEFAULT now()
             ) ENGINE = ReplacingMergeTree
             ORDER BY slot"#,
         )
@@ -199,6 +201,23 @@ impl PluginRunner {
                         .collect::<Result<Vec<_>, _>>()?;
                     }
 
+                    if let JetstreamerMessage::Block(blk, transaction_count) = &msg {
+                        #[derive(Copy, Clone, Row, serde::Serialize)]
+                        struct SlotStatusRow {
+                            slot: u64,
+                            transaction_count: u32,
+                        }
+                        let mut insert = db.insert("jetstreamer_slot_status").unwrap();
+                        insert
+                            .write(&SlotStatusRow {
+                                slot: blk.slot,
+                                transaction_count: *transaction_count,
+                            })
+                            .await
+                            .unwrap();
+                        insert.end().await.unwrap();
+                    }
+
                     if matches!(msg, JetstreamerMessage::Exit) {
                         break;
                     }
@@ -227,7 +246,7 @@ pub async fn handle_message(
     plugin_id: u16,
 ) -> Result<(), PluginRunnerError> {
     match msg {
-        JetstreamerMessage::Block(block) => {
+        JetstreamerMessage::Block(block, _) => {
             let slot = block.slot;
             if let Err(e) = plugin.on_block(db.clone(), block).await {
                 log::error!("plugin {} on_block error: {e}", plugin.name());

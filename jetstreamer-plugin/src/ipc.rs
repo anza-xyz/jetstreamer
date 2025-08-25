@@ -10,7 +10,7 @@ use crate::bridge::{Block, Transaction};
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 pub enum JetstreamerMessage {
     Transaction(Transaction, u32),
-    Block(Block),
+    Block(Block, u32),
     Exit,
 }
 

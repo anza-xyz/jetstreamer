@@ -238,7 +238,6 @@ pub async fn handle_message(
                 plugin_id: u32,
                 slot: u64,
             }
-            log::info!("Recording slot {} for plugin {}", slot, plugin.name());
             let mut insert = db.insert("jetstreamer_plugin_slots").unwrap();
             insert
                 .write(&PluginSlotRow {
@@ -248,7 +247,6 @@ pub async fn handle_message(
                 .await
                 .unwrap();
             insert.end().await.unwrap();
-            log::info!("Recorded slot {} for plugin {}", slot, plugin.name());
         }
         JetstreamerMessage::Transaction(tx, tx_index) => {
             if let Err(e) = plugin.on_transaction(db.clone(), tx, tx_index).await {

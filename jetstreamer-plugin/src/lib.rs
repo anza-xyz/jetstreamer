@@ -226,9 +226,11 @@ pub async fn handle_message(
     msg: JetstreamerMessage,
     plugin_id: u16,
 ) -> Result<(), PluginRunnerError> {
+    log::error!("GOT A MESSAGE!!!");
     match msg {
         JetstreamerMessage::Block(block) => {
-            if let Err(e) = plugin.on_block(db.clone(), block.clone()).await {
+            let slot = block.slot;
+            if let Err(e) = plugin.on_block(db.clone(), block).await {
                 log::error!("plugin {} on_block error: {e}", plugin.name());
             }
             #[derive(Row, serde::Serialize)]
@@ -237,19 +239,11 @@ pub async fn handle_message(
                 slot: u64,
             }
             let mut insert = db.insert("jetstreamer_plugin_slots")?;
-            insert
-                .write(&PluginSlotRow {
-                    plugin_id,
-                    slot: block.slot,
-                })
-                .await?;
+            insert.write(&PluginSlotRow { plugin_id, slot }).await?;
             insert.end().await?;
         }
         JetstreamerMessage::Transaction(tx, tx_index) => {
-            if let Err(e) = plugin
-                .on_transaction(db.clone(), tx.clone(), tx_index)
-                .await
-            {
+            if let Err(e) = plugin.on_transaction(db.clone(), tx, tx_index).await {
                 log::error!("plugin {} on_transaction error: {e}", plugin.name());
             }
         }

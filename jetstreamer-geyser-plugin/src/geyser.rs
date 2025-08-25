@@ -637,22 +637,24 @@ impl GeyserPlugin for Jetstreamer {
                     let current_slot = thread_current_slot(*thread_id);
                     let range_start = thread_slot_range_start(*thread_id);
                     let range_end = thread_slot_range_end(*thread_id);
-                    if current_slot <= range_end {
+                    // Only log as incomplete if we haven't actually reached the end of the range.
+                    if current_slot < range_end {
+                        let progress = if current_slot == u64::MAX {
+                            0.0
+                        } else if current_slot > range_end {
+                            100.0
+                        } else {
+                            (current_slot - range_start + 1) as f64
+                                / (range_end - range_start + 1) as f64
+                                * 100.0
+                        };
                         log::info!(
                             "Thread {} incomplete: current_slot={}, range={}..{}, progress={:.2}%",
                             thread_id,
                             current_slot,
                             range_start,
                             range_end,
-                            if current_slot == u64::MAX {
-                                0.0
-                            } else if current_slot > range_end {
-                                100.0
-                            } else {
-                                (current_slot - range_start + 1) as f64
-                                    / (range_end - range_start + 1) as f64
-                                    * 100.0
-                            }
+                            progress
                         );
                     }
                 }

@@ -234,13 +234,17 @@ pub async fn handle_message(
             }
             #[derive(Row, serde::Serialize)]
             struct PluginSlotRow {
-                plugin_id: u16,
+                // Match ClickHouse schema: plugin_id UInt32
+                plugin_id: u32,
                 slot: u64,
             }
             log::info!("Recording slot {} for plugin {}", slot, plugin.name());
             let mut insert = db.insert("jetstreamer_plugin_slots").unwrap();
             insert
-                .write(&PluginSlotRow { plugin_id, slot })
+                .write(&PluginSlotRow {
+                    plugin_id: plugin_id as u32,
+                    slot,
+                })
                 .await
                 .unwrap();
             insert.end().await.unwrap();

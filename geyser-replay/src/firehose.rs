@@ -21,6 +21,7 @@ use std::{
     sync::Arc,
 };
 use thiserror::Error;
+use tokio::time::timeout;
 
 use crate::{
     epochs::{epoch_to_slot_range, fetch_epoch_stream, slot_to_epoch},
@@ -269,11 +270,16 @@ async fn firehose_thread(
                 let mut item_index = 0;
                 let mut displayed_skip_message = false;
                 loop {
-                    let mut nodes = reader
-                        .read_until_block()
-                        .await
-                        .map_err(GeyserReplayError::ReadUntilBlockError)
-                        .map_err(|e| (e, current_slot.unwrap_or(slot_range.start)))?;
+                    let timeout_result = timeout(std::time::Duration::from_secs(5), reader.read_until_block()).await;
+                    let mut nodes = match timeout_result {
+                        Ok(result) => result
+                            .map_err(|e| GeyserReplayError::ReadUntilBlockError(e))
+                            .map_err(|e| (e, current_slot.unwrap_or(slot_range.start)))?,
+                        Err(_) => {
+                            log::warn!(target: &log_target, "timeout reading next block, retrying...");
+                            continue;
+                        },
+                    };
                     // ignore epoch and subset nodes at end of car file
                     loop {
                         if nodes.0.is_empty() {

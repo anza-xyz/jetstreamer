@@ -2949,6 +2949,7 @@ dependencies = [
  "bincode",
  "clickhouse",
  "crossbeam-channel",
+ "crossbeam-utils",
  "ctrlc",
  "geyser-replay",
  "indoc",

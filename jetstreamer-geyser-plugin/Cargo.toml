@@ -41,6 +41,7 @@ jetstreamer-plugin.workspace = true
 libc.workspace = true
 rangemap.workspace = true
 crossbeam-channel.workspace = true
+crossbeam-utils.workspace = true
 
 [features]
 plugin-runner = []

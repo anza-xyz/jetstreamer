@@ -3,6 +3,7 @@ use agave_geyser_plugin_interface::geyser_plugin_interface::{
     Result,
 };
 use core::ops::Range;
+use crossbeam_utils::CachePadded;
 use geyser_replay::{epochs::slot_to_epoch, firehose::generate_subranges};
 use rangemap::RangeMap;
 use std::time::Duration;
@@ -80,24 +81,29 @@ static IPC_SENDERS: once_cell::sync::OnceCell<Vec<Sender<JetstreamerMessage>>> =
 static IPC_TASKS: once_cell::sync::OnceCell<Vec<tokio::task::JoinHandle<()>>> =
     once_cell::sync::OnceCell::new();
 
-static EXIT: AtomicBool = AtomicBool::new(false);
-static PROCESSED_TRANSACTIONS: AtomicU64 = AtomicU64::new(0);
-static PROCESSED_SLOTS: AtomicU64 = AtomicU64::new(0);
-static NUM_VOTES: AtomicU64 = AtomicU64::new(0);
-static COMPLETE_THREADS: AtomicU8 = AtomicU8::new(0);
-static CLICKHOUSE_INITIALIZED: AtomicBool = AtomicBool::new(false);
+static EXIT: CachePadded<AtomicBool> = CachePadded::new(AtomicBool::new(false));
+static PROCESSED_TRANSACTIONS: CachePadded<AtomicU64> = CachePadded::new(AtomicU64::new(0));
+static PROCESSED_SLOTS: CachePadded<AtomicU64> = CachePadded::new(AtomicU64::new(0));
+static NUM_VOTES: CachePadded<AtomicU64> = CachePadded::new(AtomicU64::new(0));
+static COMPLETE_THREADS: CachePadded<AtomicU8> = CachePadded::new(AtomicU8::new(0));
+static CLICKHOUSE_INITIALIZED: CachePadded<AtomicBool> = CachePadded::new(AtomicBool::new(false));
 
 static START_TIME: once_cell::sync::OnceCell<Instant> = once_cell::sync::OnceCell::new();
 static SLOT_RANGE: once_cell::sync::OnceCell<Range<u64>> = once_cell::sync::OnceCell::new();
 
-static THREAD_CURRENT_SLOT: [AtomicU64; 256] = [const { AtomicU64::new(u64::MAX) }; 256];
-static THREAD_SLOT_RANGE_START: [AtomicU64; 256] = [const { AtomicU64::new(u64::MAX) }; 256];
-static THREAD_SLOT_RANGE_END: [AtomicU64; 256] = [const { AtomicU64::new(u64::MAX) }; 256];
+static THREAD_CURRENT_SLOT: [CachePadded<AtomicU64>; 256] =
+    [const { CachePadded::new(AtomicU64::new(u64::MAX)) }; 256];
+static THREAD_SLOT_RANGE_START: [CachePadded<AtomicU64>; 256] =
+    [const { CachePadded::new(AtomicU64::new(u64::MAX)) }; 256];
+static THREAD_SLOT_RANGE_END: [CachePadded<AtomicU64>; 256] =
+    [const { CachePadded::new(AtomicU64::new(u64::MAX)) }; 256];
 // Tracks how many slots each thread has actually accounted for toward completion of its own range.
 // This prevents large forward jumps in a single thread from being double-counted toward overall
 // progress (which previously could cause premature unload while other threads were still running).
-static THREAD_PROCESSED_SLOTS: [AtomicU64; 256] = [const { AtomicU64::new(0) }; 256];
-static THREAD_CURRENT_TX_INDEX: [AtomicU32; 256] = [const { AtomicU32::new(u32::MAX) }; 256];
+static THREAD_PROCESSED_SLOTS: [CachePadded<AtomicU64>; 256] =
+    [const { CachePadded::new(AtomicU64::new(0)) }; 256];
+static THREAD_CURRENT_TX_INDEX: [CachePadded<AtomicU32>; 256] =
+    [const { CachePadded::new(AtomicU32::new(u32::MAX)) }; 256];
 static THREAD_INFO: once_cell::sync::OnceCell<RangeMap<u64, u8>> = once_cell::sync::OnceCell::new();
 
 #[inline(always)]

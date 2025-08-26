@@ -277,7 +277,12 @@ async fn firehose_thread(
                             .map_err(|e| (e, current_slot.unwrap_or(slot_range.start)))?,
                         Err(_) => {
                             log::warn!(target: &log_target, "timeout reading next block, retrying...");
-                            continue;
+                            return Err((
+                                GeyserReplayError::ReadUntilBlockError(
+                                    "timeout reading next block".into(),
+                                ),
+                                current_slot.unwrap_or(slot_range.start),
+                            ));
                         },
                     };
                     // ignore epoch and subset nodes at end of car file

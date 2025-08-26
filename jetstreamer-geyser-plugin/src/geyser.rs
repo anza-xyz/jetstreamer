@@ -93,6 +93,10 @@ static SLOT_RANGE: once_cell::sync::OnceCell<Range<u64>> = once_cell::sync::Once
 static THREAD_CURRENT_SLOT: [AtomicU64; 256] = [const { AtomicU64::new(u64::MAX) }; 256];
 static THREAD_SLOT_RANGE_START: [AtomicU64; 256] = [const { AtomicU64::new(u64::MAX) }; 256];
 static THREAD_SLOT_RANGE_END: [AtomicU64; 256] = [const { AtomicU64::new(u64::MAX) }; 256];
+// Tracks how many slots each thread has actually accounted for toward completion of its own range.
+// This prevents large forward jumps in a single thread from being double-counted toward overall
+// progress (which previously could cause premature unload while other threads were still running).
+static THREAD_PROCESSED_SLOTS: [AtomicU64; 256] = [const { AtomicU64::new(0) }; 256];
 static THREAD_CURRENT_TX_INDEX: [AtomicU32; 256] = [const { AtomicU32::new(u32::MAX) }; 256];
 static THREAD_INFO: once_cell::sync::OnceCell<RangeMap<u64, u8>> = once_cell::sync::OnceCell::new();
 
@@ -424,19 +428,29 @@ impl GeyserPlugin for Jetstreamer {
         let thread_id = *range_map.get(&slot).unwrap();
         let last_slot = thread_current_slot(thread_id);
 
-        let increment = if last_slot == u64::MAX {
-            // First slot for this thread - count from range start to current slot
-            let range_start = thread_slot_range_start(thread_id);
-            slot.saturating_sub(range_start) + 1
-        } else if slot > last_slot {
-            // Normal forward progress - count all slots from last_slot+1 to current slot
-            slot - last_slot
-        } else if slot == last_slot {
-            // Same slot being processed again (duplicate) - don't count
+        // Per-thread progress accounting ---------------------------------------------------------
+        let range_start = thread_slot_range_start(thread_id);
+        let range_end = thread_slot_range_end(thread_id);
+        let thread_total = if range_start == u64::MAX || range_end == u64::MAX {
             0
         } else {
-            // Thread has gone backwards (restart) - only count if we're moving forward from restart point
-            // This handles the case where a thread restarts from an earlier slot
+            range_end.saturating_sub(range_start) + 1
+        };
+
+        // Compute new contribution from this notification for this thread only.
+        let raw_increment = if last_slot == u64::MAX {
+            // First observed slot for this thread (may jump forward). Only count in-range distance.
+            if slot >= range_start {
+                slot - range_start + 1
+            } else {
+                0
+            }
+        } else if slot > last_slot {
+            slot - last_slot
+        } else if slot == last_slot {
+            0 // duplicate
+        } else {
+            // Backwards restart: count this slot if within range and we previously had u64::MAX (handled above)
             if last_slot - slot > 1000 {
                 log::warn!(
                     "Thread {} restarted: went from slot {} back to {} (gap: {})",
@@ -446,30 +460,47 @@ impl GeyserPlugin for Jetstreamer {
                     last_slot - slot
                 );
             }
-            // Count slots from the restart point, but avoid double-counting
-            // We'll count this slot as 1 since it's a fresh start
-            1
+            0
         };
-        let processed_slots = if increment > 0 {
-            let new_total = PROCESSED_SLOTS.fetch_add(increment, Ordering::SeqCst) + increment;
-            // Debug log when we see large increments that might indicate an issue
-            if increment > 100 {
-                log::info!(
-                    "Large slot increment: thread {} advanced from {} to {} (increment: {})",
-                    thread_id,
-                    if last_slot == u64::MAX {
-                        "start".to_string()
-                    } else {
-                        last_slot.to_string()
-                    },
-                    slot,
-                    increment
-                );
+
+        // Cap per-thread total at its assigned range length to avoid over-counting when jumps skip gaps.
+        let mut applied_increment = 0u64;
+        if raw_increment > 0 && thread_total > 0 {
+            let current_total = THREAD_PROCESSED_SLOTS[thread_id as usize].load(Ordering::SeqCst);
+            if current_total < thread_total {
+                let remaining = thread_total - current_total;
+                applied_increment = raw_increment.min(remaining);
+                if applied_increment > 0 {
+                    THREAD_PROCESSED_SLOTS[thread_id as usize]
+                        .fetch_add(applied_increment, Ordering::SeqCst);
+                }
             }
-            new_total
-        } else {
-            PROCESSED_SLOTS.load(Ordering::SeqCst)
-        };
+        }
+        if applied_increment > 1000 {
+            log::debug!(
+                "Thread {} large applied increment: {} (raw: {}, last_slot: {}, new_slot: {}, range: {}..={})",
+                thread_id,
+                applied_increment,
+                raw_increment,
+                if last_slot == u64::MAX { 0 } else { last_slot },
+                slot,
+                range_start,
+                range_end
+            );
+        }
+
+        // Recompute global processed slots as the sum of per-thread processed counts.
+        let mut global_sum = 0u64;
+        for tid in 0u8..=255 {
+            let rs = THREAD_SLOT_RANGE_START[tid as usize].load(Ordering::SeqCst);
+            let re = THREAD_SLOT_RANGE_END[tid as usize].load(Ordering::SeqCst);
+            if rs == u64::MAX || re == u64::MAX {
+                continue;
+            }
+            global_sum += THREAD_PROCESSED_SLOTS[tid as usize].load(Ordering::SeqCst);
+        }
+        PROCESSED_SLOTS.store(global_sum, Ordering::SeqCst);
+        let processed_slots = global_sum;
         thread_set_current_slot(thread_id, slot);
         let range_end = thread_slot_range_end(thread_id);
 
@@ -683,13 +714,16 @@ impl GeyserPlugin for Jetstreamer {
                 slot_range.end - slot_range.start
             };
 
-            if complete_threads >= jetstreamer_threads || processed_slots >= total_slots {
+            // Only unload once ALL threads have completed their ranges (or have been explicitly marked complete).
+            if complete_threads >= jetstreamer_threads {
                 log::info!("all work has completed, unloading jetstreamer...");
                 unload();
             } else {
                 log::info!(
-                    "waiting for {} more threads to complete their work",
-                    jetstreamer_threads - complete_threads
+                    "waiting for {} more threads to complete their work ({} total processed / {} total slots)",
+                    jetstreamer_threads - complete_threads,
+                    processed_slots,
+                    total_slots
                 );
 
                 // Debug: Log status of incomplete threads

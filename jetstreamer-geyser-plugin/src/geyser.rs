@@ -16,7 +16,7 @@ use std::{
 use thousands::Separable;
 use tokio::runtime::Runtime;
 
-use crate::clickhouse;
+use crate::clickhouse_utils;
 
 /// Formats a duration in a human-readable way without allocating
 struct DurationFormatter {
@@ -340,7 +340,7 @@ impl GeyserPlugin for Jetstreamer {
                             log::info!("ClickHouse already initialized, skipping spawn.");
                         } else {
                             log::info!("automatic ClickHouse spawning enabled, starting ClickHouse...");
-                            let start_result = clickhouse::start().await
+                            let start_result = clickhouse_utils::start().await
                                 .map_err(|e| JetstreamerError::ClickHouseError(e.to_string()))?;
 
                             let (mut ready_rx, clickhouse_future) = start_result;
@@ -607,8 +607,9 @@ impl GeyserPlugin for Jetstreamer {
 
         ipc_send(
             thread_id as usize,
-            JetstreamerMessage::Block(blk, transaction_count),
+            JetstreamerMessage::Block(blk.clone(), transaction_count),
         );
+
         DB_CLIENT.with_borrow(|db| {
             TOKIO_RUNTIME.with_borrow(|rt| {
                 rt.block_on(async {
@@ -801,7 +802,7 @@ fn send_exit_signal_to_clients() {
 #[inline(always)]
 fn stop_clickhouse() {
     log::info!("stopping ClickHouse...");
-    clickhouse::stop_sync();
+    clickhouse_utils::stop_sync();
     log::info!("ClickHouse stopped.");
 }
 

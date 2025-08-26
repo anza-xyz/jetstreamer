@@ -1,4 +1,4 @@
-pub mod clickhouse;
+pub mod clickhouse_utils;
 pub mod geyser;
 
 use agave_geyser_plugin_interface::geyser_plugin_interface::GeyserPlugin;

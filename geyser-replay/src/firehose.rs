@@ -270,7 +270,7 @@ async fn firehose_thread(
                 let mut item_index = 0;
                 let mut displayed_skip_message = false;
                 loop {
-                    let timeout_result = timeout(std::time::Duration::from_secs(5), reader.read_until_block()).await;
+                    let timeout_result = timeout(std::time::Duration::from_secs(10), reader.read_until_block()).await;
                     let mut nodes = match timeout_result {
                         Ok(result) => result
                             .map_err(|e| GeyserReplayError::ReadUntilBlockError(e))

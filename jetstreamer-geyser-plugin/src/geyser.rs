@@ -602,11 +602,35 @@ impl GeyserPlugin for Jetstreamer {
         }
 
         let blk = Block::from_replica(blockinfo);
+        let slot_val = blk.slot; // capture slot before moving blk
+        let transaction_count = thread_current_tx_index(thread_id) + 1;
 
         ipc_send(
             thread_id as usize,
-            JetstreamerMessage::Block(blk, thread_current_tx_index(thread_id) + 1),
+            JetstreamerMessage::Block(blk.clone(), transaction_count),
         );
+        DB_CLIENT.with_borrow(|db| {
+            TOKIO_RUNTIME.with_borrow(|rt| {
+                rt.block_on(async {
+                    // Insert row directly without deriving Row by specifying values inline.
+                    if let Err(e) = db
+                        .query("INSERT INTO jetstreamer_slot_status (slot, transaction_count, thread_num) VALUES")
+                        .bind(slot_val)
+                        .bind(transaction_count as u32)
+                        .bind(thread_id as u8)
+                        .execute()
+                        .await
+                    {
+                        log::error!(
+                            "slot_status direct insert error slot={} thread={} err={}",
+                            blk.slot,
+                            thread_id,
+                            e
+                        );
+                    }
+                });
+            });
+        });
 
         thread_set_current_tx_index(thread_id, 0);
 

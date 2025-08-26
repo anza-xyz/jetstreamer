@@ -205,58 +205,6 @@ impl PluginRunner {
                         .collect::<Result<Vec<_>, _>>()?;
                     }
 
-                    if let JetstreamerMessage::Block(blk, transaction_count) = &msg {
-                        #[derive(Copy, Clone, Row, serde::Serialize)]
-                        struct SlotStatusRow {
-                            slot: u64,
-                            transaction_count: u32,
-                            thread_id: u8,
-                        }
-
-                        match db.insert("jetstreamer_slot_status") {
-                            Ok(mut insert) => {
-                                if let Err(e) = insert
-                                    .write(&SlotStatusRow {
-                                        slot: blk.slot,
-                                        transaction_count: *transaction_count,
-                                        thread_id: thread_id as u8,
-                                    })
-                                    .await
-                                {
-                                    log::error!(
-                                        "slot_status write error slot={} thread={} err={}",
-                                        blk.slot,
-                                        thread_id,
-                                        e
-                                    );
-                                }
-                                if let Err(e) = insert.end().await {
-                                    log::error!(
-                                        "slot_status end error slot={} thread={} err={}",
-                                        blk.slot,
-                                        thread_id,
-                                        e
-                                    );
-                                } /*else {
-                                log::info!(
-                                "slot_status inserted slot={} txs={} thread={}",
-                                blk.slot,
-                                transaction_count,
-                                thread_id,
-                                );
-                                }*/
-                            }
-                            Err(e) => {
-                                log::error!(
-                                    "slot_status inserter init failed slot={} thread={} err={}",
-                                    blk.slot,
-                                    thread_id,
-                                    e
-                                );
-                            }
-                        }
-                    }
-
                     if matches!(msg, JetstreamerMessage::Exit) {
                         log::info!(
                             "plugin runner thread {} received exit message, shutting down",

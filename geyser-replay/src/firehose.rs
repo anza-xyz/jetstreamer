@@ -250,7 +250,7 @@ async fn firehose_thread(
 
             // for each epoch
             let mut current_slot: Option<u64> = None;
-            'epoch_loop: for epoch_num in epoch_range.clone() {
+            for epoch_num in epoch_range.clone() {
                 log::info!(target: &log_target, "entering epoch {}", epoch_num);
                 let stream = match timeout(OP_TIMEOUT, fetch_epoch_stream(epoch_num, client)).await {
                     Ok(stream) => stream,
@@ -331,8 +331,12 @@ async fn firehose_thread(
                     let slot = block.slot;
                     if slot >= slot_range.end {
                         log::info!("reached end of slot range at slot {}", slot);
-                        break 'epoch_loop;
+                        // Return early to terminate the firehose thread cleanly.
+                        // We use >= because slot_range is half-open [start, end), so any slot
+                        // equal to end is out-of-range and must not be processed.
+                        return Ok(());
                     }
+                    debug_assert!(slot < slot_range.end, "processing out-of-range slot {} (end {})", slot, slot_range.end);
                     if slot < slot_range.start {
                         log::warn!(
                             "encountered slot {} before start of range {}, skipping",
@@ -532,7 +536,7 @@ async fn firehose_thread(
                             elapsed.as_secs_f32()
                         );
                         log::info!("a 🚒 firehose thread finished completed its work.");
-                        break 'epoch_loop;
+                        return Ok(());
                     }
                 }
             }

@@ -7,6 +7,7 @@ use crossbeam_utils::CachePadded;
 use geyser_replay::{epochs::slot_to_epoch, firehose::generate_subranges};
 use rangemap::RangeMap;
 use std::time::Duration;
+use std::time::{SystemTime, UNIX_EPOCH};
 use std::{
     cell::RefCell,
     error::Error,
@@ -89,6 +90,9 @@ static COMPLETE_THREADS: CachePadded<AtomicU8> = CachePadded::new(AtomicU8::new(
 static CLICKHOUSE_INITIALIZED: CachePadded<AtomicBool> = CachePadded::new(AtomicBool::new(false));
 
 static START_TIME: once_cell::sync::OnceCell<Instant> = once_cell::sync::OnceCell::new();
+// Cached TPS fetched from ClickHouse (store as micros to avoid f64 atomics). Updated periodically.
+static CLICKHOUSE_TPS_CACHE_MICRO: CachePadded<AtomicU64> = CachePadded::new(AtomicU64::new(0));
+static CLICKHOUSE_TPS_LAST_QUERY_SEC: CachePadded<AtomicU64> = CachePadded::new(AtomicU64::new(0));
 static SLOT_RANGE: once_cell::sync::OnceCell<Range<u64>> = once_cell::sync::OnceCell::new();
 
 static THREAD_CURRENT_SLOT: [CachePadded<AtomicU64>; 256] =
@@ -150,6 +154,57 @@ pub fn thread_bump_tx_index(thread_id: u8) -> u32 {
 #[inline(always)]
 pub fn thread_set_current_tx_index(thread_id: u8, index: u32) {
     THREAD_CURRENT_TX_INDEX[thread_id as usize].store(index, Ordering::SeqCst);
+}
+
+fn maybe_update_clickhouse_tps(processed_slots: u64) {
+    // Only attempt every 500 processed slot aggregations (same cadence as some logs) or if stale.
+    if processed_slots % 500 != 0 {
+        return;
+    }
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let last = CLICKHOUSE_TPS_LAST_QUERY_SEC.load(Ordering::Relaxed);
+    let min_interval = 5; // seconds
+    if now_secs.saturating_sub(last) < min_interval {
+        return;
+    }
+
+    let window_secs: u64 = std::env::var("JETSTREAMER_CLICKHOUSE_TPS_WINDOW_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(30);
+    let time_col = std::env::var("JETSTREAMER_SLOT_STATUS_TIME_COLUMN")
+        .unwrap_or_else(|_| "ingest_time".to_string());
+
+    let sql = format!(
+        "SELECT sum(transaction_count) AS txs, greatest(1, dateDiff('second', min({c}), max({c}))) AS span FROM jetstreamer_slot_status WHERE {c} >= now() - INTERVAL {w} SECOND",
+        c = time_col,
+        w = window_secs,
+    );
+
+    DB_CLIENT.with_borrow(|db| {
+        TOKIO_RUNTIME.with_borrow(|rt| {
+            let _ = rt.block_on(async {
+                #[derive(::clickhouse::Row, serde::Deserialize)]
+                struct Row {
+                    txs: u64,
+                    span: u64,
+                }
+                if let Ok(row) = db.query(&sql).fetch_one::<Row>().await {
+                    if row.span > 0 {
+                        let tps = (row.txs as f64) / (row.span as f64);
+                        let micros = (tps * 1_000_000.0) as u64;
+                        CLICKHOUSE_TPS_CACHE_MICRO.store(micros, Ordering::Relaxed);
+                        CLICKHOUSE_TPS_LAST_QUERY_SEC.store(now_secs, Ordering::Relaxed);
+                    }
+                } else {
+                    log::debug!("ClickHouse TPS query failed (sql: {})", sql);
+                }
+            });
+        });
+    });
 }
 
 #[derive(Clone, Debug, Default)]
@@ -514,10 +569,16 @@ impl GeyserPlugin for Jetstreamer {
             let processed_txs = PROCESSED_TRANSACTIONS.load(Ordering::SeqCst);
             let num_votes = NUM_VOTES.load(Ordering::SeqCst);
 
+            maybe_update_clickhouse_tps(processed_slots);
             let overall_tps = {
-                let start_time = START_TIME.get().unwrap();
-                let elapsed = start_time.elapsed().as_secs_f64();
-                processed_txs as f64 / elapsed
+                let cached = CLICKHOUSE_TPS_CACHE_MICRO.load(Ordering::Relaxed);
+                if cached > 0 {
+                    cached as f64 / 1_000_000.0
+                } else {
+                    let start_time = START_TIME.get().unwrap();
+                    let elapsed = start_time.elapsed().as_secs_f64();
+                    processed_txs as f64 / elapsed
+                }
             };
 
             let epoch = slot_to_epoch(slot);

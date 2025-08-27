@@ -835,14 +835,8 @@ impl GeyserPlugin for Jetstreamer {
         }
 
         // Tail-phase CPU friendliness: if most threads have finished, yield occasionally to let stragglers progress.
-        let complete = COMPLETE_THREADS.load(Ordering::Relaxed) as u32;
-        let total_threads = range_map.len() as u32;
-        if complete * 4 >= total_threads * 3 {
-            // >=75% complete
-            if processed_slots % 16 == 0 {
-                std::thread::yield_now();
-            }
-        }
+
+        std::thread::yield_now();
 
         Ok(())
     }

@@ -108,8 +108,8 @@ impl PluginRunner {
         log::info!("connecting to ClickHouse at {}", self.clickhouse_dsn);
         let db = Client::default()
             .with_url(&self.clickhouse_dsn)
-            .with_option("async_insert", "0")
-            .with_option("wait_for_async_insert", "1");
+            .with_option("async_insert", "1")
+            .with_option("wait_for_async_insert", "0");
 
         // Initialize plugin management tables
         // NOTE: Include thread_id in ORDER BY so each thread's status row per slot is retained.

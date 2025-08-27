@@ -29,6 +29,10 @@ use crate::{
     node_reader::NodeReader,
 };
 
+// Timeout applied to each asynchronous firehose operation (fetching epoch stream, reading header,
+// seeking, reading next block). Adjust here to tune stall detection/restart aggressiveness.
+const OP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 #[derive(Debug, Error)]
 pub enum GeyserReplayError {
     Reqwest(reqwest::Error),
@@ -41,6 +45,7 @@ pub enum GeyserReplayError {
     SlotOffsetIndexError(SlotOffsetIndexError),
     SeekToSlotError(Box<dyn std::error::Error>),
     OnLoadError(Box<dyn std::error::Error>),
+    OperationTimeout(&'static str),
 }
 
 impl Display for GeyserReplayError {
@@ -79,6 +84,9 @@ impl Display for GeyserReplayError {
                 write!(f, "Error seeking to slot: {}", error)
             }
             GeyserReplayError::OnLoadError(error) => write!(f, "Error on load: {}", error),
+            GeyserReplayError::OperationTimeout(op) => {
+                write!(f, "Timeout while waiting for operation: {}", op)
+            }
         }
     }
 }
@@ -242,48 +250,53 @@ async fn firehose_thread(
 
             // for each epoch
             let mut current_slot: Option<u64> = None;
-            'epoch_loop: for (epoch_num, stream) in
-                epoch_range.map(|epoch| (epoch, fetch_epoch_stream(epoch, client)))
-            {
+            'epoch_loop: for epoch_num in epoch_range.clone() {
                 log::info!(target: &log_target, "entering epoch {}", epoch_num);
-                let stream = stream.await;
+                let stream = match timeout(OP_TIMEOUT, fetch_epoch_stream(epoch_num, client)).await {
+                    Ok(stream) => stream,
+                    Err(_) => {
+                        return Err((GeyserReplayError::OperationTimeout("fetch_epoch_stream"), current_slot.unwrap_or(slot_range.start)));
+                    }
+                };
                 let mut reader = NodeReader::new(stream);
 
-                let header = reader
-                    .read_raw_header()
-                    .await
-                    .map_err(GeyserReplayError::ReadHeader)
-                    .map_err(|e| (e, current_slot.unwrap_or(slot_range.start)))?;
+                let header_fut = reader.read_raw_header();
+                let header = match timeout(OP_TIMEOUT, header_fut).await {
+                    Ok(res) => res
+                        .map_err(GeyserReplayError::ReadHeader)
+                        .map_err(|e| (e, current_slot.unwrap_or(slot_range.start)))?,
+                    Err(_) => {
+                        return Err((GeyserReplayError::OperationTimeout("read_raw_header"), current_slot.unwrap_or(slot_range.start)));
+                    }
+                };
                 log::debug!(target: &log_target, "read epoch {} header: {:?}", epoch_num, header);
 
                 let mut todo_previous_blockhash = solana_sdk::hash::Hash::default();
                 let mut todo_latest_entry_blockhash = solana_sdk::hash::Hash::default();
 
                 if slot_range.start > epoch_to_slot_range(epoch_num).0 {
-                    reader
-                        .seek_to_slot(slot_range.start, &mut slot_offset_index)
-                        .await
-                        .map_err(|e| (e, current_slot.unwrap_or(slot_range.start)))?;
+                    let seek_fut = reader.seek_to_slot(slot_range.start, &mut slot_offset_index);
+                    match timeout(OP_TIMEOUT, seek_fut).await {
+                        Ok(res) => res.map_err(|e| (e, current_slot.unwrap_or(slot_range.start)))?,
+                        Err(_) => {
+                            return Err((GeyserReplayError::OperationTimeout("seek_to_slot"), current_slot.unwrap_or(slot_range.start)));
+                        }
+                    }
                 }
 
                 // for each item in each block
                 let mut item_index = 0;
                 let mut displayed_skip_message = false;
                 loop {
-                    let timeout_result = timeout(std::time::Duration::from_secs(10), reader.read_until_block()).await;
-                    let mut nodes = match timeout_result {
+                    let read_fut = reader.read_until_block();
+                    let mut nodes = match timeout(OP_TIMEOUT, read_fut).await {
                         Ok(result) => result
                             .map_err(|e| GeyserReplayError::ReadUntilBlockError(e))
                             .map_err(|e| (e, current_slot.unwrap_or(slot_range.start)))?,
                         Err(_) => {
-                            log::warn!(target: &log_target, "timeout reading next block, retrying...");
-                            return Err((
-                                GeyserReplayError::ReadUntilBlockError(
-                                    "timeout reading next block".into(),
-                                ),
-                                current_slot.unwrap_or(slot_range.start),
-                            ));
-                        },
+                            log::warn!(target: &log_target, "timeout reading next block, retrying (will restart)...");
+                            return Err((GeyserReplayError::OperationTimeout("read_until_block"), current_slot.unwrap_or(slot_range.start)));
+                        }
                     };
                     // ignore epoch and subset nodes at end of car file
                     loop {

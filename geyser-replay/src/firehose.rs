@@ -503,6 +503,7 @@ async fn firehose_thread(
 									);
 							}
 							todo_previous_blockhash = todo_latest_entry_blockhash;
+                            std::thread::yield_now();
 						},
                         Subset(_subset) => (),
                         Epoch(_epoch) => (),

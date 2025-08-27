@@ -835,7 +835,6 @@ impl GeyserPlugin for Jetstreamer {
         }
 
         // Tail-phase CPU friendliness: if most threads have finished, yield occasionally to let stragglers progress.
-
         std::thread::yield_now();
 
         Ok(())

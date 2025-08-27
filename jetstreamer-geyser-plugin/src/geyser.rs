@@ -106,6 +106,9 @@ static THREAD_SLOT_RANGE_END: [CachePadded<AtomicU64>; 256] =
 // progress (which previously could cause premature unload while other threads were still running).
 static THREAD_PROCESSED_SLOTS: [CachePadded<AtomicU64>; 256] =
     [const { CachePadded::new(AtomicU64::new(0)) }; 256];
+// Last monotonic progress timestamp (nanos since START_TIME) per thread, for stall detection / diagnostics
+static THREAD_LAST_PROGRESS_NS: [CachePadded<AtomicU64>; 256] =
+    [const { CachePadded::new(AtomicU64::new(0)) }; 256];
 static THREAD_CURRENT_TX_INDEX: [CachePadded<AtomicU32>; 256] =
     [const { CachePadded::new(AtomicU32::new(u32::MAX)) }; 256];
 static THREAD_INFO: once_cell::sync::OnceCell<RangeMap<u64, u8>> = once_cell::sync::OnceCell::new();
@@ -550,18 +553,17 @@ impl GeyserPlugin for Jetstreamer {
             );
         }
 
-        // Recompute global processed slots as the sum of per-thread processed counts.
-        let mut global_sum = 0u64;
-        for tid in 0u8..=255 {
-            let rs = THREAD_SLOT_RANGE_START[tid as usize].load(Ordering::SeqCst);
-            let re = THREAD_SLOT_RANGE_END[tid as usize].load(Ordering::SeqCst);
-            if rs == u64::MAX || re == u64::MAX {
-                continue;
+        // Incremental global processed slot accounting to reduce contention.
+        let processed_slots = if applied_increment > 0 {
+            // Update last progress timestamp (nanos since start)
+            if let Some(start) = START_TIME.get() {
+                let nanos = start.elapsed().as_nanos() as u64;
+                THREAD_LAST_PROGRESS_NS[thread_id as usize].store(nanos, Ordering::Relaxed);
             }
-            global_sum += THREAD_PROCESSED_SLOTS[tid as usize].load(Ordering::SeqCst);
-        }
-        PROCESSED_SLOTS.store(global_sum, Ordering::SeqCst);
-        let processed_slots = global_sum;
+            PROCESSED_SLOTS.fetch_add(applied_increment, Ordering::AcqRel) + applied_increment
+        } else {
+            PROCESSED_SLOTS.load(Ordering::Acquire)
+        };
         thread_set_current_slot(thread_id, slot);
         let range_end = thread_slot_range_end(thread_id);
 
@@ -772,7 +774,6 @@ impl GeyserPlugin for Jetstreamer {
                 thread_id,
                 slot
             );
-            ipc_send(thread_id as usize, JetstreamerMessage::Exit);
 
             let complete_threads = COMPLETE_THREADS.fetch_add(1, Ordering::SeqCst) + 1;
             let jetstreamer_threads = range_map.len() as u8;
@@ -784,6 +785,8 @@ impl GeyserPlugin for Jetstreamer {
             // Only unload once ALL threads have completed their ranges (or have been explicitly marked complete).
             if complete_threads >= jetstreamer_threads {
                 log::info!("all work has completed, unloading jetstreamer...");
+                // Now send Exit IPC once to notify client(s) after all threads complete.
+                ipc_send(thread_id as usize, JetstreamerMessage::Exit);
                 unload();
             } else {
                 log::info!(
@@ -794,31 +797,50 @@ impl GeyserPlugin for Jetstreamer {
                 );
 
                 // Debug: Log status of incomplete threads
-                for (_slot, thread_id) in range_map.iter() {
-                    let current_slot = thread_current_slot(*thread_id);
-                    let range_start = thread_slot_range_start(*thread_id);
-                    let range_end = thread_slot_range_end(*thread_id);
-                    // Only log as incomplete if we haven't actually reached the end of the range.
-                    if current_slot < range_end {
-                        let progress = if current_slot == u64::MAX {
-                            0.0
-                        } else if current_slot > range_end {
-                            100.0
-                        } else {
-                            (current_slot - range_start + 1) as f64
-                                / (range_end - range_start + 1) as f64
-                                * 100.0
-                        };
-                        log::info!(
-                            "Thread {} incomplete: current_slot={}, range={}..{}, progress={:.2}%",
-                            thread_id,
-                            current_slot,
-                            range_start,
-                            range_end,
-                            progress
-                        );
+                if let Some(start) = START_TIME.get() {
+                    let now_ns = start.elapsed().as_nanos() as u64;
+                    for (_slot, thread_id) in range_map.iter() {
+                        let current_slot = thread_current_slot(*thread_id);
+                        let r_start = thread_slot_range_start(*thread_id);
+                        let r_end = thread_slot_range_end(*thread_id);
+                        if current_slot < r_end {
+                            let progress = if current_slot == u64::MAX {
+                                0.0
+                            } else if current_slot > r_end {
+                                100.0
+                            } else {
+                                (current_slot - r_start + 1) as f64 / (r_end - r_start + 1) as f64
+                                    * 100.0
+                            };
+                            let last_ns = THREAD_LAST_PROGRESS_NS[*thread_id as usize]
+                                .load(Ordering::Relaxed);
+                            let stale_ms = if last_ns == 0 {
+                                0
+                            } else {
+                                (now_ns.saturating_sub(last_ns)) / 1_000_000
+                            };
+                            log::info!(
+                                "Thread {} incomplete: current_slot={}, range={}..{}, progress={:.2}%, last_progress={}ms ago",
+                                thread_id,
+                                current_slot,
+                                r_start,
+                                r_end,
+                                progress,
+                                stale_ms
+                            );
+                        }
                     }
                 }
+            }
+        }
+
+        // Tail-phase CPU friendliness: if most threads have finished, yield occasionally to let stragglers progress.
+        let complete = COMPLETE_THREADS.load(Ordering::Relaxed) as u32;
+        let total_threads = range_map.len() as u32;
+        if complete * 4 >= total_threads * 3 {
+            // >=75% complete
+            if processed_slots % 16 == 0 {
+                std::thread::yield_now();
             }
         }
 

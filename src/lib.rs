@@ -11,6 +11,8 @@ use tempfile::NamedTempFile;
 
 include!(concat!(env!("OUT_DIR"), "/embed.rs")); // brings in JETSTREAMER_CDYLIB
 
+const WORKER_THREAD_MULTIPLIER: usize = 4; // each plugin thread gets 4 worker threads
+
 pub struct JetstreamerRunner {
     log_level: String,
     plugins: Vec<Box<dyn Plugin>>,
@@ -87,6 +89,20 @@ impl JetstreamerRunner {
         let slot_range = self.config.slot_range;
         log::info!("geyser config files: {:?}", geyser_config_files);
         let threads = self.config.threads as usize;
+        // Build a dedicated Tokio runtime for the PluginRunner with the configured thread count.
+        // This ensures the plugin work is scheduled on exactly `threads` worker threads, independent
+        // from the outer runtime used by the firehose orchestration.
+        let plugin_rt = std::sync::Arc::new(
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(std::cmp::max(
+                    WORKER_THREAD_MULTIPLIER,
+                    threads * WORKER_THREAD_MULTIPLIER,
+                ))
+                .enable_all()
+                .thread_name("jetstreamer")
+                .build()
+                .expect("failed to build plugin runtime"),
+        );
         let mut plugin_runner =
             PluginRunner::new("http://localhost:8123", threads).socket_name("jetstreamer.sock");
         for plugin in self.plugins {
@@ -95,16 +111,22 @@ impl JetstreamerRunner {
         let plugin_runner = Arc::new(plugin_runner);
         log::info!("using {} threads for processing", threads);
         let runner = plugin_runner.clone();
+        let plugin_rt_for_runner = plugin_rt.clone();
         if let Err((err, slot)) = firehose(
             slot_range.clone(),
             Some(geyser_config_files),
             &index_dir,
             &client,
             async move {
-                runner
-                    .run() // see below: run takes self: Arc<Self>
-                    .await
-                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + 'static>)
+                // Run the plugin runner on the dedicated runtime so it uses `threads` worker threads.
+                let handle = plugin_rt_for_runner.spawn(async move { runner.run().await });
+                match handle.await {
+                    Ok(Ok(())) => Ok(()),
+                    Ok(Err(e)) => Err(Box::new(e) as Box<dyn std::error::Error + Send + 'static>),
+                    Err(join_err) => {
+                        Err(Box::new(join_err) as Box<dyn std::error::Error + Send + 'static>)
+                    }
+                }
             },
             threads.try_into().unwrap(),
         )

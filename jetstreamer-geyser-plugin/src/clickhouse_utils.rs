@@ -15,8 +15,14 @@ fn process_log_line(line: impl AsRef<str>) {
     if line.len() > prefix_len {
         match &line[prefix_len..] {
             ln if ln.starts_with("<Information>") => {
-                if !ln[14..].trim().is_empty() {
-                    log::info!("{}", &ln[14..])
+                let msg = &ln[14..];
+                let msg_trimmed = msg.trim();
+                // Suppress noisy ClickHouse client version banner lines
+                if msg_trimmed.starts_with("(version ") {
+                    return;
+                }
+                if !msg_trimmed.is_empty() {
+                    log::info!("{}", msg)
                 }
             }
             ln if ln.starts_with("<Trace>") => log::trace!("{}", &ln[8..]),
@@ -26,6 +32,11 @@ fn process_log_line(line: impl AsRef<str>) {
             _ => log::debug!("{}", line),
         }
     } else if !line.trim().is_empty() {
+        let t = line.trim();
+        // Suppress bare version banner lines that sometimes arrive without the standard prefix
+        if t.starts_with("(version ") {
+            return;
+        }
         log::info!("{}", line);
     }
 }

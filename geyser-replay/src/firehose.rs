@@ -230,7 +230,7 @@ async fn firehose_thread(
 ) -> Result<(), (GeyserReplayError, u64)> {
     let start_time = std::time::Instant::now();
     let log_target = if let Some(thread_index) = thread_index {
-        format!("{}::{:03}", module_path!(), thread_index)
+        format!("{}::T{:03}", module_path!(), thread_index)
     } else {
         module_path!().to_string()
     };

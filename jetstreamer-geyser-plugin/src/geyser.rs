@@ -483,7 +483,7 @@ impl GeyserPlugin for Jetstreamer {
 
         let range_map = THREAD_INFO.get().unwrap();
         let thread_id = *range_map.get(&slot).unwrap();
-        let log_target = format!("{}::{}", module_path!(), thread_id);
+        let log_target = format!("{}::{:03}", module_path!(), thread_id);
         let last_slot = thread_current_slot(thread_id);
 
         // Per-thread progress accounting ---------------------------------------------------------
@@ -809,7 +809,7 @@ impl GeyserPlugin for Jetstreamer {
                             } else {
                                 (now_ns.saturating_sub(last_ns)) / 1_000_000
                             };
-                            let t_target = format!("{}::{}", module_path!(), thread_id);
+                            let t_target = format!("{}::{:03}", module_path!(), thread_id);
                             log::info!(
                                 target: &t_target,
                                 "incomplete: current_slot={}, range={}..{}, progress={:.2}%, last_progress={}ms ago",

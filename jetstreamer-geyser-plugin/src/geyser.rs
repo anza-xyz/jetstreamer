@@ -160,8 +160,8 @@ pub fn thread_set_current_tx_index(thread_id: u8, index: u32) {
 }
 
 fn maybe_update_clickhouse_tps(processed_slots: u64) {
-    // Only attempt every 500 processed slot aggregations (same cadence as some logs) or if stale.
-    if processed_slots % 500 != 0 {
+    // Only attempt every 100 processed slot aggregations (same cadence as some logs) or if stale.
+    if processed_slots % 100 != 0 {
         return;
     }
     let now_secs = SystemTime::now()
@@ -169,22 +169,15 @@ fn maybe_update_clickhouse_tps(processed_slots: u64) {
         .unwrap_or_default()
         .as_secs();
     let last = CLICKHOUSE_TPS_LAST_QUERY_SEC.load(Ordering::Relaxed);
-    let min_interval = 5; // seconds
+    let min_interval = 1; // seconds
     if now_secs.saturating_sub(last) < min_interval {
         return;
     }
 
-    let window_secs: u64 = std::env::var("JETSTREAMER_CLICKHOUSE_TPS_WINDOW_SECS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(30);
-    let time_col = std::env::var("JETSTREAMER_SLOT_STATUS_TIME_COLUMN")
-        .unwrap_or_else(|_| "ingest_time".to_string());
-
     let sql = format!(
         "SELECT sum(transaction_count) AS txs, greatest(1, dateDiff('second', min({c}), max({c}))) AS span FROM jetstreamer_slot_status WHERE {c} >= now() - INTERVAL {w} SECOND",
-        c = time_col,
-        w = window_secs,
+        c = "ingest_time",
+        w = 15, // window seconds
     );
 
     DB_CLIENT.with_borrow(|db| {

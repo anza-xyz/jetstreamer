@@ -18,7 +18,7 @@ use std::{
     future::Future,
     ops::Range,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, atomic::{AtomicU32, Ordering}},
 };
 use thiserror::Error;
 use tokio::time::timeout;
@@ -176,6 +176,8 @@ pub async fn firehose(
     }
 
     let mut handles = Vec::new();
+    // Shared per-thread error counters
+    let error_counts: Arc<Vec<AtomicU32>> = Arc::new((0..subranges.len()).map(|_| AtomicU32::new(0)).collect());
 
     for (i, slot_range) in subranges.into_iter().enumerate() {
         let transaction_notifier_maybe = (*transaction_notifier_maybe).clone();
@@ -184,6 +186,7 @@ pub async fn firehose(
         let confirmed_bank_sender = (*confirmed_bank_sender).clone();
         let slot_offset_index_path = slot_offset_index_path.as_ref().to_owned();
         let client = client.clone();
+        let error_counts = error_counts.clone();
 
         let handle = std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().unwrap();
@@ -197,6 +200,7 @@ pub async fn firehose(
                     confirmed_bank_sender,
                     &client,
                     if threads > 1 { Some(i) } else { None },
+                    error_counts,
                 )
                 .await
                 .unwrap();
@@ -222,6 +226,7 @@ async fn firehose_thread(
     confirmed_bank_sender: Sender<SlotNotification>,
     client: &Client,
     thread_index: Option<usize>,
+    error_counts: Arc<Vec<AtomicU32>>,
 ) -> Result<(), (GeyserReplayError, u64)> {
     let start_time = std::time::Instant::now();
     let log_target = if let Some(thread_index) = thread_index {
@@ -540,6 +545,21 @@ async fn firehose_thread(
                             elapsed.as_secs_f32()
                         );
                         log::info!(target: &log_target, "a 🚒 firehose thread finished completed its work.");
+                        // On completion, report threads with non-zero error counts for visibility.
+                        let summary: String = error_counts
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(i, c)| {
+                                let v = c.load(Ordering::Relaxed);
+                                if v > 0 { Some(format!("{:03}({})", i, v)) } else { None }
+                            })
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        if !summary.is_empty() {
+                            log::warn!(target: &log_target, "threads with errors: {}", summary);
+                        } else {
+                            log::info!(target: &log_target, "no threads reported errors");
+                        }
                         return Ok(());
                     }
                 }
@@ -557,6 +577,9 @@ async fn firehose_thread(
                 GeyserReplayError::NodeDecodingError(item_index, _) => item_index,
                 _ => 0,
             };
+            // Increment this thread's error counter
+            let idx = thread_index.unwrap_or(0);
+            error_counts[idx].fetch_add(1, Ordering::Relaxed);
             log::warn!(
                 target: &log_target,
                 "restarting from slot {} at index {}",

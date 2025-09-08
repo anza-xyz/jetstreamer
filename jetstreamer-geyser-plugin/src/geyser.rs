@@ -483,6 +483,7 @@ impl GeyserPlugin for Jetstreamer {
 
         let range_map = THREAD_INFO.get().unwrap();
         let thread_id = *range_map.get(&slot).unwrap();
+        let log_target = format!("{}::{}", module_path!(), thread_id);
         let last_slot = thread_current_slot(thread_id);
 
         // Per-thread progress accounting ---------------------------------------------------------
@@ -675,8 +676,8 @@ impl GeyserPlugin for Jetstreamer {
             let thread_percent = thread_slots_processed as f64 / thread_total_slots as f64 * 100.0;
 
             log::info!(
-                "T{} {}:{} | {}/{} ({:.2}%) | overall {}/{} ({:.2}%) | {} txs ({} non-vote) | TPS: {:.3} | ETA: {} (slowest: T{}@{:.1}%)",
-                thread_id,
+                target: &log_target,
+                "{}:{} | {}/{} ({:.2}%) | overall {}/{} ({:.2}%) | {} txs ({} non-vote) | TPS: {:.3} | ETA: {} (slowest: T{}@{:.1}%)",
                 epoch,
                 slot,
                 thread_slots_processed.separate_with_commas(),
@@ -762,11 +763,7 @@ impl GeyserPlugin for Jetstreamer {
         thread_set_current_tx_index(thread_id, 0);
 
         if slot >= range_end {
-            log::info!(
-                "thread {} finished processing slot {} and has completed its work",
-                thread_id,
-                slot
-            );
+            log::info!(target: &log_target, "finished processing slot {} and has completed its work", slot);
 
             let complete_threads = COMPLETE_THREADS.fetch_add(1, Ordering::SeqCst) + 1;
             let jetstreamer_threads = range_map.len() as u8;
@@ -812,9 +809,10 @@ impl GeyserPlugin for Jetstreamer {
                             } else {
                                 (now_ns.saturating_sub(last_ns)) / 1_000_000
                             };
+                            let t_target = format!("{}::{}", module_path!(), thread_id);
                             log::info!(
-                                "Thread {} incomplete: current_slot={}, range={}..{}, progress={:.2}%, last_progress={}ms ago",
-                                thread_id,
+                                target: &t_target,
+                                "incomplete: current_slot={}, range={}..{}, progress={:.2}%, last_progress={}ms ago",
                                 current_slot,
                                 r_start,
                                 r_end,

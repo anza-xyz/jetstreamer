@@ -305,7 +305,7 @@ async fn firehose_thread(
                         }
                         if let Some(node) = nodes.0.last() {
                             if node.get_node().is_epoch() {
-                                log::debug!("skipping epoch node for epoch {}", epoch_num);
+                                log::debug!(target: &log_target, "skipping epoch node for epoch {}", epoch_num);
                                 nodes.0.pop();
                             } else if node.get_node().is_subset() {
                                 nodes.0.pop();
@@ -315,7 +315,7 @@ async fn firehose_thread(
                         }
                     }
                     if nodes.0.is_empty() {
-                        log::info!("reached end of epoch {}", epoch_num);
+                        log::info!(target: &log_target, "reached end of epoch {}", epoch_num);
                         break;
                     }
                     let block = nodes
@@ -323,6 +323,7 @@ async fn firehose_thread(
                         .map_err(GeyserReplayError::GetBlockError)
                         .map_err(|e| (e, current_slot.unwrap_or(slot_range.start)))?;
                     log::debug!(
+                        target: &log_target,
                         "read {} items from epoch {}, now at slot {}",
                         item_index,
                         epoch_num,
@@ -330,7 +331,7 @@ async fn firehose_thread(
                     );
                     let slot = block.slot;
                     if slot >= slot_range.end {
-                        log::info!("reached end of slot range at slot {}", slot);
+                        log::info!(target: &log_target, "reached end of slot range at slot {}", slot);
                         // Return early to terminate the firehose thread cleanly.
                         // We use >= because slot_range is half-open [start, end), so any slot
                         // equal to end is out-of-range and must not be processed.
@@ -339,6 +340,7 @@ async fn firehose_thread(
                     debug_assert!(slot < slot_range.end, "processing out-of-range slot {} (end {})", slot, slot_range.end);
                     if slot < slot_range.start {
                         log::warn!(
+                            target: &log_target,
                             "encountered slot {} before start of range {}, skipping",
                             slot,
                             slot_range.start
@@ -529,14 +531,15 @@ async fn firehose_thread(
                     if block.slot == slot_range.end - 1 {
                         let finish_time = std::time::Instant::now();
                         let elapsed = finish_time.duration_since(start_time);
-                        log::info!("processed slot {}", block.slot);
+                        log::info!(target: &log_target, "processed slot {}", block.slot);
                         log::info!(
+                            target: &log_target,
                             "processed {} slots across {} epochs in {} seconds.",
                             slot_range.end - slot_range.start,
                             slot_to_epoch(slot_range.end) + 1 - slot_to_epoch(slot_range.start),
                             elapsed.as_secs_f32()
                         );
-                        log::info!("a 🚒 firehose thread finished completed its work.");
+                        log::info!(target: &log_target, "a 🚒 firehose thread finished completed its work.");
                         return Ok(());
                     }
                 }
@@ -544,16 +547,18 @@ async fn firehose_thread(
             Ok(())
         }.await {
             log::error!(
+                target: &log_target,
                 "🔥🔥🔥 firehose encountered an error at slot {} in epoch {}:",
                 slot,
                 slot_to_epoch(slot)
             );
-            log::error!("{}", err);
+            log::error!(target: &log_target, "{}", err);
             let item_index = match err {
                 GeyserReplayError::NodeDecodingError(item_index, _) => item_index,
                 _ => 0,
             };
             log::warn!(
+                target: &log_target,
                 "restarting from slot {} at index {}",
                 slot,
                 item_index,

@@ -101,9 +101,6 @@ static THREAD_SLOT_RANGE_START: [CachePadded<AtomicU64>; 256] =
     [const { CachePadded::new(AtomicU64::new(u64::MAX)) }; 256];
 static THREAD_SLOT_RANGE_END: [CachePadded<AtomicU64>; 256] =
     [const { CachePadded::new(AtomicU64::new(u64::MAX)) }; 256];
-// Tracks how many slots each thread has actually accounted for toward completion of its own range.
-// This prevents large forward jumps in a single thread from being double-counted toward overall
-// progress (which previously could cause premature unload while other threads were still running).
 static THREAD_PROCESSED_SLOTS: [CachePadded<AtomicU64>; 256] =
     [const { CachePadded::new(AtomicU64::new(0)) }; 256];
 // Last monotonic progress timestamp (nanos since START_TIME) per thread, for stall detection / diagnostics

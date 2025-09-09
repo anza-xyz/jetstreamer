@@ -18,7 +18,10 @@ use std::{
     future::Future,
     ops::Range,
     path::{Path, PathBuf},
-    sync::{Arc, atomic::{AtomicU32, Ordering}},
+    sync::{
+        Arc,
+        atomic::{AtomicU32, Ordering},
+    },
 };
 use thiserror::Error;
 use tokio::time::timeout;
@@ -177,7 +180,8 @@ pub async fn firehose(
 
     let mut handles = Vec::new();
     // Shared per-thread error counters
-    let error_counts: Arc<Vec<AtomicU32>> = Arc::new((0..subranges.len()).map(|_| AtomicU32::new(0)).collect());
+    let error_counts: Arc<Vec<AtomicU32>> =
+        Arc::new((0..subranges.len()).map(|_| AtomicU32::new(0)).collect());
 
     for (i, slot_range) in subranges.into_iter().enumerate() {
         let transaction_notifier_maybe = (*transaction_notifier_maybe).clone();

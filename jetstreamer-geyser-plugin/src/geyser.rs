@@ -479,7 +479,7 @@ impl GeyserPlugin for Jetstreamer {
         };
 
         let range_map = THREAD_INFO.get().unwrap();
-        let thread_id = *range_map.get(&slot).unwrap();
+        let thread_id = *range_map.get(&slot).unwrap_or(&0);
         let log_target = format!("{}::T{:03}", module_path!(), thread_id);
         let last_slot = thread_current_slot(thread_id);
 

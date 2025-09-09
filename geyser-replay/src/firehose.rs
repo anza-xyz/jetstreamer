@@ -362,6 +362,7 @@ async fn firehose_thread(
                             log::warn!(target: &log_target, "non-consecutive slots: {} followed by {}", previous_slot, slot);
                         }
                     }
+                    previous_slot = current_slot;
                     current_slot = Some(slot);
                     let mut entry_index: usize = 0;
                     let mut this_block_executed_transaction_count: u64 = 0;

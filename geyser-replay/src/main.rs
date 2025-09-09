@@ -4,8 +4,7 @@ use {
     std::env::args,
 };
 
-#[tokio::main(flavor = "multi_thread")]
-async fn main() {
+fn main() {
     solana_logger::setup_with_default("info");
     let client = Client::new();
     let index_dir = get_index_dir();
@@ -34,6 +33,5 @@ async fn main() {
         async { Ok(()) },
         1,
     )
-    .await
     .unwrap();
 }

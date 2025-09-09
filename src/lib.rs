@@ -68,8 +68,8 @@ impl JetstreamerRunner {
         self
     }
 
-    pub async fn with_jetstreamer_geyser_config(mut self) -> Self {
-        let geyser_config = setup_geyser(&self.config).await.unwrap();
+    pub fn with_jetstreamer_geyser_config(mut self) -> Self {
+        let geyser_config = setup_geyser(&self.config).unwrap();
         self.geyser_config_files.push(geyser_config);
         self
     }
@@ -79,7 +79,7 @@ impl JetstreamerRunner {
         self
     }
 
-    pub async fn run(self) -> Result<(), GeyserReplayError> {
+    pub fn run(self) -> Result<(), GeyserReplayError> {
         solana_logger::setup_with_default(&self.log_level);
         let geyser_config_files: &[PathBuf] = &self.geyser_config_files;
         log::debug!("GeyserPluginService config: {:?}", geyser_config_files);
@@ -129,9 +129,7 @@ impl JetstreamerRunner {
                 }
             },
             threads.try_into().unwrap(),
-        )
-        .await
-        {
+        ) {
             // handle error or break if needed
             log::error!(
                 "🔥🔥🔥 firehose encountered a fatal error at slot {} in epoch {}: {}",
@@ -147,7 +145,7 @@ impl JetstreamerRunner {
 
 /// Sets up the environment for the Jetstreamer geyser plugin, returning the path of an ephemeral
 /// geyser plugin config file pointing to a copy of the Jetstreamer geyser plugin shared library.
-pub async fn setup_geyser(config: &Config) -> Result<PathBuf, Box<dyn std::error::Error>> {
+pub fn setup_geyser(config: &Config) -> Result<PathBuf, Box<dyn std::error::Error>> {
     // materialize libjetstreamer.{so|dylib|dll} on disk
     let cdylib_path = {
         // pick an extension for this OS

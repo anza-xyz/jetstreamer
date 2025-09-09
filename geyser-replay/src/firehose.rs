@@ -112,7 +112,7 @@ impl From<SlotOffsetIndexError> for GeyserReplayError {
     }
 }
 
-pub async fn firehose(
+pub fn firehose(
     slot_range: Range<u64>,
     geyser_config_files: Option<&[PathBuf]>,
     slot_offset_index_path: impl AsRef<Path>,
@@ -299,7 +299,7 @@ async fn firehose_thread(
                 let mut displayed_skip_message = false;
                 loop {
                     let read_fut = reader.read_until_block();
-                    let mut nodes = match timeout(OP_TIMEOUT, read_fut).await {
+                    let nodes = match timeout(OP_TIMEOUT, read_fut).await {
                         Ok(result) => result
                             .map_err(|e| GeyserReplayError::ReadUntilBlockError(e))
                             .map_err(|e| (e, current_slot.unwrap_or(slot_range.start)))?,

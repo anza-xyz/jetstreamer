@@ -359,7 +359,7 @@ async fn firehose_thread(
                     }
                     if let Some(previous_slot) = previous_slot {
                         if slot != previous_slot + 1 {
-                            log::warn!(target: &log_target, "non-consecutive slots: {} followed by {}", previous_slot, slot);
+                            // log::warn!(target: &log_target, "non-consecutive slots: {} followed by {}", previous_slot, slot);
                         }
                     }
                     previous_slot = current_slot;

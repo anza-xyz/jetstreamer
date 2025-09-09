@@ -326,7 +326,7 @@ async fn firehose_thread(
                     }
                     if nodes.0.is_empty() {
                         log::info!(target: &log_target, "reached end of epoch {}", epoch_num);
-                        break;
+                        continue;
                     }
                     let block = nodes
                         .get_block()

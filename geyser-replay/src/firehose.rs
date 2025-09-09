@@ -569,9 +569,7 @@ async fn firehose_thread(
                             .collect::<Vec<_>>()
                             .join(", ");
                         if !summary.is_empty() {
-                            log::warn!(target: &log_target, "threads with errors: {}", summary);
-                        } else {
-                            log::info!(target: &log_target, "no threads reported errors");
+                            log::debug!(target: &log_target, "threads with errors: {}", summary);
                         }
                         return Ok(());
                     }

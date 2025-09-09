@@ -807,7 +807,7 @@ impl GeyserPlugin for Jetstreamer {
                                 (now_ns.saturating_sub(last_ns)) / 1_000_000
                             };
                             let t_target = format!("{}::T{:03}", module_path!(), thread_id);
-                            log::info!(
+                            log::debug!(
                                 target: &t_target,
                                 "incomplete: current_slot={}, range={}..{}, progress={:.2}%, last_progress={}ms ago",
                                 current_slot,

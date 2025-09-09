@@ -259,6 +259,7 @@ async fn firehose_thread(
 
             // for each epoch
             let mut current_slot: Option<u64> = None;
+            let mut previous_slot: Option<u64> = None;
             for epoch_num in epoch_range.clone() {
                 log::info!(target: &log_target, "entering epoch {}", epoch_num);
                 let stream = match timeout(OP_TIMEOUT, fetch_epoch_stream(epoch_num, client)).await {
@@ -355,6 +356,11 @@ async fn firehose_thread(
                             slot_range.start
                         );
                         continue;
+                    }
+                    if let Some(previous_slot) = previous_slot {
+                        if slot != previous_slot + 1 {
+                            log::warn!(target: &log_target, "non-consecutive slots: {} followed by {}", previous_slot, slot);
+                        }
                     }
                     current_slot = Some(slot);
                     let mut entry_index: usize = 0;

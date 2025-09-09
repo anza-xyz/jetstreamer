@@ -113,6 +113,7 @@ impl From<SlotOffsetIndexError> for GeyserReplayError {
 }
 
 pub fn firehose(
+    rt: Arc<tokio::runtime::Runtime>,
     slot_range: Range<u64>,
     geyser_config_files: Option<&[PathBuf]>,
     slot_offset_index_path: impl AsRef<Path>,
@@ -163,7 +164,7 @@ pub fn firehose(
         log::debug!("none of the plugins have enabled entry notifications")
     }
     log::info!("running on_load...");
-    tokio::task::spawn(on_load);
+    rt.spawn(on_load);
 
     let slot_offset_index_path = Arc::new(slot_offset_index_path.as_ref().to_owned());
     let slot_range = Arc::new(slot_range);
@@ -192,9 +193,10 @@ pub fn firehose(
         let client = client.clone();
         let error_counts = error_counts.clone();
 
+        let rt_clone = rt.clone();
+
         let handle = std::thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            rt.block_on(async {
+            rt_clone.block_on(async {
                 firehose_thread(
                     slot_range,
                     slot_offset_index_path,

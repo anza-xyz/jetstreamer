@@ -113,6 +113,7 @@ impl JetstreamerRunner {
         let runner = plugin_runner.clone();
         let plugin_rt_for_runner = plugin_rt.clone();
         if let Err((err, slot)) = firehose(
+            plugin_rt,
             slot_range.clone(),
             Some(geyser_config_files),
             &index_dir,

@@ -1,7 +1,7 @@
 use {
     geyser_replay::{firehose::firehose, index::get_index_dir},
     reqwest::Client,
-    std::env::args,
+    std::{env::args, sync::Arc},
 };
 
 fn main() {
@@ -26,6 +26,7 @@ fn main() {
     log::info!("slot index dir: {:?}", index_dir);
     log::info!("geyser config files: {:?}", geyser_config_files);
     firehose(
+        Arc::new(tokio::runtime::Runtime::new().unwrap()),
         slot_range,
         Some(geyser_config_files),
         index_dir,

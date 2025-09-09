@@ -483,6 +483,13 @@ impl GeyserPlugin for Jetstreamer {
         let log_target = format!("{}::T{:03}", module_path!(), thread_id);
         let last_slot = thread_current_slot(thread_id);
 
+        if slot == u64::MAX {
+            // signal for unload
+            log::info!(target: &log_target, "✅ received 100% complete from firehose, unloading geyser plugin...");
+            unload();
+            return Ok(());
+        }
+
         // Per-thread progress accounting ---------------------------------------------------------
         let range_start = thread_slot_range_start(thread_id);
         let range_end = thread_slot_range_end(thread_id);

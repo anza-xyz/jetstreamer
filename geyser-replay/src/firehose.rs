@@ -220,6 +220,22 @@ pub fn firehose(
         handle.join().unwrap();
     }
     log::info!("🚒 firehose finished successfully.");
+    if let Some(block_meta_notifier) = block_meta_notifier_maybe.as_ref() {
+        block_meta_notifier.notify_block_metadata(
+            u64::MAX,
+            "unload",
+            u64::MAX,
+            "unload",
+            &KeyedRewardsAndNumPartitions {
+                keyed_rewards: vec![],
+                num_partitions: None,
+            },
+            None,
+            None,
+            0,
+            0,
+        );
+    }
     Ok(confirmed_bank_receiver)
 }
 

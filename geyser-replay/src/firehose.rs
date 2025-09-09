@@ -346,6 +346,12 @@ async fn firehose_thread(
                     //     log::info!(target: &log_target, "reached end of epoch {}", epoch_num);
                     //     break;
                     // }
+                    if let Some(last_node) = nodes.0.last() {
+                        if !last_node.get_node().is_block() {
+                            log::info!(target: &log_target, "reached end of epoch {}", epoch_num);
+                            break;
+                        }
+                    }
                     let block = nodes
                         .get_block()
                         .map_err(GeyserReplayError::GetBlockError)

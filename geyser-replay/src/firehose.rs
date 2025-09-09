@@ -309,21 +309,21 @@ async fn firehose_thread(
                         }
                     };
                     // ignore epoch and subset nodes at end of car file
-                    loop {
-                        if nodes.0.is_empty() {
-                            break;
-                        }
-                        if let Some(node) = nodes.0.last() {
-                            if node.get_node().is_epoch() {
-                                log::debug!(target: &log_target, "skipping epoch node for epoch {}", epoch_num);
-                                nodes.0.pop();
-                            } else if node.get_node().is_subset() {
-                                nodes.0.pop();
-                            } else if node.get_node().is_block() {
-                                break;
-                            }
-                        }
-                    }
+                    // loop {
+                    //     if nodes.0.is_empty() {
+                    //         break;
+                    //     }
+                    //     if let Some(node) = nodes.0.last() {
+                    //         if node.get_node().is_epoch() {
+                    //             log::debug!(target: &log_target, "skipping epoch node for epoch {}", epoch_num);
+                    //             nodes.0.pop();
+                    //         } else if node.get_node().is_subset() {
+                    //             nodes.0.pop();
+                    //         } else if node.get_node().is_block() {
+                    //             break;
+                    //         }
+                    //     }
+                    // }
                     // if nodes.0.is_empty() {
                     //     log::info!(target: &log_target, "reached end of epoch {}", epoch_num);
                     //     break;

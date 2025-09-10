@@ -902,10 +902,13 @@ fn stop_tx_queue() {
 #[inline]
 fn send_exit_signal_to_clients() {
     log::info!("sending exit signal to clients...");
-    let senders = IPC_SENDERS.get().expect("IPC_SENDERS not initialized");
-    for (thread_id, _) in senders.iter().enumerate() {
-        log::info!("sending exit signal to client socket {}", thread_id);
-        ipc_send(thread_id, JetstreamerMessage::Exit);
+    if let Some(senders) = IPC_SENDERS.get() {
+        for (thread_id, _) in senders.iter().enumerate() {
+            log::info!("sending exit signal to client socket {}", thread_id);
+            ipc_send(thread_id, JetstreamerMessage::Exit);
+        }
+    } else {
+        log::warn!("IPC_SENDERS not initialized; no clients to signal exit to");
     }
     log::info!("exit signal sent to clients.");
 }
@@ -935,13 +938,34 @@ fn unload() {
     stop_tx_queue();
     #[cfg(feature = "plugin-runner")]
     send_exit_signal_to_clients();
+    #[cfg(not(feature = "plugin-runner"))]
+    {
+        // In direct mode (no plugin runner), explicitly invoke the plugin's on_exit
+        // so plugins can flush/cleanup before ClickHouse shuts down.
+        PLUGIN.with_borrow(|plugin| {
+            DB_CLIENT.with_borrow(|db| {
+                TOKIO_RUNTIME.with_borrow(|rt| {
+                    let plugin = plugin.clone();
+                    let db = db.clone();
+                    rt.block_on(async move {
+                        if let Err(e) = plugin.on_exit(db.clone()).await {
+                            log::error!("plugin {} on_exit error: {}", plugin.name(), e);
+                        }
+                    });
+                });
+            });
+        });
+    }
     #[cfg(feature = "plugin-runner")]
-    stop_ipc_bridge();
+    {
+        // Give clients a brief moment to process Exit before tearing down IPC.
+        std::thread::sleep(Duration::from_millis(50));
+        stop_ipc_bridge();
+    }
     stop_clickhouse();
     #[cfg(feature = "plugin-runner")]
     clear_domain_sockets();
     log::info!("jetstreamer has successfully unloaded.");
-    std::process::exit(0);
 }
 
 pub trait SolscanUrl {

@@ -1,8 +1,8 @@
 use {
+    crate::{block, dataframe, entry, epoch, rewards, subset, transaction, utils},
     cid::Cid,
     core::hash::Hasher,
     crc::{CRC_64_GO_ISO, Crc},
-    demo_rust_ipld_car::{block, dataframe, entry, epoch, rewards, subset, transaction, utils},
     fnv::FnvHasher,
     std::{
         error::Error,

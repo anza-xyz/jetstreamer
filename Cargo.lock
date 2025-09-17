@@ -1448,40 +1448,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "demo-rust-ipld-car"
-version = "0.1.0"
-source = "git+https://github.com/rpcpool/yellowstone-faithful.git#2fe9a8993da02678f68247aefad2303a2f2393c2"
-dependencies = [
- "base64 0.22.1",
- "bincode",
- "cid",
- "crc",
- "crossbeam-channel",
- "fnv",
- "multihash",
- "prost",
- "serde",
- "serde_cbor",
- "serde_json",
- "solana-accounts-db",
- "solana-clock",
- "solana-commitment-config",
- "solana-entry",
- "solana-geyser-plugin-manager",
- "solana-hash",
- "solana-message",
- "solana-pubkey",
- "solana-reward-info",
- "solana-rpc",
- "solana-runtime",
- "solana-signature",
- "solana-storage-proto",
- "solana-transaction",
- "solana-transaction-status",
- "zstd",
-]
-
-[[package]]
 name = "der-parser"
 version = "8.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2094,10 +2060,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
+ "bincode",
  "cid",
  "crc",
  "crossbeam-channel",
- "demo-rust-ipld-car",
  "fnv",
  "futures-util",
  "log",
@@ -2121,6 +2087,7 @@ dependencies = [
  "solana-transaction-status",
  "thiserror 2.0.12",
  "tokio",
+ "zstd",
 ]
 
 [[package]]

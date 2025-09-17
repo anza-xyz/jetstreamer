@@ -966,6 +966,7 @@ fn unload() {
     #[cfg(feature = "plugin-runner")]
     clear_domain_sockets();
     log::info!("jetstreamer has successfully unloaded.");
+    std::process::exit(0);
 }
 
 pub trait SolscanUrl {

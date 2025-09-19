@@ -59,6 +59,14 @@ impl Transaction {
                 cu: v.transaction_status_meta.compute_units_consumed,
                 success: v.transaction_status_meta.status.is_ok(),
             },
+            ReplicaTransactionInfoVersions::V0_0_3(v) => Self {
+                slot,
+                signature: *v.signature,
+                is_vote: v.is_vote,
+                tx: v.transaction.clone(),
+                cu: v.transaction_status_meta.compute_units_consumed,
+                success: v.transaction_status_meta.status.is_ok(),
+            },
         }
     }
 }

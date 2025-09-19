@@ -6,14 +6,15 @@ use solana_geyser_plugin_manager::{
     geyser_plugin_service::GeyserPluginServiceError,
 };
 use solana_ledger::entry_notifier_interface::EntryNotifier;
+use solana_reward_info::RewardInfo;
 use solana_rpc::{
     optimistically_confirmed_bank_tracker::SlotNotification,
     transaction_notifier_interface::TransactionNotifier,
 };
-use solana_runtime::bank::KeyedRewardsAndNumPartitions;
-use solana_sdk::{reward_info::RewardInfo, reward_type::RewardType};
+use solana_runtime::bank::{KeyedRewardsAndNumPartitions, RewardType};
+use solana_sdk::transaction::VersionedTransaction;
+use solana_vote_program::id as vote_program_id;
 use std::{
-    collections::HashSet,
     fmt::Display,
     future::Future,
     ops::Range,
@@ -424,11 +425,11 @@ async fn firehose_thread(
                     use crate::node::Node::*;
                     match node {
                         Transaction(tx) => {
-                            let parsed = tx.as_parsed()?;
-                            let reassembled_metadata =
-                                nodes.reassemble_dataframes(tx.metadata.clone())?;
+						let versioned_tx = tx.as_parsed()?;
+						let reassembled_metadata =
+							nodes.reassemble_dataframes(tx.metadata.clone())?;
 
-                            let decompressed = utils::decompress_zstd(reassembled_metadata.clone())?;
+						let decompressed = utils::decompress_zstd(reassembled_metadata.clone())?;
 
                             let metadata: solana_storage_proto::convert::generated::TransactionStatusMeta =
                                 prost_011::Message::decode(decompressed.as_slice()).map_err(|err| {
@@ -438,45 +439,53 @@ async fn firehose_thread(
                                     ))
                                 })?;
 
-							let as_native_metadata: solana_transaction_status::TransactionStatusMeta =
-								metadata.try_into()?;
+						let as_native_metadata: solana_transaction_status::TransactionStatusMeta =
+							metadata.try_into()?;
 
-							let dummy_address_loader = MessageAddressLoaderFromTxMeta::new(as_native_metadata.clone());
+						let message_hash = versioned_tx.verify_and_hash_message()?;
+						let signature = versioned_tx
+							.signatures
+							.first()
+							.ok_or_else(|| {
+								Box::new(std::io::Error::new(
+									std::io::ErrorKind::InvalidData,
+									"transaction missing signature",
+								)) as Box<dyn std::error::Error>
+							})?;
+						let is_vote = is_simple_vote_transaction(&versioned_tx);
 
-							let sanitized_tx = match  parsed.version() {
-								solana_sdk::transaction::TransactionVersion::Number(_)=> {
-									let message_hash = parsed.verify_and_hash_message()?;
-									let versioned_sanitized_tx= solana_sdk::transaction::SanitizedVersionedTransaction::try_from(parsed)?;
-									solana_sdk::transaction::SanitizedTransaction::try_new(
-										versioned_sanitized_tx,
-										message_hash,
-										false,
-										dummy_address_loader,
-										&HashSet::default(),
-									)
-								},
-								solana_sdk::transaction::TransactionVersion::Legacy(_legacy)=> {
-									solana_sdk::transaction::SanitizedTransaction::try_from_legacy_transaction(
-										parsed.into_legacy_transaction().unwrap(),
-										&HashSet::default(),
-									)
-								},
-							}?;
-
-							if let Some(transaction_notifier) = transaction_notifier_maybe.as_ref() {
-								transaction_notifier
-								.notify_transaction(
-									block.slot,
-									tx.index.unwrap() as usize,
-									sanitized_tx.signature(),
-									&as_native_metadata,
-									&sanitized_tx,
-								);
-							}
+						if let Some(transaction_notifier) = transaction_notifier_maybe.as_ref() {
+							transaction_notifier.notify_transaction(
+								block.slot,
+								tx.index.unwrap() as usize,
+								signature,
+								&message_hash,
+								is_vote,
+								&as_native_metadata,
+								&versioned_tx,
+							);
+						}
                         }
                         Entry(entry) => {
 							todo_latest_entry_blockhash = solana_sdk::hash::Hash::from(entry.hash.to_bytes());
-							this_block_executed_transaction_count += entry.transactions.len() as u64;
+							let entry_transaction_count = entry.transactions.len() as u64;
+							let starting_transaction_index = usize::try_from(
+								this_block_executed_transaction_count,
+							)
+							.map_err(|_| {
+								Box::new(std::io::Error::new(
+									std::io::ErrorKind::Other,
+									"transaction index exceeds usize range",
+								)) as Box<dyn std::error::Error>
+							})?;
+							this_block_executed_transaction_count = this_block_executed_transaction_count
+								.checked_add(entry_transaction_count)
+								.ok_or_else(|| {
+									Box::new(std::io::Error::new(
+										std::io::ErrorKind::Other,
+										"transaction count overflow",
+									)) as Box<dyn std::error::Error>
+								})?;
 							this_block_entry_count += 1;
 							if entry_notifier_maybe.is_none() {
 								return Ok(());
@@ -485,12 +494,10 @@ async fn firehose_thread(
 							let entry_summary = solana_entry::entry::EntrySummary {
 								num_hashes: entry.num_hashes,
 								hash: solana_sdk::hash::Hash::from(entry.hash.to_bytes()),
-								num_transactions: entry.transactions.len() as u64,
+								num_transactions: entry_transaction_count,
 							};
-
-							let starting_transaction_index = 0; // TODO:: implement this
 							entry_notifier
-								.notify_entry(block.slot, entry_index  ,&entry_summary, starting_transaction_index);
+								.notify_entry(block.slot, entry_index, &entry_summary, starting_transaction_index);
 							entry_index += 1;
 						},
                         Block(block) => {
@@ -629,6 +636,32 @@ async fn firehose_thread(
     Ok(())
 }
 
+fn is_simple_vote_transaction(versioned_tx: &VersionedTransaction) -> bool {
+    if !(1..=2).contains(&versioned_tx.signatures.len()) {
+        return false;
+    }
+
+    if !matches!(
+        versioned_tx.version(),
+        solana_sdk::transaction::TransactionVersion::Legacy(_)
+    ) {
+        return false;
+    }
+
+    let instructions = versioned_tx.message.instructions();
+    if instructions.len() != 1 {
+        return false;
+    }
+
+    let program_index = instructions[0].program_id_index as usize;
+    versioned_tx
+        .message
+        .static_account_keys()
+        .get(program_index)
+        .map(|program_id| program_id == &vote_program_id())
+        .unwrap_or(false)
+}
+
 pub fn generate_subranges(slot_range: &Range<u64>, threads: u8) -> Vec<Range<u64>> {
     let threads = threads as u64;
     let total = slot_range.end - slot_range.start;
@@ -672,33 +705,4 @@ pub fn generate_subranges(slot_range: &Range<u64>, threads: u8) -> Vec<Range<u64
         total_covered
     );
     ranges
-}
-
-pub struct MessageAddressLoaderFromTxMeta {
-    pub tx_meta: solana_transaction_status::TransactionStatusMeta,
-}
-
-impl MessageAddressLoaderFromTxMeta {
-    pub fn new(tx_meta: solana_transaction_status::TransactionStatusMeta) -> Self {
-        MessageAddressLoaderFromTxMeta { tx_meta }
-    }
-}
-
-impl solana_sdk::message::AddressLoader for MessageAddressLoaderFromTxMeta {
-    fn load_addresses(
-        self,
-        _lookups: &[solana_sdk::message::v0::MessageAddressTableLookup],
-    ) -> Result<solana_sdk::message::v0::LoadedAddresses, solana_sdk::message::AddressLoaderError>
-    {
-        Ok(self.tx_meta.loaded_addresses.clone())
-    }
-}
-
-// implement clone for MessageAddressLoaderFromTxMeta
-impl Clone for MessageAddressLoaderFromTxMeta {
-    fn clone(&self) -> Self {
-        MessageAddressLoaderFromTxMeta {
-            tx_meta: self.tx_meta.clone(),
-        }
-    }
 }

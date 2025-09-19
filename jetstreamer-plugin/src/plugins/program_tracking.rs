@@ -3,7 +3,7 @@ use std::{cell::RefCell, collections::HashMap, sync::Arc};
 use clickhouse::{Client, Row};
 use futures_util::FutureExt;
 use serde::{Deserialize, Serialize};
-use solana_sdk::{instruction::CompiledInstruction, message::VersionedMessage, pubkey::Pubkey};
+use solana_sdk::{message::VersionedMessage, pubkey::Pubkey};
 
 use crate::{
     Plugin, PluginFuture,
@@ -59,7 +59,7 @@ impl Plugin for ProgramTrackingPlugin {
             };
             let program_ids = instructions
                 .iter()
-                .map(|ix: &CompiledInstruction| account_keys[ix.program_id_index as usize])
+                .map(|ix| account_keys[ix.program_id_index as usize])
                 .collect::<Vec<_>>();
             let total_cu = transaction.cu.unwrap_or(0) as u32;
 

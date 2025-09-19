@@ -983,6 +983,9 @@ impl SolscanUrl for ReplicaTransactionInfoVersions<'_> {
             ReplicaTransactionInfoVersions::V0_0_2(tx) => {
                 format!("https://solscan.io/tx/{}", tx.signature)
             }
+            ReplicaTransactionInfoVersions::V0_0_3(tx) => {
+                format!("https://solscan.io/tx/{}", tx.signature)
+            }
         }
     }
 }

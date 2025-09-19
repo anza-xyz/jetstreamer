@@ -46,3 +46,5 @@ fnv.workspace = true
 rayon.workspace = true
 serde_json.workspace = true
 zstd.workspace = true
+solana-vote-program.workspace = true
+solana-reward-info.workspace = true

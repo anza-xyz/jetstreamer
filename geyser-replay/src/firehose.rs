@@ -442,7 +442,17 @@ async fn firehose_thread(
 						let as_native_metadata: solana_transaction_status::TransactionStatusMeta =
 							metadata.try_into()?;
 
-						let message_hash = versioned_tx.verify_and_hash_message()?;
+						let message_hash = {
+							#[cfg(feature = "verify-transaction-signatures")]
+							{
+								versioned_tx.verify_and_hash_message()?
+							}
+							#[cfg(not(feature = "verify-transaction-signatures"))]
+							{
+								// Signature verification is optional because it is extremely expensive at replay scale.
+								(&versioned_tx.message).hash()
+							}
+						};
 						let signature = versioned_tx
 							.signatures
 							.first()

@@ -1,7 +1,7 @@
 use core::ops::Range;
 use geyser_replay::{
     epochs::slot_to_epoch,
-    firehose::{GeyserReplayError, firehose},
+    firehose::{GeyserReplayError, firehose_geyser},
     index::get_index_dir,
 };
 use jetstreamer_plugin::{Plugin, PluginRunner};
@@ -112,7 +112,7 @@ impl JetstreamerRunner {
         log::info!("using {} threads for processing", threads);
         let runner = plugin_runner.clone();
         let plugin_rt_for_runner = plugin_rt.clone();
-        if let Err((err, slot)) = firehose(
+        if let Err((err, slot)) = firehose_geyser(
             plugin_rt,
             slot_range.clone(),
             Some(geyser_config_files),

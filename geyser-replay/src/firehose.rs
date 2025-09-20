@@ -113,7 +113,7 @@ impl From<SlotOffsetIndexError> for GeyserReplayError {
     }
 }
 
-pub fn firehose(
+pub fn firehose_geyser(
     rt: Arc<tokio::runtime::Runtime>,
     slot_range: Range<u64>,
     geyser_config_files: Option<&[PathBuf]>,
@@ -198,7 +198,7 @@ pub fn firehose(
 
         let handle = std::thread::spawn(move || {
             rt_clone.block_on(async {
-                firehose_thread(
+                firehose_geyser_thread(
                     slot_range,
                     slot_offset_index_path,
                     transaction_notifier_maybe,
@@ -240,7 +240,7 @@ pub fn firehose(
     Ok(confirmed_bank_receiver)
 }
 
-async fn firehose_thread(
+async fn firehose_geyser_thread(
     mut slot_range: Range<u64>,
     slot_offset_index_path: impl AsRef<Path>,
     transaction_notifier_maybe: Option<Arc<dyn TransactionNotifier + Send + Sync + 'static>>,

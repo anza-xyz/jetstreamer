@@ -1,5 +1,5 @@
 use crate::epochs::slot_to_epoch;
-use crate::firehose::GeyserReplayError;
+use crate::firehose::FirehoseError;
 use crate::index::{SlotOffsetIndex, SlotOffsetIndexError};
 use crate::node::{Node, NodeWithCid, NodesWithCids, parse_any_from_cbordata};
 use crate::utils;
@@ -192,7 +192,7 @@ impl<R: AsyncRead + Unpin + AsyncSeek + Len> NodeReader<R> {
         &mut self,
         slot: u64,
         index: &mut SlotOffsetIndex,
-    ) -> Result<(), GeyserReplayError> {
+    ) -> Result<(), FirehoseError> {
         self.seek_to_slot_inner(slot, index).await
     }
 
@@ -200,11 +200,11 @@ impl<R: AsyncRead + Unpin + AsyncSeek + Len> NodeReader<R> {
         &mut self,
         slot: u64,
         index: &mut SlotOffsetIndex,
-    ) -> Result<(), GeyserReplayError> {
+    ) -> Result<(), FirehoseError> {
         if self.header.is_empty() {
             self.read_raw_header()
                 .await
-                .map_err(GeyserReplayError::SeekToSlotError)?;
+                .map_err(FirehoseError::SeekToSlotError)?;
         };
 
         let epoch = slot_to_epoch(slot);
@@ -225,7 +225,7 @@ impl<R: AsyncRead + Unpin + AsyncSeek + Len> NodeReader<R> {
         self.reader
             .seek(SeekFrom::Start(offset))
             .await
-            .map_err(|e| GeyserReplayError::SeekToSlotError(Box::new(e)))?;
+            .map_err(|e| FirehoseError::SeekToSlotError(Box::new(e)))?;
 
         Ok(())
     }

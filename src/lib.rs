@@ -1,7 +1,7 @@
 use core::ops::Range;
 use geyser_replay::{
     epochs::slot_to_epoch,
-    firehose::{GeyserReplayError, firehose_geyser},
+    firehose::{FirehoseError, firehose_geyser},
     index::get_index_dir,
 };
 use jetstreamer_plugin::{Plugin, PluginRunner};
@@ -79,7 +79,7 @@ impl JetstreamerRunner {
         self
     }
 
-    pub fn run(self) -> Result<(), GeyserReplayError> {
+    pub fn run(self) -> Result<(), FirehoseError> {
         solana_logger::setup_with_default(&self.log_level);
         let geyser_config_files: &[PathBuf] = &self.geyser_config_files;
         log::debug!("GeyserPluginService config: {:?}", geyser_config_files);

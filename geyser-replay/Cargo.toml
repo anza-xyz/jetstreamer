@@ -21,6 +21,7 @@ path = "src/index_bin.rs"
 
 [dependencies]
 crossbeam-channel.workspace = true
+agave-geyser-plugin-interface.workspace = true
 solana-rpc.workspace = true
 solana-runtime.workspace = true
 solana-sdk.workspace = true

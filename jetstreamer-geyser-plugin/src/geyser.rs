@@ -353,7 +353,7 @@ impl GeyserPlugin for Jetstreamer {
             .get("threads")
             .unwrap()
             .as_u64()
-            .unwrap_or(1) as u8;
+            .unwrap_or(1);
         log::info!("jetstreamer threads: {}", threads);
         let slot_range = config_json
             .get("jetstreamer")

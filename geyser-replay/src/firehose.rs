@@ -158,11 +158,7 @@ pub async fn firehose(
 
         let handle = tokio::spawn(async move {
             let start_time = std::time::Instant::now();
-            let log_target = if let Some(thread_index) = thread_index {
-                format!("{}::T{:03}", module_path!(), thread_index)
-            } else {
-                module_path!().to_string()
-            };
+            let log_target = format!("{}::T{:03}", module_path!(), thread_index);
             let mut skip_until_index = None;
             // let mut triggered = false;
             loop {
@@ -187,7 +183,7 @@ pub async fn firehose(
                     let mut previous_slot: Option<u64> = None;
                     for epoch_num in epoch_range.clone() {
                         log::info!(target: &log_target, "entering epoch {}", epoch_num);
-                        let stream = match timeout(OP_TIMEOUT, fetch_epoch_stream(epoch_num, client)).await {
+                        let stream = match timeout(OP_TIMEOUT, fetch_epoch_stream(epoch_num, &client)).await {
                             Ok(stream) => stream,
                             Err(_) => {
                                 return Err((FirehoseError::OperationTimeout("fetch_epoch_stream"), current_slot.unwrap_or(slot_range.start)));
@@ -504,8 +500,7 @@ pub async fn firehose(
                         _ => 0,
                     };
                     // Increment this thread's error counter
-                    let idx = thread_index.unwrap_or(0);
-                    error_counts[idx].fetch_add(1, Ordering::Relaxed);
+                    error_counts[thread_index].fetch_add(1, Ordering::Relaxed);
                     log::warn!(
                         target: &log_target,
                         "restarting from slot {} at index {}",

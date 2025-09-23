@@ -147,8 +147,8 @@ pub struct BlockData {
 
 #[inline]
 pub async fn firehose<OnBlock, OnTransaction>(
-    slot_range: Range<u64>,
     threads: u64,
+    slot_range: Range<u64>,
     on_block: OnBlock,
     on_tx: OnTransaction,
 ) -> Result<(), (FirehoseError, u64)>
@@ -1143,20 +1143,21 @@ pub fn generate_subranges(slot_range: &Range<u64>, threads: u64) -> Vec<Range<u6
     ranges
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 64)]
 async fn test_firehose_epoch_800() {
     solana_logger::setup_with_default("info");
     firehose(
-        345600000..(345600000 + 20),
-        1,
+        4,
+        345600000..(345600000 + 1000),
         |thread_id, _block: BlockData| {
-            log::info!("got block on thread {}", thread_id);
+            log::info!(
+                "got block on thread {} / {:#?}",
+                thread_id,
+                std::thread::current().id()
+            );
             Ok(())
         },
-        |thread_id, _tx: TransactionData| {
-            log::info!("got tx on thread {}", thread_id);
-            Ok(())
-        },
+        |thread_id, _tx: TransactionData| Ok(()),
     )
     .await
     .unwrap();

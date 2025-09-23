@@ -74,8 +74,7 @@ impl RawNode {
         let parsed = parse_any_from_cbordata(self.data.clone());
         if parsed.is_err() {
             println!("Error: {:?}", parsed.err().unwrap());
-            Err(Box::new(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            Err(Box::new(std::io::Error::other(
                 "Unknown type".to_owned(),
             )))
         } else {
@@ -100,8 +99,7 @@ impl RawNode {
         // println!("Digest length: {}", digest_length);
 
         if digest_length > 64 {
-            return Err(Box::new(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            return Err(Box::new(std::io::Error::other(
                 format!("Digest length too long, position={}", cursor.position()),
             )));
         }
@@ -129,8 +127,7 @@ impl RawNode {
                 let raw_node = RawNode::new(cid, data);
                 Ok(raw_node)
             }
-            _ => Err(Box::new(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            _ => Err(Box::new(std::io::Error::other(
                 "Unknown CID version".to_owned(),
             ))),
         }
@@ -174,8 +171,7 @@ impl<R: AsyncRead + Unpin + AsyncSeek + Len> NodeReader<R> {
         };
         let header_length = read_uvarint(&mut self.reader).await?;
         if header_length > 1024 {
-            return Err(Box::new(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            return Err(Box::new(std::io::Error::other(
                 "Header length too long".to_owned(),
             )));
         }
@@ -244,8 +240,7 @@ impl<R: AsyncRead + Unpin + AsyncSeek + Len> NodeReader<R> {
         // println!("Section size: {}", section_size);
 
         if section_size > utils::MAX_ALLOWED_SECTION_SIZE as u64 {
-            return Err(Box::new(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            return Err(Box::new(std::io::Error::other(
                 "Section size too long".to_owned(),
             )));
         }
@@ -297,11 +292,10 @@ impl<R: AsyncRead + Unpin + AsyncSeek + Len> NodeReader<R> {
 }
 
 pub fn cid_from_cbor_link(val: &serde_cbor::Value) -> Result<cid::Cid, Box<dyn std::error::Error>> {
-    if let serde_cbor::Value::Bytes(b) = val {
-        if b.first() == Some(&0) {
+    if let serde_cbor::Value::Bytes(b) = val
+        && b.first() == Some(&0) {
             return Ok(cid::Cid::try_from(b[1..].to_vec())?);
         }
-    }
     Err("invalid DAG‑CBOR link encoding".into())
 }
 

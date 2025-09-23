@@ -71,18 +71,18 @@ impl NodesWithCids {
             for next_cid in next_arr.clone().unwrap() {
                 let next_node = self.get_by_cid(&next_cid);
                 if next_node.is_none() {
-                    return Err(Box::new(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        std::format!("Missing CID: {:?}", next_cid),
-                    )));
+                    return Err(Box::new(std::io::Error::other(std::format!(
+                        "Missing CID: {:?}",
+                        next_cid
+                    ))));
                 }
                 let next_node_un = next_node.unwrap();
 
                 if !next_node_un.get_node().is_dataframe() {
-                    return Err(Box::new(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        std::format!("Expected DataFrame, got {:?}", next_node_un.get_node()),
-                    )));
+                    return Err(Box::new(std::io::Error::other(std::format!(
+                        "Expected DataFrame, got {:?}",
+                        next_node_un.get_node()
+                    ))));
                 }
 
                 let next_dataframe = next_node_un.get_node().get_dataframe().unwrap();
@@ -120,17 +120,14 @@ impl NodesWithCids {
         // the last node should be a block
         let last_node = self.0.last();
         if last_node.is_none() {
-            return Err(Box::new(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "No nodes".to_owned(),
-            )));
+            return Err(Box::new(std::io::Error::other("No nodes".to_owned())));
         }
         let last_node_un = last_node.unwrap();
         if !last_node_un.get_node().is_block() {
-            return Err(Box::new(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                std::format!("Expected Block, got {:?}", last_node_un.get_node()),
-            )));
+            return Err(Box::new(std::io::Error::other(std::format!(
+                "Expected Block, got {:?}",
+                last_node_un.get_node()
+            ))));
         }
         let block = last_node_un.get_node().get_block().unwrap();
         Ok(block)
@@ -143,15 +140,12 @@ pub fn verify_hash(data: Vec<u8>, hash: u64) -> Result<(), Box<dyn Error>> {
         // Maybe it's the legacy checksum function?
         let fnv = checksum_fnv(&data);
         if fnv != hash {
-            return Err(Box::new(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                std::format!(
-                    "data hash mismatch: wanted {:?}, got crc64={:?}, fnv={:?}",
-                    hash,
-                    crc64,
-                    fnv
-                ),
-            )));
+            return Err(Box::new(std::io::Error::other(std::format!(
+                "data hash mismatch: wanted {:?}, got crc64={:?}, fnv={:?}",
+                hash,
+                crc64,
+                fnv
+            ))));
         }
     }
     Ok(())
@@ -272,10 +266,10 @@ pub fn parse_any_from_cbordata(data: Vec<u8>) -> Result<Node, Box<dyn Error>> {
 
             // based on the kind, we can decode the rest of the data
             let Some(kind) = Kind::from_u64(*kind as u64) else {
-                return Err(Box::new(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    std::format!("Invalid kind: {:?}", kind),
-                )));
+                return Err(Box::new(std::io::Error::other(std::format!(
+                    "Invalid kind: {:?}",
+                    kind
+                ))));
             };
             match kind {
                 Kind::Transaction => {
@@ -315,10 +309,7 @@ pub fn parse_any_from_cbordata(data: Vec<u8>) -> Result<Node, Box<dyn Error>> {
         }
     }
 
-    Err(Box::new(std::io::Error::new(
-        std::io::ErrorKind::Other,
-        "Unknown type".to_owned(),
-    )))
+    Err(Box::new(std::io::Error::other("Unknown type".to_owned())))
 }
 
 pub enum Kind {
@@ -403,15 +394,9 @@ impl RawNode {
 
     pub fn parse(&self) -> Result<Node, Box<dyn Error>> {
         let parsed = parse_any_from_cbordata(self.data.clone());
-        if parsed.is_err() {
-            println!("Error: {:?}", parsed.err().unwrap());
-            Err(Box::new(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "Unknown type".to_owned(),
-            )))
-        } else {
-            let node = parsed.unwrap();
-            Ok(node)
+        match parsed {
+            Ok(node) => Ok(node),
+            Err(_) => Err(Box::new(std::io::Error::other("Unknown type".to_owned()))),
         }
     }
 
@@ -431,8 +416,7 @@ impl RawNode {
         // println!("Digest length: {}", digest_length);
 
         if digest_length > 64 {
-            return Err(Box::new(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            return Err(Box::new(std::io::Error::other(
                 "Digest length too long".to_owned(),
             )));
         }
@@ -460,8 +444,7 @@ impl RawNode {
                 let raw_node = RawNode::new(cid, data);
                 Ok(raw_node)
             }
-            _ => Err(Box::new(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            _ => Err(Box::new(std::io::Error::other(
                 "Unknown CID version".to_owned(),
             ))),
         }
@@ -490,8 +473,7 @@ impl<R: Read> NodeReader<R> {
         };
         let header_length = utils::read_uvarint(&mut self.reader)?;
         if header_length > 1024 {
-            return Err(Box::new(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            return Err(Box::new(std::io::Error::other(
                 "Header length too long".to_owned(),
             )));
         }
@@ -518,8 +500,7 @@ impl<R: Read> NodeReader<R> {
         // println!("Section size: {}", section_size);
 
         if section_size > utils::MAX_ALLOWED_SECTION_SIZE as u64 {
-            return Err(Box::new(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            return Err(Box::new(std::io::Error::other(
                 "Section size too long".to_owned(),
             )));
         }

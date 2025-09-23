@@ -46,8 +46,7 @@ impl DataFrame {
                 data_frame.kind = *kind as u64;
 
                 if *kind as u64 != Kind::DataFrame as u64 {
-                    return Err(Box::new(std::io::Error::new(
-                        std::io::ErrorKind::Other,
+                    return Err(Box::new(std::io::Error::other(
                         std::format!(
                             "Wrong kind for DataFrame. Expected {:?}, got {:?}",
                             Kind::DataFrame,
@@ -69,8 +68,8 @@ impl DataFrame {
                 data_frame.data = Buffer::from_vec(data.clone());
             }
 
-            if array.len() > 5 {
-                if let Some(serde_cbor::Value::Array(next)) = &array.get(5) {
+            if array.len() > 5
+                && let Some(serde_cbor::Value::Array(next)) = &array.get(5) {
                     if next.is_empty() {
                         data_frame.next = None;
                     } else {
@@ -83,7 +82,6 @@ impl DataFrame {
                         data_frame.next = Some(nexts);
                     }
                 }
-            }
         }
         Ok(data_frame)
     }

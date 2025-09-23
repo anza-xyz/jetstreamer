@@ -21,7 +21,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicU32, AtomicU64, Ordering},
+        atomic::{AtomicU32, Ordering},
     },
 };
 use thiserror::Error;
@@ -235,7 +235,7 @@ where
 
                     // for each epoch
                     let mut current_slot: Option<u64> = None;
-                    let mut previous_slot: Option<u64> = None;
+                    let mut previous_slot: Option<u64>;
                     for epoch_num in epoch_range.clone() {
                         log::info!(target: &log_target, "entering epoch {}", epoch_num);
                         let stream = match timeout(OP_TIMEOUT, fetch_epoch_stream(epoch_num, &client)).await {
@@ -277,19 +277,18 @@ where
                             let read_fut = reader.read_until_block();
                             let nodes = match timeout(OP_TIMEOUT, read_fut).await {
                                 Ok(result) => result
-                                    .map_err(|e| FirehoseError::ReadUntilBlockError(e))
+                                    .map_err(FirehoseError::ReadUntilBlockError)
                                     .map_err(|e| (e, current_slot.unwrap_or(slot_range.start)))?,
                                 Err(_) => {
                                     log::warn!(target: &log_target, "timeout reading next block, retrying (will restart)...");
                                     return Err((FirehoseError::OperationTimeout("read_until_block"), current_slot.unwrap_or(slot_range.start)));
                                 }
                             };
-                            if let Some(last_node) = nodes.0.last() {
-                                if !last_node.get_node().is_block() {
+                            if let Some(last_node) = nodes.0.last()
+                                && !last_node.get_node().is_block() {
                                     log::info!(target: &log_target, "reached end of epoch {}", epoch_num);
                                     break;
                                 }
-                            }
                             let block = nodes
                                 .get_block()
                                 .map_err(FirehoseError::GetBlockError)
@@ -354,8 +353,7 @@ where
 
                                         let metadata: solana_storage_proto::convert::generated::TransactionStatusMeta =
                                             prost_011::Message::decode(decompressed.as_slice()).map_err(|err| {
-                                                Box::new(std::io::Error::new(
-                                                    std::io::ErrorKind::Other,
+                                                Box::new(std::io::Error::other(
                                                     std::format!("Error decoding metadata: {:?}", err),
                                                 ))
                                             })?;
@@ -371,7 +369,7 @@ where
                                         #[cfg(not(feature = "verify-transaction-signatures"))]
                                         {
                                             // Signature verification is optional because it is extremely expensive at replay scale.
-                                            (&versioned_tx.message).hash()
+                                            versioned_tx.message.hash()
                                         }
                                     };
                                     let signature = versioned_tx
@@ -404,8 +402,7 @@ where
                                     this_block_executed_transaction_count = this_block_executed_transaction_count
                                         .checked_add(entry_transaction_count)
                                         .ok_or_else(|| {
-                                            Box::new(std::io::Error::new(
-                                                std::io::ErrorKind::Other,
+                                            Box::new(std::io::Error::other(
                                                 "transaction count overflow",
                                             )) as Box<dyn std::error::Error>
                                         })?;
@@ -428,10 +425,7 @@ where
                                                 lamports: this_block_reward.lamports,
                                                 post_balance: this_block_reward.post_balance,
                                                 // commission is Option<u8>, but this_block_reward.commission is string
-                                                commission: match this_block_reward.commission.parse::<u8>() {
-                                                    Ok(commission) => Some(commission),
-                                                    Err(_err) => None,
-                                                },
+                                                commission: this_block_reward.commission.parse::<u8>().ok(),
                                             };
                                             keyed_rewards.push((this_block_reward.pubkey.parse()?, reward));
                                         }
@@ -482,8 +476,7 @@ where
                                         let decompressed = utils::decompress_zstd(reassembled)?;
 
                                         this_block_rewards = prost_011::Message::decode(decompressed.as_slice()).map_err(|err| {
-                                            Box::new(std::io::Error::new(
-                                                std::io::ErrorKind::Other,
+                                            Box::new(std::io::Error::other(
                                                 std::format!("Error decoding rewards: {:?}", err),
                                             ))
                                         })?;
@@ -551,7 +544,6 @@ where
                     break;
                 }
             }
-            ()
         });
         handles.push(handle);
     }
@@ -771,7 +763,7 @@ async fn firehose_geyser_thread(
                     let read_fut = reader.read_until_block();
                     let nodes = match timeout(OP_TIMEOUT, read_fut).await {
                         Ok(result) => result
-                            .map_err(|e| FirehoseError::ReadUntilBlockError(e))
+                            .map_err(FirehoseError::ReadUntilBlockError)
                             .map_err(|e| (e, current_slot.unwrap_or(slot_range.start)))?,
                         Err(_) => {
                             log::warn!(target: &log_target, "timeout reading next block, retrying (will restart)...");
@@ -798,12 +790,11 @@ async fn firehose_geyser_thread(
                     //     log::info!(target: &log_target, "reached end of epoch {}", epoch_num);
                     //     break;
                     // }
-                    if let Some(last_node) = nodes.0.last() {
-                        if !last_node.get_node().is_block() {
+                    if let Some(last_node) = nodes.0.last()
+                        && !last_node.get_node().is_block() {
                             log::info!(target: &log_target, "reached end of epoch {}", epoch_num);
                             break;
                         }
-                    }
                     let block = nodes
                         .get_block()
                         .map_err(FirehoseError::GetBlockError)
@@ -833,11 +824,10 @@ async fn firehose_geyser_thread(
                         );
                         continue;
                     }
-                    if let Some(previous_slot) = previous_slot {
-                        if slot != previous_slot + 1 {
+                    if let Some(previous_slot) = previous_slot
+                        && slot != previous_slot + 1 {
                             // log::warn!(target: &log_target, "non-consecutive slots: {} followed by {}", previous_slot, slot);
                         }
-                    }
                     previous_slot = current_slot;
                     current_slot = Some(slot);
                     let mut entry_index: usize = 0;
@@ -884,8 +874,7 @@ async fn firehose_geyser_thread(
 
                             let metadata: solana_storage_proto::convert::generated::TransactionStatusMeta =
                                 prost_011::Message::decode(decompressed.as_slice()).map_err(|err| {
-                                    Box::new(std::io::Error::new(
-                                        std::io::ErrorKind::Other,
+                                    Box::new(std::io::Error::other(
                                         std::format!("Error decoding metadata: {:?}", err),
                                     ))
                                 })?;
@@ -901,7 +890,7 @@ async fn firehose_geyser_thread(
 							#[cfg(not(feature = "verify-transaction-signatures"))]
 							{
 								// Signature verification is optional because it is extremely expensive at replay scale.
-								(&versioned_tx.message).hash()
+								versioned_tx.message.hash()
 							}
 						};
 						let signature = versioned_tx
@@ -934,16 +923,14 @@ async fn firehose_geyser_thread(
 								this_block_executed_transaction_count,
 							)
 							.map_err(|_| {
-								Box::new(std::io::Error::new(
-									std::io::ErrorKind::Other,
+								Box::new(std::io::Error::other(
 									"transaction index exceeds usize range",
 								)) as Box<dyn std::error::Error>
 							})?;
 							this_block_executed_transaction_count = this_block_executed_transaction_count
 								.checked_add(entry_transaction_count)
 								.ok_or_else(|| {
-									Box::new(std::io::Error::new(
-										std::io::ErrorKind::Other,
+									Box::new(std::io::Error::other(
 										"transaction count overflow",
 									)) as Box<dyn std::error::Error>
 								})?;
@@ -984,10 +971,7 @@ async fn firehose_geyser_thread(
 											lamports: this_block_reward.lamports,
 											post_balance: this_block_reward.post_balance,
 											// commission is Option<u8> , but this_block_reward.commission is string
-											commission: match this_block_reward.commission.parse::<u8>() {
-												Ok(commission) => Some(commission),
-												Err(_err) => None,
-											},
+											commission: this_block_reward.commission.parse::<u8>().ok(),
 										};
 										keyed_rewards.push((this_block_reward.pubkey.parse()?, reward));
 									}
@@ -1024,8 +1008,7 @@ async fn firehose_geyser_thread(
 								let decompressed = utils::decompress_zstd(reassembled)?;
 
 								this_block_rewards = prost_011::Message::decode(decompressed.as_slice()).map_err(|err| {
-									Box::new(std::io::Error::new(
-										std::io::ErrorKind::Other,
+									Box::new(std::io::Error::other(
 										std::format!("Error decoding rewards: {:?}", err),
 									))
 								})?;

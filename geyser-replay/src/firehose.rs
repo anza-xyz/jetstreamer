@@ -12,7 +12,7 @@ use solana_rpc::{
     transaction_notifier_interface::TransactionNotifier,
 };
 use solana_runtime::bank::{KeyedRewardsAndNumPartitions, RewardType};
-use solana_sdk::transaction::VersionedTransaction;
+use solana_sdk::{hash::Hash, transaction::VersionedTransaction};
 use solana_vote_program::id as vote_program_id;
 use std::{
     fmt::Display,
@@ -126,7 +126,7 @@ pub struct TransactionData {
     pub slot: u64,
     pub transaction_slot_index: usize,
     pub signature: solana_sdk::signature::Signature,
-    pub message_hash: solana_sdk::hash::Hash,
+    pub message_hash: Hash,
     pub is_vote: bool,
     pub transaction_status_meta: solana_transaction_status::TransactionStatusMeta,
     pub transaction: VersionedTransaction,
@@ -136,9 +136,9 @@ pub struct TransactionData {
 pub enum BlockData {
     Block {
         parent_slot: u64,
-        parent_blockhash: String,
+        parent_blockhash: Hash,
         slot: u64,
-        blockhash: String,
+        blockhash: Hash,
         rewards: KeyedRewardsAndNumPartitions,
         block_time: Option<i64>,
         block_height: Option<u64>,
@@ -257,8 +257,8 @@ where
                         };
                         log::debug!(target: &log_target, "read epoch {} header: {:?}", epoch_num, header);
 
-                        let mut todo_previous_blockhash = solana_sdk::hash::Hash::default();
-                        let mut todo_latest_entry_blockhash = solana_sdk::hash::Hash::default();
+                        let mut todo_previous_blockhash = Hash::default();
+                        let mut todo_latest_entry_blockhash = Hash::default();
 
                         if slot_range.start > epoch_to_slot_range(epoch_num).0 {
                             let seek_fut = reader.seek_to_slot(slot_range.start, &mut slot_offset_index);
@@ -399,7 +399,7 @@ where
                                     ).map_err(|e| FirehoseError::TransactionHandlerError(e))?;
                                 }
                                 Entry(entry) => {
-                                    todo_latest_entry_blockhash = solana_sdk::hash::Hash::from(entry.hash.to_bytes());
+                                    todo_latest_entry_blockhash = Hash::from(entry.hash.to_bytes());
                                     let entry_transaction_count = entry.transactions.len() as u64;
                                     this_block_executed_transaction_count = this_block_executed_transaction_count
                                         .checked_add(entry_transaction_count)
@@ -456,9 +456,9 @@ where
                                         thread_index,
                                         BlockData::Block {
                                             parent_slot: block.meta.parent_slot,
-                                            parent_blockhash: todo_previous_blockhash.to_string(),
+                                            parent_blockhash: todo_previous_blockhash,
                                             slot: block.slot,
-                                            blockhash: todo_latest_entry_blockhash.to_string(),
+                                            blockhash: todo_latest_entry_blockhash,
                                             rewards: KeyedRewardsAndNumPartitions {
                                                 keyed_rewards,
                                                 num_partitions: None,
@@ -751,8 +751,8 @@ async fn firehose_geyser_thread(
                 };
                 log::debug!(target: &log_target, "read epoch {} header: {:?}", epoch_num, header);
 
-                let mut todo_previous_blockhash = solana_sdk::hash::Hash::default();
-                let mut todo_latest_entry_blockhash = solana_sdk::hash::Hash::default();
+                let mut todo_previous_blockhash = Hash::default();
+                let mut todo_latest_entry_blockhash = Hash::default();
 
                 if slot_range.start > epoch_to_slot_range(epoch_num).0 {
                     let seek_fut = reader.seek_to_slot(slot_range.start, &mut slot_offset_index);
@@ -928,7 +928,7 @@ async fn firehose_geyser_thread(
 						}
                         }
                         Entry(entry) => {
-							todo_latest_entry_blockhash = solana_sdk::hash::Hash::from(entry.hash.to_bytes());
+							todo_latest_entry_blockhash = Hash::from(entry.hash.to_bytes());
 							let entry_transaction_count = entry.transactions.len() as u64;
 							let starting_transaction_index = usize::try_from(
 								this_block_executed_transaction_count,
@@ -954,7 +954,7 @@ async fn firehose_geyser_thread(
 							let entry_notifier = entry_notifier_maybe.as_ref().unwrap();
 							let entry_summary = solana_entry::entry::EntrySummary {
 								num_hashes: entry.num_hashes,
-								hash: solana_sdk::hash::Hash::from(entry.hash.to_bytes()),
+								hash: Hash::from(entry.hash.to_bytes()),
 								num_transactions: entry_transaction_count,
 							};
 							entry_notifier

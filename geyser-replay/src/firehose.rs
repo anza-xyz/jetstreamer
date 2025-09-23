@@ -319,11 +319,6 @@ where
                                 );
                                 continue;
                             }
-                            if let Some(previous_slot) = previous_slot {
-                                if slot != previous_slot + 1 {
-                                    // log::warn!(target: &log_target, "non-consecutive slots: {} followed by {}", previous_slot, slot);
-                                }
-                            }
                             previous_slot = current_slot;
                             current_slot = Some(slot);
                             let mut this_block_executed_transaction_count: u64 = 0;
@@ -439,6 +434,22 @@ where
                                                 },
                                             };
                                             keyed_rewards.push((this_block_reward.pubkey.parse()?, reward));
+                                        }
+                                    }
+                                    if let Some(previous_slot) = previous_slot {
+                                        for skipped_slot in (previous_slot + 1)..slot {
+                                            log::debug!(
+                                                target: &log_target,
+                                                "leader skipped slot {} (previous slot {}, current slot {})",
+                                                skipped_slot,
+                                                previous_slot,
+                                                slot,
+                                            );
+                                            on_block(
+                                                thread_index,
+                                                BlockData::LeaderSkipped { slot: skipped_slot },
+                                            )
+                                            .map_err(|e| FirehoseError::BlockHandlerError(e))?;
                                         }
                                     }
                                     on_block(
@@ -1173,7 +1184,7 @@ async fn test_firehose_epoch_800() {
         |thread_id, block: BlockData| {
             let prev =
                 PREV_BLOCK[thread_id % PREV_BLOCK.len()].swap(block.slot(), Ordering::Relaxed);
-            log::info!("got block on thread {}", thread_id,);
+            log::info!("got block {} on thread {}", block.slot(), thread_id,);
             if prev > 0 {
                 assert_eq!(prev + 1, block.slot());
             }

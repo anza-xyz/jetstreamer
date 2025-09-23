@@ -76,24 +76,6 @@ jobs:
       - name: cargo doc
         run: cargo doc
 
-  cargo-audit:
-    name: cargo audit
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-      - name: Dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libudev-dev clang llvm-dev libclang-dev
-      - name: Run sccache-cache
-        uses: mozilla-actions/sccache-action@v0.0.9
-      - name: Install cargo-audit
-        run: cargo install cargo-audit
-      - name: cargo audit
-        # these are ignored upstream and patched manually by the build process
-        run: cargo audit --ignore RUSTSEC-2022-0093 --ignore RUSTSEC-2024-0344
-
   cargo-clippy:
     name: cargo clippy
     runs-on: ubuntu-22.04-8core

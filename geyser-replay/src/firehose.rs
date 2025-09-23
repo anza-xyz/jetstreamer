@@ -21,7 +21,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicU32, Ordering},
+        atomic::{AtomicU32, AtomicU64, Ordering},
     },
 };
 use thiserror::Error;
@@ -1143,18 +1143,24 @@ pub fn generate_subranges(slot_range: &Range<u64>, threads: u64) -> Vec<Range<u6
     ranges
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 64)]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_firehose_epoch_800() {
     solana_logger::setup_with_default("info");
+    static PREV_BLOCK: [AtomicU64; 4] = [
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+    ];
     firehose(
         4,
         345600000..(345600000 + 1000),
-        |thread_id, _block: BlockData| {
-            log::info!(
-                "got block on thread {} / {:#?}",
-                thread_id,
-                std::thread::current().id()
-            );
+        |thread_id, block: BlockData| {
+            let prev = PREV_BLOCK[thread_id % PREV_BLOCK.len()].swap(block.slot, Ordering::Relaxed);
+            log::info!("got block on thread {}", thread_id,);
+            if prev > 0 {
+                assert_eq!(prev + 1, block.slot);
+            }
             Ok(())
         },
         |thread_id, _tx: TransactionData| Ok(()),

@@ -1152,7 +1152,7 @@ pub fn generate_subranges(slot_range: &Range<u64>, threads: u64) -> Vec<Range<u6
 #[tokio::test(flavor = "multi_thread")]
 async fn test_firehose_epoch_800() {
     use std::sync::atomic::{AtomicU64, Ordering};
-    solana_logger::setup_with_default("info");
+    //solana_logger::setup_with_default("info");
     static PREV_BLOCK: [AtomicU64; 4] = [
         AtomicU64::new(0),
         AtomicU64::new(0),

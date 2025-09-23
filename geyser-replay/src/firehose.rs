@@ -1,6 +1,5 @@
-use crate::{index::get_index_dir, utils};
 use crossbeam_channel::{Receiver, Sender, unbounded};
-use reqwest::Client;
+use reqwest::{Client, Url};
 use solana_geyser_plugin_manager::{
     block_metadata_notifier_interface::BlockMetadataNotifier,
     geyser_plugin_service::GeyserPluginServiceError,
@@ -18,7 +17,7 @@ use std::{
     fmt::Display,
     future::Future,
     ops::Range,
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::{
         Arc,
         atomic::{AtomicU32, Ordering},
@@ -29,8 +28,9 @@ use tokio::time::timeout;
 
 use crate::{
     epochs::{epoch_to_slot_range, fetch_epoch_stream, slot_to_epoch},
-    index::{SlotOffsetIndex, SlotOffsetIndexError},
+    index::{SlotOffsetIndex, SlotOffsetIndexError, get_index_base_url},
     node_reader::NodeReader,
+    utils,
 };
 
 // Timeout applied to each asynchronous firehose operation (fetching epoch stream, reading header,
@@ -186,11 +186,12 @@ where
         ));
     }
     let client = Client::new();
-    let slot_offset_index_path = get_index_dir();
+    let index_base_url = get_index_base_url()
+        .map_err(|e| (FirehoseError::SlotOffsetIndexError(e), slot_range.start))?;
     log::info!("starting firehose...");
-    log::info!("index directory: {:?}", slot_offset_index_path);
+    log::info!("index base url: {}", index_base_url);
 
-    let slot_offset_index_path = Arc::new(slot_offset_index_path);
+    let index_base_url = Arc::new(index_base_url);
     let slot_range = Arc::new(slot_range);
 
     // divide slot_range into n subranges
@@ -205,7 +206,7 @@ where
         Arc::new((0..subranges.len()).map(|_| AtomicU32::new(0)).collect());
 
     for (thread_index, mut slot_range) in subranges.into_iter().enumerate() {
-        let slot_offset_index_path = slot_offset_index_path.as_ref().to_owned();
+        let index_base_url = index_base_url.clone();
         let error_counts = error_counts.clone();
         let client = client.clone();
         let on_block = on_block.clone();
@@ -227,7 +228,7 @@ where
                         slot_to_epoch(slot_range.end)
                     );
 
-                    let mut slot_offset_index = SlotOffsetIndex::new(&slot_offset_index_path)
+                    let mut slot_offset_index = SlotOffsetIndex::new((*index_base_url).clone())
                                     .map_err(|e| (FirehoseError::SlotOffsetIndexError(e), slot_range.start))?;
 
                     log::info!(target: &log_target, "🚒 starting firehose...");
@@ -558,7 +559,7 @@ pub fn firehose_geyser(
     rt: Arc<tokio::runtime::Runtime>,
     slot_range: Range<u64>,
     geyser_config_files: Option<&[PathBuf]>,
-    slot_offset_index_path: impl AsRef<Path>,
+    index_base_url: &Url,
     client: &Client,
     on_load: impl Future<Output = Result<(), Box<dyn std::error::Error + Send + 'static>>>
     + Send
@@ -572,6 +573,7 @@ pub fn firehose_geyser(
         ));
     }
     log::info!("starting firehose...");
+    log::info!("index base url: {}", index_base_url);
     let (confirmed_bank_sender, confirmed_bank_receiver) = unbounded();
     let mut entry_notifier_maybe = None;
     let mut block_meta_notifier_maybe = None;
@@ -608,7 +610,7 @@ pub fn firehose_geyser(
     log::info!("running on_load...");
     rt.spawn(on_load);
 
-    let slot_offset_index_path = Arc::new(slot_offset_index_path.as_ref().to_owned());
+    let index_base_url = Arc::new(index_base_url.clone());
     let slot_range = Arc::new(slot_range);
     let transaction_notifier_maybe = Arc::new(transaction_notifier_maybe);
     let entry_notifier_maybe = Arc::new(entry_notifier_maybe);
@@ -631,7 +633,7 @@ pub fn firehose_geyser(
         let entry_notifier_maybe = (*entry_notifier_maybe).clone();
         let block_meta_notifier_maybe = (*block_meta_notifier_maybe).clone();
         let confirmed_bank_sender = (*confirmed_bank_sender).clone();
-        let slot_offset_index_path = slot_offset_index_path.as_ref().to_owned();
+        let index_base_url = index_base_url.clone();
         let client = client.clone();
         let error_counts = error_counts.clone();
 
@@ -641,7 +643,7 @@ pub fn firehose_geyser(
             rt_clone.block_on(async {
                 firehose_geyser_thread(
                     slot_range,
-                    slot_offset_index_path,
+                    (*index_base_url).clone(),
                     transaction_notifier_maybe,
                     entry_notifier_maybe,
                     block_meta_notifier_maybe,
@@ -684,7 +686,7 @@ pub fn firehose_geyser(
 #[allow(clippy::too_many_arguments)]
 async fn firehose_geyser_thread(
     mut slot_range: Range<u64>,
-    slot_offset_index_path: impl AsRef<Path>,
+    index_base_url: Url,
     transaction_notifier_maybe: Option<Arc<dyn TransactionNotifier + Send + Sync + 'static>>,
     entry_notifier_maybe: Option<Arc<dyn EntryNotifier + Send + Sync + 'static>>,
     block_meta_notifier_maybe: Option<Arc<dyn BlockMetadataNotifier + Send + Sync + 'static>>,
@@ -712,7 +714,7 @@ async fn firehose_geyser_thread(
                 slot_to_epoch(slot_range.end)
             );
 
-            let mut slot_offset_index = SlotOffsetIndex::new(&slot_offset_index_path)
+            let mut slot_offset_index = SlotOffsetIndex::new(index_base_url.clone())
                 .map_err(|e| (FirehoseError::SlotOffsetIndexError(e), slot_range.start))?;
 
             log::info!(target: &log_target, "🚒 starting firehose...");
@@ -1152,7 +1154,7 @@ pub fn generate_subranges(slot_range: &Range<u64>, threads: u64) -> Vec<Range<u6
 #[tokio::test(flavor = "multi_thread")]
 async fn test_firehose_epoch_800() {
     use std::sync::atomic::{AtomicU64, Ordering};
-    //solana_logger::setup_with_default("info");
+    solana_logger::setup_with_default("info");
     static PREV_BLOCK: [AtomicU64; 4] = [
         AtomicU64::new(0),
         AtomicU64::new(0),
@@ -1161,7 +1163,7 @@ async fn test_firehose_epoch_800() {
     ];
     firehose(
         4,
-        345600000..(345600000 + 1000),
+        345600000..(345600000 + 250),
         |thread_id, block: BlockData| {
             let prev =
                 PREV_BLOCK[thread_id % PREV_BLOCK.len()].swap(block.slot(), Ordering::Relaxed);

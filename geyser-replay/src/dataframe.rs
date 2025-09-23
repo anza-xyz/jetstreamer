@@ -46,13 +46,11 @@ impl DataFrame {
                 data_frame.kind = *kind as u64;
 
                 if *kind as u64 != Kind::DataFrame as u64 {
-                    return Err(Box::new(std::io::Error::other(
-                        std::format!(
-                            "Wrong kind for DataFrame. Expected {:?}, got {:?}",
-                            Kind::DataFrame,
-                            kind
-                        ),
-                    )));
+                    return Err(Box::new(std::io::Error::other(std::format!(
+                        "Wrong kind for DataFrame. Expected {:?}, got {:?}",
+                        Kind::DataFrame,
+                        kind
+                    ))));
                 }
             }
             if let Some(serde_cbor::Value::Integer(hash)) = array.get(1) {
@@ -69,19 +67,20 @@ impl DataFrame {
             }
 
             if array.len() > 5
-                && let Some(serde_cbor::Value::Array(next)) = &array.get(5) {
-                    if next.is_empty() {
-                        data_frame.next = None;
-                    } else {
-                        let mut nexts = vec![];
-                        for cid in next {
-                            if let serde_cbor::Value::Bytes(cid) = cid {
-                                nexts.push(Cid::try_from(cid[1..].to_vec()).unwrap());
-                            }
+                && let Some(serde_cbor::Value::Array(next)) = &array.get(5)
+            {
+                if next.is_empty() {
+                    data_frame.next = None;
+                } else {
+                    let mut nexts = vec![];
+                    for cid in next {
+                        if let serde_cbor::Value::Bytes(cid) = cid {
+                            nexts.push(Cid::try_from(cid[1..].to_vec()).unwrap());
                         }
-                        data_frame.next = Some(nexts);
                     }
+                    data_frame.next = Some(nexts);
                 }
+            }
         }
         Ok(data_frame)
     }

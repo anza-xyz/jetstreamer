@@ -2296,6 +2296,7 @@ dependencies = [
  "solana-storage-proto",
  "solana-transaction-status",
  "solana-vote-program",
+ "tempfile",
  "thiserror 2.0.16",
  "tokio",
  "zstd",

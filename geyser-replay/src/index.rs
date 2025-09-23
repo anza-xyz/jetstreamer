@@ -6,7 +6,7 @@ use rayon::prelude::*;
 use reqwest::Client;
 use std::collections::HashMap;
 use std::fmt::Display;
-use std::io::SeekFrom;
+use std::io::{Read, SeekFrom};
 use std::path::{Path, PathBuf};
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
@@ -334,20 +334,90 @@ pub async fn build_missing_indexes(
 
 pub fn get_index_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("JETSTREAMER_OFFSET_CACHE_DIR") {
-        return PathBuf::from(dir).canonicalize().unwrap();
+        let canonical = PathBuf::from(dir).canonicalize().unwrap();
+        ensure_not_git_lfs_placeholder(&canonical);
+        return canonical;
     }
     // List of candidate directories, in order
     const CANDIDATES: [&str; 3] = ["geyser-replay/src/index", "src/index", "index"];
     for candidate in CANDIDATES.iter() {
         let path = PathBuf::from(candidate);
         if path.exists() {
-            return path.canonicalize().unwrap();
+            let canonical = path.canonicalize().unwrap();
+            ensure_not_git_lfs_placeholder(&canonical);
+            return canonical;
         }
     }
     // Fallback to default
-    PathBuf::from("geyser-replay/src/index")
+    let fallback = PathBuf::from("geyser-replay/src/index")
         .canonicalize()
-        .unwrap()
+        .unwrap();
+    ensure_not_git_lfs_placeholder(&fallback);
+    fallback
+}
+
+fn ensure_not_git_lfs_placeholder(index_dir: &Path) {
+    if let Some(bad_path) = find_git_lfs_placeholder(index_dir) {
+        panic!(
+            "Index file {} contains a Git LFS pointer. Install Git LFS and run `git lfs pull`.",
+            bad_path.display()
+        );
+    }
+}
+
+fn find_git_lfs_placeholder(index_dir: &Path) -> Option<PathBuf> {
+    const POINTER_HEADER: &str = "version https://git-lfs.github.com/spec/v1";
+    let entries = std::fs::read_dir(index_dir).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("idx"))
+        {
+            continue;
+        }
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        if metadata.len() > 1024 {
+            continue;
+        }
+        let mut file = match std::fs::File::open(&path) {
+            Ok(file) => file,
+            Err(_) => continue,
+        };
+        let mut buf = [0u8; 256];
+        let Ok(n) = file.read(&mut buf) else {
+            continue;
+        };
+        if let Ok(header) = std::str::from_utf8(&buf[..n]) {
+            if header.starts_with(POINTER_HEADER) {
+                return Some(path);
+            }
+        }
+    }
+    None
+}
+
+#[test]
+fn test_detects_git_lfs_placeholder() {
+    use std::io::Write;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let idx_path = tmp.path().join("epoch-0.idx");
+    let mut file = std::fs::File::create(&idx_path).unwrap();
+    writeln!(
+        file,
+        "version https://git-lfs.github.com/spec/v1\noid sha256:dummy\nsize 123"
+    )
+    .unwrap();
+    file.flush().unwrap();
+
+    let result = std::panic::catch_unwind(|| {
+        ensure_not_git_lfs_placeholder(tmp.path());
+    });
+    assert!(result.is_err());
 }
 
 #[tokio::test]

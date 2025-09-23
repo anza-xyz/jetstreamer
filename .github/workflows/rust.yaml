@@ -23,7 +23,7 @@ jobs:
       - name: Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libudev-dev
+          sudo apt-get install -y libudev-dev clang llvm-dev libclang-dev
       - name: Run sccache-cache
         uses: mozilla-actions/sccache-action@v0.0.9
       - name: cargo check
@@ -38,7 +38,7 @@ jobs:
       - name: Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libudev-dev
+          sudo apt-get install -y libudev-dev clang llvm-dev libclang-dev
       - name: Run sccache-cache
         uses: mozilla-actions/sccache-action@v0.0.9
       - name: cargo test
@@ -53,7 +53,7 @@ jobs:
       - name: Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libudev-dev
+          sudo apt-get install -y libudev-dev clang llvm-dev libclang-dev
       - name: Run sccache-cache
         uses: mozilla-actions/sccache-action@v0.0.9
       - name: Install cargo-fmt
@@ -70,7 +70,7 @@ jobs:
       - name: Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libudev-dev
+          sudo apt-get install -y libudev-dev clang llvm-dev libclang-dev
       - name: Run sccache-cache
         uses: mozilla-actions/sccache-action@v0.0.9
       - name: cargo doc
@@ -85,7 +85,7 @@ jobs:
       - name: Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libudev-dev
+          sudo apt-get install -y libudev-dev clang llvm-dev libclang-dev
       - name: Run sccache-cache
         uses: mozilla-actions/sccache-action@v0.0.9
       - name: Install cargo-audit
@@ -103,7 +103,7 @@ jobs:
       - name: Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libudev-dev
+          sudo apt-get install -y libudev-dev clang llvm-dev libclang-dev
       - name: Run sccache-cache
         uses: mozilla-actions/sccache-action@v0.0.9
       - name: Install cargo-clippy
@@ -120,7 +120,7 @@ jobs:
       - name: Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libudev-dev
+          sudo apt-get install -y libudev-dev clang llvm-dev libclang-dev
       - name: Run sccache-cache
         uses: mozilla-actions/sccache-action@v0.0.9
       - name: cargo fix --workspace

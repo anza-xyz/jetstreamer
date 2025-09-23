@@ -133,16 +133,31 @@ pub struct TransactionData {
 }
 
 #[derive(Debug)]
-pub struct BlockData {
-    pub parent_slot: u64,
-    pub parent_blockhash: String,
-    pub slot: u64,
-    pub blockhash: String,
-    pub rewards: KeyedRewardsAndNumPartitions,
-    pub block_time: Option<i64>,
-    pub block_height: Option<u64>,
-    pub executed_transaction_count: u64,
-    pub entry_count: u64,
+pub enum BlockData {
+    Block {
+        parent_slot: u64,
+        parent_blockhash: String,
+        slot: u64,
+        blockhash: String,
+        rewards: KeyedRewardsAndNumPartitions,
+        block_time: Option<i64>,
+        block_height: Option<u64>,
+        executed_transaction_count: u64,
+        entry_count: u64,
+    },
+    LeaderSkipped {
+        slot: u64,
+    },
+}
+
+impl BlockData {
+    #[inline(always)]
+    pub const fn slot(&self) -> u64 {
+        match self {
+            BlockData::Block { slot, .. } => *slot,
+            BlockData::LeaderSkipped { slot } => *slot,
+        }
+    }
 }
 
 #[inline]
@@ -428,7 +443,7 @@ where
                                     }
                                     on_block(
                                         thread_index,
-                                        BlockData {
+                                        BlockData::Block {
                                             parent_slot: block.meta.parent_slot,
                                             parent_blockhash: todo_previous_blockhash.to_string(),
                                             slot: block.slot,
@@ -1156,10 +1171,11 @@ async fn test_firehose_epoch_800() {
         4,
         345600000..(345600000 + 1000),
         |thread_id, block: BlockData| {
-            let prev = PREV_BLOCK[thread_id % PREV_BLOCK.len()].swap(block.slot, Ordering::Relaxed);
+            let prev =
+                PREV_BLOCK[thread_id % PREV_BLOCK.len()].swap(block.slot(), Ordering::Relaxed);
             log::info!("got block on thread {}", thread_id,);
             if prev > 0 {
-                assert_eq!(prev + 1, block.slot);
+                assert_eq!(prev + 1, block.slot());
             }
             Ok(())
         },

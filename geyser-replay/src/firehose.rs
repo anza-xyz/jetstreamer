@@ -53,6 +53,8 @@ pub enum FirehoseError {
     SeekToSlotError(Box<dyn std::error::Error>),
     OnLoadError(Box<dyn std::error::Error>),
     OperationTimeout(&'static str),
+    TransactionHandlerError(Box<dyn std::error::Error>),
+    BlockHandlerError(Box<dyn std::error::Error>),
 }
 
 impl Display for FirehoseError {
@@ -94,6 +96,12 @@ impl Display for FirehoseError {
             FirehoseError::OperationTimeout(op) => {
                 write!(f, "Timeout while waiting for operation: {}", op)
             }
+            FirehoseError::TransactionHandlerError(error) => {
+                write!(f, "Transaction handler error: {}", error)
+            }
+            FirehoseError::BlockHandlerError(error) => {
+                write!(f, "Block handler error: {}", error)
+            }
         }
     }
 }
@@ -116,16 +124,36 @@ impl From<SlotOffsetIndexError> for FirehoseError {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct TransactionData {
+    pub slot: u64,
+    pub index: usize,
+    pub signature: solana_sdk::signature::Signature,
+    pub message_hash: solana_sdk::hash::Hash,
+    pub is_vote: bool,
+    pub metadata: solana_transaction_status::TransactionStatusMeta,
+    pub transaction: VersionedTransaction,
+}
+
+#[derive(Debug)]
+pub struct BlockData {
+    pub slot: u64,
+    pub parent_slot: u64,
+    pub blockhash: solana_sdk::hash::Hash,
+    pub previous_blockhash: solana_sdk::hash::Hash,
+    pub block_time: Option<i64>,
+    pub block_height: Option<u64>,
+    pub num_transactions: u64,
+    pub num_entries: u64,
+    pub rewards: KeyedRewardsAndNumPartitions,
+}
+
 #[inline]
 pub async fn firehose(
     slot_range: Range<u64>,
     threads: u64,
-    on_block: impl Fn(
-        ReplicaBlockInfoVersions<'_>,
-    ) -> Result<(), Box<dyn std::error::Error + Send + 'static>>,
-    on_tx: impl Fn(
-        ReplicaTransactionInfoVersions<'_>,
-    ) -> Result<(), Box<dyn std::error::Error + Send + 'static>>,
+    on_block: impl Fn(usize, BlockData) -> Result<(), Box<dyn std::error::Error + Send + 'static>>,
+    on_tx: impl Fn(usize, TransactionData) -> Result<(), Box<dyn std::error::Error + Send + 'static>>,
 ) -> Result<(), (FirehoseError, u64)> {
     if threads == 0 {
         return Err((
@@ -297,56 +325,57 @@ pub async fn firehose(
                             use crate::node::Node::*;
                             match node {
                                 Transaction(tx) => {
-                                let versioned_tx = tx.as_parsed()?;
-                                let reassembled_metadata =
-                                    nodes.reassemble_dataframes(tx.metadata.clone())?;
+                                    let versioned_tx = tx.as_parsed()?;
+                                    let reassembled_metadata =
+                                        nodes.reassemble_dataframes(tx.metadata.clone())?;
 
-                                let decompressed = utils::decompress_zstd(reassembled_metadata.clone())?;
+                                    let decompressed = utils::decompress_zstd(reassembled_metadata.clone())?;
 
-                                    let metadata: solana_storage_proto::convert::generated::TransactionStatusMeta =
-                                        prost_011::Message::decode(decompressed.as_slice()).map_err(|err| {
+                                        let metadata: solana_storage_proto::convert::generated::TransactionStatusMeta =
+                                            prost_011::Message::decode(decompressed.as_slice()).map_err(|err| {
+                                                Box::new(std::io::Error::new(
+                                                    std::io::ErrorKind::Other,
+                                                    std::format!("Error decoding metadata: {:?}", err),
+                                                ))
+                                            })?;
+
+                                    let as_native_metadata: solana_transaction_status::TransactionStatusMeta =
+                                        metadata.try_into()?;
+
+                                    let message_hash = {
+                                        #[cfg(feature = "verify-transaction-signatures")]
+                                        {
+                                            versioned_tx.verify_and_hash_message()?
+                                        }
+                                        #[cfg(not(feature = "verify-transaction-signatures"))]
+                                        {
+                                            // Signature verification is optional because it is extremely expensive at replay scale.
+                                            (&versioned_tx.message).hash()
+                                        }
+                                    };
+                                    let signature = versioned_tx
+                                        .signatures
+                                        .first()
+                                        .ok_or_else(|| {
                                             Box::new(std::io::Error::new(
-                                                std::io::ErrorKind::Other,
-                                                std::format!("Error decoding metadata: {:?}", err),
-                                            ))
+                                                std::io::ErrorKind::InvalidData,
+                                                "transaction missing signature",
+                                            )) as Box<dyn std::error::Error>
                                         })?;
+                                    let is_vote = is_simple_vote_transaction(&versioned_tx);
 
-                                let as_native_metadata: solana_transaction_status::TransactionStatusMeta =
-                                    metadata.try_into()?;
-
-                                let message_hash = {
-                                    #[cfg(feature = "verify-transaction-signatures")]
-                                    {
-                                        versioned_tx.verify_and_hash_message()?
-                                    }
-                                    #[cfg(not(feature = "verify-transaction-signatures"))]
-                                    {
-                                        // Signature verification is optional because it is extremely expensive at replay scale.
-                                        (&versioned_tx.message).hash()
-                                    }
-                                };
-                                let signature = versioned_tx
-                                    .signatures
-                                    .first()
-                                    .ok_or_else(|| {
-                                        Box::new(std::io::Error::new(
-                                            std::io::ErrorKind::InvalidData,
-                                            "transaction missing signature",
-                                        )) as Box<dyn std::error::Error>
-                                    })?;
-                                let is_vote = is_simple_vote_transaction(&versioned_tx);
-
-                                if let Some(transaction_notifier) = transaction_notifier_maybe.as_ref() {
-                                    transaction_notifier.notify_transaction(
-                                        block.slot,
-                                        tx.index.unwrap() as usize,
-                                        signature,
-                                        &message_hash,
-                                        is_vote,
-                                        &as_native_metadata,
-                                        &versioned_tx,
-                                    );
-                                }
+                                    on_tx(
+                                        thread_index,
+                                        TransactionData {
+                                            slot: block.slot,
+                                            index: tx.index.unwrap() as usize,
+                                            signature: *signature,
+                                            message_hash,
+                                            is_vote,
+                                            metadata: as_native_metadata.clone(),
+                                            transaction: versioned_tx.clone(),
+                                        },
+                                    ).map_err(|e| FirehoseError::TransactionHandlerError(e))?;
                                 }
                                 Entry(entry) => {
                                     todo_latest_entry_blockhash = solana_sdk::hash::Hash::from(entry.hash.to_bytes());
@@ -378,8 +407,8 @@ pub async fn firehose(
                                         hash: solana_sdk::hash::Hash::from(entry.hash.to_bytes()),
                                         num_transactions: entry_transaction_count,
                                     };
-                                    entry_notifier
-                                        .notify_entry(block.slot, entry_index, &entry_summary, starting_transaction_index);
+                                    /*entry_notifier
+                                        .notify_entry(block.slot, entry_index, &entry_summary, starting_transaction_index);*/
                                     entry_index += 1;
                                 },
                                 Block(block) => {
@@ -416,22 +445,40 @@ pub async fn firehose(
                                         // if keyed_rewards.read().unwrap().len() > 0 {
                                         //   panic!("___ Rewards: {:?}", keyed_rewards.read().unwrap());
                                         // }
-                                        let block_meta_notifier = block_meta_notifier_maybe.as_ref().unwrap();
-                                        block_meta_notifier
-                                            .notify_block_metadata(
-                                                block.meta.parent_slot,
-                                                todo_previous_blockhash.to_string().as_str(),
-                                                block.slot,
-                                                todo_latest_entry_blockhash.to_string().as_str(),
-                                                &KeyedRewardsAndNumPartitions {
+                                        on_block(
+                                            thread_index,
+                                            BlockData {
+                                                slot: block.slot,
+                                                parent_slot: block.meta.parent_slot,
+                                                blockhash: solana_sdk::hash::Hash::from_str(&block.meta.blockhash).unwrap(),
+                                                previous_blockhash: todo_previous_blockhash,
+                                                block_time: block.meta.block_time,
+                                                block_height: block.meta.block_height,
+                                                num_transactions: this_block_executed_transaction_count,
+                                                num_entries: this_block_entry_count,
+                                                rewards: KeyedRewardsAndNumPartitions {
                                                     keyed_rewards,
-                                                    num_partitions: None
+                                                    num_partitions: None,
                                                 },
-                                                Some(block.meta.blocktime as i64) ,
-                                                block.meta.block_height,
-                                                this_block_executed_transaction_count,
-                                                this_block_entry_count,
-                                            );
+                                            },
+                                        ).map_err(|e| FirehoseError::BlockHandlerError(e))?;
+
+                                        // let block_meta_notifier = block_meta_notifier_maybe.as_ref().unwrap();
+                                        // block_meta_notifier
+                                        //     .notify_block_metadata(
+                                        //         block.meta.parent_slot,
+                                        //         todo_previous_blockhash.to_string().as_str(),
+                                        //         block.slot,
+                                        //         todo_latest_entry_blockhash.to_string().as_str(),
+                                        //         &KeyedRewardsAndNumPartitions {
+                                        //             keyed_rewards,
+                                        //             num_partitions: None
+                                        //         },
+                                        //         Some(block.meta.blocktime as i64) ,
+                                        //         block.meta.block_height,
+                                        //         this_block_executed_transaction_count,
+                                        //         this_block_entry_count,
+                                        //     );
                                     }
                                     todo_previous_blockhash = todo_latest_entry_blockhash;
                                     std::thread::yield_now();
@@ -1060,6 +1107,7 @@ async fn firehose_geyser_thread(
     Ok(())
 }
 
+#[inline]
 fn is_simple_vote_transaction(versioned_tx: &VersionedTransaction) -> bool {
     if !(1..=2).contains(&versioned_tx.signatures.len()) {
         return false;

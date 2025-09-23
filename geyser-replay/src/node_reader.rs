@@ -71,15 +71,12 @@ impl RawNode {
     }
 
     pub fn parse(&self) -> Result<Node, Box<dyn Error>> {
-        let parsed = parse_any_from_cbordata(self.data.clone());
-        if parsed.is_err() {
-            println!("Error: {:?}", parsed.err().unwrap());
-            Err(Box::new(std::io::Error::other(
-                "Unknown type".to_owned(),
-            )))
-        } else {
-            let node = parsed.unwrap();
-            Ok(node)
+        match parse_any_from_cbordata(self.data.clone()) {
+            Ok(node) => Ok(node),
+            Err(err) => {
+                println!("Error: {:?}", err);
+                Err(Box::new(std::io::Error::other("Unknown type".to_owned())))
+            }
         }
     }
 
@@ -99,9 +96,10 @@ impl RawNode {
         // println!("Digest length: {}", digest_length);
 
         if digest_length > 64 {
-            return Err(Box::new(std::io::Error::other(
-                format!("Digest length too long, position={}", cursor.position()),
-            )));
+            return Err(Box::new(std::io::Error::other(format!(
+                "Digest length too long, position={}",
+                cursor.position()
+            ))));
         }
 
         // reac actual digest
@@ -293,9 +291,10 @@ impl<R: AsyncRead + Unpin + AsyncSeek + Len> NodeReader<R> {
 
 pub fn cid_from_cbor_link(val: &serde_cbor::Value) -> Result<cid::Cid, Box<dyn std::error::Error>> {
     if let serde_cbor::Value::Bytes(b) = val
-        && b.first() == Some(&0) {
-            return Ok(cid::Cid::try_from(b[1..].to_vec())?);
-        }
+        && b.first() == Some(&0)
+    {
+        return Ok(cid::Cid::try_from(b[1..].to_vec())?);
+    }
     Err("invalid DAG‑CBOR link encoding".into())
 }
 

@@ -216,8 +216,7 @@ where
             let log_target = format!("{}::T{:03}", module_path!(), thread_index);
             let mut skip_until_index = None;
             // let mut triggered = false;
-            loop {
-                if let Err((err, slot)) = async {
+            while let Err((err, slot)) = async {
                     let epoch_range = slot_to_epoch(slot_range.start)..=slot_to_epoch(slot_range.end - 1);
                     log::info!(
                         target: &log_target,
@@ -517,7 +516,9 @@ where
                         }
                     }
                     Ok(())
-                }.await {
+            }
+            .await
+            {
                     log::error!(
                         target: &log_target,
                         "🔥🔥🔥 firehose encountered an error at slot {} in epoch {}:",
@@ -540,9 +541,6 @@ where
                     // Update slot range to resume from the failed slot, not the original start
                     slot_range.start = slot;
                     skip_until_index = Some(item_index);
-                } else {
-                    break;
-                }
             }
         });
         handles.push(handle);
@@ -683,6 +681,7 @@ pub fn firehose_geyser(
     Ok(confirmed_bank_receiver)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn firehose_geyser_thread(
     mut slot_range: Range<u64>,
     slot_offset_index_path: impl AsRef<Path>,
@@ -702,8 +701,7 @@ async fn firehose_geyser_thread(
     };
     let mut skip_until_index = None;
     // let mut triggered = false;
-    loop {
-        if let Err((err, slot)) = async {
+    while let Err((err, slot)) = async {
             let epoch_range = slot_to_epoch(slot_range.start)..=slot_to_epoch(slot_range.end - 1);
             log::info!(
                 target: &log_target,
@@ -1049,7 +1047,9 @@ async fn firehose_geyser_thread(
                 }
             }
             Ok(())
-        }.await {
+    }
+    .await
+    {
             log::error!(
                 target: &log_target,
                 "🔥🔥🔥 firehose encountered an error at slot {} in epoch {}:",
@@ -1073,9 +1073,6 @@ async fn firehose_geyser_thread(
             // Update slot range to resume from the failed slot, not the original start
             slot_range.start = slot;
             skip_until_index = Some(item_index);
-        } else {
-            break;
-        }
     }
     Ok(())
 }
@@ -1154,6 +1151,7 @@ pub fn generate_subranges(slot_range: &Range<u64>, threads: u64) -> Vec<Range<u6
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_firehose_epoch_800() {
+    use std::sync::atomic::{AtomicU64, Ordering};
     solana_logger::setup_with_default("info");
     static PREV_BLOCK: [AtomicU64; 4] = [
         AtomicU64::new(0),
@@ -1173,7 +1171,7 @@ async fn test_firehose_epoch_800() {
             }
             Ok(())
         },
-        |thread_id, _tx: TransactionData| Ok(()),
+        |_thread_id, _tx: TransactionData| Ok(()),
     )
     .await
     .unwrap();

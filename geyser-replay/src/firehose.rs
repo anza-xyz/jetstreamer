@@ -1,7 +1,4 @@
 use crate::{index::get_index_dir, utils};
-use agave_geyser_plugin_interface::geyser_plugin_interface::{
-    ReplicaBlockInfoVersions, ReplicaTransactionInfoVersions,
-};
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use reqwest::Client;
 use solana_geyser_plugin_manager::{
@@ -127,34 +124,46 @@ impl From<SlotOffsetIndexError> for FirehoseError {
 #[derive(Debug, Clone)]
 pub struct TransactionData {
     pub slot: u64,
-    pub index: usize,
+    pub transaction_slot_index: usize,
     pub signature: solana_sdk::signature::Signature,
     pub message_hash: solana_sdk::hash::Hash,
     pub is_vote: bool,
-    pub metadata: solana_transaction_status::TransactionStatusMeta,
+    pub transaction_status_meta: solana_transaction_status::TransactionStatusMeta,
     pub transaction: VersionedTransaction,
 }
 
 #[derive(Debug)]
 pub struct BlockData {
-    pub slot: u64,
     pub parent_slot: u64,
-    pub blockhash: solana_sdk::hash::Hash,
-    pub previous_blockhash: solana_sdk::hash::Hash,
+    pub parent_blockhash: String,
+    pub slot: u64,
+    pub blockhash: String,
+    pub rewards: KeyedRewardsAndNumPartitions,
     pub block_time: Option<i64>,
     pub block_height: Option<u64>,
-    pub num_transactions: u64,
-    pub num_entries: u64,
-    pub rewards: KeyedRewardsAndNumPartitions,
+    pub executed_transaction_count: u64,
+    pub entry_count: u64,
 }
 
 #[inline]
-pub async fn firehose(
+pub async fn firehose<OnBlock, OnTransaction>(
     slot_range: Range<u64>,
     threads: u64,
-    on_block: impl Fn(usize, BlockData) -> Result<(), Box<dyn std::error::Error + Send + 'static>>,
-    on_tx: impl Fn(usize, TransactionData) -> Result<(), Box<dyn std::error::Error + Send + 'static>>,
-) -> Result<(), (FirehoseError, u64)> {
+    on_block: OnBlock,
+    on_tx: OnTransaction,
+) -> Result<(), (FirehoseError, u64)>
+where
+    OnBlock: Fn(usize, BlockData) -> Result<(), Box<dyn std::error::Error + Send + 'static>>
+        + Send
+        + Sync
+        + Clone
+        + 'static,
+    OnTransaction: Fn(usize, TransactionData) -> Result<(), Box<dyn std::error::Error + Send + 'static>>
+        + Send
+        + Sync
+        + Clone
+        + 'static,
+{
     if threads == 0 {
         return Err((
             FirehoseError::OnLoadError("Number of threads must be greater than 0".into()),
@@ -180,9 +189,12 @@ pub async fn firehose(
     let error_counts: Arc<Vec<AtomicU32>> =
         Arc::new((0..subranges.len()).map(|_| AtomicU32::new(0)).collect());
 
-    for (thread_index, slot_range) in subranges.into_iter().enumerate() {
+    for (thread_index, mut slot_range) in subranges.into_iter().enumerate() {
         let slot_offset_index_path = slot_offset_index_path.as_ref().to_owned();
         let error_counts = error_counts.clone();
+        let client = client.clone();
+        let on_block = on_block.clone();
+        let on_tx = on_tx.clone();
 
         let handle = tokio::spawn(async move {
             let start_time = std::time::Instant::now();
@@ -201,7 +213,7 @@ pub async fn firehose(
                         slot_to_epoch(slot_range.end)
                     );
 
-                    let mut slot_offset_index = SlotOffsetIndex::new(slot_offset_index_path.as_ref())
+                    let mut slot_offset_index = SlotOffsetIndex::new(&slot_offset_index_path)
                                     .map_err(|e| (FirehoseError::SlotOffsetIndexError(e), slot_range.start))?;
 
                     log::info!(target: &log_target, "🚒 starting firehose...");
@@ -299,7 +311,6 @@ pub async fn firehose(
                             }
                             previous_slot = current_slot;
                             current_slot = Some(slot);
-                            let mut entry_index: usize = 0;
                             let mut this_block_executed_transaction_count: u64 = 0;
                             let mut this_block_entry_count: u64 = 0;
                             let mut this_block_rewards: solana_storage_proto::convert::generated::Rewards =
@@ -368,11 +379,11 @@ pub async fn firehose(
                                         thread_index,
                                         TransactionData {
                                             slot: block.slot,
-                                            index: tx.index.unwrap() as usize,
+                                            transaction_slot_index: tx.index.unwrap() as usize,
                                             signature: *signature,
                                             message_hash,
                                             is_vote,
-                                            metadata: as_native_metadata.clone(),
+                                            transaction_status_meta: as_native_metadata.clone(),
                                             transaction: versioned_tx.clone(),
                                         },
                                     ).map_err(|e| FirehoseError::TransactionHandlerError(e))?;
@@ -380,15 +391,6 @@ pub async fn firehose(
                                 Entry(entry) => {
                                     todo_latest_entry_blockhash = solana_sdk::hash::Hash::from(entry.hash.to_bytes());
                                     let entry_transaction_count = entry.transactions.len() as u64;
-                                    let starting_transaction_index = usize::try_from(
-                                        this_block_executed_transaction_count,
-                                    )
-                                    .map_err(|_| {
-                                        Box::new(std::io::Error::new(
-                                            std::io::ErrorKind::Other,
-                                            "transaction index exceeds usize range",
-                                        )) as Box<dyn std::error::Error>
-                                    })?;
                                     this_block_executed_transaction_count = this_block_executed_transaction_count
                                         .checked_add(entry_transaction_count)
                                         .ok_or_else(|| {
@@ -398,88 +400,50 @@ pub async fn firehose(
                                             )) as Box<dyn std::error::Error>
                                         })?;
                                     this_block_entry_count += 1;
-                                    if entry_notifier_maybe.is_none() {
-                                        return Ok(());
-                                    }
-                                    let entry_notifier = entry_notifier_maybe.as_ref().unwrap();
-                                    let entry_summary = solana_entry::entry::EntrySummary {
-                                        num_hashes: entry.num_hashes,
-                                        hash: solana_sdk::hash::Hash::from(entry.hash.to_bytes()),
-                                        num_transactions: entry_transaction_count,
-                                    };
-                                    /*entry_notifier
-                                        .notify_entry(block.slot, entry_index, &entry_summary, starting_transaction_index);*/
-                                    entry_index += 1;
                                 },
                                 Block(block) => {
-                                    let notification = SlotNotification::Root((block.slot, block.meta.parent_slot));
-                                    confirmed_bank_sender.send(notification).unwrap();
-
+                                    let mut keyed_rewards = Vec::with_capacity(this_block_rewards.rewards.len());
                                     {
-                                        if block_meta_notifier_maybe.is_none() {
-                                            return Ok(());
-                                        }
-                                        let mut keyed_rewards = Vec::with_capacity(this_block_rewards.rewards.len());
-                                        {
-                                            // convert this_block_rewards to rewards
-                                            for this_block_reward in this_block_rewards.rewards.iter() {
-                                                let reward: RewardInfo = RewardInfo{
-                                                    reward_type: match this_block_reward.reward_type  - 1 { // -1 because of protobuf
-                                                        0 => RewardType::Fee,
-                                                        1 => RewardType::Rent,
-                                                        2 => RewardType::Staking,
-                                                        3 => RewardType::Voting,
-                                                        typ => panic!("___ not supported reward type {}", typ),
-                                                    },
-                                                    lamports: this_block_reward.lamports,
-                                                    post_balance: this_block_reward.post_balance,
-                                                    // commission is Option<u8> , but this_block_reward.commission is string
-                                                    commission: match this_block_reward.commission.parse::<u8>() {
-                                                        Ok(commission) => Some(commission),
-                                                        Err(_err) => None,
-                                                    },
-                                                };
-                                                keyed_rewards.push((this_block_reward.pubkey.parse()?, reward));
-                                            }
-                                        }
-                                        // if keyed_rewards.read().unwrap().len() > 0 {
-                                        //   panic!("___ Rewards: {:?}", keyed_rewards.read().unwrap());
-                                        // }
-                                        on_block(
-                                            thread_index,
-                                            BlockData {
-                                                slot: block.slot,
-                                                parent_slot: block.meta.parent_slot,
-                                                blockhash: solana_sdk::hash::Hash::from_str(&block.meta.blockhash).unwrap(),
-                                                previous_blockhash: todo_previous_blockhash,
-                                                block_time: block.meta.block_time,
-                                                block_height: block.meta.block_height,
-                                                num_transactions: this_block_executed_transaction_count,
-                                                num_entries: this_block_entry_count,
-                                                rewards: KeyedRewardsAndNumPartitions {
-                                                    keyed_rewards,
-                                                    num_partitions: None,
+                                        // convert this_block_rewards to rewards
+                                        for this_block_reward in this_block_rewards.rewards.iter() {
+                                            let reward: RewardInfo = RewardInfo {
+                                                reward_type: match this_block_reward.reward_type - 1 {
+                                                    // -1 because of protobuf
+                                                    0 => RewardType::Fee,
+                                                    1 => RewardType::Rent,
+                                                    2 => RewardType::Staking,
+                                                    3 => RewardType::Voting,
+                                                    typ => panic!("___ not supported reward type {}", typ),
                                                 },
-                                            },
-                                        ).map_err(|e| FirehoseError::BlockHandlerError(e))?;
-
-                                        // let block_meta_notifier = block_meta_notifier_maybe.as_ref().unwrap();
-                                        // block_meta_notifier
-                                        //     .notify_block_metadata(
-                                        //         block.meta.parent_slot,
-                                        //         todo_previous_blockhash.to_string().as_str(),
-                                        //         block.slot,
-                                        //         todo_latest_entry_blockhash.to_string().as_str(),
-                                        //         &KeyedRewardsAndNumPartitions {
-                                        //             keyed_rewards,
-                                        //             num_partitions: None
-                                        //         },
-                                        //         Some(block.meta.blocktime as i64) ,
-                                        //         block.meta.block_height,
-                                        //         this_block_executed_transaction_count,
-                                        //         this_block_entry_count,
-                                        //     );
+                                                lamports: this_block_reward.lamports,
+                                                post_balance: this_block_reward.post_balance,
+                                                // commission is Option<u8>, but this_block_reward.commission is string
+                                                commission: match this_block_reward.commission.parse::<u8>() {
+                                                    Ok(commission) => Some(commission),
+                                                    Err(_err) => None,
+                                                },
+                                            };
+                                            keyed_rewards.push((this_block_reward.pubkey.parse()?, reward));
+                                        }
                                     }
+                                    on_block(
+                                        thread_index,
+                                        BlockData {
+                                            parent_slot: block.meta.parent_slot,
+                                            parent_blockhash: todo_previous_blockhash.to_string(),
+                                            slot: block.slot,
+                                            blockhash: todo_latest_entry_blockhash.to_string(),
+                                            rewards: KeyedRewardsAndNumPartitions {
+                                                keyed_rewards,
+                                                num_partitions: None,
+                                            },
+                                            block_time: Some(block.meta.blocktime as i64),
+                                            block_height: block.meta.block_height,
+                                            executed_transaction_count: this_block_executed_transaction_count,
+                                            entry_count: this_block_entry_count,
+                                        },
+                                    )
+                                    .map_err(|e| FirehoseError::BlockHandlerError(e))?;
                                     todo_previous_blockhash = todo_latest_entry_blockhash;
                                     std::thread::yield_now();
                                 },
@@ -561,7 +525,7 @@ pub async fn firehose(
                     break;
                 }
             }
-            Ok(())
+            ()
         });
         handles.push(handle);
     }
@@ -732,8 +696,8 @@ async fn firehose_geyser_thread(
                 slot_to_epoch(slot_range.end)
             );
 
-            let mut slot_offset_index = SlotOffsetIndex::new(slot_offset_index_path.as_ref())
-                            .map_err(|e| (FirehoseError::SlotOffsetIndexError(e), slot_range.start))?;
+            let mut slot_offset_index = SlotOffsetIndex::new(&slot_offset_index_path)
+                .map_err(|e| (FirehoseError::SlotOffsetIndexError(e), slot_range.start))?;
 
             log::info!(target: &log_target, "🚒 starting firehose...");
 
@@ -1181,15 +1145,16 @@ pub fn generate_subranges(slot_range: &Range<u64>, threads: u64) -> Vec<Range<u6
 
 #[tokio::test]
 async fn test_firehose_epoch_800() {
+    solana_logger::setup_with_default("info");
     firehose(
-        800..801,
+        345600000..(345600000 + 20),
         1,
-        |block| {
-            log::info!("got block");
+        |thread_id, _block: BlockData| {
+            log::info!("got block on thread {}", thread_id);
             Ok(())
         },
-        |tx| {
-            log::info!("got tx");
+        |thread_id, _tx: TransactionData| {
+            log::info!("got tx on thread {}", thread_id);
             Ok(())
         },
     )

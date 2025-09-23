@@ -22,7 +22,7 @@ pub enum SlotOffsetIndexError {
     IndexDirNotFound(PathBuf),
     EpochIndexFileNotFound(PathBuf),
     SlotNotFound(u64, PathBuf),
-    NetworkError(Box<dyn std::error::Error>),
+    NetworkError(Box<dyn std::error::Error + Send + Sync>),
     IoError(std::io::Error, PathBuf),
 }
 

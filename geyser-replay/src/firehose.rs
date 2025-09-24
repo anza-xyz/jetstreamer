@@ -287,7 +287,7 @@ where
                                     .map_err(|e| (e, current_slot.unwrap_or(slot_range.start)))?,
                                 Err(_) => {
                                     log::warn!(target: &log_target, "timeout reading next block, retrying (will restart)...");
-                                    return Err((FirehoseError::OperationTimeout("read_until_block"), current_slot.unwrap_or(slot_range.start)));
+                                    return Err((FirehoseError::OperationTimeout("read_until_block"), current_slot.map(|s| s + 1).unwrap_or(slot_range.start)));
                                 }
                             };
                             if let Some(last_node) = nodes.0.last()

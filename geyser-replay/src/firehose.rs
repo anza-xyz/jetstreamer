@@ -36,6 +36,7 @@ use crate::{
 // Timeout applied to each asynchronous firehose operation (fetching epoch stream, reading header,
 // seeking, reading next block). Adjust here to tune stall detection/restart aggressiveness.
 const OP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const LOG_MODULE: &str = "jetstreamer::firehose";
 
 #[derive(Debug, Error)]
 pub enum FirehoseError {
@@ -193,8 +194,8 @@ where
     let client = Client::new();
     let index_base_url = get_index_base_url()
         .map_err(|e| (FirehoseError::SlotOffsetIndexError(e), slot_range.start))?;
-    log::info!("starting firehose...");
-    log::info!("index base url: {}", index_base_url);
+    log::info!(target: LOG_MODULE, "starting firehose...");
+    log::info!(target: LOG_MODULE, "index base url: {}", index_base_url);
 
     let index_base_url = Arc::new(index_base_url);
     let slot_range = Arc::new(slot_range);
@@ -202,7 +203,7 @@ where
     // divide slot_range into n subranges
     let subranges = generate_subranges(&slot_range, threads);
     if threads > 1 {
-        log::debug!("⚡ thread sub-ranges: {:?}", subranges);
+        log::debug!(target: LOG_MODULE, "⚡ thread sub-ranges: {:?}", subranges);
     }
 
     let mut handles = Vec::new();
@@ -219,7 +220,7 @@ where
 
         let handle = tokio::spawn(async move {
             let start_time = std::time::Instant::now();
-            let log_target = format!("{}::T{:03}", module_path!(), thread_index);
+            let log_target = format!("{}::T{:03}", LOG_MODULE, thread_index);
             let mut skip_until_index = None;
             // let mut triggered = false;
             while let Err((err, slot)) = async {
@@ -358,12 +359,17 @@ where
                             if let Some(skip) = skip_until_index {
                                 if item_index < skip {
                                     if !displayed_skip_message {
-                                        log::info!("skipping until index {} (at {})", skip, item_index);
+                                        log::info!(
+                                            target: &log_target,
+                                            "skipping until index {} (at {})",
+                                            skip,
+                                            item_index
+                                        );
                                         displayed_skip_message = true;
                                     }
                                     return Ok(());
                                 } else {
-                                    log::info!("reached target index {}, resuming...", skip);
+                                    log::info!(target: &log_target, "reached target index {}, resuming...", skip);
                                     skip_until_index = None;
                                 }
                             }
@@ -578,7 +584,7 @@ where
     for handle in handles {
         handle.await.unwrap();
     }
-    log::info!("🚒 firehose finished successfully.");
+    log::info!(target: LOG_MODULE, "🚒 firehose finished successfully.");
     Ok(())
 }
 
@@ -599,14 +605,14 @@ pub fn firehose_geyser(
             slot_range.start,
         ));
     }
-    log::info!("starting firehose...");
-    log::info!("index base url: {}", index_base_url);
+    log::info!(target: LOG_MODULE, "starting firehose...");
+    log::info!(target: LOG_MODULE, "index base url: {}", index_base_url);
     let (confirmed_bank_sender, confirmed_bank_receiver) = unbounded();
     let mut entry_notifier_maybe = None;
     let mut block_meta_notifier_maybe = None;
     let mut transaction_notifier_maybe = None;
     if let Some(geyser_config_files) = geyser_config_files {
-        log::debug!("geyser config files: {:?}", geyser_config_files);
+        log::debug!(target: LOG_MODULE, "geyser config files: {:?}", geyser_config_files);
 
         let service =
             solana_geyser_plugin_manager::geyser_plugin_service::GeyserPluginService::new(
@@ -626,15 +632,15 @@ pub fn firehose_geyser(
         entry_notifier_maybe = service.get_entry_notifier();
         block_meta_notifier_maybe = service.get_block_metadata_notifier();
 
-        log::debug!("geyser plugin service initialized.");
+        log::debug!(target: LOG_MODULE, "geyser plugin service initialized.");
     }
 
     if entry_notifier_maybe.is_some() {
-        log::debug!("entry notifications enabled")
+        log::debug!(target: LOG_MODULE, "entry notifications enabled")
     } else {
-        log::debug!("none of the plugins have enabled entry notifications")
+        log::debug!(target: LOG_MODULE, "none of the plugins have enabled entry notifications")
     }
-    log::info!("running on_load...");
+    log::info!(target: LOG_MODULE, "running on_load...");
     rt.spawn(on_load);
 
     let index_base_url = Arc::new(index_base_url.clone());
@@ -647,7 +653,7 @@ pub fn firehose_geyser(
     // divide slot_range into n subranges
     let subranges = generate_subranges(&slot_range, threads);
     if threads > 1 {
-        log::info!("⚡ thread sub-ranges: {:?}", subranges);
+        log::info!(target: LOG_MODULE, "⚡ thread sub-ranges: {:?}", subranges);
     }
 
     let mut handles = Vec::new();
@@ -690,7 +696,7 @@ pub fn firehose_geyser(
     for handle in handles {
         handle.join().unwrap();
     }
-    log::info!("🚒 firehose finished successfully.");
+    log::info!(target: LOG_MODULE, "🚒 firehose finished successfully.");
     if let Some(block_meta_notifier) = block_meta_notifier_maybe.as_ref() {
         block_meta_notifier.notify_block_metadata(
             u64::MAX,
@@ -724,9 +730,9 @@ async fn firehose_geyser_thread(
 ) -> Result<(), (FirehoseError, u64)> {
     let start_time = std::time::Instant::now();
     let log_target = if let Some(thread_index) = thread_index {
-        format!("{}::T{:03}", module_path!(), thread_index)
+        format!("{}::T{:03}", LOG_MODULE, thread_index)
     } else {
-        module_path!().to_string()
+        LOG_MODULE.to_string()
     };
     let mut skip_until_index = None;
     // let mut triggered = false;
@@ -879,12 +885,17 @@ async fn firehose_geyser_thread(
                     if let Some(skip) = skip_until_index {
                         if item_index < skip {
                             if !displayed_skip_message {
-                                log::info!("skipping until index {} (at {})", skip, item_index);
+                        log::info!(
+                            target: &log_target,
+                            "skipping until index {} (at {})",
+                            skip,
+                            item_index
+                        );
                                 displayed_skip_message = true;
                             }
                             return Ok(());
                         } else {
-                            log::info!("reached target index {}, resuming...", skip);
+                            log::info!(target: &log_target, "reached target index {}, resuming...", skip);
                             skip_until_index = None;
                         }
                     }
@@ -1171,6 +1182,7 @@ pub fn generate_subranges(slot_range: &Range<u64>, threads: u64) -> Vec<Range<u6
     }
 
     log::info!(
+        target: LOG_MODULE,
         "Generated {} thread ranges covering {} slots total",
         threads,
         total_covered
@@ -1195,12 +1207,18 @@ async fn test_firehose_epoch_800() {
                 PREV_BLOCK[thread_id % PREV_BLOCK.len()].swap(block.slot(), Ordering::Relaxed);
             if block.was_skipped() {
                 log::info!(
+                    target: LOG_MODULE,
                     "leader skipped block {} on thread {}",
                     block.slot(),
                     thread_id,
                 );
             } else {
-                log::info!("got block {} on thread {}", block.slot(), thread_id,);
+                log::info!(
+                    target: LOG_MODULE,
+                    "got block {} on thread {}",
+                    block.slot(),
+                    thread_id,
+                );
             }
 
             if prev > 0 {

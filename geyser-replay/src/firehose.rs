@@ -158,6 +158,11 @@ impl BlockData {
             BlockData::LeaderSkipped { slot } => *slot,
         }
     }
+
+    #[inline(always)]
+    pub const fn was_skipped(&self) -> bool {
+        matches!(self, BlockData::LeaderSkipped { .. })
+    }
 }
 
 #[inline]
@@ -235,7 +240,7 @@ where
 
                     // for each epoch
                     let mut current_slot: Option<u64> = None;
-                    let mut previous_slot: Option<u64>;
+                    let mut previous_slot: Option<u64> = Some(slot_range.start.checked_sub(1).unwrap_or(0));
                     for epoch_num in epoch_range.clone() {
                         log::info!(target: &log_target, "entering epoch {}", epoch_num);
                         let stream = match timeout(OP_TIMEOUT, fetch_epoch_stream(epoch_num, &client)).await {
@@ -300,12 +305,32 @@ where
                                 epoch_num,
                                 block.slot
                             );
-                            let slot = block.slot;
+                            let mut slot = block.slot;
                             if slot >= slot_range.end {
                                 log::info!(target: &log_target, "reached end of slot range at slot {}", slot);
                                 // Return early to terminate the firehose thread cleanly.
                                 // We use >= because slot_range is half-open [start, end), so any slot
                                 // equal to end is out-of-range and must not be processed.
+
+                                // still need to emit skipped slots up to end-1
+                                slot = slot_range.end;
+                                if let Some(previous_slot) = previous_slot {
+                                    for skipped_slot in (previous_slot + 2)..slot {
+                                        log::debug!(
+                                            target: &log_target,
+                                            "leader skipped slot {} (previous slot {}, current slot {})",
+                                            skipped_slot,
+                                            previous_slot,
+                                            slot,
+                                        );
+                                        on_block(
+                                            thread_index,
+                                            BlockData::LeaderSkipped { slot: skipped_slot },
+                                        )
+                                        .map_err(|e| FirehoseError::BlockHandlerError(e))
+                                        .map_err(|e| (e, current_slot.unwrap_or(slot_range.start)))?;
+                                    }
+                                }
                                 return Ok(());
                             }
                             debug_assert!(slot < slot_range.end, "processing out-of-range slot {} (end {})", slot, slot_range.end);
@@ -318,7 +343,9 @@ where
                                 );
                                 continue;
                             }
-                            previous_slot = current_slot;
+                            if current_slot.is_some() {
+                                previous_slot = current_slot;
+                            }
                             current_slot = Some(slot);
                             let mut this_block_executed_transaction_count: u64 = 0;
                             let mut this_block_entry_count: u64 = 0;
@@ -1155,17 +1182,34 @@ pub fn generate_subranges(slot_range: &Range<u64>, threads: u64) -> Vec<Range<u6
 async fn test_firehose_epoch_800() {
     use std::sync::atomic::{AtomicU64, Ordering};
     solana_logger::setup_with_default("info");
-    const THREADS: usize = 4;
+    const THREADS: usize = 8;
+    const NUM_SLOTS_TO_COVER: u64 = 1000;
     static PREV_BLOCK: [AtomicU64; THREADS] = [const { AtomicU64::new(0) }; THREADS];
+    static NUM_SKIPPED_BLOCKS: AtomicU64 = AtomicU64::new(0);
+    static NUM_BLOCKS: AtomicU64 = AtomicU64::new(0);
     firehose(
         THREADS.try_into().unwrap(),
-        345600000..(345600000 + 100),
+        345600000..(345600000 + NUM_SLOTS_TO_COVER),
         |thread_id, block: BlockData| {
             let prev =
                 PREV_BLOCK[thread_id % PREV_BLOCK.len()].swap(block.slot(), Ordering::Relaxed);
-            log::info!("got block {} on thread {}", block.slot(), thread_id,);
+            if block.was_skipped() {
+                log::info!(
+                    "leader skipped block {} on thread {}",
+                    block.slot(),
+                    thread_id,
+                );
+            } else {
+                log::info!("got block {} on thread {}", block.slot(), thread_id,);
+            }
+
             if prev > 0 {
                 assert_eq!(prev + 1, block.slot());
+            }
+            if block.was_skipped() {
+                NUM_SKIPPED_BLOCKS.fetch_add(1, Ordering::Relaxed);
+            } else {
+                NUM_BLOCKS.fetch_add(1, Ordering::Relaxed);
             }
             Ok(())
         },
@@ -1173,4 +1217,8 @@ async fn test_firehose_epoch_800() {
     )
     .await
     .unwrap();
+    assert_eq!(
+        NUM_BLOCKS.load(Ordering::Relaxed) + NUM_SKIPPED_BLOCKS.load(Ordering::Relaxed),
+        NUM_SLOTS_TO_COVER
+    );
 }

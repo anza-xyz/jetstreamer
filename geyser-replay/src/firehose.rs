@@ -1159,7 +1159,7 @@ async fn test_firehose_epoch_800() {
     static PREV_BLOCK: [AtomicU64; THREADS] = [const { AtomicU64::new(0) }; THREADS];
     firehose(
         THREADS.try_into().unwrap(),
-        345600000..(345600000 + 5000),
+        345600000..(345600000 + 10000),
         |thread_id, block: BlockData| {
             let prev =
                 PREV_BLOCK[thread_id % PREV_BLOCK.len()].swap(block.slot(), Ordering::Relaxed);

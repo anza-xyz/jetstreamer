@@ -58,14 +58,11 @@ impl Transaction {
                 transaction.kind = *kind as u64;
 
                 if *kind as u64 != Kind::Transaction as u64 {
-                    return Err(Box::new(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        std::format!(
-                            "Wrong kind for Transaction; expected {:?}, got {:?}",
-                            Kind::Transaction,
-                            kind
-                        ),
-                    )));
+                    return Err(Box::new(std::io::Error::other(std::format!(
+                        "Wrong kind for Transaction; expected {:?}, got {:?}",
+                        Kind::Transaction,
+                        kind
+                    ))));
                 }
             }
 

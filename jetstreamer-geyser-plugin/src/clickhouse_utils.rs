@@ -193,13 +193,11 @@ pub async fn start() -> Result<
                             log::warn!("ClickHouse process with PID {} killed.", other_pid);
                             log::warn!("Please re-launch.");
                             std::process::exit(0);
-                        } else if line.contains("PID: ") {
-                            if let Some(pid_str) = line.split_whitespace().nth(1) {
-                                if let Ok(pid) = pid_str.parse::<u32>() {
+                        } else if line.contains("PID: ")
+                            && let Some(pid_str) = line.split_whitespace().nth(1)
+                                && let Ok(pid) = pid_str.parse::<u32>() {
                                     other_pid = Some(pid);
                                 }
-                            }
-                        }
                     }
                 }
             }

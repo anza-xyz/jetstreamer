@@ -44,14 +44,11 @@ impl Entry {
                 entry.kind = *kind as u64;
 
                 if *kind as u64 != Kind::Entry as u64 {
-                    return Err(Box::new(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        std::format!(
-                            "Wrong kind for Entry. Expected {:?}, got {:?}",
-                            Kind::Entry,
-                            kind
-                        ),
-                    )));
+                    return Err(Box::new(std::io::Error::other(std::format!(
+                        "Wrong kind for Entry. Expected {:?}, got {:?}",
+                        Kind::Entry,
+                        kind
+                    ))));
                 }
             }
             if let Some(serde_cbor::Value::Integer(num_hashes)) = array.get(1) {

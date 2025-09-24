@@ -2,96 +2,166 @@ use crate::epochs::{epoch_to_slot_range, fetch_epoch_stream, slot_to_epoch};
 use crate::network::{current_epoch, latest_old_faithful_epoch};
 use crate::node::Node;
 use crate::node_reader::NodeReader;
+use futures_util::StreamExt;
 use rayon::prelude::*;
-use reqwest::Client;
-use std::collections::HashMap;
+use reqwest::{Client, StatusCode, Url};
+use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
 use std::io::SeekFrom;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
-#[derive(Clone, PartialEq, Eq, Default)]
+#[derive(Debug)]
 pub struct SlotOffsetIndex {
-    index_dir: PathBuf,
+    base_url: Url,
+    client: Client,
     data: HashMap<u64, u64>,
+    loaded_epochs: HashSet<u64>,
 }
 
 #[derive(Debug)]
 pub enum SlotOffsetIndexError {
-    IndexDirNotFound(PathBuf),
-    EpochIndexFileNotFound(PathBuf),
-    SlotNotFound(u64, PathBuf),
-    NetworkError(Box<dyn std::error::Error>),
-    IoError(std::io::Error, PathBuf),
+    InvalidBaseUrl(String),
+    InvalidIndexUrl(String),
+    EpochIndexFileNotFound(Url),
+    SlotNotFound(u64, Url),
+    NetworkError(Url, reqwest::Error),
+    HttpStatusError(Url, StatusCode),
+    IndexFormatError(Url, String),
 }
 
 impl Display for SlotOffsetIndexError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            SlotOffsetIndexError::EpochIndexFileNotFound(path) => {
-                write!(f, "epoch index file not found: {}", path.display())
+            SlotOffsetIndexError::InvalidBaseUrl(url) => {
+                write!(f, "invalid index base URL: {}", url)
             }
-            SlotOffsetIndexError::SlotNotFound(slot, path) => {
+            SlotOffsetIndexError::InvalidIndexUrl(url) => {
+                write!(f, "invalid index URL: {}", url)
+            }
+            SlotOffsetIndexError::EpochIndexFileNotFound(url) => {
+                write!(f, "epoch index file not found: {}", url)
+            }
+            SlotOffsetIndexError::SlotNotFound(slot, url) => {
+                write!(f, "slot {} not found in index: {}", slot, url)
+            }
+            SlotOffsetIndexError::NetworkError(url, err) => {
+                write!(f, "failed to fetch index {}: {}", url, err)
+            }
+            SlotOffsetIndexError::HttpStatusError(url, status) => {
                 write!(
                     f,
-                    "slot {} not found in index file: {}",
-                    slot,
-                    path.display()
+                    "unexpected HTTP status {} while fetching index {}",
+                    status, url
                 )
             }
-            SlotOffsetIndexError::NetworkError(err) => write!(f, "{}", err),
-            SlotOffsetIndexError::IndexDirNotFound(path) => {
-                write!(f, "index directory does not exist: {}", path.display())
+            SlotOffsetIndexError::IndexFormatError(url, message) => {
+                write!(f, "invalid index data at {}: {}", url, message)
             }
-            SlotOffsetIndexError::IoError(error, path) => write!(
-                f,
-                "an IO error occurred trying to read from {}: {}",
-                path.display(),
-                error
-            ),
         }
     }
 }
 
+impl std::error::Error for SlotOffsetIndexError {}
+
 impl SlotOffsetIndex {
-    pub fn new(index_dir: impl AsRef<Path>) -> Result<Self, SlotOffsetIndexError> {
-        if !index_dir.as_ref().exists() {
-            return Err(SlotOffsetIndexError::IndexDirNotFound(
-                index_dir.as_ref().to_path_buf(),
-            ));
+    pub fn new(mut base_url: Url) -> Result<Self, SlotOffsetIndexError> {
+        if !base_url.path().ends_with('/') {
+            let mut path = base_url.path().to_string();
+            if !path.ends_with('/') {
+                path.push('/');
+            }
+            base_url.set_path(&path);
         }
         Ok(Self {
-            index_dir: index_dir.as_ref().to_path_buf(),
+            base_url,
+            client: Client::new(),
             data: HashMap::new(),
+            loaded_epochs: HashSet::new(),
         })
     }
 
-    pub async fn load_index_file(
-        &mut self,
-        idx_path: impl AsRef<Path>,
-    ) -> Result<(), SlotOffsetIndexError> {
-        let idx_path = idx_path.as_ref();
-        if !idx_path.exists() {
-            return Err(SlotOffsetIndexError::EpochIndexFileNotFound(
-                idx_path.to_path_buf(),
+    fn epoch_url(&self, epoch: u64) -> Result<Url, SlotOffsetIndexError> {
+        let candidate = format!("epoch-{}.idx", epoch);
+        self.base_url.join(&candidate).map_err(|err| {
+            SlotOffsetIndexError::InvalidIndexUrl(format!("{}{} ({err})", self.base_url, candidate))
+        })
+    }
+
+    async fn load_epoch(&mut self, epoch: u64) -> Result<(), SlotOffsetIndexError> {
+        if self.loaded_epochs.contains(&epoch) {
+            return Ok(());
+        }
+
+        let url = self.epoch_url(epoch)?;
+        log::info!("Loading slot offset index: {}", url);
+
+        let response = self
+            .client
+            .get(url.clone())
+            .send()
+            .await
+            .map_err(|err| SlotOffsetIndexError::NetworkError(url.clone(), err))?;
+
+        if response.status() == StatusCode::NOT_FOUND {
+            return Err(SlotOffsetIndexError::EpochIndexFileNotFound(url));
+        }
+
+        if !response.status().is_success() {
+            return Err(SlotOffsetIndexError::HttpStatusError(
+                url,
+                response.status(),
             ));
         }
-        let file_name = idx_path.file_name().unwrap().to_str().unwrap();
-        log::info!("Loading slot offset index file: {}...", file_name);
-        let file = File::open(&idx_path)
-            .await
-            .map_err(|e| SlotOffsetIndexError::IoError(e, idx_path.to_path_buf()))?;
-        let mut file = tokio::io::BufReader::new(file);
-        let mut buf = vec![0u8; 24];
-        let mut i = 0;
-        while file.read_exact(&mut buf).await.is_ok() {
-            let slot = u64::from_le_bytes(buf[0..8].try_into().unwrap());
-            let offset = u64::from_le_bytes(buf[8..16].try_into().unwrap());
-            self.data.insert(slot, offset);
-            i += 1;
+
+        let mut stream = response.bytes_stream();
+        let mut buffer: Vec<u8> = Vec::new();
+        let mut entries = 0u64;
+
+        while let Some(chunk_result) = stream.next().await {
+            let chunk =
+                chunk_result.map_err(|err| SlotOffsetIndexError::NetworkError(url.clone(), err))?;
+            buffer.extend_from_slice(&chunk);
+
+            let mut processed = 0usize;
+            while buffer.len() - processed >= 24 {
+                let slot_bytes = &buffer[processed..processed + 8];
+                let offset_bytes = &buffer[processed + 8..processed + 16];
+
+                let mut slot = [0u8; 8];
+                slot.copy_from_slice(slot_bytes);
+                let mut offset = [0u8; 8];
+                offset.copy_from_slice(offset_bytes);
+
+                let slot = u64::from_le_bytes(slot);
+                let offset = u64::from_le_bytes(offset);
+                self.data.insert(slot, offset);
+                entries += 1;
+                processed += 24;
+            }
+
+            if processed > 0 {
+                buffer.drain(0..processed);
+            }
         }
-        log::info!("Loaded {} slot offset index entries from {}.", i, file_name);
+
+        if !buffer.is_empty() {
+            return Err(SlotOffsetIndexError::IndexFormatError(
+                url,
+                format!(
+                    "index length {} is not a multiple of 24 bytes",
+                    buffer.len()
+                ),
+            ));
+        }
+
+        self.loaded_epochs.insert(epoch);
+        log::info!(
+            "Loaded {} slot offset index entries from epoch {}.",
+            entries,
+            epoch
+        );
         Ok(())
     }
 
@@ -100,15 +170,12 @@ impl SlotOffsetIndex {
             return Ok(*offset);
         }
         let epoch = slot_to_epoch(slot);
-        let idx_path = self.index_dir.join(format!("epoch-{}.idx", epoch));
-        if !idx_path.exists() {
-            return Err(SlotOffsetIndexError::EpochIndexFileNotFound(idx_path));
-        }
-        self.load_index_file(&idx_path).await?;
+        self.load_epoch(epoch).await?;
         if let Some(offset) = self.data.get(&slot) {
             return Ok(*offset);
         }
-        Err(SlotOffsetIndexError::SlotNotFound(slot, idx_path))
+        let url = self.epoch_url(epoch)?;
+        Err(SlotOffsetIndexError::SlotNotFound(slot, url))
     }
 }
 
@@ -332,28 +399,25 @@ pub async fn build_missing_indexes(
     Ok(())
 }
 
-pub fn get_index_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("JETSTREAMER_OFFSET_CACHE_DIR") {
-        return PathBuf::from(dir).canonicalize().unwrap();
-    }
-    // List of candidate directories, in order
-    const CANDIDATES: [&str; 3] = ["geyser-replay/src/index", "src/index", "index"];
-    for candidate in CANDIDATES.iter() {
-        let path = PathBuf::from(candidate);
-        if path.exists() {
-            return path.canonicalize().unwrap();
+pub fn get_index_base_url() -> Result<Url, SlotOffsetIndexError> {
+    let base = std::env::var("JETSTREAMER_OFFSET_BASE_URL")
+        .unwrap_or_else(|_| "https://storage.googleapis.com/jetstreamer/index/".to_string());
+    let mut url = Url::parse(&base)
+        .map_err(|err| SlotOffsetIndexError::InvalidBaseUrl(format!("{} ({err})", base)))?;
+    if !url.path().ends_with('/') {
+        let mut path = url.path().to_string();
+        if !path.ends_with('/') {
+            path.push('/');
         }
+        url.set_path(&path);
     }
-    // Fallback to default
-    PathBuf::from("geyser-replay/src/index")
-        .canonicalize()
-        .unwrap()
+    Ok(url)
 }
 
 #[tokio::test]
 async fn test_slot_offset_index() {
-    let cache_dir = get_index_dir();
-    let mut index = SlotOffsetIndex::new(cache_dir).unwrap();
+    let base_url = get_index_base_url().unwrap();
+    let mut index = SlotOffsetIndex::new(base_url).unwrap();
     assert_eq!(index.get_offset(123456).await.unwrap(), 1218137096);
     assert_eq!(index.get_offset(123456789).await.unwrap(), 384461630701);
     let start = index.get_offset(334368000).await.unwrap();

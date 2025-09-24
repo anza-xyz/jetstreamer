@@ -1,10 +1,11 @@
 use core::ops::Range;
 use geyser_replay::{
     epochs::slot_to_epoch,
-    firehose::{GeyserReplayError, firehose},
-    index::get_index_dir,
+    firehose::{FirehoseError, firehose_geyser},
+    index::get_index_base_url,
 };
 use jetstreamer_plugin::{Plugin, PluginRunner};
+use reqwest::Url;
 use serde_json::json;
 use std::{fs::File, io::Write, os::unix::fs::PermissionsExt, path::PathBuf, sync::Arc};
 use tempfile::NamedTempFile;
@@ -16,7 +17,7 @@ const WORKER_THREAD_MULTIPLIER: usize = 4; // each plugin thread gets 4 worker t
 pub struct JetstreamerRunner {
     log_level: String,
     plugins: Vec<Box<dyn Plugin>>,
-    index_dir: PathBuf,
+    index_base_url: Url,
     geyser_config_files: Vec<PathBuf>,
     config: Config,
 }
@@ -26,7 +27,8 @@ impl Default for JetstreamerRunner {
         Self {
             log_level: "info".to_string(),
             plugins: Vec::new(),
-            index_dir: get_index_dir(),
+            index_base_url: get_index_base_url()
+                .expect("failed to resolve remote slot offset index location"),
             geyser_config_files: Vec::new(),
             config: Config {
                 threads: 1,
@@ -63,8 +65,8 @@ impl JetstreamerRunner {
         Ok(self)
     }
 
-    pub fn with_index_dir(mut self, index_dir: PathBuf) -> Self {
-        self.index_dir = index_dir;
+    pub fn with_index_base_url(mut self, index_base_url: Url) -> Self {
+        self.index_base_url = index_base_url;
         self
     }
 
@@ -79,13 +81,13 @@ impl JetstreamerRunner {
         self
     }
 
-    pub fn run(self) -> Result<(), GeyserReplayError> {
+    pub fn run(self) -> Result<(), FirehoseError> {
         solana_logger::setup_with_default(&self.log_level);
         let geyser_config_files: &[PathBuf] = &self.geyser_config_files;
         log::debug!("GeyserPluginService config: {:?}", geyser_config_files);
         let client = reqwest::Client::new();
-        let index_dir = self.index_dir;
-        log::info!("slot index dir: {:?}", index_dir);
+        let index_base_url = self.index_base_url;
+        log::info!("slot index base url: {}", index_base_url);
         let slot_range = self.config.slot_range;
         log::info!("geyser config files: {:?}", geyser_config_files);
         let threads = self.config.threads as usize;
@@ -112,11 +114,11 @@ impl JetstreamerRunner {
         log::info!("using {} threads for processing", threads);
         let runner = plugin_runner.clone();
         let plugin_rt_for_runner = plugin_rt.clone();
-        if let Err((err, slot)) = firehose(
+        if let Err((err, slot)) = firehose_geyser(
             plugin_rt,
             slot_range.clone(),
             Some(geyser_config_files),
-            &index_dir,
+            &index_base_url,
             &client,
             async move {
                 // Run the plugin runner on the dedicated runtime so it uses `threads` worker threads.

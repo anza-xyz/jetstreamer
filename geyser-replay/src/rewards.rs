@@ -44,14 +44,11 @@ impl Rewards {
                 rewards.kind = *kind as u64;
 
                 if *kind as u64 != Kind::Rewards as u64 {
-                    return Err(Box::new(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        std::format!(
-                            "Wrong kind for Rewards. Expected {:?}, got {:?}",
-                            Kind::Rewards,
-                            kind
-                        ),
-                    )));
+                    return Err(Box::new(std::io::Error::other(std::format!(
+                        "Wrong kind for Rewards. Expected {:?}, got {:?}",
+                        Kind::Rewards,
+                        kind
+                    ))));
                 }
             }
             if let Some(serde_cbor::Value::Integer(slot)) = array.get(1) {

@@ -158,7 +158,7 @@ pub fn thread_set_current_tx_index(thread_id: u8, index: u32) {
 
 fn maybe_update_clickhouse_tps(processed_slots: u64) {
     // Only attempt every 100 processed slot aggregations (same cadence as some logs) or if stale.
-    if processed_slots % 100 != 0 {
+    if !processed_slots.is_multiple_of(100) {
         return;
     }
     let now_secs = SystemTime::now()
@@ -179,7 +179,7 @@ fn maybe_update_clickhouse_tps(processed_slots: u64) {
 
     DB_CLIENT.with_borrow(|db| {
         TOKIO_RUNTIME.with_borrow(|rt| {
-            let _ = rt.block_on(async {
+            rt.block_on(async {
                 #[derive(::clickhouse::Row, serde::Deserialize)]
                 struct Row {
                     txs: u64,
@@ -353,7 +353,7 @@ impl GeyserPlugin for Jetstreamer {
             .get("threads")
             .unwrap()
             .as_u64()
-            .unwrap_or(1) as u8;
+            .unwrap_or(1);
         log::info!("jetstreamer threads: {}", threads);
         let slot_range = config_json
             .get("jetstreamer")
@@ -724,7 +724,7 @@ impl GeyserPlugin for Jetstreamer {
                                 .write(&SlotStatusRow {
                                     slot: blk.slot,
                                     transaction_count,
-                                    thread_id: thread_id as u8,
+                                    thread_id,
                                 })
                                 .await
                             {

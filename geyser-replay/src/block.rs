@@ -62,14 +62,11 @@ impl Block {
                 block.kind = *kind as u64;
 
                 if *kind as u64 != Kind::Block as u64 {
-                    return Err(Box::new(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        std::format!(
-                            "Wrong kind for Block. Expected {:?}, got {:?}",
-                            Kind::Block,
-                            kind
-                        ),
-                    )));
+                    return Err(Box::new(std::io::Error::other(std::format!(
+                        "Wrong kind for Block. Expected {:?}, got {:?}",
+                        Kind::Block,
+                        kind
+                    ))));
                 }
             }
             if let Some(serde_cbor::Value::Integer(slot)) = array.get(1) {

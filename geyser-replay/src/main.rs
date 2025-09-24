@@ -1,5 +1,5 @@
 use {
-    geyser_replay::{firehose::firehose, index::get_index_dir},
+    geyser_replay::{firehose::firehose_geyser, index::get_index_base_url},
     reqwest::Client,
     std::{env::args, sync::Arc},
 };
@@ -7,7 +7,8 @@ use {
 fn main() {
     solana_logger::setup_with_default("info");
     let client = Client::new();
-    let index_dir = get_index_dir();
+    let index_base_url =
+        get_index_base_url().expect("failed to resolve remote slot offset index location");
     let first_arg = args().nth(1).expect("no first argument given");
     let slot_range = if first_arg.contains(':') {
         let (slot_a, slot_b) = first_arg
@@ -23,13 +24,13 @@ fn main() {
         start_slot..end_slot
     };
     let geyser_config_files = &[std::path::PathBuf::from(args().nth(2).unwrap())];
-    log::info!("slot index dir: {:?}", index_dir);
+    log::info!("slot index base url: {}", index_base_url);
     log::info!("geyser config files: {:?}", geyser_config_files);
-    firehose(
+    firehose_geyser(
         Arc::new(tokio::runtime::Runtime::new().unwrap()),
         slot_range,
         Some(geyser_config_files),
-        index_dir,
+        &index_base_url,
         &client,
         async { Ok(()) },
         1,

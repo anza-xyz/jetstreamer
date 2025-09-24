@@ -21,6 +21,7 @@ path = "src/index_bin.rs"
 
 [dependencies]
 crossbeam-channel.workspace = true
+agave-geyser-plugin-interface.workspace = true
 solana-rpc.workspace = true
 solana-runtime.workspace = true
 solana-sdk.workspace = true
@@ -52,3 +53,6 @@ serde_json.workspace = true
 zstd.workspace = true
 solana-vote-program.workspace = true
 solana-reward-info.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -2266,6 +2266,7 @@ dependencies = [
 name = "geyser-replay"
 version = "0.1.0"
 dependencies = [
+ "agave-geyser-plugin-interface",
  "anyhow",
  "base64 0.22.1",
  "bincode",
@@ -2295,6 +2296,7 @@ dependencies = [
  "solana-storage-proto",
  "solana-transaction-status",
  "solana-vote-program",
+ "tempfile",
  "thiserror 2.0.16",
  "tokio",
  "zstd",

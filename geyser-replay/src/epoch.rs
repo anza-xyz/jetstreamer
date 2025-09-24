@@ -38,14 +38,11 @@ impl Epoch {
                 epoch.kind = *kind as u64;
 
                 if *kind as u64 != Kind::Epoch as u64 {
-                    return Err(Box::new(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        std::format!(
-                            "Wrong kind for Epoch. Expected {:?}, got {:?}",
-                            Kind::Epoch,
-                            kind
-                        ),
-                    )));
+                    return Err(Box::new(std::io::Error::other(std::format!(
+                        "Wrong kind for Epoch. Expected {:?}, got {:?}",
+                        Kind::Epoch,
+                        kind
+                    ))));
                 }
             }
             if let Some(serde_cbor::Value::Integer(num)) = array.get(1) {

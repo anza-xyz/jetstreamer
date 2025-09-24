@@ -1155,15 +1155,11 @@ pub fn generate_subranges(slot_range: &Range<u64>, threads: u64) -> Vec<Range<u6
 async fn test_firehose_epoch_800() {
     use std::sync::atomic::{AtomicU64, Ordering};
     solana_logger::setup_with_default("info");
-    static PREV_BLOCK: [AtomicU64; 4] = [
-        AtomicU64::new(0),
-        AtomicU64::new(0),
-        AtomicU64::new(0),
-        AtomicU64::new(0),
-    ];
+    const THREADS: usize = 256;
+    static PREV_BLOCK: [AtomicU64; THREADS] = [const { AtomicU64::new(0) }; THREADS];
     firehose(
-        4,
-        345600000..(345600000 + 250),
+        THREADS.try_into().unwrap(),
+        345600000..(345600000 + 5000),
         |thread_id, block: BlockData| {
             let prev =
                 PREV_BLOCK[thread_id % PREV_BLOCK.len()].swap(block.slot(), Ordering::Relaxed);

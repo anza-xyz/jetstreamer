@@ -1239,4 +1239,5 @@ async fn test_firehose_epoch_800() {
         NUM_BLOCKS.load(Ordering::Relaxed) + NUM_SKIPPED_BLOCKS.load(Ordering::Relaxed),
         NUM_SLOTS_TO_COVER
     );
+    assert!(NUM_BLOCKS.load(Ordering::Relaxed) > 0);
 }

@@ -52,6 +52,7 @@ pub enum FirehoseError {
     OnLoadError(Box<dyn std::error::Error>),
     OperationTimeout(&'static str),
     TransactionHandlerError(Box<dyn std::error::Error>),
+    EntryHandlerError(Box<dyn std::error::Error>),
     BlockHandlerError(Box<dyn std::error::Error>),
 }
 
@@ -97,6 +98,9 @@ impl Display for FirehoseError {
             FirehoseError::TransactionHandlerError(error) => {
                 write!(f, "Transaction handler error: {}", error)
             }
+            FirehoseError::EntryHandlerError(error) => {
+                write!(f, "Entry handler error: {}", error)
+            }
             FirehoseError::BlockHandlerError(error) => {
                 write!(f, "Block handler error: {}", error)
             }
@@ -133,6 +137,15 @@ pub struct TransactionData {
     pub transaction: VersionedTransaction,
 }
 
+#[derive(Debug, Clone)]
+pub struct EntryData {
+    pub slot: u64,
+    pub entry_index: usize,
+    pub transaction_indexes: Range<usize>,
+    pub num_hashes: u64,
+    pub hash: Hash,
+}
+
 #[derive(Debug)]
 pub enum BlockData {
     Block {
@@ -167,11 +180,12 @@ impl BlockData {
 }
 
 #[inline]
-pub async fn firehose<OnBlock, OnTransaction>(
+pub async fn firehose<OnBlock, OnTransaction, OnEntry>(
     threads: u64,
     slot_range: Range<u64>,
     on_block: OnBlock,
     on_tx: OnTransaction,
+    on_entry: OnEntry,
 ) -> Result<(), (FirehoseError, u64)>
 where
     OnBlock: Fn(usize, BlockData) -> Result<(), Box<dyn std::error::Error + Send + 'static>>
@@ -180,6 +194,11 @@ where
         + Clone
         + 'static,
     OnTransaction: Fn(usize, TransactionData) -> Result<(), Box<dyn std::error::Error + Send + 'static>>
+        + Send
+        + Sync
+        + Clone
+        + 'static,
+    OnEntry: Fn(usize, EntryData) -> Result<(), Box<dyn std::error::Error + Send + 'static>>
         + Send
         + Sync
         + Clone
@@ -217,6 +236,7 @@ where
         let client = client.clone();
         let on_block = on_block.clone();
         let on_tx = on_tx.clone();
+        let on_entry = on_entry.clone();
 
         let handle = tokio::spawn(async move {
             let start_time = std::time::Instant::now();
@@ -348,6 +368,7 @@ where
                                 previous_slot = current_slot;
                             }
                             current_slot = Some(slot);
+                            let mut entry_index: usize = 0;
                             let mut this_block_executed_transaction_count: u64 = 0;
                             let mut this_block_entry_count: u64 = 0;
                             let mut this_block_rewards: solana_storage_proto::convert::generated::Rewards =
@@ -430,16 +451,36 @@ where
                                     ).map_err(|e| FirehoseError::TransactionHandlerError(e))?;
                                 }
                                 Entry(entry) => {
-                                    todo_latest_entry_blockhash = Hash::from(entry.hash.to_bytes());
-                                    let entry_transaction_count = entry.transactions.len() as u64;
-                                    this_block_executed_transaction_count = this_block_executed_transaction_count
-                                        .checked_add(entry_transaction_count)
-                                        .ok_or_else(|| {
-                                            Box::new(std::io::Error::other(
-                                                "transaction count overflow",
-                                            )) as Box<dyn std::error::Error>
-                                        })?;
+                                    let entry_hash = Hash::from(entry.hash.to_bytes());
+                                    let entry_transaction_count = entry.transactions.len();
+                                    let entry_transaction_count_u64 = entry_transaction_count as u64;
+                                    let starting_transaction_index = usize::try_from(
+                                        this_block_executed_transaction_count,
+                                    )
+                                    .map_err(|_| {
+                                        Box::new(std::io::Error::other(
+                                            "transaction index exceeds usize range",
+                                        )) as Box<dyn std::error::Error>
+                                    })?;
+                                    let transaction_indexes_end =
+                                        starting_transaction_index + entry_transaction_count;
+                                    todo_latest_entry_blockhash = entry_hash;
+                                    this_block_executed_transaction_count +=
+                                        entry_transaction_count_u64;
                                     this_block_entry_count += 1;
+                                    on_entry(
+                                        thread_index,
+                                        EntryData {
+                                            slot: block.slot,
+                                            entry_index,
+                                            transaction_indexes: starting_transaction_index
+                                                ..transaction_indexes_end,
+                                            num_hashes: entry.num_hashes,
+                                            hash: entry_hash,
+                                        },
+                                    )
+                                    .map_err(|e| FirehoseError::EntryHandlerError(e))?;
+                                    entry_index += 1;
                                 },
                                 Block(block) => {
                                     let mut keyed_rewards = Vec::with_capacity(this_block_rewards.rewards.len());
@@ -965,13 +1006,7 @@ async fn firehose_geyser_thread(
 									"transaction index exceeds usize range",
 								)) as Box<dyn std::error::Error>
 							})?;
-							this_block_executed_transaction_count = this_block_executed_transaction_count
-								.checked_add(entry_transaction_count)
-								.ok_or_else(|| {
-									Box::new(std::io::Error::other(
-										"transaction count overflow",
-									)) as Box<dyn std::error::Error>
-								})?;
+							this_block_executed_transaction_count += entry_transaction_count;
 							this_block_entry_count += 1;
 							if entry_notifier_maybe.is_none() {
 								return Ok(());
@@ -1232,6 +1267,7 @@ async fn test_firehose_epoch_800() {
             Ok(())
         },
         |_thread_id, _tx: TransactionData| Ok(()),
+        |thread_id, entry: EntryData| Ok(()),
     )
     .await
     .unwrap();

@@ -482,7 +482,7 @@ where
                                                 let message_hash = {
                                                     #[cfg(feature = "verify-transaction-signatures")]
                                                     {
-                                                        versioned_tx.verify_and_hash_message()?;
+                                                        versioned_tx.verify_and_hash_message()?
                                                     }
                                                     #[cfg(not(feature = "verify-transaction-signatures"))]
                                                     {
@@ -1067,7 +1067,7 @@ async fn firehose_geyser_thread(
                                 let message_hash = {
                                     #[cfg(feature = "verify-transaction-signatures")]
                                     {
-                                        versioned_tx.verify_and_hash_message()?;
+                                        versioned_tx.verify_and_hash_message()?
                                     }
                                     #[cfg(not(feature = "verify-transaction-signatures"))]
                                     {

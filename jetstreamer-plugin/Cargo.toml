@@ -19,9 +19,8 @@ futures-util.workspace = true
 thiserror.workspace = true
 rayon.workspace = true
 once_cell.workspace = true
-geyser-replay.workspace = true
+jetstreamer-firehose.workspace = true
 reqwest.workspace = true
 futures.workspace = true
 sha2.workspace = true
 crossbeam-channel.workspace = true
-

@@ -1,5 +1,5 @@
 use {
-    geyser_replay::{firehose::firehose_geyser, index::get_index_base_url},
+    jetstreamer_firehose::{firehose::firehose_geyser, index::get_index_base_url},
     reqwest::Client,
     std::{env::args, sync::Arc},
 };
@@ -20,7 +20,7 @@ fn main() {
     } else {
         let epoch: u64 = first_arg.parse().expect("failed to parse epoch");
         log::info!("epoch: {}", epoch);
-        let (start_slot, end_slot) = geyser_replay::epochs::epoch_to_slot_range(epoch);
+        let (start_slot, end_slot) = jetstreamer_firehose::epochs::epoch_to_slot_range(epoch);
         start_slot..end_slot
     };
     let geyser_config_files = &[std::path::PathBuf::from(args().nth(2).unwrap())];

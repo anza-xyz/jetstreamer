@@ -4,7 +4,7 @@ use agave_geyser_plugin_interface::geyser_plugin_interface::{
 };
 use core::ops::Range;
 use crossbeam_utils::CachePadded;
-use geyser_replay::{epochs::slot_to_epoch, firehose::generate_subranges};
+use jetstreamer_firehose::{epochs::slot_to_epoch, firehose::generate_subranges};
 use rangemap::RangeMap;
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};

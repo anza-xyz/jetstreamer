@@ -2263,46 +2263,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "geyser-replay"
-version = "0.1.0"
-dependencies = [
- "agave-geyser-plugin-interface",
- "anyhow",
- "base64 0.22.1",
- "bincode",
- "cid",
- "crc",
- "crossbeam-channel",
- "fnv",
- "futures-util",
- "log",
- "multihash",
- "prost",
- "rangemap",
- "rayon",
- "reqwest 0.12.23",
- "rseek",
- "serde",
- "serde_cbor",
- "serde_json",
- "solana-entry",
- "solana-geyser-plugin-manager",
- "solana-ledger",
- "solana-logger",
- "solana-reward-info",
- "solana-rpc",
- "solana-runtime",
- "solana-sdk",
- "solana-storage-proto",
- "solana-transaction-status",
- "solana-vote-program",
- "tempfile",
- "thiserror 2.0.16",
- "tokio",
- "zstd",
-]
-
-[[package]]
 name = "gimli"
 version = "0.31.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3122,8 +3082,8 @@ checksum = "4a5f13b858c8d314ee3e8f639011f7ccefe71f97f96e50151fb991f267928e2c"
 name = "jetstreamer"
 version = "0.1.0"
 dependencies = [
- "geyser-replay",
  "jetstreamer-build-cdylib",
+ "jetstreamer-firehose",
  "jetstreamer-plugin",
  "log",
  "reqwest 0.12.23",
@@ -3141,6 +3101,46 @@ dependencies = [
 ]
 
 [[package]]
+name = "jetstreamer-firehose"
+version = "0.1.0"
+dependencies = [
+ "agave-geyser-plugin-interface",
+ "anyhow",
+ "base64 0.22.1",
+ "bincode",
+ "cid",
+ "crc",
+ "crossbeam-channel",
+ "fnv",
+ "futures-util",
+ "log",
+ "multihash",
+ "prost",
+ "rangemap",
+ "rayon",
+ "reqwest 0.12.23",
+ "rseek",
+ "serde",
+ "serde_cbor",
+ "serde_json",
+ "solana-entry",
+ "solana-geyser-plugin-manager",
+ "solana-ledger",
+ "solana-logger",
+ "solana-reward-info",
+ "solana-rpc",
+ "solana-runtime",
+ "solana-sdk",
+ "solana-storage-proto",
+ "solana-transaction-status",
+ "solana-vote-program",
+ "tempfile",
+ "thiserror 2.0.16",
+ "tokio",
+ "zstd",
+]
+
+[[package]]
 name = "jetstreamer-geyser-plugin"
 version = "0.1.0"
 dependencies = [
@@ -3150,9 +3150,9 @@ dependencies = [
  "crossbeam-channel",
  "crossbeam-utils",
  "ctrlc",
- "geyser-replay",
  "indoc",
  "interprocess",
+ "jetstreamer-firehose",
  "jetstreamer-plugin",
  "libc",
  "log",
@@ -3179,8 +3179,8 @@ dependencies = [
  "crossbeam-channel",
  "futures 0.3.31",
  "futures-util",
- "geyser-replay",
  "interprocess",
+ "jetstreamer-firehose",
  "log",
  "once_cell",
  "rayon",

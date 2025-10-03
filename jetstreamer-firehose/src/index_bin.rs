@@ -1,4 +1,4 @@
-use geyser_replay::index::build_missing_indexes;
+use jetstreamer_firehose::index::build_missing_indexes;
 
 #[tokio::main(worker_threads = 64, flavor = "multi_thread")]
 async fn main() {

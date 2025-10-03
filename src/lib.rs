@@ -1,5 +1,5 @@
 use core::ops::Range;
-use geyser_replay::{
+use jetstreamer_firehose::{
     epochs::slot_to_epoch,
     firehose::{FirehoseError, firehose_geyser},
     index::get_index_base_url,
@@ -216,7 +216,7 @@ pub fn parse_cli_args() -> Result<Config, Box<dyn std::error::Error>> {
     } else {
         let epoch: u64 = first_arg.parse().expect("failed to parse epoch");
         log::info!("epoch: {}", epoch);
-        let (start_slot, end_slot) = geyser_replay::epochs::epoch_to_slot_range(epoch);
+        let (start_slot, end_slot) = jetstreamer_firehose::epochs::epoch_to_slot_range(epoch);
         start_slot..end_slot
     };
     let spawn_clickhouse = std::env::var("JETSTREAMER_NO_CLICKHOUSE")

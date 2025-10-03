@@ -1,4 +1,4 @@
-# geyser-replay
+# jetstreamer-firehose
 
 A utility that allows replaying Solana blocks (even all the way back to genesis!) over a geyser
 plugin.

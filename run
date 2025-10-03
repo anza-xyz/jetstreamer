@@ -1,7 +1,7 @@
 #!/bin/sh
 set -ex
 pkill clickhouse || echo ""
-cargo build --release -p geyser-replay -p jetstreamer
+cargo build --release -p jetstreamer-firehose -p jetstreamer
 cp plugin_config.json bin/
 if [[ "$OSTYPE" == "darwin"* ]]; then
   cp target/release/libjetstreamer.dylib bin/
@@ -14,8 +14,8 @@ else
 fi
 awk "{gsub(\"{{full-path}}\", \"$PWD\")}1" plugin_config.json > plugin_config.tmp && mv plugin_config.tmp plugin_config.json
 cat plugin_config.json
-cp ../target/release/geyser-replay .
-./geyser-replay $1 `pwd`/plugin_config.json
+cp ../target/release/jetstreamer-firehose .
+./jetstreamer-firehose $1 `pwd`/plugin_config.json
 #solana-test-validator --geyser-plugin-config plugin_config.json --log
 # solana-validator \
 #     --identity ~/validator-keypair.json \

@@ -1,18 +1,18 @@
 [package]
-name = "geyser-replay"
+name = "jetstreamer-firehose"
 version = "0.1.0"
 edition = "2024"
 authors = ["sam0x17"]
 license = "MIT"
 description = "A utility that allows replaying ranges of Solana blocks, even back to genesis, over a geyser plugin using Old Faithful"
-default-run = "geyser-replay"
+default-run = "jetstreamer-firehose"
 
 [features]
 default = []
 verify-transaction-signatures = []
 
 [[bin]]
-name = "geyser-replay"
+name = "jetstreamer-firehose"
 path = "src/main.rs"
 
 [[bin]]

@@ -313,7 +313,7 @@ where
 
                     // for each epoch
                     let mut current_slot: Option<u64> = None;
-                    let mut previous_slot: Option<u64> = Some(slot_range.start.checked_sub(1).unwrap_or(0));
+                    let mut previous_slot: Option<u64> = Some(slot_range.start.saturating_sub(1));
                     for epoch_num in epoch_range.clone() {
                         log::info!(target: &log_target, "entering epoch {}", epoch_num);
                         let stream = match timeout(OP_TIMEOUT, fetch_epoch_stream(epoch_num, &client)).await {
@@ -387,8 +387,8 @@ where
 
                                 // still need to emit skipped slots up to end-1
                                 slot = slot_range.end;
-                                if block_enabled {
-                                    if let (Some(on_block_cb), Some(previous_slot)) =
+                                if block_enabled
+                                    && let (Some(on_block_cb), Some(previous_slot)) =
                                         (on_block.as_ref(), previous_slot)
                                     {
                                         for skipped_slot in (previous_slot + 2)..slot {
@@ -407,7 +407,6 @@ where
                                             .map_err(|e| (e, current_slot.unwrap_or(slot_range.start)))?;
                                         }
                                     }
-                                }
                                 return Ok(());
                             }
                             debug_assert!(slot < slot_range.end, "processing out-of-range slot {} (end {})", slot, slot_range.end);
@@ -457,8 +456,8 @@ where
                                 use crate::node::Node::*;
                                 match node {
                                     Transaction(tx) => {
-                                        if tx_enabled {
-                                            if let Some(on_tx_cb) = on_tx.as_ref() {
+                                        if tx_enabled
+                                            && let Some(on_tx_cb) = on_tx.as_ref() {
                                                 let versioned_tx = tx.as_parsed()?;
                                                 let reassembled_metadata =
                                                     nodes.reassemble_dataframes(tx.metadata.clone())?;
@@ -514,7 +513,6 @@ where
                                                 )
                                                 .map_err(|e| FirehoseError::TransactionHandlerError(e))?;
                                             }
-                                        }
                                     }
                                     Entry(entry) => {
                                         let entry_hash = Hash::from(entry.hash.to_bytes());
@@ -526,8 +524,8 @@ where
                                         this_block_executed_transaction_count += entry_transaction_count_u64;
                                         this_block_entry_count += 1;
 
-                                        if entry_enabled {
-                                            if let Some(on_entry_cb) = on_entry.as_ref() {
+                                        if entry_enabled
+                                            && let Some(on_entry_cb) = on_entry.as_ref() {
                                                 let starting_transaction_index = usize::try_from(
                                                     starting_transaction_index_u64,
                                                 )
@@ -551,7 +549,6 @@ where
                                                 )
                                                 .map_err(|e| FirehoseError::EntryHandlerError(e))?;
                                             }
-                                        }
                                         entry_index += 1;
                                     }
                                     Block(block) => {
@@ -612,8 +609,8 @@ where
                                                 nodes.reassemble_dataframes(rewards.data.clone())?;
                                             if reassembled.is_empty() {
                                                 this_block_rewards.clear();
-                                                if reward_enabled {
-                                                    if let Some(on_reward_cb) = on_reward.as_ref() {
+                                                if reward_enabled
+                                                    && let Some(on_reward_cb) = on_reward.as_ref() {
                                                         on_reward_cb(
                                                             thread_index,
                                                             RewardData {
@@ -625,7 +622,6 @@ where
                                                             FirehoseError::RewardHandlerError(e)
                                                         })?;
                                                     }
-                                                }
                                                 return Ok(());
                                             }
 
@@ -641,8 +637,8 @@ where
                                                     ))
                                                 })?;
                                             let keyed_rewards = convert_proto_rewards(&decoded)?;
-                                            if reward_enabled {
-                                                if let Some(on_reward_cb) = on_reward.as_ref() {
+                                            if reward_enabled
+                                                && let Some(on_reward_cb) = on_reward.as_ref() {
                                                     on_reward_cb(
                                                         thread_index,
                                                         RewardData {
@@ -654,7 +650,6 @@ where
                                                         FirehoseError::RewardHandlerError(e)
                                                     })?;
                                                 }
-                                            }
                                             this_block_rewards = keyed_rewards;
                                         }
                                     }

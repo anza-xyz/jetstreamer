@@ -46,7 +46,7 @@ pub trait Plugin: Send + Sync + 'static {
     ) -> PluginFuture<'_>;
     fn on_block(&self, db: Option<Arc<Client>>, block: &BlockData) -> PluginFuture<'_>;
     fn on_entry(&self, db: Option<Arc<Client>>, entry: &EntryData) -> PluginFuture<'_>;
-    fn on_reward(&self, db: Option<Arc<Client>>, reward: &RewardData) -> PluginFuture<'_>;
+    fn on_reward(&self, db: Option<Arc<Client>>, reward: &RewardsData) -> PluginFuture<'_>;
     fn on_load(&self, _db: Option<Arc<Client>>) -> PluginFuture<'_> {
         async move { Ok(()) }.boxed()
     }

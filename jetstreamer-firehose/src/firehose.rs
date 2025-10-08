@@ -157,6 +157,12 @@ pub struct Stats {
     pub rewards_processed: u64,
 }
 
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub struct StatsTracking<OnStats: Handler<ThreadStats>> {
+    pub on_stats: OnStats,
+    pub tracking_interval_slots: usize,
+}
+
 #[derive(Debug, Clone)]
 pub struct TransactionData {
     pub slot: u64,
@@ -178,7 +184,7 @@ pub struct EntryData {
 }
 
 #[derive(Debug, Clone)]
-pub struct RewardData {
+pub struct RewardsData {
     pub slot: u64,
     pub rewards: Vec<(Pubkey, RewardInfo)>,
 }
@@ -229,54 +235,24 @@ pub type HandlerFn<Data> = fn(usize, Data) -> HandlerResult;
 pub type OnBlockFn = HandlerFn<BlockData>;
 pub type OnTxFn = HandlerFn<TransactionData>;
 pub type OnEntryFn = HandlerFn<EntryData>;
-pub type OnRewardFn = HandlerFn<RewardData>;
-
-#[inline(always)]
-fn convert_proto_rewards(
-    proto_rewards: &solana_storage_proto::convert::generated::Rewards,
-) -> Result<Vec<(Pubkey, RewardInfo)>, Box<dyn std::error::Error>> {
-    let mut keyed_rewards = Vec::with_capacity(proto_rewards.rewards.len());
-    for proto_reward in proto_rewards.rewards.iter() {
-        let reward = RewardInfo {
-            reward_type: match proto_reward.reward_type - 1 {
-                0 => RewardType::Fee,
-                1 => RewardType::Rent,
-                2 => RewardType::Staking,
-                3 => RewardType::Voting,
-                typ => {
-                    return Err(Box::new(std::io::Error::other(format!(
-                        "unsupported reward type {}",
-                        typ
-                    ))));
-                }
-            },
-            lamports: proto_reward.lamports,
-            post_balance: proto_reward.post_balance,
-            commission: proto_reward.commission.parse::<u8>().ok(),
-        };
-        let pubkey = proto_reward
-            .pubkey
-            .parse::<Pubkey>()
-            .map_err(|err| Box::new(err) as Box<dyn std::error::Error>)?;
-        keyed_rewards.push((pubkey, reward));
-    }
-    Ok(keyed_rewards)
-}
+pub type OnRewardFn = HandlerFn<RewardsData>;
+pub type StatsTracker = StatsTracking<HandlerFn<ThreadStats>>;
 
 #[inline]
-pub async fn firehose<OnBlock, OnTransaction, OnEntry, OnReward>(
+pub async fn firehose<OnBlock, OnTransaction, OnEntry, OnRewards, OnStats>(
     threads: u64,
     slot_range: Range<u64>,
     on_block: Option<OnBlock>,
     on_tx: Option<OnTransaction>,
     on_entry: Option<OnEntry>,
-    on_reward: Option<OnReward>,
+    on_rewards: Option<OnRewards>,
+    stats_tracking: Option<StatsTracking<OnStats>>,
 ) -> Result<(), (FirehoseError, u64)>
 where
     OnBlock: Handler<BlockData>,
     OnTransaction: Handler<TransactionData>,
     OnEntry: Handler<EntryData>,
-    OnReward: Handler<RewardData>,
+    OnRewards: Handler<RewardsData>,
     OnStats: Handler<ThreadStats>,
 {
     if threads == 0 {
@@ -312,7 +288,7 @@ where
         let on_block = on_block.clone();
         let on_tx = on_tx.clone();
         let on_entry = on_entry.clone();
-        let on_reward = on_reward.clone();
+        let on_reward = on_rewards.clone();
 
         let handle = tokio::spawn(async move {
             let start_time = std::time::Instant::now();
@@ -641,7 +617,7 @@ where
                                                     && let Some(on_reward_cb) = on_reward.as_ref() {
                                                         on_reward_cb(
                                                             thread_index,
-                                                            RewardData {
+                                                            RewardsData {
                                                                 slot: block.slot,
                                                                 rewards: Vec::new(),
                                                             },
@@ -669,7 +645,7 @@ where
                                                 && let Some(on_reward_cb) = on_reward.as_ref() {
                                                     on_reward_cb(
                                                         thread_index,
-                                                        RewardData {
+                                                        RewardsData {
                                                             slot: block.slot,
                                                             rewards: keyed_rewards.clone(),
                                                         },
@@ -1284,6 +1260,38 @@ fn is_simple_vote_transaction(versioned_tx: &VersionedTransaction) -> bool {
         .unwrap_or(false)
 }
 
+#[inline(always)]
+fn convert_proto_rewards(
+    proto_rewards: &solana_storage_proto::convert::generated::Rewards,
+) -> Result<Vec<(Pubkey, RewardInfo)>, Box<dyn std::error::Error>> {
+    let mut keyed_rewards = Vec::with_capacity(proto_rewards.rewards.len());
+    for proto_reward in proto_rewards.rewards.iter() {
+        let reward = RewardInfo {
+            reward_type: match proto_reward.reward_type - 1 {
+                0 => RewardType::Fee,
+                1 => RewardType::Rent,
+                2 => RewardType::Staking,
+                3 => RewardType::Voting,
+                typ => {
+                    return Err(Box::new(std::io::Error::other(format!(
+                        "unsupported reward type {}",
+                        typ
+                    ))));
+                }
+            },
+            lamports: proto_reward.lamports,
+            post_balance: proto_reward.post_balance,
+            commission: proto_reward.commission.parse::<u8>().ok(),
+        };
+        let pubkey = proto_reward
+            .pubkey
+            .parse::<Pubkey>()
+            .map_err(|err| Box::new(err) as Box<dyn std::error::Error>)?;
+        keyed_rewards.push((pubkey, reward));
+    }
+    Ok(keyed_rewards)
+}
+
 #[inline]
 pub fn generate_subranges(slot_range: &Range<u64>, threads: u64) -> Vec<Range<u64>> {
     let total = slot_range.end - slot_range.start;
@@ -1374,6 +1382,7 @@ async fn test_firehose_epoch_800() {
         None::<OnTxFn>,
         None::<OnEntryFn>,
         None::<OnRewardFn>,
+        None::<StatsTracker>,
     )
     .await
     .unwrap();

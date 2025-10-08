@@ -4,7 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-agave-geyser-plugin-interface.workspace = true
+jetstreamer-firehose.workspace = true
+
 solana-logger.workspace = true
 solana-system-program.workspace = true
 solana-vote-program.workspace = true
@@ -18,8 +19,6 @@ clickhouse.workspace = true
 futures-util.workspace = true
 thiserror.workspace = true
 rayon.workspace = true
-once_cell.workspace = true
-jetstreamer-firehose.workspace = true
 reqwest.workspace = true
 futures.workspace = true
 sha2.workspace = true

@@ -130,6 +130,33 @@ impl From<SlotOffsetIndexError> for FirehoseError {
     }
 }
 
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub struct ThreadStats {
+    pub thread_id: usize,
+    pub start_time: std::time::Instant,
+    pub slot_range: Range<u64>,
+    pub current_slot: u64,
+    pub slots_processed: u64,
+    pub blocks_processed: u64,
+    pub leader_skipped_slots: u64,
+    pub transactions_processed: u64,
+    pub entries_processed: u64,
+    pub rewards_processed: u64,
+}
+
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub struct Stats {
+    pub thread_stats: ThreadStats,
+    pub start_time: std::time::Instant,
+    pub slot_range: Range<u64>,
+    pub slots_processed: u64,
+    pub blocks_processed: u64,
+    pub leader_skipped_slots: u64,
+    pub transactions_processed: u64,
+    pub entries_processed: u64,
+    pub rewards_processed: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct TransactionData {
     pub slot: u64,
@@ -250,6 +277,7 @@ where
     OnTransaction: Handler<TransactionData>,
     OnEntry: Handler<EntryData>,
     OnReward: Handler<RewardData>,
+    OnStats: Handler<ThreadStats>,
 {
     if threads == 0 {
         return Err((

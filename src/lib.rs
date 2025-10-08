@@ -10,8 +10,6 @@ use serde_json::json;
 use std::{fs::File, io::Write, os::unix::fs::PermissionsExt, path::PathBuf, sync::Arc};
 use tempfile::NamedTempFile;
 
-include!(concat!(env!("OUT_DIR"), "/embed.rs")); // brings in JETSTREAMER_CDYLIB
-
 const WORKER_THREAD_MULTIPLIER: usize = 4; // each plugin thread gets 4 worker threads
 
 pub struct JetstreamerRunner {

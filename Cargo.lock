@@ -3104,7 +3104,6 @@ checksum = "4a5f13b858c8d314ee3e8f639011f7ccefe71f97f96e50151fb991f267928e2c"
 name = "jetstreamer"
 version = "0.1.0"
 dependencies = [
- "jetstreamer-build-cdylib",
  "jetstreamer-firehose",
  "jetstreamer-plugin",
  "log",
@@ -3195,7 +3194,6 @@ dependencies = [
 name = "jetstreamer-plugin"
 version = "0.1.0"
 dependencies = [
- "agave-geyser-plugin-interface",
  "bincode",
  "clickhouse",
  "crossbeam-channel",
@@ -3204,7 +3202,6 @@ dependencies = [
  "interprocess",
  "jetstreamer-firehose",
  "log",
- "once_cell",
  "rayon",
  "reqwest 0.12.23",
  "serde",

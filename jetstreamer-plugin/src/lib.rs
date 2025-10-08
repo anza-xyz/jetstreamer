@@ -1,19 +1,17 @@
-pub mod bridge;
-pub mod ipc;
 pub mod plugins;
 
-use std::{fmt::Display, pin::Pin, sync::Arc};
+use std::{
+    fmt::Display,
+    ops::Range,
+    pin::Pin,
+    sync::{Arc, Ordering},
+};
 
 use ::clickhouse::{Client, Row};
 use futures_util::FutureExt;
-use interprocess::local_socket::{GenericNamespaced, ToNsName, tokio::prelude::*};
+use jetstreamer_firehose::firehose::*;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, BufReader};
-
-use crate::{
-    bridge::{Block, Transaction},
-    ipc::JetstreamerMessage,
-};
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -43,11 +41,13 @@ pub trait Plugin: Send + Sync + 'static {
     fn on_transaction(
         &self,
         db: Arc<Client>,
-        transaction: Transaction,
+        transaction: &TransactionData,
         tx_index: u32,
     ) -> PluginFuture<'_>;
-    fn on_block(&self, db: Arc<Client>, block: Block) -> PluginFuture<'_>;
-    fn on_load(&self, _db: Arc<Client>) -> PluginFuture<'_> {
+    fn on_block(&self, db: Option<Arc<Client>>, block: &BlockData) -> PluginFuture<'_>;
+    fn on_entry(&self, db: Option<Arc<Client>>, entry: &EntryData) -> PluginFuture<'_>;
+    fn on_reward(&self, db: Option<Arc<Client>>, reward: &RewardData) -> PluginFuture<'_>;
+    fn on_load(&self, _db: Option<Arc<Client>>) -> PluginFuture<'_> {
         async move { Ok(()) }.boxed()
     }
     fn on_exit(&self, _db: Arc<Client>) -> PluginFuture<'_> {
@@ -60,8 +60,7 @@ pub trait Plugin: Send + Sync + 'static {
 pub struct PluginRunner {
     plugins: Arc<Vec<Box<dyn Plugin>>>,
     clickhouse_dsn: String,
-    num_threads: usize, // New field to store the number of threads
-    socket_name: String,
+    num_threads: usize,
 }
 
 impl Clone for PluginRunner {
@@ -77,18 +76,16 @@ impl Clone for PluginRunner {
             },
             clickhouse_dsn: self.clickhouse_dsn.clone(),
             num_threads: self.num_threads,
-            socket_name: self.socket_name.clone(),
         }
     }
 }
 
 impl PluginRunner {
-    pub fn new(clickhouse_dsn: impl Into<String>, num_threads: usize) -> Self {
+    pub fn new(clickhouse_dsn: impl Display, num_threads: usize) -> Self {
         Self {
             plugins: Arc::new(Vec::new()),
-            clickhouse_dsn: clickhouse_dsn.into(),
-            num_threads, // Initialize the number of threads
-            socket_name: String::new(),
+            clickhouse_dsn: clickhouse_dsn.to_string(),
+            num_threads,
         }
     }
 
@@ -98,137 +95,85 @@ impl PluginRunner {
             .push(plugin);
     }
 
-    pub fn socket_name(mut self, name: impl Into<String>) -> Self {
-        self.socket_name = name.into();
-        self
-    }
+    /// Starts the [`PluginRunner`], forwarding all firehose data to all registered plugins.
+    pub async fn run(
+        self: Arc<Self>,
+        slot_range: Range<u64>,
+        clickhouse_enabled: bool,
+    ) -> Result<(), PluginRunnerError> {
+        let db = if clickhouse_enabled {
+            log::info!("connecting to ClickHouse at {}", self.clickhouse_dsn);
+            let db = Client::default()
+                .with_url(&self.clickhouse_dsn)
+                .with_option("async_insert", "1")
+                .with_option("wait_for_async_insert", "0");
 
-    /// Dial the IPC socket and forward every message to every plugin.
-    pub async fn run(self: Arc<Self>) -> Result<(), PluginRunnerError> {
-        log::info!("connecting to ClickHouse at {}", self.clickhouse_dsn);
-        let db = Client::default()
-            .with_url(&self.clickhouse_dsn)
-            .with_option("async_insert", "1")
-            .with_option("wait_for_async_insert", "0");
-
-        // Initialize plugin management tables
-        // NOTE: Include thread_id in ORDER BY so each thread's status row per slot is retained.
-        // Previously ORDER BY slot alone caused logical last-write-wins behavior under ReplacingMergeTree
-        // making per-thread rows appear "missing" when querying.
-        db.query(
-            r#"CREATE TABLE IF NOT EXISTS jetstreamer_slot_status (
+            // Initialize plugin management tables
+            // NOTE: Include thread_id in ORDER BY so each thread's status row per slot is retained.
+            // Previously ORDER BY slot alone caused logical last-write-wins behavior under ReplacingMergeTree
+            // making per-thread rows appear "missing" when querying.
+            db.query(
+                r#"CREATE TABLE IF NOT EXISTS jetstreamer_slot_status (
                 slot UInt64,
                 transaction_count UInt32 DEFAULT 0,
                 thread_id UInt8 DEFAULT 0,
                 indexed_at DateTime('UTC') DEFAULT now()
             ) ENGINE = ReplacingMergeTree
             ORDER BY (slot, thread_id)"#,
-        )
-        .execute()
-        .await?;
+            )
+            .execute()
+            .await?;
 
-        db.query(
-            r#"CREATE TABLE IF NOT EXISTS jetstreamer_plugins (
+            db.query(
+                r#"CREATE TABLE IF NOT EXISTS jetstreamer_plugins (
                 id UInt32,
                 name String,
                 version UInt32
             ) ENGINE = ReplacingMergeTree
             ORDER BY id"#,
-        )
-        .execute()
-        .await?;
+            )
+            .execute()
+            .await?;
 
-        db.query(
-            r#"CREATE TABLE IF NOT EXISTS jetstreamer_plugin_slots (
+            db.query(
+                r#"CREATE TABLE IF NOT EXISTS jetstreamer_plugin_slots (
                 plugin_id UInt32,
                 slot UInt64,
                 indexed_at DateTime('UTC') DEFAULT now()
             ) ENGINE = ReplacingMergeTree
             ORDER BY (plugin_id, slot)"#,
-        )
-        .execute()
-        .await?;
+            )
+            .execute()
+            .await?;
+            Some(db)
+        } else {
+            None
+        };
 
-        let mut handles = Vec::new();
-        let db = Arc::new(db);
-
-        for thread_id in 0..self.num_threads {
-            let db = db.clone();
-            let socket_name = format!("jetstreamer_{}.sock", thread_id);
-            let ns_name = socket_name
-                .to_ns_name::<GenericNamespaced>()
-                .map_err(|e| PluginRunnerError::UnsupportedSocketName(e.to_string()))?;
-
-            let plugins = self.plugins.clone();
-            let db = db.clone();
-            for plugin in plugins.iter() {
-                plugin.on_load(db.clone()).await.unwrap();
-            }
-
-            let handle = tokio::spawn(async move {
-                let stream: LocalSocketStream = LocalSocketStream::connect(ns_name)
-                    .await
-                    .map_err(|e| PluginRunnerError::SocketConnectError(e.to_string()))?;
-                let mut reader = BufReader::new(stream);
-
-                let plugin_ids = plugins.iter().map(|p| p.id()).collect::<Vec<_>>();
-                let fast_path = plugins.len() == 1;
-
-                loop {
-                    let mut len_buf = [0u8; 4];
-                    if reader.read_exact(&mut len_buf).await.is_err() {
-                        break; // EOF
-                    }
-                    let len = u32::from_le_bytes(len_buf) as usize;
-
-                    let mut buf = vec![0u8; len];
-                    reader
-                        .read_exact(&mut buf)
-                        .await
-                        .map_err(|e| PluginRunnerError::PayloadReadError(e.to_string()))?;
-
-                    let msg: JetstreamerMessage = bincode::deserialize(&buf)?;
-
-                    if fast_path {
-                        let plugin = &plugins[0];
-                        let plugin_id = plugin_ids[0];
-                        handle_message(plugin.as_ref(), db.clone(), msg.clone(), plugin_id).await?;
-                    } else {
-                        futures::future::join_all(plugins.iter().enumerate().map(|(i, plugin)| {
-                            let plugin_id = plugin_ids[i];
-                            let db = db.clone();
-                            let msg = msg.clone();
-                            async move { handle_message(plugin.as_ref(), db, msg, plugin_id).await }
-                        }))
-                        .await
-                        .into_iter()
-                        .collect::<Result<Vec<_>, _>>()?;
-                    }
-
-                    if matches!(msg, JetstreamerMessage::Exit) {
-                        log::info!(
-                            "plugin runner thread {} received exit message, shutting down",
-                            thread_id
-                        );
-                        break;
-                    }
+        firehose(
+            self.num_threads,
+            slot_range.clone(),
+            Some(|thread_id: usize, block: BlockData| {
+                if prev > 0 {
+                    assert_eq!(prev + 1, block.slot());
                 }
-
-                Ok::<(), PluginRunnerError>(())
-            });
-
-            handles.push(handle);
-        }
-
-        futures::future::join_all(handles)
-            .await
-            .into_iter()
-            .collect::<Result<Vec<_>, _>>()?;
-
-        Ok(())
+                if block.was_skipped() {
+                    NUM_SKIPPED_BLOCKS.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    NUM_BLOCKS.fetch_add(1, Ordering::Relaxed);
+                }
+                Ok(())
+            }),
+            None::<OnTxFn>,
+            None::<OnEntryFn>,
+            None::<OnRewardFn>,
+        )
+        .await
+        .unwrap();
     }
 }
 
+/*
 #[inline(always)]
 pub async fn handle_message(
     plugin: &dyn Plugin,
@@ -277,29 +222,17 @@ impl _CanSend for PluginRunnerError {}
 
 #[derive(Debug, thiserror::Error)]
 pub enum PluginRunnerError {
-    UnsupportedSocketName(String),
-    SocketConnectError(String),
-    PayloadReadError(String),
     ClickhouseError(clickhouse::error::Error),
-    Bincode(bincode::Error),
+    FirehoseError(FirehoseError),
 }
 
 impl Display for PluginRunnerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            PluginRunnerError::UnsupportedSocketName(s) => {
-                write!(f, "unsupported domain socket name: {}", s)
-            }
             PluginRunnerError::ClickhouseError(error) => {
                 write!(f, "clickhouse error: {}", error)
             }
-            PluginRunnerError::SocketConnectError(s) => {
-                write!(f, "failed to connect to domain socket: {}", s)
-            }
-            PluginRunnerError::PayloadReadError(s) => {
-                write!(f, "failed to read payload bytes from domain socket: {}", s)
-            }
-            PluginRunnerError::Bincode(error) => write!(f, "bincode error: {}", error),
+            PluginRunnerError::FirehoseError(error) => write!(f, "firehose error: {}", error),
         }
     }
 }
@@ -310,14 +243,9 @@ impl From<clickhouse::error::Error> for PluginRunnerError {
     }
 }
 
-impl From<bincode::Error> for PluginRunnerError {
-    fn from(error: bincode::Error) -> Self {
-        PluginRunnerError::Bincode(error)
+impl From<FirehoseError> for PluginRunnerError {
+    fn from(error: FirehoseError) -> Self {
+        PluginRunnerError::FirehoseError(error)
     }
 }
-
-impl From<tokio::task::JoinError> for PluginRunnerError {
-    fn from(error: tokio::task::JoinError) -> Self {
-        PluginRunnerError::SocketConnectError(format!("Thread join error: {error}"))
-    }
-}
+*/

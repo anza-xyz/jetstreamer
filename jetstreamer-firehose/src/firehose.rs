@@ -281,6 +281,11 @@ where
     let error_counts: Arc<Vec<AtomicU32>> =
         Arc::new((0..subranges.len()).map(|_| AtomicU32::new(0)).collect());
 
+    let overall_slots_processed: AtomicU64 = AtomicU64::new(0);
+    let overall_blocks_processed: AtomicU64 = AtomicU64::new(0);
+    let overall_transactions_processed: AtomicU64 = AtomicU64::new(0);
+    let overall_entries_processed: AtomicU64 = AtomicU64::new(0);
+
     for (thread_index, mut slot_range) in subranges.into_iter().enumerate() {
         let index_base_url = index_base_url.clone();
         let error_counts = error_counts.clone();
@@ -298,6 +303,7 @@ where
             let tx_enabled = on_tx.is_some();
             let entry_enabled = on_entry.is_some();
             let reward_enabled = on_reward.is_some();
+
             // let mut triggered = false;
             while let Err((err, slot)) = async {
                     let epoch_range = slot_to_epoch(slot_range.start)..=slot_to_epoch(slot_range.end - 1);
@@ -341,6 +347,19 @@ where
 
                         let mut todo_previous_blockhash = Hash::default();
                         let mut todo_latest_entry_blockhash = Hash::default();
+
+                        let mut thread_stats = ThreadStats {
+                            thread_id: thread_index,
+                            start_time,
+                            slot_range: slot_range.clone(),
+                            current_slot: slot_range.start,
+                            slots_processed: 0,
+                            blocks_processed: 0,
+                            leader_skipped_slots: 0,
+                            transactions_processed: 0,
+                            entries_processed: 0,
+                            rewards_processed: 0,
+                        };
 
                         if slot_range.start > epoch_to_slot_range(epoch_num).0 {
                             let seek_fut = reader.seek_to_slot(slot_range.start, &mut slot_offset_index);
@@ -391,8 +410,7 @@ where
 
                                 // still need to emit skipped slots up to end-1
                                 slot = slot_range.end;
-                                if block_enabled
-                                    && let (Some(on_block_cb), Some(previous_slot)) =
+                                if let (Some(on_block_cb), Some(previous_slot)) =
                                         (on_block.as_ref(), previous_slot)
                                     {
                                         for skipped_slot in (previous_slot + 2)..slot {
@@ -403,12 +421,16 @@ where
                                                 previous_slot,
                                                 slot,
                                             );
-                                            on_block_cb(
-                                                thread_index,
-                                                BlockData::LeaderSkipped { slot: skipped_slot },
-                                            )
-                                            .map_err(|e| FirehoseError::BlockHandlerError(e))
-                                            .map_err(|e| (e, current_slot.unwrap_or(slot_range.start)))?;
+                                            if block_enabled {
+                                                on_block_cb(
+                                                    thread_index,
+                                                    BlockData::LeaderSkipped { slot: skipped_slot },
+                                                )
+                                                .map_err(|e| FirehoseError::BlockHandlerError(e))
+                                                .map_err(|e| (e, current_slot.unwrap_or(slot_range.start)))?;
+                                            }
+                                            thread_stats.leader_skipped_slots += 1;
+                                            overall_slots_processed.fetch_add(1, Ordering::Relaxed);
                                         }
                                     }
                                 return Ok(());

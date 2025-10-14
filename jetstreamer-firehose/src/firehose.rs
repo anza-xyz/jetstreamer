@@ -170,7 +170,7 @@ pub struct StatsTracking<OnStats: Handler<Stats>> {
 }
 
 #[inline(always)]
-fn emit_stats<OnStats: Handler<Stats>>(
+fn maybe_emit_stats<OnStats: Handler<Stats>>(
     stats_tracking: Option<&StatsTracking<OnStats>>,
     thread_index: usize,
     thread_stats: &ThreadStats,
@@ -775,7 +775,7 @@ where
                             }
                         }
                         thread_stats.finish_time = Some(std::time::Instant::now());
-                        emit_stats(
+                        maybe_emit_stats(
                             stats_tracking.as_ref(),
                             thread_index,
                             &thread_stats,

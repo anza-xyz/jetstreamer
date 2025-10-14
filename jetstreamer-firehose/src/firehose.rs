@@ -134,6 +134,7 @@ impl From<SlotOffsetIndexError> for FirehoseError {
 pub struct ThreadStats {
     pub thread_id: usize,
     pub start_time: std::time::Instant,
+    pub finish_time: Option<std::time::Instant>,
     pub slot_range: Range<u64>,
     pub current_slot: u64,
     pub slots_processed: u64,
@@ -148,6 +149,7 @@ pub struct ThreadStats {
 pub struct Stats {
     pub thread_stats: ThreadStats,
     pub start_time: std::time::Instant,
+    pub finish_time: Option<std::time::Instant>,
     pub slot_range: Range<u64>,
     pub slots_processed: u64,
     pub blocks_processed: u64,
@@ -355,6 +357,7 @@ where
                         let mut thread_stats = ThreadStats {
                             thread_id: thread_index,
                             start_time,
+                            finish_time: None,
                             slot_range: slot_range.clone(),
                             current_slot: slot_range.start,
                             slots_processed: 0,
@@ -727,33 +730,35 @@ where
                                 return Ok(());
                             }
                         }
+                        thread_stats.finish_time = Some(std::time::Instant::now());
+                        log::info!(target: &log_target, "thread {} has finished its work", thread_index);
                     }
                     Ok(())
             }
             .await
             {
-                    log::error!(
-                        target: &log_target,
-                        "🔥🔥🔥 firehose encountered an error at slot {} in epoch {}:",
-                        slot,
-                        slot_to_epoch(slot)
-                    );
-                    log::error!(target: &log_target, "{}", err);
-                    let item_index = match err {
-                        FirehoseError::NodeDecodingError(item_index, _) => item_index,
-                        _ => 0,
-                    };
-                    // Increment this thread's error counter
-                    error_counts[thread_index].fetch_add(1, Ordering::Relaxed);
-                    log::warn!(
-                        target: &log_target,
-                        "restarting from slot {} at index {}",
-                        slot,
-                        item_index,
-                    );
-                    // Update slot range to resume from the failed slot, not the original start
-                    slot_range.start = slot;
-                    skip_until_index = Some(item_index);
+                log::error!(
+                    target: &log_target,
+                    "🔥🔥🔥 firehose encountered an error at slot {} in epoch {}:",
+                    slot,
+                    slot_to_epoch(slot)
+                );
+                log::error!(target: &log_target, "{}", err);
+                let item_index = match err {
+                    FirehoseError::NodeDecodingError(item_index, _) => item_index,
+                    _ => 0,
+                };
+                // Increment this thread's error counter
+                error_counts[thread_index].fetch_add(1, Ordering::Relaxed);
+                log::warn!(
+                    target: &log_target,
+                    "restarting from slot {} at index {}",
+                    slot,
+                    item_index,
+                );
+                // Update slot range to resume from the failed slot, not the original start
+                slot_range.start = slot;
+                skip_until_index = Some(item_index);
             }
         });
         handles.push(handle);

@@ -281,10 +281,10 @@ where
     let error_counts: Arc<Vec<AtomicU32>> =
         Arc::new((0..subranges.len()).map(|_| AtomicU32::new(0)).collect());
 
-    let overall_slots_processed: AtomicU64 = AtomicU64::new(0);
-    let overall_blocks_processed: AtomicU64 = AtomicU64::new(0);
-    let overall_transactions_processed: AtomicU64 = AtomicU64::new(0);
-    let overall_entries_processed: AtomicU64 = AtomicU64::new(0);
+    let overall_slots_processed: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+    let overall_blocks_processed: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+    let overall_transactions_processed: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+    let overall_entries_processed: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
 
     for (thread_index, mut slot_range) in subranges.into_iter().enumerate() {
         let index_base_url = index_base_url.clone();
@@ -294,6 +294,10 @@ where
         let on_tx = on_tx.clone();
         let on_entry = on_entry.clone();
         let on_reward = on_rewards.clone();
+        let overall_slots_processed = overall_slots_processed.clone();
+        let overall_blocks_processed = overall_blocks_processed.clone();
+        let overall_transactions_processed = overall_transactions_processed.clone();
+        let overall_entries_processed = overall_entries_processed.clone();
 
         let handle = tokio::spawn(async move {
             let start_time = std::time::Instant::now();
@@ -431,6 +435,7 @@ where
                                             }
                                             thread_stats.leader_skipped_slots += 1;
                                             overall_slots_processed.fetch_add(1, Ordering::Relaxed);
+                                            thread_stats.slots_processed += 1;
                                         }
                                     }
                                 return Ok(());
@@ -478,6 +483,8 @@ where
                                     }
                                 }
                                 let node = node_with_cid.get_node();
+
+                                thread_stats.current_slot = slot;
 
                                 use crate::node::Node::*;
                                 match node {
@@ -539,6 +546,8 @@ where
                                                 )
                                                 .map_err(|e| FirehoseError::TransactionHandlerError(e))?;
                                             }
+                                            overall_transactions_processed.fetch_add(1, Ordering::Relaxed);
+                                            thread_stats.transactions_processed += 1;
                                     }
                                     Entry(entry) => {
                                         let entry_hash = Hash::from(entry.hash.to_bytes());
@@ -576,6 +585,7 @@ where
                                                 .map_err(|e| FirehoseError::EntryHandlerError(e))?;
                                             }
                                         entry_index += 1;
+                                        overall_entries_processed.fetch_add(1, Ordering::Relaxed);
                                     }
                                     Block(block) => {
                                         if block_enabled {
@@ -598,6 +608,8 @@ where
                                                             },
                                                         )
                                                         .map_err(|e| FirehoseError::BlockHandlerError(e))?;
+                                                        overall_slots_processed.fetch_add(1, Ordering::Relaxed);
+                                                        thread_stats.leader_skipped_slots += 1;
                                                     }
                                                 }
                                                 let keyed_rewards = std::mem::take(&mut this_block_rewards);
@@ -625,7 +637,9 @@ where
                                             this_block_rewards.clear();
                                         }
                                         todo_previous_blockhash = todo_latest_entry_blockhash;
-                                        std::thread::yield_now();
+                                        overall_slots_processed.fetch_add(1, Ordering::Relaxed);
+                                        overall_blocks_processed.fetch_add(1, Ordering::Relaxed);
+                                        thread_stats.blocks_processed += 1;
                                     }
                                     Subset(_subset) => (),
                                     Epoch(_epoch) => (),
@@ -677,6 +691,7 @@ where
                                                     })?;
                                                 }
                                             this_block_rewards = keyed_rewards;
+                                            thread_stats.rewards_processed += this_block_rewards.len() as u64;
                                         }
                                     }
                                     DataFrame(_data_frame) => (),

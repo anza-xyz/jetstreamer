@@ -50,6 +50,7 @@ pub enum FirehoseError {
     SlotOffsetIndexError(SlotOffsetIndexError),
     SeekToSlotError(Box<dyn std::error::Error>),
     OnLoadError(Box<dyn std::error::Error>),
+    OnStatsHandlerError(Box<dyn std::error::Error>),
     OperationTimeout(&'static str),
     TransactionHandlerError(Box<dyn std::error::Error>),
     EntryHandlerError(Box<dyn std::error::Error>),
@@ -93,6 +94,9 @@ impl Display for FirehoseError {
                 write!(f, "Error seeking to slot: {}", error)
             }
             FirehoseError::OnLoadError(error) => write!(f, "Error on load: {}", error),
+            FirehoseError::OnStatsHandlerError(error) => {
+                write!(f, "Stats handler error: {}", error)
+            }
             FirehoseError::OperationTimeout(op) => {
                 write!(f, "Timeout while waiting for operation: {}", op)
             }
@@ -160,7 +164,7 @@ pub struct Stats {
 }
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
-pub struct StatsTracking<OnStats: Handler<ThreadStats>> {
+pub struct StatsTracking<OnStats: Handler<Stats>> {
     pub on_stats: OnStats,
     pub tracking_interval_slots: usize,
 }
@@ -238,7 +242,7 @@ pub type OnBlockFn = HandlerFn<BlockData>;
 pub type OnTxFn = HandlerFn<TransactionData>;
 pub type OnEntryFn = HandlerFn<EntryData>;
 pub type OnRewardFn = HandlerFn<RewardsData>;
-pub type StatsTracker = StatsTracking<HandlerFn<ThreadStats>>;
+pub type StatsTracker = StatsTracking<HandlerFn<Stats>>;
 
 #[inline]
 pub async fn firehose<OnBlock, OnTransaction, OnEntry, OnRewards, OnStats>(
@@ -255,7 +259,7 @@ where
     OnTransaction: Handler<TransactionData>,
     OnEntry: Handler<EntryData>,
     OnRewards: Handler<RewardsData>,
-    OnStats: Handler<ThreadStats>,
+    OnStats: Handler<Stats>,
 {
     if threads == 0 {
         return Err((
@@ -300,6 +304,7 @@ where
         let overall_blocks_processed = overall_blocks_processed.clone();
         let overall_transactions_processed = overall_transactions_processed.clone();
         let overall_entries_processed = overall_entries_processed.clone();
+        let stats_tracking = stats_tracking.clone();
 
         let handle = tokio::spawn(async move {
             let start_time = std::time::Instant::now();
@@ -731,6 +736,33 @@ where
                             }
                         }
                         thread_stats.finish_time = Some(std::time::Instant::now());
+                        if let Some(stats_tracker) = stats_tracking.as_ref() {
+                            let finish_time = thread_stats.finish_time;
+                            let total_slots = overall_slots_processed.load(Ordering::Relaxed);
+                            let total_blocks = overall_blocks_processed.load(Ordering::Relaxed);
+                            let total_transactions =
+                                overall_transactions_processed.load(Ordering::Relaxed);
+                            let total_entries =
+                                overall_entries_processed.load(Ordering::Relaxed);
+                            let stats = Stats {
+                                thread_stats: thread_stats.clone(),
+                                start_time,
+                                finish_time,
+                                slot_range: thread_stats.slot_range.clone(),
+                                slots_processed: total_slots,
+                                blocks_processed: total_blocks,
+                                leader_skipped_slots: total_slots.saturating_sub(total_blocks),
+                                transactions_processed: total_transactions,
+                                entries_processed: total_entries,
+                                rewards_processed: thread_stats.rewards_processed,
+                            };
+                            (stats_tracker.on_stats)(thread_index, stats).map_err(|e| {
+                                (
+                                    FirehoseError::OnStatsHandlerError(e),
+                                    thread_stats.current_slot,
+                                )
+                            })?;
+                        }
                         log::info!(target: &log_target, "thread {} has finished its work", thread_index);
                     }
                     Ok(())

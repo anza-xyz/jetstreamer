@@ -169,6 +169,45 @@ pub struct StatsTracking<OnStats: Handler<Stats>> {
     pub tracking_interval_slots: usize,
 }
 
+#[inline(always)]
+fn emit_stats<OnStats: Handler<Stats>>(
+    stats_tracking: Option<&StatsTracking<OnStats>>,
+    thread_index: usize,
+    thread_stats: &ThreadStats,
+    overall_slots_processed: &AtomicU64,
+    overall_blocks_processed: &AtomicU64,
+    overall_transactions_processed: &AtomicU64,
+    overall_entries_processed: &AtomicU64,
+) -> Result<(), (FirehoseError, u64)> {
+    if let Some(stats_tracker) = stats_tracking {
+        let total_slots = overall_slots_processed.load(Ordering::Relaxed);
+        let total_blocks = overall_blocks_processed.load(Ordering::Relaxed);
+        let total_transactions = overall_transactions_processed.load(Ordering::Relaxed);
+        let total_entries = overall_entries_processed.load(Ordering::Relaxed);
+
+        let stats = Stats {
+            thread_stats: thread_stats.clone(),
+            start_time: thread_stats.start_time,
+            finish_time: thread_stats.finish_time,
+            slot_range: thread_stats.slot_range.clone(),
+            slots_processed: total_slots,
+            blocks_processed: total_blocks,
+            leader_skipped_slots: total_slots.saturating_sub(total_blocks),
+            transactions_processed: total_transactions,
+            entries_processed: total_entries,
+            rewards_processed: thread_stats.rewards_processed,
+        };
+
+        (stats_tracker.on_stats)(thread_index, stats).map_err(|e| {
+            (
+                FirehoseError::OnStatsHandlerError(e),
+                thread_stats.current_slot,
+            )
+        })?;
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 pub struct TransactionData {
     pub slot: u64,
@@ -736,33 +775,15 @@ where
                             }
                         }
                         thread_stats.finish_time = Some(std::time::Instant::now());
-                        if let Some(stats_tracker) = stats_tracking.as_ref() {
-                            let finish_time = thread_stats.finish_time;
-                            let total_slots = overall_slots_processed.load(Ordering::Relaxed);
-                            let total_blocks = overall_blocks_processed.load(Ordering::Relaxed);
-                            let total_transactions =
-                                overall_transactions_processed.load(Ordering::Relaxed);
-                            let total_entries =
-                                overall_entries_processed.load(Ordering::Relaxed);
-                            let stats = Stats {
-                                thread_stats: thread_stats.clone(),
-                                start_time,
-                                finish_time,
-                                slot_range: thread_stats.slot_range.clone(),
-                                slots_processed: total_slots,
-                                blocks_processed: total_blocks,
-                                leader_skipped_slots: total_slots.saturating_sub(total_blocks),
-                                transactions_processed: total_transactions,
-                                entries_processed: total_entries,
-                                rewards_processed: thread_stats.rewards_processed,
-                            };
-                            (stats_tracker.on_stats)(thread_index, stats).map_err(|e| {
-                                (
-                                    FirehoseError::OnStatsHandlerError(e),
-                                    thread_stats.current_slot,
-                                )
-                            })?;
-                        }
+                        emit_stats(
+                            stats_tracking.as_ref(),
+                            thread_index,
+                            &thread_stats,
+                            &overall_slots_processed,
+                            &overall_blocks_processed,
+                            &overall_transactions_processed,
+                            &overall_entries_processed,
+                        )?;
                         log::info!(target: &log_target, "thread {} has finished its work", thread_index);
                     }
                     Ok(())

@@ -451,6 +451,14 @@ where
                                 return Err((FirehoseError::OperationTimeout("read_until_block"), current_slot.map(|s| s + 1).unwrap_or(slot_range.start)));
                             }
                         };
+                        if nodes.is_empty() {
+                            log::info!(
+                                target: &log_target,
+                                "reached end of epoch {}",
+                                epoch_num
+                            );
+                            break;
+                        }
                         if let Some(last_node) = nodes.0.last()
                             && !last_node.get_node().is_block()
                         {
@@ -1095,6 +1103,14 @@ async fn firehose_geyser_thread(
                             return Err((FirehoseError::OperationTimeout("read_until_block"), current_slot.unwrap_or(slot_range.start)));
                         }
                     };
+                    if nodes.is_empty() {
+                        log::info!(
+                            target: &log_target,
+                            "reached end of epoch {}",
+                            epoch_num
+                        );
+                        break;
+                    }
                     // ignore epoch and subset nodes at end of car file
                     // loop {
                     //     if nodes.0.is_empty() {

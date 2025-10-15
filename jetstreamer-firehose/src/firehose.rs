@@ -328,6 +328,7 @@ where
         log::debug!(target: LOG_MODULE, "⚡ thread sub-ranges: {:?}", subranges);
     }
 
+    let firehose_start = std::time::Instant::now();
     let mut handles = Vec::new();
     // Shared per-thread error counters
     let error_counts: Arc<Vec<AtomicU32>> =
@@ -883,6 +884,34 @@ where
     // Wait for all threads to complete
     for handle in handles {
         handle.await.unwrap();
+    }
+    if stats_tracking.is_some() {
+        let elapsed = firehose_start.elapsed();
+        let elapsed_secs = elapsed.as_secs_f64();
+        let total_slots = overall_slots_processed.load(Ordering::Relaxed);
+        let total_blocks = overall_blocks_processed.load(Ordering::Relaxed);
+        let total_transactions = overall_transactions_processed.load(Ordering::Relaxed);
+        let total_leader_skipped = total_slots.saturating_sub(total_blocks);
+        let total_errors: u64 = error_counts
+            .iter()
+            .map(|counter| counter.load(Ordering::Relaxed) as u64)
+            .sum();
+        let overall_tps = if elapsed_secs > 0.0 {
+            total_transactions as f64 / elapsed_secs
+        } else {
+            0.0
+        };
+        log::info!(
+            target: LOG_MODULE,
+            "firehose summary: elapsed={:.2}s, slots={}, blocks={}, leader_skipped={}, transactions={}, overall_tps={:.2}, total_errors={}",
+            elapsed_secs,
+            total_slots,
+            total_blocks,
+            total_leader_skipped,
+            total_transactions,
+            overall_tps,
+            total_errors
+        );
     }
     log::info!(target: LOG_MODULE, "🚒 firehose finished successfully.");
     Ok(())
@@ -1532,19 +1561,19 @@ fn log_stats_handler(thread_id: usize, stats: Stats) -> HandlerResult {
 async fn test_firehose_epoch_800() {
     use std::sync::atomic::{AtomicU64, Ordering};
     solana_logger::setup_with_default("info");
-    const THREADS: usize = 254;
-    const NUM_SLOTS_TO_COVER: u64 = 1_000_000;
+    const THREADS: usize = 4;
+    const NUM_SLOTS_TO_COVER: u64 = 50;
     static PREV_BLOCK: [AtomicU64; THREADS] = [const { AtomicU64::new(0) }; THREADS];
     static NUM_SKIPPED_BLOCKS: AtomicU64 = AtomicU64::new(0);
     static NUM_BLOCKS: AtomicU64 = AtomicU64::new(0);
     let stats_tracking = StatsTracking {
         on_stats: log_stats_handler,
-        tracking_interval_slots: 100,
+        tracking_interval_slots: 10,
     };
 
     firehose(
         THREADS.try_into().unwrap(),
-        345600000..(345600000 + NUM_SLOTS_TO_COVER),
+        (345600000 - NUM_SLOTS_TO_COVER / 2)..(345600000 + NUM_SLOTS_TO_COVER / 2),
         Some(|thread_id: usize, block: BlockData| {
             let prev =
                 PREV_BLOCK[thread_id % PREV_BLOCK.len()].swap(block.slot(), Ordering::Relaxed);

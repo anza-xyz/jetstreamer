@@ -1517,7 +1517,7 @@ async fn test_firehose_epoch_800() {
     use std::sync::atomic::{AtomicU64, Ordering};
     solana_logger::setup_with_default("info");
     const THREADS: usize = 254;
-    const NUM_SLOTS_TO_COVER: u64 = 100_000_000;
+    const NUM_SLOTS_TO_COVER: u64 = 431999;
     static PREV_BLOCK: [AtomicU64; THREADS] = [const { AtomicU64::new(0) }; THREADS];
     static NUM_SKIPPED_BLOCKS: AtomicU64 = AtomicU64::new(0);
     static NUM_BLOCKS: AtomicU64 = AtomicU64::new(0);

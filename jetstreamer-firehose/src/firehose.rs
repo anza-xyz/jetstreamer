@@ -1516,14 +1516,14 @@ fn log_stats_handler(thread_id: usize, stats: Stats) -> HandlerResult {
 async fn test_firehose_epoch_800() {
     use std::sync::atomic::{AtomicU64, Ordering};
     solana_logger::setup_with_default("info");
-    const THREADS: usize = 4;
-    const NUM_SLOTS_TO_COVER: u64 = 50;
+    const THREADS: usize = 254;
+    const NUM_SLOTS_TO_COVER: u64 = 100_000_000;
     static PREV_BLOCK: [AtomicU64; THREADS] = [const { AtomicU64::new(0) }; THREADS];
     static NUM_SKIPPED_BLOCKS: AtomicU64 = AtomicU64::new(0);
     static NUM_BLOCKS: AtomicU64 = AtomicU64::new(0);
     let stats_tracking = StatsTracking {
         on_stats: log_stats_handler,
-        tracking_interval_slots: 10,
+        tracking_interval_slots: 100,
     };
 
     firehose(

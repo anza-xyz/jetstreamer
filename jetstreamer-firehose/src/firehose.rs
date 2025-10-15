@@ -1540,12 +1540,12 @@ async fn test_firehose_epoch_800() {
                     thread_id,
                 );
             } else {
-                log::info!(
+                /*log::info!(
                     target: LOG_MODULE,
                     "got block {} on thread {}",
                     block.slot(),
                     thread_id,
-                );
+                );*/
             }
 
             if prev > 0 {

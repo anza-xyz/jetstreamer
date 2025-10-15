@@ -166,7 +166,7 @@ pub struct Stats {
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct StatsTracking<OnStats: Handler<Stats>> {
     pub on_stats: OnStats,
-    pub tracking_interval_slots: usize,
+    pub tracking_interval_slots: u64,
 }
 
 #[inline(always)]

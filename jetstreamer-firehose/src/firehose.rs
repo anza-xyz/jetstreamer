@@ -406,8 +406,8 @@ where
                     };
                     log::debug!(target: &log_target, "read epoch {} header: {:?}", epoch_num, header);
 
-                    let mut todo_previous_blockhash = Hash::default();
-                    let mut todo_latest_entry_blockhash = Hash::default();
+                    let mut previous_blockhash = Hash::default();
+                    let mut latest_entry_blockhash = Hash::default();
 
                     let mut thread_stats = if tracking_enabled {
                         Some(ThreadStats {
@@ -629,7 +629,7 @@ where
                                     let entry_transaction_count_u64 = entry_transaction_count as u64;
                                     let starting_transaction_index_u64 =
                                         this_block_executed_transaction_count;
-                                    todo_latest_entry_blockhash = entry_hash;
+                                    latest_entry_blockhash = entry_hash;
                                     this_block_executed_transaction_count += entry_transaction_count_u64;
                                     this_block_entry_count += 1;
 
@@ -698,9 +698,9 @@ where
                                                 thread_index,
                                                 BlockData::Block {
                                                     parent_slot: block.meta.parent_slot,
-                                                    parent_blockhash: todo_previous_blockhash,
+                                                    parent_blockhash: previous_blockhash,
                                                     slot: block.slot,
-                                                    blockhash: todo_latest_entry_blockhash,
+                                                    blockhash: latest_entry_blockhash,
                                                     rewards: KeyedRewardsAndNumPartitions {
                                                         keyed_rewards,
                                                         num_partitions: None,
@@ -717,19 +717,22 @@ where
                                     } else {
                                         this_block_rewards.clear();
                                     }
-                                    todo_previous_blockhash = todo_latest_entry_blockhash;
-                                    fetch_add_if(
-                                        tracking_enabled,
-                                        &overall_slots_processed,
-                                        1,
-                                    );
-                                    fetch_add_if(
-                                        tracking_enabled,
-                                        &overall_blocks_processed,
-                                        1,
-                                    );
-                                    if let Some(ref mut stats) = thread_stats {
-                                        stats.blocks_processed += 1;
+                                    previous_blockhash = latest_entry_blockhash;
+                                    if let (Some(stats_tracking_tmp), Some(thread_stats)) = (&stats_tracking, &mut thread_stats) {
+                                        overall_slots_processed.fetch_add(1, Ordering::Relaxed);
+                                        overall_blocks_processed.fetch_add(1, Ordering::Relaxed);
+                                        thread_stats.blocks_processed += 1;
+                                        if slot % stats_tracking_tmp.tracking_interval_slots == 0 {
+                                            maybe_emit_stats(
+                                                stats_tracking.as_ref(),
+                                                thread_index,
+                                                &thread_stats,
+                                                &overall_slots_processed,
+                                                &overall_blocks_processed,
+                                                &overall_transactions_processed,
+                                                &overall_entries_processed,
+                                            ).map_err(|(e, _slot)| e)?;
+                                        }
                                     }
                                 }
                                 Subset(_subset) => (),

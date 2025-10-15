@@ -1488,16 +1488,26 @@ pub fn generate_subranges(slot_range: &Range<u64>, threads: u64) -> Vec<Range<u6
     ranges
 }
 
+#[cfg(test)]
 fn log_stats_handler(thread_id: usize, stats: Stats) -> HandlerResult {
+    let elapsed = stats.start_time.elapsed();
+    let elapsed_secs = elapsed.as_secs_f64();
+    let tps = if elapsed_secs > 0.0 {
+        stats.transactions_processed as f64 / elapsed_secs
+    } else {
+        0.0
+    };
     log::info!(
         target: LOG_MODULE,
-        "thread {thread_id} stats: current_slot={}, slots_processed={}, blocks_processed={}, txs={}, entries={}, rewards={}",
+        "thread {thread_id} stats: current_slot={}, slots_processed={}, blocks_processed={}, txs={}, entries={}, rewards={}, elapsed_s={:.2}, tps={:.2}",
         stats.thread_stats.current_slot,
         stats.slots_processed,
         stats.blocks_processed,
         stats.transactions_processed,
         stats.entries_processed,
-        stats.rewards_processed
+        stats.rewards_processed,
+        elapsed_secs,
+        tps
     );
     Ok(())
 }

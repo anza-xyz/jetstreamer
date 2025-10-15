@@ -1488,6 +1488,20 @@ pub fn generate_subranges(slot_range: &Range<u64>, threads: u64) -> Vec<Range<u6
     ranges
 }
 
+fn log_stats_handler(thread_id: usize, stats: Stats) -> HandlerResult {
+    log::info!(
+        target: LOG_MODULE,
+        "thread {thread_id} stats: current_slot={}, slots_processed={}, blocks_processed={}, txs={}, entries={}, rewards={}",
+        stats.thread_stats.current_slot,
+        stats.slots_processed,
+        stats.blocks_processed,
+        stats.transactions_processed,
+        stats.entries_processed,
+        stats.rewards_processed
+    );
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn test_firehose_epoch_800() {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -1497,6 +1511,11 @@ async fn test_firehose_epoch_800() {
     static PREV_BLOCK: [AtomicU64; THREADS] = [const { AtomicU64::new(0) }; THREADS];
     static NUM_SKIPPED_BLOCKS: AtomicU64 = AtomicU64::new(0);
     static NUM_BLOCKS: AtomicU64 = AtomicU64::new(0);
+    let stats_tracking = StatsTracking {
+        on_stats: log_stats_handler,
+        tracking_interval_slots: 10,
+    };
+
     firehose(
         THREADS.try_into().unwrap(),
         345600000..(345600000 + NUM_SLOTS_TO_COVER),
@@ -1532,7 +1551,7 @@ async fn test_firehose_epoch_800() {
         None::<OnTxFn>,
         None::<OnEntryFn>,
         None::<OnRewardFn>,
-        None::<StatsTracker>,
+        Some(stats_tracking),
     )
     .await
     .unwrap();

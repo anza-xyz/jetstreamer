@@ -208,6 +208,13 @@ fn maybe_emit_stats<OnStats: Handler<Stats>>(
     Ok(())
 }
 
+#[inline(always)]
+fn fetch_add_if(tracking_enabled: bool, atomic: &AtomicU64, value: u64) {
+    if tracking_enabled {
+        atomic.fetch_add(value, Ordering::Relaxed);
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct TransactionData {
     pub slot: u64,
@@ -353,6 +360,7 @@ where
             let tx_enabled = on_tx.is_some();
             let entry_enabled = on_entry.is_some();
             let reward_enabled = on_reward.is_some();
+            let tracking_enabled = stats_tracking.is_some();
 
             // let mut triggered = false;
             while let Err((err, slot)) = async {
@@ -398,18 +406,22 @@ where
                         let mut todo_previous_blockhash = Hash::default();
                         let mut todo_latest_entry_blockhash = Hash::default();
 
-                        let mut thread_stats = ThreadStats {
-                            thread_id: thread_index,
-                            start_time,
-                            finish_time: None,
-                            slot_range: slot_range.clone(),
-                            current_slot: slot_range.start,
-                            slots_processed: 0,
-                            blocks_processed: 0,
-                            leader_skipped_slots: 0,
-                            transactions_processed: 0,
-                            entries_processed: 0,
-                            rewards_processed: 0,
+                        let mut thread_stats = if tracking_enabled {
+                            Some(ThreadStats {
+                                thread_id: thread_index,
+                                start_time,
+                                finish_time: None,
+                                slot_range: slot_range.clone(),
+                                current_slot: slot_range.start,
+                                slots_processed: 0,
+                                blocks_processed: 0,
+                                leader_skipped_slots: 0,
+                                transactions_processed: 0,
+                                entries_processed: 0,
+                                rewards_processed: 0,
+                            })
+                        } else {
+                            None
                         };
 
                         if slot_range.start > epoch_to_slot_range(epoch_num).0 {
@@ -480,9 +492,11 @@ where
                                                 .map_err(|e| FirehoseError::BlockHandlerError(e))
                                                 .map_err(|e| (e, current_slot.unwrap_or(slot_range.start)))?;
                                             }
-                                            thread_stats.leader_skipped_slots += 1;
-                                            overall_slots_processed.fetch_add(1, Ordering::Relaxed);
-                                            thread_stats.slots_processed += 1;
+                                            if let Some(ref mut stats) = thread_stats {
+                                                stats.leader_skipped_slots += 1;
+                                                stats.slots_processed += 1;
+                                            }
+                                            fetch_add_if(tracking_enabled, &overall_slots_processed, 1);
                                         }
                                     }
                                 return Ok(());
@@ -531,7 +545,9 @@ where
                                 }
                                 let node = node_with_cid.get_node();
 
-                                thread_stats.current_slot = slot;
+                                if let Some(ref mut stats) = thread_stats {
+                                    stats.current_slot = slot;
+                                }
 
                                 use crate::node::Node::*;
                                 match node {
@@ -593,8 +609,14 @@ where
                                                 )
                                                 .map_err(|e| FirehoseError::TransactionHandlerError(e))?;
                                             }
-                                            overall_transactions_processed.fetch_add(1, Ordering::Relaxed);
-                                            thread_stats.transactions_processed += 1;
+                                            fetch_add_if(
+                                                tracking_enabled,
+                                                &overall_transactions_processed,
+                                                1,
+                                            );
+                                            if let Some(ref mut stats) = thread_stats {
+                                                stats.transactions_processed += 1;
+                                            }
                                     }
                                     Entry(entry) => {
                                         let entry_hash = Hash::from(entry.hash.to_bytes());
@@ -632,7 +654,11 @@ where
                                                 .map_err(|e| FirehoseError::EntryHandlerError(e))?;
                                             }
                                         entry_index += 1;
-                                        overall_entries_processed.fetch_add(1, Ordering::Relaxed);
+                                        fetch_add_if(
+                                            tracking_enabled,
+                                            &overall_entries_processed,
+                                            1,
+                                        );
                                     }
                                     Block(block) => {
                                         if block_enabled {
@@ -655,8 +681,14 @@ where
                                                             },
                                                         )
                                                         .map_err(|e| FirehoseError::BlockHandlerError(e))?;
-                                                        overall_slots_processed.fetch_add(1, Ordering::Relaxed);
-                                                        thread_stats.leader_skipped_slots += 1;
+                                                        fetch_add_if(
+                                                            tracking_enabled,
+                                                            &overall_slots_processed,
+                                                            1,
+                                                        );
+                                                        if let Some(ref mut stats) = thread_stats {
+                                                            stats.leader_skipped_slots += 1;
+                                                        }
                                                     }
                                                 }
                                                 let keyed_rewards = std::mem::take(&mut this_block_rewards);
@@ -684,9 +716,19 @@ where
                                             this_block_rewards.clear();
                                         }
                                         todo_previous_blockhash = todo_latest_entry_blockhash;
-                                        overall_slots_processed.fetch_add(1, Ordering::Relaxed);
-                                        overall_blocks_processed.fetch_add(1, Ordering::Relaxed);
-                                        thread_stats.blocks_processed += 1;
+                                        fetch_add_if(
+                                            tracking_enabled,
+                                            &overall_slots_processed,
+                                            1,
+                                        );
+                                        fetch_add_if(
+                                            tracking_enabled,
+                                            &overall_blocks_processed,
+                                            1,
+                                        );
+                                        if let Some(ref mut stats) = thread_stats {
+                                            stats.blocks_processed += 1;
+                                        }
                                     }
                                     Subset(_subset) => (),
                                     Epoch(_epoch) => (),
@@ -738,7 +780,10 @@ where
                                                     })?;
                                                 }
                                             this_block_rewards = keyed_rewards;
-                                            thread_stats.rewards_processed += this_block_rewards.len() as u64;
+                                            if let Some(ref mut stats) = thread_stats {
+                                                stats.rewards_processed +=
+                                                    this_block_rewards.len() as u64;
+                                            }
                                         }
                                     }
                                     DataFrame(_data_frame) => (),
@@ -774,16 +819,18 @@ where
                                 return Ok(());
                             }
                         }
-                        thread_stats.finish_time = Some(std::time::Instant::now());
-                        maybe_emit_stats(
-                            stats_tracking.as_ref(),
-                            thread_index,
-                            &thread_stats,
-                            &overall_slots_processed,
-                            &overall_blocks_processed,
-                            &overall_transactions_processed,
-                            &overall_entries_processed,
-                        )?;
+                        if let Some(ref mut stats) = thread_stats {
+                            stats.finish_time = Some(std::time::Instant::now());
+                            maybe_emit_stats(
+                                stats_tracking.as_ref(),
+                                thread_index,
+                                stats,
+                                &overall_slots_processed,
+                                &overall_blocks_processed,
+                                &overall_transactions_processed,
+                                &overall_entries_processed,
+                            )?;
+                        }
                         log::info!(target: &log_target, "thread {} has finished its work", thread_index);
                     }
                     Ok(())

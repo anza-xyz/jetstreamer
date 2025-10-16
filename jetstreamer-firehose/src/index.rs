@@ -1,13 +1,13 @@
 use crate::epochs::{BASE_URL, epoch_to_slot_range, slot_to_epoch};
 use cid::{Cid, multibase::Base};
+use dashmap::{DashMap, mapref::entry::Entry};
 use log::{info, warn};
+use once_cell::sync::Lazy;
 use reqwest::{Client, StatusCode, Url, header::RANGE};
 use serde_cbor::Value;
-use std::collections::HashMap;
-use std::ops::Range;
-use std::sync::Arc;
+use std::{collections::HashMap, future::Future, ops::Range, sync::Arc};
 use thiserror::Error;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OnceCell};
 use xxhash_rust::xxh64::xxh64;
 
 const COMPACT_INDEX_MAGIC: &[u8; 8] = b"compiszd";
@@ -39,51 +39,136 @@ pub enum SlotOffsetIndexError {
     CarHeaderError(Url, String),
 }
 
+pub static SLOT_OFFSET_INDEX: Lazy<SlotOffsetIndex> = Lazy::new(|| {
+    let base_url =
+        get_index_base_url().expect("JETSTREAMER_COMPACT_INDEX_BASE_URL must be a valid URL");
+    SlotOffsetIndex::new(base_url).expect("failed to initialize slot offset index")
+});
+
+pub async fn slot_to_offset(slot: u64) -> Result<u64, SlotOffsetIndexError> {
+    SLOT_OFFSET_INDEX.get_offset(slot).await
+}
+
 pub struct SlotOffsetIndex {
     client: Client,
     base_url: Url,
     network: String,
-    epochs: HashMap<u64, EpochIndex>,
+    epochs: DashMap<u64, Arc<EpochEntry>>,
+}
+
+struct EpochEntry {
+    once: OnceCell<Arc<EpochIndex>>,
 }
 
 struct EpochIndex {
     slot_range: Range<u64>,
     slot_index: RemoteCompactIndex,
     cid_index: RemoteCompactIndex,
-    slot_cache: HashMap<u64, (u64, u32)>,
+    slot_cache: DashMap<u64, (u64, u32)>,
+}
+
+impl EpochEntry {
+    fn new() -> Self {
+        Self {
+            once: OnceCell::new(),
+        }
+    }
+
+    async fn get_or_load<F, Fut>(&self, loader: F) -> Result<Arc<EpochIndex>, SlotOffsetIndexError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<Arc<EpochIndex>, SlotOffsetIndexError>>,
+    {
+        self.once
+            .get_or_try_init(|| async { loader().await })
+            .await
+            .map(Arc::clone)
+    }
+}
+
+impl EpochIndex {
+    async fn offset_for_slot(&self, slot: u64) -> Result<u64, SlotOffsetIndexError> {
+        if !self.slot_range.contains(&slot) {
+            return Err(SlotOffsetIndexError::IndexFormatError(
+                self.slot_index.url().clone(),
+                format!("slot {slot} not in epoch slot range"),
+            ));
+        }
+
+        if let Some(entry) = self.slot_cache.get(&slot) {
+            return Ok(entry.value().0);
+        }
+
+        let slot_key = slot.to_le_bytes();
+        let slot_value = match self.slot_index.lookup(&slot_key).await? {
+            Some(bytes) => bytes,
+            None => {
+                let index_url = self.slot_index.url().clone();
+                return Err(SlotOffsetIndexError::SlotNotFound(slot, index_url));
+            }
+        };
+
+        let (offset, size) = match self.cid_index.lookup(&slot_value).await? {
+            Some(bytes) => decode_offset_and_size(&bytes, self.cid_index.url()),
+            None => {
+                let index_url = self.cid_index.url().clone();
+                return Err(SlotOffsetIndexError::SlotNotFound(slot, index_url));
+            }
+        }?;
+
+        self.slot_cache.insert(slot, (offset, size));
+        Ok(offset)
+    }
 }
 
 impl SlotOffsetIndex {
-    pub fn new(base_url: Url, client: Client) -> Result<Self, SlotOffsetIndexError> {
+    pub fn new(base_url: Url) -> Result<Self, SlotOffsetIndexError> {
         let network =
             std::env::var("JETSTREAMER_NETWORK").unwrap_or_else(|_| "mainnet".to_string());
         Ok(Self {
-            client,
+            client: Client::new(),
             base_url,
             network,
-            epochs: HashMap::new(),
+            epochs: DashMap::new(),
         })
     }
 
-    async fn ensure_epoch_loaded(&mut self, epoch: u64) -> Result<(), SlotOffsetIndexError> {
-        if self.epochs.contains_key(&epoch) {
-            return Ok(());
+    pub fn base_url(&self) -> &Url {
+        &self.base_url
+    }
+
+    async fn get_epoch(&self, epoch: u64) -> Result<Arc<EpochIndex>, SlotOffsetIndexError> {
+        if let Some(entry_ref) = self.epochs.get(&epoch) {
+            let entry_arc = Arc::clone(entry_ref.value());
+            drop(entry_ref);
+            return entry_arc
+                .get_or_load(|| async { self.load_epoch(epoch).await })
+                .await;
         }
 
-        let (slot_start, slot_end_inclusive) = epoch_to_slot_range(epoch);
-        let slot_range = slot_start..(slot_end_inclusive + 1);
-        let (slot_index, cid_index) = self.load_epoch_indexes(epoch).await?;
+        let new_entry = Arc::new(EpochEntry::new());
+        let entry_arc = match self.epochs.entry(epoch) {
+            Entry::Occupied(occupied) => Arc::clone(occupied.get()),
+            Entry::Vacant(vacant) => {
+                vacant.insert(Arc::clone(&new_entry));
+                new_entry
+            }
+        };
 
-        self.epochs.insert(
-            epoch,
-            EpochIndex {
-                slot_range,
-                slot_index,
-                cid_index,
-                slot_cache: HashMap::new(),
-            },
-        );
-        Ok(())
+        entry_arc
+            .get_or_load(|| async { self.load_epoch(epoch).await })
+            .await
+    }
+
+    async fn load_epoch(&self, epoch: u64) -> Result<Arc<EpochIndex>, SlotOffsetIndexError> {
+        let (slot_index, cid_index) = self.load_epoch_indexes(epoch).await?;
+        let (slot_start, slot_end_inclusive) = epoch_to_slot_range(epoch);
+        Ok(Arc::new(EpochIndex {
+            slot_range: slot_start..(slot_end_inclusive + 1),
+            slot_index,
+            cid_index,
+            slot_cache: DashMap::new(),
+        }))
     }
 
     async fn load_epoch_indexes(
@@ -113,7 +198,6 @@ impl SlotOffsetIndex {
             SlotOffsetIndexError::InvalidIndexUrl(format!("{cid_index_path} ({err})"))
         })?;
 
-        info!("Loading compact index for epoch {epoch}: {slot_index_url}");
         let slot_index = RemoteCompactIndex::open(
             self.client.clone(),
             slot_index_url.clone(),
@@ -122,7 +206,6 @@ impl SlotOffsetIndex {
         )
         .await?;
 
-        info!("Loading compact index for epoch {epoch}: {cid_index_url}");
         let cid_index = RemoteCompactIndex::open(
             self.client.clone(),
             cid_index_url.clone(),
@@ -131,7 +214,6 @@ impl SlotOffsetIndex {
         )
         .await?;
 
-        // Validate metadata when present
         if let Some(meta_epoch) = slot_index.metadata_epoch() {
             if meta_epoch != epoch {
                 warn!("Slot index epoch metadata mismatch: expected {epoch}, got {meta_epoch}");
@@ -146,44 +228,10 @@ impl SlotOffsetIndex {
         Ok((slot_index, cid_index))
     }
 
-    pub async fn get_offset(&mut self, slot: u64) -> Result<u64, SlotOffsetIndexError> {
+    pub async fn get_offset(&self, slot: u64) -> Result<u64, SlotOffsetIndexError> {
         let epoch = slot_to_epoch(slot);
-        self.ensure_epoch_loaded(epoch).await?;
-        let epoch_index = self
-            .epochs
-            .get_mut(&epoch)
-            .expect("epoch cache should be populated");
-
-        if !epoch_index.slot_range.contains(&slot) {
-            return Err(SlotOffsetIndexError::IndexFormatError(
-                self.base_url.clone(),
-                format!("slot {slot} not in epoch {epoch} range"),
-            ));
-        }
-
-        if let Some((offset, _)) = epoch_index.slot_cache.get(&slot) {
-            return Ok(*offset);
-        }
-
-        let slot_key = slot.to_le_bytes();
-        let slot_value = match epoch_index.slot_index.lookup(&slot_key).await? {
-            Some(bytes) => bytes,
-            None => {
-                let index_url = epoch_index.slot_index.url().clone();
-                return Err(SlotOffsetIndexError::SlotNotFound(slot, index_url));
-            }
-        };
-
-        let (offset, size) = match epoch_index.cid_index.lookup(&slot_value).await? {
-            Some(bytes) => decode_offset_and_size(&bytes, epoch_index.cid_index.url()),
-            None => {
-                let index_url = epoch_index.cid_index.url().clone();
-                return Err(SlotOffsetIndexError::SlotNotFound(slot, index_url));
-            }
-        }?;
-
-        epoch_index.slot_cache.insert(slot, (offset, size));
-        Ok(offset)
+        let epoch_index = self.get_epoch(epoch).await?;
+        epoch_index.offset_for_slot(slot).await
     }
 }
 
@@ -224,6 +272,18 @@ impl RemoteCompactIndex {
         expected_kind: &[u8],
         expected_value_size: Option<u64>,
     ) -> Result<Self, SlotOffsetIndexError> {
+        let kind_label = std::str::from_utf8(expected_kind).unwrap_or("index");
+        let epoch_hint = url
+            .path_segments()
+            .and_then(|mut segments| segments.next_back())
+            .and_then(|name| name.split('-').nth(1))
+            .and_then(|value| value.parse::<u64>().ok());
+        if let Some(epoch) = epoch_hint {
+            info!("Fetching {kind_label} compact index for epoch {epoch}");
+        } else {
+            info!("Fetching {kind_label} compact index");
+        }
+
         let header =
             fetch_and_parse_header(&client, &url, expected_kind, expected_value_size).await?;
         Ok(Self {

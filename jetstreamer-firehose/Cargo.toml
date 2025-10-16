@@ -50,6 +50,8 @@ zstd.workspace = true
 solana-vote-program.workspace = true
 solana-reward-info.workspace = true
 xxhash-rust.workspace = true
+dashmap.workspace = true
+once_cell.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -28,7 +28,7 @@ use tokio::time::timeout;
 
 use crate::{
     epochs::{epoch_to_slot_range, fetch_epoch_stream, slot_to_epoch},
-    index::{SlotOffsetIndex, SlotOffsetIndexError, get_index_base_url},
+    index::{SLOT_OFFSET_INDEX, SlotOffsetIndexError},
     node_reader::NodeReader,
     utils,
 };
@@ -314,12 +314,9 @@ where
         ));
     }
     let client = Client::new();
-    let index_base_url = get_index_base_url()
-        .map_err(|e| (FirehoseError::SlotOffsetIndexError(e), slot_range.start))?;
     log::info!(target: LOG_MODULE, "starting firehose...");
-    log::info!(target: LOG_MODULE, "index base url: {}", index_base_url);
+    log::info!(target: LOG_MODULE, "index base url: {}", SLOT_OFFSET_INDEX.base_url());
 
-    let index_base_url = Arc::new(index_base_url);
     let slot_range = Arc::new(slot_range);
 
     // divide slot_range into n subranges
@@ -340,7 +337,6 @@ where
     let overall_entries_processed: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
 
     for (thread_index, mut slot_range) in subranges.into_iter().enumerate() {
-        let index_base_url = index_base_url.clone();
         let error_counts = error_counts.clone();
         let client = client.clone();
         let on_block = on_block.clone();
@@ -374,12 +370,6 @@ where
                     slot_range.end,
                     slot_to_epoch(slot_range.end)
                 );
-
-                let mut slot_offset_index =
-                    SlotOffsetIndex::new((*index_base_url).clone(), client.clone())
-                        .map_err(|e| {
-                            (FirehoseError::SlotOffsetIndexError(e), slot_range.start)
-                        })?;
 
                 log::info!(target: &log_target, "🚒 starting firehose...");
 
@@ -429,7 +419,7 @@ where
                     };
 
                     if slot_range.start > epoch_to_slot_range(epoch_num).0 {
-                        let seek_fut = reader.seek_to_slot(slot_range.start, &mut slot_offset_index);
+                        let seek_fut = reader.seek_to_slot(slot_range.start);
                         match timeout(OP_TIMEOUT, seek_fut).await {
                             Ok(res) => res.map_err(|e| (e, current_slot.unwrap_or(slot_range.start)))?,
                             Err(_) => {
@@ -972,7 +962,6 @@ pub fn firehose_geyser(
     log::info!(target: LOG_MODULE, "running on_load...");
     rt.spawn(on_load);
 
-    let index_base_url = Arc::new(index_base_url.clone());
     let slot_range = Arc::new(slot_range);
     let transaction_notifier_maybe = Arc::new(transaction_notifier_maybe);
     let entry_notifier_maybe = Arc::new(entry_notifier_maybe);
@@ -995,7 +984,6 @@ pub fn firehose_geyser(
         let entry_notifier_maybe = (*entry_notifier_maybe).clone();
         let block_meta_notifier_maybe = (*block_meta_notifier_maybe).clone();
         let confirmed_bank_sender = (*confirmed_bank_sender).clone();
-        let index_base_url = index_base_url.clone();
         let client = client.clone();
         let error_counts = error_counts.clone();
 
@@ -1005,7 +993,6 @@ pub fn firehose_geyser(
             rt_clone.block_on(async {
                 firehose_geyser_thread(
                     slot_range,
-                    (*index_base_url).clone(),
                     transaction_notifier_maybe,
                     entry_notifier_maybe,
                     block_meta_notifier_maybe,
@@ -1048,7 +1035,6 @@ pub fn firehose_geyser(
 #[allow(clippy::too_many_arguments)]
 async fn firehose_geyser_thread(
     mut slot_range: Range<u64>,
-    index_base_url: Url,
     transaction_notifier_maybe: Option<Arc<dyn TransactionNotifier + Send + Sync + 'static>>,
     entry_notifier_maybe: Option<Arc<dyn EntryNotifier + Send + Sync + 'static>>,
     block_meta_notifier_maybe: Option<Arc<dyn BlockMetadataNotifier + Send + Sync + 'static>>,
@@ -1075,9 +1061,6 @@ async fn firehose_geyser_thread(
                 slot_range.end,
                 slot_to_epoch(slot_range.end)
             );
-
-            let mut slot_offset_index = SlotOffsetIndex::new(index_base_url.clone(), client.clone())
-                .map_err(|e| (FirehoseError::SlotOffsetIndexError(e), slot_range.start))?;
 
             log::info!(target: &log_target, "🚒 starting firehose...");
 
@@ -1109,7 +1092,7 @@ async fn firehose_geyser_thread(
                 let mut todo_latest_entry_blockhash = Hash::default();
 
                 if slot_range.start > epoch_to_slot_range(epoch_num).0 {
-                    let seek_fut = reader.seek_to_slot(slot_range.start, &mut slot_offset_index);
+                    let seek_fut = reader.seek_to_slot(slot_range.start);
                     match timeout(OP_TIMEOUT, seek_fut).await {
                         Ok(res) => res.map_err(|e| (e, current_slot.unwrap_or(slot_range.start)))?,
                         Err(_) => {

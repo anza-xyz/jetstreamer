@@ -15,10 +15,6 @@ verify-transaction-signatures = []
 name = "jetstreamer-firehose"
 path = "src/main.rs"
 
-[[bin]]
-name = "build-index"
-path = "src/index_bin.rs"
-
 [dependencies]
 crossbeam-channel.workspace = true
 agave-geyser-plugin-interface.workspace = true
@@ -53,6 +49,7 @@ serde_json.workspace = true
 zstd.workspace = true
 solana-vote-program.workspace = true
 solana-reward-info.workspace = true
+xxhash-rust.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

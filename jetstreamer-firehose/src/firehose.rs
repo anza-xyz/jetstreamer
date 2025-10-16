@@ -376,7 +376,7 @@ where
                 );
 
                 let mut slot_offset_index =
-                    SlotOffsetIndex::new((*index_base_url).clone())
+                    SlotOffsetIndex::new((*index_base_url).clone(), client.clone())
                         .map_err(|e| {
                             (FirehoseError::SlotOffsetIndexError(e), slot_range.start)
                         })?;
@@ -1076,7 +1076,7 @@ async fn firehose_geyser_thread(
                 slot_to_epoch(slot_range.end)
             );
 
-            let mut slot_offset_index = SlotOffsetIndex::new(index_base_url.clone())
+            let mut slot_offset_index = SlotOffsetIndex::new(index_base_url.clone(), client.clone())
                 .map_err(|e| (FirehoseError::SlotOffsetIndexError(e), slot_range.start))?;
 
             log::info!(target: &log_target, "🚒 starting firehose...");

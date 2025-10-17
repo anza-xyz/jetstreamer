@@ -2,33 +2,45 @@ pub mod plugins;
 
 use std::{
     fmt::Display,
+    future::Future,
     ops::Range,
     pin::Pin,
-    sync::{Arc, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
-use ::clickhouse::{Client, Row};
+use clickhouse::{Client, Row};
 use futures_util::FutureExt;
-use jetstreamer_firehose::firehose::*;
+use jetstreamer_firehose::firehose::{
+    BlockData, EntryData, RewardsData, Stats, StatsTracking, TransactionData, firehose,
+};
+use serde::Serialize;
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncReadExt, BufReader};
+use thiserror::Error;
+use tokio::{
+    sync::{Notify, Semaphore},
+    task,
+};
 
-pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+pub use jetstreamer_firehose::firehose::{Stats as FirehoseStats, ThreadStats};
 
-/// Used to work around the fact that `async fn` cannot be used in an object-safe trait.
-pub type PluginFuture<'a> = BoxFuture<'a, Result<(), Box<dyn std::error::Error>>>;
+pub type PluginFuture<'a> = Pin<
+    Box<
+        dyn Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync + 'static>>>
+            + Send
+            + 'a,
+    >,
+>;
 
 pub trait Plugin: Send + Sync + 'static {
     fn name(&self) -> &'static str;
 
-    /// Bump this when plugin schema or semantics change.
     fn version(&self) -> u16 {
         1
     }
 
-    /// A unique identifier for the plugin, derived from the Sha256 hash of its name folded
-    /// into a u16 to save space, can be overridden if you get a collision with another plugin,
-    /// but this is unlikely.
     fn id(&self) -> u16 {
         let hash = Sha256::digest(self.name());
         let mut res = 1u16;
@@ -38,46 +50,56 @@ pub trait Plugin: Send + Sync + 'static {
         res
     }
 
-    fn on_transaction(
-        &self,
-        db: Arc<Client>,
-        transaction: &TransactionData,
-        tx_index: u32,
-    ) -> PluginFuture<'_>;
-    fn on_block(&self, db: Option<Arc<Client>>, block: &BlockData) -> PluginFuture<'_>;
-    fn on_entry(&self, db: Option<Arc<Client>>, entry: &EntryData) -> PluginFuture<'_>;
-    fn on_reward(&self, db: Option<Arc<Client>>, reward: &RewardsData) -> PluginFuture<'_>;
+    fn on_transaction<'a>(
+        &'a self,
+        _thread_id: usize,
+        _db: Option<Arc<Client>>,
+        _transaction: &'a TransactionData,
+    ) -> PluginFuture<'a> {
+        async move { Ok(()) }.boxed()
+    }
+
+    fn on_block<'a>(
+        &'a self,
+        _thread_id: usize,
+        _db: Option<Arc<Client>>,
+        _block: &'a BlockData,
+    ) -> PluginFuture<'a> {
+        async move { Ok(()) }.boxed()
+    }
+
+    fn on_entry<'a>(
+        &'a self,
+        _thread_id: usize,
+        _db: Option<Arc<Client>>,
+        _entry: &'a EntryData,
+    ) -> PluginFuture<'a> {
+        async move { Ok(()) }.boxed()
+    }
+
+    fn on_reward<'a>(
+        &'a self,
+        _thread_id: usize,
+        _db: Option<Arc<Client>>,
+        _reward: &'a RewardsData,
+    ) -> PluginFuture<'a> {
+        async move { Ok(()) }.boxed()
+    }
+
     fn on_load(&self, _db: Option<Arc<Client>>) -> PluginFuture<'_> {
         async move { Ok(()) }.boxed()
     }
-    fn on_exit(&self, _db: Arc<Client>) -> PluginFuture<'_> {
+
+    fn on_exit(&self, _db: Option<Arc<Client>>) -> PluginFuture<'_> {
         async move { Ok(()) }.boxed()
     }
-
-    fn clone_plugin(&self) -> Box<dyn Plugin>;
 }
 
+#[derive(Clone)]
 pub struct PluginRunner {
-    plugins: Arc<Vec<Box<dyn Plugin>>>,
+    plugins: Arc<Vec<Arc<dyn Plugin>>>,
     clickhouse_dsn: String,
     num_threads: usize,
-}
-
-impl Clone for PluginRunner {
-    fn clone(&self) -> Self {
-        Self {
-            plugins: {
-                Arc::new(
-                    self.plugins
-                        .iter()
-                        .map(|p| p.clone_plugin())
-                        .collect::<Vec<_>>(),
-                )
-            },
-            clickhouse_dsn: self.clickhouse_dsn.clone(),
-            num_threads: self.num_threads,
-        }
-    }
 }
 
 impl PluginRunner {
@@ -85,167 +107,448 @@ impl PluginRunner {
         Self {
             plugins: Arc::new(Vec::new()),
             clickhouse_dsn: clickhouse_dsn.to_string(),
-            num_threads,
+            num_threads: std::cmp::max(1, num_threads),
         }
     }
 
     pub fn register(&mut self, plugin: Box<dyn Plugin>) {
         Arc::get_mut(&mut self.plugins)
-            .expect("cannot register plugins after the runner has started!")
-            .push(plugin);
+            .expect("cannot register plugins after the runner has started")
+            .push(Arc::from(plugin));
     }
 
-    /// Starts the [`PluginRunner`], forwarding all firehose data to all registered plugins.
     pub async fn run(
         self: Arc<Self>,
         slot_range: Range<u64>,
         clickhouse_enabled: bool,
     ) -> Result<(), PluginRunnerError> {
-        let db = if clickhouse_enabled {
-            log::info!("connecting to ClickHouse at {}", self.clickhouse_dsn);
-            let db = Client::default()
-                .with_url(&self.clickhouse_dsn)
-                .with_option("async_insert", "1")
-                .with_option("wait_for_async_insert", "0");
+        let plugin_handles: Arc<Vec<PluginHandle>> = Arc::new(
+            self.plugins
+                .iter()
+                .cloned()
+                .map(PluginHandle::from)
+                .collect(),
+        );
 
-            // Initialize plugin management tables
-            // NOTE: Include thread_id in ORDER BY so each thread's status row per slot is retained.
-            // Previously ORDER BY slot alone caused logical last-write-wins behavior under ReplacingMergeTree
-            // making per-thread rows appear "missing" when querying.
-            db.query(
-                r#"CREATE TABLE IF NOT EXISTS jetstreamer_slot_status (
-                slot UInt64,
-                transaction_count UInt32 DEFAULT 0,
-                thread_id UInt8 DEFAULT 0,
-                indexed_at DateTime('UTC') DEFAULT now()
-            ) ENGINE = ReplacingMergeTree
-            ORDER BY (slot, thread_id)"#,
-            )
-            .execute()
-            .await?;
-
-            db.query(
-                r#"CREATE TABLE IF NOT EXISTS jetstreamer_plugins (
-                id UInt32,
-                name String,
-                version UInt32
-            ) ENGINE = ReplacingMergeTree
-            ORDER BY id"#,
-            )
-            .execute()
-            .await?;
-
-            db.query(
-                r#"CREATE TABLE IF NOT EXISTS jetstreamer_plugin_slots (
-                plugin_id UInt32,
-                slot UInt64,
-                indexed_at DateTime('UTC') DEFAULT now()
-            ) ENGINE = ReplacingMergeTree
-            ORDER BY (plugin_id, slot)"#,
-            )
-            .execute()
-            .await?;
-            Some(db)
+        let clickhouse = if clickhouse_enabled {
+            let client = Arc::new(
+                Client::default()
+                    .with_url(&self.clickhouse_dsn)
+                    .with_option("async_insert", "1")
+                    .with_option("wait_for_async_insert", "0"),
+            );
+            ensure_clickhouse_tables(client.as_ref()).await?;
+            upsert_plugins(client.as_ref(), plugin_handles.as_ref()).await?;
+            Some(client)
         } else {
             None
         };
 
-        firehose(
-            self.num_threads,
-            slot_range.clone(),
-            Some(|thread_id: usize, block: BlockData| {
-                if prev > 0 {
-                    assert_eq!(prev + 1, block.slot());
+        for handle in plugin_handles.iter() {
+            if let Err(error) = handle
+                .plugin
+                .on_load(clickhouse.clone())
+                .await
+                .map_err(|e| e.to_string())
+            {
+                return Err(PluginRunnerError::PluginLifecycle {
+                    plugin: handle.name,
+                    stage: "on_load",
+                    details: error,
+                });
+            }
+        }
+
+        let concurrency = Arc::new(Semaphore::new(self.num_threads));
+        let inflight = Arc::new(AtomicUsize::new(0));
+        let notify = Arc::new(Notify::new());
+
+        let on_block = {
+            let plugin_handles = plugin_handles.clone();
+            let clickhouse = clickhouse.clone();
+            let concurrency = concurrency.clone();
+            let inflight = inflight.clone();
+            let notify = notify.clone();
+            move |thread_id: usize,
+                  block: BlockData|
+                  -> Result<(), Box<dyn std::error::Error + Send>> {
+                if plugin_handles.is_empty() {
+                    return Ok(());
                 }
-                if block.was_skipped() {
-                    NUM_SKIPPED_BLOCKS.fetch_add(1, Ordering::Relaxed);
-                } else {
-                    NUM_BLOCKS.fetch_add(1, Ordering::Relaxed);
-                }
+                inflight.fetch_add(1, Ordering::SeqCst);
+                let plugin_handles = plugin_handles.clone();
+                let clickhouse = clickhouse.clone();
+                let concurrency = concurrency.clone();
+                let inflight = inflight.clone();
+                let notify = notify.clone();
+                task::spawn(async move {
+                    let permit = concurrency.acquire_owned().await.ok();
+                    let block = Arc::new(block);
+                    for handle in plugin_handles.iter() {
+                        let db = clickhouse.clone();
+                        if let Err(err) = handle
+                            .plugin
+                            .on_block(thread_id, db.clone(), block.as_ref())
+                            .await
+                        {
+                            log::error!("plugin {} on_block error: {}", handle.name, err);
+                            continue;
+                        }
+                        if let (Some(db_client), BlockData::Block { slot, .. }) =
+                            (clickhouse.clone(), block.as_ref())
+                        {
+                            if let Err(err) = record_plugin_slot(db_client, handle.id, *slot).await
+                            {
+                                log::error!(
+                                    "failed to record plugin slot for {}: {}",
+                                    handle.name,
+                                    err
+                                );
+                            }
+                        }
+                    }
+                    drop(permit);
+                    if inflight.fetch_sub(1, Ordering::SeqCst) == 1 {
+                        notify.notify_waiters();
+                    }
+                });
                 Ok(())
-            }),
-            None::<OnTxFn>,
-            None::<OnEntryFn>,
-            None::<OnRewardFn>,
+            }
+        };
+
+        let on_transaction = {
+            let plugin_handles = plugin_handles.clone();
+            let clickhouse = clickhouse.clone();
+            let concurrency = concurrency.clone();
+            let inflight = inflight.clone();
+            let notify = notify.clone();
+            move |thread_id: usize,
+                  transaction: TransactionData|
+                  -> Result<(), Box<dyn std::error::Error + Send>> {
+                if plugin_handles.is_empty() {
+                    return Ok(());
+                }
+                inflight.fetch_add(1, Ordering::SeqCst);
+                let plugin_handles = plugin_handles.clone();
+                let clickhouse = clickhouse.clone();
+                let concurrency = concurrency.clone();
+                let inflight = inflight.clone();
+                let notify = notify.clone();
+                task::spawn(async move {
+                    let permit = concurrency.acquire_owned().await.ok();
+                    let transaction = Arc::new(transaction);
+                    for handle in plugin_handles.iter() {
+                        if let Err(err) = handle
+                            .plugin
+                            .on_transaction(thread_id, clickhouse.clone(), transaction.as_ref())
+                            .await
+                        {
+                            log::error!("plugin {} on_transaction error: {}", handle.name, err);
+                        }
+                    }
+                    drop(permit);
+                    if inflight.fetch_sub(1, Ordering::SeqCst) == 1 {
+                        notify.notify_waiters();
+                    }
+                });
+                Ok(())
+            }
+        };
+
+        let on_entry = {
+            let plugin_handles = plugin_handles.clone();
+            let clickhouse = clickhouse.clone();
+            let concurrency = concurrency.clone();
+            let inflight = inflight.clone();
+            let notify = notify.clone();
+            move |thread_id: usize,
+                  entry: EntryData|
+                  -> Result<(), Box<dyn std::error::Error + Send>> {
+                if plugin_handles.is_empty() {
+                    return Ok(());
+                }
+                inflight.fetch_add(1, Ordering::SeqCst);
+                let plugin_handles = plugin_handles.clone();
+                let clickhouse = clickhouse.clone();
+                let concurrency = concurrency.clone();
+                let inflight = inflight.clone();
+                let notify = notify.clone();
+                task::spawn(async move {
+                    let permit = concurrency.acquire_owned().await.ok();
+                    let entry = Arc::new(entry);
+                    for handle in plugin_handles.iter() {
+                        if let Err(err) = handle
+                            .plugin
+                            .on_entry(thread_id, clickhouse.clone(), entry.as_ref())
+                            .await
+                        {
+                            log::error!("plugin {} on_entry error: {}", handle.name, err);
+                        }
+                    }
+                    drop(permit);
+                    if inflight.fetch_sub(1, Ordering::SeqCst) == 1 {
+                        notify.notify_waiters();
+                    }
+                });
+                Ok(())
+            }
+        };
+
+        let on_reward = {
+            let plugin_handles = plugin_handles.clone();
+            let clickhouse = clickhouse.clone();
+            let concurrency = concurrency.clone();
+            let inflight = inflight.clone();
+            let notify = notify.clone();
+            move |thread_id: usize,
+                  reward: RewardsData|
+                  -> Result<(), Box<dyn std::error::Error + Send>> {
+                if plugin_handles.is_empty() {
+                    return Ok(());
+                }
+                inflight.fetch_add(1, Ordering::SeqCst);
+                let plugin_handles = plugin_handles.clone();
+                let clickhouse = clickhouse.clone();
+                let concurrency = concurrency.clone();
+                let inflight = inflight.clone();
+                let notify = notify.clone();
+                task::spawn(async move {
+                    let permit = concurrency.acquire_owned().await.ok();
+                    let reward = Arc::new(reward);
+                    for handle in plugin_handles.iter() {
+                        if let Err(err) = handle
+                            .plugin
+                            .on_reward(thread_id, clickhouse.clone(), reward.as_ref())
+                            .await
+                        {
+                            log::error!("plugin {} on_reward error: {}", handle.name, err);
+                        }
+                    }
+                    drop(permit);
+                    if inflight.fetch_sub(1, Ordering::SeqCst) == 1 {
+                        notify.notify_waiters();
+                    }
+                });
+                Ok(())
+            }
+        };
+
+        let stats_tracking = clickhouse.clone().map(|db| {
+            let inflight = inflight.clone();
+            let notify = notify.clone();
+            let concurrency = concurrency.clone();
+            StatsTracking {
+                on_stats: move |thread_id: usize, stats: Stats| {
+                    inflight.fetch_add(1, Ordering::SeqCst);
+                    let db = db.clone();
+                    let inflight = inflight.clone();
+                    let notify = notify.clone();
+                    let concurrency = concurrency.clone();
+                    task::spawn(async move {
+                        let permit = concurrency.acquire_owned().await.ok();
+                        if let Err(err) =
+                            record_slot_status(db.clone(), stats.clone(), thread_id).await
+                        {
+                            log::error!("failed to record slot status: {}", err);
+                        }
+                        drop(permit);
+                        if inflight.fetch_sub(1, Ordering::SeqCst) == 1 {
+                            notify.notify_waiters();
+                        }
+                    });
+                    Ok(())
+                },
+                tracking_interval_slots: 10,
+            }
+        });
+
+        let firehose_result = firehose(
+            self.num_threads as u64,
+            slot_range,
+            Some(on_block),
+            Some(on_transaction),
+            Some(on_entry),
+            Some(on_reward),
+            stats_tracking,
         )
-        .await
-        .unwrap();
+        .await;
+
+        while inflight.load(Ordering::SeqCst) > 0 {
+            notify.notified().await;
+        }
+
+        for handle in plugin_handles.iter() {
+            if let Err(error) = handle
+                .plugin
+                .on_exit(clickhouse.clone())
+                .await
+                .map_err(|e| e.to_string())
+            {
+                log::error!("plugin {} on_exit error: {}", handle.name, error);
+            }
+        }
+
+        match firehose_result {
+            Ok(()) => Ok(()),
+            Err((error, slot)) => Err(PluginRunnerError::Firehose {
+                details: error.to_string(),
+                slot,
+            }),
+        }
     }
 }
 
-/*
-#[inline(always)]
-pub async fn handle_message(
-    plugin: &dyn Plugin,
-    db: Arc<Client>,
-    msg: JetstreamerMessage,
-    plugin_id: u16,
-) -> Result<(), PluginRunnerError> {
-    match msg {
-        JetstreamerMessage::Block(block, _) => {
-            let slot = block.slot;
-            if let Err(e) = plugin.on_block(db.clone(), block).await {
-                log::error!("plugin {} on_block error: {e}", plugin.name());
-            }
-            #[derive(Row, serde::Serialize)]
-            struct PluginSlotRow {
-                plugin_id: u32,
-                slot: u64,
-            }
-            let mut insert = db.insert("jetstreamer_plugin_slots").unwrap();
-            insert
-                .write(&PluginSlotRow {
-                    plugin_id: plugin_id as u32,
-                    slot,
-                })
-                .await
-                .unwrap();
-            insert.end().await.unwrap();
-        }
-        JetstreamerMessage::Transaction(tx, tx_index) => {
-            if let Err(e) = plugin.on_transaction(db.clone(), tx, tx_index).await {
-                log::error!("plugin {} on_transaction error: {e}", plugin.name());
-            }
-        }
-        JetstreamerMessage::Exit => {
-            if let Err(e) = plugin.on_exit(db.clone()).await {
-                log::error!("plugin {} on_exit error: {e}", plugin.name());
-            }
+#[derive(Debug, Error)]
+pub enum PluginRunnerError {
+    #[error("clickhouse error: {0}")]
+    Clickhouse(#[from] clickhouse::error::Error),
+    #[error("firehose error at slot {slot}: {details}")]
+    Firehose { details: String, slot: u64 },
+    #[error("plugin {plugin} failed during {stage}: {details}")]
+    PluginLifecycle {
+        plugin: &'static str,
+        stage: &'static str,
+        details: String,
+    },
+}
+
+#[derive(Clone)]
+struct PluginHandle {
+    plugin: Arc<dyn Plugin>,
+    id: u16,
+    name: &'static str,
+    version: u16,
+}
+
+impl From<Arc<dyn Plugin>> for PluginHandle {
+    fn from(plugin: Arc<dyn Plugin>) -> Self {
+        let id = plugin.id();
+        let name = plugin.name();
+        let version = plugin.version();
+        Self {
+            plugin,
+            id,
+            name,
+            version,
         }
     }
+}
+
+#[derive(Row, Serialize)]
+struct PluginRow<'a> {
+    id: u32,
+    name: &'a str,
+    version: u32,
+}
+
+#[derive(Row, Serialize)]
+struct PluginSlotRow {
+    plugin_id: u32,
+    slot: u64,
+}
+
+#[derive(Row, Serialize)]
+struct SlotStatusRow {
+    slot: u64,
+    transaction_count: u32,
+    thread_id: u8,
+}
+
+async fn ensure_clickhouse_tables(db: &Client) -> Result<(), clickhouse::error::Error> {
+    db.query(
+        r#"CREATE TABLE IF NOT EXISTS jetstreamer_slot_status (
+            slot UInt64,
+            transaction_count UInt32 DEFAULT 0,
+            thread_id UInt8 DEFAULT 0,
+            indexed_at DateTime('UTC') DEFAULT now()
+        ) ENGINE = ReplacingMergeTree
+        ORDER BY (slot, thread_id)"#,
+    )
+    .execute()
+    .await?;
+
+    db.query(
+        r#"CREATE TABLE IF NOT EXISTS jetstreamer_plugins (
+            id UInt32,
+            name String,
+            version UInt32
+        ) ENGINE = ReplacingMergeTree
+        ORDER BY id"#,
+    )
+    .execute()
+    .await?;
+
+    db.query(
+        r#"CREATE TABLE IF NOT EXISTS jetstreamer_plugin_slots (
+            plugin_id UInt32,
+            slot UInt64,
+            indexed_at DateTime('UTC') DEFAULT now()
+        ) ENGINE = ReplacingMergeTree
+        ORDER BY (plugin_id, slot)"#,
+    )
+    .execute()
+    .await?;
+
     Ok(())
 }
 
-// ensure that PluginRunnerError is Send + Sync + 'static
+async fn upsert_plugins(
+    db: &Client,
+    plugins: &[PluginHandle],
+) -> Result<(), clickhouse::error::Error> {
+    if plugins.is_empty() {
+        return Ok(());
+    }
+    let mut insert = db.insert("jetstreamer_plugins")?;
+    for handle in plugins {
+        insert
+            .write(&PluginRow {
+                id: handle.id as u32,
+                name: handle.name,
+                version: handle.version as u32,
+            })
+            .await?;
+    }
+    insert.end().await?;
+    Ok(())
+}
+
+async fn record_plugin_slot(
+    db: Arc<Client>,
+    plugin_id: u16,
+    slot: u64,
+) -> Result<(), clickhouse::error::Error> {
+    let mut insert = db.insert("jetstreamer_plugin_slots")?;
+    insert
+        .write(&PluginSlotRow {
+            plugin_id: plugin_id as u32,
+            slot,
+        })
+        .await?;
+    insert.end().await?;
+    Ok(())
+}
+
+async fn record_slot_status(
+    db: Arc<Client>,
+    stats: Stats,
+    thread_id: usize,
+) -> Result<(), clickhouse::error::Error> {
+    let mut insert = db.insert("jetstreamer_slot_status")?;
+    insert
+        .write(&SlotStatusRow {
+            slot: stats.thread_stats.current_slot,
+            transaction_count: stats
+                .thread_stats
+                .transactions_processed
+                .min(u32::MAX as u64) as u32,
+            thread_id: thread_id.try_into().unwrap_or(u8::MAX),
+        })
+        .await?;
+    insert.end().await?;
+    Ok(())
+}
+
+// Ensure PluginRunnerError is Send + Sync + 'static
 trait _CanSend: Send + Sync + 'static {}
 impl _CanSend for PluginRunnerError {}
-
-#[derive(Debug, thiserror::Error)]
-pub enum PluginRunnerError {
-    ClickhouseError(clickhouse::error::Error),
-    FirehoseError(FirehoseError),
-}
-
-impl Display for PluginRunnerError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            PluginRunnerError::ClickhouseError(error) => {
-                write!(f, "clickhouse error: {}", error)
-            }
-            PluginRunnerError::FirehoseError(error) => write!(f, "firehose error: {}", error),
-        }
-    }
-}
-
-impl From<clickhouse::error::Error> for PluginRunnerError {
-    fn from(error: clickhouse::error::Error) -> Self {
-        PluginRunnerError::ClickhouseError(error)
-    }
-}
-
-impl From<FirehoseError> for PluginRunnerError {
-    fn from(error: FirehoseError) -> Self {
-        PluginRunnerError::FirehoseError(error)
-    }
-}
-*/

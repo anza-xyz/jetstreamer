@@ -1,37 +1,29 @@
 use core::ops::Range;
-use jetstreamer_firehose::{
-    epochs::slot_to_epoch,
-    firehose::{FirehoseError, firehose_geyser},
-    index::get_index_base_url,
-};
-use jetstreamer_plugin::{Plugin, PluginRunner};
-use reqwest::Url;
-use serde_json::json;
-use std::{fs::File, io::Write, os::unix::fs::PermissionsExt, path::PathBuf, sync::Arc};
-use tempfile::NamedTempFile;
+use jetstreamer_firehose::{epochs::slot_to_epoch, index::get_index_base_url};
+use jetstreamer_plugin::{Plugin, PluginRunner, PluginRunnerError};
+use std::sync::Arc;
 
 const WORKER_THREAD_MULTIPLIER: usize = 4; // each plugin thread gets 4 worker threads
 
 pub struct JetstreamerRunner {
     log_level: String,
     plugins: Vec<Box<dyn Plugin>>,
-    index_base_url: Url,
-    geyser_config_files: Vec<PathBuf>,
+    clickhouse_dsn: String,
     config: Config,
 }
 
 impl Default for JetstreamerRunner {
     fn default() -> Self {
+        let clickhouse_dsn = std::env::var("JETSTREAMER_CLICKHOUSE_DSN")
+            .unwrap_or_else(|_| "http://localhost:8123".to_string());
         Self {
             log_level: "info".to_string(),
             plugins: Vec::new(),
-            index_base_url: get_index_base_url()
-                .expect("failed to resolve remote slot offset index location"),
-            geyser_config_files: Vec::new(),
+            clickhouse_dsn,
             config: Config {
                 threads: 1,
                 slot_range: 0..0,
-                spawn_clickhouse: true,
+                clickhouse_enabled: true,
             },
         }
     }
@@ -58,148 +50,77 @@ impl JetstreamerRunner {
         self
     }
 
+    pub fn with_clickhouse_dsn(mut self, clickhouse_dsn: impl Into<String>) -> Self {
+        self.clickhouse_dsn = clickhouse_dsn.into();
+        self
+    }
+
     pub fn parse_cli_args(mut self) -> Result<Self, Box<dyn std::error::Error>> {
         self.config = parse_cli_args()?;
         Ok(self)
     }
 
-    pub fn with_index_base_url(mut self, index_base_url: Url) -> Self {
-        self.index_base_url = index_base_url;
-        self
-    }
-
-    pub fn with_jetstreamer_geyser_config(mut self) -> Self {
-        let geyser_config = setup_geyser(&self.config).unwrap();
-        self.geyser_config_files.push(geyser_config);
-        self
-    }
-
-    pub fn with_geyser_config(mut self, config: PathBuf) -> Self {
-        self.geyser_config_files.push(config);
-        self
-    }
-
-    pub fn run(self) -> Result<(), FirehoseError> {
+    pub fn run(self) -> Result<(), PluginRunnerError> {
         solana_logger::setup_with_default(&self.log_level);
-        let geyser_config_files: &[PathBuf] = &self.geyser_config_files;
-        log::debug!("GeyserPluginService config: {:?}", geyser_config_files);
-        let client = reqwest::Client::new();
-        let index_base_url = self.index_base_url;
-        log::info!("slot index base url: {}", index_base_url);
-        let slot_range = self.config.slot_range;
-        log::info!("geyser config files: {:?}", geyser_config_files);
-        let threads = self.config.threads as usize;
-        // Build a dedicated Tokio runtime for the PluginRunner with the configured thread count.
-        // This ensures the plugin work is scheduled on exactly `threads` worker threads, independent
-        // from the outer runtime used by the firehose orchestration.
-        let plugin_rt = std::sync::Arc::new(
-            tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(std::cmp::max(
-                    WORKER_THREAD_MULTIPLIER,
-                    threads * WORKER_THREAD_MULTIPLIER,
-                ))
-                .enable_all()
-                .thread_name("jetstreamer")
-                .build()
-                .expect("failed to build plugin runtime"),
+
+        if let Ok(index_url) = get_index_base_url() {
+            log::info!("slot index base url: {}", index_url);
+        }
+
+        let threads = std::cmp::max(1, self.config.threads as usize);
+        let clickhouse_enabled =
+            self.config.clickhouse_enabled && !self.clickhouse_dsn.trim().is_empty();
+        let slot_range = self.config.slot_range.clone();
+
+        log::info!(
+            "processing slots [{}..{}) with {} firehose threads (clickhouse_enabled={})",
+            slot_range.start,
+            slot_range.end,
+            threads,
+            clickhouse_enabled
         );
-        let mut plugin_runner =
-            PluginRunner::new("http://localhost:8123", threads).socket_name("jetstreamer.sock");
+
+        let mut runner = PluginRunner::new(&self.clickhouse_dsn, threads);
         for plugin in self.plugins {
-            plugin_runner.register(plugin);
+            runner.register(plugin);
         }
-        let plugin_runner = Arc::new(plugin_runner);
-        log::info!("using {} threads for processing", threads);
-        let runner = plugin_runner.clone();
-        let plugin_rt_for_runner = plugin_rt.clone();
-        if let Err((err, slot)) = firehose_geyser(
-            plugin_rt,
-            slot_range.clone(),
-            Some(geyser_config_files),
-            &index_base_url,
-            &client,
-            async move {
-                // Run the plugin runner on the dedicated runtime so it uses `threads` worker threads.
-                let handle = plugin_rt_for_runner.spawn(async move { runner.run().await });
-                match handle.await {
-                    Ok(Ok(())) => Ok(()),
-                    Ok(Err(e)) => Err(Box::new(e) as Box<dyn std::error::Error + Send + 'static>),
-                    Err(join_err) => {
-                        Err(Box::new(join_err) as Box<dyn std::error::Error + Send + 'static>)
-                    }
+
+        let runner = Arc::new(runner);
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(std::cmp::max(
+                1,
+                threads.saturating_mul(WORKER_THREAD_MULTIPLIER),
+            ))
+            .enable_all()
+            .thread_name("jetstreamer")
+            .build()
+            .expect("failed to build plugin runtime");
+
+        match runtime.block_on(runner.run(slot_range.clone(), clickhouse_enabled)) {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                if let PluginRunnerError::Firehose { slot, details } = &err {
+                    log::error!(
+                        "firehose failed at slot {} in epoch {}: {}",
+                        slot,
+                        slot_to_epoch(*slot),
+                        details
+                    );
                 }
-            },
-            threads.try_into().unwrap(),
-        ) {
-            // handle error or break if needed
-            log::error!(
-                "🔥🔥🔥 firehose encountered a fatal error at slot {} in epoch {}: {}",
-                slot,
-                slot_to_epoch(slot),
-                err
-            );
-            return Err(err);
+                Err(err)
+            }
         }
-        Ok(())
     }
-}
-
-/// Sets up the environment for the Jetstreamer geyser plugin, returning the path of an ephemeral
-/// geyser plugin config file pointing to a copy of the Jetstreamer geyser plugin shared library.
-pub fn setup_geyser(config: &Config) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    // materialize libjetstreamer.{so|dylib|dll} on disk
-    let cdylib_path = {
-        // pick an extension for this OS
-        let ext = if cfg!(target_os = "windows") {
-            "dll"
-        } else if cfg!(target_os = "macos") {
-            "dylib"
-        } else {
-            "so"
-        };
-
-        // create a temp file with that suffix and write the bytes
-        let file = NamedTempFile::with_suffix(format!("-jetstreamer.{ext}"))?
-            .into_temp_path()
-            .keep()?;
-        File::create(&file)?.write_all(JETSTREAMER_CDYLIB)?;
-        // executable permission for Unix
-        #[cfg(unix)]
-        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755))?;
-
-        file.as_path().to_path_buf()
-    };
-
-    // build a transient plugin_config.json
-    let cfg_path = {
-        let cfg = json!({
-            "libpath": cdylib_path,
-            "name":    "GeyserPluginJetstreamer",
-            "clickhouse": {
-                "spawn": config.spawn_clickhouse,
-            },
-            "jetstreamer": {
-                "threads": config.threads,
-                "slot_range": format!("{:?}", config.slot_range),
-            },
-            "log_level": "info"
-        });
-        println!("GeyserPluginService config: {:?}", cfg);
-        let tmp = NamedTempFile::with_suffix("-jetstreamer-plugin-config.json")?.into_temp_path();
-        serde_json::to_writer_pretty(&File::create(&tmp)?, &cfg)?;
-        tmp.keep()? // same lifetime rule
-    };
-    Ok(cfg_path)
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Config {
-    /// Number of silmultaneous firehose streams to spawn
+    /// Number of simultaneous firehose streams to spawn.
     pub threads: u8,
-    /// The range of slots to process, inclusive of the start and end slot.
+    /// The range of slots to process, inclusive of the start and exclusive of the end slot.
     pub slot_range: Range<u64>,
-    /// Whether to spawn a local ClickHouse server for the geyser plugin.
-    pub spawn_clickhouse: bool,
+    /// Whether to connect to ClickHouse for plugin output.
+    pub clickhouse_enabled: bool,
 }
 
 pub fn parse_cli_args() -> Result<Config, Box<dyn std::error::Error>> {
@@ -217,16 +138,19 @@ pub fn parse_cli_args() -> Result<Config, Box<dyn std::error::Error>> {
         let (start_slot, end_slot) = jetstreamer_firehose::epochs::epoch_to_slot_range(epoch);
         start_slot..end_slot
     };
-    let spawn_clickhouse = std::env::var("JETSTREAMER_NO_CLICKHOUSE")
-        .map(|v| v != "1" && v != "true" && v != "t")
+
+    let clickhouse_enabled = std::env::var("JETSTREAMER_NO_CLICKHOUSE")
+        .map(|v| v != "1" && v.to_ascii_lowercase() != "true")
         .unwrap_or(true);
+
     let threads = std::env::var("JETSTREAMER_THREADS")
         .ok()
         .and_then(|s| s.parse::<u8>().ok())
         .unwrap_or(1);
+
     Ok(Config {
         threads,
         slot_range,
-        spawn_clickhouse,
+        clickhouse_enabled,
     })
 }

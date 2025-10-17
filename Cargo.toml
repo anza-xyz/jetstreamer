@@ -72,12 +72,9 @@ tempfile = "3"
 libc = "0"
 
 [dependencies]
-tempfile.workspace = true
-serde_json.workspace = true
 tokio.workspace = true
 solana-logger.workspace = true
 log.workspace = true
-reqwest.workspace = true
 jetstreamer-firehose.workspace = true
 jetstreamer-plugin.workspace = true
 

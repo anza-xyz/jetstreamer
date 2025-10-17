@@ -3107,10 +3107,7 @@ dependencies = [
  "jetstreamer-firehose",
  "jetstreamer-plugin",
  "log",
- "reqwest 0.12.23",
- "serde_json",
  "solana-logger",
- "tempfile",
  "tokio",
 ]
 
@@ -3197,22 +3194,13 @@ dependencies = [
 name = "jetstreamer-plugin"
 version = "0.1.0"
 dependencies = [
- "bincode",
  "clickhouse",
- "crossbeam-channel",
- "futures 0.3.31",
  "futures-util",
- "interprocess",
  "jetstreamer-firehose",
  "log",
- "rayon",
- "reqwest 0.12.23",
  "serde",
  "sha2 0.10.9",
- "solana-logger",
  "solana-sdk",
- "solana-system-program",
- "solana-vote-program",
  "thiserror 2.0.17",
  "tokio",
 ]

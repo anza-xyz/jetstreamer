@@ -40,6 +40,12 @@ struct Contribution {
     dt: f64,
 }
 
+#[derive(Clone, Copy, Default)]
+struct Rates {
+    slot_rate: f64,
+    tx_rate: f64,
+}
+
 #[derive(Default)]
 struct SnapshotWindow {
     entries: [Option<Contribution>; 5],
@@ -49,7 +55,7 @@ struct SnapshotWindow {
 }
 
 impl SnapshotWindow {
-    fn update(&mut self, snapshot: Snapshot) -> (Option<f64>, Option<f64>) {
+    fn update(&mut self, snapshot: Snapshot) -> Option<Rates> {
         if let Some(prev) = self.last {
             if let Some(dt) = snapshot
                 .time
@@ -82,13 +88,13 @@ impl SnapshotWindow {
         }
 
         if self.len < self.entries.len() || total_dt <= 0.0 {
-            return (None, None);
+            return None;
         }
 
-        (
-            Some(total_slots as f64 / total_dt),
-            Some(total_txs as f64 / total_dt),
-        )
+        Some(Rates {
+            slot_rate: total_slots as f64 / total_dt,
+            tx_rate: total_txs as f64 / total_dt,
+        })
     }
 }
 
@@ -422,6 +428,8 @@ impl PluginRunner {
             }
         };
 
+        let total_slot_count = slot_range.end.saturating_sub(slot_range.start);
+
         let stats_tracking = clickhouse.clone().map(|db| {
             let inflight = inflight.clone();
             let notify = notify.clone();
@@ -432,6 +440,7 @@ impl PluginRunner {
             StatsTracking {
                 on_stats: {
                     let last_snapshot = last_snapshot.clone();
+                    let total_slot_count = total_slot_count;
                     move |thread_id: usize, stats: Stats| {
                         if shutting_down.load(Ordering::SeqCst) {
                             return Ok(());
@@ -453,15 +462,13 @@ impl PluginRunner {
                             0.0
                         };
                         let thread_stats = &stats.thread_stats;
-                        let overall_total_slots =
-                            stats.slot_range.end.saturating_sub(stats.slot_range.start);
-                        let overall_progress = if overall_total_slots > 0 {
-                            (stats.slots_processed as f64 / overall_total_slots as f64)
-                                .clamp(0.0, 1.0)
-                                * 100.0
+                        let processed_slots = stats.slots_processed.min(total_slot_count);
+                        let progress_fraction = if total_slot_count > 0 {
+                            processed_slots as f64 / total_slot_count as f64
                         } else {
-                            100.0
+                            1.0
                         };
+                        let overall_progress = (progress_fraction * 100.0).clamp(0.0, 100.0);
                         let thread_total_slots = thread_stats
                             .slot_range
                             .end
@@ -473,33 +480,38 @@ impl PluginRunner {
                         } else {
                             100.0
                         };
-                        let mut slot_rate = if elapsed_secs > 0.0 {
-                            stats.slots_processed as f64 / elapsed_secs
-                        } else {
-                            0.0
-                        };
+                        let mut overall_eta = None;
                         if let Ok(mut window) = last_snapshot.lock() {
-                            let (slot_opt, tx_opt) = window.update(Snapshot {
+                            if let Some(rates) = window.update(Snapshot {
                                 time: finish_at,
                                 slots: stats.slots_processed,
                                 txs: stats.transactions_processed,
-                            });
-                            if let Some(rate) = slot_opt {
-                                slot_rate = rate;
-                            }
-                            if let Some(rate) = tx_opt {
-                                tps = rate;
+                            }) {
+                                tps = rates.tx_rate;
+                                let remaining_slots = total_slot_count.saturating_sub(processed_slots);
+                                if rates.slot_rate > 0.0 && remaining_slots > 0 {
+                                    overall_eta = Some(human_readable_duration(remaining_slots as f64 / rates.slot_rate));
+                                }
                             }
                         }
-                        let remaining_slots = overall_total_slots.saturating_sub(stats.slots_processed);
-                        let overall_eta = if slot_rate > 0.0 && remaining_slots > 0 {
-                            Some(human_readable_duration(remaining_slots as f64 / slot_rate))
-                        } else {
-                            None
-                        };
+                        if overall_eta.is_none() {
+                            if progress_fraction > 0.0 && progress_fraction < 1.0 {
+                                if let Some(elapsed_total) = finish_at
+                                    .checked_duration_since(stats.start_time)
+                                    .map(|d| d.as_secs_f64())
+                                {
+                                    if elapsed_total > 0.0 {
+                                        let remaining_secs = elapsed_total * (1.0 / progress_fraction - 1.0);
+                                        overall_eta = Some(human_readable_duration(remaining_secs));
+                                    }
+                                }
+                            } else if progress_fraction >= 1.0 {
+                                overall_eta = Some("0s".into());
+                            }
+                        }
                         log::info!(
                             "stats pulse: thread={thread_id} slots={} blocks={} txs={} tps={tps:.2} progress={overall_progress:.1}% thread_slots={} thread_txs={} thread_progress={thread_progress:.1}% eta={}",
-                            stats.slots_processed,
+                            processed_slots,
                             stats.blocks_processed,
                             stats.transactions_processed,
                             thread_stats.slots_processed,

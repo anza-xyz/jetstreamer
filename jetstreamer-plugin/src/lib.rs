@@ -382,13 +382,33 @@ impl PluginRunner {
                         0.0
                     };
                     let thread_stats = &stats.thread_stats;
+                    let overall_total_slots =
+                        stats.slot_range.end.saturating_sub(stats.slot_range.start);
+                    let overall_progress = if overall_total_slots > 0 {
+                        (stats.slots_processed as f64 / overall_total_slots as f64)
+                            .clamp(0.0, 1.0)
+                            * 100.0
+                    } else {
+                        100.0
+                    };
+                    let thread_total_slots = thread_stats
+                        .slot_range
+                        .end
+                        .saturating_sub(thread_stats.slot_range.start);
+                    let thread_progress = if thread_total_slots > 0 {
+                        (thread_stats.slots_processed as f64 / thread_total_slots as f64)
+                            .clamp(0.0, 1.0)
+                            * 100.0
+                    } else {
+                        100.0
+                    };
                     log::info!(
-                        "stats pulse: thread={thread_id} slots={} blocks={} txs={} tps={overall_tps:.2} thread_slots={} thread_txs={}",
+                        "stats pulse: thread={thread_id} slots={} blocks={} txs={} tps={overall_tps:.2} progress={overall_progress:.1}% thread_slots={} thread_txs={} thread_progress={thread_progress:.1}%",
                         stats.slots_processed,
                         stats.blocks_processed,
                         stats.transactions_processed,
                         thread_stats.slots_processed,
-                        thread_stats.transactions_processed,
+                        thread_stats.transactions_processed
                     );
                     task::spawn(async move {
                         let permit = concurrency.acquire_owned().await.ok();

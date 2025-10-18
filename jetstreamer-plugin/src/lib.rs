@@ -1,12 +1,13 @@
 pub mod plugins;
 
 use std::{
+    collections::VecDeque,
     fmt::Display,
     future::Future,
     ops::Range,
     pin::Pin,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
 };
@@ -360,71 +361,102 @@ impl PluginRunner {
             let notify = notify.clone();
             let concurrency = concurrency.clone();
             let shutting_down = shutting_down.clone();
+            let last_snapshot: Arc<Mutex<VecDeque<(std::time::Instant, u64)>>> =
+                Arc::new(Mutex::new(VecDeque::new()));
             StatsTracking {
-                on_stats: move |thread_id: usize, stats: Stats| {
-                    if shutting_down.load(Ordering::SeqCst) {
-                        return Ok(());
-                    }
-                    inflight.fetch_add(1, Ordering::SeqCst);
-                    let db = db.clone();
-                    let inflight = inflight.clone();
-                    let notify = notify.clone();
-                    let concurrency = concurrency.clone();
-                    let shutting_down = shutting_down.clone();
-                    let finish_at = stats
-                        .finish_time
-                        .unwrap_or_else(std::time::Instant::now);
-                    let elapsed = finish_at.saturating_duration_since(stats.start_time);
-                    let elapsed_secs = elapsed.as_secs_f64();
-                    let overall_tps = if elapsed_secs > 0.0 {
-                        stats.transactions_processed as f64 / elapsed_secs
-                    } else {
-                        0.0
-                    };
-                    let thread_stats = &stats.thread_stats;
-                    let overall_total_slots =
-                        stats.slot_range.end.saturating_sub(stats.slot_range.start);
-                    let overall_progress = if overall_total_slots > 0 {
-                        (stats.slots_processed as f64 / overall_total_slots as f64)
-                            .clamp(0.0, 1.0)
-                            * 100.0
-                    } else {
-                        100.0
-                    };
-                    let thread_total_slots = thread_stats
-                        .slot_range
-                        .end
-                        .saturating_sub(thread_stats.slot_range.start);
-                    let thread_progress = if thread_total_slots > 0 {
-                        (thread_stats.slots_processed as f64 / thread_total_slots as f64)
-                            .clamp(0.0, 1.0)
-                            * 100.0
-                    } else {
-                        100.0
-                    };
-                    log::info!(
-                        "stats pulse: thread={thread_id} slots={} blocks={} txs={} tps={overall_tps:.2} progress={overall_progress:.1}% thread_slots={} thread_txs={} thread_progress={thread_progress:.1}%",
-                        stats.slots_processed,
-                        stats.blocks_processed,
-                        stats.transactions_processed,
-                        thread_stats.slots_processed,
-                        thread_stats.transactions_processed
-                    );
-                    task::spawn(async move {
-                        let permit = concurrency.acquire_owned().await.ok();
+                on_stats: {
+                    let last_snapshot = last_snapshot.clone();
+                    move |thread_id: usize, stats: Stats| {
                         if shutting_down.load(Ordering::SeqCst) {
-                            log::debug!("skipping stats write during shutdown");
-                        } else if let Err(err) =
-                            record_slot_status(db.clone(), stats.clone(), thread_id).await
-                        {
-                            log::error!("failed to record slot status: {}", err);
+                            return Ok(());
                         }
-                        drop(permit);
-                        if inflight.fetch_sub(1, Ordering::SeqCst) == 1 {
-                            notify.notify_waiters();
+                        inflight.fetch_add(1, Ordering::SeqCst);
+                        let db = db.clone();
+                        let inflight = inflight.clone();
+                        let notify = notify.clone();
+                        let concurrency = concurrency.clone();
+                        let shutting_down = shutting_down.clone();
+                        let finish_at = stats
+                            .finish_time
+                            .unwrap_or_else(std::time::Instant::now);
+                        let elapsed = finish_at.saturating_duration_since(stats.start_time);
+                        let elapsed_secs = elapsed.as_secs_f64();
+                        let mut tps = if elapsed_secs > 0.0 {
+                            stats.transactions_processed as f64 / elapsed_secs
+                        } else {
+                            0.0
+                        };
+                        let thread_stats = &stats.thread_stats;
+                        let overall_total_slots =
+                            stats.slot_range.end.saturating_sub(stats.slot_range.start);
+                        let overall_progress = if overall_total_slots > 0 {
+                            (stats.slots_processed as f64 / overall_total_slots as f64)
+                                .clamp(0.0, 1.0)
+                                * 100.0
+                        } else {
+                            100.0
+                        };
+                        let thread_total_slots = thread_stats
+                            .slot_range
+                            .end
+                            .saturating_sub(thread_stats.slot_range.start);
+                        let thread_progress = if thread_total_slots > 0 {
+                            (thread_stats.slots_processed as f64 / thread_total_slots as f64)
+                                .clamp(0.0, 1.0)
+                                * 100.0
+                        } else {
+                            100.0
+                        };
+                        if let Ok(mut history) = last_snapshot.lock() {
+                            history.push_back((finish_at, stats.transactions_processed));
+                            while history.len() > 5 {
+                                history.pop_front();
+                            }
+                            if history.len() >= 2 {
+                                if let (Some((old_time, old_tx)), Some((new_time, new_tx))) =
+                                    (history.front().cloned(), history.back().cloned())
+                                {
+                                    let dt = new_time
+                                        .checked_duration_since(old_time)
+                                        .map(|d| d.as_secs_f64())
+                                        .unwrap_or(0.0);
+                                    let dtx = new_tx.saturating_sub(old_tx) as f64;
+                                    if dt > 0.0 {
+                                        tps = dtx / dt;
+                                    } else if elapsed_secs > 0.0 {
+                                        tps = stats.transactions_processed as f64 / elapsed_secs;
+                                    }
+                                }
+                            } else if elapsed_secs > 0.0 {
+                                tps = stats.transactions_processed as f64 / elapsed_secs;
+                            }
+                        } else if elapsed_secs > 0.0 {
+                            tps = stats.transactions_processed as f64 / elapsed_secs;
                         }
-                    });
-                    Ok(())
+                        log::info!(
+                            "stats pulse: thread={thread_id} slots={} blocks={} txs={} tps={tps:.2} progress={overall_progress:.1}% thread_slots={} thread_txs={} thread_progress={thread_progress:.1}%",
+                            stats.slots_processed,
+                            stats.blocks_processed,
+                            stats.transactions_processed,
+                            thread_stats.slots_processed,
+                            thread_stats.transactions_processed
+                        );
+                        task::spawn(async move {
+                            let permit = concurrency.acquire_owned().await.ok();
+                            if shutting_down.load(Ordering::SeqCst) {
+                                log::debug!("skipping stats write during shutdown");
+                            } else if let Err(err) =
+                                record_slot_status(db.clone(), stats.clone(), thread_id).await
+                            {
+                                log::error!("failed to record slot status: {}", err);
+                            }
+                            drop(permit);
+                            if inflight.fetch_sub(1, Ordering::SeqCst) == 1 {
+                                notify.notify_waiters();
+                            }
+                        });
+                        Ok(())
+                    }
                 },
                 tracking_interval_slots: 10,
             }

@@ -1,4 +1,6 @@
-use std::{os::unix::fs::PermissionsExt, process::Stdio};
+use std::{future::Future, os::unix::fs::PermissionsExt, path::Path, pin::Pin, process::Stdio};
+
+use log;
 use tempfile::NamedTempFile;
 use tokio::{
     fs::File,
@@ -6,8 +8,6 @@ use tokio::{
     process::Command,
     sync::{OnceCell, mpsc},
 };
-
-use crate::geyser::JetstreamerError;
 
 fn process_log_line(line: impl AsRef<str>) {
     let line = line.as_ref();
@@ -45,6 +45,29 @@ static CLICKHOUSE_PROCESS: OnceCell<u32> = OnceCell::const_new();
 
 include!(concat!(env!("OUT_DIR"), "/embed_clickhouse.rs")); // raw bytes for clickhouse binary
 
+/// Errors that can occur when managing the embedded ClickHouse process.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClickhouseError {
+    Process(String),
+    InitializationFailed,
+}
+
+impl std::fmt::Display for ClickhouseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ClickhouseError::Process(msg) => write!(f, "ClickHouse error: {}", msg),
+            ClickhouseError::InitializationFailed => {
+                write!(f, "ClickHouse initialization failed")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ClickhouseError {}
+
+pub type ClickhouseProcessFuture = Pin<Box<dyn Future<Output = Result<(), ()>> + Send>>;
+pub type ClickhouseStartResult = (mpsc::Receiver<()>, ClickhouseProcessFuture);
+
 pub async fn start_client() -> Result<(), Box<dyn std::error::Error>> {
     let clickhouse_path = NamedTempFile::with_suffix("-clickhouse")
         .unwrap()
@@ -63,7 +86,8 @@ pub async fn start_client() -> Result<(), Box<dyn std::error::Error>> {
     std::fs::set_permissions(&clickhouse_path, std::fs::Permissions::from_mode(0o755)).unwrap();
     log::info!("ClickHouse binary written and permissions set.");
 
-    std::env::set_current_dir("./bin").unwrap();
+    let bin_dir = Path::new("./bin");
+    std::fs::create_dir_all(bin_dir).unwrap();
 
     std::thread::sleep(std::time::Duration::from_secs(1));
 
@@ -71,6 +95,7 @@ pub async fn start_client() -> Result<(), Box<dyn std::error::Error>> {
     Command::new(clickhouse_path)
         .arg("client")
         .arg("--host=localhost")
+        .current_dir(bin_dir)
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .spawn()
@@ -81,13 +106,7 @@ pub async fn start_client() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-pub async fn start() -> Result<
-    (
-        mpsc::Receiver<()>,
-        impl std::future::Future<Output = Result<(), ()>>,
-    ),
-    JetstreamerError,
-> {
+pub async fn start() -> Result<ClickhouseStartResult, ClickhouseError> {
     log::info!("Spawning local ClickHouse server...");
 
     // write clickhouse binary to a temp file
@@ -111,8 +130,8 @@ pub async fn start() -> Result<
     // Create a channel to signal when ClickHouse is ready
     let (ready_tx, ready_rx) = mpsc::channel(1);
 
-    std::fs::create_dir_all("./bin").unwrap();
-    std::env::set_current_dir("./bin").unwrap();
+    let bin_dir = Path::new("./bin");
+    std::fs::create_dir_all(bin_dir).unwrap();
     std::thread::sleep(std::time::Duration::from_secs(1));
     let mut clickhouse_command = unsafe {
         Command::new(clickhouse_path)
@@ -120,6 +139,7 @@ pub async fn start() -> Result<
             //.arg("--async_insert_queue_flush_on_shutdown=1")
             .stdout(Stdio::piped()) // Redirect stdout to capture logs
             .stderr(Stdio::piped()) // Also capture stderr
+            .current_dir(bin_dir)
             .pre_exec(|| {
                 // safety: setsid() can't fail if we're child of a real process
                 libc::setsid();
@@ -127,10 +147,7 @@ pub async fn start() -> Result<
             })
             .spawn()
             .map_err(|err| {
-                JetstreamerError::ClickHouseError(format!(
-                    "Failed to start the ClickHouse process: {}",
-                    err
-                ))
+                ClickhouseError::Process(format!("Failed to start the ClickHouse process: {}", err))
             })?
     };
 
@@ -207,23 +224,26 @@ pub async fn start() -> Result<
     log::info!("Waiting for ClickHouse process to be ready.");
 
     // Return the receiver side of the channel and the future for the ClickHouse process
-    Ok((ready_rx, async move {
-        CLICKHOUSE_PROCESS
-            .set(clickhouse_command.id().unwrap())
-            .unwrap();
-        let status = clickhouse_command.wait().await;
+    Ok((
+        ready_rx,
+        Box::pin(async move {
+            CLICKHOUSE_PROCESS
+                .set(clickhouse_command.id().unwrap())
+                .unwrap();
+            let status = clickhouse_command.wait().await;
 
-        match status {
-            Ok(status) => {
-                log::info!("ClickHouse exited with status: {}", status);
-                Ok(())
+            match status {
+                Ok(status) => {
+                    log::info!("ClickHouse exited with status: {}", status);
+                    Ok(())
+                }
+                Err(err) => {
+                    log::error!("Failed to wait on the ClickHouse process: {}", err);
+                    Err(())
+                }
             }
-            Err(err) => {
-                log::error!("Failed to wait on the ClickHouse process: {}", err);
-                Err(())
-            }
-        }
-    }))
+        }),
+    ))
 }
 
 pub async fn stop() {

@@ -1,6 +1,7 @@
 use core::ops::Range;
 use jetstreamer_firehose::{epochs::slot_to_epoch, index::get_index_base_url};
 use jetstreamer_plugin::{Plugin, PluginRunner, PluginRunnerError};
+use jetstreamer_utils::{self};
 use std::sync::Arc;
 
 const WORKER_THREAD_MULTIPLIER: usize = 4; // each plugin thread gets 4 worker threads
@@ -16,6 +17,7 @@ impl Default for JetstreamerRunner {
     fn default() -> Self {
         let clickhouse_dsn = std::env::var("JETSTREAMER_CLICKHOUSE_DSN")
             .unwrap_or_else(|_| "http://localhost:8123".to_string());
+        let spawn_clickhouse = should_spawn_for_dsn(&clickhouse_dsn);
         Self {
             log_level: "info".to_string(),
             plugins: Vec::new(),
@@ -24,6 +26,7 @@ impl Default for JetstreamerRunner {
                 threads: 1,
                 slot_range: 0..0,
                 clickhouse_enabled: true,
+                spawn_clickhouse,
             },
         }
     }
@@ -71,6 +74,9 @@ impl JetstreamerRunner {
         let clickhouse_enabled =
             self.config.clickhouse_enabled && !self.clickhouse_dsn.trim().is_empty();
         let slot_range = self.config.slot_range.clone();
+        let spawn_clickhouse = clickhouse_enabled
+            && self.config.spawn_clickhouse
+            && should_spawn_for_dsn(&self.clickhouse_dsn);
 
         log::info!(
             "processing slots [{}..{}) with {} firehose threads (clickhouse_enabled={})",
@@ -96,7 +102,56 @@ impl JetstreamerRunner {
             .build()
             .expect("failed to build plugin runtime");
 
-        match runtime.block_on(runner.run(slot_range.clone(), clickhouse_enabled)) {
+        if spawn_clickhouse {
+            runtime.block_on(async {
+                let (mut ready_rx, clickhouse_future) =
+                    jetstreamer_utils::start().await.map_err(|err| {
+                        PluginRunnerError::PluginLifecycle {
+                            plugin: "clickhouse",
+                            stage: "start",
+                            details: err.to_string(),
+                        }
+                    })?;
+
+                ready_rx
+                    .recv()
+                    .await
+                    .ok_or_else(|| PluginRunnerError::PluginLifecycle {
+                        plugin: "clickhouse",
+                        stage: "ready",
+                        details: "ClickHouse readiness signal channel closed unexpectedly".into(),
+                    })?;
+
+                tokio::spawn(async move {
+                    match clickhouse_future.await {
+                        Ok(()) => log::info!("ClickHouse process exited gracefully."),
+                        Err(()) => log::error!("ClickHouse process exited with an error."),
+                    }
+                });
+
+                Ok::<(), PluginRunnerError>(())
+            })?;
+        } else if clickhouse_enabled {
+            if !self.config.spawn_clickhouse {
+                log::info!(
+                    "ClickHouse auto-spawn disabled via configuration; using existing instance at {}",
+                    self.clickhouse_dsn
+                );
+            } else {
+                log::info!(
+                    "ClickHouse DSN {} not recognized as local; skipping embedded ClickHouse spawn",
+                    self.clickhouse_dsn
+                );
+            }
+        }
+
+        let result = runtime.block_on(runner.run(slot_range.clone(), clickhouse_enabled));
+
+        if spawn_clickhouse {
+            jetstreamer_utils::stop_sync();
+        }
+
+        match result {
             Ok(()) => Ok(()),
             Err(err) => {
                 if let PluginRunnerError::Firehose { slot, details } = &err {
@@ -121,6 +176,8 @@ pub struct Config {
     pub slot_range: Range<u64>,
     /// Whether to connect to ClickHouse for plugin output.
     pub clickhouse_enabled: bool,
+    /// Whether to spawn a local ClickHouse instance automatically.
+    pub spawn_clickhouse: bool,
 }
 
 pub fn parse_cli_args() -> Result<Config, Box<dyn std::error::Error>> {
@@ -148,9 +205,19 @@ pub fn parse_cli_args() -> Result<Config, Box<dyn std::error::Error>> {
         .and_then(|s| s.parse::<u8>().ok())
         .unwrap_or(1);
 
+    let spawn_clickhouse = std::env::var("JETSTREAMER_SPAWN_CLICKHOUSE")
+        .map(|v| v != "0" && v.to_ascii_lowercase() != "false")
+        .unwrap_or(true);
+
     Ok(Config {
         threads,
         slot_range,
         clickhouse_enabled,
+        spawn_clickhouse,
     })
+}
+
+fn should_spawn_for_dsn(dsn: &str) -> bool {
+    let lower = dsn.to_ascii_lowercase();
+    lower.contains("localhost") || lower.contains("127.0.0.1")
 }

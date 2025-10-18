@@ -1,0 +1,23 @@
+[package]
+name = "jetstreamer-utils"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "jetstreamer_utils"
+
+[[bin]]
+name = "clickhouse-server"
+path = "src/clickhouse_server_bin.rs"
+
+[[bin]]
+name = "clickhouse-client"
+path = "src/clickhouse_client_bin.rs"
+
+[dependencies]
+tokio.workspace = true
+log.workspace = true
+tempfile.workspace = true
+libc.workspace = true
+solana-logger.workspace = true
+ctrlc.workspace = true

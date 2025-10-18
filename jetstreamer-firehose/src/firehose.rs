@@ -16,15 +16,19 @@ use solana_vote_program::id as vote_program_id;
 use std::{
     fmt::Display,
     future::Future,
+    io,
     ops::Range,
     path::PathBuf,
     sync::{
         Arc,
-        atomic::{AtomicU32, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     },
 };
 use thiserror::Error;
-use tokio::time::timeout;
+use tokio::{
+    sync::broadcast::{self, error::TryRecvError},
+    time::timeout,
+};
 
 use crate::{
     epochs::{epoch_to_slot_range, fetch_epoch_stream, slot_to_epoch},
@@ -37,6 +41,42 @@ use crate::{
 // seeking, reading next block). Adjust here to tune stall detection/restart aggressiveness.
 const OP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const LOG_MODULE: &str = "jetstreamer::firehose";
+
+fn poll_shutdown(
+    flag: &Arc<std::sync::atomic::AtomicBool>,
+    receiver: &mut Option<broadcast::Receiver<()>>,
+) -> bool {
+    if let Some(rx) = receiver {
+        match rx.try_recv() {
+            Ok(_) | Err(TryRecvError::Lagged(_)) => {
+                flag.store(true, Ordering::SeqCst);
+            }
+            Err(TryRecvError::Closed) => {
+                flag.store(true, Ordering::SeqCst);
+            }
+            Err(TryRecvError::Empty) => {}
+        }
+    }
+    flag.load(Ordering::SeqCst)
+}
+
+fn is_shutdown_error(err: &FirehoseError) -> bool {
+    fn is_interrupted(inner: &(dyn std::error::Error + 'static)) -> bool {
+        inner
+            .downcast_ref::<io::Error>()
+            .map(|io_err| io_err.kind() == io::ErrorKind::Interrupted)
+            .unwrap_or(false)
+    }
+
+    match err {
+        FirehoseError::BlockHandlerError(inner)
+        | FirehoseError::TransactionHandlerError(inner)
+        | FirehoseError::EntryHandlerError(inner)
+        | FirehoseError::RewardHandlerError(inner)
+        | FirehoseError::OnStatsHandlerError(inner) => is_interrupted(inner.as_ref()),
+        _ => false,
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum FirehoseError {
@@ -299,6 +339,7 @@ pub async fn firehose<OnBlock, OnTransaction, OnEntry, OnRewards, OnStats>(
     on_entry: Option<OnEntry>,
     on_rewards: Option<OnRewards>,
     stats_tracking: Option<StatsTracking<OnStats>>,
+    shutdown_signal: Option<broadcast::Receiver<()>>,
 ) -> Result<(), (FirehoseError, u64)>
 where
     OnBlock: Handler<BlockData>,
@@ -326,6 +367,17 @@ where
     }
 
     let firehose_start = std::time::Instant::now();
+    let shutdown_flag = Arc::new(AtomicBool::new(false));
+    if let Some(ref rx) = shutdown_signal {
+        let mut rx = rx.resubscribe();
+        let flag = shutdown_flag.clone();
+        tokio::spawn(async move {
+            if rx.recv().await.is_ok() {
+                log::info!(target: LOG_MODULE, "shutdown signal received; notifying firehose threads");
+                flag.store(true, Ordering::SeqCst);
+            }
+        });
+    }
     let mut handles = Vec::new();
     // Shared per-thread error counters
     let error_counts: Arc<Vec<AtomicU32>> =
@@ -348,8 +400,11 @@ where
         let overall_transactions_processed = overall_transactions_processed.clone();
         let overall_entries_processed = overall_entries_processed.clone();
         let stats_tracking = stats_tracking.clone();
+        let shutdown_flag = shutdown_flag.clone();
+        let thread_shutdown_rx = shutdown_signal.as_ref().map(|rx| rx.resubscribe());
 
         let handle = tokio::spawn(async move {
+            let mut shutdown_rx = thread_shutdown_rx;
             let start_time = std::time::Instant::now();
             let log_target = format!("{}::T{:03}", LOG_MODULE, thread_index);
             let mut skip_until_index = None;
@@ -361,6 +416,14 @@ where
 
             // let mut triggered = false;
             while let Err((err, slot)) = async {
+                if poll_shutdown(&shutdown_flag, &mut shutdown_rx) {
+                    log::info!(
+                        target: &log_target,
+                        "shutdown requested; terminating firehose thread {}",
+                        thread_index
+                    );
+                    return Ok(());
+                }
                 let epoch_range = slot_to_epoch(slot_range.start)..=slot_to_epoch(slot_range.end - 1);
                 log::info!(
                     target: &log_target,
@@ -377,6 +440,14 @@ where
                 let mut current_slot: Option<u64> = None;
                 let mut previous_slot: Option<u64> = Some(slot_range.start.saturating_sub(1));
                 for epoch_num in epoch_range.clone() {
+                    if poll_shutdown(&shutdown_flag, &mut shutdown_rx) {
+                        log::info!(
+                            target: &log_target,
+                            "shutdown requested; terminating firehose thread {}",
+                            thread_index
+                        );
+                        return Ok(());
+                    }
                     log::info!(target: &log_target, "entering epoch {}", epoch_num);
                     let stream = match timeout(OP_TIMEOUT, fetch_epoch_stream(epoch_num, &client)).await {
                         Ok(stream) => stream,
@@ -432,6 +503,14 @@ where
                     let mut item_index = 0;
                     let mut displayed_skip_message = false;
                     loop {
+                        if poll_shutdown(&shutdown_flag, &mut shutdown_rx) {
+                            log::info!(
+                                target: &log_target,
+                                "shutdown requested; terminating firehose thread {}",
+                                thread_index
+                            );
+                            return Ok(());
+                        }
                         let read_fut = reader.read_until_block();
                         let nodes = match timeout(OP_TIMEOUT, read_fut).await {
                             Ok(result) => result
@@ -498,6 +577,7 @@ where
                                     if let Some(ref mut stats) = thread_stats {
                                         stats.leader_skipped_slots += 1;
                                         stats.slots_processed += 1;
+                                        stats.current_slot = skipped_slot;
                                     }
                                     fetch_add_if(tracking_enabled, &overall_slots_processed, 1);
                                 }
@@ -662,6 +742,9 @@ where
                                         &overall_entries_processed,
                                         1,
                                     );
+                                    if let Some(ref mut stats) = thread_stats {
+                                        stats.entries_processed += 1;
+                                    }
                                 }
                                 Block(block) => {
                                     if block_enabled {
@@ -689,6 +772,8 @@ where
                                                     );
                                                     if let Some(ref mut stats) = thread_stats {
                                                         stats.leader_skipped_slots += 1;
+                                                        stats.slots_processed += 1;
+                                                        stats.current_slot = skipped_slot;
                                                     }
                                                 }
                                             }
@@ -721,6 +806,8 @@ where
                                         overall_slots_processed.fetch_add(1, Ordering::Relaxed);
                                         overall_blocks_processed.fetch_add(1, Ordering::Relaxed);
                                         thread_stats.blocks_processed += 1;
+                                        thread_stats.slots_processed += 1;
+                                        thread_stats.current_slot = slot;
                                         if slot % stats_tracking_tmp.tracking_interval_slots == 0 {
                                             maybe_emit_stats(
                                                 stats_tracking.as_ref(),
@@ -844,6 +931,14 @@ where
             }
             .await
             {
+                if is_shutdown_error(&err) {
+                    log::info!(
+                        target: &log_target,
+                        "shutdown requested; terminating firehose thread {}",
+                        thread_index
+                    );
+                    break;
+                }
                 log::error!(
                     target: &log_target,
                     "🔥🔥🔥 firehose encountered an error at slot {} in epoch {}:",
@@ -903,7 +998,11 @@ where
             total_errors
         );
     }
-    log::info!(target: LOG_MODULE, "🚒 firehose finished successfully.");
+    if shutdown_flag.load(Ordering::SeqCst) {
+        log::info!(target: LOG_MODULE, "firehose shutdown complete; all threads exited cleanly.");
+    } else {
+        log::info!(target: LOG_MODULE, "🚒 firehose finished successfully.");
+    }
     Ok(())
 }
 
@@ -1381,14 +1480,22 @@ async fn firehose_geyser_thread(
                 }
             }
             Ok(())
-    }
-    .await
-    {
-            log::error!(
+}
+.await
+{
+        if is_shutdown_error(&err) {
+            log::info!(
                 target: &log_target,
-                "🔥🔥🔥 firehose encountered an error at slot {} in epoch {}:",
-                slot,
-                slot_to_epoch(slot)
+                "shutdown requested; terminating firehose thread {:?}",
+                thread_index
+            );
+            return Ok(());
+        }
+        log::error!(
+            target: &log_target,
+            "🔥🔥🔥 firehose encountered an error at slot {} in epoch {}:",
+            slot,
+            slot_to_epoch(slot)
             );
             log::error!(target: &log_target, "{}", err);
             let item_index = match err {
@@ -1590,6 +1697,7 @@ async fn test_firehose_epoch_800() {
         None::<OnEntryFn>,
         None::<OnRewardFn>,
         Some(stats_tracking),
+        None,
     )
     .await
     .unwrap();

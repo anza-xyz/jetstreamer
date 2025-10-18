@@ -1,5 +1,5 @@
 [workspace]
-members = ["jetstreamer-firehose", "jetstreamer-geyser-plugin", "jetstreamer-build-cdylib", "jetstreamer-plugin"]
+members = ["jetstreamer-firehose", "jetstreamer-plugin", "jetstreamer-utils"]
 
 [package]
 name = "jetstreamer"
@@ -9,8 +9,8 @@ authors = ["sam0x17"]
 
 [workspace.dependencies]
 jetstreamer-firehose = { path = "jetstreamer-firehose", version = "0.1.0" }
-jetstreamer-geyser-plugin = { path = "jetstreamer-geyser-plugin", version = "0.1.0" }
 jetstreamer-plugin = { path = "jetstreamer-plugin", version = "0.1.0" }
+jetstreamer-utils = { path = "jetstreamer-utils", version = "0.1.0" }
 tokio = { version = "1", features = ["full"] }
 futures-util = "0"
 futures = "0"
@@ -77,6 +77,7 @@ solana-logger.workspace = true
 log.workspace = true
 jetstreamer-firehose.workspace = true
 jetstreamer-plugin.workspace = true
+jetstreamer-utils.workspace = true
 
 [profile.release]
 lto = true

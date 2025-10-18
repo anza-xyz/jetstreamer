@@ -1,6 +1,4 @@
-use jetstreamer::clickhouse_utils::*;
-
-// TODO: pull clickhouse into its own crate
+use jetstreamer_utils::{start, stop_sync};
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {

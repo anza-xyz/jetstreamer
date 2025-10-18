@@ -1733,12 +1733,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "doctest-file"
-version = "1.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aac81fa3e28d21450aa4d2ac065992ba96a1d7303efbce51a95f4fd175b67562"
-
-[[package]]
 name = "downcast"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2996,12 +2990,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "indoc"
-version = "2.0.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f4c7245a08504955605670dbf141fceab975f15ca21570696aebe9d2e71576bd"
-
-[[package]]
 name = "inout"
 version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3017,21 +3005,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e0242819d153cba4b4b05a5a8f2a7e9bbf97b6055b2a002b395c96b5ff3c0222"
 dependencies = [
  "cfg-if 1.0.3",
-]
-
-[[package]]
-name = "interprocess"
-version = "2.2.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d941b405bd2322993887859a8ee6ac9134945a24ec5ec763a8a962fc64dfec2d"
-dependencies = [
- "doctest-file",
- "futures-core",
- "libc",
- "recvmsg",
- "tokio",
- "widestring",
- "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3106,16 +3079,10 @@ version = "0.1.0"
 dependencies = [
  "jetstreamer-firehose",
  "jetstreamer-plugin",
+ "jetstreamer-utils",
  "log",
  "solana-logger",
  "tokio",
-]
-
-[[package]]
-name = "jetstreamer-build-cdylib"
-version = "0.1.0"
-dependencies = [
- "jetstreamer-geyser-plugin",
 ]
 
 [[package]]
@@ -3162,35 +3129,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "jetstreamer-geyser-plugin"
-version = "0.1.0"
-dependencies = [
- "agave-geyser-plugin-interface",
- "bincode",
- "clickhouse",
- "crossbeam-channel",
- "crossbeam-utils",
- "ctrlc",
- "indoc",
- "interprocess",
- "jetstreamer-firehose",
- "jetstreamer-plugin",
- "libc",
- "log",
- "once_cell",
- "rangemap",
- "reqwest 0.12.23",
- "serde",
- "serde_json",
- "solana-logger",
- "solana-program",
- "solana-sdk",
- "tempfile",
- "thousands",
- "tokio",
-]
-
-[[package]]
 name = "jetstreamer-plugin"
 version = "0.1.0"
 dependencies = [
@@ -3202,6 +3140,18 @@ dependencies = [
  "sha2 0.10.9",
  "solana-sdk",
  "thiserror 2.0.17",
+ "tokio",
+]
+
+[[package]]
+name = "jetstreamer-utils"
+version = "0.1.0"
+dependencies = [
+ "ctrlc",
+ "libc",
+ "log",
+ "solana-logger",
+ "tempfile",
  "tokio",
 ]
 
@@ -4761,12 +4711,6 @@ dependencies = [
  "crossbeam-deque",
  "crossbeam-utils",
 ]
-
-[[package]]
-name = "recvmsg"
-version = "1.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d3edd4d5d42c92f0a659926464d4cce56b562761267ecf0f469d85b7de384175"
 
 [[package]]
 name = "redox_syscall"
@@ -9517,12 +9461,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "thousands"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3bf63baf9f5039dadc247375c29eb13706706cfde997d0330d05aa63a77d8820"
-
-[[package]]
 name = "time"
 version = "0.3.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -10324,12 +10262,6 @@ dependencies = [
  "once_cell",
  "rustix 0.38.44",
 ]
-
-[[package]]
-name = "widestring"
-version = "1.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dd7cf3379ca1aac9eea11fba24fd7e315d621f8dfe35c8d7d2be8b793726e07d"
 
 [[package]]
 name = "winapi"

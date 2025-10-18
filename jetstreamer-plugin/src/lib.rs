@@ -7,7 +7,7 @@ use std::{
     pin::Pin,
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
 };
 
@@ -20,7 +20,8 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::{
-    sync::{Notify, Semaphore},
+    signal,
+    sync::{Notify, Semaphore, broadcast},
     task,
 };
 
@@ -162,6 +163,7 @@ impl PluginRunner {
         let concurrency = Arc::new(Semaphore::new(self.num_threads));
         let inflight = Arc::new(AtomicUsize::new(0));
         let notify = Arc::new(Notify::new());
+        let shutting_down = Arc::new(AtomicBool::new(false));
 
         let on_block = {
             let plugin_handles = plugin_handles.clone();
@@ -169,10 +171,15 @@ impl PluginRunner {
             let concurrency = concurrency.clone();
             let inflight = inflight.clone();
             let notify = notify.clone();
+            let shutting_down = shutting_down.clone();
             move |thread_id: usize,
                   block: BlockData|
                   -> Result<(), Box<dyn std::error::Error + Send>> {
                 if plugin_handles.is_empty() {
+                    return Ok(());
+                }
+                if shutting_down.load(Ordering::SeqCst) {
+                    log::debug!("ignoring block while shutdown is in progress");
                     return Ok(());
                 }
                 inflight.fetch_add(1, Ordering::SeqCst);
@@ -222,10 +229,15 @@ impl PluginRunner {
             let concurrency = concurrency.clone();
             let inflight = inflight.clone();
             let notify = notify.clone();
+            let shutting_down = shutting_down.clone();
             move |thread_id: usize,
                   transaction: TransactionData|
                   -> Result<(), Box<dyn std::error::Error + Send>> {
                 if plugin_handles.is_empty() {
+                    return Ok(());
+                }
+                if shutting_down.load(Ordering::SeqCst) {
+                    log::debug!("ignoring transaction while shutdown is in progress");
                     return Ok(());
                 }
                 inflight.fetch_add(1, Ordering::SeqCst);
@@ -261,10 +273,15 @@ impl PluginRunner {
             let concurrency = concurrency.clone();
             let inflight = inflight.clone();
             let notify = notify.clone();
+            let shutting_down = shutting_down.clone();
             move |thread_id: usize,
                   entry: EntryData|
                   -> Result<(), Box<dyn std::error::Error + Send>> {
                 if plugin_handles.is_empty() {
+                    return Ok(());
+                }
+                if shutting_down.load(Ordering::SeqCst) {
+                    log::debug!("ignoring entry while shutdown is in progress");
                     return Ok(());
                 }
                 inflight.fetch_add(1, Ordering::SeqCst);
@@ -300,10 +317,15 @@ impl PluginRunner {
             let concurrency = concurrency.clone();
             let inflight = inflight.clone();
             let notify = notify.clone();
+            let shutting_down = shutting_down.clone();
             move |thread_id: usize,
                   reward: RewardsData|
                   -> Result<(), Box<dyn std::error::Error + Send>> {
                 if plugin_handles.is_empty() {
+                    return Ok(());
+                }
+                if shutting_down.load(Ordering::SeqCst) {
+                    log::debug!("ignoring reward while shutdown is in progress");
                     return Ok(());
                 }
                 inflight.fetch_add(1, Ordering::SeqCst);
@@ -337,16 +359,42 @@ impl PluginRunner {
             let inflight = inflight.clone();
             let notify = notify.clone();
             let concurrency = concurrency.clone();
+            let shutting_down = shutting_down.clone();
             StatsTracking {
                 on_stats: move |thread_id: usize, stats: Stats| {
+                    if shutting_down.load(Ordering::SeqCst) {
+                        return Ok(());
+                    }
                     inflight.fetch_add(1, Ordering::SeqCst);
                     let db = db.clone();
                     let inflight = inflight.clone();
                     let notify = notify.clone();
                     let concurrency = concurrency.clone();
+                    let shutting_down = shutting_down.clone();
+                    let finish_at = stats
+                        .finish_time
+                        .unwrap_or_else(std::time::Instant::now);
+                    let elapsed = finish_at.saturating_duration_since(stats.start_time);
+                    let elapsed_secs = elapsed.as_secs_f64();
+                    let overall_tps = if elapsed_secs > 0.0 {
+                        stats.transactions_processed as f64 / elapsed_secs
+                    } else {
+                        0.0
+                    };
+                    let thread_stats = &stats.thread_stats;
+                    log::info!(
+                        "stats pulse: thread={thread_id} slots={} blocks={} txs={} tps={overall_tps:.2} thread_slots={} thread_txs={}",
+                        stats.slots_processed,
+                        stats.blocks_processed,
+                        stats.transactions_processed,
+                        thread_stats.slots_processed,
+                        thread_stats.transactions_processed,
+                    );
                     task::spawn(async move {
                         let permit = concurrency.acquire_owned().await.ok();
-                        if let Err(err) =
+                        if shutting_down.load(Ordering::SeqCst) {
+                            log::debug!("skipping stats write during shutdown");
+                        } else if let Err(err) =
                             record_slot_status(db.clone(), stats.clone(), thread_id).await
                         {
                             log::error!("failed to record slot status: {}", err);
@@ -362,7 +410,9 @@ impl PluginRunner {
             }
         });
 
-        let firehose_result = firehose(
+        let (shutdown_tx, _) = broadcast::channel::<()>(1);
+
+        let mut firehose_future = Box::pin(firehose(
             self.num_threads as u64,
             slot_range,
             Some(on_block),
@@ -370,8 +420,22 @@ impl PluginRunner {
             Some(on_entry),
             Some(on_reward),
             stats_tracking,
-        )
-        .await;
+            Some(shutdown_tx.subscribe()),
+        ));
+
+        let firehose_result = tokio::select! {
+            res = &mut firehose_future => res,
+            ctrl = signal::ctrl_c() => {
+                match ctrl {
+                    Ok(()) => log::info!("CTRL+C received; initiating shutdown"),
+                    Err(err) => log::error!("failed to listen for CTRL+C: {}", err),
+                }
+                shutting_down.store(true, Ordering::SeqCst);
+                notify.notify_waiters();
+                let _ = shutdown_tx.send(());
+                firehose_future.await
+            }
+        };
 
         while inflight.load(Ordering::SeqCst) > 0 {
             notify.notified().await;

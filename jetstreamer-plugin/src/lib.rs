@@ -1,7 +1,6 @@
 pub mod plugins;
 
 use std::{
-    collections::VecDeque,
     fmt::Display,
     future::Future,
     ops::Range,
@@ -10,6 +9,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
+    time::Duration,
 };
 
 use clickhouse::{Client, Row};
@@ -25,6 +25,72 @@ use tokio::{
     sync::{Notify, Semaphore, broadcast},
     task,
 };
+
+#[derive(Clone, Copy)]
+struct Snapshot {
+    time: std::time::Instant,
+    slots: u64,
+    txs: u64,
+}
+
+#[derive(Clone, Copy, Default)]
+struct Contribution {
+    slot_delta: u64,
+    tx_delta: u64,
+    dt: f64,
+}
+
+#[derive(Default)]
+struct SnapshotWindow {
+    entries: [Option<Contribution>; 5],
+    idx: usize,
+    len: usize,
+    last: Option<Snapshot>,
+}
+
+impl SnapshotWindow {
+    fn update(&mut self, snapshot: Snapshot) -> (Option<f64>, Option<f64>) {
+        if let Some(prev) = self.last {
+            if let Some(dt) = snapshot
+                .time
+                .checked_duration_since(prev.time)
+                .map(|d| d.as_secs_f64())
+            {
+                if dt > 0.0 {
+                    let contrib = Contribution {
+                        slot_delta: snapshot.slots.saturating_sub(prev.slots),
+                        tx_delta: snapshot.txs.saturating_sub(prev.txs),
+                        dt,
+                    };
+                    self.entries[self.idx] = Some(contrib);
+                    self.idx = (self.idx + 1) % self.entries.len();
+                    if self.len < self.entries.len() {
+                        self.len += 1;
+                    }
+                }
+            }
+        }
+        self.last = Some(snapshot);
+
+        let mut total_slots = 0u64;
+        let mut total_txs = 0u64;
+        let mut total_dt = 0.0;
+        for entry in self.entries.iter().flatten() {
+            total_slots = total_slots.saturating_add(entry.slot_delta);
+            total_txs = total_txs.saturating_add(entry.tx_delta);
+            total_dt += entry.dt;
+        }
+
+        if self.len < self.entries.len() || total_dt <= 0.0 {
+            return (None, None);
+        }
+
+        (
+            Some(total_slots as f64 / total_dt),
+            Some(total_txs as f64 / total_dt),
+        )
+    }
+}
 
 pub use jetstreamer_firehose::firehose::{Stats as FirehoseStats, ThreadStats};
 
@@ -361,8 +427,8 @@ impl PluginRunner {
             let notify = notify.clone();
             let concurrency = concurrency.clone();
             let shutting_down = shutting_down.clone();
-            let last_snapshot: Arc<Mutex<VecDeque<(std::time::Instant, u64)>>> =
-                Arc::new(Mutex::new(VecDeque::new()));
+            let last_snapshot: Arc<Mutex<SnapshotWindow>> =
+                Arc::new(Mutex::new(SnapshotWindow::default()));
             StatsTracking {
                 on_stats: {
                     let last_snapshot = last_snapshot.clone();
@@ -407,39 +473,38 @@ impl PluginRunner {
                         } else {
                             100.0
                         };
-                        if let Ok(mut history) = last_snapshot.lock() {
-                            history.push_back((finish_at, stats.transactions_processed));
-                            while history.len() > 5 {
-                                history.pop_front();
+                        let mut slot_rate = if elapsed_secs > 0.0 {
+                            stats.slots_processed as f64 / elapsed_secs
+                        } else {
+                            0.0
+                        };
+                        if let Ok(mut window) = last_snapshot.lock() {
+                            let (slot_opt, tx_opt) = window.update(Snapshot {
+                                time: finish_at,
+                                slots: stats.slots_processed,
+                                txs: stats.transactions_processed,
+                            });
+                            if let Some(rate) = slot_opt {
+                                slot_rate = rate;
                             }
-                            if history.len() >= 2 {
-                                if let (Some((old_time, old_tx)), Some((new_time, new_tx))) =
-                                    (history.front().cloned(), history.back().cloned())
-                                {
-                                    let dt = new_time
-                                        .checked_duration_since(old_time)
-                                        .map(|d| d.as_secs_f64())
-                                        .unwrap_or(0.0);
-                                    let dtx = new_tx.saturating_sub(old_tx) as f64;
-                                    if dt > 0.0 {
-                                        tps = dtx / dt;
-                                    } else if elapsed_secs > 0.0 {
-                                        tps = stats.transactions_processed as f64 / elapsed_secs;
-                                    }
-                                }
-                            } else if elapsed_secs > 0.0 {
-                                tps = stats.transactions_processed as f64 / elapsed_secs;
+                            if let Some(rate) = tx_opt {
+                                tps = rate;
                             }
-                        } else if elapsed_secs > 0.0 {
-                            tps = stats.transactions_processed as f64 / elapsed_secs;
                         }
+                        let remaining_slots = overall_total_slots.saturating_sub(stats.slots_processed);
+                        let overall_eta = if slot_rate > 0.0 && remaining_slots > 0 {
+                            Some(human_readable_duration(remaining_slots as f64 / slot_rate))
+                        } else {
+                            None
+                        };
                         log::info!(
-                            "stats pulse: thread={thread_id} slots={} blocks={} txs={} tps={tps:.2} progress={overall_progress:.1}% thread_slots={} thread_txs={} thread_progress={thread_progress:.1}%",
+                            "stats pulse: thread={thread_id} slots={} blocks={} txs={} tps={tps:.2} progress={overall_progress:.1}% thread_slots={} thread_txs={} thread_progress={thread_progress:.1}% eta={}",
                             stats.slots_processed,
                             stats.blocks_processed,
                             stats.transactions_processed,
                             thread_stats.slots_processed,
-                            thread_stats.transactions_processed
+                            thread_stats.transactions_processed,
+                            overall_eta.unwrap_or_else(|| "n/a".into())
                         );
                         task::spawn(async move {
                             let permit = concurrency.acquire_owned().await.ok();
@@ -668,3 +733,32 @@ async fn record_slot_status(
 // Ensure PluginRunnerError is Send + Sync + 'static
 trait _CanSend: Send + Sync + 'static {}
 impl _CanSend for PluginRunnerError {}
+
+fn human_readable_duration(seconds: f64) -> String {
+    if !seconds.is_finite() {
+        return "n/a".into();
+    }
+    if seconds <= 0.0 {
+        return "0s".into();
+    }
+    if seconds < 60.0 {
+        return format!("{:.1}s", seconds);
+    }
+    let duration = Duration::from_secs(seconds.round() as u64);
+    let secs = duration.as_secs();
+    let days = secs / 86_400;
+    let hours = (secs % 86_400) / 3_600;
+    let minutes = (secs % 3_600) / 60;
+    let seconds_rem = secs % 60;
+    if days > 0 {
+        if hours > 0 {
+            format!("{}d{}h", days, hours)
+        } else {
+            format!("{}d", days)
+        }
+    } else if hours > 0 {
+        format!("{}h{}m", hours, minutes)
+    } else {
+        format!("{}m{}s", minutes, seconds_rem)
+    }
+}

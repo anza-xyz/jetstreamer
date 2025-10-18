@@ -45,15 +45,39 @@ pub static SLOT_OFFSET_INDEX: Lazy<SlotOffsetIndex> = Lazy::new(|| {
     SlotOffsetIndex::new(base_url).expect("failed to initialize slot offset index")
 });
 
+static SLOT_OFFSET_RESULT_CACHE: Lazy<DashMap<u64, u64>> = Lazy::new(DashMap::new);
+static EPOCH_CACHE: Lazy<DashMap<EpochCacheKey, Arc<EpochEntry>>> = Lazy::new(DashMap::new);
+
+#[derive(Clone, Hash, PartialEq, Eq)]
+struct EpochCacheKey {
+    namespace: Arc<str>,
+    epoch: u64,
+}
+
+impl EpochCacheKey {
+    fn new(namespace: &Arc<str>, epoch: u64) -> Self {
+        Self {
+            namespace: Arc::clone(namespace),
+            epoch,
+        }
+    }
+}
+
 pub async fn slot_to_offset(slot: u64) -> Result<u64, SlotOffsetIndexError> {
-    SLOT_OFFSET_INDEX.get_offset(slot).await
+    if let Some(offset) = SLOT_OFFSET_RESULT_CACHE.get(&slot) {
+        return Ok(*offset);
+    }
+
+    let offset = SLOT_OFFSET_INDEX.get_offset(slot).await?;
+    SLOT_OFFSET_RESULT_CACHE.insert(slot, offset);
+    Ok(offset)
 }
 
 pub struct SlotOffsetIndex {
     client: Client,
     base_url: Url,
     network: String,
-    epochs: DashMap<u64, Arc<EpochEntry>>,
+    cache_namespace: Arc<str>,
 }
 
 struct EpochEntry {
@@ -125,11 +149,13 @@ impl SlotOffsetIndex {
     pub fn new(base_url: Url) -> Result<Self, SlotOffsetIndexError> {
         let network =
             std::env::var("JETSTREAMER_NETWORK").unwrap_or_else(|_| "mainnet".to_string());
+        let cache_namespace =
+            Arc::<str>::from(format!("{}|{}", base_url.as_str(), network.as_str()));
         Ok(Self {
             client: Client::new(),
             base_url,
             network,
-            epochs: DashMap::new(),
+            cache_namespace,
         })
     }
 
@@ -138,7 +164,8 @@ impl SlotOffsetIndex {
     }
 
     async fn get_epoch(&self, epoch: u64) -> Result<Arc<EpochIndex>, SlotOffsetIndexError> {
-        if let Some(entry_ref) = self.epochs.get(&epoch) {
+        let cache_key = EpochCacheKey::new(&self.cache_namespace, epoch);
+        if let Some(entry_ref) = EPOCH_CACHE.get(&cache_key) {
             let entry_arc = Arc::clone(entry_ref.value());
             drop(entry_ref);
             return entry_arc
@@ -147,7 +174,7 @@ impl SlotOffsetIndex {
         }
 
         let new_entry = Arc::new(EpochEntry::new());
-        let entry_arc = match self.epochs.entry(epoch) {
+        let entry_arc = match EPOCH_CACHE.entry(cache_key) {
             Entry::Occupied(occupied) => Arc::clone(occupied.get()),
             Entry::Vacant(vacant) => {
                 vacant.insert(Arc::clone(&new_entry));

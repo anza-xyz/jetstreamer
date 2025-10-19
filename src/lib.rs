@@ -7,10 +7,10 @@
 //! stream live there, including utilty functions for accessing information about epochs and
 //! slots.
 //!
+//! See [`utils`] for helpers used throughout the Jetstreamer ecosystem.
+//!
 //! See [`JetstreamerRunner`] and [`plugin`] for the ability to build and run jetstreamer
 //! plugins that consume firehose data with automatic stat tracking and ClickHouse integration.
-//!
-//! See [`utils`] for helpers used throughout the Jetstreamer ecosystem.
 
 pub use jetstreamer_firehose as firehose;
 pub use jetstreamer_plugin as plugin;
@@ -23,10 +23,138 @@ use std::sync::Arc;
 
 const WORKER_THREAD_MULTIPLIER: usize = 4; // each plugin thread gets 4 worker threads
 
+#[derive(Clone, Copy)]
+struct ClickhouseSettings {
+    enabled: bool,
+    spawn_helper: bool,
+}
+
+impl ClickhouseSettings {
+    const fn new(enabled: bool, spawn_helper: bool) -> Self {
+        Self {
+            enabled,
+            spawn_helper,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ClickhouseMode {
+    Auto,
+    Disabled,
+    RemoteOnly,
+    Local,
+}
+
+fn resolve_clickhouse_settings(default_spawn_helper: bool) -> ClickhouseSettings {
+    let default_settings = ClickhouseSettings::new(true, default_spawn_helper);
+
+    if let Ok(raw_mode) = std::env::var("JETSTREAMER_CLICKHOUSE_MODE") {
+        match parse_clickhouse_mode(&raw_mode) {
+            Some(ClickhouseMode::Auto) => return default_settings,
+            Some(ClickhouseMode::Disabled) => {
+                return ClickhouseSettings::new(false, false);
+            }
+            Some(ClickhouseMode::RemoteOnly) => {
+                return ClickhouseSettings::new(true, false);
+            }
+            Some(ClickhouseMode::Local) => {
+                return ClickhouseSettings::new(true, true);
+            }
+            None => {
+                log::warn!(
+                    "Unrecognized JETSTREAMER_CLICKHOUSE_MODE value '{}'; falling back to legacy variables",
+                    raw_mode
+                );
+            }
+        }
+    }
+
+    let mut settings = default_settings;
+
+    if let Ok(no_clickhouse) = std::env::var("JETSTREAMER_NO_CLICKHOUSE") {
+        let disable = no_clickhouse == "1" || no_clickhouse.eq_ignore_ascii_case("true");
+        if disable {
+            return ClickhouseSettings::new(false, false);
+        }
+    }
+
+    if let Ok(spawn_override) = std::env::var("JETSTREAMER_SPAWN_CLICKHOUSE") {
+        settings.spawn_helper =
+            spawn_override != "0" && !spawn_override.eq_ignore_ascii_case("false");
+    }
+
+    settings
+}
+
+fn parse_clickhouse_mode(value: &str) -> Option<ClickhouseMode> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Some(ClickhouseMode::Auto);
+    }
+
+    let lowered = trimmed.to_ascii_lowercase();
+    match lowered.as_str() {
+        "auto" | "default" | "on" | "true" | "1" => Some(ClickhouseMode::Auto),
+        "off" | "disable" | "disabled" | "0" | "false" | "none" | "no" => {
+            Some(ClickhouseMode::Disabled)
+        }
+        "remote" | "external" | "no-spawn" | "no_spawn" | "nospawn" => {
+            Some(ClickhouseMode::RemoteOnly)
+        }
+        "local" | "spawn" | "helper" | "auto-spawn" | "autospawn" => Some(ClickhouseMode::Local),
+        _ => None,
+    }
+}
+
 /// Coordinates plugin execution against the firehose.
 ///
 /// Configure the runner with the builder-style methods and finish by calling
-/// [`JetstreamerRunner::run`].
+/// [`JetstreamerRunner::run`]. The runner also honours the process-level environment variables
+/// documented at the module level
+///
+/// ### Environment variables
+///
+/// [`JetstreamerRunner`] inspects a handful of environment variables at startup to fine-tune
+/// runtime behaviour:
+///
+/// - `JETSTREAMER_THREADS`: Number of firehose ingestion threads, defaulting to `1`.
+/// - `JETSTREAMER_CLICKHOUSE_DSN`: DSN for ClickHouse ingestion; defaults to
+///   `http://localhost:8123`.
+/// - `JETSTREAMER_CLICKHOUSE_MODE`: Controls ClickHouse integration. Accepted values are
+///   `auto` (default: enable output and spawn the helper only for local DSNs), `remote`
+///   (enable output but never spawn the helper), `local` (always request the helper), and
+///   `off` (disable ClickHouse entirely). Legacy variables `JETSTREAMER_NO_CLICKHOUSE` and
+///   `JETSTREAMER_SPAWN_CLICKHOUSE` remain supported for backward compatibility.
+///
+/// ### Example
+///
+/// ```no_run
+/// use jetstreamer::{JetstreamerRunner, plugin::Plugin};
+///
+/// struct Dummy;
+///
+/// impl Plugin for Dummy {
+///     fn name(&self) -> &'static str {
+///         "dummy"
+///     }
+/// }
+///
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// // Increase ingest parallelism and opt out of the embedded ClickHouse helper.
+/// unsafe {
+///     std::env::set_var("JETSTREAMER_THREADS", "4");
+///     std::env::set_var("JETSTREAMER_CLICKHOUSE_MODE", "remote");
+/// }
+///
+/// let runner = JetstreamerRunner::new()
+///     .with_plugin(Box::new(Dummy))
+///     .parse_cli_args()?;
+///
+/// runner.run().expect("runner execution");
+/// # Ok(())
+/// # }
+/// ```
 pub struct JetstreamerRunner {
     log_level: String,
     plugins: Vec<Box<dyn Plugin>>,
@@ -38,7 +166,8 @@ impl Default for JetstreamerRunner {
     fn default() -> Self {
         let clickhouse_dsn = std::env::var("JETSTREAMER_CLICKHOUSE_DSN")
             .unwrap_or_else(|_| "http://localhost:8123".to_string());
-        let spawn_clickhouse = should_spawn_for_dsn(&clickhouse_dsn);
+        let default_spawn = should_spawn_for_dsn(&clickhouse_dsn);
+        let clickhouse_settings = resolve_clickhouse_settings(default_spawn);
         Self {
             log_level: "info".to_string(),
             plugins: Vec::new(),
@@ -46,8 +175,8 @@ impl Default for JetstreamerRunner {
             config: Config {
                 threads: 1,
                 slot_range: 0..0,
-                clickhouse_enabled: true,
-                spawn_clickhouse,
+                clickhouse_enabled: clickhouse_settings.enabled,
+                spawn_clickhouse: clickhouse_settings.spawn_helper && clickhouse_settings.enabled,
             },
         }
     }
@@ -224,6 +353,25 @@ pub struct Config {
 }
 
 /// Parses command-line arguments and environment variables into a [`Config`].
+///
+/// The following environment variables are inspected:
+/// - `JETSTREAMER_CLICKHOUSE_MODE`: Controls ClickHouse integration. Accepts `auto`, `remote`,
+///   `local`, or `off`. When unspecified, legacy variables `JETSTREAMER_NO_CLICKHOUSE` and
+///   `JETSTREAMER_SPAWN_CLICKHOUSE` are still honoured.
+/// - `JETSTREAMER_THREADS`: Number of firehose ingestion threads.
+///
+/// # Examples
+///
+/// ```no_run
+/// # use jetstreamer::parse_cli_args;
+/// # unsafe {
+/// #     std::env::set_var("JETSTREAMER_THREADS", "3");
+/// #     std::env::set_var("JETSTREAMER_CLICKHOUSE_MODE", "off");
+/// # }
+/// let config = parse_cli_args().expect("env and CLI parsed");
+/// assert_eq!(config.threads, 3);
+/// assert!(!config.clickhouse_enabled);
+/// ```
 pub fn parse_cli_args() -> Result<Config, Box<dyn std::error::Error>> {
     let first_arg = std::env::args().nth(1).expect("no first argument given");
     let slot_range = if first_arg.contains(':') {
@@ -240,18 +388,15 @@ pub fn parse_cli_args() -> Result<Config, Box<dyn std::error::Error>> {
         start_slot..end_slot
     };
 
-    let clickhouse_enabled = std::env::var("JETSTREAMER_NO_CLICKHOUSE")
-        .map(|v| v != "1" && !v.eq_ignore_ascii_case("true"))
-        .unwrap_or(true);
+    let clickhouse_settings = resolve_clickhouse_settings(true);
+    let clickhouse_enabled = clickhouse_settings.enabled;
 
     let threads = std::env::var("JETSTREAMER_THREADS")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(1);
 
-    let spawn_clickhouse = std::env::var("JETSTREAMER_SPAWN_CLICKHOUSE")
-        .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
-        .unwrap_or(true);
+    let spawn_clickhouse = clickhouse_settings.spawn_helper && clickhouse_enabled;
 
     Ok(Config {
         threads,

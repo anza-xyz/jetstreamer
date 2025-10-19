@@ -1,3 +1,31 @@
+//! Helpers for resolving and loading compact index artifacts for the firehose replay engine.
+//!
+//! ## Environment variables
+//!
+//! - `JETSTREAMER_COMPACT_INDEX_BASE_URL`: Preferred base URL for compact index files.
+//! - `JETSTREAMER_OFFSET_BASE_URL`: Legacy alias used when the primary variable is unset.
+//! - `JETSTREAMER_NETWORK`: Network suffix appended to on-disk cache keys and remote filenames.
+//!
+//! ### Example
+//!
+//! ```no_run
+//! use jetstreamer_firehose::index::{get_index_base_url, SlotOffsetIndex};
+//!
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! unsafe {
+//!     std::env::set_var("JETSTREAMER_NETWORK", "testnet");
+//!     std::env::set_var(
+//!         "JETSTREAMER_COMPACT_INDEX_BASE_URL",
+//!         "https://mirror.example.com/indexes",
+//!     );
+//! }
+//!
+//! let base = get_index_base_url()?;
+//! let index = SlotOffsetIndex::new(base)?;
+//! # let _ = index.base_url();
+//! # Ok(())
+//! # }
+//! ```
 use crate::epochs::{BASE_URL, epoch_to_slot_range, slot_to_epoch};
 use cid::{Cid, multibase::Base};
 use dashmap::{DashMap, mapref::entry::Entry};
@@ -161,6 +189,9 @@ impl EpochIndex {
 
 impl SlotOffsetIndex {
     /// Constructs a new [`SlotOffsetIndex`] rooted at the provided base URL.
+    ///
+    /// The [`SlotOffsetIndex`] uses the `JETSTREAMER_NETWORK` variable to scope cache keys and
+    /// remote filenames. When unset, the network defaults to `mainnet`.
     pub fn new(base_url: Url) -> Result<Self, SlotOffsetIndexError> {
         let network =
             std::env::var("JETSTREAMER_NETWORK").unwrap_or_else(|_| "mainnet".to_string());
@@ -858,6 +889,23 @@ fn parse_metadata(data: &[u8]) -> Result<HashMap<Vec<u8>, Vec<u8>>, String> {
 }
 
 /// Resolves the base URL used when constructing the global [`SLOT_OFFSET_INDEX`].
+///
+/// The resolution order is:
+/// 1. `JETSTREAMER_COMPACT_INDEX_BASE_URL`
+/// 2. `JETSTREAMER_OFFSET_BASE_URL` (legacy)
+/// 3. The built-in [`BASE_URL`], pointing at Old Faithful's public mirror.
+///
+/// # Examples
+///
+/// ```no_run
+/// # use jetstreamer_firehose::index::get_index_base_url;
+/// unsafe {
+///     std::env::set_var("JETSTREAMER_COMPACT_INDEX_BASE_URL", "https://mirror.example.com/indexes");
+/// }
+///
+/// let base = get_index_base_url().expect("valid URL");
+/// assert_eq!(base.as_str(), "https://mirror.example.com/indexes");
+/// ```
 pub fn get_index_base_url() -> Result<Url, SlotOffsetIndexError> {
     let base = std::env::var("JETSTREAMER_COMPACT_INDEX_BASE_URL")
         .or_else(|_| std::env::var("JETSTREAMER_OFFSET_BASE_URL"))

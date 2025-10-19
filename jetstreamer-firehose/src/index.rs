@@ -5,9 +5,9 @@ use log::{info, warn};
 use once_cell::sync::Lazy;
 use reqwest::{Client, StatusCode, Url, header::RANGE};
 use serde_cbor::Value;
-use std::{collections::HashMap, future::Future, ops::Range, sync::Arc};
+use std::{collections::HashMap, future::Future, ops::Range, sync::Arc, time::Duration};
 use thiserror::Error;
-use tokio::sync::OnceCell;
+use tokio::{sync::OnceCell, time::sleep};
 use xxhash_rust::xxh64::xxh64;
 
 const COMPACT_INDEX_MAGIC: &[u8; 8] = b"compiszd";
@@ -18,6 +18,8 @@ const CID_TO_OFFSET_KIND: &[u8] = b"cid-to-offset-and-size";
 const METADATA_KEY_KIND: &[u8] = b"index_kind";
 const METADATA_KEY_EPOCH: &[u8] = b"epoch";
 const HTTP_PREFETCH_BYTES: u64 = 4 * 1024; // initial bytes to fetch for headers
+const FETCH_RANGE_MAX_RETRIES: usize = 5;
+const FETCH_RANGE_BASE_DELAY_MS: u64 = 500;
 
 #[derive(Debug, Error)]
 pub enum SlotOffsetIndexError {
@@ -746,36 +748,64 @@ async fn fetch_range(
         return Ok(Vec::new());
     }
     let range_header = format!("bytes={start}-{end}");
-    let response = client
-        .get(url.clone())
-        .header(RANGE, range_header)
-        .send()
-        .await
-        .map_err(|err| SlotOffsetIndexError::NetworkError(url.clone(), err))?;
+    let mut attempt = 0usize;
+    loop {
+        let response = client
+            .get(url.clone())
+            .header(RANGE, range_header.clone())
+            .send()
+            .await
+            .map_err(|err| SlotOffsetIndexError::NetworkError(url.clone(), err))?;
 
-    if response.status() == StatusCode::NOT_FOUND {
-        return Err(SlotOffsetIndexError::EpochIndexFileNotFound(url.clone()));
-    }
+        if response.status() == StatusCode::NOT_FOUND {
+            return Err(SlotOffsetIndexError::EpochIndexFileNotFound(url.clone()));
+        }
 
-    if !(response.status().is_success() || response.status() == StatusCode::PARTIAL_CONTENT) {
-        return Err(SlotOffsetIndexError::HttpStatusError(
-            url.clone(),
-            response.status(),
-        ));
-    }
+        if response.status() == StatusCode::TOO_MANY_REQUESTS
+            || response.status() == StatusCode::SERVICE_UNAVAILABLE
+        {
+            if attempt < FETCH_RANGE_MAX_RETRIES {
+                let delay_ms = FETCH_RANGE_BASE_DELAY_MS.saturating_mul(1u64 << attempt.min(10));
+                warn!(
+                    "HTTP {} fetching {} (range {}-{}); retrying in {} ms (attempt {}/{})",
+                    response.status(),
+                    url,
+                    start,
+                    end,
+                    delay_ms,
+                    attempt + 1,
+                    FETCH_RANGE_MAX_RETRIES
+                );
+                sleep(Duration::from_millis(delay_ms)).await;
+                attempt += 1;
+                continue;
+            }
+            return Err(SlotOffsetIndexError::HttpStatusError(
+                url.clone(),
+                response.status(),
+            ));
+        }
 
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|err| SlotOffsetIndexError::NetworkError(url.clone(), err))?;
-    let expected = (end - start + 1) as usize;
-    if exact && bytes.len() != expected {
-        return Err(SlotOffsetIndexError::IndexFormatError(
-            url.clone(),
-            format!("expected {expected} bytes, got {}", bytes.len()),
-        ));
+        if !(response.status().is_success() || response.status() == StatusCode::PARTIAL_CONTENT) {
+            return Err(SlotOffsetIndexError::HttpStatusError(
+                url.clone(),
+                response.status(),
+            ));
+        }
+
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|err| SlotOffsetIndexError::NetworkError(url.clone(), err))?;
+        let expected = (end - start + 1) as usize;
+        if exact && bytes.len() != expected {
+            return Err(SlotOffsetIndexError::IndexFormatError(
+                url.clone(),
+                format!("expected {expected} bytes, got {}", bytes.len()),
+            ));
+        }
+        return Ok(bytes.to_vec());
     }
-    Ok(bytes.to_vec())
 }
 
 fn parse_metadata(data: &[u8]) -> Result<HashMap<Vec<u8>, Vec<u8>>, String> {

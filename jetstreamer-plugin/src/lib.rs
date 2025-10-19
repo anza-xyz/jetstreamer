@@ -7,12 +7,13 @@ use std::{
     pin::Pin,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
 
 use clickhouse::{Client, Row};
+use dashmap::DashMap;
 use futures_util::FutureExt;
 use jetstreamer_firehose::firehose::{
     BlockData, EntryData, RewardsData, Stats, StatsTracking, TransactionData, firehose,
@@ -170,6 +171,7 @@ pub struct PluginRunner {
     plugins: Arc<Vec<Arc<dyn Plugin>>>,
     clickhouse_dsn: String,
     num_threads: usize,
+    db_update_interval_slots: u64,
 }
 
 impl PluginRunner {
@@ -178,6 +180,7 @@ impl PluginRunner {
             plugins: Arc::new(Vec::new()),
             clickhouse_dsn: clickhouse_dsn.to_string(),
             num_threads: std::cmp::max(1, num_threads),
+            db_update_interval_slots: 100,
         }
     }
 
@@ -192,6 +195,7 @@ impl PluginRunner {
         slot_range: Range<u64>,
         clickhouse_enabled: bool,
     ) -> Result<(), PluginRunnerError> {
+        let db_update_interval = self.db_update_interval_slots.max(1);
         let plugin_handles: Arc<Vec<PluginHandle>> = Arc::new(
             self.plugins
                 .iter()
@@ -230,14 +234,25 @@ impl PluginRunner {
         }
 
         let shutting_down = Arc::new(AtomicBool::new(false));
+        let slot_buffer: Arc<DashMap<u16, Vec<PluginSlotRow>>> = Arc::new(DashMap::new());
+        let clickhouse_enabled = clickhouse.is_some();
+        let slots_since_flush = Arc::new(AtomicU64::new(0));
 
         let on_block = {
             let plugin_handles = plugin_handles.clone();
             let clickhouse = clickhouse.clone();
+            let slot_buffer = slot_buffer.clone();
+            let clickhouse_enabled = clickhouse_enabled;
+            let slots_since_flush = slots_since_flush.clone();
+            let db_update_interval = db_update_interval;
             let shutting_down = shutting_down.clone();
             move |thread_id: usize, block: BlockData| {
                 let plugin_handles = plugin_handles.clone();
                 let clickhouse = clickhouse.clone();
+                let slot_buffer = slot_buffer.clone();
+                let clickhouse_enabled = clickhouse_enabled;
+                let slots_since_flush = slots_since_flush.clone();
+                let db_update_interval = db_update_interval;
                 let shutting_down = shutting_down.clone();
                 async move {
                     if plugin_handles.is_empty() {
@@ -261,13 +276,35 @@ impl PluginRunner {
                         if let (Some(db_client), BlockData::Block { slot, .. }) =
                             (clickhouse.clone(), block.as_ref())
                         {
-                            if let Err(err) = record_plugin_slot(db_client, handle.id, *slot).await
+                            if clickhouse_enabled {
+                                slot_buffer.entry(handle.id).or_insert_with(Vec::new).push(
+                                    PluginSlotRow {
+                                        plugin_id: handle.id as u32,
+                                        slot: *slot,
+                                    },
+                                );
+                            } else if let Err(err) =
+                                record_plugin_slot(db_client, handle.id, *slot).await
                             {
                                 log::error!(
                                     "failed to record plugin slot for {}: {}",
                                     handle.name,
                                     err
                                 );
+                            }
+                        }
+                    }
+                    if clickhouse_enabled {
+                        let current = slots_since_flush
+                            .fetch_add(1, Ordering::Relaxed)
+                            .wrapping_add(1);
+                        if current % db_update_interval == 0 {
+                            if let Some(db_client) = clickhouse.clone() {
+                                if let Err(err) =
+                                    flush_slot_buffer(db_client, slot_buffer.clone()).await
+                                {
+                                    log::error!("failed to flush buffered plugin slots: {}", err);
+                                }
                             }
                         }
                     }
@@ -524,6 +561,14 @@ impl PluginRunner {
             }
         };
 
+        if clickhouse_enabled {
+            if let Some(db_client) = clickhouse.clone() {
+                if let Err(err) = flush_slot_buffer(db_client, slot_buffer.clone()).await {
+                    log::error!("failed to flush buffered plugin slots: {}", err);
+                }
+            }
+        }
+
         for handle in plugin_handles.iter() {
             if let Err(error) = handle
                 .plugin
@@ -672,6 +717,28 @@ async fn record_plugin_slot(
             slot,
         })
         .await?;
+    insert.end().await?;
+    Ok(())
+}
+
+async fn flush_slot_buffer(
+    db: Arc<Client>,
+    buffer: Arc<DashMap<u16, Vec<PluginSlotRow>>>,
+) -> Result<(), clickhouse::error::Error> {
+    let mut pending = Vec::new();
+    for mut entry in buffer.iter_mut() {
+        if !entry.value().is_empty() {
+            pending.extend(entry.value_mut().drain(..));
+        }
+    }
+    if pending.is_empty() {
+        return Ok(());
+    }
+
+    let mut insert = db.insert("jetstreamer_plugin_slots")?;
+    for row in pending {
+        insert.write(&row).await?;
+    }
     insert.end().await?;
     Ok(())
 }

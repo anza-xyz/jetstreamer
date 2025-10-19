@@ -3133,6 +3133,7 @@ name = "jetstreamer-plugin"
 version = "0.1.0"
 dependencies = [
  "clickhouse",
+ "dashmap",
  "futures-util",
  "jetstreamer-firehose",
  "log",

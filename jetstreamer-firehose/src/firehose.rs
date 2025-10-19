@@ -204,6 +204,7 @@ pub struct Stats {
     pub transactions_processed: u64,
     pub entries_processed: u64,
     pub rewards_processed: u64,
+    pub transactions_since_last_pulse: u64,
 }
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
@@ -221,12 +222,14 @@ async fn maybe_emit_stats<OnStats: Handler<Stats>>(
     overall_blocks_processed: &AtomicU64,
     overall_transactions_processed: &AtomicU64,
     overall_entries_processed: &AtomicU64,
+    transactions_since_stats: &AtomicU64,
 ) -> Result<(), (FirehoseError, u64)> {
     if let Some(stats_tracker) = stats_tracking {
         let total_slots = overall_slots_processed.load(Ordering::Relaxed);
         let total_blocks = overall_blocks_processed.load(Ordering::Relaxed);
         let total_transactions = overall_transactions_processed.load(Ordering::Relaxed);
         let total_entries = overall_entries_processed.load(Ordering::Relaxed);
+        let processed_transactions = transactions_since_stats.swap(0, Ordering::Relaxed);
 
         let stats = Stats {
             thread_stats: thread_stats.clone(),
@@ -239,6 +242,7 @@ async fn maybe_emit_stats<OnStats: Handler<Stats>>(
             transactions_processed: total_transactions,
             entries_processed: total_entries,
             rewards_processed: thread_stats.rewards_processed,
+            transactions_since_last_pulse: processed_transactions,
         };
 
         (stats_tracker.on_stats)(thread_index, stats)
@@ -406,10 +410,13 @@ where
         let overall_transactions_processed = overall_transactions_processed.clone();
         let overall_entries_processed = overall_entries_processed.clone();
         let stats_tracking = stats_tracking.clone();
+        let transactions_since_stats = Arc::new(AtomicU64::new(0));
+        let transactions_since_stats_cloned = transactions_since_stats.clone();
         let shutdown_flag = shutdown_flag.clone();
         let thread_shutdown_rx = shutdown_signal.as_ref().map(|rx| rx.resubscribe());
 
         let handle = tokio::spawn(async move {
+            let transactions_since_stats = transactions_since_stats_cloned;
             let mut shutdown_rx = thread_shutdown_rx;
             let start_time = std::time::Instant::now();
             let log_target = format!("{}::T{:03}", LOG_MODULE, thread_index);
@@ -761,6 +768,7 @@ where
                                     if let Some(ref mut stats) = thread_stats {
                                         stats.transactions_processed += 1;
                                     }
+                                    transactions_since_stats.fetch_add(1, Ordering::Relaxed);
                                 }
                                 Entry(entry) => {
                                     let entry_hash = Hash::from(entry.hash.to_bytes());
@@ -896,6 +904,7 @@ where
                                                 &overall_blocks_processed,
                                                 &overall_transactions_processed,
                                                 &overall_entries_processed,
+                                                &transactions_since_stats,
                                             )
                                             .await?;
                                         }
@@ -1036,6 +1045,7 @@ where
                             &overall_blocks_processed,
                             &overall_transactions_processed,
                             &overall_entries_processed,
+                            &transactions_since_stats,
                         )
                         .await?;
                     }

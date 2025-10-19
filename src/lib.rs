@@ -102,8 +102,10 @@ impl JetstreamerRunner {
             .build()
             .expect("failed to build plugin runtime");
 
+        let mut clickhouse_task: Option<tokio::task::JoinHandle<Result<(), ()>>> = None;
+
         if spawn_clickhouse {
-            runtime.block_on(async {
+            clickhouse_task = Some(runtime.block_on(async {
                 let (mut ready_rx, clickhouse_future) =
                     jetstreamer_utils::start().await.map_err(|err| {
                         PluginRunnerError::PluginLifecycle {
@@ -122,15 +124,19 @@ impl JetstreamerRunner {
                         details: "ClickHouse readiness signal channel closed unexpectedly".into(),
                     })?;
 
-                tokio::spawn(async move {
+                Ok::<_, PluginRunnerError>(tokio::spawn(async move {
                     match clickhouse_future.await {
-                        Ok(()) => log::info!("ClickHouse process exited gracefully."),
-                        Err(()) => log::error!("ClickHouse process exited with an error."),
+                        Ok(()) => {
+                            log::info!("ClickHouse process exited gracefully.");
+                            Ok(())
+                        }
+                        Err(()) => {
+                            log::error!("ClickHouse process exited with an error.");
+                            Err(())
+                        }
                     }
-                });
-
-                Ok::<(), PluginRunnerError>(())
-            })?;
+                }))
+            })?);
         } else if clickhouse_enabled {
             if !self.config.spawn_clickhouse {
                 log::info!(
@@ -148,7 +154,15 @@ impl JetstreamerRunner {
         let result = runtime.block_on(runner.run(slot_range.clone(), clickhouse_enabled));
 
         if spawn_clickhouse {
-            jetstreamer_utils::stop_sync();
+            let handle = clickhouse_task.take();
+            runtime.block_on(async move {
+                jetstreamer_utils::stop().await;
+                if let Some(handle) = handle {
+                    if let Err(err) = handle.await {
+                        log::warn!("ClickHouse monitor task aborted: {}", err);
+                    }
+                }
+            });
         }
 
         match result {

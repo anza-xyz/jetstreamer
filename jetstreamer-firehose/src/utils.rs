@@ -9,6 +9,7 @@ use {
 
 const MAX_VARINT_LEN_64: usize = 10;
 
+/// Reads an unsigned LEB128-encoded integer from the provided reader.
 pub fn read_uvarint<R: Read>(reader: &mut R) -> io::Result<u64> {
     let mut x = 0u64;
     let mut s = 0u32;
@@ -41,8 +42,12 @@ pub fn read_uvarint<R: Read>(reader: &mut R) -> io::Result<u64> {
     ))
 }
 
+/// Owner type for 32-byte hashes that renders them as lowercase hex.
 #[derive(Clone, PartialEq, Eq, Hash)]
-pub struct Hash(pub Vec<u8>);
+pub struct Hash(
+    #[doc = "Underlying bytes comprising the hash."]
+    pub Vec<u8>,
+);
 
 // debug converts the hash to hex
 impl std::fmt::Debug for Hash {
@@ -96,14 +101,21 @@ impl<'de> serde::Deserialize<'de> for Hash {
 }
 
 impl Hash {
+    /// Returns the hash bytes as a `Vec<u8>`.
     pub fn to_vec(&self) -> Vec<u8> {
         self.0.clone()
     }
 
+    /// Constructs a [`struct@Hash`] from owned bytes.
     pub fn from_vec(data: Vec<u8>) -> Hash {
         Hash(data)
     }
 
+    /// Returns the hash as a 32-byte array.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the underlying byte slice is shorter than 32 bytes.
     pub fn to_bytes(&self) -> [u8; 32] {
         let mut bytes = [0u8; 32];
         bytes[..32].copy_from_slice(&self.0[..32]);
@@ -111,18 +123,29 @@ impl Hash {
     }
 }
 
+/// Growable binary buffer with base64 formatting helpers.
 #[derive(Default, Clone, PartialEq, Eq, Hash)]
-pub struct Buffer(Vec<u8>);
+pub struct Buffer(
+    #[doc = "Owned bytes stored in the buffer."]
+    Vec<u8>,
+);
 
 impl Buffer {
+    /// Creates an empty buffer.
     pub fn new() -> Buffer {
         Buffer(vec![])
     }
 
+    /// Appends `data` to the buffer.
     pub fn write(&mut self, data: Vec<u8>) {
         self.0.extend(data);
     }
 
+    /// Removes and returns `len` bytes from the front of the buffer.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `len` exceeds the available bytes.
     pub fn read(&mut self, len: usize) -> Vec<u8> {
         let mut data = vec![];
         for _ in 0..len {
@@ -131,18 +154,22 @@ impl Buffer {
         data
     }
 
+    /// Returns the buffer length in bytes.
     pub fn len(&self) -> usize {
         self.0.len()
     }
 
+    /// Returns `true` if the buffer is empty.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
+    /// Returns the buffer contents as a `Vec<u8>`.
     pub fn to_vec(&self) -> Vec<u8> {
         self.0.clone()
     }
 
+    /// Creates a buffer from owned bytes.
     pub fn from_vec(data: Vec<u8>) -> Buffer {
         Buffer(data)
     }
@@ -180,8 +207,10 @@ impl<'de> serde::Deserialize<'de> for Buffer {
     }
 }
 
+/// Maximum Old Faithful CAR section size permitted while parsing (32 MiB).
 pub const MAX_ALLOWED_SECTION_SIZE: usize = 32 << 20; // 32MiB
 
+/// Decompresses a Zstandard byte stream.
 pub fn decompress_zstd(data: Vec<u8>) -> Result<Vec<u8>, Box<dyn Error>> {
     let mut decoder = zstd::Decoder::new(&data[..])?;
     let mut decompressed = Vec::new();

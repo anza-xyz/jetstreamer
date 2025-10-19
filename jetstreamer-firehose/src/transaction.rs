@@ -11,23 +11,30 @@ use {
 // 	Slot     int
 // 	Index    **int
 // }
+/// Representation of a `Kind::Transaction` node containing the raw wire data.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct Transaction {
+    /// Kind discriminator copied from the CBOR payload.
     pub kind: u64,
+    /// Binary transaction payload stored as a [`DataFrame`].
     pub data: DataFrame,
+    /// Associated metadata payload stored as a [`DataFrame`].
     pub metadata: DataFrame,
+    /// Slot that produced the transaction.
     pub slot: u64,
+    /// Optional within-slot transaction index.
     pub index: Option<u64>,
 }
 
 impl Transaction {
+    /// Decodes a [`Transaction`] from raw CBOR bytes.
     pub fn from_bytes(data: Vec<u8>) -> Result<Transaction, Box<dyn Error>> {
         let decoded_data: serde_cbor::Value = serde_cbor::from_slice(&data).unwrap();
         let transaction = Transaction::from_cbor(decoded_data)?;
         Ok(transaction)
     }
 
-    // from serde_cbor::Value
+    /// Decodes a [`Transaction`] from a CBOR [`serde_cbor::Value`].
     pub fn from_cbor(val: serde_cbor::Value) -> Result<Transaction, Box<dyn Error>> {
         let mut transaction = Transaction {
             kind: 0,
@@ -86,6 +93,7 @@ impl Transaction {
         Ok(transaction)
     }
 
+    /// Renders the transaction as a JSON object for debugging.
     pub fn to_json(&self) -> serde_json::Value {
         let mut map = serde_json::Map::new();
         map.insert("kind".to_string(), serde_json::Value::from(self.kind));
@@ -97,17 +105,18 @@ impl Transaction {
         serde_json::Value::from(map)
     }
 
+    /// Deserializes the transaction payload into a [`solana_sdk::transaction::VersionedTransaction`].
     pub fn as_parsed(
         &self,
     ) -> Result<solana_sdk::transaction::VersionedTransaction, Box<dyn Error>> {
         Ok(deserialize(&self.data.data.to_vec())?)
     }
 
-    /// Returns whether the transaction dataframe is complete or is split into multiple dataframes.
+    /// Returns `true` when the transaction data frame has no continuation CIDs.
     pub fn is_complete_data(&self) -> bool {
         self.data.next.is_none() || self.data.next.as_ref().unwrap().is_empty()
     }
-    /// Returns whether the transaction metadata is complete or is split into multiple dataframes.
+    /// Returns `true` when the transaction metadata frame has no continuation CIDs.
     pub fn is_complete_metadata(&self) -> bool {
         self.metadata.next.is_none() || self.metadata.next.as_ref().unwrap().is_empty()
     }

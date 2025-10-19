@@ -1,3 +1,6 @@
+#![deny(missing_docs)]
+//! Application runner for Jetstreamer firehose plugins.
+
 use core::ops::Range;
 use jetstreamer_firehose::{epochs::slot_to_epoch, index::get_index_base_url};
 use jetstreamer_plugin::{Plugin, PluginRunner, PluginRunnerError};
@@ -6,6 +9,10 @@ use std::sync::Arc;
 
 const WORKER_THREAD_MULTIPLIER: usize = 4; // each plugin thread gets 4 worker threads
 
+/// Coordinates plugin execution against the firehose.
+///
+/// Configure the runner with the builder-style methods and finish by calling
+/// [`JetstreamerRunner::run`].
 pub struct JetstreamerRunner {
     log_level: String,
     plugins: Vec<Box<dyn Plugin>>,
@@ -33,36 +40,43 @@ impl Default for JetstreamerRunner {
 }
 
 impl JetstreamerRunner {
+    /// Creates a [`JetstreamerRunner`] with default configuration.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Overrides the log level used when initializing `solana_logger`.
     pub fn with_log_level(mut self, log_level: impl Into<String>) -> Self {
         self.log_level = log_level.into();
         solana_logger::setup_with_default(&self.log_level);
         self
     }
 
+    /// Registers an additional [`Plugin`] to receive firehose events.
     pub fn with_plugin(mut self, plugin: Box<dyn Plugin>) -> Self {
         self.plugins.push(plugin);
         self
     }
 
+    /// Restricts [`JetstreamerRunner::run`] to a specific slot range.
     pub fn with_slot_range(mut self, slot_range: Range<u64>) -> Self {
         self.config.slot_range = slot_range;
         self
     }
 
+    /// Sets the ClickHouse DSN passed to [`PluginRunner::new`].
     pub fn with_clickhouse_dsn(mut self, clickhouse_dsn: impl Into<String>) -> Self {
         self.clickhouse_dsn = clickhouse_dsn.into();
         self
     }
 
+    /// Replaces the current [`Config`] with values parsed from CLI arguments and the environment.
     pub fn parse_cli_args(mut self) -> Result<Self, Box<dyn std::error::Error>> {
         self.config = parse_cli_args()?;
         Ok(self)
     }
 
+    /// Builds the plugin runtime and streams blocks through every registered [`Plugin`].
     pub fn run(self) -> Result<(), PluginRunnerError> {
         solana_logger::setup_with_default(&self.log_level);
 
@@ -182,6 +196,7 @@ impl JetstreamerRunner {
     }
 }
 
+/// Runtime configuration for [`JetstreamerRunner`].
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Config {
     /// Number of simultaneous firehose streams to spawn.
@@ -194,6 +209,7 @@ pub struct Config {
     pub spawn_clickhouse: bool,
 }
 
+/// Parses command-line arguments and environment variables into a [`Config`].
 pub fn parse_cli_args() -> Result<Config, Box<dyn std::error::Error>> {
     let first_arg = std::env::args().nth(1).expect("no first argument given");
     let slot_range = if first_arg.contains(':') {

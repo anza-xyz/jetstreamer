@@ -6,15 +6,20 @@ use tokio::io::{AsyncRead, AsyncSeek, BufReader};
 
 use crate::node_reader::Len;
 
+/// Default base URL used to fetch compact epoch CAR archives hosted by Old Faithful.
 pub const BASE_URL: &str = "https://files.old-faithful.net";
 
 #[inline(always)]
+/// Returns the inclusive slot range covered by a Solana epoch.
+///
+/// The tuple contains the first slot and the final slot of the epoch.
 pub const fn epoch_to_slot_range(epoch: u64) -> (u64, u64) {
     let first = epoch * 432000;
     (first, first + 431999)
 }
 
 #[inline(always)]
+/// Converts a slot back into the epoch that contains it.
 pub const fn slot_to_epoch(slot: u64) -> u64 {
     slot / 432000
 }
@@ -29,6 +34,7 @@ impl<T: Len + AsyncRead> Len for BufReader<T> {
     }
 }
 
+/// Checks [`BASE_URL`] to determine whether the Old Faithful CAR archive for an epoch exists.
 pub async fn epoch_exists(epoch: u64, client: &Client) -> bool {
     let url = format!("{}/{}/epoch-{}.car", BASE_URL, epoch, epoch);
     let response = client.head(&url).send().await;
@@ -38,7 +44,10 @@ pub async fn epoch_exists(epoch: u64, client: &Client) -> bool {
     }
 }
 
-/// Fetch an epoch’s CAR file as a **buffered, seek-able** async stream.
+/// Fetches an epoch’s CAR file from Old Faithful as a buffered, seekable async stream.
+///
+/// The returned reader implements [`Len`] and can be consumed sequentially or
+/// randomly via [`AsyncSeek`].
 pub async fn fetch_epoch_stream(epoch: u64, client: &Client) -> impl AsyncRead + AsyncSeek + Len {
     let client = client.clone();
     let seekable =
@@ -48,11 +57,16 @@ pub async fn fetch_epoch_stream(epoch: u64, client: &Client) -> impl AsyncRead +
     BufReader::with_capacity(8 * 1024 * 1024, seekable)
 }
 
+/// Errors that can occur when calling [`get_slot_timestamp`].
 #[derive(Debug)]
 pub enum SlotTimestampError {
+    /// Network request failed while contacting the RPC endpoint.
     Transport(reqwest::Error),
+    /// JSON payload could not be decoded.
     Decode(serde_json::Error),
+    /// RPC returned an error object instead of a result.
     Rpc(Option<serde_json::Value>),
+    /// The RPC response did not include a block time.
     NoBlockTime,
 }
 impl fmt::Display for SlotTimestampError {

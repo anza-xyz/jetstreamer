@@ -21,26 +21,36 @@ const HTTP_PREFETCH_BYTES: u64 = 4 * 1024; // initial bytes to fetch for headers
 const FETCH_RANGE_MAX_RETRIES: usize = 10;
 const FETCH_RANGE_BASE_DELAY_MS: u64 = 2000;
 
+/// Errors returned while accessing the compact slot offset index.
 #[derive(Debug, Error)]
 pub enum SlotOffsetIndexError {
+    /// Environment provided an invalid base URL.
     #[error("invalid index base URL: {0}")]
     InvalidBaseUrl(String),
+    /// Constructed index URL is invalid.
     #[error("invalid index URL: {0}")]
     InvalidIndexUrl(String),
+    /// Epoch index file was not found at the expected location.
     #[error("epoch index file not found: {0}")]
     EpochIndexFileNotFound(Url),
+    /// Slot was not present in the index.
     #[error("slot {0} not found in index {1}")]
     SlotNotFound(u64, Url),
+    /// Request failed while fetching the index.
     #[error("network error while fetching {0}: {1}")]
     NetworkError(Url, #[source] reqwest::Error),
+    /// Unexpected HTTP status returned while fetching index data.
     #[error("unexpected HTTP status {1} when fetching {0}")]
     HttpStatusError(Url, StatusCode),
+    /// Index payload was malformed.
     #[error("invalid index format at {0}: {1}")]
     IndexFormatError(Url, String),
+    /// CAR header could not be read or decoded.
     #[error("failed to read CAR header {0}: {1}")]
     CarHeaderError(Url, String),
 }
 
+/// Lazily constructed global [`SlotOffsetIndex`] that honors environment configuration.
 pub static SLOT_OFFSET_INDEX: Lazy<SlotOffsetIndex> = Lazy::new(|| {
     let base_url =
         get_index_base_url().expect("JETSTREAMER_COMPACT_INDEX_BASE_URL must be a valid URL");
@@ -65,6 +75,7 @@ impl EpochCacheKey {
     }
 }
 
+/// Looks up the byte offset of a slot within Old Faithful firehose CAR archives.
 pub async fn slot_to_offset(slot: u64) -> Result<u64, SlotOffsetIndexError> {
     if let Some(offset) = SLOT_OFFSET_RESULT_CACHE.get(&slot) {
         return Ok(*offset);
@@ -75,6 +86,7 @@ pub async fn slot_to_offset(slot: u64) -> Result<u64, SlotOffsetIndexError> {
     Ok(offset)
 }
 
+/// Client that resolves slot offsets using compact CAR index files from Old Faithful.
 pub struct SlotOffsetIndex {
     client: Client,
     base_url: Url,
@@ -148,6 +160,7 @@ impl EpochIndex {
 }
 
 impl SlotOffsetIndex {
+    /// Constructs a new [`SlotOffsetIndex`] rooted at the provided base URL.
     pub fn new(base_url: Url) -> Result<Self, SlotOffsetIndexError> {
         let network =
             std::env::var("JETSTREAMER_NETWORK").unwrap_or_else(|_| "mainnet".to_string());
@@ -161,6 +174,7 @@ impl SlotOffsetIndex {
         })
     }
 
+    /// Returns the base URL that remote index files are fetched from.
     pub fn base_url(&self) -> &Url {
         &self.base_url
     }
@@ -257,6 +271,7 @@ impl SlotOffsetIndex {
         Ok((slot_index, cid_index))
     }
 
+    /// Resolves the byte offset of `slot` within its Old Faithful CAR archive.
     pub async fn get_offset(&self, slot: u64) -> Result<u64, SlotOffsetIndexError> {
         let epoch = slot_to_epoch(slot);
         let epoch_index = self.get_epoch(epoch).await?;
@@ -842,6 +857,7 @@ fn parse_metadata(data: &[u8]) -> Result<HashMap<Vec<u8>, Vec<u8>>, String> {
     Ok(map)
 }
 
+/// Resolves the base URL used when constructing the global [`SLOT_OFFSET_INDEX`].
 pub fn get_index_base_url() -> Result<Url, SlotOffsetIndexError> {
     let base = std::env::var("JETSTREAMER_COMPACT_INDEX_BASE_URL")
         .or_else(|_| std::env::var("JETSTREAMER_OFFSET_BASE_URL"))

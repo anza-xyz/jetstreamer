@@ -45,6 +45,7 @@ struct ProgramStats {
 }
 
 #[derive(Debug, Default, Clone)]
+/// Tracks per-program invocation counts and writes them to ClickHouse.
 pub struct ProgramTrackingPlugin;
 
 impl Plugin for ProgramTrackingPlugin {

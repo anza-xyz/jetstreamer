@@ -1,3 +1,7 @@
+#![deny(missing_docs)]
+//! Plugin framework for processing Jetstreamer firehose data.
+
+/// Built-in plugin implementations that ship with Jetstreamer.
 pub mod plugins;
 
 use std::{
@@ -93,8 +97,10 @@ impl SnapshotWindow {
     }
 }
 
+/// Re-exported statistics types produced by [`firehose`].
 pub use jetstreamer_firehose::firehose::{Stats as FirehoseStats, ThreadStats};
 
+/// Convenience alias for the boxed future returned by plugin hooks.
 pub type PluginFuture<'a> = Pin<
     Box<
         dyn Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync + 'static>>>
@@ -103,13 +109,17 @@ pub type PluginFuture<'a> = Pin<
     >,
 >;
 
+/// Trait implemented by plugins that consume firehose events.
 pub trait Plugin: Send + Sync + 'static {
+    /// Human-friendly plugin name used in logs and persisted metadata.
     fn name(&self) -> &'static str;
 
+    /// Semantic version for the plugin; defaults to `1`.
     fn version(&self) -> u16 {
         1
     }
 
+    /// Deterministic identifier derived from [`Plugin::name`].
     fn id(&self) -> u16 {
         let hash = Sha256::digest(self.name());
         let mut res = 1u16;
@@ -119,6 +129,7 @@ pub trait Plugin: Send + Sync + 'static {
         res
     }
 
+    /// Called for every transaction seen by the firehose.
     fn on_transaction<'a>(
         &'a self,
         _thread_id: usize,
@@ -128,6 +139,7 @@ pub trait Plugin: Send + Sync + 'static {
         async move { Ok(()) }.boxed()
     }
 
+    /// Called for every block observed by the firehose.
     fn on_block<'a>(
         &'a self,
         _thread_id: usize,
@@ -137,6 +149,7 @@ pub trait Plugin: Send + Sync + 'static {
         async move { Ok(()) }.boxed()
     }
 
+    /// Called for every entry observed by the firehose when entry notifications are enabled.
     fn on_entry<'a>(
         &'a self,
         _thread_id: usize,
@@ -146,6 +159,7 @@ pub trait Plugin: Send + Sync + 'static {
         async move { Ok(()) }.boxed()
     }
 
+    /// Called for reward updates associated with processed blocks.
     fn on_reward<'a>(
         &'a self,
         _thread_id: usize,
@@ -155,15 +169,18 @@ pub trait Plugin: Send + Sync + 'static {
         async move { Ok(()) }.boxed()
     }
 
+    /// Invoked once before the firehose starts streaming events.
     fn on_load(&self, _db: Option<Arc<Client>>) -> PluginFuture<'_> {
         async move { Ok(()) }.boxed()
     }
 
+    /// Invoked once after the firehose finishes or shuts down.
     fn on_exit(&self, _db: Option<Arc<Client>>) -> PluginFuture<'_> {
         async move { Ok(()) }.boxed()
     }
 }
 
+/// Coordinates plugin execution and ClickHouse persistence.
 #[derive(Clone)]
 pub struct PluginRunner {
     plugins: Arc<Vec<Arc<dyn Plugin>>>,
@@ -173,6 +190,7 @@ pub struct PluginRunner {
 }
 
 impl PluginRunner {
+    /// Creates a new runner that writes to `clickhouse_dsn` using `num_threads`.
     pub fn new(clickhouse_dsn: impl Display, num_threads: usize) -> Self {
         Self {
             plugins: Arc::new(Vec::new()),
@@ -182,12 +200,14 @@ impl PluginRunner {
         }
     }
 
+    /// Registers an additional plugin.
     pub fn register(&mut self, plugin: Box<dyn Plugin>) {
         Arc::get_mut(&mut self.plugins)
             .expect("cannot register plugins after the runner has started")
             .push(Arc::from(plugin));
     }
 
+    /// Runs the firehose across the specified slot range, optionally writing to ClickHouse.
     pub async fn run(
         self: Arc<Self>,
         slot_range: Range<u64>,
@@ -583,16 +603,28 @@ impl PluginRunner {
     }
 }
 
+/// Errors that can arise while running plugins against the firehose.
 #[derive(Debug, Error)]
 pub enum PluginRunnerError {
+    /// ClickHouse client returned an error.
     #[error("clickhouse error: {0}")]
     Clickhouse(#[from] clickhouse::error::Error),
+    /// Firehose streaming failed at the specified slot.
     #[error("firehose error at slot {slot}: {details}")]
-    Firehose { details: String, slot: u64 },
+    Firehose {
+        /// Human-readable description of the firehose failure.
+        details: String,
+        /// Slot where the firehose encountered the error.
+        slot: u64,
+    },
+    /// Lifecycle hook on a plugin returned an error.
     #[error("plugin {plugin} failed during {stage}: {details}")]
     PluginLifecycle {
+        /// Name of the plugin that failed.
         plugin: &'static str,
+        /// Lifecycle stage where the failure occurred.
         stage: &'static str,
+        /// Textual error details.
         details: String,
     },
 }

@@ -48,7 +48,9 @@ include!(concat!(env!("OUT_DIR"), "/embed_clickhouse.rs")); // raw bytes for cli
 /// Errors that can occur when managing the embedded ClickHouse process.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClickhouseError {
+    /// ClickHouse process terminated with an error message.
     Process(String),
+    /// Server failed to perform its required initialization steps.
     InitializationFailed,
 }
 
@@ -65,9 +67,12 @@ impl std::fmt::Display for ClickhouseError {
 
 impl std::error::Error for ClickhouseError {}
 
+/// Future type returned when supervising the ClickHouse process.
 pub type ClickhouseProcessFuture = Pin<Box<dyn Future<Output = Result<(), ()>> + Send>>;
+/// Tuple containing the readiness channel and process future returned by [`start`].
 pub type ClickhouseStartResult = (mpsc::Receiver<()>, ClickhouseProcessFuture);
 
+/// Launches the bundled ClickHouse client binary and forwards STDIO.
 pub async fn start_client() -> Result<(), Box<dyn std::error::Error>> {
     let clickhouse_path = NamedTempFile::with_suffix("-clickhouse")
         .unwrap()
@@ -106,6 +111,7 @@ pub async fn start_client() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Spawns the embedded ClickHouse server and returns a readiness channel plus process task.
 pub async fn start() -> Result<ClickhouseStartResult, ClickhouseError> {
     log::info!("Spawning local ClickHouse server...");
 
@@ -246,6 +252,7 @@ pub async fn start() -> Result<ClickhouseStartResult, ClickhouseError> {
     ))
 }
 
+/// Stops the ClickHouse process asynchronously, if one is running.
 pub async fn stop() {
     if let Some(&pid) = CLICKHOUSE_PROCESS.get() {
         log::info!("Stopping ClickHouse process with PID: {}", pid);
@@ -271,6 +278,7 @@ pub async fn stop() {
     }
 }
 
+/// Synchronously stops the ClickHouse process by blocking on [`stop`].
 pub fn stop_sync() {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()

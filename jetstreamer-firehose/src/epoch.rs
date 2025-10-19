@@ -10,20 +10,26 @@ use {
 // 		Subsets List__Link
 // 	}
 // )
+/// Representation of a `Kind::Epoch` node pointing to subset indexes.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct Epoch {
+    /// Kind discriminator copied from the CBOR payload.
     pub kind: u64,
+    /// Epoch number encoded in the payload.
     pub epoch: u64,
+    /// Subset CIDs that compose the epoch.
     pub subsets: Vec<Cid>,
 }
 
 impl Epoch {
+    /// Decodes an [`Epoch`] from raw CBOR bytes.
     pub fn from_bytes(data: Vec<u8>) -> Result<Epoch, Box<dyn Error>> {
         let decoded_data: serde_cbor::Value = serde_cbor::from_slice(&data).unwrap();
         let epoch = Epoch::from_cbor(decoded_data)?;
         Ok(epoch)
     }
 
+    /// Decodes an [`Epoch`] from a CBOR [`serde_cbor::Value`].
     pub fn from_cbor(val: serde_cbor::Value) -> Result<Epoch, Box<dyn Error>> {
         let mut epoch = Epoch {
             kind: 0,
@@ -62,6 +68,7 @@ impl Epoch {
         Ok(epoch)
     }
 
+    /// Renders the epoch as a JSON object for debugging.
     pub fn to_json(&self) -> serde_json::Value {
         let mut subsets = vec![];
         for subset in &self.subsets {

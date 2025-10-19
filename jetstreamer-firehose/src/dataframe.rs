@@ -12,23 +12,32 @@ use {
 // 	Data  []uint8
 // 	Next  **List__Link
 // }
+/// Representation of a `Kind::DataFrame` node from the firehose.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct DataFrame {
+    /// Kind discriminator copied from the CBOR payload.
     pub kind: u64,
+    /// Optional rolling hash for the data chunk.
     pub hash: Option<u64>,
+    /// Optional chunk index within the full payload.
     pub index: Option<u64>,
+    /// Optional total number of chunks.
     pub total: Option<u64>,
+    /// Raw bytes contained in this chunk.
     pub data: Buffer,
+    /// Optional list of CIDs pointing to continuation chunks.
     pub next: Option<Vec<Cid>>,
 }
 
 impl DataFrame {
+    /// Decodes a [`DataFrame`] from raw CBOR bytes.
     pub fn from_bytes(data: Vec<u8>) -> Result<DataFrame, Box<dyn Error>> {
         let decoded_data: serde_cbor::Value = serde_cbor::from_slice(&data).unwrap();
         let data_frame = DataFrame::from_cbor(decoded_data)?;
         Ok(data_frame)
     }
-    // from serde_cbor::Value
+
+    /// Decodes a [`DataFrame`] from a parsed CBOR [`serde_cbor::Value`].
     pub fn from_cbor(val: serde_cbor::Value) -> Result<DataFrame, Box<dyn Error>> {
         let mut data_frame = DataFrame {
             kind: 0,
@@ -85,6 +94,7 @@ impl DataFrame {
         Ok(data_frame)
     }
 
+    /// Renders the dataframe as a JSON value for debugging.
     pub fn to_json(&self) -> serde_json::Value {
         let mut next = vec![];
         if let Some(nexts) = &self.next {

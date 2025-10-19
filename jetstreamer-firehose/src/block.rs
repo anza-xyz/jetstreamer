@@ -15,24 +15,32 @@ use {
 // 		Rewards   datamodel.Link
 // 	}
 // )
+/// Representation of a `Kind::Block` node, including shredding metadata.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct Block {
+    /// Kind discriminator copied from the CBOR payload.
     pub kind: u64,
+    /// Slot number for the block.
     pub slot: u64,
+    /// Shredding metadata describing entry and shred indexes.
     pub shredding: Vec<Shredding>,
+    /// Transaction entry CIDs referenced by the block.
     pub entries: Vec<Cid>,
+    /// Associated [`SlotMeta`] describing ancestry and block timing.
     pub meta: SlotMeta,
+    /// CID pointing to the block rewards node.
     pub rewards: Cid,
 }
 
 impl Block {
+    /// Decodes a [`Block`] from raw CBOR bytes.
     pub fn from_bytes(data: Vec<u8>) -> Result<Block, Box<dyn Error>> {
         let decoded_data: serde_cbor::Value = serde_cbor::from_slice(&data).unwrap();
         let block = Block::from_cbor(decoded_data)?;
         Ok(block)
     }
 
-    // from serde_cbor::Value
+    /// Decodes a [`Block`] from a CBOR [`serde_cbor::Value`].
     pub fn from_cbor(val: serde_cbor::Value) -> Result<Block, Box<dyn Error>> {
         let mut block = Block {
             kind: 0,
@@ -106,6 +114,7 @@ impl Block {
         Ok(block)
     }
 
+    /// Renders the block as a JSON object for debugging.
     pub fn to_json(&self) -> serde_json::Value {
         let mut shredding = vec![];
         for shred in &self.shredding {
@@ -1101,14 +1110,17 @@ mod block_tests {
 // 	EntryEndIdx int
 // 	ShredEndIdx int
 // }
+/// Entry and shred index metadata attached to a block.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct Shredding {
+    /// Index of the final entry contained in the shred.
     pub entry_end_idx: i64,
+    /// Index of the final shred written for the entry.
     pub shred_end_idx: i64,
 }
 
 impl Shredding {
-    // from serde_cbor::Value
+    /// Decodes [`Shredding`] metadata from a CBOR array.
     pub fn from_cbor(val: serde_cbor::Value) -> Shredding {
         let mut shredding = Shredding {
             entry_end_idx: 0,
@@ -1128,6 +1140,7 @@ impl Shredding {
         shredding
     }
 
+    /// Serializes the shredding metadata into JSON for debugging.
     pub fn to_json(&self) -> serde_json::Value {
         let mut map = serde_json::Map::new();
         map.insert(
@@ -1169,15 +1182,19 @@ mod shredding_tests {
 // 	Blocktime    int
 // 	Block_height **int
 // }
+/// Slot-level metadata associated with a block.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct SlotMeta {
+    /// Parent slot that produced this block.
     pub parent_slot: u64,
+    /// Unix timestamp reported for the block.
     pub blocktime: u64,
+    /// Optional block height.
     pub block_height: Option<u64>,
 }
 
 impl SlotMeta {
-    // from serde_cbor::Value
+    /// Decodes [`SlotMeta`] from a CBOR array.
     pub fn from_cbor(val: serde_cbor::Value) -> SlotMeta {
         let mut slot_meta = SlotMeta {
             parent_slot: 0,
@@ -1201,6 +1218,7 @@ impl SlotMeta {
         slot_meta
     }
 
+    /// Renders the slot metadata as JSON for debugging.
     pub fn to_json(&self) -> serde_json::Value {
         let mut map = serde_json::Map::new();
         map.insert(

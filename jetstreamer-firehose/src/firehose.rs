@@ -40,8 +40,9 @@ use crate::{
     utils,
 };
 
-// Timeout applied to each asynchronous firehose operation (fetching epoch stream, reading header,
-// seeking, reading next block). Adjust here to tune stall detection/restart aggressiveness.
+// Timeout applied to each asynchronous firehose operation (fetching epoch stream, reading
+// header, seeking, reading next block). Adjust here to tune stall detection/restart
+// aggressiveness.
 const OP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const LOG_MODULE: &str = "jetstreamer::firehose";
 
@@ -81,23 +82,41 @@ fn is_shutdown_error(err: &FirehoseError) -> bool {
     }
 }
 
+/// Errors that can occur while streaming the firehose. Errors that can occur while streaming
+/// the firehose.
 #[derive(Debug, Error)]
 pub enum FirehoseError {
+    /// HTTP client error surfaced from `reqwest`.
     Reqwest(reqwest::Error),
+    /// Failure while reading the Old Faithful CAR header.
     ReadHeader(Box<dyn std::error::Error>),
+    /// Error emitted by the Solana Geyser plugin service.
     GeyserPluginService(GeyserPluginServiceError),
+    /// Transaction notifier could not be acquired from the Geyser service.
     FailedToGetTransactionNotifier,
+    /// Failure while reading data until the next block boundary.
     ReadUntilBlockError(Box<dyn std::error::Error>),
+    /// Failure while fetching an individual block.
     GetBlockError(Box<dyn std::error::Error>),
+    /// Failed to decode a node at the given index.
     NodeDecodingError(usize, Box<dyn std::error::Error>),
+    /// Error surfaced when querying the slot offset index.
     SlotOffsetIndexError(SlotOffsetIndexError),
+    /// Failure while seeking to a slot within the Old Faithful CAR stream.
     SeekToSlotError(Box<dyn std::error::Error>),
+    /// Error surfaced during the plugin `on_load` stage.
     OnLoadError(Box<dyn std::error::Error>),
+    /// Error emitted while invoking the stats handler.
     OnStatsHandlerError(Box<dyn std::error::Error>),
+    /// Timeout reached while waiting for a firehose operation.
     OperationTimeout(&'static str),
+    /// Transaction handler returned an error.
     TransactionHandlerError(Box<dyn std::error::Error>),
+    /// Entry handler returned an error.
     EntryHandlerError(Box<dyn std::error::Error>),
+    /// Reward handler returned an error.
     RewardHandlerError(Box<dyn std::error::Error>),
+    /// Block handler returned an error.
     BlockHandlerError(Box<dyn std::error::Error>),
 }
 
@@ -177,42 +196,72 @@ impl From<SlotOffsetIndexError> for FirehoseError {
     }
 }
 
+/// Per-thread progress information emitted by the firehose runner.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct ThreadStats {
+    /// Identifier of the worker thread reporting the stats.
     pub thread_id: usize,
+    /// Timestamp captured when the thread began processing.
     pub start_time: std::time::Instant,
+    /// Timestamp captured when the thread finished, if finished.
     pub finish_time: Option<std::time::Instant>,
+    /// Inclusive slot range assigned to the thread.
     pub slot_range: Range<u64>,
+    /// Latest slot processed by the thread.
     pub current_slot: u64,
+    /// Total slots processed by the thread.
     pub slots_processed: u64,
+    /// Number of blocks successfully processed.
     pub blocks_processed: u64,
+    /// Number of slots skipped by the cluster leader.
     pub leader_skipped_slots: u64,
+    /// Total transactions processed.
     pub transactions_processed: u64,
+    /// Total entries processed.
     pub entries_processed: u64,
+    /// Total rewards processed.
     pub rewards_processed: u64,
 }
 
+/// Aggregated firehose statistics covering all worker threads.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct Stats {
+    /// Per-thread statistics for the current update.
     pub thread_stats: ThreadStats,
+    /// Timestamp captured when processing began.
     pub start_time: std::time::Instant,
+    /// Timestamp captured when all processing finished, if finished.
     pub finish_time: Option<std::time::Instant>,
+    /// Slot range currently being processed.
     pub slot_range: Range<u64>,
+    /// Aggregate slots processed across all threads.
     pub slots_processed: u64,
+    /// Aggregate blocks processed across all threads.
     pub blocks_processed: u64,
+    /// Aggregate skipped slots across all threads.
     pub leader_skipped_slots: u64,
+    /// Aggregate transactions processed across all threads.
     pub transactions_processed: u64,
+    /// Aggregate entries processed across all threads.
     pub entries_processed: u64,
+    /// Aggregate rewards processed across all threads.
     pub rewards_processed: u64,
+    /// Transactions processed since the previous stats pulse.
     pub transactions_since_last_pulse: u64,
+    /// Blocks processed since the previous stats pulse.
     pub blocks_since_last_pulse: u64,
+    /// Slots processed since the previous stats pulse.
     pub slots_since_last_pulse: u64,
+    /// Elapsed time since the previous stats pulse.
     pub time_since_last_pulse: std::time::Duration,
 }
 
+/// Configuration for periodic stats emission via a [`Handler`] callback.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct StatsTracking<OnStats: Handler<Stats>> {
+    /// Callback invoked whenever new stats are available.
     pub on_stats: OnStats,
+    /// Minimum number of slots processed before triggering the callback.
     pub tracking_interval_slots: u64,
 }
 
@@ -281,51 +330,82 @@ fn fetch_add_if(tracking_enabled: bool, atomic: &AtomicU64, value: u64) {
     }
 }
 
+/// Firehose transaction payload passed to [`Handler`] callbacks.
 #[derive(Debug, Clone)]
 pub struct TransactionData {
+    /// Slot that contains the transaction.
     pub slot: u64,
+    /// Index of the transaction within the slot.
     pub transaction_slot_index: usize,
+    /// Transaction signature.
     pub signature: solana_sdk::signature::Signature,
+    /// Hash of the transaction message.
     pub message_hash: Hash,
+    /// Indicates whether the transaction is a vote.
     pub is_vote: bool,
+    /// Status metadata returned by the Solana runtime.
     pub transaction_status_meta: solana_transaction_status::TransactionStatusMeta,
+    /// Fully decoded transaction.
     pub transaction: VersionedTransaction,
 }
 
+/// Block entry metadata passed to [`Handler`] callbacks.
 #[derive(Debug, Clone)]
 pub struct EntryData {
+    /// Slot that generated the entry.
     pub slot: u64,
+    /// Index of the entry within the slot.
     pub entry_index: usize,
+    /// Range of transaction indexes covered by the entry.
     pub transaction_indexes: Range<usize>,
+    /// Number of hashes associated with the entry.
     pub num_hashes: u64,
+    /// Entry hash.
     pub hash: Hash,
 }
 
+/// Reward data conveyed to reward [`Handler`] callbacks.
 #[derive(Debug, Clone)]
 pub struct RewardsData {
+    /// Slot the rewards correspond to.
     pub slot: u64,
+    /// Reward recipients and their associated reward information.
     pub rewards: Vec<(Pubkey, RewardInfo)>,
 }
 
+/// Block-level data streamed to block handlers.
 #[derive(Debug)]
 pub enum BlockData {
+    /// Fully populated block payload with ledger metadata.
     Block {
+        /// Parent slot number.
         parent_slot: u64,
+        /// Parent block hash.
         parent_blockhash: Hash,
+        /// Current block slot.
         slot: u64,
+        /// Current block hash.
         blockhash: Hash,
+        /// Rewards keyed by account and partition information.
         rewards: KeyedRewardsAndNumPartitions,
+        /// Optional Unix timestamp for the block.
         block_time: Option<i64>,
+        /// Optional ledger block height.
         block_height: Option<u64>,
+        /// Number of executed transactions in the block.
         executed_transaction_count: u64,
+        /// Number of entries contained in the block.
         entry_count: u64,
     },
+    /// Marker indicating the slot was skipped by the leader.
     LeaderSkipped {
+        /// Skipped slot number.
         slot: u64,
     },
 }
 
 impl BlockData {
+    /// Returns the slot associated with this block or skipped slot.
     #[inline(always)]
     pub const fn slot(&self) -> u64 {
         match self {
@@ -334,6 +414,7 @@ impl BlockData {
         }
     }
 
+    /// Returns `true` if the slot was skipped by the leader.
     #[inline(always)]
     pub const fn was_skipped(&self) -> bool {
         matches!(self, BlockData::LeaderSkipped { .. })
@@ -343,6 +424,7 @@ impl BlockData {
 type HandlerResult = Result<(), Box<dyn std::error::Error + Send + 'static>>;
 type HandlerFuture = BoxFuture<'static, HandlerResult>;
 
+/// Asynchronous callback invoked for each firehose event of type `Data`.
 pub trait Handler<Data>: Fn(usize, Data) -> HandlerFuture + Send + Sync + Clone + 'static {}
 
 impl<Data, F> Handler<Data> for F where
@@ -350,13 +432,20 @@ impl<Data, F> Handler<Data> for F where
 {
 }
 
+/// Function pointer alias for [`Handler`] callbacks.
 pub type HandlerFn<Data> = fn(usize, Data) -> HandlerFuture;
+/// Convenience alias for block handlers accepted by [`firehose`].
 pub type OnBlockFn = HandlerFn<BlockData>;
+/// Convenience alias for transaction handlers accepted by [`firehose`].
 pub type OnTxFn = HandlerFn<TransactionData>;
+/// Convenience alias for entry handlers accepted by [`firehose`].
 pub type OnEntryFn = HandlerFn<EntryData>;
+/// Convenience alias for reward handlers accepted by [`firehose`].
 pub type OnRewardFn = HandlerFn<RewardsData>;
+/// Type alias for [`StatsTracking`] using simple function pointers.
 pub type StatsTracker = StatsTracking<HandlerFn<Stats>>;
 
+/// Streams blocks, transactions, entries, rewards, and stats to user-provided handlers.
 #[inline]
 #[allow(clippy::too_many_arguments)]
 pub async fn firehose<OnBlock, OnTransaction, OnEntry, OnRewards, OnStats>(
@@ -590,9 +679,9 @@ where
                         let mut slot = block.slot;
                         if slot >= slot_range.end {
                             log::info!(target: &log_target, "reached end of slot range at slot {}", slot);
-                            // Return early to terminate the firehose thread cleanly.
-                            // We use >= because slot_range is half-open [start, end), so any slot
-                            // equal to end is out-of-range and must not be processed.
+                            // Return early to terminate the firehose thread cleanly. We use >=
+                            // because slot_range is half-open [start, end), so any slot equal
+                            // to end is out-of-range and must not be processed.
 
                             // still need to emit skipped slots up to end-1
                             slot = slot_range.end;
@@ -1050,7 +1139,8 @@ where
                                 elapsed_pretty
                             );
                             log::info!(target: &log_target, "a 🚒 firehose thread completed its work.");
-                            // On completion, report threads with non-zero error counts for visibility.
+                            // On completion, report threads with non-zero error counts for
+                            // visibility.
                             let summary: String = error_counts
                                 .iter()
                                 .enumerate()
@@ -1170,6 +1260,10 @@ where
 }
 
 #[allow(clippy::result_large_err)]
+/// Builds a Geyser-backed firehose and returns a slot notification stream.
+///
+/// This helper is used by [`firehose`] when Geyser plugins need to be stood up in-process
+/// rather than relying solely on remote streams.
 pub fn firehose_geyser(
     rt: Arc<tokio::runtime::Runtime>,
     slot_range: Range<u64>,
@@ -1387,26 +1481,14 @@ async fn firehose_geyser_thread(
                         );
                         break;
                     }
-                    // ignore epoch and subset nodes at end of car file
-                    // loop {
-                    //     if nodes.0.is_empty() {
-                    //         break;
-                    //     }
-                    //     if let Some(node) = nodes.0.last() {
-                    //         if node.get_node().is_epoch() {
-                    //             log::debug!(target: &log_target, "skipping epoch node for epoch {}", epoch_num);
-                    //             nodes.0.pop();
-                    //         } else if node.get_node().is_subset() {
-                    //             nodes.0.pop();
-                    //         } else if node.get_node().is_block() {
-                    //             break;
-                    //         }
-                    //     }
-                    // }
-                    // if nodes.0.is_empty() {
-                    //     log::info!(target: &log_target, "reached end of epoch {}", epoch_num);
-                    //     break;
-                    // }
+                    // ignore epoch and subset nodes at end of car file loop { if
+                    // nodes.0.is_empty() { break; } if let Some(node) = nodes.0.last() { if
+                    //     node.get_node().is_epoch() { log::debug!(target: &log_target,
+                    //         "skipping epoch node for epoch {}", epoch_num); nodes.0.pop(); }
+                    //     else if node.get_node().is_subset() { nodes.0.pop(); } else if
+                    //     node.get_node().is_block() { break; } } } if nodes.0.is_empty() {
+                    //         log::info!(target: &log_target, "reached end of epoch {}",
+                    //             epoch_num); break; }
                     if let Some(last_node) = nodes.0.last()
                         && !last_node.get_node().is_block() {
                             log::info!(target: &log_target, "reached end of epoch {}", epoch_num);
@@ -1426,9 +1508,9 @@ async fn firehose_geyser_thread(
                     let slot = block.slot;
                     if slot >= slot_range.end {
                         log::info!(target: &log_target, "reached end of slot range at slot {}", slot);
-                        // Return early to terminate the firehose thread cleanly.
-                        // We use >= because slot_range is half-open [start, end), so any slot
-                        // equal to end is out-of-range and must not be processed.
+                        // Return early to terminate the firehose thread cleanly. We use >=
+                        // because slot_range is half-open [start, end), so any slot equal to
+                        // end is out-of-range and must not be processed.
                         return Ok(());
                     }
                     debug_assert!(slot < slot_range.end, "processing out-of-range slot {} (end {})", slot, slot_range.end);
@@ -1443,7 +1525,8 @@ async fn firehose_geyser_thread(
                     }
                     if let Some(previous_slot) = previous_slot
                         && slot != previous_slot + 1 {
-                            // log::warn!(target: &log_target, "non-consecutive slots: {} followed by {}", previous_slot, slot);
+                            // log::warn!(target: &log_target, "non-consecutive slots: {}
+                            // followed by {}", previous_slot, slot);
                         }
                     previous_slot = current_slot;
                     current_slot = Some(slot);
@@ -1454,16 +1537,11 @@ async fn firehose_geyser_thread(
 
                     nodes.each(|node_with_cid| -> Result<(), Box<dyn std::error::Error>> {
                         item_index += 1;
-                        // if item_index == 100000 && !triggered {
-                        //     log::info!("simulating error");
-                        //     triggered = true;
-                        //     return Err(Box::new(GeyserReplayError::NodeDecodingError(item_index,
-                        //         Box::new(std::io::Error::new(
-                        //             std::io::ErrorKind::Other,
-                        //             "simulated error",
-                        //         )),
-                        //     )));
-                        // }
+                        // if item_index == 100000 && !triggered { log::info!("simulating
+                        //     error"); triggered = true; return
+                        //     Err(Box::new(GeyserReplayError::NodeDecodingError(item_index,
+                        //     Box::new(std::io::Error::new( std::io::ErrorKind::Other,
+                        //         "simulated error", )), ))); }
                         if let Some(skip) = skip_until_index {
                             if item_index < skip {
                                 if !displayed_skip_message {
@@ -1512,7 +1590,8 @@ async fn firehose_geyser_thread(
                                     }
                                     #[cfg(not(feature = "verify-transaction-signatures"))]
                                     {
-                                        // Signature verification is optional because it is extremely expensive at replay scale.
+                                        // Signature verification is optional because it is
+                                        // extremely expensive at replay scale.
                                         versioned_tx.message.hash()
                                     }
                                 };
@@ -1628,7 +1707,8 @@ async fn firehose_geyser_thread(
                             elapsed_pretty
                         );
                         log::info!(target: &log_target, "a 🚒 firehose thread finished completed its work.");
-                        // On completion, report threads with non-zero error counts for visibility.
+                        // On completion, report threads with non-zero error counts for
+                        // visibility.
                         let summary: String = error_counts
                             .iter()
                             .enumerate()
@@ -1744,6 +1824,7 @@ fn convert_proto_rewards(
 }
 
 #[inline]
+/// Splits `slot_range` into nearly-even sub-ranges for the given thread count.
 pub fn generate_subranges(slot_range: &Range<u64>, threads: u64) -> Vec<Range<u64>> {
     let total = slot_range.end - slot_range.start;
     let slots_per_thread = total / threads;

@@ -2,7 +2,7 @@ use reqwest::Client;
 
 use crate::epochs::{epoch_exists, epoch_to_slot_range};
 
-/// Queries the current epoch from mainnet
+/// Queries the current epoch from mainnet using the Solana RPC API.
 pub async fn current_epoch(client: &Client) -> Result<u64, Box<dyn std::error::Error>> {
     let url = "https://api.mainnet-beta.solana.com";
     let request_body = r#"{"jsonrpc":"2.0","id":1,"method":"getEpochInfo","params":[]}"#;
@@ -18,6 +18,10 @@ pub async fn current_epoch(client: &Client) -> Result<u64, Box<dyn std::error::E
     Ok(epoch)
 }
 
+/// Finds the most recent epoch with a compact archive hosted on Old Faithful.
+///
+/// If `epoch` is `None`, the search starts from [`current_epoch`]. The returned
+/// tuple is `(epoch, first_slot, last_slot)`.
 pub async fn latest_old_faithful_epoch(
     client: &Client,
     epoch: Option<u64>,

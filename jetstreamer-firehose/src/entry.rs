@@ -13,22 +13,28 @@ use {
 // 	Hash         []uint8
 // 	Transactions List__Link
 // }
+/// Representation of a `Kind::Entry` node emitted by the firehose.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct Entry {
+    /// Kind discriminator copied from the CBOR payload.
     pub kind: u64,
+    /// Number of hashes stored in the entry.
     pub num_hashes: u64,
+    /// Entry hash encoded as bytes.
     pub hash: Hash,
+    /// Transactions referenced by this entry.
     pub transactions: Vec<Cid>,
 }
 
 impl Entry {
+    /// Decodes an [`Entry`] from raw CBOR bytes.
     pub fn from_bytes(data: Vec<u8>) -> Result<Entry, Box<dyn Error>> {
         let decoded_data: serde_cbor::Value = serde_cbor::from_slice(&data).unwrap();
         let entry = Entry::from_cbor(decoded_data)?;
         Ok(entry)
     }
 
-    // from serde_cbor::Value
+    /// Decodes an [`Entry`] from a CBOR [`serde_cbor::Value`].
     pub fn from_cbor(val: serde_cbor::Value) -> Result<Entry, Box<dyn Error>> {
         let mut entry = Entry {
             kind: 0,
@@ -71,6 +77,7 @@ impl Entry {
         Ok(entry)
     }
 
+    /// Renders the entry as a JSON object for debugging.
     pub fn to_json(&self) -> serde_json::Value {
         let mut transactions = vec![];
         for transaction in &self.transactions {

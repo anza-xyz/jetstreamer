@@ -1,5 +1,21 @@
 #![deny(missing_docs)]
-//! Application runner for Jetstreamer firehose plugins.
+//! Application runner for Jetstreamer firehose plugins and central hub for the
+//! Jetstreamer crates.
+
+/// Allows direct streaming of Old Faithful data to geyser or direct consumers.
+pub mod firehose {
+    pub use jetstreamer_firehose::*;
+}
+
+/// Shared utilities used by other Jetstreamer components.
+pub mod utils {
+    pub use jetstreamer_utils::*;
+}
+
+/// The Jetstreamer plugin interface, built-in plugins, and plugin runner.
+pub mod plugins {
+    pub use jetstreamer_plugin::*;
+}
 
 use core::ops::Range;
 use jetstreamer_firehose::{epochs::slot_to_epoch, index::get_index_base_url};

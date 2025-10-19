@@ -110,6 +110,35 @@ pub type PluginFuture<'a> = Pin<
 >;
 
 /// Trait implemented by plugins that consume firehose events.
+///
+/// # Examples
+/// Implement a plugin that counts slots and logs transactions:
+/// ```no_run
+/// use std::sync::Arc;
+/// use clickhouse::Client;
+/// use futures_util::FutureExt;
+/// use jetstreamer_firehose::firehose::TransactionData;
+/// use jetstreamer_plugin::{Plugin, PluginFuture};
+///
+/// struct CountingPlugin;
+///
+/// impl Plugin for CountingPlugin {
+///     fn name(&self) -> &'static str { "counting" }
+///
+///     fn on_transaction<'a>(
+///         &'a self,
+///         _thread_id: usize,
+///         _db: Option<Arc<Client>>,
+///         transaction: &'a TransactionData,
+///     ) -> PluginFuture<'a> {
+///         async move {
+///             println!("saw tx {} in slot {}", transaction.signature, transaction.slot);
+///             Ok(())
+///         }
+///         .boxed()
+///     }
+/// }
+/// ```
 pub trait Plugin: Send + Sync + 'static {
     /// Human-friendly plugin name used in logs and persisted metadata.
     fn name(&self) -> &'static str;
@@ -181,6 +210,31 @@ pub trait Plugin: Send + Sync + 'static {
 }
 
 /// Coordinates plugin execution and ClickHouse persistence.
+///
+/// # Examples
+/// Run a custom plugin with db stat tracking enabled:
+/// ```no_run
+/// use std::sync::Arc;
+/// use jetstreamer_plugin::{Plugin, PluginRunner};
+///
+/// struct LoggingPlugin;
+///
+/// impl Plugin for LoggingPlugin {
+///     fn name(&self) -> &'static str { "logging" }
+/// }
+///
+/// #[tokio::main]
+/// async fn main() -> Result<(), Box<dyn std::error::Error>> {
+///     let mut runner = PluginRunner::new("http://localhost:8123", 1);
+///     runner.register(Box::new(LoggingPlugin));
+///     let runner = Arc::new(runner);
+///
+///     // Run the registered plugins across a realistic slot range without ClickHouse.
+///     let (start, end) = jetstreamer_firehose::epochs::epoch_to_slot_range(800);
+///     runner.clone().run(start..end, true).await?;
+///     Ok(())
+/// }
+/// ```
 #[derive(Clone)]
 pub struct PluginRunner {
     plugins: Arc<Vec<Arc<dyn Plugin>>>,

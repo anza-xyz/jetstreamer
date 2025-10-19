@@ -39,7 +39,7 @@ impl NodeWithCid {
 #[derive(Default)]
 pub struct NodesWithCids(
     #[doc = "Ordered collection of nodes paired with their content identifiers."]
-    pub Vec<NodeWithCid>,
+    pub  Vec<NodeWithCid>,
 );
 
 impl NodesWithCids {

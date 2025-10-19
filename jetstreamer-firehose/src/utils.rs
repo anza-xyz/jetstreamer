@@ -44,10 +44,7 @@ pub fn read_uvarint<R: Read>(reader: &mut R) -> io::Result<u64> {
 
 /// Owner type for 32-byte hashes that renders them as lowercase hex.
 #[derive(Clone, PartialEq, Eq, Hash)]
-pub struct Hash(
-    #[doc = "Underlying bytes comprising the hash."]
-    pub Vec<u8>,
-);
+pub struct Hash(#[doc = "Underlying bytes comprising the hash."] pub Vec<u8>);
 
 // debug converts the hash to hex
 impl std::fmt::Debug for Hash {
@@ -125,10 +122,7 @@ impl Hash {
 
 /// Growable binary buffer with base64 formatting helpers.
 #[derive(Default, Clone, PartialEq, Eq, Hash)]
-pub struct Buffer(
-    #[doc = "Owned bytes stored in the buffer."]
-    Vec<u8>,
-);
+pub struct Buffer(#[doc = "Owned bytes stored in the buffer."] Vec<u8>);
 
 impl Buffer {
     /// Creates an empty buffer.

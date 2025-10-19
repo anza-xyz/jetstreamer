@@ -610,7 +610,7 @@ where
                         let mut this_block_entry_count: u64 = 0;
                         let mut this_block_rewards: Vec<(Pubkey, RewardInfo)> = Vec::new();
 
-                        nodes.each(|node_with_cid| -> Result<(), Box<dyn std::error::Error>> {
+                        for node_with_cid in &nodes.0 {
                             item_index += 1;
                             if let Some(skip) = skip_until_index {
                                 if item_index < skip {
@@ -623,7 +623,7 @@ where
                                         );
                                         displayed_skip_message = true;
                                     }
-                                    return Ok(());
+                                    continue;
                                 } else {
                                     log::info!(
                                         target: &log_target,
@@ -639,36 +639,74 @@ where
                                 stats.current_slot = slot;
                             }
 
+                            let error_slot = current_slot.unwrap_or(slot_range.start);
+
                             use crate::node::Node::*;
                             match node {
                                 Transaction(tx) => {
                                     if tx_enabled
                                         && let Some(on_tx_cb) = on_tx.as_ref()
                                     {
-                                        let versioned_tx = tx.as_parsed()?;
-                                        let reassembled_metadata =
-                                            nodes.reassemble_dataframes(tx.metadata.clone())?;
-
-                                        let decompressed =
-                                            utils::decompress_zstd(reassembled_metadata.clone())?;
-
-                                        let metadata: solana_storage_proto::convert::generated::TransactionStatusMeta =
-                                            prost_011::Message::decode(decompressed.as_slice()).map_err(|err| {
-                                                Box::new(std::io::Error::other(
-                                                    std::format!(
-                                                        "Error decoding metadata: {:?}",
-                                                        err
-                                                    ),
-                                                ))
+                                        let error_slot = current_slot.unwrap_or(slot_range.start);
+                                        let versioned_tx = tx.as_parsed().map_err(|err| {
+                                            (
+                                                FirehoseError::NodeDecodingError(item_index, err),
+                                                error_slot,
+                                            )
+                                        })?;
+                                        let reassembled_metadata = nodes
+                                            .reassemble_dataframes(tx.metadata.clone())
+                                            .map_err(|err| {
+                                                (
+                                                    FirehoseError::NodeDecodingError(item_index, err),
+                                                    error_slot,
+                                                )
                                             })?;
 
+                                        let decompressed =
+                                            utils::decompress_zstd(reassembled_metadata.clone())
+                                                .map_err(|err| {
+                                                    (
+                                                        FirehoseError::NodeDecodingError(
+                                                            item_index,
+                                                            err,
+                                                        ),
+                                                        error_slot,
+                                                    )
+                                                })?;
+
+                                        let metadata: solana_storage_proto::convert::generated::TransactionStatusMeta =
+                                            prost_011::Message::decode(decompressed.as_slice())
+                                                .map_err(|err| {
+                                                    (
+                                                        FirehoseError::NodeDecodingError(
+                                                            item_index,
+                                                            Box::new(err),
+                                                        ),
+                                                        error_slot,
+                                                    )
+                                                })?;
+
                                         let as_native_metadata: solana_transaction_status::TransactionStatusMeta =
-                                            metadata.try_into()?;
+                                            metadata.try_into().map_err(|err| {
+                                                (
+                                                    FirehoseError::NodeDecodingError(
+                                                        item_index,
+                                                        Box::new(err),
+                                                    ),
+                                                    error_slot,
+                                                )
+                                            })?;
 
                                         let message_hash = {
                                             #[cfg(feature = "verify-transaction-signatures")]
                                             {
-                                                versioned_tx.verify_and_hash_message()?
+                                                versioned_tx.verify_and_hash_message().map_err(|err| {
+                                                    (
+                                                        FirehoseError::TransactionHandlerError(Box::new(err)),
+                                                        error_slot,
+                                                    )
+                                                })?
                                             }
                                             #[cfg(not(feature = "verify-transaction-signatures"))]
                                             {
@@ -683,26 +721,37 @@ where
                                                     std::io::ErrorKind::InvalidData,
                                                     "transaction missing signature",
                                                 )) as Box<dyn std::error::Error>
+                                            })
+                                            .map_err(|err| {
+                                                (
+                                                    FirehoseError::NodeDecodingError(
+                                                        item_index,
+                                                        err,
+                                                    ),
+                                                    error_slot,
+                                                )
                                             })?;
                                         let is_vote = is_simple_vote_transaction(&versioned_tx);
 
-                                        tokio::task::block_in_place(|| {
-                                            tokio::runtime::Handle::current().block_on(on_tx_cb(
-                                                thread_index,
-                                                TransactionData {
-                                                    slot: block.slot,
-                                                    transaction_slot_index: tx.index.unwrap()
-                                                        as usize,
-                                                    signature: *signature,
-                                                    message_hash,
-                                                    is_vote,
-                                                    transaction_status_meta: as_native_metadata
-                                                        .clone(),
-                                                    transaction: versioned_tx.clone(),
-                                                },
-                                            ))
-                                        })
-                                        .map_err(|e| FirehoseError::TransactionHandlerError(e))?;
+                                        on_tx_cb(
+                                            thread_index,
+                                            TransactionData {
+                                                slot: block.slot,
+                                                transaction_slot_index: tx.index.unwrap() as usize,
+                                                signature: *signature,
+                                                message_hash,
+                                                is_vote,
+                                                transaction_status_meta: as_native_metadata.clone(),
+                                                transaction: versioned_tx.clone(),
+                                            },
+                                        )
+                                        .await
+                                        .map_err(|e| {
+                                            (
+                                                FirehoseError::TransactionHandlerError(e),
+                                                error_slot,
+                                            )
+                                        })?;
                                     }
                                     fetch_add_if(
                                         tracking_enabled,
@@ -723,31 +772,36 @@ where
                                     this_block_executed_transaction_count += entry_transaction_count_u64;
                                     this_block_entry_count += 1;
 
-                                    if entry_enabled
-                                        && let Some(on_entry_cb) = on_entry.as_ref()
-                                    {
-                                        let starting_transaction_index =
-                                            usize::try_from(starting_transaction_index_u64).map_err(|_| {
-                                                Box::new(std::io::Error::other(
-                                                    "transaction index exceeds usize range",
-                                                )) as Box<dyn std::error::Error>
-                                            })?;
+                                    if entry_enabled && let Some(on_entry_cb) = on_entry.as_ref() {
+                                        let starting_transaction_index = usize::try_from(
+                                            starting_transaction_index_u64,
+                                        )
+                                        .map_err(|err| {
+                                            (
+                                                FirehoseError::EntryHandlerError(Box::new(err)),
+                                                error_slot,
+                                            )
+                                        })?;
                                         let transaction_indexes_end =
                                             starting_transaction_index + entry_transaction_count;
-                                        tokio::task::block_in_place(|| {
-                                            tokio::runtime::Handle::current().block_on(on_entry_cb(
-                                                thread_index,
-                                                EntryData {
-                                                    slot: block.slot,
-                                                    entry_index,
-                                                    transaction_indexes: starting_transaction_index
-                                                        ..transaction_indexes_end,
-                                                    num_hashes: entry.num_hashes,
-                                                    hash: entry_hash,
-                                                },
-                                            ))
-                                        })
-                                        .map_err(|e| FirehoseError::EntryHandlerError(e))?;
+                                        on_entry_cb(
+                                            thread_index,
+                                            EntryData {
+                                                slot: block.slot,
+                                                entry_index,
+                                                transaction_indexes: starting_transaction_index
+                                                    ..transaction_indexes_end,
+                                                num_hashes: entry.num_hashes,
+                                                hash: entry_hash,
+                                            },
+                                        )
+                                        .await
+                                        .map_err(|e| {
+                                            (
+                                                FirehoseError::EntryHandlerError(e),
+                                                error_slot,
+                                            )
+                                        })?;
                                     }
                                     entry_index += 1;
                                     fetch_add_if(
@@ -771,15 +825,19 @@ where
                                                         previous_slot,
                                                         slot,
                                                     );
-                                                    tokio::task::block_in_place(|| {
-                                                        tokio::runtime::Handle::current().block_on(on_block_cb(
-                                                            thread_index,
-                                                            BlockData::LeaderSkipped {
-                                                                slot: skipped_slot,
-                                                            },
-                                                        ))
-                                                    })
-                                                    .map_err(|e| FirehoseError::BlockHandlerError(e))?;
+                                                    on_block_cb(
+                                                        thread_index,
+                                                        BlockData::LeaderSkipped {
+                                                            slot: skipped_slot,
+                                                        },
+                                                    )
+                                                    .await
+                                                    .map_err(|e| {
+                                                        (
+                                                            FirehoseError::BlockHandlerError(e),
+                                                            error_slot,
+                                                        )
+                                                    })?;
                                                     fetch_add_if(
                                                         tracking_enabled,
                                                         &overall_slots_processed,
@@ -793,27 +851,31 @@ where
                                                 }
                                             }
                                             let keyed_rewards = std::mem::take(&mut this_block_rewards);
-                                            tokio::task::block_in_place(|| {
-                                                tokio::runtime::Handle::current().block_on(on_block_cb(
-                                                    thread_index,
-                                                    BlockData::Block {
-                                                        parent_slot: block.meta.parent_slot,
-                                                        parent_blockhash: previous_blockhash,
-                                                        slot: block.slot,
-                                                        blockhash: latest_entry_blockhash,
-                                                        rewards: KeyedRewardsAndNumPartitions {
-                                                            keyed_rewards,
-                                                            num_partitions: None,
-                                                        },
-                                                        block_time: Some(block.meta.blocktime as i64),
-                                                        block_height: block.meta.block_height,
-                                                        executed_transaction_count:
-                                                            this_block_executed_transaction_count,
-                                                        entry_count: this_block_entry_count,
+                                            on_block_cb(
+                                                thread_index,
+                                                BlockData::Block {
+                                                    parent_slot: block.meta.parent_slot,
+                                                    parent_blockhash: previous_blockhash,
+                                                    slot: block.slot,
+                                                    blockhash: latest_entry_blockhash,
+                                                    rewards: KeyedRewardsAndNumPartitions {
+                                                        keyed_rewards,
+                                                        num_partitions: None,
                                                     },
-                                                ))
-                                            })
-                                            .map_err(|e| FirehoseError::BlockHandlerError(e))?;
+                                                    block_time: Some(block.meta.blocktime as i64),
+                                                    block_height: block.meta.block_height,
+                                                    executed_transaction_count:
+                                                        this_block_executed_transaction_count,
+                                                    entry_count: this_block_entry_count,
+                                                },
+                                            )
+                                            .await
+                                            .map_err(|e| {
+                                                (
+                                                    FirehoseError::BlockHandlerError(e),
+                                                    error_slot,
+                                                )
+                                            })?;
                                         }
                                     } else {
                                         this_block_rewards.clear();
@@ -826,20 +888,16 @@ where
                                         thread_stats.slots_processed += 1;
                                         thread_stats.current_slot = slot;
                                         if slot % stats_tracking_tmp.tracking_interval_slots == 0 {
-                                            tokio::task::block_in_place(|| {
-                                                tokio::runtime::Handle::current().block_on(
-                                                    maybe_emit_stats(
-                                                        stats_tracking.as_ref(),
-                                                        thread_index,
-                                                        &thread_stats,
-                                                        &overall_slots_processed,
-                                                        &overall_blocks_processed,
-                                                        &overall_transactions_processed,
-                                                        &overall_entries_processed,
-                                                    ),
-                                                )
-                                            })
-                                            .map_err(|(e, _slot)| e)?;
+                                            maybe_emit_stats(
+                                                stats_tracking.as_ref(),
+                                                thread_index,
+                                                &thread_stats,
+                                                &overall_slots_processed,
+                                                &overall_blocks_processed,
+                                                &overall_transactions_processed,
+                                                &overall_entries_processed,
+                                            )
+                                            .await?;
                                         }
                                     }
                                 }
@@ -847,52 +905,83 @@ where
                                 Epoch(_epoch) => (),
                                 Rewards(rewards) => {
                                     if reward_enabled || block_enabled {
-                                        let reassembled =
-                                            nodes.reassemble_dataframes(rewards.data.clone())?;
+                                        let reassembled = nodes
+                                            .reassemble_dataframes(rewards.data.clone())
+                                            .map_err(|err| {
+                                                (
+                                                    FirehoseError::NodeDecodingError(item_index, err),
+                                                    current_slot.unwrap_or(slot_range.start),
+                                                )
+                                            })?;
                                         if reassembled.is_empty() {
                                             this_block_rewards.clear();
                                             if reward_enabled
                                                 && let Some(on_reward_cb) = on_reward.as_ref()
                                             {
-                                                tokio::task::block_in_place(|| {
-                                                    tokio::runtime::Handle::current().block_on(on_reward_cb(
-                                                        thread_index,
-                                                        RewardsData {
-                                                            slot: block.slot,
-                                                            rewards: Vec::new(),
-                                                        },
-                                                    ))
-                                                })
-                                                .map_err(|e| FirehoseError::RewardHandlerError(e))?;
-                                            }
-                                            return Ok(());
-                                        }
-
-                                        let decompressed = utils::decompress_zstd(reassembled)?;
-
-                                        let decoded =
-                                            prost_011::Message::decode(decompressed.as_slice()).map_err(|err| {
-                                                Box::new(std::io::Error::other(
-                                                    std::format!(
-                                                        "Error decoding rewards: {:?}",
-                                                        err
-                                                    ),
-                                                ))
-                                            })?;
-                                        let keyed_rewards = convert_proto_rewards(&decoded)?;
-                                        if reward_enabled
-                                            && let Some(on_reward_cb) = on_reward.as_ref()
-                                        {
-                                            tokio::task::block_in_place(|| {
-                                                tokio::runtime::Handle::current().block_on(on_reward_cb(
+                                                on_reward_cb(
                                                     thread_index,
                                                     RewardsData {
                                                         slot: block.slot,
-                                                        rewards: keyed_rewards.clone(),
+                                                        rewards: Vec::new(),
                                                     },
-                                                ))
-                                            })
-                                            .map_err(|e| FirehoseError::RewardHandlerError(e))?;
+                                                )
+                                                .await
+                                                .map_err(|e| {
+                                                    (
+                                                        FirehoseError::RewardHandlerError(e),
+                                                        error_slot,
+                                                    )
+                                                })?;
+                                            }
+                                            continue;
+                                        }
+
+                                        let decompressed = utils::decompress_zstd(reassembled)
+                                            .map_err(|err| {
+                                                (
+                                                    FirehoseError::NodeDecodingError(
+                                                        item_index,
+                                                        err,
+                                                    ),
+                                                    error_slot,
+                                                )
+                                            })?;
+
+                                        let decoded =
+                                            prost_011::Message::decode(decompressed.as_slice())
+                                                .map_err(|err| {
+                                                    (
+                                                        FirehoseError::NodeDecodingError(
+                                                            item_index,
+                                                            Box::new(err),
+                                                        ),
+                                                        error_slot,
+                                                    )
+                                                })?;
+                                        let keyed_rewards = convert_proto_rewards(&decoded)
+                                            .map_err(|err| {
+                                                (
+                                                    FirehoseError::NodeDecodingError(item_index, err),
+                                                    error_slot,
+                                                )
+                                            })?;
+                                        if reward_enabled
+                                            && let Some(on_reward_cb) = on_reward.as_ref()
+                                        {
+                                            on_reward_cb(
+                                                thread_index,
+                                                RewardsData {
+                                                    slot: block.slot,
+                                                    rewards: keyed_rewards.clone(),
+                                                },
+                                            )
+                                            .await
+                                            .map_err(|e| {
+                                                (
+                                                    FirehoseError::RewardHandlerError(e),
+                                                    error_slot,
+                                                )
+                                            })?;
                                         }
                                         this_block_rewards = keyed_rewards;
                                         if let Some(ref mut stats) = thread_stats {
@@ -903,10 +992,7 @@ where
                                 }
                                 DataFrame(_data_frame) => (),
                             }
-                            Ok(())
-                        })
-                        .map_err(|e| FirehoseError::NodeDecodingError(item_index, e))
-                        .map_err(|e| (e, current_slot.unwrap_or(slot_range.start)))?;
+                        }
                         if block.slot == slot_range.end - 1 {
                             let finish_time = std::time::Instant::now();
                             let elapsed = finish_time.duration_since(start_time);

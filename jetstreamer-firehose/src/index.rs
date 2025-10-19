@@ -7,7 +7,7 @@ use reqwest::{Client, StatusCode, Url, header::RANGE};
 use serde_cbor::Value;
 use std::{collections::HashMap, future::Future, ops::Range, sync::Arc};
 use thiserror::Error;
-use tokio::sync::{Mutex, OnceCell};
+use tokio::sync::OnceCell;
 use xxhash_rust::xxh64::xxh64;
 
 const COMPACT_INDEX_MAGIC: &[u8; 8] = b"compiszd";
@@ -287,7 +287,7 @@ struct RemoteCompactIndex {
     client: Client,
     url: Url,
     header: CompactIndexHeader,
-    bucket_cache: Mutex<HashMap<u32, Arc<BucketData>>>,
+    bucket_entries: DashMap<u32, Arc<BucketEntry>>,
 }
 
 impl RemoteCompactIndex {
@@ -317,7 +317,7 @@ impl RemoteCompactIndex {
             client,
             url,
             header,
-            bucket_cache: Mutex::new(HashMap::new()),
+            bucket_entries: DashMap::new(),
         })
     }
 
@@ -346,10 +346,20 @@ impl RemoteCompactIndex {
     }
 
     async fn get_bucket(&self, index: u32) -> Result<Arc<BucketData>, SlotOffsetIndexError> {
-        if let Some(bucket) = self.bucket_cache.lock().await.get(&index).cloned() {
-            return Ok(bucket);
-        }
+        let entry = match self.bucket_entries.entry(index) {
+            Entry::Occupied(occupied) => Arc::clone(occupied.get()),
+            Entry::Vacant(vacant) => {
+                let new_entry = Arc::new(BucketEntry::new());
+                vacant.insert(Arc::clone(&new_entry));
+                new_entry
+            }
+        };
+        entry
+            .get_or_load(|| async { self.load_bucket(index).await })
+            .await
+    }
 
+    async fn load_bucket(&self, index: u32) -> Result<Arc<BucketData>, SlotOffsetIndexError> {
         let bucket_header_offset =
             self.header.header_size + (index as u64) * BUCKET_HEADER_SIZE as u64;
         let header_bytes = fetch_range(
@@ -386,14 +396,12 @@ impl RemoteCompactIndex {
             ));
         }
 
-        let bucket = Arc::new(BucketData::new(
+        Ok(Arc::new(BucketData::new(
             bucket_header,
             data,
             stride,
             self.header.value_size as usize,
-        ));
-        let mut cache = self.bucket_cache.lock().await;
-        Ok(cache.entry(index).or_insert_with(|| bucket.clone()).clone())
+        )))
     }
 }
 
@@ -454,6 +462,29 @@ impl BucketData {
             }
         }
         Ok(None)
+    }
+}
+
+struct BucketEntry {
+    once: OnceCell<Arc<BucketData>>,
+}
+
+impl BucketEntry {
+    fn new() -> Self {
+        Self {
+            once: OnceCell::new(),
+        }
+    }
+
+    async fn get_or_load<F, Fut>(&self, loader: F) -> Result<Arc<BucketData>, SlotOffsetIndexError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<Arc<BucketData>, SlotOffsetIndexError>>,
+    {
+        self.once
+            .get_or_try_init(|| async { loader().await })
+            .await
+            .map(Arc::clone)
     }
 }
 

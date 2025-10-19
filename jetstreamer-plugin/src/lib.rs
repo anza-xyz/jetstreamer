@@ -240,17 +240,13 @@ impl PluginRunner {
             let plugin_handles = plugin_handles.clone();
             let clickhouse = clickhouse.clone();
             let slot_buffer = slot_buffer.clone();
-            let clickhouse_enabled = clickhouse_enabled;
             let slots_since_flush = slots_since_flush.clone();
-            let db_update_interval = db_update_interval;
             let shutting_down = shutting_down.clone();
             move |thread_id: usize, block: BlockData| {
                 let plugin_handles = plugin_handles.clone();
                 let clickhouse = clickhouse.clone();
                 let slot_buffer = slot_buffer.clone();
-                let clickhouse_enabled = clickhouse_enabled;
                 let slots_since_flush = slots_since_flush.clone();
-                let db_update_interval = db_update_interval;
                 let shutting_down = shutting_down.clone();
                 async move {
                     if plugin_handles.is_empty() {
@@ -439,6 +435,7 @@ impl PluginRunner {
 
         let total_slot_count = slot_range.end.saturating_sub(slot_range.start);
 
+        let total_slot_count_capture = total_slot_count;
         let stats_tracking = clickhouse.clone().map(|_db| {
             let shutting_down = shutting_down.clone();
             let last_snapshot: Arc<Mutex<SnapshotWindow>> =
@@ -446,7 +443,7 @@ impl PluginRunner {
             StatsTracking {
                 on_stats: {
                     let last_snapshot = last_snapshot.clone();
-                    let total_slot_count = total_slot_count;
+                    let total_slot_count = total_slot_count_capture;
                     move |thread_id: usize, stats: Stats| {
                         let shutting_down = shutting_down.clone();
                         let last_snapshot = last_snapshot.clone();

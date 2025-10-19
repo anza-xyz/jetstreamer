@@ -217,6 +217,7 @@ pub struct StatsTracking<OnStats: Handler<Stats>> {
 }
 
 #[inline(always)]
+#[allow(clippy::too_many_arguments)]
 async fn maybe_emit_stats<OnStats: Handler<Stats>>(
     stats_tracking: Option<&StatsTracking<OnStats>>,
     thread_index: usize,
@@ -357,6 +358,7 @@ pub type OnRewardFn = HandlerFn<RewardsData>;
 pub type StatsTracker = StatsTracking<HandlerFn<Stats>>;
 
 #[inline]
+#[allow(clippy::too_many_arguments)]
 pub async fn firehose<OnBlock, OnTransaction, OnEntry, OnRewards, OnStats>(
     threads: u64,
     slot_range: Range<u64>,
@@ -1167,6 +1169,7 @@ where
     Ok(())
 }
 
+#[allow(clippy::result_large_err)]
 pub fn firehose_geyser(
     rt: Arc<tokio::runtime::Runtime>,
     slot_range: Range<u64>,
@@ -1293,6 +1296,7 @@ pub fn firehose_geyser(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::result_large_err)]
 async fn firehose_geyser_thread(
     mut slot_range: Range<u64>,
     transaction_notifier_maybe: Option<Arc<dyn TransactionNotifier + Send + Sync + 'static>>,

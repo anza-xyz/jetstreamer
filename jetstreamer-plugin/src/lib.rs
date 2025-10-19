@@ -20,10 +20,7 @@ use jetstreamer_firehose::firehose::{
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
-use tokio::{
-    signal,
-    sync::{Semaphore, broadcast},
-};
+use tokio::{signal, sync::broadcast};
 
 #[derive(Clone, Copy)]
 struct Snapshot {
@@ -232,18 +229,15 @@ impl PluginRunner {
             }
         }
 
-        let concurrency = Arc::new(Semaphore::new(self.num_threads));
         let shutting_down = Arc::new(AtomicBool::new(false));
 
         let on_block = {
             let plugin_handles = plugin_handles.clone();
             let clickhouse = clickhouse.clone();
-            let concurrency = concurrency.clone();
             let shutting_down = shutting_down.clone();
             move |thread_id: usize, block: BlockData| {
                 let plugin_handles = plugin_handles.clone();
                 let clickhouse = clickhouse.clone();
-                let concurrency = concurrency.clone();
                 let shutting_down = shutting_down.clone();
                 async move {
                     if plugin_handles.is_empty() {
@@ -253,10 +247,6 @@ impl PluginRunner {
                         log::debug!("ignoring block while shutdown is in progress");
                         return Ok(());
                     }
-                    let permit = match concurrency.clone().acquire_owned().await {
-                        Ok(permit) => permit,
-                        Err(_) => return Ok(()),
-                    };
                     let block = Arc::new(block);
                     for handle in plugin_handles.iter() {
                         let db = clickhouse.clone();
@@ -281,7 +271,6 @@ impl PluginRunner {
                             }
                         }
                     }
-                    drop(permit);
                     Ok(())
                 }
                 .boxed()
@@ -291,12 +280,10 @@ impl PluginRunner {
         let on_transaction = {
             let plugin_handles = plugin_handles.clone();
             let clickhouse = clickhouse.clone();
-            let concurrency = concurrency.clone();
             let shutting_down = shutting_down.clone();
             move |thread_id: usize, transaction: TransactionData| {
                 let plugin_handles = plugin_handles.clone();
                 let clickhouse = clickhouse.clone();
-                let concurrency = concurrency.clone();
                 let shutting_down = shutting_down.clone();
                 async move {
                     if plugin_handles.is_empty() {
@@ -306,10 +293,6 @@ impl PluginRunner {
                         log::debug!("ignoring transaction while shutdown is in progress");
                         return Ok(());
                     }
-                    let permit = match concurrency.clone().acquire_owned().await {
-                        Ok(permit) => permit,
-                        Err(_) => return Ok(()),
-                    };
                     let transaction = Arc::new(transaction);
                     for handle in plugin_handles.iter() {
                         if let Err(err) = handle
@@ -320,7 +303,6 @@ impl PluginRunner {
                             log::error!("plugin {} on_transaction error: {}", handle.name, err);
                         }
                     }
-                    drop(permit);
                     Ok(())
                 }
                 .boxed()
@@ -330,12 +312,10 @@ impl PluginRunner {
         let on_entry = {
             let plugin_handles = plugin_handles.clone();
             let clickhouse = clickhouse.clone();
-            let concurrency = concurrency.clone();
             let shutting_down = shutting_down.clone();
             move |thread_id: usize, entry: EntryData| {
                 let plugin_handles = plugin_handles.clone();
                 let clickhouse = clickhouse.clone();
-                let concurrency = concurrency.clone();
                 let shutting_down = shutting_down.clone();
                 async move {
                     if plugin_handles.is_empty() {
@@ -345,10 +325,6 @@ impl PluginRunner {
                         log::debug!("ignoring entry while shutdown is in progress");
                         return Ok(());
                     }
-                    let permit = match concurrency.clone().acquire_owned().await {
-                        Ok(permit) => permit,
-                        Err(_) => return Ok(()),
-                    };
                     let entry = Arc::new(entry);
                     for handle in plugin_handles.iter() {
                         if let Err(err) = handle
@@ -359,7 +335,6 @@ impl PluginRunner {
                             log::error!("plugin {} on_entry error: {}", handle.name, err);
                         }
                     }
-                    drop(permit);
                     Ok(())
                 }
                 .boxed()
@@ -369,12 +344,10 @@ impl PluginRunner {
         let on_reward = {
             let plugin_handles = plugin_handles.clone();
             let clickhouse = clickhouse.clone();
-            let concurrency = concurrency.clone();
             let shutting_down = shutting_down.clone();
             move |thread_id: usize, reward: RewardsData| {
                 let plugin_handles = plugin_handles.clone();
                 let clickhouse = clickhouse.clone();
-                let concurrency = concurrency.clone();
                 let shutting_down = shutting_down.clone();
                 async move {
                     if plugin_handles.is_empty() {
@@ -384,10 +357,6 @@ impl PluginRunner {
                         log::debug!("ignoring reward while shutdown is in progress");
                         return Ok(());
                     }
-                    let permit = match concurrency.clone().acquire_owned().await {
-                        Ok(permit) => permit,
-                        Err(_) => return Ok(()),
-                    };
                     let reward = Arc::new(reward);
                     for handle in plugin_handles.iter() {
                         if let Err(err) = handle
@@ -398,7 +367,6 @@ impl PluginRunner {
                             log::error!("plugin {} on_reward error: {}", handle.name, err);
                         }
                     }
-                    drop(permit);
                     Ok(())
                 }
                 .boxed()
@@ -530,7 +498,6 @@ impl PluginRunner {
                     Err(err) => log::error!("failed to listen for CTRL+C: {}", err),
                 }
                 shutting_down.store(true, Ordering::SeqCst);
-                concurrency.close();
                 let _ = shutdown_tx.send(());
                 firehose_future.await
             }

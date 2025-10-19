@@ -19,7 +19,7 @@ const METADATA_KEY_KIND: &[u8] = b"index_kind";
 const METADATA_KEY_EPOCH: &[u8] = b"epoch";
 const HTTP_PREFETCH_BYTES: u64 = 4 * 1024; // initial bytes to fetch for headers
 const FETCH_RANGE_MAX_RETRIES: usize = 5;
-const FETCH_RANGE_BASE_DELAY_MS: u64 = 500;
+const FETCH_RANGE_BASE_DELAY_MS: u64 = 2000;
 
 #[derive(Debug, Error)]
 pub enum SlotOffsetIndexError {

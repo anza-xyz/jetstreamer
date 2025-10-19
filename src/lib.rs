@@ -70,7 +70,7 @@ impl JetstreamerRunner {
             log::info!("slot index base url: {}", index_url);
         }
 
-        let threads = std::cmp::max(1, self.config.threads as usize);
+        let threads = std::cmp::max(1, self.config.threads);
         let clickhouse_enabled =
             self.config.clickhouse_enabled && !self.clickhouse_dsn.trim().is_empty();
         let slot_range = self.config.slot_range.clone();
@@ -185,7 +185,7 @@ impl JetstreamerRunner {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Config {
     /// Number of simultaneous firehose streams to spawn.
-    pub threads: u8,
+    pub threads: usize,
     /// The range of slots to process, inclusive of the start and exclusive of the end slot.
     pub slot_range: Range<u64>,
     /// Whether to connect to ClickHouse for plugin output.
@@ -216,7 +216,7 @@ pub fn parse_cli_args() -> Result<Config, Box<dyn std::error::Error>> {
 
     let threads = std::env::var("JETSTREAMER_THREADS")
         .ok()
-        .and_then(|s| s.parse::<u8>().ok())
+        .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(1);
 
     let spawn_clickhouse = std::env::var("JETSTREAMER_SPAWN_CLICKHOUSE")

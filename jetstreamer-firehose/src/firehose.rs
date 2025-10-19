@@ -205,6 +205,8 @@ pub struct Stats {
     pub entries_processed: u64,
     pub rewards_processed: u64,
     pub transactions_since_last_pulse: u64,
+    pub blocks_since_last_pulse: u64,
+    pub slots_since_last_pulse: u64,
 }
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
@@ -223,6 +225,8 @@ async fn maybe_emit_stats<OnStats: Handler<Stats>>(
     overall_transactions_processed: &AtomicU64,
     overall_entries_processed: &AtomicU64,
     transactions_since_stats: &AtomicU64,
+    blocks_since_stats: &AtomicU64,
+    slots_since_stats: &AtomicU64,
 ) -> Result<(), (FirehoseError, u64)> {
     if let Some(stats_tracker) = stats_tracking {
         let total_slots = overall_slots_processed.load(Ordering::Relaxed);
@@ -230,6 +234,8 @@ async fn maybe_emit_stats<OnStats: Handler<Stats>>(
         let total_transactions = overall_transactions_processed.load(Ordering::Relaxed);
         let total_entries = overall_entries_processed.load(Ordering::Relaxed);
         let processed_transactions = transactions_since_stats.swap(0, Ordering::Relaxed);
+        let processed_blocks = blocks_since_stats.swap(0, Ordering::Relaxed);
+        let processed_slots = slots_since_stats.swap(0, Ordering::Relaxed);
 
         let stats = Stats {
             thread_stats: thread_stats.clone(),
@@ -243,6 +249,8 @@ async fn maybe_emit_stats<OnStats: Handler<Stats>>(
             entries_processed: total_entries,
             rewards_processed: thread_stats.rewards_processed,
             transactions_since_last_pulse: processed_transactions,
+            blocks_since_last_pulse: processed_blocks,
+            slots_since_last_pulse: processed_slots,
         };
 
         (stats_tracker.on_stats)(thread_index, stats)
@@ -411,12 +419,18 @@ where
         let overall_entries_processed = overall_entries_processed.clone();
         let stats_tracking = stats_tracking.clone();
         let transactions_since_stats = Arc::new(AtomicU64::new(0));
+        let blocks_since_stats = Arc::new(AtomicU64::new(0));
+        let slots_since_stats = Arc::new(AtomicU64::new(0));
         let transactions_since_stats_cloned = transactions_since_stats.clone();
+        let blocks_since_stats_cloned = blocks_since_stats.clone();
+        let slots_since_stats_cloned = slots_since_stats.clone();
         let shutdown_flag = shutdown_flag.clone();
         let thread_shutdown_rx = shutdown_signal.as_ref().map(|rx| rx.resubscribe());
 
         let handle = tokio::spawn(async move {
             let transactions_since_stats = transactions_since_stats_cloned;
+            let blocks_since_stats = blocks_since_stats_cloned;
+            let slots_since_stats = slots_since_stats_cloned;
             let mut shutdown_rx = thread_shutdown_rx;
             let start_time = std::time::Instant::now();
             let log_target = format!("{}::T{:03}", LOG_MODULE, thread_index);
@@ -593,6 +607,7 @@ where
                                         stats.slots_processed += 1;
                                         stats.current_slot = skipped_slot;
                                     }
+                                    slots_since_stats.fetch_add(1, Ordering::Relaxed);
                                     fetch_add_if(tracking_enabled, &overall_slots_processed, 1);
                                 }
                             }
@@ -895,6 +910,8 @@ where
                                         thread_stats.blocks_processed += 1;
                                         thread_stats.slots_processed += 1;
                                         thread_stats.current_slot = slot;
+                                        blocks_since_stats.fetch_add(1, Ordering::Relaxed);
+                                        slots_since_stats.fetch_add(1, Ordering::Relaxed);
                                         if slot % stats_tracking_tmp.tracking_interval_slots == 0 {
                                             maybe_emit_stats(
                                                 stats_tracking.as_ref(),
@@ -905,6 +922,8 @@ where
                                                 &overall_transactions_processed,
                                                 &overall_entries_processed,
                                                 &transactions_since_stats,
+                                                &blocks_since_stats,
+                                                &slots_since_stats,
                                             )
                                             .await?;
                                         }
@@ -1046,6 +1065,8 @@ where
                             &overall_transactions_processed,
                             &overall_entries_processed,
                             &transactions_since_stats,
+                            &blocks_since_stats,
+                            &slots_since_stats,
                         )
                         .await?;
                     }

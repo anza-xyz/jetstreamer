@@ -7,7 +7,7 @@ use std::{
     pin::Pin,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, Ordering},
     },
     time::Duration,
 };
@@ -22,8 +22,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::{
     signal,
-    sync::{Notify, Semaphore, broadcast},
-    task,
+    sync::{Semaphore, broadcast},
 };
 
 #[derive(Clone, Copy)]
@@ -234,35 +233,30 @@ impl PluginRunner {
         }
 
         let concurrency = Arc::new(Semaphore::new(self.num_threads));
-        let inflight = Arc::new(AtomicUsize::new(0));
-        let notify = Arc::new(Notify::new());
         let shutting_down = Arc::new(AtomicBool::new(false));
 
         let on_block = {
             let plugin_handles = plugin_handles.clone();
             let clickhouse = clickhouse.clone();
             let concurrency = concurrency.clone();
-            let inflight = inflight.clone();
-            let notify = notify.clone();
             let shutting_down = shutting_down.clone();
-            move |thread_id: usize,
-                  block: BlockData|
-                  -> Result<(), Box<dyn std::error::Error + Send>> {
-                if plugin_handles.is_empty() {
-                    return Ok(());
-                }
-                if shutting_down.load(Ordering::SeqCst) {
-                    log::debug!("ignoring block while shutdown is in progress");
-                    return Ok(());
-                }
-                inflight.fetch_add(1, Ordering::SeqCst);
+            move |thread_id: usize, block: BlockData| {
                 let plugin_handles = plugin_handles.clone();
                 let clickhouse = clickhouse.clone();
                 let concurrency = concurrency.clone();
-                let inflight = inflight.clone();
-                let notify = notify.clone();
-                task::spawn(async move {
-                    let permit = concurrency.acquire_owned().await.ok();
+                let shutting_down = shutting_down.clone();
+                async move {
+                    if plugin_handles.is_empty() {
+                        return Ok(());
+                    }
+                    if shutting_down.load(Ordering::SeqCst) {
+                        log::debug!("ignoring block while shutdown is in progress");
+                        return Ok(());
+                    }
+                    let permit = match concurrency.clone().acquire_owned().await {
+                        Ok(permit) => permit,
+                        Err(_) => return Ok(()),
+                    };
                     let block = Arc::new(block);
                     for handle in plugin_handles.iter() {
                         let db = clickhouse.clone();
@@ -288,11 +282,9 @@ impl PluginRunner {
                         }
                     }
                     drop(permit);
-                    if inflight.fetch_sub(1, Ordering::SeqCst) == 1 {
-                        notify.notify_waiters();
-                    }
-                });
-                Ok(())
+                    Ok(())
+                }
+                .boxed()
             }
         };
 
@@ -300,27 +292,24 @@ impl PluginRunner {
             let plugin_handles = plugin_handles.clone();
             let clickhouse = clickhouse.clone();
             let concurrency = concurrency.clone();
-            let inflight = inflight.clone();
-            let notify = notify.clone();
             let shutting_down = shutting_down.clone();
-            move |thread_id: usize,
-                  transaction: TransactionData|
-                  -> Result<(), Box<dyn std::error::Error + Send>> {
-                if plugin_handles.is_empty() {
-                    return Ok(());
-                }
-                if shutting_down.load(Ordering::SeqCst) {
-                    log::debug!("ignoring transaction while shutdown is in progress");
-                    return Ok(());
-                }
-                inflight.fetch_add(1, Ordering::SeqCst);
+            move |thread_id: usize, transaction: TransactionData| {
                 let plugin_handles = plugin_handles.clone();
                 let clickhouse = clickhouse.clone();
                 let concurrency = concurrency.clone();
-                let inflight = inflight.clone();
-                let notify = notify.clone();
-                task::spawn(async move {
-                    let permit = concurrency.acquire_owned().await.ok();
+                let shutting_down = shutting_down.clone();
+                async move {
+                    if plugin_handles.is_empty() {
+                        return Ok(());
+                    }
+                    if shutting_down.load(Ordering::SeqCst) {
+                        log::debug!("ignoring transaction while shutdown is in progress");
+                        return Ok(());
+                    }
+                    let permit = match concurrency.clone().acquire_owned().await {
+                        Ok(permit) => permit,
+                        Err(_) => return Ok(()),
+                    };
                     let transaction = Arc::new(transaction);
                     for handle in plugin_handles.iter() {
                         if let Err(err) = handle
@@ -332,11 +321,9 @@ impl PluginRunner {
                         }
                     }
                     drop(permit);
-                    if inflight.fetch_sub(1, Ordering::SeqCst) == 1 {
-                        notify.notify_waiters();
-                    }
-                });
-                Ok(())
+                    Ok(())
+                }
+                .boxed()
             }
         };
 
@@ -344,27 +331,24 @@ impl PluginRunner {
             let plugin_handles = plugin_handles.clone();
             let clickhouse = clickhouse.clone();
             let concurrency = concurrency.clone();
-            let inflight = inflight.clone();
-            let notify = notify.clone();
             let shutting_down = shutting_down.clone();
-            move |thread_id: usize,
-                  entry: EntryData|
-                  -> Result<(), Box<dyn std::error::Error + Send>> {
-                if plugin_handles.is_empty() {
-                    return Ok(());
-                }
-                if shutting_down.load(Ordering::SeqCst) {
-                    log::debug!("ignoring entry while shutdown is in progress");
-                    return Ok(());
-                }
-                inflight.fetch_add(1, Ordering::SeqCst);
+            move |thread_id: usize, entry: EntryData| {
                 let plugin_handles = plugin_handles.clone();
                 let clickhouse = clickhouse.clone();
                 let concurrency = concurrency.clone();
-                let inflight = inflight.clone();
-                let notify = notify.clone();
-                task::spawn(async move {
-                    let permit = concurrency.acquire_owned().await.ok();
+                let shutting_down = shutting_down.clone();
+                async move {
+                    if plugin_handles.is_empty() {
+                        return Ok(());
+                    }
+                    if shutting_down.load(Ordering::SeqCst) {
+                        log::debug!("ignoring entry while shutdown is in progress");
+                        return Ok(());
+                    }
+                    let permit = match concurrency.clone().acquire_owned().await {
+                        Ok(permit) => permit,
+                        Err(_) => return Ok(()),
+                    };
                     let entry = Arc::new(entry);
                     for handle in plugin_handles.iter() {
                         if let Err(err) = handle
@@ -376,11 +360,9 @@ impl PluginRunner {
                         }
                     }
                     drop(permit);
-                    if inflight.fetch_sub(1, Ordering::SeqCst) == 1 {
-                        notify.notify_waiters();
-                    }
-                });
-                Ok(())
+                    Ok(())
+                }
+                .boxed()
             }
         };
 
@@ -388,27 +370,24 @@ impl PluginRunner {
             let plugin_handles = plugin_handles.clone();
             let clickhouse = clickhouse.clone();
             let concurrency = concurrency.clone();
-            let inflight = inflight.clone();
-            let notify = notify.clone();
             let shutting_down = shutting_down.clone();
-            move |thread_id: usize,
-                  reward: RewardsData|
-                  -> Result<(), Box<dyn std::error::Error + Send>> {
-                if plugin_handles.is_empty() {
-                    return Ok(());
-                }
-                if shutting_down.load(Ordering::SeqCst) {
-                    log::debug!("ignoring reward while shutdown is in progress");
-                    return Ok(());
-                }
-                inflight.fetch_add(1, Ordering::SeqCst);
+            move |thread_id: usize, reward: RewardsData| {
                 let plugin_handles = plugin_handles.clone();
                 let clickhouse = clickhouse.clone();
                 let concurrency = concurrency.clone();
-                let inflight = inflight.clone();
-                let notify = notify.clone();
-                task::spawn(async move {
-                    let permit = concurrency.acquire_owned().await.ok();
+                let shutting_down = shutting_down.clone();
+                async move {
+                    if plugin_handles.is_empty() {
+                        return Ok(());
+                    }
+                    if shutting_down.load(Ordering::SeqCst) {
+                        log::debug!("ignoring reward while shutdown is in progress");
+                        return Ok(());
+                    }
+                    let permit = match concurrency.clone().acquire_owned().await {
+                        Ok(permit) => permit,
+                        Err(_) => return Ok(()),
+                    };
                     let reward = Arc::new(reward);
                     for handle in plugin_handles.iter() {
                         if let Err(err) = handle
@@ -420,20 +399,15 @@ impl PluginRunner {
                         }
                     }
                     drop(permit);
-                    if inflight.fetch_sub(1, Ordering::SeqCst) == 1 {
-                        notify.notify_waiters();
-                    }
-                });
-                Ok(())
+                    Ok(())
+                }
+                .boxed()
             }
         };
 
         let total_slot_count = slot_range.end.saturating_sub(slot_range.start);
 
         let stats_tracking = clickhouse.clone().map(|db| {
-            let inflight = inflight.clone();
-            let notify = notify.clone();
-            let concurrency = concurrency.clone();
             let shutting_down = shutting_down.clone();
             let last_snapshot: Arc<Mutex<SnapshotWindow>> =
                 Arc::new(Mutex::new(SnapshotWindow::default()));
@@ -442,97 +416,93 @@ impl PluginRunner {
                     let last_snapshot = last_snapshot.clone();
                     let total_slot_count = total_slot_count;
                     move |thread_id: usize, stats: Stats| {
-                        if shutting_down.load(Ordering::SeqCst) {
-                            return Ok(());
-                        }
-                        inflight.fetch_add(1, Ordering::SeqCst);
                         let db = db.clone();
-                        let inflight = inflight.clone();
-                        let notify = notify.clone();
-                        let concurrency = concurrency.clone();
                         let shutting_down = shutting_down.clone();
-                        let finish_at = stats
-                            .finish_time
-                            .unwrap_or_else(std::time::Instant::now);
-                        let elapsed = finish_at.saturating_duration_since(stats.start_time);
-                        let elapsed_secs = elapsed.as_secs_f64();
-                        let mut tps = if elapsed_secs > 0.0 {
-                            stats.transactions_processed as f64 / elapsed_secs
-                        } else {
-                            0.0
-                        };
-                        let thread_stats = &stats.thread_stats;
-                        let processed_slots = stats.slots_processed.min(total_slot_count);
-                        let progress_fraction = if total_slot_count > 0 {
-                            processed_slots as f64 / total_slot_count as f64
-                        } else {
-                            1.0
-                        };
-                        let overall_progress = (progress_fraction * 100.0).clamp(0.0, 100.0);
-                        let thread_total_slots = thread_stats
-                            .slot_range
-                            .end
-                            .saturating_sub(thread_stats.slot_range.start);
-                        let thread_progress = if thread_total_slots > 0 {
-                            (thread_stats.slots_processed as f64 / thread_total_slots as f64)
-                                .clamp(0.0, 1.0)
-                                * 100.0
-                        } else {
-                            100.0
-                        };
-                        let mut overall_eta = None;
-                        if let Ok(mut window) = last_snapshot.lock() {
-                            if let Some(rates) = window.update(Snapshot {
-                                time: finish_at,
-                                slots: stats.slots_processed,
-                                txs: stats.transactions_processed,
-                            }) {
-                                tps = rates.tx_rate;
-                                let remaining_slots = total_slot_count.saturating_sub(processed_slots);
-                                if rates.slot_rate > 0.0 && remaining_slots > 0 {
-                                    overall_eta = Some(human_readable_duration(remaining_slots as f64 / rates.slot_rate));
-                                }
-                            }
-                        }
-                        if overall_eta.is_none() {
-                            if progress_fraction > 0.0 && progress_fraction < 1.0 {
-                                if let Some(elapsed_total) = finish_at
-                                    .checked_duration_since(stats.start_time)
-                                    .map(|d| d.as_secs_f64())
-                                {
-                                    if elapsed_total > 0.0 {
-                                        let remaining_secs = elapsed_total * (1.0 / progress_fraction - 1.0);
-                                        overall_eta = Some(human_readable_duration(remaining_secs));
-                                    }
-                                }
-                            } else if progress_fraction >= 1.0 {
-                                overall_eta = Some("0s".into());
-                            }
-                        }
-                        log::info!(
-                            "stats pulse: thread={thread_id} slots={} blocks={} txs={} tps={tps:.2} progress={overall_progress:.1}% thread_slots={} thread_txs={} thread_progress={thread_progress:.1}% eta={}",
-                            processed_slots,
-                            stats.blocks_processed,
-                            stats.transactions_processed,
-                            thread_stats.slots_processed,
-                            thread_stats.transactions_processed,
-                            overall_eta.unwrap_or_else(|| "n/a".into())
-                        );
-                        task::spawn(async move {
-                            let permit = concurrency.acquire_owned().await.ok();
+                        let last_snapshot = last_snapshot.clone();
+                        async move {
                             if shutting_down.load(Ordering::SeqCst) {
                                 log::debug!("skipping stats write during shutdown");
-                            } else if let Err(err) =
+                                return Ok(());
+                            }
+                            let finish_at = stats
+                                .finish_time
+                                .unwrap_or_else(std::time::Instant::now);
+                            let elapsed = finish_at.saturating_duration_since(stats.start_time);
+                            let elapsed_secs = elapsed.as_secs_f64();
+                            let mut tps = if elapsed_secs > 0.0 {
+                                stats.transactions_processed as f64 / elapsed_secs
+                            } else {
+                                0.0
+                            };
+                            let thread_stats = &stats.thread_stats;
+                            let processed_slots = stats.slots_processed.min(total_slot_count);
+                            let progress_fraction = if total_slot_count > 0 {
+                                processed_slots as f64 / total_slot_count as f64
+                            } else {
+                                1.0
+                            };
+                            let overall_progress = (progress_fraction * 100.0).clamp(0.0, 100.0);
+                            let thread_total_slots = thread_stats
+                                .slot_range
+                                .end
+                                .saturating_sub(thread_stats.slot_range.start);
+                            let thread_progress = if thread_total_slots > 0 {
+                                (thread_stats.slots_processed as f64 / thread_total_slots as f64)
+                                    .clamp(0.0, 1.0)
+                                    * 100.0
+                            } else {
+                                100.0
+                            };
+                            let mut overall_eta = None;
+                            if let Ok(mut window) = last_snapshot.lock() {
+                                if let Some(rates) = window.update(Snapshot {
+                                    time: finish_at,
+                                    slots: stats.slots_processed,
+                                    txs: stats.transactions_processed,
+                                }) {
+                                    tps = rates.tx_rate;
+                                    let remaining_slots =
+                                        total_slot_count.saturating_sub(processed_slots);
+                                    if rates.slot_rate > 0.0 && remaining_slots > 0 {
+                                        overall_eta = Some(human_readable_duration(
+                                            remaining_slots as f64 / rates.slot_rate,
+                                        ));
+                                    }
+                                }
+                            }
+                            if overall_eta.is_none() {
+                                if progress_fraction > 0.0 && progress_fraction < 1.0 {
+                                    if let Some(elapsed_total) = finish_at
+                                        .checked_duration_since(stats.start_time)
+                                        .map(|d| d.as_secs_f64())
+                                    {
+                                        if elapsed_total > 0.0 {
+                                            let remaining_secs =
+                                                elapsed_total * (1.0 / progress_fraction - 1.0);
+                                            overall_eta = Some(human_readable_duration(remaining_secs));
+                                        }
+                                    }
+                                } else if progress_fraction >= 1.0 {
+                                    overall_eta = Some("0s".into());
+                                }
+                            }
+                            log::info!(
+                                "stats pulse: thread={thread_id} slots={} blocks={} txs={} tps={tps:.2} progress={overall_progress:.1}% thread_slots={} thread_txs={} thread_progress={thread_progress:.1}% eta={}",
+                                processed_slots,
+                                stats.blocks_processed,
+                                stats.transactions_processed,
+                                thread_stats.slots_processed,
+                                thread_stats.transactions_processed,
+                                overall_eta.unwrap_or_else(|| "n/a".into())
+                            );
+                            if let Err(err) =
                                 record_slot_status(db.clone(), stats.clone(), thread_id).await
                             {
                                 log::error!("failed to record slot status: {}", err);
                             }
-                            drop(permit);
-                            if inflight.fetch_sub(1, Ordering::SeqCst) == 1 {
-                                notify.notify_waiters();
-                            }
-                        });
-                        Ok(())
+                            Ok(())
+                        }
+                        .boxed()
                     }
                 },
                 tracking_interval_slots: 10,
@@ -560,15 +530,11 @@ impl PluginRunner {
                     Err(err) => log::error!("failed to listen for CTRL+C: {}", err),
                 }
                 shutting_down.store(true, Ordering::SeqCst);
-                notify.notify_waiters();
+                concurrency.close();
                 let _ = shutdown_tx.send(());
                 firehose_future.await
             }
         };
-
-        while inflight.load(Ordering::SeqCst) > 0 {
-            notify.notified().await;
-        }
 
         for handle in plugin_handles.iter() {
             if let Err(error) = handle

@@ -1,4 +1,7 @@
 use crossbeam_channel::{Receiver, Sender, unbounded};
+#[cfg(test)]
+use futures_util::FutureExt;
+use futures_util::future::BoxFuture;
 use reqwest::{Client, Url};
 use solana_geyser_plugin_manager::{
     block_metadata_notifier_interface::BlockMetadataNotifier,
@@ -210,7 +213,7 @@ pub struct StatsTracking<OnStats: Handler<Stats>> {
 }
 
 #[inline(always)]
-fn maybe_emit_stats<OnStats: Handler<Stats>>(
+async fn maybe_emit_stats<OnStats: Handler<Stats>>(
     stats_tracking: Option<&StatsTracking<OnStats>>,
     thread_index: usize,
     thread_stats: &ThreadStats,
@@ -238,12 +241,14 @@ fn maybe_emit_stats<OnStats: Handler<Stats>>(
             rewards_processed: thread_stats.rewards_processed,
         };
 
-        (stats_tracker.on_stats)(thread_index, stats).map_err(|e| {
-            (
-                FirehoseError::OnStatsHandlerError(e),
-                thread_stats.current_slot,
-            )
-        })?;
+        (stats_tracker.on_stats)(thread_index, stats)
+            .await
+            .map_err(|e| {
+                (
+                    FirehoseError::OnStatsHandlerError(e),
+                    thread_stats.current_slot,
+                )
+            })?;
     }
     Ok(())
 }
@@ -315,15 +320,16 @@ impl BlockData {
 }
 
 type HandlerResult = Result<(), Box<dyn std::error::Error + Send + 'static>>;
+type HandlerFuture = BoxFuture<'static, HandlerResult>;
 
-pub trait Handler<Data>: Fn(usize, Data) -> HandlerResult + Send + Sync + Clone + 'static {}
+pub trait Handler<Data>: Fn(usize, Data) -> HandlerFuture + Send + Sync + Clone + 'static {}
 
 impl<Data, F> Handler<Data> for F where
-    F: Fn(usize, Data) -> HandlerResult + Send + Sync + Clone + 'static
+    F: Fn(usize, Data) -> HandlerFuture + Send + Sync + Clone + 'static
 {
 }
 
-pub type HandlerFn<Data> = fn(usize, Data) -> HandlerResult;
+pub type HandlerFn<Data> = fn(usize, Data) -> HandlerFuture;
 pub type OnBlockFn = HandlerFn<BlockData>;
 pub type OnTxFn = HandlerFn<TransactionData>;
 pub type OnEntryFn = HandlerFn<EntryData>;
@@ -571,6 +577,7 @@ where
                                             thread_index,
                                             BlockData::LeaderSkipped { slot: skipped_slot },
                                         )
+                                        .await
                                         .map_err(|e| FirehoseError::BlockHandlerError(e))
                                         .map_err(|e| (e, current_slot.unwrap_or(slot_range.start)))?;
                                     }
@@ -679,18 +686,22 @@ where
                                             })?;
                                         let is_vote = is_simple_vote_transaction(&versioned_tx);
 
-                                        on_tx_cb(
-                                            thread_index,
-                                            TransactionData {
-                                                slot: block.slot,
-                                                transaction_slot_index: tx.index.unwrap() as usize,
-                                                signature: *signature,
-                                                message_hash,
-                                                is_vote,
-                                                transaction_status_meta: as_native_metadata.clone(),
-                                                transaction: versioned_tx.clone(),
-                                            },
-                                        )
+                                        tokio::task::block_in_place(|| {
+                                            tokio::runtime::Handle::current().block_on(on_tx_cb(
+                                                thread_index,
+                                                TransactionData {
+                                                    slot: block.slot,
+                                                    transaction_slot_index: tx.index.unwrap()
+                                                        as usize,
+                                                    signature: *signature,
+                                                    message_hash,
+                                                    is_vote,
+                                                    transaction_status_meta: as_native_metadata
+                                                        .clone(),
+                                                    transaction: versioned_tx.clone(),
+                                                },
+                                            ))
+                                        })
                                         .map_err(|e| FirehoseError::TransactionHandlerError(e))?;
                                     }
                                     fetch_add_if(
@@ -723,17 +734,19 @@ where
                                             })?;
                                         let transaction_indexes_end =
                                             starting_transaction_index + entry_transaction_count;
-                                        on_entry_cb(
-                                            thread_index,
-                                            EntryData {
-                                                slot: block.slot,
-                                                entry_index,
-                                                transaction_indexes: starting_transaction_index
-                                                    ..transaction_indexes_end,
-                                                num_hashes: entry.num_hashes,
-                                                hash: entry_hash,
-                                            },
-                                        )
+                                        tokio::task::block_in_place(|| {
+                                            tokio::runtime::Handle::current().block_on(on_entry_cb(
+                                                thread_index,
+                                                EntryData {
+                                                    slot: block.slot,
+                                                    entry_index,
+                                                    transaction_indexes: starting_transaction_index
+                                                        ..transaction_indexes_end,
+                                                    num_hashes: entry.num_hashes,
+                                                    hash: entry_hash,
+                                                },
+                                            ))
+                                        })
                                         .map_err(|e| FirehoseError::EntryHandlerError(e))?;
                                     }
                                     entry_index += 1;
@@ -758,12 +771,14 @@ where
                                                         previous_slot,
                                                         slot,
                                                     );
-                                                    on_block_cb(
-                                                        thread_index,
-                                                        BlockData::LeaderSkipped {
-                                                            slot: skipped_slot,
-                                                        },
-                                                    )
+                                                    tokio::task::block_in_place(|| {
+                                                        tokio::runtime::Handle::current().block_on(on_block_cb(
+                                                            thread_index,
+                                                            BlockData::LeaderSkipped {
+                                                                slot: skipped_slot,
+                                                            },
+                                                        ))
+                                                    })
                                                     .map_err(|e| FirehoseError::BlockHandlerError(e))?;
                                                     fetch_add_if(
                                                         tracking_enabled,
@@ -778,24 +793,26 @@ where
                                                 }
                                             }
                                             let keyed_rewards = std::mem::take(&mut this_block_rewards);
-                                            on_block_cb(
-                                                thread_index,
-                                                BlockData::Block {
-                                                    parent_slot: block.meta.parent_slot,
-                                                    parent_blockhash: previous_blockhash,
-                                                    slot: block.slot,
-                                                    blockhash: latest_entry_blockhash,
-                                                    rewards: KeyedRewardsAndNumPartitions {
-                                                        keyed_rewards,
-                                                        num_partitions: None,
+                                            tokio::task::block_in_place(|| {
+                                                tokio::runtime::Handle::current().block_on(on_block_cb(
+                                                    thread_index,
+                                                    BlockData::Block {
+                                                        parent_slot: block.meta.parent_slot,
+                                                        parent_blockhash: previous_blockhash,
+                                                        slot: block.slot,
+                                                        blockhash: latest_entry_blockhash,
+                                                        rewards: KeyedRewardsAndNumPartitions {
+                                                            keyed_rewards,
+                                                            num_partitions: None,
+                                                        },
+                                                        block_time: Some(block.meta.blocktime as i64),
+                                                        block_height: block.meta.block_height,
+                                                        executed_transaction_count:
+                                                            this_block_executed_transaction_count,
+                                                        entry_count: this_block_entry_count,
                                                     },
-                                                    block_time: Some(block.meta.blocktime as i64),
-                                                    block_height: block.meta.block_height,
-                                                    executed_transaction_count:
-                                                        this_block_executed_transaction_count,
-                                                    entry_count: this_block_entry_count,
-                                                },
-                                            )
+                                                ))
+                                            })
                                             .map_err(|e| FirehoseError::BlockHandlerError(e))?;
                                         }
                                     } else {
@@ -809,15 +826,20 @@ where
                                         thread_stats.slots_processed += 1;
                                         thread_stats.current_slot = slot;
                                         if slot % stats_tracking_tmp.tracking_interval_slots == 0 {
-                                            maybe_emit_stats(
-                                                stats_tracking.as_ref(),
-                                                thread_index,
-                                                &thread_stats,
-                                                &overall_slots_processed,
-                                                &overall_blocks_processed,
-                                                &overall_transactions_processed,
-                                                &overall_entries_processed,
-                                            ).map_err(|(e, _slot)| e)?;
+                                            tokio::task::block_in_place(|| {
+                                                tokio::runtime::Handle::current().block_on(
+                                                    maybe_emit_stats(
+                                                        stats_tracking.as_ref(),
+                                                        thread_index,
+                                                        &thread_stats,
+                                                        &overall_slots_processed,
+                                                        &overall_blocks_processed,
+                                                        &overall_transactions_processed,
+                                                        &overall_entries_processed,
+                                                    ),
+                                                )
+                                            })
+                                            .map_err(|(e, _slot)| e)?;
                                         }
                                     }
                                 }
@@ -832,13 +854,15 @@ where
                                             if reward_enabled
                                                 && let Some(on_reward_cb) = on_reward.as_ref()
                                             {
-                                                on_reward_cb(
-                                                    thread_index,
-                                                    RewardsData {
-                                                        slot: block.slot,
-                                                        rewards: Vec::new(),
-                                                    },
-                                                )
+                                                tokio::task::block_in_place(|| {
+                                                    tokio::runtime::Handle::current().block_on(on_reward_cb(
+                                                        thread_index,
+                                                        RewardsData {
+                                                            slot: block.slot,
+                                                            rewards: Vec::new(),
+                                                        },
+                                                    ))
+                                                })
                                                 .map_err(|e| FirehoseError::RewardHandlerError(e))?;
                                             }
                                             return Ok(());
@@ -859,13 +883,15 @@ where
                                         if reward_enabled
                                             && let Some(on_reward_cb) = on_reward.as_ref()
                                         {
-                                            on_reward_cb(
-                                                thread_index,
-                                                RewardsData {
-                                                    slot: block.slot,
-                                                    rewards: keyed_rewards.clone(),
-                                                },
-                                            )
+                                            tokio::task::block_in_place(|| {
+                                                tokio::runtime::Handle::current().block_on(on_reward_cb(
+                                                    thread_index,
+                                                    RewardsData {
+                                                        slot: block.slot,
+                                                        rewards: keyed_rewards.clone(),
+                                                    },
+                                                ))
+                                            })
                                             .map_err(|e| FirehoseError::RewardHandlerError(e))?;
                                         }
                                         this_block_rewards = keyed_rewards;
@@ -923,7 +949,8 @@ where
                             &overall_blocks_processed,
                             &overall_transactions_processed,
                             &overall_entries_processed,
-                        )?;
+                        )
+                        .await?;
                     }
                     log::info!(target: &log_target, "thread {} has finished its work", thread_index);
                     }
@@ -1624,27 +1651,29 @@ pub fn generate_subranges(slot_range: &Range<u64>, threads: u64) -> Vec<Range<u6
 }
 
 #[cfg(test)]
-fn log_stats_handler(thread_id: usize, stats: Stats) -> HandlerResult {
-    let elapsed = stats.start_time.elapsed();
-    let elapsed_secs = elapsed.as_secs_f64();
-    let tps = if elapsed_secs > 0.0 {
-        stats.transactions_processed as f64 / elapsed_secs
-    } else {
-        0.0
-    };
-    log::info!(
-        target: LOG_MODULE,
-        "thread {thread_id} stats: current_slot={}, slots_processed={}, blocks_processed={}, txs={}, entries={}, rewards={}, elapsed_s={:.2}, tps={:.2}",
-        stats.thread_stats.current_slot,
-        stats.slots_processed,
-        stats.blocks_processed,
-        stats.transactions_processed,
-        stats.entries_processed,
-        stats.rewards_processed,
-        elapsed_secs,
-        tps
-    );
-    Ok(())
+fn log_stats_handler(thread_id: usize, stats: Stats) -> HandlerFuture {
+    Box::pin(async move {
+        let elapsed = stats.start_time.elapsed();
+        let elapsed_secs = elapsed.as_secs_f64();
+        let tps = if elapsed_secs > 0.0 {
+            stats.transactions_processed as f64 / elapsed_secs
+        } else {
+            0.0
+        };
+        log::info!(
+            target: LOG_MODULE,
+            "thread {thread_id} stats: current_slot={}, slots_processed={}, blocks_processed={}, txs={}, entries={}, rewards={}, elapsed_s={:.2}, tps={:.2}",
+            stats.thread_stats.current_slot,
+            stats.slots_processed,
+            stats.blocks_processed,
+            stats.transactions_processed,
+            stats.entries_processed,
+            stats.rewards_processed,
+            elapsed_secs,
+            tps
+        );
+        Ok(())
+    })
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1665,33 +1694,36 @@ async fn test_firehose_epoch_800() {
         THREADS.try_into().unwrap(),
         (345600000 - NUM_SLOTS_TO_COVER / 2)..(345600000 + NUM_SLOTS_TO_COVER / 2),
         Some(|thread_id: usize, block: BlockData| {
-            let prev =
-                PREV_BLOCK[thread_id % PREV_BLOCK.len()].swap(block.slot(), Ordering::Relaxed);
-            if block.was_skipped() {
-                log::info!(
-                    target: LOG_MODULE,
-                    "leader skipped block {} on thread {}",
-                    block.slot(),
-                    thread_id,
-                );
-            } else {
-                /*log::info!(
-                    target: LOG_MODULE,
-                    "got block {} on thread {}",
-                    block.slot(),
-                    thread_id,
-                );*/
-            }
+            async move {
+                let prev =
+                    PREV_BLOCK[thread_id % PREV_BLOCK.len()].swap(block.slot(), Ordering::Relaxed);
+                if block.was_skipped() {
+                    log::info!(
+                        target: LOG_MODULE,
+                        "leader skipped block {} on thread {}",
+                        block.slot(),
+                        thread_id,
+                    );
+                } else {
+                    /*log::info!(
+                        target: LOG_MODULE,
+                        "got block {} on thread {}",
+                        block.slot(),
+                        thread_id,
+                    );*/
+                }
 
-            if prev > 0 {
-                assert_eq!(prev + 1, block.slot());
+                if prev > 0 {
+                    assert_eq!(prev + 1, block.slot());
+                }
+                if block.was_skipped() {
+                    NUM_SKIPPED_BLOCKS.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    NUM_BLOCKS.fetch_add(1, Ordering::Relaxed);
+                }
+                Ok(())
             }
-            if block.was_skipped() {
-                NUM_SKIPPED_BLOCKS.fetch_add(1, Ordering::Relaxed);
-            } else {
-                NUM_BLOCKS.fetch_add(1, Ordering::Relaxed);
-            }
-            Ok(())
+            .boxed()
         }),
         None::<OnTxFn>,
         None::<OnEntryFn>,

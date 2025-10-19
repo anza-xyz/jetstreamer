@@ -928,7 +928,7 @@ where
                                             maybe_emit_stats(
                                                 stats_tracking.as_ref(),
                                                 thread_index,
-                                                &thread_stats,
+                                                thread_stats,
                                                 &overall_slots_processed,
                                                 &overall_blocks_processed,
                                                 &overall_transactions_processed,

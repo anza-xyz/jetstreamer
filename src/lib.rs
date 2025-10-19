@@ -157,10 +157,10 @@ impl JetstreamerRunner {
             let handle = clickhouse_task.take();
             runtime.block_on(async move {
                 jetstreamer_utils::stop().await;
-                if let Some(handle) = handle {
-                    if let Err(err) = handle.await {
-                        log::warn!("ClickHouse monitor task aborted: {}", err);
-                    }
+                if let Some(handle) = handle
+                    && let Err(err) = handle.await
+                {
+                    log::warn!("ClickHouse monitor task aborted: {}", err);
                 }
             });
         }
@@ -211,7 +211,7 @@ pub fn parse_cli_args() -> Result<Config, Box<dyn std::error::Error>> {
     };
 
     let clickhouse_enabled = std::env::var("JETSTREAMER_NO_CLICKHOUSE")
-        .map(|v| v != "1" && v.to_ascii_lowercase() != "true")
+        .map(|v| v != "1" && !v.eq_ignore_ascii_case("true"))
         .unwrap_or(true);
 
     let threads = std::env::var("JETSTREAMER_THREADS")
@@ -220,7 +220,7 @@ pub fn parse_cli_args() -> Result<Config, Box<dyn std::error::Error>> {
         .unwrap_or(1);
 
     let spawn_clickhouse = std::env::var("JETSTREAMER_SPAWN_CLICKHOUSE")
-        .map(|v| v != "0" && v.to_ascii_lowercase() != "false")
+        .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
         .unwrap_or(true);
 
     Ok(Config {

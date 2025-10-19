@@ -53,24 +53,22 @@ struct SnapshotWindow {
 
 impl SnapshotWindow {
     fn update(&mut self, snapshot: Snapshot) -> Option<Rates> {
-        if let Some(prev) = self.last {
-            if let Some(dt) = snapshot
+        if let Some(prev) = self.last
+            && let Some(dt) = snapshot
                 .time
                 .checked_duration_since(prev.time)
                 .map(|d| d.as_secs_f64())
-            {
-                if dt > 0.0 {
-                    let contrib = Contribution {
-                        slot_delta: snapshot.slots.saturating_sub(prev.slots),
-                        tx_delta: snapshot.txs.saturating_sub(prev.txs),
-                        dt,
-                    };
-                    self.entries[self.idx] = Some(contrib);
-                    self.idx = (self.idx + 1) % self.entries.len();
-                    if self.len < self.entries.len() {
-                        self.len += 1;
-                    }
-                }
+            && dt > 0.0
+        {
+            let contrib = Contribution {
+                slot_delta: snapshot.slots.saturating_sub(prev.slots),
+                tx_delta: snapshot.txs.saturating_sub(prev.txs),
+                dt,
+            };
+            self.entries[self.idx] = Some(contrib);
+            self.idx = (self.idx + 1) % self.entries.len();
+            if self.len < self.entries.len() {
+                self.len += 1;
             }
         }
         self.last = Some(snapshot);
@@ -277,12 +275,13 @@ impl PluginRunner {
                             (clickhouse.clone(), block.as_ref())
                         {
                             if clickhouse_enabled {
-                                slot_buffer.entry(handle.id).or_insert_with(Vec::new).push(
-                                    PluginSlotRow {
+                                slot_buffer
+                                    .entry(handle.id)
+                                    .or_default()
+                                    .push(PluginSlotRow {
                                         plugin_id: handle.id as u32,
                                         slot: *slot,
-                                    },
-                                );
+                                    });
                             } else if let Err(err) =
                                 record_plugin_slot(db_client, handle.id, *slot).await
                             {
@@ -298,18 +297,15 @@ impl PluginRunner {
                         let current = slots_since_flush
                             .fetch_add(1, Ordering::Relaxed)
                             .wrapping_add(1);
-                        if current % db_update_interval == 0 {
-                            if let Some(db_client) = clickhouse.clone() {
-                                let buffer = slot_buffer.clone();
-                                tokio::spawn(async move {
-                                    if let Err(err) = flush_slot_buffer(db_client, buffer).await {
-                                        log::error!(
-                                            "failed to flush buffered plugin slots: {}",
-                                            err
-                                        );
-                                    }
-                                });
-                            }
+                        if current.is_multiple_of(db_update_interval)
+                            && let Some(db_client) = clickhouse.clone()
+                        {
+                            let buffer = slot_buffer.clone();
+                            tokio::spawn(async move {
+                                if let Err(err) = flush_slot_buffer(db_client, buffer).await {
+                                    log::error!("failed to flush buffered plugin slots: {}", err);
+                                }
+                            });
                         }
                     }
                     if let Some(db_client) = clickhouse.clone() {
@@ -489,8 +485,8 @@ impl PluginRunner {
                                 100.0
                             };
                             let mut overall_eta = None;
-                            if let Ok(mut window) = last_snapshot.lock() {
-                                if let Some(rates) = window.update(Snapshot {
+                            if let Ok(mut window) = last_snapshot.lock()
+                                && let Some(rates) = window.update(Snapshot {
                                     time: finish_at,
                                     slots: stats.slots_processed,
                                     txs: stats.transactions_processed,
@@ -504,19 +500,16 @@ impl PluginRunner {
                                         ));
                                     }
                                 }
-                            }
                             if overall_eta.is_none() {
                                 if progress_fraction > 0.0 && progress_fraction < 1.0 {
                                     if let Some(elapsed_total) = finish_at
                                         .checked_duration_since(stats.start_time)
                                         .map(|d| d.as_secs_f64())
-                                    {
-                                        if elapsed_total > 0.0 {
+                                        && elapsed_total > 0.0 {
                                             let remaining_secs =
                                                 elapsed_total * (1.0 / progress_fraction - 1.0);
                                             overall_eta = Some(human_readable_duration(remaining_secs));
                                         }
-                                    }
                                 } else if progress_fraction >= 1.0 {
                                     overall_eta = Some("0s".into());
                                 }
@@ -565,12 +558,11 @@ impl PluginRunner {
             }
         };
 
-        if clickhouse_enabled {
-            if let Some(db_client) = clickhouse.clone() {
-                if let Err(err) = flush_slot_buffer(db_client, slot_buffer.clone()).await {
-                    log::error!("failed to flush buffered plugin slots: {}", err);
-                }
-            }
+        if clickhouse_enabled
+            && let Some(db_client) = clickhouse.clone()
+            && let Err(err) = flush_slot_buffer(db_client, slot_buffer.clone()).await
+        {
+            log::error!("failed to flush buffered plugin slots: {}", err);
         }
 
         for handle in plugin_handles.iter() {
@@ -732,7 +724,7 @@ async fn flush_slot_buffer(
     let mut rows = Vec::new();
     buffer.iter_mut().for_each(|mut entry| {
         if !entry.value().is_empty() {
-            rows.extend(entry.value_mut().drain(..));
+            rows.append(entry.value_mut());
         }
     });
 

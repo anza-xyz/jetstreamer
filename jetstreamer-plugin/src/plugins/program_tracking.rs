@@ -213,10 +213,10 @@ impl Plugin for ProgramTrackingPlugin {
                     }
                     rows
                 });
-                if !rows.is_empty() {
-                    if let Err(err) = write_program_events(db_client, rows).await {
-                        error!("failed to flush program rows on exit: {}", err);
-                    }
+                if !rows.is_empty()
+                    && let Err(err) = write_program_events(db_client, rows).await
+                {
+                    error!("failed to flush program rows on exit: {}", err);
                 }
             }
             Ok(())

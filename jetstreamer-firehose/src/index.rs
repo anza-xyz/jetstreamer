@@ -243,15 +243,15 @@ impl SlotOffsetIndex {
         )
         .await?;
 
-        if let Some(meta_epoch) = slot_index.metadata_epoch() {
-            if meta_epoch != epoch {
-                warn!("Slot index epoch metadata mismatch: expected {epoch}, got {meta_epoch}");
-            }
+        if let Some(meta_epoch) = slot_index.metadata_epoch()
+            && meta_epoch != epoch
+        {
+            warn!("Slot index epoch metadata mismatch: expected {epoch}, got {meta_epoch}");
         }
-        if let Some(meta_epoch) = cid_index.metadata_epoch() {
-            if meta_epoch != epoch {
-                warn!("CID index epoch metadata mismatch: expected {epoch}, got {meta_epoch}");
-            }
+        if let Some(meta_epoch) = cid_index.metadata_epoch()
+            && meta_epoch != epoch
+        {
+            warn!("CID index epoch metadata mismatch: expected {epoch}, got {meta_epoch}");
         }
 
         Ok((slot_index, cid_index))
@@ -604,24 +604,24 @@ async fn fetch_and_parse_header(
         SlotOffsetIndexError::IndexFormatError(url.clone(), format!("invalid metadata: {msg}"))
     })?;
 
-    if let Some(expected) = expected_value_size {
-        if value_size != expected {
-            return Err(SlotOffsetIndexError::IndexFormatError(
-                url.clone(),
-                format!("unexpected value size: expected {expected}, got {value_size}"),
-            ));
-        }
+    if let Some(expected) = expected_value_size
+        && value_size != expected
+    {
+        return Err(SlotOffsetIndexError::IndexFormatError(
+            url.clone(),
+            format!("unexpected value size: expected {expected}, got {value_size}"),
+        ));
     }
-    if let Some(kind) = metadata.get(METADATA_KEY_KIND) {
-        if kind.as_slice() != expected_kind {
-            return Err(SlotOffsetIndexError::IndexFormatError(
-                url.clone(),
-                format!(
-                    "wrong index kind: expected {:?}, got {:?}",
-                    expected_kind, kind
-                ),
-            ));
-        }
+    if let Some(kind) = metadata.get(METADATA_KEY_KIND)
+        && kind.as_slice() != expected_kind
+    {
+        return Err(SlotOffsetIndexError::IndexFormatError(
+            url.clone(),
+            format!(
+                "wrong index kind: expected {:?}, got {:?}",
+                expected_kind, kind
+            ),
+        ));
     }
 
     Ok(CompactIndexHeader {
@@ -666,7 +666,7 @@ async fn fetch_epoch_root(
         )
     })?;
     let root_cid = extract_root_cid(&value)
-        .map_err(|msg| SlotOffsetIndexError::CarHeaderError(car_url.clone(), format!("{msg}")))?;
+        .map_err(|msg| SlotOffsetIndexError::CarHeaderError(car_url.clone(), msg.to_string()))?;
     Ok((root_cid, car_url))
 }
 

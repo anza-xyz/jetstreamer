@@ -1,6 +1,16 @@
 #![deny(missing_docs)]
-//! Application runner for Jetstreamer firehose plugins and central hub for the
-//! Jetstreamer crates.
+//! Application runner for Jetstreamer firehose plugins and central hub for the Jetstreamer
+//! crates.
+//!
+//! See [`firehose`] for the raw ability to stream transaction and block data from Old Faithful
+//! at high speed to your custom logic. Additionally all the raw types used in the firehose
+//! stream live there, including utilty functions for accessing information about epochs and
+//! slots.
+//!
+//! See [`JetstreamerRunner`] and [`plugin`] for the ability to build and run jetstreamer
+//! plugins that consume firehose data with automatic stat tracking and ClickHouse integration.
+//!
+//! See [`utils`] for helpers used throughout the Jetstreamer ecosystem.
 
 pub use jetstreamer_firehose as firehose;
 pub use jetstreamer_plugin as plugin;

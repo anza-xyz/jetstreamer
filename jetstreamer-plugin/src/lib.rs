@@ -473,7 +473,7 @@ impl PluginRunner {
                         .boxed()
                     }
                 },
-                tracking_interval_slots: 10,
+                tracking_interval_slots: 100,
             }
         });
 

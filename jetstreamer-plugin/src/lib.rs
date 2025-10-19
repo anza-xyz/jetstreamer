@@ -1,6 +1,7 @@
 pub mod plugins;
 
 use std::{
+    collections::HashMap,
     fmt::Display,
     future::Future,
     ops::Range,
@@ -13,7 +14,6 @@ use std::{
 };
 
 use clickhouse::{Client, Row};
-use dashmap::DashMap;
 use futures_util::FutureExt;
 use jetstreamer_firehose::firehose::{
     BlockData, EntryData, RewardsData, Stats, StatsTracking, TransactionData, firehose,
@@ -234,7 +234,8 @@ impl PluginRunner {
         }
 
         let shutting_down = Arc::new(AtomicBool::new(false));
-        let slot_buffer: Arc<DashMap<u16, Vec<PluginSlotRow>>> = Arc::new(DashMap::new());
+        let slot_buffer: Arc<Mutex<HashMap<u16, Vec<PluginSlotRow>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
         let clickhouse_enabled = clickhouse.is_some();
         let slots_since_flush = Arc::new(AtomicU64::new(0));
 
@@ -277,7 +278,8 @@ impl PluginRunner {
                             (clickhouse.clone(), block.as_ref())
                         {
                             if clickhouse_enabled {
-                                slot_buffer.entry(handle.id).or_insert_with(Vec::new).push(
+                                let mut guard = slot_buffer.lock().unwrap();
+                                guard.entry(handle.id).or_insert_with(Vec::new).push(
                                     PluginSlotRow {
                                         plugin_id: handle.id as u32,
                                         slot: *slot,
@@ -723,20 +725,23 @@ async fn record_plugin_slot(
 
 async fn flush_slot_buffer(
     db: Arc<Client>,
-    buffer: Arc<DashMap<u16, Vec<PluginSlotRow>>>,
+    buffer: Arc<Mutex<HashMap<u16, Vec<PluginSlotRow>>>>,
 ) -> Result<(), clickhouse::error::Error> {
-    let mut pending = Vec::new();
-    for mut entry in buffer.iter_mut() {
-        if !entry.value().is_empty() {
-            pending.extend(entry.value_mut().drain(..));
+    let rows = {
+        let mut guard = buffer.lock().unwrap();
+        let mut pending = Vec::new();
+        for vec in guard.values_mut() {
+            pending.extend(vec.drain(..));
         }
-    }
-    if pending.is_empty() {
+        pending
+    };
+
+    if rows.is_empty() {
         return Ok(());
     }
 
     let mut insert = db.insert("jetstreamer_plugin_slots")?;
-    for row in pending {
+    for row in rows {
         insert.write(&row).await?;
     }
     insert.end().await?;

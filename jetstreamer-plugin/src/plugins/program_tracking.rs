@@ -2,14 +2,24 @@ use std::{cell::RefCell, collections::HashMap, sync::Arc};
 
 use clickhouse::{Client, Row};
 use futures_util::FutureExt;
+use log::error;
 use serde::{Deserialize, Serialize};
 use solana_sdk::{message::VersionedMessage, pubkey::Pubkey};
 
 use crate::{Plugin, PluginFuture};
 use jetstreamer_firehose::firehose::{BlockData, TransactionData};
 
+const DB_WRITE_INTERVAL_SLOTS: u64 = 200;
+
+#[derive(Default)]
+struct ThreadLocalData {
+    slot_stats: HashMap<u64, HashMap<Pubkey, ProgramStats>>,
+    pending_rows: Vec<ProgramEvent>,
+    slots_since_flush: u64,
+}
+
 thread_local! {
-    static DATA: RefCell<HashMap<u64, HashMap<Pubkey, ProgramStats>>> = RefCell::new(HashMap::new());
+    static DATA: RefCell<ThreadLocalData> = RefCell::new(ThreadLocalData::default());
 }
 
 #[derive(Row, Deserialize, Serialize, Copy, Clone, Debug, PartialEq, Eq, Hash)]
@@ -75,7 +85,7 @@ impl Plugin for ProgramTrackingPlugin {
 
             DATA.with(|data| {
                 let mut data = data.borrow_mut();
-                let slot_data = data.entry(transaction.slot).or_default();
+                let slot_data = data.slot_stats.entry(transaction.slot).or_default();
 
                 for program_id in program_ids.iter() {
                     let this_program_cu = if program_count == 0 {
@@ -122,45 +132,30 @@ impl Plugin for ProgramTrackingPlugin {
             let Some((slot, block_time)) = slot_info else {
                 return Ok(());
             };
-            let mut rows = Vec::new();
 
-            DATA.with(|data| {
+            let flush_rows = DATA.with(|data| {
                 let mut data = data.borrow_mut();
-                if let Some(slot_data) = data.remove(&slot) {
-                    let raw_ts = block_time.unwrap_or(0);
-                    let timestamp: u32 = if raw_ts < 0 {
-                        0
-                    } else if raw_ts > u32::MAX as i64 {
-                        u32::MAX
+                if let Some(slot_data) = data.slot_stats.remove(&slot) {
+                    let slot_rows = events_from_slot(slot, block_time, &slot_data);
+                    data.pending_rows.extend(slot_rows);
+                }
+                data.slots_since_flush = data.slots_since_flush.saturating_add(1);
+                if data.slots_since_flush >= DB_WRITE_INTERVAL_SLOTS {
+                    data.slots_since_flush = 0;
+                    if data.pending_rows.is_empty() {
+                        None
                     } else {
-                        raw_ts as u32
-                    };
-
-                    for (program_id, stats) in slot_data.iter() {
-                        rows.push(ProgramEvent {
-                            slot: slot.min(u32::MAX as u64) as u32,
-                            program_id: *program_id,
-                            count: stats.count,
-                            error_count: stats.error_count,
-                            min_cus: stats.min_cus,
-                            max_cus: stats.max_cus,
-                            total_cus: stats.total_cus,
-                            timestamp,
-                        });
+                        Some(data.pending_rows.drain(..).collect::<Vec<_>>())
                     }
+                } else {
+                    None
                 }
             });
 
-            if rows.is_empty() {
-                return Ok(());
-            }
-
-            if let Some(db) = db {
-                let mut insert = db.insert("program_invocations")?;
-                for row in rows {
-                    insert.write(&row).await?;
+            if let (Some(db_client), Some(rows)) = (db, flush_rows) {
+                if let Err(err) = write_program_events(db_client, rows).await {
+                    error!("failed to flush program rows: {}", err);
                 }
-                insert.end().await?;
             }
 
             Ok(())
@@ -205,11 +200,69 @@ impl Plugin for ProgramTrackingPlugin {
     }
 
     #[inline(always)]
-    fn on_exit(&self, _db: Option<Arc<Client>>) -> PluginFuture<'_> {
+    fn on_exit(&self, db: Option<Arc<Client>>) -> PluginFuture<'_> {
         async move {
-            log::info!("Program Tracking Plugin unloading...");
+            if let Some(db_client) = db {
+                let rows = DATA.with(|data| {
+                    let mut data = data.borrow_mut();
+                    let mut rows = std::mem::take(&mut data.pending_rows);
+                    for (slot, stats) in data.slot_stats.drain() {
+                        rows.extend(events_from_slot(slot, None, &stats));
+                    }
+                    rows
+                });
+                if !rows.is_empty() {
+                    if let Err(err) = write_program_events(db_client, rows).await {
+                        error!("failed to flush program rows on exit: {}", err);
+                    }
+                }
+            }
             Ok(())
         }
         .boxed()
     }
+}
+
+async fn write_program_events(
+    db: Arc<Client>,
+    rows: Vec<ProgramEvent>,
+) -> Result<(), clickhouse::error::Error> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let mut insert = db.insert("program_invocations")?;
+    for row in rows {
+        insert.write(&row).await?;
+    }
+    insert.end().await?;
+    Ok(())
+}
+
+fn events_from_slot(
+    slot: u64,
+    block_time: Option<i64>,
+    slot_data: &HashMap<Pubkey, ProgramStats>,
+) -> Vec<ProgramEvent> {
+    let raw_ts = block_time.unwrap_or(0);
+    let timestamp: u32 = if raw_ts < 0 {
+        0
+    } else if raw_ts > u32::MAX as i64 {
+        u32::MAX
+    } else {
+        raw_ts as u32
+    };
+
+    slot_data
+        .iter()
+        .map(|(program_id, stats)| ProgramEvent {
+            slot: slot.min(u32::MAX as u64) as u32,
+            program_id: *program_id,
+            count: stats.count,
+            error_count: stats.error_count,
+            min_cus: stats.min_cus,
+            max_cus: stats.max_cus,
+            total_cus: stats.total_cus,
+            timestamp,
+        })
+        .collect()
 }

@@ -271,6 +271,33 @@ impl PluginRunner {
                             }
                         }
                     }
+                    if let Some(db_client) = clickhouse.clone() {
+                        match block.as_ref() {
+                            BlockData::Block {
+                                slot,
+                                executed_transaction_count,
+                                ..
+                            } => {
+                                if let Err(err) = record_slot_status(
+                                    db_client,
+                                    *slot,
+                                    thread_id,
+                                    *executed_transaction_count,
+                                )
+                                .await
+                                {
+                                    log::error!("failed to record slot status: {}", err);
+                                }
+                            }
+                            BlockData::LeaderSkipped { slot } => {
+                                if let Err(err) =
+                                    record_slot_status(db_client, *slot, thread_id, 0).await
+                                {
+                                    log::error!("failed to record slot status: {}", err);
+                                }
+                            }
+                        }
+                    }
                     Ok(())
                 }
                 .boxed()
@@ -375,7 +402,7 @@ impl PluginRunner {
 
         let total_slot_count = slot_range.end.saturating_sub(slot_range.start);
 
-        let stats_tracking = clickhouse.clone().map(|db| {
+        let stats_tracking = clickhouse.clone().map(|_db| {
             let shutting_down = shutting_down.clone();
             let last_snapshot: Arc<Mutex<SnapshotWindow>> =
                 Arc::new(Mutex::new(SnapshotWindow::default()));
@@ -384,7 +411,6 @@ impl PluginRunner {
                     let last_snapshot = last_snapshot.clone();
                     let total_slot_count = total_slot_count;
                     move |thread_id: usize, stats: Stats| {
-                        let db = db.clone();
                         let shutting_down = shutting_down.clone();
                         let last_snapshot = last_snapshot.clone();
                         async move {
@@ -463,11 +489,6 @@ impl PluginRunner {
                                 thread_stats.transactions_processed,
                                 overall_eta.unwrap_or_else(|| "n/a".into())
                             );
-                            if let Err(err) =
-                                record_slot_status(db.clone(), stats.clone(), thread_id).await
-                            {
-                                log::error!("failed to record slot status: {}", err);
-                            }
                             Ok(())
                         }
                         .boxed()
@@ -657,17 +678,15 @@ async fn record_plugin_slot(
 
 async fn record_slot_status(
     db: Arc<Client>,
-    stats: Stats,
+    slot: u64,
     thread_id: usize,
+    transaction_count: u64,
 ) -> Result<(), clickhouse::error::Error> {
     let mut insert = db.insert("jetstreamer_slot_status")?;
     insert
         .write(&SlotStatusRow {
-            slot: stats.thread_stats.current_slot,
-            transaction_count: stats
-                .thread_stats
-                .transactions_processed
-                .min(u32::MAX as u64) as u32,
+            slot,
+            transaction_count: transaction_count.min(u32::MAX as u64) as u32,
             thread_id: thread_id.try_into().unwrap_or(u8::MAX),
         })
         .await?;

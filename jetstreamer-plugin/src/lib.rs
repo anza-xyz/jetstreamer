@@ -1,7 +1,6 @@
 pub mod plugins;
 
 use std::{
-    collections::HashMap,
     fmt::Display,
     future::Future,
     ops::Range,
@@ -14,6 +13,7 @@ use std::{
 };
 
 use clickhouse::{Client, Row};
+use dashmap::DashMap;
 use futures_util::FutureExt;
 use jetstreamer_firehose::firehose::{
     BlockData, EntryData, RewardsData, Stats, StatsTracking, TransactionData, firehose,
@@ -234,8 +234,7 @@ impl PluginRunner {
         }
 
         let shutting_down = Arc::new(AtomicBool::new(false));
-        let slot_buffer: Arc<Mutex<HashMap<u16, Vec<PluginSlotRow>>>> =
-            Arc::new(Mutex::new(HashMap::new()));
+        let slot_buffer: Arc<DashMap<u16, Vec<PluginSlotRow>>> = Arc::new(DashMap::new());
         let clickhouse_enabled = clickhouse.is_some();
         let slots_since_flush = Arc::new(AtomicU64::new(0));
 
@@ -278,8 +277,7 @@ impl PluginRunner {
                             (clickhouse.clone(), block.as_ref())
                         {
                             if clickhouse_enabled {
-                                let mut guard = slot_buffer.lock().unwrap();
-                                guard.entry(handle.id).or_insert_with(Vec::new).push(
+                                slot_buffer.entry(handle.id).or_insert_with(Vec::new).push(
                                     PluginSlotRow {
                                         plugin_id: handle.id as u32,
                                         slot: *slot,
@@ -302,11 +300,15 @@ impl PluginRunner {
                             .wrapping_add(1);
                         if current % db_update_interval == 0 {
                             if let Some(db_client) = clickhouse.clone() {
-                                if let Err(err) =
-                                    flush_slot_buffer(db_client, slot_buffer.clone()).await
-                                {
-                                    log::error!("failed to flush buffered plugin slots: {}", err);
-                                }
+                                let buffer = slot_buffer.clone();
+                                tokio::spawn(async move {
+                                    if let Err(err) = flush_slot_buffer(db_client, buffer).await {
+                                        log::error!(
+                                            "failed to flush buffered plugin slots: {}",
+                                            err
+                                        );
+                                    }
+                                });
                             }
                         }
                     }
@@ -725,16 +727,14 @@ async fn record_plugin_slot(
 
 async fn flush_slot_buffer(
     db: Arc<Client>,
-    buffer: Arc<Mutex<HashMap<u16, Vec<PluginSlotRow>>>>,
+    buffer: Arc<DashMap<u16, Vec<PluginSlotRow>>>,
 ) -> Result<(), clickhouse::error::Error> {
-    let rows = {
-        let mut guard = buffer.lock().unwrap();
-        let mut pending = Vec::new();
-        for vec in guard.values_mut() {
-            pending.extend(vec.drain(..));
+    let mut rows = Vec::new();
+    buffer.iter_mut().for_each(|mut entry| {
+        if !entry.value().is_empty() {
+            rows.extend(entry.value_mut().drain(..));
         }
-        pending
-    };
+    });
 
     if rows.is_empty() {
         return Ok(());

@@ -9,7 +9,7 @@ use solana_sdk::{message::VersionedMessage, pubkey::Pubkey};
 use crate::{Plugin, PluginFuture};
 use jetstreamer_firehose::firehose::{BlockData, TransactionData};
 
-const DB_WRITE_INTERVAL_SLOTS: u64 = 200;
+const DB_WRITE_INTERVAL_SLOTS: u64 = 1000;
 
 #[derive(Default)]
 struct ThreadLocalData {
@@ -153,9 +153,11 @@ impl Plugin for ProgramTrackingPlugin {
             });
 
             if let (Some(db_client), Some(rows)) = (db, flush_rows) {
-                if let Err(err) = write_program_events(db_client, rows).await {
-                    error!("failed to flush program rows: {}", err);
-                }
+                tokio::spawn(async move {
+                    if let Err(err) = write_program_events(db_client, rows).await {
+                        error!("failed to flush program rows: {}", err);
+                    }
+                });
             }
 
             Ok(())

@@ -911,12 +911,13 @@ where
                             let finish_time = std::time::Instant::now();
                             let elapsed = finish_time.duration_since(start_time);
                             log::info!(target: &log_target, "processed slot {}", block.slot);
+                            let elapsed_pretty = human_readable_duration(elapsed);
                             log::info!(
                                 target: &log_target,
-                                "processed {} slots across {} epochs in {} seconds.",
+                                "processed {} slots across {} epochs in {}.",
                                 slot_range.end - slot_range.start,
                                 slot_to_epoch(slot_range.end) + 1 - slot_to_epoch(slot_range.start),
-                                elapsed.as_secs_f32()
+                                elapsed_pretty
                             );
                             log::info!(target: &log_target, "a 🚒 firehose thread completed its work.");
                             // On completion, report threads with non-zero error counts for visibility.
@@ -1481,12 +1482,13 @@ async fn firehose_geyser_thread(
                         let finish_time = std::time::Instant::now();
                         let elapsed = finish_time.duration_since(start_time);
                         log::info!(target: &log_target, "processed slot {}", block.slot);
+                        let elapsed_pretty = human_readable_duration(elapsed);
                         log::info!(
                             target: &log_target,
-                            "processed {} slots across {} epochs in {} seconds.",
+                            "processed {} slots across {} epochs in {}.",
                             slot_range.end - slot_range.start,
                             slot_to_epoch(slot_range.end) + 1 - slot_to_epoch(slot_range.start),
-                            elapsed.as_secs_f32()
+                            elapsed_pretty
                         );
                         log::info!(target: &log_target, "a 🚒 firehose thread finished completed its work.");
                         // On completion, report threads with non-zero error counts for visibility.
@@ -1648,6 +1650,52 @@ pub fn generate_subranges(slot_range: &Range<u64>, threads: u64) -> Vec<Range<u6
         total_covered
     );
     ranges
+}
+
+fn human_readable_duration(duration: std::time::Duration) -> String {
+    if duration.is_zero() {
+        return "0s".into();
+    }
+    let total_secs = duration.as_secs();
+    if total_secs < 60 {
+        let secs_f = duration.as_secs_f64();
+        if total_secs == 0 {
+            format!("{:.2}s", secs_f)
+        } else if duration.subsec_millis() == 0 {
+            format!("{}s", total_secs)
+        } else {
+            format!("{:.2}s", secs_f)
+        }
+    } else {
+        let mut secs = total_secs;
+        let days = secs / 86_400;
+        secs %= 86_400;
+        let hours = secs / 3_600;
+        secs %= 3_600;
+        let minutes = secs / 60;
+        secs %= 60;
+        if days > 0 {
+            if hours > 0 {
+                format!("{days}d{hours}h")
+            } else {
+                format!("{days}d")
+            }
+        } else if hours > 0 {
+            if minutes > 0 {
+                format!("{hours}h{minutes}m")
+            } else {
+                format!("{hours}h")
+            }
+        } else if minutes > 0 {
+            if secs > 0 {
+                format!("{minutes}m{secs}s")
+            } else {
+                format!("{minutes}m")
+            }
+        } else {
+            format!("{secs}s")
+        }
+    }
 }
 
 #[cfg(test)]

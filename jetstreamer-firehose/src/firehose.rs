@@ -207,6 +207,7 @@ pub struct Stats {
     pub transactions_since_last_pulse: u64,
     pub blocks_since_last_pulse: u64,
     pub slots_since_last_pulse: u64,
+    pub time_since_last_pulse: std::time::Duration,
 }
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
@@ -227,12 +228,18 @@ async fn maybe_emit_stats<OnStats: Handler<Stats>>(
     transactions_since_stats: &AtomicU64,
     blocks_since_stats: &AtomicU64,
     slots_since_stats: &AtomicU64,
+    last_pulse: &Arc<AtomicU64>,
+    base_instant: std::time::Instant,
 ) -> Result<(), (FirehoseError, u64)> {
     if let Some(stats_tracker) = stats_tracking {
         let total_slots = overall_slots_processed.load(Ordering::Relaxed);
         let total_blocks = overall_blocks_processed.load(Ordering::Relaxed);
         let total_transactions = overall_transactions_processed.load(Ordering::Relaxed);
         let total_entries = overall_entries_processed.load(Ordering::Relaxed);
+        let now_nanos = base_instant.elapsed().as_nanos() as u64;
+        let previous = last_pulse.swap(now_nanos, Ordering::Relaxed);
+        let delta_nanos = now_nanos.saturating_sub(previous);
+        let time_since_last_pulse = std::time::Duration::from_nanos(delta_nanos.max(1));
         let processed_transactions = transactions_since_stats.swap(0, Ordering::Relaxed);
         let processed_blocks = blocks_since_stats.swap(0, Ordering::Relaxed);
         let processed_slots = slots_since_stats.swap(0, Ordering::Relaxed);
@@ -251,6 +258,7 @@ async fn maybe_emit_stats<OnStats: Handler<Stats>>(
             transactions_since_last_pulse: processed_transactions,
             blocks_since_last_pulse: processed_blocks,
             slots_since_last_pulse: processed_slots,
+            time_since_last_pulse,
         };
 
         (stats_tracker.on_stats)(thread_index, stats)
@@ -421,9 +429,11 @@ where
         let transactions_since_stats = Arc::new(AtomicU64::new(0));
         let blocks_since_stats = Arc::new(AtomicU64::new(0));
         let slots_since_stats = Arc::new(AtomicU64::new(0));
+        let last_pulse = Arc::new(AtomicU64::new(0));
         let transactions_since_stats_cloned = transactions_since_stats.clone();
         let blocks_since_stats_cloned = blocks_since_stats.clone();
         let slots_since_stats_cloned = slots_since_stats.clone();
+        let last_pulse_cloned = last_pulse.clone();
         let shutdown_flag = shutdown_flag.clone();
         let thread_shutdown_rx = shutdown_signal.as_ref().map(|rx| rx.resubscribe());
 
@@ -431,8 +441,10 @@ where
             let transactions_since_stats = transactions_since_stats_cloned;
             let blocks_since_stats = blocks_since_stats_cloned;
             let slots_since_stats = slots_since_stats_cloned;
+            let last_pulse = last_pulse_cloned;
             let mut shutdown_rx = thread_shutdown_rx;
             let start_time = std::time::Instant::now();
+            last_pulse.store(0, Ordering::Relaxed);
             let log_target = format!("{}::T{:03}", LOG_MODULE, thread_index);
             let mut skip_until_index = None;
             let block_enabled = on_block.is_some();
@@ -924,6 +936,8 @@ where
                                                 &transactions_since_stats,
                                                 &blocks_since_stats,
                                                 &slots_since_stats,
+                                                &last_pulse,
+                                                start_time,
                                             )
                                             .await?;
                                         }
@@ -1067,6 +1081,8 @@ where
                             &transactions_since_stats,
                             &blocks_since_stats,
                             &slots_since_stats,
+                            &last_pulse,
+                            start_time,
                         )
                         .await?;
                     }

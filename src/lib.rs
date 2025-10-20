@@ -43,8 +43,7 @@
 //! - `JETSTREAMER_CLICKHOUSE_DSN` (default `http://localhost:8123`): DSN passed to plugin
 //!   instances that emit ClickHouse writes.
 //! - `JETSTREAMER_CLICKHOUSE_MODE` (default `auto`): controls ClickHouse integration. Accepted
-//!   values are `auto`, `remote`, `local`, and `off`. Legacy variables
-//!   `JETSTREAMER_NO_CLICKHOUSE` and `JETSTREAMER_SPAWN_CLICKHOUSE` remain supported.
+//!   values are `auto`, `remote`, `local`, and `off`.
 //!
 //! Additional firehose-specific knobs such as `JETSTREAMER_COMPACT_INDEX_BASE_URL` and
 //! `JETSTREAMER_NETWORK` live in [`jetstreamer_firehose`](crate::firehose).
@@ -69,9 +68,9 @@
 //! accounting first appears at epoch `450`.
 //!
 //! # Related Modules
-//! - [`firehose`](crate::firehose) exposes the underlying streaming primitives.
-//! - [`plugin`](crate::plugin) provides the trait surface for authoring plugins.
-//! - [`utils`](crate::utils) hosts shared helpers used across the Jetstreamer ecosystem.
+//! - [`firehose`] exposes the underlying streaming primitives.
+//! - [`plugin`] provides the trait surface for authoring plugins.
+//! - [`utils`] hosts shared helpers used across the Jetstreamer ecosystem.
 
 pub use jetstreamer_firehose as firehose;
 pub use jetstreamer_plugin as plugin;
@@ -110,42 +109,22 @@ enum ClickhouseMode {
 fn resolve_clickhouse_settings(default_spawn_helper: bool) -> ClickhouseSettings {
     let default_settings = ClickhouseSettings::new(true, default_spawn_helper);
 
-    if let Ok(raw_mode) = std::env::var("JETSTREAMER_CLICKHOUSE_MODE") {
-        match parse_clickhouse_mode(&raw_mode) {
-            Some(ClickhouseMode::Auto) => return default_settings,
-            Some(ClickhouseMode::Disabled) => {
-                return ClickhouseSettings::new(false, false);
-            }
-            Some(ClickhouseMode::RemoteOnly) => {
-                return ClickhouseSettings::new(true, false);
-            }
-            Some(ClickhouseMode::Local) => {
-                return ClickhouseSettings::new(true, true);
-            }
+    match std::env::var("JETSTREAMER_CLICKHOUSE_MODE") {
+        Ok(raw_mode) => match parse_clickhouse_mode(&raw_mode) {
+            Some(ClickhouseMode::Auto) => default_settings,
+            Some(ClickhouseMode::Disabled) => ClickhouseSettings::new(false, false),
+            Some(ClickhouseMode::RemoteOnly) => ClickhouseSettings::new(true, false),
+            Some(ClickhouseMode::Local) => ClickhouseSettings::new(true, true),
             None => {
                 log::warn!(
-                    "Unrecognized JETSTREAMER_CLICKHOUSE_MODE value '{}'; falling back to legacy variables",
+                    "Unrecognized JETSTREAMER_CLICKHOUSE_MODE value '{}'; falling back to default settings",
                     raw_mode
                 );
+                default_settings
             }
-        }
+        },
+        Err(_) => default_settings,
     }
-
-    let mut settings = default_settings;
-
-    if let Ok(no_clickhouse) = std::env::var("JETSTREAMER_NO_CLICKHOUSE") {
-        let disable = no_clickhouse == "1" || no_clickhouse.eq_ignore_ascii_case("true");
-        if disable {
-            return ClickhouseSettings::new(false, false);
-        }
-    }
-
-    if let Ok(spawn_override) = std::env::var("JETSTREAMER_SPAWN_CLICKHOUSE") {
-        settings.spawn_helper =
-            spawn_override != "0" && !spawn_override.eq_ignore_ascii_case("false");
-    }
-
-    settings
 }
 
 fn parse_clickhouse_mode(value: &str) -> Option<ClickhouseMode> {
@@ -185,8 +164,7 @@ fn parse_clickhouse_mode(value: &str) -> Option<ClickhouseMode> {
 /// - `JETSTREAMER_CLICKHOUSE_MODE`: Controls ClickHouse integration. Accepted values are
 ///   `auto` (default: enable output and spawn the helper only for local DSNs), `remote`
 ///   (enable output but never spawn the helper), `local` (always request the helper), and
-///   `off` (disable ClickHouse entirely). Legacy variables `JETSTREAMER_NO_CLICKHOUSE` and
-///   `JETSTREAMER_SPAWN_CLICKHOUSE` remain supported for backward compatibility.
+///   `off` (disable ClickHouse entirely).
 ///
 /// ### Example
 ///
@@ -259,9 +237,9 @@ fn parse_clickhouse_mode(value: &str) -> Option<ClickhouseMode> {
 /// multiplexing works is multiple threads connect to different subsections of the underlying
 /// slot range being streamed from Old Faithful, and handle this subrange in parallel with
 /// other threads, achieving embarrasingly parallel throughput increases up to the limit of
-/// your CPU and internet connection. A good rule of thumb is to expect about 100 Mbps of
+/// your CPU and internet connection. A good rule of thumb is to expect about 250 Mbps of
 /// bandwidth and significant one-core compute per thread. On a 16 core system with a 1 Gbps
-/// network connection, setting `JETSTREAMER_THREADS` to 8-10 should yield optimal results.
+/// network connection, setting `JETSTREAMER_THREADS` to 4-5 should yield optimal results.
 ///
 /// To achieve 2M TPS+, you will need a 20+ Gbps network connection and at least a 64 core CPU.
 /// On our benchmark hardware we currently have a 100 Gbps connection and 64 cores, which has
@@ -467,8 +445,7 @@ pub struct Config {
 ///
 /// The following environment variables are inspected:
 /// - `JETSTREAMER_CLICKHOUSE_MODE`: Controls ClickHouse integration. Accepts `auto`, `remote`,
-///   `local`, or `off`. When unspecified, legacy variables `JETSTREAMER_NO_CLICKHOUSE` and
-///   `JETSTREAMER_SPAWN_CLICKHOUSE` are still honoured.
+///   `local`, or `off`.
 /// - `JETSTREAMER_THREADS`: Number of firehose ingestion threads.
 ///
 /// # Examples

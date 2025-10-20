@@ -3,7 +3,6 @@
 //! ## Environment variables
 //!
 //! - `JETSTREAMER_COMPACT_INDEX_BASE_URL`: Preferred base URL for compact index files.
-//! - `JETSTREAMER_OFFSET_BASE_URL`: Legacy alias used when the primary variable is unset.
 //! - `JETSTREAMER_NETWORK`: Network suffix appended to on-disk cache keys and remote filenames.
 //!
 //! ### Example
@@ -892,8 +891,7 @@ fn parse_metadata(data: &[u8]) -> Result<HashMap<Vec<u8>, Vec<u8>>, String> {
 ///
 /// The resolution order is:
 /// 1. `JETSTREAMER_COMPACT_INDEX_BASE_URL`
-/// 2. `JETSTREAMER_OFFSET_BASE_URL` (legacy)
-/// 3. The built-in [`BASE_URL`], pointing at Old Faithful's public mirror.
+/// 2. The built-in [`BASE_URL`], pointing at Old Faithful's public mirror.
 ///
 /// # Examples
 ///
@@ -908,7 +906,6 @@ fn parse_metadata(data: &[u8]) -> Result<HashMap<Vec<u8>, Vec<u8>>, String> {
 /// ```
 pub fn get_index_base_url() -> Result<Url, SlotOffsetIndexError> {
     let base = std::env::var("JETSTREAMER_COMPACT_INDEX_BASE_URL")
-        .or_else(|_| std::env::var("JETSTREAMER_OFFSET_BASE_URL"))
         .unwrap_or_else(|_| BASE_URL.to_string());
     Url::parse(&base).map_err(|err| SlotOffsetIndexError::InvalidBaseUrl(format!("{base} ({err})")))
 }

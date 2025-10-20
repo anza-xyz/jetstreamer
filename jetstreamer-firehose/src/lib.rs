@@ -23,7 +23,6 @@
 //! - `JETSTREAMER_COMPACT_INDEX_BASE_URL` (default `https://files.old-faithful.net`): base URL
 //!   for compact CAR index artifacts. Point this at your own mirror to reduce load on the
 //!   public Old Faithful deployment.
-//! - `JETSTREAMER_OFFSET_BASE_URL`: legacy alias used when the primary variable is unset.
 //! - `JETSTREAMER_NETWORK` (default `mainnet`): suffix appended to cache namespaces and index
 //!   filenames so you can swap between clusters without purging local state.
 //!

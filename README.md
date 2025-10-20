@@ -57,8 +57,28 @@ The CLI accepts either `<start>:<end>` slot ranges or a single epoch on the comm
 [`JetstreamerRunner::parse_cli_args`](https://docs.rs/jetstreamer/latest/jetstreamer/fn.parse_cli_args.html)
 for the precise rules.
 
+### ClickHouse Integration
+
 Jetstreamer Runner has a built-in ClickHouse integration (by default a clickhouse server is
 spawned running out of the `bin` directory in the repo)
+
+To manage the ClickHouse integration with ease, the following bundled Cargo aliases are
+provided when within the `jetstreamer` workspace:
+
+```bash
+cargo clickhouse-server
+cargo clickhouse-client
+```
+
+`cargo clickhouse-server` launches the same ClickHouse binary that Jetstreamer Runner spawns in
+`bin/`, while `cargo clickhouse-client` connects to the local instance so you can inspect
+tables populated by the runner or plugin runner.
+
+While Jetstreamer is running, you can use `cargo clickhouse-client` to connect directly to the
+ClickHouse instance that Jetstreamer has spawned. If you want to access data after a run has
+finished, you can run `cargo clickhouse-server` to bring up that server again using the data
+that is currently in the `bin` directory. It is also possible to copy a `bin` directory from
+one system to another as a way of migrating data.
 
 ### Writing Jetstreamer Plugins
 

@@ -2,31 +2,33 @@
 //! Trait-based framework for building structured observers on top of Jetstreamer's firehose.
 //!
 //! # Overview
-//! Plugins let you react to every block, transaction, reward, entry, and stats update emitted by
-//! [`jetstreamer_firehose`](https://crates.io/crates/jetstreamer-firehose). Combined with the
+//! Plugins let you react to every block, transaction, reward, entry, and stats update emitted
+//! by [`jetstreamer_firehose`](https://crates.io/crates/jetstreamer-firehose). Combined with
+//! the
 //! [`JetstreamerRunner`](https://docs.rs/jetstreamer/latest/jetstreamer/struct.JetstreamerRunner.html),
-//! they provide a high-throughput analytics pipeline capable of exceeding 2.7 million transactions
-//! per second on the right hardware. All events originate from Old Faithful's CAR archive and are
-//! streamed over the network into your local runner.
+//! they provide a high-throughput analytics pipeline capable of exceeding 2.7 million
+//! transactions per second on the right hardware. All events originate from Old Faithful's CAR
+//! archive and are streamed over the network into your local runner.
 //!
 //! The framework offers:
 //! - A [`Plugin`] trait with async hook points for each data type.
 //! - [`PluginRunner`] for coordinating multiple plugins with shared ClickHouse connections
 //!   (used internally by `JetstreamerRunner`).
-//! - Built-in plugins under [`plugins`] that demonstrate common batching strategies and metrics.
+//! - Built-in plugins under [`plugins`] that demonstrate common batching strategies and
+//!   metrics.
 //! - See `JetstreamerRunner` in the `jetstreamer` crate for the easiest way to run plugins.
 //!
 //! # ClickHouse Integration
-//! Jetstreamer plugins are typically paired with ClickHouse for persistence. Runner instances honour
-//! the following environment variables:
-//! - `JETSTREAMER_CLICKHOUSE_DSN` (default `http://localhost:8123`): HTTP(S) DSN handed to every
-//!   plugin that requests a database handle.
-//! - `JETSTREAMER_CLICKHOUSE_MODE` (default `auto`): toggles the bundled ClickHouse helper. Set to
-//!   `remote` to opt out of spawning the helper while still writing to a cluster, `local` to always
-//!   spawn, or `off` to disable ClickHouse entirely.
+//! Jetstreamer plugins are typically paired with ClickHouse for persistence. Runner instances
+//! honor the following environment variables:
+//! - `JETSTREAMER_CLICKHOUSE_DSN` (default `http://localhost:8123`): HTTP(S) DSN handed to
+//!   every plugin that requests a database handle.
+//! - `JETSTREAMER_CLICKHOUSE_MODE` (default `auto`): toggles the bundled ClickHouse helper.
+//!   Set to `remote` to opt out of spawning the helper while still writing to a cluster,
+//!   `local` to always spawn, or `off` to disable ClickHouse entirely.
 //!
-//! When the mode is `auto`, Jetstreamer inspects the DSN at runtime and only launches the embedded
-//! helper for local endpoints, enabling native clustering workflows out of the box.
+//! When the mode is `auto`, Jetstreamer inspects the DSN at runtime and only launches the
+//! embedded helper for local endpoints, enabling native clustering workflows out of the box.
 //!
 //! # Examples
 //! ## Defining a Plugin

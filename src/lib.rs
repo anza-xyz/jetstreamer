@@ -35,9 +35,18 @@
 //!
 //! When `JETSTREAMER_CLICKHOUSE_MODE` is `auto` (the default) the runner inspects the DSN to
 //! decide whether to launch the bundled ClickHouse helper or connect to an external cluster.
+//! You can also manage that helper manually via the crate-level Cargo aliases:
+//!
+//! ```bash
+//! cargo clickhouse-server
+//! cargo clickhouse-client
+//! ```
+//!
+//! `cargo clickhouse-server` launches the bundled binary in `bin/`, while
+//! `cargo clickhouse-client` opens a client session against the locally spawned helper.
 //!
 //! # Environment Variables
-//! `JetstreamerRunner` honours several environment variables for runtime tuning:
+//! `JetstreamerRunner` honors several environment variables for runtime tuning:
 //! - `JETSTREAMER_THREADS` (default `1`): number of firehose ingestion threads. Increase this to
 //!   multiplex Old Faithful HTTP requests across more cores.
 //! - `JETSTREAMER_CLICKHOUSE_DSN` (default `http://localhost:8123`): DSN passed to plugin
@@ -150,13 +159,13 @@ fn parse_clickhouse_mode(value: &str) -> Option<ClickhouseMode> {
 /// Coordinates plugin execution against the firehose.
 ///
 /// Configure the runner with the builder-style methods and finish by calling
-/// [`JetstreamerRunner::run`]. The runner also honours the process-level environment variables
+/// [`JetstreamerRunner::run`]. The runner also honors the process-level environment variables
 /// documented at the module level
 ///
 /// ### Environment variables
 ///
 /// [`JetstreamerRunner`] inspects a handful of environment variables at startup to fine-tune
-/// runtime behaviour:
+/// runtime behavior:
 ///
 /// - `JETSTREAMER_THREADS`: Number of firehose ingestion threads, defaulting to `1`.
 /// - `JETSTREAMER_CLICKHOUSE_DSN`: DSN for ClickHouse ingestion; defaults to

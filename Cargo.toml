@@ -88,6 +88,8 @@ log.workspace = true
 jetstreamer-firehose.workspace = true
 jetstreamer-plugin.workspace = true
 jetstreamer-utils.workspace = true
+
+[dev-dependencies]
 clickhouse.workspace = true
 
 [profile.release]

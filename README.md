@@ -153,6 +153,20 @@ JetstreamerRunner::new()
 When `JETSTREAMER_CLICKHOUSE_MODE` is `auto` (the default), Jetstreamer inspects the DSN to
 decide whether to launch the bundled ClickHouse helper or connect to an external cluster.
 
+#### Batching ClickHouse Writes
+
+ClickHouse (and anything you do in your callbacks) applies backpressure that will slow down
+Jetstreamer if not kept in check.
+
+When implementing a Jetstreamer plugin, prefer buffering records locally and flushing them in
+periodic batches rather than writing on every hook invocation. The runner's built-in stats
+pulses are emitted every 100 slots by default (`jetstreamer-plugin/src/lib.rs`), which strikes
+a balance between timely metrics and avoiding tight write loops. The bundled Program Tracking
+plugin follows this model: each worker thread accumulates its desired `ProgramEvent` rows in a
+`Vec` and performs a single batch insert once 1,000 slots have elapsed
+(`jetstreamer-plugin/src/plugins/program_tracking.rs`). Structuring custom plugins with a
+similar cadence keeps ClickHouse responsive during high throughput replays.
+
 ### Firehose
 
 For direct access to the stream of transactions/blocks/rewards etc, you can use the `firehose`

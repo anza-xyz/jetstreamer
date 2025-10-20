@@ -42,7 +42,6 @@ Jetstreamer Runner with the Program Tracking plugin enabled:
 ### Jetstreamer Runner CLI
 
 ```bash
-
 # Replay all transactions in epoch 800, using 8 HTTP multiplexing cores.
 JETSTREAMER_THREADS=8 cargo run --release -- 800
 
@@ -187,17 +186,8 @@ unit accounting first appears at epoch 450. Plan replay windows accordingly.
 - Run tests: `cargo test --workspace`.
 - Regenerate docs: `cargo doc --workspace --open`.
 
----
-
-## License
-
-Jetstreamer is released under the terms of the GNU Affero General Public License, version 3.0.
-See [LICENSE](jetstreamer-firehose/LICENSE) for details.
-
----
-
 ## Community
 
 Questions, issues, and contributions are welcome! Open a discussion or pull request on
-[GitHub](https://github.com/sam0x17/jetstreamer) and join the effort to build faster Solana
+[GitHub](https://github.com/anza-xyz/jetstreamer) and join the effort to build faster Solana
 analytics pipelines.

@@ -2,9 +2,48 @@
 #![recursion_limit = "512"]
 //! Core data structures and streaming utilities for Jetstreamer firehose processing.
 //!
-//! All CAR archive access refers to data hosted in Triton One's Old Faithful
-//! archive of Solana ledger snapshots. References below may use the shorthand
-//! “Old Faithful” for brevity.
+//! # Overview
+//! The firehose crate streams data live over the network directly from Project Yellowstone's
+//! [Old Faithful](https://old-faithful.net/) archive of CAR files, which hosts the complete
+//! history of every Solana transaction. Data only flows outward from Old Faithful to your
+//! local consumer; nothing is ever uploaded back to the archive. With sufficient CPU and
+//! network headroom the pipeline can exceed 2.7 million transactions per second while decoding
+//! the stream for analysis and backfilling workloads.
+//!
+//! Firehose is the foundation that powers
+//! [`jetstreamer`](https://crates.io/crates/jetstreamer) and
+//! [`jetstreamer-plugin`](https://crates.io/crates/jetstreamer-plugin), but it can also be
+//! consumed directly to build bespoke replay pipelines. The crate exposes:
+//! - Async readers for Old Faithful CAR archives via [`firehose`].
+//! - Rich data models for blocks, entries, rewards, and transactions.
+//! - Epoch helpers for reasoning about slot ranges and availability windows.
+//!
+//! # Configuration
+//! Several environment variables influence how the firehose locates and caches data:
+//! - `JETSTREAMER_COMPACT_INDEX_BASE_URL` (default `https://files.old-faithful.net`): base URL
+//!   for compact CAR index artifacts. Point this at your own mirror to reduce load on the
+//!   public Old Faithful deployment.
+//! - `JETSTREAMER_OFFSET_BASE_URL`: legacy alias used when the primary variable is unset.
+//! - `JETSTREAMER_NETWORK` (default `mainnet`): suffix appended to cache namespaces and index
+//!   filenames so you can swap between clusters without purging local state.
+//!
+//! # Limitations
+//! Old Faithful currently publishes blocks, transactions, epochs, and reward metadata but does
+//! not ship account updates. The firehose mirrors that limitation; plan on a separate data
+//! source if you require account updates.
+//!
+//! # Epoch Feature Availability
+//! Old Faithful snapshots expose different metadata as the Solana protocol evolved. Use the
+//! table below to decide which replay windows fit your requirements:
+//!
+//! | Epoch range | Slot range    | Comment |
+//! |-------------|---------------|--------------------------------------------------|
+//! | 0–156       | 0–?           | Incompatible with modern Geyser plugins           |
+//! | 157+        | ?             | Compatible with modern Geyser plugins             |
+//! | 0–449       | 0–194184610   | CU tracking not available (reported as `0`)       |
+//! | 450+        | 194184611+    | CU tracking fully available                       |
+//!
+//! Detailed helpers for translating between epochs and slots live in the [`epochs`] module.
 //!
 //! # Examples
 //! Run the firehose with handlers for every data type:

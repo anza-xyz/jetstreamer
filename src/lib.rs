@@ -1,16 +1,77 @@
 #![deny(missing_docs)]
-//! Application runner for Jetstreamer firehose plugins and central hub for the Jetstreamer
-//! crates.
+//! High-throughput Solana backfilling and research runner built on Jetstreamer firehose plugins.
 //!
-//! See [`firehose`] for the raw ability to stream transaction and block data from Old Faithful
-//! at high speed to your custom logic. Additionally all the raw types used in the firehose
-//! stream live there, including utilty functions for accessing information about epochs and
-//! slots.
+//! # Overview
+//! Jetstreamer streams historical Solana ledger data directly from Project Yellowstone's [Old
+//! Faithful](https://old-faithful.net/) archive — a complete collection of every transaction
+//! from genesis to the current chain tip. With adequate hardware and bandwidth, Jetstreamer
+//! can sustain well over 2.7 million transactions per second of replay throughput streaming
+//! historical Old Faithful data to your local plugins or consumers for analysis and/or
+//! backfilling.
 //!
-//! See [`utils`] for helpers used throughout the Jetstreamer ecosystem.
+//! Jetstreamer ships as a trio of companion crates:
+//! - `jetstreamer`: this facade crate that wires firehose ingestion into your plugins.
+//! - [`jetstreamer_firehose`](crate::firehose): async helpers for downloading, compacting, and
+//!   replaying Old Faithful CAR archives at scale.
+//! - [`jetstreamer_plugin`](crate::plugin): trait-driven framework for building structured
+//!   observers with ClickHouse-friendly batching and runtime metrics.
 //!
-//! See [`JetstreamerRunner`] and [`plugin`] for the ability to build and run jetstreamer
-//! plugins that consume firehose data with automatic stat tracking and ClickHouse integration.
+//! All three crates are re-exported from this facade, which keeps most applications reliant on
+//! a single dependency.
+//!
+//! # Quick Start
+//! Install the CLI by cloning the repository and running the bundled demo runner:
+//!
+//! ```bash
+//! # Replay all transactions in epoch 800 using eight HTTP multiplexing workers.
+//! JETSTREAMER_THREADS=8 cargo run --release -- 800
+//!
+//! # Or replay an explicit slot range (slot ranges may cross epoch boundaries).
+//! JETSTREAMER_THREADS=8 cargo run --release -- 358560000:367631999
+//! ```
+//!
+//! The CLI accepts either `<start>:<end>` slot ranges or a single epoch. See
+//! [`JetstreamerRunner::parse_cli_args`] for the precise argument grammar.
+//!
+//! When `JETSTREAMER_CLICKHOUSE_MODE` is `auto` (the default) the runner inspects the DSN to
+//! decide whether to launch the bundled ClickHouse helper or connect to an external cluster.
+//!
+//! # Environment Variables
+//! `JetstreamerRunner` honours several environment variables for runtime tuning:
+//! - `JETSTREAMER_THREADS` (default `1`): number of firehose ingestion threads. Increase this to
+//!   multiplex Old Faithful HTTP requests across more cores.
+//! - `JETSTREAMER_CLICKHOUSE_DSN` (default `http://localhost:8123`): DSN passed to plugin
+//!   instances that emit ClickHouse writes.
+//! - `JETSTREAMER_CLICKHOUSE_MODE` (default `auto`): controls ClickHouse integration. Accepted
+//!   values are `auto`, `remote`, `local`, and `off`. Legacy variables
+//!   `JETSTREAMER_NO_CLICKHOUSE` and `JETSTREAMER_SPAWN_CLICKHOUSE` remain supported.
+//!
+//! Additional firehose-specific knobs such as `JETSTREAMER_COMPACT_INDEX_BASE_URL` and
+//! `JETSTREAMER_NETWORK` live in [`jetstreamer_firehose`](crate::firehose).
+//!
+//! # Limitations
+//! Jetstreamer can replay every block, transaction, epoch, and reward recorded in Old Faithful's
+//! archive. Account updates, however, are not yet available because the upstream archive does not
+//! expose them. A companion project is planned to fill this gap.
+//!
+//! # Epoch Feature Availability
+//! Old Faithful snapshots expose different metadata across the network's history. Use the table
+//! below to choose replay windows that match your requirements:
+//!
+//! | Epoch range | Slot range    | Comment |
+//! |-------------|---------------|--------------------------------------------------|
+//! | 0–156       | 0–?           | Incompatible with modern Geyser plugins          |
+//! | 157+        | ?             | Compatible with modern Geyser plugins            |
+//! | 0–449       | 0–194184610   | CU tracking not available (reported as `0`)      |
+//! | 450+        | 194184611+    | CU tracking fully available                      |
+//!
+//! Epochs at or above `157` work with the bundled Geyser plugin interface, while compute unit
+//! accounting first appears at epoch `450`.
+//!
+//! # Related Modules
+//! - [`firehose`](crate::firehose) exposes the underlying streaming primitives.
+//! - [`plugin`](crate::plugin) provides the trait surface for authoring plugins.
+//! - [`utils`](crate::utils) hosts shared helpers used across the Jetstreamer ecosystem.
 
 pub use jetstreamer_firehose as firehose;
 pub use jetstreamer_plugin as plugin;

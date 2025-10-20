@@ -1,11 +1,21 @@
 [workspace]
 members = ["jetstreamer-firehose", "jetstreamer-plugin", "jetstreamer-utils"]
 
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+authors = ["sam0x17", "anza-team"]
+license = "MIT OR Apache-2.0"
+keywords = ["solana", "geyser", "jetstreamer", "firehose", "transaction"]
+
 [package]
 name = "jetstreamer"
-version = "0.1.0"
-edition = "2024"
-authors = ["sam0x17"]
+description = "High-throughput Solana transaction ledger streaming and plugin framework suitable for research and backfilling"
+keywords.workspace = true
+edition.workspace = true
+version.workspace = true
+authors.workspace = true
+license.workspace = true
 
 [workspace.dependencies]
 jetstreamer-firehose = { path = "jetstreamer-firehose", version = "0.1.0" }

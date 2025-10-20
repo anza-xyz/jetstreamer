@@ -1,7 +1,11 @@
 [package]
 name = "jetstreamer-utils"
-version = "0.1.0"
-edition = "2024"
+description = "Support crate for Jetstreamer containing utility functions, types, and ClickHouse integration"
+keywords.workspace = true
+edition.workspace = true
+version.workspace = true
+authors.workspace = true
+license.workspace = true
 
 [lib]
 name = "jetstreamer_utils"

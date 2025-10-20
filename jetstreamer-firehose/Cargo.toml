@@ -1,10 +1,11 @@
 [package]
 name = "jetstreamer-firehose"
-version = "0.1.0"
-edition = "2024"
-authors = ["sam0x17"]
-license = "MIT"
-description = "A utility that allows replaying ranges of Solana blocks, even back to genesis, over a geyser plugin using Old Faithful"
+description = "Support crate for Jetstreamer containing firehose ingestion engine and core abstractions"
+keywords.workspace = true
+edition.workspace = true
+version.workspace = true
+authors.workspace = true
+license.workspace = true
 default-run = "jetstreamer-firehose"
 
 [features]

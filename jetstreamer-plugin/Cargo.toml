@@ -1,7 +1,11 @@
 [package]
 name = "jetstreamer-plugin"
-version = "0.1.0"
-edition = "2024"
+description = "Support crate for Jetstreamer containing plugin framework abstractions and utilities"
+keywords.workspace = true
+edition.workspace = true
+version.workspace = true
+authors.workspace = true
+license.workspace = true
 
 [dependencies]
 jetstreamer-firehose.workspace = true

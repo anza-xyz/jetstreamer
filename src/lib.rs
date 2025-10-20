@@ -130,13 +130,48 @@ fn parse_clickhouse_mode(value: &str) -> Option<ClickhouseMode> {
 /// ### Example
 ///
 /// ```no_run
-/// use jetstreamer::{JetstreamerRunner, plugin::Plugin};
+/// use std::sync::Arc;
+///
+/// use clickhouse::Client;
+/// use jetstreamer::{
+///     JetstreamerRunner,
+///     firehose::firehose::{BlockData, TransactionData},
+///     plugin::{Plugin, PluginFuture},
+/// };
 ///
 /// struct Dummy;
 ///
 /// impl Plugin for Dummy {
 ///     fn name(&self) -> &'static str {
 ///         "dummy"
+///     }
+///
+///     fn on_transaction<'a>(
+///         &'a self,
+///         _thread_id: usize,
+///         _db: Option<Arc<Client>>,
+///         tx: &'a TransactionData,
+///     ) -> PluginFuture<'a> {
+///         Box::pin(async move {
+///             println!("tx {} landed in slot {}", tx.signature, tx.slot);
+///             Ok(())
+///         })
+///     }
+///
+///     fn on_block<'a>(
+///         &'a self,
+///         _thread_id: usize,
+///         _db: Option<Arc<Client>>,
+///         block: &'a BlockData,
+///     ) -> PluginFuture<'a> {
+///         Box::pin(async move {
+///             if block.was_skipped() {
+///                 println!("slot {} was skipped", block.slot());
+///             } else {
+///                 println!("processed block at slot {}", block.slot());
+///             }
+///             Ok(())
+///         })
 ///     }
 /// }
 ///

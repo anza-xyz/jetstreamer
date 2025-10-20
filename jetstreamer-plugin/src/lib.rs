@@ -30,6 +30,16 @@
 //! When the mode is `auto`, Jetstreamer inspects the DSN at runtime and only launches the
 //! embedded helper for local endpoints, enabling native clustering workflows out of the box.
 //!
+//! # Batching ClickHouse Writes
+//! ClickHouse (and any sinks you invoke inside hook handlers) can apply backpressure on large
+//! numbers of tiny inserts. Plugins should buffer work locally and flush in batches on a cadence
+//! that matches their workload. The default [`PluginRunner`] configuration triggers stats pulses
+//! every 100 slots, which offers a reasonable heartbeat without thrashing the database. The
+//! bundled [`plugins::program_tracking::ProgramTrackingPlugin`] mirrors this approach by
+//! accumulating `ProgramEvent` rows per worker thread and issuing a single batch insert every
+//! 1,000 slots. Adopting a similar strategy keeps long-running replays responsive even under
+//! peak throughput.
+//!
 //! # Examples
 //! ## Defining a Plugin
 //! ```no_run

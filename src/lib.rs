@@ -190,6 +190,21 @@ fn parse_clickhouse_mode(value: &str) -> Option<ClickhouseMode> {
 /// # Ok(())
 /// # }
 /// ```
+///
+/// ## Multiplexing and Throughput
+///
+/// By default `JETSTREAMER_THREADS` is set to `1` which there is no HTTP multiplexing of the
+/// underlying [`firehose`](jetstreamer_firehose::firehose::firehose) stream. The way
+/// multiplexing works is multiple threads connect to different subsections of the underlying
+/// slot range being streamed from Old Faithful, and handle this subrange in parallel with
+/// other threads, achieving embarrasingly parallel throughput increases up to the limit of
+/// your CPU and internet connection. A good rule of thumb is to expect about 100 Mbps of
+/// bandwidth and significant one-core compute per thread. On a 16 core system with a 1 Gbps
+/// network connection, setting `JETSTREAMER_THREADS` to 8-10 should yield optimal results.
+///
+/// To achieve 2M TPS+, you will need a 20+ Gbps network connection and at least a 64 core CPU.
+/// On our benchmark hardware we currently have a 100 Gbps connection and 64 cores, which has
+/// led to a record of 2.7M TPS of the course of a 12 hour run.
 pub struct JetstreamerRunner {
     log_level: String,
     plugins: Vec<Box<dyn Plugin>>,

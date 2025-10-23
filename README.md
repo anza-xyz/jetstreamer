@@ -55,12 +55,20 @@ Jetstreamer Runner with the Program Tracking plugin enabled:
 ### Jetstreamer Runner CLI
 
 ```bash
-# Replay all transactions in epoch 800, using 8 HTTP multiplexing cores.
-JETSTREAMER_THREADS=8 cargo run --release -- 800
+# Replay all transactions in epoch 800, using the default number of multiplexing threads based on your system
+cargo run --release -- 800
+
+# The same as above, but tuning network capacity for 10 Gbps, resulting in a higher number of multiplexing threads
+JETSTREAMER_NETWORK_CAPACITY_MB=10000 cargo run --release -- 800
 
 # Do the same but for slots 358560000 through 367631999, which is epoch 830-850 (slot ranges can be cross-epoch!)
+# and using 8 threads explicitly instead of using automatic thread count
 JETSTREAMER_THREADS=8 cargo run --release -- 358560000:367631999
 ```
+
+If `JETSTREAMER_THREADS` is omitted, Jetstreamer auto-sizes the worker pool using the same
+hardware-aware heuristic exposed by
+`jetstreamer_firehose::system::optimal_firehose_thread_count`.
 
 The CLI accepts either `<start>:<end>` slot ranges or a single epoch on the command line. See
 [`JetstreamerRunner::parse_cli_args`](https://docs.rs/jetstreamer/latest/jetstreamer/fn.parse_cli_args.html)

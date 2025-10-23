@@ -548,7 +548,7 @@ pub fn parse_cli_args() -> Result<Config, Box<dyn std::error::Error>> {
     let threads = std::env::var("JETSTREAMER_THREADS")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or_else(|| jetstreamer_firehose::system::optimal_firehose_thread_count());
+        .unwrap_or_else(jetstreamer_firehose::system::optimal_firehose_thread_count);
 
     let spawn_clickhouse = clickhouse_settings.spawn_helper && clickhouse_enabled;
 

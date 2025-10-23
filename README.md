@@ -221,3 +221,12 @@ unit accounting first appears at epoch 450. Plan replay windows accordingly.
 Questions, issues, and contributions are welcome! Open a discussion or pull request on
 [GitHub](https://github.com/anza-xyz/jetstreamer) and join the effort to build faster Solana
 analytics pipelines.
+
+## License
+
+Licensed under either of
+
+* Apache License, Version 2.0, ([LICENSE-APACHE](LICENSE-APACHE) or http://www.apache.org/licenses/LICENSE-2.0)
+* MIT license ([LICENSE-MIT](LICENSE-MIT) or http://opensource.org/licenses/MIT)
+
+at your option.

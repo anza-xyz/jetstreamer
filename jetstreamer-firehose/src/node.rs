@@ -20,17 +20,17 @@ pub struct NodeWithCid {
 
 impl NodeWithCid {
     /// Creates a new `(CID, node)` pair.
-    pub fn new(cid: Cid, node: Node) -> NodeWithCid {
+    pub const fn new(cid: Cid, node: Node) -> NodeWithCid {
         NodeWithCid { cid, node }
     }
 
     /// Returns the CID associated with the node.
-    pub fn get_cid(&self) -> &Cid {
+    pub const fn get_cid(&self) -> &Cid {
         &self.cid
     }
 
     /// Returns the decoded node.
-    pub fn get_node(&self) -> &Node {
+    pub const fn get_node(&self) -> &Node {
         &self.node
     }
 }
@@ -44,7 +44,7 @@ pub struct NodesWithCids(
 
 impl NodesWithCids {
     /// Creates an empty [`NodesWithCids`].
-    pub fn new() -> NodesWithCids {
+    pub const fn new() -> NodesWithCids {
         NodesWithCids(vec![])
     }
 
@@ -54,12 +54,12 @@ impl NodesWithCids {
     }
 
     /// Returns the number of stored nodes.
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.0.len()
     }
 
     /// Returns `true` if no nodes are stored.
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
@@ -204,42 +204,42 @@ pub enum Node {
 
 impl Node {
     /// Returns `true` if this node is a [`transaction::Transaction`].
-    pub fn is_transaction(&self) -> bool {
+    pub const fn is_transaction(&self) -> bool {
         matches!(self, Node::Transaction(_))
     }
 
     /// Returns `true` if this node is an [`entry::Entry`].
-    pub fn is_entry(&self) -> bool {
+    pub const fn is_entry(&self) -> bool {
         matches!(self, Node::Entry(_))
     }
 
     /// Returns `true` if this node is a [`block::Block`].
-    pub fn is_block(&self) -> bool {
+    pub const fn is_block(&self) -> bool {
         matches!(self, Node::Block(_))
     }
 
     /// Returns `true` if this node is a [`subset::Subset`].
-    pub fn is_subset(&self) -> bool {
+    pub const fn is_subset(&self) -> bool {
         matches!(self, Node::Subset(_))
     }
 
     /// Returns `true` if this node is an [`epoch::Epoch`].
-    pub fn is_epoch(&self) -> bool {
+    pub const fn is_epoch(&self) -> bool {
         matches!(self, Node::Epoch(_))
     }
 
     /// Returns `true` if this node is a [`rewards::Rewards`].
-    pub fn is_rewards(&self) -> bool {
+    pub const fn is_rewards(&self) -> bool {
         matches!(self, Node::Rewards(_))
     }
 
     /// Returns `true` if this node is a [`dataframe::DataFrame`].
-    pub fn is_dataframe(&self) -> bool {
+    pub const fn is_dataframe(&self) -> bool {
         matches!(self, Node::DataFrame(_))
     }
 
     /// Returns the transaction if this node is [`Node::Transaction`].
-    pub fn get_transaction(&self) -> Option<&transaction::Transaction> {
+    pub const fn get_transaction(&self) -> Option<&transaction::Transaction> {
         match self {
             Node::Transaction(transaction) => Some(transaction),
             _ => None,
@@ -247,7 +247,7 @@ impl Node {
     }
 
     /// Returns the entry if this node is [`Node::Entry`].
-    pub fn get_entry(&self) -> Option<&entry::Entry> {
+    pub const fn get_entry(&self) -> Option<&entry::Entry> {
         match self {
             Node::Entry(entry) => Some(entry),
             _ => None,
@@ -255,7 +255,7 @@ impl Node {
     }
 
     /// Returns the block if this node is [`Node::Block`].
-    pub fn get_block(&self) -> Option<&block::Block> {
+    pub const fn get_block(&self) -> Option<&block::Block> {
         match self {
             Node::Block(block) => Some(block),
             _ => None,
@@ -263,7 +263,7 @@ impl Node {
     }
 
     /// Returns the subset if this node is [`Node::Subset`].
-    pub fn get_subset(&self) -> Option<&subset::Subset> {
+    pub const fn get_subset(&self) -> Option<&subset::Subset> {
         match self {
             Node::Subset(subset) => Some(subset),
             _ => None,
@@ -271,7 +271,7 @@ impl Node {
     }
 
     /// Returns the epoch if this node is [`Node::Epoch`].
-    pub fn get_epoch(&self) -> Option<&epoch::Epoch> {
+    pub const fn get_epoch(&self) -> Option<&epoch::Epoch> {
         match self {
             Node::Epoch(epoch) => Some(epoch),
             _ => None,
@@ -279,7 +279,7 @@ impl Node {
     }
 
     /// Returns the rewards data if this node is [`Node::Rewards`].
-    pub fn get_rewards(&self) -> Option<&rewards::Rewards> {
+    pub const fn get_rewards(&self) -> Option<&rewards::Rewards> {
         match self {
             Node::Rewards(rewards) => Some(rewards),
             _ => None,
@@ -287,7 +287,7 @@ impl Node {
     }
 
     /// Returns the dataframe if this node is [`Node::DataFrame`].
-    pub fn get_dataframe(&self) -> Option<&dataframe::DataFrame> {
+    pub const fn get_dataframe(&self) -> Option<&dataframe::DataFrame> {
         match self {
             Node::DataFrame(dataframe) => Some(dataframe),
             _ => None,
@@ -403,7 +403,7 @@ impl fmt::Display for Kind {
 
 impl Kind {
     /// Converts a numeric discriminant into a [`Kind`].
-    pub fn from_u64(kind: u64) -> Option<Kind> {
+    pub const fn from_u64(kind: u64) -> Option<Kind> {
         match kind {
             0 => Some(Kind::Transaction),
             1 => Some(Kind::Entry),
@@ -417,7 +417,7 @@ impl Kind {
     }
 
     /// Returns the numeric discriminant for this [`Kind`].
-    pub fn to_u64(&self) -> u64 {
+    pub const fn to_u64(&self) -> u64 {
         match self {
             Kind::Transaction => 0,
             Kind::Entry => 1,
@@ -448,7 +448,7 @@ impl fmt::Debug for RawNode {
 
 impl RawNode {
     /// Creates a [`RawNode`] from the provided CID and raw bytes read from Old Faithful.
-    pub fn new(cid: Cid, data: Vec<u8>) -> RawNode {
+    pub const fn new(cid: Cid, data: Vec<u8>) -> RawNode {
         RawNode { cid, data }
     }
 
@@ -609,7 +609,7 @@ impl<R: Read> NodeReader<R> {
     }
 
     /// Returns the number of CAR items read so far.
-    pub fn get_item_index(&self) -> u64 {
+    pub const fn get_item_index(&self) -> u64 {
         self.item_index
     }
 }

@@ -72,7 +72,7 @@ impl core::fmt::Debug for RawNode {
 
 impl RawNode {
     /// Creates a new [`RawNode`] from a CID and CBOR payload.
-    pub fn new(cid: Cid, data: Vec<u8>) -> RawNode {
+    pub const fn new(cid: Cid, data: Vec<u8>) -> RawNode {
         RawNode { cid, data }
     }
 
@@ -171,7 +171,7 @@ pub struct NodeReader<R: AsyncRead + AsyncSeek + Len> {
 
 impl<R: AsyncRead + Unpin + AsyncSeek + Len> NodeReader<R> {
     /// Wraps an async reader and primes it for Old Faithful CAR decoding.
-    pub fn new(reader: R) -> NodeReader<R> {
+    pub const fn new(reader: R) -> NodeReader<R> {
         NodeReader {
             reader,
             header: vec![],
@@ -303,7 +303,7 @@ impl<R: AsyncRead + Unpin + AsyncSeek + Len> NodeReader<R> {
     }
 
     /// Returns the number of Old Faithful CAR items that have been yielded so far.
-    pub fn get_item_index(&self) -> u64 {
+    pub const fn get_item_index(&self) -> u64 {
         self.item_index
     }
 }

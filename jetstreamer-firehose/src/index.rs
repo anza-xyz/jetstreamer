@@ -208,7 +208,7 @@ impl SlotOffsetIndex {
     }
 
     /// Returns the base URL that remote index files are fetched from.
-    pub fn base_url(&self) -> &Url {
+    pub const fn base_url(&self) -> &Url {
         &self.base_url
     }
 
@@ -393,7 +393,7 @@ impl RemoteCompactIndex {
         self.header.metadata_epoch()
     }
 
-    fn url(&self) -> &Url {
+    const fn url(&self) -> &Url {
         &self.url
     }
 
@@ -495,7 +495,7 @@ struct BucketData {
 }
 
 impl BucketData {
-    fn new(header: BucketHeader, data: Vec<u8>, stride: usize, value_width: usize) -> Self {
+    const fn new(header: BucketHeader, data: Vec<u8>, stride: usize, value_width: usize) -> Self {
         Self {
             header,
             data,
@@ -607,7 +607,7 @@ fn entry_hash64(prefix: u32, key: &[u8]) -> u64 {
     xxh64(&data, 0)
 }
 
-fn hash_uint64(mut x: u64) -> u64 {
+const fn hash_uint64(mut x: u64) -> u64 {
     x ^= x >> 33;
     x = x.wrapping_mul(0xff51afd7ed558ccd);
     x ^= x >> 33;

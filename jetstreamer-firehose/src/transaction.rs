@@ -113,11 +113,11 @@ impl Transaction {
     }
 
     /// Returns `true` when the transaction data frame has no continuation CIDs.
-    pub fn is_complete_data(&self) -> bool {
+    pub const fn is_complete_data(&self) -> bool {
         self.data.next.is_none() || self.data.next.as_ref().unwrap().is_empty()
     }
     /// Returns `true` when the transaction metadata frame has no continuation CIDs.
-    pub fn is_complete_metadata(&self) -> bool {
+    pub const fn is_complete_metadata(&self) -> bool {
         self.metadata.next.is_none() || self.metadata.next.as_ref().unwrap().is_empty()
     }
 }

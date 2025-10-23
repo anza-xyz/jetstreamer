@@ -104,7 +104,7 @@ impl Hash {
     }
 
     /// Constructs a [`struct@Hash`] from owned bytes.
-    pub fn from_vec(data: Vec<u8>) -> Hash {
+    pub const fn from_vec(data: Vec<u8>) -> Hash {
         Hash(data)
     }
 
@@ -126,7 +126,7 @@ pub struct Buffer(#[doc = "Owned bytes stored in the buffer."] Vec<u8>);
 
 impl Buffer {
     /// Creates an empty buffer.
-    pub fn new() -> Buffer {
+    pub const fn new() -> Buffer {
         Buffer(vec![])
     }
 
@@ -149,12 +149,12 @@ impl Buffer {
     }
 
     /// Returns the buffer length in bytes.
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.0.len()
     }
 
     /// Returns `true` if the buffer is empty.
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
@@ -164,7 +164,7 @@ impl Buffer {
     }
 
     /// Creates a buffer from owned bytes.
-    pub fn from_vec(data: Vec<u8>) -> Buffer {
+    pub const fn from_vec(data: Vec<u8>) -> Buffer {
         Buffer(data)
     }
 }

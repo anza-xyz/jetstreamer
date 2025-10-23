@@ -79,7 +79,7 @@ impl Rewards {
     }
 
     /// Returns `true` when the rewards data frame has no continuation CIDs.
-    pub fn is_complete(&self) -> bool {
+    pub const fn is_complete(&self) -> bool {
         self.data.next.is_none() || self.data.next.as_ref().unwrap().is_empty()
     }
 }

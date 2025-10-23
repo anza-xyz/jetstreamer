@@ -347,7 +347,7 @@ impl JetstreamerRunner {
     }
 
     /// Restricts [`JetstreamerRunner::run`] to a specific slot range.
-    pub fn with_slot_range(mut self, slot_range: Range<u64>) -> Self {
+    pub const fn with_slot_range(mut self, slot_range: Range<u64>) -> Self {
         self.config.slot_range = slot_range;
         self
     }

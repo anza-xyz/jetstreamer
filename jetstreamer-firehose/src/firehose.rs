@@ -3,13 +3,13 @@ use crossbeam_channel::{Receiver, Sender, unbounded};
 use futures_util::FutureExt;
 use futures_util::future::BoxFuture;
 use reqwest::{Client, Url};
+use solana_address::Address;
 use solana_geyser_plugin_manager::{
     block_metadata_notifier_interface::BlockMetadataNotifier,
     geyser_plugin_service::GeyserPluginServiceError,
 };
 use solana_hash::Hash;
 use solana_ledger::entry_notifier_interface::EntryNotifier;
-use solana_pubkey::Pubkey;
 use solana_reward_info::RewardInfo;
 use solana_rpc::{
     optimistically_confirmed_bank_tracker::SlotNotification,
@@ -374,7 +374,7 @@ pub struct RewardsData {
     /// Slot the rewards correspond to.
     pub slot: u64,
     /// Reward recipients and their associated reward information.
-    pub rewards: Vec<(Pubkey, RewardInfo)>,
+    pub rewards: Vec<(Address, RewardInfo)>,
 }
 
 /// Block-level data streamed to block handlers.
@@ -748,7 +748,7 @@ where
                         let mut entry_index: usize = 0;
                         let mut this_block_executed_transaction_count: u64 = 0;
                         let mut this_block_entry_count: u64 = 0;
-                        let mut this_block_rewards: Vec<(Pubkey, RewardInfo)> = Vec::new();
+                        let mut this_block_rewards: Vec<(Address, RewardInfo)> = Vec::new();
 
                         for node_with_cid in &nodes.0 {
                             item_index += 1;
@@ -1643,7 +1643,7 @@ async fn firehose_geyser_thread(
                     let mut entry_index: usize = 0;
                     let mut this_block_executed_transaction_count: u64 = 0;
                     let mut this_block_entry_count: u64 = 0;
-                    let mut this_block_rewards: Vec<(Pubkey, RewardInfo)> = Vec::new();
+                    let mut this_block_rewards: Vec<(Address, RewardInfo)> = Vec::new();
 
                     nodes.each(|node_with_cid| -> Result<(), Box<dyn std::error::Error>> {
                         item_index += 1;
@@ -1904,7 +1904,7 @@ fn is_simple_vote_transaction(versioned_tx: &VersionedTransaction) -> bool {
 #[inline(always)]
 fn convert_proto_rewards(
     proto_rewards: &solana_storage_proto::convert::generated::Rewards,
-) -> Result<Vec<(Pubkey, RewardInfo)>, Box<dyn std::error::Error>> {
+) -> Result<Vec<(Address, RewardInfo)>, Box<dyn std::error::Error>> {
     let mut keyed_rewards = Vec::with_capacity(proto_rewards.rewards.len());
     for proto_reward in proto_rewards.rewards.iter() {
         let reward = RewardInfo {
@@ -1926,7 +1926,7 @@ fn convert_proto_rewards(
         };
         let pubkey = proto_reward
             .pubkey
-            .parse::<Pubkey>()
+            .parse::<Address>()
             .map_err(|err| Box::new(err) as Box<dyn std::error::Error>)?;
         keyed_rewards.push((pubkey, reward));
     }

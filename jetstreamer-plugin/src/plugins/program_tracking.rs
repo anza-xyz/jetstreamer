@@ -4,8 +4,8 @@ use clickhouse::{Client, Row};
 use futures_util::FutureExt;
 use log::error;
 use serde::{Deserialize, Serialize};
+use solana_address::Address;
 use solana_message::VersionedMessage;
-use solana_pubkey::Pubkey;
 
 use crate::{Plugin, PluginFuture};
 use jetstreamer_firehose::firehose::{BlockData, TransactionData};
@@ -14,7 +14,7 @@ const DB_WRITE_INTERVAL_SLOTS: u64 = 1000;
 
 #[derive(Default)]
 struct ThreadLocalData {
-    slot_stats: HashMap<u64, HashMap<Pubkey, ProgramStats>>,
+    slot_stats: HashMap<u64, HashMap<Address, ProgramStats>>,
     pending_rows: Vec<ProgramEvent>,
     slots_since_flush: u64,
 }
@@ -28,7 +28,7 @@ struct ProgramEvent {
     pub slot: u32,
     // Stored as ClickHouse DateTime('UTC') -> UInt32 seconds; we clamp Solana i64.
     pub timestamp: u32,
-    pub program_id: Pubkey,
+    pub program_id: Address,
     pub count: u32,
     pub error_count: u32,
     pub min_cus: u32,
@@ -245,7 +245,7 @@ async fn write_program_events(
 fn events_from_slot(
     slot: u64,
     block_time: Option<i64>,
-    slot_data: &HashMap<Pubkey, ProgramStats>,
+    slot_data: &HashMap<Address, ProgramStats>,
 ) -> Vec<ProgramEvent> {
     let raw_ts = block_time.unwrap_or(0);
     let timestamp: u32 = if raw_ts < 0 {

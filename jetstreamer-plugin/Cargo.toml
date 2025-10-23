@@ -14,7 +14,7 @@ jetstreamer-firehose.workspace = true
 
 serde.workspace = true
 solana-message.workspace = true
-solana-pubkey.workspace = true
+solana-address.workspace = true
 tokio.workspace = true
 log.workspace = true
 clickhouse.workspace = true

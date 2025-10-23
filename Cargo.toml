@@ -53,9 +53,9 @@ protobuf-src = "1"
 serde = { version = "1", default-features = false }
 serde_cbor = "0"
 agave-geyser-plugin-interface = "3"
+solana-address = "1"
 solana-hash = "3"
 solana-logger = "3"
-solana-pubkey = "3"
 solana-signature = { version = "3", default-features = false }
 solana-accounts-db = "3"
 solana-entry = "3"

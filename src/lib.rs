@@ -277,8 +277,8 @@ fn parse_clickhouse_mode(value: &str) -> Option<ClickhouseMode> {
 ///
 /// ## Multiplexing and Throughput
 ///
-/// When `JETSTREAMER_THREADS` is unset and you do not call [`JetstreamerRunner::with_threads`],
-/// the runner defers to
+/// When `JETSTREAMER_THREADS` is unset and you do not call
+/// [`JetstreamerRunner::with_threads`], the runner defers to
 /// [`jetstreamer_firehose::system::optimal_firehose_thread_count`] to size the ingestion pool
 /// automatically. Set the environment variable (or call [`JetstreamerRunner::with_threads`])
 /// to override the heuristic with an explicit value. Multiplexing works by allowing multiple
@@ -287,11 +287,13 @@ fn parse_clickhouse_mode(value: &str) -> Option<ClickhouseMode> {
 /// speedups up to the limits of your CPU and network. A good rule of thumb is to expect about
 /// 250 Mbps of bandwidth and significant one-core compute per thread. On a 16 core system with
 /// a 1 Gbps network connection, the heuristic typically lands between 4-5 threads; overriding
-/// `JETSTREAMER_THREADS` to a nearby value is a fine-tuning knob if you know your workload well.
+/// `JETSTREAMER_THREADS` to a nearby value is a fine-tuning knob if you know your workload
+/// well. If the automatic sizing feels off, adjust `JETSTREAMER_NETWORK_CAPACITY_MB` so the
+/// heuristic reflects your actual network budget before reaching for manual thread counts.
 ///
 /// To achieve 2M TPS+, you will need a 20+ Gbps network connection and at least a 64 core CPU.
 /// On our benchmark hardware we currently have a 100 Gbps connection and 64 cores, which has
-/// led to a record of 2.7M TPS of the course of a 12 hour run.
+/// led to a record of 2.7M TPS of the course of a 12 hour run using 255 threads.
 pub struct JetstreamerRunner {
     log_level: String,
     plugins: Vec<Box<dyn Plugin>>,

@@ -25,6 +25,9 @@
 //!   public Old Faithful deployment.
 //! - `JETSTREAMER_NETWORK` (default `mainnet`): suffix appended to cache namespaces and index
 //!   filenames so you can swap between clusters without purging local state.
+//! - `JETSTREAMER_NETWORK_CAPACITY_MB` (default `1000`): assumed network throughput in megabytes
+//!   per second used when sizing the firehose thread pool. Increase or decrease to match your
+//!   host's effective bandwidth.
 //!
 //! # Limitations
 //! Old Faithful currently publishes blocks, transactions, epochs, and reward metadata but does
@@ -155,6 +158,8 @@ pub mod node_reader;
 pub mod rewards;
 /// Utilities for working with subset nodes.
 pub mod subset;
+/// System heuristics for sizing the firehose runtime.
+pub mod system;
 /// Transaction decoding and helpers.
 pub mod transaction;
 /// Shared helpers used throughout the firehose crate.

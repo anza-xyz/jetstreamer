@@ -48,8 +48,10 @@
 //!
 //! # Environment Variables
 //! `JetstreamerRunner` honors several environment variables for runtime tuning:
-//! - `JETSTREAMER_THREADS` (default `1`): number of firehose ingestion threads. Increase this
-//!   to multiplex Old Faithful HTTP requests across more cores.
+//! - `JETSTREAMER_THREADS` (default hardware auto-detect via
+//!   [`jetstreamer_firehose::system::optimal_firehose_thread_count`]): number of firehose
+//!   ingestion threads. Increase this to multiplex Old Faithful HTTP requests across more
+//!   cores, or leave it unset to size the pool automatically using CPU and network heuristics.
 //! - `JETSTREAMER_CLICKHOUSE_DSN` (default `http://localhost:8123`): DSN passed to plugin
 //!   instances that emit ClickHouse writes.
 //! - `JETSTREAMER_CLICKHOUSE_MODE` (default `auto`): controls ClickHouse integration. Accepted
@@ -83,7 +85,7 @@
 //! |----------|---------|--------|
 //! | `JETSTREAMER_CLICKHOUSE_DSN` | `http://localhost:8123` | HTTP(S) DSN passed to the embedded plugin runner for ClickHouse writes. Override to target a remote ClickHouse deployment. |
 //! | `JETSTREAMER_CLICKHOUSE_MODE` | `auto` | Controls ClickHouse integration. `auto` enables output and spawns the helper only for local DSNs, `remote` enables output without spawning the helper, `local` always requests the helper, and `off` disables ClickHouse entirely. |
-//! | `JETSTREAMER_THREADS` | `1` | Number of firehose ingestion threads. Increase based on CPU headroom and downstream sink capacity. |
+//! | `JETSTREAMER_THREADS` | `auto` | Number of firehose ingestion threads. Leave unset to rely on hardware-based sizing or override with an explicit value when you know the ideal concurrency. |
 //!
 //! Helper spawning only occurs when both the mode allows it (`auto`/`local`) **and** the DSN
 //! points to `localhost` or `127.0.0.1`.
@@ -94,6 +96,7 @@
 //! |----------|---------|--------|
 //! | `JETSTREAMER_COMPACT_INDEX_BASE_URL` | `https://files.old-faithful.net` | Base URL for compact CAR index artifacts. Point this at your own mirror to reduce load on the public archive. |
 //! | `JETSTREAMER_NETWORK` | `mainnet` | Network suffix appended to cache namespaces and index filenames (e.g., `testnet`). |
+//! | `JETSTREAMER_NETWORK_CAPACITY_MB` | `1000` | Assumed network throughput in megabytes per second used when auto-sizing firehose thread counts. |
 //!
 //! Changing the network automatically segregates cache entries, allowing you to toggle between
 //! clusters without purging state.
@@ -198,7 +201,8 @@ fn parse_clickhouse_mode(value: &str) -> Option<ClickhouseMode> {
 /// [`JetstreamerRunner`] inspects a handful of environment variables at startup to fine-tune
 /// runtime behavior:
 ///
-/// - `JETSTREAMER_THREADS`: Number of firehose ingestion threads, defaulting to `1`.
+/// - `JETSTREAMER_THREADS`: Number of firehose ingestion threads. When unset the value is
+///   derived from [`jetstreamer_firehose::system::optimal_firehose_thread_count`].
 /// - `JETSTREAMER_CLICKHOUSE_DSN`: DSN for ClickHouse ingestion; defaults to
 ///   `http://localhost:8123`.
 /// - `JETSTREAMER_CLICKHOUSE_MODE`: Controls ClickHouse integration. Accepted values are
@@ -273,19 +277,23 @@ fn parse_clickhouse_mode(value: &str) -> Option<ClickhouseMode> {
 ///
 /// ## Multiplexing and Throughput
 ///
-/// By default `JETSTREAMER_THREADS` (or a runner without [`JetstreamerRunner::with_threads`])
-/// uses a single ingestion thread, meaning there is no HTTP multiplexing of the underlying
-/// [`firehose`](jetstreamer_firehose::firehose::firehose) stream. The way multiplexing works
-/// is multiple threads connect to different subsections of the underlying slot range being
-/// streamed from Old Faithful, and handle this subrange in parallel with other threads,
-/// achieving embarrasingly parallel throughput increases up to the limit of your CPU and
-/// internet connection. A good rule of thumb is to expect about 250 Mbps of bandwidth and
-/// significant one-core compute per thread. On a 16 core system with a 1 Gbps network
-/// connection, setting `JETSTREAMER_THREADS` to 4-5 should yield optimal results.
+/// When `JETSTREAMER_THREADS` is unset and you do not call
+/// [`JetstreamerRunner::with_threads`], the runner defers to
+/// [`jetstreamer_firehose::system::optimal_firehose_thread_count`] to size the ingestion pool
+/// automatically. Set the environment variable (or call [`JetstreamerRunner::with_threads`])
+/// to override the heuristic with an explicit value. Multiplexing works by allowing multiple
+/// threads to connect to different subsections of the underlying slot range being streamed
+/// from Old Faithful, processing each slice in parallel. This yields embarrassingly parallel
+/// speedups up to the limits of your CPU and network. A good rule of thumb is to expect about
+/// 250 Mbps of bandwidth and significant one-core compute per thread. On a 16 core system with
+/// a 1 Gbps network connection, the heuristic typically lands between 4-5 threads; overriding
+/// `JETSTREAMER_THREADS` to a nearby value is a fine-tuning knob if you know your workload
+/// well. If the automatic sizing feels off, adjust `JETSTREAMER_NETWORK_CAPACITY_MB` so the
+/// heuristic reflects your actual network budget before reaching for manual thread counts.
 ///
 /// To achieve 2M TPS+, you will need a 20+ Gbps network connection and at least a 64 core CPU.
 /// On our benchmark hardware we currently have a 100 Gbps connection and 64 cores, which has
-/// led to a record of 2.7M TPS of the course of a 12 hour run.
+/// led to a record of 2.7M TPS of the course of a 12 hour run using 255 threads.
 pub struct JetstreamerRunner {
     log_level: String,
     plugins: Vec<Box<dyn Plugin>>,
@@ -304,7 +312,7 @@ impl Default for JetstreamerRunner {
             plugins: Vec::new(),
             clickhouse_dsn,
             config: Config {
-                threads: 1,
+                threads: jetstreamer_firehose::system::optimal_firehose_thread_count(),
                 slot_range: 0..0,
                 clickhouse_enabled: clickhouse_settings.enabled,
                 spawn_clickhouse: clickhouse_settings.spawn_helper && clickhouse_settings.enabled,
@@ -542,7 +550,7 @@ pub fn parse_cli_args() -> Result<Config, Box<dyn std::error::Error>> {
     let threads = std::env::var("JETSTREAMER_THREADS")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(1);
+        .unwrap_or_else(jetstreamer_firehose::system::optimal_firehose_thread_count);
 
     let spawn_clickhouse = clickhouse_settings.spawn_helper && clickhouse_enabled;
 

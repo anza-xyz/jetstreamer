@@ -896,7 +896,7 @@ async fn upsert_plugins(
     if plugins.is_empty() {
         return Ok(());
     }
-    let mut insert = db.insert("jetstreamer_plugins")?;
+    let mut insert = db.insert::<PluginRow>("jetstreamer_plugins").await?;
     for handle in plugins {
         insert
             .write(&PluginRow {
@@ -915,7 +915,7 @@ async fn record_plugin_slot(
     plugin_id: u16,
     slot: u64,
 ) -> Result<(), clickhouse::error::Error> {
-    let mut insert = db.insert("jetstreamer_plugin_slots")?;
+    let mut insert = db.insert::<PluginSlotRow>("jetstreamer_plugin_slots").await?;
     insert
         .write(&PluginSlotRow {
             plugin_id: plugin_id as u32,
@@ -941,7 +941,7 @@ async fn flush_slot_buffer(
         return Ok(());
     }
 
-    let mut insert = db.insert("jetstreamer_plugin_slots")?;
+    let mut insert = db.insert::<PluginSlotRow>("jetstreamer_plugin_slots").await?;
     for row in rows {
         insert.write(&row).await?;
     }
@@ -955,7 +955,7 @@ async fn record_slot_status(
     thread_id: usize,
     transaction_count: u64,
 ) -> Result<(), clickhouse::error::Error> {
-    let mut insert = db.insert("jetstreamer_slot_status")?;
+    let mut insert = db.insert::<SlotStatusRow>("jetstreamer_slot_status").await?;
     insert
         .write(&SlotStatusRow {
             slot,

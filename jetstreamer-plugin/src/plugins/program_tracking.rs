@@ -234,7 +234,7 @@ async fn write_program_events(
     if rows.is_empty() {
         return Ok(());
     }
-    let mut insert = db.insert("program_invocations")?;
+    let mut insert = db.insert::<ProgramEvent>("program_invocations").await?;
     for row in rows {
         insert.write(&row).await?;
     }

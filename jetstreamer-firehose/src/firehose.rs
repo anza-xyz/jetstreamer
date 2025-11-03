@@ -2061,10 +2061,18 @@ async fn test_firehose_epoch_800() {
     static PREV_BLOCK: [AtomicU64; THREADS] = [const { AtomicU64::new(0) }; THREADS];
     static NUM_SKIPPED_BLOCKS: AtomicU64 = AtomicU64::new(0);
     static NUM_BLOCKS: AtomicU64 = AtomicU64::new(0);
+    static MIN_TRANSACTIONS: AtomicU64 = AtomicU64::new(u64::MAX);
     let stats_tracking = StatsTracking {
         on_stats: log_stats_handler,
         tracking_interval_slots: 10,
     };
+
+    for prev in PREV_BLOCK.iter() {
+        prev.store(0, Ordering::Relaxed);
+    }
+    NUM_SKIPPED_BLOCKS.store(0, Ordering::Relaxed);
+    NUM_BLOCKS.store(0, Ordering::Relaxed);
+    MIN_TRANSACTIONS.store(u64::MAX, Ordering::Relaxed);
 
     firehose(
         THREADS.try_into().unwrap(),
@@ -2096,6 +2104,24 @@ async fn test_firehose_epoch_800() {
                     NUM_SKIPPED_BLOCKS.fetch_add(1, Ordering::Relaxed);
                 } else {
                     NUM_BLOCKS.fetch_add(1, Ordering::Relaxed);
+                    if let BlockData::Block {
+                        executed_transaction_count,
+                        ..
+                    } = &block
+                    {
+                        let executed = *executed_transaction_count;
+                        let _ = MIN_TRANSACTIONS.fetch_update(
+                            Ordering::Relaxed,
+                            Ordering::Relaxed,
+                            |current| {
+                                if executed < current {
+                                    Some(executed)
+                                } else {
+                                    None
+                                }
+                            },
+                        );
+                    }
                 }
                 Ok(())
             }
@@ -2114,4 +2140,9 @@ async fn test_firehose_epoch_800() {
         NUM_SLOTS_TO_COVER
     );
     assert!(NUM_BLOCKS.load(Ordering::Relaxed) > 0);
+    let min_transactions = MIN_TRANSACTIONS.load(Ordering::Relaxed);
+    assert!(
+        min_transactions >= 100,
+        "expected at least 100 transactions in every block, minimum observed {min_transactions}"
+    );
 }

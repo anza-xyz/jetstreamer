@@ -625,7 +625,10 @@ where
                     };
 
                     if slot_range.start > epoch_to_slot_range(epoch_num).0 {
-                        let seek_fut = reader.seek_to_slot(slot_range.start);
+                        // Seek to the previous slot so the stream includes all nodes (transactions,
+                        // entries, rewards) that precede the block payload for `slot_range.start`.
+                        let seek_slot = slot_range.start.saturating_sub(1);
+                        let seek_fut = reader.seek_to_slot(seek_slot);
                         match timeout(OP_TIMEOUT, seek_fut).await {
                             Ok(res) => res.map_err(|e| (e, current_slot.unwrap_or(slot_range.start)))?,
                             Err(_) => {
@@ -733,12 +736,20 @@ where
                         }
                         debug_assert!(slot < slot_range.end, "processing out-of-range slot {} (end {})", slot, slot_range.end);
                         if slot < slot_range.start {
-                            log::warn!(
-                                target: &log_target,
-                                "encountered slot {} before start of range {}, skipping",
-                                slot,
-                                slot_range.start
-                            );
+                            if slot.saturating_add(1) == slot_range.start {
+                                log::debug!(
+                                    target: &log_target,
+                                    "priming reader with preceding slot {}, skipping",
+                                    slot
+                                );
+                            } else {
+                                log::warn!(
+                                    target: &log_target,
+                                    "encountered slot {} before start of range {}, skipping",
+                                    slot,
+                                    slot_range.start
+                                );
+                            }
                             continue;
                         }
                         if current_slot.is_some() {
@@ -1560,7 +1571,11 @@ async fn firehose_geyser_thread(
                 let mut todo_latest_entry_blockhash = Hash::default();
 
                 if slot_range.start > epoch_to_slot_range(epoch_num).0 {
-                    let seek_fut = reader.seek_to_slot(slot_range.start);
+                    // Seek to the slot immediately preceding the requested range so the reader
+                    // captures the full node set (transactions, entries, rewards) for the target
+                    // block on the next iteration.
+                    let seek_slot = slot_range.start.saturating_sub(1);
+                    let seek_fut = reader.seek_to_slot(seek_slot);
                     match timeout(OP_TIMEOUT, seek_fut).await {
                         Ok(res) => res.map_err(|e| (e, current_slot.unwrap_or(slot_range.start)))?,
                         Err(_) => {
@@ -1625,12 +1640,20 @@ async fn firehose_geyser_thread(
                     }
                     debug_assert!(slot < slot_range.end, "processing out-of-range slot {} (end {})", slot, slot_range.end);
                     if slot < slot_range.start {
-                        log::warn!(
-                            target: &log_target,
-                            "encountered slot {} before start of range {}, skipping",
-                            slot,
-                            slot_range.start
-                        );
+                        if slot.saturating_add(1) == slot_range.start {
+                            log::debug!(
+                                target: &log_target,
+                                "priming reader with preceding slot {}, skipping",
+                                slot
+                            );
+                        } else {
+                            log::warn!(
+                                target: &log_target,
+                                "encountered slot {} before start of range {}, skipping",
+                                slot,
+                                slot_range.start
+                            );
+                        }
                         continue;
                     }
                     if let Some(previous_slot) = previous_slot
@@ -2061,10 +2084,18 @@ async fn test_firehose_epoch_800() {
     static PREV_BLOCK: [AtomicU64; THREADS] = [const { AtomicU64::new(0) }; THREADS];
     static NUM_SKIPPED_BLOCKS: AtomicU64 = AtomicU64::new(0);
     static NUM_BLOCKS: AtomicU64 = AtomicU64::new(0);
+    static MIN_TRANSACTIONS: AtomicU64 = AtomicU64::new(u64::MAX);
     let stats_tracking = StatsTracking {
         on_stats: log_stats_handler,
         tracking_interval_slots: 10,
     };
+
+    for prev in PREV_BLOCK.iter() {
+        prev.store(0, Ordering::Relaxed);
+    }
+    NUM_SKIPPED_BLOCKS.store(0, Ordering::Relaxed);
+    NUM_BLOCKS.store(0, Ordering::Relaxed);
+    MIN_TRANSACTIONS.store(u64::MAX, Ordering::Relaxed);
 
     firehose(
         THREADS.try_into().unwrap(),
@@ -2096,6 +2127,24 @@ async fn test_firehose_epoch_800() {
                     NUM_SKIPPED_BLOCKS.fetch_add(1, Ordering::Relaxed);
                 } else {
                     NUM_BLOCKS.fetch_add(1, Ordering::Relaxed);
+                    if let BlockData::Block {
+                        executed_transaction_count,
+                        ..
+                    } = &block
+                    {
+                        let executed = *executed_transaction_count;
+                        let _ = MIN_TRANSACTIONS.fetch_update(
+                            Ordering::Relaxed,
+                            Ordering::Relaxed,
+                            |current| {
+                                if executed < current {
+                                    Some(executed)
+                                } else {
+                                    None
+                                }
+                            },
+                        );
+                    }
                 }
                 Ok(())
             }
@@ -2114,4 +2163,9 @@ async fn test_firehose_epoch_800() {
         NUM_SLOTS_TO_COVER
     );
     assert!(NUM_BLOCKS.load(Ordering::Relaxed) > 0);
+    let min_transactions = MIN_TRANSACTIONS.load(Ordering::Relaxed);
+    assert!(
+        min_transactions >= 10,
+        "expected at least 10 transactions in every block, minimum observed {min_transactions}"
+    );
 }

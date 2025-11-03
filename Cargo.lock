@@ -3052,7 +3052,7 @@ checksum = "4a5f13b858c8d314ee3e8f639011f7ccefe71f97f96e50151fb991f267928e2c"
 
 [[package]]
 name = "jetstreamer"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "clickhouse",
  "jetstreamer-firehose",
@@ -3065,7 +3065,7 @@ dependencies = [
 
 [[package]]
 name = "jetstreamer-firehose"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "base64 0.22.1",
  "bincode",
@@ -3107,7 +3107,7 @@ dependencies = [
 
 [[package]]
 name = "jetstreamer-plugin"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "clickhouse",
  "dashmap",
@@ -3124,7 +3124,7 @@ dependencies = [
 
 [[package]]
 name = "jetstreamer-utils"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "ctrlc",
  "libc",

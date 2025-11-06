@@ -101,10 +101,10 @@ impl Plugin for InstructionTrackingPlugin {
                 }
             });
 
-            if let (Some(db_client), Some(rows)) = (db, flush_rows) {
-                if let Err(err) = write_instruction_events(db_client, rows).await {
-                    error!("failed to flush instruction rows: {}", err);
-                }
+            if let (Some(db_client), Some(rows)) = (db, flush_rows)
+                && let Err(err) = write_instruction_events(db_client, rows).await
+            {
+                error!("failed to flush instruction rows: {}", err);
             }
 
             Ok(())

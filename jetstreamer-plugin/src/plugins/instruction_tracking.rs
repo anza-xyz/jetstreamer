@@ -76,18 +76,24 @@ impl Plugin for InstructionTrackingPlugin {
         db: Option<Arc<Client>>,
         block: &BlockData,
     ) -> PluginFuture<'_> {
-        let slot = block.slot();
-        let block_time = match block {
-            BlockData::Block { block_time, .. } => *block_time,
+        let slot_info = match block {
+            BlockData::Block {
+                slot, block_time, ..
+            } => Some((*slot, *block_time)),
             BlockData::LeaderSkipped { .. } => None,
         };
 
         async move {
+            let Some((slot, block_time)) = slot_info else {
+                return Ok(());
+            };
+
             let flush_rows = DATA.with(|data| {
                 let mut data = data.borrow_mut();
-                let stats = data.slot_stats.remove(&slot).unwrap_or_default();
-                data.pending_rows
-                    .push(event_from_slot(slot, block_time, stats));
+                if let Some(stats) = data.slot_stats.remove(&slot) {
+                    data.pending_rows
+                        .push(event_from_slot(slot, block_time, stats));
+                }
                 data.slots_since_flush = data.slots_since_flush.saturating_add(1);
                 if data.slots_since_flush >= DB_WRITE_INTERVAL_SLOTS {
                     data.slots_since_flush = 0;
@@ -101,10 +107,12 @@ impl Plugin for InstructionTrackingPlugin {
                 }
             });
 
-            if let (Some(db_client), Some(rows)) = (db, flush_rows)
-                && let Err(err) = write_instruction_events(db_client, rows).await
-            {
-                error!("failed to flush instruction rows: {}", err);
+            if let (Some(db_client), Some(rows)) = (db, flush_rows) {
+                tokio::spawn(async move {
+                    if let Err(err) = write_instruction_events(db_client, rows).await {
+                        error!("failed to flush instruction rows: {}", err);
+                    }
+                });
             }
 
             Ok(())

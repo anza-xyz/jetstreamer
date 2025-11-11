@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use solana_message::VersionedMessage;
 
 use crate::{Plugin, PluginFuture};
-use jetstreamer_firehose::firehose::{BlockData, TransactionData};
+use jetstreamer_firehose::firehose::{BlockData, FirehoseErrorContext, TransactionData};
 
 const DB_WRITE_INTERVAL_SLOTS: u64 = 1000;
 
@@ -40,6 +40,21 @@ struct SlotInstructionEvent {
 #[derive(Debug, Default, Clone)]
 /// Tracks total instructions executed per slot and batches writes to ClickHouse.
 pub struct InstructionTrackingPlugin;
+
+impl InstructionTrackingPlugin {
+    fn drain_thread_rows(block_time: Option<i64>) -> Vec<SlotInstructionEvent> {
+        DATA.with(|data| {
+            let mut data = data.borrow_mut();
+            let mut rows = std::mem::take(&mut data.pending_rows);
+            rows.extend(
+                data.slot_stats
+                    .drain()
+                    .map(|(slot, stats)| event_from_slot(slot, block_time, stats)),
+            );
+            rows
+        })
+    }
+}
 
 impl Plugin for InstructionTrackingPlugin {
     #[inline(always)]
@@ -156,18 +171,32 @@ impl Plugin for InstructionTrackingPlugin {
     fn on_exit(&self, db: Option<Arc<Client>>) -> PluginFuture<'_> {
         async move {
             if let Some(db_client) = db {
-                let rows = DATA.with(|data| {
-                    let mut data = data.borrow_mut();
-                    let mut rows = std::mem::take(&mut data.pending_rows);
-                    for (slot, stats) in data.slot_stats.drain() {
-                        rows.push(event_from_slot(slot, None, stats));
-                    }
-                    rows
-                });
+                let rows = Self::drain_thread_rows(None);
                 if !rows.is_empty()
                     && let Err(err) = write_instruction_events(db_client, rows).await
                 {
                     error!("failed to flush instruction rows on exit: {}", err);
+                }
+            }
+            Ok(())
+        }
+        .boxed()
+    }
+
+    #[inline(always)]
+    fn on_error<'a>(
+        &'a self,
+        _thread_id: usize,
+        db: Option<Arc<Client>>,
+        _error: &'a FirehoseErrorContext,
+    ) -> PluginFuture<'a> {
+        async move {
+            if let Some(db_client) = db {
+                let rows = Self::drain_thread_rows(None);
+                if !rows.is_empty()
+                    && let Err(err) = write_instruction_events(db_client, rows).await
+                {
+                    error!("failed to flush instruction rows after error: {}", err);
                 }
             }
             Ok(())

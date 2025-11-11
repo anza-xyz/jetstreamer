@@ -8,7 +8,7 @@ use solana_address::Address;
 use solana_message::VersionedMessage;
 
 use crate::{Plugin, PluginFuture};
-use jetstreamer_firehose::firehose::{BlockData, TransactionData};
+use jetstreamer_firehose::firehose::{BlockData, FirehoseErrorContext, TransactionData};
 
 const DB_WRITE_INTERVAL_SLOTS: u64 = 1000;
 
@@ -48,6 +48,19 @@ struct ProgramStats {
 #[derive(Debug, Default, Clone)]
 /// Tracks per-program invocation counts and writes them to ClickHouse.
 pub struct ProgramTrackingPlugin;
+
+impl ProgramTrackingPlugin {
+    fn drain_thread_rows(block_time: Option<i64>) -> Vec<ProgramEvent> {
+        DATA.with(|data| {
+            let mut data = data.borrow_mut();
+            let mut rows = std::mem::take(&mut data.pending_rows);
+            for (slot, stats) in data.slot_stats.drain() {
+                rows.extend(events_from_slot(slot, block_time, &stats));
+            }
+            rows
+        })
+    }
+}
 
 impl Plugin for ProgramTrackingPlugin {
     #[inline(always)]
@@ -207,18 +220,32 @@ impl Plugin for ProgramTrackingPlugin {
     fn on_exit(&self, db: Option<Arc<Client>>) -> PluginFuture<'_> {
         async move {
             if let Some(db_client) = db {
-                let rows = DATA.with(|data| {
-                    let mut data = data.borrow_mut();
-                    let mut rows = std::mem::take(&mut data.pending_rows);
-                    for (slot, stats) in data.slot_stats.drain() {
-                        rows.extend(events_from_slot(slot, None, &stats));
-                    }
-                    rows
-                });
+                let rows = Self::drain_thread_rows(None);
                 if !rows.is_empty()
                     && let Err(err) = write_program_events(db_client, rows).await
                 {
                     error!("failed to flush program rows on exit: {}", err);
+                }
+            }
+            Ok(())
+        }
+        .boxed()
+    }
+
+    #[inline(always)]
+    fn on_error<'a>(
+        &'a self,
+        _thread_id: usize,
+        db: Option<Arc<Client>>,
+        _error: &'a FirehoseErrorContext,
+    ) -> PluginFuture<'a> {
+        async move {
+            if let Some(db_client) = db {
+                let rows = Self::drain_thread_rows(None);
+                if !rows.is_empty()
+                    && let Err(err) = write_program_events(db_client, rows).await
+                {
+                    error!("failed to flush program rows after error: {}", err);
                 }
             }
             Ok(())

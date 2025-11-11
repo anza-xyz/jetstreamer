@@ -32,6 +32,7 @@ use std::{
 use thiserror::Error;
 use tokio::{
     sync::broadcast::{self, error::TryRecvError},
+    task::block_in_place,
     time::timeout,
 };
 
@@ -448,17 +449,33 @@ pub type OnEntryFn = HandlerFn<EntryData>;
 pub type OnRewardFn = HandlerFn<RewardsData>;
 /// Type alias for [`StatsTracking`] using simple function pointers.
 pub type StatsTracker = StatsTracking<HandlerFn<Stats>>;
+/// Convenience alias for firehose error handlers.
+pub type OnErrorFn = HandlerFn<FirehoseErrorContext>;
+
+/// Metadata describing a firehose worker failure.
+#[derive(Clone, Debug)]
+pub struct FirehoseErrorContext {
+    /// Thread index that encountered the error.
+    pub thread_id: usize,
+    /// Slot the worker was processing when the error surfaced.
+    pub slot: u64,
+    /// Epoch derived from the failing slot.
+    pub epoch: u64,
+    /// Stringified error payload for display/logging.
+    pub error_message: String,
+}
 
 /// Streams blocks, transactions, entries, rewards, and stats to user-provided handlers.
 #[inline]
 #[allow(clippy::too_many_arguments)]
-pub async fn firehose<OnBlock, OnTransaction, OnEntry, OnRewards, OnStats>(
+pub async fn firehose<OnBlock, OnTransaction, OnEntry, OnRewards, OnStats, OnError>(
     threads: u64,
     slot_range: Range<u64>,
     on_block: Option<OnBlock>,
     on_tx: Option<OnTransaction>,
     on_entry: Option<OnEntry>,
     on_rewards: Option<OnRewards>,
+    on_error: Option<OnError>,
     stats_tracking: Option<StatsTracking<OnStats>>,
     shutdown_signal: Option<broadcast::Receiver<()>>,
 ) -> Result<(), (FirehoseError, u64)>
@@ -468,6 +485,7 @@ where
     OnEntry: Handler<EntryData>,
     OnRewards: Handler<RewardsData>,
     OnStats: Handler<Stats>,
+    OnError: Handler<FirehoseErrorContext>,
 {
     if threads == 0 {
         return Err((
@@ -516,6 +534,7 @@ where
         let on_tx = on_tx.clone();
         let on_entry = on_entry.clone();
         let on_reward = on_rewards.clone();
+        let on_error = on_error.clone();
         let overall_slots_processed = overall_slots_processed.clone();
         let overall_blocks_processed = overall_blocks_processed.clone();
         let overall_transactions_processed = overall_transactions_processed.clone();
@@ -1313,17 +1332,29 @@ where
                     );
                     break;
                 }
+                let epoch = slot_to_epoch(slot);
+                let item_index = match &err {
+                    FirehoseError::NodeDecodingError(item_index, _) => *item_index,
+                    _ => 0,
+                };
+                let error_message = err.to_string();
+                drop(err);
                 log::error!(
                     target: &log_target,
                     "🔥🔥🔥 firehose encountered an error at slot {} in epoch {}:",
                     slot,
-                    slot_to_epoch(slot)
+                    epoch
                 );
-                log::error!(target: &log_target, "{}", err);
-                let item_index = match err {
-                    FirehoseError::NodeDecodingError(item_index, _) => item_index,
-                    _ => 0,
-                };
+                log::error!(target: &log_target, "{}", error_message);
+                if let Some(on_error_cb) = on_error.clone() {
+                    let context = FirehoseErrorContext {
+                        thread_id: thread_index,
+                        slot,
+                        epoch,
+                        error_message: error_message.clone(),
+                    };
+                    run_on_error_handler(on_error_cb, thread_index, context, log_target.clone());
+                }
                 // Increment this thread's error counter
                 error_counts[thread_index].fetch_add(1, Ordering::Relaxed);
                 log::warn!(
@@ -2049,6 +2080,23 @@ fn human_readable_duration(duration: std::time::Duration) -> String {
     }
 }
 
+fn run_on_error_handler<OnError>(
+    handler: OnError,
+    thread_id: usize,
+    context: FirehoseErrorContext,
+    log_target: String,
+) where
+    OnError: Handler<FirehoseErrorContext>,
+{
+    block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(async move {
+            if let Err(err) = handler(thread_id, context).await {
+                log::error!(target: &log_target, "on_error handler failed: {}", err);
+            }
+        });
+    });
+}
+
 #[cfg(test)]
 fn log_stats_handler(thread_id: usize, stats: Stats) -> HandlerFuture {
     Box::pin(async move {
@@ -2153,6 +2201,7 @@ async fn test_firehose_epoch_800() {
         None::<OnTxFn>,
         None::<OnEntryFn>,
         None::<OnRewardFn>,
+        None::<OnErrorFn>,
         Some(stats_tracking),
         None,
     )

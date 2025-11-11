@@ -123,6 +123,7 @@
 //!         Some(tx_handler()),
 //!         Some(entry_handler()),
 //!         Some(reward_handler()),
+//!         None::<firehose::OnErrorFn>,
 //!         Some(stats),
 //!         None,
 //!     )

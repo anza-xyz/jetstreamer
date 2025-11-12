@@ -1,8 +1,10 @@
-use std::{cell::RefCell, collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::Arc};
 
 use clickhouse::{Client, Row};
+use dashmap::DashMap;
 use futures_util::FutureExt;
 use log::error;
+use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use solana_address::Address;
 use solana_message::VersionedMessage;
@@ -19,9 +21,7 @@ struct ThreadLocalData {
     slots_since_flush: u64,
 }
 
-thread_local! {
-    static DATA: RefCell<ThreadLocalData> = RefCell::new(ThreadLocalData::default());
-}
+static THREAD_DATA: Lazy<DashMap<usize, ThreadLocalData>> = Lazy::new(DashMap::new);
 
 #[derive(Row, Deserialize, Serialize, Copy, Clone, Debug, PartialEq, Eq, Hash)]
 struct ProgramEvent {
@@ -50,15 +50,34 @@ struct ProgramStats {
 pub struct ProgramTrackingPlugin;
 
 impl ProgramTrackingPlugin {
-    fn drain_thread_rows(block_time: Option<i64>) -> Vec<ProgramEvent> {
-        DATA.with(|data| {
-            let mut data = data.borrow_mut();
-            let mut rows = std::mem::take(&mut data.pending_rows);
-            for (slot, stats) in data.slot_stats.drain() {
-                rows.extend(events_from_slot(slot, block_time, &stats));
-            }
-            rows
-        })
+    fn with_thread_data<F, R>(thread_id: usize, f: F) -> R
+    where
+        F: FnOnce(&mut ThreadLocalData) -> R,
+    {
+        let mut guard = THREAD_DATA
+            .entry(thread_id)
+            .or_insert_with(ThreadLocalData::default);
+        f(&mut *guard)
+    }
+
+    fn drain_rows_for(thread_id: usize, block_time: Option<i64>) -> Vec<ProgramEvent> {
+        Self::with_thread_data(thread_id, |data| Self::flush_data(data, block_time))
+    }
+
+    fn drain_all_rows(block_time: Option<i64>) -> Vec<ProgramEvent> {
+        let mut rows = Vec::new();
+        for mut entry in THREAD_DATA.iter_mut() {
+            rows.extend(Self::flush_data(&mut *entry, block_time));
+        }
+        rows
+    }
+
+    fn flush_data(data: &mut ThreadLocalData, block_time: Option<i64>) -> Vec<ProgramEvent> {
+        let mut rows = std::mem::take(&mut data.pending_rows);
+        for (slot, stats) in data.slot_stats.drain() {
+            rows.extend(events_from_slot(slot, block_time, &stats));
+        }
+        rows
     }
 }
 
@@ -71,7 +90,7 @@ impl Plugin for ProgramTrackingPlugin {
     #[inline(always)]
     fn on_transaction<'a>(
         &'a self,
-        _thread_id: usize,
+        thread_id: usize,
         _db: Option<Arc<Client>>,
         transaction: &'a TransactionData,
     ) -> PluginFuture<'a> {
@@ -98,8 +117,7 @@ impl Plugin for ProgramTrackingPlugin {
                 .unwrap_or(0) as u32;
             let program_count = program_ids.len() as u32;
 
-            DATA.with(|data| {
-                let mut data = data.borrow_mut();
+            Self::with_thread_data(thread_id, |data| {
                 let slot_data = data.slot_stats.entry(transaction.slot).or_default();
 
                 for program_id in program_ids.iter() {
@@ -133,7 +151,7 @@ impl Plugin for ProgramTrackingPlugin {
     #[inline(always)]
     fn on_block(
         &self,
-        _thread_id: usize,
+        thread_id: usize,
         db: Option<Arc<Client>>,
         block: &BlockData,
     ) -> PluginFuture<'_> {
@@ -148,8 +166,7 @@ impl Plugin for ProgramTrackingPlugin {
                 return Ok(());
             };
 
-            let flush_rows = DATA.with(|data| {
-                let mut data = data.borrow_mut();
+            let flush_rows = Self::with_thread_data(thread_id, |data| {
                 if let Some(slot_data) = data.slot_stats.remove(&slot) {
                     let slot_rows = events_from_slot(slot, block_time, &slot_data);
                     data.pending_rows.extend(slot_rows);
@@ -182,9 +199,6 @@ impl Plugin for ProgramTrackingPlugin {
 
     #[inline(always)]
     fn on_load(&self, db: Option<Arc<Client>>) -> PluginFuture<'_> {
-        // Remove invalid `get_or_init` call in `on_load`
-        DATA.with(|_| {});
-        // SLOT_TIMESTAMPS is a Lazy global, nothing to initialize
         async move {
             log::info!("Program Tracking Plugin loaded.");
             if let Some(db) = db {
@@ -220,7 +234,7 @@ impl Plugin for ProgramTrackingPlugin {
     fn on_exit(&self, db: Option<Arc<Client>>) -> PluginFuture<'_> {
         async move {
             if let Some(db_client) = db {
-                let rows = Self::drain_thread_rows(None);
+                let rows = Self::drain_all_rows(None);
                 if !rows.is_empty()
                     && let Err(err) = write_program_events(db_client, rows).await
                 {
@@ -235,13 +249,13 @@ impl Plugin for ProgramTrackingPlugin {
     #[inline(always)]
     fn on_error<'a>(
         &'a self,
-        _thread_id: usize,
+        thread_id: usize,
         db: Option<Arc<Client>>,
         _error: &'a FirehoseErrorContext,
     ) -> PluginFuture<'a> {
         async move {
             if let Some(db_client) = db {
-                let rows = Self::drain_thread_rows(None);
+                let rows = Self::drain_rows_for(thread_id, None);
                 if !rows.is_empty()
                     && let Err(err) = write_program_events(db_client, rows).await
                 {

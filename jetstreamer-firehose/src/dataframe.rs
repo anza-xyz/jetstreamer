@@ -1,7 +1,7 @@
 use {
-    crate::{node::Kind, utils::Buffer},
+    crate::{SharedError, node::Kind, utils::Buffer},
     cid::Cid,
-    std::{error::Error, vec::Vec},
+    std::vec::Vec,
 };
 
 // type DataFrame struct {
@@ -31,14 +31,14 @@ pub struct DataFrame {
 
 impl DataFrame {
     /// Decodes a [`DataFrame`] from raw CBOR bytes.
-    pub fn from_bytes(data: Vec<u8>) -> Result<DataFrame, Box<dyn Error>> {
+    pub fn from_bytes(data: Vec<u8>) -> Result<DataFrame, SharedError> {
         let decoded_data: serde_cbor::Value = serde_cbor::from_slice(&data).unwrap();
         let data_frame = DataFrame::from_cbor(decoded_data)?;
         Ok(data_frame)
     }
 
     /// Decodes a [`DataFrame`] from a parsed CBOR [`serde_cbor::Value`].
-    pub fn from_cbor(val: serde_cbor::Value) -> Result<DataFrame, Box<dyn Error>> {
+    pub fn from_cbor(val: serde_cbor::Value) -> Result<DataFrame, SharedError> {
         let mut data_frame = DataFrame {
             kind: 0,
             hash: None,
@@ -59,7 +59,7 @@ impl DataFrame {
                         "Wrong kind for DataFrame. Expected {:?}, got {:?}",
                         Kind::DataFrame,
                         kind
-                    ))));
+                    ))) as SharedError);
                 }
             }
             if let Some(serde_cbor::Value::Integer(hash)) = array.get(1) {

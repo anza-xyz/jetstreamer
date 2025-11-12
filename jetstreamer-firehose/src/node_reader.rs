@@ -1,4 +1,5 @@
 use crate::LOG_MODULE;
+use crate::SharedError;
 use crate::epochs::slot_to_epoch;
 use crate::firehose::FirehoseError;
 use crate::index::{SlotOffsetIndexError, slot_to_offset};
@@ -7,12 +8,9 @@ use crate::utils;
 use cid::Cid;
 use reqwest::RequestBuilder;
 use rseek::Seekable;
+use std::io;
 use std::io::SeekFrom;
 use std::vec::Vec;
-use std::{
-    error::Error,
-    io::{self},
-};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt};
 
 const MAX_VARINT_LEN_64: usize = 10;
@@ -77,7 +75,7 @@ impl RawNode {
     }
 
     /// Parses the CBOR payload into a typed [`Node`].
-    pub fn parse(&self) -> Result<Node, Box<dyn Error>> {
+    pub fn parse(&self) -> Result<Node, SharedError> {
         match parse_any_from_cbordata(self.data.clone()) {
             Ok(node) => Ok(node),
             Err(err) => {
@@ -88,7 +86,7 @@ impl RawNode {
     }
 
     /// Reads a [`RawNode`] from a CAR section cursor.
-    pub async fn from_cursor(cursor: &mut io::Cursor<Vec<u8>>) -> Result<RawNode, Box<dyn Error>> {
+    pub async fn from_cursor(cursor: &mut io::Cursor<Vec<u8>>) -> Result<RawNode, SharedError> {
         let cid_version = read_uvarint(cursor).await?;
         // println!("CID version: {}", cid_version);
 
@@ -180,7 +178,7 @@ impl<R: AsyncRead + Unpin + AsyncSeek + Len> NodeReader<R> {
     }
 
     /// Returns the raw Old Faithful CAR header, fetching and caching it on first use.
-    pub async fn read_raw_header(&mut self) -> Result<Vec<u8>, Box<dyn Error>> {
+    pub async fn read_raw_header(&mut self) -> Result<Vec<u8>, SharedError> {
         if !self.header.is_empty() {
             return Ok(self.header.clone());
         };
@@ -241,7 +239,7 @@ impl<R: AsyncRead + Unpin + AsyncSeek + Len> NodeReader<R> {
 
     #[allow(clippy::should_implement_trait)]
     /// Reads the next raw node from the Old Faithful stream without parsing it.
-    pub async fn next(&mut self) -> Result<RawNode, Box<dyn Error>> {
+    pub async fn next(&mut self) -> Result<RawNode, SharedError> {
         if self.header.is_empty() {
             self.read_raw_header().await?;
         };
@@ -273,14 +271,14 @@ impl<R: AsyncRead + Unpin + AsyncSeek + Len> NodeReader<R> {
     }
 
     /// Reads and parses the next node, returning it paired with its [`Cid`].
-    pub async fn next_parsed(&mut self) -> Result<NodeWithCid, Box<dyn Error>> {
+    pub async fn next_parsed(&mut self) -> Result<NodeWithCid, SharedError> {
         let raw_node = self.next().await?;
         let cid = raw_node.cid;
         Ok(NodeWithCid::new(cid, raw_node.parse()?))
     }
 
     /// Continues reading nodes until the next block is encountered.
-    pub async fn read_until_block(&mut self) -> Result<NodesWithCids, Box<dyn Error>> {
+    pub async fn read_until_block(&mut self) -> Result<NodesWithCids, SharedError> {
         let mut nodes = NodesWithCids::new();
         loop {
             let node = match self.next_parsed().await {
@@ -309,7 +307,7 @@ impl<R: AsyncRead + Unpin + AsyncSeek + Len> NodeReader<R> {
 }
 
 /// Extracts a CID from a DAG-CBOR link value.
-pub fn cid_from_cbor_link(val: &serde_cbor::Value) -> Result<cid::Cid, Box<dyn std::error::Error>> {
+pub fn cid_from_cbor_link(val: &serde_cbor::Value) -> Result<cid::Cid, SharedError> {
     if let serde_cbor::Value::Bytes(b) = val
         && b.first() == Some(&0)
     {

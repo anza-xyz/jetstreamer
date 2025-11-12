@@ -32,12 +32,11 @@ use std::{
 use thiserror::Error;
 use tokio::{
     sync::broadcast::{self, error::TryRecvError},
-    task::block_in_place,
     time::timeout,
 };
 
 use crate::{
-    LOG_MODULE,
+    LOG_MODULE, SharedError,
     epochs::{epoch_to_slot_range, fetch_epoch_stream, slot_to_epoch},
     index::{SLOT_OFFSET_INDEX, SlotOffsetIndexError},
     node_reader::NodeReader,
@@ -92,36 +91,39 @@ pub enum FirehoseError {
     /// HTTP client error surfaced from `reqwest`.
     Reqwest(reqwest::Error),
     /// Failure while reading the Old Faithful CAR header.
-    ReadHeader(Box<dyn std::error::Error>),
+    ReadHeader(SharedError),
     /// Error emitted by the Solana Geyser plugin service.
     GeyserPluginService(GeyserPluginServiceError),
     /// Transaction notifier could not be acquired from the Geyser service.
     FailedToGetTransactionNotifier,
     /// Failure while reading data until the next block boundary.
-    ReadUntilBlockError(Box<dyn std::error::Error>),
+    ReadUntilBlockError(SharedError),
     /// Failure while fetching an individual block.
-    GetBlockError(Box<dyn std::error::Error>),
+    GetBlockError(SharedError),
     /// Failed to decode a node at the given index.
-    NodeDecodingError(usize, Box<dyn std::error::Error>),
+    NodeDecodingError(usize, SharedError),
     /// Error surfaced when querying the slot offset index.
     SlotOffsetIndexError(SlotOffsetIndexError),
     /// Failure while seeking to a slot within the Old Faithful CAR stream.
-    SeekToSlotError(Box<dyn std::error::Error>),
+    SeekToSlotError(SharedError),
     /// Error surfaced during the plugin `on_load` stage.
-    OnLoadError(Box<dyn std::error::Error>),
+    OnLoadError(SharedError),
     /// Error emitted while invoking the stats handler.
-    OnStatsHandlerError(Box<dyn std::error::Error>),
+    OnStatsHandlerError(SharedError),
     /// Timeout reached while waiting for a firehose operation.
     OperationTimeout(&'static str),
     /// Transaction handler returned an error.
-    TransactionHandlerError(Box<dyn std::error::Error>),
+    TransactionHandlerError(SharedError),
     /// Entry handler returned an error.
-    EntryHandlerError(Box<dyn std::error::Error>),
+    EntryHandlerError(SharedError),
     /// Reward handler returned an error.
-    RewardHandlerError(Box<dyn std::error::Error>),
+    RewardHandlerError(SharedError),
     /// Block handler returned an error.
-    BlockHandlerError(Box<dyn std::error::Error>),
+    BlockHandlerError(SharedError),
 }
+
+unsafe impl Send for FirehoseError {}
+unsafe impl Sync for FirehoseError {}
 
 impl Display for FirehoseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -426,7 +428,7 @@ impl BlockData {
     }
 }
 
-type HandlerResult = Result<(), Box<dyn std::error::Error + Send + 'static>>;
+type HandlerResult = Result<(), SharedError>;
 type HandlerFuture = BoxFuture<'static, HandlerResult>;
 
 /// Asynchronous callback invoked for each firehose event of type `Data`.
@@ -890,7 +892,7 @@ where
                                                 Box::new(std::io::Error::new(
                                                     std::io::ErrorKind::InvalidData,
                                                     "transaction missing signature",
-                                                )) as Box<dyn std::error::Error>
+                                                )) as SharedError
                                             })
                                             .map_err(|err| {
                                                 (
@@ -1332,13 +1334,16 @@ where
                     );
                     break;
                 }
-                let epoch = slot_to_epoch(slot);
-                let item_index = match &err {
-                    FirehoseError::NodeDecodingError(item_index, _) => *item_index,
-                    _ => 0,
+                let (epoch, item_index, error_message) = {
+                    let epoch = slot_to_epoch(slot);
+                    let item_index = match &err {
+                        FirehoseError::NodeDecodingError(item_index, _) => *item_index,
+                        _ => 0,
+                    };
+                    let error_message = err.to_string();
+                    drop(err);
+                    (epoch, item_index, error_message)
                 };
-                let error_message = err.to_string();
-                drop(err);
                 log::error!(
                     target: &log_target,
                     "🔥🔥🔥 firehose encountered an error at slot {} in epoch {}:",
@@ -1353,7 +1358,13 @@ where
                         epoch,
                         error_message: error_message.clone(),
                     };
-                    run_on_error_handler(on_error_cb, thread_index, context, log_target.clone());
+                    if let Err(handler_err) = on_error_cb(thread_index, context).await {
+                        log::error!(
+                            target: &log_target,
+                            "on_error handler failed: {}",
+                            handler_err
+                        );
+                    }
                 }
                 // Increment this thread's error counter
                 error_counts[thread_index].fetch_add(1, Ordering::Relaxed);
@@ -1422,9 +1433,7 @@ pub fn firehose_geyser(
     geyser_config_files: Option<&[PathBuf]>,
     index_base_url: &Url,
     client: &Client,
-    on_load: impl Future<Output = Result<(), Box<dyn std::error::Error + Send + 'static>>>
-    + Send
-    + 'static,
+    on_load: impl Future<Output = Result<(), SharedError>> + Send + 'static,
     threads: u64,
 ) -> Result<Receiver<SlotNotification>, (FirehoseError, u64)> {
     if threads == 0 {
@@ -1699,7 +1708,7 @@ async fn firehose_geyser_thread(
                     let mut this_block_entry_count: u64 = 0;
                     let mut this_block_rewards: Vec<(Address, RewardInfo)> = Vec::new();
 
-                    nodes.each(|node_with_cid| -> Result<(), Box<dyn std::error::Error>> {
+                    nodes.each(|node_with_cid| -> Result<(), SharedError> {
                         item_index += 1;
                         // if item_index == 100000 && !triggered { log::info!("simulating
                         //     error"); triggered = true; return
@@ -1766,7 +1775,7 @@ async fn firehose_geyser_thread(
                                         Box::new(std::io::Error::new(
                                             std::io::ErrorKind::InvalidData,
                                             "transaction missing signature",
-                                        )) as Box<dyn std::error::Error>
+                                        )) as SharedError
                                     })?;
                                 let is_vote = is_simple_vote_transaction(&versioned_tx);
 
@@ -1791,7 +1800,7 @@ async fn firehose_geyser_thread(
                                     usize::try_from(this_block_executed_transaction_count).map_err(|_| {
                                         Box::new(std::io::Error::other(
                                             "transaction index exceeds usize range",
-                                        )) as Box<dyn std::error::Error>
+                                        )) as SharedError
                                     })?;
                                 todo_latest_entry_blockhash = entry_hash;
                                 this_block_executed_transaction_count += entry_transaction_count_u64;
@@ -1958,7 +1967,7 @@ fn is_simple_vote_transaction(versioned_tx: &VersionedTransaction) -> bool {
 #[inline(always)]
 fn convert_proto_rewards(
     proto_rewards: &solana_storage_proto::convert::generated::Rewards,
-) -> Result<Vec<(Address, RewardInfo)>, Box<dyn std::error::Error>> {
+) -> Result<Vec<(Address, RewardInfo)>, SharedError> {
     let mut keyed_rewards = Vec::with_capacity(proto_rewards.rewards.len());
     for proto_reward in proto_rewards.rewards.iter() {
         let reward = RewardInfo {
@@ -1981,7 +1990,7 @@ fn convert_proto_rewards(
         let pubkey = proto_reward
             .pubkey
             .parse::<Address>()
-            .map_err(|err| Box::new(err) as Box<dyn std::error::Error>)?;
+            .map_err(|err| Box::new(err) as SharedError)?;
         keyed_rewards.push((pubkey, reward));
     }
     Ok(keyed_rewards)
@@ -2078,23 +2087,6 @@ fn human_readable_duration(duration: std::time::Duration) -> String {
             format!("{secs}s")
         }
     }
-}
-
-fn run_on_error_handler<OnError>(
-    handler: OnError,
-    thread_id: usize,
-    context: FirehoseErrorContext,
-    log_target: String,
-) where
-    OnError: Handler<FirehoseErrorContext>,
-{
-    block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(async move {
-            if let Err(err) = handler(thread_id, context).await {
-                log::error!(target: &log_target, "on_error handler failed: {}", err);
-            }
-        });
-    });
 }
 
 #[cfg(test)]

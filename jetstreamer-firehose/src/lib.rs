@@ -135,6 +135,9 @@
 //! }
 //! ```
 
+/// Shared boxed error type propagated across firehose modules.
+pub type SharedError = Box<dyn std::error::Error + Send + Sync + 'static>;
+
 /// Types for decoding block-level records emitted by the firehose.
 pub mod block;
 /// Encodes and decodes arbitrary binary [`DataFrame`](dataframe::DataFrame) nodes.

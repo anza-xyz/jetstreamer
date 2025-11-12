@@ -1,7 +1,7 @@
 use {
-    crate::node::Kind,
+    crate::{SharedError, node::Kind},
     cid::Cid,
-    std::{error::Error, vec::Vec},
+    std::vec::Vec,
 };
 
 // type (
@@ -34,14 +34,14 @@ pub struct Block {
 
 impl Block {
     /// Decodes a [`Block`] from raw CBOR bytes.
-    pub fn from_bytes(data: Vec<u8>) -> Result<Block, Box<dyn Error>> {
+    pub fn from_bytes(data: Vec<u8>) -> Result<Block, SharedError> {
         let decoded_data: serde_cbor::Value = serde_cbor::from_slice(&data).unwrap();
         let block = Block::from_cbor(decoded_data)?;
         Ok(block)
     }
 
     /// Decodes a [`Block`] from a CBOR [`serde_cbor::Value`].
-    pub fn from_cbor(val: serde_cbor::Value) -> Result<Block, Box<dyn Error>> {
+    pub fn from_cbor(val: serde_cbor::Value) -> Result<Block, SharedError> {
         let mut block = Block {
             kind: 0,
             slot: 0,
@@ -74,7 +74,7 @@ impl Block {
                         "Wrong kind for Block. Expected {:?}, got {:?}",
                         Kind::Block,
                         kind
-                    ))));
+                    ))) as SharedError);
                 }
             }
             if let Some(serde_cbor::Value::Integer(slot)) = array.get(1) {

@@ -10,7 +10,7 @@ use solana_address::Address;
 use solana_message::VersionedMessage;
 
 use crate::{Plugin, PluginFuture};
-use jetstreamer_firehose::firehose::{BlockData, FirehoseErrorContext, TransactionData};
+use jetstreamer_firehose::firehose::{BlockData, TransactionData};
 
 const DB_WRITE_INTERVAL_SLOTS: u64 = 1000;
 
@@ -59,10 +59,6 @@ impl ProgramTrackingPlugin {
             .entry(thread_id)
             .or_insert_with(ThreadLocalData::default);
         f(&mut *guard)
-    }
-
-    fn drain_rows_for(thread_id: usize, block_time: Option<i64>) -> Vec<ProgramEvent> {
-        Self::with_thread_data(thread_id, |data| Self::flush_data(data, block_time))
     }
 
     fn drain_all_rows(block_time: Option<i64>) -> Vec<ProgramEvent> {
@@ -198,10 +194,21 @@ impl Plugin for ProgramTrackingPlugin {
                 }
             });
 
-            if let (Some(db_client), Some(rows)) = (db, flush_rows) {
+            if let (Some(db_client), Some(rows)) = (db.clone(), flush_rows) {
                 tokio::spawn(async move {
                     if let Err(err) = write_program_events(db_client, rows).await {
                         error!("failed to flush program rows: {}", err);
+                    }
+                });
+            }
+
+            if let (Some(db_client), Some(ts)) = (db, block_time) {
+                let slot_to_update = slot;
+                tokio::spawn(async move {
+                    if let Err(err) =
+                        backfill_program_timestamp(db_client, slot_to_update, ts).await
+                    {
+                        error!("failed to backfill program timestamps: {}", err);
                     }
                 });
             }
@@ -259,27 +266,6 @@ impl Plugin for ProgramTrackingPlugin {
         }
         .boxed()
     }
-
-    #[inline(always)]
-    fn on_error<'a>(
-        &'a self,
-        thread_id: usize,
-        db: Option<Arc<Client>>,
-        _error: &'a FirehoseErrorContext,
-    ) -> PluginFuture<'a> {
-        async move {
-            if let Some(db_client) = db {
-                let rows = Self::drain_rows_for(thread_id, None);
-                if !rows.is_empty()
-                    && let Err(err) = write_program_events(db_client, rows).await
-                {
-                    error!("failed to flush program rows after error: {}", err);
-                }
-            }
-            Ok(())
-        }
-        .boxed()
-    }
 }
 
 async fn write_program_events(
@@ -302,14 +288,7 @@ fn events_from_slot(
     block_time: Option<i64>,
     slot_data: &HashMap<Address, ProgramStats>,
 ) -> Vec<ProgramEvent> {
-    let raw_ts = block_time.unwrap_or(0);
-    let timestamp: u32 = if raw_ts < 0 {
-        0
-    } else if raw_ts > u32::MAX as i64 {
-        u32::MAX
-    } else {
-        raw_ts as u32
-    };
+    let timestamp = clamp_block_time(block_time);
 
     slot_data
         .iter()
@@ -324,4 +303,30 @@ fn events_from_slot(
             timestamp,
         })
         .collect()
+}
+
+fn clamp_block_time(block_time: Option<i64>) -> u32 {
+    let raw_ts = block_time.unwrap_or(0);
+    if raw_ts < 0 {
+        0
+    } else if raw_ts > u32::MAX as i64 {
+        u32::MAX
+    } else {
+        raw_ts as u32
+    }
+}
+
+async fn backfill_program_timestamp(
+    db: Arc<Client>,
+    slot: u64,
+    block_time: i64,
+) -> Result<(), clickhouse::error::Error> {
+    let ts = clamp_block_time(Some(block_time));
+    db.query(
+        "ALTER TABLE program_invocations UPDATE timestamp = toDateTime(?) WHERE slot = ? AND timestamp = 0",
+    )
+    .bind(ts)
+    .bind(slot as u32)
+    .execute()
+    .await
 }

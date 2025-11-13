@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use solana_message::VersionedMessage;
 
 use crate::{Plugin, PluginFuture};
-use jetstreamer_firehose::firehose::{BlockData, FirehoseErrorContext, TransactionData};
+use jetstreamer_firehose::firehose::{BlockData, TransactionData};
 
 const DB_WRITE_INTERVAL_SLOTS: u64 = 1000;
 
@@ -51,10 +51,6 @@ impl InstructionTrackingPlugin {
             .entry(thread_id)
             .or_insert_with(ThreadLocalData::default);
         f(&mut *guard)
-    }
-
-    fn drain_rows_for(thread_id: usize, block_time: Option<i64>) -> Vec<SlotInstructionEvent> {
-        Self::with_thread_data(thread_id, |data| Self::flush_data(data, block_time))
     }
 
     fn drain_all_rows(block_time: Option<i64>) -> Vec<SlotInstructionEvent> {
@@ -146,10 +142,21 @@ impl Plugin for InstructionTrackingPlugin {
                 }
             });
 
-            if let (Some(db_client), Some(rows)) = (db, flush_rows) {
+            if let (Some(db_client), Some(rows)) = (db.clone(), flush_rows) {
                 tokio::spawn(async move {
                     if let Err(err) = write_instruction_events(db_client, rows).await {
                         error!("failed to flush instruction rows: {}", err);
+                    }
+                });
+            }
+
+            if let (Some(db_client), Some(ts)) = (db, block_time) {
+                let slot_to_update = slot;
+                tokio::spawn(async move {
+                    if let Err(err) =
+                        backfill_instruction_timestamp(db_client, slot_to_update, ts).await
+                    {
+                        error!("failed to backfill instruction timestamps: {}", err);
                     }
                 });
             }
@@ -199,27 +206,6 @@ impl Plugin for InstructionTrackingPlugin {
                     && let Err(err) = write_instruction_events(db_client, rows).await
                 {
                     error!("failed to flush instruction rows on exit: {}", err);
-                }
-            }
-            Ok(())
-        }
-        .boxed()
-    }
-
-    #[inline(always)]
-    fn on_error<'a>(
-        &'a self,
-        thread_id: usize,
-        db: Option<Arc<Client>>,
-        _error: &'a FirehoseErrorContext,
-    ) -> PluginFuture<'a> {
-        async move {
-            if let Some(db_client) = db {
-                let rows = Self::drain_rows_for(thread_id, None);
-                if !rows.is_empty()
-                    && let Err(err) = write_instruction_events(db_client, rows).await
-                {
-                    error!("failed to flush instruction rows after error: {}", err);
                 }
             }
             Ok(())
@@ -288,4 +274,19 @@ fn total_instruction_count(transaction: &TransactionData) -> u64 {
         })
         .unwrap_or(0);
     message_instructions.saturating_add(inner_instruction_count)
+}
+
+async fn backfill_instruction_timestamp(
+    db: Arc<Client>,
+    slot: u64,
+    block_time: i64,
+) -> Result<(), clickhouse::error::Error> {
+    let ts = clamp_block_time(Some(block_time));
+    db.query(
+        "ALTER TABLE slot_instructions UPDATE timestamp = toDateTime(?) WHERE slot = ? AND timestamp = 0",
+    )
+    .bind(ts)
+    .bind(slot as u32)
+    .execute()
+    .await
 }

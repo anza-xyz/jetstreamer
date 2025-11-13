@@ -17,7 +17,6 @@ const DB_WRITE_INTERVAL_SLOTS: u64 = 1000;
 #[derive(Default)]
 struct ThreadLocalData {
     slot_stats: HashMap<u64, HashMap<Address, ProgramStats>>,
-    slot_block_times: HashMap<u64, Option<i64>>,
     pending_rows: Vec<ProgramEvent>,
     slots_since_flush: u64,
 }
@@ -72,12 +71,7 @@ impl ProgramTrackingPlugin {
     fn flush_data(data: &mut ThreadLocalData, block_time: Option<i64>) -> Vec<ProgramEvent> {
         let mut rows = std::mem::take(&mut data.pending_rows);
         for (slot, stats) in data.slot_stats.drain() {
-            let slot_block_time = data
-                .slot_block_times
-                .remove(&slot)
-                .and_then(|ts| ts)
-                .or(block_time);
-            rows.extend(events_from_slot(slot, slot_block_time, &stats));
+            rows.extend(events_from_slot(slot, block_time, &stats));
         }
         rows
     }
@@ -169,17 +163,9 @@ impl Plugin for ProgramTrackingPlugin {
             };
 
             let flush_rows = Self::with_thread_data(thread_id, |data| {
-                data.slot_block_times.insert(slot, block_time);
                 if let Some(slot_data) = data.slot_stats.remove(&slot) {
-                    let slot_block_time = data
-                        .slot_block_times
-                        .remove(&slot)
-                        .and_then(|ts| ts)
-                        .or(block_time);
-                    let slot_rows = events_from_slot(slot, slot_block_time, &slot_data);
+                    let slot_rows = events_from_slot(slot, block_time, &slot_data);
                     data.pending_rows.extend(slot_rows);
-                } else {
-                    data.slot_block_times.remove(&slot);
                 }
                 data.slots_since_flush = data.slots_since_flush.saturating_add(1);
                 if data.slots_since_flush >= DB_WRITE_INTERVAL_SLOTS {
@@ -202,13 +188,11 @@ impl Plugin for ProgramTrackingPlugin {
                 });
             }
 
-            if let (Some(db_client), Some(ts)) = (db, block_time) {
+            if let Some(db_client) = db {
                 let slot_to_update = slot;
                 tokio::spawn(async move {
-                    if let Err(err) =
-                        backfill_program_timestamp(db_client, slot_to_update, ts).await
-                    {
-                        error!("failed to backfill program timestamps: {}", err);
+                    if let Err(err) = backfill_program_timestamp(db_client, slot_to_update).await {
+                        error!("failed to backfill program timestamp: {}", err);
                     }
                 });
             }
@@ -319,14 +303,22 @@ fn clamp_block_time(block_time: Option<i64>) -> u32 {
 async fn backfill_program_timestamp(
     db: Arc<Client>,
     slot: u64,
-    block_time: i64,
 ) -> Result<(), clickhouse::error::Error> {
-    let ts = clamp_block_time(Some(block_time));
     db.query(
-        "ALTER TABLE program_invocations UPDATE timestamp = toDateTime(?) WHERE slot = ? AND timestamp = 0",
+        r#"
+        ALTER TABLE program_invocations
+        UPDATE timestamp = (
+            SELECT block_time
+            FROM jetstreamer_slot_status
+            WHERE slot = ?
+            ORDER BY block_time DESC
+            LIMIT 1
+        )
+        WHERE slot = ? AND timestamp = toDateTime(0)
+        "#,
     )
-    .bind(ts)
-    .bind(slot as u32)
+    .bind(slot)
+    .bind(slot)
     .execute()
     .await
 }

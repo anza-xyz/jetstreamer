@@ -466,6 +466,7 @@ impl PluginRunner {
                             BlockData::Block {
                                 slot,
                                 executed_transaction_count,
+                                block_time,
                                 ..
                             } => {
                                 if let Err(err) = record_slot_status(
@@ -473,6 +474,7 @@ impl PluginRunner {
                                     *slot,
                                     thread_id,
                                     *executed_transaction_count,
+                                    *block_time,
                                 )
                                 .await
                                 {
@@ -485,7 +487,7 @@ impl PluginRunner {
                             }
                             BlockData::LeaderSkipped { slot } => {
                                 if let Err(err) =
-                                    record_slot_status(db_client, *slot, thread_id, 0).await
+                                    record_slot_status(db_client, *slot, thread_id, 0, None).await
                                 {
                                     log::error!(
                                         target: &log_target,
@@ -903,6 +905,7 @@ struct SlotStatusRow {
     slot: u64,
     transaction_count: u32,
     thread_id: u8,
+    block_time: u32,
 }
 
 async fn ensure_clickhouse_tables(db: &Client) -> Result<(), clickhouse::error::Error> {
@@ -911,9 +914,17 @@ async fn ensure_clickhouse_tables(db: &Client) -> Result<(), clickhouse::error::
             slot UInt64,
             transaction_count UInt32 DEFAULT 0,
             thread_id UInt8 DEFAULT 0,
+            block_time DateTime('UTC') DEFAULT toDateTime(0),
             indexed_at DateTime('UTC') DEFAULT now()
         ) ENGINE = ReplacingMergeTree
         ORDER BY (slot, thread_id)"#,
+    )
+    .execute()
+    .await?;
+
+    db.query(
+        r#"ALTER TABLE jetstreamer_slot_status
+           ADD COLUMN IF NOT EXISTS block_time DateTime('UTC') DEFAULT toDateTime(0)"#,
     )
     .execute()
     .await?;
@@ -1012,6 +1023,7 @@ async fn record_slot_status(
     slot: u64,
     thread_id: usize,
     transaction_count: u64,
+    block_time: Option<i64>,
 ) -> Result<(), clickhouse::error::Error> {
     let mut insert = db
         .insert::<SlotStatusRow>("jetstreamer_slot_status")
@@ -1021,10 +1033,20 @@ async fn record_slot_status(
             slot,
             transaction_count: transaction_count.min(u32::MAX as u64) as u32,
             thread_id: thread_id.try_into().unwrap_or(u8::MAX),
+            block_time: clamp_block_time(block_time),
         })
         .await?;
     insert.end().await?;
     Ok(())
+}
+
+fn clamp_block_time(block_time: Option<i64>) -> u32 {
+    match block_time {
+        Some(ts) if ts > 0 && ts <= u32::MAX as i64 => ts as u32,
+        Some(ts) if ts > u32::MAX as i64 => u32::MAX,
+        Some(ts) if ts < 0 => 0,
+        _ => 0,
+    }
 }
 
 // Ensure PluginRunnerError is Send + Sync + 'static

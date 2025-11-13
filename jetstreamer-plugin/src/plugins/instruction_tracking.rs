@@ -150,13 +150,13 @@ impl Plugin for InstructionTrackingPlugin {
                 });
             }
 
-            if let (Some(db_client), Some(ts)) = (db, block_time) {
+            if let Some(db_client) = db {
                 let slot_to_update = slot;
                 tokio::spawn(async move {
                     if let Err(err) =
-                        backfill_instruction_timestamp(db_client, slot_to_update, ts).await
+                        backfill_instruction_timestamp(db_client, slot_to_update).await
                     {
-                        error!("failed to backfill instruction timestamps: {}", err);
+                        error!("failed to backfill instruction timestamp: {}", err);
                     }
                 });
             }
@@ -279,14 +279,22 @@ fn total_instruction_count(transaction: &TransactionData) -> u64 {
 async fn backfill_instruction_timestamp(
     db: Arc<Client>,
     slot: u64,
-    block_time: i64,
 ) -> Result<(), clickhouse::error::Error> {
-    let ts = clamp_block_time(Some(block_time));
     db.query(
-        "ALTER TABLE slot_instructions UPDATE timestamp = toDateTime(?) WHERE slot = ? AND timestamp = 0",
+        r#"
+        ALTER TABLE slot_instructions
+        UPDATE timestamp = (
+            SELECT block_time
+            FROM jetstreamer_slot_status
+            WHERE slot = ?
+            ORDER BY block_time DESC
+            LIMIT 1
+        )
+        WHERE slot = ? AND timestamp = toDateTime(0)
+        "#,
     )
-    .bind(ts)
-    .bind(slot as u32)
+    .bind(slot)
+    .bind(slot)
     .execute()
     .await
 }

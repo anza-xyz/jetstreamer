@@ -304,21 +304,53 @@ async fn backfill_program_timestamp(
     db: Arc<Client>,
     slot: u64,
 ) -> Result<(), clickhouse::error::Error> {
+    let Some(block_time) = fetch_slot_block_time(db.as_ref(), slot).await? else {
+        return Ok(());
+    };
+
     db.query(
         r#"
-        ALTER TABLE program_invocations
-        UPDATE timestamp = (
-            SELECT block_time
-            FROM jetstreamer_slot_status
-            WHERE slot = ?
-            ORDER BY block_time DESC
-            LIMIT 1
-        )
+        INSERT INTO program_invocations
+        SELECT slot,
+               toDateTime(?),
+               program_id,
+               count,
+               error_count,
+               min_cus,
+               max_cus,
+               total_cus
+        FROM program_invocations
         WHERE slot = ? AND timestamp = toDateTime(0)
         "#,
     )
-    .bind(slot)
+    .bind(block_time)
     .bind(slot)
     .execute()
     .await
+}
+
+#[derive(Row, Deserialize)]
+struct SlotBlockTime {
+    block_time: u32,
+}
+
+async fn fetch_slot_block_time(
+    db: &Client,
+    slot: u64,
+) -> Result<Option<u32>, clickhouse::error::Error> {
+    let result = db
+        .query(
+            r#"
+            SELECT toUInt32(block_time) AS block_time
+            FROM jetstreamer_slot_status
+            WHERE slot = ? AND block_time > toDateTime(0)
+            ORDER BY block_time DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(slot)
+        .fetch_optional::<SlotBlockTime>()
+        .await?;
+
+    Ok(result.map(|row| row.block_time))
 }

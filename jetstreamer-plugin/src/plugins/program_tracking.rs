@@ -17,6 +17,7 @@ const DB_WRITE_INTERVAL_SLOTS: u64 = 1000;
 #[derive(Default)]
 struct ThreadLocalData {
     slot_stats: HashMap<u64, HashMap<Address, ProgramStats>>,
+    slot_block_times: HashMap<u64, Option<i64>>,
     pending_rows: Vec<ProgramEvent>,
     slots_since_flush: u64,
 }
@@ -75,7 +76,12 @@ impl ProgramTrackingPlugin {
     fn flush_data(data: &mut ThreadLocalData, block_time: Option<i64>) -> Vec<ProgramEvent> {
         let mut rows = std::mem::take(&mut data.pending_rows);
         for (slot, stats) in data.slot_stats.drain() {
-            rows.extend(events_from_slot(slot, block_time, &stats));
+            let slot_block_time = data
+                .slot_block_times
+                .remove(&slot)
+                .and_then(|ts| ts)
+                .or(block_time);
+            rows.extend(events_from_slot(slot, slot_block_time, &stats));
         }
         rows
     }
@@ -167,9 +173,17 @@ impl Plugin for ProgramTrackingPlugin {
             };
 
             let flush_rows = Self::with_thread_data(thread_id, |data| {
+                data.slot_block_times.insert(slot, block_time);
                 if let Some(slot_data) = data.slot_stats.remove(&slot) {
-                    let slot_rows = events_from_slot(slot, block_time, &slot_data);
+                    let slot_block_time = data
+                        .slot_block_times
+                        .remove(&slot)
+                        .and_then(|ts| ts)
+                        .or(block_time);
+                    let slot_rows = events_from_slot(slot, slot_block_time, &slot_data);
                     data.pending_rows.extend(slot_rows);
+                } else {
+                    data.slot_block_times.remove(&slot);
                 }
                 data.slots_since_flush = data.slots_since_flush.saturating_add(1);
                 if data.slots_since_flush >= DB_WRITE_INTERVAL_SLOTS {

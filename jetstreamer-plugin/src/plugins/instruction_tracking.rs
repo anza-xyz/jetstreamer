@@ -26,6 +26,7 @@ static THREAD_DATA: Lazy<DashMap<usize, ThreadLocalData>> = Lazy::new(DashMap::n
 struct SlotInstructionStats {
     instruction_count: u64,
     transaction_count: u32,
+    block_time: Option<i64>,
 }
 
 #[derive(Row, Deserialize, Serialize, Copy, Clone, Debug)]
@@ -72,7 +73,7 @@ impl InstructionTrackingPlugin {
         rows.extend(
             data.slot_stats
                 .drain()
-                .map(|(slot, stats)| event_from_slot(slot, block_time, stats)),
+                .map(|(slot, stats)| event_from_slot(slot, block_time.or(stats.block_time), stats)),
         );
         rows
     }
@@ -125,10 +126,13 @@ impl Plugin for InstructionTrackingPlugin {
             };
 
             let flush_rows = Self::with_thread_data(thread_id, |data| {
-                if let Some(stats) = data.slot_stats.remove(&slot) {
-                    data.pending_rows
-                        .push(event_from_slot(slot, block_time, stats));
+                let mut stats = data.slot_stats.remove(&slot).unwrap_or_default();
+                if stats.block_time.is_none() {
+                    stats.block_time = block_time;
                 }
+                let timestamp_source = stats.block_time.or(block_time);
+                data.pending_rows
+                    .push(event_from_slot(slot, timestamp_source, stats));
                 data.slots_since_flush = data.slots_since_flush.saturating_add(1);
                 if data.slots_since_flush >= DB_WRITE_INTERVAL_SLOTS {
                     data.slots_since_flush = 0;

@@ -3,7 +3,6 @@ use std::{collections::HashMap, sync::Arc};
 use clickhouse::{Client, Row};
 use dashmap::DashMap;
 use futures_util::FutureExt;
-use log::error;
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use solana_address::Address;
@@ -180,21 +179,16 @@ impl Plugin for ProgramTrackingPlugin {
                 }
             });
 
-            if let (Some(db_client), Some(rows)) = (db.clone(), flush_rows) {
-                tokio::spawn(async move {
-                    if let Err(err) = write_program_events(db_client, rows).await {
-                        error!("failed to flush program rows: {}", err);
-                    }
-                });
+            if let (Some(db_client), Some(rows)) = (db.as_ref(), flush_rows) {
+                write_program_events(Arc::clone(db_client), rows)
+                    .await
+                    .map_err(|err| -> Box<dyn std::error::Error + Send + Sync> { Box::new(err) })?;
             }
 
-            if let Some(db_client) = db {
-                let slot_to_update = slot;
-                tokio::spawn(async move {
-                    if let Err(err) = backfill_program_timestamp(db_client, slot_to_update).await {
-                        error!("failed to backfill program timestamp: {}", err);
-                    }
-                });
+            if let Some(db_client) = db.as_ref() {
+                backfill_program_timestamp(Arc::clone(db_client), slot)
+                    .await
+                    .map_err(|err| -> Box<dyn std::error::Error + Send + Sync> { Box::new(err) })?;
             }
 
             Ok(())
@@ -240,10 +234,12 @@ impl Plugin for ProgramTrackingPlugin {
         async move {
             if let Some(db_client) = db {
                 let rows = Self::drain_all_rows(None);
-                if !rows.is_empty()
-                    && let Err(err) = write_program_events(db_client, rows).await
-                {
-                    error!("failed to flush program rows on exit: {}", err);
+                if !rows.is_empty() {
+                    write_program_events(db_client, rows)
+                        .await
+                        .map_err(|err| -> Box<dyn std::error::Error + Send + Sync> {
+                            Box::new(err)
+                        })?;
                 }
             }
             Ok(())

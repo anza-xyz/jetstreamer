@@ -3,7 +3,6 @@ use std::{collections::HashMap, sync::Arc};
 use clickhouse::{Client, Row};
 use dashmap::DashMap;
 use futures_util::FutureExt;
-use log::error;
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use solana_message::VersionedMessage;
@@ -142,23 +141,16 @@ impl Plugin for InstructionTrackingPlugin {
                 }
             });
 
-            if let (Some(db_client), Some(rows)) = (db.clone(), flush_rows) {
-                tokio::spawn(async move {
-                    if let Err(err) = write_instruction_events(db_client, rows).await {
-                        error!("failed to flush instruction rows: {}", err);
-                    }
-                });
+            if let (Some(db_client), Some(rows)) = (db.as_ref(), flush_rows) {
+                write_instruction_events(Arc::clone(db_client), rows)
+                    .await
+                    .map_err(|err| -> Box<dyn std::error::Error + Send + Sync> { Box::new(err) })?;
             }
 
-            if let Some(db_client) = db {
-                let slot_to_update = slot;
-                tokio::spawn(async move {
-                    if let Err(err) =
-                        backfill_instruction_timestamp(db_client, slot_to_update).await
-                    {
-                        error!("failed to backfill instruction timestamp: {}", err);
-                    }
-                });
+            if let Some(db_client) = db.as_ref() {
+                backfill_instruction_timestamp(Arc::clone(db_client), slot)
+                    .await
+                    .map_err(|err| -> Box<dyn std::error::Error + Send + Sync> { Box::new(err) })?;
             }
 
             Ok(())
@@ -202,10 +194,12 @@ impl Plugin for InstructionTrackingPlugin {
         async move {
             if let Some(db_client) = db {
                 let rows = Self::drain_all_rows(None);
-                if !rows.is_empty()
-                    && let Err(err) = write_instruction_events(db_client, rows).await
-                {
-                    error!("failed to flush instruction rows on exit: {}", err);
+                if !rows.is_empty() {
+                    write_instruction_events(db_client, rows)
+                        .await
+                        .map_err(|err| -> Box<dyn std::error::Error + Send + Sync> {
+                            Box::new(err)
+                        })?;
                 }
             }
             Ok(())

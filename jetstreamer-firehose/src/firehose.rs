@@ -735,7 +735,7 @@ where
                                                 BlockData::LeaderSkipped { slot: skipped_slot },
                                             )
                                             .await
-                                            .map_err(|e| FirehoseError::BlockHandlerError(e))
+                                            .map_err(FirehoseError::BlockHandlerError)
                                             .map_err(|e| (e, current_slot.unwrap_or(slot_range.start)))?;
                                         }
                                     }
@@ -1288,7 +1288,7 @@ where
                                                 BlockData::LeaderSkipped { slot: skipped_slot },
                                             )
                                             .await
-                                            .map_err(|e| FirehoseError::BlockHandlerError(e))
+                                            .map_err(FirehoseError::BlockHandlerError)
                                             .map_err(|e| (e, error_slot))?;
                                         }
                                     }

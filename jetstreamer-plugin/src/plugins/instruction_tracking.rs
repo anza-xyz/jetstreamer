@@ -46,16 +46,14 @@ impl InstructionTrackingPlugin {
     where
         F: FnOnce(&mut ThreadLocalData) -> R,
     {
-        let mut guard = THREAD_DATA
-            .entry(thread_id)
-            .or_insert_with(ThreadLocalData::default);
-        f(&mut *guard)
+        let mut guard = THREAD_DATA.entry(thread_id).or_default();
+        f(&mut guard)
     }
 
     fn drain_all_rows(block_time: Option<i64>) -> Vec<SlotInstructionEvent> {
         let mut rows = Vec::new();
         for mut entry in THREAD_DATA.iter_mut() {
-            rows.extend(Self::flush_data(&mut *entry, block_time));
+            rows.extend(Self::flush_data(&mut entry, block_time));
         }
         rows
     }
@@ -195,11 +193,9 @@ impl Plugin for InstructionTrackingPlugin {
             if let Some(db_client) = db {
                 let rows = Self::drain_all_rows(None);
                 if !rows.is_empty() {
-                    write_instruction_events(db_client, rows)
-                        .await
-                        .map_err(|err| -> Box<dyn std::error::Error + Send + Sync> {
-                            Box::new(err)
-                        })?;
+                    write_instruction_events(db_client, rows).await.map_err(
+                        |err| -> Box<dyn std::error::Error + Send + Sync> { Box::new(err) },
+                    )?;
                 }
             }
             Ok(())

@@ -426,6 +426,15 @@ impl BlockData {
     pub const fn was_skipped(&self) -> bool {
         matches!(self, BlockData::LeaderSkipped { .. })
     }
+
+    /// Returns the optional block time when available.
+    #[inline(always)]
+    pub const fn block_time(&self) -> Option<i64> {
+        match self {
+            BlockData::Block { block_time, .. } => *block_time,
+            BlockData::LeaderSkipped { .. } => None,
+        }
+    }
 }
 
 type HandlerResult = Result<(), SharedError>;

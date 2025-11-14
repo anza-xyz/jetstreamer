@@ -13,13 +13,13 @@ use jetstreamer_firehose::firehose::{BlockData, TransactionData};
 const DB_WRITE_INTERVAL_SLOTS: u64 = 1000;
 
 #[derive(Default)]
-struct ThreadLocalData {
+struct ThreadData {
     slot_stats: HashMap<u64, SlotInstructionStats>,
     pending_rows: Vec<SlotInstructionEvent>,
     slots_since_flush: u64,
 }
 
-static THREAD_DATA: Lazy<DashMap<usize, ThreadLocalData>> = Lazy::new(DashMap::new);
+static THREAD_DATA: Lazy<DashMap<usize, ThreadData>> = Lazy::new(DashMap::new);
 
 #[derive(Copy, Clone, Default)]
 struct SlotInstructionStats {
@@ -44,7 +44,7 @@ pub struct InstructionTrackingPlugin;
 impl InstructionTrackingPlugin {
     fn with_thread_data<F, R>(thread_id: usize, f: F) -> R
     where
-        F: FnOnce(&mut ThreadLocalData) -> R,
+        F: FnOnce(&mut ThreadData) -> R,
     {
         let mut guard = THREAD_DATA.entry(thread_id).or_default();
         f(&mut guard)
@@ -58,10 +58,7 @@ impl InstructionTrackingPlugin {
         rows
     }
 
-    fn flush_data(
-        data: &mut ThreadLocalData,
-        block_time: Option<i64>,
-    ) -> Vec<SlotInstructionEvent> {
+    fn flush_data(data: &mut ThreadData, block_time: Option<i64>) -> Vec<SlotInstructionEvent> {
         let mut rows = std::mem::take(&mut data.pending_rows);
         rows.extend(
             data.slot_stats
@@ -106,17 +103,14 @@ impl Plugin for InstructionTrackingPlugin {
         db: Option<Arc<Client>>,
         block: &BlockData,
     ) -> PluginFuture<'_> {
-        let slot_info = match block {
-            BlockData::Block {
-                slot, block_time, ..
-            } => Some((*slot, *block_time)),
-            BlockData::LeaderSkipped { .. } => None,
-        };
+        let slot = block.slot();
+        let block_time = block.block_time();
+        let was_skipped = block.was_skipped();
 
         async move {
-            let Some((slot, block_time)) = slot_info else {
+            if was_skipped {
                 return Ok(());
-            };
+            }
 
             let flush_rows = Self::with_thread_data(thread_id, |data| {
                 let mut stats = data.slot_stats.remove(&slot).unwrap_or_default();
@@ -141,12 +135,6 @@ impl Plugin for InstructionTrackingPlugin {
 
             if let (Some(db_client), Some(rows)) = (db.as_ref(), flush_rows) {
                 write_instruction_events(Arc::clone(db_client), rows)
-                    .await
-                    .map_err(|err| -> Box<dyn std::error::Error + Send + Sync> { Box::new(err) })?;
-            }
-
-            if let Some(db_client) = db.as_ref() {
-                backfill_instruction_timestamp(Arc::clone(db_client), slot)
                     .await
                     .map_err(|err| -> Box<dyn std::error::Error + Send + Sync> { Box::new(err) })?;
             }
@@ -193,10 +181,15 @@ impl Plugin for InstructionTrackingPlugin {
             if let Some(db_client) = db {
                 let rows = Self::drain_all_rows(None);
                 if !rows.is_empty() {
-                    write_instruction_events(db_client, rows).await.map_err(
-                        |err| -> Box<dyn std::error::Error + Send + Sync> { Box::new(err) },
-                    )?;
+                    write_instruction_events(Arc::clone(&db_client), rows)
+                        .await
+                        .map_err(|err| -> Box<dyn std::error::Error + Send + Sync> {
+                            Box::new(err)
+                        })?;
                 }
+                backfill_instruction_timestamps(db_client)
+                    .await
+                    .map_err(|err| -> Box<dyn std::error::Error + Send + Sync> { Box::new(err) })?;
             }
             Ok(())
         }
@@ -266,53 +259,20 @@ fn total_instruction_count(transaction: &TransactionData) -> u64 {
     message_instructions.saturating_add(inner_instruction_count)
 }
 
-async fn backfill_instruction_timestamp(
-    db: Arc<Client>,
-    slot: u64,
-) -> Result<(), clickhouse::error::Error> {
-    let Some(block_time) = fetch_slot_block_time(db.as_ref(), slot).await? else {
-        return Ok(());
-    };
-
+async fn backfill_instruction_timestamps(db: Arc<Client>) -> Result<(), clickhouse::error::Error> {
     db.query(
         r#"
         INSERT INTO slot_instructions
-        SELECT slot,
-               toDateTime(?),
-               instruction_count,
-               transaction_count
-        FROM slot_instructions
-        WHERE slot = ? AND timestamp = toDateTime(0)
+        SELECT si.slot,
+               ss.block_time,
+               si.instruction_count,
+               si.transaction_count
+        FROM slot_instructions AS si
+        ANY INNER JOIN jetstreamer_slot_status AS ss USING (slot)
+        WHERE si.timestamp = toDateTime(0)
+          AND ss.block_time > toDateTime(0)
         "#,
     )
-    .bind(block_time)
-    .bind(slot)
     .execute()
     .await
-}
-
-#[derive(Row, Deserialize)]
-struct SlotBlockTime {
-    block_time: u32,
-}
-
-async fn fetch_slot_block_time(
-    db: &Client,
-    slot: u64,
-) -> Result<Option<u32>, clickhouse::error::Error> {
-    let result = db
-        .query(
-            r#"
-            SELECT toUInt32(block_time) AS block_time
-            FROM jetstreamer_slot_status
-            WHERE slot = ? AND block_time > toDateTime(0)
-            ORDER BY block_time DESC
-            LIMIT 1
-            "#,
-        )
-        .bind(slot)
-        .fetch_optional::<SlotBlockTime>()
-        .await?;
-
-    Ok(result.map(|row| row.block_time))
 }

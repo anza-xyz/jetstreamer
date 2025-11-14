@@ -14,13 +14,13 @@ use jetstreamer_firehose::firehose::{BlockData, TransactionData};
 const DB_WRITE_INTERVAL_SLOTS: u64 = 1000;
 
 #[derive(Default)]
-struct ThreadLocalData {
+struct ThreadData {
     slot_stats: HashMap<u64, HashMap<Address, ProgramStats>>,
     pending_rows: Vec<ProgramEvent>,
     slots_since_flush: u64,
 }
 
-static THREAD_DATA: Lazy<DashMap<usize, ThreadLocalData>> = Lazy::new(DashMap::new);
+static THREAD_DATA: Lazy<DashMap<usize, ThreadData>> = Lazy::new(DashMap::new);
 
 #[derive(Row, Deserialize, Serialize, Copy, Clone, Debug, PartialEq, Eq, Hash)]
 struct ProgramEvent {
@@ -51,7 +51,7 @@ pub struct ProgramTrackingPlugin;
 impl ProgramTrackingPlugin {
     fn with_thread_data<F, R>(thread_id: usize, f: F) -> R
     where
-        F: FnOnce(&mut ThreadLocalData) -> R,
+        F: FnOnce(&mut ThreadData) -> R,
     {
         let mut guard = THREAD_DATA.entry(thread_id).or_default();
         f(&mut guard)
@@ -65,7 +65,7 @@ impl ProgramTrackingPlugin {
         rows
     }
 
-    fn flush_data(data: &mut ThreadLocalData, block_time: Option<i64>) -> Vec<ProgramEvent> {
+    fn flush_data(data: &mut ThreadData, block_time: Option<i64>) -> Vec<ProgramEvent> {
         let mut rows = std::mem::take(&mut data.pending_rows);
         for (slot, stats) in data.slot_stats.drain() {
             rows.extend(events_from_slot(slot, block_time, &stats));
@@ -148,16 +148,13 @@ impl Plugin for ProgramTrackingPlugin {
         db: Option<Arc<Client>>,
         block: &BlockData,
     ) -> PluginFuture<'_> {
-        let slot_info = match block {
-            BlockData::Block {
-                slot, block_time, ..
-            } => Some((*slot, *block_time)),
-            BlockData::LeaderSkipped { .. } => None,
-        };
+        let slot = block.slot();
+        let block_time = block.block_time();
+        let was_skipped = block.was_skipped();
         async move {
-            let Some((slot, block_time)) = slot_info else {
+            if was_skipped {
                 return Ok(());
-            };
+            }
 
             let flush_rows = Self::with_thread_data(thread_id, |data| {
                 if let Some(slot_data) = data.slot_stats.remove(&slot) {
@@ -179,12 +176,6 @@ impl Plugin for ProgramTrackingPlugin {
 
             if let (Some(db_client), Some(rows)) = (db.as_ref(), flush_rows) {
                 write_program_events(Arc::clone(db_client), rows)
-                    .await
-                    .map_err(|err| -> Box<dyn std::error::Error + Send + Sync> { Box::new(err) })?;
-            }
-
-            if let Some(db_client) = db.as_ref() {
-                backfill_program_timestamp(Arc::clone(db_client), slot)
                     .await
                     .map_err(|err| -> Box<dyn std::error::Error + Send + Sync> { Box::new(err) })?;
             }
@@ -233,10 +224,15 @@ impl Plugin for ProgramTrackingPlugin {
             if let Some(db_client) = db {
                 let rows = Self::drain_all_rows(None);
                 if !rows.is_empty() {
-                    write_program_events(db_client, rows).await.map_err(
-                        |err| -> Box<dyn std::error::Error + Send + Sync> { Box::new(err) },
-                    )?;
+                    write_program_events(Arc::clone(&db_client), rows)
+                        .await
+                        .map_err(|err| -> Box<dyn std::error::Error + Send + Sync> {
+                            Box::new(err)
+                        })?;
                 }
+                backfill_program_timestamps(db_client)
+                    .await
+                    .map_err(|err| -> Box<dyn std::error::Error + Send + Sync> { Box::new(err) })?;
             }
             Ok(())
         }
@@ -292,57 +288,24 @@ fn clamp_block_time(block_time: Option<i64>) -> u32 {
     }
 }
 
-async fn backfill_program_timestamp(
-    db: Arc<Client>,
-    slot: u64,
-) -> Result<(), clickhouse::error::Error> {
-    let Some(block_time) = fetch_slot_block_time(db.as_ref(), slot).await? else {
-        return Ok(());
-    };
-
+async fn backfill_program_timestamps(db: Arc<Client>) -> Result<(), clickhouse::error::Error> {
     db.query(
         r#"
         INSERT INTO program_invocations
-        SELECT slot,
-               toDateTime(?),
-               program_id,
-               count,
-               error_count,
-               min_cus,
-               max_cus,
-               total_cus
-        FROM program_invocations
-        WHERE slot = ? AND timestamp = toDateTime(0)
+        SELECT pi.slot,
+               ss.block_time,
+               pi.program_id,
+               pi.count,
+               pi.error_count,
+               pi.min_cus,
+               pi.max_cus,
+               pi.total_cus
+        FROM program_invocations AS pi
+        ANY INNER JOIN jetstreamer_slot_status AS ss USING (slot)
+        WHERE pi.timestamp = toDateTime(0)
+          AND ss.block_time > toDateTime(0)
         "#,
     )
-    .bind(block_time)
-    .bind(slot)
     .execute()
     .await
-}
-
-#[derive(Row, Deserialize)]
-struct SlotBlockTime {
-    block_time: u32,
-}
-
-async fn fetch_slot_block_time(
-    db: &Client,
-    slot: u64,
-) -> Result<Option<u32>, clickhouse::error::Error> {
-    let result = db
-        .query(
-            r#"
-            SELECT toUInt32(block_time) AS block_time
-            FROM jetstreamer_slot_status
-            WHERE slot = ? AND block_time > toDateTime(0)
-            ORDER BY block_time DESC
-            LIMIT 1
-            "#,
-        )
-        .bind(slot)
-        .fetch_optional::<SlotBlockTime>()
-        .await?;
-
-    Ok(result.map(|row| row.block_time))
 }

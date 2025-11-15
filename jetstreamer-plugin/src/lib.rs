@@ -485,7 +485,7 @@ impl PluginRunner {
                                     );
                                 }
                             }
-                            BlockData::LeaderSkipped { slot } => {
+                            BlockData::PossibleLeaderSkipped { slot } => {
                                 if let Err(err) =
                                     record_slot_status(db_client, *slot, thread_id, 0, None).await
                                 {

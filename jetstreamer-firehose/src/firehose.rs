@@ -411,9 +411,10 @@ pub enum BlockData {
         /// Number of entries contained in the block.
         entry_count: u64,
     },
-    /// Marker indicating the slot was skipped by the leader.
-    LeaderSkipped {
-        /// Skipped slot number.
+    /// Marker indicating the slot appears skipped (either truly skipped or it is late and will
+    /// arrive out of order).
+    PossibleLeaderSkipped {
+        /// Slot number that either lacked a block or may still arrive later.
         slot: u64,
     },
 }
@@ -424,14 +425,14 @@ impl BlockData {
     pub const fn slot(&self) -> u64 {
         match self {
             BlockData::Block { slot, .. } => *slot,
-            BlockData::LeaderSkipped { slot } => *slot,
+            BlockData::PossibleLeaderSkipped { slot } => *slot,
         }
     }
 
-    /// Returns `true` if the slot was skipped by the leader.
+    /// Returns `true` if this record currently represents a missing/possibly skipped slot.
     #[inline(always)]
     pub const fn was_skipped(&self) -> bool {
-        matches!(self, BlockData::LeaderSkipped { .. })
+        matches!(self, BlockData::PossibleLeaderSkipped { .. })
     }
 
     /// Returns the optional block time when available.
@@ -439,7 +440,7 @@ impl BlockData {
     pub const fn block_time(&self) -> Option<i64> {
         match self {
             BlockData::Block { block_time, .. } => *block_time,
-            BlockData::LeaderSkipped { .. } => None,
+            BlockData::PossibleLeaderSkipped { .. } => None,
         }
     }
 }
@@ -669,8 +670,9 @@ where
                     };
 
                     if slot_range.start > epoch_to_slot_range(epoch_num).0 {
-                        // Seek to the previous slot so the stream includes all nodes (transactions,
-                        // entries, rewards) that precede the block payload for `slot_range.start`.
+                        // Seek to the previous slot so the stream includes all nodes
+                        // (transactions, entries, rewards) that precede the block payload for
+                        // `slot_range.start`.
                         let seek_slot = slot_range.start.saturating_sub(1);
                         let seek_fut = reader.seek_to_slot(seek_slot);
                         match timeout(OP_TIMEOUT, seek_fut).await {
@@ -760,7 +762,7 @@ where
                                             .insert(skipped_slot);
                                         on_block_cb(
                                             thread_index,
-                                            BlockData::LeaderSkipped { slot: skipped_slot },
+                                            BlockData::PossibleLeaderSkipped { slot: skipped_slot },
                                         )
                                         .await
                                         .map_err(FirehoseError::BlockHandlerError)
@@ -1065,7 +1067,7 @@ where
                                         {
                                             on_block_cb(
                                                 thread_index,
-                                                BlockData::LeaderSkipped { slot: skipped_slot },
+                                                BlockData::PossibleLeaderSkipped { slot: skipped_slot },
                                             )
                                             .await
                                             .map_err(|e| {
@@ -1349,7 +1351,7 @@ where
                                     .insert(skipped_slot);
                                 on_block_cb(
                                     thread_index,
-                                    BlockData::LeaderSkipped { slot: skipped_slot },
+                                    BlockData::PossibleLeaderSkipped { slot: skipped_slot },
                                 )
                                 .await
                                 .map_err(FirehoseError::BlockHandlerError)
@@ -1690,8 +1692,8 @@ async fn firehose_geyser_thread(
 
                 if slot_range.start > epoch_to_slot_range(epoch_num).0 {
                     // Seek to the slot immediately preceding the requested range so the reader
-                    // captures the full node set (transactions, entries, rewards) for the target
-                    // block on the next iteration.
+                    // captures the full node set (transactions, entries, rewards) for the
+                    // target block on the next iteration.
                     let seek_slot = slot_range.start.saturating_sub(1);
                     let seek_fut = reader.seek_to_slot(seek_slot);
                     match timeout(OP_TIMEOUT, seek_fut).await {

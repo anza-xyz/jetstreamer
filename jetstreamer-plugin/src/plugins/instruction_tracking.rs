@@ -10,7 +10,7 @@ use solana_message::VersionedMessage;
 use crate::{Plugin, PluginFuture};
 use jetstreamer_firehose::firehose::{BlockData, TransactionData};
 
-const DB_WRITE_INTERVAL_SLOTS: u64 = 1000;
+const DB_WRITE_INTERVAL_SLOTS: u64 = 100;
 
 #[derive(Default)]
 struct ThreadData {
@@ -274,5 +274,7 @@ async fn backfill_instruction_timestamps(db: Arc<Client>) -> Result<(), clickhou
         "#,
     )
     .execute()
-    .await
+    .await?;
+
+    Ok(())
 }

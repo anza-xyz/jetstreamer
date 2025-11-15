@@ -916,8 +916,8 @@ async fn ensure_clickhouse_tables(db: &Client) -> Result<(), clickhouse::error::
             thread_id UInt8 DEFAULT 0,
             block_time DateTime('UTC') DEFAULT toDateTime(0),
             indexed_at DateTime('UTC') DEFAULT now()
-        ) ENGINE = ReplacingMergeTree
-        ORDER BY (slot, thread_id)"#,
+        ) ENGINE = ReplacingMergeTree(indexed_at)
+        ORDER BY slot"#,
     )
     .execute()
     .await?;

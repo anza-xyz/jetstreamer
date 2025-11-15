@@ -588,9 +588,7 @@ where
             let reward_enabled = on_reward.is_some();
             let tracking_enabled = stats_tracking.is_some();
             if block_enabled {
-                pending_skipped_slots
-                    .entry(thread_index)
-                    .or_insert_with(DashSet::new);
+                pending_skipped_slots.entry(thread_index).or_default();
             }
             let mut last_counted_slot = slot_range.start.saturating_sub(1);
 
@@ -758,7 +756,7 @@ where
                                         );
                                         pending_skipped_slots
                                             .entry(thread_index)
-                                            .or_insert_with(DashSet::new)
+                                            .or_default()
                                             .insert(skipped_slot);
                                         on_block_cb(
                                             thread_index,
@@ -1059,7 +1057,7 @@ where
                                         if block_enabled {
                                             pending_skipped_slots
                                                 .entry(thread_index)
-                                                .or_insert_with(DashSet::new)
+                                                .or_default()
                                                 .insert(skipped_slot);
                                         }
                                         if block_enabled
@@ -1347,7 +1345,7 @@ where
                                 );
                                 pending_skipped_slots
                                     .entry(thread_index)
-                                    .or_insert_with(DashSet::new)
+                                    .or_default()
                                     .insert(skipped_slot);
                                 on_block_cb(
                                     thread_index,

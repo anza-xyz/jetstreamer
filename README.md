@@ -78,6 +78,8 @@ The CLI accepts either `<start>:<end>` slot ranges or a single epoch on the comm
 [`JetstreamerRunner::parse_cli_args`](https://docs.rs/jetstreamer/latest/jetstreamer/fn.parse_cli_args.html)
 for the precise rules.
 
+You can export the table's output using the flag: `--export jsonl` 
+
 ### ClickHouse Integration
 
 Jetstreamer Runner has a built-in ClickHouse integration (by default a clickhouse server is

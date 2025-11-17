@@ -322,6 +322,7 @@ impl Default for JetstreamerRunner {
                 clickhouse_enabled: clickhouse_settings.enabled,
                 spawn_clickhouse: clickhouse_settings.spawn_helper && clickhouse_settings.enabled,
                 builtin_plugins: Vec::new(),
+                export_format: None,
             },
         }
     }
@@ -404,6 +405,11 @@ impl JetstreamerRunner {
             threads,
             clickhouse_enabled
         );
+
+        // Set export format for plugins to access
+        if let Some(ref format) = self.config.export_format {
+            jetstreamer_utils::set_export_format(format.clone());
+        }
 
         let mut runner = PluginRunner::new(&self.clickhouse_dsn, threads);
         for plugin in &self.config.builtin_plugins {
@@ -518,6 +524,8 @@ pub struct Config {
     pub spawn_clickhouse: bool,
     /// Built-in plugins requested via CLI flags.
     pub builtin_plugins: Vec<BuiltinPlugin>,
+    /// Export format for plugin data (e.g., "jsonl").
+    pub export_format: Option<String>,
 }
 
 /// Built-in plugins that can be toggled via CLI flags.
@@ -573,28 +581,34 @@ impl BuiltinPlugin {
 /// assert!(!config.clickhouse_enabled);
 /// ```
 pub fn parse_cli_args() -> Result<Config, Box<dyn std::error::Error>> {
-    let mut args = std::env::args();
-    args.next(); // binary name
+    let args: Vec<String> = std::env::args().collect();
     let mut first_arg: Option<String> = None;
     let mut builtin_plugins = Vec::new();
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
             "--with-plugin" => {
-                let plugin_name = args
-                    .next()
-                    .ok_or_else(|| "--with-plugin requires a plugin name".to_string())?;
-                let plugin = BuiltinPlugin::from_flag(&plugin_name).ok_or_else(|| {
+                let plugin_name = args.get(i + 1).ok_or_else(|| "--with-plugin requires a plugin name".to_string())?;
+                let plugin = BuiltinPlugin::from_flag(plugin_name).ok_or_else(|| {
                     format!(
                         "unknown plugin '{plugin_name}'. expected 'program-tracking' or 'instruction-tracking'"
                     )
                 })?;
                 builtin_plugins.push(plugin);
+                i += 2;
             }
-            _ if first_arg.is_none() => first_arg = Some(arg),
+            "--export" => {
+                // We'll handle --export in the post-selection code block.
+                i += 2; // skip the flag and its param
+            }
+            other if first_arg.is_none() => {
+                first_arg = Some(other.to_string());
+                i += 1;
+            }
             other => return Err(format!("unrecognized argument '{other}'").into()),
         }
     }
-    let first_arg = first_arg.expect("no first argument given");
+    let first_arg = first_arg.as_ref().expect("no first argument given");
     let slot_range = if first_arg.contains(':') {
         let (slot_a, slot_b) = first_arg
             .split_once(':')
@@ -626,12 +640,21 @@ pub fn parse_cli_args() -> Result<Config, Box<dyn std::error::Error>> {
         builtin_plugins
     };
 
+    // Parse --export flag
+    let mut export_format = None;
+    if let Some(export_idx) = args.iter().position(|arg| arg == "--export") {
+        if let Some(format) = args.get(export_idx + 1) {
+            export_format = Some(format.clone());
+        }
+    }
+
     Ok(Config {
         threads,
         slot_range,
         clickhouse_enabled,
         spawn_clickhouse,
         builtin_plugins,
+        export_format,
     })
 }
 

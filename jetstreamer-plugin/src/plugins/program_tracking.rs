@@ -10,6 +10,7 @@ use solana_message::VersionedMessage;
 
 use crate::{Plugin, PluginFuture};
 use jetstreamer_firehose::firehose::{BlockData, TransactionData};
+use jetstreamer_utils::{get_export_format, write_to_jsonl};
 
 const DB_WRITE_INTERVAL_SLOTS: u64 = 1;
 
@@ -173,6 +174,16 @@ impl Plugin for ProgramTrackingPlugin {
                     None
                 }
             });
+
+
+            // Write to JSONL file if export format is jsonl and flush_rows is not None
+            if let Some(ref rows) = flush_rows {
+                if get_export_format() == Some("jsonl") {
+                    write_to_jsonl("program_invocations", rows.clone())
+                        .await
+                        .map_err(|err| -> Box<dyn std::error::Error + Send + Sync> { Box::new(err) })?;
+                }
+            }
 
             if let (Some(db_client), Some(rows)) = (db.as_ref(), flush_rows) {
                 write_program_events(Arc::clone(db_client), rows)

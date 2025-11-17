@@ -9,6 +9,7 @@ use solana_message::VersionedMessage;
 
 use crate::{Plugin, PluginFuture};
 use jetstreamer_firehose::firehose::{BlockData, TransactionData};
+use jetstreamer_utils::{get_export_format, write_to_jsonl};
 
 const DB_WRITE_INTERVAL_SLOTS: u64 = 1000;
 
@@ -153,6 +154,18 @@ impl Plugin for ProgramTrackingPlugin {
                     None
                 }
             });
+
+            // Write to JSONL file if export format is jsonl and flush_rows is not None
+            if let Some(ref rows) = flush_rows {
+                if get_export_format() == Some("jsonl") {
+                    let rows_clone = rows.clone();
+                    tokio::spawn(async move {
+                        if let Err(err) = write_to_jsonl("program_invocations", rows_clone).await {
+                            error!("failed to write program invocations to JSONL: {}", err);
+                        }
+                    });
+                }
+            }
 
             if let (Some(db_client), Some(rows)) = (db, flush_rows) {
                 tokio::spawn(async move {

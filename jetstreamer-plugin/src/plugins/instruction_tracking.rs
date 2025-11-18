@@ -158,7 +158,7 @@ impl Plugin for InstructionTrackingPlugin {
                         instruction_count  UInt64,
                         transaction_count  UInt32
                     )
-                    ENGINE = ReplacingMergeTree(slot)
+                    ENGINE = ReplacingMergeTree(timestamp)
                     ORDER BY slot
                     "#,
                 )

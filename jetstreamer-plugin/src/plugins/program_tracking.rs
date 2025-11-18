@@ -203,7 +203,7 @@ impl Plugin for ProgramTrackingPlugin {
                         max_cus     UInt32,
                         total_cus   UInt32
                     )
-                    ENGINE = ReplacingMergeTree(slot)
+                    ENGINE = ReplacingMergeTree(timestamp)
                     ORDER BY (slot, program_id)
                     "#,
                 )

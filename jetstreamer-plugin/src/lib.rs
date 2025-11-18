@@ -485,17 +485,7 @@ impl PluginRunner {
                                     );
                                 }
                             }
-                            BlockData::PossibleLeaderSkipped { slot } => {
-                                if let Err(err) =
-                                    record_slot_status(db_client, *slot, thread_id, 0, None).await
-                                {
-                                    log::error!(
-                                        target: &log_target,
-                                        "failed to record slot status: {}",
-                                        err
-                                    );
-                                }
-                            }
+                            BlockData::PossibleLeaderSkipped { .. } => {}
                         }
                     }
                     Ok(())

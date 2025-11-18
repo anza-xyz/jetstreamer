@@ -13,6 +13,12 @@ documentation.workspace = true
 [features]
 default = []
 verify-transaction-signatures = []
+s3-backend = [
+    "aws-credential-types",
+    "aws-sdk-s3",
+    "aws-smithy-types",
+    "aws-types",
+]
 
 [[bin]]
 name = "jetstreamer-firehose"
@@ -54,6 +60,12 @@ solana-reward-info.workspace = true
 xxhash-rust.workspace = true
 dashmap.workspace = true
 once_cell.workspace = true
+url.workspace = true
+
+aws-credential-types = { workspace = true, optional = true }
+aws-sdk-s3 = { workspace = true, optional = true }
+aws-smithy-types = { workspace = true, optional = true }
+aws-types = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile.workspace = true

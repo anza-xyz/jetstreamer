@@ -20,9 +20,19 @@
 //!
 //! # Configuration
 //! Several environment variables influence how the firehose locates and caches data:
+//! - `JETSTREAMER_HTTP_BASE_URL` (default `https://files.old-faithful.net`): base URL or
+//!   `s3://bucket/prefix` for CAR snapshots. Change this to point at a private mirror.
 //! - `JETSTREAMER_COMPACT_INDEX_BASE_URL` (default `https://files.old-faithful.net`): base URL
 //!   for compact CAR index artifacts. Point this at your own mirror to reduce load on the
-//!   public Old Faithful deployment.
+//!   public Old Faithful deployment. Also supports `s3://` URIs.
+//! - `JETSTREAMER_ARCHIVE_BASE`: fallback URL/URI that applies to both CARs and compact
+//!   indexes when the more specific knobs are unset.
+//! - `JETSTREAMER_ARCHIVE_BACKEND` (default `http`): set to `s3` to force the S3 transport even
+//!   when the resolved URL still points at `https://`.
+//! - `JETSTREAMER_S3_BUCKET`, `JETSTREAMER_S3_PREFIX`, `JETSTREAMER_S3_INDEX_PREFIX`,
+//!   `JETSTREAMER_S3_REGION`, `JETSTREAMER_S3_ENDPOINT`, `JETSTREAMER_S3_ACCESS_KEY`,
+//!   `JETSTREAMER_S3_SECRET_KEY`, `JETSTREAMER_S3_SESSION_TOKEN`: credentials and overrides
+//!   applied when the S3 backend is active.
 //! - `JETSTREAMER_NETWORK` (default `mainnet`): suffix appended to cache namespaces and index
 //!   filenames so you can swap between clusters without purging local state.
 //! - `JETSTREAMER_NETWORK_CAPACITY_MB` (default `1000`): assumed network throughput in megabytes
@@ -134,6 +144,8 @@
 //! }
 //! ```
 
+/// Backend configuration for archive mirrors (HTTP and S3).
+pub mod archive;
 /// Types for decoding block-level records emitted by the firehose.
 pub mod block;
 /// Encodes and decodes arbitrary binary [`DataFrame`](dataframe::DataFrame) nodes.

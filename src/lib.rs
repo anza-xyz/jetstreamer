@@ -121,7 +121,13 @@ pub use jetstreamer_utils as utils;
 
 use core::ops::Range;
 use jetstreamer_firehose::{epochs::slot_to_epoch, index::get_index_base_url};
-use jetstreamer_plugin::{Plugin, PluginRunner, PluginRunnerError};
+use jetstreamer_plugin::{
+    plugins::{
+        instruction_tracking::InstructionTrackingPlugin,
+        program_tracking::ProgramTrackingPlugin,
+    },
+    Plugin, PluginRunner, PluginRunnerError,
+};
 use std::sync::Arc;
 
 const WORKER_THREAD_MULTIPLIER: usize = 4; // each plugin thread gets 4 worker threads
@@ -316,6 +322,7 @@ impl Default for JetstreamerRunner {
                 slot_range: 0..0,
                 clickhouse_enabled: clickhouse_settings.enabled,
                 spawn_clickhouse: clickhouse_settings.spawn_helper && clickhouse_settings.enabled,
+                builtin_plugins: Vec::new(),
             },
         }
     }
@@ -400,6 +407,10 @@ impl JetstreamerRunner {
         );
 
         let mut runner = PluginRunner::new(&self.clickhouse_dsn, threads);
+        for plugin in &self.config.builtin_plugins {
+            runner.register(plugin.instantiate());
+        }
+
         for plugin in self.plugins {
             runner.register(plugin);
         }
@@ -506,6 +517,34 @@ pub struct Config {
     pub clickhouse_enabled: bool,
     /// Whether to spawn a local ClickHouse instance automatically.
     pub spawn_clickhouse: bool,
+    /// Built-in plugins requested via CLI flags.
+    pub builtin_plugins: Vec<BuiltinPlugin>,
+}
+
+/// Built-in plugins that can be toggled via CLI flags.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BuiltinPlugin {
+    /// Program Tracking.
+    ProgramTracking,
+    /// Instruction Tracking.
+    InstructionTracking,
+}
+
+impl BuiltinPlugin {
+    fn from_flag(value: &str) -> Option<Self> {
+        match value {
+            "program-tracking" => Some(Self::ProgramTracking),
+            "instruction-tracking" => Some(Self::InstructionTracking),
+            _ => None,
+        }
+    }
+
+    fn instantiate(self) -> Box<dyn Plugin> {
+        match self {
+            Self::ProgramTracking => Box::new(ProgramTrackingPlugin),
+            Self::InstructionTracking => Box::new(InstructionTrackingPlugin),
+        }
+    }
 }
 
 /// Parses command-line arguments and environment variables into a [`Config`].
@@ -514,6 +553,13 @@ pub struct Config {
 /// - `JETSTREAMER_CLICKHOUSE_MODE`: Controls ClickHouse integration. Accepts `auto`, `remote`,
 ///   `local`, or `off`.
 /// - `JETSTREAMER_THREADS`: Number of firehose ingestion threads.
+///
+/// CLI flags:
+/// - `--with-plugin <name>`: adds a built-in plugin (`program-tracking` or `instruction-tracking`).
+///
+/// Additional CLI flags:
+/// - `--with-plugin <name>`: Adds one of the built-in plugins (`program-tracking` or
+///   `instruction-tracking`). When omitted, the CLI defaults to `program-tracking`.
 ///
 /// # Examples
 ///
@@ -528,7 +574,28 @@ pub struct Config {
 /// assert!(!config.clickhouse_enabled);
 /// ```
 pub fn parse_cli_args() -> Result<Config, Box<dyn std::error::Error>> {
-    let first_arg = std::env::args().nth(1).expect("no first argument given");
+    let mut args = std::env::args();
+    args.next(); // binary name
+    let mut first_arg: Option<String> = None;
+    let mut builtin_plugins = Vec::new();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--with-plugin" => {
+                let plugin_name = args
+                    .next()
+                    .ok_or_else(|| "--with-plugin requires a plugin name".to_string())?;
+                let plugin = BuiltinPlugin::from_flag(&plugin_name).ok_or_else(|| {
+                    format!(
+                        "unknown plugin '{plugin_name}'. expected 'program-tracking' or 'instruction-tracking'"
+                    )
+                })?;
+                builtin_plugins.push(plugin);
+            }
+            _ if first_arg.is_none() => first_arg = Some(arg),
+            other => return Err(format!("unrecognized argument '{other}'").into()),
+        }
+    }
+    let first_arg = first_arg.expect("no first argument given");
     let slot_range = if first_arg.contains(':') {
         let (slot_a, slot_b) = first_arg
             .split_once(':')
@@ -554,11 +621,18 @@ pub fn parse_cli_args() -> Result<Config, Box<dyn std::error::Error>> {
 
     let spawn_clickhouse = clickhouse_settings.spawn_helper && clickhouse_enabled;
 
+    let builtin_plugins = if builtin_plugins.is_empty() {
+        vec![BuiltinPlugin::ProgramTracking]
+    } else {
+        builtin_plugins
+    };
+
     Ok(Config {
         threads,
         slot_range,
         clickhouse_enabled,
         spawn_clickhouse,
+        builtin_plugins,
     })
 }
 

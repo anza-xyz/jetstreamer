@@ -50,7 +50,8 @@ Geyser plugin locally, streamed over the internet from the Old Faithful archive.
 ## Quick Start
 
 To get an idea of what Jetstreamer is capable of, you can try out the demo CLI that runs
-Jetstreamer Runner with the Instruction Tracking plugin enabled:
+Jetstreamer Runner with the Program Tracking plugin enabled. Pass `--with-plugin
+instruction-tracking` (or repeat the flag to run both built-ins) to change the default set:
 
 ### Jetstreamer Runner CLI
 
@@ -64,6 +65,9 @@ JETSTREAMER_NETWORK_CAPACITY_MB=10000 cargo run --release -- 800
 # Do the same but for slots 358560000 through 367631999, which is epoch 830-850 (slot ranges can be cross-epoch!)
 # and using 8 threads explicitly instead of using automatic thread count
 JETSTREAMER_THREADS=8 cargo run --release -- 358560000:367631999
+
+# Replay epoch 800 with the instruction tracking plugin instead of the default
+cargo run --release -- 800 --with-plugin instruction-tracking
 ```
 
 If `JETSTREAMER_THREADS` is omitted, Jetstreamer auto-sizes the worker pool using the same

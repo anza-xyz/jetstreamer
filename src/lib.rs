@@ -122,11 +122,10 @@ pub use jetstreamer_utils as utils;
 use core::ops::Range;
 use jetstreamer_firehose::{epochs::slot_to_epoch, index::get_index_base_url};
 use jetstreamer_plugin::{
-    plugins::{
-        instruction_tracking::InstructionTrackingPlugin,
-        program_tracking::ProgramTrackingPlugin,
-    },
     Plugin, PluginRunner, PluginRunnerError,
+    plugins::{
+        instruction_tracking::InstructionTrackingPlugin, program_tracking::ProgramTrackingPlugin,
+    },
 };
 use std::sync::Arc;
 

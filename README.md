@@ -50,7 +50,7 @@ Geyser plugin locally, streamed over the internet from the Old Faithful archive.
 ## Quick Start
 
 To get an idea of what Jetstreamer is capable of, you can try out the demo CLI that runs
-Jetstreamer Runner with the Program Tracking plugin enabled:
+Jetstreamer Runner with the Instruction Tracking plugin enabled:
 
 ### Jetstreamer Runner CLI
 
@@ -105,8 +105,10 @@ Implement the `Plugin` trait to observe epoch/block/transaction/reward/entry eve
 example below mirrors the crate-level documentation and demonstrates how to react to both
 transactions and blocks.
 
-Note that Jetstreamer's firehose and underlying interface emits events for leader-skipped
-blocks, unlike traditional geyser.
+Note that Jetstreamer's firehose and underlying interface emits `BlockData::PossibleLeaderSkipped`
+events whenever it observes a slot gap. These represent either leader-skipped slots or blocks
+that have not arrived yet; when the real block eventually shows up, `BlockData::Block` will be
+emitted for it just like normal geyser streams.
 
 Also note that because Jetstreamer spawns parallel threads that process different subranges of
 the overall slot range at the same time, while each thread sees a purely sequential view of

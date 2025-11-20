@@ -86,6 +86,10 @@ ctrlc = "3"
 indoc = "2"
 tempfile = "3"
 libc = "0"
+aws-credential-types = "1"
+aws-sdk-s3 = "1"
+aws-smithy-types = "1"
+aws-types = "1"
 
 [dependencies]
 tokio.workspace = true
@@ -94,6 +98,7 @@ log.workspace = true
 jetstreamer-firehose.workspace = true
 jetstreamer-plugin.workspace = true
 jetstreamer-utils.workspace = true
+url.workspace = true
 
 [dev-dependencies]
 clickhouse.workspace = true

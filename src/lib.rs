@@ -316,6 +316,7 @@ impl Default for JetstreamerRunner {
                 slot_range: 0..0,
                 clickhouse_enabled: clickhouse_settings.enabled,
                 spawn_clickhouse: clickhouse_settings.spawn_helper && clickhouse_settings.enabled,
+                export_format: None,
             },
         }
     }
@@ -398,6 +399,11 @@ impl JetstreamerRunner {
             threads,
             clickhouse_enabled
         );
+
+        // Set export format for plugins to access
+        if let Some(ref format) = self.config.export_format {
+            jetstreamer_utils::set_export_format(format.clone());
+        }
 
         let mut runner = PluginRunner::new(&self.clickhouse_dsn, threads);
         for plugin in self.plugins {
@@ -506,6 +512,8 @@ pub struct Config {
     pub clickhouse_enabled: bool,
     /// Whether to spawn a local ClickHouse instance automatically.
     pub spawn_clickhouse: bool,
+    /// Export format for plugin data (e.g., "jsonl").
+    pub export_format: Option<String>,
 }
 
 /// Parses command-line arguments and environment variables into a [`Config`].
@@ -528,7 +536,8 @@ pub struct Config {
 /// assert!(!config.clickhouse_enabled);
 /// ```
 pub fn parse_cli_args() -> Result<Config, Box<dyn std::error::Error>> {
-    let first_arg = std::env::args().nth(1).expect("no first argument given");
+    let args: Vec<String> = std::env::args().collect();
+    let first_arg = args.get(1).expect("no first argument given");
     let slot_range = if first_arg.contains(':') {
         let (slot_a, slot_b) = first_arg
             .split_once(':')
@@ -554,11 +563,20 @@ pub fn parse_cli_args() -> Result<Config, Box<dyn std::error::Error>> {
 
     let spawn_clickhouse = clickhouse_settings.spawn_helper && clickhouse_enabled;
 
+    // Parse --export flag
+    let mut export_format = None;
+    if let Some(export_idx) = args.iter().position(|arg| arg == "--export") {
+        if let Some(format) = args.get(export_idx + 1) {
+            export_format = Some(format.clone());
+        }
+    }
+
     Ok(Config {
         threads,
         slot_range,
         clickhouse_enabled,
         spawn_clickhouse,
+        export_format,
     })
 }
 

@@ -1,10 +1,11 @@
 use {
     crate::{
+        SharedError,
         node::Kind,
         utils::{self, Hash},
     },
     cid::Cid,
-    std::{error::Error, vec::Vec},
+    std::vec::Vec,
 };
 
 // type Entry struct {
@@ -28,14 +29,14 @@ pub struct Entry {
 
 impl Entry {
     /// Decodes an [`Entry`] from raw CBOR bytes.
-    pub fn from_bytes(data: Vec<u8>) -> Result<Entry, Box<dyn Error>> {
+    pub fn from_bytes(data: Vec<u8>) -> Result<Entry, SharedError> {
         let decoded_data: serde_cbor::Value = serde_cbor::from_slice(&data).unwrap();
         let entry = Entry::from_cbor(decoded_data)?;
         Ok(entry)
     }
 
     /// Decodes an [`Entry`] from a CBOR [`serde_cbor::Value`].
-    pub fn from_cbor(val: serde_cbor::Value) -> Result<Entry, Box<dyn Error>> {
+    pub fn from_cbor(val: serde_cbor::Value) -> Result<Entry, SharedError> {
         let mut entry = Entry {
             kind: 0,
             num_hashes: 0,
@@ -54,7 +55,7 @@ impl Entry {
                         "Wrong kind for Entry. Expected {:?}, got {:?}",
                         Kind::Entry,
                         kind
-                    ))));
+                    ))) as SharedError);
                 }
             }
             if let Some(serde_cbor::Value::Integer(num_hashes)) = array.get(1) {

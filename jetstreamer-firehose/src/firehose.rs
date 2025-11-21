@@ -1,4 +1,5 @@
 use crossbeam_channel::{Receiver, Sender, unbounded};
+use dashmap::{DashMap, DashSet};
 #[cfg(test)]
 use futures_util::FutureExt;
 use futures_util::future::BoxFuture;
@@ -36,7 +37,7 @@ use tokio::{
 };
 
 use crate::{
-    LOG_MODULE,
+    LOG_MODULE, SharedError,
     epochs::{epoch_to_slot_range, fetch_epoch_stream, slot_to_epoch},
     index::{SLOT_OFFSET_INDEX, SlotOffsetIndexError},
     node_reader::NodeReader,
@@ -91,36 +92,39 @@ pub enum FirehoseError {
     /// HTTP client error surfaced from `reqwest`.
     Reqwest(reqwest::Error),
     /// Failure while reading the Old Faithful CAR header.
-    ReadHeader(Box<dyn std::error::Error>),
+    ReadHeader(SharedError),
     /// Error emitted by the Solana Geyser plugin service.
     GeyserPluginService(GeyserPluginServiceError),
     /// Transaction notifier could not be acquired from the Geyser service.
     FailedToGetTransactionNotifier,
     /// Failure while reading data until the next block boundary.
-    ReadUntilBlockError(Box<dyn std::error::Error>),
+    ReadUntilBlockError(SharedError),
     /// Failure while fetching an individual block.
-    GetBlockError(Box<dyn std::error::Error>),
+    GetBlockError(SharedError),
     /// Failed to decode a node at the given index.
-    NodeDecodingError(usize, Box<dyn std::error::Error>),
+    NodeDecodingError(usize, SharedError),
     /// Error surfaced when querying the slot offset index.
     SlotOffsetIndexError(SlotOffsetIndexError),
     /// Failure while seeking to a slot within the Old Faithful CAR stream.
-    SeekToSlotError(Box<dyn std::error::Error>),
+    SeekToSlotError(SharedError),
     /// Error surfaced during the plugin `on_load` stage.
-    OnLoadError(Box<dyn std::error::Error>),
+    OnLoadError(SharedError),
     /// Error emitted while invoking the stats handler.
-    OnStatsHandlerError(Box<dyn std::error::Error>),
+    OnStatsHandlerError(SharedError),
     /// Timeout reached while waiting for a firehose operation.
     OperationTimeout(&'static str),
     /// Transaction handler returned an error.
-    TransactionHandlerError(Box<dyn std::error::Error>),
+    TransactionHandlerError(SharedError),
     /// Entry handler returned an error.
-    EntryHandlerError(Box<dyn std::error::Error>),
+    EntryHandlerError(SharedError),
     /// Reward handler returned an error.
-    RewardHandlerError(Box<dyn std::error::Error>),
+    RewardHandlerError(SharedError),
     /// Block handler returned an error.
-    BlockHandlerError(Box<dyn std::error::Error>),
+    BlockHandlerError(SharedError),
 }
+
+unsafe impl Send for FirehoseError {}
+unsafe impl Sync for FirehoseError {}
 
 impl Display for FirehoseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -334,6 +338,12 @@ fn fetch_add_if(tracking_enabled: bool, atomic: &AtomicU64, value: u64) {
     }
 }
 
+fn clear_pending_skip(map: &DashMap<usize, DashSet<u64>>, thread_id: usize, slot: u64) -> bool {
+    map.get(&thread_id)
+        .map(|set| set.remove(&slot).is_some())
+        .unwrap_or(false)
+}
+
 /// Firehose transaction payload passed to [`Handler`] callbacks.
 #[derive(Debug, Clone)]
 pub struct TransactionData {
@@ -401,9 +411,10 @@ pub enum BlockData {
         /// Number of entries contained in the block.
         entry_count: u64,
     },
-    /// Marker indicating the slot was skipped by the leader.
-    LeaderSkipped {
-        /// Skipped slot number.
+    /// Marker indicating the slot appears skipped (either truly skipped or it is late and will
+    /// arrive out of order).
+    PossibleLeaderSkipped {
+        /// Slot number that either lacked a block or may still arrive later.
         slot: u64,
     },
 }
@@ -414,18 +425,27 @@ impl BlockData {
     pub const fn slot(&self) -> u64 {
         match self {
             BlockData::Block { slot, .. } => *slot,
-            BlockData::LeaderSkipped { slot } => *slot,
+            BlockData::PossibleLeaderSkipped { slot } => *slot,
         }
     }
 
-    /// Returns `true` if the slot was skipped by the leader.
+    /// Returns `true` if this record currently represents a missing/possibly skipped slot.
     #[inline(always)]
     pub const fn was_skipped(&self) -> bool {
-        matches!(self, BlockData::LeaderSkipped { .. })
+        matches!(self, BlockData::PossibleLeaderSkipped { .. })
+    }
+
+    /// Returns the optional block time when available.
+    #[inline(always)]
+    pub const fn block_time(&self) -> Option<i64> {
+        match self {
+            BlockData::Block { block_time, .. } => *block_time,
+            BlockData::PossibleLeaderSkipped { .. } => None,
+        }
     }
 }
 
-type HandlerResult = Result<(), Box<dyn std::error::Error + Send + 'static>>;
+type HandlerResult = Result<(), SharedError>;
 type HandlerFuture = BoxFuture<'static, HandlerResult>;
 
 /// Asynchronous callback invoked for each firehose event of type `Data`.
@@ -448,17 +468,33 @@ pub type OnEntryFn = HandlerFn<EntryData>;
 pub type OnRewardFn = HandlerFn<RewardsData>;
 /// Type alias for [`StatsTracking`] using simple function pointers.
 pub type StatsTracker = StatsTracking<HandlerFn<Stats>>;
+/// Convenience alias for firehose error handlers.
+pub type OnErrorFn = HandlerFn<FirehoseErrorContext>;
+
+/// Metadata describing a firehose worker failure.
+#[derive(Clone, Debug)]
+pub struct FirehoseErrorContext {
+    /// Thread index that encountered the error.
+    pub thread_id: usize,
+    /// Slot the worker was processing when the error surfaced.
+    pub slot: u64,
+    /// Epoch derived from the failing slot.
+    pub epoch: u64,
+    /// Stringified error payload for display/logging.
+    pub error_message: String,
+}
 
 /// Streams blocks, transactions, entries, rewards, and stats to user-provided handlers.
 #[inline]
 #[allow(clippy::too_many_arguments)]
-pub async fn firehose<OnBlock, OnTransaction, OnEntry, OnRewards, OnStats>(
+pub async fn firehose<OnBlock, OnTransaction, OnEntry, OnRewards, OnStats, OnError>(
     threads: u64,
     slot_range: Range<u64>,
     on_block: Option<OnBlock>,
     on_tx: Option<OnTransaction>,
     on_entry: Option<OnEntry>,
     on_rewards: Option<OnRewards>,
+    on_error: Option<OnError>,
     stats_tracking: Option<StatsTracking<OnStats>>,
     shutdown_signal: Option<broadcast::Receiver<()>>,
 ) -> Result<(), (FirehoseError, u64)>
@@ -468,6 +504,7 @@ where
     OnEntry: Handler<EntryData>,
     OnRewards: Handler<RewardsData>,
     OnStats: Handler<Stats>,
+    OnError: Handler<FirehoseErrorContext>,
 {
     if threads == 0 {
         return Err((
@@ -508,6 +545,7 @@ where
     let overall_blocks_processed: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
     let overall_transactions_processed: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
     let overall_entries_processed: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+    let pending_skipped_slots: Arc<DashMap<usize, DashSet<u64>>> = Arc::new(DashMap::new());
 
     for (thread_index, mut slot_range) in subranges.into_iter().enumerate() {
         let error_counts = error_counts.clone();
@@ -516,6 +554,7 @@ where
         let on_tx = on_tx.clone();
         let on_entry = on_entry.clone();
         let on_reward = on_rewards.clone();
+        let on_error = on_error.clone();
         let overall_slots_processed = overall_slots_processed.clone();
         let overall_blocks_processed = overall_blocks_processed.clone();
         let overall_transactions_processed = overall_transactions_processed.clone();
@@ -530,6 +569,7 @@ where
         let slots_since_stats_cloned = slots_since_stats.clone();
         let last_pulse_cloned = last_pulse.clone();
         let shutdown_flag = shutdown_flag.clone();
+        let pending_skipped_slots = pending_skipped_slots.clone();
         let thread_shutdown_rx = shutdown_signal.as_ref().map(|rx| rx.resubscribe());
 
         let handle = tokio::spawn(async move {
@@ -547,6 +587,9 @@ where
             let entry_enabled = on_entry.is_some();
             let reward_enabled = on_reward.is_some();
             let tracking_enabled = stats_tracking.is_some();
+            if block_enabled {
+                pending_skipped_slots.entry(thread_index).or_default();
+            }
             let mut last_counted_slot = slot_range.start.saturating_sub(1);
 
             // let mut triggered = false;
@@ -625,8 +668,9 @@ where
                     };
 
                     if slot_range.start > epoch_to_slot_range(epoch_num).0 {
-                        // Seek to the previous slot so the stream includes all nodes (transactions,
-                        // entries, rewards) that precede the block payload for `slot_range.start`.
+                        // Seek to the previous slot so the stream includes all nodes
+                        // (transactions, entries, rewards) that precede the block payload for
+                        // `slot_range.start`.
                         let seek_slot = slot_range.start.saturating_sub(1);
                         let seek_fut = reader.seek_to_slot(seek_slot);
                         match timeout(OP_TIMEOUT, seek_fut).await {
@@ -700,38 +744,58 @@ where
 
                             if skip_start <= target_last_slot {
                                 if block_enabled
-                                    && let Some(on_block_cb) = on_block.as_ref() {
-                                        for skipped_slot in skip_start..=target_last_slot {
-                                            log::debug!(
-                                                target: &log_target,
-                                                "leader skipped slot {} (prev_counted {}, target {})",
-                                                skipped_slot,
-                                                last_counted_slot,
-                                                target_last_slot,
-                                            );
-                                            on_block_cb(
-                                                thread_index,
-                                                BlockData::LeaderSkipped { slot: skipped_slot },
-                                            )
-                                            .await
-                                            .map_err(|e| FirehoseError::BlockHandlerError(e))
-                                            .map_err(|e| (e, current_slot.unwrap_or(slot_range.start)))?;
+                                    && let Some(on_block_cb) = on_block.as_ref()
+                                {
+                                    for skipped_slot in skip_start..=target_last_slot {
+                                        log::debug!(
+                                            target: &log_target,
+                                            "leader skipped slot {} (prev_counted {}, target {})",
+                                            skipped_slot,
+                                            last_counted_slot,
+                                            target_last_slot,
+                                        );
+                                        pending_skipped_slots
+                                            .entry(thread_index)
+                                            .or_default()
+                                            .insert(skipped_slot);
+                                        on_block_cb(
+                                            thread_index,
+                                            BlockData::PossibleLeaderSkipped { slot: skipped_slot },
+                                        )
+                                        .await
+                                        .map_err(FirehoseError::BlockHandlerError)
+                                        .map_err(|e| (e, current_slot.unwrap_or(slot_range.start)))?;
+                                        if tracking_enabled {
+                                            if let Some(ref mut stats) = thread_stats {
+                                                stats.leader_skipped_slots += 1;
+                                                stats.slots_processed += 1;
+                                                stats.current_slot = skipped_slot;
+                                            }
+                                            overall_slots_processed
+                                                .fetch_add(1, Ordering::Relaxed);
+                                            slots_since_stats.fetch_add(1, Ordering::Relaxed);
                                         }
+                                        last_counted_slot = skipped_slot;
                                     }
-
-                                let missing_slots = target_last_slot.saturating_sub(skip_start) + 1;
-                                if tracking_enabled {
-                                    if let Some(ref mut stats) = thread_stats {
-                                        stats.leader_skipped_slots += missing_slots;
-                                        stats.slots_processed += missing_slots;
-                                        stats.current_slot = target_last_slot;
+                                } else {
+                                    let missing_slots = target_last_slot.saturating_sub(skip_start) + 1;
+                                    if tracking_enabled {
+                                        if let Some(ref mut stats) = thread_stats {
+                                            stats.leader_skipped_slots += missing_slots;
+                                            stats.slots_processed += missing_slots;
+                                            stats.current_slot = target_last_slot;
+                                        }
+                                        overall_slots_processed
+                                            .fetch_add(missing_slots, Ordering::Relaxed);
+                                        slots_since_stats.fetch_add(missing_slots, Ordering::Relaxed);
                                     }
-                                    overall_slots_processed.fetch_add(missing_slots, Ordering::Relaxed);
-                                    slots_since_stats.fetch_add(missing_slots, Ordering::Relaxed);
+                                    last_counted_slot = target_last_slot;
                                 }
-                                last_counted_slot = target_last_slot;
                             }
 
+                            if block_enabled {
+                                pending_skipped_slots.remove(&thread_index);
+                            }
                             return Ok(());
                         }
                         debug_assert!(slot < slot_range.end, "processing out-of-range slot {} (end {})", slot, slot_range.end);
@@ -871,7 +935,7 @@ where
                                                 Box::new(std::io::Error::new(
                                                     std::io::ErrorKind::InvalidData,
                                                     "transaction missing signature",
-                                                )) as Box<dyn std::error::Error>
+                                                )) as SharedError
                                             })
                                             .map_err(|err| {
                                                 (
@@ -990,22 +1054,27 @@ where
                                             prev_last_counted_slot,
                                             slot,
                                         );
+                                        if block_enabled {
+                                            pending_skipped_slots
+                                                .entry(thread_index)
+                                                .or_default()
+                                                .insert(skipped_slot);
+                                        }
                                         if block_enabled
-                                            && let Some(on_block_cb) = on_block.as_ref() {
-                                                on_block_cb(
-                                                    thread_index,
-                                                    BlockData::LeaderSkipped {
-                                                        slot: skipped_slot,
-                                                    },
+                                            && let Some(on_block_cb) = on_block.as_ref()
+                                        {
+                                            on_block_cb(
+                                                thread_index,
+                                                BlockData::PossibleLeaderSkipped { slot: skipped_slot },
+                                            )
+                                            .await
+                                            .map_err(|e| {
+                                                (
+                                                    FirehoseError::BlockHandlerError(e),
+                                                    error_slot,
                                                 )
-                                                .await
-                                                .map_err(|e| {
-                                                    (
-                                                        FirehoseError::BlockHandlerError(e),
-                                                        error_slot,
-                                                    )
-                                                })?;
-                                            }
+                                            })?;
+                                        }
                                         if tracking_enabled {
                                             overall_slots_processed.fetch_add(1, Ordering::Relaxed);
                                             slots_since_stats.fetch_add(1, Ordering::Relaxed);
@@ -1018,7 +1087,17 @@ where
                                         last_counted_slot = skipped_slot;
                                     }
 
-                                    if slot <= last_counted_slot {
+                                    let cleared_pending_skip = if block_enabled {
+                                        clear_pending_skip(
+                                            &pending_skipped_slots,
+                                            thread_index,
+                                            slot,
+                                        )
+                                    } else {
+                                        false
+                                    };
+
+                                    if slot <= last_counted_slot && !cleared_pending_skip {
                                         log::debug!(
                                             target: &log_target,
                                             "duplicate block {}, already counted (last_counted={})",
@@ -1120,7 +1199,9 @@ where
                                                 }
                                     }
 
-                                    last_counted_slot = slot;
+                                    if slot > last_counted_slot {
+                                        last_counted_slot = slot;
+                                    }
                                 }
                                 Subset(_subset) => (),
                                 Epoch(_epoch) => (),
@@ -1248,39 +1329,54 @@ where
                             return Ok(());
                         }
                     }
-                    if tracking_enabled
-                        && let Some(expected_last_slot) = slot_range.end.checked_sub(1)
-                            && last_counted_slot < expected_last_slot {
-                                let flush_start = last_counted_slot.saturating_add(1);
-                                if block_enabled
-                                    && let Some(on_block_cb) = on_block.as_ref() {
-                                        let error_slot = current_slot.unwrap_or(slot_range.start);
-                                        for skipped_slot in flush_start..=expected_last_slot {
-                                            log::debug!(
-                                                target: &log_target,
-                                                "leader skipped slot {} during final flush (prev_counted {})",
-                                                skipped_slot,
-                                                last_counted_slot,
-                                            );
-                                            on_block_cb(
-                                                thread_index,
-                                                BlockData::LeaderSkipped { slot: skipped_slot },
-                                            )
-                                            .await
-                                            .map_err(|e| FirehoseError::BlockHandlerError(e))
-                                            .map_err(|e| (e, error_slot))?;
-                                        }
+                    if let Some(expected_last_slot) = slot_range.end.checked_sub(1)
+                        && last_counted_slot < expected_last_slot
+                    {
+                        let flush_start = last_counted_slot.saturating_add(1);
+                        if block_enabled
+                            && let Some(on_block_cb) = on_block.as_ref()
+                        {
+                            for skipped_slot in flush_start..=expected_last_slot {
+                                log::debug!(
+                                    target: &log_target,
+                                    "leader skipped slot {} during final flush (prev_counted {})",
+                                    skipped_slot,
+                                    last_counted_slot,
+                                );
+                                pending_skipped_slots
+                                    .entry(thread_index)
+                                    .or_default()
+                                    .insert(skipped_slot);
+                                on_block_cb(
+                                    thread_index,
+                                    BlockData::PossibleLeaderSkipped { slot: skipped_slot },
+                                )
+                                .await
+                                .map_err(FirehoseError::BlockHandlerError)
+                                .map_err(|e| (e, current_slot.unwrap_or(slot_range.start)))?;
+                                if tracking_enabled {
+                                    if let Some(stats_ref) = thread_stats.as_mut() {
+                                        stats_ref.leader_skipped_slots += 1;
+                                        stats_ref.slots_processed += 1;
+                                        stats_ref.current_slot = skipped_slot;
                                     }
-                                let missing_slots = expected_last_slot.saturating_sub(last_counted_slot);
-                                if let Some(stats_ref) = thread_stats.as_mut() {
-                                    stats_ref.leader_skipped_slots += missing_slots;
-                                    stats_ref.slots_processed += missing_slots;
-                                    stats_ref.current_slot = expected_last_slot;
+                                    overall_slots_processed.fetch_add(1, Ordering::Relaxed);
+                                    slots_since_stats.fetch_add(1, Ordering::Relaxed);
                                 }
-                                overall_slots_processed.fetch_add(missing_slots, Ordering::Relaxed);
-                                slots_since_stats.fetch_add(missing_slots, Ordering::Relaxed);
-                                last_counted_slot = expected_last_slot;
+                                last_counted_slot = skipped_slot;
                             }
+                        } else if tracking_enabled {
+                            let missing_slots = expected_last_slot.saturating_sub(last_counted_slot);
+                            if let Some(stats_ref) = thread_stats.as_mut() {
+                                stats_ref.leader_skipped_slots += missing_slots;
+                                stats_ref.slots_processed += missing_slots;
+                                stats_ref.current_slot = expected_last_slot;
+                            }
+                            overall_slots_processed.fetch_add(missing_slots, Ordering::Relaxed);
+                            slots_since_stats.fetch_add(missing_slots, Ordering::Relaxed);
+                            last_counted_slot = expected_last_slot;
+                        }
+                    }
                     if let Some(ref mut stats) = thread_stats {
                         stats.finish_time = Some(std::time::Instant::now());
                         maybe_emit_stats(
@@ -1299,6 +1395,9 @@ where
                         )
                         .await?;
                     }
+                    if block_enabled {
+                        pending_skipped_slots.remove(&thread_index);
+                    }
                     log::info!(target: &log_target, "thread {} has finished its work", thread_index);
                     }
                     Ok(())
@@ -1313,17 +1412,38 @@ where
                     );
                     break;
                 }
+                let (epoch, item_index, error_message) = {
+                    let epoch = slot_to_epoch(slot);
+                    let item_index = match &err {
+                        FirehoseError::NodeDecodingError(item_index, _) => *item_index,
+                        _ => 0,
+                    };
+                    let error_message = err.to_string();
+                    drop(err);
+                    (epoch, item_index, error_message)
+                };
                 log::error!(
                     target: &log_target,
                     "🔥🔥🔥 firehose encountered an error at slot {} in epoch {}:",
                     slot,
-                    slot_to_epoch(slot)
+                    epoch
                 );
-                log::error!(target: &log_target, "{}", err);
-                let item_index = match err {
-                    FirehoseError::NodeDecodingError(item_index, _) => item_index,
-                    _ => 0,
-                };
+                log::error!(target: &log_target, "{}", error_message);
+                if let Some(on_error_cb) = on_error.clone() {
+                    let context = FirehoseErrorContext {
+                        thread_id: thread_index,
+                        slot,
+                        epoch,
+                        error_message: error_message.clone(),
+                    };
+                    if let Err(handler_err) = on_error_cb(thread_index, context).await {
+                        log::error!(
+                            target: &log_target,
+                            "on_error handler failed: {}",
+                            handler_err
+                        );
+                    }
+                }
                 // Increment this thread's error counter
                 error_counts[thread_index].fetch_add(1, Ordering::Relaxed);
                 log::warn!(
@@ -1391,9 +1511,7 @@ pub fn firehose_geyser(
     geyser_config_files: Option<&[PathBuf]>,
     index_base_url: &Url,
     client: &Client,
-    on_load: impl Future<Output = Result<(), Box<dyn std::error::Error + Send + 'static>>>
-    + Send
-    + 'static,
+    on_load: impl Future<Output = Result<(), SharedError>> + Send + 'static,
     threads: u64,
 ) -> Result<Receiver<SlotNotification>, (FirehoseError, u64)> {
     if threads == 0 {
@@ -1572,8 +1690,8 @@ async fn firehose_geyser_thread(
 
                 if slot_range.start > epoch_to_slot_range(epoch_num).0 {
                     // Seek to the slot immediately preceding the requested range so the reader
-                    // captures the full node set (transactions, entries, rewards) for the target
-                    // block on the next iteration.
+                    // captures the full node set (transactions, entries, rewards) for the
+                    // target block on the next iteration.
                     let seek_slot = slot_range.start.saturating_sub(1);
                     let seek_fut = reader.seek_to_slot(seek_slot);
                     match timeout(OP_TIMEOUT, seek_fut).await {
@@ -1668,7 +1786,7 @@ async fn firehose_geyser_thread(
                     let mut this_block_entry_count: u64 = 0;
                     let mut this_block_rewards: Vec<(Address, RewardInfo)> = Vec::new();
 
-                    nodes.each(|node_with_cid| -> Result<(), Box<dyn std::error::Error>> {
+                    nodes.each(|node_with_cid| -> Result<(), SharedError> {
                         item_index += 1;
                         // if item_index == 100000 && !triggered { log::info!("simulating
                         //     error"); triggered = true; return
@@ -1735,7 +1853,7 @@ async fn firehose_geyser_thread(
                                         Box::new(std::io::Error::new(
                                             std::io::ErrorKind::InvalidData,
                                             "transaction missing signature",
-                                        )) as Box<dyn std::error::Error>
+                                        )) as SharedError
                                     })?;
                                 let is_vote = is_simple_vote_transaction(&versioned_tx);
 
@@ -1760,7 +1878,7 @@ async fn firehose_geyser_thread(
                                     usize::try_from(this_block_executed_transaction_count).map_err(|_| {
                                         Box::new(std::io::Error::other(
                                             "transaction index exceeds usize range",
-                                        )) as Box<dyn std::error::Error>
+                                        )) as SharedError
                                     })?;
                                 todo_latest_entry_blockhash = entry_hash;
                                 this_block_executed_transaction_count += entry_transaction_count_u64;
@@ -1927,7 +2045,7 @@ fn is_simple_vote_transaction(versioned_tx: &VersionedTransaction) -> bool {
 #[inline(always)]
 fn convert_proto_rewards(
     proto_rewards: &solana_storage_proto::convert::generated::Rewards,
-) -> Result<Vec<(Address, RewardInfo)>, Box<dyn std::error::Error>> {
+) -> Result<Vec<(Address, RewardInfo)>, SharedError> {
     let mut keyed_rewards = Vec::with_capacity(proto_rewards.rewards.len());
     for proto_reward in proto_rewards.rewards.iter() {
         let reward = RewardInfo {
@@ -1950,7 +2068,7 @@ fn convert_proto_rewards(
         let pubkey = proto_reward
             .pubkey
             .parse::<Address>()
-            .map_err(|err| Box::new(err) as Box<dyn std::error::Error>)?;
+            .map_err(|err| Box::new(err) as SharedError)?;
         keyed_rewards.push((pubkey, reward));
     }
     Ok(keyed_rewards)
@@ -2153,6 +2271,7 @@ async fn test_firehose_epoch_800() {
         None::<OnTxFn>,
         None::<OnEntryFn>,
         None::<OnRewardFn>,
+        None::<OnErrorFn>,
         Some(stats_tracking),
         None,
     )
@@ -2167,5 +2286,82 @@ async fn test_firehose_epoch_800() {
     assert!(
         min_transactions >= 10,
         "expected at least 10 transactions in every block, minimum observed {min_transactions}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_firehose_target_slot_transactions() {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    solana_logger::setup_with_default("info");
+    const TARGET_SLOT: u64 = 376_273_722;
+    const SLOT_RADIUS: u64 = 50;
+    const EXPECTED_TRANSACTIONS: u64 = 1414;
+    const EXPECTED_NON_VOTE_TRANSACTIONS: u64 = 511;
+    static FOUND: AtomicBool = AtomicBool::new(false);
+    static OBSERVED_TXS: AtomicU64 = AtomicU64::new(0);
+    static OBSERVED_NON_VOTE: AtomicU64 = AtomicU64::new(0);
+
+    FOUND.store(false, Ordering::Relaxed);
+    OBSERVED_TXS.store(0, Ordering::Relaxed);
+    OBSERVED_NON_VOTE.store(0, Ordering::Relaxed);
+
+    firehose(
+        4,
+        (TARGET_SLOT - SLOT_RADIUS)..(TARGET_SLOT + SLOT_RADIUS),
+        Some(|_thread_id: usize, block: BlockData| {
+            async move {
+                if block.slot() == TARGET_SLOT {
+                    assert!(
+                        !block.was_skipped(),
+                        "target slot {TARGET_SLOT} was marked leader skipped",
+                    );
+                    if let BlockData::Block {
+                        executed_transaction_count,
+                        ..
+                    } = block
+                    {
+                        OBSERVED_TXS.store(executed_transaction_count, Ordering::Relaxed);
+                        FOUND.store(true, Ordering::Relaxed);
+                        assert_eq!(
+                            executed_transaction_count, EXPECTED_TRANSACTIONS,
+                            "unexpected transaction count for slot {TARGET_SLOT}"
+                        );
+                        assert_eq!(
+                            OBSERVED_NON_VOTE.load(Ordering::Relaxed),
+                            EXPECTED_NON_VOTE_TRANSACTIONS,
+                            "unexpected non-vote transaction count for slot {TARGET_SLOT}"
+                        );
+                    }
+                }
+                Ok(())
+            }
+            .boxed()
+        }),
+        Some(|_thread_id: usize, transaction: TransactionData| {
+            async move {
+                if transaction.slot == TARGET_SLOT && !transaction.is_vote {
+                    OBSERVED_NON_VOTE.fetch_add(1, Ordering::Relaxed);
+                }
+                Ok(())
+            }
+            .boxed()
+        }),
+        None::<OnEntryFn>,
+        None::<OnRewardFn>,
+        None::<OnErrorFn>,
+        None::<StatsTracking<HandlerFn<Stats>>>,
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        FOUND.load(Ordering::Relaxed),
+        "target slot was not processed"
+    );
+    assert_eq!(
+        OBSERVED_TXS.load(Ordering::Relaxed),
+        EXPECTED_TRANSACTIONS,
+        "recorded transaction count mismatch"
     );
 }

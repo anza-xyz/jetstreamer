@@ -1,6 +1,6 @@
 use {
-    crate::{dataframe, node::Kind, utils::Buffer},
-    std::{error::Error, vec::Vec},
+    crate::{SharedError, dataframe, node::Kind, utils::Buffer},
+    std::vec::Vec,
 };
 
 // type Rewards struct {
@@ -21,14 +21,14 @@ pub struct Rewards {
 
 impl Rewards {
     /// Decodes [`Rewards`] from raw CBOR bytes.
-    pub fn from_bytes(data: Vec<u8>) -> Result<Rewards, Box<dyn Error>> {
+    pub fn from_bytes(data: Vec<u8>) -> Result<Rewards, SharedError> {
         let decoded_data: serde_cbor::Value = serde_cbor::from_slice(&data).unwrap();
         let rewards = Rewards::from_cbor(decoded_data)?;
         Ok(rewards)
     }
 
     /// Decodes [`Rewards`] from a CBOR [`serde_cbor::Value`].
-    pub fn from_cbor(val: serde_cbor::Value) -> Result<Rewards, Box<dyn Error>> {
+    pub fn from_cbor(val: serde_cbor::Value) -> Result<Rewards, SharedError> {
         let mut rewards = Rewards {
             kind: 0,
             slot: 0,
@@ -53,7 +53,7 @@ impl Rewards {
                         "Wrong kind for Rewards. Expected {:?}, got {:?}",
                         Kind::Rewards,
                         kind
-                    ))));
+                    ))) as SharedError);
                 }
             }
             if let Some(serde_cbor::Value::Integer(slot)) = array.get(1) {

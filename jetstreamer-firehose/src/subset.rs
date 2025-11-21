@@ -1,7 +1,7 @@
 use {
-    crate::node::Kind,
+    crate::{SharedError, node::Kind},
     cid::Cid,
-    std::{error::Error, vec::Vec},
+    std::vec::Vec,
 };
 
 // type Subset struct {
@@ -25,14 +25,14 @@ pub struct Subset {
 
 impl Subset {
     /// Decodes a [`Subset`] from raw CBOR bytes.
-    pub fn from_bytes(data: Vec<u8>) -> Result<Subset, Box<dyn Error>> {
+    pub fn from_bytes(data: Vec<u8>) -> Result<Subset, SharedError> {
         let decoded_data: serde_cbor::Value = serde_cbor::from_slice(&data).unwrap();
         let subset = Subset::from_cbor(decoded_data)?;
         Ok(subset)
     }
 
     /// Decodes a [`Subset`] from a CBOR [`serde_cbor::Value`].
-    pub fn from_cbor(val: serde_cbor::Value) -> Result<Subset, Box<dyn Error>> {
+    pub fn from_cbor(val: serde_cbor::Value) -> Result<Subset, SharedError> {
         let mut subset = Subset {
             kind: 0,
             first: 0,
@@ -51,7 +51,7 @@ impl Subset {
                         "Wrong kind for Subset. Expected {:?}, got {:?}",
                         Kind::Subset,
                         kind
-                    ))));
+                    ))) as SharedError);
                 }
             }
             if let Some(serde_cbor::Value::Integer(first)) = array.get(1) {

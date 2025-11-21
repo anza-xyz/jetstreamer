@@ -3114,6 +3114,7 @@ dependencies = [
  "futures-util",
  "jetstreamer-firehose",
  "log",
+ "once_cell",
  "serde",
  "sha2 0.10.9",
  "solana-address",

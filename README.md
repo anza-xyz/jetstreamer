@@ -50,7 +50,8 @@ Geyser plugin locally, streamed over the internet from the Old Faithful archive.
 ## Quick Start
 
 To get an idea of what Jetstreamer is capable of, you can try out the demo CLI that runs
-Jetstreamer Runner with the Program Tracking plugin enabled:
+Jetstreamer Runner with the Program Tracking plugin enabled. Pass `--with-plugin
+instruction-tracking` (or repeat the flag to run both built-ins) to change the default set:
 
 ### Jetstreamer Runner CLI
 
@@ -64,6 +65,9 @@ JETSTREAMER_NETWORK_CAPACITY_MB=10000 cargo run --release -- 800
 # Do the same but for slots 358560000 through 367631999, which is epoch 830-850 (slot ranges can be cross-epoch!)
 # and using 8 threads explicitly instead of using automatic thread count
 JETSTREAMER_THREADS=8 cargo run --release -- 358560000:367631999
+
+# Replay epoch 800 with the instruction tracking plugin instead of the default
+cargo run --release -- 800 --with-plugin instruction-tracking
 ```
 
 If `JETSTREAMER_THREADS` is omitted, Jetstreamer auto-sizes the worker pool using the same
@@ -105,8 +109,10 @@ Implement the `Plugin` trait to observe epoch/block/transaction/reward/entry eve
 example below mirrors the crate-level documentation and demonstrates how to react to both
 transactions and blocks.
 
-Note that Jetstreamer's firehose and underlying interface emits events for leader-skipped
-blocks, unlike traditional geyser.
+Note that Jetstreamer's firehose and underlying interface emits `BlockData::PossibleLeaderSkipped`
+events whenever it observes a slot gap. These represent either leader-skipped slots or blocks
+that have not arrived yet; when the real block eventually shows up, `BlockData::Block` will be
+emitted for it just like normal geyser streams.
 
 Also note that because Jetstreamer spawns parallel threads that process different subranges of
 the overall slot range at the same time, while each thread sees a purely sequential view of

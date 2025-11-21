@@ -9,7 +9,7 @@ use solana_address::Address;
 use solana_message::VersionedMessage;
 
 use crate::{Plugin, PluginFuture};
-use jetstreamer_firehose::firehose::{BlockData, TransactionData};
+use jetstreamer_firehose::firehose::{BlockData, FirehoseErrorContext, TransactionData};
 
 const DB_WRITE_INTERVAL_SLOTS: u64 = 1;
 
@@ -63,6 +63,14 @@ impl ProgramTrackingPlugin {
             rows.extend(Self::flush_data(&mut entry, block_time));
         }
         rows
+    }
+
+    fn drain_thread_rows(thread_id: usize, block_time: Option<i64>) -> Vec<ProgramEvent> {
+        Self::with_thread_data(thread_id, |data| {
+            let rows = Self::flush_data(data, block_time);
+            data.slots_since_flush = 0;
+            rows
+        })
     }
 
     fn flush_data(data: &mut ThreadData, block_time: Option<i64>) -> Vec<ProgramEvent> {
@@ -175,11 +183,40 @@ impl Plugin for ProgramTrackingPlugin {
             });
 
             if let (Some(db_client), Some(rows)) = (db.as_ref(), flush_rows) {
-                write_program_events(Arc::clone(db_client), rows)
-                    .await
-                    .map_err(|err| -> Box<dyn std::error::Error + Send + Sync> { Box::new(err) })?;
+                if let Err(err) = write_program_events(Arc::clone(db_client), &rows).await {
+                    Self::with_thread_data(thread_id, |data| {
+                        data.pending_rows.extend(rows);
+                    });
+                    return Err(Box::new(err) as Box<dyn std::error::Error + Send + Sync>);
+                }
             }
 
+            Ok(())
+        }
+        .boxed()
+    }
+
+    #[inline(always)]
+    fn on_error<'a>(
+        &'a self,
+        thread_id: usize,
+        db: Option<Arc<Client>>,
+        _error: &'a FirehoseErrorContext,
+    ) -> PluginFuture<'a> {
+        async move {
+            let rows = Self::drain_thread_rows(thread_id, None);
+            if let Some(db_client) = db {
+                if !rows.is_empty() {
+                    if let Err(err) = write_program_events(Arc::clone(&db_client), &rows).await {
+                        Self::with_thread_data(thread_id, |data| {
+                            data.pending_rows.extend(rows);
+                        });
+                        return Err(Box::new(err) as Box<dyn std::error::Error + Send + Sync>);
+                    }
+                }
+            } else if !rows.is_empty() {
+                Self::with_thread_data(thread_id, |data| data.pending_rows.extend(rows));
+            }
             Ok(())
         }
         .boxed()
@@ -224,7 +261,7 @@ impl Plugin for ProgramTrackingPlugin {
             if let Some(db_client) = db {
                 let rows = Self::drain_all_rows(None);
                 if !rows.is_empty() {
-                    write_program_events(Arc::clone(&db_client), rows)
+                    write_program_events(Arc::clone(&db_client), &rows)
                         .await
                         .map_err(|err| -> Box<dyn std::error::Error + Send + Sync> {
                             Box::new(err)
@@ -242,14 +279,14 @@ impl Plugin for ProgramTrackingPlugin {
 
 async fn write_program_events(
     db: Arc<Client>,
-    rows: Vec<ProgramEvent>,
+    rows: &[ProgramEvent],
 ) -> Result<(), clickhouse::error::Error> {
     if rows.is_empty() {
         return Ok(());
     }
     let mut insert = db.insert::<ProgramEvent>("program_invocations").await?;
     for row in rows {
-        insert.write(&row).await?;
+        insert.write(row).await?;
     }
     insert.end().await?;
     Ok(())

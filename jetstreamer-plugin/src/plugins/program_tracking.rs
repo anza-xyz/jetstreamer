@@ -12,12 +12,14 @@ use crate::{Plugin, PluginFuture};
 use jetstreamer_firehose::firehose::{BlockData, FirehoseErrorContext, TransactionData};
 
 const DB_WRITE_INTERVAL_SLOTS: u64 = 1;
+const OPTIMIZE_INTERVAL_SLOTS: u64 = 100;
 
 #[derive(Default)]
 struct ThreadData {
     slot_stats: HashMap<u64, HashMap<Address, ProgramStats>>,
     pending_rows: Vec<ProgramEvent>,
     slots_since_flush: u64,
+    slots_since_optimize: u64,
 }
 
 static THREAD_DATA: Lazy<DashMap<usize, ThreadData>> = Lazy::new(DashMap::new);
@@ -69,6 +71,7 @@ impl ProgramTrackingPlugin {
         Self::with_thread_data(thread_id, |data| {
             let rows = Self::flush_data(data, block_time);
             data.slots_since_flush = 0;
+            data.slots_since_optimize = 0;
             rows
         })
     }
@@ -164,7 +167,9 @@ impl Plugin for ProgramTrackingPlugin {
                 return Ok(());
             }
 
-            let flush_rows = Self::with_thread_data(thread_id, |data| {
+            let (flush_rows, should_optimize) = Self::with_thread_data(thread_id, |data| {
+                let mut do_optimize = false;
+                let mut flush_rows: Option<Vec<ProgramEvent>> = None;
                 if let Some(slot_data) = data.slot_stats.remove(&slot) {
                     let slot_rows = events_from_slot(slot, block_time, &slot_data);
                     data.pending_rows.extend(slot_rows);
@@ -172,14 +177,16 @@ impl Plugin for ProgramTrackingPlugin {
                 data.slots_since_flush = data.slots_since_flush.saturating_add(1);
                 if data.slots_since_flush >= DB_WRITE_INTERVAL_SLOTS {
                     data.slots_since_flush = 0;
-                    if data.pending_rows.is_empty() {
-                        None
-                    } else {
-                        Some(data.pending_rows.drain(..).collect::<Vec<_>>())
+                    if !data.pending_rows.is_empty() {
+                        flush_rows = Some(data.pending_rows.drain(..).collect::<Vec<_>>());
                     }
-                } else {
-                    None
                 }
+                data.slots_since_optimize = data.slots_since_optimize.saturating_add(1);
+                if data.slots_since_optimize >= OPTIMIZE_INTERVAL_SLOTS {
+                    data.slots_since_optimize = 0;
+                    do_optimize = true;
+                }
+                (flush_rows, do_optimize)
             });
 
             if let (Some(db_client), Some(rows)) = (db.as_ref(), flush_rows) {
@@ -188,6 +195,16 @@ impl Plugin for ProgramTrackingPlugin {
                         data.pending_rows.extend(rows);
                     });
                     return Err(Box::new(err) as Box<dyn std::error::Error + Send + Sync>);
+                }
+            }
+
+            if let (Some(db_client), true) = (db.as_ref(), should_optimize) {
+                if let Err(err) = optimize_program_invocations(Arc::clone(db_client)).await {
+                    log::warn!(
+                        "failed to optimize program_invocations after slot {}: {}",
+                        slot,
+                        err
+                    );
                 }
             }
 
@@ -258,7 +275,7 @@ impl Plugin for ProgramTrackingPlugin {
     #[inline(always)]
     fn on_exit(&self, db: Option<Arc<Client>>) -> PluginFuture<'_> {
         async move {
-            if let Some(db_client) = db {
+            if let Some(db_client) = db.clone() {
                 let rows = Self::drain_all_rows(None);
                 if !rows.is_empty() {
                     write_program_events(Arc::clone(&db_client), &rows)
@@ -270,6 +287,11 @@ impl Plugin for ProgramTrackingPlugin {
                 backfill_program_timestamps(db_client)
                     .await
                     .map_err(|err| -> Box<dyn std::error::Error + Send + Sync> { Box::new(err) })?;
+            }
+            if let Some(db_client) = db {
+                if let Err(err) = optimize_program_invocations(db_client).await {
+                    log::warn!("failed to optimize program_invocations at exit: {}", err);
+                }
             }
             Ok(())
         }
@@ -289,6 +311,13 @@ async fn write_program_events(
         insert.write(row).await?;
     }
     insert.end().await?;
+    Ok(())
+}
+
+async fn optimize_program_invocations(db: Arc<Client>) -> Result<(), clickhouse::error::Error> {
+    db.query("OPTIMIZE TABLE program_invocations FINAL")
+        .execute()
+        .await?;
     Ok(())
 }
 

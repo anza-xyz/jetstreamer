@@ -109,6 +109,7 @@
 pub mod plugins;
 
 const LOG_MODULE: &str = "jetstreamer::runner";
+const SLOT_OPTIMIZE_INTERVAL_SLOTS: u64 = 100;
 
 use std::{
     fmt::Display,
@@ -455,6 +456,20 @@ impl PluginRunner {
                                     log::error!(
                                         target: &log_target_clone,
                                         "failed to flush buffered plugin slots: {}",
+                                        err
+                                    );
+                                }
+                            });
+                        }
+                        if current.is_multiple_of(SLOT_OPTIMIZE_INTERVAL_SLOTS)
+                            && let Some(db_client) = clickhouse.clone()
+                        {
+                            let log_target_clone = log_target.clone();
+                            tokio::spawn(async move {
+                                if let Err(err) = optimize_slot_status(db_client).await {
+                                    log::warn!(
+                                        target: &log_target_clone,
+                                        "failed to optimize jetstreamer_slot_status: {}",
                                         err
                                     );
                                 }
@@ -819,6 +834,16 @@ impl PluginRunner {
             }
         }
 
+        if clickhouse_enabled && let Some(db_client) = clickhouse.clone() {
+            if let Err(err) = optimize_slot_status(db_client).await {
+                log::warn!(
+                    target: LOG_MODULE,
+                    "failed to optimize jetstreamer_slot_status table: {}",
+                    err
+                );
+            }
+        }
+
         match firehose_result {
             Ok(()) => Ok(()),
             Err((error, slot)) => Err(PluginRunnerError::Firehose {
@@ -1027,6 +1052,13 @@ async fn record_slot_status(
         })
         .await?;
     insert.end().await?;
+    Ok(())
+}
+
+async fn optimize_slot_status(db: Arc<Client>) -> Result<(), clickhouse::error::Error> {
+    db.query("OPTIMIZE TABLE jetstreamer_slot_status FINAL")
+        .execute()
+        .await?;
     Ok(())
 }
 

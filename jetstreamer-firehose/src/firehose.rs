@@ -1,9 +1,13 @@
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use dashmap::{DashMap, DashSet};
 #[cfg(test)]
+extern crate serial_test;
+#[cfg(test)]
 use futures_util::FutureExt;
 use futures_util::future::BoxFuture;
 use reqwest::{Client, Url};
+#[cfg(test)]
+use serial_test::serial;
 use solana_address::Address;
 use solana_geyser_plugin_manager::{
     block_metadata_notifier_interface::BlockMetadataNotifier,
@@ -19,6 +23,8 @@ use solana_rpc::{
 use solana_runtime::bank::{KeyedRewardsAndNumPartitions, RewardType};
 use solana_sdk_ids::vote::id as vote_program_id;
 use solana_transaction::versioned::VersionedTransaction;
+#[cfg(test)]
+use std::sync::{Mutex, OnceLock};
 use std::{
     fmt::Display,
     future::Future,
@@ -30,6 +36,9 @@ use std::{
         atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     },
 };
+
+#[cfg(test)]
+static INJECT_LAST_COUNTED_AT_RESTART: AtomicBool = AtomicBool::new(false);
 use thiserror::Error;
 use tokio::{
     sync::broadcast::{self, error::TryRecvError},
@@ -447,6 +456,11 @@ impl BlockData {
 
 type HandlerResult = Result<(), SharedError>;
 type HandlerFuture = BoxFuture<'static, HandlerResult>;
+
+#[cfg(test)]
+fn set_inject_last_counted_at_restart(enabled: bool) {
+    INJECT_LAST_COUNTED_AT_RESTART.store(enabled, Ordering::Relaxed);
+}
 
 /// Asynchronous callback invoked for each firehose event of type `Data`.
 pub trait Handler<Data>: Fn(usize, Data) -> HandlerFuture + Send + Sync + Clone + 'static {}
@@ -1454,6 +1468,12 @@ where
                 );
                 // Update slot range to resume from the failed slot, not the original start
                 slot_range.start = slot;
+                #[cfg(test)]
+                {
+                    if INJECT_LAST_COUNTED_AT_RESTART.load(Ordering::Relaxed) {
+                        last_counted_slot = slot;
+                    }
+                }
                 skip_until_index = Some(item_index);
             }
         });
@@ -2364,4 +2384,70 @@ async fn test_firehose_target_slot_transactions() {
         EXPECTED_TRANSACTIONS,
         "recorded transaction count mismatch"
     );
+}
+
+#[cfg(test)]
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn test_firehose_restart_loses_coverage_without_reset() {
+    use std::collections::HashMap;
+    solana_logger::setup_with_default("info");
+    const THREADS: usize = 1;
+    const START_SLOT: u64 = 345_600_000;
+    const NUM_SLOTS: u64 = 8;
+
+    static COVERAGE: OnceLock<Mutex<HashMap<u64, u32>>> = OnceLock::new();
+    COVERAGE
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap()
+        .clear();
+    static FAIL_TRIGGERED: AtomicBool = AtomicBool::new(false);
+    static SEEN_BLOCKS: AtomicU64 = AtomicU64::new(0);
+    FAIL_TRIGGERED.store(false, Ordering::Relaxed);
+    SEEN_BLOCKS.store(0, Ordering::Relaxed);
+    set_inject_last_counted_at_restart(true);
+
+    let result = firehose(
+        THREADS.try_into().unwrap(),
+        START_SLOT..(START_SLOT + NUM_SLOTS),
+        Some(|_thread_id: usize, block: BlockData| {
+            async move {
+                // Force an error after at least one block has been seen so restart happens mid-range.
+                if !block.was_skipped()
+                    && SEEN_BLOCKS.load(Ordering::Relaxed) > 0
+                    && !FAIL_TRIGGERED.swap(true, Ordering::SeqCst)
+                {
+                    return Err("synthetic handler failure to exercise restart".into());
+                }
+                let mut coverage = COVERAGE
+                    .get_or_init(|| Mutex::new(HashMap::new()))
+                    .lock()
+                    .unwrap();
+                *coverage.entry(block.slot()).or_insert(0) += 1;
+                if !block.was_skipped() {
+                    SEEN_BLOCKS.fetch_add(1, Ordering::Relaxed);
+                }
+                Ok(())
+            }
+            .boxed()
+        }),
+        None::<OnTxFn>,
+        None::<OnEntryFn>,
+        None::<OnRewardFn>,
+        None::<OnErrorFn>,
+        None::<StatsTracking<HandlerFn<Stats>>>,
+        None,
+    )
+    .await;
+
+    assert!(result.is_ok(), "firehose run failed: {result:?}");
+    let coverage = COVERAGE.get().unwrap().lock().unwrap();
+    for slot in START_SLOT..(START_SLOT + NUM_SLOTS) {
+        assert!(
+            coverage.contains_key(&slot),
+            "missing coverage for slot {slot} after restart"
+        );
+    }
+    set_inject_last_counted_at_restart(false);
 }

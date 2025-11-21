@@ -11,7 +11,7 @@ use solana_message::VersionedMessage;
 use crate::{Plugin, PluginFuture};
 use jetstreamer_firehose::firehose::{BlockData, TransactionData};
 
-const DB_WRITE_INTERVAL_SLOTS: u64 = 100;
+const DB_WRITE_INTERVAL_SLOTS: u64 = 1;
 
 #[derive(Default)]
 struct ThreadData {

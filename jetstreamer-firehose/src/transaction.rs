@@ -1,7 +1,7 @@
 use {
-    crate::{dataframe::DataFrame, node::Kind, utils::Buffer},
+    crate::{SharedError, dataframe::DataFrame, node::Kind, utils::Buffer},
     bincode::deserialize,
-    std::{error::Error, vec::Vec},
+    std::vec::Vec,
 };
 
 // type Transaction struct {
@@ -28,14 +28,14 @@ pub struct Transaction {
 
 impl Transaction {
     /// Decodes a [`Transaction`] from raw CBOR bytes.
-    pub fn from_bytes(data: Vec<u8>) -> Result<Transaction, Box<dyn Error>> {
+    pub fn from_bytes(data: Vec<u8>) -> Result<Transaction, SharedError> {
         let decoded_data: serde_cbor::Value = serde_cbor::from_slice(&data).unwrap();
         let transaction = Transaction::from_cbor(decoded_data)?;
         Ok(transaction)
     }
 
     /// Decodes a [`Transaction`] from a CBOR [`serde_cbor::Value`].
-    pub fn from_cbor(val: serde_cbor::Value) -> Result<Transaction, Box<dyn Error>> {
+    pub fn from_cbor(val: serde_cbor::Value) -> Result<Transaction, SharedError> {
         let mut transaction = Transaction {
             kind: 0,
             data: DataFrame {
@@ -69,7 +69,7 @@ impl Transaction {
                         "Wrong kind for Transaction; expected {:?}, got {:?}",
                         Kind::Transaction,
                         kind
-                    ))));
+                    ))) as SharedError);
                 }
             }
 
@@ -108,7 +108,7 @@ impl Transaction {
     /// Deserializes the transaction payload into a [`solana_transaction::versioned::VersionedTransaction`].
     pub fn as_parsed(
         &self,
-    ) -> Result<solana_transaction::versioned::VersionedTransaction, Box<dyn Error>> {
+    ) -> Result<solana_transaction::versioned::VersionedTransaction, SharedError> {
         Ok(deserialize(&self.data.data.to_vec())?)
     }
 

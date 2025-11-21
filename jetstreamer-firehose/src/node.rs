@@ -1,11 +1,10 @@
 use {
-    crate::{block, dataframe, entry, epoch, rewards, subset, transaction, utils},
+    crate::{SharedError, block, dataframe, entry, epoch, rewards, subset, transaction, utils},
     cid::Cid,
     core::hash::Hasher,
     crc::{CRC_64_GO_ISO, Crc},
     fnv::FnvHasher,
     std::{
-        error::Error,
         fmt,
         io::{self, Read},
         vec::Vec,
@@ -79,7 +78,7 @@ impl NodesWithCids {
     pub fn reassemble_dataframes(
         &self,
         first_dataframe: dataframe::DataFrame,
-    ) -> Result<Vec<u8>, Box<dyn Error>> {
+    ) -> Result<Vec<u8>, SharedError> {
         let mut data = first_dataframe.data.to_vec();
         let mut next_arr = first_dataframe.next;
         while next_arr.is_some() {
@@ -114,9 +113,9 @@ impl NodesWithCids {
     }
 
     /// Iterates over every node and invokes `f`.
-    pub fn each<F>(&self, mut f: F) -> Result<(), Box<dyn Error>>
+    pub fn each<F>(&self, mut f: F) -> Result<(), SharedError>
     where
-        F: FnMut(&NodeWithCid) -> Result<(), Box<dyn Error>>,
+        F: FnMut(&NodeWithCid) -> Result<(), SharedError>,
     {
         for node_with_cid in &self.0 {
             f(node_with_cid)?;
@@ -134,7 +133,7 @@ impl NodesWithCids {
     }
 
     /// Returns a reference to the final [`block::Block`] in the collection.
-    pub fn get_block(&self) -> Result<&block::Block, Box<dyn Error>> {
+    pub fn get_block(&self) -> Result<&block::Block, SharedError> {
         // the last node should be a block
         let last_node = self.0.last();
         if last_node.is_none() {
@@ -153,7 +152,7 @@ impl NodesWithCids {
 }
 
 /// Validates the provided data against the expected CRC64 (or legacy FNV) hash.
-pub fn verify_hash(data: Vec<u8>, hash: u64) -> Result<(), Box<dyn Error>> {
+pub fn verify_hash(data: Vec<u8>, hash: u64) -> Result<(), SharedError> {
     let crc64 = checksum_crc64(&data);
     if crc64 != hash {
         // Maybe it's the legacy checksum function?
@@ -297,7 +296,7 @@ impl Node {
 
 // parse_any_from_cbordata parses any CBOR data into either a Epoch, Subset, Block, Rewards, Entry, or Transaction
 /// Parses the raw CBOR payload into the appropriate [`Node`] variant.
-pub fn parse_any_from_cbordata(data: Vec<u8>) -> Result<Node, Box<dyn Error>> {
+pub fn parse_any_from_cbordata(data: Vec<u8>) -> Result<Node, SharedError> {
     let decoded_data: serde_cbor::Value = serde_cbor::from_slice(&data)?;
     // Process the decoded data
     // println!("Data: {:?}", decoded_data);
@@ -453,7 +452,7 @@ impl RawNode {
     }
 
     /// Parses the node into a typed [`Node`].
-    pub fn parse(&self) -> Result<Node, Box<dyn Error>> {
+    pub fn parse(&self) -> Result<Node, SharedError> {
         let parsed = parse_any_from_cbordata(self.data.clone());
         match parsed {
             Ok(node) => Ok(node),
@@ -462,7 +461,7 @@ impl RawNode {
     }
 
     /// Decodes a [`RawNode`] from an Old Faithful CAR cursor.
-    pub fn from_cursor(cursor: &mut io::Cursor<Vec<u8>>) -> Result<RawNode, Box<dyn Error>> {
+    pub fn from_cursor(cursor: &mut io::Cursor<Vec<u8>>) -> Result<RawNode, SharedError> {
         let cid_version = utils::read_uvarint(cursor)?;
         // println!("CID version: {}", cid_version);
 
@@ -525,7 +524,7 @@ pub struct NodeReader<R: Read> {
 
 impl<R: Read> NodeReader<R> {
     /// Creates a new [`NodeReader`] around a blocking reader.
-    pub fn new(reader: R) -> Result<NodeReader<R>, Box<dyn Error>> {
+    pub fn new(reader: R) -> Result<NodeReader<R>, SharedError> {
         let node_reader = NodeReader {
             reader,
             header: vec![],
@@ -535,7 +534,7 @@ impl<R: Read> NodeReader<R> {
     }
 
     /// Returns the raw Old Faithful CAR header, caching it for subsequent calls.
-    pub fn read_raw_header(&mut self) -> Result<Vec<u8>, Box<dyn Error>> {
+    pub fn read_raw_header(&mut self) -> Result<Vec<u8>, SharedError> {
         if !self.header.is_empty() {
             return Ok(self.header.clone());
         };
@@ -556,7 +555,7 @@ impl<R: Read> NodeReader<R> {
 
     #[allow(clippy::should_implement_trait)]
     /// Reads the next [`RawNode`] without parsing it from Old Faithful data.
-    pub fn next(&mut self) -> Result<RawNode, Box<dyn Error>> {
+    pub fn next(&mut self) -> Result<RawNode, SharedError> {
         if self.header.is_empty() {
             self.read_raw_header()?;
         };
@@ -588,14 +587,14 @@ impl<R: Read> NodeReader<R> {
     }
 
     /// Reads and parses the next node, returning it with its [`Cid`].
-    pub fn next_parsed(&mut self) -> Result<NodeWithCid, Box<dyn Error>> {
+    pub fn next_parsed(&mut self) -> Result<NodeWithCid, SharedError> {
         let raw_node = self.next()?;
         let cid = raw_node.cid;
         Ok(NodeWithCid::new(cid, raw_node.parse()?))
     }
 
     /// Iterates Old Faithful nodes until a block is encountered, returning the collected list.
-    pub fn read_until_block(&mut self) -> Result<NodesWithCids, Box<dyn Error>> {
+    pub fn read_until_block(&mut self) -> Result<NodesWithCids, SharedError> {
         let mut nodes = NodesWithCids::new();
         loop {
             let node = self.next_parsed()?;

@@ -1,7 +1,7 @@
 use {
-    crate::node::Kind,
+    crate::{SharedError, node::Kind},
     cid::Cid,
-    std::{error::Error, vec::Vec},
+    std::vec::Vec,
 };
 // type (
 // 	Epoch      struct {
@@ -23,14 +23,14 @@ pub struct Epoch {
 
 impl Epoch {
     /// Decodes an [`Epoch`] from raw CBOR bytes.
-    pub fn from_bytes(data: Vec<u8>) -> Result<Epoch, Box<dyn Error>> {
+    pub fn from_bytes(data: Vec<u8>) -> Result<Epoch, SharedError> {
         let decoded_data: serde_cbor::Value = serde_cbor::from_slice(&data).unwrap();
         let epoch = Epoch::from_cbor(decoded_data)?;
         Ok(epoch)
     }
 
     /// Decodes an [`Epoch`] from a CBOR [`serde_cbor::Value`].
-    pub fn from_cbor(val: serde_cbor::Value) -> Result<Epoch, Box<dyn Error>> {
+    pub fn from_cbor(val: serde_cbor::Value) -> Result<Epoch, SharedError> {
         let mut epoch = Epoch {
             kind: 0,
             epoch: 0,
@@ -48,7 +48,7 @@ impl Epoch {
                         "Wrong kind for Epoch. Expected {:?}, got {:?}",
                         Kind::Epoch,
                         kind
-                    ))));
+                    ))) as SharedError);
                 }
             }
             if let Some(serde_cbor::Value::Integer(num)) = array.get(1) {

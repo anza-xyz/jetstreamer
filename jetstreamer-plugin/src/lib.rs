@@ -834,14 +834,15 @@ impl PluginRunner {
             }
         }
 
-        if clickhouse_enabled && let Some(db_client) = clickhouse.clone() {
-            if let Err(err) = optimize_slot_status(db_client).await {
-                log::warn!(
-                    target: LOG_MODULE,
-                    "failed to optimize jetstreamer_slot_status table: {}",
-                    err
-                );
-            }
+        if clickhouse_enabled
+            && let Some(db_client) = clickhouse.clone()
+            && let Err(err) = optimize_slot_status(db_client).await
+        {
+            log::warn!(
+                target: LOG_MODULE,
+                "failed to optimize jetstreamer_slot_status table: {}",
+                err
+            );
         }
 
         match firehose_result {

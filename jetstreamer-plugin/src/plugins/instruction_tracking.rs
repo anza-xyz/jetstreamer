@@ -148,23 +148,23 @@ impl Plugin for InstructionTrackingPlugin {
                 (flush_rows, do_optimize)
             });
 
-            if let (Some(db_client), Some(rows)) = (db.as_ref(), flush_rows) {
-                if let Err(err) = write_instruction_events(Arc::clone(db_client), &rows).await {
-                    Self::with_thread_data(thread_id, |data| {
-                        data.pending_rows.extend(rows);
-                    });
-                    return Err(Box::new(err) as Box<dyn std::error::Error + Send + Sync>);
-                }
+            if let (Some(db_client), Some(rows)) = (db.as_ref(), flush_rows)
+                && let Err(err) = write_instruction_events(Arc::clone(db_client), &rows).await
+            {
+                Self::with_thread_data(thread_id, |data| {
+                    data.pending_rows.extend(rows);
+                });
+                return Err(Box::new(err) as Box<dyn std::error::Error + Send + Sync>);
             }
 
-            if let (Some(db_client), true) = (db.as_ref(), should_optimize) {
-                if let Err(err) = optimize_slot_instructions(Arc::clone(db_client)).await {
-                    log::warn!(
-                        "failed to optimize slot_instructions after slot {}: {}",
-                        slot,
-                        err
-                    );
-                }
+            if let (Some(db_client), true) = (db.as_ref(), should_optimize)
+                && let Err(err) = optimize_slot_instructions(Arc::clone(db_client)).await
+            {
+                log::warn!(
+                    "failed to optimize slot_instructions after slot {}: {}",
+                    slot,
+                    err
+                );
             }
 
             Ok(())
@@ -182,14 +182,13 @@ impl Plugin for InstructionTrackingPlugin {
         async move {
             let rows = Self::drain_thread_rows(thread_id, None);
             if let Some(db_client) = db {
-                if !rows.is_empty() {
-                    if let Err(err) = write_instruction_events(Arc::clone(&db_client), &rows).await
-                    {
-                        Self::with_thread_data(thread_id, |data| {
-                            data.pending_rows.extend(rows);
-                        });
-                        return Err(Box::new(err) as Box<dyn std::error::Error + Send + Sync>);
-                    }
+                if !rows.is_empty()
+                    && let Err(err) = write_instruction_events(Arc::clone(&db_client), &rows).await
+                {
+                    Self::with_thread_data(thread_id, |data| {
+                        data.pending_rows.extend(rows);
+                    });
+                    return Err(Box::new(err) as Box<dyn std::error::Error + Send + Sync>);
                 }
             } else if !rows.is_empty() {
                 Self::with_thread_data(thread_id, |data| data.pending_rows.extend(rows));
@@ -246,10 +245,10 @@ impl Plugin for InstructionTrackingPlugin {
                     .await
                     .map_err(|err| -> Box<dyn std::error::Error + Send + Sync> { Box::new(err) })?;
             }
-            if let Some(db_client) = db {
-                if let Err(err) = optimize_slot_instructions(db_client).await {
-                    log::warn!("failed to optimize slot_instructions at exit: {}", err);
-                }
+            if let Some(db_client) = db
+                && let Err(err) = optimize_slot_instructions(db_client).await
+            {
+                log::warn!("failed to optimize slot_instructions at exit: {}", err);
             }
             Ok(())
         }

@@ -37,8 +37,6 @@ use std::{
     },
 };
 
-#[cfg(test)]
-static INJECT_LAST_COUNTED_AT_RESTART: AtomicBool = AtomicBool::new(false);
 use thiserror::Error;
 use tokio::{
     sync::broadcast::{self, error::TryRecvError},
@@ -456,11 +454,6 @@ impl BlockData {
 
 type HandlerResult = Result<(), SharedError>;
 type HandlerFuture = BoxFuture<'static, HandlerResult>;
-
-#[cfg(test)]
-fn set_inject_last_counted_at_restart(enabled: bool) {
-    INJECT_LAST_COUNTED_AT_RESTART.store(enabled, Ordering::Relaxed);
-}
 
 /// Asynchronous callback invoked for each firehose event of type `Data`.
 pub trait Handler<Data>: Fn(usize, Data) -> HandlerFuture + Send + Sync + Clone + 'static {}
@@ -1466,13 +1459,12 @@ where
                     slot,
                     item_index,
                 );
-                // Update slot range to resume from the failed slot, not the original start
+                // Update slot range to resume from the failed slot, not the original start.
+                // Reset local tracking so we don't treat the resumed slot range as already counted.
                 slot_range.start = slot;
-                #[cfg(test)]
-                {
-                    if INJECT_LAST_COUNTED_AT_RESTART.load(Ordering::Relaxed) {
-                        last_counted_slot = slot;
-                    }
+                last_counted_slot = slot.saturating_sub(1);
+                if block_enabled {
+                    pending_skipped_slots.remove(&thread_index);
                 }
                 skip_until_index = Some(item_index);
             }
@@ -2406,7 +2398,6 @@ async fn test_firehose_restart_loses_coverage_without_reset() {
     static SEEN_BLOCKS: AtomicU64 = AtomicU64::new(0);
     FAIL_TRIGGERED.store(false, Ordering::Relaxed);
     SEEN_BLOCKS.store(0, Ordering::Relaxed);
-    set_inject_last_counted_at_restart(true);
 
     let result = firehose(
         THREADS.try_into().unwrap(),
@@ -2449,5 +2440,4 @@ async fn test_firehose_restart_loses_coverage_without_reset() {
             "missing coverage for slot {slot} after restart"
         );
     }
-    set_inject_last_counted_at_restart(false);
 }

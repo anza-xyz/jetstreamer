@@ -532,6 +532,12 @@ where
     if threads > 1 {
         log::debug!(target: LOG_MODULE, "⚡ thread sub-ranges: {:?}", subranges);
     }
+    if let Err(err) = SLOT_OFFSET_INDEX
+        .prime_slot_ranges(subranges.iter().cloned())
+        .await
+    {
+        return Err((err.into(), slot_range.start));
+    }
 
     let firehose_start = std::time::Instant::now();
     let shutdown_flag = Arc::new(AtomicBool::new(false));
@@ -1582,6 +1588,9 @@ pub fn firehose_geyser(
     let subranges = generate_subranges(&slot_range, threads);
     if threads > 1 {
         log::info!(target: LOG_MODULE, "⚡ thread sub-ranges: {:?}", subranges);
+    }
+    if let Err(err) = rt.block_on(SLOT_OFFSET_INDEX.prime_slot_ranges(subranges.iter().cloned())) {
+        return Err((err.into(), slot_range.start));
     }
 
     let mut handles = Vec::new();

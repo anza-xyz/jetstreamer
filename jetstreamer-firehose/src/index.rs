@@ -38,7 +38,12 @@ use reqwest::{Client, StatusCode, Url, header::RANGE};
 use serde_cbor::Value;
 #[cfg(test)]
 use std::time::Instant;
-use std::{collections::HashMap, ops::RangeInclusive, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeSet, HashMap},
+    ops::{Range, RangeInclusive},
+    sync::Arc,
+    time::Duration,
+};
 use thiserror::Error;
 use tokio::{sync::OnceCell, time::sleep};
 use xxhash_rust::xxh64::xxh64;
@@ -232,13 +237,25 @@ impl SlotOffsetIndex {
         }
 
         let epoch = slot_to_epoch(slot);
+        let indexes = self.get_epoch_indexes(epoch).await?;
+
+        let offset = indexes.lookup_slot(slot).await?;
+        SLOT_OFFSET_RESULT_CACHE.insert(slot, offset);
+
+        Ok(offset)
+    }
+
+    async fn get_epoch_indexes(
+        &self,
+        epoch: u64,
+    ) -> Result<Arc<EpochIndexes>, SlotOffsetIndexError> {
         let cache_key = EpochCacheKey::new(&self.cache_namespace, epoch);
         let entry_arc = EPOCH_CACHE
-            .entry(cache_key.clone())
+            .entry(cache_key)
             .or_insert_with(|| Arc::new(EpochEntry::new()))
             .clone();
 
-        let indexes = entry_arc
+        entry_arc
             .indexes
             .get_or_try_init(|| async {
                 let (slot_index, cid_index) = self.load_epoch_indexes(epoch).await?;
@@ -250,13 +267,53 @@ impl SlotOffsetIndex {
                     slot_end_inclusive,
                 )))
             })
-            .await?
-            .clone();
+            .await
+            .map(Arc::clone)
+    }
 
-        let offset = indexes.lookup_slot(slot).await?;
-        SLOT_OFFSET_RESULT_CACHE.insert(slot, offset);
+    /// Preloads the compact indexes for each epoch spanned by the provided slot ranges.
+    ///
+    /// Ranges are deduplicated and primed sequentially to avoid issuing many parallel HTTP
+    /// requests when a new firehose job starts.
+    pub async fn prime_slot_ranges<I>(&self, ranges: I) -> Result<(), SlotOffsetIndexError>
+    where
+        I: IntoIterator<Item = Range<u64>>,
+    {
+        let mut unique_ranges = BTreeSet::new();
+        let mut epochs_to_prime = BTreeSet::new();
 
-        Ok(offset)
+        for range in ranges.into_iter() {
+            if range.start >= range.end {
+                continue;
+            }
+            if !unique_ranges.insert((range.start, range.end)) {
+                continue;
+            }
+
+            let last_slot = range.end.saturating_sub(1);
+            let start_epoch = slot_to_epoch(range.start);
+            let end_epoch = slot_to_epoch(last_slot);
+            for epoch in start_epoch..=end_epoch {
+                epochs_to_prime.insert(epoch);
+            }
+        }
+
+        if epochs_to_prime.is_empty() {
+            return Ok(());
+        }
+
+        info!(
+            target: LOG_MODULE,
+            "Priming slot offset index for {} epoch(s) across {} subrange(s) (sequential)",
+            epochs_to_prime.len(),
+            unique_ranges.len()
+        );
+
+        for epoch in epochs_to_prime {
+            let _ = self.get_epoch_indexes(epoch).await?;
+        }
+
+        Ok(())
     }
 }
 

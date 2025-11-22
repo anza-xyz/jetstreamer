@@ -10,8 +10,8 @@ use solana_message::VersionedMessage;
 use crate::{Plugin, PluginFuture};
 use jetstreamer_firehose::firehose::{BlockData, FirehoseErrorContext, TransactionData};
 
-const DB_WRITE_INTERVAL_SLOTS: u64 = 1;
-const OPTIMIZE_INTERVAL_SLOTS: u64 = 100;
+const DB_WRITE_INTERVAL_SLOTS: u64 = 50;
+const OPTIMIZE_INTERVAL_SLOTS: u64 = 250;
 
 #[derive(Default)]
 struct ThreadData {

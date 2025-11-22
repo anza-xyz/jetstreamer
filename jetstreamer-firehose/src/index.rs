@@ -58,6 +58,7 @@ const METADATA_KEY_EPOCH: &[u8] = b"epoch";
 const HTTP_PREFETCH_BYTES: u64 = 4 * 1024; // initial bytes to fetch for headers
 const FETCH_RANGE_MAX_RETRIES: usize = 10;
 const FETCH_RANGE_BASE_DELAY_MS: u64 = 4000;
+const PRIMING_MAX_CONCURRENCY: usize = 16;
 
 /// Errors returned while accessing the compact slot offset index.
 #[derive(Debug, Error)]
@@ -304,13 +305,21 @@ impl SlotOffsetIndex {
 
         info!(
             target: LOG_MODULE,
-            "Priming slot offset index for {} epoch(s) across {} subrange(s) (sequential)",
+            "Priming slot offset index for {} epoch(s) across {} subrange(s) (up to {} concurrent)",
             epochs_to_prime.len(),
-            unique_ranges.len()
+            unique_ranges.len(),
+            PRIMING_MAX_CONCURRENCY
         );
 
-        for epoch in epochs_to_prime {
-            let _ = self.get_epoch_indexes(epoch).await?;
+        let mut priming = futures_util::stream::iter(
+            epochs_to_prime
+                .into_iter()
+                .map(|epoch| async move { self.get_epoch_indexes(epoch).await.map(|_| epoch) }),
+        )
+        .buffer_unordered(PRIMING_MAX_CONCURRENCY);
+
+        while let Some(result) = priming.next().await {
+            let _ = result?;
         }
 
         Ok(())

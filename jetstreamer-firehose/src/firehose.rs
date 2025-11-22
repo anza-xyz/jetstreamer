@@ -477,6 +477,8 @@ pub type OnRewardFn = HandlerFn<RewardsData>;
 pub type StatsTracker = StatsTracking<HandlerFn<Stats>>;
 /// Convenience alias for firehose error handlers.
 pub type OnErrorFn = HandlerFn<FirehoseErrorContext>;
+/// Convenience alias for stats tracking handlers accepted by [`firehose`].
+pub type OnStatsTrackingFn = StatsTracking<HandlerFn<Stats>>;
 
 /// Metadata describing a firehose worker failure.
 #[derive(Clone, Debug)]
@@ -2361,7 +2363,7 @@ async fn test_firehose_target_slot_transactions() {
         None::<OnEntryFn>,
         None::<OnRewardFn>,
         None::<OnErrorFn>,
-        None::<StatsTracking<HandlerFn<Stats>>>,
+        None::<OnStatsTrackingFn>,
         None,
     )
     .await
@@ -2399,7 +2401,7 @@ async fn test_firehose_restart_loses_coverage_without_reset() {
     FAIL_TRIGGERED.store(false, Ordering::Relaxed);
     SEEN_BLOCKS.store(0, Ordering::Relaxed);
 
-    let result = firehose(
+    firehose(
         THREADS.try_into().unwrap(),
         START_SLOT..(START_SLOT + NUM_SLOTS),
         Some(|_thread_id: usize, block: BlockData| {
@@ -2427,12 +2429,12 @@ async fn test_firehose_restart_loses_coverage_without_reset() {
         None::<OnEntryFn>,
         None::<OnRewardFn>,
         None::<OnErrorFn>,
-        None::<StatsTracking<HandlerFn<Stats>>>,
+        None::<OnStatsTrackingFn>,
         None,
     )
-    .await;
+    .await
+    .unwrap();
 
-    assert!(result.is_ok(), "firehose run failed: {result:?}");
     let coverage = COVERAGE.get().unwrap().lock().unwrap();
     for slot in START_SLOT..(START_SLOT + NUM_SLOTS) {
         assert!(

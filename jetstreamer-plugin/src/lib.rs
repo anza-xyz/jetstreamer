@@ -126,8 +126,11 @@ use std::{
 use clickhouse::{Client, Row};
 use dashmap::DashMap;
 use futures_util::FutureExt;
-use jetstreamer_firehose::firehose::{
-    BlockData, EntryData, RewardsData, Stats, StatsTracking, TransactionData, firehose,
+use jetstreamer_firehose::{
+    SharedError,
+    firehose::{
+        BlockData, EntryData, RewardsData, Stats, StatsTracking, TransactionData, firehose,
+    },
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -417,7 +420,7 @@ impl PluginRunner {
                                 handle.name,
                                 err
                             );
-                            continue;
+                            return Err(err);
                         }
                         if let (Some(db_client), BlockData::Block { slot, .. }) =
                             (clickhouse.clone(), block.as_ref())
@@ -439,6 +442,7 @@ impl PluginRunner {
                                     handle.name,
                                     err
                                 );
+                                return Err(Box::new(err) as SharedError);
                             }
                         }
                     }
@@ -498,6 +502,7 @@ impl PluginRunner {
                                         "failed to record slot status: {}",
                                         err
                                     );
+                                    return Err(Box::new(err) as SharedError);
                                 }
                             }
                             BlockData::PossibleLeaderSkipped { .. } => {}
@@ -542,6 +547,7 @@ impl PluginRunner {
                                 handle.name,
                                 err
                             );
+                            return Err(err);
                         }
                     }
                     Ok(())
@@ -583,6 +589,7 @@ impl PluginRunner {
                                 handle.name,
                                 err
                             );
+                            return Err(err);
                         }
                     }
                     Ok(())
@@ -624,6 +631,7 @@ impl PluginRunner {
                                 handle.name,
                                 err
                             );
+                            return Err(err);
                         }
                     }
                     Ok(())
@@ -665,6 +673,7 @@ impl PluginRunner {
                                 handle.name,
                                 err
                             );
+                            return Err(err);
                         }
                     }
                     Ok(())

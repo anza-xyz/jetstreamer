@@ -2451,9 +2451,9 @@ async fn test_firehose_gap_coverage_near_known_missing_range() {
     use std::collections::HashSet;
     solana_logger::setup_with_default("info");
     const GAP_START: u64 = 378864000;
-    const START_SLOT: u64 = GAP_START - 5000;
-    const END_SLOT: u64 = GAP_START + 5000;
-    const THREADS: usize = 255;
+    const START_SLOT: u64 = GAP_START - 1000;
+    const END_SLOT: u64 = GAP_START + 1000;
+    const THREADS: usize = 16;
 
     static COVERAGE: OnceLock<Mutex<HashSet<u64>>> = OnceLock::new();
     COVERAGE

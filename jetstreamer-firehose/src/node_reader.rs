@@ -18,7 +18,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt};
 use tokio::task::yield_now;
 
 const MAX_VARINT_LEN_64: usize = 10;
-const MIN_SEEK_SPACING_MS: u64 = 50;
+const MIN_SEEK_SPACING_MS: u64 = 100;
 static SEEK_START_INSTANT: Lazy<Instant> = Lazy::new(Instant::now);
 static LAST_SEEK_HIT_TIME: AtomicU64 = AtomicU64::new(0);
 

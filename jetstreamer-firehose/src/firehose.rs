@@ -2443,3 +2443,75 @@ async fn test_firehose_restart_loses_coverage_without_reset() {
         );
     }
 }
+
+#[cfg(test)]
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn test_firehose_gap_coverage_near_known_missing_range() {
+    use std::collections::HashSet;
+    solana_logger::setup_with_default("info");
+    const GAP_START: u64 = 378864000;
+    const START_SLOT: u64 = GAP_START - 5000;
+    const END_SLOT: u64 = GAP_START + 5000;
+    const THREADS: usize = 255;
+
+    static COVERAGE: OnceLock<Mutex<HashSet<u64>>> = OnceLock::new();
+    COVERAGE
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .unwrap()
+        .clear();
+
+    firehose(
+        THREADS.try_into().unwrap(),
+        START_SLOT..(END_SLOT + 1),
+        Some(|_thread_id: usize, block: BlockData| {
+            async move {
+                if block.was_skipped() {
+                    return Ok(());
+                }
+                let slot = block.slot();
+                COVERAGE
+                    .get_or_init(|| Mutex::new(HashSet::new()))
+                    .lock()
+                    .unwrap()
+                    .insert(slot);
+                Ok(())
+            }
+            .boxed()
+        }),
+        None::<OnTxFn>,
+        None::<OnEntryFn>,
+        None::<OnRewardFn>,
+        None::<OnErrorFn>,
+        None::<OnStatsTrackingFn>,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let mut coverage = COVERAGE
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .unwrap()
+        .clone();
+
+    // ignore a known 4-slot leader skipped gap
+    coverage.insert(378864396);
+    coverage.insert(378864397);
+    coverage.insert(378864398);
+    coverage.insert(378864399);
+
+    let expected: Vec<u64> = (START_SLOT..=END_SLOT).collect();
+    let missing: Vec<u64> = expected
+        .iter()
+        .copied()
+        .filter(|slot| !coverage.contains(slot))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "missing slots in {START_SLOT}..={END_SLOT}; count={}, first few={:?}",
+        missing.len(),
+        &missing[..missing.len().min(10)]
+    );
+}

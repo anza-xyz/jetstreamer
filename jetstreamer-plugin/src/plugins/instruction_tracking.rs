@@ -1,4 +1,4 @@
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
 use clickhouse::{Client, Row};
 use dashmap::DashMap;
@@ -10,23 +10,7 @@ use solana_message::VersionedMessage;
 use crate::{Plugin, PluginFuture};
 use jetstreamer_firehose::firehose::{BlockData, TransactionData};
 
-const DB_WRITE_INTERVAL_SLOTS: u64 = 50;
-
-#[derive(Default)]
-struct ThreadData {
-    slot_stats: HashMap<u64, SlotInstructionStats>,
-    pending_rows: Vec<SlotInstructionEvent>,
-    slots_since_flush: u64,
-}
-
-static THREAD_DATA: Lazy<DashMap<usize, ThreadData>> = Lazy::new(DashMap::new);
-
-#[derive(Copy, Clone, Default)]
-struct SlotInstructionStats {
-    instruction_count: u64,
-    transaction_count: u32,
-    block_time: Option<i64>,
-}
+static PENDING_BY_SLOT: Lazy<DashMap<u64, SlotInstructionEvent>> = Lazy::new(DashMap::new);
 
 #[derive(Row, Deserialize, Serialize, Copy, Clone, Debug)]
 struct SlotInstructionEvent {
@@ -42,29 +26,24 @@ struct SlotInstructionEvent {
 pub struct InstructionTrackingPlugin;
 
 impl InstructionTrackingPlugin {
-    fn with_thread_data<F, R>(thread_id: usize, f: F) -> R
-    where
-        F: FnOnce(&mut ThreadData) -> R,
-    {
-        let mut guard = THREAD_DATA.entry(thread_id).or_default();
-        f(&mut guard)
+    fn take_slot_event(slot: u64, block_time: Option<i64>) -> Option<SlotInstructionEvent> {
+        let timestamp = clamp_block_time(block_time);
+        PENDING_BY_SLOT.remove(&slot).map(|(_, mut event)| {
+            event.timestamp = timestamp;
+            event
+        })
     }
 
-    fn drain_all_rows(block_time: Option<i64>) -> Vec<SlotInstructionEvent> {
+    fn drain_all_pending(block_time: Option<i64>) -> Vec<SlotInstructionEvent> {
+        let timestamp = clamp_block_time(block_time);
+        let slots: Vec<u64> = PENDING_BY_SLOT.iter().map(|entry| *entry.key()).collect();
         let mut rows = Vec::new();
-        for mut entry in THREAD_DATA.iter_mut() {
-            rows.extend(Self::flush_data(&mut entry, block_time));
+        for slot in slots {
+            if let Some((_, mut event)) = PENDING_BY_SLOT.remove(&slot) {
+                event.timestamp = timestamp;
+                rows.push(event);
+            }
         }
-        rows
-    }
-
-    fn flush_data(data: &mut ThreadData, block_time: Option<i64>) -> Vec<SlotInstructionEvent> {
-        let mut rows = std::mem::take(&mut data.pending_rows);
-        rows.extend(
-            data.slot_stats
-                .drain()
-                .map(|(slot, stats)| event_from_slot(slot, block_time.or(stats.block_time), stats)),
-        );
         rows
     }
 }
@@ -78,18 +57,24 @@ impl Plugin for InstructionTrackingPlugin {
     #[inline(always)]
     fn on_transaction<'a>(
         &'a self,
-        thread_id: usize,
+        _thread_id: usize,
         _db: Option<Arc<Client>>,
         transaction: &'a TransactionData,
     ) -> PluginFuture<'a> {
         async move {
             let instruction_count = total_instruction_count(transaction);
 
-            Self::with_thread_data(thread_id, |data| {
-                let entry = data.slot_stats.entry(transaction.slot).or_default();
-                entry.instruction_count = entry.instruction_count.saturating_add(instruction_count);
-                entry.transaction_count = entry.transaction_count.saturating_add(1);
-            });
+            let slot = transaction.slot;
+            let mut entry = PENDING_BY_SLOT
+                .entry(slot)
+                .or_insert_with(|| SlotInstructionEvent {
+                    slot: slot.min(u32::MAX as u64) as u32,
+                    timestamp: 0,
+                    instruction_count: 0,
+                    transaction_count: 0,
+                });
+            entry.instruction_count = entry.instruction_count.saturating_add(instruction_count);
+            entry.transaction_count = entry.transaction_count.saturating_add(1);
 
             Ok(())
         }
@@ -99,7 +84,7 @@ impl Plugin for InstructionTrackingPlugin {
     #[inline(always)]
     fn on_block(
         &self,
-        thread_id: usize,
+        _thread_id: usize,
         db: Option<Arc<Client>>,
         block: &BlockData,
     ) -> PluginFuture<'_> {
@@ -112,31 +97,18 @@ impl Plugin for InstructionTrackingPlugin {
                 return Ok(());
             }
 
-            let flush_rows = Self::with_thread_data(thread_id, |data| {
-                let mut stats = data.slot_stats.remove(&slot).unwrap_or_default();
-                if stats.block_time.is_none() {
-                    stats.block_time = block_time;
-                }
-                let timestamp_source = stats.block_time.or(block_time);
-                data.pending_rows
-                    .push(event_from_slot(slot, timestamp_source, stats));
-                data.slots_since_flush = data.slots_since_flush.saturating_add(1);
-                if data.slots_since_flush >= DB_WRITE_INTERVAL_SLOTS {
-                    data.slots_since_flush = 0;
-                    if data.pending_rows.is_empty() {
-                        None
-                    } else {
-                        Some(data.pending_rows.drain(..).collect::<Vec<_>>())
-                    }
-                } else {
-                    None
-                }
-            });
+            let rows = Self::take_slot_event(slot, block_time)
+                .into_iter()
+                .collect::<Vec<_>>();
 
-            if let (Some(db_client), Some(rows)) = (db.as_ref(), flush_rows) {
-                write_instruction_events(Arc::clone(db_client), rows)
-                    .await
-                    .map_err(|err| -> Box<dyn std::error::Error + Send + Sync> { Box::new(err) })?;
+            if let Some(db_client) = db.as_ref() {
+                if !rows.is_empty() {
+                    write_instruction_events(Arc::clone(db_client), rows)
+                        .await
+                        .map_err(|err| -> Box<dyn std::error::Error + Send + Sync> {
+                            Box::new(err)
+                        })?;
+                }
             }
 
             Ok(())
@@ -179,7 +151,7 @@ impl Plugin for InstructionTrackingPlugin {
     fn on_exit(&self, db: Option<Arc<Client>>) -> PluginFuture<'_> {
         async move {
             if let Some(db_client) = db {
-                let rows = Self::drain_all_rows(None);
+                let rows = Self::drain_all_pending(None);
                 if !rows.is_empty() {
                     write_instruction_events(Arc::clone(&db_client), rows)
                         .await
@@ -212,20 +184,6 @@ async fn write_instruction_events(
     }
     insert.end().await?;
     Ok(())
-}
-
-fn event_from_slot(
-    slot: u64,
-    block_time: Option<i64>,
-    stats: SlotInstructionStats,
-) -> SlotInstructionEvent {
-    let timestamp = clamp_block_time(block_time);
-    SlotInstructionEvent {
-        slot: slot.min(u32::MAX as u64) as u32,
-        timestamp,
-        instruction_count: stats.instruction_count,
-        transaction_count: stats.transaction_count,
-    }
 }
 
 fn clamp_block_time(block_time: Option<i64>) -> u32 {

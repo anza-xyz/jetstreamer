@@ -40,8 +40,8 @@ use std::{
     collections::HashMap,
     ops::RangeInclusive,
     sync::{
-        atomic::{AtomicU64, Ordering},
         Arc,
+        atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -59,7 +59,7 @@ const METADATA_KEY_EPOCH: &[u8] = b"epoch";
 const HTTP_PREFETCH_BYTES: u64 = 4 * 1024; // initial bytes to fetch for headers
 const FETCH_RANGE_MAX_RETRIES: usize = 10;
 const FETCH_RANGE_BASE_DELAY_MS: u64 = 10_000;
-const MIN_HIT_SPACING_MS: u64 = 50;
+const MIN_HIT_SPACING_MS: u64 = 20;
 
 /// Errors returned while accessing the compact slot offset index.
 #[derive(Debug, Error)]

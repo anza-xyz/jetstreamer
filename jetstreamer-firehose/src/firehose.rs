@@ -54,7 +54,7 @@ use crate::{
 // Timeout applied to each asynchronous firehose operation (fetching epoch stream, reading
 // header, seeking, reading next block). Adjust here to tune stall detection/restart
 // aggressiveness.
-const OP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const OP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
 fn poll_shutdown(
     flag: &Arc<std::sync::atomic::AtomicBool>,

@@ -866,7 +866,7 @@ fn monotonic_millis() -> u64 {
     }
 }
 
-async fn wait_for_remote_hit_slot() {
+pub(crate) async fn wait_for_remote_hit_slot() {
     loop {
         let now_ms = monotonic_millis();
         let last_hit = LAST_HIT_TIME.load(Ordering::Relaxed);

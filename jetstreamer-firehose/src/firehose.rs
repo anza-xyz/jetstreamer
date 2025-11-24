@@ -695,11 +695,10 @@ where
                 // from being treated as already-counted after a restart.
                 last_counted_slot = local_start.saturating_sub(1);
                 current_slot = None;
-                if tracking_enabled {
-                    if let Some(ref mut stats) = thread_stats {
+                if tracking_enabled
+                    && let Some(ref mut stats) = thread_stats {
                         stats.current_slot = local_start;
                     }
-                }
 
                     if local_start > epoch_start {
                         // Seek to the previous slot so the stream includes all nodes

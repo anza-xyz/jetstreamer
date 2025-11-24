@@ -204,7 +204,9 @@ impl SnapshotWindow {
 }
 
 /// Re-exported statistics types produced by [`firehose`].
-pub use jetstreamer_firehose::firehose::{Stats as FirehoseStats, ThreadStats};
+pub use jetstreamer_firehose::firehose::{
+    FirehoseErrorContext, Stats as FirehoseStats, ThreadStats,
+};
 
 /// Convenience alias for the boxed future returned by plugin hooks.
 pub type PluginFuture<'a> = Pin<
@@ -273,6 +275,16 @@ pub trait Plugin: Send + Sync + 'static {
         _thread_id: usize,
         _db: Option<Arc<Client>>,
         _reward: &'a RewardsData,
+    ) -> PluginFuture<'a> {
+        async move { Ok(()) }.boxed()
+    }
+
+    /// Called whenever a firehose thread encounters an error before restarting.
+    fn on_error<'a>(
+        &'a self,
+        _thread_id: usize,
+        _db: Option<Arc<Client>>,
+        _error: &'a FirehoseErrorContext,
     ) -> PluginFuture<'a> {
         async move { Ok(()) }.boxed()
     }
@@ -454,6 +466,7 @@ impl PluginRunner {
                             BlockData::Block {
                                 slot,
                                 executed_transaction_count,
+                                block_time,
                                 ..
                             } => {
                                 if let Err(err) = record_slot_status(
@@ -461,6 +474,7 @@ impl PluginRunner {
                                     *slot,
                                     thread_id,
                                     *executed_transaction_count,
+                                    *block_time,
                                 )
                                 .await
                                 {
@@ -471,17 +485,7 @@ impl PluginRunner {
                                     );
                                 }
                             }
-                            BlockData::LeaderSkipped { slot } => {
-                                if let Err(err) =
-                                    record_slot_status(db_client, *slot, thread_id, 0).await
-                                {
-                                    log::error!(
-                                        target: &log_target,
-                                        "failed to record slot status: {}",
-                                        err
-                                    );
-                                }
-                            }
+                            BlockData::PossibleLeaderSkipped { .. } => {}
                         }
                     }
                     Ok(())
@@ -613,6 +617,47 @@ impl PluginRunner {
             }
         };
 
+        let on_error = {
+            let plugin_handles = plugin_handles.clone();
+            let clickhouse = clickhouse.clone();
+            let shutting_down = shutting_down.clone();
+            move |thread_id: usize, context: FirehoseErrorContext| {
+                let plugin_handles = plugin_handles.clone();
+                let clickhouse = clickhouse.clone();
+                let shutting_down = shutting_down.clone();
+                async move {
+                    let log_target = format!("{}::T{:03}", LOG_MODULE, thread_id);
+                    if plugin_handles.is_empty() {
+                        return Ok(());
+                    }
+                    if shutting_down.load(Ordering::SeqCst) {
+                        log::debug!(
+                            target: &log_target,
+                            "ignoring error callback while shutdown is in progress"
+                        );
+                        return Ok(());
+                    }
+                    let context = Arc::new(context);
+                    for handle in plugin_handles.iter() {
+                        if let Err(err) = handle
+                            .plugin
+                            .on_error(thread_id, clickhouse.clone(), context.as_ref())
+                            .await
+                        {
+                            log::error!(
+                                target: &log_target,
+                                "plugin {} on_error error: {}",
+                                handle.name,
+                                err
+                            );
+                        }
+                    }
+                    Ok(())
+                }
+                .boxed()
+            }
+        };
+
         let total_slot_count = slot_range.end.saturating_sub(slot_range.start);
 
         let total_slot_count_capture = total_slot_count;
@@ -722,6 +767,7 @@ impl PluginRunner {
             Some(on_transaction),
             Some(on_entry),
             Some(on_reward),
+            Some(on_error),
             stats_tracking,
             Some(shutdown_tx.subscribe()),
         ));
@@ -849,6 +895,7 @@ struct SlotStatusRow {
     slot: u64,
     transaction_count: u32,
     thread_id: u8,
+    block_time: u32,
 }
 
 async fn ensure_clickhouse_tables(db: &Client) -> Result<(), clickhouse::error::Error> {
@@ -857,9 +904,17 @@ async fn ensure_clickhouse_tables(db: &Client) -> Result<(), clickhouse::error::
             slot UInt64,
             transaction_count UInt32 DEFAULT 0,
             thread_id UInt8 DEFAULT 0,
+            block_time DateTime('UTC') DEFAULT toDateTime(0),
             indexed_at DateTime('UTC') DEFAULT now()
-        ) ENGINE = ReplacingMergeTree
-        ORDER BY (slot, thread_id)"#,
+        ) ENGINE = ReplacingMergeTree(indexed_at)
+        ORDER BY slot"#,
+    )
+    .execute()
+    .await?;
+
+    db.query(
+        r#"ALTER TABLE jetstreamer_slot_status
+           ADD COLUMN IF NOT EXISTS block_time DateTime('UTC') DEFAULT toDateTime(0)"#,
     )
     .execute()
     .await?;
@@ -958,6 +1013,7 @@ async fn record_slot_status(
     slot: u64,
     thread_id: usize,
     transaction_count: u64,
+    block_time: Option<i64>,
 ) -> Result<(), clickhouse::error::Error> {
     let mut insert = db
         .insert::<SlotStatusRow>("jetstreamer_slot_status")
@@ -967,10 +1023,20 @@ async fn record_slot_status(
             slot,
             transaction_count: transaction_count.min(u32::MAX as u64) as u32,
             thread_id: thread_id.try_into().unwrap_or(u8::MAX),
+            block_time: clamp_block_time(block_time),
         })
         .await?;
     insert.end().await?;
     Ok(())
+}
+
+fn clamp_block_time(block_time: Option<i64>) -> u32 {
+    match block_time {
+        Some(ts) if ts > 0 && ts <= u32::MAX as i64 => ts as u32,
+        Some(ts) if ts > u32::MAX as i64 => u32::MAX,
+        Some(ts) if ts < 0 => 0,
+        _ => 0,
+    }
 }
 
 // Ensure PluginRunnerError is Send + Sync + 'static

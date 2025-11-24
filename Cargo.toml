@@ -3,7 +3,7 @@ members = ["jetstreamer-firehose", "jetstreamer-plugin", "jetstreamer-utils"]
 
 [workspace.package]
 edition = "2024"
-version = "0.1.6"
+version = "0.1.7"
 authors = ["sam0x17", "anza-team"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/anza-xyz/jetstreamer"

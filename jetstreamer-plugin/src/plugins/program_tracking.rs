@@ -1,8 +1,9 @@
-use std::{cell::RefCell, collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::Arc};
 
 use clickhouse::{Client, Row};
+use dashmap::DashMap;
 use futures_util::FutureExt;
-use log::error;
+use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use solana_address::Address;
 use solana_message::VersionedMessage;
@@ -10,18 +11,16 @@ use solana_message::VersionedMessage;
 use crate::{Plugin, PluginFuture};
 use jetstreamer_firehose::firehose::{BlockData, TransactionData};
 
-const DB_WRITE_INTERVAL_SLOTS: u64 = 1000;
+const DB_WRITE_INTERVAL_SLOTS: u64 = 1;
 
 #[derive(Default)]
-struct ThreadLocalData {
+struct ThreadData {
     slot_stats: HashMap<u64, HashMap<Address, ProgramStats>>,
     pending_rows: Vec<ProgramEvent>,
     slots_since_flush: u64,
 }
 
-thread_local! {
-    static DATA: RefCell<ThreadLocalData> = RefCell::new(ThreadLocalData::default());
-}
+static THREAD_DATA: Lazy<DashMap<usize, ThreadData>> = Lazy::new(DashMap::new);
 
 #[derive(Row, Deserialize, Serialize, Copy, Clone, Debug, PartialEq, Eq, Hash)]
 struct ProgramEvent {
@@ -49,6 +48,32 @@ struct ProgramStats {
 /// Tracks per-program invocation counts and writes them to ClickHouse.
 pub struct ProgramTrackingPlugin;
 
+impl ProgramTrackingPlugin {
+    fn with_thread_data<F, R>(thread_id: usize, f: F) -> R
+    where
+        F: FnOnce(&mut ThreadData) -> R,
+    {
+        let mut guard = THREAD_DATA.entry(thread_id).or_default();
+        f(&mut guard)
+    }
+
+    fn drain_all_rows(block_time: Option<i64>) -> Vec<ProgramEvent> {
+        let mut rows = Vec::new();
+        for mut entry in THREAD_DATA.iter_mut() {
+            rows.extend(Self::flush_data(&mut entry, block_time));
+        }
+        rows
+    }
+
+    fn flush_data(data: &mut ThreadData, block_time: Option<i64>) -> Vec<ProgramEvent> {
+        let mut rows = std::mem::take(&mut data.pending_rows);
+        for (slot, stats) in data.slot_stats.drain() {
+            rows.extend(events_from_slot(slot, block_time, &stats));
+        }
+        rows
+    }
+}
+
 impl Plugin for ProgramTrackingPlugin {
     #[inline(always)]
     fn name(&self) -> &'static str {
@@ -58,7 +83,7 @@ impl Plugin for ProgramTrackingPlugin {
     #[inline(always)]
     fn on_transaction<'a>(
         &'a self,
-        _thread_id: usize,
+        thread_id: usize,
         _db: Option<Arc<Client>>,
         transaction: &'a TransactionData,
     ) -> PluginFuture<'a> {
@@ -85,8 +110,7 @@ impl Plugin for ProgramTrackingPlugin {
                 .unwrap_or(0) as u32;
             let program_count = program_ids.len() as u32;
 
-            DATA.with(|data| {
-                let mut data = data.borrow_mut();
+            Self::with_thread_data(thread_id, |data| {
                 let slot_data = data.slot_stats.entry(transaction.slot).or_default();
 
                 for program_id in program_ids.iter() {
@@ -120,23 +144,19 @@ impl Plugin for ProgramTrackingPlugin {
     #[inline(always)]
     fn on_block(
         &self,
-        _thread_id: usize,
+        thread_id: usize,
         db: Option<Arc<Client>>,
         block: &BlockData,
     ) -> PluginFuture<'_> {
-        let slot_info = match block {
-            BlockData::Block {
-                slot, block_time, ..
-            } => Some((*slot, *block_time)),
-            BlockData::LeaderSkipped { .. } => None,
-        };
+        let slot = block.slot();
+        let block_time = block.block_time();
+        let was_skipped = block.was_skipped();
         async move {
-            let Some((slot, block_time)) = slot_info else {
+            if was_skipped {
                 return Ok(());
-            };
+            }
 
-            let flush_rows = DATA.with(|data| {
-                let mut data = data.borrow_mut();
+            let flush_rows = Self::with_thread_data(thread_id, |data| {
                 if let Some(slot_data) = data.slot_stats.remove(&slot) {
                     let slot_rows = events_from_slot(slot, block_time, &slot_data);
                     data.pending_rows.extend(slot_rows);
@@ -154,12 +174,10 @@ impl Plugin for ProgramTrackingPlugin {
                 }
             });
 
-            if let (Some(db_client), Some(rows)) = (db, flush_rows) {
-                tokio::spawn(async move {
-                    if let Err(err) = write_program_events(db_client, rows).await {
-                        error!("failed to flush program rows: {}", err);
-                    }
-                });
+            if let (Some(db_client), Some(rows)) = (db.as_ref(), flush_rows) {
+                write_program_events(Arc::clone(db_client), rows)
+                    .await
+                    .map_err(|err| -> Box<dyn std::error::Error + Send + Sync> { Box::new(err) })?;
             }
 
             Ok(())
@@ -169,9 +187,6 @@ impl Plugin for ProgramTrackingPlugin {
 
     #[inline(always)]
     fn on_load(&self, db: Option<Arc<Client>>) -> PluginFuture<'_> {
-        // Remove invalid `get_or_init` call in `on_load`
-        DATA.with(|_| {});
-        // SLOT_TIMESTAMPS is a Lazy global, nothing to initialize
         async move {
             log::info!("Program Tracking Plugin loaded.");
             if let Some(db) = db {
@@ -188,7 +203,7 @@ impl Plugin for ProgramTrackingPlugin {
                         max_cus     UInt32,
                         total_cus   UInt32
                     )
-                    ENGINE = ReplacingMergeTree(slot)
+                    ENGINE = ReplacingMergeTree(timestamp)
                     ORDER BY (slot, program_id)
                     "#,
                 )
@@ -207,19 +222,17 @@ impl Plugin for ProgramTrackingPlugin {
     fn on_exit(&self, db: Option<Arc<Client>>) -> PluginFuture<'_> {
         async move {
             if let Some(db_client) = db {
-                let rows = DATA.with(|data| {
-                    let mut data = data.borrow_mut();
-                    let mut rows = std::mem::take(&mut data.pending_rows);
-                    for (slot, stats) in data.slot_stats.drain() {
-                        rows.extend(events_from_slot(slot, None, &stats));
-                    }
-                    rows
-                });
-                if !rows.is_empty()
-                    && let Err(err) = write_program_events(db_client, rows).await
-                {
-                    error!("failed to flush program rows on exit: {}", err);
+                let rows = Self::drain_all_rows(None);
+                if !rows.is_empty() {
+                    write_program_events(Arc::clone(&db_client), rows)
+                        .await
+                        .map_err(|err| -> Box<dyn std::error::Error + Send + Sync> {
+                            Box::new(err)
+                        })?;
                 }
+                backfill_program_timestamps(db_client)
+                    .await
+                    .map_err(|err| -> Box<dyn std::error::Error + Send + Sync> { Box::new(err) })?;
             }
             Ok(())
         }
@@ -247,14 +260,7 @@ fn events_from_slot(
     block_time: Option<i64>,
     slot_data: &HashMap<Address, ProgramStats>,
 ) -> Vec<ProgramEvent> {
-    let raw_ts = block_time.unwrap_or(0);
-    let timestamp: u32 = if raw_ts < 0 {
-        0
-    } else if raw_ts > u32::MAX as i64 {
-        u32::MAX
-    } else {
-        raw_ts as u32
-    };
+    let timestamp = clamp_block_time(block_time);
 
     slot_data
         .iter()
@@ -269,4 +275,39 @@ fn events_from_slot(
             timestamp,
         })
         .collect()
+}
+
+fn clamp_block_time(block_time: Option<i64>) -> u32 {
+    let raw_ts = block_time.unwrap_or(0);
+    if raw_ts < 0 {
+        0
+    } else if raw_ts > u32::MAX as i64 {
+        u32::MAX
+    } else {
+        raw_ts as u32
+    }
+}
+
+async fn backfill_program_timestamps(db: Arc<Client>) -> Result<(), clickhouse::error::Error> {
+    db.query(
+        r#"
+        INSERT INTO program_invocations
+        SELECT pi.slot,
+               ss.block_time,
+               pi.program_id,
+               pi.count,
+               pi.error_count,
+               pi.min_cus,
+               pi.max_cus,
+               pi.total_cus
+        FROM program_invocations AS pi
+        ANY INNER JOIN jetstreamer_slot_status AS ss USING (slot)
+        WHERE pi.timestamp = toDateTime(0)
+          AND ss.block_time > toDateTime(0)
+        "#,
+    )
+    .execute()
+    .await?;
+
+    Ok(())
 }

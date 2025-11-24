@@ -50,7 +50,8 @@ Geyser plugin locally, streamed over the internet from the Old Faithful archive.
 ## Quick Start
 
 To get an idea of what Jetstreamer is capable of, you can try out the demo CLI that runs
-Jetstreamer Runner with the Program Tracking plugin enabled:
+Jetstreamer Runner with the Program Tracking plugin enabled. Pass `--with-plugin
+instruction-tracking` (or repeat the flag to run both built-ins) to change the default set:
 
 ### Jetstreamer Runner CLI
 
@@ -64,6 +65,9 @@ JETSTREAMER_NETWORK_CAPACITY_MB=10000 cargo run --release -- 800
 # Do the same but for slots 358560000 through 367631999, which is epoch 830-850 (slot ranges can be cross-epoch!)
 # and using 8 threads explicitly instead of using automatic thread count
 JETSTREAMER_THREADS=8 cargo run --release -- 358560000:367631999
+
+# Replay epoch 800 with the instruction tracking plugin instead of the default
+cargo run --release -- 800 --with-plugin instruction-tracking
 ```
 
 If `JETSTREAMER_THREADS` is omitted, Jetstreamer auto-sizes the worker pool using the same
@@ -105,8 +109,10 @@ Implement the `Plugin` trait to observe epoch/block/transaction/reward/entry eve
 example below mirrors the crate-level documentation and demonstrates how to react to both
 transactions and blocks.
 
-Note that Jetstreamer's firehose and underlying interface emits events for leader-skipped
-blocks, unlike traditional geyser.
+Note that Jetstreamer's firehose and underlying interface emits `BlockData::PossibleLeaderSkipped`
+events whenever it observes a slot gap. These represent either leader-skipped slots or blocks
+that have not arrived yet; when the real block eventually shows up, `BlockData::Block` will be
+emitted for it just like normal geyser streams.
 
 Also note that because Jetstreamer spawns parallel threads that process different subranges of
 the overall slot range at the same time, while each thread sees a purely sequential view of
@@ -242,6 +248,66 @@ go back far enough.
 
 Epochs at or above 157 are compatible with the current Geyser plugin interface, while compute
 unit accounting first appears at epoch 450. Plan replay windows accordingly.
+
+## Installation and Setup
+
+### Nix (Recommended)
+
+For the most reliable setup, use Nix:
+
+```bash
+nix-shell
+cargo build --release
+```
+
+### Non-Nix Setup
+
+Jetstreamer requires **Clang 16** (not 17) due to RocksDB dependencies. Install dependencies and set environment variables:
+
+#### Linux (Ubuntu/Debian)
+
+```bash
+# Install Clang 16
+wget -qO- https://apt.llvm.org/llvm.sh | sudo bash -s -- 16
+sudo apt update && sudo apt install -y gcc-13 g++-13 zlib1g-dev libssl-dev libtool
+
+# Set as default
+sudo update-alternatives --install /usr/bin/clang clang /usr/bin/clang-16 100
+sudo update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-16 100
+
+# Environment variables (add to ~/.bashrc)
+export CC=clang
+export CXX=clang++
+export LIBCLANG_PATH=/usr/lib/llvm16/lib/libclang.so
+```
+
+#### Linux (Arch)
+
+```bash
+sudo pacman -S clang16 llvm16 zlib openssl libtool
+yay -S gcc13  # or use system gcc
+
+# Environment variables (add to ~/.bashrc)
+export CC=clang-16
+export CXX=clang++-16
+export LIBCLANG_PATH=/usr/lib/llvm16/lib/libclang.so
+export LD_LIBRARY_PATH=/usr/lib/llvm16/lib:$LD_LIBRARY_PATH
+```
+
+#### macOS
+
+```bash
+brew install llvm@16 zlib openssl libtool
+
+# Environment variables (add to ~/.zshrc)
+export CC=/opt/homebrew/opt/llvm@16/bin/clang
+export CXX=/opt/homebrew/opt/llvm@16/bin/clang++
+export LIBCLANG_PATH=/opt/homebrew/opt/llvm@16/lib/libclang.dylib
+export LDFLAGS="-L/opt/homebrew/opt/llvm@16/lib"
+export CPPFLAGS="-I/opt/homebrew/opt/llvm@16/include"
+```
+
+**Troubleshooting**: If you get RocksDB compilation errors, ensure you're using Clang 16 (not 17) and `LIBCLANG_PATH` is correctly set.
 
 ## Developing Locally
 

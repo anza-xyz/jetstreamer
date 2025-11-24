@@ -33,11 +33,14 @@ use crate::{
 };
 use cid::{Cid, multibase::Base};
 use dashmap::{DashMap, mapref::entry::Entry};
+use futures_util::StreamExt;
 use log::{info, warn};
-use once_cell::sync::Lazy;
+use once_cell::sync::{Lazy, OnceCell as SyncOnceCell};
 use reqwest::{Client, StatusCode, Url, header::RANGE};
 use serde_cbor::Value;
-use std::{collections::HashMap, future::Future, ops::Range, sync::Arc, time::Duration};
+#[cfg(test)]
+use std::time::Instant;
+use std::{collections::HashMap, ops::RangeInclusive, sync::Arc, time::Duration};
 use thiserror::Error;
 use tokio::{sync::OnceCell, time::sleep};
 use xxhash_rust::xxh64::xxh64;
@@ -124,8 +127,18 @@ impl RemoteObject {
         }
     }
 
-    fn url(&self) -> &Url {
+    const fn url(&self) -> &Url {
         &self.url
+    }
+
+    async fn fetch_full(&self) -> Result<Vec<u8>, SlotOffsetIndexError> {
+        match &self.kind {
+            RemoteObjectKind::Http { client } => fetch_full(client, &self.url).await,
+            #[cfg(feature = "s3-backend")]
+            RemoteObjectKind::S3 { location, key } => {
+                fetch_s3_full(location, key.as_str(), &self.url).await
+            }
+        }
     }
 
     async fn fetch_range(
@@ -136,11 +149,11 @@ impl RemoteObject {
     ) -> Result<Vec<u8>, SlotOffsetIndexError> {
         match &self.kind {
             RemoteObjectKind::Http { client } => {
-                fetch_http_range(client.clone(), self.url.clone(), start, end, exact).await
+                fetch_http_range(client, &self.url, start, end, exact).await
             }
             #[cfg(feature = "s3-backend")]
             RemoteObjectKind::S3 { location, key } => {
-                fetch_s3_range(location, key.as_str(), self.url.clone(), start, end, exact).await
+                fetch_s3_range(location, key.as_str(), &self.url, start, end, exact).await
             }
         }
     }
@@ -192,67 +205,14 @@ pub struct SlotOffsetIndex {
 }
 
 struct EpochEntry {
-    once: OnceCell<Arc<EpochIndex>>,
-}
-
-struct EpochIndex {
-    slot_range: Range<u64>,
-    slot_index: RemoteCompactIndex,
-    cid_index: RemoteCompactIndex,
-    slot_cache: DashMap<u64, (u64, u32)>,
+    indexes: OnceCell<Arc<EpochIndexes>>,
 }
 
 impl EpochEntry {
     fn new() -> Self {
         Self {
-            once: OnceCell::new(),
+            indexes: OnceCell::new(),
         }
-    }
-
-    async fn get_or_load<F, Fut>(&self, loader: F) -> Result<Arc<EpochIndex>, SlotOffsetIndexError>
-    where
-        F: FnOnce() -> Fut,
-        Fut: Future<Output = Result<Arc<EpochIndex>, SlotOffsetIndexError>>,
-    {
-        self.once
-            .get_or_try_init(|| async { loader().await })
-            .await
-            .map(Arc::clone)
-    }
-}
-
-impl EpochIndex {
-    async fn offset_for_slot(&self, slot: u64) -> Result<u64, SlotOffsetIndexError> {
-        if !self.slot_range.contains(&slot) {
-            return Err(SlotOffsetIndexError::IndexFormatError(
-                self.slot_index.url().clone(),
-                format!("slot {slot} not in epoch slot range"),
-            ));
-        }
-
-        if let Some(entry) = self.slot_cache.get(&slot) {
-            return Ok(entry.value().0);
-        }
-
-        let slot_key = slot.to_le_bytes();
-        let slot_value = match self.slot_index.lookup(&slot_key).await? {
-            Some(bytes) => bytes,
-            None => {
-                let index_url = self.slot_index.url().clone();
-                return Err(SlotOffsetIndexError::SlotNotFound(slot, index_url));
-            }
-        };
-
-        let (offset, size) = match self.cid_index.lookup(&slot_value).await? {
-            Some(bytes) => decode_offset_and_size(&bytes, self.cid_index.url()),
-            None => {
-                let index_url = self.cid_index.url().clone();
-                return Err(SlotOffsetIndexError::SlotNotFound(slot, index_url));
-            }
-        }?;
-
-        self.slot_cache.insert(slot, (offset, size));
-        Ok(offset)
     }
 }
 
@@ -298,45 +258,10 @@ impl SlotOffsetIndex {
         &self.base_url
     }
 
-    async fn get_epoch(&self, epoch: u64) -> Result<Arc<EpochIndex>, SlotOffsetIndexError> {
-        let cache_key = EpochCacheKey::new(&self.cache_namespace, epoch);
-        if let Some(entry_ref) = EPOCH_CACHE.get(&cache_key) {
-            let entry_arc = Arc::clone(entry_ref.value());
-            drop(entry_ref);
-            return entry_arc
-                .get_or_load(|| async { self.load_epoch(epoch).await })
-                .await;
-        }
-
-        let new_entry = Arc::new(EpochEntry::new());
-        let entry_arc = match EPOCH_CACHE.entry(cache_key) {
-            Entry::Occupied(occupied) => Arc::clone(occupied.get()),
-            Entry::Vacant(vacant) => {
-                vacant.insert(Arc::clone(&new_entry));
-                new_entry
-            }
-        };
-
-        entry_arc
-            .get_or_load(|| async { self.load_epoch(epoch).await })
-            .await
-    }
-
-    async fn load_epoch(&self, epoch: u64) -> Result<Arc<EpochIndex>, SlotOffsetIndexError> {
-        let (slot_index, cid_index) = self.load_epoch_indexes(epoch).await?;
-        let (slot_start, slot_end_inclusive) = epoch_to_slot_range(epoch);
-        Ok(Arc::new(EpochIndex {
-            slot_range: slot_start..(slot_end_inclusive + 1),
-            slot_index,
-            cid_index,
-            slot_cache: DashMap::new(),
-        }))
-    }
-
     async fn load_epoch_indexes(
         &self,
         epoch: u64,
-    ) -> Result<(RemoteCompactIndex, RemoteCompactIndex), SlotOffsetIndexError> {
+    ) -> Result<(SlotCidIndex, CidOffsetIndex), SlotOffsetIndexError> {
         let car_path = format!("{epoch}/epoch-{epoch}.car");
         let car_object = self.remote_for_path(&car_path)?;
         let (root_cid, car_url) = fetch_epoch_root(&car_object).await?;
@@ -358,12 +283,13 @@ impl SlotOffsetIndex {
         let slot_object = self.remote_for_path(&slot_index_path)?;
         let cid_object = self.remote_for_path(&cid_index_path)?;
 
-        let slot_index = RemoteCompactIndex::open(slot_object, SLOT_TO_CID_KIND, None).await?;
+        let slot_index =
+            SlotCidIndex::open(slot_object, SLOT_TO_CID_KIND, None).await?;
 
-        let cid_index = RemoteCompactIndex::open(
+        let cid_index = CidOffsetIndex::open(
             cid_object,
             CID_TO_OFFSET_KIND,
-            Some(RemoteCompactIndex::OFFSET_AND_SIZE_VALUE_SIZE),
+            Some(CidOffsetIndex::OFFSET_AND_SIZE_VALUE_SIZE),
         )
         .await?;
 
@@ -389,9 +315,36 @@ impl SlotOffsetIndex {
 
     /// Resolves the byte offset of `slot` within its Old Faithful CAR archive.
     pub async fn get_offset(&self, slot: u64) -> Result<u64, SlotOffsetIndexError> {
+        if let Some(offset) = SLOT_OFFSET_RESULT_CACHE.get(&slot) {
+            return Ok(*offset);
+        }
+
         let epoch = slot_to_epoch(slot);
-        let epoch_index = self.get_epoch(epoch).await?;
-        epoch_index.offset_for_slot(slot).await
+        let cache_key = EpochCacheKey::new(&self.cache_namespace, epoch);
+        let entry_arc = EPOCH_CACHE
+            .entry(cache_key.clone())
+            .or_insert_with(|| Arc::new(EpochEntry::new()))
+            .clone();
+
+        let indexes = entry_arc
+            .indexes
+            .get_or_try_init(|| async {
+                let (slot_index, cid_index) = self.load_epoch_indexes(epoch).await?;
+                let (slot_start, slot_end_inclusive) = epoch_to_slot_range(epoch);
+                Ok(Arc::new(EpochIndexes::new(
+                    slot_index,
+                    cid_index,
+                    slot_start,
+                    slot_end_inclusive,
+                )))
+            })
+            .await?
+            .clone();
+
+        let offset = indexes.lookup_slot(slot).await?;
+        SLOT_OFFSET_RESULT_CACHE.insert(slot, offset);
+
+        Ok(offset)
     }
 
     fn remote_for_path(&self, path: &str) -> Result<RemoteObject, SlotOffsetIndexError> {
@@ -414,13 +367,65 @@ impl SlotOffsetIndex {
     }
 }
 
+struct EpochIndexes {
+    slot_index: Arc<SlotCidIndex>,
+    cid_index: Arc<CidOffsetIndex>,
+    slot_cid_cache: DashMap<u64, Arc<[u8]>>,
+    slot_range: RangeInclusive<u64>,
+}
+
+impl EpochIndexes {
+    fn new(
+        slot_index: SlotCidIndex,
+        cid_index: CidOffsetIndex,
+        slot_start: u64,
+        slot_end_inclusive: u64,
+    ) -> Self {
+        Self {
+            slot_index: Arc::new(slot_index),
+            cid_index: Arc::new(cid_index),
+            slot_cid_cache: DashMap::new(),
+            slot_range: slot_start..=slot_end_inclusive,
+        }
+    }
+
+    async fn lookup_slot(&self, slot: u64) -> Result<u64, SlotOffsetIndexError> {
+        if !self.slot_range.contains(&slot) {
+            return Err(SlotOffsetIndexError::IndexFormatError(
+                self.slot_index.url().clone(),
+                format!("slot {slot} not in epoch slot range"),
+            ));
+        }
+
+        let cid = if let Some(entry) = self.slot_cid_cache.get(&slot) {
+            Arc::clone(entry.value())
+        } else {
+            let bytes = self.slot_index.lookup(slot)?;
+            let cid = Arc::<[u8]>::from(bytes);
+            self.slot_cid_cache.insert(slot, Arc::clone(&cid));
+            cid
+        };
+
+        let (offset, _) = match self.cid_index.lookup(cid.as_ref()).await? {
+            Some(bytes) => decode_offset_and_size(&bytes, self.cid_index.url()),
+            None => {
+                return Err(SlotOffsetIndexError::SlotNotFound(
+                    slot,
+                    self.cid_index.url().clone(),
+                ));
+            }
+        }?;
+        Ok(offset)
+    }
+}
+
 fn decode_offset_and_size(value: &[u8], url: &Url) -> Result<(u64, u32), SlotOffsetIndexError> {
-    if value.len() != RemoteCompactIndex::OFFSET_AND_SIZE_VALUE_SIZE as usize {
+    if value.len() != CidOffsetIndex::OFFSET_AND_SIZE_VALUE_SIZE as usize {
         return Err(SlotOffsetIndexError::IndexFormatError(
             url.clone(),
             format!(
                 "offset-and-size entry expected {} bytes, got {}",
-                RemoteCompactIndex::OFFSET_AND_SIZE_VALUE_SIZE,
+                CidOffsetIndex::OFFSET_AND_SIZE_VALUE_SIZE,
                 value.len()
             ),
         ));
@@ -435,13 +440,181 @@ fn decode_offset_and_size(value: &[u8], url: &Url) -> Result<(u64, u32), SlotOff
     Ok((offset, size))
 }
 
-struct RemoteCompactIndex {
-    object: RemoteObject,
-    header: CompactIndexHeader,
-    bucket_entries: DashMap<u32, Arc<BucketEntry>>,
+struct RemoteIndexFile {
+    url: Url,
+    data: Arc<[u8]>,
 }
 
-impl RemoteCompactIndex {
+impl RemoteIndexFile {
+    async fn download(object: &RemoteObject) -> Result<Self, SlotOffsetIndexError> {
+        let url = object.url().clone();
+        let bytes = object.fetch_full().await?;
+        Ok(Self {
+            url,
+            data: Arc::from(bytes),
+        })
+    }
+
+    const fn url(&self) -> &Url {
+        &self.url
+    }
+
+    fn slice(&self, offset: usize, len: usize) -> Result<&[u8], SlotOffsetIndexError> {
+        let end = offset.checked_add(len).ok_or_else(|| {
+            SlotOffsetIndexError::IndexFormatError(
+                self.url.clone(),
+                "slice range overflowed usize".into(),
+            )
+        })?;
+        if end > self.data.len() {
+            return Err(SlotOffsetIndexError::IndexFormatError(
+                self.url.clone(),
+                format!("slice {offset}-{end} exceeds file size {}", self.data.len()),
+            ));
+        }
+        Ok(&self.data[offset..end])
+    }
+
+    fn slice_u64(&self, offset: u64, len: usize) -> Result<&[u8], SlotOffsetIndexError> {
+        let start = usize::try_from(offset).map_err(|_| {
+            SlotOffsetIndexError::IndexFormatError(
+                self.url.clone(),
+                format!("offset {offset} exceeds usize bounds"),
+            )
+        })?;
+        self.slice(start, len)
+    }
+
+    fn bytes(&self) -> &[u8] {
+        &self.data
+    }
+}
+
+struct SlotCidIndex {
+    file: Arc<RemoteIndexFile>,
+    header: CompactIndexHeader,
+    bucket_entries: DashMap<u32, Arc<SlotBucketEntry>>,
+}
+
+impl SlotCidIndex {
+    async fn open(
+        object: RemoteObject,
+        expected_kind: &[u8],
+        expected_value_size: Option<u64>,
+    ) -> Result<Self, SlotOffsetIndexError> {
+        let kind_label = std::str::from_utf8(expected_kind).unwrap_or("index");
+        let url = object.url().clone();
+        let epoch_hint = url
+            .path_segments()
+            .and_then(|mut segments| segments.next_back())
+            .and_then(|name| name.split('-').nth(1))
+            .and_then(|value| value.parse::<u64>().ok());
+        if let Some(epoch) = epoch_hint {
+            info!(
+                target: LOG_MODULE,
+                "Fetching {kind_label} compact index for epoch {epoch}"
+            );
+        } else {
+            info!(
+                target: LOG_MODULE,
+                "Fetching {kind_label} compact index"
+            );
+        }
+
+        let file = Arc::new(RemoteIndexFile::download(&object).await?);
+        let header =
+            parse_compact_index_header(file.bytes(), &url, expected_kind, expected_value_size)?;
+        Ok(Self {
+            file,
+            header,
+            bucket_entries: DashMap::new(),
+        })
+    }
+
+    fn lookup(&self, slot: u64) -> Result<Vec<u8>, SlotOffsetIndexError> {
+        let key = slot.to_le_bytes();
+        match self.lookup_raw(&key)? {
+            Some(bytes) => Ok(bytes),
+            None => Err(SlotOffsetIndexError::SlotNotFound(slot, self.url().clone())),
+        }
+    }
+
+    fn lookup_raw(&self, key: &[u8]) -> Result<Option<Vec<u8>>, SlotOffsetIndexError> {
+        let bucket_index = self.bucket_hash(key);
+        let bucket = self.get_bucket(bucket_index)?;
+        bucket.lookup(key)
+    }
+
+    fn metadata_epoch(&self) -> Option<u64> {
+        self.header.metadata_epoch()
+    }
+
+    fn url(&self) -> &Url {
+        self.file.url()
+    }
+
+    fn bucket_hash(&self, key: &[u8]) -> u32 {
+        let h = xxh64(key, 0);
+        let n = self.header.num_buckets as u64;
+        let mut u = h % n;
+        if ((h - u) / n) < u {
+            u = hash_uint64(u);
+        }
+        (u % n) as u32
+    }
+
+    fn get_bucket(&self, index: u32) -> Result<Arc<SlotBucketData>, SlotOffsetIndexError> {
+        let entry = match self.bucket_entries.entry(index) {
+            Entry::Occupied(occupied) => Arc::clone(occupied.get()),
+            Entry::Vacant(vacant) => {
+                let new_entry = Arc::new(SlotBucketEntry::new());
+                vacant.insert(Arc::clone(&new_entry));
+                new_entry
+            }
+        };
+        entry.get_or_load(|| self.load_bucket(index))
+    }
+
+    fn load_bucket(&self, index: u32) -> Result<Arc<SlotBucketData>, SlotOffsetIndexError> {
+        let bucket_header_offset =
+            self.header.header_size + (index as u64) * BUCKET_HEADER_SIZE as u64;
+        let header_slice = self
+            .file
+            .slice_u64(bucket_header_offset, BUCKET_HEADER_SIZE)?;
+        let mut header_bytes = [0u8; BUCKET_HEADER_SIZE];
+        header_bytes.copy_from_slice(header_slice);
+        let bucket_header = BucketHeader::from_bytes(header_bytes);
+        let stride = bucket_header.hash_len as usize + self.header.value_size as usize;
+        let data_len = stride * bucket_header.num_entries as usize;
+        let data_start = usize::try_from(bucket_header.file_offset).map_err(|_| {
+            SlotOffsetIndexError::IndexFormatError(
+                self.url().clone(),
+                format!(
+                    "bucket data offset {} exceeds usize bounds",
+                    bucket_header.file_offset
+                ),
+            )
+        })?;
+        // Ensure the bucket contents reside inside the downloaded file.
+        let _ = self.file.slice(data_start, data_len)?;
+
+        Ok(Arc::new(SlotBucketData::new(
+            bucket_header,
+            Arc::clone(&self.file),
+            data_start,
+            stride,
+            self.header.value_size as usize,
+        )))
+    }
+}
+
+struct CidOffsetIndex {
+    object: RemoteObject,
+    header: CompactIndexHeader,
+    bucket_entries: DashMap<u32, Arc<RemoteBucketEntry>>,
+}
+
+impl CidOffsetIndex {
     const OFFSET_AND_SIZE_VALUE_SIZE: u64 = 9;
 
     async fn open(
@@ -500,11 +673,11 @@ impl RemoteCompactIndex {
         (u % n) as u32
     }
 
-    async fn get_bucket(&self, index: u32) -> Result<Arc<BucketData>, SlotOffsetIndexError> {
+    async fn get_bucket(&self, index: u32) -> Result<Arc<RemoteBucketData>, SlotOffsetIndexError> {
         let entry = match self.bucket_entries.entry(index) {
             Entry::Occupied(occupied) => Arc::clone(occupied.get()),
             Entry::Vacant(vacant) => {
-                let new_entry = Arc::new(BucketEntry::new());
+                let new_entry = Arc::new(RemoteBucketEntry::new());
                 vacant.insert(Arc::clone(&new_entry));
                 new_entry
             }
@@ -514,7 +687,7 @@ impl RemoteCompactIndex {
             .await
     }
 
-    async fn load_bucket(&self, index: u32) -> Result<Arc<BucketData>, SlotOffsetIndexError> {
+    async fn load_bucket(&self, index: u32) -> Result<Arc<RemoteBucketData>, SlotOffsetIndexError> {
         let bucket_header_offset =
             self.header.header_size + (index as u64) * BUCKET_HEADER_SIZE as u64;
         let header_bytes = self
@@ -551,7 +724,7 @@ impl RemoteCompactIndex {
             ));
         }
 
-        Ok(Arc::new(BucketData::new(
+        Ok(Arc::new(RemoteBucketData::new(
             bucket_header,
             data,
             stride,
@@ -580,14 +753,63 @@ impl CompactIndexHeader {
     }
 }
 
-struct BucketData {
+struct SlotBucketData {
+    header: BucketHeader,
+    file: Arc<RemoteIndexFile>,
+    data_offset: usize,
+    stride: usize,
+    value_width: usize,
+}
+
+impl SlotBucketData {
+    const fn new(
+        header: BucketHeader,
+        file: Arc<RemoteIndexFile>,
+        data_offset: usize,
+        stride: usize,
+        value_width: usize,
+    ) -> Self {
+        Self {
+            header,
+            file,
+            data_offset,
+            stride,
+            value_width,
+        }
+    }
+
+    fn lookup(&self, key: &[u8]) -> Result<Option<Vec<u8>>, SlotOffsetIndexError> {
+        let target_hash = truncated_entry_hash(self.header.hash_domain, key, self.header.hash_len);
+        let max = self.header.num_entries as usize;
+        let hash_len = self.header.hash_len as usize;
+
+        let mut index = 0usize;
+        while index < max {
+            let offset = index * self.stride;
+            let hash_slice = self.file.slice(self.data_offset + offset, hash_len)?;
+            let hash = read_hash(hash_slice);
+            if hash == target_hash {
+                let value_start = self.data_offset + offset + hash_len;
+                let value_slice = self.file.slice(value_start, self.value_width)?;
+                return Ok(Some(value_slice.to_vec()));
+            }
+            index = (index << 1) | 1;
+            if hash < target_hash {
+                index += 1;
+            }
+        }
+        Ok(None)
+    }
+}
+
+struct RemoteBucketData {
     header: BucketHeader,
     data: Vec<u8>,
     stride: usize,
     value_width: usize,
 }
 
-impl BucketData {
+impl RemoteBucketData {
     const fn new(header: BucketHeader, data: Vec<u8>, stride: usize, value_width: usize) -> Self {
         Self {
             header,
@@ -620,21 +842,43 @@ impl BucketData {
     }
 }
 
-struct BucketEntry {
-    once: OnceCell<Arc<BucketData>>,
+struct SlotBucketEntry {
+    once: SyncOnceCell<Arc<SlotBucketData>>,
 }
 
-impl BucketEntry {
+impl SlotBucketEntry {
+    fn new() -> Self {
+        Self {
+            once: SyncOnceCell::new(),
+        }
+    }
+
+    fn get_or_load<F>(&self, loader: F) -> Result<Arc<SlotBucketData>, SlotOffsetIndexError>
+    where
+        F: FnOnce() -> Result<Arc<SlotBucketData>, SlotOffsetIndexError>,
+    {
+        self.once.get_or_try_init(loader).map(Arc::clone)
+    }
+}
+
+struct RemoteBucketEntry {
+    once: OnceCell<Arc<RemoteBucketData>>,
+}
+
+impl RemoteBucketEntry {
     fn new() -> Self {
         Self {
             once: OnceCell::new(),
         }
     }
 
-    async fn get_or_load<F, Fut>(&self, loader: F) -> Result<Arc<BucketData>, SlotOffsetIndexError>
+    async fn get_or_load<F, Fut>(
+        &self,
+        loader: F,
+    ) -> Result<Arc<RemoteBucketData>, SlotOffsetIndexError>
     where
         F: FnOnce() -> Fut,
-        Fut: Future<Output = Result<Arc<BucketData>, SlotOffsetIndexError>>,
+        Fut: std::future::Future<Output = Result<Arc<RemoteBucketData>, SlotOffsetIndexError>>,
     {
         self.once
             .get_or_try_init(|| async { loader().await })
@@ -747,16 +991,49 @@ async fn fetch_and_parse_header(
         }
     }
 
-    let value_size = u64::from_le_bytes(bytes[12..20].try_into().unwrap());
-    let num_buckets = u32::from_le_bytes(bytes[20..24].try_into().unwrap());
-    let version = bytes[24];
+    parse_compact_index_header(&bytes, url, expected_kind, expected_value_size)
+}
+
+fn parse_compact_index_header(
+    data: &[u8],
+    url: &Url,
+    expected_kind: &[u8],
+    expected_value_size: Option<u64>,
+) -> Result<CompactIndexHeader, SlotOffsetIndexError> {
+    if data.len() < 12 {
+        return Err(SlotOffsetIndexError::IndexFormatError(
+            url.clone(),
+            "index header shorter than 12 bytes".into(),
+        ));
+    }
+    if data[..8] != COMPACT_INDEX_MAGIC[..] {
+        return Err(SlotOffsetIndexError::IndexFormatError(
+            url.clone(),
+            "invalid compactindex magic".into(),
+        ));
+    }
+    let header_len = u32::from_le_bytes(data[8..12].try_into().unwrap()) as usize;
+    let total_header_size = 8 + 4 + header_len;
+    if data.len() < total_header_size {
+        return Err(SlotOffsetIndexError::IndexFormatError(
+            url.clone(),
+            format!(
+                "incomplete index header: expected {total_header_size} bytes, got {}",
+                data.len()
+            ),
+        ));
+    }
+
+    let value_size = u64::from_le_bytes(data[12..20].try_into().unwrap());
+    let num_buckets = u32::from_le_bytes(data[20..24].try_into().unwrap());
+    let version = data[24];
     if version != 1 {
         return Err(SlotOffsetIndexError::IndexFormatError(
             url.clone(),
             format!("unsupported compactindex version {version}"),
         ));
     }
-    let metadata_slice = &bytes[25..total_header_size];
+    let metadata_slice = &data[25..total_header_size];
     let metadata = parse_metadata(metadata_slice).map_err(|msg| {
         SlotOffsetIndexError::IndexFormatError(url.clone(), format!("invalid metadata: {msg}"))
     })?;
@@ -890,9 +1167,115 @@ fn decode_cid_bytes(bytes: &[u8]) -> Result<Cid, String> {
         .unwrap_or_else(|| "invalid CID bytes".into()))
 }
 
+async fn fetch_full(client: &Client, url: &Url) -> Result<Vec<u8>, SlotOffsetIndexError> {
+    let mut attempt = 0usize;
+    loop {
+        let response = match client.get(url.clone()).send().await {
+            Ok(resp) => resp,
+            Err(err) => {
+                if attempt < FETCH_RANGE_MAX_RETRIES {
+                    let delay_ms =
+                        FETCH_RANGE_BASE_DELAY_MS.saturating_mul(1u64 << attempt.min(10));
+                    warn!(
+                        target: LOG_MODULE,
+                        "Network error fetching {}: {}; retrying in {} ms (attempt {}/{})",
+                        url,
+                        err,
+                        delay_ms,
+                        attempt + 1,
+                        FETCH_RANGE_MAX_RETRIES
+                    );
+                    sleep(Duration::from_millis(delay_ms)).await;
+                    attempt += 1;
+                    continue;
+                }
+                return Err(SlotOffsetIndexError::NetworkError(url.clone(), err));
+            }
+        };
+
+        if response.status() == StatusCode::NOT_FOUND {
+            return Err(SlotOffsetIndexError::EpochIndexFileNotFound(url.clone()));
+        }
+
+        if response.status() == StatusCode::TOO_MANY_REQUESTS
+            || response.status() == StatusCode::SERVICE_UNAVAILABLE
+        {
+            if attempt < FETCH_RANGE_MAX_RETRIES {
+                let delay_ms = FETCH_RANGE_BASE_DELAY_MS.saturating_mul(1u64 << attempt.min(10));
+                warn!(
+                    target: LOG_MODULE,
+                    "HTTP {} fetching {}; retrying in {} ms (attempt {}/{})",
+                    response.status(),
+                    url,
+                    delay_ms,
+                    attempt + 1,
+                    FETCH_RANGE_MAX_RETRIES
+                );
+                sleep(Duration::from_millis(delay_ms)).await;
+                attempt += 1;
+                continue;
+            }
+            return Err(SlotOffsetIndexError::HttpStatusError(
+                url.clone(),
+                response.status(),
+            ));
+        }
+
+        if !response.status().is_success() {
+            return Err(SlotOffsetIndexError::HttpStatusError(
+                url.clone(),
+                response.status(),
+            ));
+        }
+
+        match read_response_with_progress(response, url).await {
+            Ok(bytes) => return Ok(bytes),
+            Err(err @ SlotOffsetIndexError::NetworkError(_, _)) => {
+                if attempt < FETCH_RANGE_MAX_RETRIES {
+                    let delay_ms =
+                        FETCH_RANGE_BASE_DELAY_MS.saturating_mul(1u64 << attempt.min(10));
+                    warn!(
+                        target: LOG_MODULE,
+                        "Error reading {} body: {}; retrying in {} ms (attempt {}/{})",
+                        url,
+                        err,
+                        delay_ms,
+                        attempt + 1,
+                        FETCH_RANGE_MAX_RETRIES
+                    );
+                    sleep(Duration::from_millis(delay_ms)).await;
+                    attempt += 1;
+                    continue;
+                }
+                return Err(err);
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+async fn read_response_with_progress(
+    response: reqwest::Response,
+    url: &Url,
+) -> Result<Vec<u8>, SlotOffsetIndexError> {
+    let total_len = response.content_length();
+    let mut bytes = match total_len.and_then(|len| usize::try_from(len).ok()) {
+        Some(len) => Vec::with_capacity(len),
+        None => Vec::new(),
+    };
+    let mut stream = response.bytes_stream();
+    while let Some(chunk_result) = stream.next().await {
+        let chunk =
+            chunk_result.map_err(|err| SlotOffsetIndexError::NetworkError(url.clone(), err))?;
+        bytes.extend_from_slice(&chunk);
+    }
+
+    Ok(bytes)
+}
+
 async fn fetch_http_range(
-    client: Client,
-    url: Url,
+    client: &Client,
+    url: &Url,
     start: u64,
     end: u64,
     exact: bool,
@@ -903,12 +1286,35 @@ async fn fetch_http_range(
     let range_header = format!("bytes={start}-{end}");
     let mut attempt = 0usize;
     loop {
-        let response = client
+        let response = match client
             .get(url.clone())
             .header(RANGE, range_header.clone())
             .send()
             .await
-            .map_err(|err| SlotOffsetIndexError::NetworkError(url.clone(), err))?;
+        {
+            Ok(resp) => resp,
+            Err(err) => {
+                if attempt < FETCH_RANGE_MAX_RETRIES {
+                    let delay_ms =
+                        FETCH_RANGE_BASE_DELAY_MS.saturating_mul(1u64 << attempt.min(10));
+                    warn!(
+                        target: LOG_MODULE,
+                        "Network error fetching {} (range {}-{}): {}; retrying in {} ms (attempt {}/{})",
+                        url,
+                        start,
+                        end,
+                        err,
+                        delay_ms,
+                        attempt + 1,
+                        FETCH_RANGE_MAX_RETRIES
+                    );
+                    sleep(Duration::from_millis(delay_ms)).await;
+                    attempt += 1;
+                    continue;
+                }
+                return Err(SlotOffsetIndexError::NetworkError(url.clone(), err));
+            }
+        };
 
         if response.status() == StatusCode::NOT_FOUND {
             return Err(SlotOffsetIndexError::EpochIndexFileNotFound(url.clone()));
@@ -947,10 +1353,30 @@ async fn fetch_http_range(
             ));
         }
 
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|err| SlotOffsetIndexError::NetworkError(url.clone(), err))?;
+        let bytes = match response.bytes().await {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                if attempt < FETCH_RANGE_MAX_RETRIES {
+                    let delay_ms =
+                        FETCH_RANGE_BASE_DELAY_MS.saturating_mul(1u64 << attempt.min(10));
+                    warn!(
+                        target: LOG_MODULE,
+                        "Error reading {} (range {}-{}) body: {}; retrying in {} ms (attempt {}/{})",
+                        url,
+                        start,
+                        end,
+                        err,
+                        delay_ms,
+                        attempt + 1,
+                        FETCH_RANGE_MAX_RETRIES
+                    );
+                    sleep(Duration::from_millis(delay_ms)).await;
+                    attempt += 1;
+                    continue;
+                }
+                return Err(SlotOffsetIndexError::NetworkError(url.clone(), err));
+            }
+        };
         let expected = (end - start + 1) as usize;
         if exact && bytes.len() != expected {
             return Err(SlotOffsetIndexError::IndexFormatError(
@@ -963,10 +1389,32 @@ async fn fetch_http_range(
 }
 
 #[cfg(feature = "s3-backend")]
+async fn fetch_s3_full(
+    location: &Arc<S3Location>,
+    key: &str,
+    url: &Url,
+) -> Result<Vec<u8>, SlotOffsetIndexError> {
+    let resp = location
+        .client
+        .get_object()
+        .bucket(location.bucket.as_ref())
+        .key(key)
+        .send()
+        .await
+        .map_err(|err| SlotOffsetIndexError::S3Error(url.clone(), err.to_string()))?;
+    let body = resp
+        .body
+        .collect()
+        .await
+        .map_err(|err| SlotOffsetIndexError::S3Error(url.clone(), err.to_string()))?;
+    Ok(body.into_bytes().to_vec())
+}
+
+#[cfg(feature = "s3-backend")]
 async fn fetch_s3_range(
     location: &Arc<S3Location>,
     key: &str,
-    url: Url,
+    url: &Url,
     start: u64,
     end: u64,
     exact: bool,
@@ -993,7 +1441,7 @@ async fn fetch_s3_range(
     let expected = (end - start + 1) as usize;
     if exact && data.len() != expected {
         return Err(SlotOffsetIndexError::IndexFormatError(
-            url,
+            url.clone(),
             format!("expected {expected} bytes, got {}", data.len()),
         ));
     }
@@ -1039,7 +1487,7 @@ fn parse_metadata(data: &[u8]) -> Result<HashMap<Vec<u8>, Vec<u8>>, String> {
 /// The resolution order is:
 /// 1. `JETSTREAMER_COMPACT_INDEX_BASE_URL`
 /// 2. `JETSTREAMER_ARCHIVE_BASE`
-/// 3. `JETSTREAMER_HTTP_BASE_URL` (falling back to [`BASE_URL`])
+/// 3. `JETSTREAMER_HTTP_BASE_URL` (falling back to the built-in public mirror)
 ///
 /// All three knobs accept either `https://` URLs or `s3://bucket/prefix` URIs.
 ///
@@ -1056,4 +1504,101 @@ fn parse_metadata(data: &[u8]) -> Result<HashMap<Vec<u8>, Vec<u8>>, String> {
 /// ```
 pub fn get_index_base_url() -> Result<Url, SlotOffsetIndexError> {
     Ok(archive::index_location().url().clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn init_logger() {
+        static INIT: std::sync::Once = std::sync::Once::new();
+        INIT.call_once(|| {
+            solana_logger::setup_with_default("info");
+        });
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore]
+    async fn test_epoch_800_hydration_time() {
+        init_logger();
+        SLOT_OFFSET_RESULT_CACHE.clear();
+        EPOCH_CACHE.clear();
+
+        let base = get_index_base_url().expect("base url");
+        let index = SlotOffsetIndex::new(base).expect("slot offset index");
+        let epoch = 800;
+        let download_started = Instant::now();
+        let (_slot_index, _cid_index) = index
+            .load_epoch_indexes(epoch)
+            .await
+            .expect("download epoch indexes");
+        let download_elapsed = download_started.elapsed();
+
+        let (slot_start, slot_end) = epoch_to_slot_range(epoch);
+        info!(
+            target: LOG_MODULE,
+            "epoch {epoch} index download took {:?}",
+            download_elapsed
+        );
+        let mut previous_offset = None;
+        let mut successful_slots: Vec<(u64, u64)> = Vec::new();
+        let mut slot = slot_start;
+        while successful_slots.len() < 10 && slot <= slot_end {
+            let lookup_started = Instant::now();
+            match index.get_offset(slot).await {
+                Ok(offset) => {
+                    let elapsed = lookup_started.elapsed();
+                    info!(
+                        target: LOG_MODULE,
+                        "epoch {epoch} lookup {} for slot {slot} returned offset {offset} in {:?}",
+                        successful_slots.len(),
+                        elapsed
+                    );
+                    if let Some(prev) = previous_offset {
+                        assert!(
+                            offset >= prev,
+                            "slot offsets must be non-decreasing (prev {prev}, now {offset})"
+                        );
+                    }
+                    successful_slots.push((slot, offset));
+                    previous_offset = Some(offset);
+                }
+                Err(SlotOffsetIndexError::SlotNotFound(_, _)) => {
+                    info!(
+                        target: LOG_MODULE,
+                        "epoch {epoch} skipping leader-missing slot {slot}"
+                    );
+                }
+                Err(err) => panic!("lookup for slot {slot} failed: {err}"),
+            }
+            slot += 1;
+        }
+        assert!(
+            successful_slots.len() == 10,
+            "epoch {epoch} expected 10 successful slots starting at {slot_start}, only found {}",
+            successful_slots.len()
+        );
+
+        info!(
+            target: LOG_MODULE,
+            "Repeating first three successful slot lookups to verify caching"
+        );
+        for (idx, (slot, offset)) in successful_slots.iter().take(3).enumerate() {
+            let lookup_started = Instant::now();
+            let repeat = index
+                .get_offset(*slot)
+                .await
+                .unwrap_or_else(|err| panic!("repeat lookup for slot {slot} failed: {err}"));
+            assert_eq!(
+                *offset, repeat,
+                "repeat lookup for slot {slot} returned different offset (expected {offset}, got {repeat})"
+            );
+            let elapsed = lookup_started.elapsed();
+            info!(
+                target: LOG_MODULE,
+                "epoch {epoch} repeat lookup {idx} for slot {slot} returned offset {repeat} in {:?}",
+                elapsed
+            );
+        }
+    }
 }

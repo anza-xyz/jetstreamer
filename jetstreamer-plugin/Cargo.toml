@@ -22,3 +22,4 @@ futures-util.workspace = true
 thiserror.workspace = true
 sha2.workspace = true
 dashmap.workspace = true
+once_cell.workspace = true

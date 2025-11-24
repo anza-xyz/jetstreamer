@@ -1,9 +1,12 @@
 use reqwest::Client;
 
-use crate::epochs::{epoch_exists, epoch_to_slot_range};
+use crate::{
+    SharedError,
+    epochs::{epoch_exists, epoch_to_slot_range},
+};
 
 /// Queries the current epoch from mainnet using the Solana RPC API.
-pub async fn current_epoch(client: &Client) -> Result<u64, Box<dyn std::error::Error>> {
+pub async fn current_epoch(client: &Client) -> Result<u64, SharedError> {
     let url = "https://api.mainnet-beta.solana.com";
     let request_body = r#"{"jsonrpc":"2.0","id":1,"method":"getEpochInfo","params":[]}"#;
     let response = client
@@ -25,7 +28,7 @@ pub async fn current_epoch(client: &Client) -> Result<u64, Box<dyn std::error::E
 pub async fn latest_old_faithful_epoch(
     client: &Client,
     epoch: Option<u64>,
-) -> Result<(u64, u64, u64), Box<dyn std::error::Error>> {
+) -> Result<(u64, u64, u64), SharedError> {
     let mut epoch = if let Some(epoch) = epoch {
         epoch
     } else {

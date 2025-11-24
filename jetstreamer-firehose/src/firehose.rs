@@ -602,6 +602,23 @@ where
             }
             let mut last_counted_slot = slot_range.start.saturating_sub(1);
             let mut last_emitted_slot_global = slot_range.start.saturating_sub(1);
+            let mut thread_stats = if tracking_enabled {
+                Some(ThreadStats {
+                    thread_id: thread_index,
+                    start_time,
+                    finish_time: None,
+                    slot_range: slot_range.clone(),
+                    current_slot: slot_range.start,
+                    slots_processed: 0,
+                    blocks_processed: 0,
+                    leader_skipped_slots: 0,
+                    transactions_processed: 0,
+                    entries_processed: 0,
+                    rewards_processed: 0,
+                })
+            } else {
+                None
+            };
 
             // let mut triggered = false;
             while let Err((err, slot)) = async {
@@ -672,30 +689,17 @@ where
                         continue;
                     }
 
-                    let mut previous_blockhash = Hash::default();
-                    let mut latest_entry_blockhash = Hash::default();
-                    // Reset counters to align to the local epoch slice; prevents boundary slots
-                    // from being treated as already-counted after a restart.
-                    last_counted_slot = local_start.saturating_sub(1);
-                    current_slot = None;
-
-                    let mut thread_stats = if tracking_enabled {
-                        Some(ThreadStats {
-                            thread_id: thread_index,
-                            start_time,
-                            finish_time: None,
-                            slot_range: slot_range.clone(),
-                            current_slot: slot_range.start,
-                            slots_processed: 0,
-                            blocks_processed: 0,
-                            leader_skipped_slots: 0,
-                            transactions_processed: 0,
-                            entries_processed: 0,
-                            rewards_processed: 0,
-                        })
-                    } else {
-                        None
-                    };
+                let mut previous_blockhash = Hash::default();
+                let mut latest_entry_blockhash = Hash::default();
+                // Reset counters to align to the local epoch slice; prevents boundary slots
+                // from being treated as already-counted after a restart.
+                last_counted_slot = local_start.saturating_sub(1);
+                current_slot = None;
+                if tracking_enabled {
+                    if let Some(ref mut stats) = thread_stats {
+                        stats.current_slot = local_start;
+                    }
+                }
 
                     if local_start > epoch_start {
                         // Seek to the previous slot so the stream includes all nodes

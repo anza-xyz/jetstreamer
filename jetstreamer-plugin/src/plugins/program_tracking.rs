@@ -181,7 +181,9 @@ impl Plugin for ProgramTrackingPlugin {
                 if get_export_format() == Some("jsonl") {
                     write_to_jsonl("program_invocations", rows.clone())
                         .await
-                        .map_err(|err| -> Box<dyn std::error::Error + Send + Sync> { Box::new(err) })?;
+                        .map_err(|err| -> Box<dyn std::error::Error + Send + Sync> {
+                            Box::new(std::io::Error::new(std::io::ErrorKind::Other, err.to_string()))
+                        })?;
                 }
             }
 

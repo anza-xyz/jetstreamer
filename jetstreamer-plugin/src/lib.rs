@@ -665,13 +665,16 @@ impl PluginRunner {
             let shutting_down = shutting_down.clone();
             let last_snapshot: Arc<Mutex<SnapshotWindow>> =
                 Arc::new(Mutex::new(SnapshotWindow::default()));
+            let thread_progress_max: Arc<DashMap<usize, f64>> = Arc::new(DashMap::new());
             StatsTracking {
                 on_stats: {
                     let last_snapshot = last_snapshot.clone();
+                    let thread_progress_max = thread_progress_max.clone();
                     let total_slot_count = total_slot_count_capture;
                     move |thread_id: usize, stats: Stats| {
                         let shutting_down = shutting_down.clone();
                         let last_snapshot = last_snapshot.clone();
+                        let thread_progress_max = thread_progress_max.clone();
                         async move {
                             let log_target = format!("{}::T{:03}", LOG_MODULE, thread_id);
                             if shutting_down.load(Ordering::SeqCst) {
@@ -703,13 +706,22 @@ impl PluginRunner {
                                 .slot_range
                                 .end
                                 .saturating_sub(thread_stats.slot_range.start);
-                            let thread_progress = if thread_total_slots > 0 {
+                            let thread_progress_raw = if thread_total_slots > 0 {
                                 (thread_stats.slots_processed as f64 / thread_total_slots as f64)
                                     .clamp(0.0, 1.0)
                                     * 100.0
                             } else {
                                 100.0
                             };
+                            let thread_progress = thread_progress_max
+                                .entry(thread_id)
+                                .and_modify(|max| {
+                                    if thread_progress_raw > *max {
+                                        *max = thread_progress_raw;
+                                    }
+                                })
+                                .or_insert(thread_progress_raw)
+                                .clone();
                             let mut overall_eta = None;
                             if let Ok(mut window) = last_snapshot.lock()
                                 && let Some(rates) = window.update(Snapshot {

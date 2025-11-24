@@ -175,14 +175,16 @@ impl Plugin for ProgramTrackingPlugin {
                 }
             });
 
-
             // Write to JSONL file if export format is jsonl and flush_rows is not None
             if let Some(ref rows) = flush_rows {
                 if get_export_format() == Some("jsonl") {
                     write_to_jsonl("program_invocations", rows.clone())
                         .await
                         .map_err(|err| -> Box<dyn std::error::Error + Send + Sync> {
-                            Box::new(std::io::Error::new(std::io::ErrorKind::Other, err.to_string()))
+                            Box::new(std::io::Error::new(
+                                std::io::ErrorKind::Other,
+                                err.to_string(),
+                            ))
                         })?;
                 }
             }

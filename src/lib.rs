@@ -588,7 +588,9 @@ pub fn parse_cli_args() -> Result<Config, Box<dyn std::error::Error>> {
     while i < args.len() {
         match args[i].as_str() {
             "--with-plugin" => {
-                let plugin_name = args.get(i + 1).ok_or_else(|| "--with-plugin requires a plugin name".to_string())?;
+                let plugin_name = args
+                    .get(i + 1)
+                    .ok_or_else(|| "--with-plugin requires a plugin name".to_string())?;
                 let plugin = BuiltinPlugin::from_flag(plugin_name).ok_or_else(|| {
                     format!(
                         "unknown plugin '{plugin_name}'. expected 'program-tracking' or 'instruction-tracking'"

@@ -267,6 +267,16 @@ impl SlotOffsetIndex {
 
         Ok(offset)
     }
+
+    /// Clears cached index data for the given epoch, forcing a refetch on next lookup.
+    pub fn invalidate_epoch(&self, epoch: u64) {
+        let key = EpochCacheKey::new(&self.cache_namespace, epoch);
+        EPOCH_CACHE.remove(&key);
+
+        let (epoch_start, epoch_end_inclusive) = epoch_to_slot_range(epoch);
+        SLOT_OFFSET_RESULT_CACHE
+            .retain(|slot, _| *slot < epoch_start || *slot > epoch_end_inclusive);
+    }
 }
 
 struct EpochIndexes {
@@ -1390,7 +1400,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    #[ignore]
+    #[serial_test::serial]
     async fn test_epoch_800_hydration_time() {
         init_logger();
         SLOT_OFFSET_RESULT_CACHE.clear();

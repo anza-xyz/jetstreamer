@@ -283,8 +283,7 @@ impl SlotOffsetIndex {
         let slot_object = self.remote_for_path(&slot_index_path)?;
         let cid_object = self.remote_for_path(&cid_index_path)?;
 
-        let slot_index =
-            SlotCidIndex::open(slot_object, SLOT_TO_CID_KIND, None).await?;
+        let slot_index = SlotCidIndex::open(slot_object, SLOT_TO_CID_KIND, None).await?;
 
         let cid_index = CidOffsetIndex::open(
             cid_object,
@@ -991,7 +990,7 @@ async fn fetch_and_parse_header(
         }
     }
 
-    parse_compact_index_header(&bytes, url, expected_kind, expected_value_size)
+    parse_compact_index_header(&bytes, &url, expected_kind, expected_value_size)
 }
 
 fn parse_compact_index_header(

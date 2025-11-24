@@ -1411,13 +1411,12 @@ where
                 } else {
                     slot_range.start = slot;
                 }
-                if tracking_enabled {
-                    if let Some(ref mut stats_ref) = thread_stats {
+                if tracking_enabled
+                    && let Some(ref mut stats_ref) = thread_stats {
                         stats_ref.slot_range.start = slot_range.start;
                         stats_ref.slot_range.end = slot_range.end;
                         // initial_slot_range remains unchanged for progress reporting.
                     }
-                }
                 if block_enabled {
                     pending_skipped_slots.remove(&thread_index);
                 }

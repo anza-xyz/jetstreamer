@@ -116,7 +116,7 @@ use std::{
     ops::Range,
     pin::Pin,
     sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
@@ -132,77 +132,6 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::{signal, sync::broadcast};
-
-#[derive(Clone, Copy)]
-struct Snapshot {
-    time: std::time::Instant,
-    slots: u64,
-    txs: u64,
-}
-
-#[derive(Clone, Copy, Default)]
-struct Contribution {
-    slot_delta: u64,
-    tx_delta: u64,
-    dt: f64,
-}
-
-#[derive(Clone, Copy, Default)]
-struct Rates {
-    slot_rate: f64,
-    tx_rate: f64,
-}
-
-#[derive(Default)]
-struct SnapshotWindow {
-    entries: [Option<Contribution>; 5],
-    idx: usize,
-    len: usize,
-    last: Option<Snapshot>,
-}
-
-impl SnapshotWindow {
-    fn update(&mut self, snapshot: Snapshot) -> Option<Rates> {
-        if let Some(prev) = self.last
-            && let Some(dt) = snapshot
-                .time
-                .checked_duration_since(prev.time)
-                .map(|d| d.as_secs_f64())
-            && dt > 0.0
-            && snapshot.slots > prev.slots
-        {
-            let contrib = Contribution {
-                slot_delta: snapshot.slots.saturating_sub(prev.slots),
-                tx_delta: snapshot.txs.saturating_sub(prev.txs),
-                dt,
-            };
-            self.entries[self.idx] = Some(contrib);
-            self.idx = (self.idx + 1) % self.entries.len();
-            if self.len < self.entries.len() {
-                self.len += 1;
-            }
-        }
-        self.last = Some(snapshot);
-
-        let mut total_slots = 0u64;
-        let mut total_txs = 0u64;
-        let mut total_dt = 0.0;
-        for entry in self.entries.iter().flatten() {
-            total_slots = total_slots.saturating_add(entry.slot_delta);
-            total_txs = total_txs.saturating_add(entry.tx_delta);
-            total_dt += entry.dt;
-        }
-
-        if self.len < self.entries.len() || total_dt <= 0.0 {
-            return None;
-        }
-
-        Some(Rates {
-            slot_rate: total_slots as f64 / total_dt,
-            tx_rate: total_txs as f64 / total_dt,
-        })
-    }
-}
 
 /// Re-exported statistics types produced by [`firehose`].
 pub use jetstreamer_firehose::firehose::{
@@ -664,17 +593,13 @@ impl PluginRunner {
         let total_slot_count_capture = total_slot_count;
         let stats_tracking = clickhouse.clone().map(|_db| {
             let shutting_down = shutting_down.clone();
-            let last_snapshot: Arc<Mutex<SnapshotWindow>> =
-                Arc::new(Mutex::new(SnapshotWindow::default()));
             let thread_progress_max: Arc<DashMap<usize, f64>> = Arc::new(DashMap::new());
             StatsTracking {
                 on_stats: {
-                    let last_snapshot = last_snapshot.clone();
                     let thread_progress_max = thread_progress_max.clone();
                     let total_slot_count = total_slot_count_capture;
                     move |thread_id: usize, stats: Stats| {
                         let shutting_down = shutting_down.clone();
-                        let last_snapshot = last_snapshot.clone();
                         let thread_progress_max = thread_progress_max.clone();
                         async move {
                             let log_target = format!("{}::T{:03}", LOG_MODULE, thread_id);
@@ -688,13 +613,12 @@ impl PluginRunner {
                             let finish_at = stats
                                 .finish_time
                                 .unwrap_or_else(std::time::Instant::now);
-                            let elapsed = finish_at.saturating_duration_since(stats.start_time);
-                            let elapsed_secs = elapsed.as_secs_f64();
-                            let mut tps = if elapsed_secs > 0.0 {
-                                stats.transactions_processed as f64 / elapsed_secs
-                            } else {
-                                0.0
-                            };
+                            let _elapsed_secs =
+                                finish_at.saturating_duration_since(stats.start_time).as_secs_f64();
+                            let dt = stats.time_since_last_pulse.as_secs_f64().max(1e-9);
+                            let slot_rate = stats.slots_since_last_pulse as f64 / dt;
+                            let tx_rate = stats.transactions_since_last_pulse as f64 / dt;
+                            let tps = tx_rate;
                             let thread_stats = &stats.thread_stats;
                             let processed_slots = stats.slots_processed.min(total_slot_count);
                             let progress_fraction = if total_slot_count > 0 {
@@ -723,21 +647,13 @@ impl PluginRunner {
                                 })
                                 .or_insert(thread_progress_raw);
                             let mut overall_eta = None;
-                            if let Ok(mut window) = last_snapshot.lock()
-                                && let Some(rates) = window.update(Snapshot {
-                                    time: finish_at,
-                                    slots: stats.slots_processed,
-                                    txs: stats.transactions_processed,
-                                }) {
-                                    tps = rates.tx_rate;
-                                    let remaining_slots =
-                                        total_slot_count.saturating_sub(processed_slots);
-                                    if rates.slot_rate > 0.0 && remaining_slots > 0 {
-                                        overall_eta = Some(human_readable_duration(
-                                            remaining_slots as f64 / rates.slot_rate,
-                                        ));
-                                    }
-                                }
+                            if slot_rate > 0.0 {
+                                let remaining_slots =
+                                    total_slot_count.saturating_sub(processed_slots);
+                                overall_eta = Some(human_readable_duration(
+                                    remaining_slots as f64 / slot_rate,
+                                ));
+                            }
                             if overall_eta.is_none() {
                                 if progress_fraction > 0.0 && progress_fraction < 1.0 {
                                     if let Some(elapsed_total) = finish_at

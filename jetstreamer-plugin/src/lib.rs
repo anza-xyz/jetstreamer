@@ -713,15 +713,14 @@ impl PluginRunner {
                             } else {
                                 100.0
                             };
-                            let thread_progress = thread_progress_max
+                            let thread_progress = *thread_progress_max
                                 .entry(thread_id)
                                 .and_modify(|max| {
                                     if thread_progress_raw > *max {
                                         *max = thread_progress_raw;
                                     }
                                 })
-                                .or_insert(thread_progress_raw)
-                                .clone();
+                                .or_insert(thread_progress_raw);
                             let mut overall_eta = None;
                             if let Ok(mut window) = last_snapshot.lock()
                                 && let Some(rates) = window.update(Snapshot {

@@ -11,8 +11,10 @@ documentation.workspace = true
 
 [dependencies]
 jetstreamer-firehose.workspace = true
+jetstreamer-utils.workspace = true
 
 serde.workspace = true
+serde_json.workspace = true
 solana-message.workspace = true
 solana-address.workspace = true
 tokio.workspace = true

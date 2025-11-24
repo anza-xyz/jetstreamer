@@ -25,9 +25,11 @@
 //! # Ok(())
 //! # }
 //! ```
+#[cfg(feature = "s3-backend")]
+use crate::archive::S3Location;
 use crate::{
-    LOG_MODULE,
-    epochs::{BASE_URL, epoch_to_slot_range, slot_to_epoch},
+    LOG_MODULE, archive,
+    epochs::{epoch_to_slot_range, slot_to_epoch},
 };
 use cid::{Cid, multibase::Base};
 use dashmap::{DashMap, mapref::entry::Entry};
@@ -81,6 +83,80 @@ pub enum SlotOffsetIndexError {
     /// CAR header could not be read or decoded.
     #[error("failed to read CAR header {0}: {1}")]
     CarHeaderError(Url, String),
+    /// Error returned by the S3 backend.
+    #[cfg(feature = "s3-backend")]
+    #[error("S3 error while fetching {0}: {1}")]
+    S3Error(Url, String),
+}
+
+enum IndexBackend {
+    Http,
+    #[cfg(feature = "s3-backend")]
+    S3(Arc<S3Location>),
+}
+
+struct RemoteObject {
+    kind: RemoteObjectKind,
+    url: Url,
+}
+
+enum RemoteObjectKind {
+    Http {
+        client: Client,
+    },
+    #[cfg(feature = "s3-backend")]
+    S3 {
+        location: Arc<S3Location>,
+        key: String,
+    },
+}
+
+impl RemoteObject {
+    fn http(client: Client, url: Url) -> Self {
+        Self {
+            kind: RemoteObjectKind::Http { client },
+            url,
+        }
+    }
+
+    #[cfg(feature = "s3-backend")]
+    fn s3(location: Arc<S3Location>, key: String, url: Url) -> Self {
+        Self {
+            kind: RemoteObjectKind::S3 { location, key },
+            url,
+        }
+    }
+
+    const fn url(&self) -> &Url {
+        &self.url
+    }
+
+    async fn fetch_full(&self) -> Result<Vec<u8>, SlotOffsetIndexError> {
+        match &self.kind {
+            RemoteObjectKind::Http { client } => fetch_full(client, &self.url).await,
+            #[cfg(feature = "s3-backend")]
+            RemoteObjectKind::S3 { location, key } => {
+                fetch_s3_full(location, key.as_str(), &self.url).await
+            }
+        }
+    }
+
+    async fn fetch_range(
+        &self,
+        start: u64,
+        end: u64,
+        exact: bool,
+    ) -> Result<Vec<u8>, SlotOffsetIndexError> {
+        match &self.kind {
+            RemoteObjectKind::Http { client } => {
+                fetch_http_range(client, &self.url, start, end, exact).await
+            }
+            #[cfg(feature = "s3-backend")]
+            RemoteObjectKind::S3 { location, key } => {
+                fetch_s3_range(location, key.as_str(), &self.url, start, end, exact).await
+            }
+        }
+    }
 }
 
 /// Lazily constructed global [`SlotOffsetIndex`] that honors environment configuration.
@@ -125,6 +201,7 @@ pub struct SlotOffsetIndex {
     base_url: Url,
     network: String,
     cache_namespace: Arc<str>,
+    backend: IndexBackend,
 }
 
 struct EpochEntry {
@@ -149,11 +226,30 @@ impl SlotOffsetIndex {
             std::env::var("JETSTREAMER_NETWORK").unwrap_or_else(|_| "mainnet".to_string());
         let cache_namespace =
             Arc::<str>::from(format!("{}|{}", base_url.as_str(), network.as_str()));
+        let location = archive::index_location();
+        let backend = if location.is_http() {
+            IndexBackend::Http
+        } else {
+            #[cfg(feature = "s3-backend")]
+            {
+                let cfg = location
+                    .as_s3()
+                    .expect("S3 backend requested but not configured");
+                IndexBackend::S3(cfg)
+            }
+            #[cfg(not(feature = "s3-backend"))]
+            {
+                return Err(SlotOffsetIndexError::InvalidBaseUrl(
+                    "compiled without s3-backend support".into(),
+                ));
+            }
+        };
         Ok(Self {
             client: Client::new(),
             base_url,
             network,
             cache_namespace,
+            backend,
         })
     }
 
@@ -166,7 +262,9 @@ impl SlotOffsetIndex {
         &self,
         epoch: u64,
     ) -> Result<(SlotCidIndex, CidOffsetIndex), SlotOffsetIndexError> {
-        let (root_cid, car_url) = fetch_epoch_root(&self.client, &self.base_url, epoch).await?;
+        let car_path = format!("{epoch}/epoch-{epoch}.car");
+        let car_object = self.remote_for_path(&car_path)?;
+        let (root_cid, car_url) = fetch_epoch_root(&car_object).await?;
         let root_base32 = root_cid
             .to_string_of_base(Base::Base32Lower)
             .map_err(|err| {
@@ -182,24 +280,13 @@ impl SlotOffsetIndex {
             epoch, root_base32, self.network
         );
 
-        let slot_index_url = self.base_url.join(&slot_index_path).map_err(|err| {
-            SlotOffsetIndexError::InvalidIndexUrl(format!("{slot_index_path} ({err})"))
-        })?;
-        let cid_index_url = self.base_url.join(&cid_index_path).map_err(|err| {
-            SlotOffsetIndexError::InvalidIndexUrl(format!("{cid_index_path} ({err})"))
-        })?;
+        let slot_object = self.remote_for_path(&slot_index_path)?;
+        let cid_object = self.remote_for_path(&cid_index_path)?;
 
-        let slot_index = SlotCidIndex::open(
-            self.client.clone(),
-            slot_index_url.clone(),
-            SLOT_TO_CID_KIND,
-            None,
-        )
-        .await?;
+        let slot_index = SlotCidIndex::open(slot_object, SLOT_TO_CID_KIND, None).await?;
 
         let cid_index = CidOffsetIndex::open(
-            self.client.clone(),
-            cid_index_url.clone(),
+            cid_object,
             CID_TO_OFFSET_KIND,
             Some(CidOffsetIndex::OFFSET_AND_SIZE_VALUE_SIZE),
         )
@@ -257,6 +344,25 @@ impl SlotOffsetIndex {
         SLOT_OFFSET_RESULT_CACHE.insert(slot, offset);
 
         Ok(offset)
+    }
+
+    fn remote_for_path(&self, path: &str) -> Result<RemoteObject, SlotOffsetIndexError> {
+        match &self.backend {
+            IndexBackend::Http => {
+                let url = self.base_url.join(path).map_err(|err| {
+                    SlotOffsetIndexError::InvalidIndexUrl(format!("{path} ({err})"))
+                })?;
+                Ok(RemoteObject::http(self.client.clone(), url))
+            }
+            #[cfg(feature = "s3-backend")]
+            IndexBackend::S3(location) => {
+                let url = self.base_url.join(path).map_err(|err| {
+                    SlotOffsetIndexError::InvalidIndexUrl(format!("{path} ({err})"))
+                })?;
+                let key = location.key_for(path);
+                Ok(RemoteObject::s3(Arc::clone(location), key, url))
+            }
+        }
     }
 }
 
@@ -339,8 +445,9 @@ struct RemoteIndexFile {
 }
 
 impl RemoteIndexFile {
-    async fn download(client: &Client, url: Url) -> Result<Self, SlotOffsetIndexError> {
-        let bytes = fetch_full(client, &url).await?;
+    async fn download(object: &RemoteObject) -> Result<Self, SlotOffsetIndexError> {
+        let url = object.url().clone();
+        let bytes = object.fetch_full().await?;
         Ok(Self {
             url,
             data: Arc::from(bytes),
@@ -390,12 +497,12 @@ struct SlotCidIndex {
 
 impl SlotCidIndex {
     async fn open(
-        client: Client,
-        url: Url,
+        object: RemoteObject,
         expected_kind: &[u8],
         expected_value_size: Option<u64>,
     ) -> Result<Self, SlotOffsetIndexError> {
         let kind_label = std::str::from_utf8(expected_kind).unwrap_or("index");
+        let url = object.url().clone();
         let epoch_hint = url
             .path_segments()
             .and_then(|mut segments| segments.next_back())
@@ -413,7 +520,7 @@ impl SlotCidIndex {
             );
         }
 
-        let file = Arc::new(RemoteIndexFile::download(&client, url.clone()).await?);
+        let file = Arc::new(RemoteIndexFile::download(&object).await?);
         let header =
             parse_compact_index_header(file.bytes(), &url, expected_kind, expected_value_size)?;
         Ok(Self {
@@ -501,8 +608,7 @@ impl SlotCidIndex {
 }
 
 struct CidOffsetIndex {
-    client: Client,
-    url: Url,
+    object: RemoteObject,
     header: CompactIndexHeader,
     bucket_entries: DashMap<u32, Arc<RemoteBucketEntry>>,
 }
@@ -511,12 +617,12 @@ impl CidOffsetIndex {
     const OFFSET_AND_SIZE_VALUE_SIZE: u64 = 9;
 
     async fn open(
-        client: Client,
-        url: Url,
+        object: RemoteObject,
         expected_kind: &[u8],
         expected_value_size: Option<u64>,
     ) -> Result<Self, SlotOffsetIndexError> {
         let kind_label = std::str::from_utf8(expected_kind).unwrap_or("index");
+        let url = object.url().clone();
         let epoch_hint = url
             .path_segments()
             .and_then(|mut segments| segments.next_back())
@@ -534,11 +640,9 @@ impl CidOffsetIndex {
             );
         }
 
-        let header =
-            fetch_and_parse_header(&client, &url, expected_kind, expected_value_size).await?;
+        let header = fetch_and_parse_header(&object, expected_kind, expected_value_size).await?;
         Ok(Self {
-            client,
-            url,
+            object,
             header,
             bucket_entries: DashMap::new(),
         })
@@ -555,7 +659,7 @@ impl CidOffsetIndex {
     }
 
     fn url(&self) -> &Url {
-        &self.url
+        self.object.url()
     }
 
     fn bucket_hash(&self, key: &[u8]) -> u32 {
@@ -585,17 +689,17 @@ impl CidOffsetIndex {
     async fn load_bucket(&self, index: u32) -> Result<Arc<RemoteBucketData>, SlotOffsetIndexError> {
         let bucket_header_offset =
             self.header.header_size + (index as u64) * BUCKET_HEADER_SIZE as u64;
-        let header_bytes = fetch_range(
-            &self.client,
-            &self.url,
-            bucket_header_offset,
-            bucket_header_offset + BUCKET_HEADER_SIZE as u64 - 1,
-            true,
-        )
-        .await?;
+        let header_bytes = self
+            .object
+            .fetch_range(
+                bucket_header_offset,
+                bucket_header_offset + BUCKET_HEADER_SIZE as u64 - 1,
+                true,
+            )
+            .await?;
         if header_bytes.len() != BUCKET_HEADER_SIZE {
             return Err(SlotOffsetIndexError::IndexFormatError(
-                self.url.clone(),
+                self.object.url().clone(),
                 format!(
                     "expected {BUCKET_HEADER_SIZE} bucket header bytes, got {}",
                     header_bytes.len()
@@ -607,10 +711,10 @@ impl CidOffsetIndex {
         let data_len = stride * bucket_header.num_entries as usize;
         let data_start = bucket_header.file_offset;
         let data_end = data_start + data_len as u64 - 1;
-        let data = fetch_range(&self.client, &self.url, data_start, data_end, true).await?;
+        let data = self.object.fetch_range(data_start, data_end, true).await?;
         if data.len() != data_len {
             return Err(SlotOffsetIndexError::IndexFormatError(
-                self.url.clone(),
+                self.object.url().clone(),
                 format!(
                     "expected {} bytes of bucket data, got {}",
                     data_len,
@@ -849,12 +953,14 @@ const fn hash_uint64(mut x: u64) -> u64 {
 }
 
 async fn fetch_and_parse_header(
-    client: &Client,
-    url: &Url,
+    object: &RemoteObject,
     expected_kind: &[u8],
     expected_value_size: Option<u64>,
 ) -> Result<CompactIndexHeader, SlotOffsetIndexError> {
-    let mut bytes = fetch_range(client, url, 0, HTTP_PREFETCH_BYTES - 1, false).await?;
+    let url = object.url().clone();
+    let mut bytes = object
+        .fetch_range(0, HTTP_PREFETCH_BYTES - 1, false)
+        .await?;
     if bytes.len() < 12 {
         return Err(SlotOffsetIndexError::IndexFormatError(
             url.clone(),
@@ -870,7 +976,9 @@ async fn fetch_and_parse_header(
     let header_len = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
     let total_header_size = 8 + 4 + header_len;
     if bytes.len() < total_header_size {
-        bytes = fetch_range(client, url, 0, total_header_size as u64 - 1, false).await?;
+        bytes = object
+            .fetch_range(0, total_header_size as u64 - 1, false)
+            .await?;
         if bytes.len() < total_header_size {
             return Err(SlotOffsetIndexError::IndexFormatError(
                 url.clone(),
@@ -882,7 +990,7 @@ async fn fetch_and_parse_header(
         }
     }
 
-    parse_compact_index_header(&bytes, url, expected_kind, expected_value_size)
+    parse_compact_index_header(&bytes, &url, expected_kind, expected_value_size)
 }
 
 fn parse_compact_index_header(
@@ -957,22 +1065,18 @@ fn parse_compact_index_header(
     })
 }
 
-async fn fetch_epoch_root(
-    client: &Client,
-    base_url: &Url,
-    epoch: u64,
-) -> Result<(Cid, Url), SlotOffsetIndexError> {
-    let car_path = format!("{epoch}/epoch-{epoch}.car");
-    let car_url = base_url
-        .join(&car_path)
-        .map_err(|err| SlotOffsetIndexError::InvalidIndexUrl(format!("{car_path} ({err})")))?;
-
-    let mut bytes = fetch_range(client, &car_url, 0, HTTP_PREFETCH_BYTES - 1, false).await?;
+async fn fetch_epoch_root(object: &RemoteObject) -> Result<(Cid, Url), SlotOffsetIndexError> {
+    let car_url = object.url().clone();
+    let mut bytes = object
+        .fetch_range(0, HTTP_PREFETCH_BYTES - 1, false)
+        .await?;
     let (header_len, prefix) = decode_varint(&bytes)
         .map_err(|msg| SlotOffsetIndexError::CarHeaderError(car_url.clone(), msg))?;
     let total_needed = prefix + header_len as usize;
     if bytes.len() < total_needed {
-        bytes = fetch_range(client, &car_url, 0, total_needed as u64 - 1, false).await?;
+        bytes = object
+            .fetch_range(0, total_needed as u64 - 1, false)
+            .await?;
         if bytes.len() < total_needed {
             return Err(SlotOffsetIndexError::CarHeaderError(
                 car_url.clone(),
@@ -1168,7 +1272,7 @@ async fn read_response_with_progress(
     Ok(bytes)
 }
 
-async fn fetch_range(
+async fn fetch_http_range(
     client: &Client,
     url: &Url,
     start: u64,
@@ -1283,6 +1387,66 @@ async fn fetch_range(
     }
 }
 
+#[cfg(feature = "s3-backend")]
+async fn fetch_s3_full(
+    location: &Arc<S3Location>,
+    key: &str,
+    url: &Url,
+) -> Result<Vec<u8>, SlotOffsetIndexError> {
+    let resp = location
+        .client
+        .get_object()
+        .bucket(location.bucket.as_ref())
+        .key(key)
+        .send()
+        .await
+        .map_err(|err| SlotOffsetIndexError::S3Error(url.clone(), err.to_string()))?;
+    let body = resp
+        .body
+        .collect()
+        .await
+        .map_err(|err| SlotOffsetIndexError::S3Error(url.clone(), err.to_string()))?;
+    Ok(body.into_bytes().to_vec())
+}
+
+#[cfg(feature = "s3-backend")]
+async fn fetch_s3_range(
+    location: &Arc<S3Location>,
+    key: &str,
+    url: &Url,
+    start: u64,
+    end: u64,
+    exact: bool,
+) -> Result<Vec<u8>, SlotOffsetIndexError> {
+    if end < start {
+        return Ok(Vec::new());
+    }
+    let range = format!("bytes={start}-{end}");
+    let resp = location
+        .client
+        .get_object()
+        .bucket(location.bucket.as_ref())
+        .key(key)
+        .range(range)
+        .send()
+        .await
+        .map_err(|err| SlotOffsetIndexError::S3Error(url.clone(), err.to_string()))?;
+    let body = resp
+        .body
+        .collect()
+        .await
+        .map_err(|err| SlotOffsetIndexError::S3Error(url.clone(), err.to_string()))?;
+    let data = body.into_bytes().to_vec();
+    let expected = (end - start + 1) as usize;
+    if exact && data.len() != expected {
+        return Err(SlotOffsetIndexError::IndexFormatError(
+            url.clone(),
+            format!("expected {expected} bytes, got {}", data.len()),
+        ));
+    }
+    Ok(data)
+}
+
 fn parse_metadata(data: &[u8]) -> Result<HashMap<Vec<u8>, Vec<u8>>, String> {
     if data.is_empty() {
         return Ok(HashMap::new());
@@ -1321,7 +1485,10 @@ fn parse_metadata(data: &[u8]) -> Result<HashMap<Vec<u8>, Vec<u8>>, String> {
 ///
 /// The resolution order is:
 /// 1. `JETSTREAMER_COMPACT_INDEX_BASE_URL`
-/// 2. The built-in [`BASE_URL`], pointing at Old Faithful's public mirror.
+/// 2. `JETSTREAMER_ARCHIVE_BASE`
+/// 3. `JETSTREAMER_HTTP_BASE_URL` (falling back to the built-in public mirror)
+///
+/// All three knobs accept either `https://` URLs or `s3://bucket/prefix` URIs.
 ///
 /// # Examples
 ///
@@ -1335,9 +1502,7 @@ fn parse_metadata(data: &[u8]) -> Result<HashMap<Vec<u8>, Vec<u8>>, String> {
 /// assert_eq!(base.as_str(), "https://mirror.example.com/indexes");
 /// ```
 pub fn get_index_base_url() -> Result<Url, SlotOffsetIndexError> {
-    let base = std::env::var("JETSTREAMER_COMPACT_INDEX_BASE_URL")
-        .unwrap_or_else(|_| BASE_URL.to_string());
-    Url::parse(&base).map_err(|err| SlotOffsetIndexError::InvalidBaseUrl(format!("{base} ({err})")))
+    Ok(archive::index_location().url().clone())
 }
 
 #[cfg(test)]

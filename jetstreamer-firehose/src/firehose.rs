@@ -1042,8 +1042,7 @@ where
                                         }
                                         if block_enabled
                                             && let Some(on_block_cb) = on_block.as_ref()
-                                        {
-                                            if skipped_slot > last_emitted_slot {
+                                            && skipped_slot > last_emitted_slot {
                                                 last_emitted_slot = skipped_slot;
                                                 on_block_cb(
                                                     thread_index,
@@ -1059,7 +1058,6 @@ where
                                                     )
                                                 })?;
                                             }
-                                        }
                                         if tracking_enabled {
                                             overall_slots_processed.fetch_add(1, Ordering::Relaxed);
                                             slots_since_stats.fetch_add(1, Ordering::Relaxed);

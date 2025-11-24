@@ -36,8 +36,8 @@ impl ProgramTrackingPlugin {
         let timestamp = clamp_block_time(block_time);
         if let Some((_, events_by_program)) = PENDING_BY_SLOT.remove(&slot) {
             return events_by_program
-                .into_iter()
-                .map(|(_, mut event)| {
+                .into_values()
+                .map(|mut event| {
                     event.timestamp = timestamp;
                     event
                 })
@@ -52,7 +52,7 @@ impl ProgramTrackingPlugin {
         let mut rows = Vec::new();
         for slot in slots {
             if let Some((_, events_by_program)) = PENDING_BY_SLOT.remove(&slot) {
-                rows.extend(events_by_program.into_iter().map(|(_, mut event)| {
+                rows.extend(events_by_program.into_values().map(|mut event| {
                     event.timestamp = timestamp;
                     event
                 }));
@@ -150,14 +150,12 @@ impl Plugin for ProgramTrackingPlugin {
 
             let rows = Self::take_slot_events(slot, block_time);
 
-            if let Some(db_client) = db.as_ref() {
-                if !rows.is_empty() {
-                    write_program_events(Arc::clone(db_client), rows)
-                        .await
-                        .map_err(|err| -> Box<dyn std::error::Error + Send + Sync> {
-                            Box::new(err)
-                        })?;
-                }
+            if let Some(db_client) = db.as_ref()
+                && !rows.is_empty()
+            {
+                write_program_events(Arc::clone(db_client), rows)
+                    .await
+                    .map_err(|err| -> Box<dyn std::error::Error + Send + Sync> { Box::new(err) })?;
             }
 
             Ok(())

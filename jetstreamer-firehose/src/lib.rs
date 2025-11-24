@@ -39,6 +39,9 @@
 //!   per second used when sizing the firehose thread pool. Increase or decrease to match your
 //!   host's effective bandwidth.
 //!
+//! S3 transports are compiled behind the `s3-backend` Cargo feature. Enable that feature when
+//! building if you plan to stream from `s3://` URIs instead of HTTP mirrors.
+//!
 //! # Limitations
 //! Old Faithful currently publishes blocks, transactions, epochs, and reward metadata but does
 //! not ship account updates. The firehose mirrors that limitation; plan on a separate data

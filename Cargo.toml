@@ -21,6 +21,11 @@ license.workspace = true
 repository.workspace = true
 documentation.workspace = true
 
+[features]
+default = []
+s3-backend = ["jetstreamer-firehose/s3-backend"]
+verify-transaction-signatures = ["jetstreamer-firehose/verify-transaction-signatures"]
+
 [workspace.dependencies]
 jetstreamer-firehose = { path = "jetstreamer-firehose", version = "0.1.3" }
 jetstreamer-plugin = { path = "jetstreamer-plugin", version = "0.1.3" }

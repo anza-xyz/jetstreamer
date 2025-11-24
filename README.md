@@ -197,6 +197,13 @@ S3-compatible storage. Configure the backend via the following environment varia
 - `JETSTREAMER_S3_REGION` and `JETSTREAMER_S3_ENDPOINT`: region plus optional custom endpoint (e.g. `https://s3.eu-central-003.backblazeb2.com`).
 - `JETSTREAMER_S3_ACCESS_KEY`, `JETSTREAMER_S3_SECRET_KEY`, `JETSTREAMER_S3_SESSION_TOKEN`: credentials used for signing requests (falls back to AWS standard env vars).
 
+S3 support is compiled behind the `s3-backend` Cargo feature. Enable it when running or
+depending on `jetstreamer` if you plan to consume `s3://` archives:
+
+```bash
+cargo run --features s3-backend -- 800
+```
+
 #### Batching ClickHouse Writes
 
 ClickHouse (and anything you do in your callbacks) applies backpressure that will slow down

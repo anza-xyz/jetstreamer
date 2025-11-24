@@ -218,8 +218,10 @@ pub struct ThreadStats {
     pub start_time: std::time::Instant,
     /// Timestamp captured when the thread finished, if finished.
     pub finish_time: Option<std::time::Instant>,
-    /// Inclusive slot range assigned to the thread.
+    /// Inclusive slot range currently assigned to the thread (may shrink on restart).
     pub slot_range: Range<u64>,
+    /// Original slot range assigned to the thread (never modified).
+    pub initial_slot_range: Range<u64>,
     /// Latest slot processed by the thread.
     pub current_slot: u64,
     /// Total slots processed by the thread.
@@ -608,6 +610,7 @@ where
                     start_time,
                     finish_time: None,
                     slot_range: slot_range.clone(),
+                    initial_slot_range: slot_range.clone(),
                     current_slot: slot_range.start,
                     slots_processed: 0,
                     blocks_processed: 0,
@@ -689,16 +692,17 @@ where
                         continue;
                     }
 
-                let mut previous_blockhash = Hash::default();
-                let mut latest_entry_blockhash = Hash::default();
-                // Reset counters to align to the local epoch slice; prevents boundary slots
-                // from being treated as already-counted after a restart.
-                last_counted_slot = local_start.saturating_sub(1);
-                current_slot = None;
-                if tracking_enabled
-                    && let Some(ref mut stats) = thread_stats {
-                        stats.current_slot = local_start;
-                    }
+                    let mut previous_blockhash = Hash::default();
+                    let mut latest_entry_blockhash = Hash::default();
+                    // Reset counters to align to the local epoch slice; prevents boundary slots
+                    // from being treated as already-counted after a restart.
+                    last_counted_slot = local_start.saturating_sub(1);
+                    current_slot = None;
+                    if tracking_enabled
+                        && let Some(ref mut stats) = thread_stats {
+                            stats.current_slot = local_start;
+                            stats.slot_range.start = local_start;
+                        }
 
                     if local_start > epoch_start {
                         // Seek to the previous slot so the stream includes all nodes
@@ -1410,6 +1414,8 @@ where
                 if tracking_enabled {
                     if let Some(ref mut stats_ref) = thread_stats {
                         stats_ref.slot_range.start = slot_range.start;
+                        stats_ref.slot_range.end = slot_range.end;
+                        // initial_slot_range remains unchanged for progress reporting.
                     }
                 }
                 if block_enabled {

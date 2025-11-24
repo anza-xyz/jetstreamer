@@ -703,9 +703,9 @@ impl PluginRunner {
                             };
                             let overall_progress = (progress_fraction * 100.0).clamp(0.0, 100.0);
                             let thread_total_slots = thread_stats
-                                .slot_range
+                                .initial_slot_range
                                 .end
-                                .saturating_sub(thread_stats.slot_range.start);
+                                .saturating_sub(thread_stats.initial_slot_range.start);
                             let thread_progress_raw = if thread_total_slots > 0 {
                                 (thread_stats.slots_processed as f64 / thread_total_slots as f64)
                                     .clamp(0.0, 1.0)

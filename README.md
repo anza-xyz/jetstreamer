@@ -185,10 +185,6 @@ environment variables.
 When `JETSTREAMER_CLICKHOUSE_MODE` is `auto` (the default), Jetstreamer inspects the DSN to
 decide whether to launch the bundled ClickHouse helper or connect to an external cluster.
 
-Set `JETSTREAMER_CLICKHOUSE_USER` / `JETSTREAMER_CLICKHOUSE_PASSWORD` to override any
-credentials embedded in `JETSTREAMER_CLICKHOUSE_DSN`. The CLI strips inline credentials from
-logs automatically, so you can safely supply secrets without leaking them during startup.
-
 ### Alternate Archive Mirrors
 
 Jetstreamer defaults to the public Old Faithful mirror (`https://files.old-faithful.net`), but

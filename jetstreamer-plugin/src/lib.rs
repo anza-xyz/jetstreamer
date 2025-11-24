@@ -169,6 +169,7 @@ impl SnapshotWindow {
                 .checked_duration_since(prev.time)
                 .map(|d| d.as_secs_f64())
             && dt > 0.0
+            && snapshot.slots > prev.slots
         {
             let contrib = Contribution {
                 slot_delta: snapshot.slots.saturating_sub(prev.slots),

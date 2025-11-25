@@ -113,6 +113,7 @@ const LOG_MODULE: &str = "jetstreamer::runner";
 use std::{
     fmt::Display,
     future::Future,
+    hint,
     ops::Range,
     pin::Pin,
     sync::{
@@ -137,6 +138,12 @@ use tokio::{signal, sync::broadcast};
 pub use jetstreamer_firehose::firehose::{
     FirehoseErrorContext, Stats as FirehoseStats, ThreadStats,
 };
+
+// Global totals snapshot used to compute overall TPS/ETA between pulses.
+static LAST_TOTAL_SLOTS: AtomicU64 = AtomicU64::new(0);
+static LAST_TOTAL_TXS: AtomicU64 = AtomicU64::new(0);
+static LAST_TOTAL_TIME_NS: AtomicU64 = AtomicU64::new(0);
+static SNAPSHOT_LOCK: AtomicBool = AtomicBool::new(false);
 
 /// Convenience alias for the boxed future returned by plugin hooks.
 pub type PluginFuture<'a> = Pin<
@@ -591,6 +598,11 @@ impl PluginRunner {
         let total_slot_count = slot_range.end.saturating_sub(slot_range.start);
 
         let total_slot_count_capture = total_slot_count;
+        // Reset global rate snapshot for a new run.
+        SNAPSHOT_LOCK.store(false, Ordering::Relaxed);
+        LAST_TOTAL_SLOTS.store(0, Ordering::Relaxed);
+        LAST_TOTAL_TXS.store(0, Ordering::Relaxed);
+        LAST_TOTAL_TIME_NS.store(0, Ordering::Relaxed);
         let stats_tracking = clickhouse.clone().map(|_db| {
             let shutting_down = shutting_down.clone();
             let thread_progress_max: Arc<DashMap<usize, f64>> = Arc::new(DashMap::new());
@@ -613,12 +625,44 @@ impl PluginRunner {
                             let finish_at = stats
                                 .finish_time
                                 .unwrap_or_else(std::time::Instant::now);
-                            let _elapsed_secs =
-                                finish_at.saturating_duration_since(stats.start_time).as_secs_f64();
-                            let dt = stats.time_since_last_pulse.as_secs_f64().max(1e-9);
-                            let slot_rate = stats.slots_since_last_pulse as f64 / dt;
-                            let tx_rate = stats.transactions_since_last_pulse as f64 / dt;
-                            let tps = tx_rate;
+                            let elapsed_since_start = finish_at
+                                .saturating_duration_since(stats.start_time)
+                                .as_nanos()
+                                .max(1) as u64;
+                            let total_slots = stats.slots_processed;
+                            let total_txs = stats.transactions_processed;
+                            // Serialize snapshot updates so every pulse measures deltas from the
+                            // previous pulse (regardless of which thread emitted it).
+                            let (delta_slots, delta_txs, delta_time_ns) = {
+                                while SNAPSHOT_LOCK
+                                    .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                                    .is_err()
+                                {
+                                    hint::spin_loop();
+                                }
+                                let prev_slots = LAST_TOTAL_SLOTS.load(Ordering::Relaxed);
+                                let prev_txs = LAST_TOTAL_TXS.load(Ordering::Relaxed);
+                                let prev_time_ns = LAST_TOTAL_TIME_NS.load(Ordering::Relaxed);
+                                LAST_TOTAL_SLOTS.store(total_slots, Ordering::Relaxed);
+                                LAST_TOTAL_TXS.store(total_txs, Ordering::Relaxed);
+                                LAST_TOTAL_TIME_NS.store(elapsed_since_start, Ordering::Relaxed);
+                                SNAPSHOT_LOCK.store(false, Ordering::Release);
+                                let delta_slots = total_slots.saturating_sub(prev_slots);
+                                let delta_txs = total_txs.saturating_sub(prev_txs);
+                                let delta_time_ns =
+                                    elapsed_since_start.saturating_sub(prev_time_ns).max(1);
+                                (delta_slots, delta_txs, delta_time_ns)
+                            };
+                            let delta_secs = (delta_time_ns as f64 / 1e9).max(1e-9);
+                            let mut slot_rate = delta_slots as f64 / delta_secs;
+                            let mut tps = delta_txs as f64 / delta_secs;
+                            if slot_rate <= 0.0 && total_slots > 0 {
+                                slot_rate =
+                                    total_slots as f64 / (elapsed_since_start as f64 / 1e9);
+                            }
+                            if tps <= 0.0 && total_txs > 0 {
+                                tps = total_txs as f64 / (elapsed_since_start as f64 / 1e9);
+                            }
                             let thread_stats = &stats.thread_stats;
                             let processed_slots = stats.slots_processed.min(total_slot_count);
                             let progress_fraction = if total_slot_count > 0 {

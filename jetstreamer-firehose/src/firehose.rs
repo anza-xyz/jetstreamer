@@ -589,8 +589,11 @@ where
             let slots_since_stats = slots_since_stats_cloned;
             let last_pulse = last_pulse_cloned;
             let mut shutdown_rx = thread_shutdown_rx;
-            let start_time = std::time::Instant::now();
-            last_pulse.store(0, Ordering::Relaxed);
+            let start_time = firehose_start;
+            last_pulse.store(
+                firehose_start.elapsed().as_nanos() as u64,
+                Ordering::Relaxed,
+            );
             let log_target = format!("{}::T{:03}", LOG_MODULE, thread_index);
             let mut skip_until_index = None;
             let last_emitted_slot = slot_range.start.saturating_sub(1);
@@ -1157,15 +1160,15 @@ where
                                                     &overall_blocks_processed,
                                                     &overall_transactions_processed,
                                                     &overall_entries_processed,
-                                                    &transactions_since_stats,
-                                                    &blocks_since_stats,
-                                                    &slots_since_stats,
-                                                    &last_pulse,
-                                                    start_time,
-                                                )
-                                                .await
-                                                {
-                                                    blocks_since_stats.fetch_sub(1, Ordering::Relaxed);
+                                                &transactions_since_stats,
+                                                &blocks_since_stats,
+                                                &slots_since_stats,
+                                                &last_pulse,
+                                                start_time,
+                                            )
+                                            .await
+                                            {
+                                                blocks_since_stats.fetch_sub(1, Ordering::Relaxed);
                                                     slots_since_stats.fetch_sub(1, Ordering::Relaxed);
                                                     overall_blocks_processed
                                                         .fetch_sub(1, Ordering::Relaxed);
@@ -1411,6 +1414,8 @@ where
                 } else {
                     slot_range.start = slot;
                 }
+                // Reset pulse timer to exclude downtime from next rate calc.
+                last_pulse.store(start_time.elapsed().as_nanos() as u64, Ordering::Relaxed);
                 if tracking_enabled
                     && let Some(ref mut stats_ref) = thread_stats {
                         stats_ref.slot_range.start = slot_range.start;
@@ -1978,7 +1983,7 @@ async fn firehose_geyser_thread(
             // Update slot range to resume from the failed slot, not the original start
             slot_range.start = slot;
             skip_until_index = Some(item_index);
-    }
+}
     Ok(())
 }
 

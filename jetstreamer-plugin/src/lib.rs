@@ -144,6 +144,10 @@ static LAST_TOTAL_SLOTS: AtomicU64 = AtomicU64::new(0);
 static LAST_TOTAL_TXS: AtomicU64 = AtomicU64::new(0);
 static LAST_TOTAL_TIME_NS: AtomicU64 = AtomicU64::new(0);
 static SNAPSHOT_LOCK: AtomicBool = AtomicBool::new(false);
+#[inline]
+fn monotonic_nanos_since(origin: std::time::Instant) -> u64 {
+    origin.elapsed().as_nanos() as u64
+}
 
 /// Convenience alias for the boxed future returned by plugin hooks.
 pub type PluginFuture<'a> = Pin<
@@ -598,11 +602,12 @@ impl PluginRunner {
         let total_slot_count = slot_range.end.saturating_sub(slot_range.start);
 
         let total_slot_count_capture = total_slot_count;
+        let run_origin = std::time::Instant::now();
         // Reset global rate snapshot for a new run.
         SNAPSHOT_LOCK.store(false, Ordering::Relaxed);
         LAST_TOTAL_SLOTS.store(0, Ordering::Relaxed);
         LAST_TOTAL_TXS.store(0, Ordering::Relaxed);
-        LAST_TOTAL_TIME_NS.store(0, Ordering::Relaxed);
+        LAST_TOTAL_TIME_NS.store(monotonic_nanos_since(run_origin), Ordering::Relaxed);
         let stats_tracking = clickhouse.clone().map(|_db| {
             let shutting_down = shutting_down.clone();
             let thread_progress_max: Arc<DashMap<usize, f64>> = Arc::new(DashMap::new());
@@ -610,9 +615,11 @@ impl PluginRunner {
                 on_stats: {
                     let thread_progress_max = thread_progress_max.clone();
                     let total_slot_count = total_slot_count_capture;
+                    let run_origin = run_origin;
                     move |thread_id: usize, stats: Stats| {
                         let shutting_down = shutting_down.clone();
                         let thread_progress_max = thread_progress_max.clone();
+                        let run_origin = run_origin;
                         async move {
                             let log_target = format!("{}::T{:03}", LOG_MODULE, thread_id);
                             if shutting_down.load(Ordering::SeqCst) {
@@ -631,8 +638,10 @@ impl PluginRunner {
                                 .max(1) as u64;
                             let total_slots = stats.slots_processed;
                             let total_txs = stats.transactions_processed;
+                            let now_ns = monotonic_nanos_since(run_origin);
                             // Serialize snapshot updates so every pulse measures deltas from the
-                            // previous pulse (regardless of which thread emitted it).
+                            // previous pulse (regardless of which thread emitted it) using a
+                            // monotonic clock shared across threads.
                             let (delta_slots, delta_txs, delta_time_ns) = {
                                 while SNAPSHOT_LOCK
                                     .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
@@ -645,12 +654,11 @@ impl PluginRunner {
                                 let prev_time_ns = LAST_TOTAL_TIME_NS.load(Ordering::Relaxed);
                                 LAST_TOTAL_SLOTS.store(total_slots, Ordering::Relaxed);
                                 LAST_TOTAL_TXS.store(total_txs, Ordering::Relaxed);
-                                LAST_TOTAL_TIME_NS.store(elapsed_since_start, Ordering::Relaxed);
+                                LAST_TOTAL_TIME_NS.store(now_ns, Ordering::Relaxed);
                                 SNAPSHOT_LOCK.store(false, Ordering::Release);
                                 let delta_slots = total_slots.saturating_sub(prev_slots);
                                 let delta_txs = total_txs.saturating_sub(prev_txs);
-                                let delta_time_ns =
-                                    elapsed_since_start.saturating_sub(prev_time_ns).max(1);
+                                let delta_time_ns = now_ns.saturating_sub(prev_time_ns).max(1);
                                 (delta_slots, delta_txs, delta_time_ns)
                             };
                             let delta_secs = (delta_time_ns as f64 / 1e9).max(1e-9);

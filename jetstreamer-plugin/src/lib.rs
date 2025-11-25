@@ -612,17 +612,15 @@ impl PluginRunner {
             let shutting_down = shutting_down.clone();
             let thread_progress_max: Arc<DashMap<usize, f64>> = Arc::new(DashMap::new());
             StatsTracking {
-                on_stats: {
-                    let thread_progress_max = thread_progress_max.clone();
-                    let total_slot_count = total_slot_count_capture;
-                    let run_origin = run_origin;
-                    move |thread_id: usize, stats: Stats| {
-                        let shutting_down = shutting_down.clone();
-                        let thread_progress_max = thread_progress_max.clone();
-                        let run_origin = run_origin;
-                        async move {
-                            let log_target = format!("{}::T{:03}", LOG_MODULE, thread_id);
-                            if shutting_down.load(Ordering::SeqCst) {
+        on_stats: {
+            let thread_progress_max = thread_progress_max.clone();
+            let total_slot_count = total_slot_count_capture;
+            move |thread_id: usize, stats: Stats| {
+                let shutting_down = shutting_down.clone();
+                let thread_progress_max = thread_progress_max.clone();
+                async move {
+                    let log_target = format!("{}::T{:03}", LOG_MODULE, thread_id);
+                    if shutting_down.load(Ordering::SeqCst) {
                                 log::debug!(
                                     target: &log_target,
                                     "skipping stats write during shutdown"

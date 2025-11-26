@@ -22,9 +22,9 @@ repository.workspace = true
 documentation.workspace = true
 
 [workspace.dependencies]
-jetstreamer-firehose = { path = "jetstreamer-firehose", version = "0.1.3" }
-jetstreamer-plugin = { path = "jetstreamer-plugin", version = "0.1.3" }
-jetstreamer-utils = { path = "jetstreamer-utils", version = "0.1.3" }
+jetstreamer-firehose = { path = "jetstreamer-firehose", version = "0.2.0" }
+jetstreamer-plugin = { path = "jetstreamer-plugin", version = "0.2.0" }
+jetstreamer-utils = { path = "jetstreamer-utils", version = "0.2.0" }
 tokio = "1"
 futures-util = { version = "0", default-features = false }
 futures = "0"

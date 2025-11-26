@@ -3068,7 +3068,6 @@ name = "jetstreamer-firehose"
 version = "0.2.0"
 dependencies = [
  "base64 0.22.1",
- "bincode",
  "cid",
  "crc",
  "crossbeam-channel",
@@ -3091,6 +3090,7 @@ dependencies = [
  "solana-hash",
  "solana-ledger",
  "solana-logger",
+ "solana-message",
  "solana-reward-info",
  "solana-rpc",
  "solana-runtime",
@@ -3102,6 +3102,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.17",
  "tokio",
+ "wincode",
  "xxhash-rust",
  "zstd",
 ]
@@ -10137,6 +10138,31 @@ name = "winapi-x86_64-pc-windows-gnu"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "712e227841d057c1ee1cd2fb22fa7e5a5461ae8e48fa2ca79ec42cfc1931183f"
+
+[[package]]
+name = "wincode"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cd2ce6dda5b5cde0288a9fd83d513cef824744c4ca601a92e12970c3120e8e93"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "solana-short-vec",
+ "thiserror 2.0.17",
+ "wincode-derive",
+]
+
+[[package]]
+name = "wincode-derive"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a73ae1f9280de1c129b7baa5899ff75682ac67da1224d82d1b473a2ad1cbb49a"
+dependencies = [
+ "darling",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.108",
+]
 
 [[package]]
 name = "windows-core"

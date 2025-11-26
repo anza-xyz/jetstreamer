@@ -1,8 +1,10 @@
 use {
     crate::{SharedError, dataframe::DataFrame, node::Kind, utils::Buffer},
-    bincode::deserialize,
     std::vec::Vec,
+    wincode::Deserialize,
 };
+
+use self::wincode_schema::VersionedTransactionSchema;
 
 // type Transaction struct {
 // 	Kind     int
@@ -109,7 +111,9 @@ impl Transaction {
     pub fn as_parsed(
         &self,
     ) -> Result<solana_transaction::versioned::VersionedTransaction, SharedError> {
-        Ok(deserialize(&self.data.data.to_vec())?)
+        Ok(VersionedTransactionSchema::deserialize(
+            self.data.data.as_slice(),
+        )?)
     }
 
     /// Returns `true` when the transaction data frame has no continuation CIDs.
@@ -119,6 +123,143 @@ impl Transaction {
     /// Returns `true` when the transaction metadata frame has no continuation CIDs.
     pub const fn is_complete_metadata(&self) -> bool {
         self.metadata.next.is_none() || self.metadata.next.as_ref().unwrap().is_empty()
+    }
+}
+
+mod wincode_schema {
+    use {
+        solana_address::Address,
+        solana_hash::Hash,
+        solana_message::{self, MESSAGE_VERSION_PREFIX, legacy, v0},
+        solana_signature::Signature,
+        solana_transaction::versioned,
+        std::mem::MaybeUninit,
+        wincode::{
+            ReadResult, SchemaRead, SchemaWrite, WriteResult,
+            containers::{self, Pod},
+            error::invalid_tag_encoding,
+            io::{Reader, Writer},
+            len::ShortU16Len,
+        },
+    };
+
+    #[derive(SchemaWrite, SchemaRead)]
+    #[wincode(from = "solana_message::MessageHeader", struct_extensions)]
+    struct MessageHeader {
+        num_required_signatures: u8,
+        num_readonly_signed_accounts: u8,
+        num_readonly_unsigned_accounts: u8,
+    }
+
+    #[derive(SchemaWrite, SchemaRead)]
+    #[wincode(from = "solana_message::compiled_instruction::CompiledInstruction")]
+    struct CompiledInstruction {
+        program_id_index: u8,
+        accounts: containers::Vec<Pod<u8>, ShortU16Len>,
+        data: containers::Vec<Pod<u8>, ShortU16Len>,
+    }
+
+    #[derive(SchemaWrite, SchemaRead)]
+    #[wincode(from = "legacy::Message", struct_extensions)]
+    struct LegacyMessage {
+        header: MessageHeader,
+        account_keys: containers::Vec<Pod<Address>, ShortU16Len>,
+        recent_blockhash: Pod<Hash>,
+        instructions: containers::Vec<CompiledInstruction, ShortU16Len>,
+    }
+
+    #[derive(SchemaWrite, SchemaRead)]
+    #[wincode(from = "v0::MessageAddressTableLookup")]
+    struct MessageAddressTableLookup {
+        account_key: Pod<Address>,
+        writable_indexes: containers::Vec<Pod<u8>, ShortU16Len>,
+        readonly_indexes: containers::Vec<Pod<u8>, ShortU16Len>,
+    }
+
+    #[derive(SchemaWrite, SchemaRead)]
+    #[wincode(from = "v0::Message")]
+    struct V0Message {
+        #[wincode(with = "Pod<_>")]
+        header: solana_message::MessageHeader,
+        account_keys: containers::Vec<Pod<Address>, ShortU16Len>,
+        recent_blockhash: Pod<Hash>,
+        instructions: containers::Vec<CompiledInstruction, ShortU16Len>,
+        address_table_lookups: containers::Vec<MessageAddressTableLookup, ShortU16Len>,
+    }
+
+    #[derive(SchemaWrite, SchemaRead)]
+    #[wincode(from = "versioned::VersionedTransaction")]
+    pub(super) struct VersionedTransactionSchema {
+        signatures: containers::Vec<Pod<Signature>, ShortU16Len>,
+        message: VersionedMsg,
+    }
+
+    struct VersionedMsg;
+
+    impl SchemaWrite for VersionedMsg {
+        type Src = solana_message::VersionedMessage;
+
+        #[inline(always)]
+        fn size_of(src: &Self::Src) -> WriteResult<usize> {
+            match src {
+                solana_message::VersionedMessage::Legacy(message) => {
+                    LegacyMessage::size_of(message)
+                }
+                // +1 for message version prefix
+                solana_message::VersionedMessage::V0(message) => {
+                    Ok(1 + V0Message::size_of(message)?)
+                }
+            }
+        }
+
+        #[inline(always)]
+        fn write(writer: &mut impl Writer, src: &Self::Src) -> WriteResult<()> {
+            match src {
+                solana_message::VersionedMessage::Legacy(message) => {
+                    LegacyMessage::write(writer, message)
+                }
+                solana_message::VersionedMessage::V0(message) => {
+                    u8::write(writer, &MESSAGE_VERSION_PREFIX)?;
+                    V0Message::write(writer, message)
+                }
+            }
+        }
+    }
+
+    impl<'de> SchemaRead<'de> for VersionedMsg {
+        type Dst = solana_message::VersionedMessage;
+
+        fn read(reader: &mut impl Reader<'de>, dst: &mut MaybeUninit<Self::Dst>) -> ReadResult<()> {
+            let variant = u8::get(reader)?;
+
+            if variant & MESSAGE_VERSION_PREFIX != 0 {
+                let version = variant & !MESSAGE_VERSION_PREFIX;
+                return match version {
+                    0 => {
+                        let msg = V0Message::get(reader)?;
+                        dst.write(solana_message::VersionedMessage::V0(msg));
+                        Ok(())
+                    }
+                    _ => Err(invalid_tag_encoding(version as usize)),
+                };
+            }
+
+            let mut msg = MaybeUninit::<legacy::Message>::uninit();
+            let header_uninit = LegacyMessage::uninit_header_mut(&mut msg);
+
+            MessageHeader::write_uninit_num_required_signatures(variant, header_uninit);
+            MessageHeader::read_num_readonly_signed_accounts(reader, header_uninit)?;
+            MessageHeader::read_num_readonly_unsigned_accounts(reader, header_uninit)?;
+
+            LegacyMessage::read_account_keys(reader, &mut msg)?;
+            LegacyMessage::read_recent_blockhash(reader, &mut msg)?;
+            LegacyMessage::read_instructions(reader, &mut msg)?;
+
+            let msg = unsafe { msg.assume_init() };
+            dst.write(solana_message::VersionedMessage::Legacy(msg));
+
+            Ok(())
+        }
     }
 }
 

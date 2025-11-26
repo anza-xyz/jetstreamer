@@ -1,13 +1,7 @@
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use dashmap::{DashMap, DashSet};
-#[cfg(test)]
-extern crate serial_test;
-#[cfg(test)]
-use futures_util::FutureExt;
 use futures_util::future::BoxFuture;
 use reqwest::{Client, Url};
-#[cfg(test)]
-use serial_test::serial;
 use solana_address::Address;
 use solana_geyser_plugin_manager::{
     block_metadata_notifier_interface::BlockMetadataNotifier,
@@ -23,8 +17,6 @@ use solana_rpc::{
 use solana_runtime::bank::{KeyedRewardsAndNumPartitions, RewardType};
 use solana_sdk_ids::vote::id as vote_program_id;
 use solana_transaction::versioned::VersionedTransaction;
-#[cfg(test)]
-use std::sync::{Mutex, OnceLock};
 use std::{
     fmt::Display,
     future::Future,
@@ -36,7 +28,6 @@ use std::{
         atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     },
 };
-
 use thiserror::Error;
 use tokio::{
     sync::broadcast::{self, error::TryRecvError},
@@ -2221,6 +2212,13 @@ fn log_stats_handler(thread_id: usize, stats: Stats) -> HandlerFuture {
         Ok(())
     })
 }
+
+#[cfg(test)]
+use futures_util::FutureExt;
+#[cfg(test)]
+use serial_test::serial;
+#[cfg(test)]
+use std::sync::{Mutex, OnceLock};
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_firehose_epoch_800() {

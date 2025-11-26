@@ -218,9 +218,9 @@ pub struct ThreadStats {
     pub start_time: std::time::Instant,
     /// Timestamp captured when the thread finished, if finished.
     pub finish_time: Option<std::time::Instant>,
-    /// Inclusive slot range currently assigned to the thread (may shrink on restart).
+    /// Slot range currently assigned to the thread (half-open, may shrink on restart).
     pub slot_range: Range<u64>,
-    /// Original slot range assigned to the thread (never modified).
+    /// Original slot range assigned to the thread (half-open, never modified).
     pub initial_slot_range: Range<u64>,
     /// Latest slot processed by the thread.
     pub current_slot: u64,
@@ -247,7 +247,7 @@ pub struct Stats {
     pub start_time: std::time::Instant,
     /// Timestamp captured when all processing finished, if finished.
     pub finish_time: Option<std::time::Instant>,
-    /// Slot range currently being processed.
+    /// Slot range currently being processed (half-open [start, end)).
     pub slot_range: Range<u64>,
     /// Aggregate slots processed across all threads.
     pub slots_processed: u64,
@@ -276,7 +276,7 @@ pub struct Stats {
 pub struct StatsTracking<OnStats: Handler<Stats>> {
     /// Callback invoked whenever new stats are available.
     pub on_stats: OnStats,
-    /// Minimum number of slots processed before triggering the callback.
+    /// Emits a stats callback when the current slot is a multiple of this interval.
     pub tracking_interval_slots: u64,
 }
 
@@ -496,6 +496,9 @@ pub struct FirehoseErrorContext {
 }
 
 /// Streams blocks, transactions, entries, rewards, and stats to user-provided handlers.
+///
+/// The requested `slot_range` is half-open `[start, end)`; on recoverable errors the
+/// runner restarts from the last processed slot to maintain coverage.
 #[inline]
 #[allow(clippy::too_many_arguments)]
 pub async fn firehose<OnBlock, OnTransaction, OnEntry, OnRewards, OnStats, OnError>(
@@ -1476,7 +1479,9 @@ where
 /// Builds a Geyser-backed firehose and returns a slot notification stream.
 ///
 /// This helper is used by [`firehose`] when Geyser plugins need to be stood up in-process
-/// rather than relying solely on remote streams.
+/// rather than relying solely on remote streams. The provided `slot_range` is treated as a
+/// half-open interval `[start, end)`, and the thread will restart from the last processed
+/// slot on recoverable errors to maintain coverage.
 pub fn firehose_geyser(
     rt: Arc<tokio::runtime::Runtime>,
     slot_range: Range<u64>,

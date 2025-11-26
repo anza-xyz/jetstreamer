@@ -112,7 +112,7 @@ impl Transaction {
         &self,
     ) -> Result<solana_transaction::versioned::VersionedTransaction, SharedError> {
         Ok(VersionedTransactionSchema::deserialize(
-            &self.data.data.to_vec(),
+            self.data.data.as_slice(),
         )?)
     }
 

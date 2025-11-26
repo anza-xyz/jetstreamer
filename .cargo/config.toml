@@ -1,3 +1,7 @@
 [alias]
 clickhouse-server = "run --release -p jetstreamer-utils --bin clickhouse-server"
 clickhouse-client = "run --release -p jetstreamer-utils --bin clickhouse-client"
+
+# fix for Tahoe
+[target.aarch64-apple-darwin]
+linker = "rust-lld"

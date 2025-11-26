@@ -333,9 +333,6 @@ impl PluginRunner {
                 let shutting_down = shutting_down.clone();
                 async move {
                     let log_target = format!("{}::T{:03}", LOG_MODULE, thread_id);
-                    if plugin_handles.is_empty() {
-                        return Ok(());
-                    }
                     if shutting_down.load(Ordering::SeqCst) {
                         log::debug!(
                             target: &log_target,
@@ -344,62 +341,64 @@ impl PluginRunner {
                         return Ok(());
                     }
                     let block = Arc::new(block);
-                    for handle in plugin_handles.iter() {
-                        let db = clickhouse.clone();
-                        if let Err(err) = handle
-                            .plugin
-                            .on_block(thread_id, db.clone(), block.as_ref())
-                            .await
-                        {
-                            log::error!(
-                                target: &log_target,
-                                "plugin {} on_block error: {}",
-                                handle.name,
-                                err
-                            );
-                            continue;
-                        }
-                        if let (Some(db_client), BlockData::Block { slot, .. }) =
-                            (clickhouse.clone(), block.as_ref())
-                        {
-                            if clickhouse_enabled {
-                                slot_buffer
-                                    .entry(handle.id)
-                                    .or_default()
-                                    .push(PluginSlotRow {
-                                        plugin_id: handle.id as u32,
-                                        slot: *slot,
-                                    });
-                            } else if let Err(err) =
-                                record_plugin_slot(db_client, handle.id, *slot).await
+                    if !plugin_handles.is_empty() {
+                        for handle in plugin_handles.iter() {
+                            let db = clickhouse.clone();
+                            if let Err(err) = handle
+                                .plugin
+                                .on_block(thread_id, db.clone(), block.as_ref())
+                                .await
                             {
                                 log::error!(
                                     target: &log_target,
-                                    "failed to record plugin slot for {}: {}",
+                                    "plugin {} on_block error: {}",
                                     handle.name,
                                     err
                                 );
+                                continue;
                             }
-                        }
-                    }
-                    if clickhouse_enabled {
-                        let current = slots_since_flush
-                            .fetch_add(1, Ordering::Relaxed)
-                            .wrapping_add(1);
-                        if current.is_multiple_of(db_update_interval)
-                            && let Some(db_client) = clickhouse.clone()
-                        {
-                            let buffer = slot_buffer.clone();
-                            let log_target_clone = log_target.clone();
-                            tokio::spawn(async move {
-                                if let Err(err) = flush_slot_buffer(db_client, buffer).await {
+                            if let (Some(db_client), BlockData::Block { slot, .. }) =
+                                (clickhouse.clone(), block.as_ref())
+                            {
+                                if clickhouse_enabled {
+                                    slot_buffer
+                                        .entry(handle.id)
+                                        .or_default()
+                                        .push(PluginSlotRow {
+                                            plugin_id: handle.id as u32,
+                                            slot: *slot,
+                                        });
+                                } else if let Err(err) =
+                                    record_plugin_slot(db_client, handle.id, *slot).await
+                                {
                                     log::error!(
-                                        target: &log_target_clone,
-                                        "failed to flush buffered plugin slots: {}",
+                                        target: &log_target,
+                                        "failed to record plugin slot for {}: {}",
+                                        handle.name,
                                         err
                                     );
                                 }
-                            });
+                            }
+                        }
+                        if clickhouse_enabled {
+                            let current = slots_since_flush
+                                .fetch_add(1, Ordering::Relaxed)
+                                .wrapping_add(1);
+                            if current.is_multiple_of(db_update_interval)
+                                && let Some(db_client) = clickhouse.clone()
+                            {
+                                let buffer = slot_buffer.clone();
+                                let log_target_clone = log_target.clone();
+                                tokio::spawn(async move {
+                                    if let Err(err) = flush_slot_buffer(db_client, buffer).await {
+                                        log::error!(
+                                            target: &log_target_clone,
+                                            "failed to flush buffered plugin slots: {}",
+                                            err
+                                        );
+                                    }
+                                });
+                            }
                         }
                     }
                     if let Some(db_client) = clickhouse.clone() {

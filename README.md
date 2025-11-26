@@ -73,6 +73,10 @@ If `JETSTREAMER_THREADS` is omitted, Jetstreamer auto-sizes the worker pool usin
 hardware-aware heuristic exposed by
 `jetstreamer_firehose::system::optimal_firehose_thread_count`.
 
+The built-in program and instruction tracking plugins skip vote transactions by default. Pass
+`--include-votes` (or set `JETSTREAMER_IGNORE_VOTES=false`) if you want vote activity included
+in their metrics.
+
 The CLI accepts either `<start>:<end>` slot ranges or a single epoch on the command line. See
 [`JetstreamerRunner::parse_cli_args`](https://docs.rs/jetstreamer/latest/jetstreamer/fn.parse_cli_args.html)
 for the precise rules.

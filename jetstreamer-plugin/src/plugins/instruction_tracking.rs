@@ -21,11 +21,19 @@ struct SlotInstructionEvent {
     transaction_count: u32,
 }
 
-#[derive(Debug, Default, Clone)]
-/// Tracks total instructions executed per slot and batches writes to ClickHouse.
-pub struct InstructionTrackingPlugin;
+#[derive(Debug, Clone)]
+/// Tracks total instructions executed per slot and batches writes to ClickHouse. Vote
+/// transactions are skipped by default; construct with `ignore_votes = false` to include them.
+pub struct InstructionTrackingPlugin {
+    ignore_votes: bool,
+}
 
 impl InstructionTrackingPlugin {
+    /// Creates a new instance that optionally skips vote transactions.
+    pub const fn new(ignore_votes: bool) -> Self {
+        Self { ignore_votes }
+    }
+
     fn take_slot_event(slot: u64, block_time: Option<i64>) -> Option<SlotInstructionEvent> {
         let timestamp = clamp_block_time(block_time);
         PENDING_BY_SLOT.remove(&slot).map(|(_, mut event)| {
@@ -48,6 +56,12 @@ impl InstructionTrackingPlugin {
     }
 }
 
+impl Default for InstructionTrackingPlugin {
+    fn default() -> Self {
+        Self::new(true)
+    }
+}
+
 impl Plugin for InstructionTrackingPlugin {
     #[inline(always)]
     fn name(&self) -> &'static str {
@@ -61,7 +75,12 @@ impl Plugin for InstructionTrackingPlugin {
         _db: Option<Arc<Client>>,
         transaction: &'a TransactionData,
     ) -> PluginFuture<'a> {
+        let ignore_votes = self.ignore_votes;
         async move {
+            if ignore_votes && transaction.is_vote {
+                return Ok(());
+            }
+
             let instruction_count = total_instruction_count(transaction);
 
             let slot = transaction.slot;

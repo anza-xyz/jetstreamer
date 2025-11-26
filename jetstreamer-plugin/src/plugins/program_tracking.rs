@@ -27,11 +27,20 @@ struct ProgramEvent {
     pub total_cus: u32,
 }
 
-#[derive(Debug, Default, Clone)]
-/// Tracks per-program invocation counts and writes them to ClickHouse.
-pub struct ProgramTrackingPlugin;
+#[derive(Debug, Clone)]
+/// Tracks per-program invocation counts and writes them to ClickHouse. Vote transactions are
+/// skipped by default to reduce noise; call [`ProgramTrackingPlugin::new`] with `false` to
+/// include them.
+pub struct ProgramTrackingPlugin {
+    ignore_votes: bool,
+}
 
 impl ProgramTrackingPlugin {
+    /// Creates a new instance that optionally skips vote transactions.
+    pub const fn new(ignore_votes: bool) -> Self {
+        Self { ignore_votes }
+    }
+
     fn take_slot_events(slot: u64, block_time: Option<i64>) -> Vec<ProgramEvent> {
         let timestamp = clamp_block_time(block_time);
         if let Some((_, events_by_program)) = PENDING_BY_SLOT.remove(&slot) {
@@ -62,6 +71,12 @@ impl ProgramTrackingPlugin {
     }
 }
 
+impl Default for ProgramTrackingPlugin {
+    fn default() -> Self {
+        Self::new(true)
+    }
+}
+
 impl Plugin for ProgramTrackingPlugin {
     #[inline(always)]
     fn name(&self) -> &'static str {
@@ -75,7 +90,12 @@ impl Plugin for ProgramTrackingPlugin {
         _db: Option<Arc<Client>>,
         transaction: &'a TransactionData,
     ) -> PluginFuture<'a> {
+        let ignore_votes = self.ignore_votes;
         async move {
+            if ignore_votes && transaction.is_vote {
+                return Ok(());
+            }
+
             let message = &transaction.transaction.message;
             let (account_keys, instructions) = match message {
                 VersionedMessage::Legacy(msg) => (&msg.account_keys, &msg.instructions),

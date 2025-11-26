@@ -1618,7 +1618,9 @@ async fn firehose_geyser_thread(
     } else {
         LOG_MODULE.to_string()
     };
+    let initial_slot_range = slot_range.clone();
     let mut skip_until_index = None;
+    let mut last_counted_slot = slot_range.start.saturating_sub(1);
     // let mut triggered = false;
     while let Err((err, slot)) = async {
             let epoch_range = slot_to_epoch(slot_range.start)..=slot_to_epoch(slot_range.end - 1);
@@ -1635,7 +1637,6 @@ async fn firehose_geyser_thread(
 
             // for each epoch
             let mut current_slot: Option<u64> = None;
-            let mut previous_slot: Option<u64> = None;
             for epoch_num in epoch_range.clone() {
                 log::info!(target: &log_target, "entering epoch {}", epoch_num);
                 let stream = match timeout(OP_TIMEOUT, fetch_epoch_stream(epoch_num, client)).await {
@@ -1657,14 +1658,33 @@ async fn firehose_geyser_thread(
                 };
                 log::debug!(target: &log_target, "read epoch {} header: {:?}", epoch_num, header);
 
+                let (epoch_start, epoch_end_inclusive) = epoch_to_slot_range(epoch_num);
+                let local_start = std::cmp::max(slot_range.start, epoch_start);
+                let local_end_inclusive =
+                    std::cmp::min(slot_range.end.saturating_sub(1), epoch_end_inclusive);
+                if local_start > local_end_inclusive {
+                    log::debug!(
+                        target: &log_target,
+                        "epoch {} has no overlap with thread range ({}..{}), skipping",
+                        epoch_num,
+                        slot_range.start,
+                        slot_range.end
+                    );
+                    continue;
+                }
+
                 let mut todo_previous_blockhash = Hash::default();
                 let mut todo_latest_entry_blockhash = Hash::default();
+                // Reset counters to align to the local epoch slice; prevents boundary slots
+                // from being treated as already-counted after a restart.
+                last_counted_slot = local_start.saturating_sub(1);
+                current_slot = None;
 
-                if slot_range.start > epoch_to_slot_range(epoch_num).0 {
+                if local_start > epoch_start {
                     // Seek to the slot immediately preceding the requested range so the reader
                     // captures the full node set (transactions, entries, rewards) for the
                     // target block on the next iteration.
-                    let seek_slot = slot_range.start.saturating_sub(1);
+                    let seek_slot = local_start.saturating_sub(1);
                     let seek_fut = reader.seek_to_slot(seek_slot);
                     match timeout(OP_TIMEOUT, seek_fut).await {
                         Ok(res) => res.map_err(|e| (e, current_slot.unwrap_or(slot_range.start)))?,
@@ -1685,7 +1705,12 @@ async fn firehose_geyser_thread(
                             .map_err(|e| (e, current_slot.unwrap_or(slot_range.start)))?,
                         Err(_) => {
                             log::warn!(target: &log_target, "timeout reading next block, retrying (will restart)...");
-                            return Err((FirehoseError::OperationTimeout("read_until_block"), current_slot.unwrap_or(slot_range.start)));
+                            let restart_slot =
+                                current_slot.map(|s| s + 1).unwrap_or(slot_range.start);
+                            return Err((
+                                FirehoseError::OperationTimeout("read_until_block"),
+                                restart_slot,
+                            ));
                         }
                     };
                     if nodes.is_empty() {
@@ -1721,6 +1746,15 @@ async fn firehose_geyser_thread(
                         block.slot
                     );
                     let slot = block.slot;
+                    if slot > local_end_inclusive {
+                        log::debug!(
+                            target: &log_target,
+                            "reached end of local slice at slot {} (epoch {}), stopping",
+                            slot,
+                            epoch_num
+                        );
+                        break;
+                    }
                     if slot >= slot_range.end {
                         log::info!(target: &log_target, "reached end of slot range at slot {}", slot);
                         // Return early to terminate the firehose thread cleanly. We use >=
@@ -1729,8 +1763,8 @@ async fn firehose_geyser_thread(
                         return Ok(());
                     }
                     debug_assert!(slot < slot_range.end, "processing out-of-range slot {} (end {})", slot, slot_range.end);
-                    if slot < slot_range.start {
-                        if slot.saturating_add(1) == slot_range.start {
+                    if slot < local_start {
+                        if slot.saturating_add(1) == local_start {
                             log::debug!(
                                 target: &log_target,
                                 "priming reader with preceding slot {}, skipping",
@@ -1741,22 +1775,27 @@ async fn firehose_geyser_thread(
                                 target: &log_target,
                                 "encountered slot {} before start of range {}, skipping",
                                 slot,
-                                slot_range.start
+                                local_start
                             );
                         }
                         continue;
                     }
-                    if let Some(previous_slot) = previous_slot
-                        && slot != previous_slot + 1 {
-                            // log::warn!(target: &log_target, "non-consecutive slots: {}
-                            // followed by {}", previous_slot, slot);
-                        }
-                    previous_slot = current_slot;
                     current_slot = Some(slot);
                     let mut entry_index: usize = 0;
                     let mut this_block_executed_transaction_count: u64 = 0;
                     let mut this_block_entry_count: u64 = 0;
                     let mut this_block_rewards: Vec<(Address, RewardInfo)> = Vec::new();
+
+                    if slot <= last_counted_slot {
+                        log::debug!(
+                            target: &log_target,
+                            "duplicate block {}, already counted (last_counted={})",
+                            slot,
+                            last_counted_slot,
+                        );
+                        this_block_rewards.clear();
+                        continue;
+                    }
 
                     nodes.each(|node_with_cid| -> Result<(), SharedError> {
                         item_index += 1;
@@ -1877,6 +1916,7 @@ async fn firehose_geyser_thread(
                                 confirmed_bank_sender.send(notification).unwrap();
 
                                 if block_meta_notifier_maybe.is_none() {
+                                    last_counted_slot = block.slot;
                                     return Ok(());
                                 }
                                 let keyed_rewards = std::mem::take(&mut this_block_rewards);
@@ -1896,6 +1936,7 @@ async fn firehose_geyser_thread(
                                     this_block_entry_count,
                                 );
                                 todo_previous_blockhash = todo_latest_entry_blockhash;
+                                last_counted_slot = block.slot;
                                 std::thread::yield_now();
                             }
                             Subset(_subset) => (),
@@ -1925,8 +1966,10 @@ async fn firehose_geyser_thread(
                         log::info!(
                             target: &log_target,
                             "processed {} slots across {} epochs in {}.",
-                            slot_range.end - slot_range.start,
-                            slot_to_epoch(slot_range.end) + 1 - slot_to_epoch(slot_range.start),
+                            initial_slot_range.end - initial_slot_range.start,
+                            slot_to_epoch(initial_slot_range.end)
+                                + 1
+                                - slot_to_epoch(initial_slot_range.start),
                             elapsed_pretty
                         );
                         log::info!(target: &log_target, "a 🚒 firehose thread finished completed its work.");
@@ -1967,6 +2010,10 @@ async fn firehose_geyser_thread(
             slot_to_epoch(slot)
             );
             log::error!(target: &log_target, "{}", err);
+            if matches!(err, FirehoseError::SlotOffsetIndexError(_)) {
+                // Clear cached index data for this epoch to avoid retrying with a bad/partial index.
+                SLOT_OFFSET_INDEX.invalidate_epoch(slot_to_epoch(slot));
+            }
             let item_index = match err {
                 FirehoseError::NodeDecodingError(item_index, _) => item_index,
                 _ => 0,
@@ -1980,8 +2027,13 @@ async fn firehose_geyser_thread(
                 slot,
                 item_index,
             );
-            // Update slot range to resume from the failed slot, not the original start
-            slot_range.start = slot;
+            // Update slot range to resume from the failed slot, not the original start.
+            // If the failing slot was already fully processed, resume from the next slot.
+            if slot <= last_counted_slot {
+                slot_range.start = last_counted_slot.saturating_add(1);
+            } else {
+                slot_range.start = slot;
+            }
             skip_until_index = Some(item_index);
 }
     Ok(())

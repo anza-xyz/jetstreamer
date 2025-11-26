@@ -554,11 +554,9 @@ impl BuiltinPlugin {
 /// - `JETSTREAMER_THREADS`: Number of firehose ingestion threads.
 ///
 /// CLI flags:
-/// - `--with-plugin <name>`: adds a built-in plugin (`program-tracking` or `instruction-tracking`).
-///
-/// Additional CLI flags:
 /// - `--with-plugin <name>`: Adds one of the built-in plugins (`program-tracking` or
 ///   `instruction-tracking`). When omitted, the CLI defaults to `program-tracking`.
+/// - `--no-plugins`: Disables all built-in plugins (overrides the default and any `--with-plugin`).
 ///
 /// # Examples
 ///
@@ -577,6 +575,7 @@ pub fn parse_cli_args() -> Result<Config, Box<dyn std::error::Error>> {
     args.next(); // binary name
     let mut first_arg: Option<String> = None;
     let mut builtin_plugins = Vec::new();
+    let mut no_plugins = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--with-plugin" => {
@@ -590,11 +589,17 @@ pub fn parse_cli_args() -> Result<Config, Box<dyn std::error::Error>> {
                 })?;
                 builtin_plugins.push(plugin);
             }
+            "--no-plugins" => {
+                no_plugins = true;
+            }
             _ if first_arg.is_none() => first_arg = Some(arg),
             other => return Err(format!("unrecognized argument '{other}'").into()),
         }
     }
     let first_arg = first_arg.expect("no first argument given");
+    if no_plugins && !builtin_plugins.is_empty() {
+        return Err("--no-plugins cannot be combined with --with-plugin".into());
+    }
     let slot_range = if first_arg.contains(':') {
         let (slot_a, slot_b) = first_arg
             .split_once(':')
@@ -620,7 +625,9 @@ pub fn parse_cli_args() -> Result<Config, Box<dyn std::error::Error>> {
 
     let spawn_clickhouse = clickhouse_settings.spawn_helper && clickhouse_enabled;
 
-    let builtin_plugins = if builtin_plugins.is_empty() {
+    let builtin_plugins = if no_plugins {
+        Vec::new()
+    } else if builtin_plugins.is_empty() {
         vec![BuiltinPlugin::ProgramTracking]
     } else {
         builtin_plugins

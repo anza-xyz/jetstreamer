@@ -36,11 +36,17 @@ use log::{info, warn};
 use once_cell::sync::{Lazy, OnceCell as SyncOnceCell};
 use reqwest::{Client, StatusCode, Url, header::RANGE};
 use serde_cbor::Value;
-#[cfg(test)]
-use std::time::Instant;
-use std::{collections::HashMap, ops::RangeInclusive, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    ops::RangeInclusive,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, Instant},
+};
 use thiserror::Error;
-use tokio::{sync::OnceCell, time::sleep};
+use tokio::{sync::OnceCell, task::yield_now, time::sleep};
 use xxhash_rust::xxh64::xxh64;
 
 const COMPACT_INDEX_MAGIC: &[u8; 8] = b"compiszd";
@@ -52,7 +58,8 @@ const METADATA_KEY_KIND: &[u8] = b"index_kind";
 const METADATA_KEY_EPOCH: &[u8] = b"epoch";
 const HTTP_PREFETCH_BYTES: u64 = 4 * 1024; // initial bytes to fetch for headers
 const FETCH_RANGE_MAX_RETRIES: usize = 10;
-const FETCH_RANGE_BASE_DELAY_MS: u64 = 4000;
+const FETCH_RANGE_BASE_DELAY_MS: u64 = 10_000;
+const MIN_HIT_SPACING_MS: u64 = 20;
 
 /// Errors returned while accessing the compact slot offset index.
 #[derive(Debug, Error)]
@@ -90,6 +97,8 @@ pub static SLOT_OFFSET_INDEX: Lazy<SlotOffsetIndex> = Lazy::new(|| {
     SlotOffsetIndex::new(base_url).expect("failed to initialize slot offset index")
 });
 
+static START_INSTANT: Lazy<Instant> = Lazy::new(Instant::now);
+static LAST_HIT_TIME: AtomicU64 = AtomicU64::new(0);
 static SLOT_OFFSET_RESULT_CACHE: Lazy<DashMap<u64, u64>> = Lazy::new(DashMap::new);
 static EPOCH_CACHE: Lazy<DashMap<EpochCacheKey, Arc<EpochEntry>>> = Lazy::new(DashMap::new);
 
@@ -257,6 +266,16 @@ impl SlotOffsetIndex {
         SLOT_OFFSET_RESULT_CACHE.insert(slot, offset);
 
         Ok(offset)
+    }
+
+    /// Clears cached index data for the given epoch, forcing a refetch on next lookup.
+    pub fn invalidate_epoch(&self, epoch: u64) {
+        let key = EpochCacheKey::new(&self.cache_namespace, epoch);
+        EPOCH_CACHE.remove(&key);
+
+        let (epoch_start, epoch_end_inclusive) = epoch_to_slot_range(epoch);
+        SLOT_OFFSET_RESULT_CACHE
+            .retain(|slot, _| *slot < epoch_start || *slot > epoch_end_inclusive);
     }
 }
 
@@ -848,6 +867,33 @@ const fn hash_uint64(mut x: u64) -> u64 {
     x
 }
 
+fn monotonic_millis() -> u64 {
+    let elapsed = START_INSTANT.elapsed().as_millis();
+    if elapsed > u64::MAX as u128 {
+        u64::MAX
+    } else {
+        elapsed as u64
+    }
+}
+
+pub(crate) async fn wait_for_remote_hit_slot() {
+    loop {
+        let now_ms = monotonic_millis();
+        let last_hit = LAST_HIT_TIME.load(Ordering::Relaxed);
+        if now_ms.saturating_sub(last_hit) < MIN_HIT_SPACING_MS {
+            yield_now().await;
+            continue;
+        }
+        if LAST_HIT_TIME
+            .compare_exchange(last_hit, now_ms, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            return;
+        }
+        yield_now().await;
+    }
+}
+
 async fn fetch_and_parse_header(
     client: &Client,
     url: &Url,
@@ -1065,6 +1111,7 @@ fn decode_cid_bytes(bytes: &[u8]) -> Result<Cid, String> {
 async fn fetch_full(client: &Client, url: &Url) -> Result<Vec<u8>, SlotOffsetIndexError> {
     let mut attempt = 0usize;
     loop {
+        wait_for_remote_hit_slot().await;
         let response = match client.get(url.clone()).send().await {
             Ok(resp) => resp,
             Err(err) => {
@@ -1181,6 +1228,7 @@ async fn fetch_range(
     let range_header = format!("bytes={start}-{end}");
     let mut attempt = 0usize;
     loop {
+        wait_for_remote_hit_slot().await;
         let response = match client
             .get(url.clone())
             .header(RANGE, range_header.clone())
@@ -1352,7 +1400,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    #[ignore]
+    #[serial_test::serial]
     async fn test_epoch_800_hydration_time() {
         init_logger();
         SLOT_OFFSET_RESULT_CACHE.clear();

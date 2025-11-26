@@ -6,14 +6,21 @@ use crate::index::{SlotOffsetIndexError, slot_to_offset};
 use crate::node::{Node, NodeWithCid, NodesWithCids, parse_any_from_cbordata};
 use crate::utils;
 use cid::Cid;
+use once_cell::sync::Lazy;
 use reqwest::RequestBuilder;
 use rseek::Seekable;
 use std::io;
 use std::io::SeekFrom;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 use std::vec::Vec;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt};
+use tokio::task::yield_now;
 
 const MAX_VARINT_LEN_64: usize = 10;
+const MIN_SEEK_SPACING_MS: u64 = 51;
+static SEEK_START_INSTANT: Lazy<Instant> = Lazy::new(Instant::now);
+static LAST_SEEK_HIT_TIME: AtomicU64 = AtomicU64::new(0);
 
 /// Reads an unsigned LEB128-encoded integer from the provided async reader.
 pub async fn read_uvarint<R: AsyncRead + Unpin>(reader: &mut R) -> io::Result<u64> {
@@ -229,6 +236,7 @@ impl<R: AsyncRead + Unpin + AsyncSeek + Len> NodeReader<R> {
             epoch,
             offset
         );
+        wait_for_seek_hit_slot().await;
         self.reader
             .seek(SeekFrom::Start(offset))
             .await
@@ -303,6 +311,33 @@ impl<R: AsyncRead + Unpin + AsyncSeek + Len> NodeReader<R> {
     /// Returns the number of Old Faithful CAR items that have been yielded so far.
     pub const fn get_item_index(&self) -> u64 {
         self.item_index
+    }
+}
+
+fn seek_monotonic_millis() -> u64 {
+    let elapsed = SEEK_START_INSTANT.elapsed().as_millis();
+    if elapsed > u64::MAX as u128 {
+        u64::MAX
+    } else {
+        elapsed as u64
+    }
+}
+
+async fn wait_for_seek_hit_slot() {
+    loop {
+        let now_ms = seek_monotonic_millis();
+        let last_hit = LAST_SEEK_HIT_TIME.load(Ordering::Relaxed);
+        if now_ms.saturating_sub(last_hit) < MIN_SEEK_SPACING_MS {
+            yield_now().await;
+            continue;
+        }
+        if LAST_SEEK_HIT_TIME
+            .compare_exchange(last_hit, now_ms, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            return;
+        }
+        yield_now().await;
     }
 }
 

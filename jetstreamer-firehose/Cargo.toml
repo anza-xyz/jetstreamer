@@ -20,6 +20,7 @@ path = "src/main.rs"
 
 [dependencies]
 crossbeam-channel.workspace = true
+serial_test.workspace = true
 solana-rpc.workspace = true
 solana-runtime.workspace = true
 solana-hash.workspace = true
@@ -57,3 +58,4 @@ once_cell.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+serial_test = "2"

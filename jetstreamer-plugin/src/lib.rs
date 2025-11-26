@@ -113,10 +113,11 @@ const LOG_MODULE: &str = "jetstreamer::runner";
 use std::{
     fmt::Display,
     future::Future,
+    hint,
     ops::Range,
     pin::Pin,
     sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
@@ -133,80 +134,20 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::{signal, sync::broadcast};
 
-#[derive(Clone, Copy)]
-struct Snapshot {
-    time: std::time::Instant,
-    slots: u64,
-    txs: u64,
-}
-
-#[derive(Clone, Copy, Default)]
-struct Contribution {
-    slot_delta: u64,
-    tx_delta: u64,
-    dt: f64,
-}
-
-#[derive(Clone, Copy, Default)]
-struct Rates {
-    slot_rate: f64,
-    tx_rate: f64,
-}
-
-#[derive(Default)]
-struct SnapshotWindow {
-    entries: [Option<Contribution>; 5],
-    idx: usize,
-    len: usize,
-    last: Option<Snapshot>,
-}
-
-impl SnapshotWindow {
-    fn update(&mut self, snapshot: Snapshot) -> Option<Rates> {
-        if let Some(prev) = self.last
-            && let Some(dt) = snapshot
-                .time
-                .checked_duration_since(prev.time)
-                .map(|d| d.as_secs_f64())
-            && dt > 0.0
-        {
-            let contrib = Contribution {
-                slot_delta: snapshot.slots.saturating_sub(prev.slots),
-                tx_delta: snapshot.txs.saturating_sub(prev.txs),
-                dt,
-            };
-            self.entries[self.idx] = Some(contrib);
-            self.idx = (self.idx + 1) % self.entries.len();
-            if self.len < self.entries.len() {
-                self.len += 1;
-            }
-        }
-        self.last = Some(snapshot);
-
-        let mut total_slots = 0u64;
-        let mut total_txs = 0u64;
-        let mut total_dt = 0.0;
-        for entry in self.entries.iter().flatten() {
-            total_slots = total_slots.saturating_add(entry.slot_delta);
-            total_txs = total_txs.saturating_add(entry.tx_delta);
-            total_dt += entry.dt;
-        }
-
-        if self.len < self.entries.len() || total_dt <= 0.0 {
-            return None;
-        }
-
-        Some(Rates {
-            slot_rate: total_slots as f64 / total_dt,
-            tx_rate: total_txs as f64 / total_dt,
-        })
-    }
-}
-
 /// Re-exported statistics types produced by [`firehose`].
 pub use jetstreamer_firehose::firehose::{
     FirehoseErrorContext, Stats as FirehoseStats, ThreadStats,
 };
+
+// Global totals snapshot used to compute overall TPS/ETA between pulses.
+static LAST_TOTAL_SLOTS: AtomicU64 = AtomicU64::new(0);
+static LAST_TOTAL_TXS: AtomicU64 = AtomicU64::new(0);
+static LAST_TOTAL_TIME_NS: AtomicU64 = AtomicU64::new(0);
+static SNAPSHOT_LOCK: AtomicBool = AtomicBool::new(false);
+#[inline]
+fn monotonic_nanos_since(origin: std::time::Instant) -> u64 {
+    origin.elapsed().as_nanos() as u64
+}
 
 /// Convenience alias for the boxed future returned by plugin hooks.
 pub type PluginFuture<'a> = Pin<
@@ -661,20 +602,25 @@ impl PluginRunner {
         let total_slot_count = slot_range.end.saturating_sub(slot_range.start);
 
         let total_slot_count_capture = total_slot_count;
+        let run_origin = std::time::Instant::now();
+        // Reset global rate snapshot for a new run.
+        SNAPSHOT_LOCK.store(false, Ordering::Relaxed);
+        LAST_TOTAL_SLOTS.store(0, Ordering::Relaxed);
+        LAST_TOTAL_TXS.store(0, Ordering::Relaxed);
+        LAST_TOTAL_TIME_NS.store(monotonic_nanos_since(run_origin), Ordering::Relaxed);
         let stats_tracking = clickhouse.clone().map(|_db| {
             let shutting_down = shutting_down.clone();
-            let last_snapshot: Arc<Mutex<SnapshotWindow>> =
-                Arc::new(Mutex::new(SnapshotWindow::default()));
+            let thread_progress_max: Arc<DashMap<usize, f64>> = Arc::new(DashMap::new());
             StatsTracking {
-                on_stats: {
-                    let last_snapshot = last_snapshot.clone();
-                    let total_slot_count = total_slot_count_capture;
-                    move |thread_id: usize, stats: Stats| {
-                        let shutting_down = shutting_down.clone();
-                        let last_snapshot = last_snapshot.clone();
-                        async move {
-                            let log_target = format!("{}::T{:03}", LOG_MODULE, thread_id);
-                            if shutting_down.load(Ordering::SeqCst) {
+        on_stats: {
+            let thread_progress_max = thread_progress_max.clone();
+            let total_slot_count = total_slot_count_capture;
+            move |thread_id: usize, stats: Stats| {
+                let shutting_down = shutting_down.clone();
+                let thread_progress_max = thread_progress_max.clone();
+                async move {
+                    let log_target = format!("{}::T{:03}", LOG_MODULE, thread_id);
+                    if shutting_down.load(Ordering::SeqCst) {
                                 log::debug!(
                                     target: &log_target,
                                     "skipping stats write during shutdown"
@@ -684,13 +630,45 @@ impl PluginRunner {
                             let finish_at = stats
                                 .finish_time
                                 .unwrap_or_else(std::time::Instant::now);
-                            let elapsed = finish_at.saturating_duration_since(stats.start_time);
-                            let elapsed_secs = elapsed.as_secs_f64();
-                            let mut tps = if elapsed_secs > 0.0 {
-                                stats.transactions_processed as f64 / elapsed_secs
-                            } else {
-                                0.0
+                            let elapsed_since_start = finish_at
+                                .saturating_duration_since(stats.start_time)
+                                .as_nanos()
+                                .max(1) as u64;
+                            let total_slots = stats.slots_processed;
+                            let total_txs = stats.transactions_processed;
+                            let now_ns = monotonic_nanos_since(run_origin);
+                            // Serialize snapshot updates so every pulse measures deltas from the
+                            // previous pulse (regardless of which thread emitted it) using a
+                            // monotonic clock shared across threads.
+                            let (delta_slots, delta_txs, delta_time_ns) = {
+                                while SNAPSHOT_LOCK
+                                    .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                                    .is_err()
+                                {
+                                    hint::spin_loop();
+                                }
+                                let prev_slots = LAST_TOTAL_SLOTS.load(Ordering::Relaxed);
+                                let prev_txs = LAST_TOTAL_TXS.load(Ordering::Relaxed);
+                                let prev_time_ns = LAST_TOTAL_TIME_NS.load(Ordering::Relaxed);
+                                LAST_TOTAL_SLOTS.store(total_slots, Ordering::Relaxed);
+                                LAST_TOTAL_TXS.store(total_txs, Ordering::Relaxed);
+                                LAST_TOTAL_TIME_NS.store(now_ns, Ordering::Relaxed);
+                                SNAPSHOT_LOCK.store(false, Ordering::Release);
+                                let delta_slots = total_slots.saturating_sub(prev_slots);
+                                let delta_txs = total_txs.saturating_sub(prev_txs);
+                                let delta_time_ns = now_ns.saturating_sub(prev_time_ns).max(1);
+                                (delta_slots, delta_txs, delta_time_ns)
                             };
+                            let delta_secs = (delta_time_ns as f64 / 1e9).max(1e-9);
+                            let mut slot_rate = delta_slots as f64 / delta_secs;
+                            let mut tps = delta_txs as f64 / delta_secs;
+                            if slot_rate <= 0.0 && total_slots > 0 {
+                                slot_rate =
+                                    total_slots as f64 / (elapsed_since_start as f64 / 1e9);
+                            }
+                            if tps <= 0.0 && total_txs > 0 {
+                                tps = total_txs as f64 / (elapsed_since_start as f64 / 1e9);
+                            }
                             let thread_stats = &stats.thread_stats;
                             let processed_slots = stats.slots_processed.min(total_slot_count);
                             let progress_fraction = if total_slot_count > 0 {
@@ -700,32 +678,32 @@ impl PluginRunner {
                             };
                             let overall_progress = (progress_fraction * 100.0).clamp(0.0, 100.0);
                             let thread_total_slots = thread_stats
-                                .slot_range
+                                .initial_slot_range
                                 .end
-                                .saturating_sub(thread_stats.slot_range.start);
-                            let thread_progress = if thread_total_slots > 0 {
+                                .saturating_sub(thread_stats.initial_slot_range.start);
+                            let thread_progress_raw = if thread_total_slots > 0 {
                                 (thread_stats.slots_processed as f64 / thread_total_slots as f64)
                                     .clamp(0.0, 1.0)
                                     * 100.0
                             } else {
                                 100.0
                             };
-                            let mut overall_eta = None;
-                            if let Ok(mut window) = last_snapshot.lock()
-                                && let Some(rates) = window.update(Snapshot {
-                                    time: finish_at,
-                                    slots: stats.slots_processed,
-                                    txs: stats.transactions_processed,
-                                }) {
-                                    tps = rates.tx_rate;
-                                    let remaining_slots =
-                                        total_slot_count.saturating_sub(processed_slots);
-                                    if rates.slot_rate > 0.0 && remaining_slots > 0 {
-                                        overall_eta = Some(human_readable_duration(
-                                            remaining_slots as f64 / rates.slot_rate,
-                                        ));
+                            let thread_progress = *thread_progress_max
+                                .entry(thread_id)
+                                .and_modify(|max| {
+                                    if thread_progress_raw > *max {
+                                        *max = thread_progress_raw;
                                     }
-                                }
+                                })
+                                .or_insert(thread_progress_raw);
+                            let mut overall_eta = None;
+                            if slot_rate > 0.0 {
+                                let remaining_slots =
+                                    total_slot_count.saturating_sub(processed_slots);
+                                overall_eta = Some(human_readable_duration(
+                                    remaining_slots as f64 / slot_rate,
+                                ));
+                            }
                             if overall_eta.is_none() {
                                 if progress_fraction > 0.0 && progress_fraction < 1.0 {
                                     if let Some(elapsed_total) = finish_at

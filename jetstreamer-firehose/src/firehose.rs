@@ -1374,7 +1374,7 @@ where
                 let error_message = err.to_string();
                 log::error!(
                     target: &log_target,
-                    "🔥🔥🔥 firehose encountered an error at slot {} in epoch {}:",
+                    "🧯💦🔥 firehose encountered an error at slot {} in epoch {} and will roll back one slot and retry:",
                     slot,
                     epoch
                 );
@@ -2005,7 +2005,7 @@ async fn firehose_geyser_thread(
         }
         log::error!(
             target: &log_target,
-            "🔥🔥🔥 firehose encountered an error at slot {} in epoch {}:",
+            "🧯💦🔥 firehose encountered an error at slot {} in epoch {} and will roll back one slot and retry:",
             slot,
             slot_to_epoch(slot)
             );

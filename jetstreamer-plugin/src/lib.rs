@@ -129,6 +129,7 @@ use futures_util::FutureExt;
 use jetstreamer_firehose::firehose::{
     BlockData, EntryData, RewardsData, Stats, StatsTracking, TransactionData, firehose,
 };
+use once_cell::sync::Lazy;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -409,11 +410,14 @@ impl PluginRunner {
                                 block_time,
                                 ..
                             } => {
+                                let tally = take_slot_tx_tally(*slot);
                                 if let Err(err) = record_slot_status(
                                     db_client,
                                     *slot,
                                     thread_id,
                                     *executed_transaction_count,
+                                    tally.votes,
+                                    tally.non_votes,
                                     *block_time,
                                 )
                                 .await
@@ -425,7 +429,10 @@ impl PluginRunner {
                                     );
                                 }
                             }
-                            BlockData::PossibleLeaderSkipped { .. } => {}
+                            BlockData::PossibleLeaderSkipped { slot } => {
+                                // Drop any tallies that may exist for skipped slots.
+                                take_slot_tx_tally(*slot);
+                            }
                         }
                     }
                     Ok(())
@@ -444,6 +451,7 @@ impl PluginRunner {
                 let shutting_down = shutting_down.clone();
                 async move {
                     let log_target = format!("{}::T{:03}", LOG_MODULE, thread_id);
+                    record_slot_vote_tally(transaction.slot, transaction.is_vote);
                     if plugin_handles.is_empty() {
                         return Ok(());
                     }
@@ -871,27 +879,32 @@ struct PluginSlotRow {
 struct SlotStatusRow {
     slot: u64,
     transaction_count: u32,
+    vote_transaction_count: u32,
+    non_vote_transaction_count: u32,
     thread_id: u8,
     block_time: u32,
 }
+
+#[derive(Default, Clone, Copy)]
+struct SlotTxTally {
+    votes: u64,
+    non_votes: u64,
+}
+
+static SLOT_TX_TALLY: Lazy<DashMap<u64, SlotTxTally>> = Lazy::new(DashMap::new);
 
 async fn ensure_clickhouse_tables(db: &Client) -> Result<(), clickhouse::error::Error> {
     db.query(
         r#"CREATE TABLE IF NOT EXISTS jetstreamer_slot_status (
             slot UInt64,
             transaction_count UInt32 DEFAULT 0,
+            vote_transaction_count UInt32 DEFAULT 0,
+            non_vote_transaction_count UInt32 DEFAULT 0,
             thread_id UInt8 DEFAULT 0,
             block_time DateTime('UTC') DEFAULT toDateTime(0),
             indexed_at DateTime('UTC') DEFAULT now()
         ) ENGINE = ReplacingMergeTree(indexed_at)
         ORDER BY slot"#,
-    )
-    .execute()
-    .await?;
-
-    db.query(
-        r#"ALTER TABLE jetstreamer_slot_status
-           ADD COLUMN IF NOT EXISTS block_time DateTime('UTC') DEFAULT toDateTime(0)"#,
     )
     .execute()
     .await?;
@@ -990,6 +1003,8 @@ async fn record_slot_status(
     slot: u64,
     thread_id: usize,
     transaction_count: u64,
+    vote_transaction_count: u64,
+    non_vote_transaction_count: u64,
     block_time: Option<i64>,
 ) -> Result<(), clickhouse::error::Error> {
     let mut insert = db
@@ -999,6 +1014,8 @@ async fn record_slot_status(
         .write(&SlotStatusRow {
             slot,
             transaction_count: transaction_count.min(u32::MAX as u64) as u32,
+            vote_transaction_count: vote_transaction_count.min(u32::MAX as u64) as u32,
+            non_vote_transaction_count: non_vote_transaction_count.min(u32::MAX as u64) as u32,
             thread_id: thread_id.try_into().unwrap_or(u8::MAX),
             block_time: clamp_block_time(block_time),
         })
@@ -1014,6 +1031,22 @@ fn clamp_block_time(block_time: Option<i64>) -> u32 {
         Some(ts) if ts < 0 => 0,
         _ => 0,
     }
+}
+
+fn record_slot_vote_tally(slot: u64, is_vote: bool) {
+    let mut entry = SLOT_TX_TALLY.entry(slot).or_default();
+    if is_vote {
+        entry.votes = entry.votes.saturating_add(1);
+    } else {
+        entry.non_votes = entry.non_votes.saturating_add(1);
+    }
+}
+
+fn take_slot_tx_tally(slot: u64) -> SlotTxTally {
+    SLOT_TX_TALLY
+        .remove(&slot)
+        .map(|(_, tally)| tally)
+        .unwrap_or_default()
 }
 
 // Ensure PluginRunnerError is Send + Sync + 'static

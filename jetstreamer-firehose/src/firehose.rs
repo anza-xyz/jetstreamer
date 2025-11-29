@@ -2411,6 +2411,68 @@ async fn test_firehose_target_slot_transactions() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn test_firehose_epoch_850_votes_present() {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    solana_logger::setup_with_default("info");
+    const TARGET_SLOT: u64 = 367_200_100; // epoch 850
+    const SLOT_RADIUS: u64 = 10;
+    static SEEN_BLOCK: AtomicBool = AtomicBool::new(false);
+    static VOTE_TXS: AtomicU64 = AtomicU64::new(0);
+    static TOTAL_TXS: AtomicU64 = AtomicU64::new(0);
+
+    SEEN_BLOCK.store(false, Ordering::Relaxed);
+    VOTE_TXS.store(0, Ordering::Relaxed);
+    TOTAL_TXS.store(0, Ordering::Relaxed);
+
+    firehose(
+        2,
+        (TARGET_SLOT - SLOT_RADIUS)..(TARGET_SLOT + SLOT_RADIUS),
+        Some(|_thread_id: usize, block: BlockData| {
+            async move {
+                if block.slot() == TARGET_SLOT {
+                    assert!(
+                        !block.was_skipped(),
+                        "target slot {TARGET_SLOT} was marked leader skipped",
+                    );
+                    SEEN_BLOCK.store(true, Ordering::Relaxed);
+                }
+                Ok(())
+            }
+            .boxed()
+        }),
+        Some(|_thread_id: usize, transaction: TransactionData| {
+            async move {
+                if transaction.slot == TARGET_SLOT {
+                    TOTAL_TXS.fetch_add(1, Ordering::Relaxed);
+                    if transaction.is_vote {
+                        VOTE_TXS.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                Ok(())
+            }
+            .boxed()
+        }),
+        None::<OnEntryFn>,
+        None::<OnRewardFn>,
+        None::<OnErrorFn>,
+        None::<OnStatsTrackingFn>,
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        SEEN_BLOCK.load(Ordering::Relaxed),
+        "target slot was not processed"
+    );
+    assert!(
+        TOTAL_TXS.load(Ordering::Relaxed) > 0,
+        "no transactions counted in target slot"
+    );
+    assert_eq!(VOTE_TXS.load(Ordering::Relaxed), 991);
+}
+
 #[cfg(test)]
 #[tokio::test(flavor = "multi_thread")]
 #[serial]

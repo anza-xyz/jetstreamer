@@ -158,6 +158,11 @@ impl Buffer {
         self.len() == 0
     }
 
+    /// Returns the buffer contents as a borrowed slice.
+    pub fn as_slice(&self) -> &[u8] {
+        &self.0
+    }
+
     /// Returns the buffer contents as a `Vec<u8>`.
     pub fn to_vec(&self) -> Vec<u8> {
         self.0.clone()

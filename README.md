@@ -37,8 +37,7 @@ following re-exports:
 
 While Jetstreamer is able to play back all blocks, transactions, epochs, and rewards in the
 history of Solana mainnet, it is limited by what is in Old Faithful. Old Faithful does not
-contain account updates, so Jetstreamer at the moment also does not have account updates or
-transaction logs, though we plan to eventually have a separate project that provides this, stay
+contain account updates, so Jetstreamer at the moment also does not have them, though we plan to eventually have a separate project that provides this, stay
 tuned!
 
 It is worth noting that the way Old Faithful and thus Jetstreamer stores transactions, they are
@@ -73,6 +72,10 @@ cargo run --release -- 800 --with-plugin instruction-tracking
 If `JETSTREAMER_THREADS` is omitted, Jetstreamer auto-sizes the worker pool using the same
 hardware-aware heuristic exposed by
 `jetstreamer_firehose::system::optimal_firehose_thread_count`.
+
+The built-in program and instruction tracking plugins skip vote transactions by default. Pass
+`--include-votes` (or set `JETSTREAMER_IGNORE_VOTES=false`) if you want vote activity included
+in their metrics.
 
 The CLI accepts either `<start>:<end>` slot ranges or a single epoch on the command line. See
 [`JetstreamerRunner::parse_cli_args`](https://docs.rs/jetstreamer/latest/jetstreamer/fn.parse_cli_args.html)

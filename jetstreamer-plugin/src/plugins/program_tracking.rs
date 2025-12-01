@@ -11,16 +11,8 @@ use solana_message::VersionedMessage;
 use crate::{Plugin, PluginFuture};
 use jetstreamer_firehose::firehose::{BlockData, TransactionData};
 
-const DB_WRITE_INTERVAL_SLOTS: u64 = 1;
-
-#[derive(Default)]
-struct ThreadData {
-    slot_stats: HashMap<u64, HashMap<Address, ProgramStats>>,
-    pending_rows: Vec<ProgramEvent>,
-    slots_since_flush: u64,
-}
-
-static THREAD_DATA: Lazy<DashMap<usize, ThreadData>> = Lazy::new(DashMap::new);
+static PENDING_BY_SLOT: Lazy<DashMap<u64, HashMap<Address, ProgramEvent>>> =
+    Lazy::new(DashMap::new);
 
 #[derive(Row, Deserialize, Serialize, Copy, Clone, Debug, PartialEq, Eq, Hash)]
 struct ProgramEvent {
@@ -35,42 +27,53 @@ struct ProgramEvent {
     pub total_cus: u32,
 }
 
-#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
-struct ProgramStats {
-    pub count: u32,
-    pub error_count: u32,
-    pub min_cus: u32,
-    pub max_cus: u32,
-    pub total_cus: u32,
+#[derive(Debug, Clone)]
+/// Tracks per-program invocation counts and writes them to ClickHouse. Vote transactions are
+/// skipped by default to reduce noise; call [`ProgramTrackingPlugin::new`] with `false` to
+/// include them.
+pub struct ProgramTrackingPlugin {
+    ignore_votes: bool,
 }
 
-#[derive(Debug, Default, Clone)]
-/// Tracks per-program invocation counts and writes them to ClickHouse.
-pub struct ProgramTrackingPlugin;
-
 impl ProgramTrackingPlugin {
-    fn with_thread_data<F, R>(thread_id: usize, f: F) -> R
-    where
-        F: FnOnce(&mut ThreadData) -> R,
-    {
-        let mut guard = THREAD_DATA.entry(thread_id).or_default();
-        f(&mut guard)
+    /// Creates a new instance that optionally skips vote transactions.
+    pub const fn new(ignore_votes: bool) -> Self {
+        Self { ignore_votes }
     }
 
-    fn drain_all_rows(block_time: Option<i64>) -> Vec<ProgramEvent> {
+    fn take_slot_events(slot: u64, block_time: Option<i64>) -> Vec<ProgramEvent> {
+        let timestamp = clamp_block_time(block_time);
+        if let Some((_, events_by_program)) = PENDING_BY_SLOT.remove(&slot) {
+            return events_by_program
+                .into_values()
+                .map(|mut event| {
+                    event.timestamp = timestamp;
+                    event
+                })
+                .collect();
+        }
+        Vec::new()
+    }
+
+    fn drain_all_pending(block_time: Option<i64>) -> Vec<ProgramEvent> {
+        let timestamp = clamp_block_time(block_time);
+        let slots: Vec<u64> = PENDING_BY_SLOT.iter().map(|entry| *entry.key()).collect();
         let mut rows = Vec::new();
-        for mut entry in THREAD_DATA.iter_mut() {
-            rows.extend(Self::flush_data(&mut entry, block_time));
+        for slot in slots {
+            if let Some((_, events_by_program)) = PENDING_BY_SLOT.remove(&slot) {
+                rows.extend(events_by_program.into_values().map(|mut event| {
+                    event.timestamp = timestamp;
+                    event
+                }));
+            }
         }
         rows
     }
+}
 
-    fn flush_data(data: &mut ThreadData, block_time: Option<i64>) -> Vec<ProgramEvent> {
-        let mut rows = std::mem::take(&mut data.pending_rows);
-        for (slot, stats) in data.slot_stats.drain() {
-            rows.extend(events_from_slot(slot, block_time, &stats));
-        }
-        rows
+impl Default for ProgramTrackingPlugin {
+    fn default() -> Self {
+        Self::new(true)
     }
 }
 
@@ -83,11 +86,16 @@ impl Plugin for ProgramTrackingPlugin {
     #[inline(always)]
     fn on_transaction<'a>(
         &'a self,
-        thread_id: usize,
+        _thread_id: usize,
         _db: Option<Arc<Client>>,
         transaction: &'a TransactionData,
     ) -> PluginFuture<'a> {
+        let ignore_votes = self.ignore_votes;
         async move {
+            if ignore_votes && transaction.is_vote {
+                return Ok(());
+            }
+
             let message = &transaction.transaction.message;
             let (account_keys, instructions) = match message {
                 VersionedMessage::Legacy(msg) => (&msg.account_keys, &msg.instructions),
@@ -109,32 +117,36 @@ impl Plugin for ProgramTrackingPlugin {
                 .compute_units_consumed
                 .unwrap_or(0) as u32;
             let program_count = program_ids.len() as u32;
+            let errored = transaction.transaction_status_meta.status.is_err();
+            let slot = transaction.slot;
 
-            Self::with_thread_data(thread_id, |data| {
-                let slot_data = data.slot_stats.entry(transaction.slot).or_default();
-
-                for program_id in program_ids.iter() {
-                    let this_program_cu = if program_count == 0 {
-                        0
-                    } else {
-                        total_cu / program_count
-                    };
-                    let stats = slot_data.entry(*program_id).or_insert(ProgramStats {
+            let mut slot_entry = PENDING_BY_SLOT.entry(slot).or_default();
+            for program_id in program_ids.iter() {
+                let this_program_cu = if program_count == 0 {
+                    0
+                } else {
+                    total_cu / program_count
+                };
+                let event = slot_entry
+                    .entry(*program_id)
+                    .or_insert_with(|| ProgramEvent {
+                        slot: slot.min(u32::MAX as u64) as u32,
+                        timestamp: 0,
+                        program_id: *program_id,
+                        count: 0,
+                        error_count: 0,
                         min_cus: u32::MAX,
                         max_cus: 0,
                         total_cus: 0,
-                        count: 0,
-                        error_count: 0,
                     });
-                    stats.min_cus = stats.min_cus.min(this_program_cu);
-                    stats.max_cus = stats.max_cus.max(this_program_cu);
-                    stats.total_cus += this_program_cu;
-                    stats.count += 1;
-                    if transaction.transaction_status_meta.status.is_err() {
-                        stats.error_count += 1;
-                    }
+                event.min_cus = event.min_cus.min(this_program_cu);
+                event.max_cus = event.max_cus.max(this_program_cu);
+                event.total_cus = event.total_cus.saturating_add(this_program_cu);
+                event.count = event.count.saturating_add(1);
+                if errored {
+                    event.error_count = event.error_count.saturating_add(1);
                 }
-            });
+            }
 
             Ok(())
         }
@@ -144,7 +156,7 @@ impl Plugin for ProgramTrackingPlugin {
     #[inline(always)]
     fn on_block(
         &self,
-        thread_id: usize,
+        _thread_id: usize,
         db: Option<Arc<Client>>,
         block: &BlockData,
     ) -> PluginFuture<'_> {
@@ -156,25 +168,11 @@ impl Plugin for ProgramTrackingPlugin {
                 return Ok(());
             }
 
-            let flush_rows = Self::with_thread_data(thread_id, |data| {
-                if let Some(slot_data) = data.slot_stats.remove(&slot) {
-                    let slot_rows = events_from_slot(slot, block_time, &slot_data);
-                    data.pending_rows.extend(slot_rows);
-                }
-                data.slots_since_flush = data.slots_since_flush.saturating_add(1);
-                if data.slots_since_flush >= DB_WRITE_INTERVAL_SLOTS {
-                    data.slots_since_flush = 0;
-                    if data.pending_rows.is_empty() {
-                        None
-                    } else {
-                        Some(data.pending_rows.drain(..).collect::<Vec<_>>())
-                    }
-                } else {
-                    None
-                }
-            });
+            let rows = Self::take_slot_events(slot, block_time);
 
-            if let (Some(db_client), Some(rows)) = (db.as_ref(), flush_rows) {
+            if let Some(db_client) = db.as_ref()
+                && !rows.is_empty()
+            {
                 write_program_events(Arc::clone(db_client), rows)
                     .await
                     .map_err(|err| -> Box<dyn std::error::Error + Send + Sync> { Box::new(err) })?;
@@ -222,7 +220,7 @@ impl Plugin for ProgramTrackingPlugin {
     fn on_exit(&self, db: Option<Arc<Client>>) -> PluginFuture<'_> {
         async move {
             if let Some(db_client) = db {
-                let rows = Self::drain_all_rows(None);
+                let rows = Self::drain_all_pending(None);
                 if !rows.is_empty() {
                     write_program_events(Arc::clone(&db_client), rows)
                         .await
@@ -253,28 +251,6 @@ async fn write_program_events(
     }
     insert.end().await?;
     Ok(())
-}
-
-fn events_from_slot(
-    slot: u64,
-    block_time: Option<i64>,
-    slot_data: &HashMap<Address, ProgramStats>,
-) -> Vec<ProgramEvent> {
-    let timestamp = clamp_block_time(block_time);
-
-    slot_data
-        .iter()
-        .map(|(program_id, stats)| ProgramEvent {
-            slot: slot.min(u32::MAX as u64) as u32,
-            program_id: *program_id,
-            count: stats.count,
-            error_count: stats.error_count,
-            min_cus: stats.min_cus,
-            max_cus: stats.max_cus,
-            total_cus: stats.total_cus,
-            timestamp,
-        })
-        .collect()
 }
 
 fn clamp_block_time(block_time: Option<i64>) -> u32 {

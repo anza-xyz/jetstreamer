@@ -11,8 +11,10 @@ use solana_message::VersionedMessage;
 use crate::{Plugin, PluginFuture};
 use jetstreamer_firehose::firehose::{BlockData, TransactionData};
 
-static PENDING_BY_SLOT: Lazy<DashMap<u64, HashMap<(Address, bool), ProgramEvent>>> =
-    Lazy::new(DashMap::new);
+type SlotProgramKey = (Address, bool);
+type SlotProgramEvents = HashMap<SlotProgramKey, ProgramEvent>;
+
+static PENDING_BY_SLOT: Lazy<DashMap<u64, SlotProgramEvents>> = Lazy::new(DashMap::new);
 
 #[derive(Row, Deserialize, Serialize, Copy, Clone, Debug, PartialEq, Eq, Hash)]
 struct ProgramEvent {

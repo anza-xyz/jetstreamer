@@ -11,7 +11,7 @@ use solana_message::VersionedMessage;
 use crate::{Plugin, PluginFuture};
 use jetstreamer_firehose::firehose::{BlockData, TransactionData};
 
-static PENDING_BY_SLOT: Lazy<DashMap<u64, HashMap<Address, ProgramEvent>>> =
+static PENDING_BY_SLOT: Lazy<DashMap<u64, HashMap<(Address, bool), ProgramEvent>>> =
     Lazy::new(DashMap::new);
 
 #[derive(Row, Deserialize, Serialize, Copy, Clone, Debug, PartialEq, Eq, Hash)]
@@ -20,6 +20,7 @@ struct ProgramEvent {
     // Stored as ClickHouse DateTime('UTC') -> UInt32 seconds; we clamp Solana i64.
     pub timestamp: u32,
     pub program_id: Address,
+    pub is_vote: bool,
     pub count: u32,
     pub error_count: u32,
     pub min_cus: u32,
@@ -28,17 +29,13 @@ struct ProgramEvent {
 }
 
 #[derive(Debug, Clone)]
-/// Tracks per-program invocation counts and writes them to ClickHouse. Vote transactions are
-/// skipped by default to reduce noise; call [`ProgramTrackingPlugin::new`] with `false` to
-/// include them.
-pub struct ProgramTrackingPlugin {
-    ignore_votes: bool,
-}
+/// Tracks per-program invocation counts (including vote transactions) and writes them to ClickHouse.
+pub struct ProgramTrackingPlugin;
 
 impl ProgramTrackingPlugin {
-    /// Creates a new instance that optionally skips vote transactions.
-    pub const fn new(ignore_votes: bool) -> Self {
-        Self { ignore_votes }
+    /// Creates a new instance that records both vote and non-vote transactions.
+    pub const fn new() -> Self {
+        Self
     }
 
     fn take_slot_events(slot: u64, block_time: Option<i64>) -> Vec<ProgramEvent> {
@@ -73,7 +70,7 @@ impl ProgramTrackingPlugin {
 
 impl Default for ProgramTrackingPlugin {
     fn default() -> Self {
-        Self::new(true)
+        Self::new()
     }
 }
 
@@ -90,12 +87,7 @@ impl Plugin for ProgramTrackingPlugin {
         _db: Option<Arc<Client>>,
         transaction: &'a TransactionData,
     ) -> PluginFuture<'a> {
-        let ignore_votes = self.ignore_votes;
         async move {
-            if ignore_votes && transaction.is_vote {
-                return Ok(());
-            }
-
             let message = &transaction.transaction.message;
             let (account_keys, instructions) = match message {
                 VersionedMessage::Legacy(msg) => (&msg.account_keys, &msg.instructions),
@@ -119,6 +111,7 @@ impl Plugin for ProgramTrackingPlugin {
             let program_count = program_ids.len() as u32;
             let errored = transaction.transaction_status_meta.status.is_err();
             let slot = transaction.slot;
+            let is_vote = transaction.is_vote;
 
             let mut slot_entry = PENDING_BY_SLOT.entry(slot).or_default();
             for program_id in program_ids.iter() {
@@ -127,18 +120,20 @@ impl Plugin for ProgramTrackingPlugin {
                 } else {
                     total_cu / program_count
                 };
-                let event = slot_entry
-                    .entry(*program_id)
-                    .or_insert_with(|| ProgramEvent {
-                        slot: slot.min(u32::MAX as u64) as u32,
-                        timestamp: 0,
-                        program_id: *program_id,
-                        count: 0,
-                        error_count: 0,
-                        min_cus: u32::MAX,
-                        max_cus: 0,
-                        total_cus: 0,
-                    });
+                let event =
+                    slot_entry
+                        .entry((*program_id, is_vote))
+                        .or_insert_with(|| ProgramEvent {
+                            slot: slot.min(u32::MAX as u64) as u32,
+                            timestamp: 0,
+                            program_id: *program_id,
+                            is_vote,
+                            count: 0,
+                            error_count: 0,
+                            min_cus: u32::MAX,
+                            max_cus: 0,
+                            total_cus: 0,
+                        });
                 event.min_cus = event.min_cus.min(this_program_cu);
                 event.max_cus = event.max_cus.max(this_program_cu);
                 event.total_cus = event.total_cus.saturating_add(this_program_cu);
@@ -195,6 +190,7 @@ impl Plugin for ProgramTrackingPlugin {
                         slot        UInt32,
                         timestamp   DateTime('UTC'),
                         program_id  FixedString(32),
+                        is_vote     UInt8,
                         count       UInt32,
                         error_count UInt32,
                         min_cus     UInt32,
@@ -202,7 +198,7 @@ impl Plugin for ProgramTrackingPlugin {
                         total_cus   UInt32
                     )
                     ENGINE = ReplacingMergeTree(timestamp)
-                    ORDER BY (slot, program_id)
+                    ORDER BY (slot, program_id, is_vote)
                     "#,
                 )
                 .execute()
@@ -271,6 +267,7 @@ async fn backfill_program_timestamps(db: Arc<Client>) -> Result<(), clickhouse::
         SELECT pi.slot,
                ss.block_time,
                pi.program_id,
+               pi.is_vote,
                pi.count,
                pi.error_count,
                pi.min_cus,

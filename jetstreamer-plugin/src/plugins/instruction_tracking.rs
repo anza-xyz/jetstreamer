@@ -17,21 +17,20 @@ struct SlotInstructionEvent {
     slot: u32,
     // Stored as ClickHouse DateTime('UTC') -> UInt32 seconds; clamp Solana's i64 timestamp.
     timestamp: u32,
-    instruction_count: u64,
-    transaction_count: u32,
+    vote_instruction_count: u64,
+    non_vote_instruction_count: u64,
+    vote_transaction_count: u32,
+    non_vote_transaction_count: u32,
 }
 
 #[derive(Debug, Clone)]
-/// Tracks total instructions executed per slot and batches writes to ClickHouse. Vote
-/// transactions are skipped by default; construct with `ignore_votes = false` to include them.
-pub struct InstructionTrackingPlugin {
-    ignore_votes: bool,
-}
+/// Tracks total instructions executed per slot (votes and non-votes separated) and batches writes to ClickHouse.
+pub struct InstructionTrackingPlugin;
 
 impl InstructionTrackingPlugin {
-    /// Creates a new instance that optionally skips vote transactions.
-    pub const fn new(ignore_votes: bool) -> Self {
-        Self { ignore_votes }
+    /// Creates a new instance that records both vote and non-vote transactions.
+    pub const fn new() -> Self {
+        Self
     }
 
     fn take_slot_event(slot: u64, block_time: Option<i64>) -> Option<SlotInstructionEvent> {
@@ -58,7 +57,7 @@ impl InstructionTrackingPlugin {
 
 impl Default for InstructionTrackingPlugin {
     fn default() -> Self {
-        Self::new(true)
+        Self::new()
     }
 }
 
@@ -75,25 +74,33 @@ impl Plugin for InstructionTrackingPlugin {
         _db: Option<Arc<Client>>,
         transaction: &'a TransactionData,
     ) -> PluginFuture<'a> {
-        let ignore_votes = self.ignore_votes;
         async move {
-            if ignore_votes && transaction.is_vote {
-                return Ok(());
-            }
-
             let instruction_count = total_instruction_count(transaction);
 
             let slot = transaction.slot;
+            let is_vote = transaction.is_vote;
             let mut entry = PENDING_BY_SLOT
                 .entry(slot)
                 .or_insert_with(|| SlotInstructionEvent {
                     slot: slot.min(u32::MAX as u64) as u32,
                     timestamp: 0,
-                    instruction_count: 0,
-                    transaction_count: 0,
+                    vote_instruction_count: 0,
+                    non_vote_instruction_count: 0,
+                    vote_transaction_count: 0,
+                    non_vote_transaction_count: 0,
                 });
-            entry.instruction_count = entry.instruction_count.saturating_add(instruction_count);
-            entry.transaction_count = entry.transaction_count.saturating_add(1);
+            if is_vote {
+                entry.vote_instruction_count = entry
+                    .vote_instruction_count
+                    .saturating_add(instruction_count);
+                entry.vote_transaction_count = entry.vote_transaction_count.saturating_add(1);
+            } else {
+                entry.non_vote_instruction_count = entry
+                    .non_vote_instruction_count
+                    .saturating_add(instruction_count);
+                entry.non_vote_transaction_count =
+                    entry.non_vote_transaction_count.saturating_add(1);
+            }
 
             Ok(())
         }
@@ -142,10 +149,12 @@ impl Plugin for InstructionTrackingPlugin {
                 db.query(
                     r#"
                     CREATE TABLE IF NOT EXISTS slot_instructions (
-                        slot               UInt32,
-                        timestamp          DateTime('UTC'),
-                        instruction_count  UInt64,
-                        transaction_count  UInt32
+                        slot                         UInt32,
+                        timestamp                    DateTime('UTC'),
+                        vote_instruction_count       UInt64,
+                        non_vote_instruction_count   UInt64,
+                        vote_transaction_count       UInt32,
+                        non_vote_transaction_count   UInt32
                     )
                     ENGINE = ReplacingMergeTree(timestamp)
                     ORDER BY slot
@@ -240,8 +249,10 @@ async fn backfill_instruction_timestamps(db: Arc<Client>) -> Result<(), clickhou
         INSERT INTO slot_instructions
         SELECT si.slot,
                ss.block_time,
-               si.instruction_count,
-               si.transaction_count
+               si.vote_instruction_count,
+               si.non_vote_instruction_count,
+               si.vote_transaction_count,
+               si.non_vote_transaction_count
         FROM slot_instructions AS si
         ANY INNER JOIN jetstreamer_slot_status AS ss USING (slot)
         WHERE si.timestamp = toDateTime(0)

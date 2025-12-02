@@ -6,6 +6,7 @@ use futures_util::FutureExt;
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use solana_message::VersionedMessage;
+use solana_sdk_ids::vote::id as vote_program_id;
 
 use crate::{Plugin, PluginFuture};
 use jetstreamer_firehose::firehose::{BlockData, TransactionData};
@@ -75,10 +76,10 @@ impl Plugin for InstructionTrackingPlugin {
         transaction: &'a TransactionData,
     ) -> PluginFuture<'a> {
         async move {
-            let instruction_count = total_instruction_count(transaction);
+            let (vote_instruction_count, non_vote_instruction_count) =
+                instruction_vote_counts(transaction);
 
             let slot = transaction.slot;
-            let is_vote = transaction.is_vote;
             let mut entry = PENDING_BY_SLOT
                 .entry(slot)
                 .or_insert_with(|| SlotInstructionEvent {
@@ -89,15 +90,15 @@ impl Plugin for InstructionTrackingPlugin {
                     vote_transaction_count: 0,
                     non_vote_transaction_count: 0,
                 });
-            if is_vote {
-                entry.vote_instruction_count = entry
-                    .vote_instruction_count
-                    .saturating_add(instruction_count);
+            entry.vote_instruction_count = entry
+                .vote_instruction_count
+                .saturating_add(vote_instruction_count);
+            entry.non_vote_instruction_count = entry
+                .non_vote_instruction_count
+                .saturating_add(non_vote_instruction_count);
+            if vote_instruction_count > 0 {
                 entry.vote_transaction_count = entry.vote_transaction_count.saturating_add(1);
             } else {
-                entry.non_vote_instruction_count = entry
-                    .non_vote_instruction_count
-                    .saturating_add(instruction_count);
                 entry.non_vote_transaction_count =
                     entry.non_vote_transaction_count.saturating_add(1);
             }
@@ -225,22 +226,62 @@ fn clamp_block_time(block_time: Option<i64>) -> u32 {
     }
 }
 
-fn total_instruction_count(transaction: &TransactionData) -> u64 {
-    let message_instructions = match &transaction.transaction.message {
-        VersionedMessage::Legacy(msg) => msg.instructions.len() as u64,
-        VersionedMessage::V0(msg) => msg.instructions.len() as u64,
+fn instruction_vote_counts(transaction: &TransactionData) -> (u64, u64) {
+    let static_keys = transaction.transaction.message.static_account_keys();
+    let vote_program = vote_program_id();
+    let mut vote_count: u64 = 0;
+    let mut non_vote_count: u64 = 0;
+
+    let classify = |program_index: usize, vote_count: &mut u64, non_vote_count: &mut u64| {
+        if let Some(pid) = static_keys.get(program_index) {
+            if pid == &vote_program {
+                *vote_count = vote_count.saturating_add(1);
+            } else {
+                *non_vote_count = non_vote_count.saturating_add(1);
+            }
+        } else {
+            *non_vote_count = non_vote_count.saturating_add(1);
+        }
     };
-    let inner_instruction_count = transaction
+
+    match &transaction.transaction.message {
+        VersionedMessage::Legacy(msg) => {
+            for ix in &msg.instructions {
+                classify(
+                    ix.program_id_index as usize,
+                    &mut vote_count,
+                    &mut non_vote_count,
+                );
+            }
+        }
+        VersionedMessage::V0(msg) => {
+            for ix in &msg.instructions {
+                classify(
+                    ix.program_id_index as usize,
+                    &mut vote_count,
+                    &mut non_vote_count,
+                );
+            }
+        }
+    }
+
+    if let Some(inner_sets) = transaction
         .transaction_status_meta
         .inner_instructions
         .as_ref()
-        .map(|sets| {
-            sets.iter()
-                .map(|set| set.instructions.len() as u64)
-                .sum::<u64>()
-        })
-        .unwrap_or(0);
-    message_instructions.saturating_add(inner_instruction_count)
+    {
+        for set in inner_sets {
+            for ix in &set.instructions {
+                classify(
+                    ix.instruction.program_id_index as usize,
+                    &mut vote_count,
+                    &mut non_vote_count,
+                );
+            }
+        }
+    }
+
+    (vote_count, non_vote_count)
 }
 
 async fn backfill_instruction_timestamps(db: Arc<Client>) -> Result<(), clickhouse::error::Error> {

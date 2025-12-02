@@ -356,13 +356,13 @@ fn decode_transaction_status_meta_from_frame(
     }
 
     match utils::decompress_zstd(reassembled_metadata.clone()) {
-        Ok(decompressed) => decode_transaction_status_meta(slot, decompressed.as_slice()).map_err(
-            |err| {
+        Ok(decompressed) => {
+            decode_transaction_status_meta(slot, decompressed.as_slice()).map_err(|err| {
                 Box::new(std::io::Error::other(format!(
                     "decode transaction metadata (slot {slot}): {err}"
                 ))) as SharedError
-            },
-        ),
+            })
+        }
         Err(decomp_err) => {
             // If the frame was not zstd-compressed (common for very early data), try to
             // decode the raw bytes directly before bailing.
@@ -1974,17 +1974,10 @@ async fn firehose_geyser_thread(
                                 let versioned_tx = tx.as_parsed()?;
                                 let reassembled_metadata = nodes.reassemble_dataframes(tx.metadata.clone())?;
 
-                                let decompressed = utils::decompress_zstd(reassembled_metadata.clone())?;
-
-                                let metadata: solana_storage_proto::convert::generated::TransactionStatusMeta =
-                                    prost_011::Message::decode(decompressed.as_slice()).map_err(|err| {
-                                        Box::new(std::io::Error::other(
-                                            std::format!("Error decoding metadata: {:?}", err),
-                                        ))
-                                    })?;
-
-                                let as_native_metadata: solana_transaction_status::TransactionStatusMeta =
-                                    metadata.try_into()?;
+                                let as_native_metadata = decode_transaction_status_meta_from_frame(
+                                    block.slot,
+                                    reassembled_metadata,
+                                )?;
 
                                 let message_hash = {
                                     #[cfg(feature = "verify-transaction-signatures")]

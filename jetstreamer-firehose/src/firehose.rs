@@ -2612,8 +2612,8 @@ async fn test_firehose_epoch_850_votes_present() {
 }
 
 #[cfg(test)]
-#[tokio::test(flavor = "multi_thread")]
 #[serial]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_firehose_restart_loses_coverage_without_reset() {
     use std::collections::HashMap;
     solana_logger::setup_with_default("info");
@@ -2676,8 +2676,8 @@ async fn test_firehose_restart_loses_coverage_without_reset() {
 }
 
 #[cfg(test)]
-#[tokio::test(flavor = "multi_thread")]
 #[serial]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_firehose_gap_coverage_near_known_missing_range() {
     use std::collections::HashSet;
     solana_logger::setup_with_default("info");

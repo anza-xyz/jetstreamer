@@ -46,6 +46,8 @@ use crate::{
 // header, seeking, reading next block). Adjust here to tune stall detection/restart
 // aggressiveness.
 const OP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+// Epochs earlier than this were bincode-encoded in Old Faithful.
+const BINCODE_EPOCH_CUTOFF: u64 = 157;
 
 fn poll_shutdown(
     flag: &Arc<std::sync::atomic::AtomicBool>,
@@ -342,6 +344,173 @@ fn clear_pending_skip(map: &DashMap<usize, DashSet<u64>>, thread_id: usize, slot
     map.get(&thread_id)
         .map(|set| set.remove(&slot).is_some())
         .unwrap_or(false)
+}
+
+fn decode_transaction_status_meta_from_frame(
+    slot: u64,
+    reassembled_metadata: Vec<u8>,
+) -> Result<solana_transaction_status::TransactionStatusMeta, SharedError> {
+    if reassembled_metadata.is_empty() {
+        // Early epochs often omit metadata entirely.
+        return Ok(solana_transaction_status::TransactionStatusMeta::default());
+    }
+
+    match utils::decompress_zstd(reassembled_metadata.clone()) {
+        Ok(decompressed) => {
+            decode_transaction_status_meta(slot, decompressed.as_slice()).map_err(|err| {
+                Box::new(std::io::Error::other(format!(
+                    "decode transaction metadata (slot {slot}): {err}"
+                ))) as SharedError
+            })
+        }
+        Err(decomp_err) => {
+            // If the frame was not zstd-compressed (common for very early data), try to
+            // decode the raw bytes directly before bailing.
+            decode_transaction_status_meta(slot, reassembled_metadata.as_slice()).map_err(|err| {
+                Box::new(std::io::Error::other(format!(
+                    "transaction metadata not zstd-compressed for slot {slot}; raw decode failed (raw_err={err}, decompress_err={decomp_err})"
+                ))) as SharedError
+            })
+        }
+    }
+}
+
+fn decode_transaction_status_meta(
+    slot: u64,
+    metadata_bytes: &[u8],
+) -> Result<solana_transaction_status::TransactionStatusMeta, SharedError> {
+    let epoch = slot_to_epoch(slot);
+    let mut bincode_err: Option<String> = None;
+    if epoch < BINCODE_EPOCH_CUTOFF {
+        match bincode::deserialize::<solana_storage_proto::StoredTransactionStatusMeta>(
+            metadata_bytes,
+        ) {
+            Ok(stored) => return Ok(stored.into()),
+            Err(err) => {
+                bincode_err = Some(err.to_string());
+            }
+        }
+    }
+
+    let bin_err_for_proto = bincode_err.clone();
+    let proto: solana_storage_proto::convert::generated::TransactionStatusMeta =
+        prost_011::Message::decode(metadata_bytes).map_err(|err| {
+            // If we already tried bincode, surface both failures for easier debugging.
+            if let Some(ref bin_err) = bin_err_for_proto {
+                Box::new(std::io::Error::other(format!(
+                    "protobuf decode transaction metadata failed (epoch {epoch}); bincode failed earlier: {bin_err}; protobuf error: {err}"
+                ))) as SharedError
+            } else {
+                Box::new(std::io::Error::other(format!(
+                    "protobuf decode transaction metadata: {err}"
+                ))) as SharedError
+            }
+        })?;
+
+    proto.try_into().map_err(|err| {
+        if let Some(ref bin_err) = bincode_err {
+            Box::new(std::io::Error::other(format!(
+                "convert transaction metadata proto failed (epoch {epoch}); bincode failed earlier: {bin_err}; conversion error: {err}"
+            ))) as SharedError
+        } else {
+            Box::new(std::io::Error::other(format!(
+                "convert transaction metadata proto: {err}"
+            ))) as SharedError
+        }
+    })
+}
+
+#[cfg(test)]
+mod metadata_decode_tests {
+    use super::{decode_transaction_status_meta, decode_transaction_status_meta_from_frame};
+    use solana_message::v0::LoadedAddresses;
+    use solana_storage_proto::StoredTransactionStatusMeta;
+    use solana_transaction_status::TransactionStatusMeta;
+
+    fn sample_meta() -> TransactionStatusMeta {
+        let mut meta = TransactionStatusMeta::default();
+        meta.fee = 42;
+        meta.pre_balances = vec![1, 2];
+        meta.post_balances = vec![3, 4];
+        meta.log_messages = Some(vec!["hello".into()]);
+        meta.pre_token_balances = Some(Vec::new());
+        meta.post_token_balances = Some(Vec::new());
+        meta.rewards = Some(Vec::new());
+        meta.compute_units_consumed = Some(7);
+        meta.cost_units = Some(9);
+        meta.loaded_addresses = LoadedAddresses::default();
+        meta
+    }
+
+    #[test]
+    fn decodes_bincode_metadata_for_early_epochs() {
+        let stored = StoredTransactionStatusMeta {
+            status: Ok(()),
+            fee: 42,
+            pre_balances: vec![1, 2],
+            post_balances: vec![3, 4],
+            inner_instructions: None,
+            log_messages: Some(vec!["hello".into()]),
+            pre_token_balances: Some(Vec::new()),
+            post_token_balances: Some(Vec::new()),
+            rewards: Some(Vec::new()),
+            return_data: None,
+            compute_units_consumed: Some(7),
+            cost_units: Some(9),
+        };
+        let bytes = bincode::serialize(&stored).expect("bincode serialize");
+        let decoded = decode_transaction_status_meta(0, &bytes).expect("decode");
+        assert_eq!(decoded, TransactionStatusMeta::from(stored));
+    }
+
+    #[test]
+    fn decodes_protobuf_metadata_for_later_epochs() {
+        let meta = sample_meta();
+        let generated: solana_storage_proto::convert::generated::TransactionStatusMeta =
+            meta.clone().into();
+        let bytes = prost_011::Message::encode_to_vec(&generated);
+        let decoded = decode_transaction_status_meta(157 * 432000, &bytes).expect("decode");
+        assert_eq!(decoded, meta);
+    }
+
+    #[test]
+    fn falls_back_to_proto_when_early_epoch_bytes_are_proto() {
+        let meta = sample_meta();
+        let generated: solana_storage_proto::convert::generated::TransactionStatusMeta =
+            meta.clone().into();
+        let bytes = prost_011::Message::encode_to_vec(&generated);
+        // Epoch 100 should try bincode first; if those bytes are proto, we must fall back.
+        let decoded = decode_transaction_status_meta(100 * 432000, &bytes).expect("decode");
+        assert_eq!(decoded, meta);
+    }
+
+    #[test]
+    fn empty_frame_decodes_to_default() {
+        let decoded = decode_transaction_status_meta_from_frame(0, Vec::new()).expect("decode");
+        assert_eq!(decoded, TransactionStatusMeta::default());
+    }
+
+    #[test]
+    fn raw_bincode_frame_without_zstd_still_decodes() {
+        let stored = StoredTransactionStatusMeta {
+            status: Ok(()),
+            fee: 1,
+            pre_balances: vec![],
+            post_balances: vec![],
+            inner_instructions: None,
+            log_messages: None,
+            pre_token_balances: Some(Vec::new()),
+            post_token_balances: Some(Vec::new()),
+            rewards: Some(Vec::new()),
+            return_data: None,
+            compute_units_consumed: None,
+            cost_units: None,
+        };
+        let raw_bytes = bincode::serialize(&stored).expect("serialize");
+        let decoded =
+            decode_transaction_status_meta_from_frame(0, raw_bytes).expect("decode fallback");
+        assert_eq!(decoded, TransactionStatusMeta::from(stored));
+    }
 }
 
 /// Firehose transaction payload passed to [`Handler`] callbacks.
@@ -860,40 +1029,16 @@ where
                                                 )
                                             })?;
 
-                                        let decompressed =
-                                            utils::decompress_zstd(reassembled_metadata.clone())
-                                                .map_err(|err| {
-                                                    (
-                                                        FirehoseError::NodeDecodingError(
-                                                            item_index,
-                                                            err,
-                                                        ),
-                                                        error_slot,
-                                                    )
-                                                })?;
-
-                                        let metadata: solana_storage_proto::convert::generated::TransactionStatusMeta =
-                                            prost_011::Message::decode(decompressed.as_slice())
-                                                .map_err(|err| {
-                                                    (
-                                                        FirehoseError::NodeDecodingError(
-                                                            item_index,
-                                                            Box::new(err),
-                                                        ),
-                                                        error_slot,
-                                                    )
-                                                })?;
-
-                                        let as_native_metadata: solana_transaction_status::TransactionStatusMeta =
-                                            metadata.try_into().map_err(|err| {
-                                                (
-                                                    FirehoseError::NodeDecodingError(
-                                                        item_index,
-                                                        Box::new(err),
-                                                    ),
-                                                    error_slot,
-                                                )
-                                            })?;
+                                        let as_native_metadata = decode_transaction_status_meta_from_frame(
+                                            block.slot,
+                                            reassembled_metadata,
+                                        )
+                                        .map_err(|err| {
+                                            (
+                                                FirehoseError::NodeDecodingError(item_index, err),
+                                                error_slot,
+                                            )
+                                        })?;
 
                                         let message_hash = {
                                             #[cfg(feature = "verify-transaction-signatures")]
@@ -1829,17 +1974,10 @@ async fn firehose_geyser_thread(
                                 let versioned_tx = tx.as_parsed()?;
                                 let reassembled_metadata = nodes.reassemble_dataframes(tx.metadata.clone())?;
 
-                                let decompressed = utils::decompress_zstd(reassembled_metadata.clone())?;
-
-                                let metadata: solana_storage_proto::convert::generated::TransactionStatusMeta =
-                                    prost_011::Message::decode(decompressed.as_slice()).map_err(|err| {
-                                        Box::new(std::io::Error::other(
-                                            std::format!("Error decoding metadata: {:?}", err),
-                                        ))
-                                    })?;
-
-                                let as_native_metadata: solana_transaction_status::TransactionStatusMeta =
-                                    metadata.try_into()?;
+                                let as_native_metadata = decode_transaction_status_meta_from_frame(
+                                    block.slot,
+                                    reassembled_metadata,
+                                )?;
 
                                 let message_hash = {
                                     #[cfg(feature = "verify-transaction-signatures")]

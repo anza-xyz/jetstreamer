@@ -40,6 +40,7 @@ thiserror = { version = "2", default-features = false }
 reqwest = { version = "0.12", default-features = false }
 anyhow = { version = "1", default-features = false }
 base64 = "0.22"
+bincode = "1"
 serial_test = "2"
 wincode = { version = "0.2", features = ["derive", "solana-short-vec"] }
 bs58 = { version = "0", default-features = false }

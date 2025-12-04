@@ -86,7 +86,6 @@
 //! | `JETSTREAMER_CLICKHOUSE_DSN` | `http://localhost:8123` | HTTP(S) DSN passed to the embedded plugin runner for ClickHouse writes. Override to target a remote ClickHouse deployment. |
 //! | `JETSTREAMER_CLICKHOUSE_MODE` | `auto` | Controls ClickHouse integration. `auto` enables output and spawns the helper only for local DSNs, `remote` enables output without spawning the helper, `local` always requests the helper, and `off` disables ClickHouse entirely. |
 //! | `JETSTREAMER_THREADS` | `auto` | Number of firehose ingestion threads. Leave unset to rely on hardware-based sizing or override with an explicit value when you know the ideal concurrency. |
-//! | `JETSTREAMER_IGNORE_VOTES` | `true` | When `true`, skip vote transactions in the built-in program and instruction tracking plugins. Set to `false` to include votes. |
 //!
 //! Helper spawning only occurs when both the mode allows it (`auto`/`local`) **and** the DSN
 //! points to `localhost` or `127.0.0.1`.
@@ -193,31 +192,6 @@ fn parse_clickhouse_mode(value: &str) -> Option<ClickhouseMode> {
         }
         "local" | "spawn" | "helper" | "auto-spawn" | "autospawn" => Some(ClickhouseMode::Local),
         _ => None,
-    }
-}
-
-fn parse_env_bool(var_name: &str, default: bool) -> bool {
-    match std::env::var(var_name) {
-        Ok(raw) => {
-            let trimmed = raw.trim();
-            if trimmed.is_empty() {
-                return default;
-            }
-            match trimmed.to_ascii_lowercase().as_str() {
-                "1" | "true" | "yes" | "on" => true,
-                "0" | "false" | "no" | "off" => false,
-                other => {
-                    log::warn!(
-                        "Unrecognized {} value '{}'; defaulting to {}",
-                        var_name,
-                        other,
-                        default
-                    );
-                    default
-                }
-            }
-        }
-        Err(_) => default,
     }
 }
 
@@ -348,7 +322,6 @@ impl Default for JetstreamerRunner {
                 clickhouse_enabled: clickhouse_settings.enabled,
                 spawn_clickhouse: clickhouse_settings.spawn_helper && clickhouse_settings.enabled,
                 builtin_plugins: Vec::new(),
-                ignore_votes: parse_env_bool("JETSTREAMER_IGNORE_VOTES", true),
             },
         }
     }
@@ -401,12 +374,6 @@ impl JetstreamerRunner {
         self
     }
 
-    /// Configures whether built-in plugins should skip vote transactions (default `true`).
-    pub fn with_ignore_votes(mut self, ignore_votes: bool) -> Self {
-        self.config.ignore_votes = ignore_votes;
-        self
-    }
-
     /// Replaces the current [`Config`] with values parsed from CLI arguments and the
     /// environment.
     pub fn parse_cli_args(mut self) -> Result<Self, Box<dyn std::error::Error>> {
@@ -440,7 +407,7 @@ impl JetstreamerRunner {
 
         let mut runner = PluginRunner::new(&self.clickhouse_dsn, threads);
         for plugin in &self.config.builtin_plugins {
-            runner.register(plugin.instantiate(self.config.ignore_votes));
+            runner.register(plugin.instantiate());
         }
 
         for plugin in self.plugins {
@@ -551,8 +518,6 @@ pub struct Config {
     pub spawn_clickhouse: bool,
     /// Built-in plugins requested via CLI flags.
     pub builtin_plugins: Vec<BuiltinPlugin>,
-    /// Whether built-in plugins should skip vote transactions.
-    pub ignore_votes: bool,
 }
 
 /// Built-in plugins that can be toggled via CLI flags.
@@ -573,10 +538,10 @@ impl BuiltinPlugin {
         }
     }
 
-    fn instantiate(self, ignore_votes: bool) -> Box<dyn Plugin> {
+    fn instantiate(self) -> Box<dyn Plugin> {
         match self {
-            Self::ProgramTracking => Box::new(ProgramTrackingPlugin::new(ignore_votes)),
-            Self::InstructionTracking => Box::new(InstructionTrackingPlugin::new(ignore_votes)),
+            Self::ProgramTracking => Box::new(ProgramTrackingPlugin::new()),
+            Self::InstructionTracking => Box::new(InstructionTrackingPlugin::new()),
         }
     }
 }
@@ -587,16 +552,11 @@ impl BuiltinPlugin {
 /// - `JETSTREAMER_CLICKHOUSE_MODE`: Controls ClickHouse integration. Accepts `auto`, `remote`,
 ///   `local`, or `off`.
 /// - `JETSTREAMER_THREADS`: Number of firehose ingestion threads.
-/// - `JETSTREAMER_IGNORE_VOTES`: When `true` (default), skip vote transactions in built-in plugins.
 ///
 /// CLI flags:
 /// - `--with-plugin <name>`: Adds one of the built-in plugins (`program-tracking` or
 ///   `instruction-tracking`). When omitted, the CLI defaults to `program-tracking`.
 /// - `--no-plugins`: Disables all built-in plugins (overrides the default and any `--with-plugin`).
-/// - `--include-votes`: Process vote transactions in built-in plugins (overrides
-///   `JETSTREAMER_IGNORE_VOTES`).
-/// - `--ignore-votes`: Skip vote transactions in built-in plugins (overrides
-///   `JETSTREAMER_IGNORE_VOTES`).
 ///
 /// # Examples
 ///
@@ -616,7 +576,6 @@ pub fn parse_cli_args() -> Result<Config, Box<dyn std::error::Error>> {
     let mut first_arg: Option<String> = None;
     let mut builtin_plugins = Vec::new();
     let mut no_plugins = false;
-    let mut ignore_votes = parse_env_bool("JETSTREAMER_IGNORE_VOTES", true);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--with-plugin" => {
@@ -632,12 +591,6 @@ pub fn parse_cli_args() -> Result<Config, Box<dyn std::error::Error>> {
             }
             "--no-plugins" => {
                 no_plugins = true;
-            }
-            "--include-votes" => {
-                ignore_votes = false;
-            }
-            "--ignore-votes" => {
-                ignore_votes = true;
             }
             _ if first_arg.is_none() => first_arg = Some(arg),
             other => return Err(format!("unrecognized argument '{other}'").into()),
@@ -686,7 +639,6 @@ pub fn parse_cli_args() -> Result<Config, Box<dyn std::error::Error>> {
         clickhouse_enabled,
         spawn_clickhouse,
         builtin_plugins,
-        ignore_votes,
     })
 }
 

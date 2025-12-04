@@ -3833,6 +3833,7 @@ dependencies = [
  "aws-smithy-types",
  "aws-types",
  "base64 0.22.1",
+ "bincode",
  "cid",
  "crc",
  "crossbeam-channel",
@@ -3887,6 +3888,7 @@ dependencies = [
  "sha2 0.10.9",
  "solana-address 1.1.0",
  "solana-message",
+ "solana-sdk-ids",
  "thiserror 2.0.17",
  "tokio",
 ]

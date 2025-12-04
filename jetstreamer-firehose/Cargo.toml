@@ -59,6 +59,7 @@ fnv.workspace = true
 serde_json.workspace = true
 zstd.workspace = true
 solana-reward-info.workspace = true
+bincode.workspace = true
 xxhash-rust.workspace = true
 dashmap.workspace = true
 once_cell.workspace = true

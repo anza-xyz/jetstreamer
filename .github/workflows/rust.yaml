@@ -17,6 +17,13 @@ jobs:
   cargo-check:
     name: cargo check
     runs-on: ubuntu-22.04-8core
+    strategy:
+      matrix:
+        include:
+          - name: default
+            flags: ""
+          - name: all-features
+            flags: "--all-features"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -26,12 +33,19 @@ jobs:
           sudo apt-get install -y libudev-dev clang llvm-dev libclang-dev
       - name: Run sccache-cache
         uses: mozilla-actions/sccache-action@v0.0.9
-      - name: cargo check
-        run: cargo check --workspace --all-features
+      - name: cargo check (${{ matrix.name }})
+        run: cargo check --workspace ${{ matrix.flags }}
 
   cargo-test:
     name: cargo test
     runs-on: ubuntu-22.04-8core
+    strategy:
+      matrix:
+        include:
+          - name: default
+            flags: ""
+          - name: all-features
+            flags: "--all-features"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -41,8 +55,8 @@ jobs:
           sudo apt-get install -y libudev-dev clang llvm-dev libclang-dev
       - name: Run sccache-cache
         uses: mozilla-actions/sccache-action@v0.0.9
-      - name: cargo test
-        run: cargo test --workspace --all-features
+      - name: cargo test (${{ matrix.name }})
+        run: cargo test --workspace ${{ matrix.flags }}
 
   cargo-fmt:
     name: cargo fmt
@@ -79,6 +93,13 @@ jobs:
   cargo-clippy:
     name: cargo clippy
     runs-on: ubuntu-22.04-8core
+    strategy:
+      matrix:
+        include:
+          - name: default
+            flags: ""
+          - name: all-features
+            flags: "--all-features"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -90,8 +111,8 @@ jobs:
         uses: mozilla-actions/sccache-action@v0.0.9
       - name: Install cargo-clippy
         run: rustup component add clippy
-      - name: cargo clippy
-        run: cargo clippy --workspace --all-features
+      - name: cargo clippy (${{ matrix.name }})
+        run: cargo clippy --workspace ${{ matrix.flags }}
 
   cargo-fix:
     name: cargo fix

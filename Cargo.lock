@@ -3864,6 +3864,8 @@ dependencies = [
  "solana-signature",
  "solana-storage-proto",
  "solana-transaction",
+ "solana-transaction-context",
+ "solana-transaction-error",
  "solana-transaction-status",
  "tempfile",
  "thiserror 2.0.17",

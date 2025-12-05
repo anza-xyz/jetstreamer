@@ -2,6 +2,7 @@ use crossbeam_channel::{Receiver, Sender, unbounded};
 use dashmap::{DashMap, DashSet};
 use futures_util::future::BoxFuture;
 use reqwest::{Client, Url};
+use bincode::Options as _;
 use solana_address::Address;
 use solana_geyser_plugin_manager::{
     block_metadata_notifier_interface::BlockMetadataNotifier,
@@ -17,6 +18,10 @@ use solana_rpc::{
 use solana_runtime::bank::{KeyedRewardsAndNumPartitions, RewardType};
 use solana_sdk_ids::vote::id as vote_program_id;
 use solana_transaction::versioned::VersionedTransaction;
+use solana_transaction_context::TransactionReturnData;
+use solana_transaction_error::TransactionResult as TxResult;
+use solana_transaction_status::{InnerInstructions, Reward, RewardType as TxRewardType, TransactionStatusMeta, TransactionTokenBalance};
+use serde::Deserialize;
 use std::{
     fmt::Display,
     future::Future,
@@ -346,6 +351,178 @@ fn clear_pending_skip(map: &DashMap<usize, DashSet<u64>>, thread_id: usize, slot
         .unwrap_or(false)
 }
 
+#[derive(Deserialize)]
+struct PermissiveStoredExtendedReward {
+    pubkey: String,
+    lamports: i64,
+    post_balance: u64,
+    reward_type: Option<u8>,
+    commission: Option<u8>,
+}
+
+#[derive(Deserialize)]
+struct PermissiveStoredTransactionStatusMeta {
+    status: TxResult<()>,
+    fee: u64,
+    pre_balances: Vec<u64>,
+    post_balances: Vec<u64>,
+    inner_instructions: Option<Vec<InnerInstructions>>,
+    log_messages: Option<Vec<String>>,
+    pre_token_balances: Option<Vec<solana_storage_proto::StoredTransactionTokenBalance>>,
+    post_token_balances: Option<Vec<solana_storage_proto::StoredTransactionTokenBalance>>,
+    rewards: Option<Vec<PermissiveStoredExtendedReward>>,
+    return_data: Option<TransactionReturnData>,
+    compute_units_consumed: Option<u64>,
+    cost_units: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct PermissiveStoredTransactionStatusMetaNoRewards {
+    status: TxResult<()>,
+    fee: u64,
+    pre_balances: Vec<u64>,
+    post_balances: Vec<u64>,
+    inner_instructions: Option<Vec<InnerInstructions>>,
+    log_messages: Option<Vec<String>>,
+    pre_token_balances: Option<Vec<solana_storage_proto::StoredTransactionTokenBalance>>,
+    post_token_balances: Option<Vec<solana_storage_proto::StoredTransactionTokenBalance>>,
+    return_data: Option<TransactionReturnData>,
+    compute_units_consumed: Option<u64>,
+    cost_units: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct TruncatedStoredTransactionStatusMeta {
+    status: TxResult<()>,
+    fee: u64,
+    pre_balances: Vec<u64>,
+    post_balances: Vec<u64>,
+    inner_instructions: Option<Vec<InnerInstructions>>,
+    log_messages: Option<Vec<String>>,
+    pre_token_balances: Option<Vec<solana_storage_proto::StoredTransactionTokenBalance>>,
+    post_token_balances: Option<Vec<solana_storage_proto::StoredTransactionTokenBalance>>,
+}
+
+fn decode_bincode_permissive(
+    metadata_bytes: &[u8],
+) -> Result<Option<TransactionStatusMeta>, SharedError> {
+    // First try deserializing only the fields up to post_token_balances, ignoring any trailing
+    // rewards/return_data/cost fields that may have schema drift. Extra trailing bytes are allowed.
+    let truncated = bincode::DefaultOptions::new()
+        .allow_trailing_bytes()
+        .deserialize::<TruncatedStoredTransactionStatusMeta>(metadata_bytes)
+        .or_else(|_| {
+            bincode::DefaultOptions::new()
+                .with_fixint_encoding()
+                .allow_trailing_bytes()
+                .deserialize::<TruncatedStoredTransactionStatusMeta>(metadata_bytes)
+        });
+    if let Ok(t) = truncated {
+        let pre_token_balances = t
+            .pre_token_balances
+            .map(|balances| balances.into_iter().map(TransactionTokenBalance::from).collect());
+        let post_token_balances = t
+            .post_token_balances
+            .map(|balances| balances.into_iter().map(TransactionTokenBalance::from).collect());
+        let meta = TransactionStatusMeta {
+            status: t.status,
+            fee: t.fee,
+            pre_balances: t.pre_balances,
+            post_balances: t.post_balances,
+            inner_instructions: t.inner_instructions,
+            log_messages: t.log_messages,
+            pre_token_balances,
+            post_token_balances,
+            rewards: None,
+            loaded_addresses: solana_message::v0::LoadedAddresses::default(),
+            return_data: None,
+            compute_units_consumed: None,
+            cost_units: None,
+        };
+        return Ok(Some(meta));
+    }
+
+    let options_varint = bincode::DefaultOptions::new().allow_trailing_bytes();
+    let decoded = options_varint
+        .deserialize::<PermissiveStoredTransactionStatusMeta>(metadata_bytes)
+        .or_else(|_| {
+            bincode::DefaultOptions::new()
+                .with_fixint_encoding()
+                .allow_trailing_bytes()
+                .deserialize::<PermissiveStoredTransactionStatusMeta>(metadata_bytes)
+        })
+        .or_else(|_| {
+            // Fallback: ignore rewards section entirely if it contains unknown encodings.
+            bincode::DefaultOptions::new()
+                .allow_trailing_bytes()
+                .deserialize::<PermissiveStoredTransactionStatusMetaNoRewards>(metadata_bytes)
+                .map(|v| PermissiveStoredTransactionStatusMeta {
+                    status: v.status,
+                    fee: v.fee,
+                    pre_balances: v.pre_balances,
+                    post_balances: v.post_balances,
+                    inner_instructions: v.inner_instructions,
+                    log_messages: v.log_messages,
+                    pre_token_balances: v.pre_token_balances,
+                    post_token_balances: v.post_token_balances,
+                    rewards: None,
+                    return_data: v.return_data,
+                    compute_units_consumed: v.compute_units_consumed,
+                    cost_units: v.cost_units,
+                })
+        });
+    let decoded: PermissiveStoredTransactionStatusMeta = match decoded {
+        Ok(val) => val,
+        Err(_) => return Ok(None),
+    };
+
+    let rewards = decoded.rewards.map(|list| {
+        list.into_iter()
+            .filter_map(|r| {
+                let reward_type = match r.reward_type {
+                    Some(0) => Some(TxRewardType::Fee),
+                    Some(1) => Some(TxRewardType::Rent),
+                    Some(2) => Some(TxRewardType::Staking),
+                    Some(3) => Some(TxRewardType::Voting),
+                    _ => None,
+                };
+                Some(Reward {
+                    pubkey: r.pubkey,
+                    lamports: r.lamports,
+                    post_balance: r.post_balance,
+                    reward_type,
+                    commission: r.commission,
+                })
+            })
+            .collect::<Vec<_>>()
+    });
+
+    let pre_token_balances = decoded
+        .pre_token_balances
+        .map(|balances| balances.into_iter().map(TransactionTokenBalance::from).collect());
+    let post_token_balances = decoded
+        .post_token_balances
+        .map(|balances| balances.into_iter().map(TransactionTokenBalance::from).collect());
+
+    let meta = TransactionStatusMeta {
+        status: decoded.status,
+        fee: decoded.fee,
+        pre_balances: decoded.pre_balances,
+        post_balances: decoded.post_balances,
+        inner_instructions: decoded.inner_instructions,
+        log_messages: decoded.log_messages,
+        pre_token_balances,
+        post_token_balances,
+        rewards,
+        loaded_addresses: solana_message::v0::LoadedAddresses::default(),
+        return_data: decoded.return_data,
+        compute_units_consumed: decoded.compute_units_consumed,
+        cost_units: decoded.cost_units,
+    };
+
+    Ok(Some(meta))
+}
+
 fn decode_transaction_status_meta_from_frame(
     slot: u64,
     reassembled_metadata: Vec<u8>,
@@ -357,20 +534,30 @@ fn decode_transaction_status_meta_from_frame(
 
     match utils::decompress_zstd(reassembled_metadata.clone()) {
         Ok(decompressed) => {
-            decode_transaction_status_meta(slot, decompressed.as_slice()).map_err(|err| {
-                Box::new(std::io::Error::other(format!(
-                    "decode transaction metadata (slot {slot}): {err}"
-                ))) as SharedError
-            })
+            match decode_transaction_status_meta(slot, decompressed.as_slice()) {
+                Ok(meta) => Ok(meta),
+                Err(err) => {
+                    log::warn!(
+                        target: LOG_MODULE,
+                        "transaction metadata decode failed (slot {slot}): {err}; using empty metadata"
+                    );
+                    Ok(solana_transaction_status::TransactionStatusMeta::default())
+                }
+            }
         }
         Err(decomp_err) => {
             // If the frame was not zstd-compressed (common for very early data), try to
             // decode the raw bytes directly before bailing.
-            decode_transaction_status_meta(slot, reassembled_metadata.as_slice()).map_err(|err| {
-                Box::new(std::io::Error::other(format!(
-                    "transaction metadata not zstd-compressed for slot {slot}; raw decode failed (raw_err={err}, decompress_err={decomp_err})"
-                ))) as SharedError
-            })
+            match decode_transaction_status_meta(slot, reassembled_metadata.as_slice()) {
+                Ok(meta) => Ok(meta),
+                Err(err) => {
+                    log::warn!(
+                        target: LOG_MODULE,
+                        "transaction metadata decode failed for uncompressed frame (slot {slot}, decompress_err={decomp_err}, raw_err={err}); using empty metadata"
+                    );
+                    Ok(solana_transaction_status::TransactionStatusMeta::default())
+                }
+            }
         }
     }
 }
@@ -390,34 +577,48 @@ fn decode_transaction_status_meta(
                 bincode_err = Some(err.to_string());
             }
         }
+        if let Some(meta) = decode_bincode_permissive(metadata_bytes)? {
+            return Ok(meta);
+        }
     }
 
     let bin_err_for_proto = bincode_err.clone();
     let proto: solana_storage_proto::convert::generated::TransactionStatusMeta =
-        prost_011::Message::decode(metadata_bytes).map_err(|err| {
-            // If we already tried bincode, surface both failures for easier debugging.
-            if let Some(ref bin_err) = bin_err_for_proto {
-                Box::new(std::io::Error::other(format!(
-                    "protobuf decode transaction metadata failed (epoch {epoch}); bincode failed earlier: {bin_err}; protobuf error: {err}"
-                ))) as SharedError
-            } else {
-                Box::new(std::io::Error::other(format!(
-                    "protobuf decode transaction metadata: {err}"
-                ))) as SharedError
+        match prost_011::Message::decode(metadata_bytes) {
+            Ok(p) => p,
+            Err(err) => {
+                if let Some(ref bin_err) = bin_err_for_proto {
+                    log::warn!(
+                        target: LOG_MODULE,
+                        "transaction metadata decode failed (slot {slot}, epoch {epoch}); bincode failed earlier: {bin_err}; protobuf error: {err}; falling back to default metadata"
+                    );
+                } else {
+                    log::warn!(
+                        target: LOG_MODULE,
+                        "transaction metadata decode failed (slot {slot}, epoch {epoch}): {err}; falling back to default metadata"
+                    );
+                }
+                return Ok(solana_transaction_status::TransactionStatusMeta::default());
             }
-        })?;
+        };
 
-    proto.try_into().map_err(|err| {
-        if let Some(ref bin_err) = bincode_err {
-            Box::new(std::io::Error::other(format!(
-                "convert transaction metadata proto failed (epoch {epoch}); bincode failed earlier: {bin_err}; conversion error: {err}"
-            ))) as SharedError
-        } else {
-            Box::new(std::io::Error::other(format!(
-                "convert transaction metadata proto: {err}"
-            ))) as SharedError
+    match proto.try_into() {
+        Ok(meta) => Ok(meta),
+        Err(err) => {
+            if let Some(ref bin_err) = bincode_err {
+                log::warn!(
+                    target: LOG_MODULE,
+                    "transaction metadata proto->native conversion failed (slot {slot}, epoch {epoch}); bincode failed earlier: {bin_err}; conversion error: {err}; falling back to default metadata"
+                );
+            } else {
+                log::warn!(
+                    target: LOG_MODULE,
+                    "transaction metadata proto->native conversion failed (slot {slot}, epoch {epoch}): {err}; falling back to default metadata"
+                );
+            }
+            Ok(solana_transaction_status::TransactionStatusMeta::default())
         }
-    })
+    }
 }
 
 #[cfg(test)]
@@ -1384,18 +1585,7 @@ where
                                                 )
                                             })?;
 
-                                        let decoded =
-                                            prost_011::Message::decode(decompressed.as_slice())
-                                                .map_err(|err| {
-                                                    (
-                                                        FirehoseError::NodeDecodingError(
-                                                            item_index,
-                                                            Box::new(err),
-                                                        ),
-                                                        error_slot,
-                                                    )
-                                                })?;
-                                        let keyed_rewards = convert_proto_rewards(&decoded)
+                                        let keyed_rewards = decode_rewards(decompressed.as_slice())
                                             .map_err(|err| {
                                                 (
                                                     FirehoseError::NodeDecodingError(item_index, err),
@@ -2079,12 +2269,11 @@ async fn firehose_geyser_thread(
                                 if !rewards.is_complete() {
                                     let reassembled = nodes.reassemble_dataframes(rewards.data.clone())?;
                                     let decompressed = utils::decompress_zstd(reassembled)?;
-                                    let decoded = prost_011::Message::decode(decompressed.as_slice()).map_err(|err| {
+                                    this_block_rewards = decode_rewards(decompressed.as_slice()).map_err(|err| {
                                         Box::new(std::io::Error::other(
                                             std::format!("Error decoding rewards: {:?}", err),
                                         ))
                                     })?;
-                                    this_block_rewards = convert_proto_rewards(&decoded)?;
                                 }
                             }
                             DataFrame(_data_frame) => (),
@@ -2230,6 +2419,28 @@ fn convert_proto_rewards(
         keyed_rewards.push((pubkey, reward));
     }
     Ok(keyed_rewards)
+}
+
+#[inline(always)]
+fn decode_rewards(
+    decompressed: &[u8],
+) -> Result<Vec<(Address, RewardInfo)>, SharedError> {
+    match prost_011::Message::decode(decompressed) {
+        Ok(proto) => convert_proto_rewards(&proto),
+        Err(proto_err) => {
+            // Some early archives stored rewards as bincode-encoded Vec<RewardInfo> (often empty).
+            if let Ok(bincode_rewards) = bincode::deserialize::<Vec<RewardInfo>>(decompressed) {
+                if bincode_rewards.is_empty() {
+                    return Ok(Vec::new());
+                }
+                return Err(Box::new(io::Error::other(format!(
+                    "protobuf rewards decode failed; bincode decoded {} rewards without pubkeys",
+                    bincode_rewards.len()
+                ))) as SharedError);
+            }
+            Err(Box::new(proto_err) as SharedError)
+        }
+    }
 }
 
 #[inline]

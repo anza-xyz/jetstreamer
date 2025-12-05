@@ -64,6 +64,8 @@ xxhash-rust.workspace = true
 dashmap.workspace = true
 once_cell.workspace = true
 url.workspace = true
+solana-transaction-context = "3"
+solana-transaction-error = "3"
 
 aws-credential-types = { workspace = true, optional = true }
 aws-sdk-s3 = { workspace = true, optional = true }

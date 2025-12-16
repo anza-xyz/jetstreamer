@@ -1,10 +1,18 @@
 use reqwest::Client;
 use rseek::Seekable;
 use serde::Deserialize;
-use std::fmt;
-use tokio::io::{AsyncRead, AsyncSeek, BufReader};
+use std::{fmt, io, pin::Pin};
+use tokio::io::{AsyncRead, AsyncSeek, BufReader, ReadBuf, SeekFrom};
 
+use crate::archive;
 use crate::node_reader::Len;
+
+#[cfg(feature = "s3-backend")]
+use {
+    crate::archive::S3Location,
+    aws_sdk_s3::Client as S3Client,
+    std::{future::Future, sync::Arc},
+};
 
 /// Default base URL used to fetch compact epoch CAR archives hosted by Old Faithful.
 pub const BASE_URL: &str = "https://files.old-faithful.net";
@@ -24,6 +32,63 @@ pub const fn slot_to_epoch(slot: u64) -> u64 {
     slot / 432000
 }
 
+trait EpochReader: AsyncRead + AsyncSeek + Send + Unpin {}
+impl<T> EpochReader for T where T: AsyncRead + AsyncSeek + Send + Unpin {}
+type DynEpochReader = dyn EpochReader;
+
+/// Seekable reader returned by [`fetch_epoch_stream`] regardless of backend.
+pub struct EpochStream {
+    inner: Pin<Box<DynEpochReader>>,
+    total_len: u64,
+}
+
+impl EpochStream {
+    fn new<R>(reader: R) -> Self
+    where
+        R: AsyncRead + AsyncSeek + Len + Send + Unpin + 'static,
+    {
+        let len = reader.len();
+        Self {
+            inner: Box::pin(reader),
+            total_len: len,
+        }
+    }
+}
+
+impl AsyncRead for EpochStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        let this = unsafe { self.get_unchecked_mut() };
+        this.inner.as_mut().poll_read(cx, buf)
+    }
+}
+
+impl AsyncSeek for EpochStream {
+    fn start_seek(self: Pin<&mut Self>, position: SeekFrom) -> io::Result<()> {
+        let this = unsafe { self.get_unchecked_mut() };
+        this.inner.as_mut().start_seek(position)
+    }
+
+    fn poll_complete(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<u64>> {
+        let this = unsafe { self.get_unchecked_mut() };
+        this.inner.as_mut().poll_complete(cx)
+    }
+}
+
+impl Len for EpochStream {
+    fn len(&self) -> u64 {
+        self.total_len
+    }
+}
+
+impl Unpin for EpochStream {}
+
 /* ────────────────────────────────────────────────────────────────────────── */
 /*  Blanket Len impl so BufReader<T> keeps the .len() we rely on            */
 /* ────────────────────────────────────────────────────────────────────────── */
@@ -34,28 +99,238 @@ impl<T: Len + AsyncRead> Len for BufReader<T> {
     }
 }
 
-/// Checks [`BASE_URL`] to determine whether the Old Faithful CAR archive for an epoch exists.
+/// Checks the configured archive backend to determine whether an epoch CAR exists.
 pub async fn epoch_exists(epoch: u64, client: &Client) -> bool {
-    let url = format!("{}/{}/epoch-{}.car", BASE_URL, epoch, epoch);
-    let response = client.head(&url).send().await;
-    match response {
-        Ok(res) => res.status().is_success(),
-        Err(_) => false,
+    let location = archive::car_location();
+    let path = format!("{epoch}/epoch-{epoch}.car");
+
+    if location.is_http() {
+        let url = location
+            .url()
+            .join(&path)
+            .unwrap_or_else(|err| panic!("invalid CAR URL for epoch {epoch}: {err}"));
+        let response = client.head(url).send().await;
+        return response
+            .map(|res| res.status().is_success())
+            .unwrap_or(false);
+    }
+
+    #[cfg(feature = "s3-backend")]
+    if let Some(cfg) = location.as_s3() {
+        let key = cfg.key_for(&path);
+        return cfg
+            .client
+            .head_object()
+            .bucket(cfg.bucket.as_ref())
+            .key(key)
+            .send()
+            .await
+            .is_ok();
+    }
+
+    panic!(
+        "unsupported archive backend for CAR location {}",
+        location.url()
+    );
+}
+
+/// Fetches an epoch’s CAR file from the configured archive backend as a buffered, seekable stream.
+pub async fn fetch_epoch_stream(epoch: u64, client: &Client) -> EpochStream {
+    let location = archive::car_location();
+    let path = format!("{epoch}/epoch-{epoch}.car");
+
+    if location.is_http() {
+        let url = location
+            .url()
+            .join(&path)
+            .unwrap_or_else(|err| panic!("invalid CAR URL for epoch {epoch}: {err}"));
+        let request_url = url.to_string();
+        let http_client = client.clone();
+        let seekable = Seekable::new(move || http_client.get(request_url.clone())).await;
+        let reader = BufReader::with_capacity(8 * 1024 * 1024, seekable);
+        return EpochStream::new(reader);
+    }
+
+    #[cfg(feature = "s3-backend")]
+    if let Some(cfg) = location.as_s3() {
+        let s3_reader = S3SeekableReader::new(cfg, path)
+            .await
+            .unwrap_or_else(|err| panic!("failed to open epoch {epoch} CAR via S3: {err}"));
+        let reader = BufReader::with_capacity(8 * 1024 * 1024, s3_reader);
+        return EpochStream::new(reader);
+    }
+
+    panic!(
+        "unsupported archive backend for CAR location {}",
+        location.url()
+    );
+}
+
+#[cfg(feature = "s3-backend")]
+type ReaderFuture =
+    Pin<Box<dyn Future<Output = io::Result<Pin<Box<dyn AsyncRead + Send>>>> + Send>>;
+
+#[cfg(feature = "s3-backend")]
+struct S3SeekableReader {
+    client: Arc<S3Client>,
+    bucket: Arc<str>,
+    key: String,
+    len: u64,
+    position: u64,
+    reader: Option<Pin<Box<dyn AsyncRead + Send>>>,
+    init_fetch: Option<ReaderFuture>,
+}
+
+#[cfg(feature = "s3-backend")]
+impl S3SeekableReader {
+    async fn new(location: Arc<S3Location>, path: String) -> io::Result<Self> {
+        let key = location.key_for(&path);
+        let head = location
+            .client
+            .head_object()
+            .bucket(location.bucket.as_ref())
+            .key(&key)
+            .send()
+            .await
+            .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
+        let len = head
+            .content_length()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "S3 object missing length"))?
+            as u64;
+
+        let mut reader = Self {
+            client: Arc::clone(&location.client),
+            bucket: Arc::clone(&location.bucket),
+            key,
+            len,
+            position: 0,
+            reader: None,
+            init_fetch: None,
+        };
+        reader.schedule_fetch(0);
+        Ok(reader)
+    }
+
+    fn schedule_fetch(&mut self, start: u64) {
+        let client = Arc::clone(&self.client);
+        let bucket = Arc::clone(&self.bucket);
+        let key = self.key.clone();
+        let len = self.len;
+        self.reader = None;
+        self.init_fetch = Some(Box::pin(async move {
+            let end = len.saturating_sub(1);
+            let range = if start >= len {
+                format!("bytes={end}-{end}")
+            } else {
+                format!("bytes={start}-{end}")
+            };
+            let resp = client
+                .get_object()
+                .bucket(bucket.as_ref())
+                .key(&key)
+                .range(range)
+                .send()
+                .await
+                .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
+            let reader = tokio::io::BufReader::new(resp.body.into_async_read());
+            Ok(Box::pin(reader) as Pin<Box<dyn AsyncRead + Send>>)
+        }));
     }
 }
 
-/// Fetches an epoch’s CAR file from Old Faithful as a buffered, seekable async stream.
-///
-/// The returned reader implements [`Len`] and can be consumed sequentially or
-/// randomly via [`AsyncSeek`].
-pub async fn fetch_epoch_stream(epoch: u64, client: &Client) -> impl AsyncRead + AsyncSeek + Len {
-    let client = client.clone();
-    let seekable =
-        Seekable::new(move || client.get(format!("{}/{}/epoch-{}.car", BASE_URL, epoch, epoch)))
-            .await;
+#[cfg(feature = "s3-backend")]
+impl AsyncRead for S3SeekableReader {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        let this = unsafe { self.get_unchecked_mut() };
 
-    BufReader::with_capacity(8 * 1024 * 1024, seekable)
+        if this.position >= this.len {
+            return std::task::Poll::Ready(Ok(()));
+        }
+
+        loop {
+            if let Some(reader) = this.reader.as_mut() {
+                let before = buf.filled().len();
+                match reader.as_mut().poll_read(cx, buf) {
+                    std::task::Poll::Ready(Ok(())) => {
+                        let after = buf.filled().len();
+                        let delta = after.saturating_sub(before);
+                        this.position = this.position.saturating_add(delta as u64);
+                        return std::task::Poll::Ready(Ok(()));
+                    }
+                    other => return other,
+                }
+            }
+
+            if let Some(fut) = this.init_fetch.as_mut() {
+                match fut.as_mut().poll(cx) {
+                    std::task::Poll::Ready(Ok(reader)) => {
+                        this.reader = Some(reader);
+                        this.init_fetch = None;
+                        continue;
+                    }
+                    std::task::Poll::Ready(Err(err)) => {
+                        this.init_fetch = None;
+                        return std::task::Poll::Ready(Err(err));
+                    }
+                    std::task::Poll::Pending => return std::task::Poll::Pending,
+                }
+            } else {
+                this.schedule_fetch(this.position);
+            }
+        }
+    }
 }
+
+#[cfg(feature = "s3-backend")]
+impl AsyncSeek for S3SeekableReader {
+    fn start_seek(self: Pin<&mut Self>, position: SeekFrom) -> io::Result<()> {
+        let this = unsafe { self.get_unchecked_mut() };
+        let target = match position {
+            SeekFrom::Start(offset) => offset,
+            SeekFrom::Current(delta) => {
+                let tmp = this.position as i64 + delta;
+                if tmp < 0 {
+                    return Err(io::Error::new(io::ErrorKind::InvalidInput, "negative seek"));
+                }
+                tmp as u64
+            }
+            SeekFrom::End(delta) => {
+                let tmp = this.len as i64 + delta;
+                if tmp < 0 {
+                    return Err(io::Error::new(io::ErrorKind::InvalidInput, "negative seek"));
+                }
+                tmp as u64
+            }
+        };
+        this.position = target.min(this.len);
+        this.reader = None;
+        this.init_fetch = None;
+        this.schedule_fetch(this.position);
+        Ok(())
+    }
+
+    fn poll_complete(
+        self: Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<u64>> {
+        let this = unsafe { self.get_unchecked_mut() };
+        std::task::Poll::Ready(Ok(this.position))
+    }
+}
+
+#[cfg(feature = "s3-backend")]
+impl Len for S3SeekableReader {
+    fn len(&self) -> u64 {
+        self.len
+    }
+}
+
+#[cfg(feature = "s3-backend")]
+impl Unpin for S3SeekableReader {}
 
 /// Errors that can occur when calling [`get_slot_timestamp`].
 #[derive(Debug)]

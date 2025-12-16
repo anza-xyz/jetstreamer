@@ -188,6 +188,27 @@ environment variables.
 When `JETSTREAMER_CLICKHOUSE_MODE` is `auto` (the default), Jetstreamer inspects the DSN to
 decide whether to launch the bundled ClickHouse helper or connect to an external cluster.
 
+### Alternate Archive Mirrors
+
+Jetstreamer defaults to the public Old Faithful mirror (`https://files.old-faithful.net`), but
+the firehose can also stream CARs and compact indexes directly from authenticated
+S3-compatible storage. Configure the backend via the following environment variables:
+
+- `JETSTREAMER_ARCHIVE_BACKEND` (default `http`): set to `s3` to force the S3 client.
+- `JETSTREAMER_HTTP_BASE_URL`: base URL or `s3://bucket/prefix` for CAR files.
+- `JETSTREAMER_COMPACT_INDEX_BASE_URL`: optional override for compact indexes (also accepts `s3://` URIs).
+- `JETSTREAMER_ARCHIVE_BASE`: single knob that applies to both cars and indexes when the more specific variables are unset.
+- `JETSTREAMER_S3_BUCKET`, `JETSTREAMER_S3_PREFIX`, `JETSTREAMER_S3_INDEX_PREFIX`: bucket/prefix overrides when not encoded in the `s3://` URL.
+- `JETSTREAMER_S3_REGION` and `JETSTREAMER_S3_ENDPOINT`: region plus optional custom endpoint (e.g. `https://s3.eu-central-003.backblazeb2.com`).
+- `JETSTREAMER_S3_ACCESS_KEY`, `JETSTREAMER_S3_SECRET_KEY`, `JETSTREAMER_S3_SESSION_TOKEN`: credentials used for signing requests (falls back to AWS standard env vars).
+
+S3 support is compiled behind the `s3-backend` Cargo feature. Enable it when running or
+depending on `jetstreamer` if you plan to consume `s3://` archives:
+
+```bash
+cargo run --features s3-backend -- 800
+```
+
 #### Batching ClickHouse Writes
 
 ClickHouse (and anything you do in your callbacks) applies backpressure that will slow down

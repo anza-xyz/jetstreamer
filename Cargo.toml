@@ -21,6 +21,11 @@ license.workspace = true
 repository.workspace = true
 documentation.workspace = true
 
+[features]
+default = []
+s3-backend = ["jetstreamer-firehose/s3-backend"]
+verify-transaction-signatures = ["jetstreamer-firehose/verify-transaction-signatures"]
+
 [workspace.dependencies]
 jetstreamer-firehose = { path = "jetstreamer-firehose", version = "0.2.0" }
 jetstreamer-plugin = { path = "jetstreamer-plugin", version = "0.2.0" }
@@ -57,6 +62,9 @@ serde_cbor = "0"
 agave-geyser-plugin-interface = "3"
 solana-address = "1"
 solana-hash = "3"
+solana-blake3-hasher = "=3.0.0"
+solana-epoch-rewards-hasher = "=3.0.0"
+solana-keccak-hasher = "=3.0.0"
 solana-logger = "3"
 solana-signature = { version = "3", default-features = false }
 solana-accounts-db = "3"
@@ -71,6 +79,7 @@ solana-transaction = "3"
 solana-transaction-status = "3"
 solana-sdk-ids = "3"
 solana-reward-info = "3"
+solana-sysvar = "=3.0.0"
 sha2 = "0.10"
 tonic = { version = "0", default-features = false }
 tonic-build = "0"
@@ -88,6 +97,10 @@ ctrlc = "3"
 indoc = "2"
 tempfile = "3"
 libc = "0"
+aws-credential-types = "1"
+aws-sdk-s3 = "1"
+aws-smithy-types = "1"
+aws-types = "1"
 
 [dependencies]
 tokio.workspace = true
@@ -96,6 +109,11 @@ log.workspace = true
 jetstreamer-firehose.workspace = true
 jetstreamer-plugin.workspace = true
 jetstreamer-utils.workspace = true
+url.workspace = true
+solana-sysvar.workspace = true
+solana-blake3-hasher.workspace = true
+solana-epoch-rewards-hasher.workspace = true
+solana-keccak-hasher.workspace = true
 
 [dev-dependencies]
 clickhouse.workspace = true

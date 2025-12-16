@@ -192,10 +192,10 @@ impl S3SeekableReader {
             .key(&key)
             .send()
             .await
-            .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
+            .map_err(|err| io::Error::other(err.to_string()))?;
         let len = head
             .content_length()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "S3 object missing length"))?
+            .ok_or_else(|| io::Error::other("S3 object missing length"))?
             as u64;
 
         let mut reader = Self {
@@ -231,7 +231,7 @@ impl S3SeekableReader {
                 .range(range)
                 .send()
                 .await
-                .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
+                .map_err(|err| io::Error::other(err.to_string()))?;
             let reader = tokio::io::BufReader::new(resp.body.into_async_read());
             Ok(Box::pin(reader) as Pin<Box<dyn AsyncRead + Send>>)
         }));

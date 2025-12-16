@@ -195,8 +195,7 @@ impl S3SeekableReader {
             .map_err(|err| io::Error::other(err.to_string()))?;
         let len = head
             .content_length()
-            .ok_or_else(|| io::Error::other("S3 object missing length"))?
-            as u64;
+            .ok_or_else(|| io::Error::other("S3 object missing length"))? as u64;
 
         let mut reader = Self {
             client: Arc::clone(&location.client),

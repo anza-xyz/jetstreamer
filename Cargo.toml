@@ -70,7 +70,7 @@ solana-signature = { version = "3", default-features = false }
 solana-accounts-db = "3"
 solana-entry = "3"
 solana-ledger = "3"
-solana-geyser-plugin-manager = "3"
+solana-geyser-plugin-manager = { version = "3", features = ["agave-unstable-api"] }
 solana-rpc = "3"
 solana-runtime = "3"
 solana-storage-proto = "3"

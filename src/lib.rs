@@ -66,7 +66,7 @@
 //! history of Solana mainnet, it is limited by what is in Old Faithful. Old Faithful does not
 //! contain account updates, so Jetstreamer at the moment also does not have account updates.
 //! Transaction logs **are** available in `transaction_status_meta.log_messages` for all epochs.
-//! 
+//!
 //! It is worth noting that the way Old Faithful and thus Jetstreamer stores transactions, they
 //! are stored in their "already-executed" state as they originally appeared to Geyser when
 //! they were first executed. Thus while Jetstreamer can replay ledger data, it is not

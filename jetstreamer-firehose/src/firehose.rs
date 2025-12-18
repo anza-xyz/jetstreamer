@@ -2550,6 +2550,46 @@ async fn test_firehose_target_slot_transactions() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn test_firehose_epoch_850_has_logs() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    solana_logger::setup_with_default("info");
+    const START_SLOT: u64 = 367_200_075; // within epoch 850
+    const SLOT_COUNT: u64 = 50;
+    static TOTAL_TXS: AtomicU64 = AtomicU64::new(0);
+
+    TOTAL_TXS.store(0, Ordering::Relaxed);
+
+    firehose(
+        4,
+        START_SLOT..(START_SLOT + SLOT_COUNT),
+        None::<OnBlockFn>,
+        Some(|_thread_id: usize, transaction: TransactionData| {
+            async move {
+                TOTAL_TXS.fetch_add(1, Ordering::Relaxed);
+                if let Some(logs) = transaction.transaction_status_meta.log_messages.as_ref() {
+                    let has_logs = logs.iter().any(|msg| !msg.is_empty());
+                    assert_eq!(has_logs, true);
+                }
+                Ok(())
+            }
+            .boxed()
+        }),
+        None::<OnEntryFn>,
+        None::<OnRewardFn>,
+        None::<OnErrorFn>,
+        None::<OnStatsTrackingFn>,
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        TOTAL_TXS.load(Ordering::Relaxed) > 0,
+        "no transactions observed in epoch 850 range"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_firehose_epoch_850_votes_present() {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     solana_logger::setup_with_default("info");

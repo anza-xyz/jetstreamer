@@ -1,5 +1,8 @@
 use {
-    jetstreamer_firehose::{LOG_MODULE, firehose::firehose_geyser, index::get_index_base_url, network::create_http_client},
+    jetstreamer_firehose::{
+        LOG_MODULE, firehose::firehose_geyser, index::get_index_base_url,
+        network::create_http_client,
+    },
     reqwest::Client,
     std::{env::args, sync::Arc},
 };

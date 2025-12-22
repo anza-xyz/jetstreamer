@@ -1,12 +1,12 @@
 use {
-    jetstreamer_firehose::{LOG_MODULE, firehose::firehose_geyser, index::get_index_base_url},
+    jetstreamer_firehose::{LOG_MODULE, firehose::firehose_geyser, index::get_index_base_url, network::create_http_client},
     reqwest::Client,
     std::{env::args, sync::Arc},
 };
 
 fn main() {
     solana_logger::setup_with_default("info");
-    let client = Client::new();
+    let client = create_http_client();
     let index_base_url =
         get_index_base_url().expect("failed to resolve remote slot offset index location");
     let first_arg = args().nth(1).expect("no first argument given");

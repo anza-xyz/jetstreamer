@@ -686,7 +686,7 @@ where
             slot_range.start,
         ));
     }
-    let client = Client::new();
+    let client = crate::network::create_http_client();
     log::info!(target: LOG_MODULE, "starting firehose...");
     log::info!(target: LOG_MODULE, "index base url: {}", SLOT_OFFSET_INDEX.base_url());
 

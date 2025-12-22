@@ -407,7 +407,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_fetch_epoch_stream() {
-        let client = reqwest::Client::new();
+        let client = crate::network::create_http_client();
         let mut stream = fetch_epoch_stream(670, &client).await;
 
         /* first 1 KiB */
@@ -424,7 +424,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_slot_timestamp() {
         // well-known public Solana RPC, slot 246446651 occurred in Apr 2024
-        let client = reqwest::Client::new();
+        let client = crate::network::create_http_client();
         let rpc_url = "https://api.mainnet-beta.solana.com";
         let slot = 246446651u64;
         let ts = get_slot_timestamp(slot, rpc_url, &client)
@@ -437,7 +437,7 @@ mod tests {
 
 #[tokio::test]
 async fn test_epoch_exists() {
-    let client = reqwest::Client::new();
+    let client = crate::network::create_http_client();
     assert!(epoch_exists(670, &client).await);
     assert!(!epoch_exists(999999, &client).await);
 }

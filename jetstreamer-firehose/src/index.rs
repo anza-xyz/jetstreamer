@@ -254,7 +254,7 @@ impl SlotOffsetIndex {
             }
         };
         Ok(Self {
-            client: Client::new(),
+            client: crate::network::create_http_client(),
             base_url,
             network,
             cache_namespace,

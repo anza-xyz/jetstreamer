@@ -354,7 +354,7 @@ pub fn cid_from_cbor_link(val: &serde_cbor::Value) -> Result<cid::Cid, SharedErr
 #[tokio::test]
 async fn test_async_node_reader() {
     use crate::epochs::fetch_epoch_stream;
-    let client = reqwest::Client::new();
+    let client = crate::network::create_http_client();
     let stream = fetch_epoch_stream(670, &client).await;
     let mut reader = NodeReader::new(stream);
     let nodes = reader.read_until_block().await.unwrap();

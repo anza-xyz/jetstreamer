@@ -12,8 +12,7 @@ use crate::{
 /// at build time (e.g., via CI/CD), it will be used instead, allowing git
 /// commit information to be included (e.g., `jetstreamer/v0.3.0+24d5efe-dirty`).
 pub fn create_http_client() -> Client {
-    let version = option_env!("JETSTREAMER_VERSION")
-        .unwrap_or(env!("CARGO_PKG_VERSION"));
+    let version = option_env!("JETSTREAMER_VERSION").unwrap_or(env!("CARGO_PKG_VERSION"));
     let user_agent = format!("jetstreamer/v{}", version);
     Client::builder()
         .user_agent(user_agent)

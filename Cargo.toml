@@ -1,5 +1,5 @@
 [workspace]
-members = ["jetstreamer-firehose", "jetstreamer-plugin", "jetstreamer-utils"]
+members = ["jetstreamer-firehose", "jetstreamer-node", "jetstreamer-plugin", "jetstreamer-utils"]
 
 [workspace.package]
 edition = "2024"

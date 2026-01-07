@@ -1,0 +1,11 @@
+[package]
+name = "jetstreamer-node"
+edition.workspace = true
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+
+[dependencies]

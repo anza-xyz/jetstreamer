@@ -1,14 +1,5 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
+//! Helpers for working with Solana ledger snapshots stored in GCS.
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+pub mod snapshots;
 
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
-}
+pub use snapshots::{SnapshotError, SnapshotInfo, download_epoch_snapshot, resolve_epoch_snapshot};

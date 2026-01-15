@@ -3875,6 +3875,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "jetstreamer-node"
+version = "0.3.0"
+dependencies = [
+ "jetstreamer-firehose",
+ "thiserror 2.0.17",
+ "tokio",
+]
+
+[[package]]
 name = "jetstreamer-plugin"
 version = "0.3.0"
 dependencies = [

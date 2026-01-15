@@ -9,3 +9,6 @@ documentation.workspace = true
 keywords.workspace = true
 
 [dependencies]
+jetstreamer-firehose.workspace = true
+thiserror.workspace = true
+tokio.workspace = true

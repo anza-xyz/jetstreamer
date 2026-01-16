@@ -83,11 +83,11 @@ async fn main() {
         }
     };
 
+    println!("Downloaded snapshot to {}", dest_path.display());
+    println!("Extracting snapshot into {}", dest_dir.display());
     if let Err(err) = extract_tarball(&dest_path, &dest_dir).await {
         eprintln!("error: {err}");
         exit(1);
     }
-
-    println!("Downloaded snapshot to {}", dest_path.display());
-    println!("Extracted snapshot into {}", dest_dir.display());
+    println!("Extraction complete");
 }

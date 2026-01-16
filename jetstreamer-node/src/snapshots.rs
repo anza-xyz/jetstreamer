@@ -1,4 +1,7 @@
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    process::Stdio,
+};
 
 use jetstreamer_firehose::epochs::epoch_to_slot_range;
 use tokio::process::Command;
@@ -179,7 +182,7 @@ async fn download_snapshot_to_dir(
     let dest_path = dest_dir.join(filename);
     let dest_arg = dest_path.to_string_lossy().to_string();
 
-    gcloud_stdout(&["storage", "cp", &info.snapshot_uri, &dest_arg]).await?;
+    gcloud_status(&["storage", "cp", &info.snapshot_uri, &dest_arg]).await?;
     Ok(dest_path)
 }
 
@@ -304,6 +307,25 @@ async fn gcloud_stdout(args: &[&str]) -> Result<String, SnapshotError> {
         });
     }
     Ok(output.stdout)
+}
+
+async fn gcloud_status(args: &[&str]) -> Result<(), SnapshotError> {
+    let status = Command::new("gcloud")
+        .args(args)
+        .env("CLOUDSDK_CORE_DISABLE_PROMPTS", "1")
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .await?;
+
+    if !status.success() {
+        return Err(SnapshotError::CommandFailed {
+            command: format_command(args),
+            stderr: "see output above".to_string(),
+        });
+    }
+
+    Ok(())
 }
 
 fn format_command(args: &[&str]) -> String {

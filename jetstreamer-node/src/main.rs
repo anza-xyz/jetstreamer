@@ -1,7 +1,12 @@
-use std::{env, path::PathBuf, process::exit};
+use std::{
+    env,
+    path::{Path, PathBuf},
+    process::exit,
+};
 
 use jetstreamer_firehose::epochs::epoch_to_slot_range;
 use jetstreamer_node::snapshots::download_snapshot_at_or_before_slot;
+use tokio::process::Command;
 
 fn epoch_to_slot(epoch: u64) -> u64 {
     epoch_to_slot_range(epoch).0
@@ -9,6 +14,28 @@ fn epoch_to_slot(epoch: u64) -> u64 {
 
 fn usage(program: &str) -> String {
     format!("Usage: {program} <epoch> [dest-dir]")
+}
+
+async fn extract_tarball(archive: &Path, dest_dir: &Path) -> Result<(), String> {
+    let output = Command::new("tar")
+        .arg("-xf")
+        .arg(archive)
+        .arg("-C")
+        .arg(dest_dir)
+        .output()
+        .await
+        .map_err(|err| format!("failed to run tar: {err}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let command = format!("tar -xf {} -C {}", archive.display(), dest_dir.display());
+        if stderr.is_empty() {
+            return Err(format!("{command} failed"));
+        }
+        return Err(format!("{command} failed: {stderr}"));
+    }
+
+    Ok(())
 }
 
 #[tokio::main]
@@ -56,5 +83,11 @@ async fn main() {
         }
     };
 
+    if let Err(err) = extract_tarball(&dest_path, &dest_dir).await {
+        eprintln!("error: {err}");
+        exit(1);
+    }
+
     println!("Downloaded snapshot to {}", dest_path.display());
+    println!("Extracted snapshot into {}", dest_dir.display());
 }

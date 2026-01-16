@@ -900,7 +900,14 @@ where
                         let nodes = match timeout(OP_TIMEOUT, read_fut).await {
                             Ok(result) => result
                                 .map_err(FirehoseError::ReadUntilBlockError)
-                                .map_err(|e| (e, current_slot.unwrap_or(slot_range.start)))?,
+                                .map_err(|e| {
+                                    (
+                                        e,
+                                        current_slot
+                                            .map(|slot| slot.saturating_add(1))
+                                            .unwrap_or(slot_range.start),
+                                    )
+                                })?,
                             Err(_) => {
                                 log::warn!(target: &log_target, "timeout reading next block, retrying (will restart)...");
                                 return Err((FirehoseError::OperationTimeout("read_until_block"), current_slot.map(|s| s + 1).unwrap_or(slot_range.start)));
@@ -1518,8 +1525,11 @@ where
                     epoch
                 );
                 log::error!(target: &log_target, "{}", error_message);
-                if matches!(err, FirehoseError::SlotOffsetIndexError(_)) {
-                    // Clear cached index data for this epoch to avoid retrying with a bad/partial index.
+                if matches!(err, FirehoseError::SlotOffsetIndexError(_))
+                    || error_message.contains("Unknown CID version")
+                {
+                    // Clear cached index data for this epoch to avoid retrying with a bad/partial index
+                    // (or a bad seek offset that landed mid-stream).
                     SLOT_OFFSET_INDEX.invalidate_epoch(epoch);
                 }
                 if let Some(on_error_cb) = on_error.clone() {
@@ -1564,7 +1574,10 @@ where
                 if block_enabled {
                     pending_skipped_slots.remove(&thread_index);
                 }
-                skip_until_index = Some(item_index);
+                // `skip_until_index` is unsafe across retries because `item_index`
+                // is reset to 0 each epoch restart. Keeping it can skip large portions
+                // of the stream and silently drop slots.
+                skip_until_index = None;
                 last_emitted_slot_global = last_emitted_slot;
             }
         });
@@ -2144,8 +2157,12 @@ async fn firehose_geyser_thread(
             slot_to_epoch(slot)
             );
             log::error!(target: &log_target, "{}", err);
-            if matches!(err, FirehoseError::SlotOffsetIndexError(_)) {
-                // Clear cached index data for this epoch to avoid retrying with a bad/partial index.
+            let error_message = err.to_string();
+            if matches!(err, FirehoseError::SlotOffsetIndexError(_))
+                || error_message.contains("Unknown CID version")
+            {
+                // Clear cached index data for this epoch to avoid retrying with a bad/partial index
+                // (or a bad seek offset that landed mid-stream).
                 SLOT_OFFSET_INDEX.invalidate_epoch(slot_to_epoch(slot));
             }
             let item_index = match err {
@@ -2168,7 +2185,10 @@ async fn firehose_geyser_thread(
             } else {
                 slot_range.start = slot;
             }
-            skip_until_index = Some(item_index);
+            // `skip_until_index` is unsafe across retries because `item_index`
+            // is reset to 0 each epoch restart. Keeping it can skip large portions
+            // of the stream and silently drop slots.
+            skip_until_index = None;
 }
     Ok(())
 }

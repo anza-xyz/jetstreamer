@@ -35,6 +35,8 @@ pub enum SnapshotError {
     },
     #[error("no snapshot directory found for epoch {epoch} in slot range {start}-{end}")]
     SnapshotDirNotFound { epoch: u64, start: u64, end: u64 },
+    #[error("no snapshot directory found at or before slot {slot} for epoch {epoch}")]
+    SnapshotDirNotFoundAtOrBeforeSlot { epoch: u64, slot: u64 },
     #[error("no snapshot directory reported epoch {epoch}; candidates: {candidates:?}")]
     SnapshotDirEpochMismatch { epoch: u64, candidates: Vec<u64> },
     #[error("no snapshot object found in {slot_dir}")]
@@ -76,27 +78,25 @@ pub async fn resolve_epoch_snapshot(epoch: u64) -> Result<SnapshotInfo, Snapshot
         _ => *matches.iter().max().unwrap(),
     };
 
-    let snapshot_objects = list_snapshot_objects(DEFAULT_BUCKET, slot_dir).await?;
-    let snapshot_uri = match snapshot_objects.len() {
-        0 => {
-            return Err(SnapshotError::SnapshotObjectNotFound {
-                slot_dir: format!("{DEFAULT_BUCKET}/{slot_dir}"),
-            });
-        }
-        1 => snapshot_objects[0].clone(),
-        _ => {
-            return Err(SnapshotError::MultipleSnapshotObjects {
-                slot_dir: format!("{DEFAULT_BUCKET}/{slot_dir}"),
-                objects: snapshot_objects,
-            });
-        }
-    };
+    resolve_snapshot_for_slot(DEFAULT_BUCKET, epoch, slot_dir).await
+}
 
-    Ok(SnapshotInfo {
-        epoch,
-        slot_dir,
-        snapshot_uri,
-    })
+/// Resolve the latest snapshot at or before the provided slot.
+pub async fn resolve_snapshot_at_or_before_slot(
+    epoch: u64,
+    target_slot: u64,
+) -> Result<SnapshotInfo, SnapshotError> {
+    let slot_dir = list_bucket_slots(DEFAULT_BUCKET)
+        .await?
+        .into_iter()
+        .filter(|slot| *slot <= target_slot)
+        .max()
+        .ok_or(SnapshotError::SnapshotDirNotFoundAtOrBeforeSlot {
+            epoch,
+            slot: target_slot,
+        })?;
+
+    resolve_snapshot_for_slot(DEFAULT_BUCKET, epoch, slot_dir).await
 }
 
 /// Download the snapshot tarball for an epoch into a destination directory.
@@ -113,12 +113,25 @@ pub async fn download_epoch_snapshot(
         })?;
 
     let info = resolve_epoch_snapshot(epoch).await?;
-    let filename = snapshot_filename(&info.snapshot_uri)?;
-    let dest_path = dest_dir.join(filename);
-    let dest_arg = dest_path.to_string_lossy().to_string();
+    download_snapshot_to_dir(&info, dest_dir).await
+}
 
-    gcloud_stdout(&["storage", "cp", &info.snapshot_uri, &dest_arg]).await?;
-    Ok(dest_path)
+/// Download the latest snapshot at or before the provided slot into a destination directory.
+pub async fn download_snapshot_at_or_before_slot(
+    epoch: u64,
+    target_slot: u64,
+    dest_dir: impl AsRef<Path>,
+) -> Result<PathBuf, SnapshotError> {
+    let dest_dir = dest_dir.as_ref();
+    tokio::fs::create_dir_all(dest_dir)
+        .await
+        .map_err(|source| SnapshotError::CreateDir {
+            path: dest_dir.to_path_buf(),
+            source,
+        })?;
+
+    let info = resolve_snapshot_at_or_before_slot(epoch, target_slot).await?;
+    download_snapshot_to_dir(&info, dest_dir).await
 }
 
 fn snapshot_filename(uri: &str) -> Result<&str, SnapshotError> {
@@ -128,6 +141,46 @@ fn snapshot_filename(uri: &str) -> Result<&str, SnapshotError> {
         .ok_or_else(|| SnapshotError::SnapshotFilenameMissing {
             uri: uri.to_string(),
         })
+}
+
+async fn resolve_snapshot_for_slot(
+    bucket: &str,
+    epoch: u64,
+    slot_dir: u64,
+) -> Result<SnapshotInfo, SnapshotError> {
+    let snapshot_objects = list_snapshot_objects(bucket, slot_dir).await?;
+    let snapshot_uri = match snapshot_objects.len() {
+        0 => {
+            return Err(SnapshotError::SnapshotObjectNotFound {
+                slot_dir: format!("{bucket}/{slot_dir}"),
+            });
+        }
+        1 => snapshot_objects[0].clone(),
+        _ => {
+            return Err(SnapshotError::MultipleSnapshotObjects {
+                slot_dir: format!("{bucket}/{slot_dir}"),
+                objects: snapshot_objects,
+            });
+        }
+    };
+
+    Ok(SnapshotInfo {
+        epoch,
+        slot_dir,
+        snapshot_uri,
+    })
+}
+
+async fn download_snapshot_to_dir(
+    info: &SnapshotInfo,
+    dest_dir: &Path,
+) -> Result<PathBuf, SnapshotError> {
+    let filename = snapshot_filename(&info.snapshot_uri)?;
+    let dest_path = dest_dir.join(filename);
+    let dest_arg = dest_path.to_string_lossy().to_string();
+
+    gcloud_stdout(&["storage", "cp", &info.snapshot_uri, &dest_arg]).await?;
+    Ok(dest_path)
 }
 
 async fn list_bucket_slots(bucket: &str) -> Result<Vec<u64>, SnapshotError> {

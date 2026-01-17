@@ -39,6 +39,8 @@ const ACCOUNTS_HARDLINKS_DIR: &str = "accounts_hardlinks";
 const GENESIS_ARCHIVE: &str = "genesis.tar.bz2";
 const SNAPSHOT_VERSION_FILE: &str = "version";
 const SNAPSHOT_STATUS_CACHE_FILE: &str = "status_cache";
+const ACCOUNTS_SNAPSHOT_DIR: &str = "snapshot";
+const ACCOUNTS_RUN_DIR: &str = "run";
 
 struct BankReplay {
     bank: Mutex<Arc<Bank>>,
@@ -300,6 +302,18 @@ fn link_or_copy(src: &Path, dest: &Path) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(unix)]
+fn symlink_dir(src: &Path, dest: &Path) -> Result<(), String> {
+    std::os::unix::fs::symlink(src, dest)
+        .map_err(|err| format!("failed to symlink {} -> {}: {err}", src.display(), dest.display()))
+}
+
+#[cfg(windows)]
+fn symlink_dir(src: &Path, dest: &Path) -> Result<(), String> {
+    std::os::windows::fs::symlink_dir(src, dest)
+        .map_err(|err| format!("failed to symlink {} -> {}: {err}", src.display(), dest.display()))
+}
+
 fn ensure_snapshot_meta_files(ledger_dir: &Path) -> Result<bool, String> {
     let snapshots_dir = ledger_dir.join(BANK_SNAPSHOTS_DIR);
     if !snapshots_dir.is_dir() {
@@ -364,6 +378,63 @@ fn ensure_snapshot_meta_files(ledger_dir: &Path) -> Result<bool, String> {
     Ok(changed)
 }
 
+fn ensure_accounts_hardlinks(
+    ledger_dir: &Path,
+    bank_snapshot: &snapshot_utils::BankSnapshotInfo,
+) -> Result<bool, String> {
+    let hardlinks_dir = bank_snapshot.snapshot_dir.join(ACCOUNTS_HARDLINKS_DIR);
+    let mut existing = false;
+    if hardlinks_dir.is_dir() {
+        let mut entries = fs::read_dir(&hardlinks_dir)
+            .map_err(|err| format!("failed to read {}: {err}", hardlinks_dir.display()))?;
+        existing = entries.next().is_some();
+    } else {
+        fs::create_dir_all(&hardlinks_dir)
+            .map_err(|err| format!("failed to create {}: {err}", hardlinks_dir.display()))?;
+    }
+
+    if existing {
+        return Ok(false);
+    }
+
+    let slot_dir = bank_snapshot.slot.to_string();
+    let mut account_paths = Vec::new();
+    let read_dir = fs::read_dir(ledger_dir)
+        .map_err(|err| format!("failed to read {}: {err}", ledger_dir.display()))?;
+    for entry in read_dir {
+        let entry = entry.map_err(|err| format!("failed to read dir entry: {err}"))?;
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let snapshot_dir = path.join(ACCOUNTS_SNAPSHOT_DIR).join(&slot_dir);
+        if snapshot_dir.is_dir() {
+            account_paths.push((path, snapshot_dir));
+        }
+    }
+
+    if account_paths.is_empty() {
+        return Err(format!(
+            "no account snapshot dirs found under {} for slot {}",
+            ledger_dir.display(),
+            slot_dir
+        ));
+    }
+
+    for (idx, (account_path, snapshot_dir)) in account_paths.into_iter().enumerate() {
+        let run_path = account_path.join(ACCOUNTS_RUN_DIR);
+        fs::create_dir_all(&run_path)
+            .map_err(|err| format!("failed to create {}: {err}", run_path.display()))?;
+        let link_path = hardlinks_dir.join(format!("account_path_{idx}"));
+        if link_path.exists() {
+            continue;
+        }
+        symlink_dir(&snapshot_dir, &link_path)?;
+    }
+
+    Ok(true)
+}
+
 fn load_bank_from_snapshot(
     ledger_dir: &Path,
     accounts_update_notifier: Option<AccountsUpdateNotifier>,
@@ -386,6 +457,12 @@ fn load_bank_from_snapshot(
         )
     })?;
 
+    if ensure_accounts_hardlinks(ledger_dir, &bank_snapshot)? {
+        info!(
+            "repaired accounts hardlinks in {}",
+            bank_snapshot.snapshot_dir.display()
+        );
+    }
     let account_run_paths = account_run_paths_from_snapshot(&bank_snapshot.snapshot_dir)?;
     for path in &account_run_paths {
         fs::create_dir_all(path)

@@ -45,6 +45,7 @@ const SNAPSHOT_VERSION_FILE: &str = "version";
 const SNAPSHOT_STATUS_CACHE_FILE: &str = "status_cache";
 const ACCOUNTS_SNAPSHOT_DIR: &str = "snapshot";
 const ACCOUNTS_RUN_DIR: &str = "run";
+const ARCHIVE_ACCOUNTS_DIR: &str = "accounts-run";
 
 struct BankReplay {
     bank: Mutex<Arc<Bank>>,
@@ -548,14 +549,18 @@ fn looks_like_appendvec(name: &str) -> bool {
         && id.chars().all(|c| c.is_ascii_digit())
 }
 
-fn skip_snapshot_verify() -> bool {
-    match env::var("JETSTREAMER_SKIP_SNAPSHOT_VERIFY") {
+fn env_truthy(var: &str) -> bool {
+    match env::var(var) {
         Ok(value) => {
             let value = value.trim().to_ascii_lowercase();
             !matches!(value.as_str(), "" | "0" | "false" | "no")
         }
         Err(_) => false,
     }
+}
+
+fn skip_snapshot_verify() -> bool {
+    env_truthy("JETSTREAMER_SKIP_SNAPSHOT_VERIFY")
 }
 
 fn load_bank_from_snapshot(
@@ -619,6 +624,59 @@ fn load_bank_from_snapshot(
     .map_err(|err| format!("failed to build bank from snapshot: {err}"))
 }
 
+fn load_bank_from_snapshot_archive(
+    ledger_dir: &Path,
+    snapshot_archive: &Path,
+    accounts_update_notifier: Option<AccountsUpdateNotifier>,
+) -> Result<Bank, String> {
+    let bank_snapshots_dir = ledger_dir.join(BANK_SNAPSHOTS_DIR);
+    fs::create_dir_all(&bank_snapshots_dir)
+        .map_err(|err| format!("failed to create {}: {err}", bank_snapshots_dir.display()))?;
+    let account_run_dir = ledger_dir.join(ARCHIVE_ACCOUNTS_DIR);
+    if account_run_dir.exists() {
+        fs::remove_dir_all(&account_run_dir).map_err(|err| {
+            format!(
+                "failed to remove {}: {err}",
+                account_run_dir.display()
+            )
+        })?;
+    }
+    fs::create_dir_all(&account_run_dir)
+        .map_err(|err| format!("failed to create {}: {err}", account_run_dir.display()))?;
+
+    let full_snapshot = FullSnapshotArchiveInfo::new_from_path(snapshot_archive.to_path_buf())
+        .map_err(|err| format!("failed to parse snapshot archive: {err}"))?;
+    let genesis_config = open_genesis_config(ledger_dir, MAX_GENESIS_ARCHIVE_UNPACKED_SIZE)
+        .map_err(|err| format!("failed to load genesis config: {err}"))?;
+    let runtime_config = RuntimeConfig::default();
+    let accounts_db_config = AccountsDbConfig::default();
+    let exit = Arc::new(AtomicBool::new(false));
+    let limit_load_slot_count_from_snapshot = if skip_snapshot_verify() {
+        info!("snapshot verification disabled via JETSTREAMER_SKIP_SNAPSHOT_VERIFY");
+        Some(usize::MAX)
+    } else {
+        None
+    };
+
+    snapshot_bank_utils::bank_from_snapshot_archives(
+        &[account_run_dir],
+        &bank_snapshots_dir,
+        &full_snapshot,
+        None,
+        &genesis_config,
+        &runtime_config,
+        None,
+        limit_load_slot_count_from_snapshot,
+        false,
+        false,
+        false,
+        accounts_db_config,
+        accounts_update_notifier,
+        exit,
+    )
+    .map_err(|err| format!("failed to build bank from snapshot archive: {err}"))
+}
+
 fn firehose_threads() -> u64 {
     env::var("JETSTREAMER_THREADS")
         .ok()
@@ -627,7 +685,11 @@ fn firehose_threads() -> u64 {
         .unwrap_or(1)
 }
 
-async fn run_geyser_replay(epoch: u64, ledger_dir: &Path) -> Result<(), String> {
+async fn run_geyser_replay(
+    epoch: u64,
+    ledger_dir: &Path,
+    snapshot_archive: &Path,
+) -> Result<(), String> {
     let libpath = plugin_library_path()?;
     let config_path = write_geyser_config(ledger_dir, &libpath)?;
     let (confirmed_bank_sender, confirmed_bank_receiver) = unbounded();
@@ -640,8 +702,14 @@ async fn run_geyser_replay(epoch: u64, ledger_dir: &Path) -> Result<(), String> 
     ensure_genesis_archive(ledger_dir).await?;
     info!("loading bank from snapshot");
     let ledger_dir = ledger_dir.to_path_buf();
+    let snapshot_archive = snapshot_archive.to_path_buf();
+    let use_dir_loader = env_truthy("JETSTREAMER_LOAD_FROM_DIR");
     let bank = tokio::task::spawn_blocking(move || {
-        load_bank_from_snapshot(&ledger_dir, accounts_update_notifier)
+        if use_dir_loader {
+            load_bank_from_snapshot(&ledger_dir, accounts_update_notifier)
+        } else {
+            load_bank_from_snapshot_archive(&ledger_dir, &snapshot_archive, accounts_update_notifier)
+        }
     })
     .await
     .map_err(|err| format!("snapshot load task failed: {err}"))??;
@@ -815,13 +883,17 @@ async fn main() {
 
     println!("Downloaded snapshot to {}", dest_path.display());
     println!("Extracting snapshot into {}", dest_dir.display());
-    if let Err(err) = extract_tarball(&dest_path, &dest_dir).await {
+    if env_truthy("JETSTREAMER_SKIP_EXTRACT") {
+        println!("Skipping extraction because JETSTREAMER_SKIP_EXTRACT is set");
+    } else if let Err(err) = extract_tarball(&dest_path, &dest_dir).await {
         eprintln!("error: {err}");
         exit(1);
     }
-    println!("Extraction complete");
+    if !env_truthy("JETSTREAMER_SKIP_EXTRACT") {
+        println!("Extraction complete");
+    }
 
-    if let Err(err) = run_geyser_replay(epoch, &dest_dir).await {
+    if let Err(err) = run_geyser_replay(epoch, &dest_dir, &dest_path).await {
         eprintln!("error: {err}");
         exit(1);
     }

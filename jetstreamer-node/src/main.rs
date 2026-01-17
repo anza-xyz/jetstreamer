@@ -34,6 +34,7 @@ use solana_runtime::{
 use solana_signature::Signature;
 use solana_transaction::versioned::VersionedTransaction;
 use solana_transaction_status::TransactionStatusMeta;
+use tempfile::Builder as TempDirBuilder;
 use tokio::process::Command;
 
 const PLUGIN_NAME: &str = "jetstreamer-node-geyser";
@@ -309,14 +310,24 @@ fn link_or_copy(src: &Path, dest: &Path) -> Result<(), String> {
 
 #[cfg(unix)]
 fn symlink_dir(src: &Path, dest: &Path) -> Result<(), String> {
-    std::os::unix::fs::symlink(src, dest)
-        .map_err(|err| format!("failed to symlink {} -> {}: {err}", src.display(), dest.display()))
+    std::os::unix::fs::symlink(src, dest).map_err(|err| {
+        format!(
+            "failed to symlink {} -> {}: {err}",
+            src.display(),
+            dest.display()
+        )
+    })
 }
 
 #[cfg(windows)]
 fn symlink_dir(src: &Path, dest: &Path) -> Result<(), String> {
-    std::os::windows::fs::symlink_dir(src, dest)
-        .map_err(|err| format!("failed to symlink {} -> {}: {err}", src.display(), dest.display()))
+    std::os::windows::fs::symlink_dir(src, dest).map_err(|err| {
+        format!(
+            "failed to symlink {} -> {}: {err}",
+            src.display(),
+            dest.display()
+        )
+    })
 }
 
 fn ensure_snapshot_meta_files(ledger_dir: &Path) -> Result<bool, String> {
@@ -401,10 +412,8 @@ fn ensure_accounts_hardlinks(
                 needs_cleanup = true;
                 break;
             }
-            let link_target =
-                fs::read_link(entry.path()).map_err(|err| {
-                    format!("failed to read link {}: {err}", entry.path().display())
-                })?;
+            let link_target = fs::read_link(entry.path())
+                .map_err(|err| format!("failed to read link {}: {err}", entry.path().display()))?;
             if link_target.is_relative() || !link_target.exists() {
                 needs_cleanup = true;
                 break;
@@ -722,24 +731,47 @@ fn load_bank_from_snapshot_archive(
         None
     };
 
-    let (unarchived, _guard) = snapshot_utils::verify_and_unarchive_snapshots(
-        &bank_snapshots_dir,
-        &full_snapshot,
-        None,
-        &[account_run_dir.clone()],
-        &accounts_db_config,
-    )
-    .map_err(|err| format!("failed to unarchive snapshot: {err}"))?;
+    let temp_dir = TempDirBuilder::new()
+        .prefix("tmp-snapshot-archive-")
+        .tempdir_in(&bank_snapshots_dir)
+        .map_err(|err| {
+            format!(
+                "failed to create temp dir in {}: {err}",
+                bank_snapshots_dir.display()
+            )
+        })?;
+    let unpack_dir = temp_dir.path().to_path_buf();
+    let (sender, receiver) = unbounded();
+    let drain = std::thread::spawn(move || for _ in receiver.iter() {});
+    let handle = streaming_unarchive_snapshot(
+        sender,
+        vec![account_run_dir.clone()],
+        unpack_dir.clone(),
+        snapshot_archive.to_path_buf(),
+        full_snapshot.archive_format(),
+        0,
+    );
+    let result = handle
+        .join()
+        .map_err(|_| "snapshot unarchive thread panicked".to_string())?;
+    result.map_err(|err| format!("snapshot unarchive failed: {err}"))?;
+    let _ = drain.join();
 
-    let snapshot_dir = &unarchived
-        .full_unpacked_snapshots_dir_and_version
-        .unpacked_snapshots_dir;
-    let bank_snapshot = snapshot_utils::get_highest_bank_snapshot(snapshot_dir).ok_or_else(|| {
-        format!(
-            "no bank snapshots found in {}",
-            snapshot_dir.display()
-        )
-    })?;
+    if ensure_snapshot_meta_files(&unpack_dir)? {
+        info!(
+            "repaired snapshot metadata in {}",
+            unpack_dir.join(BANK_SNAPSHOTS_DIR).display()
+        );
+    }
+
+    let bank_snapshots_dir = unpack_dir.join(BANK_SNAPSHOTS_DIR);
+    let bank_snapshot =
+        snapshot_utils::get_highest_bank_snapshot(&bank_snapshots_dir).ok_or_else(|| {
+            format!(
+                "no bank snapshots found in {}",
+                bank_snapshots_dir.display()
+            )
+        })?;
 
     ensure_accounts_hardlinks_for_archive(&bank_snapshot, &account_run_dir)?;
     let account_run_paths = account_run_paths_from_snapshot(&bank_snapshot.snapshot_dir)?;
@@ -809,7 +841,11 @@ async fn run_geyser_replay(
         if use_dir_loader {
             load_bank_from_snapshot(&ledger_dir, accounts_update_notifier)
         } else {
-            load_bank_from_snapshot_archive(&ledger_dir, &snapshot_archive, accounts_update_notifier)
+            load_bank_from_snapshot_archive(
+                &ledger_dir,
+                &snapshot_archive,
+                accounts_update_notifier,
+            )
         }
     })
     .await
@@ -896,9 +932,7 @@ async fn extract_tarball(archive: &Path, dest_dir: &Path) -> Result<(), String> 
 
         if let Ok(archive_info) = FullSnapshotArchiveInfo::new_from_path(archive.clone()) {
             let (sender, receiver) = unbounded();
-            let drain = std::thread::spawn(move || {
-                for _ in receiver.iter() {}
-            });
+            let drain = std::thread::spawn(move || for _ in receiver.iter() {});
             let handle = streaming_unarchive_snapshot(
                 sender,
                 vec![account_path],

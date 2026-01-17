@@ -46,14 +46,11 @@ impl GeyserPlugin for JetstreamerNodeGeyserPlugin {
             self.startup_accounts.fetch_add(1, Ordering::Relaxed);
             return Ok(());
         }
-        let mut guard = self
-            .per_slot
-            .lock()
-            .map_err(|_| {
-                agave_geyser_plugin_interface::geyser_plugin_interface::GeyserPluginError::Custom(
-                    "slot counter lock poisoned".into(),
-                )
-            })?;
+        let mut guard = self.per_slot.lock().map_err(|_| {
+            agave_geyser_plugin_interface::geyser_plugin_interface::GeyserPluginError::Custom(
+                "slot counter lock poisoned".into(),
+            )
+        })?;
         let counters = guard.entry(slot).or_default();
         counters.account_updates = counters.account_updates.saturating_add(1);
         Ok(())
@@ -70,14 +67,11 @@ impl GeyserPlugin for JetstreamerNodeGeyserPlugin {
         _transaction: agave_geyser_plugin_interface::geyser_plugin_interface::ReplicaTransactionInfoVersions,
         slot: u64,
     ) -> Result<()> {
-        let mut guard = self
-            .per_slot
-            .lock()
-            .map_err(|_| {
-                agave_geyser_plugin_interface::geyser_plugin_interface::GeyserPluginError::Custom(
-                    "slot counter lock poisoned".into(),
-                )
-            })?;
+        let mut guard = self.per_slot.lock().map_err(|_| {
+            agave_geyser_plugin_interface::geyser_plugin_interface::GeyserPluginError::Custom(
+                "slot counter lock poisoned".into(),
+            )
+        })?;
         let counters = guard.entry(slot).or_default();
         counters.transactions = counters.transactions.saturating_add(1);
         Ok(())
@@ -94,14 +88,11 @@ impl GeyserPlugin for JetstreamerNodeGeyserPlugin {
             return Ok(());
         }
         let (transactions, account_updates) = {
-            let mut guard = self
-                .per_slot
-                .lock()
-                .map_err(|_| {
-                    agave_geyser_plugin_interface::geyser_plugin_interface::GeyserPluginError::Custom(
-                        "slot counter lock poisoned".into(),
-                    )
-                })?;
+            let mut guard = self.per_slot.lock().map_err(|_| {
+                agave_geyser_plugin_interface::geyser_plugin_interface::GeyserPluginError::Custom(
+                    "slot counter lock poisoned".into(),
+                )
+            })?;
             let counters = guard.remove(&slot).unwrap_or_default();
             (counters.transactions, counters.account_updates)
         };

@@ -37,6 +37,8 @@ const PLUGIN_LIB_BASENAME: &str = "jetstreamer_node_geyser";
 const BANK_SNAPSHOTS_DIR: &str = "snapshots";
 const ACCOUNTS_HARDLINKS_DIR: &str = "accounts_hardlinks";
 const GENESIS_ARCHIVE: &str = "genesis.tar.bz2";
+const SNAPSHOT_VERSION_FILE: &str = "version";
+const SNAPSHOT_STATUS_CACHE_FILE: &str = "status_cache";
 
 struct BankReplay {
     bank: Mutex<Arc<Bank>>,
@@ -283,18 +285,106 @@ fn account_run_paths_from_snapshot(bank_snapshot_dir: &Path) -> Result<Vec<PathB
     Ok(run_paths)
 }
 
+fn link_or_copy(src: &Path, dest: &Path) -> Result<(), String> {
+    if let Err(err) = fs::hard_link(src, dest) {
+        fs::copy(src, dest)
+            .map_err(|copy_err| {
+                format!(
+                    "failed to link {} -> {}: {err}; copy failed: {copy_err}",
+                    src.display(),
+                    dest.display()
+                )
+            })
+            .map(|_| ())?;
+    }
+    Ok(())
+}
+
+fn ensure_snapshot_meta_files(ledger_dir: &Path) -> Result<bool, String> {
+    let snapshots_dir = ledger_dir.join(BANK_SNAPSHOTS_DIR);
+    if !snapshots_dir.is_dir() {
+        return Ok(false);
+    }
+
+    let version_src = [
+        ledger_dir.join(SNAPSHOT_VERSION_FILE),
+        snapshots_dir.join(SNAPSHOT_VERSION_FILE),
+    ]
+    .into_iter()
+    .find(|path| path.exists())
+    .ok_or_else(|| {
+        format!(
+            "missing snapshot version file under {}",
+            ledger_dir.display()
+        )
+    })?;
+    let status_src = snapshots_dir.join(SNAPSHOT_STATUS_CACHE_FILE);
+    if !status_src.exists() {
+        return Err(format!(
+            "missing snapshot status cache file {}",
+            status_src.display()
+        ));
+    }
+
+    let mut slot_dirs = Vec::new();
+    let read_dir = fs::read_dir(&snapshots_dir)
+        .map_err(|err| format!("failed to read {}: {err}", snapshots_dir.display()))?;
+    for entry in read_dir {
+        let entry = entry.map_err(|err| format!("failed to read dir entry: {err}"))?;
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if name.parse::<u64>().is_ok() {
+            slot_dirs.push(path);
+        }
+    }
+
+    if slot_dirs.is_empty() {
+        return Ok(false);
+    }
+
+    let mut changed = false;
+    for slot_dir in slot_dirs {
+        let version_dest = slot_dir.join(SNAPSHOT_VERSION_FILE);
+        if !version_dest.exists() {
+            link_or_copy(&version_src, &version_dest)?;
+            changed = true;
+        }
+        let status_dest = slot_dir.join(SNAPSHOT_STATUS_CACHE_FILE);
+        if !status_dest.exists() {
+            link_or_copy(&status_src, &status_dest)?;
+            changed = true;
+        }
+    }
+
+    Ok(changed)
+}
+
 fn load_bank_from_snapshot(
     ledger_dir: &Path,
     accounts_update_notifier: Option<AccountsUpdateNotifier>,
 ) -> Result<Bank, String> {
     let bank_snapshots_dir = ledger_dir.join(BANK_SNAPSHOTS_DIR);
-    let bank_snapshot =
-        snapshot_utils::get_highest_bank_snapshot(&bank_snapshots_dir).ok_or_else(|| {
-            format!(
-                "no bank snapshots found in {}",
+    let mut bank_snapshot = snapshot_utils::get_highest_bank_snapshot(&bank_snapshots_dir);
+    if bank_snapshot.is_none() {
+        if ensure_snapshot_meta_files(ledger_dir)? {
+            info!(
+                "repaired snapshot metadata in {}",
                 bank_snapshots_dir.display()
-            )
-        })?;
+            );
+        }
+        bank_snapshot = snapshot_utils::get_highest_bank_snapshot(&bank_snapshots_dir);
+    }
+    let bank_snapshot = bank_snapshot.ok_or_else(|| {
+        format!(
+            "no bank snapshots found in {}",
+            bank_snapshots_dir.display()
+        )
+    })?;
 
     let account_run_paths = account_run_paths_from_snapshot(&bank_snapshot.snapshot_dir)?;
     for path in &account_run_paths {

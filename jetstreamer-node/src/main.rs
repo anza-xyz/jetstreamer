@@ -5,7 +5,10 @@ use std::{
     sync::{Arc, Mutex, atomic::AtomicBool},
 };
 
-use agave_snapshots::{snapshot_archive_info::FullSnapshotArchiveInfo, streaming_unarchive_snapshot};
+use agave_snapshots::{
+    snapshot_archive_info::{FullSnapshotArchiveInfo, SnapshotArchiveInfoGetter},
+    streaming_unarchive_snapshot,
+};
 use crossbeam_channel::unbounded;
 use jetstreamer_firehose::{
     epochs::epoch_to_slot_range,

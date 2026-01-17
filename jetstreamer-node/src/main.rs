@@ -16,7 +16,7 @@ use jetstreamer_firehose::{
     index::get_index_base_url,
 };
 use jetstreamer_node::snapshots::{DEFAULT_BUCKET, download_snapshot_at_or_before_slot};
-use log::info;
+use log::{info, warn};
 use reqwest::Client;
 use solana_accounts_db::{
     accounts_db::AccountsDbConfig, accounts_update_notifier_interface::AccountsUpdateNotifier,
@@ -563,6 +563,79 @@ fn skip_snapshot_verify() -> bool {
     env_truthy("JETSTREAMER_SKIP_SNAPSHOT_VERIFY")
 }
 
+fn reset_dir(path: &Path) -> Result<(), String> {
+    if path.exists() {
+        fs::remove_dir_all(path)
+            .map_err(|err| format!("failed to remove {}: {err}", path.display()))?;
+    }
+    fs::create_dir_all(path)
+        .map_err(|err| format!("failed to create {}: {err}", path.display()))?;
+    Ok(())
+}
+
+fn ensure_accounts_hardlinks_for_archive(
+    bank_snapshot: &snapshot_utils::BankSnapshotInfo,
+    account_dir: &Path,
+) -> Result<(), String> {
+    let slot_dir = bank_snapshot.slot.to_string();
+    let snapshot_dir = account_dir.join(ACCOUNTS_SNAPSHOT_DIR).join(&slot_dir);
+    if snapshot_dir.exists() {
+        fs::remove_dir_all(&snapshot_dir)
+            .map_err(|err| format!("failed to remove {}: {err}", snapshot_dir.display()))?;
+    }
+    fs::create_dir_all(&snapshot_dir)
+        .map_err(|err| format!("failed to create {}: {err}", snapshot_dir.display()))?;
+
+    let mut linked_any = false;
+    let read_dir = fs::read_dir(account_dir)
+        .map_err(|err| format!("failed to read {}: {err}", account_dir.display()))?;
+    for entry in read_dir {
+        let entry = entry.map_err(|err| format!("failed to read dir entry: {err}"))?;
+        let file_type = entry
+            .file_type()
+            .map_err(|err| format!("failed to read file type: {err}"))?;
+        if !file_type.is_file() {
+            continue;
+        }
+        let Some(name) = entry.file_name().to_str().map(|s| s.to_string()) else {
+            continue;
+        };
+        if !looks_like_appendvec(&name) {
+            continue;
+        }
+        let dest_path = snapshot_dir.join(&name);
+        if dest_path.exists() {
+            continue;
+        }
+        link_or_copy(&entry.path(), &dest_path)?;
+        linked_any = true;
+    }
+
+    if !linked_any {
+        return Err(format!(
+            "no appendvec files found under {}",
+            account_dir.display()
+        ));
+    }
+
+    let run_dir = account_dir.join(ACCOUNTS_RUN_DIR);
+    fs::create_dir_all(&run_dir)
+        .map_err(|err| format!("failed to create {}: {err}", run_dir.display()))?;
+
+    let hardlinks_dir = bank_snapshot.snapshot_dir.join(ACCOUNTS_HARDLINKS_DIR);
+    reset_dir(&hardlinks_dir)?;
+    let link_path = hardlinks_dir.join("account_path_0");
+    if link_path.exists() {
+        fs::remove_file(&link_path)
+            .map_err(|err| format!("failed to remove {}: {err}", link_path.display()))?;
+    }
+    let link_target = snapshot_dir
+        .canonicalize()
+        .unwrap_or_else(|_| snapshot_dir.clone());
+    symlink_dir(&link_target, &link_path)?;
+    Ok(())
+}
+
 fn load_bank_from_snapshot(
     ledger_dir: &Path,
     accounts_update_notifier: Option<AccountsUpdateNotifier>,
@@ -633,16 +706,7 @@ fn load_bank_from_snapshot_archive(
     fs::create_dir_all(&bank_snapshots_dir)
         .map_err(|err| format!("failed to create {}: {err}", bank_snapshots_dir.display()))?;
     let account_run_dir = ledger_dir.join(ARCHIVE_ACCOUNTS_DIR);
-    if account_run_dir.exists() {
-        fs::remove_dir_all(&account_run_dir).map_err(|err| {
-            format!(
-                "failed to remove {}: {err}",
-                account_run_dir.display()
-            )
-        })?;
-    }
-    fs::create_dir_all(&account_run_dir)
-        .map_err(|err| format!("failed to create {}: {err}", account_run_dir.display()))?;
+    reset_dir(&account_run_dir)?;
 
     let full_snapshot = FullSnapshotArchiveInfo::new_from_path(snapshot_archive.to_path_buf())
         .map_err(|err| format!("failed to parse snapshot archive: {err}"))?;
@@ -658,23 +722,60 @@ fn load_bank_from_snapshot_archive(
         None
     };
 
-    snapshot_bank_utils::bank_from_snapshot_archives(
-        &[account_run_dir],
+    let (unarchived, _guard) = snapshot_utils::verify_and_unarchive_snapshots(
         &bank_snapshots_dir,
         &full_snapshot,
         None,
+        &[account_run_dir.clone()],
+        &accounts_db_config,
+    )
+    .map_err(|err| format!("failed to unarchive snapshot: {err}"))?;
+
+    let snapshot_dir = &unarchived
+        .full_unpacked_snapshots_dir_and_version
+        .unpacked_snapshots_dir;
+    let bank_snapshot = snapshot_utils::get_highest_bank_snapshot(snapshot_dir).ok_or_else(|| {
+        format!(
+            "no bank snapshots found in {}",
+            snapshot_dir.display()
+        )
+    })?;
+
+    ensure_accounts_hardlinks_for_archive(&bank_snapshot, &account_run_dir)?;
+    let account_run_paths = account_run_paths_from_snapshot(&bank_snapshot.snapshot_dir)?;
+    for path in &account_run_paths {
+        fs::create_dir_all(path)
+            .map_err(|err| format!("failed to create {}: {err}", path.display()))?;
+    }
+
+    let bank = snapshot_bank_utils::bank_from_snapshot_dir(
+        &account_run_paths,
+        &bank_snapshot,
         &genesis_config,
         &runtime_config,
         None,
         limit_load_slot_count_from_snapshot,
         false,
-        false,
-        false,
         accounts_db_config,
         accounts_update_notifier,
         exit,
     )
-    .map_err(|err| format!("failed to build bank from snapshot archive: {err}"))
+    .map_err(|err| format!("failed to build bank from snapshot archive: {err}"))?;
+
+    let bank_hash = bank.get_snapshot_hash();
+    let archive_hash = *full_snapshot.hash();
+    if bank_hash != archive_hash {
+        if env_truthy("JETSTREAMER_ENFORCE_ARCHIVE_HASH") {
+            return Err(format!(
+                "snapshot archive hash mismatch: deserialized bank: {bank_hash:?}, snapshot archive: {archive_hash:?}"
+            ));
+        }
+        warn!(
+            "snapshot archive hash mismatch: deserialized bank: {bank_hash:?}, snapshot archive: {archive_hash:?}"
+        );
+    }
+
+    Ok(bank)
 }
 
 fn firehose_threads() -> u64 {

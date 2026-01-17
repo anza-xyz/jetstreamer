@@ -399,6 +399,7 @@ fn ensure_accounts_hardlinks(
 
     let slot_dir = bank_snapshot.slot.to_string();
     let mut account_paths = Vec::new();
+    let mut changed = false;
     let read_dir = fs::read_dir(ledger_dir)
         .map_err(|err| format!("failed to read {}: {err}", ledger_dir.display()))?;
     for entry in read_dir {
@@ -407,8 +408,62 @@ fn ensure_accounts_hardlinks(
         if !path.is_dir() {
             continue;
         }
+        if path == ledger_dir.join(BANK_SNAPSHOTS_DIR) {
+            continue;
+        }
         let snapshot_dir = path.join(ACCOUNTS_SNAPSHOT_DIR).join(&slot_dir);
-        if snapshot_dir.is_dir() {
+        let snapshot_has_files = snapshot_dir
+            .read_dir()
+            .ok()
+            .and_then(|mut dir| dir.next())
+            .is_some();
+        if snapshot_dir.is_dir() && snapshot_has_files {
+            account_paths.push((path, snapshot_dir));
+            continue;
+        }
+
+        let mut has_appendvecs = false;
+        let mut appendvecs = Vec::new();
+        let dir_entries = fs::read_dir(&path)
+            .map_err(|err| format!("failed to read {}: {err}", path.display()))?;
+        for entry in dir_entries {
+            let entry = entry.map_err(|err| format!("failed to read dir entry: {err}"))?;
+            let file_type = entry
+                .file_type()
+                .map_err(|err| format!("failed to read file type: {err}"))?;
+            if !file_type.is_file() {
+                continue;
+            }
+            let Some(name) = entry.file_name().to_str().map(|s| s.to_string()) else {
+                continue;
+            };
+            if looks_like_appendvec(&name) {
+                has_appendvecs = true;
+                appendvecs.push(entry.path());
+            }
+        }
+
+        if has_appendvecs {
+            fs::create_dir_all(&snapshot_dir).map_err(|err| {
+                format!(
+                    "failed to create snapshot dir {}: {err}",
+                    snapshot_dir.display()
+                )
+            })?;
+            for file_path in appendvecs {
+                let Some(file_name) = file_path.file_name() else {
+                    continue;
+                };
+                let dest_path = snapshot_dir.join(file_name);
+                if dest_path.exists() {
+                    continue;
+                }
+                link_or_copy(&file_path, &dest_path)?;
+                changed = true;
+            }
+            let run_path = path.join(ACCOUNTS_RUN_DIR);
+            fs::create_dir_all(&run_path)
+                .map_err(|err| format!("failed to create {}: {err}", run_path.display()))?;
             account_paths.push((path, snapshot_dir));
         }
     }
@@ -432,7 +487,24 @@ fn ensure_accounts_hardlinks(
         symlink_dir(&snapshot_dir, &link_path)?;
     }
 
-    Ok(true)
+    Ok(changed)
+}
+
+fn looks_like_appendvec(name: &str) -> bool {
+    let mut parts = name.split('.');
+    let Some(slot) = parts.next() else {
+        return false;
+    };
+    let Some(id) = parts.next() else {
+        return false;
+    };
+    if parts.next().is_some() {
+        return false;
+    }
+    !slot.is_empty()
+        && !id.is_empty()
+        && slot.chars().all(|c| c.is_ascii_digit())
+        && id.chars().all(|c| c.is_ascii_digit())
 }
 
 fn load_bank_from_snapshot(

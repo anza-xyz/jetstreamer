@@ -9,6 +9,7 @@ documentation.workspace = true
 keywords.workspace = true
 
 [dependencies]
+agave-snapshots.workspace = true
 crossbeam-channel.workspace = true
 jetstreamer-firehose.workspace = true
 log.workspace = true

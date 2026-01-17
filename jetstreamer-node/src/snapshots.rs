@@ -268,7 +268,7 @@ async fn list_snapshot_objects(bucket: &str, slot: u64) -> Result<Vec<String>, S
             continue;
         };
         if name.starts_with("snapshot-")
-            && (name.ends_with(".tar.zst") || name.ends_with(".tar.bz2"))
+            && (name.ends_with(".tar.zst") || name.ends_with(".tar.lz4") || name.ends_with(".tar.bz2"))
         {
             objects.push(line.to_string());
         }

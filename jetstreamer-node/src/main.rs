@@ -5,6 +5,7 @@ use std::{
     sync::{Arc, Mutex, atomic::AtomicBool},
 };
 
+use agave_snapshots::{snapshot_archive_info::FullSnapshotArchiveInfo, streaming_unarchive_snapshot};
 use crossbeam_channel::unbounded;
 use jetstreamer_firehose::{
     epochs::epoch_to_slot_range,
@@ -544,6 +545,16 @@ fn looks_like_appendvec(name: &str) -> bool {
         && id.chars().all(|c| c.is_ascii_digit())
 }
 
+fn skip_snapshot_verify() -> bool {
+    match env::var("JETSTREAMER_SKIP_SNAPSHOT_VERIFY") {
+        Ok(value) => {
+            let value = value.trim().to_ascii_lowercase();
+            !matches!(value.as_str(), "" | "0" | "false" | "no")
+        }
+        Err(_) => false,
+    }
+}
+
 fn load_bank_from_snapshot(
     ledger_dir: &Path,
     accounts_update_notifier: Option<AccountsUpdateNotifier>,
@@ -583,6 +594,12 @@ fn load_bank_from_snapshot(
     let runtime_config = RuntimeConfig::default();
     let accounts_db_config = AccountsDbConfig::default();
     let exit = Arc::new(AtomicBool::new(false));
+    let limit_load_slot_count_from_snapshot = if skip_snapshot_verify() {
+        info!("snapshot verification disabled via JETSTREAMER_SKIP_SNAPSHOT_VERIFY");
+        Some(usize::MAX)
+    } else {
+        None
+    };
 
     snapshot_bank_utils::bank_from_snapshot_dir(
         &account_run_paths,
@@ -590,7 +607,7 @@ fn load_bank_from_snapshot(
         &genesis_config,
         &runtime_config,
         None,
-        None,
+        limit_load_slot_count_from_snapshot,
         false,
         accounts_db_config,
         accounts_update_notifier,
@@ -676,25 +693,75 @@ async fn run_geyser_replay(epoch: u64, ledger_dir: &Path) -> Result<(), String> 
 }
 
 async fn extract_tarball(archive: &Path, dest_dir: &Path) -> Result<(), String> {
-    let output = Command::new("tar")
-        .arg("-xf")
-        .arg(archive)
-        .arg("-C")
-        .arg(dest_dir)
-        .output()
-        .await
-        .map_err(|err| format!("failed to run tar: {err}"))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let command = format!("tar -xf {} -C {}", archive.display(), dest_dir.display());
-        if stderr.is_empty() {
-            return Err(format!("{command} failed"));
+    let archive = archive.to_path_buf();
+    let dest_dir = dest_dir.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        fn remove_path_if_exists(path: &Path) -> Result<(), String> {
+            if !path.exists() {
+                return Ok(());
+            }
+            let metadata = fs::symlink_metadata(path)
+                .map_err(|err| format!("failed to read {}: {err}", path.display()))?;
+            if metadata.is_dir() {
+                fs::remove_dir_all(path)
+                    .map_err(|err| format!("failed to remove {}: {err}", path.display()))?;
+            } else {
+                fs::remove_file(path)
+                    .map_err(|err| format!("failed to remove {}: {err}", path.display()))?;
+            }
+            Ok(())
         }
-        return Err(format!("{command} failed: {stderr}"));
-    }
 
-    Ok(())
+        fs::create_dir_all(&dest_dir)
+            .map_err(|err| format!("failed to create {}: {err}", dest_dir.display()))?;
+        remove_path_if_exists(&dest_dir.join("accounts"))?;
+        remove_path_if_exists(&dest_dir.join(BANK_SNAPSHOTS_DIR))?;
+        remove_path_if_exists(&dest_dir.join(SNAPSHOT_VERSION_FILE))?;
+
+        let account_path = dest_dir.join("accounts");
+        fs::create_dir_all(&account_path)
+            .map_err(|err| format!("failed to create {}: {err}", account_path.display()))?;
+
+        if let Ok(archive_info) = FullSnapshotArchiveInfo::new_from_path(archive.clone()) {
+            let (sender, receiver) = unbounded();
+            let drain = std::thread::spawn(move || {
+                for _ in receiver.iter() {}
+            });
+            let handle = streaming_unarchive_snapshot(
+                sender,
+                vec![account_path],
+                dest_dir.clone(),
+                archive,
+                archive_info.archive_format(),
+                0,
+            );
+            let result = handle
+                .join()
+                .map_err(|_| "snapshot unarchive thread panicked".to_string())?;
+            result.map_err(|err| format!("snapshot unarchive failed: {err}"))?;
+            let _ = drain.join();
+            Ok(())
+        } else {
+            let output = std::process::Command::new("tar")
+                .arg("-xf")
+                .arg(&archive)
+                .arg("-C")
+                .arg(&dest_dir)
+                .output()
+                .map_err(|err| format!("failed to run tar: {err}"))?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                let command = format!("tar -xf {} -C {}", archive.display(), dest_dir.display());
+                if stderr.is_empty() {
+                    return Err(format!("{command} failed"));
+                }
+                return Err(format!("{command} failed: {stderr}"));
+            }
+            Ok(())
+        }
+    })
+    .await
+    .map_err(|err| format!("snapshot unarchive task failed: {err}"))?
 }
 
 #[tokio::main]

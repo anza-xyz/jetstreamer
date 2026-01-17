@@ -66,6 +66,7 @@ protobuf-src = "1"
 serde = { version = "1", default-features = false }
 serde_cbor = "0"
 agave-geyser-plugin-interface = "3"
+agave-snapshots = "3"
 solana-address = "1"
 solana-hash = "3"
 solana-blake3-hasher = "=3.0.0"

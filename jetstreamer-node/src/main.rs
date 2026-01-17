@@ -383,18 +383,51 @@ fn ensure_accounts_hardlinks(
     bank_snapshot: &snapshot_utils::BankSnapshotInfo,
 ) -> Result<bool, String> {
     let hardlinks_dir = bank_snapshot.snapshot_dir.join(ACCOUNTS_HARDLINKS_DIR);
-    let mut existing = false;
+    let mut needs_cleanup = false;
     if hardlinks_dir.is_dir() {
-        let mut entries = fs::read_dir(&hardlinks_dir)
+        let entries = fs::read_dir(&hardlinks_dir)
             .map_err(|err| format!("failed to read {}: {err}", hardlinks_dir.display()))?;
-        existing = entries.next().is_some();
+        for entry in entries {
+            let entry = entry.map_err(|err| format!("failed to read dir entry: {err}"))?;
+            let file_type = entry
+                .file_type()
+                .map_err(|err| format!("failed to read file type: {err}"))?;
+            if !file_type.is_symlink() {
+                needs_cleanup = true;
+                break;
+            }
+            let link_target =
+                fs::read_link(entry.path()).map_err(|err| {
+                    format!("failed to read link {}: {err}", entry.path().display())
+                })?;
+            if link_target.is_relative() || !link_target.exists() {
+                needs_cleanup = true;
+                break;
+            }
+        }
     } else {
         fs::create_dir_all(&hardlinks_dir)
             .map_err(|err| format!("failed to create {}: {err}", hardlinks_dir.display()))?;
+        needs_cleanup = true;
     }
 
-    if existing {
-        return Ok(false);
+    if needs_cleanup {
+        let entries = fs::read_dir(&hardlinks_dir)
+            .map_err(|err| format!("failed to read {}: {err}", hardlinks_dir.display()))?;
+        for entry in entries {
+            let entry = entry.map_err(|err| format!("failed to read dir entry: {err}"))?;
+            let path = entry.path();
+            let file_type = entry
+                .file_type()
+                .map_err(|err| format!("failed to read file type: {err}"))?;
+            if file_type.is_dir() && !file_type.is_symlink() {
+                fs::remove_dir_all(&path)
+                    .map_err(|err| format!("failed to remove {}: {err}", path.display()))?;
+            } else {
+                fs::remove_file(&path)
+                    .map_err(|err| format!("failed to remove {}: {err}", path.display()))?;
+            }
+        }
     }
 
     let slot_dir = bank_snapshot.slot.to_string();
@@ -484,10 +517,14 @@ fn ensure_accounts_hardlinks(
         if link_path.exists() {
             continue;
         }
-        symlink_dir(&snapshot_dir, &link_path)?;
+        let link_target = snapshot_dir
+            .canonicalize()
+            .unwrap_or_else(|_| snapshot_dir.clone());
+        symlink_dir(&link_target, &link_path)?;
+        changed = true;
     }
 
-    Ok(changed)
+    Ok(changed || needs_cleanup)
 }
 
 fn looks_like_appendvec(name: &str) -> bool {

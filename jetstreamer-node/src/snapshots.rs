@@ -6,7 +6,7 @@ use std::{
 use jetstreamer_firehose::epochs::epoch_to_slot_range;
 use tokio::process::Command;
 
-const DEFAULT_BUCKET: &str = "gs://mainnet-beta-ledger-us-ny5";
+pub const DEFAULT_BUCKET: &str = "gs://mainnet-beta-ledger-us-ny5";
 
 /// Metadata for a snapshot stored in the ledger bucket.
 #[derive(Debug, Clone)]

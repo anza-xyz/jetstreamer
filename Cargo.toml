@@ -1,5 +1,11 @@
 [workspace]
-members = ["jetstreamer-firehose", "jetstreamer-node", "jetstreamer-plugin", "jetstreamer-utils"]
+members = [
+    "jetstreamer-firehose",
+    "jetstreamer-node",
+    "jetstreamer-node/geyser-plugin",
+    "jetstreamer-plugin",
+    "jetstreamer-utils",
+]
 
 [workspace.package]
 edition = "2024"
@@ -63,6 +69,7 @@ agave-geyser-plugin-interface = "3"
 solana-address = "1"
 solana-hash = "3"
 solana-blake3-hasher = "=3.0.0"
+solana-clock = "3"
 solana-epoch-rewards-hasher = "=3.0.0"
 solana-keccak-hasher = "=3.0.0"
 solana-logger = "3"
@@ -80,6 +87,7 @@ solana-transaction-status = "3"
 solana-sdk-ids = "3"
 solana-reward-info = "3"
 solana-sysvar = "=3.0.0"
+solana-genesis-utils = { version = "3", features = ["agave-unstable-api"] }
 sha2 = "0.10"
 tonic = { version = "0", default-features = false }
 tonic-build = "0"

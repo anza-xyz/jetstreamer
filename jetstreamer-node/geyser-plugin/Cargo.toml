@@ -1,0 +1,15 @@
+[package]
+name = "jetstreamer-node-geyser"
+edition.workspace = true
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+documentation.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+agave-geyser-plugin-interface.workspace = true
+log.workspace = true

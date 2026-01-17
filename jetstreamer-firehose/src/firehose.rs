@@ -184,6 +184,16 @@ impl Display for FirehoseError {
     }
 }
 
+/// Bundles optional Geyser notifiers for in-process replay.
+pub struct GeyserNotifiers {
+    /// Optional notifier for transaction updates.
+    pub transaction_notifier: Option<Arc<dyn TransactionNotifier + Send + Sync + 'static>>,
+    /// Optional notifier for entry updates.
+    pub entry_notifier: Option<Arc<dyn EntryNotifier + Send + Sync + 'static>>,
+    /// Optional notifier for block metadata updates.
+    pub block_metadata_notifier: Option<Arc<dyn BlockMetadataNotifier + Send + Sync + 'static>>,
+}
+
 impl From<reqwest::Error> for FirehoseError {
     fn from(e: reqwest::Error) -> Self {
         FirehoseError::Reqwest(e)
@@ -1634,7 +1644,6 @@ pub fn firehose_geyser(
         ));
     }
     log::info!(target: LOG_MODULE, "starting firehose...");
-    log::info!(target: LOG_MODULE, "index base url: {}", index_base_url);
     let (confirmed_bank_sender, confirmed_bank_receiver) = unbounded();
     let mut entry_notifier_maybe = None;
     let mut block_meta_notifier_maybe = None;
@@ -1663,6 +1672,50 @@ pub fn firehose_geyser(
         log::debug!(target: LOG_MODULE, "geyser plugin service initialized.");
     }
 
+    let notifiers = GeyserNotifiers {
+        transaction_notifier: transaction_notifier_maybe,
+        entry_notifier: entry_notifier_maybe,
+        block_metadata_notifier: block_meta_notifier_maybe,
+    };
+
+    firehose_geyser_with_notifiers(
+        rt,
+        slot_range,
+        notifiers,
+        confirmed_bank_sender,
+        index_base_url,
+        client,
+        on_load,
+        threads,
+    )?;
+    Ok(confirmed_bank_receiver)
+}
+
+#[allow(clippy::result_large_err)]
+/// Builds a Geyser-backed firehose using caller-provided notifiers.
+pub fn firehose_geyser_with_notifiers(
+    rt: Arc<tokio::runtime::Runtime>,
+    slot_range: Range<u64>,
+    notifiers: GeyserNotifiers,
+    confirmed_bank_sender: Sender<SlotNotification>,
+    index_base_url: &Url,
+    client: &Client,
+    on_load: impl Future<Output = Result<(), SharedError>> + Send + 'static,
+    threads: u64,
+) -> Result<(), (FirehoseError, u64)> {
+    if threads == 0 {
+        return Err((
+            FirehoseError::OnLoadError("Number of threads must be greater than 0".into()),
+            slot_range.start,
+        ));
+    }
+    log::info!(target: LOG_MODULE, "starting firehose...");
+    log::info!(target: LOG_MODULE, "index base url: {}", index_base_url);
+
+    let transaction_notifier_maybe = Arc::new(notifiers.transaction_notifier);
+    let entry_notifier_maybe = Arc::new(notifiers.entry_notifier);
+    let block_meta_notifier_maybe = Arc::new(notifiers.block_metadata_notifier);
+
     if entry_notifier_maybe.is_some() {
         log::debug!(target: LOG_MODULE, "entry notifications enabled")
     } else {
@@ -1672,9 +1725,6 @@ pub fn firehose_geyser(
     rt.spawn(on_load);
 
     let slot_range = Arc::new(slot_range);
-    let transaction_notifier_maybe = Arc::new(transaction_notifier_maybe);
-    let entry_notifier_maybe = Arc::new(entry_notifier_maybe);
-    let block_meta_notifier_maybe = Arc::new(block_meta_notifier_maybe);
     let confirmed_bank_sender = Arc::new(confirmed_bank_sender);
 
     // divide slot_range into n subranges
@@ -1738,7 +1788,7 @@ pub fn firehose_geyser(
             0,
         );
     }
-    Ok(confirmed_bank_receiver)
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]

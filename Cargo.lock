@@ -3878,9 +3878,34 @@ dependencies = [
 name = "jetstreamer-node"
 version = "0.3.0"
 dependencies = [
+ "crossbeam-channel",
  "jetstreamer-firehose",
+ "log",
+ "reqwest 0.12.24",
+ "serde_json",
+ "solana-accounts-db",
+ "solana-clock",
+ "solana-entry",
+ "solana-genesis-utils",
+ "solana-geyser-plugin-manager",
+ "solana-hash",
+ "solana-ledger",
+ "solana-logger",
+ "solana-rpc",
+ "solana-runtime",
+ "solana-signature",
+ "solana-transaction",
+ "solana-transaction-status",
  "thiserror 2.0.17",
  "tokio",
+]
+
+[[package]]
+name = "jetstreamer-node-geyser"
+version = "0.3.0"
+dependencies = [
+ "agave-geyser-plugin-interface",
+ "log",
 ]
 
 [[package]]

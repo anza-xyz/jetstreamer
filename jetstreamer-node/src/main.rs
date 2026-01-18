@@ -2,7 +2,8 @@ use std::{
     env, fs,
     path::{Path, PathBuf},
     process::{Stdio, exit},
-    sync::{Arc, RwLock, atomic::AtomicBool},
+    sync::{Arc, RwLock, atomic::{AtomicBool, AtomicU64, Ordering}},
+    time::{Duration, Instant},
 };
 
 use agave_snapshots::{
@@ -19,8 +20,12 @@ use jetstreamer_node::snapshots::{DEFAULT_BUCKET, download_snapshot_at_or_before
 use log::{info, warn};
 use reqwest::Client;
 use solana_accounts_db::{
-    accounts_db::AccountsDbConfig, accounts_update_notifier_interface::AccountsUpdateNotifier,
+    accounts_db::AccountsDbConfig,
+    accounts_update_notifier_interface::{
+        AccountForGeyser, AccountsUpdateNotifier, AccountsUpdateNotifierInterface,
+    },
 };
+use solana_account::AccountSharedData;
 use solana_clock::Slot;
 use solana_genesis_utils::{MAX_GENESIS_ARCHIVE_UNPACKED_SIZE, open_genesis_config};
 use solana_geyser_plugin_manager::geyser_plugin_service::GeyserPluginService;
@@ -35,6 +40,7 @@ use solana_runtime::{
     snapshot_bank_utils, snapshot_utils,
 };
 use solana_signature::Signature;
+use solana_transaction::sanitized::SanitizedTransaction;
 use solana_transaction::versioned::VersionedTransaction;
 use solana_transaction_status::TransactionStatusMeta;
 use tempfile::Builder as TempDirBuilder;
@@ -93,8 +99,96 @@ impl BankReplay {
     }
 }
 
+#[derive(Debug)]
+struct ReplayProgress {
+    latest_slot: AtomicU64,
+    tx_count: AtomicU64,
+    account_update_count: AtomicU64,
+}
+
+impl ReplayProgress {
+    fn new(start_slot: Slot) -> Self {
+        Self {
+            latest_slot: AtomicU64::new(start_slot.saturating_sub(1)),
+            tx_count: AtomicU64::new(0),
+            account_update_count: AtomicU64::new(0),
+        }
+    }
+
+    fn note_slot(&self, slot: Slot) {
+        let mut current = self.latest_slot.load(Ordering::Relaxed);
+        while slot > current {
+            match self.latest_slot.compare_exchange(
+                current,
+                slot,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(next) => current = next,
+            }
+        }
+    }
+
+    fn inc_tx(&self) {
+        self.tx_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn inc_account_update(&self) {
+        self.account_update_count.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[derive(Debug)]
+struct ProgressAccountsUpdateNotifier {
+    progress: Arc<ReplayProgress>,
+    delegate: Option<AccountsUpdateNotifier>,
+}
+
+impl AccountsUpdateNotifierInterface for ProgressAccountsUpdateNotifier {
+    fn snapshot_notifications_enabled(&self) -> bool {
+        self.delegate
+            .as_ref()
+            .map(|delegate| delegate.snapshot_notifications_enabled())
+            .unwrap_or(false)
+    }
+
+    fn notify_account_update(
+        &self,
+        slot: Slot,
+        account: &AccountSharedData,
+        txn: &Option<&SanitizedTransaction>,
+        pubkey: &solana_pubkey::Pubkey,
+        write_version: u64,
+    ) {
+        self.progress.note_slot(slot);
+        self.progress.inc_account_update();
+        if let Some(delegate) = self.delegate.as_ref() {
+            delegate.notify_account_update(slot, account, txn, pubkey, write_version);
+        }
+    }
+
+    fn notify_account_restore_from_snapshot(
+        &self,
+        slot: Slot,
+        write_version: u64,
+        account: &AccountForGeyser<'_>,
+    ) {
+        if let Some(delegate) = self.delegate.as_ref() {
+            delegate.notify_account_restore_from_snapshot(slot, write_version, account);
+        }
+    }
+
+    fn notify_end_of_restore_from_snapshot(&self) {
+        if let Some(delegate) = self.delegate.as_ref() {
+            delegate.notify_end_of_restore_from_snapshot();
+        }
+    }
+}
+
 struct BankTransactionNotifier {
     bank_replay: Arc<BankReplay>,
+    progress: Arc<ReplayProgress>,
     delegate: Option<Arc<dyn TransactionNotifier + Send + Sync + 'static>>,
 }
 
@@ -109,6 +203,8 @@ impl TransactionNotifier for BankTransactionNotifier {
         transaction_status_meta: &TransactionStatusMeta,
         transaction: &VersionedTransaction,
     ) {
+        self.progress.note_slot(slot);
+        self.progress.inc_tx();
         match self.bank_replay.bank_for_slot(slot) {
             Ok(bank) => match bank.try_process_entry_transactions(vec![transaction.clone()]) {
                 Ok(mut results) => {
@@ -147,6 +243,7 @@ impl TransactionNotifier for BankTransactionNotifier {
 
 struct BankEntryNotifier {
     bank_replay: Arc<BankReplay>,
+    progress: Arc<ReplayProgress>,
     delegate: Option<Arc<dyn EntryNotifier + Send + Sync + 'static>>,
 }
 
@@ -158,6 +255,7 @@ impl EntryNotifier for BankEntryNotifier {
         entry: &solana_entry::entry::EntrySummary,
         starting_transaction_index: usize,
     ) {
+        self.progress.note_slot(slot);
         if entry.num_transactions == 0 {
             if let Err(err) = self.bank_replay.register_tick(slot, entry.hash) {
                 log::debug!("failed to register tick for slot {slot} entry {index}: {err}");
@@ -168,6 +266,14 @@ impl EntryNotifier for BankEntryNotifier {
             delegate.notify_entry(slot, index, entry, starting_transaction_index);
         }
     }
+}
+
+fn format_eta(duration: Duration) -> String {
+    let total_secs = duration.as_secs();
+    let hours = total_secs / 3600;
+    let minutes = (total_secs % 3600) / 60;
+    let seconds = total_secs % 60;
+    format!("{hours:02}:{minutes:02}:{seconds:02}")
 }
 
 fn epoch_to_slot(epoch: u64) -> u64 {
@@ -836,7 +942,14 @@ async fn run_geyser_replay(
 
     let service = GeyserPluginService::new(confirmed_bank_receiver, true, &config_files)
         .map_err(|err| format!("failed to load geyser plugin: {err}"))?;
-    let accounts_update_notifier = service.get_accounts_update_notifier();
+    let (start_slot, end_inclusive) = epoch_to_slot_range(epoch);
+    let progress = Arc::new(ReplayProgress::new(start_slot));
+    let accounts_update_notifier = service.get_accounts_update_notifier().map(|delegate| {
+        Arc::new(ProgressAccountsUpdateNotifier {
+            progress: progress.clone(),
+            delegate: Some(delegate),
+        }) as AccountsUpdateNotifier
+    });
 
     ensure_genesis_archive(ledger_dir).await?;
     info!("loading bank from snapshot");
@@ -857,8 +970,6 @@ async fn run_geyser_replay(
     .await
     .map_err(|err| format!("snapshot load task failed: {err}"))??;
     let bank_replay = Arc::new(BankReplay::new(bank));
-
-    let (start_slot, end_inclusive) = epoch_to_slot_range(epoch);
     let slot_range = start_slot..(end_inclusive + 1);
 
     let rt = Arc::new(
@@ -869,10 +980,12 @@ async fn run_geyser_replay(
         get_index_base_url().map_err(|err| format!("failed to resolve index base url: {err}"))?;
     let transaction_notifier = Arc::new(BankTransactionNotifier {
         bank_replay: bank_replay.clone(),
+        progress: progress.clone(),
         delegate: service.get_transaction_notifier(),
     });
     let entry_notifier = Arc::new(BankEntryNotifier {
         bank_replay,
+        progress: progress.clone(),
         delegate: service.get_entry_notifier(),
     });
     let notifiers = GeyserNotifiers {
@@ -886,8 +999,67 @@ async fn run_geyser_replay(
         threads = 1;
     }
 
+    let progress_done = Arc::new(AtomicBool::new(false));
+    let progress_handle = {
+        let progress = progress.clone();
+        let progress_done = progress_done.clone();
+        std::thread::spawn(move || {
+            let total_slots = end_inclusive.saturating_sub(start_slot).saturating_add(1);
+            let mut start = None::<Instant>;
+            while !progress_done.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_secs(3));
+                if progress_done.load(Ordering::Relaxed) {
+                    break;
+                }
+                if start.is_none() {
+                    start = Some(Instant::now());
+                }
+                let latest = progress.latest_slot.load(Ordering::Relaxed);
+                let processed = if latest < start_slot {
+                    0
+                } else {
+                    latest.saturating_sub(start_slot).saturating_add(1)
+                };
+                let percent = if total_slots == 0 {
+                    100.0
+                } else {
+                    (processed as f64) * 100.0 / (total_slots as f64)
+                };
+                let display_slot = if latest < start_slot {
+                    start_slot
+                } else {
+                    latest
+                };
+                let tx_count = progress.tx_count.load(Ordering::Relaxed);
+                let account_updates = progress.account_update_count.load(Ordering::Relaxed);
+                let eta = if processed == 0 {
+                    "unknown".to_string()
+                } else if let Some(start) = start {
+                    let elapsed = start.elapsed().as_secs_f64();
+                    if elapsed <= 0.0 {
+                        "unknown".to_string()
+                    } else {
+                        let rate = (processed as f64) / elapsed;
+                        if rate <= 0.0 {
+                            "unknown".to_string()
+                        } else {
+                            let remaining = total_slots.saturating_sub(processed);
+                            let eta_secs = ((remaining as f64) / rate).ceil() as u64;
+                            format_eta(Duration::from_secs(eta_secs))
+                        }
+                    }
+                } else {
+                    "unknown".to_string()
+                };
+                info!(
+                    "progress slot {display_slot}/{end_inclusive} ({percent:.2}%) txs={tx_count} accounts={account_updates} eta={eta}"
+                );
+            }
+        })
+    };
+
     info!("starting firehose replay with {} thread(s)", threads);
-    firehose_geyser_with_notifiers(
+    let firehose_result = firehose_geyser_with_notifiers(
         rt,
         slot_range,
         notifiers,
@@ -896,8 +1068,10 @@ async fn run_geyser_replay(
         &client,
         async { Ok(()) },
         threads,
-    )
-    .map_err(|(err, slot)| format!("firehose error at slot {slot}: {err}"))?;
+    );
+    progress_done.store(true, Ordering::Relaxed);
+    let _ = progress_handle.join();
+    firehose_result.map_err(|(err, slot)| format!("firehose error at slot {slot}: {err}"))?;
 
     service
         .join()
@@ -978,7 +1152,7 @@ async fn extract_tarball(archive: &Path, dest_dir: &Path) -> Result<(), String> 
 
 #[tokio::main]
 async fn main() {
-    solana_logger::setup_with_default("info");
+    solana_logger::setup_with_default("info,solana_metrics=off");
     let mut args = env::args();
     let program = args
         .next()

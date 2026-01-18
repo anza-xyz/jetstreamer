@@ -2,7 +2,7 @@ use std::{
     env, fs,
     path::{Path, PathBuf},
     process::{Stdio, exit},
-    sync::{Arc, Mutex, atomic::AtomicBool},
+    sync::{Arc, RwLock, atomic::AtomicBool},
 };
 
 use agave_snapshots::{
@@ -28,7 +28,10 @@ use solana_hash::Hash;
 use solana_ledger::entry_notifier_interface::EntryNotifier;
 use solana_rpc::transaction_notifier_interface::TransactionNotifier;
 use solana_runtime::{
-    bank::Bank, installed_scheduler_pool::BankWithScheduler, runtime_config::RuntimeConfig,
+    bank::Bank,
+    bank_forks::BankForks,
+    installed_scheduler_pool::BankWithScheduler,
+    runtime_config::RuntimeConfig,
     snapshot_bank_utils, snapshot_utils,
 };
 use solana_signature::Signature;
@@ -49,34 +52,37 @@ const ACCOUNTS_RUN_DIR: &str = "run";
 const ARCHIVE_ACCOUNTS_DIR: &str = "accounts-run";
 
 struct BankReplay {
-    bank: Mutex<Arc<Bank>>,
+    bank_forks: Arc<RwLock<BankForks>>,
 }
 
 impl BankReplay {
     fn new(bank: Bank) -> Self {
+        let bank_forks = BankForks::new_rw_arc(bank);
         Self {
-            bank: Mutex::new(Arc::new(bank)),
+            bank_forks,
         }
     }
 
     fn bank_for_slot(&self, slot: Slot) -> Result<Arc<Bank>, String> {
         let mut guard = self
-            .bank
-            .lock()
-            .map_err(|_| "bank lock poisoned".to_string())?;
-        let current_slot = guard.slot();
+            .bank_forks
+            .write()
+            .map_err(|_| "bank forks lock poisoned".to_string())?;
+        let current_slot = guard.highest_slot();
         if slot < current_slot {
             return Err(format!(
                 "slot {slot} behind current bank slot {current_slot}"
             ));
         }
         if slot > current_slot {
-            guard.freeze();
-            let collector_id = *guard.collector_id();
-            let next_bank = Bank::new_from_parent(guard.clone(), &collector_id, slot);
-            *guard = Arc::new(next_bank);
+            let parent = guard.working_bank();
+            parent.freeze();
+            let collector_id = *parent.collector_id();
+            let next_bank = Bank::new_from_parent(parent, &collector_id, slot);
+            let bank_with_scheduler = guard.insert(next_bank);
+            return Ok(bank_with_scheduler.clone_without_scheduler());
         }
-        Ok(guard.clone())
+        Ok(guard.working_bank())
     }
 
     fn register_tick(&self, slot: Slot, hash: Hash) -> Result<(), String> {

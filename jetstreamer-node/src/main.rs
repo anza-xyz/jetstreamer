@@ -65,6 +65,7 @@ const SNAPSHOT_STATUS_CACHE_FILE: &str = "status_cache";
 const ACCOUNTS_SNAPSHOT_DIR: &str = "snapshot";
 const ACCOUNTS_RUN_DIR: &str = "run";
 const ARCHIVE_ACCOUNTS_DIR: &str = "accounts-run";
+const DEFAULT_ROOT_INTERVAL: u64 = 1024;
 
 struct SnapshotVerifier {
     expected: DashMap<Slot, SnapshotHash>,
@@ -156,14 +157,20 @@ impl SnapshotVerifier {
 struct BankReplay {
     bank_forks: Arc<RwLock<BankForks>>,
     snapshot_verifier: Option<Arc<SnapshotVerifier>>,
+    root_interval: Option<u64>,
 }
 
 impl BankReplay {
-    fn new(bank: Bank, snapshot_verifier: Option<Arc<SnapshotVerifier>>) -> Self {
+    fn new(
+        bank: Bank,
+        snapshot_verifier: Option<Arc<SnapshotVerifier>>,
+        root_interval: Option<u64>,
+    ) -> Self {
         let bank_forks = BankForks::new_rw_arc(bank);
         Self {
             bank_forks,
             snapshot_verifier,
+            root_interval,
         }
     }
 
@@ -183,8 +190,14 @@ impl BankReplay {
             parent.freeze();
             let frozen_bank = parent.clone();
             let collector_id = *parent.collector_id();
+            let parent_slot = parent.slot();
             let next_bank = Bank::new_from_parent(parent, &collector_id, slot);
             let bank_with_scheduler = guard.insert(next_bank);
+            if let Some(interval) = self.root_interval {
+                if interval > 0 && parent_slot % interval == 0 {
+                    guard.set_root(parent_slot, None, None);
+                }
+            }
             let next_bank = bank_with_scheduler.clone_without_scheduler();
             drop(guard);
             if let Some(verifier) = self.snapshot_verifier.as_ref() {
@@ -851,6 +864,28 @@ fn env_truthy(var: &str) -> bool {
     }
 }
 
+fn bank_root_interval() -> Option<u64> {
+    match env::var("JETSTREAMER_ROOT_INTERVAL") {
+        Ok(value) => {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+            match trimmed.parse::<u64>() {
+                Ok(0) => None,
+                Ok(interval) => Some(interval),
+                Err(err) => {
+                    warn!(
+                        "invalid JETSTREAMER_ROOT_INTERVAL '{value}': {err}; disabling root pruning"
+                    );
+                    None
+                }
+            }
+        }
+        Err(_) => Some(DEFAULT_ROOT_INTERVAL),
+    }
+}
+
 fn skip_snapshot_verify() -> bool {
     env_truthy("JETSTREAMER_SKIP_SNAPSHOT_VERIFY")
 }
@@ -1142,7 +1177,17 @@ async fn run_geyser_replay(
     })
     .await
     .map_err(|err| format!("snapshot load task failed: {err}"))??;
-    let bank_replay = Arc::new(BankReplay::new(bank, snapshot_verifier.clone()));
+    let root_interval = bank_root_interval();
+    if let Some(interval) = root_interval {
+        info!("bank root pruning interval: {interval}");
+    } else {
+        info!("bank root pruning disabled");
+    }
+    let bank_replay = Arc::new(BankReplay::new(
+        bank,
+        snapshot_verifier.clone(),
+        root_interval,
+    ));
     let slot_range = start_slot..(end_inclusive + 1);
 
     let rt = Arc::new(

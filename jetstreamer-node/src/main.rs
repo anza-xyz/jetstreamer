@@ -934,6 +934,7 @@ async fn run_geyser_replay(
     epoch: u64,
     ledger_dir: &Path,
     snapshot_archive: &Path,
+    shutdown: Arc<AtomicBool>,
 ) -> Result<(), String> {
     let libpath = plugin_library_path()?;
     let config_path = write_geyser_config(ledger_dir, &libpath)?;
@@ -1003,12 +1004,13 @@ async fn run_geyser_replay(
     let progress_handle = {
         let progress = progress.clone();
         let progress_done = progress_done.clone();
+        let shutdown = shutdown.clone();
         std::thread::spawn(move || {
             let total_slots = end_inclusive.saturating_sub(start_slot).saturating_add(1);
             let mut start = None::<Instant>;
-            while !progress_done.load(Ordering::Relaxed) {
+            while !progress_done.load(Ordering::Relaxed) && !shutdown.load(Ordering::Relaxed) {
                 std::thread::sleep(Duration::from_secs(3));
-                if progress_done.load(Ordering::Relaxed) {
+                if progress_done.load(Ordering::Relaxed) || shutdown.load(Ordering::Relaxed) {
                     break;
                 }
                 if start.is_none() {
@@ -1066,6 +1068,7 @@ async fn run_geyser_replay(
         confirmed_bank_sender,
         &index_base_url,
         &client,
+        shutdown.clone(),
         async { Ok(()) },
         threads,
     );
@@ -1152,7 +1155,18 @@ async fn extract_tarball(archive: &Path, dest_dir: &Path) -> Result<(), String> 
 
 #[tokio::main]
 async fn main() {
-    solana_logger::setup_with_default("info,solana_metrics=off");
+    solana_logger::setup_with_default("info,solana_metrics=off,solana_runtime::bank=off");
+    let shutdown = Arc::new(AtomicBool::new(false));
+    {
+        let shutdown = shutdown.clone();
+        if let Err(err) = ctrlc::set_handler(move || {
+            if !shutdown.swap(true, Ordering::SeqCst) {
+                eprintln!("CTRL+C received, shutting down...");
+            }
+        }) {
+            eprintln!("failed to set CTRL+C handler: {err}");
+        }
+    }
     let mut args = env::args();
     let program = args
         .next()
@@ -1208,7 +1222,7 @@ async fn main() {
         println!("Extraction complete");
     }
 
-    if let Err(err) = run_geyser_replay(epoch, &dest_dir, &dest_path).await {
+    if let Err(err) = run_geyser_replay(epoch, &dest_dir, &dest_path, shutdown).await {
         eprintln!("error: {err}");
         exit(1);
     }

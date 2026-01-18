@@ -1685,6 +1685,7 @@ pub fn firehose_geyser(
         confirmed_bank_sender,
         index_base_url,
         client,
+        Arc::new(AtomicBool::new(false)),
         on_load,
         threads,
     )?;
@@ -1700,6 +1701,7 @@ pub fn firehose_geyser_with_notifiers(
     confirmed_bank_sender: Sender<SlotNotification>,
     index_base_url: &Url,
     client: &Client,
+    shutdown: Arc<AtomicBool>,
     on_load: impl Future<Output = Result<(), SharedError>> + Send + 'static,
     threads: u64,
 ) -> Result<(), (FirehoseError, u64)> {
@@ -1745,6 +1747,7 @@ pub fn firehose_geyser_with_notifiers(
         let confirmed_bank_sender = (*confirmed_bank_sender).clone();
         let client = client.clone();
         let error_counts = error_counts.clone();
+        let shutdown = shutdown.clone();
 
         let rt_clone = rt.clone();
 
@@ -1759,6 +1762,7 @@ pub fn firehose_geyser_with_notifiers(
                     &client,
                     if threads > 1 { Some(i) } else { None },
                     error_counts,
+                    shutdown,
                 )
                 .await
                 .unwrap();
@@ -1802,6 +1806,7 @@ async fn firehose_geyser_thread(
     client: &Client,
     thread_index: Option<usize>,
     error_counts: Arc<Vec<AtomicU32>>,
+    shutdown: Arc<AtomicBool>,
 ) -> Result<(), (FirehoseError, u64)> {
     let start_time = std::time::Instant::now();
     let log_target = if let Some(thread_index) = thread_index {
@@ -1814,6 +1819,9 @@ async fn firehose_geyser_thread(
     let mut last_counted_slot = slot_range.start.saturating_sub(1);
     // let mut triggered = false;
     while let Err((err, slot)) = async {
+            if shutdown.load(Ordering::Relaxed) {
+                return Ok(());
+            }
             let epoch_range = slot_to_epoch(slot_range.start)..=slot_to_epoch(slot_range.end - 1);
             log::info!(
                 target: &log_target,
@@ -1829,6 +1837,9 @@ async fn firehose_geyser_thread(
             // for each epoch
             let mut current_slot: Option<u64> = None;
             for epoch_num in epoch_range.clone() {
+                if shutdown.load(Ordering::Relaxed) {
+                    return Ok(());
+                }
                 log::info!(target: &log_target, "entering epoch {}", epoch_num);
                 let stream = match timeout(OP_TIMEOUT, fetch_epoch_stream(epoch_num, client)).await {
                     Ok(stream) => stream,
@@ -1889,6 +1900,9 @@ async fn firehose_geyser_thread(
                 let mut item_index = 0;
                 let mut displayed_skip_message = false;
                 loop {
+                    if shutdown.load(Ordering::Relaxed) {
+                        return Ok(());
+                    }
                     let read_fut = reader.read_until_block();
                     let nodes = match timeout(OP_TIMEOUT, read_fut).await {
                         Ok(result) => result
@@ -1904,6 +1918,9 @@ async fn firehose_geyser_thread(
                             ));
                         }
                     };
+                    if shutdown.load(Ordering::Relaxed) {
+                        return Ok(());
+                    }
                     if nodes.is_empty() {
                         log::info!(
                             target: &log_target,
@@ -1986,6 +2003,10 @@ async fn firehose_geyser_thread(
                         );
                         this_block_rewards.clear();
                         continue;
+                    }
+
+                    if shutdown.load(Ordering::Relaxed) {
+                        return Ok(());
                     }
 
                     nodes.each(|node_with_cid| -> Result<(), SharedError> {

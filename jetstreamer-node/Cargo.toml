@@ -11,6 +11,7 @@ keywords.workspace = true
 [dependencies]
 agave-snapshots.workspace = true
 crossbeam-channel.workspace = true
+ctrlc.workspace = true
 jetstreamer-firehose.workspace = true
 log.workspace = true
 reqwest.workspace = true

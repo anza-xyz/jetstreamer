@@ -84,6 +84,40 @@ pub async fn resolve_epoch_snapshot(epoch: u64) -> Result<SnapshotInfo, Snapshot
     resolve_snapshot_for_slot(DEFAULT_BUCKET, epoch, slot_dir).await
 }
 
+/// List all snapshot tarballs in the epoch's slot range.
+pub async fn list_epoch_snapshots(epoch: u64) -> Result<Vec<SnapshotInfo>, SnapshotError> {
+    let (start, end) = epoch_to_slot_range(epoch);
+    let mut candidates = list_bucket_slots(DEFAULT_BUCKET)
+        .await?
+        .into_iter()
+        .filter(|slot| *slot >= start && *slot <= end)
+        .collect::<Vec<_>>();
+
+    if candidates.is_empty() {
+        return Err(SnapshotError::SnapshotDirNotFound { epoch, start, end });
+    }
+
+    candidates.sort_unstable();
+    let mut matches = Vec::new();
+    for slot in candidates.iter().copied() {
+        let marker_epoch = read_epoch_marker(DEFAULT_BUCKET, slot).await?;
+        if marker_epoch == epoch {
+            matches.push(slot);
+        }
+    }
+
+    if matches.is_empty() {
+        return Err(SnapshotError::SnapshotDirEpochMismatch { epoch, candidates });
+    }
+
+    let mut snapshots = Vec::new();
+    for slot in matches {
+        snapshots.push(resolve_snapshot_for_slot(DEFAULT_BUCKET, epoch, slot).await?);
+    }
+    snapshots.sort_by_key(|info| info.slot_dir);
+    Ok(snapshots)
+}
+
 /// Resolve the latest snapshot at or before the provided slot.
 pub async fn resolve_snapshot_at_or_before_slot(
     epoch: u64,

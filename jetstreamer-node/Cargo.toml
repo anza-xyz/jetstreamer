@@ -12,6 +12,7 @@ keywords.workspace = true
 agave-snapshots.workspace = true
 crossbeam-channel.workspace = true
 ctrlc.workspace = true
+dashmap.workspace = true
 jetstreamer-firehose.workspace = true
 log.workspace = true
 reqwest.workspace = true

@@ -1,22 +1,31 @@
 use std::{
+    collections::BTreeMap,
     env, fs,
     path::{Path, PathBuf},
     process::{Stdio, exit},
-    sync::{Arc, RwLock, atomic::{AtomicBool, AtomicU64, Ordering}},
+    sync::{
+        Arc,
+        RwLock,
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+    },
     time::{Duration, Instant},
 };
 
 use agave_snapshots::{
     snapshot_archive_info::{FullSnapshotArchiveInfo, SnapshotArchiveInfoGetter},
+    snapshot_hash::SnapshotHash,
     streaming_unarchive_snapshot,
 };
 use crossbeam_channel::unbounded;
+use dashmap::DashMap;
 use jetstreamer_firehose::{
     epochs::epoch_to_slot_range,
     firehose::{GeyserNotifiers, firehose_geyser_with_notifiers},
     index::get_index_base_url,
 };
-use jetstreamer_node::snapshots::{DEFAULT_BUCKET, download_snapshot_at_or_before_slot};
+use jetstreamer_node::snapshots::{
+    DEFAULT_BUCKET, download_snapshot_at_or_before_slot, list_epoch_snapshots,
+};
 use log::{info, warn};
 use reqwest::Client;
 use solana_accounts_db::{
@@ -57,15 +66,104 @@ const ACCOUNTS_SNAPSHOT_DIR: &str = "snapshot";
 const ACCOUNTS_RUN_DIR: &str = "run";
 const ARCHIVE_ACCOUNTS_DIR: &str = "accounts-run";
 
+struct SnapshotVerifier {
+    expected: DashMap<Slot, SnapshotHash>,
+    errors: DashMap<usize, String>,
+    error_count: AtomicUsize,
+    shutdown: Option<Arc<AtomicBool>>,
+}
+
+impl SnapshotVerifier {
+    fn new(expected: BTreeMap<Slot, SnapshotHash>, shutdown: Option<Arc<AtomicBool>>) -> Self {
+        let expected_map = DashMap::new();
+        for (slot, hash) in expected {
+            expected_map.insert(slot, hash);
+        }
+        Self {
+            expected: expected_map,
+            errors: DashMap::new(),
+            error_count: AtomicUsize::new(0),
+            shutdown,
+        }
+    }
+
+    fn verify_bank(&self, bank: &Bank) {
+        let slot = bank.slot();
+        let expected_hash = self.expected.remove(&slot).map(|(_, hash)| hash);
+        let Some(expected_hash) = expected_hash else {
+            return;
+        };
+
+        let actual_hash = bank.get_snapshot_hash();
+        if actual_hash != expected_hash {
+            let message = format!(
+                "snapshot hash mismatch at slot {slot}: expected {}, got {}",
+                expected_hash.0,
+                actual_hash.0
+            );
+            warn!("{message}");
+            self.record_error(message);
+        } else {
+            info!("verified snapshot hash at slot {slot}");
+        }
+    }
+
+    fn finish(&self) -> Result<(), String> {
+        let total_errors = self.error_count.load(Ordering::Relaxed);
+        if total_errors > 0 {
+            let mut entries: Vec<(usize, String)> = self
+                .errors
+                .iter()
+                .map(|entry| (*entry.key(), entry.value().clone()))
+                .collect();
+            entries.sort_by_key(|(idx, _)| *idx);
+            let total = total_errors.max(entries.len());
+            let mut message = String::from("snapshot verification failed:");
+            for (_, error) in entries.iter().take(5) {
+                message.push_str("\n- ");
+                message.push_str(error);
+            }
+            if total > 5 {
+                message.push_str(&format!("\n- ... {} more", total - 5));
+            }
+            return Err(message);
+        }
+
+        let mut missing: Vec<Slot> = self.expected.iter().map(|entry| *entry.key()).collect();
+        if !missing.is_empty() {
+            missing.sort_unstable();
+            let preview: Vec<Slot> = missing.iter().copied().take(10).collect();
+            return Err(format!(
+                "snapshot verification incomplete: missing {} snapshot slot(s) (first {}: {:?})",
+                missing.len(),
+                preview.len(),
+                preview
+            ));
+        }
+
+        Ok(())
+    }
+
+    fn record_error(&self, message: String) {
+        let idx = self.error_count.fetch_add(1, Ordering::Relaxed);
+        self.errors.insert(idx, message);
+        if let Some(shutdown) = &self.shutdown {
+            shutdown.store(true, Ordering::SeqCst);
+        }
+    }
+}
+
 struct BankReplay {
     bank_forks: Arc<RwLock<BankForks>>,
+    snapshot_verifier: Option<Arc<SnapshotVerifier>>,
 }
 
 impl BankReplay {
-    fn new(bank: Bank) -> Self {
+    fn new(bank: Bank, snapshot_verifier: Option<Arc<SnapshotVerifier>>) -> Self {
         let bank_forks = BankForks::new_rw_arc(bank);
         Self {
             bank_forks,
+            snapshot_verifier,
         }
     }
 
@@ -83,10 +181,16 @@ impl BankReplay {
         if slot > current_slot {
             let parent = guard.working_bank();
             parent.freeze();
+            let frozen_bank = parent.clone();
             let collector_id = *parent.collector_id();
             let next_bank = Bank::new_from_parent(parent, &collector_id, slot);
             let bank_with_scheduler = guard.insert(next_bank);
-            return Ok(bank_with_scheduler.clone_without_scheduler());
+            let next_bank = bank_with_scheduler.clone_without_scheduler();
+            drop(guard);
+            if let Some(verifier) = self.snapshot_verifier.as_ref() {
+                verifier.verify_bank(&frozen_bank);
+            }
+            return Ok(next_bank);
         }
         Ok(guard.working_bank())
     }
@@ -95,6 +199,22 @@ impl BankReplay {
         let bank = self.bank_for_slot(slot)?;
         let bank_with_scheduler = BankWithScheduler::new_without_scheduler(bank);
         bank_with_scheduler.register_tick(&hash);
+        Ok(())
+    }
+
+    fn verify_latest_bank(&self) -> Result<(), String> {
+        let bank = {
+            let guard = self
+                .bank_forks
+                .write()
+                .map_err(|_| "bank forks lock poisoned".to_string())?;
+            let bank = guard.working_bank();
+            bank.freeze();
+            bank.clone()
+        };
+        if let Some(verifier) = self.snapshot_verifier.as_ref() {
+            verifier.verify_bank(&bank);
+        }
         Ok(())
     }
 }
@@ -281,7 +401,58 @@ fn epoch_to_slot(epoch: u64) -> u64 {
 }
 
 fn usage(program: &str) -> String {
-    format!("Usage: {program} <epoch> [dest-dir]")
+    format!("Usage: {program} <epoch> [dest-dir] [--verify]")
+}
+
+fn snapshot_filename(uri: &str) -> Result<&str, String> {
+    uri.rsplit('/')
+        .next()
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| format!("snapshot uri missing filename: {uri}"))
+}
+
+fn parse_snapshot_archive_name(name: &str) -> Result<(Slot, SnapshotHash), String> {
+    let name = name
+        .strip_prefix("snapshot-")
+        .ok_or_else(|| format!("snapshot filename missing prefix: {name}"))?;
+    let (slot_str, rest) = name
+        .split_once('-')
+        .ok_or_else(|| format!("snapshot filename missing slot/hash separator: {name}"))?;
+    let slot: Slot = slot_str
+        .parse()
+        .map_err(|err| format!("invalid snapshot slot '{slot_str}': {err}"))?;
+    let hash_str = rest
+        .strip_suffix(".tar.zst")
+        .or_else(|| rest.strip_suffix(".tar.lz4"))
+        .or_else(|| rest.strip_suffix(".tar.bz2"))
+        .ok_or_else(|| format!("snapshot filename missing archive extension: {name}"))?;
+    let hash: Hash = hash_str
+        .parse()
+        .map_err(|err| format!("invalid snapshot hash '{hash_str}': {err}"))?;
+    Ok((slot, SnapshotHash(hash)))
+}
+
+async fn snapshot_expectations_for_epoch(
+    epoch: u64,
+) -> Result<BTreeMap<Slot, SnapshotHash>, String> {
+    let snapshots = list_epoch_snapshots(epoch)
+        .await
+        .map_err(|err| format!("failed to list epoch {epoch} snapshots: {err}"))?;
+    let mut expected = BTreeMap::new();
+    for snapshot in snapshots {
+        let name = snapshot_filename(&snapshot.snapshot_uri)?;
+        let (slot, hash) = parse_snapshot_archive_name(name)?;
+        if slot != snapshot.slot_dir {
+            return Err(format!(
+                "snapshot filename slot {slot} does not match directory {}",
+                snapshot.slot_dir
+            ));
+        }
+        if expected.insert(slot, hash).is_some() {
+            return Err(format!("duplicate snapshot entry for slot {slot}"));
+        }
+    }
+    Ok(expected)
 }
 
 fn plugin_library_filename() -> String {
@@ -935,6 +1106,7 @@ async fn run_geyser_replay(
     ledger_dir: &Path,
     snapshot_archive: &Path,
     shutdown: Arc<AtomicBool>,
+    snapshot_verifier: Option<Arc<SnapshotVerifier>>,
 ) -> Result<(), String> {
     let libpath = plugin_library_path()?;
     let config_path = write_geyser_config(ledger_dir, &libpath)?;
@@ -970,7 +1142,7 @@ async fn run_geyser_replay(
     })
     .await
     .map_err(|err| format!("snapshot load task failed: {err}"))??;
-    let bank_replay = Arc::new(BankReplay::new(bank));
+    let bank_replay = Arc::new(BankReplay::new(bank, snapshot_verifier.clone()));
     let slot_range = start_slot..(end_inclusive + 1);
 
     let rt = Arc::new(
@@ -985,7 +1157,7 @@ async fn run_geyser_replay(
         delegate: service.get_transaction_notifier(),
     });
     let entry_notifier = Arc::new(BankEntryNotifier {
-        bank_replay,
+        bank_replay: bank_replay.clone(),
         progress: progress.clone(),
         delegate: service.get_entry_notifier(),
     });
@@ -1079,6 +1251,12 @@ async fn run_geyser_replay(
     service
         .join()
         .map_err(|err| format!("geyser service join failed: {err:?}"))?;
+
+    if let Some(verifier) = snapshot_verifier {
+        bank_replay.verify_latest_bank()?;
+        verifier.finish()?;
+        info!("snapshot verification complete");
+    }
 
     Ok(())
 }
@@ -1190,8 +1368,26 @@ async fn main() {
         }
     };
 
-    let dest_dir = match args.next() {
-        Some(path) => PathBuf::from(path),
+    let mut dest_dir_arg = None;
+    let mut verify_snapshots = false;
+    for arg in args {
+        if arg == "--verify" {
+            verify_snapshots = true;
+        } else if arg.starts_with('-') {
+            eprintln!("unknown option '{arg}'");
+            eprintln!("{}", usage(&program));
+            exit(2);
+        } else if dest_dir_arg.is_none() {
+            dest_dir_arg = Some(PathBuf::from(arg));
+        } else {
+            eprintln!("unexpected argument '{arg}'");
+            eprintln!("{}", usage(&program));
+            exit(2);
+        }
+    }
+
+    let dest_dir = match dest_dir_arg {
+        Some(path) => path,
         None => match env::current_dir() {
             Ok(path) => path,
             Err(err) => {
@@ -1222,7 +1418,33 @@ async fn main() {
         println!("Extraction complete");
     }
 
-    if let Err(err) = run_geyser_replay(epoch, &dest_dir, &dest_path, shutdown).await {
+    let snapshot_verifier = if verify_snapshots {
+        info!("collecting canonical snapshot hashes for epoch {epoch}");
+        let expected = match snapshot_expectations_for_epoch(epoch).await {
+            Ok(expected) => expected,
+            Err(err) => {
+                eprintln!("error: {err}");
+                exit(1);
+            }
+        };
+        info!("snapshot verification enabled for {} snapshot(s)", expected.len());
+        Some(Arc::new(SnapshotVerifier::new(
+            expected,
+            Some(shutdown.clone()),
+        )))
+    } else {
+        None
+    };
+
+    if let Err(err) = run_geyser_replay(
+        epoch,
+        &dest_dir,
+        &dest_path,
+        shutdown,
+        snapshot_verifier,
+    )
+    .await
+    {
         eprintln!("error: {err}");
         exit(1);
     }

@@ -13,12 +13,27 @@ fn read_version(bucket: &str, slot: u64, filename: &str) -> Option<String> {
     if !output.status.success() {
         return None;
     }
-    let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if version.is_empty() {
+    let raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if raw.is_empty() {
         None
-    } else {
+    } else if let Some(version) = extract_version(&raw) {
         Some(version)
+    } else {
+        eprintln!("warning: failed to parse version from '{raw}' at slot {slot}");
+        None
     }
+}
+
+fn extract_version(raw: &str) -> Option<String> {
+    for token in raw.split_whitespace() {
+        let token = token
+            .trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '.')
+            .trim_start_matches('v');
+        if token.contains('.') && token.chars().all(|c| c.is_ascii_digit() || c == '.') {
+            return Some(token.to_string());
+        }
+    }
+    None
 }
 
 fn main() -> Result<(), Box<dyn Error>> {

@@ -55,7 +55,7 @@ pub enum SnapshotError {
 
 /// Resolve the GCS URI for the snapshot tarball corresponding to an epoch.
 pub async fn resolve_epoch_snapshot(epoch: u64) -> Result<SnapshotInfo, SnapshotError> {
-    let (start, end) = epoch_to_slot_range(epoch);
+    let (start, end) = epoch_snapshot_search_window(epoch);
     let mut candidates = list_bucket_slots(DEFAULT_BUCKET)
         .await?
         .into_iter()
@@ -75,18 +75,17 @@ pub async fn resolve_epoch_snapshot(epoch: u64) -> Result<SnapshotInfo, Snapshot
         }
     }
 
-    let slot_dir = match matches.len() {
-        0 => return Err(SnapshotError::SnapshotDirEpochMismatch { epoch, candidates }),
-        1 => matches[0],
-        _ => *matches.iter().max().unwrap(),
-    };
+    if matches.is_empty() {
+        return Err(SnapshotError::SnapshotDirEpochMismatch { epoch, candidates });
+    }
 
+    let slot_dir = *matches.iter().max().unwrap();
     resolve_snapshot_for_slot(DEFAULT_BUCKET, epoch, slot_dir).await
 }
 
-/// List all snapshot tarballs in the epoch's slot range.
+/// List all snapshot tarballs that report the requested epoch.
 pub async fn list_epoch_snapshots(epoch: u64) -> Result<Vec<SnapshotInfo>, SnapshotError> {
-    let (start, end) = epoch_to_slot_range(epoch);
+    let (start, end) = epoch_snapshot_search_window(epoch);
     let mut candidates = list_bucket_slots(DEFAULT_BUCKET)
         .await?
         .into_iter()
@@ -178,6 +177,13 @@ fn snapshot_filename(uri: &str) -> Result<&str, SnapshotError> {
         .ok_or_else(|| SnapshotError::SnapshotFilenameMissing {
             uri: uri.to_string(),
         })
+}
+
+fn epoch_snapshot_search_window(epoch: u64) -> (u64, u64) {
+    let (_, epoch_end) = epoch_to_slot_range(epoch);
+    let prev_epoch = epoch.saturating_sub(1);
+    let (prev_start, _) = epoch_to_slot_range(prev_epoch);
+    (prev_start, epoch_end)
 }
 
 async fn resolve_snapshot_for_slot(

@@ -110,8 +110,8 @@ fn main() -> Result<(), Box<dyn Error>> {
             continue;
         };
 
+        let boundary = (version.major, version.minor);
         let should_print = if breaking_only {
-            let boundary = (version.major, version.minor);
             last_boundary.map_or(true, |last| last != boundary)
         } else {
             last_version
@@ -120,10 +120,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         };
 
         if should_print {
-            println!("{slot}\t{}", version.version);
-            last_boundary = Some((version.major, version.minor));
-            last_version = Some(version);
+            println!("{slot}\t{}", &version.version);
         }
+
+        last_boundary = Some(boundary);
+        last_version = Some(version);
     }
 
     Ok(())

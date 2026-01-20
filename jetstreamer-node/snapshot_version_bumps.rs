@@ -1,7 +1,17 @@
 #!/usr/bin/env rust-script
 
-use std::error::Error;
-use std::process::Command;
+use std::{
+    collections::{BTreeMap, VecDeque},
+    error::Error,
+    io::{self, Write},
+    process::Command,
+    sync::{
+        Arc, Mutex, mpsc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
+    thread,
+    time::{Duration, Instant},
+};
 
 #[derive(Clone, Debug)]
 struct VersionInfo {
@@ -53,6 +63,14 @@ fn extract_version(raw: &str) -> Option<(String, u64, u64)> {
     None
 }
 
+fn format_duration(duration: Duration) -> String {
+    let total_secs = duration.as_secs();
+    let hours = total_secs / 3600;
+    let minutes = (total_secs % 3600) / 60;
+    let seconds = total_secs % 60;
+    format!("{hours:02}:{minutes:02}:{seconds:02}")
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     let mut bucket = "gs://mainnet-beta-ledger-us-ny5".to_string();
     let mut breaking_only = false;
@@ -101,15 +119,98 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     slots.sort_unstable();
 
+    let workers = thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(4)
+        .min(32)
+        .max(1);
+    let workers = workers.min(slots.len().max(1));
+    let queue = Arc::new(Mutex::new(VecDeque::from(slots)));
+    let (tx, rx) = mpsc::channel::<(u64, VersionInfo)>();
+    let done = Arc::new(AtomicUsize::new(0));
+    let progress_done = Arc::new(AtomicBool::new(false));
+    let total = queue.lock().unwrap().len();
+    let progress_handle = if total > 0 {
+        let done = Arc::clone(&done);
+        let progress_done = Arc::clone(&progress_done);
+        Some(thread::spawn(move || {
+            let stderr = io::stderr();
+            let mut handle = stderr.lock();
+            let start = Instant::now();
+            while !progress_done.load(Ordering::Relaxed) {
+                let count = done.load(Ordering::Relaxed);
+                let percent = (count as f64) * 100.0 / (total as f64);
+                let eta = if count == 0 {
+                    "unknown".to_string()
+                } else {
+                    let elapsed = start.elapsed().as_secs_f64();
+                    if elapsed <= 0.0 {
+                        "unknown".to_string()
+                    } else {
+                        let rate = (count as f64) / elapsed;
+                        if rate <= 0.0 {
+                            "unknown".to_string()
+                        } else {
+                            let remaining = total.saturating_sub(count);
+                            let eta_secs = ((remaining as f64) / rate).ceil() as u64;
+                            format_duration(Duration::from_secs(eta_secs))
+                        }
+                    }
+                };
+                let _ = write!(
+                    handle,
+                    "\rprogress: {count}/{total} ({percent:.2}%) eta={eta}"
+                );
+                let _ = handle.flush();
+                thread::sleep(Duration::from_secs(1));
+            }
+            let _ = write!(handle, "\r{:<60}\r", "");
+            let _ = handle.flush();
+        }))
+    } else {
+        None
+    };
+    let mut handles = Vec::with_capacity(workers);
+
+    for _ in 0..workers {
+        let bucket = bucket.clone();
+        let queue = Arc::clone(&queue);
+        let tx = tx.clone();
+        let done = Arc::clone(&done);
+        handles.push(thread::spawn(move || loop {
+            let slot = {
+                let mut queue = queue.lock().unwrap();
+                queue.pop_front()
+            };
+            let Some(slot) = slot else {
+                break;
+            };
+            let version = read_version(&bucket, slot, "version")
+                .or_else(|| read_version(&bucket, slot, "version.txt"));
+            if let Some(version) = version {
+                let _ = tx.send((slot, version));
+            }
+            done.fetch_add(1, Ordering::Relaxed);
+        }));
+    }
+
+    drop(tx);
+    for handle in handles {
+        let _ = handle.join();
+    }
+    progress_done.store(true, Ordering::Relaxed);
+    if let Some(handle) = progress_handle {
+        let _ = handle.join();
+    }
+
+    let mut results = BTreeMap::new();
+    for (slot, version) in rx {
+        results.insert(slot, version);
+    }
+
     let mut last_version: Option<VersionInfo> = None;
     let mut last_boundary: Option<(u64, u64)> = None;
-    for slot in slots {
-        let version = read_version(&bucket, slot, "version")
-            .or_else(|| read_version(&bucket, slot, "version.txt"));
-        let Some(version) = version else {
-            continue;
-        };
-
+    for (slot, version) in results {
         let boundary = (version.major, version.minor);
         let should_print = if breaking_only {
             last_boundary.map_or(true, |last| last != boundary)

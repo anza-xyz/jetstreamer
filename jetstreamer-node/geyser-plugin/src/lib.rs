@@ -1,11 +1,10 @@
 use agave_geyser_plugin_interface::geyser_plugin_interface::{
     GeyserPlugin, ReplicaBlockInfoVersions, Result,
 };
+use dashmap::DashMap;
 use log::info;
 use std::{
-    collections::HashMap,
     sync::{
-        Mutex,
         atomic::{AtomicU64, Ordering},
     },
 };
@@ -18,14 +17,14 @@ struct SlotCounters {
 
 #[derive(Debug)]
 struct JetstreamerNodeGeyserPlugin {
-    per_slot: Mutex<HashMap<u64, SlotCounters>>,
+    per_slot: DashMap<u64, SlotCounters>,
     startup_accounts: AtomicU64,
 }
 
 impl Default for JetstreamerNodeGeyserPlugin {
     fn default() -> Self {
         Self {
-            per_slot: Mutex::new(HashMap::new()),
+            per_slot: DashMap::new(),
             startup_accounts: AtomicU64::new(0),
         }
     }
@@ -46,12 +45,7 @@ impl GeyserPlugin for JetstreamerNodeGeyserPlugin {
             self.startup_accounts.fetch_add(1, Ordering::Relaxed);
             return Ok(());
         }
-        let mut guard = self.per_slot.lock().map_err(|_| {
-            agave_geyser_plugin_interface::geyser_plugin_interface::GeyserPluginError::Custom(
-                "slot counter lock poisoned".into(),
-            )
-        })?;
-        let counters = guard.entry(slot).or_default();
+        let mut counters = self.per_slot.entry(slot).or_default();
         counters.account_updates = counters.account_updates.saturating_add(1);
         Ok(())
     }
@@ -67,12 +61,7 @@ impl GeyserPlugin for JetstreamerNodeGeyserPlugin {
         _transaction: agave_geyser_plugin_interface::geyser_plugin_interface::ReplicaTransactionInfoVersions,
         slot: u64,
     ) -> Result<()> {
-        let mut guard = self.per_slot.lock().map_err(|_| {
-            agave_geyser_plugin_interface::geyser_plugin_interface::GeyserPluginError::Custom(
-                "slot counter lock poisoned".into(),
-            )
-        })?;
-        let counters = guard.entry(slot).or_default();
+        let mut counters = self.per_slot.entry(slot).or_default();
         counters.transactions = counters.transactions.saturating_add(1);
         Ok(())
     }
@@ -87,15 +76,13 @@ impl GeyserPlugin for JetstreamerNodeGeyserPlugin {
         if slot == u64::MAX {
             return Ok(());
         }
-        let (transactions, account_updates) = {
-            let mut guard = self.per_slot.lock().map_err(|_| {
-                agave_geyser_plugin_interface::geyser_plugin_interface::GeyserPluginError::Custom(
-                    "slot counter lock poisoned".into(),
-                )
-            })?;
-            let counters = guard.remove(&slot).unwrap_or_default();
-            (counters.transactions, counters.account_updates)
-        };
+        let counters = self
+            .per_slot
+            .remove(&slot)
+            .map(|(_, counters)| counters)
+            .unwrap_or_default();
+        let (transactions, account_updates) =
+            (counters.transactions, counters.account_updates);
         info!(
             "block slot {} txs={} account_updates={}",
             slot, transactions, account_updates

@@ -3911,6 +3911,7 @@ name = "jetstreamer-node-geyser"
 version = "0.3.0"
 dependencies = [
  "agave-geyser-plugin-interface",
+ "dashmap",
  "log",
 ]
 

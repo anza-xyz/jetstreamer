@@ -31,8 +31,23 @@ impl Default for JetstreamerNodeGeyserPlugin {
 }
 
 impl GeyserPlugin for JetstreamerNodeGeyserPlugin {
+    fn setup_logger(&self, logger: &'static dyn log::Log, level: log::LevelFilter) -> Result<()> {
+        log::set_max_level(level);
+        // Ignore errors if the logger is already set (e.g., plugin reload).
+        let _ = log::set_logger(logger);
+        Ok(())
+    }
+
     fn name(&self) -> &'static str {
         "jetstreamer-node-geyser"
+    }
+
+    fn on_load(&mut self, config_file: &str, is_reload: bool) -> Result<()> {
+        info!(
+            "loaded geyser plugin config={} reload={}",
+            config_file, is_reload
+        );
+        Ok(())
     }
 
     fn update_account(

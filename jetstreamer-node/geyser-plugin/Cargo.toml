@@ -12,5 +12,4 @@ crate-type = ["cdylib"]
 
 [dependencies]
 agave-geyser-plugin-interface.workspace = true
-dashmap.workspace = true
 log.workspace = true

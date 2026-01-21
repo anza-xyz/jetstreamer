@@ -1,31 +1,24 @@
 use agave_geyser_plugin_interface::geyser_plugin_interface::{
     GeyserPlugin, ReplicaBlockInfoVersions, Result,
 };
-use dashmap::DashMap;
 use log::info;
 use std::{
-    sync::{
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::atomic::{AtomicU64, Ordering},
 };
-
-#[derive(Debug, Default)]
-struct SlotCounters {
-    transactions: u64,
-    account_updates: u64,
-}
 
 #[derive(Debug)]
 struct JetstreamerNodeGeyserPlugin {
-    per_slot: DashMap<u64, SlotCounters>,
     startup_accounts: AtomicU64,
+    account_updates: AtomicU64,
+    transactions: AtomicU64,
 }
 
 impl Default for JetstreamerNodeGeyserPlugin {
     fn default() -> Self {
         Self {
-            per_slot: DashMap::new(),
             startup_accounts: AtomicU64::new(0),
+            account_updates: AtomicU64::new(0),
+            transactions: AtomicU64::new(0),
         }
     }
 }
@@ -53,15 +46,14 @@ impl GeyserPlugin for JetstreamerNodeGeyserPlugin {
     fn update_account(
         &self,
         _account: agave_geyser_plugin_interface::geyser_plugin_interface::ReplicaAccountInfoVersions,
-        slot: u64,
+        _slot: u64,
         is_startup: bool,
     ) -> Result<()> {
         if is_startup {
             self.startup_accounts.fetch_add(1, Ordering::Relaxed);
             return Ok(());
         }
-        let mut counters = self.per_slot.entry(slot).or_default();
-        counters.account_updates = counters.account_updates.saturating_add(1);
+        self.account_updates.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
@@ -74,10 +66,9 @@ impl GeyserPlugin for JetstreamerNodeGeyserPlugin {
     fn notify_transaction(
         &self,
         _transaction: agave_geyser_plugin_interface::geyser_plugin_interface::ReplicaTransactionInfoVersions,
-        slot: u64,
+        _slot: u64,
     ) -> Result<()> {
-        let mut counters = self.per_slot.entry(slot).or_default();
-        counters.transactions = counters.transactions.saturating_add(1);
+        self.transactions.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
@@ -91,15 +82,10 @@ impl GeyserPlugin for JetstreamerNodeGeyserPlugin {
         if slot == u64::MAX {
             return Ok(());
         }
-        let counters = self
-            .per_slot
-            .remove(&slot)
-            .map(|(_, counters)| counters)
-            .unwrap_or_default();
-        let (transactions, account_updates) =
-            (counters.transactions, counters.account_updates);
+        let transactions = self.transactions.load(Ordering::Relaxed);
+        let account_updates = self.account_updates.load(Ordering::Relaxed);
         info!(
-            "block slot {} txs={} account_updates={}",
+            "block slot {} total_txs={} total_account_updates={}",
             slot, transactions, account_updates
         );
         Ok(())

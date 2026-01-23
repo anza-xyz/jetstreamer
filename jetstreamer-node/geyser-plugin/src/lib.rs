@@ -1,6 +1,7 @@
 use agave_geyser_plugin_interface::geyser_plugin_interface::{
     GeyserPlugin, ReplicaBlockInfoVersions, Result,
 };
+use jetstreamer_horizon::account_updates::AccountUpdate;
 use log::info;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -43,7 +44,7 @@ impl GeyserPlugin for JetstreamerNodeGeyserPlugin {
 
     fn update_account(
         &self,
-        _account: agave_geyser_plugin_interface::geyser_plugin_interface::ReplicaAccountInfoVersions,
+        account: agave_geyser_plugin_interface::geyser_plugin_interface::ReplicaAccountInfoVersions,
         _slot: u64,
         is_startup: bool,
     ) -> Result<()> {
@@ -52,7 +53,8 @@ impl GeyserPlugin for JetstreamerNodeGeyserPlugin {
             return Ok(());
         }
         self.account_updates.fetch_add(1, Ordering::Relaxed);
-        // TODO: print tx index here
+        let ac: AccountUpdate = account.into();
+        info!("account update: {:?}", ac);
         Ok(())
     }
 

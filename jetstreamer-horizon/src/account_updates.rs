@@ -73,6 +73,23 @@ impl From<&ReplicaAccountInfoV3<'_>> for AccountUpdate {
     }
 }
 
+impl From<ReplicaAccountInfoVersions<'_>> for AccountUpdate {
+    #[inline]
+    fn from(info: ReplicaAccountInfoVersions<'_>) -> Self {
+        match info {
+            ReplicaAccountInfoVersions::V0_0_1(replica_account_info) => {
+                AccountUpdate::from(replica_account_info)
+            }
+            ReplicaAccountInfoVersions::V0_0_2(replica_account_info_v2) => {
+                AccountUpdate::from(replica_account_info_v2)
+            }
+            ReplicaAccountInfoVersions::V0_0_3(replica_account_info_v3) => {
+                AccountUpdate::from(replica_account_info_v3)
+            }
+        }
+    }
+}
+
 impl From<&ReplicaAccountInfoVersions<'_>> for AccountUpdate {
     #[inline]
     fn from(info: &ReplicaAccountInfoVersions<'_>) -> Self {

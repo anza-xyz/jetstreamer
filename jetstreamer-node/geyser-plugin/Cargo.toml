@@ -11,5 +11,6 @@ documentation.workspace = true
 crate-type = ["cdylib"]
 
 [dependencies]
+jetstreamer-horizon.workspace = true
 agave-geyser-plugin-interface.workspace = true
 log.workspace = true

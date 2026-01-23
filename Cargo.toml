@@ -37,6 +37,9 @@ verify-transaction-signatures = ["jetstreamer-firehose/verify-transaction-signat
 jetstreamer-firehose = { path = "jetstreamer-firehose", version = "0.3.0" }
 jetstreamer-plugin = { path = "jetstreamer-plugin", version = "0.3.0" }
 jetstreamer-utils = { path = "jetstreamer-utils", version = "0.3.0" }
+jetstreamer-node = { path = "jetstreamer-node", version = "0.3.0" }
+jetstreamer-node-geyser = { path = "jetstreamer-node/geyser-plugin", version = "0.3.0" }
+jetstreamer-horizon = { path = "jetstreamer-horizon", version = "0.3.0" }
 tokio = "1"
 futures-util = { version = "0", default-features = false }
 futures = "0"

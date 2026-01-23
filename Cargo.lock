@@ -4114,6 +4114,7 @@ version = "0.3.0"
 dependencies = [
  "agave-geyser-plugin-interface",
  "jetstreamer-horizon",
+ "lencode",
  "log",
 ]
 

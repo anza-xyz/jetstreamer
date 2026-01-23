@@ -2,6 +2,7 @@ use agave_geyser_plugin_interface::geyser_plugin_interface::{
     GeyserPlugin, ReplicaBlockInfoVersions, Result,
 };
 use jetstreamer_horizon::account_updates::AccountUpdate;
+use lencode::prelude::*;
 use log::info;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -55,6 +56,12 @@ impl GeyserPlugin for JetstreamerNodeGeyserPlugin {
         self.account_updates.fetch_add(1, Ordering::Relaxed);
         let ac: AccountUpdate = account.into();
         info!("account update: {:?}", ac);
+        let mut out: Vec<u8> = vec![];
+        ac.encode(&mut out).unwrap();
+
+        info!("  in-memory size: {} bytes", ac.memory_size());
+        info!("    encoded size: {} bytes", out.len());
+        println!();
         Ok(())
     }
 

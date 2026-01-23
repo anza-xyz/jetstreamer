@@ -26,7 +26,12 @@ pub struct AccountUpdate {
     pub write_version: u64,
 }
 
-impl AccountUpdate {}
+impl AccountUpdate {
+    #[inline(always)]
+    pub fn memory_size(&self) -> usize {
+        core::mem::size_of::<Self>() + self.data.len()
+    }
+}
 
 impl From<&ReplicaAccountInfo<'_>> for AccountUpdate {
     #[inline]

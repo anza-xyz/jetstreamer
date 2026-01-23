@@ -344,10 +344,7 @@ impl ReplayFailure {
     }
 
     fn error_message(&self) -> Option<String> {
-        self.error
-            .lock()
-            .expect("replay failure lock")
-            .clone()
+        self.error.lock().expect("replay failure lock").clone()
     }
 }
 
@@ -386,7 +383,10 @@ impl TransactionScheduler {
             ));
         }
         let current_slot = state.current_slot;
-        let buffer = state.slots.entry(slot).or_insert_with(SlotExecutionBuffer::default);
+        let buffer = state
+            .slots
+            .entry(slot)
+            .or_insert_with(SlotExecutionBuffer::default);
         buffer.insert_transaction(index, tx)?;
         if slot != current_slot {
             return Ok(Vec::new());
@@ -410,7 +410,10 @@ impl TransactionScheduler {
             ));
         }
         let current_slot = state.current_slot;
-        let buffer = state.slots.entry(slot).or_insert_with(SlotExecutionBuffer::default);
+        let buffer = state
+            .slots
+            .entry(slot)
+            .or_insert_with(SlotExecutionBuffer::default);
         buffer.push_entry(entry_index, start_index, tx_count, hash)?;
         if slot != current_slot {
             return Ok(Vec::new());
@@ -1775,10 +1778,7 @@ async fn run_geyser_replay(
             let rt = match tokio::runtime::Runtime::new() {
                 Ok(rt) => Arc::new(rt),
                 Err(err) => {
-                    return Err((
-                        FirehoseError::OnLoadError(Box::new(err)),
-                        slot_range.start,
-                    ));
+                    return Err((FirehoseError::OnLoadError(Box::new(err)), slot_range.start));
                 }
             };
             firehose_geyser_with_notifiers(

@@ -82,8 +82,6 @@ impl GeyserPlugin for JetstreamerNodeGeyserPlugin {
 
         self.total_encoded_account_update_size
             .fetch_add(out.len() as u64, Ordering::Relaxed);
-
-        println!();
         Ok(())
     }
 

@@ -338,6 +338,7 @@ impl ReplayFailure {
     fn record(&self, message: String) {
         let mut guard = self.error.lock().expect("replay failure lock");
         if guard.is_none() {
+            warn!("replay failure: {message}");
             *guard = Some(message);
             self.shutdown.store(true, Ordering::SeqCst);
         }
@@ -428,10 +429,21 @@ impl TransactionScheduler {
         expected_entry_count: u64,
     ) -> Result<(SlotExecutionStats, Vec<ReadyEntry>), String> {
         let mut state = self.state.lock().expect("transaction scheduler lock");
-        if slot != state.current_slot {
+        if slot < state.current_slot {
             return Err(format!(
-                "block metadata for slot {slot} while current slot is {}",
+                "late block metadata for slot {slot} (current slot {})",
                 state.current_slot
+            ));
+        }
+        if let Some(pending_slot) = state
+            .slots
+            .keys()
+            .filter(|pending| **pending < slot)
+            .min()
+            .copied()
+        {
+            return Err(format!(
+                "block metadata for slot {slot} while pending slot {pending_slot} is unfinished"
             ));
         }
         let buffer = state
@@ -464,7 +476,7 @@ impl TransactionScheduler {
             ));
         }
 
-        state.current_slot = state.current_slot.saturating_add(1);
+        state.current_slot = slot.saturating_add(1);
         let next_slot = state.current_slot;
         let mut ready = Vec::new();
         if let Some(next_buffer) = state.slots.get_mut(&next_slot) {

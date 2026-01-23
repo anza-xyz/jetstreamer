@@ -3,7 +3,7 @@ members = ["jetstreamer-firehose", "jetstreamer-plugin", "jetstreamer-utils"]
 
 [workspace.package]
 edition = "2024"
-version = "0.3.0"
+version = "0.4.0"
 authors = ["sam0x17", "anza-team"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/anza-xyz/jetstreamer"
@@ -27,9 +27,9 @@ s3-backend = ["jetstreamer-firehose/s3-backend"]
 verify-transaction-signatures = ["jetstreamer-firehose/verify-transaction-signatures"]
 
 [workspace.dependencies]
-jetstreamer-firehose = { path = "jetstreamer-firehose", version = "0.3.0" }
-jetstreamer-plugin = { path = "jetstreamer-plugin", version = "0.3.0" }
-jetstreamer-utils = { path = "jetstreamer-utils", version = "0.3.0" }
+jetstreamer-firehose = { path = "jetstreamer-firehose", version = "0.4.0" }
+jetstreamer-plugin = { path = "jetstreamer-plugin", version = "0.4.0" }
+jetstreamer-utils = { path = "jetstreamer-utils", version = "0.4.0" }
 tokio = "1"
 futures-util = { version = "0", default-features = false }
 futures = "0"

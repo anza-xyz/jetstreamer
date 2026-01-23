@@ -4,8 +4,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Stdio, exit},
     sync::{
-        Arc,
-        RwLock,
+        Arc, RwLock,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
@@ -28,13 +27,13 @@ use jetstreamer_node::snapshots::{
 };
 use log::{info, warn};
 use reqwest::Client;
+use solana_account::AccountSharedData;
 use solana_accounts_db::{
     accounts_db::AccountsDbConfig,
     accounts_update_notifier_interface::{
         AccountForGeyser, AccountsUpdateNotifier, AccountsUpdateNotifierInterface,
     },
 };
-use solana_account::AccountSharedData;
 use solana_clock::Slot;
 use solana_genesis_utils::{MAX_GENESIS_ARCHIVE_UNPACKED_SIZE, open_genesis_config};
 use solana_geyser_plugin_manager::geyser_plugin_service::GeyserPluginService;
@@ -42,11 +41,8 @@ use solana_hash::Hash;
 use solana_ledger::entry_notifier_interface::EntryNotifier;
 use solana_rpc::transaction_notifier_interface::TransactionNotifier;
 use solana_runtime::{
-    bank::Bank,
-    bank_forks::BankForks,
-    installed_scheduler_pool::BankWithScheduler,
-    runtime_config::RuntimeConfig,
-    snapshot_bank_utils, snapshot_utils,
+    bank::Bank, bank_forks::BankForks, installed_scheduler_pool::BankWithScheduler,
+    runtime_config::RuntimeConfig, snapshot_bank_utils, snapshot_utils,
 };
 use solana_signature::Signature;
 use solana_transaction::sanitized::SanitizedTransaction;
@@ -99,8 +95,7 @@ impl SnapshotVerifier {
         if actual_hash != expected_hash {
             let message = format!(
                 "snapshot hash mismatch at slot {slot}: expected {}, got {}",
-                expected_hash.0,
-                actual_hash.0
+                expected_hash.0, actual_hash.0
             );
             warn!("{message}");
             self.record_error(message);
@@ -1472,7 +1467,10 @@ async fn main() {
                 exit(1);
             }
         };
-        info!("snapshot verification enabled for {} snapshot(s)", expected.len());
+        info!(
+            "snapshot verification enabled for {} snapshot(s)",
+            expected.len()
+        );
         Some(Arc::new(SnapshotVerifier::new(
             expected,
             Some(shutdown.clone()),
@@ -1481,14 +1479,8 @@ async fn main() {
         None
     };
 
-    if let Err(err) = run_geyser_replay(
-        epoch,
-        &dest_dir,
-        &dest_path,
-        shutdown,
-        snapshot_verifier,
-    )
-    .await
+    if let Err(err) =
+        run_geyser_replay(epoch, &dest_dir, &dest_path, shutdown, snapshot_verifier).await
     {
         eprintln!("error: {err}");
         exit(1);

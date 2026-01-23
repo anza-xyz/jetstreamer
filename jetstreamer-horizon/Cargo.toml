@@ -1,0 +1,21 @@
+[package]
+name = "jetstreamer-horizon"
+edition.workspace = true
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+
+[dependencies]
+lencode.workspace = true
+agave-geyser-plugin-interface.workspace = true
+solana-message.workspace = true
+solana-transaction.workspace = true
+solana-transaction-status.workspace = true
+solana-hash.workspace = true
+solana-signature.workspace = true
+solana-pubkey.workspace = true
+solana-clock.workspace = true
+solana-reward-info.workspace = true

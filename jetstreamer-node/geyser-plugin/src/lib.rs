@@ -2,9 +2,7 @@ use agave_geyser_plugin_interface::geyser_plugin_interface::{
     GeyserPlugin, ReplicaBlockInfoVersions, Result,
 };
 use log::info;
-use std::{
-    sync::atomic::{AtomicU64, Ordering},
-};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Debug)]
 struct JetstreamerNodeGeyserPlugin {

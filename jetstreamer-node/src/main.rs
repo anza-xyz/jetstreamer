@@ -322,14 +322,53 @@ impl ReplayProgress {
 }
 
 #[derive(Debug)]
+struct ReplayFailure {
+    shutdown: Arc<AtomicBool>,
+    error: Mutex<Option<String>>,
+}
+
+impl ReplayFailure {
+    fn new(shutdown: Arc<AtomicBool>) -> Self {
+        Self {
+            shutdown,
+            error: Mutex::new(None),
+        }
+    }
+
+    fn record(&self, message: String) {
+        let mut guard = self.error.lock().expect("replay failure lock");
+        if guard.is_none() {
+            *guard = Some(message);
+            self.shutdown.store(true, Ordering::SeqCst);
+        }
+    }
+
+    fn error_message(&self) -> Option<String> {
+        self.error
+            .lock()
+            .expect("replay failure lock")
+            .clone()
+    }
+}
+
+#[derive(Debug)]
 struct TransactionScheduler {
-    slots: Mutex<HashMap<Slot, SlotExecutionBuffer>>,
+    state: Mutex<SchedulerState>,
+}
+
+#[derive(Debug)]
+struct SchedulerState {
+    current_slot: Slot,
+    slots: HashMap<Slot, SlotExecutionBuffer>,
 }
 
 impl TransactionScheduler {
-    fn new() -> Self {
+    fn new(start_slot: Slot) -> Self {
         Self {
-            slots: Mutex::new(HashMap::new()),
+            state: Mutex::new(SchedulerState {
+                current_slot: start_slot,
+                slots: HashMap::new(),
+            }),
         }
     }
 
@@ -338,12 +377,20 @@ impl TransactionScheduler {
         slot: Slot,
         index: usize,
         tx: VersionedTransaction,
-    ) -> Vec<ReadyEntry> {
-        let mut guard = self.slots.lock().expect("transaction scheduler lock");
-        let buffer = guard
-            .entry(slot)
-            .or_insert_with(SlotExecutionBuffer::default);
-        buffer.insert_transaction(index, tx);
+    ) -> Result<Vec<ReadyEntry>, String> {
+        let mut state = self.state.lock().expect("transaction scheduler lock");
+        if slot < state.current_slot {
+            return Err(format!(
+                "late transaction for slot {slot} (current slot {})",
+                state.current_slot
+            ));
+        }
+        let current_slot = state.current_slot;
+        let buffer = state.slots.entry(slot).or_insert_with(SlotExecutionBuffer::default);
+        buffer.insert_transaction(index, tx)?;
+        if slot != current_slot {
+            return Ok(Vec::new());
+        }
         buffer.drain_ready_entries(slot)
     }
 
@@ -354,12 +401,20 @@ impl TransactionScheduler {
         start_index: usize,
         tx_count: usize,
         hash: Hash,
-    ) -> Vec<ReadyEntry> {
-        let mut guard = self.slots.lock().expect("transaction scheduler lock");
-        let buffer = guard
-            .entry(slot)
-            .or_insert_with(SlotExecutionBuffer::default);
-        buffer.push_entry(entry_index, start_index, tx_count, hash);
+    ) -> Result<Vec<ReadyEntry>, String> {
+        let mut state = self.state.lock().expect("transaction scheduler lock");
+        if slot < state.current_slot {
+            return Err(format!(
+                "late entry for slot {slot} (current slot {})",
+                state.current_slot
+            ));
+        }
+        let current_slot = state.current_slot;
+        let buffer = state.slots.entry(slot).or_insert_with(SlotExecutionBuffer::default);
+        buffer.push_entry(entry_index, start_index, tx_count, hash)?;
+        if slot != current_slot {
+            return Ok(Vec::new());
+        }
         buffer.drain_ready_entries(slot)
     }
 
@@ -368,9 +423,19 @@ impl TransactionScheduler {
         slot: Slot,
         expected_tx_count: u64,
         expected_entry_count: u64,
-    ) -> Option<SlotExecutionStats> {
-        let mut guard = self.slots.lock().expect("transaction scheduler lock");
-        guard.remove(&slot).map(|buffer| SlotExecutionStats {
+    ) -> Result<(SlotExecutionStats, Vec<ReadyEntry>), String> {
+        let mut state = self.state.lock().expect("transaction scheduler lock");
+        if slot != state.current_slot {
+            return Err(format!(
+                "block metadata for slot {slot} while current slot is {}",
+                state.current_slot
+            ));
+        }
+        let buffer = state
+            .slots
+            .remove(&slot)
+            .unwrap_or_else(SlotExecutionBuffer::default);
+        let stats = SlotExecutionStats {
             slot,
             expected_tx_count,
             expected_entry_count,
@@ -378,7 +443,31 @@ impl TransactionScheduler {
             processed_entry_count: buffer.processed_entry_count,
             pending_entries: buffer.pending_entries.len(),
             buffered_transactions: buffer.txs.iter().filter(|value| value.is_some()).count(),
-        })
+        };
+        if stats.processed_tx_count != stats.expected_tx_count
+            || stats.processed_entry_count != stats.expected_entry_count
+            || stats.pending_entries > 0
+            || stats.buffered_transactions > 0
+        {
+            return Err(format!(
+                "slot {} replay mismatch: processed txs {}/{} entries {}/{} pending_entries={} buffered_txs={}",
+                stats.slot,
+                stats.processed_tx_count,
+                stats.expected_tx_count,
+                stats.processed_entry_count,
+                stats.expected_entry_count,
+                stats.pending_entries,
+                stats.buffered_transactions,
+            ));
+        }
+
+        state.current_slot = state.current_slot.saturating_add(1);
+        let next_slot = state.current_slot;
+        let mut ready = Vec::new();
+        if let Some(next_buffer) = state.slots.get_mut(&next_slot) {
+            ready = next_buffer.drain_ready_entries(next_slot)?;
+        }
+        Ok((stats, ready))
     }
 }
 
@@ -392,24 +481,29 @@ struct SlotExecutionBuffer {
 }
 
 impl SlotExecutionBuffer {
-    fn insert_transaction(&mut self, index: usize, tx: VersionedTransaction) {
+    fn insert_transaction(&mut self, index: usize, tx: VersionedTransaction) -> Result<(), String> {
         if self.txs.len() <= index {
             self.txs.resize_with(index + 1, || None);
         }
         if self.txs[index].is_some() {
-            log::debug!("duplicate transaction at index {index}");
+            return Err(format!("duplicate transaction at index {index}"));
         }
         self.txs[index] = Some(tx);
+        Ok(())
     }
 
-    fn push_entry(&mut self, entry_index: usize, start_index: usize, tx_count: usize, hash: Hash) {
+    fn push_entry(
+        &mut self,
+        entry_index: usize,
+        start_index: usize,
+        tx_count: usize,
+        hash: Hash,
+    ) -> Result<(), String> {
         if entry_index != self.next_entry_index {
-            log::debug!(
+            return Err(format!(
                 "entry index out of order: expected {}, got {}",
-                self.next_entry_index,
-                entry_index
-            );
-            self.next_entry_index = entry_index;
+                self.next_entry_index, entry_index
+            ));
         }
         self.next_entry_index = self.next_entry_index.saturating_add(1);
         self.pending_entries.push_back(PendingEntry {
@@ -418,9 +512,10 @@ impl SlotExecutionBuffer {
             tx_count,
             hash,
         });
+        Ok(())
     }
 
-    fn drain_ready_entries(&mut self, slot: Slot) -> Vec<ReadyEntry> {
+    fn drain_ready_entries(&mut self, slot: Slot) -> Result<Vec<ReadyEntry>, String> {
         let mut ready = Vec::new();
         loop {
             let Some(entry) = self.pending_entries.front() else {
@@ -474,7 +569,7 @@ impl SlotExecutionBuffer {
                 tx_count: entry.tx_count,
             });
         }
-        ready
+        Ok(ready)
     }
 }
 
@@ -558,6 +653,7 @@ struct BankTransactionNotifier {
     bank_replay: Arc<BankReplay>,
     progress: Arc<ReplayProgress>,
     scheduler: Arc<TransactionScheduler>,
+    failure: Arc<ReplayFailure>,
     delegate: Option<Arc<dyn TransactionNotifier + Send + Sync + 'static>>,
 }
 
@@ -574,10 +670,13 @@ impl TransactionNotifier for BankTransactionNotifier {
     ) {
         self.progress.note_slot(slot);
         self.progress.inc_tx();
-        let ready_entries =
-            self.scheduler
-                .insert_transaction(slot, transaction_slot_index, transaction.clone());
-        self.bank_replay.process_ready_entries(ready_entries);
+        match self
+            .scheduler
+            .insert_transaction(slot, transaction_slot_index, transaction.clone())
+        {
+            Ok(ready_entries) => self.bank_replay.process_ready_entries(ready_entries),
+            Err(err) => self.failure.record(err),
+        }
 
         if let Some(delegate) = self.delegate.as_ref() {
             delegate.notify_transaction(
@@ -597,6 +696,7 @@ struct BankEntryNotifier {
     bank_replay: Arc<BankReplay>,
     progress: Arc<ReplayProgress>,
     scheduler: Arc<TransactionScheduler>,
+    failure: Arc<ReplayFailure>,
     delegate: Option<Arc<dyn EntryNotifier + Send + Sync + 'static>>,
 }
 
@@ -609,14 +709,16 @@ impl EntryNotifier for BankEntryNotifier {
         starting_transaction_index: usize,
     ) {
         self.progress.note_slot(slot);
-        let ready_entries = self.scheduler.push_entry(
+        match self.scheduler.push_entry(
             slot,
             index,
             starting_transaction_index,
             entry.num_transactions as usize,
             entry.hash,
-        );
-        self.bank_replay.process_ready_entries(ready_entries);
+        ) {
+            Ok(ready_entries) => self.bank_replay.process_ready_entries(ready_entries),
+            Err(err) => self.failure.record(err),
+        }
 
         if let Some(delegate) = self.delegate.as_ref() {
             delegate.notify_entry(slot, index, entry, starting_transaction_index);
@@ -626,6 +728,8 @@ impl EntryNotifier for BankEntryNotifier {
 
 struct BankBlockMetadataNotifier {
     scheduler: Arc<TransactionScheduler>,
+    bank_replay: Arc<BankReplay>,
+    failure: Arc<ReplayFailure>,
     delegate: Option<BlockMetadataNotifierArc>,
 }
 
@@ -642,26 +746,16 @@ impl BlockMetadataNotifier for BankBlockMetadataNotifier {
         executed_transaction_count: u64,
         entry_count: u64,
     ) {
-        if let Some(stats) =
-            self.scheduler
-                .finalize_slot(slot, executed_transaction_count, entry_count)
+        match self
+            .scheduler
+            .finalize_slot(slot, executed_transaction_count, entry_count)
         {
-            if stats.processed_tx_count != stats.expected_tx_count
-                || stats.processed_entry_count != stats.expected_entry_count
-                || stats.pending_entries > 0
-                || stats.buffered_transactions > 0
-            {
-                warn!(
-                    "slot {} replay mismatch: processed txs {}/{} entries {}/{} pending_entries={} buffered_txs={}",
-                    stats.slot,
-                    stats.processed_tx_count,
-                    stats.expected_tx_count,
-                    stats.processed_entry_count,
-                    stats.expected_entry_count,
-                    stats.pending_entries,
-                    stats.buffered_transactions,
-                );
+            Ok((_stats, ready_entries)) => {
+                if !ready_entries.is_empty() {
+                    self.bank_replay.process_ready_entries(ready_entries);
+                }
             }
+            Err(err) => self.failure.record(err),
         }
 
         if let Some(delegate) = self.delegate.as_ref() {
@@ -1535,7 +1629,8 @@ async fn run_geyser_replay(
         .map_err(|err| format!("failed to load geyser plugin: {err}"))?;
     let (start_slot, end_inclusive) = epoch_to_slot_range(epoch);
     let progress = Arc::new(ReplayProgress::new(start_slot));
-    let scheduler = Arc::new(TransactionScheduler::new());
+    let failure = Arc::new(ReplayFailure::new(shutdown.clone()));
+    let scheduler = Arc::new(TransactionScheduler::new(start_slot));
     let accounts_update_notifier = service.get_accounts_update_notifier().map(|delegate| {
         Arc::new(ProgressAccountsUpdateNotifier {
             progress: progress.clone(),
@@ -1584,16 +1679,20 @@ async fn run_geyser_replay(
         bank_replay: bank_replay.clone(),
         progress: progress.clone(),
         scheduler: scheduler.clone(),
+        failure: failure.clone(),
         delegate: service.get_transaction_notifier(),
     });
     let entry_notifier = Arc::new(BankEntryNotifier {
         bank_replay: bank_replay.clone(),
         progress: progress.clone(),
         scheduler: scheduler.clone(),
+        failure: failure.clone(),
         delegate: service.get_entry_notifier(),
     });
     let block_metadata_notifier = Arc::new(BankBlockMetadataNotifier {
         scheduler: scheduler.clone(),
+        bank_replay: bank_replay.clone(),
+        failure: failure.clone(),
         delegate: service.get_block_metadata_notifier(),
     });
     let notifiers = GeyserNotifiers {
@@ -1686,6 +1785,10 @@ async fn run_geyser_replay(
     service
         .join()
         .map_err(|err| format!("geyser service join failed: {err:?}"))?;
+
+    if let Some(message) = failure.error_message() {
+        return Err(message);
+    }
 
     if let Some(verifier) = snapshot_verifier {
         bank_replay.verify_latest_bank()?;

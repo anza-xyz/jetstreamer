@@ -1,10 +1,10 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap, VecDeque},
     env, fs,
     path::{Path, PathBuf},
     process::{Stdio, exit},
     sync::{
-        Arc, RwLock,
+        Arc, Mutex, RwLock,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
@@ -36,6 +36,9 @@ use solana_accounts_db::{
 };
 use solana_clock::Slot;
 use solana_genesis_utils::{MAX_GENESIS_ARCHIVE_UNPACKED_SIZE, open_genesis_config};
+use solana_geyser_plugin_manager::block_metadata_notifier_interface::{
+    BlockMetadataNotifier, BlockMetadataNotifierArc,
+};
 use solana_geyser_plugin_manager::geyser_plugin_service::GeyserPluginService;
 use solana_hash::Hash;
 use solana_ledger::entry_notifier_interface::EntryNotifier;
@@ -210,6 +213,57 @@ impl BankReplay {
         Ok(())
     }
 
+    fn process_ready_entries(&self, entries: Vec<ReadyEntry>) {
+        for entry in entries {
+            if entry.tx_count == 0 {
+                if let Err(err) = self.register_tick(entry.slot, entry.hash) {
+                    log::debug!(
+                        "failed to register tick for slot {} entry {}: {}",
+                        entry.slot,
+                        entry.entry_index,
+                        err
+                    );
+                }
+                continue;
+            }
+
+            match self.bank_for_slot(entry.slot) {
+                Ok(bank) => match bank.try_process_entry_transactions(entry.txs) {
+                    Ok(results) => {
+                        for (offset, result) in results.into_iter().enumerate() {
+                            if let Err(err) = result {
+                                let tx_index = entry.start_index.saturating_add(offset);
+                                log::debug!(
+                                    "transaction execution failed at slot {} entry {} index {}: {}",
+                                    entry.slot,
+                                    entry.entry_index,
+                                    tx_index,
+                                    err
+                                );
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        log::debug!(
+                            "transaction batch execution failed at slot {} entry {}: {}",
+                            entry.slot,
+                            entry.entry_index,
+                            err
+                        );
+                    }
+                },
+                Err(err) => {
+                    log::debug!(
+                        "skipping transaction execution at slot {} entry {}: {}",
+                        entry.slot,
+                        entry.entry_index,
+                        err
+                    );
+                }
+            }
+        }
+    }
+
     fn verify_latest_bank(&self) -> Result<(), String> {
         let bank = {
             let guard = self
@@ -268,6 +322,192 @@ impl ReplayProgress {
 }
 
 #[derive(Debug)]
+struct TransactionScheduler {
+    slots: Mutex<HashMap<Slot, SlotExecutionBuffer>>,
+}
+
+impl TransactionScheduler {
+    fn new() -> Self {
+        Self {
+            slots: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn insert_transaction(
+        &self,
+        slot: Slot,
+        index: usize,
+        tx: VersionedTransaction,
+    ) -> Vec<ReadyEntry> {
+        let mut guard = self.slots.lock().expect("transaction scheduler lock");
+        let buffer = guard
+            .entry(slot)
+            .or_insert_with(SlotExecutionBuffer::default);
+        buffer.insert_transaction(index, tx);
+        buffer.drain_ready_entries(slot)
+    }
+
+    fn push_entry(
+        &self,
+        slot: Slot,
+        entry_index: usize,
+        start_index: usize,
+        tx_count: usize,
+        hash: Hash,
+    ) -> Vec<ReadyEntry> {
+        let mut guard = self.slots.lock().expect("transaction scheduler lock");
+        let buffer = guard
+            .entry(slot)
+            .or_insert_with(SlotExecutionBuffer::default);
+        buffer.push_entry(entry_index, start_index, tx_count, hash);
+        buffer.drain_ready_entries(slot)
+    }
+
+    fn finalize_slot(
+        &self,
+        slot: Slot,
+        expected_tx_count: u64,
+        expected_entry_count: u64,
+    ) -> Option<SlotExecutionStats> {
+        let mut guard = self.slots.lock().expect("transaction scheduler lock");
+        guard.remove(&slot).map(|buffer| SlotExecutionStats {
+            slot,
+            expected_tx_count,
+            expected_entry_count,
+            processed_tx_count: buffer.processed_tx_count,
+            processed_entry_count: buffer.processed_entry_count,
+            pending_entries: buffer.pending_entries.len(),
+            buffered_transactions: buffer.txs.iter().filter(|value| value.is_some()).count(),
+        })
+    }
+}
+
+#[derive(Debug, Default)]
+struct SlotExecutionBuffer {
+    txs: Vec<Option<VersionedTransaction>>,
+    pending_entries: VecDeque<PendingEntry>,
+    next_entry_index: usize,
+    processed_tx_count: u64,
+    processed_entry_count: u64,
+}
+
+impl SlotExecutionBuffer {
+    fn insert_transaction(&mut self, index: usize, tx: VersionedTransaction) {
+        if self.txs.len() <= index {
+            self.txs.resize_with(index + 1, || None);
+        }
+        if self.txs[index].is_some() {
+            log::debug!("duplicate transaction at index {index}");
+        }
+        self.txs[index] = Some(tx);
+    }
+
+    fn push_entry(&mut self, entry_index: usize, start_index: usize, tx_count: usize, hash: Hash) {
+        if entry_index != self.next_entry_index {
+            log::debug!(
+                "entry index out of order: expected {}, got {}",
+                self.next_entry_index,
+                entry_index
+            );
+            self.next_entry_index = entry_index;
+        }
+        self.next_entry_index = self.next_entry_index.saturating_add(1);
+        self.pending_entries.push_back(PendingEntry {
+            entry_index,
+            start_index,
+            tx_count,
+            hash,
+        });
+    }
+
+    fn drain_ready_entries(&mut self, slot: Slot) -> Vec<ReadyEntry> {
+        let mut ready = Vec::new();
+        loop {
+            let Some(entry) = self.pending_entries.front() else {
+                break;
+            };
+            if entry.tx_count == 0 {
+                let entry = self.pending_entries.pop_front().expect("pending entry");
+                self.processed_entry_count = self.processed_entry_count.saturating_add(1);
+                ready.push(ReadyEntry {
+                    slot,
+                    entry_index: entry.entry_index,
+                    start_index: entry.start_index,
+                    txs: Vec::new(),
+                    hash: entry.hash,
+                    tx_count: 0,
+                });
+                continue;
+            }
+
+            let end = entry.start_index.saturating_add(entry.tx_count);
+            if self.txs.len() < end {
+                break;
+            }
+            let mut missing = false;
+            for idx in entry.start_index..end {
+                if self.txs[idx].is_none() {
+                    missing = true;
+                    break;
+                }
+            }
+            if missing {
+                break;
+            }
+
+            let entry = self.pending_entries.pop_front().expect("pending entry");
+            let mut txs = Vec::with_capacity(entry.tx_count);
+            for idx in entry.start_index..end {
+                let tx = self.txs[idx].take().expect("transaction present");
+                txs.push(tx);
+            }
+            self.processed_entry_count = self.processed_entry_count.saturating_add(1);
+            self.processed_tx_count = self
+                .processed_tx_count
+                .saturating_add(entry.tx_count as u64);
+            ready.push(ReadyEntry {
+                slot,
+                entry_index: entry.entry_index,
+                start_index: entry.start_index,
+                txs,
+                hash: entry.hash,
+                tx_count: entry.tx_count,
+            });
+        }
+        ready
+    }
+}
+
+#[derive(Debug)]
+struct PendingEntry {
+    entry_index: usize,
+    start_index: usize,
+    tx_count: usize,
+    hash: Hash,
+}
+
+#[derive(Debug)]
+struct ReadyEntry {
+    slot: Slot,
+    entry_index: usize,
+    start_index: usize,
+    txs: Vec<VersionedTransaction>,
+    hash: Hash,
+    tx_count: usize,
+}
+
+#[derive(Debug)]
+struct SlotExecutionStats {
+    slot: Slot,
+    expected_tx_count: u64,
+    expected_entry_count: u64,
+    processed_tx_count: u64,
+    processed_entry_count: u64,
+    pending_entries: usize,
+    buffered_transactions: usize,
+}
+
+#[derive(Debug)]
 struct ProgressAccountsUpdateNotifier {
     progress: Arc<ReplayProgress>,
     delegate: Option<AccountsUpdateNotifier>,
@@ -317,6 +557,7 @@ impl AccountsUpdateNotifierInterface for ProgressAccountsUpdateNotifier {
 struct BankTransactionNotifier {
     bank_replay: Arc<BankReplay>,
     progress: Arc<ReplayProgress>,
+    scheduler: Arc<TransactionScheduler>,
     delegate: Option<Arc<dyn TransactionNotifier + Send + Sync + 'static>>,
 }
 
@@ -333,27 +574,10 @@ impl TransactionNotifier for BankTransactionNotifier {
     ) {
         self.progress.note_slot(slot);
         self.progress.inc_tx();
-        match self.bank_replay.bank_for_slot(slot) {
-            Ok(bank) => match bank.try_process_entry_transactions(vec![transaction.clone()]) {
-                Ok(mut results) => {
-                    if let Some(Err(err)) = results.pop() {
-                        log::debug!(
-                            "transaction execution failed at slot {slot} index {transaction_slot_index}: {err}"
-                        );
-                    }
-                }
-                Err(err) => {
-                    log::debug!(
-                        "transaction batch execution failed at slot {slot} index {transaction_slot_index}: {err}"
-                    );
-                }
-            },
-            Err(err) => {
-                log::debug!(
-                    "skipping transaction execution at slot {slot} index {transaction_slot_index}: {err}"
-                );
-            }
-        }
+        let ready_entries =
+            self.scheduler
+                .insert_transaction(slot, transaction_slot_index, transaction.clone());
+        self.bank_replay.process_ready_entries(ready_entries);
 
         if let Some(delegate) = self.delegate.as_ref() {
             delegate.notify_transaction(
@@ -372,6 +596,7 @@ impl TransactionNotifier for BankTransactionNotifier {
 struct BankEntryNotifier {
     bank_replay: Arc<BankReplay>,
     progress: Arc<ReplayProgress>,
+    scheduler: Arc<TransactionScheduler>,
     delegate: Option<Arc<dyn EntryNotifier + Send + Sync + 'static>>,
 }
 
@@ -384,14 +609,73 @@ impl EntryNotifier for BankEntryNotifier {
         starting_transaction_index: usize,
     ) {
         self.progress.note_slot(slot);
-        if entry.num_transactions == 0 {
-            if let Err(err) = self.bank_replay.register_tick(slot, entry.hash) {
-                log::debug!("failed to register tick for slot {slot} entry {index}: {err}");
+        let ready_entries = self.scheduler.push_entry(
+            slot,
+            index,
+            starting_transaction_index,
+            entry.num_transactions as usize,
+            entry.hash,
+        );
+        self.bank_replay.process_ready_entries(ready_entries);
+
+        if let Some(delegate) = self.delegate.as_ref() {
+            delegate.notify_entry(slot, index, entry, starting_transaction_index);
+        }
+    }
+}
+
+struct BankBlockMetadataNotifier {
+    scheduler: Arc<TransactionScheduler>,
+    delegate: Option<BlockMetadataNotifierArc>,
+}
+
+impl BlockMetadataNotifier for BankBlockMetadataNotifier {
+    fn notify_block_metadata(
+        &self,
+        parent_slot: u64,
+        parent_blockhash: &str,
+        slot: u64,
+        blockhash: &str,
+        rewards: &solana_runtime::bank::KeyedRewardsAndNumPartitions,
+        block_time: Option<solana_clock::UnixTimestamp>,
+        block_height: Option<u64>,
+        executed_transaction_count: u64,
+        entry_count: u64,
+    ) {
+        if let Some(stats) =
+            self.scheduler
+                .finalize_slot(slot, executed_transaction_count, entry_count)
+        {
+            if stats.processed_tx_count != stats.expected_tx_count
+                || stats.processed_entry_count != stats.expected_entry_count
+                || stats.pending_entries > 0
+                || stats.buffered_transactions > 0
+            {
+                warn!(
+                    "slot {} replay mismatch: processed txs {}/{} entries {}/{} pending_entries={} buffered_txs={}",
+                    stats.slot,
+                    stats.processed_tx_count,
+                    stats.expected_tx_count,
+                    stats.processed_entry_count,
+                    stats.expected_entry_count,
+                    stats.pending_entries,
+                    stats.buffered_transactions,
+                );
             }
         }
 
         if let Some(delegate) = self.delegate.as_ref() {
-            delegate.notify_entry(slot, index, entry, starting_transaction_index);
+            delegate.notify_block_metadata(
+                parent_slot,
+                parent_blockhash,
+                slot,
+                blockhash,
+                rewards,
+                block_time,
+                block_height,
+                executed_transaction_count,
+                entry_count,
+            );
         }
     }
 }
@@ -463,7 +747,8 @@ fn find_existing_snapshot_archive(
         if !file_type.is_file() {
             continue;
         }
-        let Some(name) = entry.file_name().to_str() else {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
             continue;
         };
         let (slot, _) = match parse_snapshot_archive_name(name) {
@@ -532,7 +817,8 @@ fn has_extracted_snapshot(dest_dir: &Path, slot: Slot) -> Result<bool, String> {
         if !file_type.is_file() {
             continue;
         }
-        let Some(name) = entry.file_name().to_str() else {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
             continue;
         };
         if looks_like_appendvec(name) {
@@ -1249,6 +1535,7 @@ async fn run_geyser_replay(
         .map_err(|err| format!("failed to load geyser plugin: {err}"))?;
     let (start_slot, end_inclusive) = epoch_to_slot_range(epoch);
     let progress = Arc::new(ReplayProgress::new(start_slot));
+    let scheduler = Arc::new(TransactionScheduler::new());
     let accounts_update_notifier = service.get_accounts_update_notifier().map(|delegate| {
         Arc::new(ProgressAccountsUpdateNotifier {
             progress: progress.clone(),
@@ -1296,17 +1583,23 @@ async fn run_geyser_replay(
     let transaction_notifier = Arc::new(BankTransactionNotifier {
         bank_replay: bank_replay.clone(),
         progress: progress.clone(),
+        scheduler: scheduler.clone(),
         delegate: service.get_transaction_notifier(),
     });
     let entry_notifier = Arc::new(BankEntryNotifier {
         bank_replay: bank_replay.clone(),
         progress: progress.clone(),
+        scheduler: scheduler.clone(),
         delegate: service.get_entry_notifier(),
+    });
+    let block_metadata_notifier = Arc::new(BankBlockMetadataNotifier {
+        scheduler: scheduler.clone(),
+        delegate: service.get_block_metadata_notifier(),
     });
     let notifiers = GeyserNotifiers {
         transaction_notifier: Some(transaction_notifier),
         entry_notifier: Some(entry_notifier),
-        block_metadata_notifier: service.get_block_metadata_notifier(),
+        block_metadata_notifier: Some(block_metadata_notifier),
     };
     let mut threads = firehose_threads();
     if threads > 1 {

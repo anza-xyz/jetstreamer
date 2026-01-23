@@ -4,7 +4,7 @@ use agave_geyser_plugin_interface::geyser_plugin_interface::{
 use lencode::prelude::*;
 use solana_pubkey::Pubkey;
 
-#[derive(Encode, Decode, Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Encode, Decode, Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(C)]
 pub struct AccountUpdate {
     pub pubkey: Pubkey,

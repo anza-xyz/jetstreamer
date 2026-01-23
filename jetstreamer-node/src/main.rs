@@ -440,6 +440,108 @@ fn parse_snapshot_archive_name(name: &str) -> Result<(Slot, SnapshotHash), Strin
     Ok((slot, SnapshotHash(hash)))
 }
 
+struct SnapshotArchiveCandidate {
+    path: PathBuf,
+    slot: Slot,
+}
+
+fn find_existing_snapshot_archive(
+    dest_dir: &Path,
+    target_slot: Slot,
+) -> Result<Option<SnapshotArchiveCandidate>, String> {
+    if !dest_dir.is_dir() {
+        return Ok(None);
+    }
+    let read_dir = fs::read_dir(dest_dir)
+        .map_err(|err| format!("failed to read {}: {err}", dest_dir.display()))?;
+    let mut best: Option<SnapshotArchiveCandidate> = None;
+    for entry in read_dir {
+        let entry = entry.map_err(|err| format!("failed to read dir entry: {err}"))?;
+        let file_type = entry
+            .file_type()
+            .map_err(|err| format!("failed to read file type: {err}"))?;
+        if !file_type.is_file() {
+            continue;
+        }
+        let Some(name) = entry.file_name().to_str() else {
+            continue;
+        };
+        let (slot, _) = match parse_snapshot_archive_name(name) {
+            Ok(parsed) => parsed,
+            Err(_) => continue,
+        };
+        if slot > target_slot {
+            continue;
+        }
+        let metadata = entry
+            .metadata()
+            .map_err(|err| format!("failed to read metadata for {}: {err}", name))?;
+        if metadata.len() == 0 {
+            continue;
+        }
+        let candidate = SnapshotArchiveCandidate {
+            path: entry.path(),
+            slot,
+        };
+        match best.as_ref() {
+            Some(current) if current.slot >= candidate.slot => {}
+            _ => best = Some(candidate),
+        }
+    }
+    Ok(best)
+}
+
+fn has_extracted_snapshot(dest_dir: &Path, slot: Slot) -> Result<bool, String> {
+    let snapshots_dir = dest_dir.join(BANK_SNAPSHOTS_DIR);
+    let slot_dir = snapshots_dir.join(slot.to_string());
+    if !slot_dir.is_dir() {
+        return Ok(false);
+    }
+    let slot_has_files = slot_dir
+        .read_dir()
+        .map_err(|err| format!("failed to read {}: {err}", slot_dir.display()))?
+        .next()
+        .is_some();
+    if !slot_has_files {
+        return Ok(false);
+    }
+    let accounts_dir = dest_dir.join("accounts");
+    if !accounts_dir.is_dir() {
+        return Ok(false);
+    }
+    let snapshot_accounts_dir = accounts_dir
+        .join(ACCOUNTS_SNAPSHOT_DIR)
+        .join(slot.to_string());
+    if snapshot_accounts_dir.is_dir() {
+        let has_files = snapshot_accounts_dir
+            .read_dir()
+            .map_err(|err| format!("failed to read {}: {err}", snapshot_accounts_dir.display()))?
+            .next()
+            .is_some();
+        if has_files {
+            return Ok(true);
+        }
+    }
+    let read_dir = fs::read_dir(&accounts_dir)
+        .map_err(|err| format!("failed to read {}: {err}", accounts_dir.display()))?;
+    for entry in read_dir {
+        let entry = entry.map_err(|err| format!("failed to read dir entry: {err}"))?;
+        let file_type = entry
+            .file_type()
+            .map_err(|err| format!("failed to read file type: {err}"))?;
+        if !file_type.is_file() {
+            continue;
+        }
+        let Some(name) = entry.file_name().to_str() else {
+            continue;
+        };
+        if looks_like_appendvec(name) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 async fn snapshot_expectations_for_epoch(
     epoch: u64,
 ) -> Result<BTreeMap<Slot, SnapshotHash>, String> {
@@ -1438,23 +1540,60 @@ async fn main() {
     };
 
     let target_slot = epoch_to_slot(epoch).saturating_sub(1);
-    let dest_path = match download_snapshot_at_or_before_slot(epoch, target_slot, &dest_dir).await {
-        Ok(path) => path,
+    let mut extracted_snapshot = false;
+    let dest_path = match find_existing_snapshot_archive(&dest_dir, target_slot) {
+        Ok(Some(candidate)) => {
+            extracted_snapshot = match has_extracted_snapshot(&dest_dir, candidate.slot) {
+                Ok(has_snapshot) => has_snapshot,
+                Err(err) => {
+                    eprintln!("error: {err}");
+                    exit(1);
+                }
+            };
+            if extracted_snapshot {
+                println!(
+                    "Found existing snapshot archive at {} with extracted data; skipping download",
+                    candidate.path.display()
+                );
+            } else {
+                println!(
+                    "Found existing snapshot archive at {}; skipping download",
+                    candidate.path.display()
+                );
+            }
+            candidate.path
+        }
+        Ok(None) => {
+            match download_snapshot_at_or_before_slot(epoch, target_slot, &dest_dir).await {
+                Ok(path) => {
+                    println!("Downloaded snapshot to {}", path.display());
+                    path
+                }
+                Err(err) => {
+                    eprintln!("error: {err}");
+                    exit(1);
+                }
+            }
+        }
         Err(err) => {
             eprintln!("error: {err}");
             exit(1);
         }
     };
 
-    println!("Downloaded snapshot to {}", dest_path.display());
-    println!("Extracting snapshot into {}", dest_dir.display());
     if env_truthy("JETSTREAMER_SKIP_EXTRACT") {
         println!("Skipping extraction because JETSTREAMER_SKIP_EXTRACT is set");
-    } else if let Err(err) = extract_tarball(&dest_path, &dest_dir).await {
-        eprintln!("error: {err}");
-        exit(1);
-    }
-    if !env_truthy("JETSTREAMER_SKIP_EXTRACT") {
+    } else if extracted_snapshot {
+        println!(
+            "Skipping extraction because snapshot data already exists in {}",
+            dest_dir.display()
+        );
+    } else {
+        println!("Extracting snapshot into {}", dest_dir.display());
+        if let Err(err) = extract_tarball(&dest_path, &dest_dir).await {
+            eprintln!("error: {err}");
+            exit(1);
+        }
         println!("Extraction complete");
     }
 

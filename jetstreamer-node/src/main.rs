@@ -1800,6 +1800,8 @@ async fn run_geyser_replay(
     let _ = progress_handle.join();
     firehose_result.map_err(|(err, slot)| format!("firehose error at slot {slot}: {err}"))?;
 
+    // Allow slot status observer to exit cleanly on shutdown.
+    drop(confirmed_bank_sender);
     service
         .join()
         .map_err(|err| format!("geyser service join failed: {err:?}"))?;

@@ -4,13 +4,22 @@ use agave_geyser_plugin_interface::geyser_plugin_interface::{
 use jetstreamer_horizon::account_updates::AccountUpdate;
 use lencode::prelude::*;
 use log::info;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::{
+    cell::RefCell,
+    sync::atomic::{AtomicU64, Ordering},
+};
+
+thread_local! {
+    static ENCODER: RefCell<DedupeEncoder> = RefCell::new(DedupeEncoder::new());
+}
 
 #[derive(Debug)]
 struct JetstreamerNodeGeyserPlugin {
     startup_accounts: AtomicU64,
     account_updates: AtomicU64,
     transactions: AtomicU64,
+    total_in_memory_account_update_size: AtomicU64,
+    total_encoded_account_update_size: AtomicU64,
 }
 
 impl Default for JetstreamerNodeGeyserPlugin {
@@ -19,6 +28,8 @@ impl Default for JetstreamerNodeGeyserPlugin {
             startup_accounts: AtomicU64::new(0),
             account_updates: AtomicU64::new(0),
             transactions: AtomicU64::new(0),
+            total_in_memory_account_update_size: AtomicU64::new(0),
+            total_encoded_account_update_size: AtomicU64::new(0),
         }
     }
 }
@@ -40,6 +51,10 @@ impl GeyserPlugin for JetstreamerNodeGeyserPlugin {
             "loaded geyser plugin config={} reload={}",
             config_file, is_reload
         );
+        ENCODER.with(|encoder| {
+            let mut encoder = encoder.borrow_mut();
+            encoder.clear();
+        });
         Ok(())
     }
 
@@ -55,12 +70,22 @@ impl GeyserPlugin for JetstreamerNodeGeyserPlugin {
         }
         self.account_updates.fetch_add(1, Ordering::Relaxed);
         let ac: AccountUpdate = account.into();
-        info!("account update: {:?}", ac);
+        //info!("account update: {:?}", ac);
         let mut out: Vec<u8> = vec![];
-        ac.encode(&mut out).unwrap();
+        ENCODER.with(|encoder| {
+            ac.encode_ext(&mut out, Some(&mut *encoder.borrow_mut()))
+                .unwrap();
+        });
 
         info!("  in-memory size: {} bytes", ac.memory_size());
         info!("    encoded size: {} bytes", out.len());
+
+        self.total_in_memory_account_update_size
+            .fetch_add(ac.memory_size() as u64, Ordering::Relaxed);
+
+        self.total_encoded_account_update_size
+            .fetch_add(out.len() as u64, Ordering::Relaxed);
+
         println!();
         Ok(())
     }
@@ -93,8 +118,14 @@ impl GeyserPlugin for JetstreamerNodeGeyserPlugin {
         let transactions = self.transactions.load(Ordering::Relaxed);
         let account_updates = self.account_updates.load(Ordering::Relaxed);
         info!(
-            "block slot {} total_txs={} total_account_updates={}",
-            slot, transactions, account_updates
+            "block slot {} total_txs={} total_account_updates={} memory_size={} encoded_size={}",
+            slot,
+            transactions,
+            account_updates,
+            self.total_in_memory_account_update_size
+                .load(Ordering::Relaxed),
+            self.total_encoded_account_update_size
+                .load(Ordering::Relaxed)
         );
         Ok(())
     }

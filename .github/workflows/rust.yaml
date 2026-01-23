@@ -12,6 +12,7 @@ on:
 env:
   SCCACHE_GHA_ENABLED: "true"
   RUSTC_WRAPPER: "sccache"
+  OPENSSL_NO_VENDOR: "1"
 
 jobs:
   cargo-check:
@@ -30,7 +31,7 @@ jobs:
       - name: Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential libudev-dev clang llvm-dev libclang-dev pkg-config
+          sudo apt-get install -y build-essential libudev-dev clang llvm-dev libclang-dev pkg-config libssl-dev
       - name: Run sccache-cache
         uses: mozilla-actions/sccache-action@v0.0.9
       - name: cargo check (${{ matrix.name }})
@@ -52,7 +53,7 @@ jobs:
       - name: Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential libudev-dev clang llvm-dev libclang-dev pkg-config
+          sudo apt-get install -y build-essential libudev-dev clang llvm-dev libclang-dev pkg-config libssl-dev
       - name: Run sccache-cache
         uses: mozilla-actions/sccache-action@v0.0.9
       - name: cargo test (${{ matrix.name }})
@@ -67,7 +68,7 @@ jobs:
       - name: Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential libudev-dev clang llvm-dev libclang-dev pkg-config
+          sudo apt-get install -y build-essential libudev-dev clang llvm-dev libclang-dev pkg-config libssl-dev
       - name: Run sccache-cache
         uses: mozilla-actions/sccache-action@v0.0.9
       - name: Install cargo-fmt
@@ -84,7 +85,7 @@ jobs:
       - name: Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential libudev-dev clang llvm-dev libclang-dev pkg-config
+          sudo apt-get install -y build-essential libudev-dev clang llvm-dev libclang-dev pkg-config libssl-dev
       - name: Run sccache-cache
         uses: mozilla-actions/sccache-action@v0.0.9
       - name: cargo doc
@@ -106,7 +107,7 @@ jobs:
       - name: Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential libudev-dev clang llvm-dev libclang-dev pkg-config
+          sudo apt-get install -y build-essential libudev-dev clang llvm-dev libclang-dev pkg-config libssl-dev
       - name: Run sccache-cache
         uses: mozilla-actions/sccache-action@v0.0.9
       - name: Install cargo-clippy
@@ -123,7 +124,7 @@ jobs:
       - name: Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential libudev-dev clang llvm-dev libclang-dev pkg-config
+          sudo apt-get install -y build-essential libudev-dev clang llvm-dev libclang-dev pkg-config libssl-dev
       - name: Run sccache-cache
         uses: mozilla-actions/sccache-action@v0.0.9
       - name: cargo fix --workspace

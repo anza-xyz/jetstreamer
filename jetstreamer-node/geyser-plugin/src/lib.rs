@@ -52,6 +52,7 @@ impl GeyserPlugin for JetstreamerNodeGeyserPlugin {
             return Ok(());
         }
         self.account_updates.fetch_add(1, Ordering::Relaxed);
+        // TODO: print tx index here
         Ok(())
     }
 

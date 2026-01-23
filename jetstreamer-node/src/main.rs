@@ -19,7 +19,7 @@ use crossbeam_channel::unbounded;
 use dashmap::DashMap;
 use jetstreamer_firehose::{
     epochs::epoch_to_slot_range,
-    firehose::{GeyserNotifiers, firehose_geyser_with_notifiers},
+    firehose::{FirehoseError, GeyserNotifiers, firehose_geyser_with_notifiers},
     index::get_index_base_url,
 };
 use jetstreamer_node::snapshots::{
@@ -1669,9 +1669,6 @@ async fn run_geyser_replay(
     ));
     let slot_range = start_slot..(end_inclusive + 1);
 
-    let rt = Arc::new(
-        tokio::runtime::Runtime::new().map_err(|err| format!("failed to create runtime: {err}"))?,
-    );
     let client = Client::new();
     let index_base_url =
         get_index_base_url().map_err(|err| format!("failed to resolve index base url: {err}"))?;
@@ -1767,17 +1764,38 @@ async fn run_geyser_replay(
     };
 
     info!("starting firehose replay with {} thread(s)", threads);
-    let firehose_result = firehose_geyser_with_notifiers(
-        rt,
-        slot_range,
-        notifiers,
-        confirmed_bank_sender,
-        &index_base_url,
-        &client,
-        shutdown.clone(),
-        async { Ok(()) },
-        threads,
-    );
+    let firehose_result = tokio::task::spawn_blocking({
+        let slot_range = slot_range.clone();
+        let notifiers = notifiers;
+        let confirmed_bank_sender = confirmed_bank_sender.clone();
+        let index_base_url = index_base_url.clone();
+        let client = client.clone();
+        let shutdown = shutdown.clone();
+        move || {
+            let rt = match tokio::runtime::Runtime::new() {
+                Ok(rt) => Arc::new(rt),
+                Err(err) => {
+                    return Err((
+                        FirehoseError::OnLoadError(Box::new(err)),
+                        slot_range.start,
+                    ));
+                }
+            };
+            firehose_geyser_with_notifiers(
+                rt,
+                slot_range,
+                notifiers,
+                confirmed_bank_sender,
+                &index_base_url,
+                &client,
+                shutdown,
+                async { Ok(()) },
+                threads,
+            )
+        }
+    })
+    .await
+    .map_err(|err| format!("firehose task failed: {err}"))?;
     progress_done.store(true, Ordering::Relaxed);
     let _ = progress_handle.join();
     firehose_result.map_err(|(err, slot)| format!("firehose error at slot {slot}: {err}"))?;

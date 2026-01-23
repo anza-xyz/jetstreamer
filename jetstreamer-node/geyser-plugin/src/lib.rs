@@ -77,9 +77,6 @@ impl GeyserPlugin for JetstreamerNodeGeyserPlugin {
                 .unwrap();
         });
 
-        info!("  in-memory size: {} bytes", ac.memory_size());
-        info!("    encoded size: {} bytes", out.len());
-
         self.total_in_memory_account_update_size
             .fetch_add(ac.memory_size() as u64, Ordering::Relaxed);
 

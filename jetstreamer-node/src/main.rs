@@ -1772,6 +1772,7 @@ fn firehose_threads() -> u64 {
 async fn build_slot_presence_map(
     start_slot: Slot,
     end_inclusive: Slot,
+    shutdown: Arc<AtomicBool>,
 ) -> Result<Arc<SlotPresenceMap>, String> {
     if end_inclusive < start_slot {
         return Err(format!(
@@ -1803,7 +1804,18 @@ async fn build_slot_presence_map(
     );
 
     for (idx, slot) in (start_slot..=end_inclusive).enumerate() {
-        match SLOT_OFFSET_INDEX.get_offset(slot).await {
+        if shutdown.load(Ordering::Relaxed) {
+            return Err("shutdown requested during slot presence scan".to_string());
+        }
+        let shutdown_wait = async {
+            while !shutdown.load(Ordering::Relaxed) {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        };
+        match tokio::select! {
+            res = SLOT_OFFSET_INDEX.get_offset(slot) => res,
+            _ = shutdown_wait => return Err("shutdown requested during slot presence scan".to_string()),
+        } {
             Ok(_) => {
                 states[idx] = SlotPresenceState::Present;
                 present += 1;
@@ -1862,7 +1874,7 @@ async fn run_geyser_replay(
     let service = GeyserPluginService::new(confirmed_bank_receiver, true, &config_files)
         .map_err(|err| format!("failed to load geyser plugin: {err}"))?;
     let (start_slot, end_inclusive) = epoch_to_slot_range(epoch);
-    let slot_presence = build_slot_presence_map(start_slot, end_inclusive).await?;
+    let slot_presence = build_slot_presence_map(start_slot, end_inclusive, shutdown.clone()).await?;
     let progress = Arc::new(ReplayProgress::new(start_slot));
     let failure = Arc::new(ReplayFailure::new(shutdown.clone()));
     let scheduler = Arc::new(TransactionScheduler::new(start_slot, slot_presence));

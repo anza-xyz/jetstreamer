@@ -20,7 +20,7 @@ use dashmap::DashMap;
 use jetstreamer_firehose::{
     epochs::{BASE_URL, epoch_to_slot_range},
     firehose::{FirehoseError, GeyserNotifiers, firehose_geyser_with_notifiers},
-    index::{SLOT_OFFSET_INDEX, SlotOffsetIndex, SlotOffsetIndexError, set_index_base_url_override},
+    index::{SLOT_OFFSET_INDEX, SlotOffsetIndex, SlotOffsetIndexError, pin_epoch_local},
 };
 use jetstreamer_node::snapshots::{
     DEFAULT_BUCKET, download_snapshot_at_or_before_slot, list_epoch_snapshots,
@@ -1888,13 +1888,16 @@ fn local_index_path(cache_dir: &Path, url: &Url) -> Result<PathBuf, String> {
 
 fn resolve_remote_index_base_url() -> Result<Url, String> {
     if let Ok(value) = env::var("JETSTREAMER_COMPACT_INDEX_BASE_URL") {
-        return Url::parse(&value).map_err(|err| format!("invalid JETSTREAMER_COMPACT_INDEX_BASE_URL: {err}"));
+        return Url::parse(&value)
+            .map_err(|err| format!("invalid JETSTREAMER_COMPACT_INDEX_BASE_URL: {err}"));
     }
     if let Ok(value) = env::var("JETSTREAMER_ARCHIVE_BASE") {
-        return Url::parse(&value).map_err(|err| format!("invalid JETSTREAMER_ARCHIVE_BASE: {err}"));
+        return Url::parse(&value)
+            .map_err(|err| format!("invalid JETSTREAMER_ARCHIVE_BASE: {err}"));
     }
     if let Ok(value) = env::var("JETSTREAMER_HTTP_BASE_URL") {
-        return Url::parse(&value).map_err(|err| format!("invalid JETSTREAMER_HTTP_BASE_URL: {err}"));
+        return Url::parse(&value)
+            .map_err(|err| format!("invalid JETSTREAMER_HTTP_BASE_URL: {err}"));
     }
     Url::parse(BASE_URL).map_err(|err| format!("invalid default index base url: {err}"))
 }
@@ -1969,10 +1972,10 @@ async fn ensure_compact_indexes_cached(
     epoch: u64,
     ledger_dir: &Path,
     shutdown: Arc<AtomicBool>,
-) -> Result<Url, String> {
+) -> Result<PathBuf, String> {
     let remote_base = resolve_remote_index_base_url()?;
     if remote_base.scheme() == "file" {
-        return Ok(remote_base);
+        return Err("local file base url is not supported for index pinning".to_string());
     }
 
     let resolver = SlotOffsetIndex::new(remote_base.clone())
@@ -1991,17 +1994,14 @@ async fn ensure_compact_indexes_cached(
     download_with_ripget(&slot_url, &slot_path, shutdown.clone()).await?;
     download_with_ripget(&cid_url, &cid_path, shutdown).await?;
 
-    let cache_dir = if cache_dir.is_absolute() {
-        cache_dir
-    } else {
-        env::current_dir()
-            .map_err(|err| format!("failed to resolve current dir: {err}"))?
-            .join(cache_dir)
-    };
-    let cache_dir = fs::canonicalize(&cache_dir)
-        .map_err(|err| format!("failed to canonicalize {}: {err}", cache_dir.display()))?;
-    Url::from_directory_path(&cache_dir)
-        .map_err(|_| format!("failed to convert {} to file url", cache_dir.display()))
+    let slot_path = fs::canonicalize(&slot_path)
+        .map_err(|err| format!("failed to canonicalize {}: {err}", slot_path.display()))?;
+    let epoch_usize =
+        usize::try_from(epoch).map_err(|_| format!("epoch {epoch} exceeds usize bounds"))?;
+    pin_epoch_local(epoch_usize, &slot_path)
+        .map_err(|err| format!("failed to pin epoch {epoch} slot index: {err}"))?;
+
+    Ok(slot_path)
 }
 
 async fn build_slot_presence_map(
@@ -2192,17 +2192,13 @@ async fn run_geyser_replay(
     let service = GeyserPluginService::new(confirmed_bank_receiver, true, &config_files)
         .map_err(|err| format!("failed to load geyser plugin: {err}"))?;
     let (start_slot, end_inclusive) = epoch_to_slot_range(epoch);
-    let index_base_url = ensure_compact_indexes_cached(epoch, ledger_dir, shutdown.clone()).await?;
-    if let Err(err) = set_index_base_url_override(index_base_url.clone()) {
-        warn!("failed to override index base url: {err}");
-    }
-    unsafe {
-        env::set_var(
-            "JETSTREAMER_COMPACT_INDEX_BASE_URL",
-            index_base_url.as_str(),
-        );
-    }
-    info!("using compact index base url: {}", index_base_url);
+    let slot_index_path =
+        ensure_compact_indexes_cached(epoch, ledger_dir, shutdown.clone()).await?;
+    info!(
+        "pinned slot-to-cid index for epoch {} at {}",
+        epoch,
+        slot_index_path.display()
+    );
     let slot_presence =
         build_slot_presence_map(start_slot, end_inclusive, shutdown.clone()).await?;
     let progress = Arc::new(ReplayProgress::new(start_slot));
@@ -2247,6 +2243,7 @@ async fn run_geyser_replay(
     let slot_range = start_slot..(end_inclusive + 1);
 
     let client = Client::new();
+    let index_base_url = resolve_remote_index_base_url()?;
     let transaction_notifier = Arc::new(BankTransactionNotifier {
         bank_replay: bank_replay.clone(),
         progress: progress.clone(),

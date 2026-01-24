@@ -54,6 +54,8 @@ use solana_transaction_status::TransactionStatusMeta;
 use tempfile::Builder as TempDirBuilder;
 use tokio::{process::Command, task::JoinSet};
 
+const RIPGET_LOG_INTERVAL_SECS: u64 = 5;
+
 const PLUGIN_NAME: &str = "jetstreamer-node-geyser";
 const PLUGIN_LIB_BASENAME: &str = "jetstreamer_node_geyser";
 const BANK_SNAPSHOTS_DIR: &str = "snapshots";
@@ -374,6 +376,97 @@ impl SlotPresenceMap {
     fn is_missing(&self, slot: Slot) -> Option<bool> {
         self.state(slot)
             .map(|state| state == SlotPresenceState::Missing)
+    }
+}
+
+struct RipgetProgress {
+    label: String,
+    log_interval: Duration,
+    start: Instant,
+    total: AtomicU64,
+    downloaded: AtomicU64,
+    threads: AtomicUsize,
+    last_log_ms: AtomicU64,
+}
+
+impl RipgetProgress {
+    fn new(label: String, log_interval: Duration) -> Self {
+        Self {
+            label,
+            log_interval,
+            start: Instant::now(),
+            total: AtomicU64::new(0),
+            downloaded: AtomicU64::new(0),
+            threads: AtomicUsize::new(0),
+            last_log_ms: AtomicU64::new(0),
+        }
+    }
+
+    fn log_maybe(&self) {
+        let elapsed_ms = self.start.elapsed().as_millis() as u64;
+        let min_ms = self.log_interval.as_millis() as u64;
+        if min_ms == 0 {
+            return;
+        }
+        let last = self.last_log_ms.load(Ordering::Relaxed);
+        if elapsed_ms.saturating_sub(last) < min_ms {
+            return;
+        }
+        if self
+            .last_log_ms
+            .compare_exchange(last, elapsed_ms, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+        let total = self.total.load(Ordering::Relaxed);
+        let downloaded = self.downloaded.load(Ordering::Relaxed);
+        let threads = self.threads.load(Ordering::Relaxed);
+        let elapsed = self.start.elapsed().as_secs_f64();
+        let rate = if elapsed > 0.0 {
+            downloaded as f64 / elapsed
+        } else {
+            0.0
+        };
+        let percent = if total == 0 {
+            0.0
+        } else {
+            (downloaded as f64) * 100.0 / (total as f64)
+        };
+        let eta = if rate > 0.0 && total > downloaded {
+            let remaining = total.saturating_sub(downloaded);
+            let eta_secs = (remaining as f64 / rate).ceil() as u64;
+            format_eta(Duration::from_secs(eta_secs))
+        } else {
+            "unknown".to_string()
+        };
+        info!(
+            "{} progress: {}/{} ({:.2}%) threads={} rate={:.1}B/s eta={}",
+            self.label,
+            format_bytes(downloaded),
+            format_bytes(total),
+            percent,
+            threads,
+            rate,
+            eta
+        );
+    }
+}
+
+impl ripget::ProgressReporter for RipgetProgress {
+    fn init(&self, total: u64) {
+        self.total.store(total, Ordering::Relaxed);
+        self.log_maybe();
+    }
+
+    fn add(&self, delta: u64) {
+        self.downloaded.fetch_add(delta, Ordering::Relaxed);
+        self.log_maybe();
+    }
+
+    fn set_threads(&self, threads: usize) {
+        self.threads.store(threads, Ordering::Relaxed);
+        self.log_maybe();
     }
 }
 
@@ -936,6 +1029,22 @@ fn format_eta(duration: Duration) -> String {
     let minutes = (total_secs % 3600) / 60;
     let seconds = total_secs % 60;
     format!("{hours:02}:{minutes:02}:{seconds:02}")
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = KB * 1024.0;
+    const GB: f64 = MB * 1024.0;
+    let value = bytes as f64;
+    if value >= GB {
+        format!("{:.2}GiB", value / GB)
+    } else if value >= MB {
+        format!("{:.2}MiB", value / MB)
+    } else if value >= KB {
+        format!("{:.2}KiB", value / KB)
+    } else {
+        format!("{bytes}B")
+    }
 }
 
 fn epoch_to_slot(epoch: u64) -> u64 {
@@ -1793,40 +1902,51 @@ async fn download_with_ripget(
     }
     let ripget_threads = env::var("JETSTREAMER_RIPGET_THREADS")
         .ok()
-        .and_then(|value| value.parse::<u64>().ok())
+        .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(255);
+    let log_interval = env::var("JETSTREAMER_RIPGET_LOG_INTERVAL_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(RIPGET_LOG_INTERVAL_SECS);
     info!(
-        "downloading compact index {} (ripget threads={ripget_threads})",
-        url.as_str()
+        "downloading compact index {} (ripget threads={} log_interval={}s)",
+        url.as_str(),
+        ripget_threads,
+        log_interval
     );
-    let mut child = Command::new("ripget")
-        .arg("--threads")
-        .arg(ripget_threads.to_string())
-        .arg(url.as_str())
-        .arg(dest)
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .map_err(|err| format!("failed to spawn ripget: {err}"))?;
-
     let shutdown_wait = async {
         while !shutdown.load(Ordering::Relaxed) {
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
     };
 
-    let status = tokio::select! {
+    let progress = Arc::new(RipgetProgress::new(
+        format!("ripget {}", dest.display()),
+        Duration::from_secs(log_interval),
+    ));
+    let result = tokio::select! {
         _ = shutdown_wait => {
-            let _ = child.kill().await;
             return Err("shutdown requested during compact index download".to_string());
         }
-        result = child.wait() => result.map_err(|err| format!("ripget failed: {err}"))?,
+        result = ripget::download_url_with_progress(
+            url.as_str(),
+            dest,
+            Some(ripget_threads),
+            None,
+            Some(progress),
+            None,
+        ) => result,
     };
 
-    if !status.success() {
-        return Err(format!("ripget failed for {}", url.as_str()));
-    }
+    let report = result.map_err(|err| format!("ripget failed for {}: {err}", url.as_str()))?;
+    info!(
+        "ripget finished: {} -> {} ({})",
+        url.as_str(),
+        report.path.display(),
+        format_bytes(report.bytes),
+    );
 
     Ok(())
 }

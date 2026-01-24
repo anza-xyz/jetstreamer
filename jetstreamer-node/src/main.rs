@@ -1970,12 +1970,23 @@ async fn ensure_compact_indexes_cached(
         .map_err(|err| format!("failed to resolve epoch {epoch} index urls: {err}"))?;
 
     let cache_dir = ledger_dir.join("compact-indexes");
+    fs::create_dir_all(&cache_dir)
+        .map_err(|err| format!("failed to create {}: {err}", cache_dir.display()))?;
     let slot_path = local_index_path(&cache_dir, &slot_url)?;
     let cid_path = local_index_path(&cache_dir, &cid_url)?;
 
     download_with_ripget(&slot_url, &slot_path, shutdown.clone()).await?;
     download_with_ripget(&cid_url, &cid_path, shutdown).await?;
 
+    let cache_dir = if cache_dir.is_absolute() {
+        cache_dir
+    } else {
+        env::current_dir()
+            .map_err(|err| format!("failed to resolve current dir: {err}"))?
+            .join(cache_dir)
+    };
+    let cache_dir = fs::canonicalize(&cache_dir)
+        .map_err(|err| format!("failed to canonicalize {}: {err}", cache_dir.display()))?;
     Url::from_directory_path(&cache_dir)
         .map_err(|_| format!("failed to convert {} to file url", cache_dir.display()))
 }

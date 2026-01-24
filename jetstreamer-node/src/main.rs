@@ -1789,6 +1789,13 @@ async fn build_slot_presence_map(
         .and_then(|value| value.parse::<u64>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(10_000);
+    let log_interval = env::var("JETSTREAMER_SLOT_PRESENCE_LOG_INTERVAL_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(5);
+    let start_time = Instant::now();
+    let mut last_log = Instant::now();
 
     info!(
         "building slot presence map for slots {}..={} ({} total)",
@@ -1810,10 +1817,25 @@ async fn build_slot_presence_map(
             }
         }
         let processed = (idx + 1) as u64;
-        if processed % log_every == 0 {
+        if processed % log_every == 0 || last_log.elapsed() >= Duration::from_secs(log_interval) {
+            let elapsed = start_time.elapsed().as_secs_f64();
+            let rate = if elapsed > 0.0 {
+                processed as f64 / elapsed
+            } else {
+                0.0
+            };
+            let remaining = total_slots.saturating_sub(processed);
+            let eta = if rate > 0.0 {
+                let eta_secs = (remaining as f64 / rate).ceil() as u64;
+                format_eta(Duration::from_secs(eta_secs))
+            } else {
+                "unknown".to_string()
+            };
+            let percent = (processed as f64) * 100.0 / (total_slots as f64);
             info!(
-                "slot presence progress: {processed}/{total_slots} (present={present}, missing={missing})"
+                "slot presence progress: {processed}/{total_slots} ({percent:.2}%) present={present} missing={missing} rate={rate:.1} slots/s eta={eta}"
             );
+            last_log = Instant::now();
         }
     }
 

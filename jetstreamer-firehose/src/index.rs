@@ -258,6 +258,7 @@ static START_INSTANT: Lazy<Instant> = Lazy::new(Instant::now);
 static LAST_HIT_TIME: AtomicU64 = AtomicU64::new(0);
 static SLOT_OFFSET_RESULT_CACHE: Lazy<DashMap<u64, u64>> = Lazy::new(DashMap::new);
 static EPOCH_CACHE: Lazy<DashMap<EpochCacheKey, Arc<EpochEntry>>> = Lazy::new(DashMap::new);
+static INDEX_BASE_URL_OVERRIDE: SyncOnceCell<Url> = SyncOnceCell::new();
 
 #[derive(Clone, Hash, PartialEq, Eq)]
 struct EpochCacheKey {
@@ -1660,7 +1661,29 @@ fn parse_metadata(data: &[u8]) -> Result<HashMap<Vec<u8>, Vec<u8>>, String> {
 /// assert_eq!(base.as_str(), "https://mirror.example.com/indexes");
 /// ```
 pub fn get_index_base_url() -> Result<Url, SlotOffsetIndexError> {
+    if let Some(url) = INDEX_BASE_URL_OVERRIDE.get() {
+        return Ok(url.clone());
+    }
     Ok(archive::index_location().url().clone())
+}
+
+/// Overrides the base URL used by [`SLOT_OFFSET_INDEX`] and related helpers.
+///
+/// This is intended for callers that prefetch compact indexes and want to
+/// force lookups to use a local `file://` base URL.
+pub fn set_index_base_url_override(url: Url) -> Result<(), SlotOffsetIndexError> {
+    if let Some(existing) = INDEX_BASE_URL_OVERRIDE.get() {
+        if existing == &url {
+            return Ok(());
+        }
+        return Err(SlotOffsetIndexError::InvalidBaseUrl(format!(
+            "index base url override already set to {}",
+            existing
+        )));
+    }
+    INDEX_BASE_URL_OVERRIDE
+        .set(url)
+        .map_err(|_| SlotOffsetIndexError::InvalidBaseUrl("index base url override already set".into()))
 }
 
 #[cfg(test)]

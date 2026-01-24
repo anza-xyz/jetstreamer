@@ -18,9 +18,9 @@ use agave_snapshots::{
 use crossbeam_channel::unbounded;
 use dashmap::DashMap;
 use jetstreamer_firehose::{
-    epochs::epoch_to_slot_range,
+    epochs::{BASE_URL, epoch_to_slot_range},
     firehose::{FirehoseError, GeyserNotifiers, firehose_geyser_with_notifiers},
-    index::{SLOT_OFFSET_INDEX, SlotOffsetIndex, SlotOffsetIndexError, get_index_base_url},
+    index::{SLOT_OFFSET_INDEX, SlotOffsetIndex, SlotOffsetIndexError, set_index_base_url_override},
 };
 use jetstreamer_node::snapshots::{
     DEFAULT_BUCKET, download_snapshot_at_or_before_slot, list_epoch_snapshots,
@@ -1886,6 +1886,19 @@ fn local_index_path(cache_dir: &Path, url: &Url) -> Result<PathBuf, String> {
     Ok(cache_dir.join(path))
 }
 
+fn resolve_remote_index_base_url() -> Result<Url, String> {
+    if let Ok(value) = env::var("JETSTREAMER_COMPACT_INDEX_BASE_URL") {
+        return Url::parse(&value).map_err(|err| format!("invalid JETSTREAMER_COMPACT_INDEX_BASE_URL: {err}"));
+    }
+    if let Ok(value) = env::var("JETSTREAMER_ARCHIVE_BASE") {
+        return Url::parse(&value).map_err(|err| format!("invalid JETSTREAMER_ARCHIVE_BASE: {err}"));
+    }
+    if let Ok(value) = env::var("JETSTREAMER_HTTP_BASE_URL") {
+        return Url::parse(&value).map_err(|err| format!("invalid JETSTREAMER_HTTP_BASE_URL: {err}"));
+    }
+    Url::parse(BASE_URL).map_err(|err| format!("invalid default index base url: {err}"))
+}
+
 async fn download_with_ripget(
     url: &Url,
     dest: &Path,
@@ -1893,6 +1906,7 @@ async fn download_with_ripget(
 ) -> Result<(), String> {
     if let Ok(metadata) = fs::metadata(dest) {
         if metadata.len() > 0 {
+            info!("compact index already cached at {}", dest.display());
             return Ok(());
         }
     }
@@ -1956,8 +1970,7 @@ async fn ensure_compact_indexes_cached(
     ledger_dir: &Path,
     shutdown: Arc<AtomicBool>,
 ) -> Result<Url, String> {
-    let remote_base =
-        get_index_base_url().map_err(|err| format!("failed to resolve index base url: {err}"))?;
+    let remote_base = resolve_remote_index_base_url()?;
     if remote_base.scheme() == "file" {
         return Ok(remote_base);
     }
@@ -2180,12 +2193,16 @@ async fn run_geyser_replay(
         .map_err(|err| format!("failed to load geyser plugin: {err}"))?;
     let (start_slot, end_inclusive) = epoch_to_slot_range(epoch);
     let index_base_url = ensure_compact_indexes_cached(epoch, ledger_dir, shutdown.clone()).await?;
+    if let Err(err) = set_index_base_url_override(index_base_url.clone()) {
+        warn!("failed to override index base url: {err}");
+    }
     unsafe {
         env::set_var(
             "JETSTREAMER_COMPACT_INDEX_BASE_URL",
             index_base_url.as_str(),
         );
     }
+    info!("using compact index base url: {}", index_base_url);
     let slot_presence =
         build_slot_presence_map(start_slot, end_inclusive, shutdown.clone()).await?;
     let progress = Arc::new(ReplayProgress::new(start_slot));

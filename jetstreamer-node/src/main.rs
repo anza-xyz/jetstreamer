@@ -52,7 +52,7 @@ use solana_transaction::sanitized::SanitizedTransaction;
 use solana_transaction::versioned::VersionedTransaction;
 use solana_transaction_status::TransactionStatusMeta;
 use tempfile::Builder as TempDirBuilder;
-use tokio::process::Command;
+use tokio::{process::Command, task::JoinSet};
 
 const PLUGIN_NAME: &str = "jetstreamer-node-geyser";
 const PLUGIN_LIB_BASENAME: &str = "jetstreamer_node_geyser";
@@ -1789,12 +1789,17 @@ async fn build_slot_presence_map(
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .filter(|value| *value > 0)
-        .unwrap_or(10_000);
+        .unwrap_or(0);
     let log_interval = env::var("JETSTREAMER_SLOT_PRESENCE_LOG_INTERVAL_SECS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(5);
+    let concurrency = env::var("JETSTREAMER_SLOT_PRESENCE_CONCURRENCY")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(8);
     let start_time = Instant::now();
     let mut last_log = Instant::now();
 
@@ -1803,19 +1808,82 @@ async fn build_slot_presence_map(
         start_slot, end_inclusive, total_slots
     );
 
-    for (idx, slot) in (start_slot..=end_inclusive).enumerate() {
+    info!(
+        "slot presence scan concurrency: {concurrency} parallel lookups (logging every {log_interval}s)"
+    );
+
+    let mut join_set = JoinSet::new();
+    let mut next_slot = start_slot;
+    let mut processed = 0u64;
+
+    let enqueue_slot = |slot: Slot, join_set: &mut JoinSet<(Slot, Result<u64, SlotOffsetIndexError>)>| {
+        join_set.spawn(async move { (slot, SLOT_OFFSET_INDEX.get_offset(slot).await) });
+    };
+
+    while next_slot <= end_inclusive && join_set.len() < concurrency {
+        enqueue_slot(next_slot, &mut join_set);
+        next_slot = next_slot.saturating_add(1);
+    }
+
+    while processed < total_slots {
         if shutdown.load(Ordering::Relaxed) {
+            join_set.abort_all();
             return Err("shutdown requested during slot presence scan".to_string());
         }
+
         let shutdown_wait = async {
             while !shutdown.load(Ordering::Relaxed) {
                 tokio::time::sleep(Duration::from_millis(200)).await;
             }
         };
-        match tokio::select! {
-            res = SLOT_OFFSET_INDEX.get_offset(slot) => res,
-            _ = shutdown_wait => return Err("shutdown requested during slot presence scan".to_string()),
-        } {
+
+        let result = tokio::select! {
+            _ = shutdown_wait => {
+                join_set.abort_all();
+                return Err("shutdown requested during slot presence scan".to_string());
+            }
+            res = join_set.join_next() => res,
+            _ = tokio::time::sleep(Duration::from_secs(log_interval)) => {
+                let elapsed = start_time.elapsed().as_secs_f64();
+                let rate = if elapsed > 0.0 { processed as f64 / elapsed } else { 0.0 };
+                let remaining = total_slots.saturating_sub(processed);
+                let eta = if rate > 0.0 {
+                    let eta_secs = (remaining as f64 / rate).ceil() as u64;
+                    format_eta(Duration::from_secs(eta_secs))
+                } else {
+                    "unknown".to_string()
+                };
+                let percent = if total_slots == 0 {
+                    100.0
+                } else {
+                    (processed as f64) * 100.0 / (total_slots as f64)
+                };
+                info!(
+                    "slot presence progress: {processed}/{total_slots} ({percent:.2}%) present={present} missing={missing} in_flight={} rate={rate:.1} slots/s eta={eta}",
+                    join_set.len()
+                );
+                last_log = Instant::now();
+                continue;
+            }
+        };
+
+        let Some(join_result) = result else {
+            if join_set.is_empty() {
+                break;
+            }
+            continue;
+        };
+
+        let (slot, lookup_result) = match join_result {
+            Ok(result) => result,
+            Err(err) => {
+                join_set.abort_all();
+                return Err(format!("slot presence task failed: {err}"));
+            }
+        };
+
+        let idx = (slot - start_slot) as usize;
+        match lookup_result {
             Ok(_) => {
                 states[idx] = SlotPresenceState::Present;
                 present += 1;
@@ -1825,11 +1893,15 @@ async fn build_slot_presence_map(
                 missing += 1;
             }
             Err(err) => {
+                join_set.abort_all();
                 return Err(format!("slot presence lookup failed at slot {slot}: {err}"));
             }
         }
-        let processed = (idx + 1) as u64;
-        if processed % log_every == 0 || last_log.elapsed() >= Duration::from_secs(log_interval) {
+
+        processed = processed.saturating_add(1);
+        if (log_every > 0 && processed % log_every == 0)
+            || last_log.elapsed() >= Duration::from_secs(log_interval)
+        {
             let elapsed = start_time.elapsed().as_secs_f64();
             let rate = if elapsed > 0.0 {
                 processed as f64 / elapsed
@@ -1843,11 +1915,21 @@ async fn build_slot_presence_map(
             } else {
                 "unknown".to_string()
             };
-            let percent = (processed as f64) * 100.0 / (total_slots as f64);
+            let percent = if total_slots == 0 {
+                100.0
+            } else {
+                (processed as f64) * 100.0 / (total_slots as f64)
+            };
             info!(
-                "slot presence progress: {processed}/{total_slots} ({percent:.2}%) present={present} missing={missing} rate={rate:.1} slots/s eta={eta}"
+                "slot presence progress: {processed}/{total_slots} ({percent:.2}%) present={present} missing={missing} in_flight={} rate={rate:.1} slots/s eta={eta}",
+                join_set.len()
             );
             last_log = Instant::now();
+        }
+
+        while next_slot <= end_inclusive && join_set.len() < concurrency {
+            enqueue_slot(next_slot, &mut join_set);
+            next_slot = next_slot.saturating_add(1);
         }
     }
 

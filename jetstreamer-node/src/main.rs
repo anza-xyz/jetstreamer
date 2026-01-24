@@ -20,13 +20,13 @@ use dashmap::DashMap;
 use jetstreamer_firehose::{
     epochs::epoch_to_slot_range,
     firehose::{FirehoseError, GeyserNotifiers, firehose_geyser_with_notifiers},
-    index::{SLOT_OFFSET_INDEX, SlotOffsetIndexError, get_index_base_url},
+    index::{SLOT_OFFSET_INDEX, SlotOffsetIndex, SlotOffsetIndexError, get_index_base_url},
 };
 use jetstreamer_node::snapshots::{
     DEFAULT_BUCKET, download_snapshot_at_or_before_slot, list_epoch_snapshots,
 };
 use log::{info, warn};
-use reqwest::Client;
+use reqwest::{Client, Url};
 use solana_account::AccountSharedData;
 use solana_accounts_db::{
     accounts_db::AccountsDbConfig,
@@ -1769,6 +1769,87 @@ fn firehose_threads() -> u64 {
         .unwrap_or(1)
 }
 
+fn local_index_path(cache_dir: &Path, url: &Url) -> Result<PathBuf, String> {
+    let path = url.path().trim_start_matches('/');
+    if path.is_empty() {
+        return Err(format!("index url missing path: {url}"));
+    }
+    Ok(cache_dir.join(path))
+}
+
+async fn download_with_ripget(
+    url: &Url,
+    dest: &Path,
+    shutdown: Arc<AtomicBool>,
+) -> Result<(), String> {
+    if let Ok(metadata) = fs::metadata(dest) {
+        if metadata.len() > 0 {
+            return Ok(());
+        }
+    }
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|err| format!("failed to create {}: {err}", parent.display()))?;
+    }
+    info!("downloading compact index {}", url.as_str());
+    let mut child = Command::new("ripget")
+        .arg(url.as_str())
+        .arg(dest)
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .map_err(|err| format!("failed to spawn ripget: {err}"))?;
+
+    let shutdown_wait = async {
+        while !shutdown.load(Ordering::Relaxed) {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    };
+
+    let status = tokio::select! {
+        _ = shutdown_wait => {
+            let _ = child.kill().await;
+            return Err("shutdown requested during compact index download".to_string());
+        }
+        result = child.wait() => result.map_err(|err| format!("ripget failed: {err}"))?,
+    };
+
+    if !status.success() {
+        return Err(format!("ripget failed for {}", url.as_str()));
+    }
+
+    Ok(())
+}
+
+async fn ensure_compact_indexes_cached(
+    epoch: u64,
+    ledger_dir: &Path,
+    shutdown: Arc<AtomicBool>,
+) -> Result<Url, String> {
+    let remote_base =
+        get_index_base_url().map_err(|err| format!("failed to resolve index base url: {err}"))?;
+    if remote_base.scheme() == "file" {
+        return Ok(remote_base);
+    }
+
+    let resolver = SlotOffsetIndex::new(remote_base.clone())
+        .map_err(|err| format!("failed to build index resolver: {err}"))?;
+    let (slot_url, cid_url) = resolver
+        .resolve_epoch_index_urls(epoch)
+        .await
+        .map_err(|err| format!("failed to resolve epoch {epoch} index urls: {err}"))?;
+
+    let cache_dir = ledger_dir.join("compact-indexes");
+    let slot_path = local_index_path(&cache_dir, &slot_url)?;
+    let cid_path = local_index_path(&cache_dir, &cid_url)?;
+
+    download_with_ripget(&slot_url, &slot_path, shutdown.clone()).await?;
+    download_with_ripget(&cid_url, &cid_path, shutdown).await?;
+
+    Url::from_directory_path(&cache_dir)
+        .map_err(|_| format!("failed to convert {} to file url", cache_dir.display()))
+}
+
 async fn build_slot_presence_map(
     start_slot: Slot,
     end_inclusive: Slot,
@@ -1816,9 +1897,10 @@ async fn build_slot_presence_map(
     let mut next_slot = start_slot;
     let mut processed = 0u64;
 
-    let enqueue_slot = |slot: Slot, join_set: &mut JoinSet<(Slot, Result<u64, SlotOffsetIndexError>)>| {
-        join_set.spawn(async move { (slot, SLOT_OFFSET_INDEX.get_offset(slot).await) });
-    };
+    let enqueue_slot =
+        |slot: Slot, join_set: &mut JoinSet<(Slot, Result<u64, SlotOffsetIndexError>)>| {
+            join_set.spawn(async move { (slot, SLOT_OFFSET_INDEX.get_offset(slot).await) });
+        };
 
     while next_slot <= end_inclusive && join_set.len() < concurrency {
         enqueue_slot(next_slot, &mut join_set);
@@ -1956,7 +2038,15 @@ async fn run_geyser_replay(
     let service = GeyserPluginService::new(confirmed_bank_receiver, true, &config_files)
         .map_err(|err| format!("failed to load geyser plugin: {err}"))?;
     let (start_slot, end_inclusive) = epoch_to_slot_range(epoch);
-    let slot_presence = build_slot_presence_map(start_slot, end_inclusive, shutdown.clone()).await?;
+    let index_base_url = ensure_compact_indexes_cached(epoch, ledger_dir, shutdown.clone()).await?;
+    unsafe {
+        env::set_var(
+            "JETSTREAMER_COMPACT_INDEX_BASE_URL",
+            index_base_url.as_str(),
+        );
+    }
+    let slot_presence =
+        build_slot_presence_map(start_slot, end_inclusive, shutdown.clone()).await?;
     let progress = Arc::new(ReplayProgress::new(start_slot));
     let failure = Arc::new(ReplayFailure::new(shutdown.clone()));
     let scheduler = Arc::new(TransactionScheduler::new(start_slot, slot_presence));
@@ -1999,8 +2089,6 @@ async fn run_geyser_replay(
     let slot_range = start_slot..(end_inclusive + 1);
 
     let client = Client::new();
-    let index_base_url =
-        get_index_base_url().map_err(|err| format!("failed to resolve index base url: {err}"))?;
     let transaction_notifier = Arc::new(BankTransactionNotifier {
         bank_replay: bank_replay.clone(),
         progress: progress.clone(),

@@ -41,6 +41,7 @@ use serde_cbor::Value;
 use std::{
     collections::HashMap,
     ops::RangeInclusive,
+    path::PathBuf,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -48,7 +49,13 @@ use std::{
     time::{Duration, Instant},
 };
 use thiserror::Error;
-use tokio::{sync::OnceCell, task::yield_now, time::sleep};
+use tokio::{
+    fs::File,
+    io::{AsyncReadExt, AsyncSeekExt},
+    sync::OnceCell,
+    task::yield_now,
+    time::sleep,
+};
 use xxhash_rust::xxh64::xxh64;
 
 const COMPACT_INDEX_MAGIC: &[u8; 8] = b"compiszd";
@@ -111,6 +118,9 @@ enum RemoteObjectKind {
     Http {
         client: Client,
     },
+    File {
+        path: PathBuf,
+    },
     #[cfg(feature = "s3-backend")]
     S3 {
         location: Arc<S3Location>,
@@ -120,6 +130,14 @@ enum RemoteObjectKind {
 
 impl RemoteObject {
     fn http(client: Client, url: Url) -> Self {
+        if url.scheme() == "file" {
+            if let Ok(path) = url.to_file_path() {
+                return Self {
+                    kind: RemoteObjectKind::File { path },
+                    url,
+                };
+            }
+        }
         Self {
             kind: RemoteObjectKind::Http { client },
             url,
@@ -141,6 +159,12 @@ impl RemoteObject {
     async fn fetch_full(&self) -> Result<Vec<u8>, SlotOffsetIndexError> {
         match &self.kind {
             RemoteObjectKind::Http { client } => fetch_full(client, &self.url).await,
+            RemoteObjectKind::File { path } => tokio::fs::read(path).await.map_err(|err| {
+                SlotOffsetIndexError::IndexFormatError(
+                    self.url.clone(),
+                    format!("failed to read {}: {err}", path.display()),
+                )
+            }),
             #[cfg(feature = "s3-backend")]
             RemoteObjectKind::S3 { location, key } => {
                 fetch_s3_full(location, key.as_str(), &self.url).await
@@ -157,6 +181,63 @@ impl RemoteObject {
         match &self.kind {
             RemoteObjectKind::Http { client } => {
                 fetch_http_range(client, &self.url, start, end, exact).await
+            }
+            RemoteObjectKind::File { path } => {
+                let start = usize::try_from(start).map_err(|_| {
+                    SlotOffsetIndexError::IndexFormatError(
+                        self.url.clone(),
+                        format!("start offset {start} exceeds usize bounds"),
+                    )
+                })?;
+                let end = usize::try_from(end).map_err(|_| {
+                    SlotOffsetIndexError::IndexFormatError(
+                        self.url.clone(),
+                        format!("end offset {end} exceeds usize bounds"),
+                    )
+                })?;
+                if end < start {
+                    return Err(SlotOffsetIndexError::IndexFormatError(
+                        self.url.clone(),
+                        format!("invalid range {start}-{end}"),
+                    ));
+                }
+                let len = end - start + 1;
+                let mut file = File::open(path).await.map_err(|err| {
+                    SlotOffsetIndexError::IndexFormatError(
+                        self.url.clone(),
+                        format!("failed to open {}: {err}", path.display()),
+                    )
+                })?;
+                file.seek(std::io::SeekFrom::Start(start as u64))
+                    .await
+                    .map_err(|err| {
+                        SlotOffsetIndexError::IndexFormatError(
+                            self.url.clone(),
+                            format!("failed to seek {} to {start}: {err}", path.display()),
+                        )
+                    })?;
+                let mut buf = vec![0u8; len];
+                let mut read = 0usize;
+                while read < buf.len() {
+                    let n = file.read(&mut buf[read..]).await.map_err(|err| {
+                        SlotOffsetIndexError::IndexFormatError(
+                            self.url.clone(),
+                            format!("failed to read {} at {start}: {err}", path.display()),
+                        )
+                    })?;
+                    if n == 0 {
+                        break;
+                    }
+                    read += n;
+                }
+                if exact && read != buf.len() {
+                    return Err(SlotOffsetIndexError::IndexFormatError(
+                        self.url.clone(),
+                        format!("expected {len} bytes, got {read}"),
+                    ));
+                }
+                buf.truncate(read);
+                Ok(buf)
             }
             #[cfg(feature = "s3-backend")]
             RemoteObjectKind::S3 { location, key } => {
@@ -265,6 +346,35 @@ impl SlotOffsetIndex {
     /// Returns the base URL that remote index files are fetched from.
     pub const fn base_url(&self) -> &Url {
         &self.base_url
+    }
+
+    /// Resolves the slot-to-cid and cid-to-offset index URLs for the given epoch.
+    pub async fn resolve_epoch_index_urls(
+        &self,
+        epoch: u64,
+    ) -> Result<(Url, Url), SlotOffsetIndexError> {
+        let car_path = format!("{epoch}/epoch-{epoch}.car");
+        let car_object = self.remote_for_path(&car_path)?;
+        let (root_cid, _) = fetch_epoch_root(&car_object).await?;
+        let root_base32 = root_cid
+            .to_string_of_base(Base::Base32Lower)
+            .map_err(|err| {
+                SlotOffsetIndexError::CarHeaderError(car_object.url().clone(), err.to_string())
+            })?;
+
+        let slot_index_path = format!(
+            "{0}/epoch-{0}-{1}-{2}-slot-to-cid.index",
+            epoch, root_base32, self.network
+        );
+        let cid_index_path = format!(
+            "{0}/epoch-{0}-{1}-{2}-cid-to-offset-and-size.index",
+            epoch, root_base32, self.network
+        );
+
+        let slot_url = self.remote_for_path(&slot_index_path)?.url().clone();
+        let cid_url = self.remote_for_path(&cid_index_path)?.url().clone();
+
+        Ok((slot_url, cid_url))
     }
 
     async fn load_epoch_indexes(

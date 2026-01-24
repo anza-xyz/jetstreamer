@@ -5,6 +5,21 @@ use crate::{
     epochs::{epoch_exists, epoch_to_slot_range},
 };
 
+/// Creates a new HTTP client with the Jetstreamer user agent header.
+///
+/// The user agent is set to `jetstreamer/v{version}` where version comes from
+/// the crate version. If the `JETSTREAMER_VERSION` environment variable is set
+/// at build time (e.g., via CI/CD), it will be used instead, allowing git
+/// commit information to be included (e.g., `jetstreamer/v0.3.0+24d5efe-dirty`).
+pub fn create_http_client() -> Client {
+    let version = option_env!("JETSTREAMER_VERSION").unwrap_or(env!("CARGO_PKG_VERSION"));
+    let user_agent = format!("jetstreamer/v{}", version);
+    Client::builder()
+        .user_agent(user_agent)
+        .build()
+        .expect("failed to create HTTP client")
+}
+
 /// Queries the current epoch from mainnet using the Solana RPC API.
 pub async fn current_epoch(client: &Client) -> Result<u64, SharedError> {
     let url = "https://api.mainnet-beta.solana.com";

@@ -1791,8 +1791,18 @@ async fn download_with_ripget(
         fs::create_dir_all(parent)
             .map_err(|err| format!("failed to create {}: {err}", parent.display()))?;
     }
-    info!("downloading compact index {}", url.as_str());
+    let ripget_threads = env::var("JETSTREAMER_RIPGET_THREADS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(255);
+    info!(
+        "downloading compact index {} (ripget threads={ripget_threads})",
+        url.as_str()
+    );
     let mut child = Command::new("ripget")
+        .arg("--threads")
+        .arg(ripget_threads.to_string())
         .arg(url.as_str())
         .arg(dest)
         .stdout(Stdio::inherit())

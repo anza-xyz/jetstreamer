@@ -2034,7 +2034,11 @@ async fn build_slot_presence_map(
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
-        .unwrap_or(100);
+        .unwrap_or(1000);
+    let stagger_ms = env::var("JETSTREAMER_SLOT_PRESENCE_STAGGER_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(2);
     let start_time = Instant::now();
     let mut last_log = Instant::now();
 
@@ -2044,7 +2048,7 @@ async fn build_slot_presence_map(
     );
 
     info!(
-        "slot presence scan concurrency: {concurrency} parallel lookups (logging every {log_interval}s)"
+        "slot presence scan concurrency: {concurrency} parallel lookups (logging every {log_interval}s, stagger {stagger_ms}ms)"
     );
 
     let mut join_set = JoinSet::new();
@@ -2059,6 +2063,9 @@ async fn build_slot_presence_map(
     while next_slot <= end_inclusive && join_set.len() < concurrency {
         enqueue_slot(next_slot, &mut join_set);
         next_slot = next_slot.saturating_add(1);
+        if stagger_ms > 0 {
+            tokio::time::sleep(Duration::from_millis(stagger_ms)).await;
+        }
     }
 
     while processed < total_slots {
@@ -2166,6 +2173,9 @@ async fn build_slot_presence_map(
         while next_slot <= end_inclusive && join_set.len() < concurrency {
             enqueue_slot(next_slot, &mut join_set);
             next_slot = next_slot.saturating_add(1);
+            if stagger_ms > 0 {
+                tokio::time::sleep(Duration::from_millis(stagger_ms)).await;
+            }
         }
     }
 

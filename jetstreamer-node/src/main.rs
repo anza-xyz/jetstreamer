@@ -20,7 +20,7 @@ use dashmap::DashMap;
 use jetstreamer_firehose::{
     epochs::epoch_to_slot_range,
     firehose::{FirehoseError, GeyserNotifiers, firehose_geyser_with_notifiers},
-    index::get_index_base_url,
+    index::{SLOT_OFFSET_INDEX, SlotOffsetIndexError, get_index_base_url},
 };
 use jetstreamer_node::snapshots::{
     DEFAULT_BUCKET, download_snapshot_at_or_before_slot, list_epoch_snapshots,
@@ -349,24 +349,56 @@ impl ReplayFailure {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SlotPresenceState {
+    Present,
+    Missing,
+}
+
+#[derive(Debug)]
+struct SlotPresenceMap {
+    start: Slot,
+    end_inclusive: Slot,
+    states: Vec<SlotPresenceState>,
+}
+
+impl SlotPresenceMap {
+    fn state(&self, slot: Slot) -> Option<SlotPresenceState> {
+        if slot < self.start || slot > self.end_inclusive {
+            return None;
+        }
+        let idx = (slot - self.start) as usize;
+        self.states.get(idx).copied()
+    }
+
+    fn is_missing(&self, slot: Slot) -> Option<bool> {
+        self.state(slot)
+            .map(|state| state == SlotPresenceState::Missing)
+    }
+}
+
 #[derive(Debug)]
 struct TransactionScheduler {
     state: Mutex<SchedulerState>,
+    presence: Arc<SlotPresenceMap>,
 }
 
 #[derive(Debug)]
 struct SchedulerState {
+    last_finalized_slot: Slot,
     current_slot: Slot,
     slots: HashMap<Slot, SlotExecutionBuffer>,
 }
 
 impl TransactionScheduler {
-    fn new(start_slot: Slot) -> Self {
+    fn new(start_slot: Slot, presence: Arc<SlotPresenceMap>) -> Self {
         Self {
             state: Mutex::new(SchedulerState {
+                last_finalized_slot: start_slot.saturating_sub(1),
                 current_slot: start_slot,
                 slots: HashMap::new(),
             }),
+            presence,
         }
     }
 
@@ -377,22 +409,18 @@ impl TransactionScheduler {
         tx: VersionedTransaction,
     ) -> Result<Vec<ReadyEntry>, String> {
         let mut state = self.state.lock().expect("transaction scheduler lock");
-        if slot < state.current_slot {
+        if slot <= state.last_finalized_slot {
             return Err(format!(
-                "late transaction for slot {slot} (current slot {})",
-                state.current_slot
+                "late transaction for slot {slot} (last finalized slot {})",
+                state.last_finalized_slot
             ));
         }
-        let current_slot = state.current_slot;
         let buffer = state
             .slots
             .entry(slot)
             .or_insert_with(SlotExecutionBuffer::default);
         buffer.insert_transaction(index, tx)?;
-        if slot != current_slot {
-            return Ok(Vec::new());
-        }
-        buffer.drain_ready_entries(slot)
+        self.advance_ready_locked(&mut state)
     }
 
     fn push_entry(
@@ -404,85 +432,117 @@ impl TransactionScheduler {
         hash: Hash,
     ) -> Result<Vec<ReadyEntry>, String> {
         let mut state = self.state.lock().expect("transaction scheduler lock");
-        if slot < state.current_slot {
+        if slot <= state.last_finalized_slot {
             return Err(format!(
-                "late entry for slot {slot} (current slot {})",
-                state.current_slot
+                "late entry for slot {slot} (last finalized slot {})",
+                state.last_finalized_slot
             ));
         }
-        let current_slot = state.current_slot;
         let buffer = state
             .slots
             .entry(slot)
             .or_insert_with(SlotExecutionBuffer::default);
         buffer.push_entry(entry_index, start_index, tx_count, hash)?;
-        if slot != current_slot {
-            return Ok(Vec::new());
-        }
-        buffer.drain_ready_entries(slot)
+        self.advance_ready_locked(&mut state)
     }
 
-    fn finalize_slot(
+    fn record_block_metadata(
         &self,
         slot: Slot,
         expected_tx_count: u64,
         expected_entry_count: u64,
-    ) -> Result<(SlotExecutionStats, Vec<ReadyEntry>), String> {
+    ) -> Result<Vec<ReadyEntry>, String> {
         let mut state = self.state.lock().expect("transaction scheduler lock");
-        if slot < state.current_slot {
+        if slot <= state.last_finalized_slot {
             return Err(format!(
-                "late block metadata for slot {slot} (current slot {})",
-                state.current_slot
-            ));
-        }
-        if let Some(pending_slot) = state
-            .slots
-            .keys()
-            .filter(|pending| **pending < slot)
-            .min()
-            .copied()
-        {
-            return Err(format!(
-                "block metadata for slot {slot} while pending slot {pending_slot} is unfinished"
+                "late block metadata for slot {slot} (last finalized slot {})",
+                state.last_finalized_slot
             ));
         }
         let buffer = state
             .slots
-            .remove(&slot)
-            .unwrap_or_else(SlotExecutionBuffer::default);
-        let stats = SlotExecutionStats {
-            slot,
-            expected_tx_count,
-            expected_entry_count,
-            processed_tx_count: buffer.processed_tx_count,
-            processed_entry_count: buffer.processed_entry_count,
-            pending_entries: buffer.pending_entries.len(),
-            buffered_transactions: buffer.txs.iter().filter(|value| value.is_some()).count(),
-        };
-        if stats.processed_tx_count != stats.expected_tx_count
-            || stats.processed_entry_count != stats.expected_entry_count
-            || stats.pending_entries > 0
-            || stats.buffered_transactions > 0
-        {
-            return Err(format!(
-                "slot {} replay mismatch: processed txs {}/{} entries {}/{} pending_entries={} buffered_txs={}",
-                stats.slot,
-                stats.processed_tx_count,
-                stats.expected_tx_count,
-                stats.processed_entry_count,
-                stats.expected_entry_count,
-                stats.pending_entries,
-                stats.buffered_transactions,
-            ));
+            .entry(slot)
+            .or_insert_with(SlotExecutionBuffer::default);
+        buffer.set_expected_counts(expected_tx_count, expected_entry_count)?;
+        self.advance_ready_locked(&mut state)
+    }
+
+    fn drain_ready_entries(&self) -> Result<Vec<ReadyEntry>, String> {
+        let mut state = self.state.lock().expect("transaction scheduler lock");
+        self.advance_ready_locked(&mut state)
+    }
+
+    fn verify_complete(&self, end_inclusive: Slot) -> Result<(), String> {
+        let state = self.state.lock().expect("transaction scheduler lock");
+        for (slot, buffer) in state.slots.iter() {
+            if *slot <= end_inclusive && buffer.has_any_data() {
+                return Err(format!(
+                    "replay incomplete: slot {slot} still has buffered data"
+                ));
+            }
+            if *slot > end_inclusive && buffer.has_any_data() {
+                return Err(format!(
+                    "replay received data for slot {slot} beyond end slot {end_inclusive}"
+                ));
+            }
         }
 
-        state.current_slot = slot.saturating_add(1);
-        let next_slot = state.current_slot;
-        let mut ready = Vec::new();
-        if let Some(next_buffer) = state.slots.get_mut(&next_slot) {
-            ready = next_buffer.drain_ready_entries(next_slot)?;
+        let mut slot = state.current_slot;
+        while slot <= end_inclusive {
+            match self.presence.state(slot) {
+                Some(SlotPresenceState::Missing) => slot = slot.saturating_add(1),
+                Some(SlotPresenceState::Present) => {
+                    return Err(format!(
+                        "replay incomplete: missing block data for slot {slot}"
+                    ));
+                }
+                None => break,
+            }
         }
-        Ok((stats, ready))
+
+        Ok(())
+    }
+
+    fn advance_ready_locked(&self, state: &mut SchedulerState) -> Result<Vec<ReadyEntry>, String> {
+        let mut ready = Vec::new();
+        loop {
+            let current_slot = state.current_slot;
+            match self.presence.is_missing(current_slot) {
+                Some(true) => {
+                    if let Some(buffer) = state.slots.remove(&current_slot) {
+                        if buffer.has_any_data() {
+                            return Err(format!(
+                                "slot {} marked leader skipped but contains buffered data",
+                                current_slot
+                            ));
+                        }
+                    }
+                    state.last_finalized_slot = current_slot;
+                    state.current_slot = current_slot.saturating_add(1);
+                    continue;
+                }
+                Some(false) => {}
+                None => break,
+            }
+
+            let Some(buffer) = state.slots.get_mut(&current_slot) else {
+                break;
+            };
+
+            let mut drained = buffer.drain_ready_entries(current_slot)?;
+            ready.append(&mut drained);
+
+            let should_finalize = buffer.should_finalize(current_slot)?;
+            if !should_finalize {
+                break;
+            }
+
+            state.slots.remove(&current_slot);
+            state.last_finalized_slot = current_slot;
+            state.current_slot = current_slot.saturating_add(1);
+        }
+
+        Ok(ready)
     }
 }
 
@@ -493,9 +553,33 @@ struct SlotExecutionBuffer {
     next_entry_index: usize,
     processed_tx_count: u64,
     processed_entry_count: u64,
+    expected_tx_count: Option<u64>,
+    expected_entry_count: Option<u64>,
 }
 
 impl SlotExecutionBuffer {
+    fn set_expected_counts(
+        &mut self,
+        expected_tx_count: u64,
+        expected_entry_count: u64,
+    ) -> Result<(), String> {
+        match (self.expected_tx_count, self.expected_entry_count) {
+            (Some(existing_tx), Some(existing_entry))
+                if existing_tx != expected_tx_count || existing_entry != expected_entry_count =>
+            {
+                return Err(format!(
+                    "block metadata mismatch: expected txs {existing_tx} entries {existing_entry}, got txs {expected_tx_count} entries {expected_entry_count}"
+                ));
+            }
+            (Some(_), Some(_)) => {}
+            _ => {
+                self.expected_tx_count = Some(expected_tx_count);
+                self.expected_entry_count = Some(expected_entry_count);
+            }
+        }
+        Ok(())
+    }
+
     fn insert_transaction(&mut self, index: usize, tx: VersionedTransaction) -> Result<(), String> {
         if self.txs.len() <= index {
             self.txs.resize_with(index + 1, || None);
@@ -586,6 +670,58 @@ impl SlotExecutionBuffer {
         }
         Ok(ready)
     }
+
+    fn buffered_transaction_count(&self) -> usize {
+        self.txs.iter().filter(|value| value.is_some()).count()
+    }
+
+    fn has_any_data(&self) -> bool {
+        self.expected_tx_count.is_some()
+            || self.expected_entry_count.is_some()
+            || !self.pending_entries.is_empty()
+            || self.txs.iter().any(|value| value.is_some())
+            || self.processed_tx_count > 0
+            || self.processed_entry_count > 0
+    }
+
+    fn should_finalize(&self, slot: Slot) -> Result<bool, String> {
+        let (Some(expected_tx), Some(expected_entry)) =
+            (self.expected_tx_count, self.expected_entry_count)
+        else {
+            return Ok(false);
+        };
+
+        if self.processed_tx_count > expected_tx || self.processed_entry_count > expected_entry {
+            return Err(format!(
+                "slot {} replay mismatch: processed txs {}/{} entries {}/{}",
+                slot,
+                self.processed_tx_count,
+                expected_tx,
+                self.processed_entry_count,
+                expected_entry
+            ));
+        }
+
+        let pending_entries = self.pending_entries.len();
+        let buffered_transactions = self.buffered_transaction_count();
+        if self.processed_tx_count == expected_tx && self.processed_entry_count == expected_entry {
+            if pending_entries > 0 || buffered_transactions > 0 {
+                return Err(format!(
+                    "slot {} replay mismatch: processed txs {}/{} entries {}/{} pending_entries={} buffered_txs={}",
+                    slot,
+                    self.processed_tx_count,
+                    expected_tx,
+                    self.processed_entry_count,
+                    expected_entry,
+                    pending_entries,
+                    buffered_transactions,
+                ));
+            }
+            return Ok(true);
+        }
+
+        Ok(false)
+    }
 }
 
 #[derive(Debug)]
@@ -604,17 +740,6 @@ struct ReadyEntry {
     txs: Vec<VersionedTransaction>,
     hash: Hash,
     tx_count: usize,
-}
-
-#[derive(Debug)]
-struct SlotExecutionStats {
-    slot: Slot,
-    expected_tx_count: u64,
-    expected_entry_count: u64,
-    processed_tx_count: u64,
-    processed_entry_count: u64,
-    pending_entries: usize,
-    buffered_transactions: usize,
 }
 
 #[derive(Debug)]
@@ -761,11 +886,27 @@ impl BlockMetadataNotifier for BankBlockMetadataNotifier {
         executed_transaction_count: u64,
         entry_count: u64,
     ) {
+        if slot == u64::MAX {
+            if let Some(delegate) = self.delegate.as_ref() {
+                delegate.notify_block_metadata(
+                    parent_slot,
+                    parent_blockhash,
+                    slot,
+                    blockhash,
+                    rewards,
+                    block_time,
+                    block_height,
+                    executed_transaction_count,
+                    entry_count,
+                );
+            }
+            return;
+        }
         match self
             .scheduler
-            .finalize_slot(slot, executed_transaction_count, entry_count)
+            .record_block_metadata(slot, executed_transaction_count, entry_count)
         {
-            Ok((_stats, ready_entries)) => {
+            Ok(ready_entries) => {
                 if !ready_entries.is_empty() {
                     self.bank_replay.process_ready_entries(ready_entries);
                 }
@@ -1628,6 +1769,62 @@ fn firehose_threads() -> u64 {
         .unwrap_or(1)
 }
 
+async fn build_slot_presence_map(
+    start_slot: Slot,
+    end_inclusive: Slot,
+) -> Result<Arc<SlotPresenceMap>, String> {
+    if end_inclusive < start_slot {
+        return Err(format!(
+            "invalid slot range: {start_slot}..={end_inclusive}"
+        ));
+    }
+    let total_slots = end_inclusive.saturating_sub(start_slot).saturating_add(1);
+    let total_len =
+        usize::try_from(total_slots).map_err(|_| "slot range too large to index".to_string())?;
+    let mut states = vec![SlotPresenceState::Missing; total_len];
+    let mut present = 0usize;
+    let mut missing = 0usize;
+    let log_every = env::var("JETSTREAMER_SLOT_PRESENCE_LOG_EVERY")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(10_000);
+
+    info!(
+        "building slot presence map for slots {}..={} ({} total)",
+        start_slot, end_inclusive, total_slots
+    );
+
+    for (idx, slot) in (start_slot..=end_inclusive).enumerate() {
+        match SLOT_OFFSET_INDEX.get_offset(slot).await {
+            Ok(_) => {
+                states[idx] = SlotPresenceState::Present;
+                present += 1;
+            }
+            Err(SlotOffsetIndexError::SlotNotFound(..)) => {
+                states[idx] = SlotPresenceState::Missing;
+                missing += 1;
+            }
+            Err(err) => {
+                return Err(format!("slot presence lookup failed at slot {slot}: {err}"));
+            }
+        }
+        let processed = (idx + 1) as u64;
+        if processed % log_every == 0 {
+            info!(
+                "slot presence progress: {processed}/{total_slots} (present={present}, missing={missing})"
+            );
+        }
+    }
+
+    info!("slot presence map built: present={present}, missing={missing}");
+    Ok(Arc::new(SlotPresenceMap {
+        start: start_slot,
+        end_inclusive,
+        states,
+    }))
+}
+
 async fn run_geyser_replay(
     epoch: u64,
     ledger_dir: &Path,
@@ -1643,9 +1840,10 @@ async fn run_geyser_replay(
     let service = GeyserPluginService::new(confirmed_bank_receiver, true, &config_files)
         .map_err(|err| format!("failed to load geyser plugin: {err}"))?;
     let (start_slot, end_inclusive) = epoch_to_slot_range(epoch);
+    let slot_presence = build_slot_presence_map(start_slot, end_inclusive).await?;
     let progress = Arc::new(ReplayProgress::new(start_slot));
     let failure = Arc::new(ReplayFailure::new(shutdown.clone()));
-    let scheduler = Arc::new(TransactionScheduler::new(start_slot));
+    let scheduler = Arc::new(TransactionScheduler::new(start_slot, slot_presence));
     let accounts_update_notifier = service.get_accounts_update_notifier().map(|delegate| {
         Arc::new(ProgressAccountsUpdateNotifier {
             progress: progress.clone(),
@@ -1811,6 +2009,18 @@ async fn run_geyser_replay(
     progress_done.store(true, Ordering::Relaxed);
     let _ = progress_handle.join();
     firehose_result.map_err(|(err, slot)| format!("firehose error at slot {slot}: {err}"))?;
+
+    match scheduler.drain_ready_entries() {
+        Ok(ready_entries) => {
+            if !ready_entries.is_empty() {
+                bank_replay.process_ready_entries(ready_entries);
+            }
+        }
+        Err(err) => failure.record(err),
+    }
+    if let Err(err) = scheduler.verify_complete(end_inclusive) {
+        failure.record(err);
+    }
 
     // Allow slot status observer to exit cleanly on shutdown.
     drop(confirmed_bank_sender);

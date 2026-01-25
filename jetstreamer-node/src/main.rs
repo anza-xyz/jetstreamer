@@ -236,6 +236,7 @@ impl BankReplay {
             if let Some(interval) = self.root_interval {
                 if interval > 0 && parent_slot % interval == 0 {
                     guard.set_root(parent_slot, None, None);
+                    guard.prune_program_cache(parent_slot);
                 }
             }
             let next_bank = bank_with_scheduler.clone_without_scheduler();

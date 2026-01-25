@@ -42,7 +42,10 @@ use solana_geyser_plugin_manager::block_metadata_notifier_interface::{
 };
 use solana_geyser_plugin_manager::geyser_plugin_service::GeyserPluginService;
 use solana_hash::Hash;
-use solana_ledger::entry_notifier_interface::EntryNotifier;
+use solana_ledger::{
+    blockstore_processor::set_alpenglow_ticks, entry_notifier_interface::EntryNotifier,
+    leader_schedule_cache::LeaderScheduleCache,
+};
 use solana_rpc::transaction_notifier_interface::TransactionNotifier;
 use solana_runtime::{
     bank::Bank, bank_forks::BankForks, installed_scheduler_pool::BankWithScheduler,
@@ -169,6 +172,7 @@ struct BankReplay {
     bank_forks: Arc<RwLock<BankForks>>,
     snapshot_verifier: Option<Arc<SnapshotVerifier>>,
     root_interval: Option<u64>,
+    leader_schedule_cache: LeaderScheduleCache,
     failure: Arc<ReplayFailure>,
 }
 
@@ -179,11 +183,14 @@ impl BankReplay {
         root_interval: Option<u64>,
         failure: Arc<ReplayFailure>,
     ) -> Self {
+        let mut leader_schedule_cache = LeaderScheduleCache::new_from_bank(&bank);
+        leader_schedule_cache.set_max_schedules(usize::MAX);
         let bank_forks = BankForks::new_rw_arc(bank);
         Self {
             bank_forks,
             snapshot_verifier,
             root_interval,
+            leader_schedule_cache,
             failure,
         }
     }
@@ -203,9 +210,14 @@ impl BankReplay {
             let parent = guard.working_bank();
             parent.freeze();
             let frozen_bank = parent.clone();
-            let collector_id = *parent.collector_id();
             let parent_slot = parent.slot();
+            self.leader_schedule_cache.set_root(&frozen_bank);
+            let collector_id = self
+                .leader_schedule_cache
+                .slot_leader_at(slot, Some(&parent))
+                .unwrap_or_else(|| *parent.collector_id());
             let next_bank = Bank::new_from_parent(parent, &collector_id, slot);
+            set_alpenglow_ticks(&next_bank);
             let bank_with_scheduler = guard.insert(next_bank);
             if let Some(interval) = self.root_interval {
                 if interval > 0 && parent_slot % interval == 0 {

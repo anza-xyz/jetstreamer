@@ -1048,6 +1048,26 @@ struct SchedulerState {
     slots: HashMap<Slot, SlotExecutionBuffer>,
 }
 
+#[derive(Debug)]
+struct SlotBufferSnapshot {
+    expected_tx_count: Option<u64>,
+    expected_entry_count: Option<u64>,
+    processed_tx_count: u64,
+    processed_entry_count: u64,
+    pending_entries: usize,
+    buffered_txs: usize,
+    next_entry_index: usize,
+}
+
+#[derive(Debug)]
+struct SchedulerSnapshot {
+    current_slot: Slot,
+    last_finalized_slot: Slot,
+    buffered_slots: usize,
+    presence: Option<SlotPresenceState>,
+    buffer: Option<SlotBufferSnapshot>,
+}
+
 impl TransactionScheduler {
     fn new(start_slot: Slot, presence: Arc<SlotPresenceMap>) -> Self {
         Self {
@@ -1160,6 +1180,28 @@ impl TransactionScheduler {
         }
 
         Ok(())
+    }
+
+    fn snapshot(&self) -> SchedulerSnapshot {
+        let state = self.state.lock().expect("transaction scheduler lock");
+        let current_slot = state.current_slot;
+        let presence = self.presence.state(current_slot);
+        let buffer = state.slots.get(&current_slot).map(|slot_buffer| SlotBufferSnapshot {
+            expected_tx_count: slot_buffer.expected_tx_count,
+            expected_entry_count: slot_buffer.expected_entry_count,
+            processed_tx_count: slot_buffer.processed_tx_count,
+            processed_entry_count: slot_buffer.processed_entry_count,
+            pending_entries: slot_buffer.pending_entries.len(),
+            buffered_txs: slot_buffer.buffered_transaction_count(),
+            next_entry_index: slot_buffer.next_entry_index,
+        });
+        SchedulerSnapshot {
+            current_slot,
+            last_finalized_slot: state.last_finalized_slot,
+            buffered_slots: state.slots.len(),
+            presence,
+            buffer,
+        }
     }
 
     fn advance_ready_locked(&self, state: &mut SchedulerState) -> Result<Vec<ReadyEntry>, String> {
@@ -3057,6 +3099,7 @@ async fn run_geyser_replay(
     let progress_done = Arc::new(AtomicBool::new(false));
     let progress_handle = {
         let progress = progress.clone();
+        let scheduler = scheduler.clone();
         let progress_done = progress_done.clone();
         let shutdown = shutdown.clone();
         std::thread::spawn(move || {
@@ -3068,8 +3111,16 @@ async fn run_geyser_replay(
                 0
             };
             let main_total = end_inclusive.saturating_sub(epoch_start).saturating_add(1);
+            let stall_interval = env::var("JETSTREAMER_STALL_LOG_SECS")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .map(Duration::from_secs)
+                .unwrap_or(Duration::from_secs(30));
             let mut phase_start = None::<Instant>;
             let mut in_warmup = has_warmup;
+            let mut last_seen_slot = progress.latest_slot.load(Ordering::Relaxed);
+            let mut last_seen_change = Instant::now();
+            let mut last_stall_log = Instant::now();
             while !progress_done.load(Ordering::Relaxed) && !shutdown.load(Ordering::Relaxed) {
                 std::thread::sleep(Duration::from_secs(3));
                 if progress_done.load(Ordering::Relaxed) || shutdown.load(Ordering::Relaxed) {
@@ -3081,6 +3132,32 @@ async fn run_geyser_replay(
                 let latest = progress.latest_slot.load(Ordering::Relaxed);
                 let tx_count = progress.tx_count.load(Ordering::Relaxed);
                 let account_updates = progress.account_update_count.load(Ordering::Relaxed);
+                if latest != last_seen_slot {
+                    last_seen_slot = latest;
+                    last_seen_change = Instant::now();
+                } else {
+                    let stalled_for = last_seen_change.elapsed();
+                    if stalled_for >= stall_interval
+                        && last_stall_log.elapsed() >= stall_interval
+                    {
+                        let snapshot = scheduler.snapshot();
+                        let phase = if in_warmup && latest < epoch_start {
+                            "warmup"
+                        } else {
+                            "main"
+                        };
+                        info!(
+                            "replay stall ({phase}): slot {latest} unchanged for {:.1}s; scheduler current_slot={} last_finalized={} buffered_slots={} presence={:?} buffer={:?}",
+                            stalled_for.as_secs_f64(),
+                            snapshot.current_slot,
+                            snapshot.last_finalized_slot,
+                            snapshot.buffered_slots,
+                            snapshot.presence,
+                            snapshot.buffer
+                        );
+                        last_stall_log = Instant::now();
+                    }
+                }
                 if in_warmup && latest < epoch_start {
                     let processed = if latest < replay_start {
                         0

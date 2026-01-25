@@ -58,6 +58,7 @@ use tokio::process::Command;
 use xxhash_rust::xxh64::xxh64;
 
 const RIPGET_LOG_INTERVAL_SECS: u64 = 5;
+const SNAPSHOT_UNPACK_LOG_INTERVAL_SECS: u64 = 5;
 const COMPACT_INDEX_MAGIC: &[u8; 8] = b"compiszd";
 const BUCKET_HEADER_SIZE: usize = 16;
 const HASH_PREFIX_SIZE: usize = 32;
@@ -2208,8 +2209,56 @@ fn load_bank_from_snapshot_archive(
             )
         })?;
     let unpack_dir = temp_dir.path().to_path_buf();
-    let (sender, receiver) = unbounded();
-    let drain = std::thread::spawn(move || for _ in receiver.iter() {});
+    let (sender, receiver) = unbounded::<PathBuf>();
+    let log_interval = env::var("JETSTREAMER_SNAPSHOT_UNPACK_LOG_INTERVAL_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .or_else(|| Some(Duration::from_secs(SNAPSHOT_UNPACK_LOG_INTERVAL_SECS)));
+    if let Some(interval) = log_interval {
+        info!(
+            "unpacking snapshot archive {} (log interval {}s)",
+            snapshot_archive.display(),
+            interval.as_secs()
+        );
+    } else {
+        info!(
+            "unpacking snapshot archive {}",
+            snapshot_archive.display()
+        );
+    }
+    let drain = std::thread::spawn(move || {
+        let mut count = 0u64;
+        let mut last_log = Instant::now();
+        let start = Instant::now();
+        for path in receiver.iter() {
+            count += 1;
+            if let Some(interval) = log_interval {
+                if last_log.elapsed() >= interval {
+                    let elapsed = start.elapsed().as_secs_f64();
+                    let rate = if elapsed > 0.0 {
+                        count as f64 / elapsed
+                    } else {
+                        0.0
+                    };
+                    let last_display = path.display().to_string();
+                    info!(
+                        "snapshot unpack progress: files={count} rate={rate:.1} files/s last={last_display}"
+                    );
+                    last_log = Instant::now();
+                }
+            }
+        }
+        if count > 0 {
+            let elapsed = start.elapsed().as_secs_f64();
+            let rate = if elapsed > 0.0 {
+                count as f64 / elapsed
+            } else {
+                0.0
+            };
+            info!("snapshot unpack complete: files={count} rate={rate:.1} files/s");
+        }
+    });
     let handle = streaming_unarchive_snapshot(
         sender,
         vec![account_run_dir.clone()],

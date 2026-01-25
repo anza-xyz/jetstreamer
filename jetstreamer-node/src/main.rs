@@ -49,8 +49,7 @@ use solana_runtime::{
     runtime_config::RuntimeConfig, snapshot_bank_utils, snapshot_utils,
 };
 use solana_signature::Signature;
-use solana_transaction::sanitized::SanitizedTransaction;
-use solana_transaction::versioned::VersionedTransaction;
+use solana_transaction::{TransactionError, sanitized::SanitizedTransaction, versioned::VersionedTransaction};
 use solana_transaction_status::TransactionStatusMeta;
 use tempfile::Builder as TempDirBuilder;
 use tokio::process::Command;
@@ -167,6 +166,7 @@ struct BankReplay {
     bank_forks: Arc<RwLock<BankForks>>,
     snapshot_verifier: Option<Arc<SnapshotVerifier>>,
     root_interval: Option<u64>,
+    failure: Arc<ReplayFailure>,
 }
 
 impl BankReplay {
@@ -174,12 +174,14 @@ impl BankReplay {
         bank: Bank,
         snapshot_verifier: Option<Arc<SnapshotVerifier>>,
         root_interval: Option<u64>,
+        failure: Arc<ReplayFailure>,
     ) -> Self {
         let bank_forks = BankForks::new_rw_arc(bank);
         Self {
             bank_forks,
             snapshot_verifier,
             root_interval,
+            failure,
         }
     }
 
@@ -239,30 +241,66 @@ impl BankReplay {
             }
 
             match self.bank_for_slot(entry.slot) {
-                Ok(bank) => match bank.try_process_entry_transactions(entry.txs) {
-                    Ok(results) => {
-                        for (offset, result) in results.into_iter().enumerate() {
-                            if let Err(err) = result {
-                                let tx_index = entry.start_index.saturating_add(offset);
-                                log::debug!(
-                                    "transaction execution failed at slot {} entry {} index {}: {}",
-                                    entry.slot,
-                                    entry.entry_index,
-                                    tx_index,
-                                    err
-                                );
-                            }
+                Ok(bank) => {
+                    let txs: Vec<VersionedTransaction> = entry
+                        .txs
+                        .iter()
+                        .map(|scheduled| scheduled.tx.clone())
+                        .collect();
+                    let expected_statuses: Vec<Result<(), TransactionError>> = entry
+                        .txs
+                        .iter()
+                        .map(|scheduled| scheduled.expected_status.clone())
+                        .collect();
+                    let results = match bank.try_process_entry_transactions(txs) {
+                        Ok(results) => results,
+                        Err(err) => {
+                            let message = format!(
+                                "transaction batch execution failed at slot {} entry {}: {}",
+                                entry.slot, entry.entry_index, err
+                            );
+                            self.failure.record(message.clone());
+                            panic!("{message}");
                         }
-                    }
-                    Err(err) => {
-                        log::debug!(
-                            "transaction batch execution failed at slot {} entry {}: {}",
+                    };
+
+                    if results.len() != expected_statuses.len() {
+                        let message = format!(
+                            "transaction result length mismatch at slot {} entry {}: expected {} results, got {}",
                             entry.slot,
                             entry.entry_index,
-                            err
+                            expected_statuses.len(),
+                            results.len()
                         );
+                        self.failure.record(message.clone());
+                        panic!("{message}");
                     }
-                },
+
+                    for (offset, (actual, expected)) in
+                        results.into_iter().zip(expected_statuses).enumerate()
+                    {
+                        if actual != expected {
+                            let tx_index = entry.start_index.saturating_add(offset);
+                            let signature = entry
+                                .txs
+                                .get(offset)
+                                .and_then(|scheduled| scheduled.tx.signatures.first())
+                                .map(|sig| sig.to_string())
+                                .unwrap_or_else(|| "<missing-signature>".to_string());
+                            let message = format!(
+                                "transaction execution mismatch at slot {} entry {} index {} sig {}: expected {:?}, got {:?}",
+                                entry.slot,
+                                entry.entry_index,
+                                tx_index,
+                                signature,
+                                expected,
+                                actual
+                            );
+                            self.failure.record(message.clone());
+                            panic!("{message}");
+                        }
+                    }
+                }
                 Err(err) => {
                     log::debug!(
                         "skipping transaction execution at slot {} entry {}: {}",
@@ -833,6 +871,7 @@ impl TransactionScheduler {
         slot: Slot,
         index: usize,
         tx: VersionedTransaction,
+        expected_status: Result<(), TransactionError>,
     ) -> Result<Vec<ReadyEntry>, String> {
         let mut state = self.state.lock().expect("transaction scheduler lock");
         if slot <= state.last_finalized_slot {
@@ -845,7 +884,7 @@ impl TransactionScheduler {
             .slots
             .entry(slot)
             .or_insert_with(SlotExecutionBuffer::default);
-        buffer.insert_transaction(index, tx)?;
+        buffer.insert_transaction(index, tx, expected_status)?;
         self.advance_ready_locked(&mut state)
     }
 
@@ -974,7 +1013,7 @@ impl TransactionScheduler {
 
 #[derive(Debug, Default)]
 struct SlotExecutionBuffer {
-    txs: Vec<Option<VersionedTransaction>>,
+    txs: Vec<Option<ScheduledTransaction>>,
     pending_entries: VecDeque<PendingEntry>,
     next_entry_index: usize,
     processed_tx_count: u64,
@@ -1006,14 +1045,22 @@ impl SlotExecutionBuffer {
         Ok(())
     }
 
-    fn insert_transaction(&mut self, index: usize, tx: VersionedTransaction) -> Result<(), String> {
+    fn insert_transaction(
+        &mut self,
+        index: usize,
+        tx: VersionedTransaction,
+        expected_status: Result<(), TransactionError>,
+    ) -> Result<(), String> {
         if self.txs.len() <= index {
             self.txs.resize_with(index + 1, || None);
         }
         if self.txs[index].is_some() {
             return Err(format!("duplicate transaction at index {index}"));
         }
-        self.txs[index] = Some(tx);
+        self.txs[index] = Some(ScheduledTransaction {
+            tx,
+            expected_status,
+        });
         Ok(())
     }
 
@@ -1159,11 +1206,17 @@ struct PendingEntry {
 }
 
 #[derive(Debug)]
+struct ScheduledTransaction {
+    tx: VersionedTransaction,
+    expected_status: Result<(), TransactionError>,
+}
+
+#[derive(Debug)]
 struct ReadyEntry {
     slot: Slot,
     entry_index: usize,
     start_index: usize,
-    txs: Vec<VersionedTransaction>,
+    txs: Vec<ScheduledTransaction>,
     hash: Hash,
     tx_count: usize,
 }
@@ -1238,7 +1291,12 @@ impl TransactionNotifier for BankTransactionNotifier {
         self.progress.inc_tx();
         match self
             .scheduler
-            .insert_transaction(slot, transaction_slot_index, transaction.clone())
+            .insert_transaction(
+                slot,
+                transaction_slot_index,
+                transaction.clone(),
+                transaction_status_meta.status.clone(),
+            )
         {
             Ok(ready_entries) => self.bank_replay.process_ready_entries(ready_entries),
             Err(err) => self.failure.record(err),
@@ -2565,6 +2623,7 @@ async fn run_geyser_replay(
         bank,
         snapshot_verifier.clone(),
         root_interval,
+        failure.clone(),
     ));
     let slot_range = start_slot..(end_inclusive + 1);
 

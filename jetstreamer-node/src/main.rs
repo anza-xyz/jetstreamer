@@ -19,7 +19,7 @@ use cid::{Cid, multibase::Base};
 use crossbeam_channel::unbounded;
 use dashmap::DashMap;
 use jetstreamer_firehose::{
-    epochs::{BASE_URL, epoch_to_slot_range},
+    epochs::{BASE_URL, epoch_to_slot_range, slot_to_epoch},
     firehose::{FirehoseError, GeyserNotifiers, firehose_geyser_with_notifiers},
 };
 use jetstreamer_node::snapshots::{
@@ -49,7 +49,9 @@ use solana_runtime::{
     runtime_config::RuntimeConfig, snapshot_bank_utils, snapshot_utils,
 };
 use solana_signature::Signature;
-use solana_transaction::{TransactionError, sanitized::SanitizedTransaction, versioned::VersionedTransaction};
+use solana_transaction::{
+    TransactionError, sanitized::SanitizedTransaction, versioned::VersionedTransaction,
+};
 use solana_transaction_status::TransactionStatusMeta;
 use tempfile::Builder as TempDirBuilder;
 use tokio::process::Command;
@@ -344,6 +346,11 @@ impl ReplayProgress {
             tx_count: AtomicU64::new(0),
             account_update_count: AtomicU64::new(0),
         }
+    }
+
+    fn reset_counts(&self) {
+        self.tx_count.store(0, Ordering::Relaxed);
+        self.account_update_count.store(0, Ordering::Relaxed);
     }
 
     fn note_slot(&self, slot: Slot) {
@@ -1225,6 +1232,7 @@ struct ReadyEntry {
 struct ProgressAccountsUpdateNotifier {
     progress: Arc<ReplayProgress>,
     delegate: Option<AccountsUpdateNotifier>,
+    live_start_slot: Slot,
 }
 
 impl AccountsUpdateNotifierInterface for ProgressAccountsUpdateNotifier {
@@ -1245,8 +1253,10 @@ impl AccountsUpdateNotifierInterface for ProgressAccountsUpdateNotifier {
     ) {
         self.progress.note_slot(slot);
         self.progress.inc_account_update();
-        if let Some(delegate) = self.delegate.as_ref() {
-            delegate.notify_account_update(slot, account, txn, pubkey, write_version);
+        if slot >= self.live_start_slot {
+            if let Some(delegate) = self.delegate.as_ref() {
+                delegate.notify_account_update(slot, account, txn, pubkey, write_version);
+            }
         }
     }
 
@@ -1274,6 +1284,7 @@ struct BankTransactionNotifier {
     scheduler: Arc<TransactionScheduler>,
     failure: Arc<ReplayFailure>,
     delegate: Option<Arc<dyn TransactionNotifier + Send + Sync + 'static>>,
+    live_start_slot: Slot,
 }
 
 impl TransactionNotifier for BankTransactionNotifier {
@@ -1289,29 +1300,28 @@ impl TransactionNotifier for BankTransactionNotifier {
     ) {
         self.progress.note_slot(slot);
         self.progress.inc_tx();
-        match self
-            .scheduler
-            .insert_transaction(
-                slot,
-                transaction_slot_index,
-                transaction.clone(),
-                transaction_status_meta.status.clone(),
-            )
-        {
+        match self.scheduler.insert_transaction(
+            slot,
+            transaction_slot_index,
+            transaction.clone(),
+            transaction_status_meta.status.clone(),
+        ) {
             Ok(ready_entries) => self.bank_replay.process_ready_entries(ready_entries),
             Err(err) => self.failure.record(err),
         }
 
         if let Some(delegate) = self.delegate.as_ref() {
-            delegate.notify_transaction(
-                slot,
-                transaction_slot_index,
-                signature,
-                message_hash,
-                is_vote,
-                transaction_status_meta,
-                transaction,
-            );
+            if slot >= self.live_start_slot {
+                delegate.notify_transaction(
+                    slot,
+                    transaction_slot_index,
+                    signature,
+                    message_hash,
+                    is_vote,
+                    transaction_status_meta,
+                    transaction,
+                );
+            }
         }
     }
 }
@@ -1322,6 +1332,7 @@ struct BankEntryNotifier {
     scheduler: Arc<TransactionScheduler>,
     failure: Arc<ReplayFailure>,
     delegate: Option<Arc<dyn EntryNotifier + Send + Sync + 'static>>,
+    live_start_slot: Slot,
 }
 
 impl EntryNotifier for BankEntryNotifier {
@@ -1345,7 +1356,9 @@ impl EntryNotifier for BankEntryNotifier {
         }
 
         if let Some(delegate) = self.delegate.as_ref() {
-            delegate.notify_entry(slot, index, entry, starting_transaction_index);
+            if slot >= self.live_start_slot {
+                delegate.notify_entry(slot, index, entry, starting_transaction_index);
+            }
         }
     }
 }
@@ -1355,6 +1368,7 @@ struct BankBlockMetadataNotifier {
     bank_replay: Arc<BankReplay>,
     failure: Arc<ReplayFailure>,
     delegate: Option<BlockMetadataNotifierArc>,
+    live_start_slot: Slot,
 }
 
 impl BlockMetadataNotifier for BankBlockMetadataNotifier {
@@ -1399,17 +1413,19 @@ impl BlockMetadataNotifier for BankBlockMetadataNotifier {
         }
 
         if let Some(delegate) = self.delegate.as_ref() {
-            delegate.notify_block_metadata(
-                parent_slot,
-                parent_blockhash,
-                slot,
-                blockhash,
-                rewards,
-                block_time,
-                block_height,
-                executed_transaction_count,
-                entry_count,
-            );
+            if slot >= self.live_start_slot {
+                delegate.notify_block_metadata(
+                    parent_slot,
+                    parent_blockhash,
+                    slot,
+                    blockhash,
+                    rewards,
+                    block_time,
+                    block_height,
+                    executed_transaction_count,
+                    entry_count,
+                );
+            }
         }
     }
 }
@@ -2461,20 +2477,59 @@ async fn ensure_compact_indexes_cached(
         .map_err(|err| format!("failed to canonicalize {}: {err}", slot_path.display()))
 }
 
+async fn ensure_slot_index_cached(
+    epoch: u64,
+    ledger_dir: &Path,
+    shutdown: Arc<AtomicBool>,
+) -> Result<PathBuf, String> {
+    let remote_base = resolve_remote_index_base_url()?;
+    let client = Client::new();
+    let (slot_url, _cid_url) = resolve_compact_index_urls(epoch, &remote_base, &client).await?;
+
+    let cache_dir = ledger_dir.join("compact-indexes");
+    fs::create_dir_all(&cache_dir)
+        .map_err(|err| format!("failed to create {}: {err}", cache_dir.display()))?;
+    let slot_path = local_index_path(&cache_dir, &slot_url)?;
+
+    download_with_ripget(&slot_url, &slot_path, shutdown).await?;
+
+    fs::canonicalize(&slot_path)
+        .map_err(|err| format!("failed to canonicalize {}: {err}", slot_path.display()))
+}
+
 async fn build_slot_presence_map(
     start_slot: Slot,
     end_inclusive: Slot,
     shutdown: Arc<AtomicBool>,
-    slot_index_path: &Path,
+    ledger_dir: &Path,
+    target_epoch: u64,
 ) -> Result<Arc<SlotPresenceMap>, String> {
-    let slot_index_path = slot_index_path.to_path_buf();
+    if end_inclusive < start_slot {
+        return Err(format!(
+            "invalid slot range: {start_slot}..={end_inclusive}"
+        ));
+    }
+
+    let mut epoch_indexes: Vec<(u64, Slot, Slot, PathBuf)> = Vec::new();
+    let start_epoch = slot_to_epoch(start_slot);
+    let end_epoch = slot_to_epoch(end_inclusive);
+    for epoch in start_epoch..=end_epoch {
+        let (epoch_start, epoch_end_inclusive) = epoch_to_slot_range(epoch);
+        let range_start = start_slot.max(epoch_start);
+        let range_end = end_inclusive.min(epoch_end_inclusive);
+        if range_start > range_end {
+            continue;
+        }
+        let slot_index_path = if epoch == target_epoch {
+            ensure_compact_indexes_cached(epoch, ledger_dir, shutdown.clone()).await?
+        } else {
+            ensure_slot_index_cached(epoch, ledger_dir, shutdown.clone()).await?
+        };
+        epoch_indexes.push((epoch, range_start, range_end, slot_index_path));
+    }
+
     let shutdown = shutdown.clone();
     tokio::task::spawn_blocking(move || {
-        if end_inclusive < start_slot {
-            return Err(format!(
-                "invalid slot range: {start_slot}..={end_inclusive}"
-            ));
-        }
         let total_slots = end_inclusive.saturating_sub(start_slot).saturating_add(1);
         let total_len = usize::try_from(total_slots)
             .map_err(|_| "slot range too large to index".to_string())?;
@@ -2491,57 +2546,73 @@ async fn build_slot_presence_map(
             "building slot presence map for slots {}..={} ({} total)",
             start_slot, end_inclusive, total_slots
         );
-        info!(
-            "loading slot-to-cid index from {}",
-            slot_index_path.display()
-        );
-        let data = fs::read(&slot_index_path)
-            .map_err(|err| format!("failed to read {}: {err}", slot_index_path.display()))?;
-        let index = LocalSlotIndex::from_bytes(data)?;
-        if let Some(epoch) = index.header.metadata_epoch() {
-            info!("slot-to-cid index metadata epoch: {}", epoch);
-        }
 
         let start_time = Instant::now();
         let mut last_log = Instant::now();
         let mut processed = 0u64;
 
-        for slot in start_slot..=end_inclusive {
-            if shutdown.load(Ordering::Relaxed) {
-                return Err("shutdown requested during slot presence scan".to_string());
+        for (epoch, range_start, range_end, slot_index_path) in epoch_indexes {
+            info!(
+                "slot-to-cid index cached for epoch {} at {}",
+                epoch,
+                slot_index_path.display()
+            );
+            info!(
+                "loading slot-to-cid index for epoch {} from {}",
+                epoch,
+                slot_index_path.display()
+            );
+            let data = fs::read(&slot_index_path)
+                .map_err(|err| format!("failed to read {}: {err}", slot_index_path.display()))?;
+            let index = LocalSlotIndex::from_bytes(data)?;
+            if let Some(meta_epoch) = index.header.metadata_epoch() {
+                if meta_epoch != epoch {
+                    warn!(
+                        "slot-to-cid index metadata epoch mismatch: expected {}, got {}",
+                        epoch, meta_epoch
+                    );
+                } else {
+                    info!("slot-to-cid index metadata epoch: {}", meta_epoch);
+                }
             }
-            let idx = (slot - start_slot) as usize;
-            if index.contains_slot(slot)? {
-                states[idx] = SlotPresenceState::Present;
-                present += 1;
-            } else {
-                states[idx] = SlotPresenceState::Missing;
-                missing += 1;
-            }
-            processed += 1;
-            if last_log.elapsed() >= Duration::from_secs(log_interval) {
-                let elapsed = start_time.elapsed().as_secs_f64();
-                let rate = if elapsed > 0.0 {
-                    processed as f64 / elapsed
+
+            for slot in range_start..=range_end {
+                if shutdown.load(Ordering::Relaxed) {
+                    return Err("shutdown requested during slot presence scan".to_string());
+                }
+                let idx = (slot - start_slot) as usize;
+                if index.contains_slot(slot)? {
+                    states[idx] = SlotPresenceState::Present;
+                    present += 1;
                 } else {
-                    0.0
-                };
-                let remaining = total_slots.saturating_sub(processed);
-                let eta = if rate > 0.0 {
-                    let eta_secs = (remaining as f64 / rate).ceil() as u64;
-                    format_eta(Duration::from_secs(eta_secs))
-                } else {
-                    "unknown".to_string()
-                };
-                let percent = if total_slots == 0 {
-                    100.0
-                } else {
-                    (processed as f64) * 100.0 / (total_slots as f64)
-                };
-                info!(
-                    "slot presence progress: {processed}/{total_slots} ({percent:.2}%) present={present} missing={missing} rate={rate:.1} slots/s eta={eta}"
-                );
-                last_log = Instant::now();
+                    states[idx] = SlotPresenceState::Missing;
+                    missing += 1;
+                }
+                processed += 1;
+                if last_log.elapsed() >= Duration::from_secs(log_interval) {
+                    let elapsed = start_time.elapsed().as_secs_f64();
+                    let rate = if elapsed > 0.0 {
+                        processed as f64 / elapsed
+                    } else {
+                        0.0
+                    };
+                    let remaining = total_slots.saturating_sub(processed);
+                    let eta = if rate > 0.0 {
+                        let eta_secs = (remaining as f64 / rate).ceil() as u64;
+                        format_eta(Duration::from_secs(eta_secs))
+                    } else {
+                        "unknown".to_string()
+                    };
+                    let percent = if total_slots == 0 {
+                        100.0
+                    } else {
+                        (processed as f64) * 100.0 / (total_slots as f64)
+                    };
+                    info!(
+                        "slot presence progress: {processed}/{total_slots} ({percent:.2}%) present={present} missing={missing} rate={rate:.1} slots/s eta={eta}"
+                    );
+                    last_log = Instant::now();
+                }
             }
         }
 
@@ -2570,42 +2641,29 @@ async fn run_geyser_replay(
 
     let service = GeyserPluginService::new(confirmed_bank_receiver, true, &config_files)
         .map_err(|err| format!("failed to load geyser plugin: {err}"))?;
-    let (start_slot, end_inclusive) = epoch_to_slot_range(epoch);
-    let slot_index_path =
-        ensure_compact_indexes_cached(epoch, ledger_dir, shutdown.clone()).await?;
-    info!(
-        "slot-to-cid index cached for epoch {} at {}",
-        epoch,
-        slot_index_path.display()
-    );
-    let slot_presence = build_slot_presence_map(
-        start_slot,
-        end_inclusive,
-        shutdown.clone(),
-        &slot_index_path,
-    )
-    .await?;
-    let progress = Arc::new(ReplayProgress::new(start_slot));
+    let (epoch_start, end_inclusive) = epoch_to_slot_range(epoch);
+    let progress = Arc::new(ReplayProgress::new(epoch_start));
     let failure = Arc::new(ReplayFailure::new(shutdown.clone()));
-    let scheduler = Arc::new(TransactionScheduler::new(start_slot, slot_presence));
     let accounts_update_notifier = service.get_accounts_update_notifier().map(|delegate| {
         Arc::new(ProgressAccountsUpdateNotifier {
             progress: progress.clone(),
             delegate: Some(delegate),
+            live_start_slot: epoch_start,
         }) as AccountsUpdateNotifier
     });
 
     ensure_genesis_archive(ledger_dir).await?;
     info!("loading bank from snapshot");
     let ledger_dir = ledger_dir.to_path_buf();
+    let ledger_dir_for_load = ledger_dir.clone();
     let snapshot_archive = snapshot_archive.to_path_buf();
     let use_dir_loader = env_truthy("JETSTREAMER_LOAD_FROM_DIR");
     let bank = tokio::task::spawn_blocking(move || {
         if use_dir_loader {
-            load_bank_from_snapshot(&ledger_dir, accounts_update_notifier)
+            load_bank_from_snapshot(&ledger_dir_for_load, accounts_update_notifier)
         } else {
             load_bank_from_snapshot_archive(
-                &ledger_dir,
+                &ledger_dir_for_load,
                 &snapshot_archive,
                 accounts_update_notifier,
             )
@@ -2619,13 +2677,43 @@ async fn run_geyser_replay(
     } else {
         info!("bank root pruning disabled");
     }
+    let snapshot_slot = bank.slot();
+    let replay_start = if snapshot_slot.saturating_add(1) < epoch_start {
+        snapshot_slot.saturating_add(1)
+    } else {
+        epoch_start
+    };
+    if replay_start < epoch_start {
+        info!(
+            "warming up replay from slot {} to {} (epoch {} starts at {})",
+            replay_start,
+            epoch_start.saturating_sub(1),
+            epoch,
+            epoch_start
+        );
+    } else {
+        info!("starting replay at epoch {} slot {}", epoch, replay_start);
+    }
+    progress
+        .latest_slot
+        .store(replay_start.saturating_sub(1), Ordering::Relaxed);
+
+    let slot_presence = build_slot_presence_map(
+        replay_start,
+        end_inclusive,
+        shutdown.clone(),
+        &ledger_dir,
+        epoch,
+    )
+    .await?;
+    let scheduler = Arc::new(TransactionScheduler::new(replay_start, slot_presence));
     let bank_replay = Arc::new(BankReplay::new(
         bank,
         snapshot_verifier.clone(),
         root_interval,
         failure.clone(),
     ));
-    let slot_range = start_slot..(end_inclusive + 1);
+    let slot_range = replay_start..(end_inclusive + 1);
 
     let client = Client::new();
     let index_base_url = resolve_remote_index_base_url()?;
@@ -2635,6 +2723,7 @@ async fn run_geyser_replay(
         scheduler: scheduler.clone(),
         failure: failure.clone(),
         delegate: service.get_transaction_notifier(),
+        live_start_slot: epoch_start,
     });
     let entry_notifier = Arc::new(BankEntryNotifier {
         bank_replay: bank_replay.clone(),
@@ -2642,12 +2731,14 @@ async fn run_geyser_replay(
         scheduler: scheduler.clone(),
         failure: failure.clone(),
         delegate: service.get_entry_notifier(),
+        live_start_slot: epoch_start,
     });
     let block_metadata_notifier = Arc::new(BankBlockMetadataNotifier {
         scheduler: scheduler.clone(),
         bank_replay: bank_replay.clone(),
         failure: failure.clone(),
         delegate: service.get_block_metadata_notifier(),
+        live_start_slot: epoch_start,
     });
     let notifiers = GeyserNotifiers {
         transaction_notifier: Some(transaction_notifier),
@@ -2666,56 +2757,105 @@ async fn run_geyser_replay(
         let progress_done = progress_done.clone();
         let shutdown = shutdown.clone();
         std::thread::spawn(move || {
-            let total_slots = end_inclusive.saturating_sub(start_slot).saturating_add(1);
-            let mut start = None::<Instant>;
+            let has_warmup = replay_start < epoch_start;
+            let warmup_end = epoch_start.saturating_sub(1);
+            let warmup_total = if has_warmup {
+                warmup_end.saturating_sub(replay_start).saturating_add(1)
+            } else {
+                0
+            };
+            let main_total = end_inclusive.saturating_sub(epoch_start).saturating_add(1);
+            let mut phase_start = None::<Instant>;
+            let mut in_warmup = has_warmup;
             while !progress_done.load(Ordering::Relaxed) && !shutdown.load(Ordering::Relaxed) {
                 std::thread::sleep(Duration::from_secs(3));
                 if progress_done.load(Ordering::Relaxed) || shutdown.load(Ordering::Relaxed) {
                     break;
                 }
-                if start.is_none() {
-                    start = Some(Instant::now());
+                if phase_start.is_none() {
+                    phase_start = Some(Instant::now());
                 }
                 let latest = progress.latest_slot.load(Ordering::Relaxed);
-                let processed = if latest < start_slot {
-                    0
-                } else {
-                    latest.saturating_sub(start_slot).saturating_add(1)
-                };
-                let percent = if total_slots == 0 {
-                    100.0
-                } else {
-                    (processed as f64) * 100.0 / (total_slots as f64)
-                };
-                let display_slot = if latest < start_slot {
-                    start_slot
-                } else {
-                    latest
-                };
                 let tx_count = progress.tx_count.load(Ordering::Relaxed);
                 let account_updates = progress.account_update_count.load(Ordering::Relaxed);
-                let eta = if processed == 0 {
-                    "unknown".to_string()
-                } else if let Some(start) = start {
-                    let elapsed = start.elapsed().as_secs_f64();
-                    if elapsed <= 0.0 {
-                        "unknown".to_string()
+                if in_warmup && latest < epoch_start {
+                    let processed = if latest < replay_start {
+                        0
                     } else {
-                        let rate = (processed as f64) / elapsed;
-                        if rate <= 0.0 {
+                        latest.saturating_sub(replay_start).saturating_add(1)
+                    };
+                    let percent = if warmup_total == 0 {
+                        100.0
+                    } else {
+                        (processed as f64) * 100.0 / (warmup_total as f64)
+                    };
+                    let display_slot = if latest < replay_start {
+                        replay_start
+                    } else {
+                        latest
+                    };
+                    let eta = if processed == 0 {
+                        "unknown".to_string()
+                    } else if let Some(start) = phase_start {
+                        let elapsed = start.elapsed().as_secs_f64();
+                        if elapsed <= 0.0 {
                             "unknown".to_string()
                         } else {
-                            let remaining = total_slots.saturating_sub(processed);
-                            let eta_secs = ((remaining as f64) / rate).ceil() as u64;
-                            format_eta(Duration::from_secs(eta_secs))
+                            let rate = (processed as f64) / elapsed;
+                            if rate <= 0.0 {
+                                "unknown".to_string()
+                            } else {
+                                let remaining = warmup_total.saturating_sub(processed);
+                                let eta_secs = ((remaining as f64) / rate).ceil() as u64;
+                                format_eta(Duration::from_secs(eta_secs))
+                            }
                         }
-                    }
+                    } else {
+                        "unknown".to_string()
+                    };
+                    info!(
+                        "warmup slot {display_slot}/{warmup_end} ({percent:.2}%) txs={tx_count} accounts={account_updates} eta={eta} (epoch {epoch} starts at {epoch_start})"
+                    );
                 } else {
-                    "unknown".to_string()
-                };
-                info!(
-                    "progress slot {display_slot}/{end_inclusive} ({percent:.2}%) txs={tx_count} accounts={account_updates} eta={eta}"
-                );
+                    if in_warmup {
+                        in_warmup = false;
+                        phase_start = Some(Instant::now());
+                        progress.reset_counts();
+                    }
+                    let display_slot = latest.clamp(epoch_start, end_inclusive);
+                    let processed = if display_slot < epoch_start {
+                        0
+                    } else {
+                        display_slot.saturating_sub(epoch_start).saturating_add(1)
+                    };
+                    let percent = if main_total == 0 {
+                        100.0
+                    } else {
+                        (processed as f64) * 100.0 / (main_total as f64)
+                    };
+                    let eta = if processed == 0 {
+                        "unknown".to_string()
+                    } else if let Some(start) = phase_start {
+                        let elapsed = start.elapsed().as_secs_f64();
+                        if elapsed <= 0.0 {
+                            "unknown".to_string()
+                        } else {
+                            let rate = (processed as f64) / elapsed;
+                            if rate <= 0.0 {
+                                "unknown".to_string()
+                            } else {
+                                let remaining = main_total.saturating_sub(processed);
+                                let eta_secs = ((remaining as f64) / rate).ceil() as u64;
+                                format_eta(Duration::from_secs(eta_secs))
+                            }
+                        }
+                    } else {
+                        "unknown".to_string()
+                    };
+                    info!(
+                        "progress slot {display_slot}/{end_inclusive} ({percent:.2}%) txs={tx_count} accounts={account_updates} eta={eta}"
+                    );
+                }
             }
         })
     };

@@ -17,6 +17,7 @@ dashmap.workspace = true
 env_logger.workspace = true
 jetstreamer-firehose.workspace = true
 log.workspace = true
+bs58.workspace = true
 reqwest.workspace = true
 serde_cbor.workspace = true
 ripget = "0.1"

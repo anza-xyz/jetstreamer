@@ -4127,6 +4127,7 @@ name = "jetstreamer-node"
 version = "0.4.0"
 dependencies = [
  "agave-snapshots",
+ "bs58",
  "cid",
  "crossbeam-channel",
  "ctrlc",

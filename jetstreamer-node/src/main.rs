@@ -178,6 +178,7 @@ struct BankReplay {
     root_interval: Option<u64>,
     leader_schedule_cache: LeaderScheduleCache,
     failure: Arc<ReplayFailure>,
+    cursor: Arc<ReplayCursor>,
 }
 
 impl BankReplay {
@@ -186,6 +187,7 @@ impl BankReplay {
         snapshot_verifier: Option<Arc<SnapshotVerifier>>,
         root_interval: Option<u64>,
         failure: Arc<ReplayFailure>,
+        cursor: Arc<ReplayCursor>,
     ) -> Self {
         let mut leader_schedule_cache = LeaderScheduleCache::new_from_bank(&bank);
         leader_schedule_cache.set_max_schedules(usize::MAX);
@@ -196,6 +198,7 @@ impl BankReplay {
             root_interval,
             leader_schedule_cache,
             failure,
+            cursor,
         }
     }
 
@@ -261,6 +264,18 @@ impl BankReplay {
 
             match self.bank_for_slot(entry.slot) {
                 Ok(bank) => {
+                    let signature = entry
+                        .txs
+                        .first()
+                        .and_then(|scheduled| scheduled.tx.signatures.first())
+                        .map(|sig| sig.to_string());
+                    self.cursor.update(
+                        entry.slot,
+                        entry.entry_index,
+                        entry.start_index,
+                        entry.tx_count,
+                        signature,
+                    );
                     let txs: Vec<VersionedTransaction> = entry
                         .txs
                         .iter()
@@ -400,20 +415,76 @@ struct ReplayFailure {
     error: Mutex<Option<String>>,
 }
 
+#[derive(Debug)]
+struct ReplayCursor {
+    slot: AtomicU64,
+    entry_index: AtomicU64,
+    tx_start: AtomicU64,
+    tx_count: AtomicU64,
+    signature: Mutex<Option<String>>,
+}
+
+impl ReplayCursor {
+    fn new() -> Self {
+        Self {
+            slot: AtomicU64::new(0),
+            entry_index: AtomicU64::new(0),
+            tx_start: AtomicU64::new(0),
+            tx_count: AtomicU64::new(0),
+            signature: Mutex::new(None),
+        }
+    }
+
+    fn update(
+        &self,
+        slot: Slot,
+        entry_index: usize,
+        tx_start: usize,
+        tx_count: usize,
+        signature: Option<String>,
+    ) {
+        self.slot.store(slot, Ordering::Relaxed);
+        self.entry_index.store(entry_index as u64, Ordering::Relaxed);
+        self.tx_start.store(tx_start as u64, Ordering::Relaxed);
+        self.tx_count.store(tx_count as u64, Ordering::Relaxed);
+        if let Ok(mut guard) = self.signature.lock() {
+            *guard = signature;
+        }
+    }
+
+    fn snapshot(&self) -> (u64, u64, u64, u64, Option<String>) {
+        let slot = self.slot.load(Ordering::Relaxed);
+        let entry_index = self.entry_index.load(Ordering::Relaxed);
+        let tx_start = self.tx_start.load(Ordering::Relaxed);
+        let tx_count = self.tx_count.load(Ordering::Relaxed);
+        let signature = self.signature.lock().ok().and_then(|guard| guard.clone());
+        (slot, entry_index, tx_start, tx_count, signature)
+    }
+}
+
 struct AbortOnErrorLogger {
     inner: env_logger::Logger,
     shutdown: Arc<AtomicBool>,
     abort_on_error: bool,
+    cursor: Arc<ReplayCursor>,
 }
 
 impl log::Log for AbortOnErrorLogger {
     fn enabled(&self, metadata: &log::Metadata) -> bool {
+        if metadata.level() == log::Level::Error {
+            return true;
+        }
         self.inner.enabled(metadata)
     }
 
     fn log(&self, record: &log::Record) {
         self.inner.log(record);
         if self.abort_on_error && record.level() == log::Level::Error {
+            let (slot, entry_index, tx_start, tx_count, signature) = self.cursor.snapshot();
+            eprintln!(
+                "replay cursor at error: slot={slot} entry={entry_index} tx_start={tx_start} tx_count={tx_count} sig={}",
+                signature.as_deref().unwrap_or("<unknown>")
+            );
             self.shutdown.store(true, Ordering::SeqCst);
             std::process::exit(1);
         }
@@ -422,7 +493,7 @@ impl log::Log for AbortOnErrorLogger {
     fn flush(&self) {}
 }
 
-fn setup_logger(shutdown: Arc<AtomicBool>) {
+fn setup_logger(shutdown: Arc<AtomicBool>, cursor: Arc<ReplayCursor>) {
     let abort_on_error = match env::var("JETSTREAMER_ABORT_ON_ERROR_LOG") {
         Ok(value) => {
             let value = value.trim().to_ascii_lowercase();
@@ -435,12 +506,26 @@ fn setup_logger(shutdown: Arc<AtomicBool>) {
     )
     .format_timestamp_nanos()
     .build();
-    log::set_max_level(logger.filter());
-    let _ = log::set_boxed_logger(Box::new(AbortOnErrorLogger {
+    let max_level = logger.filter();
+    let install = log::set_boxed_logger(Box::new(AbortOnErrorLogger {
         inner: logger,
         shutdown,
         abort_on_error,
+        cursor,
     }));
+    match install {
+        Ok(()) => {
+            log::set_max_level(max_level);
+            eprintln!(
+                "jetstreamer logger installed (abort_on_error={abort_on_error})"
+            );
+        }
+        Err(_) => {
+            eprintln!(
+                "jetstreamer logger already initialized; abort_on_error may be disabled"
+            );
+        }
+    }
 }
 
 impl ReplayFailure {
@@ -2806,6 +2891,7 @@ async fn run_geyser_replay(
     ledger_dir: &Path,
     snapshot_archive: &Path,
     shutdown: Arc<AtomicBool>,
+    cursor: Arc<ReplayCursor>,
     snapshot_verifier: Option<Arc<SnapshotVerifier>>,
 ) -> Result<(), String> {
     let libpath = plugin_library_path()?;
@@ -2886,6 +2972,7 @@ async fn run_geyser_replay(
         snapshot_verifier.clone(),
         root_interval,
         failure.clone(),
+        cursor.clone(),
     ));
     let slot_range = replay_start..(end_inclusive + 1);
 
@@ -3172,7 +3259,8 @@ async fn extract_tarball(archive: &Path, dest_dir: &Path) -> Result<(), String> 
 #[tokio::main]
 async fn main() {
     let shutdown = Arc::new(AtomicBool::new(false));
-    setup_logger(shutdown.clone());
+    let cursor = Arc::new(ReplayCursor::new());
+    setup_logger(shutdown.clone(), cursor.clone());
     {
         let shutdown = shutdown.clone();
         if let Err(err) = ctrlc::set_handler(move || {
@@ -3315,7 +3403,15 @@ async fn main() {
     };
 
     if let Err(err) =
-        run_geyser_replay(epoch, &dest_dir, &dest_path, shutdown, snapshot_verifier).await
+        run_geyser_replay(
+            epoch,
+            &dest_dir,
+            &dest_path,
+            shutdown,
+            cursor,
+            snapshot_verifier,
+        )
+        .await
     {
         eprintln!("error: {err}");
         exit(1);

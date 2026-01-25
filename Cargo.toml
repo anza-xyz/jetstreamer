@@ -50,6 +50,8 @@ serde_json = { version = "1", default-features = false }
 thiserror = { version = "2", default-features = false }
 reqwest = { version = "0.12", default-features = false }
 anyhow = { version = "1", default-features = false }
+tar = "0.4"
+env_logger = "0.11"
 base64 = "0.22"
 bincode = "1"
 serial_test = "2"

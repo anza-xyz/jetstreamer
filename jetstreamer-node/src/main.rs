@@ -11,6 +11,7 @@ use std::{
 };
 
 use agave_snapshots::{
+    ArchiveFormat, ArchiveFormatDecompressor,
     snapshot_archive_info::{FullSnapshotArchiveInfo, SnapshotArchiveInfoGetter},
     snapshot_hash::SnapshotHash,
     streaming_unarchive_snapshot,
@@ -57,11 +58,14 @@ use solana_transaction::{
 };
 use solana_transaction_status::TransactionStatusMeta;
 use tempfile::Builder as TempDirBuilder;
+use tar::Archive as TarArchive;
 use tokio::process::Command;
 use xxhash_rust::xxh64::xxh64;
 
 const RIPGET_LOG_INTERVAL_SECS: u64 = 5;
 const SNAPSHOT_UNPACK_LOG_INTERVAL_SECS: u64 = 5;
+const SNAPSHOT_PRECOUNT_BUFFER_BYTES: usize = 16 * 1024 * 1024;
+const DEFAULT_LOG_FILTER: &str = "info,solana_metrics=off,solana_runtime::bank=off";
 const COMPACT_INDEX_MAGIC: &[u8; 8] = b"compiszd";
 const BUCKET_HEADER_SIZE: usize = 16;
 const HASH_PREFIX_SIZE: usize = 32;
@@ -394,6 +398,49 @@ impl ReplayProgress {
 struct ReplayFailure {
     shutdown: Arc<AtomicBool>,
     error: Mutex<Option<String>>,
+}
+
+struct AbortOnErrorLogger {
+    inner: env_logger::Logger,
+    shutdown: Arc<AtomicBool>,
+    abort_on_error: bool,
+}
+
+impl log::Log for AbortOnErrorLogger {
+    fn enabled(&self, metadata: &log::Metadata) -> bool {
+        self.inner.enabled(metadata)
+    }
+
+    fn log(&self, record: &log::Record) {
+        self.inner.log(record);
+        if self.abort_on_error && record.level() == log::Level::Error {
+            self.shutdown.store(true, Ordering::SeqCst);
+            std::process::exit(1);
+        }
+    }
+
+    fn flush(&self) {}
+}
+
+fn setup_logger(shutdown: Arc<AtomicBool>) {
+    let abort_on_error = match env::var("JETSTREAMER_ABORT_ON_ERROR_LOG") {
+        Ok(value) => {
+            let value = value.trim().to_ascii_lowercase();
+            !matches!(value.as_str(), "" | "0" | "false" | "no")
+        }
+        Err(_) => true,
+    };
+    let logger = env_logger::Builder::from_env(
+        env_logger::Env::new().default_filter_or(DEFAULT_LOG_FILTER),
+    )
+    .format_timestamp_nanos()
+    .build();
+    log::set_max_level(logger.filter());
+    let _ = log::set_boxed_logger(Box::new(AbortOnErrorLogger {
+        inner: logger,
+        shutdown,
+        abort_on_error,
+    }));
 }
 
 impl ReplayFailure {
@@ -2026,6 +2073,27 @@ fn env_truthy(var: &str) -> bool {
     }
 }
 
+fn count_snapshot_entries(
+    snapshot_archive: &Path,
+    archive_format: ArchiveFormat,
+) -> Result<u64, String> {
+    let file = fs::File::open(snapshot_archive)
+        .map_err(|err| format!("failed to open snapshot archive for counting: {err}"))?;
+    let reader = std::io::BufReader::with_capacity(SNAPSHOT_PRECOUNT_BUFFER_BYTES, file);
+    let decompressor = ArchiveFormatDecompressor::new(archive_format, reader)
+        .map_err(|err| format!("failed to create snapshot archive reader: {err}"))?;
+    let mut archive = TarArchive::new(decompressor);
+    let entries = archive
+        .entries()
+        .map_err(|err| format!("failed to read snapshot archive entries: {err}"))?;
+    let mut count = 0u64;
+    for entry in entries {
+        entry.map_err(|err| format!("failed to read snapshot archive entry: {err}"))?;
+        count = count.saturating_add(1);
+    }
+    Ok(count)
+}
+
 fn bank_root_interval() -> Option<u64> {
     match env::var("JETSTREAMER_ROOT_INTERVAL") {
         Ok(value) => {
@@ -2227,6 +2295,29 @@ fn load_bank_from_snapshot_archive(
         .and_then(|value| value.parse::<u64>().ok())
         .map(Duration::from_secs)
         .or_else(|| Some(Duration::from_secs(SNAPSHOT_UNPACK_LOG_INTERVAL_SECS)));
+    let percent_enabled = !env_truthy("JETSTREAMER_SNAPSHOT_UNPACK_NO_PERCENT");
+    let total_entries = if percent_enabled {
+        info!(
+            "counting snapshot archive entries for progress percent ({})",
+            snapshot_archive.display()
+        );
+        let start = Instant::now();
+        match count_snapshot_entries(snapshot_archive, full_snapshot.archive_format()) {
+            Ok(total) => {
+                info!(
+                    "snapshot archive entries: total={total} (counted in {:.2}s)",
+                    start.elapsed().as_secs_f64()
+                );
+                Some(total)
+            }
+            Err(err) => {
+                warn!("snapshot entry counting failed: {err} (percent disabled)");
+                None
+            }
+        }
+    } else {
+        None
+    };
     if let Some(interval) = log_interval {
         info!(
             "unpacking snapshot archive {} (log interval {}s)",
@@ -2254,9 +2345,20 @@ fn load_bank_from_snapshot_archive(
                         0.0
                     };
                     let last_display = path.display().to_string();
-                    info!(
-                        "snapshot unpack progress: files={count} rate={rate:.1} files/s last={last_display}"
-                    );
+                    if let Some(total) = total_entries {
+                        let percent = if total > 0 {
+                            (count as f64 * 100.0 / total as f64).min(100.0)
+                        } else {
+                            0.0
+                        };
+                        info!(
+                            "snapshot unpack progress: files={count}/{total} ({percent:.2}%) rate={rate:.1} files/s last={last_display}"
+                        );
+                    } else {
+                        info!(
+                            "snapshot unpack progress: files={count} rate={rate:.1} files/s last={last_display}"
+                        );
+                    }
                     last_log = Instant::now();
                 }
             }
@@ -2268,7 +2370,18 @@ fn load_bank_from_snapshot_archive(
             } else {
                 0.0
             };
-            info!("snapshot unpack complete: files={count} rate={rate:.1} files/s");
+            if let Some(total) = total_entries {
+                let percent = if total > 0 {
+                    (count as f64 * 100.0 / total as f64).min(100.0)
+                } else {
+                    0.0
+                };
+                info!(
+                    "snapshot unpack complete: files={count}/{total} ({percent:.2}%) rate={rate:.1} files/s"
+                );
+            } else {
+                info!("snapshot unpack complete: files={count} rate={rate:.1} files/s");
+            }
         }
     });
     let handle = streaming_unarchive_snapshot(
@@ -3058,8 +3171,8 @@ async fn extract_tarball(archive: &Path, dest_dir: &Path) -> Result<(), String> 
 
 #[tokio::main]
 async fn main() {
-    solana_logger::setup_with_default("info,solana_metrics=off,solana_runtime::bank=off");
     let shutdown = Arc::new(AtomicBool::new(false));
+    setup_logger(shutdown.clone());
     {
         let shutdown = shutdown.clone();
         if let Err(err) = ctrlc::set_handler(move || {

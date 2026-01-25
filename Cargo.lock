@@ -4127,6 +4127,7 @@ name = "jetstreamer-node"
 version = "0.4.0"
 dependencies = [
  "agave-snapshots",
+ "cid",
  "crossbeam-channel",
  "ctrlc",
  "dashmap",
@@ -4134,6 +4135,7 @@ dependencies = [
  "log",
  "reqwest 0.12.24",
  "ripget",
+ "serde_cbor",
  "serde_json",
  "solana-account",
  "solana-accounts-db",
@@ -4153,6 +4155,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.17",
  "tokio",
+ "xxhash-rust",
 ]
 
 [[package]]

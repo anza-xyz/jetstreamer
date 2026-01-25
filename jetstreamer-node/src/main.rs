@@ -15,18 +15,19 @@ use agave_snapshots::{
     snapshot_hash::SnapshotHash,
     streaming_unarchive_snapshot,
 };
+use cid::{Cid, multibase::Base};
 use crossbeam_channel::unbounded;
 use dashmap::DashMap;
 use jetstreamer_firehose::{
     epochs::{BASE_URL, epoch_to_slot_range},
     firehose::{FirehoseError, GeyserNotifiers, firehose_geyser_with_notifiers},
-    index::{SLOT_OFFSET_INDEX, SlotOffsetIndex, SlotOffsetIndexError, pin_epoch_local},
 };
 use jetstreamer_node::snapshots::{
     DEFAULT_BUCKET, download_snapshot_at_or_before_slot, list_epoch_snapshots,
 };
 use log::{info, warn};
-use reqwest::{Client, Url};
+use reqwest::{Client, Url, header::RANGE};
+use serde_cbor::Value;
 use solana_account::AccountSharedData;
 use solana_accounts_db::{
     accounts_db::AccountsDbConfig,
@@ -52,9 +53,17 @@ use solana_transaction::sanitized::SanitizedTransaction;
 use solana_transaction::versioned::VersionedTransaction;
 use solana_transaction_status::TransactionStatusMeta;
 use tempfile::Builder as TempDirBuilder;
-use tokio::{process::Command, task::JoinSet};
+use tokio::process::Command;
+use xxhash_rust::xxh64::xxh64;
 
 const RIPGET_LOG_INTERVAL_SECS: u64 = 5;
+const COMPACT_INDEX_MAGIC: &[u8; 8] = b"compiszd";
+const BUCKET_HEADER_SIZE: usize = 16;
+const HASH_PREFIX_SIZE: usize = 32;
+const SLOT_TO_CID_KIND: &[u8] = b"slot-to-cid";
+const METADATA_KEY_KIND: &[u8] = b"index_kind";
+const METADATA_KEY_EPOCH: &[u8] = b"epoch";
+const CAR_HEADER_PREFETCH_BYTES: u64 = 4 * 1024;
 
 const PLUGIN_NAME: &str = "jetstreamer-node-geyser";
 const PLUGIN_LIB_BASENAME: &str = "jetstreamer_node_geyser";
@@ -468,6 +477,330 @@ impl ripget::ProgressReporter for RipgetProgress {
         self.threads.store(threads, Ordering::Relaxed);
         self.log_maybe();
     }
+}
+
+struct LocalIndexFile {
+    data: Arc<[u8]>,
+}
+
+impl LocalIndexFile {
+    fn new(data: Vec<u8>) -> Self {
+        Self {
+            data: Arc::from(data),
+        }
+    }
+
+    fn slice(&self, offset: usize, len: usize) -> Result<&[u8], String> {
+        let end = offset
+            .checked_add(len)
+            .ok_or_else(|| format!("slice range overflowed usize (offset {offset}, len {len})"))?;
+        if end > self.data.len() {
+            return Err(format!(
+                "slice {offset}-{end} exceeds file size {}",
+                self.data.len()
+            ));
+        }
+        Ok(&self.data[offset..end])
+    }
+}
+
+struct CompactIndexHeader {
+    value_size: u64,
+    num_buckets: u32,
+    header_size: u64,
+    metadata: HashMap<Vec<u8>, Vec<u8>>,
+}
+
+impl CompactIndexHeader {
+    fn metadata_epoch(&self) -> Option<u64> {
+        self.metadata
+            .get(METADATA_KEY_EPOCH)
+            .and_then(|bytes| bytes.get(..8))
+            .map(|slice| {
+                let mut buf = [0u8; 8];
+                buf.copy_from_slice(slice);
+                u64::from_le_bytes(buf)
+            })
+    }
+}
+
+#[derive(Clone, Copy)]
+struct BucketHeader {
+    hash_domain: u32,
+    num_entries: u32,
+    hash_len: u8,
+    file_offset: u64,
+}
+
+impl BucketHeader {
+    fn from_bytes(bytes: [u8; BUCKET_HEADER_SIZE]) -> Self {
+        let hash_domain = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
+        let num_entries = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+        let hash_len = bytes[8];
+        let mut offset_bytes = [0u8; 8];
+        offset_bytes[..6].copy_from_slice(&bytes[10..16]);
+        let file_offset = u64::from_le_bytes(offset_bytes);
+        Self {
+            hash_domain,
+            num_entries,
+            hash_len,
+            file_offset,
+        }
+    }
+}
+
+struct LocalSlotIndex {
+    file: Arc<LocalIndexFile>,
+    header: CompactIndexHeader,
+    buckets: Vec<BucketHeader>,
+}
+
+impl LocalSlotIndex {
+    fn from_bytes(bytes: Vec<u8>) -> Result<Self, String> {
+        let file = Arc::new(LocalIndexFile::new(bytes));
+        let header = parse_compact_index_header(file.data.as_ref(), SLOT_TO_CID_KIND)?;
+        let mut buckets = Vec::with_capacity(header.num_buckets as usize);
+        for idx in 0..header.num_buckets {
+            let offset = header.header_size as usize + (idx as usize) * BUCKET_HEADER_SIZE;
+            let raw = file.slice(offset, BUCKET_HEADER_SIZE)?;
+            let mut buf = [0u8; BUCKET_HEADER_SIZE];
+            buf.copy_from_slice(raw);
+            buckets.push(BucketHeader::from_bytes(buf));
+        }
+        Ok(Self {
+            file,
+            header,
+            buckets,
+        })
+    }
+
+    fn contains_slot(&self, slot: u64) -> Result<bool, String> {
+        let key = slot.to_le_bytes();
+        let bucket_index = self.bucket_hash(&key) as usize;
+        let header = self
+            .buckets
+            .get(bucket_index)
+            .ok_or_else(|| format!("bucket index {bucket_index} out of bounds"))?;
+        if header.num_entries == 0 {
+            return Ok(false);
+        }
+        let target_hash = truncated_entry_hash(header.hash_domain, &key, header.hash_len);
+        let max = header.num_entries as usize;
+        let hash_len = header.hash_len as usize;
+        let stride = hash_len + self.header.value_size as usize;
+        let base: usize = header
+            .file_offset
+            .try_into()
+            .map_err(|_| "bucket file offset exceeds usize".to_string())?;
+
+        let mut index = 0usize;
+        while index < max {
+            let offset = base + index * stride;
+            let hash_slice = self.file.slice(offset, hash_len)?;
+            let hash = read_hash(hash_slice);
+            if hash == target_hash {
+                return Ok(true);
+            }
+            index = (index << 1) | 1;
+            if hash < target_hash {
+                index += 1;
+            }
+        }
+        Ok(false)
+    }
+
+    fn bucket_hash(&self, key: &[u8]) -> u32 {
+        let h = xxh64(key, 0);
+        let n = self.header.num_buckets as u64;
+        let mut u = h % n;
+        if ((h - u) / n) < u {
+            u = hash_uint64(u);
+        }
+        (u % n) as u32
+    }
+}
+
+fn read_hash(bytes: &[u8]) -> u64 {
+    let mut buf = 0u64;
+    for (i, b) in bytes.iter().enumerate() {
+        buf |= (*b as u64) << (8 * i);
+    }
+    buf
+}
+
+fn truncated_entry_hash(hash_domain: u32, key: &[u8], hash_len: u8) -> u64 {
+    let raw = entry_hash64(hash_domain, key);
+    if hash_len >= 8 {
+        raw
+    } else {
+        let bits = (hash_len as usize) * 8;
+        let mask = if bits == 64 {
+            u64::MAX
+        } else {
+            (1u64 << bits) - 1
+        };
+        raw & mask
+    }
+}
+
+fn entry_hash64(prefix: u32, key: &[u8]) -> u64 {
+    let mut block = [0u8; HASH_PREFIX_SIZE];
+    block[..4].copy_from_slice(&prefix.to_le_bytes());
+    let mut data = Vec::with_capacity(HASH_PREFIX_SIZE + key.len());
+    data.extend_from_slice(&block);
+    data.extend_from_slice(key);
+    xxh64(&data, 0)
+}
+
+const fn hash_uint64(mut x: u64) -> u64 {
+    x ^= x >> 33;
+    x = x.wrapping_mul(0xff51afd7ed558ccd);
+    x ^= x >> 33;
+    x = x.wrapping_mul(0xc4ceb9fe1a85ec53);
+    x ^= x >> 33;
+    x
+}
+
+fn parse_compact_index_header(
+    data: &[u8],
+    expected_kind: &[u8],
+) -> Result<CompactIndexHeader, String> {
+    if data.len() < 12 {
+        return Err("index header shorter than 12 bytes".into());
+    }
+    if data[..8] != COMPACT_INDEX_MAGIC[..] {
+        return Err("invalid compactindex magic".into());
+    }
+    let header_len = u32::from_le_bytes(data[8..12].try_into().unwrap()) as usize;
+    let total_header_size = 8 + 4 + header_len;
+    if data.len() < total_header_size {
+        return Err(format!(
+            "incomplete index header: expected {total_header_size} bytes, got {}",
+            data.len()
+        ));
+    }
+    let value_size = u64::from_le_bytes(data[12..20].try_into().unwrap());
+    let num_buckets = u32::from_le_bytes(data[20..24].try_into().unwrap());
+    let version = data[24];
+    if version != 1 {
+        return Err(format!("unsupported compactindex version {version}"));
+    }
+    let metadata_slice = &data[25..total_header_size];
+    let metadata = parse_metadata(metadata_slice)?;
+    if let Some(kind) = metadata.get(METADATA_KEY_KIND)
+        && kind.as_slice() != expected_kind
+    {
+        return Err(format!(
+            "wrong index kind: expected {:?}, got {:?}",
+            expected_kind, kind
+        ));
+    }
+    Ok(CompactIndexHeader {
+        value_size,
+        num_buckets,
+        header_size: total_header_size as u64,
+        metadata,
+    })
+}
+
+fn parse_metadata(data: &[u8]) -> Result<HashMap<Vec<u8>, Vec<u8>>, String> {
+    if data.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let mut map = HashMap::new();
+    let mut offset = 0;
+    let num_pairs = data[offset] as usize;
+    offset += 1;
+    for _ in 0..num_pairs {
+        if offset >= data.len() {
+            return Err("unexpected end while reading metadata key length".into());
+        }
+        let key_len = data[offset] as usize;
+        offset += 1;
+        if offset + key_len > data.len() {
+            return Err("metadata key length out of bounds".into());
+        }
+        let key = data[offset..offset + key_len].to_vec();
+        offset += key_len;
+        if offset >= data.len() {
+            return Err("unexpected end while reading metadata value length".into());
+        }
+        let value_len = data[offset] as usize;
+        offset += 1;
+        if offset + value_len > data.len() {
+            return Err("metadata value length out of bounds".into());
+        }
+        let value = data[offset..offset + value_len].to_vec();
+        offset += value_len;
+        map.insert(key, value);
+    }
+    Ok(map)
+}
+
+fn decode_varint(bytes: &[u8]) -> Result<(u64, usize), String> {
+    let mut value = 0u64;
+    let mut shift = 0u32;
+    for (idx, b) in bytes.iter().enumerate() {
+        let byte = *b as u64;
+        if byte < 0x80 {
+            value |= byte << shift;
+            return Ok((value, idx + 1));
+        }
+        value |= (byte & 0x7f) << shift;
+        shift += 7;
+        if shift > 63 {
+            return Err("varint overflow".into());
+        }
+    }
+    Err("buffer ended before varint terminated".into())
+}
+
+fn extract_root_cid(value: &Value) -> Result<Cid, String> {
+    let map_entries = match value {
+        Value::Map(entries) => entries,
+        _ => return Err("CAR header is not a map".into()),
+    };
+    let roots_value = map_entries
+        .iter()
+        .find(|(k, _)| matches!(k, Value::Text(s) if s == "roots"))
+        .map(|(_, v)| v)
+        .ok_or_else(|| "CAR header missing 'roots'".to_string())?;
+    let roots = match roots_value {
+        Value::Array(items) => items,
+        _ => return Err("CAR header 'roots' not an array".into()),
+    };
+    let first = roots
+        .first()
+        .ok_or_else(|| "CAR header 'roots' array empty".to_string())?;
+    match first {
+        Value::Tag(42, boxed) => match boxed.as_ref() {
+            Value::Bytes(bytes) => decode_cid_bytes(bytes),
+            _ => Err("CID tag did not contain bytes".into()),
+        },
+        Value::Bytes(bytes) => decode_cid_bytes(bytes),
+        _ => Err("unexpected CID encoding in CAR header".into()),
+    }
+}
+
+fn decode_cid_bytes(bytes: &[u8]) -> Result<Cid, String> {
+    if bytes.is_empty() {
+        return Err("CID bytes were empty".into());
+    }
+    let mut candidates: Vec<&[u8]> = Vec::with_capacity(2);
+    if bytes[0] == 0 && bytes.len() > 1 {
+        candidates.push(&bytes[1..]);
+    }
+    candidates.push(bytes);
+    let mut last_err = None;
+    for slice in candidates {
+        match Cid::try_from(slice.to_vec()) {
+            Ok(cid) => return Ok(cid),
+            Err(err) => last_err = Some(err),
+        }
+    }
+    Err(last_err
+        .map(|err| format!("invalid CID: {err}"))
+        .unwrap_or_else(|| "invalid CID bytes".into()))
 }
 
 #[derive(Debug)]
@@ -1902,6 +2235,86 @@ fn resolve_remote_index_base_url() -> Result<Url, String> {
     Url::parse(BASE_URL).map_err(|err| format!("invalid default index base url: {err}"))
 }
 
+async fn fetch_url_range(
+    client: &Client,
+    url: &Url,
+    start: u64,
+    end: u64,
+) -> Result<Vec<u8>, String> {
+    if end < start {
+        return Ok(Vec::new());
+    }
+    let range = format!("bytes={start}-{end}");
+    let response = client
+        .get(url.clone())
+        .header(RANGE, range)
+        .send()
+        .await
+        .map_err(|err| format!("failed to fetch {}: {err}", url.as_str()))?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "unexpected HTTP status {} fetching {}",
+            response.status(),
+            url.as_str()
+        ));
+    }
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|err| format!("failed to read {}: {err}", url.as_str()))?;
+    Ok(bytes.to_vec())
+}
+
+async fn fetch_epoch_root_cid(client: &Client, car_url: &Url) -> Result<Cid, String> {
+    let mut bytes = fetch_url_range(client, car_url, 0, CAR_HEADER_PREFETCH_BYTES - 1).await?;
+    let (header_len, prefix) = decode_varint(&bytes)?;
+    let total_needed = prefix + header_len as usize;
+    if bytes.len() < total_needed {
+        bytes = fetch_url_range(client, car_url, 0, total_needed as u64 - 1).await?;
+        if bytes.len() < total_needed {
+            return Err(format!(
+                "incomplete CAR header: expected {total_needed} bytes, got {}",
+                bytes.len()
+            ));
+        }
+    }
+    let header_bytes = &bytes[prefix..total_needed];
+    let value: Value = serde_cbor::from_slice(header_bytes)
+        .map_err(|err| format!("failed to decode CBOR: {err}"))?;
+    extract_root_cid(&value)
+}
+
+async fn resolve_compact_index_urls(
+    epoch: u64,
+    base_url: &Url,
+    client: &Client,
+) -> Result<(Url, Url), String> {
+    let car_path = format!("{epoch}/epoch-{epoch}.car");
+    let car_url = base_url
+        .join(&car_path)
+        .map_err(|err| format!("invalid car url {car_path}: {err}"))?;
+    let root_cid = fetch_epoch_root_cid(client, &car_url).await?;
+    let root_base32 = root_cid
+        .to_string_of_base(Base::Base32Lower)
+        .map_err(|err| format!("failed to encode root cid: {err}"))?;
+    let network = env::var("JETSTREAMER_NETWORK").unwrap_or_else(|_| "mainnet".to_string());
+    let slot_index_path = format!(
+        "{0}/epoch-{0}-{1}-{2}-slot-to-cid.index",
+        epoch, root_base32, network
+    );
+    let cid_index_path = format!(
+        "{0}/epoch-{0}-{1}-{2}-cid-to-offset-and-size.index",
+        epoch, root_base32, network
+    );
+    let slot_url = base_url
+        .join(&slot_index_path)
+        .map_err(|err| format!("invalid slot index url: {err}"))?;
+    let cid_url = base_url
+        .join(&cid_index_path)
+        .map_err(|err| format!("invalid cid index url: {err}"))?;
+    Ok((slot_url, cid_url))
+}
+
 async fn download_with_ripget(
     url: &Url,
     dest: &Path,
@@ -1974,16 +2387,8 @@ async fn ensure_compact_indexes_cached(
     shutdown: Arc<AtomicBool>,
 ) -> Result<PathBuf, String> {
     let remote_base = resolve_remote_index_base_url()?;
-    if remote_base.scheme() == "file" {
-        return Err("local file base url is not supported for index pinning".to_string());
-    }
-
-    let resolver = SlotOffsetIndex::new(remote_base.clone())
-        .map_err(|err| format!("failed to build index resolver: {err}"))?;
-    let (slot_url, cid_url) = resolver
-        .resolve_epoch_index_urls(epoch)
-        .await
-        .map_err(|err| format!("failed to resolve epoch {epoch} index urls: {err}"))?;
+    let client = Client::new();
+    let (slot_url, cid_url) = resolve_compact_index_urls(epoch, &remote_base, &client).await?;
 
     let cache_dir = ledger_dir.join("compact-indexes");
     fs::create_dir_all(&cache_dir)
@@ -1994,101 +2399,75 @@ async fn ensure_compact_indexes_cached(
     download_with_ripget(&slot_url, &slot_path, shutdown.clone()).await?;
     download_with_ripget(&cid_url, &cid_path, shutdown).await?;
 
-    let slot_path = fs::canonicalize(&slot_path)
-        .map_err(|err| format!("failed to canonicalize {}: {err}", slot_path.display()))?;
-    let epoch_usize =
-        usize::try_from(epoch).map_err(|_| format!("epoch {epoch} exceeds usize bounds"))?;
-    pin_epoch_local(epoch_usize, &slot_path)
-        .map_err(|err| format!("failed to pin epoch {epoch} slot index: {err}"))?;
-
-    Ok(slot_path)
+    fs::canonicalize(&slot_path)
+        .map_err(|err| format!("failed to canonicalize {}: {err}", slot_path.display()))
 }
 
 async fn build_slot_presence_map(
     start_slot: Slot,
     end_inclusive: Slot,
     shutdown: Arc<AtomicBool>,
+    slot_index_path: &Path,
 ) -> Result<Arc<SlotPresenceMap>, String> {
-    if end_inclusive < start_slot {
-        return Err(format!(
-            "invalid slot range: {start_slot}..={end_inclusive}"
-        ));
-    }
-    let total_slots = end_inclusive.saturating_sub(start_slot).saturating_add(1);
-    let total_len =
-        usize::try_from(total_slots).map_err(|_| "slot range too large to index".to_string())?;
-    let mut states = vec![SlotPresenceState::Missing; total_len];
-    let mut present = 0usize;
-    let mut missing = 0usize;
-    let log_every = env::var("JETSTREAMER_SLOT_PRESENCE_LOG_EVERY")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(0);
-    let log_interval = env::var("JETSTREAMER_SLOT_PRESENCE_LOG_INTERVAL_SECS")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(5);
-    let concurrency = env::var("JETSTREAMER_SLOT_PRESENCE_CONCURRENCY")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(1000);
-    let stagger_ms = env::var("JETSTREAMER_SLOT_PRESENCE_STAGGER_MS")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(2);
-    let start_time = Instant::now();
-    let mut last_log = Instant::now();
-
-    info!(
-        "building slot presence map for slots {}..={} ({} total)",
-        start_slot, end_inclusive, total_slots
-    );
-
-    info!(
-        "slot presence scan concurrency: {concurrency} parallel lookups (logging every {log_interval}s, stagger {stagger_ms}ms)"
-    );
-
-    let mut join_set = JoinSet::new();
-    let mut next_slot = start_slot;
-    let mut processed = 0u64;
-
-    let enqueue_slot =
-        |slot: Slot, join_set: &mut JoinSet<(Slot, Result<u64, SlotOffsetIndexError>)>| {
-            join_set.spawn(async move { (slot, SLOT_OFFSET_INDEX.get_offset(slot).await) });
-        };
-
-    while next_slot <= end_inclusive && join_set.len() < concurrency {
-        enqueue_slot(next_slot, &mut join_set);
-        next_slot = next_slot.saturating_add(1);
-        if stagger_ms > 0 {
-            tokio::time::sleep(Duration::from_millis(stagger_ms)).await;
+    let slot_index_path = slot_index_path.to_path_buf();
+    let shutdown = shutdown.clone();
+    tokio::task::spawn_blocking(move || {
+        if end_inclusive < start_slot {
+            return Err(format!(
+                "invalid slot range: {start_slot}..={end_inclusive}"
+            ));
         }
-    }
+        let total_slots = end_inclusive.saturating_sub(start_slot).saturating_add(1);
+        let total_len = usize::try_from(total_slots)
+            .map_err(|_| "slot range too large to index".to_string())?;
+        let mut states = vec![SlotPresenceState::Missing; total_len];
+        let mut present = 0usize;
+        let mut missing = 0usize;
+        let log_interval = env::var("JETSTREAMER_SLOT_PRESENCE_LOG_INTERVAL_SECS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(5);
 
-    while processed < total_slots {
-        if shutdown.load(Ordering::Relaxed) {
-            join_set.abort_all();
-            return Err("shutdown requested during slot presence scan".to_string());
+        info!(
+            "building slot presence map for slots {}..={} ({} total)",
+            start_slot, end_inclusive, total_slots
+        );
+        info!(
+            "loading slot-to-cid index from {}",
+            slot_index_path.display()
+        );
+        let data = fs::read(&slot_index_path)
+            .map_err(|err| format!("failed to read {}: {err}", slot_index_path.display()))?;
+        let index = LocalSlotIndex::from_bytes(data)?;
+        if let Some(epoch) = index.header.metadata_epoch() {
+            info!("slot-to-cid index metadata epoch: {}", epoch);
         }
 
-        let shutdown_wait = async {
-            while !shutdown.load(Ordering::Relaxed) {
-                tokio::time::sleep(Duration::from_millis(200)).await;
-            }
-        };
+        let start_time = Instant::now();
+        let mut last_log = Instant::now();
+        let mut processed = 0u64;
 
-        let result = tokio::select! {
-            _ = shutdown_wait => {
-                join_set.abort_all();
+        for slot in start_slot..=end_inclusive {
+            if shutdown.load(Ordering::Relaxed) {
                 return Err("shutdown requested during slot presence scan".to_string());
             }
-            res = join_set.join_next() => res,
-            _ = tokio::time::sleep(Duration::from_secs(log_interval)) => {
+            let idx = (slot - start_slot) as usize;
+            if index.contains_slot(slot)? {
+                states[idx] = SlotPresenceState::Present;
+                present += 1;
+            } else {
+                states[idx] = SlotPresenceState::Missing;
+                missing += 1;
+            }
+            processed += 1;
+            if last_log.elapsed() >= Duration::from_secs(log_interval) {
                 let elapsed = start_time.elapsed().as_secs_f64();
-                let rate = if elapsed > 0.0 { processed as f64 / elapsed } else { 0.0 };
+                let rate = if elapsed > 0.0 {
+                    processed as f64 / elapsed
+                } else {
+                    0.0
+                };
                 let remaining = total_slots.saturating_sub(processed);
                 let eta = if rate > 0.0 {
                     let eta_secs = (remaining as f64 / rate).ceil() as u64;
@@ -2102,89 +2481,21 @@ async fn build_slot_presence_map(
                     (processed as f64) * 100.0 / (total_slots as f64)
                 };
                 info!(
-                    "slot presence progress: {processed}/{total_slots} ({percent:.2}%) present={present} missing={missing} in_flight={} rate={rate:.1} slots/s eta={eta}",
-                    join_set.len()
+                    "slot presence progress: {processed}/{total_slots} ({percent:.2}%) present={present} missing={missing} rate={rate:.1} slots/s eta={eta}"
                 );
                 last_log = Instant::now();
-                continue;
-            }
-        };
-
-        let Some(join_result) = result else {
-            if join_set.is_empty() {
-                break;
-            }
-            continue;
-        };
-
-        let (slot, lookup_result) = match join_result {
-            Ok(result) => result,
-            Err(err) => {
-                join_set.abort_all();
-                return Err(format!("slot presence task failed: {err}"));
-            }
-        };
-
-        let idx = (slot - start_slot) as usize;
-        match lookup_result {
-            Ok(_) => {
-                states[idx] = SlotPresenceState::Present;
-                present += 1;
-            }
-            Err(SlotOffsetIndexError::SlotNotFound(..)) => {
-                states[idx] = SlotPresenceState::Missing;
-                missing += 1;
-            }
-            Err(err) => {
-                join_set.abort_all();
-                return Err(format!("slot presence lookup failed at slot {slot}: {err}"));
             }
         }
 
-        processed = processed.saturating_add(1);
-        if (log_every > 0 && processed % log_every == 0)
-            || last_log.elapsed() >= Duration::from_secs(log_interval)
-        {
-            let elapsed = start_time.elapsed().as_secs_f64();
-            let rate = if elapsed > 0.0 {
-                processed as f64 / elapsed
-            } else {
-                0.0
-            };
-            let remaining = total_slots.saturating_sub(processed);
-            let eta = if rate > 0.0 {
-                let eta_secs = (remaining as f64 / rate).ceil() as u64;
-                format_eta(Duration::from_secs(eta_secs))
-            } else {
-                "unknown".to_string()
-            };
-            let percent = if total_slots == 0 {
-                100.0
-            } else {
-                (processed as f64) * 100.0 / (total_slots as f64)
-            };
-            info!(
-                "slot presence progress: {processed}/{total_slots} ({percent:.2}%) present={present} missing={missing} in_flight={} rate={rate:.1} slots/s eta={eta}",
-                join_set.len()
-            );
-            last_log = Instant::now();
-        }
-
-        while next_slot <= end_inclusive && join_set.len() < concurrency {
-            enqueue_slot(next_slot, &mut join_set);
-            next_slot = next_slot.saturating_add(1);
-            if stagger_ms > 0 {
-                tokio::time::sleep(Duration::from_millis(stagger_ms)).await;
-            }
-        }
-    }
-
-    info!("slot presence map built: present={present}, missing={missing}");
-    Ok(Arc::new(SlotPresenceMap {
-        start: start_slot,
-        end_inclusive,
-        states,
-    }))
+        info!("slot presence map built: present={present}, missing={missing}");
+        Ok(Arc::new(SlotPresenceMap {
+            start: start_slot,
+            end_inclusive,
+            states,
+        }))
+    })
+    .await
+    .map_err(|err| format!("slot presence task failed: {err}"))?
 }
 
 async fn run_geyser_replay(
@@ -2205,12 +2516,17 @@ async fn run_geyser_replay(
     let slot_index_path =
         ensure_compact_indexes_cached(epoch, ledger_dir, shutdown.clone()).await?;
     info!(
-        "pinned slot-to-cid index for epoch {} at {}",
+        "slot-to-cid index cached for epoch {} at {}",
         epoch,
         slot_index_path.display()
     );
-    let slot_presence =
-        build_slot_presence_map(start_slot, end_inclusive, shutdown.clone()).await?;
+    let slot_presence = build_slot_presence_map(
+        start_slot,
+        end_inclusive,
+        shutdown.clone(),
+        &slot_index_path,
+    )
+    .await?;
     let progress = Arc::new(ReplayProgress::new(start_slot));
     let failure = Arc::new(ReplayFailure::new(shutdown.clone()));
     let scheduler = Arc::new(TransactionScheduler::new(start_slot, slot_presence));

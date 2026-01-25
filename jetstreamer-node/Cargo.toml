@@ -10,12 +10,14 @@ keywords.workspace = true
 
 [dependencies]
 agave-snapshots.workspace = true
+cid.workspace = true
 crossbeam-channel.workspace = true
 ctrlc.workspace = true
 dashmap.workspace = true
 jetstreamer-firehose.workspace = true
 log.workspace = true
 reqwest.workspace = true
+serde_cbor.workspace = true
 ripget = "0.1"
 serde_json.workspace = true
 solana-account.workspace = true
@@ -36,3 +38,4 @@ solana-transaction-status.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+xxhash-rust.workspace = true

@@ -3,6 +3,7 @@ use std::{
     env, fs,
     path::{Path, PathBuf},
     process::{Stdio, exit},
+    str::FromStr,
     sync::{
         Arc, Mutex, RwLock,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
@@ -16,6 +17,7 @@ use agave_snapshots::{
     snapshot_hash::SnapshotHash,
     streaming_unarchive_snapshot,
 };
+use bs58;
 use cid::{Cid, multibase::Base};
 use crossbeam_channel::unbounded;
 use dashmap::DashMap;
@@ -179,6 +181,7 @@ struct BankReplay {
     leader_schedule_cache: LeaderScheduleCache,
     failure: Arc<ReplayFailure>,
     cursor: Arc<ReplayCursor>,
+    debug_signature: Option<Signature>,
 }
 
 impl BankReplay {
@@ -191,6 +194,9 @@ impl BankReplay {
     ) -> Self {
         let mut leader_schedule_cache = LeaderScheduleCache::new_from_bank(&bank);
         leader_schedule_cache.set_max_schedules(usize::MAX);
+        let debug_signature = env::var("JETSTREAMER_DEBUG_SIG")
+            .ok()
+            .and_then(|value| Signature::from_str(value.trim()).ok());
         let bank_forks = BankForks::new_rw_arc(bank);
         Self {
             bank_forks,
@@ -199,6 +205,7 @@ impl BankReplay {
             leader_schedule_cache,
             failure,
             cursor,
+            debug_signature,
         }
     }
 
@@ -276,6 +283,40 @@ impl BankReplay {
                         entry.tx_count,
                         signature,
                     );
+                    if let Some(debug_sig) = self.debug_signature.as_ref() {
+                        for (offset, scheduled) in entry.txs.iter().enumerate() {
+                            if scheduled.tx.signatures.first() == Some(debug_sig) {
+                                let tx_index = entry.start_index.saturating_add(offset);
+                                let message = &scheduled.tx.message;
+                                let static_keys = message.static_account_keys();
+                                let mut program_ids =
+                                    Vec::with_capacity(message.instructions().len());
+                                for ix in message.instructions() {
+                                    let program_id = static_keys
+                                        .get(ix.program_id_index as usize)
+                                        .map(|key| bs58::encode(key.to_bytes()).into_string())
+                                        .unwrap_or_else(|| "<unknown>".to_string());
+                                    program_ids.push(program_id);
+                                }
+                                info!(
+                                    "debug tx match: slot={} entry={} tx_index={} sig={} instrs={} programs={:?}",
+                                    entry.slot,
+                                    entry.entry_index,
+                                    tx_index,
+                                    debug_sig,
+                                    message.instructions().len(),
+                                    program_ids
+                                );
+                                info!(
+                                    "debug tx accounts: slot={} entry={} tx_index={} keys={}",
+                                    entry.slot,
+                                    entry.entry_index,
+                                    tx_index,
+                                    static_keys.len()
+                                );
+                            }
+                        }
+                    }
                     let txs: Vec<VersionedTransaction> = entry
                         .txs
                         .iter()

@@ -182,6 +182,8 @@ struct BankReplay {
     failure: Arc<ReplayFailure>,
     cursor: Arc<ReplayCursor>,
     debug_signature: Option<Signature>,
+    entry_exec_warn_after: Option<Duration>,
+    entry_exec_fail_after: Option<Duration>,
 }
 
 impl BankReplay {
@@ -197,6 +199,16 @@ impl BankReplay {
         let debug_signature = env::var("JETSTREAMER_DEBUG_SIG")
             .ok()
             .and_then(|value| Signature::from_str(value.trim()).ok());
+        let entry_exec_warn_after = env::var("JETSTREAMER_ENTRY_EXEC_WARN_SECS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value > 0)
+            .map(Duration::from_secs);
+        let entry_exec_fail_after = env::var("JETSTREAMER_ENTRY_EXEC_FAIL_SECS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value > 0)
+            .map(Duration::from_secs);
         let bank_forks = BankForks::new_rw_arc(bank);
         Self {
             bank_forks,
@@ -206,6 +218,8 @@ impl BankReplay {
             failure,
             cursor,
             debug_signature,
+            entry_exec_warn_after,
+            entry_exec_fail_after,
         }
     }
 
@@ -256,9 +270,48 @@ impl BankReplay {
         Ok(())
     }
 
+    fn note_entry_duration(
+        &self,
+        entry: &ReadyEntry,
+        elapsed: Duration,
+        signature: Option<&str>,
+    ) {
+        let warn_after = self.entry_exec_warn_after;
+        let fail_after = self.entry_exec_fail_after;
+        if let Some(warn_after) = warn_after {
+            if elapsed >= warn_after {
+                warn!(
+                    "slow entry execution: slot {} entry {} txs={} elapsed={:.3}s sig={}",
+                    entry.slot,
+                    entry.entry_index,
+                    entry.tx_count,
+                    elapsed.as_secs_f64(),
+                    signature.unwrap_or("<none>")
+                );
+            }
+        }
+        if let Some(fail_after) = fail_after {
+            if elapsed >= fail_after {
+                let message = format!(
+                    "entry execution exceeded timeout: slot {} entry {} txs={} elapsed={:.3}s sig={}",
+                    entry.slot,
+                    entry.entry_index,
+                    entry.tx_count,
+                    elapsed.as_secs_f64(),
+                    signature.unwrap_or("<none>")
+                );
+                self.failure.record(message.clone());
+                panic!("{message}");
+            }
+        }
+    }
+
     fn process_ready_entries(&self, entries: Vec<ReadyEntry>) {
         for entry in entries {
+            let watchdog_enabled =
+                self.entry_exec_warn_after.is_some() || self.entry_exec_fail_after.is_some();
             if entry.tx_count == 0 {
+                let start = watchdog_enabled.then(Instant::now);
                 if let Err(err) = self.register_tick(entry.slot, entry.hash) {
                     log::debug!(
                         "failed to register tick for slot {} entry {}: {}",
@@ -267,9 +320,13 @@ impl BankReplay {
                         err
                     );
                 }
+                if let Some(start) = start {
+                    self.note_entry_duration(&entry, start.elapsed(), None);
+                }
                 continue;
             }
 
+            let start = watchdog_enabled.then(Instant::now);
             match self.bank_for_slot(entry.slot) {
                 Ok(bank) => {
                     let signature = entry
@@ -282,7 +339,7 @@ impl BankReplay {
                         entry.entry_index,
                         entry.start_index,
                         entry.tx_count,
-                        signature,
+                        signature.clone(),
                     );
                     if let Some(debug_sig) = self.debug_signature.as_ref() {
                         for (offset, scheduled) in entry.txs.iter().enumerate() {
@@ -376,6 +433,9 @@ impl BankReplay {
                             panic!("{message}");
                         }
                     }
+                    if let Some(start) = start {
+                        self.note_entry_duration(&entry, start.elapsed(), signature.as_deref());
+                    }
                 }
                 Err(err) => {
                     log::debug!(
@@ -384,6 +444,9 @@ impl BankReplay {
                         entry.entry_index,
                         err
                     );
+                    if let Some(start) = start {
+                        self.note_entry_duration(&entry, start.elapsed(), None);
+                    }
                 }
             }
         }
@@ -434,6 +497,15 @@ impl ReplayProgress {
     fn reset_counts(&self) {
         self.tx_count.store(0, Ordering::Relaxed);
         self.account_update_count.store(0, Ordering::Relaxed);
+    }
+
+    fn reset_last_slots(&self, slot: Slot) {
+        self.latest_slot.store(slot, Ordering::Relaxed);
+        self.last_tx_slot.store(slot, Ordering::Relaxed);
+        self.last_entry_slot.store(slot, Ordering::Relaxed);
+        self.last_block_meta_slot.store(slot, Ordering::Relaxed);
+        self.last_account_update_slot
+            .store(slot, Ordering::Relaxed);
     }
 
     fn note_slot(&self, slot: Slot) {
@@ -3065,9 +3137,7 @@ async fn run_geyser_replay(
     } else {
         info!("starting replay at epoch {} slot {}", epoch, replay_start);
     }
-    progress
-        .latest_slot
-        .store(replay_start.saturating_sub(1), Ordering::Relaxed);
+    progress.reset_last_slots(replay_start.saturating_sub(1));
 
     let slot_presence = build_slot_presence_map(
         replay_start,
@@ -3128,6 +3198,7 @@ async fn run_geyser_replay(
     let progress_handle = {
         let progress = progress.clone();
         let scheduler = scheduler.clone();
+        let cursor = cursor.clone();
         let progress_done = progress_done.clone();
         let shutdown = shutdown.clone();
         std::thread::spawn(move || {
@@ -3167,6 +3238,8 @@ async fn run_geyser_replay(
                     let stalled_for = last_seen_change.elapsed();
                     if stalled_for >= stall_interval && last_stall_log.elapsed() >= stall_interval {
                         let snapshot = scheduler.snapshot();
+                        let (cursor_slot, cursor_entry, cursor_tx_start, cursor_tx_count, cursor_sig) =
+                            cursor.snapshot();
                         let last_tx_slot = progress.last_tx_slot.load(Ordering::Relaxed);
                         let last_entry_slot = progress.last_entry_slot.load(Ordering::Relaxed);
                         let last_block_meta_slot =
@@ -3179,7 +3252,7 @@ async fn run_geyser_replay(
                             "main"
                         };
                         info!(
-                            "replay stall ({phase}): slot {latest} unchanged for {:.1}s; scheduler current_slot={} last_finalized={} buffered_slots={} presence={:?} buffer={:?} last_tx_slot={} last_entry_slot={} last_block_meta_slot={} last_account_update_slot={}",
+                            "replay stall ({phase}): slot {latest} unchanged for {:.1}s; scheduler current_slot={} last_finalized={} buffered_slots={} presence={:?} buffer={:?} last_tx_slot={} last_entry_slot={} last_block_meta_slot={} last_account_update_slot={} cursor_slot={} cursor_entry={} cursor_tx_start={} cursor_tx_count={} cursor_sig={}",
                             stalled_for.as_secs_f64(),
                             snapshot.current_slot,
                             snapshot.last_finalized_slot,
@@ -3189,7 +3262,12 @@ async fn run_geyser_replay(
                             last_tx_slot,
                             last_entry_slot,
                             last_block_meta_slot,
-                            last_account_update_slot
+                            last_account_update_slot,
+                            cursor_slot,
+                            cursor_entry,
+                            cursor_tx_start,
+                            cursor_tx_count,
+                            cursor_sig.as_deref().unwrap_or("<unknown>"),
                         );
                         last_stall_log = Instant::now();
                     }

@@ -87,6 +87,8 @@ const ACCOUNTS_SNAPSHOT_DIR: &str = "snapshot";
 const ACCOUNTS_RUN_DIR: &str = "run";
 const ARCHIVE_ACCOUNTS_DIR: &str = "accounts-run";
 const DEFAULT_ROOT_INTERVAL: u64 = 1024;
+const ENTRY_EXEC_WARN_AFTER: Duration = Duration::from_secs(5);
+const ENTRY_EXEC_FAIL_AFTER: Duration = Duration::from_secs(30);
 
 struct SnapshotVerifier {
     expected: DashMap<Slot, SnapshotHash>,
@@ -182,8 +184,16 @@ struct BankReplay {
     failure: Arc<ReplayFailure>,
     cursor: Arc<ReplayCursor>,
     debug_signature: Option<Signature>,
-    entry_exec_warn_after: Option<Duration>,
-    entry_exec_fail_after: Option<Duration>,
+}
+
+struct InFlightGuard {
+    cursor: Arc<ReplayCursor>,
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.cursor.finish_inflight();
+    }
 }
 
 impl BankReplay {
@@ -199,16 +209,6 @@ impl BankReplay {
         let debug_signature = env::var("JETSTREAMER_DEBUG_SIG")
             .ok()
             .and_then(|value| Signature::from_str(value.trim()).ok());
-        let entry_exec_warn_after = env::var("JETSTREAMER_ENTRY_EXEC_WARN_SECS")
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-            .filter(|value| *value > 0)
-            .map(Duration::from_secs);
-        let entry_exec_fail_after = env::var("JETSTREAMER_ENTRY_EXEC_FAIL_SECS")
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-            .filter(|value| *value > 0)
-            .map(Duration::from_secs);
         let bank_forks = BankForks::new_rw_arc(bank);
         Self {
             bank_forks,
@@ -218,8 +218,6 @@ impl BankReplay {
             failure,
             cursor,
             debug_signature,
-            entry_exec_warn_after,
-            entry_exec_fail_after,
         }
     }
 
@@ -276,42 +274,49 @@ impl BankReplay {
         elapsed: Duration,
         signature: Option<&str>,
     ) {
-        let warn_after = self.entry_exec_warn_after;
-        let fail_after = self.entry_exec_fail_after;
-        if let Some(warn_after) = warn_after {
-            if elapsed >= warn_after {
-                warn!(
-                    "slow entry execution: slot {} entry {} txs={} elapsed={:.3}s sig={}",
-                    entry.slot,
-                    entry.entry_index,
-                    entry.tx_count,
-                    elapsed.as_secs_f64(),
-                    signature.unwrap_or("<none>")
-                );
-            }
+        if elapsed >= ENTRY_EXEC_WARN_AFTER {
+            warn!(
+                "slow entry execution: slot {} entry {} txs={} elapsed={:.3}s sig={}",
+                entry.slot,
+                entry.entry_index,
+                entry.tx_count,
+                elapsed.as_secs_f64(),
+                signature.unwrap_or("<none>")
+            );
         }
-        if let Some(fail_after) = fail_after {
-            if elapsed >= fail_after {
-                let message = format!(
-                    "entry execution exceeded timeout: slot {} entry {} txs={} elapsed={:.3}s sig={}",
-                    entry.slot,
-                    entry.entry_index,
-                    entry.tx_count,
-                    elapsed.as_secs_f64(),
-                    signature.unwrap_or("<none>")
-                );
-                self.failure.record(message.clone());
-                panic!("{message}");
-            }
+        if elapsed >= ENTRY_EXEC_FAIL_AFTER {
+            let message = format!(
+                "entry execution exceeded timeout: slot {} entry {} txs={} elapsed={:.3}s sig={}",
+                entry.slot,
+                entry.entry_index,
+                entry.tx_count,
+                elapsed.as_secs_f64(),
+                signature.unwrap_or("<none>")
+            );
+            self.failure.record(message.clone());
+            panic!("{message}");
         }
     }
 
     fn process_ready_entries(&self, entries: Vec<ReadyEntry>) {
         for entry in entries {
-            let watchdog_enabled =
-                self.entry_exec_warn_after.is_some() || self.entry_exec_fail_after.is_some();
+            let signature = entry
+                .txs
+                .first()
+                .and_then(|scheduled| scheduled.tx.signatures.first())
+                .map(|sig| sig.to_string());
+            self.cursor.start_inflight(
+                entry.slot,
+                entry.entry_index,
+                entry.start_index,
+                entry.tx_count,
+                signature.clone(),
+            );
+            let _inflight_guard = InFlightGuard {
+                cursor: self.cursor.clone(),
+            };
             if entry.tx_count == 0 {
-                let start = watchdog_enabled.then(Instant::now);
+                let start = Instant::now();
                 if let Err(err) = self.register_tick(entry.slot, entry.hash) {
                     log::debug!(
                         "failed to register tick for slot {} entry {}: {}",
@@ -320,20 +325,13 @@ impl BankReplay {
                         err
                     );
                 }
-                if let Some(start) = start {
-                    self.note_entry_duration(&entry, start.elapsed(), None);
-                }
+                self.note_entry_duration(&entry, start.elapsed(), None);
                 continue;
             }
 
-            let start = watchdog_enabled.then(Instant::now);
+            let start = Instant::now();
             match self.bank_for_slot(entry.slot) {
                 Ok(bank) => {
-                    let signature = entry
-                        .txs
-                        .first()
-                        .and_then(|scheduled| scheduled.tx.signatures.first())
-                        .map(|sig| sig.to_string());
                     self.cursor.update(
                         entry.slot,
                         entry.entry_index,
@@ -433,9 +431,7 @@ impl BankReplay {
                             panic!("{message}");
                         }
                     }
-                    if let Some(start) = start {
-                        self.note_entry_duration(&entry, start.elapsed(), signature.as_deref());
-                    }
+                    self.note_entry_duration(&entry, start.elapsed(), signature.as_deref());
                 }
                 Err(err) => {
                     log::debug!(
@@ -444,9 +440,7 @@ impl BankReplay {
                         entry.entry_index,
                         err
                     );
-                    if let Some(start) = start {
-                        self.note_entry_duration(&entry, start.elapsed(), None);
-                    }
+                    self.note_entry_duration(&entry, start.elapsed(), None);
                 }
             }
         }
@@ -564,6 +558,7 @@ struct ReplayCursor {
     tx_start: AtomicU64,
     tx_count: AtomicU64,
     signature: Mutex<Option<String>>,
+    inflight: Mutex<Option<InFlightEntry>>,
 }
 
 impl ReplayCursor {
@@ -574,6 +569,7 @@ impl ReplayCursor {
             tx_start: AtomicU64::new(0),
             tx_count: AtomicU64::new(0),
             signature: Mutex::new(None),
+            inflight: Mutex::new(None),
         }
     }
 
@@ -603,6 +599,58 @@ impl ReplayCursor {
         let signature = self.signature.lock().ok().and_then(|guard| guard.clone());
         (slot, entry_index, tx_start, tx_count, signature)
     }
+
+    fn start_inflight(
+        &self,
+        slot: Slot,
+        entry_index: usize,
+        tx_start: usize,
+        tx_count: usize,
+        signature: Option<String>,
+    ) {
+        if let Ok(mut guard) = self.inflight.lock() {
+            *guard = Some(InFlightEntry {
+                slot,
+                entry_index,
+                tx_start,
+                tx_count,
+                signature,
+                started_at: Instant::now(),
+            });
+        }
+    }
+
+    fn finish_inflight(&self) {
+        if let Ok(mut guard) = self.inflight.lock() {
+            *guard = None;
+        }
+    }
+
+    fn inflight_snapshot(
+        &self,
+    ) -> Option<(u64, u64, u64, u64, Option<String>, Duration)> {
+        let guard = self.inflight.lock().ok()?;
+        guard.as_ref().map(|entry| {
+            (
+                entry.slot,
+                entry.entry_index as u64,
+                entry.tx_start as u64,
+                entry.tx_count as u64,
+                entry.signature.clone(),
+                entry.started_at.elapsed(),
+            )
+        })
+    }
+}
+
+#[derive(Debug)]
+struct InFlightEntry {
+    slot: Slot,
+    entry_index: usize,
+    tx_start: usize,
+    tx_count: usize,
+    signature: Option<String>,
+    started_at: Instant,
 }
 
 struct AbortOnErrorLogger {
@@ -3199,6 +3247,7 @@ async fn run_geyser_replay(
         let progress = progress.clone();
         let scheduler = scheduler.clone();
         let cursor = cursor.clone();
+        let failure = failure.clone();
         let progress_done = progress_done.clone();
         let shutdown = shutdown.clone();
         std::thread::spawn(move || {
@@ -3215,6 +3264,8 @@ async fn run_geyser_replay(
                 .and_then(|value| value.parse::<u64>().ok())
                 .map(Duration::from_secs)
                 .unwrap_or(Duration::from_secs(30));
+            let inflight_warn_after = ENTRY_EXEC_WARN_AFTER;
+            let inflight_fail_after = ENTRY_EXEC_FAIL_AFTER;
             let mut phase_start = None::<Instant>;
             let mut in_warmup = has_warmup;
             let mut last_seen_slot = progress.latest_slot.load(Ordering::Relaxed);
@@ -3240,6 +3291,45 @@ async fn run_geyser_replay(
                         let snapshot = scheduler.snapshot();
                         let (cursor_slot, cursor_entry, cursor_tx_start, cursor_tx_count, cursor_sig) =
                             cursor.snapshot();
+                        let mut inflight_slot = 0;
+                        let mut inflight_entry = 0;
+                        let mut inflight_tx_start = 0;
+                        let mut inflight_tx_count = 0;
+                        let mut inflight_sig: Option<String> = None;
+                        let mut inflight_elapsed: Option<Duration> = None;
+                        if let Some((slot, entry, tx_start, tx_count, sig, elapsed)) =
+                            cursor.inflight_snapshot()
+                        {
+                            inflight_slot = slot;
+                            inflight_entry = entry;
+                            inflight_tx_start = tx_start;
+                            inflight_tx_count = tx_count;
+                            inflight_sig = sig.clone();
+                            inflight_elapsed = Some(elapsed);
+                            if elapsed >= inflight_warn_after {
+                                warn!(
+                                    "entry execution in-flight: slot {} entry {} tx_start={} tx_count={} elapsed={:.3}s sig={}",
+                                    slot,
+                                    entry,
+                                    tx_start,
+                                    tx_count,
+                                    elapsed.as_secs_f64(),
+                                    sig.as_deref().unwrap_or("<none>"),
+                                );
+                            }
+                            if elapsed >= inflight_fail_after {
+                                let message = format!(
+                                    "entry execution exceeded timeout: slot {} entry {} tx_start={} tx_count={} elapsed={:.3}s sig={}",
+                                    slot,
+                                    entry,
+                                    tx_start,
+                                    tx_count,
+                                    elapsed.as_secs_f64(),
+                                    sig.as_deref().unwrap_or("<none>"),
+                                );
+                                failure.record(message);
+                            }
+                        }
                         let last_tx_slot = progress.last_tx_slot.load(Ordering::Relaxed);
                         let last_entry_slot = progress.last_entry_slot.load(Ordering::Relaxed);
                         let last_block_meta_slot =
@@ -3252,7 +3342,7 @@ async fn run_geyser_replay(
                             "main"
                         };
                         info!(
-                            "replay stall ({phase}): slot {latest} unchanged for {:.1}s; scheduler current_slot={} last_finalized={} buffered_slots={} presence={:?} buffer={:?} last_tx_slot={} last_entry_slot={} last_block_meta_slot={} last_account_update_slot={} cursor_slot={} cursor_entry={} cursor_tx_start={} cursor_tx_count={} cursor_sig={}",
+                            "replay stall ({phase}): slot {latest} unchanged for {:.1}s; scheduler current_slot={} last_finalized={} buffered_slots={} presence={:?} buffer={:?} last_tx_slot={} last_entry_slot={} last_block_meta_slot={} last_account_update_slot={} cursor_slot={} cursor_entry={} cursor_tx_start={} cursor_tx_count={} cursor_sig={} inflight_slot={} inflight_entry={} inflight_tx_start={} inflight_tx_count={} inflight_elapsed={} inflight_sig={}",
                             stalled_for.as_secs_f64(),
                             snapshot.current_slot,
                             snapshot.last_finalized_slot,
@@ -3268,6 +3358,14 @@ async fn run_geyser_replay(
                             cursor_tx_start,
                             cursor_tx_count,
                             cursor_sig.as_deref().unwrap_or("<unknown>"),
+                            inflight_slot,
+                            inflight_entry,
+                            inflight_tx_start,
+                            inflight_tx_count,
+                            inflight_elapsed
+                                .map(|duration| format!("{:.3}s", duration.as_secs_f64()))
+                                .unwrap_or_else(|| "<none>".to_string()),
+                            inflight_sig.as_deref().unwrap_or("<none>"),
                         );
                         last_stall_log = Instant::now();
                     }

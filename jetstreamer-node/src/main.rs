@@ -90,7 +90,7 @@ const DEFAULT_ROOT_INTERVAL: u64 = 1024;
 const ENTRY_EXEC_WARN_AFTER: Duration = Duration::from_secs(5);
 const ENTRY_EXEC_FAIL_AFTER: Duration = Duration::from_secs(30);
 const BANK_FOR_SLOT_WARN_AFTER: Duration = Duration::from_secs(5);
-const ENABLE_ROOT_PRUNE: bool = false;
+const ENABLE_PROGRAM_CACHE_PRUNE: bool = false;
 
 struct SnapshotVerifier {
     expected: DashMap<Slot, SnapshotHash>,
@@ -274,18 +274,18 @@ impl BankReplay {
             let bank_with_scheduler = guard.insert(next_bank);
             if let Some(interval) = self.root_interval {
                 if interval > 0 && parent_slot % interval == 0 {
-                    if ENABLE_ROOT_PRUNE {
-                        self.cursor.update_inflight_stage("root_set");
-                        let root_start = Instant::now();
-                        guard.set_root(parent_slot, None, None);
-                        let set_elapsed = root_start.elapsed();
-                        if set_elapsed >= BANK_FOR_SLOT_WARN_AFTER {
-                            warn!(
-                                "bank_for_slot root set slow: slot {} took {:.3}s",
-                                parent_slot,
-                                set_elapsed.as_secs_f64()
-                            );
-                        }
+                    self.cursor.update_inflight_stage("root_set");
+                    let root_start = Instant::now();
+                    guard.set_root(parent_slot, None, None);
+                    let set_elapsed = root_start.elapsed();
+                    if set_elapsed >= BANK_FOR_SLOT_WARN_AFTER {
+                        warn!(
+                            "bank_for_slot root set slow: slot {} took {:.3}s",
+                            parent_slot,
+                            set_elapsed.as_secs_f64()
+                        );
+                    }
+                    if ENABLE_PROGRAM_CACHE_PRUNE {
                         self.cursor.update_inflight_stage("root_prune");
                         let prune_start = Instant::now();
                         guard.prune_program_cache(parent_slot);
@@ -299,7 +299,7 @@ impl BankReplay {
                         }
                     } else {
                         warn!(
-                            "bank_for_slot skipping root prune at slot {} (debug)",
+                            "bank_for_slot skipping program cache prune at slot {} (debug)",
                             parent_slot
                         );
                     }
@@ -362,6 +362,45 @@ impl BankReplay {
         }
     }
 
+    fn log_slow_entry_details(&self, entry: &ReadyEntry) {
+        if entry.tx_count == 0 {
+            return;
+        }
+        warn!(
+            "slow entry details: slot {} entry {} tx_start={} tx_count={}",
+            entry.slot, entry.entry_index, entry.start_index, entry.tx_count
+        );
+        for (offset, scheduled) in entry.txs.iter().enumerate() {
+            let signature = scheduled
+                .tx
+                .signatures
+                .first()
+                .map(|sig| sig.to_string())
+                .unwrap_or_else(|| "<missing-signature>".to_string());
+            let message = &scheduled.tx.message;
+            let static_keys = message.static_account_keys();
+            let mut program_ids = Vec::with_capacity(message.instructions().len());
+            for ix in message.instructions() {
+                let program_id = static_keys
+                    .get(ix.program_id_index as usize)
+                    .map(|key| bs58::encode(key.to_bytes()).into_string())
+                    .unwrap_or_else(|| "<unknown>".to_string());
+                program_ids.push(program_id);
+            }
+            let tx_index = entry.start_index.saturating_add(offset);
+            warn!(
+                "slow entry tx: slot {} entry {} tx_index={} sig={} instrs={} accounts={} programs={:?}",
+                entry.slot,
+                entry.entry_index,
+                tx_index,
+                signature,
+                message.instructions().len(),
+                static_keys.len(),
+                program_ids
+            );
+        }
+    }
+
     fn process_ready_entries(&self, entries: Vec<ReadyEntry>) {
         for entry in entries {
             let signature = entry
@@ -390,7 +429,8 @@ impl BankReplay {
                         err
                     );
                 }
-                self.note_entry_duration(&entry, start.elapsed(), None);
+                let elapsed = start.elapsed();
+                self.note_entry_duration(&entry, elapsed, None);
                 continue;
             }
 
@@ -499,7 +539,11 @@ impl BankReplay {
                             panic!("{message}");
                         }
                     }
-                    self.note_entry_duration(&entry, start.elapsed(), signature.as_deref());
+                    let elapsed = start.elapsed();
+                    self.note_entry_duration(&entry, elapsed, signature.as_deref());
+                    if elapsed >= ENTRY_EXEC_WARN_AFTER {
+                        self.log_slow_entry_details(&entry);
+                    }
                 }
                 Err(err) => {
                     log::debug!(
@@ -508,7 +552,8 @@ impl BankReplay {
                         entry.entry_index,
                         err
                     );
-                    self.note_entry_duration(&entry, start.elapsed(), None);
+                    let elapsed = start.elapsed();
+                    self.note_entry_duration(&entry, elapsed, None);
                 }
             }
         }

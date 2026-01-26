@@ -90,6 +90,7 @@ const DEFAULT_ROOT_INTERVAL: u64 = 1024;
 const ENTRY_EXEC_WARN_AFTER: Duration = Duration::from_secs(5);
 const ENTRY_EXEC_FAIL_AFTER: Duration = Duration::from_secs(30);
 const BANK_FOR_SLOT_WARN_AFTER: Duration = Duration::from_secs(5);
+const ENABLE_ROOT_PRUNE: bool = false;
 
 struct SnapshotVerifier {
     expected: DashMap<Slot, SnapshotHash>,
@@ -273,9 +274,35 @@ impl BankReplay {
             let bank_with_scheduler = guard.insert(next_bank);
             if let Some(interval) = self.root_interval {
                 if interval > 0 && parent_slot % interval == 0 {
-                    self.cursor.update_inflight_stage("root_prune");
-                    guard.set_root(parent_slot, None, None);
-                    guard.prune_program_cache(parent_slot);
+                    if ENABLE_ROOT_PRUNE {
+                        self.cursor.update_inflight_stage("root_set");
+                        let root_start = Instant::now();
+                        guard.set_root(parent_slot, None, None);
+                        let set_elapsed = root_start.elapsed();
+                        if set_elapsed >= BANK_FOR_SLOT_WARN_AFTER {
+                            warn!(
+                                "bank_for_slot root set slow: slot {} took {:.3}s",
+                                parent_slot,
+                                set_elapsed.as_secs_f64()
+                            );
+                        }
+                        self.cursor.update_inflight_stage("root_prune");
+                        let prune_start = Instant::now();
+                        guard.prune_program_cache(parent_slot);
+                        let prune_elapsed = prune_start.elapsed();
+                        if prune_elapsed >= BANK_FOR_SLOT_WARN_AFTER {
+                            warn!(
+                                "bank_for_slot program cache prune slow: slot {} took {:.3}s",
+                                parent_slot,
+                                prune_elapsed.as_secs_f64()
+                            );
+                        }
+                    } else {
+                        warn!(
+                            "bank_for_slot skipping root prune at slot {} (debug)",
+                            parent_slot
+                        );
+                    }
                 }
             }
             self.cursor.update_inflight_stage("clone_without_scheduler");

@@ -89,6 +89,7 @@ const ARCHIVE_ACCOUNTS_DIR: &str = "accounts-run";
 const DEFAULT_ROOT_INTERVAL: u64 = 1024;
 const ENTRY_EXEC_WARN_AFTER: Duration = Duration::from_secs(5);
 const ENTRY_EXEC_FAIL_AFTER: Duration = Duration::from_secs(30);
+const BANK_FOR_SLOT_WARN_AFTER: Duration = Duration::from_secs(5);
 
 struct SnapshotVerifier {
     expected: DashMap<Slot, SnapshotHash>,
@@ -222,10 +223,28 @@ impl BankReplay {
     }
 
     fn bank_for_slot(&self, slot: Slot) -> Result<Arc<Bank>, String> {
-        let mut guard = self
-            .bank_forks
-            .write()
-            .map_err(|_| "bank forks lock poisoned".to_string())?;
+        self.cursor.update_inflight_stage("bank_for_slot_lock_try");
+        let lock_start = Instant::now();
+        let mut guard = match self.bank_forks.try_write() {
+            Ok(guard) => guard,
+            Err(_) => {
+                self.cursor.update_inflight_stage("bank_for_slot_lock_wait");
+                let guard = self
+                    .bank_forks
+                    .write()
+                    .map_err(|_| "bank forks lock poisoned".to_string())?;
+                let waited = lock_start.elapsed();
+                if waited >= BANK_FOR_SLOT_WARN_AFTER {
+                    warn!(
+                        "bank_for_slot lock waited {:.3}s for slot {}",
+                        waited.as_secs_f64(),
+                        slot
+                    );
+                }
+                guard
+            }
+        };
+        self.cursor.update_inflight_stage("bank_for_slot_locked");
         let current_slot = guard.highest_slot();
         if slot < current_slot {
             return Err(format!(
@@ -233,28 +252,46 @@ impl BankReplay {
             ));
         }
         if slot > current_slot {
+            let step_start = Instant::now();
             let parent = guard.working_bank();
+            self.cursor.update_inflight_stage("freeze_parent");
             parent.freeze();
             let frozen_bank = parent.clone();
             let parent_slot = parent.slot();
+            self.cursor.update_inflight_stage("set_root");
             self.leader_schedule_cache.set_root(&frozen_bank);
+            self.cursor.update_inflight_stage("slot_leader_at");
             let collector_id = self
                 .leader_schedule_cache
                 .slot_leader_at(slot, Some(&parent))
                 .unwrap_or_else(|| *parent.collector_id());
+            self.cursor.update_inflight_stage("new_from_parent");
             let next_bank = Bank::new_from_parent(parent, &collector_id, slot);
+            self.cursor.update_inflight_stage("set_alpenglow_ticks");
             set_alpenglow_ticks(&next_bank);
+            self.cursor.update_inflight_stage("insert_bank");
             let bank_with_scheduler = guard.insert(next_bank);
             if let Some(interval) = self.root_interval {
                 if interval > 0 && parent_slot % interval == 0 {
+                    self.cursor.update_inflight_stage("root_prune");
                     guard.set_root(parent_slot, None, None);
                     guard.prune_program_cache(parent_slot);
                 }
             }
+            self.cursor.update_inflight_stage("clone_without_scheduler");
             let next_bank = bank_with_scheduler.clone_without_scheduler();
             drop(guard);
             if let Some(verifier) = self.snapshot_verifier.as_ref() {
+                self.cursor.update_inflight_stage("verify_bank");
                 verifier.verify_bank(&frozen_bank);
+            }
+            let elapsed = step_start.elapsed();
+            if elapsed >= BANK_FOR_SLOT_WARN_AFTER {
+                warn!(
+                    "bank_for_slot slow path: slot {} took {:.3}s",
+                    slot,
+                    elapsed.as_secs_f64()
+                );
             }
             return Ok(next_bank);
         }

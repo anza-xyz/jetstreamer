@@ -316,6 +316,7 @@ impl BankReplay {
                 cursor: self.cursor.clone(),
             };
             if entry.tx_count == 0 {
+                self.cursor.update_inflight_stage("register_tick");
                 let start = Instant::now();
                 if let Err(err) = self.register_tick(entry.slot, entry.hash) {
                     log::debug!(
@@ -329,9 +330,11 @@ impl BankReplay {
                 continue;
             }
 
+            self.cursor.update_inflight_stage("bank_for_slot");
             let start = Instant::now();
             match self.bank_for_slot(entry.slot) {
                 Ok(bank) => {
+                    self.cursor.update_inflight_stage("try_process");
                     self.cursor.update(
                         entry.slot,
                         entry.entry_index,
@@ -394,6 +397,7 @@ impl BankReplay {
                             panic!("{message}");
                         }
                     };
+                    self.cursor.update_inflight_stage("post_process");
 
                     if results.len() != expected_statuses.len() {
                         let message = format!(
@@ -615,8 +619,17 @@ impl ReplayCursor {
                 tx_start,
                 tx_count,
                 signature,
+                stage: "start",
                 started_at: Instant::now(),
             });
+        }
+    }
+
+    fn update_inflight_stage(&self, stage: &'static str) {
+        if let Ok(mut guard) = self.inflight.lock() {
+            if let Some(ref mut entry) = *guard {
+                entry.stage = stage;
+            }
         }
     }
 
@@ -628,7 +641,7 @@ impl ReplayCursor {
 
     fn inflight_snapshot(
         &self,
-    ) -> Option<(u64, u64, u64, u64, Option<String>, Duration)> {
+    ) -> Option<(u64, u64, u64, u64, Option<String>, &'static str, Duration)> {
         let guard = self.inflight.lock().ok()?;
         guard.as_ref().map(|entry| {
             (
@@ -637,6 +650,7 @@ impl ReplayCursor {
                 entry.tx_start as u64,
                 entry.tx_count as u64,
                 entry.signature.clone(),
+                entry.stage,
                 entry.started_at.elapsed(),
             )
         })
@@ -650,6 +664,7 @@ struct InFlightEntry {
     tx_start: usize,
     tx_count: usize,
     signature: Option<String>,
+    stage: &'static str,
     started_at: Instant,
 }
 
@@ -3296,8 +3311,9 @@ async fn run_geyser_replay(
                         let mut inflight_tx_start = 0;
                         let mut inflight_tx_count = 0;
                         let mut inflight_sig: Option<String> = None;
+                        let mut inflight_stage = "<none>";
                         let mut inflight_elapsed: Option<Duration> = None;
-                        if let Some((slot, entry, tx_start, tx_count, sig, elapsed)) =
+                        if let Some((slot, entry, tx_start, tx_count, sig, stage, elapsed)) =
                             cursor.inflight_snapshot()
                         {
                             inflight_slot = slot;
@@ -3305,25 +3321,28 @@ async fn run_geyser_replay(
                             inflight_tx_start = tx_start;
                             inflight_tx_count = tx_count;
                             inflight_sig = sig.clone();
+                            inflight_stage = stage;
                             inflight_elapsed = Some(elapsed);
                             if elapsed >= inflight_warn_after {
                                 warn!(
-                                    "entry execution in-flight: slot {} entry {} tx_start={} tx_count={} elapsed={:.3}s sig={}",
+                                    "entry execution in-flight: slot {} entry {} tx_start={} tx_count={} stage={} elapsed={:.3}s sig={}",
                                     slot,
                                     entry,
                                     tx_start,
                                     tx_count,
+                                    stage,
                                     elapsed.as_secs_f64(),
                                     sig.as_deref().unwrap_or("<none>"),
                                 );
                             }
                             if elapsed >= inflight_fail_after {
                                 let message = format!(
-                                    "entry execution exceeded timeout: slot {} entry {} tx_start={} tx_count={} elapsed={:.3}s sig={}",
+                                    "entry execution exceeded timeout: slot {} entry {} tx_start={} tx_count={} stage={} elapsed={:.3}s sig={}",
                                     slot,
                                     entry,
                                     tx_start,
                                     tx_count,
+                                    stage,
                                     elapsed.as_secs_f64(),
                                     sig.as_deref().unwrap_or("<none>"),
                                 );
@@ -3342,7 +3361,7 @@ async fn run_geyser_replay(
                             "main"
                         };
                         info!(
-                            "replay stall ({phase}): slot {latest} unchanged for {:.1}s; scheduler current_slot={} last_finalized={} buffered_slots={} presence={:?} buffer={:?} last_tx_slot={} last_entry_slot={} last_block_meta_slot={} last_account_update_slot={} cursor_slot={} cursor_entry={} cursor_tx_start={} cursor_tx_count={} cursor_sig={} inflight_slot={} inflight_entry={} inflight_tx_start={} inflight_tx_count={} inflight_elapsed={} inflight_sig={}",
+                            "replay stall ({phase}): slot {latest} unchanged for {:.1}s; scheduler current_slot={} last_finalized={} buffered_slots={} presence={:?} buffer={:?} last_tx_slot={} last_entry_slot={} last_block_meta_slot={} last_account_update_slot={} cursor_slot={} cursor_entry={} cursor_tx_start={} cursor_tx_count={} cursor_sig={} inflight_slot={} inflight_entry={} inflight_tx_start={} inflight_tx_count={} inflight_stage={} inflight_elapsed={} inflight_sig={}",
                             stalled_for.as_secs_f64(),
                             snapshot.current_slot,
                             snapshot.last_finalized_slot,
@@ -3362,6 +3381,7 @@ async fn run_geyser_replay(
                             inflight_entry,
                             inflight_tx_start,
                             inflight_tx_count,
+                            inflight_stage,
                             inflight_elapsed
                                 .map(|duration| format!("{:.3}s", duration.as_secs_f64()))
                                 .unwrap_or_else(|| "<none>".to_string()),

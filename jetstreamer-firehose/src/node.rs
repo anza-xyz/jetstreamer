@@ -5,6 +5,7 @@ use {
     crc::{CRC_64_GO_ISO, Crc},
     fnv::FnvHasher,
     std::{
+        collections::HashSet,
         fmt,
         io::{self, Read},
         vec::Vec,
@@ -81,16 +82,25 @@ impl NodesWithCids {
     ) -> Result<Vec<u8>, SharedError> {
         let mut data = first_dataframe.data.to_vec();
         let mut next_arr = first_dataframe.next;
+        let mut seen: HashSet<Cid> = HashSet::new();
+        let mut frame_count: u64 = 1;
+        let declared_total = first_dataframe.total;
         while next_arr.is_some() {
-            for next_cid in next_arr.clone().unwrap() {
-                let next_node = self.get_by_cid(&next_cid);
-                if next_node.is_none() {
+            let nexts = next_arr.take().unwrap();
+            for next_cid in nexts {
+                if !seen.insert(next_cid) {
                     return Err(Box::new(std::io::Error::other(std::format!(
-                        "Missing CID: {:?}",
+                        "dataframe cycle detected at CID {:?}",
                         next_cid
                     ))));
                 }
-                let next_node_un = next_node.unwrap();
+                let next_node = self.get_by_cid(&next_cid).ok_or_else(|| {
+                    Box::new(std::io::Error::other(std::format!(
+                        "Missing CID: {:?}",
+                        next_cid
+                    ))) as SharedError
+                })?;
+                let next_node_un = next_node;
 
                 if !next_node_un.get_node().is_dataframe() {
                     return Err(Box::new(std::io::Error::other(std::format!(
@@ -101,6 +111,15 @@ impl NodesWithCids {
 
                 let next_dataframe = next_node_un.get_node().get_dataframe().unwrap();
                 data.extend(next_dataframe.data.to_vec());
+                frame_count = frame_count.saturating_add(1);
+                if let Some(total) = declared_total {
+                    if frame_count > total {
+                        return Err(Box::new(std::io::Error::other(std::format!(
+                            "dataframe chain exceeded declared total {}",
+                            total
+                        ))));
+                    }
+                }
                 next_arr.clone_from(&next_dataframe.next);
             }
         }

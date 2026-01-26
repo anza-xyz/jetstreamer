@@ -59,8 +59,8 @@ use solana_transaction::{
     TransactionError, sanitized::SanitizedTransaction, versioned::VersionedTransaction,
 };
 use solana_transaction_status::TransactionStatusMeta;
-use tempfile::Builder as TempDirBuilder;
 use tar::Archive as TarArchive;
+use tempfile::Builder as TempDirBuilder;
 use tokio::process::Command;
 use xxhash_rust::xxh64::xxh64;
 
@@ -411,14 +411,23 @@ struct ReplayProgress {
     latest_slot: AtomicU64,
     tx_count: AtomicU64,
     account_update_count: AtomicU64,
+    last_tx_slot: AtomicU64,
+    last_entry_slot: AtomicU64,
+    last_block_meta_slot: AtomicU64,
+    last_account_update_slot: AtomicU64,
 }
 
 impl ReplayProgress {
     fn new(start_slot: Slot) -> Self {
+        let initial = start_slot.saturating_sub(1);
         Self {
-            latest_slot: AtomicU64::new(start_slot.saturating_sub(1)),
+            latest_slot: AtomicU64::new(initial),
             tx_count: AtomicU64::new(0),
             account_update_count: AtomicU64::new(0),
+            last_tx_slot: AtomicU64::new(initial),
+            last_entry_slot: AtomicU64::new(initial),
+            last_block_meta_slot: AtomicU64::new(initial),
+            last_account_update_slot: AtomicU64::new(initial),
         }
     }
 
@@ -428,14 +437,33 @@ impl ReplayProgress {
     }
 
     fn note_slot(&self, slot: Slot) {
-        let mut current = self.latest_slot.load(Ordering::Relaxed);
+        Self::update_max(&self.latest_slot, slot);
+    }
+
+    fn note_tx_slot(&self, slot: Slot) {
+        self.note_slot(slot);
+        Self::update_max(&self.last_tx_slot, slot);
+    }
+
+    fn note_entry_slot(&self, slot: Slot) {
+        self.note_slot(slot);
+        Self::update_max(&self.last_entry_slot, slot);
+    }
+
+    fn note_block_meta_slot(&self, slot: Slot) {
+        self.note_slot(slot);
+        Self::update_max(&self.last_block_meta_slot, slot);
+    }
+
+    fn note_account_update_slot(&self, slot: Slot) {
+        self.note_slot(slot);
+        Self::update_max(&self.last_account_update_slot, slot);
+    }
+
+    fn update_max(target: &AtomicU64, slot: Slot) {
+        let mut current = target.load(Ordering::Relaxed);
         while slot > current {
-            match self.latest_slot.compare_exchange(
-                current,
-                slot,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
+            match target.compare_exchange(current, slot, Ordering::Relaxed, Ordering::Relaxed) {
                 Ok(_) => break,
                 Err(next) => current = next,
             }
@@ -486,7 +514,8 @@ impl ReplayCursor {
         signature: Option<String>,
     ) {
         self.slot.store(slot, Ordering::Relaxed);
-        self.entry_index.store(entry_index as u64, Ordering::Relaxed);
+        self.entry_index
+            .store(entry_index as u64, Ordering::Relaxed);
         self.tx_start.store(tx_start as u64, Ordering::Relaxed);
         self.tx_count.store(tx_count as u64, Ordering::Relaxed);
         if let Ok(mut guard) = self.signature.lock() {
@@ -543,11 +572,10 @@ fn setup_logger(shutdown: Arc<AtomicBool>, cursor: Arc<ReplayCursor>) {
         }
         Err(_) => true,
     };
-    let logger = env_logger::Builder::from_env(
-        env_logger::Env::new().default_filter_or(DEFAULT_LOG_FILTER),
-    )
-    .format_timestamp_nanos()
-    .build();
+    let logger =
+        env_logger::Builder::from_env(env_logger::Env::new().default_filter_or(DEFAULT_LOG_FILTER))
+            .format_timestamp_nanos()
+            .build();
     let max_level = logger.filter();
     let install = log::set_boxed_logger(Box::new(AbortOnErrorLogger {
         inner: logger,
@@ -558,14 +586,10 @@ fn setup_logger(shutdown: Arc<AtomicBool>, cursor: Arc<ReplayCursor>) {
     match install {
         Ok(()) => {
             log::set_max_level(max_level);
-            eprintln!(
-                "jetstreamer logger installed (abort_on_error={abort_on_error})"
-            );
+            eprintln!("jetstreamer logger installed (abort_on_error={abort_on_error})");
         }
         Err(_) => {
-            eprintln!(
-                "jetstreamer logger already initialized; abort_on_error may be disabled"
-            );
+            eprintln!("jetstreamer logger already initialized; abort_on_error may be disabled");
         }
     }
 }
@@ -1048,6 +1072,7 @@ struct SchedulerState {
     slots: HashMap<Slot, SlotExecutionBuffer>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug)]
 struct SlotBufferSnapshot {
     expected_tx_count: Option<u64>,
@@ -1186,15 +1211,18 @@ impl TransactionScheduler {
         let state = self.state.lock().expect("transaction scheduler lock");
         let current_slot = state.current_slot;
         let presence = self.presence.state(current_slot);
-        let buffer = state.slots.get(&current_slot).map(|slot_buffer| SlotBufferSnapshot {
-            expected_tx_count: slot_buffer.expected_tx_count,
-            expected_entry_count: slot_buffer.expected_entry_count,
-            processed_tx_count: slot_buffer.processed_tx_count,
-            processed_entry_count: slot_buffer.processed_entry_count,
-            pending_entries: slot_buffer.pending_entries.len(),
-            buffered_txs: slot_buffer.buffered_transaction_count(),
-            next_entry_index: slot_buffer.next_entry_index,
-        });
+        let buffer = state
+            .slots
+            .get(&current_slot)
+            .map(|slot_buffer| SlotBufferSnapshot {
+                expected_tx_count: slot_buffer.expected_tx_count,
+                expected_entry_count: slot_buffer.expected_entry_count,
+                processed_tx_count: slot_buffer.processed_tx_count,
+                processed_entry_count: slot_buffer.processed_entry_count,
+                pending_entries: slot_buffer.pending_entries.len(),
+                buffered_txs: slot_buffer.buffered_transaction_count(),
+                next_entry_index: slot_buffer.next_entry_index,
+            });
         SchedulerSnapshot {
             current_slot,
             last_finalized_slot: state.last_finalized_slot,
@@ -1480,7 +1508,7 @@ impl AccountsUpdateNotifierInterface for ProgressAccountsUpdateNotifier {
         pubkey: &solana_pubkey::Pubkey,
         write_version: u64,
     ) {
-        self.progress.note_slot(slot);
+        self.progress.note_account_update_slot(slot);
         self.progress.inc_account_update();
         if slot >= self.live_start_slot {
             if let Some(delegate) = self.delegate.as_ref() {
@@ -1527,7 +1555,7 @@ impl TransactionNotifier for BankTransactionNotifier {
         transaction_status_meta: &TransactionStatusMeta,
         transaction: &VersionedTransaction,
     ) {
-        self.progress.note_slot(slot);
+        self.progress.note_tx_slot(slot);
         self.progress.inc_tx();
         match self.scheduler.insert_transaction(
             slot,
@@ -1572,7 +1600,7 @@ impl EntryNotifier for BankEntryNotifier {
         entry: &solana_entry::entry::EntrySummary,
         starting_transaction_index: usize,
     ) {
-        self.progress.note_slot(slot);
+        self.progress.note_entry_slot(slot);
         match self.scheduler.push_entry(
             slot,
             index,
@@ -1595,6 +1623,7 @@ impl EntryNotifier for BankEntryNotifier {
 struct BankBlockMetadataNotifier {
     scheduler: Arc<TransactionScheduler>,
     bank_replay: Arc<BankReplay>,
+    progress: Arc<ReplayProgress>,
     failure: Arc<ReplayFailure>,
     delegate: Option<BlockMetadataNotifierArc>,
     live_start_slot: Slot,
@@ -1629,6 +1658,7 @@ impl BlockMetadataNotifier for BankBlockMetadataNotifier {
             }
             return;
         }
+        self.progress.note_block_meta_slot(slot);
         match self
             .scheduler
             .record_block_metadata(slot, executed_transaction_count, entry_count)
@@ -2494,10 +2524,7 @@ fn load_bank_from_snapshot_archive(
             interval.as_secs()
         );
     } else {
-        info!(
-            "unpacking snapshot archive {}",
-            snapshot_archive.display()
-        );
+        info!("unpacking snapshot archive {}", snapshot_archive.display());
     }
     let drain = std::thread::spawn(move || {
         let mut count = 0u64;
@@ -3081,6 +3108,7 @@ async fn run_geyser_replay(
     let block_metadata_notifier = Arc::new(BankBlockMetadataNotifier {
         scheduler: scheduler.clone(),
         bank_replay: bank_replay.clone(),
+        progress: progress.clone(),
         failure: failure.clone(),
         delegate: service.get_block_metadata_notifier(),
         live_start_slot: epoch_start,
@@ -3137,23 +3165,31 @@ async fn run_geyser_replay(
                     last_seen_change = Instant::now();
                 } else {
                     let stalled_for = last_seen_change.elapsed();
-                    if stalled_for >= stall_interval
-                        && last_stall_log.elapsed() >= stall_interval
-                    {
+                    if stalled_for >= stall_interval && last_stall_log.elapsed() >= stall_interval {
                         let snapshot = scheduler.snapshot();
+                        let last_tx_slot = progress.last_tx_slot.load(Ordering::Relaxed);
+                        let last_entry_slot = progress.last_entry_slot.load(Ordering::Relaxed);
+                        let last_block_meta_slot =
+                            progress.last_block_meta_slot.load(Ordering::Relaxed);
+                        let last_account_update_slot =
+                            progress.last_account_update_slot.load(Ordering::Relaxed);
                         let phase = if in_warmup && latest < epoch_start {
                             "warmup"
                         } else {
                             "main"
                         };
                         info!(
-                            "replay stall ({phase}): slot {latest} unchanged for {:.1}s; scheduler current_slot={} last_finalized={} buffered_slots={} presence={:?} buffer={:?}",
+                            "replay stall ({phase}): slot {latest} unchanged for {:.1}s; scheduler current_slot={} last_finalized={} buffered_slots={} presence={:?} buffer={:?} last_tx_slot={} last_entry_slot={} last_block_meta_slot={} last_account_update_slot={}",
                             stalled_for.as_secs_f64(),
                             snapshot.current_slot,
                             snapshot.last_finalized_slot,
                             snapshot.buffered_slots,
                             snapshot.presence,
-                            snapshot.buffer
+                            snapshot.buffer,
+                            last_tx_slot,
+                            last_entry_slot,
+                            last_block_meta_slot,
+                            last_account_update_slot
                         );
                         last_stall_log = Instant::now();
                     }
@@ -3521,16 +3557,15 @@ async fn main() {
         None
     };
 
-    if let Err(err) =
-        run_geyser_replay(
-            epoch,
-            &dest_dir,
-            &dest_path,
-            shutdown,
-            cursor,
-            snapshot_verifier,
-        )
-        .await
+    if let Err(err) = run_geyser_replay(
+        epoch,
+        &dest_dir,
+        &dest_path,
+        shutdown,
+        cursor,
+        snapshot_verifier,
+    )
+    .await
     {
         eprintln!("error: {err}");
         exit(1);

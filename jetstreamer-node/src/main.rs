@@ -88,9 +88,9 @@ const ACCOUNTS_RUN_DIR: &str = "run";
 const ARCHIVE_ACCOUNTS_DIR: &str = "accounts-run";
 const DEFAULT_ROOT_INTERVAL: u64 = 1024;
 const ENTRY_EXEC_WARN_AFTER: Duration = Duration::from_secs(5);
-const ENTRY_EXEC_FAIL_AFTER: Duration = Duration::from_secs(30);
+const ENTRY_EXEC_FAIL_AFTER: Duration = Duration::from_secs(300);
 const BANK_FOR_SLOT_WARN_AFTER: Duration = Duration::from_secs(5);
-const ENABLE_PROGRAM_CACHE_PRUNE: bool = false;
+const ENABLE_PROGRAM_CACHE_PRUNE: bool = true;
 
 struct SnapshotVerifier {
     expected: DashMap<Slot, SnapshotHash>,

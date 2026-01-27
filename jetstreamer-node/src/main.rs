@@ -1483,6 +1483,7 @@ struct SchedulerState {
     last_finalized_slot: Slot,
     current_slot: Slot,
     slots: HashMap<Slot, SlotExecutionBuffer>,
+    inferred_blocks: HashMap<Slot, (u64, u64)>,
 }
 
 #[allow(dead_code)]
@@ -1513,6 +1514,7 @@ impl TransactionScheduler {
                 last_finalized_slot: start_slot.saturating_sub(1),
                 current_slot: start_slot,
                 slots: HashMap::new(),
+                inferred_blocks: HashMap::new(),
             }),
             presence,
         }
@@ -1571,10 +1573,25 @@ impl TransactionScheduler {
     ) -> Result<Vec<ReadyEntry>, String> {
         let mut state = self.state.lock().expect("transaction scheduler lock");
         if slot <= state.last_finalized_slot {
+            if let Some((inferred_tx, inferred_entry)) = state.inferred_blocks.remove(&slot) {
+                if inferred_tx == expected_tx_count && inferred_entry == expected_entry_count {
+                    return Ok(Vec::new());
+                }
+                return Err(format!(
+                    "late block metadata mismatch for slot {slot}: inferred txs {inferred_tx} entries {inferred_entry}, got txs {expected_tx_count} entries {expected_entry_count}"
+                ));
+            }
             return Err(format!(
                 "late block metadata for slot {slot} (last finalized slot {})",
                 state.last_finalized_slot
             ));
+        }
+        if let Some((inferred_tx, inferred_entry)) = state.inferred_blocks.remove(&slot) {
+            if inferred_tx != expected_tx_count || inferred_entry != expected_entry_count {
+                return Err(format!(
+                    "block metadata mismatch for slot {slot}: inferred txs {inferred_tx} entries {inferred_entry}, got txs {expected_tx_count} entries {expected_entry_count}"
+                ));
+            }
         }
         let buffer = state
             .slots
@@ -1673,6 +1690,9 @@ impl TransactionScheduler {
 
             let mut drained = buffer.drain_ready_entries(current_slot)?;
             ready.append(&mut drained);
+            if let Some((txs, entries)) = buffer.infer_expected_counts_if_missing(current_slot) {
+                state.inferred_blocks.insert(current_slot, (txs, entries));
+            }
 
             let should_finalize = buffer.should_finalize(current_slot)?;
             if !should_finalize {
@@ -1700,6 +1720,25 @@ struct SlotExecutionBuffer {
 }
 
 impl SlotExecutionBuffer {
+    fn infer_expected_counts_if_missing(&mut self, slot: Slot) -> Option<(u64, u64)> {
+        if self.expected_tx_count.is_some() || self.expected_entry_count.is_some() {
+            return None;
+        }
+        if self.processed_tx_count == 0 && self.processed_entry_count == 0 {
+            return None;
+        }
+        if !self.pending_entries.is_empty() || self.buffered_transaction_count() > 0 {
+            return None;
+        }
+        self.expected_tx_count = Some(self.processed_tx_count);
+        self.expected_entry_count = Some(self.processed_entry_count);
+        warn!(
+            "missing block metadata: inferring expected counts for slot {} txs={} entries={}",
+            slot, self.processed_tx_count, self.processed_entry_count
+        );
+        Some((self.processed_tx_count, self.processed_entry_count))
+    }
+
     fn set_expected_counts(
         &mut self,
         expected_tx_count: u64,

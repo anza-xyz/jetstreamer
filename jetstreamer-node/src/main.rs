@@ -471,10 +471,11 @@ impl BankReplay {
                         && entry.entry_index == 0
                         && !LOGGED_STALL_TX.swap(true, Ordering::SeqCst)
                     {
-                        warn!(
+                        let mut details = String::new();
+                        details.push_str(&format!(
                             "stalling entry pre-exec dump: slot {} entry {} tx_start={} tx_count={}",
                             entry.slot, entry.entry_index, entry.start_index, entry.tx_count
-                        );
+                        ));
                         for (offset, scheduled) in entry.txs.iter().enumerate() {
                             let signature = scheduled
                                 .tx
@@ -494,8 +495,8 @@ impl BankReplay {
                                 program_ids.push(program_id);
                             }
                             let tx_index = entry.start_index.saturating_add(offset);
-                            warn!(
-                                "stalling tx: slot {} entry {} tx_index={} sig={} instrs={} accounts={} programs={:?} recent_blockhash={}",
+                            details.push_str(&format!(
+                                "\nstalling tx: slot {} entry {} tx_index={} sig={} instrs={} accounts={} programs={:?} recent_blockhash={}",
                                 entry.slot,
                                 entry.entry_index,
                                 tx_index,
@@ -504,8 +505,10 @@ impl BankReplay {
                                 static_keys.len(),
                                 program_ids,
                                 message.recent_blockhash()
-                            );
+                            ));
                         }
+                        warn!("{details}");
+                        self.cursor.set_inflight_details(details);
                     }
                     self.cursor.update(
                         entry.slot,
@@ -797,6 +800,7 @@ impl ReplayCursor {
                 tx_count,
                 signature,
                 stage: "start",
+                details: None,
                 started_at: Instant::now(),
             });
         }
@@ -808,6 +812,23 @@ impl ReplayCursor {
                 entry.stage = stage;
             }
         }
+    }
+
+    fn set_inflight_details(&self, details: String) {
+        if let Ok(mut guard) = self.inflight.lock() {
+            if let Some(ref mut entry) = *guard {
+                entry.details = Some(details);
+            }
+        }
+    }
+
+    fn take_inflight_details(&self) -> Option<String> {
+        if let Ok(mut guard) = self.inflight.lock() {
+            if let Some(ref mut entry) = *guard {
+                return entry.details.take();
+            }
+        }
+        None
     }
 
     fn finish_inflight(&self) {
@@ -842,6 +863,7 @@ struct InFlightEntry {
     tx_count: usize,
     signature: Option<String>,
     stage: &'static str,
+    details: Option<String>,
     started_at: Instant,
 }
 
@@ -3524,6 +3546,11 @@ async fn run_geyser_replay(
                                     sig.as_deref().unwrap_or("<none>"),
                                 );
                                 failure.record(message);
+                            }
+                        }
+                        if inflight_slot == 393_521_153 && inflight_entry == 0 {
+                            if let Some(details) = cursor.take_inflight_details() {
+                                warn!("{details}");
                             }
                         }
                         let last_tx_slot = progress.last_tx_slot.load(Ordering::Relaxed);

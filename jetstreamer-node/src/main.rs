@@ -189,6 +189,7 @@ struct BankReplay {
     debug_signature: Option<Signature>,
     prune_inflight: Arc<AtomicBool>,
     cached_bank: Mutex<Option<CachedBank>>,
+    execution_gate: Arc<Mutex<()>>,
 }
 
 #[derive(Debug)]
@@ -241,6 +242,7 @@ impl BankReplay {
             debug_signature,
             prune_inflight: Arc::new(AtomicBool::new(false)),
             cached_bank,
+            execution_gate: Arc::new(Mutex::new(())),
         }
     }
 
@@ -342,11 +344,15 @@ impl BankReplay {
             if let Some(prune_slot) = prune_request {
                 let inflight = self.prune_inflight.clone();
                 let bank_forks = Arc::clone(&self.bank_forks);
+                let execution_gate = Arc::clone(&self.execution_gate);
                 if inflight
                     .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
                     .is_ok()
                 {
                     std::thread::spawn(move || {
+                        let _gate = execution_gate
+                            .lock()
+                            .expect("execution gate lock poisoned");
                         let start = Instant::now();
                         let guard = bank_forks
                             .write()
@@ -467,6 +473,20 @@ impl BankReplay {
 
     fn process_ready_entries(&self, entries: Vec<ReadyEntry>) {
         for entry in entries {
+            let gate_start = Instant::now();
+            let _execution_guard = self
+                .execution_gate
+                .lock()
+                .expect("execution gate lock poisoned");
+            let gate_wait = gate_start.elapsed();
+            if gate_wait >= BANK_FOR_SLOT_WARN_AFTER {
+                warn!(
+                    "entry execution gate waited {:.3}s (slot {} entry {})",
+                    gate_wait.as_secs_f64(),
+                    entry.slot,
+                    entry.entry_index
+                );
+            }
             let signature = entry
                 .txs
                 .first()

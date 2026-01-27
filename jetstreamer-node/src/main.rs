@@ -188,6 +188,7 @@ struct BankReplay {
     cursor: Arc<ReplayCursor>,
     debug_signature: Option<Signature>,
     prune_inflight: Arc<AtomicBool>,
+    execution_gate: Arc<Mutex<()>>,
 }
 
 struct InFlightGuard {
@@ -223,6 +224,7 @@ impl BankReplay {
             cursor,
             debug_signature,
             prune_inflight: Arc::new(AtomicBool::new(false)),
+            execution_gate: Arc::new(Mutex::new(())),
         }
     }
 
@@ -304,21 +306,21 @@ impl BankReplay {
             drop(guard);
             if let Some(prune_slot) = prune_request {
                 let inflight = self.prune_inflight.clone();
+                let bank_forks = Arc::clone(&self.bank_forks);
+                let execution_gate = Arc::clone(&self.execution_gate);
                 if inflight
                     .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
                     .is_ok()
                 {
-                    let bank_forks = Arc::clone(&self.bank_forks);
                     std::thread::spawn(move || {
+                        let _gate = execution_gate
+                            .lock()
+                            .expect("execution gate lock poisoned");
                         let start = Instant::now();
-                        if let Ok(guard) = bank_forks.try_write() {
-                            guard.prune_program_cache(prune_slot);
-                        } else {
-                            warn!(
-                                "bank_for_slot skipping program cache prune at slot {} (lock busy)",
-                                prune_slot
-                            );
-                        }
+                        let guard = bank_forks
+                            .write()
+                            .expect("bank forks lock poisoned");
+                        guard.prune_program_cache(prune_slot);
                         let elapsed = start.elapsed();
                         if elapsed >= BANK_FOR_SLOT_WARN_AFTER {
                             warn!(
@@ -431,6 +433,10 @@ impl BankReplay {
 
     fn process_ready_entries(&self, entries: Vec<ReadyEntry>) {
         for entry in entries {
+            let _execution_guard = self
+                .execution_gate
+                .lock()
+                .expect("execution gate lock poisoned");
             let signature = entry
                 .txs
                 .first()

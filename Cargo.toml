@@ -96,6 +96,8 @@ solana-transaction = "3"
 solana-transaction-status = "3"
 solana-sdk-ids = "3"
 solana-reward-info = "3"
+solana-svm = "3"
+solana-svm-timings = "3"
 solana-sysvar = "=3.0.0"
 solana-genesis-utils = { version = "3", features = ["agave-unstable-api"] }
 sha2 = "0.10"

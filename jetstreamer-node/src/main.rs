@@ -38,7 +38,7 @@ use solana_accounts_db::{
         AccountForGeyser, AccountsUpdateNotifier, AccountsUpdateNotifierInterface,
     },
 };
-use solana_clock::Slot;
+use solana_clock::{Slot, MAX_PROCESSING_AGE};
 use solana_genesis_utils::{MAX_GENESIS_ARCHIVE_UNPACKED_SIZE, open_genesis_config};
 use solana_geyser_plugin_manager::block_metadata_notifier_interface::{
     BlockMetadataNotifier, BlockMetadataNotifierArc,
@@ -55,6 +55,8 @@ use solana_runtime::{
     runtime_config::RuntimeConfig, snapshot_bank_utils, snapshot_utils,
 };
 use solana_signature::Signature;
+use solana_svm::transaction_processor::ExecutionRecordingConfig;
+use solana_svm_timings::ExecuteTimings;
 use solana_transaction::{
     TransactionError, sanitized::SanitizedTransaction, versioned::VersionedTransaction,
 };
@@ -617,17 +619,38 @@ impl BankReplay {
                         .iter()
                         .map(|scheduled| scheduled.expected_status.clone())
                         .collect();
-                    let results = match bank.try_process_entry_transactions(txs) {
-                        Ok(results) => results,
+                    self.cursor.update_inflight_stage("prepare_entry_batch");
+                    let batch = match bank.prepare_entry_batch(txs) {
+                        Ok(batch) => batch,
                         Err(err) => {
                             let message = format!(
-                                "transaction batch execution failed at slot {} entry {}: {}",
+                                "transaction batch prepare failed at slot {} entry {}: {}",
                                 entry.slot, entry.entry_index, err
                             );
                             self.failure.record(message.clone());
                             panic!("{message}");
                         }
                     };
+                    self.cursor.update_inflight_stage("load_execute_and_commit");
+                    let mut timings = ExecuteTimings::default();
+                    let (commit_results, _balance_collector) =
+                        bank.load_execute_and_commit_transactions(
+                            &batch,
+                            MAX_PROCESSING_AGE,
+                            ExecutionRecordingConfig::new_single_setting(false),
+                            &mut timings,
+                            None,
+                        );
+                    if entry.slot == 393_521_153 && entry.entry_index == 0 {
+                        info!(
+                            "entry timings: slot {} entry {} timings={:?}",
+                            entry.slot, entry.entry_index, timings
+                        );
+                    }
+                    let results: Vec<Result<(), TransactionError>> = commit_results
+                        .into_iter()
+                        .map(|commit_result| commit_result.and_then(|committed| committed.status))
+                        .collect();
                     self.cursor.update_inflight_stage("post_process");
 
                     if results.len() != expected_statuses.len() {

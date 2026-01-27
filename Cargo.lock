@@ -4152,6 +4152,8 @@ dependencies = [
  "solana-rpc",
  "solana-runtime",
  "solana-signature",
+ "solana-svm",
+ "solana-svm-timings",
  "solana-transaction",
  "solana-transaction-status",
  "tar",

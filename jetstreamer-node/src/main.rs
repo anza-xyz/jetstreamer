@@ -91,6 +91,7 @@ const ENTRY_EXEC_WARN_AFTER: Duration = Duration::from_secs(5);
 const ENTRY_EXEC_FAIL_AFTER: Duration = Duration::from_secs(300);
 const BANK_FOR_SLOT_WARN_AFTER: Duration = Duration::from_secs(5);
 const ENABLE_PROGRAM_CACHE_PRUNE: bool = true;
+static LOGGED_STALL_TX: AtomicBool = AtomicBool::new(false);
 
 struct SnapshotVerifier {
     expected: DashMap<Slot, SnapshotHash>,
@@ -466,6 +467,46 @@ impl BankReplay {
             match self.bank_for_slot(entry.slot) {
                 Ok(bank) => {
                     self.cursor.update_inflight_stage("try_process");
+                    if entry.slot == 393_521_153
+                        && entry.entry_index == 0
+                        && !LOGGED_STALL_TX.swap(true, Ordering::SeqCst)
+                    {
+                        warn!(
+                            "stalling entry pre-exec dump: slot {} entry {} tx_start={} tx_count={}",
+                            entry.slot, entry.entry_index, entry.start_index, entry.tx_count
+                        );
+                        for (offset, scheduled) in entry.txs.iter().enumerate() {
+                            let signature = scheduled
+                                .tx
+                                .signatures
+                                .first()
+                                .map(|sig| sig.to_string())
+                                .unwrap_or_else(|| "<missing-signature>".to_string());
+                            let message = &scheduled.tx.message;
+                            let static_keys = message.static_account_keys();
+                            let mut program_ids =
+                                Vec::with_capacity(message.instructions().len());
+                            for ix in message.instructions() {
+                                let program_id = static_keys
+                                    .get(ix.program_id_index as usize)
+                                    .map(|key| bs58::encode(key.to_bytes()).into_string())
+                                    .unwrap_or_else(|| "<unknown>".to_string());
+                                program_ids.push(program_id);
+                            }
+                            let tx_index = entry.start_index.saturating_add(offset);
+                            warn!(
+                                "stalling tx: slot {} entry {} tx_index={} sig={} instrs={} accounts={} programs={:?} recent_blockhash={}",
+                                entry.slot,
+                                entry.entry_index,
+                                tx_index,
+                                signature,
+                                message.instructions().len(),
+                                static_keys.len(),
+                                program_ids,
+                                message.recent_blockhash()
+                            );
+                        }
+                    }
                     self.cursor.update(
                         entry.slot,
                         entry.entry_index,

@@ -188,7 +188,13 @@ struct BankReplay {
     cursor: Arc<ReplayCursor>,
     debug_signature: Option<Signature>,
     prune_inflight: Arc<AtomicBool>,
-    execution_gate: Arc<Mutex<()>>,
+    cached_bank: Mutex<Option<CachedBank>>,
+}
+
+#[derive(Debug)]
+struct CachedBank {
+    slot: Slot,
+    bank: Arc<Bank>,
 }
 
 struct InFlightGuard {
@@ -215,6 +221,16 @@ impl BankReplay {
             .ok()
             .and_then(|value| Signature::from_str(value.trim()).ok());
         let bank_forks = BankForks::new_rw_arc(bank);
+        let cached_bank = {
+            let guard = bank_forks
+                .read()
+                .expect("bank forks lock poisoned during init");
+            let bank = guard.working_bank();
+            Mutex::new(Some(CachedBank {
+                slot: bank.slot(),
+                bank,
+            }))
+        };
         Self {
             bank_forks,
             snapshot_verifier,
@@ -224,11 +240,30 @@ impl BankReplay {
             cursor,
             debug_signature,
             prune_inflight: Arc::new(AtomicBool::new(false)),
-            execution_gate: Arc::new(Mutex::new(())),
+            cached_bank,
+        }
+    }
+
+    fn cached_bank_for_slot(&self, slot: Slot) -> Option<Arc<Bank>> {
+        let guard = self.cached_bank.lock().ok()?;
+        guard
+            .as_ref()
+            .and_then(|cached| (cached.slot == slot).then(|| Arc::clone(&cached.bank)))
+    }
+
+    fn update_cached_bank(&self, bank: Arc<Bank>) {
+        if let Ok(mut guard) = self.cached_bank.lock() {
+            *guard = Some(CachedBank {
+                slot: bank.slot(),
+                bank,
+            });
         }
     }
 
     fn bank_for_slot(&self, slot: Slot) -> Result<Arc<Bank>, String> {
+        if let Some(bank) = self.cached_bank_for_slot(slot) {
+            return Ok(bank);
+        }
         self.cursor.update_inflight_stage("bank_for_slot_lock_try");
         let lock_start = Instant::now();
         let mut guard = match self.bank_forks.try_write() {
@@ -307,15 +342,11 @@ impl BankReplay {
             if let Some(prune_slot) = prune_request {
                 let inflight = self.prune_inflight.clone();
                 let bank_forks = Arc::clone(&self.bank_forks);
-                let execution_gate = Arc::clone(&self.execution_gate);
                 if inflight
                     .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
                     .is_ok()
                 {
                     std::thread::spawn(move || {
-                        let _gate = execution_gate
-                            .lock()
-                            .expect("execution gate lock poisoned");
                         let start = Instant::now();
                         let guard = bank_forks
                             .write()
@@ -350,9 +381,12 @@ impl BankReplay {
                     elapsed.as_secs_f64()
                 );
             }
+            self.update_cached_bank(Arc::clone(&next_bank));
             return Ok(next_bank);
         }
-        Ok(guard.working_bank())
+        let bank = guard.working_bank();
+        self.update_cached_bank(Arc::clone(&bank));
+        Ok(bank)
     }
 
     fn register_tick(&self, slot: Slot, hash: Hash) -> Result<(), String> {
@@ -433,10 +467,6 @@ impl BankReplay {
 
     fn process_ready_entries(&self, entries: Vec<ReadyEntry>) {
         for entry in entries {
-            let _execution_guard = self
-                .execution_gate
-                .lock()
-                .expect("execution gate lock poisoned");
             let signature = entry
                 .txs
                 .first()

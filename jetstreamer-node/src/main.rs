@@ -1040,6 +1040,7 @@ struct SlotPresenceMap {
     start: Slot,
     end_inclusive: Slot,
     states: Vec<SlotPresenceState>,
+    next_present_after: Vec<Option<Slot>>,
 }
 
 impl SlotPresenceMap {
@@ -1054,6 +1055,14 @@ impl SlotPresenceMap {
     fn is_missing(&self, slot: Slot) -> Option<bool> {
         self.state(slot)
             .map(|state| state == SlotPresenceState::Missing)
+    }
+
+    fn next_present_after(&self, slot: Slot) -> Option<Slot> {
+        if slot < self.start || slot > self.end_inclusive {
+            return None;
+        }
+        let idx = (slot - self.start) as usize;
+        self.next_present_after.get(idx).copied().flatten()
     }
 }
 
@@ -1671,6 +1680,10 @@ impl TransactionScheduler {
             presence,
             buffer,
         }
+    }
+
+    fn expected_block_metadata_after(&self, slot: Slot) -> Option<Slot> {
+        self.presence.next_present_after(slot)
     }
 
     fn advance_ready_locked(&self, state: &mut SchedulerState) -> Result<Vec<ReadyEntry>, String> {
@@ -3451,11 +3464,22 @@ async fn build_slot_presence_map(
             }
         }
 
+        let mut next_present_after: Vec<Option<Slot>> = vec![None; states.len()];
+        let mut next_present: Option<Slot> = None;
+        for idx in (0..states.len()).rev() {
+            next_present_after[idx] = next_present;
+            if states[idx] == SlotPresenceState::Present {
+                let slot = start_slot.saturating_add(idx as Slot);
+                next_present = Some(slot);
+            }
+        }
+
         info!("slot presence map built: present={present}, missing={missing}");
         Ok(Arc::new(SlotPresenceMap {
             start: start_slot,
             end_inclusive,
             states,
+            next_present_after,
         }))
     })
     .await
@@ -3636,6 +3660,18 @@ async fn run_geyser_replay(
                         let snapshot = scheduler.snapshot();
                         let (cursor_slot, cursor_entry, cursor_tx_start, cursor_tx_count, cursor_sig) =
                             cursor.snapshot();
+                        let mut expected_after_slot: Option<Slot> = None;
+                        if let Some(buffer) = snapshot.buffer.as_ref() {
+                            if buffer.expected_tx_count.is_none()
+                                && buffer.expected_entry_count.is_none()
+                                && buffer.processed_entry_count > 0
+                                && buffer.pending_entries == 0
+                                && buffer.buffered_txs == 0
+                            {
+                                expected_after_slot =
+                                    scheduler.expected_block_metadata_after(snapshot.current_slot);
+                            }
+                        }
                         let mut inflight_slot = 0;
                         let mut inflight_entry = 0;
                         let mut inflight_tx_start = 0;
@@ -3695,14 +3731,58 @@ async fn run_geyser_replay(
                         } else {
                             "main"
                         };
+                        let expected_after_display = expected_after_slot
+                            .map(|slot| slot.to_string())
+                            .unwrap_or_else(|| "<none>".to_string());
+                        let expected_after_eta = if let Some(expected_after) = expected_after_slot {
+                            let remaining_slots = expected_after.saturating_sub(latest);
+                            if remaining_slots == 0 {
+                                "00:00:00".to_string()
+                            } else if let Some(start) = phase_start {
+                                let processed = if in_warmup && latest < epoch_start {
+                                    if latest < replay_start {
+                                        0
+                                    } else {
+                                        latest.saturating_sub(replay_start).saturating_add(1)
+                                    }
+                                } else {
+                                    let display_slot = latest.clamp(epoch_start, end_inclusive);
+                                    if display_slot < epoch_start {
+                                        0
+                                    } else {
+                                        display_slot
+                                            .saturating_sub(epoch_start)
+                                            .saturating_add(1)
+                                    }
+                                };
+                                let elapsed = start.elapsed().as_secs_f64();
+                                let rate = if elapsed > 0.0 {
+                                    processed as f64 / elapsed
+                                } else {
+                                    0.0
+                                };
+                                if rate > 0.0 {
+                                    let eta_secs = ((remaining_slots as f64) / rate).ceil() as u64;
+                                    format_eta(Duration::from_secs(eta_secs))
+                                } else {
+                                    "unknown".to_string()
+                                }
+                            } else {
+                                "unknown".to_string()
+                            }
+                        } else {
+                            "<none>".to_string()
+                        };
                         info!(
-                            "replay stall ({phase}): slot {latest} unchanged for {:.1}s; scheduler current_slot={} last_finalized={} buffered_slots={} presence={:?} buffer={:?} last_tx_slot={} last_entry_slot={} last_block_meta_slot={} last_account_update_slot={} cursor_slot={} cursor_entry={} cursor_tx_start={} cursor_tx_count={} cursor_sig={} inflight_slot={} inflight_entry={} inflight_tx_start={} inflight_tx_count={} inflight_stage={} inflight_elapsed={} inflight_sig={}",
+                            "replay stall ({phase}): slot {latest} unchanged for {:.1}s; scheduler current_slot={} last_finalized={} buffered_slots={} presence={:?} buffer={:?} expected_after_slot={} expected_after_eta={} last_tx_slot={} last_entry_slot={} last_block_meta_slot={} last_account_update_slot={} cursor_slot={} cursor_entry={} cursor_tx_start={} cursor_tx_count={} cursor_sig={} inflight_slot={} inflight_entry={} inflight_tx_start={} inflight_tx_count={} inflight_stage={} inflight_elapsed={} inflight_sig={}",
                             stalled_for.as_secs_f64(),
                             snapshot.current_slot,
                             snapshot.last_finalized_slot,
                             snapshot.buffered_slots,
                             snapshot.presence,
                             snapshot.buffer,
+                            expected_after_display,
+                            expected_after_eta,
                             last_tx_slot,
                             last_entry_slot,
                             last_block_meta_slot,

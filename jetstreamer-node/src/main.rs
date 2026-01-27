@@ -1513,6 +1513,7 @@ struct SchedulerSnapshot {
     current_slot: Slot,
     last_finalized_slot: Slot,
     buffered_slots: usize,
+    highest_seen_slot: Slot,
     presence: Option<SlotPresenceState>,
     buffer: Option<SlotBufferSnapshot>,
 }
@@ -1677,6 +1678,7 @@ impl TransactionScheduler {
             current_slot,
             last_finalized_slot: state.last_finalized_slot,
             buffered_slots: state.slots.len(),
+            highest_seen_slot: state.highest_seen_slot,
             presence,
             buffer,
         }
@@ -2014,10 +2016,10 @@ impl AccountsUpdateNotifierInterface for ProgressAccountsUpdateNotifier {
 }
 
 struct BankTransactionNotifier {
-    bank_replay: Arc<BankReplay>,
     progress: Arc<ReplayProgress>,
     scheduler: Arc<TransactionScheduler>,
     failure: Arc<ReplayFailure>,
+    ready_sender: crossbeam_channel::Sender<Vec<ReadyEntry>>,
     delegate: Option<Arc<dyn TransactionNotifier + Send + Sync + 'static>>,
     live_start_slot: Slot,
 }
@@ -2041,7 +2043,14 @@ impl TransactionNotifier for BankTransactionNotifier {
             transaction.clone(),
             transaction_status_meta.status.clone(),
         ) {
-            Ok(ready_entries) => self.bank_replay.process_ready_entries(ready_entries),
+            Ok(ready_entries) => {
+                if !ready_entries.is_empty() {
+                    if let Err(err) = self.ready_sender.send(ready_entries) {
+                        self.failure
+                            .record(format!("ready entry channel closed: {err}"));
+                    }
+                }
+            }
             Err(err) => self.failure.record(err),
         }
 
@@ -2062,10 +2071,10 @@ impl TransactionNotifier for BankTransactionNotifier {
 }
 
 struct BankEntryNotifier {
-    bank_replay: Arc<BankReplay>,
     progress: Arc<ReplayProgress>,
     scheduler: Arc<TransactionScheduler>,
     failure: Arc<ReplayFailure>,
+    ready_sender: crossbeam_channel::Sender<Vec<ReadyEntry>>,
     delegate: Option<Arc<dyn EntryNotifier + Send + Sync + 'static>>,
     live_start_slot: Slot,
 }
@@ -2086,7 +2095,14 @@ impl EntryNotifier for BankEntryNotifier {
             entry.num_transactions as usize,
             entry.hash,
         ) {
-            Ok(ready_entries) => self.bank_replay.process_ready_entries(ready_entries),
+            Ok(ready_entries) => {
+                if !ready_entries.is_empty() {
+                    if let Err(err) = self.ready_sender.send(ready_entries) {
+                        self.failure
+                            .record(format!("ready entry channel closed: {err}"));
+                    }
+                }
+            }
             Err(err) => self.failure.record(err),
         }
 
@@ -2100,9 +2116,9 @@ impl EntryNotifier for BankEntryNotifier {
 
 struct BankBlockMetadataNotifier {
     scheduler: Arc<TransactionScheduler>,
-    bank_replay: Arc<BankReplay>,
     progress: Arc<ReplayProgress>,
     failure: Arc<ReplayFailure>,
+    ready_sender: crossbeam_channel::Sender<Vec<ReadyEntry>>,
     delegate: Option<BlockMetadataNotifierArc>,
     live_start_slot: Slot,
 }
@@ -2143,7 +2159,10 @@ impl BlockMetadataNotifier for BankBlockMetadataNotifier {
         {
             Ok(ready_entries) => {
                 if !ready_entries.is_empty() {
-                    self.bank_replay.process_ready_entries(ready_entries);
+                    if let Err(err) = self.ready_sender.send(ready_entries) {
+                        self.failure
+                            .record(format!("ready entry channel closed: {err}"));
+                    }
                 }
             }
             Err(err) => self.failure.record(err),
@@ -3572,38 +3591,49 @@ async fn run_geyser_replay(
         failure.clone(),
         cursor.clone(),
     ));
+    let (ready_sender, ready_receiver) = unbounded::<Vec<ReadyEntry>>();
+    let ready_shutdown = shutdown.clone();
+    let ready_bank_replay = bank_replay.clone();
+    let ready_handle = std::thread::spawn(move || {
+        while let Ok(entries) = ready_receiver.recv() {
+            if ready_shutdown.load(Ordering::Relaxed) {
+                break;
+            }
+            ready_bank_replay.process_ready_entries(entries);
+        }
+    });
     let slot_range = replay_start..(end_inclusive + 1);
 
     let client = Client::new();
     let index_base_url = resolve_remote_index_base_url()?;
     let transaction_notifier = Arc::new(BankTransactionNotifier {
-        bank_replay: bank_replay.clone(),
         progress: progress.clone(),
         scheduler: scheduler.clone(),
         failure: failure.clone(),
+        ready_sender: ready_sender.clone(),
         delegate: service.get_transaction_notifier(),
         live_start_slot: epoch_start,
     });
     let entry_notifier = Arc::new(BankEntryNotifier {
-        bank_replay: bank_replay.clone(),
         progress: progress.clone(),
         scheduler: scheduler.clone(),
         failure: failure.clone(),
+        ready_sender: ready_sender.clone(),
         delegate: service.get_entry_notifier(),
         live_start_slot: epoch_start,
     });
     let block_metadata_notifier = Arc::new(BankBlockMetadataNotifier {
         scheduler: scheduler.clone(),
-        bank_replay: bank_replay.clone(),
         progress: progress.clone(),
         failure: failure.clone(),
+        ready_sender: ready_sender.clone(),
         delegate: service.get_block_metadata_notifier(),
         live_start_slot: epoch_start,
     });
     let notifiers = GeyserNotifiers {
-        transaction_notifier: Some(transaction_notifier),
-        entry_notifier: Some(entry_notifier),
-        block_metadata_notifier: Some(block_metadata_notifier),
+        transaction_notifier: Some(transaction_notifier.clone()),
+        entry_notifier: Some(entry_notifier.clone()),
+        block_metadata_notifier: Some(block_metadata_notifier.clone()),
     };
     let mut threads = firehose_threads();
     if threads > 1 {
@@ -3774,11 +3804,12 @@ async fn run_geyser_replay(
                             "<none>".to_string()
                         };
                         info!(
-                            "replay stall ({phase}): slot {latest} unchanged for {:.1}s; scheduler current_slot={} last_finalized={} buffered_slots={} presence={:?} buffer={:?} expected_after_slot={} expected_after_eta={} last_tx_slot={} last_entry_slot={} last_block_meta_slot={} last_account_update_slot={} cursor_slot={} cursor_entry={} cursor_tx_start={} cursor_tx_count={} cursor_sig={} inflight_slot={} inflight_entry={} inflight_tx_start={} inflight_tx_count={} inflight_stage={} inflight_elapsed={} inflight_sig={}",
+                            "replay stall ({phase}): slot {latest} unchanged for {:.1}s; scheduler current_slot={} last_finalized={} buffered_slots={} highest_seen_slot={} presence={:?} buffer={:?} expected_after_slot={} expected_after_eta={} last_tx_slot={} last_entry_slot={} last_block_meta_slot={} last_account_update_slot={} cursor_slot={} cursor_entry={} cursor_tx_start={} cursor_tx_count={} cursor_sig={} inflight_slot={} inflight_entry={} inflight_tx_start={} inflight_tx_count={} inflight_stage={} inflight_elapsed={} inflight_sig={}",
                             stalled_for.as_secs_f64(),
                             snapshot.current_slot,
                             snapshot.last_finalized_slot,
                             snapshot.buffered_slots,
+                            snapshot.highest_seen_slot,
                             snapshot.presence,
                             snapshot.buffer,
                             expected_after_display,
@@ -3924,11 +3955,18 @@ async fn run_geyser_replay(
     match scheduler.drain_ready_entries() {
         Ok(ready_entries) => {
             if !ready_entries.is_empty() {
-                bank_replay.process_ready_entries(ready_entries);
+                if let Err(err) = ready_sender.send(ready_entries) {
+                    failure.record(format!("ready entry channel closed: {err}"));
+                }
             }
         }
         Err(err) => failure.record(err),
     }
+    drop(transaction_notifier);
+    drop(entry_notifier);
+    drop(block_metadata_notifier);
+    drop(ready_sender);
+    let _ = ready_handle.join();
     if let Err(err) = scheduler.verify_complete(end_inclusive) {
         failure.record(err);
     }

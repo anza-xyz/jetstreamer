@@ -1484,6 +1484,7 @@ struct SchedulerState {
     current_slot: Slot,
     slots: HashMap<Slot, SlotExecutionBuffer>,
     inferred_blocks: HashMap<Slot, (u64, u64)>,
+    highest_seen_slot: Slot,
 }
 
 #[allow(dead_code)]
@@ -1515,6 +1516,7 @@ impl TransactionScheduler {
                 current_slot: start_slot,
                 slots: HashMap::new(),
                 inferred_blocks: HashMap::new(),
+                highest_seen_slot: start_slot.saturating_sub(1),
             }),
             presence,
         }
@@ -1533,6 +1535,9 @@ impl TransactionScheduler {
                 "late transaction for slot {slot} (last finalized slot {})",
                 state.last_finalized_slot
             ));
+        }
+        if slot > state.highest_seen_slot {
+            state.highest_seen_slot = slot;
         }
         let buffer = state
             .slots
@@ -1556,6 +1561,9 @@ impl TransactionScheduler {
                 "late entry for slot {slot} (last finalized slot {})",
                 state.last_finalized_slot
             ));
+        }
+        if slot > state.highest_seen_slot {
+            state.highest_seen_slot = slot;
         }
         let buffer = state
             .slots
@@ -1585,6 +1593,9 @@ impl TransactionScheduler {
                 "late block metadata for slot {slot} (last finalized slot {})",
                 state.last_finalized_slot
             ));
+        }
+        if slot > state.highest_seen_slot {
+            state.highest_seen_slot = slot;
         }
         if let Some((inferred_tx, inferred_entry)) = state.inferred_blocks.remove(&slot) {
             if inferred_tx != expected_tx_count || inferred_entry != expected_entry_count {
@@ -1690,8 +1701,10 @@ impl TransactionScheduler {
 
             let mut drained = buffer.drain_ready_entries(current_slot)?;
             ready.append(&mut drained);
-            if let Some((txs, entries)) = buffer.infer_expected_counts_if_missing(current_slot) {
-                state.inferred_blocks.insert(current_slot, (txs, entries));
+            if state.highest_seen_slot > current_slot {
+                if let Some((txs, entries)) = buffer.infer_expected_counts_if_missing(current_slot) {
+                    state.inferred_blocks.insert(current_slot, (txs, entries));
+                }
             }
 
             let should_finalize = buffer.should_finalize(current_slot)?;

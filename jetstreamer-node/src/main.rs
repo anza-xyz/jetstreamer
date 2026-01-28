@@ -4044,11 +4044,22 @@ async fn run_geyser_replay(
                 } else if tx_advanced {
                     let stalled_slots = latest.saturating_sub(last_account_update_slot_seen);
                     if stalled_slots > 5 && latest > last_account_update_slot_seen {
+                        let inflight_overdue = inflight_elapsed
+                            .map(|elapsed| elapsed >= inflight_fail_after)
+                            .unwrap_or(false);
+                        if inflight_elapsed.is_some() && !inflight_overdue {
+                            warn!(
+                                "account updates stalled ({phase}): count {account_updates} unchanged for {stalled_slots} slots but entry still in-flight (stage={inflight_stage} elapsed={})",
+                                inflight_elapsed
+                                    .map(|elapsed| format!("{:.3}s", elapsed.as_secs_f64()))
+                                    .unwrap_or_else(|| "<none>".to_string())
+                            );
+                        } else {
                         let snapshot = scheduler.snapshot();
                         let (cursor_slot, cursor_entry, cursor_tx_start, cursor_tx_count, cursor_sig) =
                             cursor.snapshot();
                         let message = format!(
-                            "account updates stalled ({phase}): count {account_updates} unchanged for {stalled_slots} slots (latest_slot={latest} last_account_update_slot={last_account_update_slot_seen}) scheduler current_slot={} last_finalized={} buffered_slots={} highest_seen_slot={} presence={:?} buffer={:?} last_tx_slot={} last_entry_slot={} last_block_meta_slot={} last_account_update_slot={} cursor_slot={} cursor_entry={} cursor_tx_start={} cursor_tx_count={} cursor_sig={}",
+                            "account updates stalled ({phase}): count {account_updates} unchanged for {stalled_slots} slots (latest_slot={latest} last_account_update_slot={last_account_update_slot_seen}) scheduler current_slot={} last_finalized={} buffered_slots={} highest_seen_slot={} presence={:?} buffer={:?} last_tx_slot={} last_entry_slot={} last_block_meta_slot={} last_account_update_slot={} cursor_slot={} cursor_entry={} cursor_tx_start={} cursor_tx_count={} cursor_sig={} inflight_slot={} inflight_entry={} inflight_tx_start={} inflight_tx_count={} inflight_stage={} inflight_elapsed={} inflight_sig={}",
                             snapshot.current_slot,
                             snapshot.last_finalized_slot,
                             snapshot.buffered_slots,
@@ -4064,10 +4075,20 @@ async fn run_geyser_replay(
                             cursor_tx_start,
                             cursor_tx_count,
                             cursor_sig.as_deref().unwrap_or("<unknown>"),
+                            inflight_slot,
+                            inflight_entry,
+                            inflight_tx_start,
+                            inflight_tx_count,
+                            inflight_stage,
+                            inflight_elapsed
+                                .map(|elapsed| format!("{:.3}s", elapsed.as_secs_f64()))
+                                .unwrap_or_else(|| "<none>".to_string()),
+                            inflight_sig.as_deref().unwrap_or("<none>"),
                         );
                         failure.record(message.clone());
                         eprintln!("{message}");
                         std::process::exit(1);
+                        }
                     }
                     let stalled_for = last_account_change.elapsed();
                     if stalled_for >= stall_interval && last_account_log.elapsed() >= stall_interval {

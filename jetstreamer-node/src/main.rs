@@ -3532,21 +3532,23 @@ async fn run_geyser_replay(
     let (epoch_start, end_inclusive) = epoch_to_slot_range(epoch);
     let progress = Arc::new(ReplayProgress::new(epoch_start));
     let failure = Arc::new(ReplayFailure::new(shutdown.clone()));
-    let accounts_update_notifier = service.get_accounts_update_notifier().map(|delegate| {
+    let delegate = service.get_accounts_update_notifier();
+    if let Some(delegate) = delegate.as_ref() {
         info!(
             "geyser account updates enabled: snapshot_notifications={}",
             delegate.snapshot_notifications_enabled()
         );
-        Arc::new(ProgressAccountsUpdateNotifier {
+    } else {
+        warn!("geyser account updates not enabled; updates will not be forwarded to plugin");
+    }
+    let accounts_update_notifier: Option<AccountsUpdateNotifier> = Some(Arc::new(
+        ProgressAccountsUpdateNotifier {
             progress: progress.clone(),
-            delegate: Some(delegate),
+            delegate,
             live_start_slot: epoch_start,
-        }) as AccountsUpdateNotifier
-    });
-    info!(
-        "accounts update notifier wired into snapshot load: {}",
-        accounts_update_notifier.is_some()
-    );
+        },
+    ) as AccountsUpdateNotifier);
+    info!("accounts update notifier wired into snapshot load: true");
 
     ensure_genesis_archive(ledger_dir).await?;
     info!("loading bank from snapshot");

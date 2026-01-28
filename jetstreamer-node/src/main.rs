@@ -3842,6 +3842,49 @@ async fn run_geyser_replay(
                 } else {
                     "main"
                 };
+                let mut inflight_slot = 0;
+                let mut inflight_entry = 0;
+                let mut inflight_tx_start = 0;
+                let mut inflight_tx_count = 0;
+                let mut inflight_sig: Option<String> = None;
+                let mut inflight_stage = "<none>";
+                let mut inflight_elapsed: Option<Duration> = None;
+                if let Some((slot, entry, tx_start, tx_count, sig, stage, elapsed)) =
+                    cursor.inflight_snapshot()
+                {
+                    inflight_slot = slot;
+                    inflight_entry = entry;
+                    inflight_tx_start = tx_start;
+                    inflight_tx_count = tx_count;
+                    inflight_sig = sig.clone();
+                    inflight_stage = stage;
+                    inflight_elapsed = Some(elapsed);
+                    if elapsed >= inflight_warn_after {
+                        warn!(
+                            "entry execution in-flight: slot {} entry {} tx_start={} tx_count={} stage={} elapsed={:.3}s sig={}",
+                            slot,
+                            entry,
+                            tx_start,
+                            tx_count,
+                            stage,
+                            elapsed.as_secs_f64(),
+                            sig.as_deref().unwrap_or("<none>"),
+                        );
+                    }
+                    if elapsed >= inflight_fail_after {
+                        let message = format!(
+                            "entry execution exceeded timeout: slot {} entry {} tx_start={} tx_count={} stage={} elapsed={:.3}s sig={}",
+                            slot,
+                            entry,
+                            tx_start,
+                            tx_count,
+                            stage,
+                            elapsed.as_secs_f64(),
+                            sig.as_deref().unwrap_or("<none>"),
+                        );
+                        failure.record(message);
+                    }
+                }
                 let prev_tx_count = last_seen_tx_count;
                 let tx_advanced = tx_count > last_seen_tx_count;
                 if latest != last_seen_slot {
@@ -3863,49 +3906,6 @@ async fn run_geyser_replay(
                             {
                                 expected_after_slot =
                                     scheduler.expected_block_metadata_after(snapshot.current_slot);
-                            }
-                        }
-                        let mut inflight_slot = 0;
-                        let mut inflight_entry = 0;
-                        let mut inflight_tx_start = 0;
-                        let mut inflight_tx_count = 0;
-                        let mut inflight_sig: Option<String> = None;
-                        let mut inflight_stage = "<none>";
-                        let mut inflight_elapsed: Option<Duration> = None;
-                        if let Some((slot, entry, tx_start, tx_count, sig, stage, elapsed)) =
-                            cursor.inflight_snapshot()
-                        {
-                            inflight_slot = slot;
-                            inflight_entry = entry;
-                            inflight_tx_start = tx_start;
-                            inflight_tx_count = tx_count;
-                            inflight_sig = sig.clone();
-                            inflight_stage = stage;
-                            inflight_elapsed = Some(elapsed);
-                            if elapsed >= inflight_warn_after {
-                                warn!(
-                                    "entry execution in-flight: slot {} entry {} tx_start={} tx_count={} stage={} elapsed={:.3}s sig={}",
-                                    slot,
-                                    entry,
-                                    tx_start,
-                                    tx_count,
-                                    stage,
-                                    elapsed.as_secs_f64(),
-                                    sig.as_deref().unwrap_or("<none>"),
-                                );
-                            }
-                            if elapsed >= inflight_fail_after {
-                                let message = format!(
-                                    "entry execution exceeded timeout: slot {} entry {} tx_start={} tx_count={} stage={} elapsed={:.3}s sig={}",
-                                    slot,
-                                    entry,
-                                    tx_start,
-                                    tx_count,
-                                    stage,
-                                    elapsed.as_secs_f64(),
-                                    sig.as_deref().unwrap_or("<none>"),
-                                );
-                                failure.record(message);
                             }
                         }
                         if inflight_slot == 393_521_153 && inflight_entry == 0 {
@@ -4036,24 +4036,6 @@ async fn run_geyser_replay(
                         let snapshot = scheduler.snapshot();
                         let (cursor_slot, cursor_entry, cursor_tx_start, cursor_tx_count, cursor_sig) =
                             cursor.snapshot();
-                        let mut inflight_slot = 0;
-                        let mut inflight_entry = 0;
-                        let mut inflight_tx_start = 0;
-                        let mut inflight_tx_count = 0;
-                        let mut inflight_sig: Option<String> = None;
-                        let mut inflight_stage = "<none>";
-                        let mut inflight_elapsed: Option<Duration> = None;
-                        if let Some((slot, entry, tx_start, tx_count, sig, stage, elapsed)) =
-                            cursor.inflight_snapshot()
-                        {
-                            inflight_slot = slot;
-                            inflight_entry = entry;
-                            inflight_tx_start = tx_start;
-                            inflight_tx_count = tx_count;
-                            inflight_sig = sig.clone();
-                            inflight_stage = stage;
-                            inflight_elapsed = Some(elapsed);
-                        }
                         let last_tx_slot = progress.last_tx_slot.load(Ordering::Relaxed);
                         let last_entry_slot = progress.last_entry_slot.load(Ordering::Relaxed);
                         let last_block_meta_slot =

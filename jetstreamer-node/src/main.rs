@@ -62,7 +62,6 @@ use solana_transaction::{
 };
 use solana_transaction_status::TransactionStatusMeta;
 use tar::Archive as TarArchive;
-use tempfile::Builder as TempDirBuilder;
 use tokio::process::Command;
 use xxhash_rust::xxh64::xxh64;
 
@@ -2853,6 +2852,14 @@ fn reset_dir(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+fn stage_marker(dir: &Path, name: &str) -> PathBuf {
+    dir.join(format!(".stage_{name}"))
+}
+
+fn write_stage_marker(path: &Path) -> Result<(), String> {
+    fs::write(path, "ok\n").map_err(|err| format!("failed to write {}: {err}", path.display()))
+}
+
 fn ensure_accounts_hardlinks_for_archive(
     bank_snapshot: &snapshot_utils::BankSnapshotInfo,
     account_dir: &Path,
@@ -2982,12 +2989,6 @@ fn load_bank_from_snapshot_archive(
     snapshot_archive: &Path,
     accounts_update_notifier: Option<AccountsUpdateNotifier>,
 ) -> Result<Bank, String> {
-    let bank_snapshots_dir = ledger_dir.join(BANK_SNAPSHOTS_DIR);
-    fs::create_dir_all(&bank_snapshots_dir)
-        .map_err(|err| format!("failed to create {}: {err}", bank_snapshots_dir.display()))?;
-    let account_run_dir = ledger_dir.join(ARCHIVE_ACCOUNTS_DIR);
-    reset_dir(&account_run_dir)?;
-
     let full_snapshot = FullSnapshotArchiveInfo::new_from_path(snapshot_archive.to_path_buf())
         .map_err(|err| format!("failed to parse snapshot archive: {err}"))?;
     let genesis_config = open_genesis_config(ledger_dir, MAX_GENESIS_ARCHIVE_UNPACKED_SIZE)
@@ -3002,130 +3003,204 @@ fn load_bank_from_snapshot_archive(
         None
     };
 
-    let temp_dir = TempDirBuilder::new()
-        .prefix("tmp-snapshot-archive-")
-        .tempdir_in(&bank_snapshots_dir)
-        .map_err(|err| {
-            format!(
-                "failed to create temp dir in {}: {err}",
+    let archive_tag = snapshot_archive
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("snapshot");
+    let unpack_dir = ledger_dir.join(format!(".snapshot-extract-{archive_tag}"));
+    fs::create_dir_all(&unpack_dir)
+        .map_err(|err| format!("failed to create {}: {err}", unpack_dir.display()))?;
+    let unpack_marker = stage_marker(&unpack_dir, "unpacked");
+    let meta_marker = stage_marker(&unpack_dir, "meta_fixed");
+    let hardlinks_marker = stage_marker(&unpack_dir, "hardlinks");
+    let run_paths_marker = stage_marker(&unpack_dir, "account_paths");
+    let account_run_dir = ledger_dir.join(ARCHIVE_ACCOUNTS_DIR);
+    let bank_snapshots_dir = unpack_dir.join(BANK_SNAPSHOTS_DIR);
+    let mut unpack_done = unpack_marker.is_file();
+    if unpack_done {
+        if !bank_snapshots_dir.is_dir() {
+            warn!(
+                "snapshot unpack marker found but {} is missing; re-unpacking",
                 bank_snapshots_dir.display()
-            )
-        })?;
-    let unpack_dir = temp_dir.path().to_path_buf();
-    let (sender, receiver) = unbounded::<PathBuf>();
-    let log_interval = env::var("JETSTREAMER_SNAPSHOT_UNPACK_LOG_INTERVAL_SECS")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .map(Duration::from_secs)
-        .or_else(|| Some(Duration::from_secs(SNAPSHOT_UNPACK_LOG_INTERVAL_SECS)));
-    let percent_enabled = !env_truthy("JETSTREAMER_SNAPSHOT_UNPACK_NO_PERCENT");
-    let total_entries = if percent_enabled {
-        info!(
-            "counting snapshot archive entries for progress percent ({})",
-            snapshot_archive.display()
-        );
-        let start = Instant::now();
-        match count_snapshot_entries(snapshot_archive, full_snapshot.archive_format()) {
-            Ok(total) => {
-                info!(
-                    "snapshot archive entries: total={total} (counted in {:.2}s)",
-                    start.elapsed().as_secs_f64()
-                );
-                Some(total)
+            );
+            let _ = fs::remove_file(&unpack_marker);
+            unpack_done = false;
+        } else if !account_run_dir.is_dir() {
+            warn!(
+                "snapshot unpack marker found but {} is missing; re-unpacking",
+                account_run_dir.display()
+            );
+            let _ = fs::remove_file(&unpack_marker);
+            unpack_done = false;
+        } else {
+            let mut has_appendvec = false;
+            let read_dir = fs::read_dir(&account_run_dir)
+                .map_err(|err| format!("failed to read {}: {err}", account_run_dir.display()))?;
+            for entry in read_dir {
+                let entry = entry.map_err(|err| format!("failed to read dir entry: {err}"))?;
+                if !entry
+                    .file_type()
+                    .map_err(|err| format!("failed to read file type: {err}"))?
+                    .is_file()
+                {
+                    continue;
+                }
+                let Some(name) = entry.file_name().to_str() else {
+                    continue;
+                };
+                if looks_like_appendvec(name) {
+                    has_appendvec = true;
+                    break;
+                }
             }
-            Err(err) => {
-                warn!("snapshot entry counting failed: {err} (percent disabled)");
-                None
+            if !has_appendvec {
+                warn!(
+                    "snapshot unpack marker found but no appendvec files under {}; re-unpacking",
+                    account_run_dir.display()
+                );
+                let _ = fs::remove_file(&unpack_marker);
+                unpack_done = false;
             }
         }
-    } else {
-        None
-    };
-    if let Some(interval) = log_interval {
-        info!(
-            "unpacking snapshot archive {} (log interval {}s)",
-            snapshot_archive.display(),
-            interval.as_secs()
-        );
-    } else {
-        info!("unpacking snapshot archive {}", snapshot_archive.display());
     }
-    let drain = std::thread::spawn(move || {
-        let mut count = 0u64;
-        let mut last_log = Instant::now();
-        let start = Instant::now();
-        for path in receiver.iter() {
-            count += 1;
-            if let Some(interval) = log_interval {
-                if last_log.elapsed() >= interval {
-                    let elapsed = start.elapsed().as_secs_f64();
-                    let rate = if elapsed > 0.0 {
-                        count as f64 / elapsed
-                    } else {
-                        0.0
-                    };
-                    let last_display = path.display().to_string();
-                    if let Some(total) = total_entries {
-                        let percent = if total > 0 {
-                            (count as f64 * 100.0 / total as f64).min(100.0)
+
+    if !unpack_done {
+        reset_dir(&unpack_dir)?;
+        reset_dir(&account_run_dir)?;
+    }
+    if !unpack_done {
+        let (sender, receiver) = unbounded::<PathBuf>();
+        let log_interval = env::var("JETSTREAMER_SNAPSHOT_UNPACK_LOG_INTERVAL_SECS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .map(Duration::from_secs)
+            .or_else(|| Some(Duration::from_secs(SNAPSHOT_UNPACK_LOG_INTERVAL_SECS)));
+        let percent_enabled = !env_truthy("JETSTREAMER_SNAPSHOT_UNPACK_NO_PERCENT");
+        let total_entries = if percent_enabled {
+            info!(
+                "counting snapshot archive entries for progress percent ({})",
+                snapshot_archive.display()
+            );
+            let start = Instant::now();
+            match count_snapshot_entries(snapshot_archive, full_snapshot.archive_format()) {
+                Ok(total) => {
+                    info!(
+                        "snapshot archive entries: total={total} (counted in {:.2}s)",
+                        start.elapsed().as_secs_f64()
+                    );
+                    Some(total)
+                }
+                Err(err) => {
+                    warn!("snapshot entry counting failed: {err} (percent disabled)");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        if let Some(interval) = log_interval {
+            info!(
+                "unpacking snapshot archive {} (log interval {}s)",
+                snapshot_archive.display(),
+                interval.as_secs()
+            );
+        } else {
+            info!("unpacking snapshot archive {}", snapshot_archive.display());
+        }
+        let drain = std::thread::spawn(move || {
+            let mut count = 0u64;
+            let mut last_log = Instant::now();
+            let start = Instant::now();
+            for path in receiver.iter() {
+                count += 1;
+                if let Some(interval) = log_interval {
+                    if last_log.elapsed() >= interval {
+                        let elapsed = start.elapsed().as_secs_f64();
+                        let rate = if elapsed > 0.0 {
+                            count as f64 / elapsed
                         } else {
                             0.0
                         };
-                        info!(
-                            "snapshot unpack progress: files={count}/{total} ({percent:.2}%) rate={rate:.1} files/s last={last_display}"
-                        );
-                    } else {
-                        info!(
-                            "snapshot unpack progress: files={count} rate={rate:.1} files/s last={last_display}"
-                        );
+                        let last_display = path.display().to_string();
+                        if let Some(total) = total_entries {
+                            let percent = if total > 0 {
+                                (count as f64 * 100.0 / total as f64).min(100.0)
+                            } else {
+                                0.0
+                            };
+                            info!(
+                                "snapshot unpack progress: files={count}/{total} ({percent:.2}%) rate={rate:.1} files/s last={last_display}"
+                            );
+                        } else {
+                            info!(
+                                "snapshot unpack progress: files={count} rate={rate:.1} files/s last={last_display}"
+                            );
+                        }
+                        last_log = Instant::now();
                     }
-                    last_log = Instant::now();
                 }
             }
-        }
-        if count > 0 {
-            let elapsed = start.elapsed().as_secs_f64();
-            let rate = if elapsed > 0.0 {
-                count as f64 / elapsed
-            } else {
-                0.0
-            };
-            if let Some(total) = total_entries {
-                let percent = if total > 0 {
-                    (count as f64 * 100.0 / total as f64).min(100.0)
+            if count > 0 {
+                let elapsed = start.elapsed().as_secs_f64();
+                let rate = if elapsed > 0.0 {
+                    count as f64 / elapsed
                 } else {
                     0.0
                 };
-                info!(
-                    "snapshot unpack complete: files={count}/{total} ({percent:.2}%) rate={rate:.1} files/s"
-                );
-            } else {
-                info!("snapshot unpack complete: files={count} rate={rate:.1} files/s");
+                if let Some(total) = total_entries {
+                    let percent = if total > 0 {
+                        (count as f64 * 100.0 / total as f64).min(100.0)
+                    } else {
+                        0.0
+                    };
+                    info!(
+                        "snapshot unpack complete: files={count}/{total} ({percent:.2}%) rate={rate:.1} files/s"
+                    );
+                } else {
+                    info!("snapshot unpack complete: files={count} rate={rate:.1} files/s");
+                }
             }
-        }
-    });
-    let handle = streaming_unarchive_snapshot(
-        sender,
-        vec![account_run_dir.clone()],
-        unpack_dir.clone(),
-        snapshot_archive.to_path_buf(),
-        full_snapshot.archive_format(),
-        0,
-    );
-    let result = handle
-        .join()
-        .map_err(|_| "snapshot unarchive thread panicked".to_string())?;
-    result.map_err(|err| format!("snapshot unarchive failed: {err}"))?;
-    let _ = drain.join();
-
-    if ensure_snapshot_meta_files(&unpack_dir)? {
+        });
+        let handle = streaming_unarchive_snapshot(
+            sender,
+            vec![account_run_dir.clone()],
+            unpack_dir.clone(),
+            snapshot_archive.to_path_buf(),
+            full_snapshot.archive_format(),
+            0,
+        );
+        let result = handle
+            .join()
+            .map_err(|_| "snapshot unarchive thread panicked".to_string())?;
+        result.map_err(|err| format!("snapshot unarchive failed: {err}"))?;
+        let _ = drain.join();
+        write_stage_marker(&unpack_marker)?;
+    } else {
         info!(
-            "repaired snapshot metadata in {}",
-            unpack_dir.join(BANK_SNAPSHOTS_DIR).display()
+            "snapshot archive already unpacked at {}; skipping",
+            unpack_dir.display()
         );
     }
 
-    let bank_snapshots_dir = unpack_dir.join(BANK_SNAPSHOTS_DIR);
+    let mut meta_done = meta_marker.is_file();
+    if meta_done && !bank_snapshots_dir.is_dir() {
+        warn!(
+            "snapshot metadata marker found but {} is missing; re-running metadata fix",
+            bank_snapshots_dir.display()
+        );
+        let _ = fs::remove_file(&meta_marker);
+        meta_done = false;
+    }
+    if !meta_done {
+        if ensure_snapshot_meta_files(&unpack_dir)? {
+            info!(
+                "repaired snapshot metadata in {}",
+                unpack_dir.join(BANK_SNAPSHOTS_DIR).display()
+            );
+        }
+        write_stage_marker(&meta_marker)?;
+    }
+
     let bank_snapshot =
         snapshot_utils::get_highest_bank_snapshot(&bank_snapshots_dir).ok_or_else(|| {
             format!(
@@ -3134,11 +3209,42 @@ fn load_bank_from_snapshot_archive(
             )
         })?;
 
-    ensure_accounts_hardlinks_for_archive(&bank_snapshot, &account_run_dir)?;
+    let hardlinks_dir = bank_snapshot.snapshot_dir.join(ACCOUNTS_HARDLINKS_DIR);
+    let mut hardlinks_done = hardlinks_marker.is_file();
+    if hardlinks_done && !hardlinks_dir.is_dir() {
+        warn!(
+            "hardlinks marker found but {} is missing; re-linking accounts",
+            hardlinks_dir.display()
+        );
+        let _ = fs::remove_file(&hardlinks_marker);
+        hardlinks_done = false;
+    }
+    if !hardlinks_done {
+        ensure_accounts_hardlinks_for_archive(&bank_snapshot, &account_run_dir)?;
+        write_stage_marker(&hardlinks_marker)?;
+    }
+
     let account_run_paths = account_run_paths_from_snapshot(&bank_snapshot.snapshot_dir)?;
-    for path in &account_run_paths {
-        fs::create_dir_all(path)
-            .map_err(|err| format!("failed to create {}: {err}", path.display()))?;
+    let mut run_paths_done = run_paths_marker.is_file();
+    if run_paths_done {
+        for path in &account_run_paths {
+            if !path.is_dir() {
+                warn!(
+                    "account paths marker found but {} is missing; recreating",
+                    path.display()
+                );
+                let _ = fs::remove_file(&run_paths_marker);
+                run_paths_done = false;
+                break;
+            }
+        }
+    }
+    if !run_paths_done {
+        for path in &account_run_paths {
+            fs::create_dir_all(path)
+                .map_err(|err| format!("failed to create {}: {err}", path.display()))?;
+        }
+        write_stage_marker(&run_paths_marker)?;
     }
 
     let bank = snapshot_bank_utils::bank_from_snapshot_dir(

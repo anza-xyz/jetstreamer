@@ -91,11 +91,12 @@ const DEFAULT_ROOT_INTERVAL: u64 = 1024;
 const ENTRY_EXEC_WARN_AFTER: Duration = Duration::from_secs(5);
 const ENTRY_EXEC_FAIL_AFTER: Duration = Duration::from_secs(300);
 const BANK_FOR_SLOT_WARN_AFTER: Duration = Duration::from_secs(5);
-const ENABLE_PROGRAM_CACHE_PRUNE: bool = false;
+const ENABLE_PROGRAM_CACHE_PRUNE: bool = true;
 static LOGGED_STALL_TX: AtomicBool = AtomicBool::new(false);
 static LOGGED_FIRST_ACCOUNT_UPDATE: AtomicBool = AtomicBool::new(false);
 static LOGGED_PROGRAM_CACHE_ASSIGN_FAIL: AtomicBool = AtomicBool::new(false);
 static PROGRAM_CACHE_ASSIGN_FAIL_COUNT: AtomicU64 = AtomicU64::new(0);
+static PROGRAM_CACHE_PRUNE_DEPLOYMENT_SLOT: AtomicU64 = AtomicU64::new(0);
 
 struct SnapshotVerifier {
     expected: DashMap<Slot, SnapshotHash>,
@@ -255,6 +256,15 @@ impl BankReplay {
         guard
             .as_ref()
             .and_then(|cached| (cached.slot == slot).then(|| Arc::clone(&cached.bank)))
+    }
+
+    fn maybe_prune_program_cache_by_deployment_slot(&self, bank: &Bank) {
+        let slot = PROGRAM_CACHE_PRUNE_DEPLOYMENT_SLOT.swap(0, Ordering::Relaxed);
+        if slot == 0 {
+            return;
+        }
+        warn!("pruning program cache by deployment slot {}", slot);
+        bank.prune_program_cache_by_deployment_slot(slot);
     }
 
     fn update_cached_bank(&self, bank: Arc<Bank>) {
@@ -526,6 +536,7 @@ impl BankReplay {
             let start = Instant::now();
             match self.bank_for_slot(entry.slot) {
                 Ok(bank) => {
+                    self.maybe_prune_program_cache_by_deployment_slot(&bank);
                     self.cursor.update_inflight_stage("try_process");
                     if entry.slot == 393_521_153
                         && entry.entry_index == 0
@@ -936,6 +947,23 @@ impl ReplayCursor {
     }
 }
 
+fn extract_program_cache_deployment_slot(message: &str) -> Option<u64> {
+    let marker = "entry=ProgramCacheEntry";
+    let (_, after_marker) = message.split_once(marker)?;
+    let key = "deployment_slot:";
+    let (_, after_key) = after_marker.split_once(key)?;
+    let digits: String = after_key
+        .trim_start()
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect();
+    if digits.is_empty() {
+        None
+    } else {
+        digits.parse().ok()
+    }
+}
+
 #[derive(Debug)]
 struct InFlightEntry {
     slot: Slot,
@@ -971,12 +999,22 @@ impl log::Log for AbortOnErrorLogger {
                 .contains("ProgramCache::assign_program() failed")
         {
             PROGRAM_CACHE_ASSIGN_FAIL_COUNT.fetch_add(1, Ordering::Relaxed);
+            let message = record.args().to_string();
+            if let Some(deployment_slot) = extract_program_cache_deployment_slot(&message) {
+                PROGRAM_CACHE_PRUNE_DEPLOYMENT_SLOT.store(deployment_slot, Ordering::Relaxed);
+            }
             if LOGGED_PROGRAM_CACHE_ASSIGN_FAIL.swap(true, Ordering::SeqCst) {
                 return;
             }
-            eprintln!(
-                "suppressing repeated ProgramCache::assign_program() failed logs (benign)"
-            );
+            if let Some(deployment_slot) = extract_program_cache_deployment_slot(&message) {
+                eprintln!(
+                    "suppressing repeated ProgramCache::assign_program() failed logs (will prune deployment_slot={deployment_slot})"
+                );
+            } else {
+                eprintln!(
+                    "suppressing repeated ProgramCache::assign_program() failed logs (benign)"
+                );
+            }
             return;
         }
 

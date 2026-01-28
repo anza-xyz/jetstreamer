@@ -94,6 +94,7 @@ const ENTRY_EXEC_FAIL_AFTER: Duration = Duration::from_secs(300);
 const BANK_FOR_SLOT_WARN_AFTER: Duration = Duration::from_secs(5);
 const ENABLE_PROGRAM_CACHE_PRUNE: bool = true;
 static LOGGED_STALL_TX: AtomicBool = AtomicBool::new(false);
+static LOGGED_FIRST_ACCOUNT_UPDATE: AtomicBool = AtomicBool::new(false);
 
 struct SnapshotVerifier {
     expected: DashMap<Slot, SnapshotHash>,
@@ -1988,6 +1989,14 @@ impl AccountsUpdateNotifierInterface for ProgressAccountsUpdateNotifier {
         pubkey: &solana_pubkey::Pubkey,
         write_version: u64,
     ) {
+        if !LOGGED_FIRST_ACCOUNT_UPDATE.swap(true, Ordering::SeqCst) {
+            info!(
+                "first account update: slot={} pubkey={} write_version={}",
+                slot,
+                pubkey,
+                write_version
+            );
+        }
         self.progress.note_account_update_slot(slot);
         self.progress.inc_account_update();
         if slot >= self.live_start_slot {
@@ -3524,12 +3533,20 @@ async fn run_geyser_replay(
     let progress = Arc::new(ReplayProgress::new(epoch_start));
     let failure = Arc::new(ReplayFailure::new(shutdown.clone()));
     let accounts_update_notifier = service.get_accounts_update_notifier().map(|delegate| {
+        info!(
+            "geyser account updates enabled: snapshot_notifications={}",
+            delegate.snapshot_notifications_enabled()
+        );
         Arc::new(ProgressAccountsUpdateNotifier {
             progress: progress.clone(),
             delegate: Some(delegate),
             live_start_slot: epoch_start,
         }) as AccountsUpdateNotifier
     });
+    info!(
+        "accounts update notifier wired into snapshot load: {}",
+        accounts_update_notifier.is_some()
+    );
 
     ensure_genesis_archive(ledger_dir).await?;
     info!("loading bank from snapshot");
@@ -3550,6 +3567,10 @@ async fn run_geyser_replay(
     })
     .await
     .map_err(|err| format!("snapshot load task failed: {err}"))??;
+    info!(
+        "bank accounts update notifier active: {}",
+        bank.rc.accounts.accounts_db.has_accounts_update_notifier()
+    );
     let root_interval = bank_root_interval();
     if let Some(interval) = root_interval {
         info!("bank root pruning interval: {interval}");

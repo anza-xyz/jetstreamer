@@ -125,6 +125,14 @@ impl GeyserPlugin for JetstreamerNodeGeyserPlugin {
         Ok(())
     }
 
+    fn account_data_notifications_enabled(&self) -> bool {
+        true
+    }
+
+    fn account_data_snapshot_notifications_enabled(&self) -> bool {
+        true
+    }
+
     fn transaction_notifications_enabled(&self) -> bool {
         true
     }

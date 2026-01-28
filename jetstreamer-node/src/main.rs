@@ -95,6 +95,8 @@ const BANK_FOR_SLOT_WARN_AFTER: Duration = Duration::from_secs(5);
 const ENABLE_PROGRAM_CACHE_PRUNE: bool = false;
 static LOGGED_STALL_TX: AtomicBool = AtomicBool::new(false);
 static LOGGED_FIRST_ACCOUNT_UPDATE: AtomicBool = AtomicBool::new(false);
+static LOGGED_PROGRAM_CACHE_ASSIGN_FAIL: AtomicBool = AtomicBool::new(false);
+static PROGRAM_CACHE_ASSIGN_FAIL_COUNT: AtomicU64 = AtomicU64::new(0);
 
 struct SnapshotVerifier {
     expected: DashMap<Slot, SnapshotHash>,
@@ -963,15 +965,24 @@ impl log::Log for AbortOnErrorLogger {
     }
 
     fn log(&self, record: &log::Record) {
+        if record.target() == "solana_program_runtime::loaded_programs"
+            && record
+                .args()
+                .to_string()
+                .contains("ProgramCache::assign_program() failed")
+        {
+            PROGRAM_CACHE_ASSIGN_FAIL_COUNT.fetch_add(1, Ordering::Relaxed);
+            if LOGGED_PROGRAM_CACHE_ASSIGN_FAIL.swap(true, Ordering::SeqCst) {
+                return;
+            }
+            eprintln!(
+                "suppressing repeated ProgramCache::assign_program() failed logs (benign)"
+            );
+            return;
+        }
+
         self.inner.log(record);
         if self.abort_on_error && record.level() == log::Level::Error {
-            if record.target() == "solana_program_runtime::loaded_programs" {
-                let message = record.args().to_string();
-                if message.contains("ProgramCache::assign_program() failed") {
-                    // Solana logs this as ERROR even when it is benign; don't abort replay.
-                    return;
-                }
-            }
             let (slot, entry_index, tx_start, tx_count, signature) = self.cursor.snapshot();
             eprintln!(
                 "replay cursor at error: slot={slot} entry={entry_index} tx_start={tx_start} tx_count={tx_count} sig={}",
@@ -3942,6 +3953,13 @@ async fn run_geyser_replay(
                     };
                     info!(
                         "progress slot {display_slot}/{end_inclusive} ({percent:.2}%) txs={tx_count} accounts={account_updates} eta={eta}"
+                    );
+                }
+
+                let assign_fail = PROGRAM_CACHE_ASSIGN_FAIL_COUNT.load(Ordering::Relaxed);
+                if assign_fail > 0 {
+                    info!(
+                        "program cache assign failures so far: {assign_fail}"
                     );
                 }
             }

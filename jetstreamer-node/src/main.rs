@@ -3817,6 +3817,10 @@ async fn run_geyser_replay(
             let mut last_seen_slot = progress.latest_slot.load(Ordering::Relaxed);
             let mut last_seen_change = Instant::now();
             let mut last_stall_log = Instant::now();
+            let mut last_seen_tx_count = progress.tx_count.load(Ordering::Relaxed);
+            let mut last_account_updates = progress.account_update_count.load(Ordering::Relaxed);
+            let mut last_account_change = Instant::now();
+            let mut last_account_log = Instant::now();
             while !progress_done.load(Ordering::Relaxed) && !shutdown.load(Ordering::Relaxed) {
                 std::thread::sleep(Duration::from_secs(3));
                 if progress_done.load(Ordering::Relaxed) || shutdown.load(Ordering::Relaxed) {
@@ -3828,6 +3832,17 @@ async fn run_geyser_replay(
                 let latest = progress.latest_slot.load(Ordering::Relaxed);
                 let tx_count = progress.tx_count.load(Ordering::Relaxed);
                 let account_updates = progress.account_update_count.load(Ordering::Relaxed);
+                let phase = if in_warmup && latest < epoch_start {
+                    "warmup"
+                } else {
+                    "main"
+                };
+                let prev_tx_count = last_seen_tx_count;
+                let mut tx_advanced = tx_count > last_seen_tx_count;
+                if tx_count < last_seen_tx_count {
+                    last_seen_tx_count = tx_count;
+                    tx_advanced = false;
+                }
                 if latest != last_seen_slot {
                     last_seen_slot = latest;
                     last_seen_change = Instant::now();
@@ -3903,11 +3918,6 @@ async fn run_geyser_replay(
                             progress.last_block_meta_slot.load(Ordering::Relaxed);
                         let last_account_update_slot =
                             progress.last_account_update_slot.load(Ordering::Relaxed);
-                        let phase = if in_warmup && latest < epoch_start {
-                            "warmup"
-                        } else {
-                            "main"
-                        };
                         let expected_after_display = expected_after_slot
                             .map(|slot| slot.to_string())
                             .unwrap_or_else(|| "<none>".to_string());
@@ -3983,6 +3993,78 @@ async fn run_geyser_replay(
                         last_stall_log = Instant::now();
                     }
                 }
+                if account_updates < last_account_updates {
+                    last_account_updates = account_updates;
+                    last_account_change = Instant::now();
+                    last_account_log = Instant::now();
+                } else if account_updates != last_account_updates {
+                    last_account_updates = account_updates;
+                    last_account_change = Instant::now();
+                } else if tx_advanced {
+                    let stalled_for = last_account_change.elapsed();
+                    if stalled_for >= stall_interval && last_account_log.elapsed() >= stall_interval {
+                        let snapshot = scheduler.snapshot();
+                        let (cursor_slot, cursor_entry, cursor_tx_start, cursor_tx_count, cursor_sig) =
+                            cursor.snapshot();
+                        let mut inflight_slot = 0;
+                        let mut inflight_entry = 0;
+                        let mut inflight_tx_start = 0;
+                        let mut inflight_tx_count = 0;
+                        let mut inflight_sig: Option<String> = None;
+                        let mut inflight_stage = "<none>";
+                        let mut inflight_elapsed: Option<Duration> = None;
+                        if let Some((slot, entry, tx_start, tx_count, sig, stage, elapsed)) =
+                            cursor.inflight_snapshot()
+                        {
+                            inflight_slot = slot;
+                            inflight_entry = entry;
+                            inflight_tx_start = tx_start;
+                            inflight_tx_count = tx_count;
+                            inflight_sig = sig.clone();
+                            inflight_stage = stage;
+                            inflight_elapsed = Some(elapsed);
+                        }
+                        let last_tx_slot = progress.last_tx_slot.load(Ordering::Relaxed);
+                        let last_entry_slot = progress.last_entry_slot.load(Ordering::Relaxed);
+                        let last_block_meta_slot =
+                            progress.last_block_meta_slot.load(Ordering::Relaxed);
+                        let last_account_update_slot =
+                            progress.last_account_update_slot.load(Ordering::Relaxed);
+                        info!(
+                            "account updates stalled ({phase}): count {account_updates} unchanged for {:.1}s while txs advanced ({} -> {}), latest_slot={} scheduler current_slot={} last_finalized={} buffered_slots={} highest_seen_slot={} presence={:?} buffer={:?} last_tx_slot={} last_entry_slot={} last_block_meta_slot={} last_account_update_slot={} cursor_slot={} cursor_entry={} cursor_tx_start={} cursor_tx_count={} cursor_sig={} inflight_slot={} inflight_entry={} inflight_tx_start={} inflight_tx_count={} inflight_stage={} inflight_elapsed={} inflight_sig={}",
+                            stalled_for.as_secs_f64(),
+                            prev_tx_count,
+                            tx_count,
+                            latest,
+                            snapshot.current_slot,
+                            snapshot.last_finalized_slot,
+                            snapshot.buffered_slots,
+                            snapshot.highest_seen_slot,
+                            snapshot.presence,
+                            snapshot.buffer,
+                            last_tx_slot,
+                            last_entry_slot,
+                            last_block_meta_slot,
+                            last_account_update_slot,
+                            cursor_slot,
+                            cursor_entry,
+                            cursor_tx_start,
+                            cursor_tx_count,
+                            cursor_sig.as_deref().unwrap_or("<unknown>"),
+                            inflight_slot,
+                            inflight_entry,
+                            inflight_tx_start,
+                            inflight_tx_count,
+                            inflight_stage,
+                            inflight_elapsed
+                                .map(|duration| format!("{:.3}s", duration.as_secs_f64()))
+                                .unwrap_or_else(|| "<none>".to_string()),
+                            inflight_sig.as_deref().unwrap_or("<none>"),
+                        );
+                        last_account_log = Instant::now();
+                    }
+                }
+                last_seen_tx_count = tx_count;
                 if in_warmup && latest < epoch_start {
                     let processed = if latest < replay_start {
                         0
@@ -4026,6 +4108,10 @@ async fn run_geyser_replay(
                         in_warmup = false;
                         phase_start = Some(Instant::now());
                         progress.reset_counts();
+                        last_seen_tx_count = 0;
+                        last_account_updates = 0;
+                        last_account_change = Instant::now();
+                        last_account_log = Instant::now();
                     }
                     let display_slot = latest.clamp(epoch_start, end_inclusive);
                     let processed = if display_slot < epoch_start {

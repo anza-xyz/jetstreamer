@@ -965,6 +965,13 @@ impl log::Log for AbortOnErrorLogger {
     fn log(&self, record: &log::Record) {
         self.inner.log(record);
         if self.abort_on_error && record.level() == log::Level::Error {
+            if record.target() == "solana_program_runtime::loaded_programs" {
+                let message = record.args().to_string();
+                if message.contains("ProgramCache::assign_program() failed") {
+                    // Solana logs this as ERROR even when it is benign; don't abort replay.
+                    return;
+                }
+            }
             let (slot, entry_index, tx_start, tx_count, signature) = self.cursor.snapshot();
             eprintln!(
                 "replay cursor at error: slot={slot} entry={entry_index} tx_start={tx_start} tx_count={tx_count} sig={}",

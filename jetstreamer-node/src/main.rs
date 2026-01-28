@@ -3045,7 +3045,8 @@ fn load_bank_from_snapshot_archive(
                 {
                     continue;
                 }
-                let Some(name) = entry.file_name().to_str() else {
+                let file_name = entry.file_name();
+                let Some(name) = file_name.to_str() else {
                     continue;
                 };
                 if looks_like_appendvec(name) {
@@ -3838,11 +3839,7 @@ async fn run_geyser_replay(
                     "main"
                 };
                 let prev_tx_count = last_seen_tx_count;
-                let mut tx_advanced = tx_count > last_seen_tx_count;
-                if tx_count < last_seen_tx_count {
-                    last_seen_tx_count = tx_count;
-                    tx_advanced = false;
-                }
+                let tx_advanced = tx_count > last_seen_tx_count;
                 if latest != last_seen_slot {
                     last_seen_slot = latest;
                     last_seen_change = Instant::now();

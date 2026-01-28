@@ -3820,6 +3820,8 @@ async fn run_geyser_replay(
             let mut last_stall_log = Instant::now();
             let mut last_seen_tx_count = progress.tx_count.load(Ordering::Relaxed);
             let mut last_account_updates = progress.account_update_count.load(Ordering::Relaxed);
+            let mut last_account_update_slot_seen =
+                progress.last_account_update_slot.load(Ordering::Relaxed);
             let mut last_account_change = Instant::now();
             let mut last_account_log = Instant::now();
             while !progress_done.load(Ordering::Relaxed) && !shutdown.load(Ordering::Relaxed) {
@@ -3833,6 +3835,8 @@ async fn run_geyser_replay(
                 let latest = progress.latest_slot.load(Ordering::Relaxed);
                 let tx_count = progress.tx_count.load(Ordering::Relaxed);
                 let account_updates = progress.account_update_count.load(Ordering::Relaxed);
+                let last_account_update_slot =
+                    progress.last_account_update_slot.load(Ordering::Relaxed);
                 let phase = if in_warmup && latest < epoch_start {
                     "warmup"
                 } else {
@@ -3992,12 +3996,41 @@ async fn run_geyser_replay(
                 }
                 if account_updates < last_account_updates {
                     last_account_updates = account_updates;
+                    last_account_update_slot_seen = last_account_update_slot;
                     last_account_change = Instant::now();
                     last_account_log = Instant::now();
                 } else if account_updates != last_account_updates {
                     last_account_updates = account_updates;
+                    last_account_update_slot_seen = last_account_update_slot;
                     last_account_change = Instant::now();
                 } else if tx_advanced {
+                    let stalled_slots = latest.saturating_sub(last_account_update_slot_seen);
+                    if stalled_slots > 5 && latest > last_account_update_slot_seen {
+                        let snapshot = scheduler.snapshot();
+                        let (cursor_slot, cursor_entry, cursor_tx_start, cursor_tx_count, cursor_sig) =
+                            cursor.snapshot();
+                        let message = format!(
+                            "account updates stalled ({phase}): count {account_updates} unchanged for {stalled_slots} slots (latest_slot={latest} last_account_update_slot={last_account_update_slot_seen}) scheduler current_slot={} last_finalized={} buffered_slots={} highest_seen_slot={} presence={:?} buffer={:?} last_tx_slot={} last_entry_slot={} last_block_meta_slot={} last_account_update_slot={} cursor_slot={} cursor_entry={} cursor_tx_start={} cursor_tx_count={} cursor_sig={}",
+                            snapshot.current_slot,
+                            snapshot.last_finalized_slot,
+                            snapshot.buffered_slots,
+                            snapshot.highest_seen_slot,
+                            snapshot.presence,
+                            snapshot.buffer,
+                            progress.last_tx_slot.load(Ordering::Relaxed),
+                            progress.last_entry_slot.load(Ordering::Relaxed),
+                            progress.last_block_meta_slot.load(Ordering::Relaxed),
+                            last_account_update_slot,
+                            cursor_slot,
+                            cursor_entry,
+                            cursor_tx_start,
+                            cursor_tx_count,
+                            cursor_sig.as_deref().unwrap_or("<unknown>"),
+                        );
+                        failure.record(message.clone());
+                        eprintln!("{message}");
+                        std::process::exit(1);
+                    }
                     let stalled_for = last_account_change.elapsed();
                     if stalled_for >= stall_interval && last_account_log.elapsed() >= stall_interval {
                         let snapshot = scheduler.snapshot();
@@ -4107,6 +4140,7 @@ async fn run_geyser_replay(
                         progress.reset_counts();
                         last_seen_tx_count = 0;
                         last_account_updates = 0;
+                        last_account_update_slot_seen = latest;
                         last_account_change = Instant::now();
                         last_account_log = Instant::now();
                     }

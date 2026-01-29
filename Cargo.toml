@@ -146,3 +146,6 @@ opt-level = 3
 [profile.release.package."*"]
 opt-level = 3
 codegen-units = 1
+
+[patch.crates-io]
+solana-program-runtime = { path = "vendor/solana-program-runtime" }

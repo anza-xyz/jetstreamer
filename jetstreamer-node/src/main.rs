@@ -1024,6 +1024,16 @@ impl log::Log for AbortOnErrorLogger {
 
         self.inner.log(record);
         if self.abort_on_error && record.level() == log::Level::Error {
+            if record.target().starts_with("jetstreamer::firehose") {
+                let message = record.args().to_string();
+                if message.contains("will roll back one slot and retry")
+                    || message.contains("timeout reading next block")
+                    || message.contains("restarting from slot")
+                {
+                    // Firehose retry path is expected; do not abort the process.
+                    return;
+                }
+            }
             let (slot, entry_index, tx_start, tx_count, signature) = self.cursor.snapshot();
             eprintln!(
                 "replay cursor at error: slot={slot} entry={entry_index} tx_start={tx_start} tx_count={tx_count} sig={}",
@@ -1855,11 +1865,24 @@ impl SlotExecutionBuffer {
         tx: VersionedTransaction,
         expected_status: Result<(), TransactionError>,
     ) -> Result<(), String> {
+        if (index as u64) < self.processed_tx_count {
+            // Duplicate transaction after a firehose restart; already processed.
+            return Ok(());
+        }
         if self.txs.len() <= index {
             self.txs.resize_with(index + 1, || None);
         }
-        if self.txs[index].is_some() {
-            return Err(format!("duplicate transaction at index {index}"));
+        if let Some(existing) = &self.txs[index] {
+            let existing_sig = existing.tx.signatures.get(0);
+            let incoming_sig = tx.signatures.get(0);
+            if existing_sig == incoming_sig && existing.expected_status == expected_status {
+                // Duplicate delivery of the same transaction; ignore.
+                return Ok(());
+            }
+            return Err(format!(
+                "duplicate transaction at index {index} (existing_sig={:?}, incoming_sig={:?})",
+                existing_sig, incoming_sig
+            ));
         }
         self.txs[index] = Some(ScheduledTransaction {
             tx,
@@ -1875,6 +1898,10 @@ impl SlotExecutionBuffer {
         tx_count: usize,
         hash: Hash,
     ) -> Result<(), String> {
+        if entry_index < self.next_entry_index {
+            // Duplicate entry after a firehose restart; already processed.
+            return Ok(());
+        }
         if entry_index != self.next_entry_index {
             return Err(format!(
                 "entry index out of order: expected {}, got {}",

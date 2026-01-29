@@ -192,6 +192,7 @@ struct BankReplay {
     failure: Arc<ReplayFailure>,
     cursor: Arc<ReplayCursor>,
     debug_signature: Option<Signature>,
+    prune_inflight: Arc<AtomicBool>,
     cached_bank: Mutex<Option<CachedBank>>,
     execution_gate: Arc<Mutex<()>>,
 }
@@ -244,6 +245,7 @@ impl BankReplay {
             failure,
             cursor,
             debug_signature,
+            prune_inflight: Arc::new(AtomicBool::new(false)),
             cached_bank,
             execution_gate: Arc::new(Mutex::new(())),
         }
@@ -313,6 +315,7 @@ impl BankReplay {
             parent.freeze();
             let frozen_bank = parent.clone();
             let parent_slot = parent.slot();
+            let mut prune_request = None::<Slot>;
             self.cursor.update_inflight_stage("set_root");
             self.leader_schedule_cache.set_root(&frozen_bank);
             self.cursor.update_inflight_stage("slot_leader_at");
@@ -340,17 +343,7 @@ impl BankReplay {
                         );
                     }
                     if ENABLE_PROGRAM_CACHE_PRUNE {
-                        self.cursor.update_inflight_stage("prune_program_cache");
-                        let prune_start = Instant::now();
-                        guard.prune_program_cache(parent_slot);
-                        let prune_elapsed = prune_start.elapsed();
-                        if prune_elapsed >= BANK_FOR_SLOT_WARN_AFTER {
-                            warn!(
-                                "bank_for_slot program cache prune: slot {} took {:.3}s",
-                                parent_slot,
-                                prune_elapsed.as_secs_f64()
-                            );
-                        }
+                        prune_request = Some(parent_slot);
                     } else {
                         warn!(
                             "bank_for_slot skipping program cache prune at slot {} (debug)",
@@ -362,6 +355,44 @@ impl BankReplay {
             self.cursor.update_inflight_stage("clone_without_scheduler");
             let next_bank = bank_with_scheduler.clone_without_scheduler();
             drop(guard);
+            if let Some(prune_slot) = prune_request {
+                let inflight = self.prune_inflight.clone();
+                let bank_forks = Arc::clone(&self.bank_forks);
+                if inflight
+                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+                {
+                    std::thread::spawn(move || {
+                        let start = Instant::now();
+                        let guard = match bank_forks.try_write() {
+                            Ok(guard) => guard,
+                            Err(_) => {
+                                warn!(
+                                    "bank_for_slot skipping program cache prune at slot {} (bank forks busy)",
+                                    prune_slot
+                                );
+                                inflight.store(false, Ordering::SeqCst);
+                                return;
+                            }
+                        };
+                        guard.prune_program_cache(prune_slot);
+                        let elapsed = start.elapsed();
+                        if elapsed >= BANK_FOR_SLOT_WARN_AFTER {
+                            warn!(
+                                "bank_for_slot program cache prune async: slot {} took {:.3}s",
+                                prune_slot,
+                                elapsed.as_secs_f64()
+                            );
+                        }
+                        inflight.store(false, Ordering::SeqCst);
+                    });
+                } else {
+                    warn!(
+                        "bank_for_slot skipping program cache prune at slot {} (already running)",
+                        prune_slot
+                    );
+                }
+            }
             if let Some(verifier) = self.snapshot_verifier.as_ref() {
                 self.cursor.update_inflight_stage("verify_bank");
                 verifier.verify_bank(&frozen_bank);

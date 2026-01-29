@@ -432,6 +432,12 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
             } else {
                 None
             };
+            let is_target = sig
+                .as_deref()
+                .map(|sig| {
+                    sig == "5NXGBBXnSjt93aXtY52Ghoj8aBtGYVWPhgfkgaTqo2EYYxKiqkF7NXLyA19ptQbrr5o6QTMLRCu4tyfoj4BWt3JZ"
+                })
+                .unwrap_or(false);
             if let Some(sig) = sig.as_deref() {
                 let programs: Vec<String> = tx
                     .program_instructions_iter()
@@ -476,8 +482,14 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
             }
             load_us = load_us.saturating_add(single_load_us);
 
+            if is_target {
+                warn!("svm slot {} tx sig={} collect_pre_balances begin", self.slot, sig.as_deref().unwrap_or("<unknown>"));
+            }
             let ((), collect_balances_us) =
                 measure_us!(balance_collector.collect_pre_balances(&mut account_loader, tx));
+            if is_target {
+                warn!("svm slot {} tx sig={} collect_pre_balances done", self.slot, sig.as_deref().unwrap_or("<unknown>"));
+            }
             execute_timings
                 .saturating_add_in_place(ExecuteTimingType::CollectBalancesUs, collect_balances_us);
 
@@ -490,17 +502,35 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
                     Ok(ProcessedTransaction::FeesOnly(Box::new(fees_only_tx)))
                 }
                 TransactionLoadResult::Loaded(loaded_transaction) => {
+                    if is_target {
+                        warn!("svm slot {} tx sig={} filter_executable begin", self.slot, sig.as_deref().unwrap_or("<unknown>"));
+                    }
                     let (program_accounts_set, filter_executable_us) = measure_us!(self
                         .filter_executable_program_accounts(
                             &account_loader,
                             &mut program_cache_for_tx_batch,
                             tx,
                         ));
+                    if is_target {
+                        let programs: Vec<String> = program_accounts_set
+                            .iter()
+                            .map(|pid| pid.to_string())
+                            .collect();
+                        warn!(
+                            "svm slot {} tx sig={} filter_executable done programs={:?}",
+                            self.slot,
+                            sig.as_deref().unwrap_or("<unknown>"),
+                            programs
+                        );
+                    }
                     execute_timings.saturating_add_in_place(
                         ExecuteTimingType::FilterExecutableUs,
                         filter_executable_us,
                     );
 
+                    if is_target {
+                        warn!("svm slot {} tx sig={} replenish_program_cache begin", self.slot, sig.as_deref().unwrap_or("<unknown>"));
+                    }
                     let ((), program_cache_us) = measure_us!({
                         self.replenish_program_cache(
                             &account_loader,
@@ -513,6 +543,9 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
                             true, // increment_usage_counter
                         );
                     });
+                    if is_target {
+                        warn!("svm slot {} tx sig={} replenish_program_cache done", self.slot, sig.as_deref().unwrap_or("<unknown>"));
+                    }
                     execute_timings.saturating_add_in_place(
                         ExecuteTimingType::ProgramCacheUs,
                         program_cache_us,

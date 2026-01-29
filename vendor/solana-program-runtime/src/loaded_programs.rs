@@ -1140,16 +1140,21 @@ impl<FG: ForkGraph> ProgramCache<FG> {
                             }
                             Entry::Occupied(mut entry) => {
                                 let (slot, owner) = *entry.get();
-                                if owner == thread::current().id() {
+                                let current = thread::current().id();
+                                if owner == current {
                                     // The current thread already claimed this load but never completed it.
                                     // Re-claim to avoid waiting forever in single-threaded replay.
                                     debug!(
                                         "program cache cooperative load re-claimed for {key:?} (slot {slot})"
                                     );
-                                    *entry.get_mut() = (
-                                        loaded_programs_for_tx_batch.slot,
-                                        thread::current().id(),
+                                    *entry.get_mut() = (loaded_programs_for_tx_batch.slot, current);
+                                    cooperative_loading_task = Some(*key);
+                                } else if loaded_programs_for_tx_batch.slot > slot {
+                                    // We're replaying ahead of a stale loader; steal the task to avoid deadlock.
+                                    debug!(
+                                        "program cache cooperative load stolen for {key:?} (stale slot {slot})"
                                     );
+                                    *entry.get_mut() = (loaded_programs_for_tx_batch.slot, current);
                                     cooperative_loading_task = Some(*key);
                                 }
                             }

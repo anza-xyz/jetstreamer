@@ -781,7 +781,7 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
 
         let mut count_hits_and_misses = true;
         loop {
-            let (program_to_store, task_cookie, task_waiter) = {
+            let (program_to_store, _task_cookie, _task_waiter) = {
                 // Lock the global cache.
                 let global_program_cache = self.global_program_cache.read().unwrap();
                 // Figure out which program needs to be loaded next.

@@ -1130,12 +1130,29 @@ impl<FG: ForkGraph> ProgramCache<FG> {
                     if cooperative_loading_task.is_none() {
                         let mut loading_entries = loading_entries.lock().unwrap();
                         let entry = loading_entries.entry(*key);
-                        if let Entry::Vacant(entry) = entry {
-                            entry.insert((
-                                loaded_programs_for_tx_batch.slot,
-                                thread::current().id(),
-                            ));
-                            cooperative_loading_task = Some(*key);
+                        match entry {
+                            Entry::Vacant(entry) => {
+                                entry.insert((
+                                    loaded_programs_for_tx_batch.slot,
+                                    thread::current().id(),
+                                ));
+                                cooperative_loading_task = Some(*key);
+                            }
+                            Entry::Occupied(mut entry) => {
+                                let (slot, owner) = *entry.get();
+                                if owner == thread::current().id() {
+                                    // The current thread already claimed this load but never completed it.
+                                    // Re-claim to avoid waiting forever in single-threaded replay.
+                                    debug!(
+                                        "program cache cooperative load re-claimed for {key:?} (slot {slot})"
+                                    );
+                                    *entry.get_mut() = (
+                                        loaded_programs_for_tx_batch.slot,
+                                        thread::current().id(),
+                                    );
+                                    cooperative_loading_task = Some(*key);
+                                }
+                            }
                         }
                     }
                     true

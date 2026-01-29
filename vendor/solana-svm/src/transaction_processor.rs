@@ -55,6 +55,7 @@ use {
         collections::HashSet,
         fmt::{Debug, Formatter},
         rc::Rc,
+        time::Instant,
     },
 };
 #[cfg(feature = "dev-context-only-utils")]
@@ -401,6 +402,7 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
                 config.check_program_modification_slot,
                 config.limit_to_load_programs,
                 false, // increment_usage_counter
+                false, // trace_target
             );
         });
         execute_timings
@@ -541,6 +543,7 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
                             config.check_program_modification_slot,
                             config.limit_to_load_programs,
                             true, // increment_usage_counter
+                            is_target,
                         );
                     });
                     if is_target {
@@ -829,6 +832,7 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
         check_program_modification_slot: bool,
         limit_to_load_programs: bool,
         increment_usage_counter: bool,
+        trace_target: bool,
     ) {
         let mut missing_programs: Vec<(Pubkey, ProgramCacheMatchCriteria)> = program_accounts_set
             .iter()
@@ -846,10 +850,27 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
             .collect();
 
         let mut count_hits_and_misses = true;
+        if trace_target {
+            let missing: Vec<String> = missing_programs
+                .iter()
+                .map(|(key, _)| key.to_string())
+                .collect();
+            warn!(
+                "svm slot {} replenish: initial missing_programs={:?}",
+                self.slot, missing
+            );
+        }
         loop {
             let (program_to_store, _task_cookie, _task_waiter) = {
                 // Lock the global cache.
                 let global_program_cache = self.global_program_cache.read().unwrap();
+                if trace_target {
+                    warn!(
+                        "svm slot {} replenish: extract begin missing_len={}",
+                        self.slot,
+                        missing_programs.len()
+                    );
+                }
                 // Figure out which program needs to be loaded next.
                 let program_to_load = global_program_cache.extract(
                     &mut missing_programs,
@@ -858,9 +879,25 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
                     increment_usage_counter,
                     count_hits_and_misses,
                 );
+                if trace_target {
+                    warn!(
+                        "svm slot {} replenish: extract done program_to_load={:?} missing_len={}",
+                        self.slot,
+                        program_to_load.map(|key| key.to_string()),
+                        missing_programs.len()
+                    );
+                }
                 count_hits_and_misses = false;
 
                 let program_to_store = program_to_load.map(|key| {
+                    let load_start = Instant::now();
+                    if trace_target {
+                        warn!(
+                            "svm slot {} load_program_with_pubkey start {}",
+                            self.slot,
+                            key
+                        );
+                    }
                     // Load, verify and compile one program.
                     let program = load_program_with_pubkey(
                         account_loader,
@@ -871,6 +908,14 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
                         false,
                     )
                     .expect("called load_program_with_pubkey() with nonexistent account");
+                    if trace_target {
+                        warn!(
+                            "svm slot {} load_program_with_pubkey done {} elapsed={:.3}s",
+                            self.slot,
+                            key,
+                            load_start.elapsed().as_secs_f64()
+                        );
+                    }
                     (key, program)
                 });
 

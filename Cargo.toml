@@ -149,3 +149,4 @@ codegen-units = 1
 
 [patch.crates-io]
 solana-program-runtime = { path = "vendor/solana-program-runtime" }
+solana-svm = { path = "vendor/solana-svm" }

@@ -16,7 +16,7 @@ use {
         transaction_execution_result::{ExecutedTransaction, TransactionExecutionDetails},
         transaction_processing_result::{ProcessedTransaction, TransactionProcessingResult},
     },
-    log::debug,
+    log::{debug, warn},
     percentage::Percentage,
     solana_account::{state_traits::StateMut, AccountSharedData, ReadableAccount, PROGRAM_OWNERS},
     solana_clock::{Epoch, Slot},
@@ -426,6 +426,22 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
         // in the same batch may modify the same accounts. Transaction order is
         // preserved within entries written to the ledger.
         for (tx, check_result) in sanitized_txs.iter().zip(check_results) {
+            let debug_slot = self.slot == 393_524_483;
+            let sig = if debug_slot {
+                Some(tx.signature().to_string())
+            } else {
+                None
+            };
+            if let Some(sig) = sig.as_deref() {
+                let programs: Vec<String> = tx
+                    .program_instructions_iter()
+                    .map(|(pid, _)| pid.to_string())
+                    .collect();
+                warn!(
+                    "svm slot {} tx sig={} programs={:?} begin",
+                    self.slot, sig, programs
+                );
+            }
             let (validate_result, validate_fees_us) =
                 measure_us!(check_result.and_then(|tx_details| {
                     Self::validate_transaction_nonce_and_fee_payer(
@@ -447,6 +463,17 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
                 &mut error_metrics,
                 &environment.rent,
             ));
+            if let Some(sig) = sig.as_deref() {
+                let label = match &load_result {
+                    TransactionLoadResult::Loaded(_) => "Loaded",
+                    TransactionLoadResult::FeesOnly(_) => "FeesOnly",
+                    TransactionLoadResult::NotLoaded(_) => "NotLoaded",
+                };
+                warn!(
+                    "svm slot {} tx sig={} load_result={}",
+                    self.slot, sig, label
+                );
+            }
             load_us = load_us.saturating_add(single_load_us);
 
             let ((), collect_balances_us) =
@@ -504,6 +531,9 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
                         };
                     }
 
+                    if let Some(sig) = sig.as_deref() {
+                        warn!("svm slot {} tx sig={} execute begin", self.slot, sig);
+                    }
                     let executed_tx = self.execute_loaded_transaction(
                         callbacks,
                         tx,
@@ -514,6 +544,9 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
                         environment,
                         config,
                     );
+                    if let Some(sig) = sig.as_deref() {
+                        warn!("svm slot {} tx sig={} execute done", self.slot, sig);
+                    }
 
                     // Update loaded accounts cache with account states which might have changed.
                     // Also update local program cache with modifications made by the transaction,
@@ -837,6 +870,9 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
                 // Cooperative loading can deadlock in single-threaded replay.
                 // Force-load the next missing program instead of waiting.
                 let (key, _criteria) = missing_programs.remove(0);
+                if self.slot == 393_524_483 {
+                    warn!("svm slot {} force-loading program {}", self.slot, key);
+                }
                 let program = load_program_with_pubkey(
                     account_loader,
                     program_runtime_environments_for_execution,

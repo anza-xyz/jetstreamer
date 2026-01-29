@@ -1025,14 +1025,9 @@ impl log::Log for AbortOnErrorLogger {
         self.inner.log(record);
         if self.abort_on_error && record.level() == log::Level::Error {
             if record.target().starts_with("jetstreamer::firehose") {
-                let message = record.args().to_string();
-                if message.contains("will roll back one slot and retry")
-                    || message.contains("timeout reading next block")
-                    || message.contains("restarting from slot")
-                {
-                    // Firehose retry path is expected; do not abort the process.
-                    return;
-                }
+                // Firehose handles retries/rollbacks internally; do not abort the process on
+                // any firehose error logs.
+                return;
             }
             let (slot, entry_index, tx_start, tx_count, signature) = self.cursor.snapshot();
             eprintln!(

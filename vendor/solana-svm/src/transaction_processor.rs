@@ -926,13 +926,15 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
 
             if let Some((key, program)) = program_to_store {
                 program_cache_for_tx_batch.loaded_missing = true;
+                // Ensure the batch-local cache can satisfy the program immediately.
+                program_cache_for_tx_batch.replenish(key, program.clone());
                 let mut global_program_cache = self.global_program_cache.write().unwrap();
                 // Submit our last completed loading task.
                 if global_program_cache.finish_cooperative_loading_task(
                     program_runtime_environments_for_execution,
                     self.slot,
                     key,
-                    program,
+                    program.clone(),
                 ) && limit_to_load_programs
                 {
                     // This branch is taken when there is an error in assigning a program to a
@@ -941,6 +943,31 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
                     *program_cache_for_tx_batch = ProgramCacheForTxBatch::new(self.slot);
                     program_cache_for_tx_batch.hit_max_limit = true;
                     return;
+                }
+                // If the key is still marked missing, avoid an infinite loop.
+                if missing_programs.iter().any(|(k, _)| *k == key) {
+                    if trace_target {
+                        let criteria_desc = missing_programs
+                            .iter()
+                            .find(|(k, _)| *k == key)
+                            .map(|(_, c)| match c {
+                                ProgramCacheMatchCriteria::DeployedOnOrAfterSlot(slot) => {
+                                    format!("DeployedOnOrAfterSlot({})", slot)
+                                }
+                                ProgramCacheMatchCriteria::Tombstone => "Tombstone".to_string(),
+                                ProgramCacheMatchCriteria::NoCriteria => "NoCriteria".to_string(),
+                            })
+                            .unwrap_or_else(|| "<unknown>".to_string());
+                        warn!(
+                            "svm slot {} replenish: removing still-missing program {} criteria={} deployment_slot={} effective_slot={}",
+                            self.slot,
+                            key,
+                            criteria_desc,
+                            program.deployment_slot,
+                            program.effective_slot,
+                        );
+                    }
+                    missing_programs.retain(|(k, _)| *k != key);
                 }
             } else if missing_programs.is_empty() {
                 break;

@@ -4086,6 +4086,7 @@ async fn run_geyser_replay(
                     last_account_change = Instant::now();
                 } else if tx_advanced {
                     let stalled_slots = latest.saturating_sub(last_account_update_slot_seen);
+                    let stalled_for = last_account_change.elapsed();
                     if stalled_slots > 5 && latest > last_account_update_slot_seen {
                         let inflight_overdue = inflight_elapsed
                             .map(|elapsed| elapsed >= inflight_fail_after)
@@ -4097,7 +4098,7 @@ async fn run_geyser_replay(
                                     .map(|elapsed| format!("{:.3}s", elapsed.as_secs_f64()))
                                     .unwrap_or_else(|| "<none>".to_string())
                             );
-                        } else {
+                        } else if stalled_for >= inflight_fail_after {
                         let snapshot = scheduler.snapshot();
                         let (cursor_slot, cursor_entry, cursor_tx_start, cursor_tx_count, cursor_sig) =
                             cursor.snapshot();
@@ -4133,7 +4134,6 @@ async fn run_geyser_replay(
                         std::process::exit(1);
                         }
                     }
-                    let stalled_for = last_account_change.elapsed();
                     if stalled_for >= stall_interval && last_account_log.elapsed() >= stall_interval {
                         let snapshot = scheduler.snapshot();
                         let (cursor_slot, cursor_entry, cursor_tx_start, cursor_tx_count, cursor_sig) =

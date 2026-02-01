@@ -1,7 +1,7 @@
 use crate::account_updates::AccountUpdate;
 use lencode::prelude::*;
 use solana_hash::Hash;
-use solana_pubkey::Pubkey;
+use solana_address::Address;
 use solana_signature::Signature;
 use solana_transaction::TransactionResult;
 use solana_transaction_context::TransactionReturnData;
@@ -26,7 +26,7 @@ pub struct CompiledInstruction {
 #[derive(Encode, Decode, Debug, Clone, PartialEq, Eq, Default)]
 #[repr(C)]
 pub struct MessageAddressTableLookup {
-    pub account_key: Pubkey,
+    pub account_key: Address,
     pub writable_indexes: Vec<u8>,
     pub readonly_indexes: Vec<u8>,
 }
@@ -35,7 +35,7 @@ pub struct MessageAddressTableLookup {
 #[repr(C)]
 pub struct LegacyMessage {
     pub header: MessageHeader,
-    pub account_keys: Vec<Pubkey>,
+    pub account_keys: Vec<Address>,
     pub recent_blockhash: Hash,
     pub instructions: Vec<CompiledInstruction>,
 }
@@ -44,7 +44,7 @@ pub struct LegacyMessage {
 #[repr(C)]
 pub struct V0Message {
     pub header: MessageHeader,
-    pub account_keys: Vec<Pubkey>,
+    pub account_keys: Vec<Address>,
     pub recent_blockhash: Hash,
     pub instructions: Vec<CompiledInstruction>,
     pub address_table_lookups: Vec<MessageAddressTableLookup>,
@@ -91,10 +91,10 @@ pub struct Transaction {
 #[repr(C)]
 pub struct TransactionTokenBalance {
     pub account_index: u8,
-    pub mint: Pubkey,
+    pub mint: Address,
     pub ui_token_amount: TokenAmount,
-    pub owner: Option<Pubkey>,
-    pub program_id: Option<Pubkey>,
+    pub owner: Option<Address>,
+    pub program_id: Option<Address>,
 }
 
 #[derive(Encode, Decode, Debug, Clone, Copy, PartialEq, Eq, Default)]

@@ -2,17 +2,17 @@ use agave_geyser_plugin_interface::geyser_plugin_interface::{
     ReplicaAccountInfo, ReplicaAccountInfoV2, ReplicaAccountInfoV3, ReplicaAccountInfoVersions,
 };
 use lencode::prelude::*;
-use solana_pubkey::Pubkey;
+use solana_address::Address;
 
 #[derive(Default, Encode, Decode, Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(C)]
 pub struct AccountUpdate {
-    /// The [`Pubkey`]` for the account
-    pub pubkey: Pubkey,
+    /// The address for the account
+    pub pubkey: Address,
     /// The lamports for the account
     pub lamports: u64,
-    /// The [`Pubkey`] of the owner program account
-    pub owner: Pubkey,
+    /// The address of the owner program account
+    pub owner: Address,
     /// This account's data contains a loaded program (and is now read-only)
     pub executable: bool,
     /// The epoch at which this account will next owe rent
@@ -37,9 +37,9 @@ impl From<&ReplicaAccountInfo<'_>> for AccountUpdate {
     #[inline]
     fn from(info: &ReplicaAccountInfo<'_>) -> Self {
         Self {
-            pubkey: Pubkey::new_from_array(info.pubkey[..32].try_into().unwrap_or_default()),
+            pubkey: Address::new_from_array(info.pubkey[..32].try_into().unwrap_or_default()),
             lamports: info.lamports,
-            owner: Pubkey::new_from_array(info.owner[..32].try_into().unwrap_or_default()),
+            owner: Address::new_from_array(info.owner[..32].try_into().unwrap_or_default()),
             executable: info.executable,
             rent_epoch: info.rent_epoch,
             data: info.data.to_vec(),
@@ -52,9 +52,9 @@ impl From<&ReplicaAccountInfoV2<'_>> for AccountUpdate {
     #[inline]
     fn from(info: &ReplicaAccountInfoV2<'_>) -> Self {
         Self {
-            pubkey: Pubkey::new_from_array(info.pubkey[..32].try_into().unwrap_or_default()),
+            pubkey: Address::new_from_array(info.pubkey[..32].try_into().unwrap_or_default()),
             lamports: info.lamports,
-            owner: Pubkey::new_from_array(info.owner[..32].try_into().unwrap_or_default()),
+            owner: Address::new_from_array(info.owner[..32].try_into().unwrap_or_default()),
             executable: info.executable,
             rent_epoch: info.rent_epoch,
             data: info.data.to_vec(),
@@ -67,9 +67,9 @@ impl From<&ReplicaAccountInfoV3<'_>> for AccountUpdate {
     #[inline]
     fn from(info: &ReplicaAccountInfoV3<'_>) -> Self {
         Self {
-            pubkey: Pubkey::new_from_array(info.pubkey[..32].try_into().unwrap_or_default()),
+            pubkey: Address::new_from_array(info.pubkey[..32].try_into().unwrap_or_default()),
             lamports: info.lamports,
-            owner: Pubkey::new_from_array(info.owner[..32].try_into().unwrap_or_default()),
+            owner: Address::new_from_array(info.owner[..32].try_into().unwrap_or_default()),
             executable: info.executable,
             rent_epoch: info.rent_epoch,
             data: info.data.to_vec(),

@@ -4112,10 +4112,10 @@ version = "0.4.0"
 dependencies = [
  "agave-geyser-plugin-interface",
  "lencode",
+ "solana-address 1.1.0",
  "solana-clock",
  "solana-hash",
  "solana-message",
- "solana-pubkey 3.0.0",
  "solana-reward-info",
  "solana-signature",
  "solana-transaction",

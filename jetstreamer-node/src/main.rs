@@ -38,7 +38,7 @@ use solana_accounts_db::{
         AccountForGeyser, AccountsUpdateNotifier, AccountsUpdateNotifierInterface,
     },
 };
-use solana_clock::{Slot, MAX_PROCESSING_AGE};
+use solana_clock::{MAX_PROCESSING_AGE, Slot};
 use solana_genesis_utils::{MAX_GENESIS_ARCHIVE_UNPACKED_SIZE, open_genesis_config};
 use solana_geyser_plugin_manager::block_metadata_notifier_interface::{
     BlockMetadataNotifier, BlockMetadataNotifierArc,
@@ -420,12 +420,7 @@ impl BankReplay {
         Ok(())
     }
 
-    fn note_entry_duration(
-        &self,
-        entry: &ReadyEntry,
-        elapsed: Duration,
-        signature: Option<&str>,
-    ) {
+    fn note_entry_duration(&self, entry: &ReadyEntry, elapsed: Duration, signature: Option<&str>) {
         if elapsed >= ENTRY_EXEC_WARN_AFTER {
             warn!(
                 "slow entry execution: slot {} entry {} txs={} elapsed={:.3}s sig={}",
@@ -560,8 +555,7 @@ impl BankReplay {
                                 .unwrap_or_else(|| "<missing-signature>".to_string());
                             let message = &scheduled.tx.message;
                             let static_keys = message.static_account_keys();
-                            let mut program_ids =
-                                Vec::with_capacity(message.instructions().len());
+                            let mut program_ids = Vec::with_capacity(message.instructions().len());
                             for ix in message.instructions() {
                                 let program_id = static_keys
                                     .get(ix.program_id_index as usize)
@@ -650,8 +644,8 @@ impl BankReplay {
                     };
                     self.cursor.update_inflight_stage("load_execute_and_commit");
                     let mut timings = ExecuteTimings::default();
-                    let (commit_results, _balance_collector) =
-                        bank.load_execute_and_commit_transactions(
+                    let (commit_results, _balance_collector) = bank
+                        .load_execute_and_commit_transactions(
                             &batch,
                             MAX_PROCESSING_AGE,
                             ExecutionRecordingConfig::new_single_setting(false),
@@ -778,8 +772,7 @@ impl ReplayProgress {
         self.last_tx_slot.store(slot, Ordering::Relaxed);
         self.last_entry_slot.store(slot, Ordering::Relaxed);
         self.last_block_meta_slot.store(slot, Ordering::Relaxed);
-        self.last_account_update_slot
-            .store(slot, Ordering::Relaxed);
+        self.last_account_update_slot.store(slot, Ordering::Relaxed);
     }
 
     fn note_slot(&self, slot: Slot) {
@@ -1782,7 +1775,8 @@ impl TransactionScheduler {
             let mut drained = buffer.drain_ready_entries(current_slot)?;
             ready.append(&mut drained);
             if state.highest_seen_slot > current_slot {
-                if let Some((txs, entries)) = buffer.infer_expected_counts_if_missing(current_slot) {
+                if let Some((txs, entries)) = buffer.infer_expected_counts_if_missing(current_slot)
+                {
                     state.inferred_blocks.insert(current_slot, (txs, entries));
                 }
             }
@@ -2074,9 +2068,7 @@ impl AccountsUpdateNotifierInterface for ProgressAccountsUpdateNotifier {
         if !LOGGED_FIRST_ACCOUNT_UPDATE.swap(true, Ordering::SeqCst) {
             info!(
                 "first account update: slot={} pubkey={} write_version={}",
-                slot,
-                pubkey,
-                write_version
+                slot, pubkey, write_version
             );
         }
         self.progress.note_account_update_slot(slot);
@@ -2092,9 +2084,7 @@ impl AccountsUpdateNotifierInterface for ProgressAccountsUpdateNotifier {
                     if !self.warned_late_forward.swap(true, Ordering::SeqCst) {
                         warn!(
                             "forwarding late account updates after live start: update_slot={} live_start_slot={} latest_slot={}",
-                            slot,
-                            self.live_start_slot,
-                            latest
+                            slot, self.live_start_slot, latest
                         );
                     }
                     delegate.notify_account_update(slot, account, txn, pubkey, write_version);
@@ -3746,14 +3736,13 @@ async fn run_geyser_replay(
     } else {
         warn!("geyser account updates not enabled; updates will not be forwarded to plugin");
     }
-    let accounts_update_notifier: Option<AccountsUpdateNotifier> = Some(Arc::new(
-        ProgressAccountsUpdateNotifier {
+    let accounts_update_notifier: Option<AccountsUpdateNotifier> =
+        Some(Arc::new(ProgressAccountsUpdateNotifier {
             progress: progress.clone(),
             delegate,
             live_start_slot: epoch_start,
             warned_late_forward: AtomicBool::new(false),
-        },
-    ) as AccountsUpdateNotifier);
+        }) as AccountsUpdateNotifier);
     info!("accounts update notifier wired into snapshot load: true");
 
     ensure_genesis_archive(ledger_dir).await?;
@@ -3975,8 +3964,13 @@ async fn run_geyser_replay(
                     let stalled_for = last_seen_change.elapsed();
                     if stalled_for >= stall_interval && last_stall_log.elapsed() >= stall_interval {
                         let snapshot = scheduler.snapshot();
-                        let (cursor_slot, cursor_entry, cursor_tx_start, cursor_tx_count, cursor_sig) =
-                            cursor.snapshot();
+                        let (
+                            cursor_slot,
+                            cursor_entry,
+                            cursor_tx_start,
+                            cursor_tx_count,
+                            cursor_sig,
+                        ) = cursor.snapshot();
                         let mut expected_after_slot: Option<Slot> = None;
                         if let Some(buffer) = snapshot.buffer.as_ref() {
                             if buffer.expected_tx_count.is_none()
@@ -4019,9 +4013,7 @@ async fn run_geyser_replay(
                                     if display_slot < epoch_start {
                                         0
                                     } else {
-                                        display_slot
-                                            .saturating_sub(epoch_start)
-                                            .saturating_add(1)
+                                        display_slot.saturating_sub(epoch_start).saturating_add(1)
                                     }
                                 };
                                 let elapsed = start.elapsed().as_secs_f64();
@@ -4099,45 +4091,56 @@ async fn run_geyser_replay(
                                     .unwrap_or_else(|| "<none>".to_string())
                             );
                         } else if stalled_for >= inflight_fail_after {
+                            let snapshot = scheduler.snapshot();
+                            let (
+                                cursor_slot,
+                                cursor_entry,
+                                cursor_tx_start,
+                                cursor_tx_count,
+                                cursor_sig,
+                            ) = cursor.snapshot();
+                            let message = format!(
+                                "account updates stalled ({phase}): count {account_updates} unchanged for {stalled_slots} slots (latest_slot={latest} last_account_update_slot={last_account_update_slot_seen}) scheduler current_slot={} last_finalized={} buffered_slots={} highest_seen_slot={} presence={:?} buffer={:?} last_tx_slot={} last_entry_slot={} last_block_meta_slot={} last_account_update_slot={} cursor_slot={} cursor_entry={} cursor_tx_start={} cursor_tx_count={} cursor_sig={} inflight_slot={} inflight_entry={} inflight_tx_start={} inflight_tx_count={} inflight_stage={} inflight_elapsed={} inflight_sig={}",
+                                snapshot.current_slot,
+                                snapshot.last_finalized_slot,
+                                snapshot.buffered_slots,
+                                snapshot.highest_seen_slot,
+                                snapshot.presence,
+                                snapshot.buffer,
+                                progress.last_tx_slot.load(Ordering::Relaxed),
+                                progress.last_entry_slot.load(Ordering::Relaxed),
+                                progress.last_block_meta_slot.load(Ordering::Relaxed),
+                                last_account_update_slot,
+                                cursor_slot,
+                                cursor_entry,
+                                cursor_tx_start,
+                                cursor_tx_count,
+                                cursor_sig.as_deref().unwrap_or("<unknown>"),
+                                inflight_slot,
+                                inflight_entry,
+                                inflight_tx_start,
+                                inflight_tx_count,
+                                inflight_stage,
+                                inflight_elapsed
+                                    .map(|elapsed| format!("{:.3}s", elapsed.as_secs_f64()))
+                                    .unwrap_or_else(|| "<none>".to_string()),
+                                inflight_sig.as_deref().unwrap_or("<none>"),
+                            );
+                            failure.record(message.clone());
+                            eprintln!("{message}");
+                            std::process::exit(1);
+                        }
+                    }
+                    if stalled_for >= stall_interval && last_account_log.elapsed() >= stall_interval
+                    {
                         let snapshot = scheduler.snapshot();
-                        let (cursor_slot, cursor_entry, cursor_tx_start, cursor_tx_count, cursor_sig) =
-                            cursor.snapshot();
-                        let message = format!(
-                            "account updates stalled ({phase}): count {account_updates} unchanged for {stalled_slots} slots (latest_slot={latest} last_account_update_slot={last_account_update_slot_seen}) scheduler current_slot={} last_finalized={} buffered_slots={} highest_seen_slot={} presence={:?} buffer={:?} last_tx_slot={} last_entry_slot={} last_block_meta_slot={} last_account_update_slot={} cursor_slot={} cursor_entry={} cursor_tx_start={} cursor_tx_count={} cursor_sig={} inflight_slot={} inflight_entry={} inflight_tx_start={} inflight_tx_count={} inflight_stage={} inflight_elapsed={} inflight_sig={}",
-                            snapshot.current_slot,
-                            snapshot.last_finalized_slot,
-                            snapshot.buffered_slots,
-                            snapshot.highest_seen_slot,
-                            snapshot.presence,
-                            snapshot.buffer,
-                            progress.last_tx_slot.load(Ordering::Relaxed),
-                            progress.last_entry_slot.load(Ordering::Relaxed),
-                            progress.last_block_meta_slot.load(Ordering::Relaxed),
-                            last_account_update_slot,
+                        let (
                             cursor_slot,
                             cursor_entry,
                             cursor_tx_start,
                             cursor_tx_count,
-                            cursor_sig.as_deref().unwrap_or("<unknown>"),
-                            inflight_slot,
-                            inflight_entry,
-                            inflight_tx_start,
-                            inflight_tx_count,
-                            inflight_stage,
-                            inflight_elapsed
-                                .map(|elapsed| format!("{:.3}s", elapsed.as_secs_f64()))
-                                .unwrap_or_else(|| "<none>".to_string()),
-                            inflight_sig.as_deref().unwrap_or("<none>"),
-                        );
-                        failure.record(message.clone());
-                        eprintln!("{message}");
-                        std::process::exit(1);
-                        }
-                    }
-                    if stalled_for >= stall_interval && last_account_log.elapsed() >= stall_interval {
-                        let snapshot = scheduler.snapshot();
-                        let (cursor_slot, cursor_entry, cursor_tx_start, cursor_tx_count, cursor_sig) =
-                            cursor.snapshot();
+                            cursor_sig,
+                        ) = cursor.snapshot();
                         let last_tx_slot = progress.last_tx_slot.load(Ordering::Relaxed);
                         let last_entry_slot = progress.last_entry_slot.load(Ordering::Relaxed);
                         let last_block_meta_slot =
@@ -4265,9 +4268,7 @@ async fn run_geyser_replay(
 
                 let assign_fail = PROGRAM_CACHE_ASSIGN_FAIL_COUNT.load(Ordering::Relaxed);
                 if assign_fail > 0 {
-                    info!(
-                        "program cache assign failures so far: {assign_fail}"
-                    );
+                    info!("program cache assign failures so far: {assign_fail}");
                 }
             }
         })

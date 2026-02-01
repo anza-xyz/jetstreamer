@@ -4119,6 +4119,7 @@ dependencies = [
  "solana-reward-info",
  "solana-signature",
  "solana-transaction",
+ "solana-transaction-context",
  "solana-transaction-status",
 ]
 

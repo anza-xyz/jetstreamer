@@ -91,6 +91,7 @@ const DEFAULT_ROOT_INTERVAL: u64 = 1024;
 const ENTRY_EXEC_WARN_AFTER: Duration = Duration::from_secs(5);
 const ENTRY_EXEC_FAIL_AFTER: Duration = Duration::from_secs(300);
 const BANK_FOR_SLOT_WARN_AFTER: Duration = Duration::from_secs(5);
+const PROGRAM_CACHE_PRUNE_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_PROGRAM_CACHE_PRUNE_ENABLED: bool = true;
 static LOGGED_STALL_TX: AtomicBool = AtomicBool::new(false);
 static LOGGED_FIRST_ACCOUNT_UPDATE: AtomicBool = AtomicBool::new(false);
@@ -372,27 +373,57 @@ impl BankReplay {
                 {
                     std::thread::spawn(move || {
                         let start = Instant::now();
-                        info!(
-                            "bank_for_slot program cache prune starting: slot {}",
-                            prune_slot
-                        );
-                        let _firehose_guard = firehose_gate
-                            .lock()
-                            .expect("firehose gate lock poisoned during prune");
-                        let _execution_guard = execution_gate
-                            .lock()
-                            .expect("execution gate lock poisoned during prune");
-                        let guard = match bank_forks.write() {
-                            Ok(guard) => guard,
-                            Err(_) => {
+                        let mut wait_start = Instant::now();
+                        let _firehose_guard = loop {
+                            if let Ok(guard) = firehose_gate.try_lock() {
+                                break guard;
+                            }
+                            if wait_start.elapsed() >= PROGRAM_CACHE_PRUNE_LOCK_TIMEOUT {
                                 warn!(
-                                    "bank_for_slot skipping program cache prune at slot {} (bank forks lock poisoned)",
+                                    "bank_for_slot skipping program cache prune at slot {} (firehose gate busy)",
                                     prune_slot
                                 );
                                 inflight.store(false, Ordering::SeqCst);
                                 return;
                             }
+                            std::thread::sleep(Duration::from_millis(10));
                         };
+                        wait_start = Instant::now();
+                        let _execution_guard = loop {
+                            if let Ok(guard) = execution_gate.try_lock() {
+                                break guard;
+                            }
+                            if wait_start.elapsed() >= PROGRAM_CACHE_PRUNE_LOCK_TIMEOUT {
+                                warn!(
+                                    "bank_for_slot skipping program cache prune at slot {} (execution gate busy)",
+                                    prune_slot
+                                );
+                                inflight.store(false, Ordering::SeqCst);
+                                return;
+                            }
+                            std::thread::sleep(Duration::from_millis(10));
+                        };
+                        wait_start = Instant::now();
+                        let guard = loop {
+                            match bank_forks.try_write() {
+                                Ok(guard) => break guard,
+                                Err(_) => {
+                                    if wait_start.elapsed() >= PROGRAM_CACHE_PRUNE_LOCK_TIMEOUT {
+                                        warn!(
+                                            "bank_for_slot skipping program cache prune at slot {} (bank forks busy)",
+                                            prune_slot
+                                        );
+                                        inflight.store(false, Ordering::SeqCst);
+                                        return;
+                                    }
+                                    std::thread::sleep(Duration::from_millis(10));
+                                }
+                            }
+                        };
+                        info!(
+                            "bank_for_slot program cache prune starting: slot {}",
+                            prune_slot
+                        );
                         guard.prune_program_cache(prune_slot);
                         let elapsed = start.elapsed();
                         info!(

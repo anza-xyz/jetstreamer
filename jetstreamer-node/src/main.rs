@@ -372,6 +372,10 @@ impl BankReplay {
                 {
                     std::thread::spawn(move || {
                         let start = Instant::now();
+                        info!(
+                            "bank_for_slot program cache prune starting: slot {}",
+                            prune_slot
+                        );
                         let _firehose_guard = firehose_gate
                             .lock()
                             .expect("firehose gate lock poisoned during prune");
@@ -391,6 +395,11 @@ impl BankReplay {
                         };
                         guard.prune_program_cache(prune_slot);
                         let elapsed = start.elapsed();
+                        info!(
+                            "bank_for_slot program cache prune finished: slot {} took {:.3}s",
+                            prune_slot,
+                            elapsed.as_secs_f64()
+                        );
                         if elapsed >= BANK_FOR_SLOT_WARN_AFTER {
                             warn!(
                                 "bank_for_slot program cache prune async: slot {} took {:.3}s",

@@ -91,7 +91,7 @@ const DEFAULT_ROOT_INTERVAL: u64 = 1024;
 const ENTRY_EXEC_WARN_AFTER: Duration = Duration::from_secs(5);
 const ENTRY_EXEC_FAIL_AFTER: Duration = Duration::from_secs(300);
 const BANK_FOR_SLOT_WARN_AFTER: Duration = Duration::from_secs(5);
-const ENABLE_PROGRAM_CACHE_PRUNE: bool = false;
+const DEFAULT_PROGRAM_CACHE_PRUNE_ENABLED: bool = true;
 static LOGGED_STALL_TX: AtomicBool = AtomicBool::new(false);
 static LOGGED_FIRST_ACCOUNT_UPDATE: AtomicBool = AtomicBool::new(false);
 static LOGGED_PROGRAM_CACHE_ASSIGN_FAIL: AtomicBool = AtomicBool::new(false);
@@ -195,6 +195,8 @@ struct BankReplay {
     prune_inflight: Arc<AtomicBool>,
     cached_bank: Mutex<Option<CachedBank>>,
     execution_gate: Arc<Mutex<()>>,
+    firehose_gate: Arc<Mutex<()>>,
+    enable_program_cache_prune: bool,
 }
 
 #[derive(Debug)]
@@ -220,6 +222,8 @@ impl BankReplay {
         root_interval: Option<u64>,
         failure: Arc<ReplayFailure>,
         cursor: Arc<ReplayCursor>,
+        firehose_gate: Arc<Mutex<()>>,
+        enable_program_cache_prune: bool,
     ) -> Self {
         let mut leader_schedule_cache = LeaderScheduleCache::new_from_bank(&bank);
         leader_schedule_cache.set_max_schedules(usize::MAX);
@@ -248,6 +252,8 @@ impl BankReplay {
             prune_inflight: Arc::new(AtomicBool::new(false)),
             cached_bank,
             execution_gate: Arc::new(Mutex::new(())),
+            firehose_gate,
+            enable_program_cache_prune,
         }
     }
 
@@ -342,7 +348,7 @@ impl BankReplay {
                             set_elapsed.as_secs_f64()
                         );
                     }
-                    if ENABLE_PROGRAM_CACHE_PRUNE {
+                    if self.enable_program_cache_prune {
                         prune_request = Some(parent_slot);
                     } else {
                         warn!(
@@ -358,17 +364,25 @@ impl BankReplay {
             if let Some(prune_slot) = prune_request {
                 let inflight = self.prune_inflight.clone();
                 let bank_forks = Arc::clone(&self.bank_forks);
+                let execution_gate = self.execution_gate.clone();
+                let firehose_gate = self.firehose_gate.clone();
                 if inflight
                     .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
                     .is_ok()
                 {
                     std::thread::spawn(move || {
                         let start = Instant::now();
-                        let guard = match bank_forks.try_write() {
+                        let _firehose_guard = firehose_gate
+                            .lock()
+                            .expect("firehose gate lock poisoned during prune");
+                        let _execution_guard = execution_gate
+                            .lock()
+                            .expect("execution gate lock poisoned during prune");
+                        let guard = match bank_forks.write() {
                             Ok(guard) => guard,
                             Err(_) => {
                                 warn!(
-                                    "bank_for_slot skipping program cache prune at slot {} (bank forks busy)",
+                                    "bank_for_slot skipping program cache prune at slot {} (bank forks lock poisoned)",
                                     prune_slot
                                 );
                                 inflight.store(false, Ordering::SeqCst);
@@ -2118,6 +2132,7 @@ struct BankTransactionNotifier {
     ready_sender: crossbeam_channel::Sender<Vec<ReadyEntry>>,
     delegate: Option<Arc<dyn TransactionNotifier + Send + Sync + 'static>>,
     live_start_slot: Slot,
+    firehose_gate: Arc<Mutex<()>>,
 }
 
 impl TransactionNotifier for BankTransactionNotifier {
@@ -2131,6 +2146,10 @@ impl TransactionNotifier for BankTransactionNotifier {
         transaction_status_meta: &TransactionStatusMeta,
         transaction: &VersionedTransaction,
     ) {
+        let _firehose_guard = self
+            .firehose_gate
+            .lock()
+            .expect("firehose gate lock poisoned");
         self.progress.note_tx_slot(slot);
         self.progress.inc_tx();
         match self.scheduler.insert_transaction(
@@ -2173,6 +2192,7 @@ struct BankEntryNotifier {
     ready_sender: crossbeam_channel::Sender<Vec<ReadyEntry>>,
     delegate: Option<Arc<dyn EntryNotifier + Send + Sync + 'static>>,
     live_start_slot: Slot,
+    firehose_gate: Arc<Mutex<()>>,
 }
 
 impl EntryNotifier for BankEntryNotifier {
@@ -2183,6 +2203,10 @@ impl EntryNotifier for BankEntryNotifier {
         entry: &solana_entry::entry::EntrySummary,
         starting_transaction_index: usize,
     ) {
+        let _firehose_guard = self
+            .firehose_gate
+            .lock()
+            .expect("firehose gate lock poisoned");
         self.progress.note_entry_slot(slot);
         match self.scheduler.push_entry(
             slot,
@@ -2217,6 +2241,7 @@ struct BankBlockMetadataNotifier {
     ready_sender: crossbeam_channel::Sender<Vec<ReadyEntry>>,
     delegate: Option<BlockMetadataNotifierArc>,
     live_start_slot: Slot,
+    firehose_gate: Arc<Mutex<()>>,
 }
 
 impl BlockMetadataNotifier for BankBlockMetadataNotifier {
@@ -2232,6 +2257,10 @@ impl BlockMetadataNotifier for BankBlockMetadataNotifier {
         executed_transaction_count: u64,
         entry_count: u64,
     ) {
+        let _firehose_guard = self
+            .firehose_gate
+            .lock()
+            .expect("firehose gate lock poisoned");
         if slot == u64::MAX {
             if let Some(delegate) = self.delegate.as_ref() {
                 delegate.notify_block_metadata(
@@ -2862,6 +2891,16 @@ fn env_truthy(var: &str) -> bool {
             !matches!(value.as_str(), "" | "0" | "false" | "no")
         }
         Err(_) => false,
+    }
+}
+
+fn env_truthy_default(var: &str, default: bool) -> bool {
+    match env::var(var) {
+        Ok(value) => {
+            let value = value.trim().to_ascii_lowercase();
+            !matches!(value.as_str(), "" | "0" | "false" | "no")
+        }
+        Err(_) => default,
     }
 }
 
@@ -3802,12 +3841,25 @@ async fn run_geyser_replay(
     )
     .await?;
     let scheduler = Arc::new(TransactionScheduler::new(replay_start, slot_presence));
+    let firehose_gate = Arc::new(Mutex::new(()));
+    let enable_program_cache_prune = env_truthy_default(
+        "JETSTREAMER_PROGRAM_CACHE_PRUNE",
+        DEFAULT_PROGRAM_CACHE_PRUNE_ENABLED,
+    );
+    if enable_program_cache_prune {
+        info!("program cache pruning enabled");
+        info!("firehose paused during program cache pruning");
+    } else {
+        info!("program cache pruning disabled");
+    }
     let bank_replay = Arc::new(BankReplay::new(
         bank,
         snapshot_verifier.clone(),
         root_interval,
         failure.clone(),
         cursor.clone(),
+        firehose_gate.clone(),
+        enable_program_cache_prune,
     ));
     let (ready_sender, ready_receiver) = unbounded::<Vec<ReadyEntry>>();
     let ready_shutdown = shutdown.clone();
@@ -3831,6 +3883,7 @@ async fn run_geyser_replay(
         ready_sender: ready_sender.clone(),
         delegate: service.get_transaction_notifier(),
         live_start_slot: epoch_start,
+        firehose_gate: firehose_gate.clone(),
     });
     let entry_notifier = Arc::new(BankEntryNotifier {
         progress: progress.clone(),
@@ -3839,6 +3892,7 @@ async fn run_geyser_replay(
         ready_sender: ready_sender.clone(),
         delegate: service.get_entry_notifier(),
         live_start_slot: epoch_start,
+        firehose_gate: firehose_gate.clone(),
     });
     let block_metadata_notifier = Arc::new(BankBlockMetadataNotifier {
         scheduler: scheduler.clone(),
@@ -3847,6 +3901,7 @@ async fn run_geyser_replay(
         ready_sender: ready_sender.clone(),
         delegate: service.get_block_metadata_notifier(),
         live_start_slot: epoch_start,
+        firehose_gate: firehose_gate.clone(),
     });
     let notifiers = GeyserNotifiers {
         transaction_notifier: Some(transaction_notifier.clone()),

@@ -1,6 +1,6 @@
 use {
     crate::invoke_context::{BuiltinFunctionWithContext, InvokeContext},
-    log::{debug, error, log_enabled, trace},
+    log::{debug, error, info, log_enabled, trace, warn},
     percentage::PercentageInteger,
     solana_clock::{Epoch, Slot},
     solana_pubkey::Pubkey,
@@ -22,6 +22,7 @@ use {
         collections::{hash_map::Entry, HashMap},
         fmt::{Debug, Formatter},
         sync::Weak,
+        time::{Duration, Instant},
     },
 };
 #[cfg(feature = "metrics")]
@@ -942,18 +943,41 @@ impl<FG: ForkGraph> ProgramCache<FG> {
         new_root_slot: Slot,
         upcoming_environments: Option<ProgramRuntimeEnvironments>,
     ) {
+        let start = Instant::now();
         let Some(fork_graph) = self.fork_graph.clone() else {
             error!("Program cache doesn't have fork graph.");
             return;
         };
         let fork_graph = fork_graph.upgrade().unwrap();
-        let Ok(fork_graph) = fork_graph.read() else {
-            error!("Failed to lock fork graph for reading.");
-            return;
+        let mut last_log = Instant::now();
+        let fork_graph = loop {
+            match fork_graph.try_read() {
+                Ok(guard) => break guard,
+                Err(_) => {
+                    if last_log.elapsed() >= Duration::from_secs(30) {
+                        warn!(
+                            "program cache prune: waiting on fork graph read lock (root slot {})",
+                            new_root_slot
+                        );
+                        last_log = Instant::now();
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+            }
         };
         match &mut self.index {
             IndexImplementation::V1 { entries, .. } => {
+                let total_programs = entries.len();
+                let total_entries_before: usize =
+                    entries.values().map(|second_level| second_level.len()).sum();
+                info!(
+                    "program cache prune: start root={} latest_root={} programs={} entries={}",
+                    new_root_slot, self.latest_root_slot, total_programs, total_entries_before
+                );
+                let mut total_entries_after = 0usize;
+                let mut total_pruned = 0usize;
                 for second_level in entries.values_mut() {
+                    let before_len = second_level.len();
                     // Remove entries un/re/deployed on orphan forks
                     let mut first_ancestor_found = false;
                     let mut first_ancestor_env = None;
@@ -1008,7 +1032,19 @@ impl<FG: ForkGraph> ProgramCache<FG> {
                         .cloned()
                         .collect();
                     second_level.reverse();
+                    let after_len = second_level.len();
+                    total_entries_after = total_entries_after.saturating_add(after_len);
+                    if before_len >= after_len {
+                        total_pruned = total_pruned.saturating_add(before_len - after_len);
+                    }
                 }
+                info!(
+                    "program cache prune: end root={} entries_after={} pruned={} elapsed={:.3}s",
+                    new_root_slot,
+                    total_entries_after,
+                    total_pruned,
+                    start.elapsed().as_secs_f64()
+                );
             }
         }
         self.remove_programs_with_no_entries();

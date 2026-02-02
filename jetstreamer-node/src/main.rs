@@ -409,15 +409,19 @@ impl BankReplay {
                         let bank_forks = Arc::clone(&bank_forks);
                         std::thread::spawn(move || {
                             let mut last_progress = Instant::now();
-                            let guard = loop {
-                                match bank_forks.try_write() {
-                                    Ok(guard) => break guard,
+                            let bank = loop {
+                                match bank_forks.try_read() {
+                                    Ok(guard) => {
+                                        let bank = guard.get(prune_slot);
+                                        drop(guard);
+                                        break bank;
+                                    }
                                     Err(_) => {
                                         if last_progress.elapsed()
                                             >= PROGRAM_CACHE_PRUNE_PROGRESS_INTERVAL
                                         {
                                             warn!(
-                                                "bank_for_slot waiting on bank forks for program cache prune: slot {}",
+                                                "bank_for_slot waiting on bank forks read lock for program cache prune: slot {}",
                                                 prune_slot
                                             );
                                             last_progress = Instant::now();
@@ -426,11 +430,20 @@ impl BankReplay {
                                     }
                                 }
                             };
+                            let Some(bank) = bank else {
+                                warn!(
+                                    "bank_for_slot program cache prune skipped: missing root bank slot {}",
+                                    prune_slot
+                                );
+                                inflight.store(false, Ordering::SeqCst);
+                                let _ = done_tx.send(());
+                                return;
+                            };
                             info!(
                                 "bank_for_slot program cache prune starting: slot {}",
                                 prune_slot
                             );
-                            guard.prune_program_cache(prune_slot);
+                            bank.prune_program_cache(prune_slot, bank.epoch());
                             let elapsed = start.elapsed();
                             info!(
                                 "bank_for_slot program cache prune finished: slot {} took {:.3}s",

@@ -93,7 +93,6 @@ const ENTRY_EXEC_FAIL_AFTER: Duration = Duration::from_secs(300);
 const BANK_FOR_SLOT_WARN_AFTER: Duration = Duration::from_secs(5);
 const PROGRAM_CACHE_PRUNE_PROGRESS_INTERVAL: Duration = Duration::from_secs(30);
 const DEFAULT_PROGRAM_CACHE_PRUNE_ENABLED: bool = true;
-static LOGGED_STALL_TX: AtomicBool = AtomicBool::new(false);
 static LOGGED_FIRST_ACCOUNT_UPDATE: AtomicBool = AtomicBool::new(false);
 static LOGGED_PROGRAM_CACHE_ASSIGN_FAIL: AtomicBool = AtomicBool::new(false);
 static PROGRAM_CACHE_ASSIGN_FAIL_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -633,48 +632,6 @@ impl BankReplay {
                 Ok(bank) => {
                     self.maybe_prune_program_cache_by_deployment_slot(&bank);
                     self.cursor.update_inflight_stage("try_process");
-                    if entry.slot == 393_521_153
-                        && entry.entry_index == 0
-                        && !LOGGED_STALL_TX.swap(true, Ordering::SeqCst)
-                    {
-                        let mut details = String::new();
-                        details.push_str(&format!(
-                            "stalling entry pre-exec dump: slot {} entry {} tx_start={} tx_count={}",
-                            entry.slot, entry.entry_index, entry.start_index, entry.tx_count
-                        ));
-                        for (offset, scheduled) in entry.txs.iter().enumerate() {
-                            let signature = scheduled
-                                .tx
-                                .signatures
-                                .first()
-                                .map(|sig| sig.to_string())
-                                .unwrap_or_else(|| "<missing-signature>".to_string());
-                            let message = &scheduled.tx.message;
-                            let static_keys = message.static_account_keys();
-                            let mut program_ids = Vec::with_capacity(message.instructions().len());
-                            for ix in message.instructions() {
-                                let program_id = static_keys
-                                    .get(ix.program_id_index as usize)
-                                    .map(|key| bs58::encode(key.to_bytes()).into_string())
-                                    .unwrap_or_else(|| "<unknown>".to_string());
-                                program_ids.push(program_id);
-                            }
-                            let tx_index = entry.start_index.saturating_add(offset);
-                            details.push_str(&format!(
-                                "\nstalling tx: slot {} entry {} tx_index={} sig={} instrs={} accounts={} programs={:?} recent_blockhash={}",
-                                entry.slot,
-                                entry.entry_index,
-                                tx_index,
-                                signature,
-                                message.instructions().len(),
-                                static_keys.len(),
-                                program_ids,
-                                message.recent_blockhash()
-                            ));
-                        }
-                        warn!("{details}");
-                        self.cursor.set_inflight_details(details);
-                    }
                     self.cursor.update(
                         entry.slot,
                         entry.entry_index,
@@ -748,12 +705,6 @@ impl BankReplay {
                             &mut timings,
                             None,
                         );
-                    if entry.slot == 393_521_153 && entry.entry_index == 0 {
-                        info!(
-                            "entry timings: slot {} entry {} timings={:?}",
-                            entry.slot, entry.entry_index, timings
-                        );
-                    }
                     let results: Vec<Result<(), TransactionError>> = commit_results
                         .into_iter()
                         .map(|commit_result| commit_result.and_then(|committed| committed.status))
@@ -985,7 +936,6 @@ impl ReplayCursor {
                 tx_count,
                 signature,
                 stage: "start",
-                details: None,
                 started_at: Instant::now(),
             });
         }
@@ -997,23 +947,6 @@ impl ReplayCursor {
                 entry.stage = stage;
             }
         }
-    }
-
-    fn set_inflight_details(&self, details: String) {
-        if let Ok(mut guard) = self.inflight.lock() {
-            if let Some(ref mut entry) = *guard {
-                entry.details = Some(details);
-            }
-        }
-    }
-
-    fn take_inflight_details(&self) -> Option<String> {
-        if let Ok(mut guard) = self.inflight.lock() {
-            if let Some(ref mut entry) = *guard {
-                return entry.details.take();
-            }
-        }
-        None
     }
 
     fn finish_inflight(&self) {
@@ -1065,7 +998,6 @@ struct InFlightEntry {
     tx_count: usize,
     signature: Option<String>,
     stage: &'static str,
-    details: Option<String>,
     started_at: Instant,
 }
 
@@ -4118,11 +4050,6 @@ async fn run_geyser_replay(
                             {
                                 expected_after_slot =
                                     scheduler.expected_block_metadata_after(snapshot.current_slot);
-                            }
-                        }
-                        if inflight_slot == 393_521_153 && inflight_entry == 0 {
-                            if let Some(details) = cursor.take_inflight_details() {
-                                warn!("{details}");
                             }
                         }
                         let last_tx_slot = progress.last_tx_slot.load(Ordering::Relaxed);

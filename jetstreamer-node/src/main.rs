@@ -91,7 +91,7 @@ const DEFAULT_ROOT_INTERVAL: u64 = 1024;
 const ENTRY_EXEC_WARN_AFTER: Duration = Duration::from_secs(5);
 const ENTRY_EXEC_FAIL_AFTER: Duration = Duration::from_secs(300);
 const BANK_FOR_SLOT_WARN_AFTER: Duration = Duration::from_secs(5);
-const PROGRAM_CACHE_PRUNE_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
+const PROGRAM_CACHE_PRUNE_PROGRESS_INTERVAL: Duration = Duration::from_secs(30);
 const DEFAULT_PROGRAM_CACHE_PRUNE_ENABLED: bool = true;
 static LOGGED_STALL_TX: AtomicBool = AtomicBool::new(false);
 static LOGGED_FIRST_ACCOUNT_UPDATE: AtomicBool = AtomicBool::new(false);
@@ -373,72 +373,101 @@ impl BankReplay {
                 {
                     std::thread::spawn(move || {
                         let start = Instant::now();
-                        let mut wait_start = Instant::now();
+                        let mut last_progress = Instant::now();
                         let _firehose_guard = loop {
                             if let Ok(guard) = firehose_gate.try_lock() {
                                 break guard;
                             }
-                            if wait_start.elapsed() >= PROGRAM_CACHE_PRUNE_LOCK_TIMEOUT {
+                            if last_progress.elapsed()
+                                >= PROGRAM_CACHE_PRUNE_PROGRESS_INTERVAL
+                            {
                                 warn!(
-                                    "bank_for_slot skipping program cache prune at slot {} (firehose gate busy)",
+                                    "bank_for_slot waiting on firehose gate for program cache prune: slot {}",
                                     prune_slot
                                 );
-                                inflight.store(false, Ordering::SeqCst);
-                                return;
+                                last_progress = Instant::now();
                             }
                             std::thread::sleep(Duration::from_millis(10));
                         };
-                        wait_start = Instant::now();
+                        last_progress = Instant::now();
                         let _execution_guard = loop {
                             if let Ok(guard) = execution_gate.try_lock() {
                                 break guard;
                             }
-                            if wait_start.elapsed() >= PROGRAM_CACHE_PRUNE_LOCK_TIMEOUT {
+                            if last_progress.elapsed()
+                                >= PROGRAM_CACHE_PRUNE_PROGRESS_INTERVAL
+                            {
                                 warn!(
-                                    "bank_for_slot skipping program cache prune at slot {} (execution gate busy)",
+                                    "bank_for_slot waiting on execution gate for program cache prune: slot {}",
                                     prune_slot
                                 );
-                                inflight.store(false, Ordering::SeqCst);
-                                return;
+                                last_progress = Instant::now();
                             }
                             std::thread::sleep(Duration::from_millis(10));
                         };
-                        wait_start = Instant::now();
-                        let guard = loop {
-                            match bank_forks.try_write() {
-                                Ok(guard) => break guard,
-                                Err(_) => {
-                                    if wait_start.elapsed() >= PROGRAM_CACHE_PRUNE_LOCK_TIMEOUT {
-                                        warn!(
-                                            "bank_for_slot skipping program cache prune at slot {} (bank forks busy)",
-                                            prune_slot
-                                        );
-                                        inflight.store(false, Ordering::SeqCst);
-                                        return;
+                        let (done_tx, done_rx) = std::sync::mpsc::channel();
+                        let bank_forks = Arc::clone(&bank_forks);
+                        std::thread::spawn(move || {
+                            let mut last_progress = Instant::now();
+                            let guard = loop {
+                                match bank_forks.try_write() {
+                                    Ok(guard) => break guard,
+                                    Err(_) => {
+                                        if last_progress.elapsed()
+                                            >= PROGRAM_CACHE_PRUNE_PROGRESS_INTERVAL
+                                        {
+                                            warn!(
+                                                "bank_for_slot waiting on bank forks for program cache prune: slot {}",
+                                                prune_slot
+                                            );
+                                            last_progress = Instant::now();
+                                        }
+                                        std::thread::sleep(Duration::from_millis(10));
                                     }
-                                    std::thread::sleep(Duration::from_millis(10));
                                 }
-                            }
-                        };
-                        info!(
-                            "bank_for_slot program cache prune starting: slot {}",
-                            prune_slot
-                        );
-                        guard.prune_program_cache(prune_slot);
-                        let elapsed = start.elapsed();
-                        info!(
-                            "bank_for_slot program cache prune finished: slot {} took {:.3}s",
-                            prune_slot,
-                            elapsed.as_secs_f64()
-                        );
-                        if elapsed >= BANK_FOR_SLOT_WARN_AFTER {
-                            warn!(
-                                "bank_for_slot program cache prune async: slot {} took {:.3}s",
+                            };
+                            info!(
+                                "bank_for_slot program cache prune starting: slot {}",
+                                prune_slot
+                            );
+                            guard.prune_program_cache(prune_slot);
+                            let elapsed = start.elapsed();
+                            info!(
+                                "bank_for_slot program cache prune finished: slot {} took {:.3}s",
                                 prune_slot,
                                 elapsed.as_secs_f64()
                             );
+                            if elapsed >= BANK_FOR_SLOT_WARN_AFTER {
+                                warn!(
+                                    "bank_for_slot program cache prune async: slot {} took {:.3}s",
+                                    prune_slot,
+                                    elapsed.as_secs_f64()
+                                );
+                            }
+                            inflight.store(false, Ordering::SeqCst);
+                            let _ = done_tx.send(());
+                        });
+                        loop {
+                            match done_rx.recv_timeout(
+                                PROGRAM_CACHE_PRUNE_PROGRESS_INTERVAL,
+                            ) {
+                                Ok(()) => break,
+                                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                                    warn!(
+                                        "bank_for_slot program cache prune still running after {:.3}s: slot {}",
+                                        start.elapsed().as_secs_f64(),
+                                        prune_slot
+                                    );
+                                }
+                                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                                    warn!(
+                                        "bank_for_slot program cache prune worker disconnected: slot {}",
+                                        prune_slot
+                                    );
+                                    break;
+                                }
+                            }
                         }
-                        inflight.store(false, Ordering::SeqCst);
                     });
                 } else {
                     warn!(

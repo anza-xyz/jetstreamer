@@ -375,6 +375,87 @@ fn decode_transaction_status_meta_from_frame(
     }
 }
 
+#[derive(Debug, Default)]
+struct DecodedRewards {
+    keyed_rewards: Vec<(Address, RewardInfo)>,
+    num_partitions: Option<u64>,
+}
+
+impl DecodedRewards {
+    fn empty() -> Self {
+        Self {
+            keyed_rewards: Vec::new(),
+            num_partitions: None,
+        }
+    }
+}
+
+fn decode_rewards_from_frame(
+    slot: u64,
+    reassembled_rewards: Vec<u8>,
+) -> Result<DecodedRewards, SharedError> {
+    if reassembled_rewards.is_empty() {
+        // Early epochs sometimes omit rewards payloads entirely.
+        return Ok(DecodedRewards::empty());
+    }
+
+    match utils::decompress_zstd(reassembled_rewards.clone()) {
+        Ok(decompressed) => decode_rewards_from_bytes(slot, decompressed.as_slice()).map_err(
+            |err| {
+                Box::new(std::io::Error::other(format!(
+                    "decode rewards (slot {slot}): {err}"
+                ))) as SharedError
+            },
+        ),
+        Err(decomp_err) => decode_rewards_from_bytes(slot, reassembled_rewards.as_slice()).map_err(
+            |err| {
+                Box::new(std::io::Error::other(format!(
+                    "rewards not zstd-compressed for slot {slot}; raw decode failed (raw_err={err}, decompress_err={decomp_err})"
+                ))) as SharedError
+            },
+        ),
+    }
+}
+
+fn decode_rewards_from_bytes(slot: u64, bytes: &[u8]) -> Result<DecodedRewards, SharedError> {
+    let epoch = slot_to_epoch(slot);
+    let proto_attempt: Result<solana_storage_proto::convert::generated::Rewards, _> =
+        prost_011::Message::decode(bytes);
+    match proto_attempt {
+        Ok(proto) => {
+            let num_partitions = proto.num_partitions.as_ref().map(|p| p.num_partitions);
+            let keyed_rewards = convert_proto_rewards(&proto).map_err(|err| {
+                Box::new(std::io::Error::other(format!(
+                    "convert rewards proto failed (epoch {epoch}): {err}"
+                ))) as SharedError
+            })?;
+            Ok(DecodedRewards {
+                keyed_rewards,
+                num_partitions,
+            })
+        }
+        Err(proto_err) => {
+            let stored: solana_storage_proto::StoredExtendedRewards =
+                bincode::deserialize(bytes).map_err(|bin_err| {
+                    Box::new(std::io::Error::other(format!(
+                        "protobuf decode rewards failed (epoch {epoch}); bincode failed too: {bin_err}; protobuf error: {proto_err}"
+                    ))) as SharedError
+                })?;
+            let proto: solana_storage_proto::convert::generated::Rewards = stored.into();
+            let num_partitions = proto.num_partitions.as_ref().map(|p| p.num_partitions);
+            let keyed_rewards = convert_proto_rewards(&proto).map_err(|err| {
+                Box::new(std::io::Error::other(format!(
+                    "convert rewards bincode fallback failed (epoch {epoch}); protobuf error: {proto_err}; conversion error: {err}"
+                ))) as SharedError
+            })?;
+            Ok(DecodedRewards {
+                keyed_rewards,
+                num_partitions,
+            })
+        }
+    }
+}
+
 fn decode_transaction_status_meta(
     slot: u64,
     metadata_bytes: &[u8],
@@ -510,6 +591,52 @@ mod metadata_decode_tests {
         let decoded =
             decode_transaction_status_meta_from_frame(0, raw_bytes).expect("decode fallback");
         assert_eq!(decoded, TransactionStatusMeta::from(stored));
+    }
+}
+
+#[cfg(test)]
+mod rewards_decode_tests {
+    use super::decode_rewards_from_bytes;
+    use solana_sdk_ids::vote::id as vote_program_id;
+    use solana_storage_proto::StoredExtendedRewards;
+    use solana_transaction_status::{Reward, RewardType};
+
+    #[test]
+    fn decodes_protobuf_rewards() {
+        let pubkey = vote_program_id().to_string();
+        let proto = solana_storage_proto::convert::generated::Rewards {
+            rewards: vec![solana_storage_proto::convert::generated::Reward {
+                pubkey,
+                lamports: 5,
+                post_balance: 10,
+                reward_type: solana_storage_proto::convert::generated::RewardType::Fee as i32,
+                commission: "1".to_string(),
+            }],
+            num_partitions: Some(solana_storage_proto::convert::generated::NumPartitions {
+                num_partitions: 2,
+            }),
+        };
+        let bytes = prost_011::Message::encode_to_vec(&proto);
+        let decoded = decode_rewards_from_bytes(0, &bytes).expect("decode proto rewards");
+        assert_eq!(decoded.keyed_rewards.len(), 1);
+        assert_eq!(decoded.num_partitions, Some(2));
+    }
+
+    #[test]
+    fn decodes_bincode_rewards() {
+        let pubkey = vote_program_id().to_string();
+        let reward = Reward {
+            pubkey,
+            lamports: 7,
+            post_balance: 9,
+            reward_type: Some(RewardType::Rent),
+            commission: Some(3),
+        };
+        let stored_rewards: StoredExtendedRewards = vec![reward.into()];
+        let bytes = bincode::serialize(&stored_rewards).expect("bincode serialize");
+        let decoded = decode_rewards_from_bytes(0, &bytes).expect("decode bincode rewards");
+        assert_eq!(decoded.keyed_rewards.len(), 1);
+        assert_eq!(decoded.num_partitions, None);
     }
 }
 
@@ -981,7 +1108,7 @@ where
                         let mut entry_index: usize = 0;
                         let mut this_block_executed_transaction_count: u64 = 0;
                         let mut this_block_entry_count: u64 = 0;
-                        let mut this_block_rewards: Vec<(Address, RewardInfo)> = Vec::new();
+                        let mut this_block_rewards = DecodedRewards::empty();
 
                         for node_with_cid in &nodes.0 {
                             item_index += 1;
@@ -1243,13 +1370,16 @@ where
                                             slot,
                                             last_counted_slot,
                                         );
-                                        this_block_rewards.clear();
+                                        this_block_rewards = DecodedRewards::empty();
                                         continue;
                                     }
 
                                     if block_enabled {
                                         if let Some(on_block_cb) = on_block.as_ref() {
-                                            let keyed_rewards = std::mem::take(&mut this_block_rewards);
+                                            let DecodedRewards {
+                                                keyed_rewards,
+                                                num_partitions,
+                                            } = std::mem::take(&mut this_block_rewards);
                                             if slot > last_emitted_slot {
                                                 last_emitted_slot = slot;
                                                 on_block_cb(
@@ -1261,7 +1391,7 @@ where
                                                         blockhash: latest_entry_blockhash,
                                                         rewards: KeyedRewardsAndNumPartitions {
                                                             keyed_rewards,
-                                                            num_partitions: None,
+                                                            num_partitions,
                                                         },
                                                         block_time: Some(block.meta.blocktime as i64),
                                                         block_height: block.meta.block_height,
@@ -1280,7 +1410,7 @@ where
                                             }
                                         }
                                     } else {
-                                        this_block_rewards.clear();
+                                        this_block_rewards = DecodedRewards::empty();
                                     }
                                     previous_blockhash = latest_entry_blockhash;
 
@@ -1358,7 +1488,7 @@ where
                                                 )
                                             })?;
                                         if reassembled.is_empty() {
-                                            this_block_rewards.clear();
+                                            this_block_rewards = DecodedRewards::empty();
                                             if reward_enabled
                                                 && let Some(on_reward_cb) = on_reward.as_ref()
                                             {
@@ -1380,35 +1510,17 @@ where
                                             continue;
                                         }
 
-                                        let decompressed = utils::decompress_zstd(reassembled)
-                                            .map_err(|err| {
-                                                (
-                                                    FirehoseError::NodeDecodingError(
-                                                        item_index,
-                                                        err,
-                                                    ),
-                                                    error_slot,
-                                                )
-                                            })?;
-
-                                        let decoded =
-                                            prost_011::Message::decode(decompressed.as_slice())
+                                        let decoded_rewards =
+                                            decode_rewards_from_frame(block.slot, reassembled)
                                                 .map_err(|err| {
                                                     (
                                                         FirehoseError::NodeDecodingError(
                                                             item_index,
-                                                            Box::new(err),
+                                                            err,
                                                         ),
                                                         error_slot,
                                                     )
                                                 })?;
-                                        let keyed_rewards = convert_proto_rewards(&decoded)
-                                            .map_err(|err| {
-                                                (
-                                                    FirehoseError::NodeDecodingError(item_index, err),
-                                                    error_slot,
-                                                )
-                                            })?;
                                         if reward_enabled
                                             && let Some(on_reward_cb) = on_reward.as_ref()
                                         {
@@ -1416,7 +1528,7 @@ where
                                                 thread_index,
                                                 RewardsData {
                                                     slot: block.slot,
-                                                    rewards: keyed_rewards.clone(),
+                                                    rewards: decoded_rewards.keyed_rewards.clone(),
                                                 },
                                             )
                                             .await
@@ -1427,10 +1539,10 @@ where
                                                 )
                                             })?;
                                         }
-                                        this_block_rewards = keyed_rewards;
+                                        this_block_rewards = decoded_rewards;
                                         if let Some(ref mut stats) = thread_stats {
                                             stats.rewards_processed +=
-                                                this_block_rewards.len() as u64;
+                                                this_block_rewards.keyed_rewards.len() as u64;
                                         }
                                     }
                                 }
@@ -1938,7 +2050,7 @@ async fn firehose_geyser_thread(
                     let mut entry_index: usize = 0;
                     let mut this_block_executed_transaction_count: u64 = 0;
                     let mut this_block_entry_count: u64 = 0;
-                    let mut this_block_rewards: Vec<(Address, RewardInfo)> = Vec::new();
+                    let mut this_block_rewards = DecodedRewards::empty();
 
                     if slot <= last_counted_slot {
                         log::debug!(
@@ -1947,7 +2059,6 @@ async fn firehose_geyser_thread(
                             slot,
                             last_counted_slot,
                         );
-                        this_block_rewards.clear();
                         continue;
                     }
 
@@ -2066,7 +2177,10 @@ async fn firehose_geyser_thread(
                                     last_counted_slot = block.slot;
                                     return Ok(());
                                 }
-                                let keyed_rewards = std::mem::take(&mut this_block_rewards);
+                                let DecodedRewards {
+                                    keyed_rewards,
+                                    num_partitions,
+                                } = std::mem::take(&mut this_block_rewards);
                                 let block_meta_notifier = block_meta_notifier_maybe.as_ref().unwrap();
                                 block_meta_notifier.notify_block_metadata(
                                     block.meta.parent_slot,
@@ -2075,7 +2189,7 @@ async fn firehose_geyser_thread(
                                     todo_latest_entry_blockhash.to_string().as_str(),
                                     &KeyedRewardsAndNumPartitions {
                                         keyed_rewards,
-                                        num_partitions: None,
+                                        num_partitions,
                                     },
                                     Some(block.meta.blocktime as i64),
                                     block.meta.block_height,
@@ -2089,15 +2203,14 @@ async fn firehose_geyser_thread(
                             Subset(_subset) => (),
                             Epoch(_epoch) => (),
                             Rewards(rewards) => {
-                                if !rewards.is_complete() {
-                                    let reassembled = nodes.reassemble_dataframes(rewards.data.clone())?;
-                                    let decompressed = utils::decompress_zstd(reassembled)?;
-                                    let decoded = prost_011::Message::decode(decompressed.as_slice()).map_err(|err| {
-                                        Box::new(std::io::Error::other(
-                                            std::format!("Error decoding rewards: {:?}", err),
-                                        ))
-                                    })?;
-                                    this_block_rewards = convert_proto_rewards(&decoded)?;
+                                let reassembled = nodes.reassemble_dataframes(rewards.data.clone())?;
+                                if !reassembled.is_empty() {
+                                    this_block_rewards = decode_rewards_from_frame(
+                                        block.slot,
+                                        reassembled,
+                                    )?;
+                                } else {
+                                    this_block_rewards = DecodedRewards::empty();
                                 }
                             }
                             DataFrame(_data_frame) => (),

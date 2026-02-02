@@ -727,9 +727,41 @@ impl CidOffsetIndex {
         }
         let bucket_header = BucketHeader::from_bytes(header_bytes.try_into().unwrap());
         let stride = bucket_header.hash_len as usize + self.header.value_size as usize;
+        if stride == 0 {
+            if bucket_header.num_entries == 0 {
+                return Ok(Arc::new(RemoteBucketData::new(
+                    bucket_header,
+                    Vec::new(),
+                    stride,
+                    self.header.value_size as usize,
+                )));
+            }
+            return Err(SlotOffsetIndexError::IndexFormatError(
+                self.object.url().clone(),
+                "bucket stride is zero for non-empty bucket".to_string(),
+            ));
+        }
         let data_len = stride * bucket_header.num_entries as usize;
+        if data_len == 0 {
+            return Ok(Arc::new(RemoteBucketData::new(
+                bucket_header,
+                Vec::new(),
+                stride,
+                self.header.value_size as usize,
+            )));
+        }
         let data_start = bucket_header.file_offset;
-        let data_end = data_start + data_len as u64 - 1;
+        let data_end = data_start
+            .checked_add(data_len as u64)
+            .and_then(|end| end.checked_sub(1))
+            .ok_or_else(|| {
+                SlotOffsetIndexError::IndexFormatError(
+                    self.object.url().clone(),
+                    format!(
+                        "bucket data range overflow (offset {data_start}, len {data_len})"
+                    ),
+                )
+            })?;
         let data = self.object.fetch_range(data_start, data_end, true).await?;
         if data.len() != data_len {
             return Err(SlotOffsetIndexError::IndexFormatError(
@@ -1648,4 +1680,79 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn test_bucket_lookup_eytzinger_layout() {
+        let keys: [&[u8]; 3] = [b"alpha", b"beta", b"gamma"];
+        let hash_len = 4u8;
+
+        let mut domain = None;
+        for candidate in 0u32..1000 {
+            let mut hashes = keys
+                .iter()
+                .map(|key| truncated_entry_hash(candidate, key, hash_len))
+                .collect::<Vec<_>>();
+            hashes.sort_unstable();
+            hashes.dedup();
+            if hashes.len() == keys.len() {
+                domain = Some(candidate);
+                break;
+            }
+        }
+        let hash_domain = domain.expect("hash collisions in test data");
+
+        let mut entries: Vec<(u64, Vec<u8>)> = keys
+            .iter()
+            .enumerate()
+            .map(|(idx, key)| {
+                let hash = truncated_entry_hash(hash_domain, key, hash_len);
+                let value = (idx as u32).to_le_bytes().to_vec();
+                (hash, value)
+            })
+            .collect();
+        entries.sort_by_key(|(hash, _)| *hash);
+
+        fn build_eytzinger(
+            sorted: &[(u64, Vec<u8>)],
+            out: &mut [Option<(u64, Vec<u8>)>],
+            idx: usize,
+        ) {
+            if sorted.is_empty() || idx >= out.len() {
+                return;
+            }
+            let mid = sorted.len() / 2;
+            out[idx] = Some(sorted[mid].clone());
+            build_eytzinger(&sorted[..mid], out, idx * 2 + 1);
+            build_eytzinger(&sorted[mid + 1..], out, idx * 2 + 2);
+        }
+
+        let value_width = 4usize;
+        let stride = hash_len as usize + value_width;
+        let mut eytzinger = vec![None; entries.len()];
+        build_eytzinger(&entries, &mut eytzinger, 0);
+        let mut data = Vec::with_capacity(entries.len() * stride);
+        for entry in eytzinger.into_iter() {
+            let (hash, value) = entry.expect("eytzinger layout should be filled");
+            for i in 0..hash_len as usize {
+                data.push(((hash >> (8 * i)) & 0xff) as u8);
+            }
+            data.extend_from_slice(&value);
+        }
+
+        let header = BucketHeader {
+            hash_domain,
+            num_entries: entries.len() as u32,
+            hash_len,
+            file_offset: 0,
+        };
+        let bucket = RemoteBucketData::new(header, data, stride, value_width);
+
+        let expected = (1u32).to_le_bytes().to_vec();
+        let got = bucket
+            .lookup(b"beta")
+            .expect("lookup should succeed")
+            .expect("beta should be present");
+        assert_eq!(got, expected);
+    }
+
 }

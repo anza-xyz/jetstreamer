@@ -442,18 +442,29 @@ impl BankReplay {
                                 "bank_for_slot program cache prune starting: slot {}",
                                 prune_slot
                             );
+                            let rss_before = read_rss_bytes();
                             bank.prune_program_cache(prune_slot, bank.epoch());
+                            let rss_after = read_rss_bytes();
+                            let rss_saved = match (rss_before, rss_after) {
+                                (Some(before), Some(after)) if before > after => {
+                                    format_bytes(before - after)
+                                }
+                                (Some(_), Some(_)) => "0B".to_string(),
+                                _ => "n/a".to_string(),
+                            };
                             let elapsed = start.elapsed();
                             info!(
-                                "bank_for_slot program cache prune finished: slot {} took {:.3}s",
+                                "bank_for_slot program cache prune finished: slot {} took {:.3}s rss_saved={}",
                                 prune_slot,
-                                elapsed.as_secs_f64()
+                                elapsed.as_secs_f64(),
+                                rss_saved
                             );
                             if elapsed >= BANK_FOR_SLOT_WARN_AFTER {
                                 warn!(
-                                    "bank_for_slot program cache prune async: slot {} took {:.3}s",
+                                    "bank_for_slot program cache prune async: slot {} took {:.3}s rss_saved={}",
                                     prune_slot,
-                                    elapsed.as_secs_f64()
+                                    elapsed.as_secs_f64(),
+                                    rss_saved
                                 );
                             }
                             inflight.store(false, Ordering::SeqCst);
@@ -2347,6 +2358,17 @@ fn format_bytes(bytes: u64) -> String {
     } else {
         format!("{bytes}B")
     }
+}
+
+fn read_rss_bytes() -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    for line in status.lines() {
+        if let Some(value) = line.strip_prefix("VmRSS:") {
+            let kb = value.trim().split_whitespace().next()?.parse::<u64>().ok()?;
+            return kb.checked_mul(1024);
+        }
+    }
+    None
 }
 
 fn epoch_to_slot(epoch: u64) -> u64 {

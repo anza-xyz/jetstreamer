@@ -193,6 +193,7 @@ struct BankReplay {
     cursor: Arc<ReplayCursor>,
     debug_signature: Option<Signature>,
     prune_inflight: Arc<AtomicBool>,
+    last_root_set: Arc<AtomicU64>,
     cached_bank: Mutex<Option<CachedBank>>,
     execution_gate: Arc<Mutex<()>>,
     firehose_gate: Arc<Mutex<()>>,
@@ -250,6 +251,7 @@ impl BankReplay {
             cursor,
             debug_signature,
             prune_inflight: Arc::new(AtomicBool::new(false)),
+            last_root_set: Arc::new(AtomicU64::new(0)),
             cached_bank,
             execution_gate: Arc::new(Mutex::new(())),
             firehose_gate,
@@ -336,25 +338,37 @@ impl BankReplay {
             self.cursor.update_inflight_stage("insert_bank");
             let bank_with_scheduler = guard.insert(next_bank);
             if let Some(interval) = self.root_interval {
-                if interval > 0 && parent_slot % interval == 0 {
-                    self.cursor.update_inflight_stage("root_set");
-                    let root_start = Instant::now();
-                    guard.set_root(parent_slot, None, None);
-                    let set_elapsed = root_start.elapsed();
-                    if set_elapsed >= BANK_FOR_SLOT_WARN_AFTER {
-                        warn!(
-                            "bank_for_slot root set slow: slot {} took {:.3}s",
-                            parent_slot,
-                            set_elapsed.as_secs_f64()
-                        );
-                    }
-                    if self.enable_program_cache_prune {
-                        prune_request = Some(parent_slot);
-                    } else {
-                        warn!(
-                            "bank_for_slot skipping program cache prune at slot {} (debug)",
-                            parent_slot
-                        );
+                if interval > 0 {
+                    let root_slot = parent_slot.saturating_sub(parent_slot % interval);
+                    let last_root = self.last_root_set.load(Ordering::Relaxed);
+                    if root_slot > 0 && root_slot > last_root {
+                        self.cursor.update_inflight_stage("root_set");
+                        let root_start = Instant::now();
+                        if guard.get(root_slot).is_some() {
+                            guard.set_root(root_slot, None, None);
+                        } else {
+                            warn!(
+                                "bank_for_slot program cache prune skipped: missing root bank slot {}",
+                                root_slot
+                            );
+                        }
+                        self.last_root_set.store(root_slot, Ordering::Relaxed);
+                        let set_elapsed = root_start.elapsed();
+                        if set_elapsed >= BANK_FOR_SLOT_WARN_AFTER {
+                            warn!(
+                                "bank_for_slot root set slow: slot {} took {:.3}s",
+                                root_slot,
+                                set_elapsed.as_secs_f64()
+                            );
+                        }
+                        if self.enable_program_cache_prune {
+                            prune_request = Some(root_slot);
+                        } else {
+                            warn!(
+                                "bank_for_slot skipping program cache prune at slot {} (debug)",
+                                root_slot
+                            );
+                        }
                     }
                 }
             }
@@ -377,9 +391,7 @@ impl BankReplay {
                             if let Ok(guard) = firehose_gate.try_lock() {
                                 break guard;
                             }
-                            if last_progress.elapsed()
-                                >= PROGRAM_CACHE_PRUNE_PROGRESS_INTERVAL
-                            {
+                            if last_progress.elapsed() >= PROGRAM_CACHE_PRUNE_PROGRESS_INTERVAL {
                                 warn!(
                                     "bank_for_slot waiting on firehose gate for program cache prune: slot {}",
                                     prune_slot
@@ -393,9 +405,7 @@ impl BankReplay {
                             if let Ok(guard) = execution_gate.try_lock() {
                                 break guard;
                             }
-                            if last_progress.elapsed()
-                                >= PROGRAM_CACHE_PRUNE_PROGRESS_INTERVAL
-                            {
+                            if last_progress.elapsed() >= PROGRAM_CACHE_PRUNE_PROGRESS_INTERVAL {
                                 warn!(
                                     "bank_for_slot waiting on execution gate for program cache prune: slot {}",
                                     prune_slot
@@ -471,9 +481,7 @@ impl BankReplay {
                             let _ = done_tx.send(());
                         });
                         loop {
-                            match done_rx.recv_timeout(
-                                PROGRAM_CACHE_PRUNE_PROGRESS_INTERVAL,
-                            ) {
+                            match done_rx.recv_timeout(PROGRAM_CACHE_PRUNE_PROGRESS_INTERVAL) {
                                 Ok(()) => break,
                                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                                     warn!(
@@ -2364,7 +2372,12 @@ fn read_rss_bytes() -> Option<u64> {
     let status = std::fs::read_to_string("/proc/self/status").ok()?;
     for line in status.lines() {
         if let Some(value) = line.strip_prefix("VmRSS:") {
-            let kb = value.trim().split_whitespace().next()?.parse::<u64>().ok()?;
+            let kb = value
+                .trim()
+                .split_whitespace()
+                .next()?
+                .parse::<u64>()
+                .ok()?;
             return kb.checked_mul(1024);
         }
     }

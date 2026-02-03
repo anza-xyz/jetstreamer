@@ -191,6 +191,7 @@ struct BankReplay {
     leader_schedule_cache: LeaderScheduleCache,
     failure: Arc<ReplayFailure>,
     cursor: Arc<ReplayCursor>,
+    scheduler: Arc<TransactionScheduler>,
     debug_signature: Option<Signature>,
     prune_inflight: Arc<AtomicBool>,
     last_root_set: Arc<AtomicU64>,
@@ -223,6 +224,7 @@ impl BankReplay {
         root_interval: Option<u64>,
         failure: Arc<ReplayFailure>,
         cursor: Arc<ReplayCursor>,
+        scheduler: Arc<TransactionScheduler>,
         firehose_gate: Arc<Mutex<()>>,
         enable_program_cache_prune: bool,
     ) -> Self {
@@ -249,6 +251,7 @@ impl BankReplay {
             leader_schedule_cache,
             failure,
             cursor,
+            scheduler,
             debug_signature,
             prune_inflight: Arc::new(AtomicBool::new(false)),
             last_root_set: Arc::new(AtomicU64::new(0)),
@@ -380,6 +383,8 @@ impl BankReplay {
                 let bank_forks = Arc::clone(&self.bank_forks);
                 let execution_gate = self.execution_gate.clone();
                 let firehose_gate = self.firehose_gate.clone();
+                let cursor = self.cursor.clone();
+                let scheduler = self.scheduler.clone();
                 if inflight
                     .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
                     .is_ok()
@@ -414,6 +419,29 @@ impl BankReplay {
                             }
                             std::thread::sleep(Duration::from_millis(10));
                         };
+                        if let Some((
+                            slot,
+                            entry_index,
+                            tx_start,
+                            _tx_count,
+                            _sig,
+                            _stage,
+                            _elapsed,
+                        )) = cursor.inflight_snapshot()
+                        {
+                            scheduler.set_resume_target(
+                                slot,
+                                entry_index as usize,
+                                tx_start as usize,
+                            );
+                        } else {
+                            let (slot, entry_index, tx_start, _tx_count, _sig) = cursor.snapshot();
+                            scheduler.set_resume_target(
+                                slot,
+                                entry_index as usize,
+                                tx_start as usize,
+                            );
+                        }
                         let (done_tx, done_rx) = std::sync::mpsc::channel();
                         let bank_forks = Arc::clone(&bank_forks);
                         std::thread::spawn(move || {
@@ -1590,6 +1618,7 @@ fn decode_cid_bytes(bytes: &[u8]) -> Result<Cid, String> {
 struct TransactionScheduler {
     state: Mutex<SchedulerState>,
     presence: Arc<SlotPresenceMap>,
+    resume_target: Mutex<Option<ResumeTarget>>,
 }
 
 #[derive(Debug)]
@@ -1599,6 +1628,13 @@ struct SchedulerState {
     slots: HashMap<Slot, SlotExecutionBuffer>,
     inferred_blocks: HashMap<Slot, (u64, u64)>,
     highest_seen_slot: Slot,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ResumeTarget {
+    slot: Slot,
+    entry_index: usize,
+    tx_start: usize,
 }
 
 #[allow(dead_code)]
@@ -1634,7 +1670,20 @@ impl TransactionScheduler {
                 highest_seen_slot: start_slot.saturating_sub(1),
             }),
             presence,
+            resume_target: Mutex::new(None),
         }
+    }
+
+    fn set_resume_target(&self, slot: Slot, entry_index: usize, tx_start: usize) {
+        if slot == 0 {
+            return;
+        }
+        let mut guard = self.resume_target.lock().expect("resume target lock");
+        *guard = Some(ResumeTarget {
+            slot,
+            entry_index,
+            tx_start,
+        });
     }
 
     fn insert_transaction(
@@ -1654,10 +1703,66 @@ impl TransactionScheduler {
         if slot > state.highest_seen_slot {
             state.highest_seen_slot = slot;
         }
+        let (buffer_has_data, processed_entry_count, processed_tx_count) = {
+            let buffer = state
+                .slots
+                .entry(slot)
+                .or_insert_with(SlotExecutionBuffer::default);
+            (
+                buffer.has_any_data(),
+                buffer.processed_entry_count,
+                buffer.processed_tx_count,
+            )
+        };
+        let mut resume_target_for_slot: Option<ResumeTarget> = None;
+        let mut reset_for_restart = false;
+        if index == 0
+            && buffer_has_data
+            && processed_entry_count == 0
+            && processed_tx_count == 0
+        {
+            let mut resume_target = self
+                .resume_target
+                .lock()
+                .expect("resume target lock");
+            if let Some(target) = resume_target.take() {
+                if target.slot == slot {
+                    resume_target_for_slot = Some(target);
+                } else {
+                    *resume_target = Some(target);
+                }
+            }
+            reset_for_restart = true;
+        } else if !buffer_has_data {
+            if let Ok(mut resume_target) = self.resume_target.lock() {
+                if let Some(target) = resume_target.take() {
+                    if target.slot == slot && target.tx_start > 0 {
+                        resume_target_for_slot = Some(target);
+                    } else {
+                        *resume_target = Some(target);
+                    }
+                }
+            }
+        }
+        if reset_for_restart {
+            state.inferred_blocks.remove(&slot);
+        }
         let buffer = state
             .slots
             .entry(slot)
             .or_insert_with(SlotExecutionBuffer::default);
+        if reset_for_restart {
+            buffer.reset_for_restart();
+        }
+        if let Some(target) = resume_target_for_slot {
+            buffer.apply_resume_counts(target.entry_index, target.tx_start);
+            info!(
+                "firehose restart detected; resuming slot {} from entry {} tx_index {}",
+                slot, target.entry_index, target.tx_start
+            );
+        } else if reset_for_restart {
+            info!("firehose restart detected; resetting slot buffer for slot {slot}");
+        }
         buffer.insert_transaction(index, tx, expected_status)?;
         self.advance_ready_locked(&mut state)
     }
@@ -1680,10 +1785,66 @@ impl TransactionScheduler {
         if slot > state.highest_seen_slot {
             state.highest_seen_slot = slot;
         }
+        let (buffer_has_data, processed_entry_count, processed_tx_count) = {
+            let buffer = state
+                .slots
+                .entry(slot)
+                .or_insert_with(SlotExecutionBuffer::default);
+            (
+                buffer.has_any_data(),
+                buffer.processed_entry_count,
+                buffer.processed_tx_count,
+            )
+        };
+        let mut resume_target_for_slot: Option<ResumeTarget> = None;
+        let mut reset_for_restart = false;
+        if entry_index == 0
+            && buffer_has_data
+            && processed_entry_count == 0
+            && processed_tx_count == 0
+        {
+            let mut resume_target = self
+                .resume_target
+                .lock()
+                .expect("resume target lock");
+            if let Some(target) = resume_target.take() {
+                if target.slot == slot {
+                    resume_target_for_slot = Some(target);
+                } else {
+                    *resume_target = Some(target);
+                }
+            }
+            reset_for_restart = true;
+        } else if !buffer_has_data {
+            if let Ok(mut resume_target) = self.resume_target.lock() {
+                if let Some(target) = resume_target.take() {
+                    if target.slot == slot && target.tx_start > 0 {
+                        resume_target_for_slot = Some(target);
+                    } else {
+                        *resume_target = Some(target);
+                    }
+                }
+            }
+        }
+        if reset_for_restart {
+            state.inferred_blocks.remove(&slot);
+        }
         let buffer = state
             .slots
             .entry(slot)
             .or_insert_with(SlotExecutionBuffer::default);
+        if reset_for_restart {
+            buffer.reset_for_restart();
+        }
+        if let Some(target) = resume_target_for_slot {
+            buffer.apply_resume_counts(target.entry_index, target.tx_start);
+            info!(
+                "firehose restart detected; resuming slot {} from entry {} tx_index {}",
+                slot, target.entry_index, target.tx_start
+            );
+        } else if reset_for_restart {
+            info!("firehose restart detected; resetting slot buffer for slot {slot}");
+        }
         buffer.push_entry(entry_index, start_index, tx_count, hash)?;
         self.advance_ready_locked(&mut state)
     }
@@ -1854,6 +2015,22 @@ struct SlotExecutionBuffer {
 }
 
 impl SlotExecutionBuffer {
+    fn reset_for_restart(&mut self) {
+        self.txs.clear();
+        self.pending_entries.clear();
+        self.next_entry_index = 0;
+        self.processed_tx_count = 0;
+        self.processed_entry_count = 0;
+        self.expected_tx_count = None;
+        self.expected_entry_count = None;
+    }
+
+    fn apply_resume_counts(&mut self, entry_index: usize, tx_start: usize) {
+        self.next_entry_index = entry_index;
+        self.processed_entry_count = entry_index as u64;
+        self.processed_tx_count = tx_start as u64;
+    }
+
     fn infer_expected_counts_if_missing(&mut self, slot: Slot) -> Option<(u64, u64)> {
         if self.expected_tx_count.is_some() || self.expected_entry_count.is_some() {
             return None;
@@ -3907,6 +4084,7 @@ async fn run_geyser_replay(
         root_interval,
         failure.clone(),
         cursor.clone(),
+        scheduler.clone(),
         firehose_gate.clone(),
         enable_program_cache_prune,
     ));

@@ -934,6 +934,47 @@ struct ReplayCursor {
     inflight: Mutex<Option<InFlightEntry>>,
 }
 
+#[derive(Debug)]
+struct RestartTracker {
+    pending: AtomicBool,
+    slot: AtomicU64,
+    entry_index: AtomicU64,
+    tx_start: AtomicU64,
+}
+
+impl RestartTracker {
+    fn new() -> Self {
+        Self {
+            pending: AtomicBool::new(false),
+            slot: AtomicU64::new(0),
+            entry_index: AtomicU64::new(0),
+            tx_start: AtomicU64::new(0),
+        }
+    }
+
+    fn mark_restart(&self, slot: Slot, entry_index: usize, tx_start: usize) {
+        self.slot.store(slot, Ordering::Relaxed);
+        self.entry_index.store(entry_index as u64, Ordering::Relaxed);
+        self.tx_start.store(tx_start as u64, Ordering::Relaxed);
+        self.pending.store(true, Ordering::Relaxed);
+    }
+
+    fn take_if_slot(&self, slot: Slot) -> Option<ResumeTarget> {
+        if !self.pending.load(Ordering::Relaxed) {
+            return None;
+        }
+        if self.slot.load(Ordering::Relaxed) != slot {
+            return None;
+        }
+        self.pending.store(false, Ordering::Relaxed);
+        Some(ResumeTarget {
+            slot,
+            entry_index: self.entry_index.load(Ordering::Relaxed) as usize,
+            tx_start: self.tx_start.load(Ordering::Relaxed) as usize,
+        })
+    }
+}
+
 impl ReplayCursor {
     fn new() -> Self {
         Self {
@@ -1059,6 +1100,7 @@ struct AbortOnErrorLogger {
     shutdown: Arc<AtomicBool>,
     abort_on_error: bool,
     cursor: Arc<ReplayCursor>,
+    restart_tracker: Arc<RestartTracker>,
 }
 
 impl log::Log for AbortOnErrorLogger {
@@ -1070,6 +1112,17 @@ impl log::Log for AbortOnErrorLogger {
     }
 
     fn log(&self, record: &log::Record) {
+        if record.target().starts_with("jetstreamer::firehose") {
+            let message = record.args().to_string();
+            if let Some(restart_slot) = parse_firehose_restart_slot(&message) {
+                let (_slot, entry_index, tx_start, _tx_count, _sig) = self.cursor.snapshot();
+                self.restart_tracker.mark_restart(
+                    restart_slot,
+                    entry_index as usize,
+                    tx_start as usize,
+                );
+            }
+        }
         if record.target() == "solana_program_runtime::loaded_programs"
             && record
                 .args()
@@ -1116,7 +1169,11 @@ impl log::Log for AbortOnErrorLogger {
     fn flush(&self) {}
 }
 
-fn setup_logger(shutdown: Arc<AtomicBool>, cursor: Arc<ReplayCursor>) {
+fn setup_logger(
+    shutdown: Arc<AtomicBool>,
+    cursor: Arc<ReplayCursor>,
+    restart_tracker: Arc<RestartTracker>,
+) {
     let abort_on_error = match env::var("JETSTREAMER_ABORT_ON_ERROR_LOG") {
         Ok(value) => {
             let value = value.trim().to_ascii_lowercase();
@@ -1134,6 +1191,7 @@ fn setup_logger(shutdown: Arc<AtomicBool>, cursor: Arc<ReplayCursor>) {
         shutdown,
         abort_on_error,
         cursor,
+        restart_tracker,
     }));
     match install {
         Ok(()) => {
@@ -1143,6 +1201,21 @@ fn setup_logger(shutdown: Arc<AtomicBool>, cursor: Arc<ReplayCursor>) {
         Err(_) => {
             eprintln!("jetstreamer logger already initialized; abort_on_error may be disabled");
         }
+    }
+}
+
+fn parse_firehose_restart_slot(message: &str) -> Option<u64> {
+    let needle = "restarting from slot ";
+    let start = message.find(needle)? + needle.len();
+    let after = &message[start..];
+    let digits: String = after
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect();
+    if digits.is_empty() {
+        None
+    } else {
+        digits.parse().ok()
     }
 }
 
@@ -1625,6 +1698,7 @@ struct TransactionScheduler {
     state: Mutex<SchedulerState>,
     presence: Arc<SlotPresenceMap>,
     resume_target: Mutex<Option<ResumeTarget>>,
+    restart_tracker: Arc<RestartTracker>,
 }
 
 #[derive(Debug)]
@@ -1666,7 +1740,11 @@ struct SchedulerSnapshot {
 }
 
 impl TransactionScheduler {
-    fn new(start_slot: Slot, presence: Arc<SlotPresenceMap>) -> Self {
+    fn new(
+        start_slot: Slot,
+        presence: Arc<SlotPresenceMap>,
+        restart_tracker: Arc<RestartTracker>,
+    ) -> Self {
         Self {
             state: Mutex::new(SchedulerState {
                 last_finalized_slot: start_slot.saturating_sub(1),
@@ -1677,6 +1755,7 @@ impl TransactionScheduler {
             }),
             presence,
             resume_target: Mutex::new(None),
+            restart_tracker,
         }
     }
 
@@ -1724,42 +1803,7 @@ impl TransactionScheduler {
         expected_status: Result<(), TransactionError>,
     ) -> Result<Vec<ReadyEntry>, String> {
         let mut state = self.state.lock().expect("transaction scheduler lock");
-        if slot <= state.last_finalized_slot {
-            return Err(format!(
-                "late transaction for slot {slot} (last finalized slot {})",
-                state.last_finalized_slot
-            ));
-        }
-        if slot > state.highest_seen_slot {
-            state.highest_seen_slot = slot;
-        }
-        let (buffer_has_data, processed_entry_count, processed_tx_count) = {
-            let buffer = state
-                .slots
-                .entry(slot)
-                .or_insert_with(SlotExecutionBuffer::default);
-            (
-                buffer.has_any_data(),
-                buffer.processed_entry_count,
-                buffer.processed_tx_count,
-            )
-        };
-        let mut resume_target_for_slot: Option<ResumeTarget> = None;
-        let mut reset_without_resume = false;
-        if index == 0 && buffer_has_data && processed_entry_count == 0 && processed_tx_count == 0 {
-            let mut resume_target = self.resume_target.lock().expect("resume target lock");
-            if let Some(target) = resume_target.take() {
-                if target.slot == slot {
-                    resume_target_for_slot = Some(target);
-                } else {
-                    *resume_target = Some(target);
-                    reset_without_resume = true;
-                }
-            } else {
-                reset_without_resume = true;
-            }
-        }
-        if let Some(target) = resume_target_for_slot {
+        if let Some(target) = self.restart_tracker.take_if_slot(slot) {
             state.inferred_blocks.remove(&slot);
             let buffer = state
                 .slots
@@ -1771,17 +1815,15 @@ impl TransactionScheduler {
                 "firehose restart detected; resuming slot {} from entry {} tx_index {}",
                 slot, target.entry_index, target.tx_start
             );
-        } else if reset_without_resume {
-            state.inferred_blocks.remove(&slot);
-            let buffer = state
-                .slots
-                .entry(slot)
-                .or_insert_with(SlotExecutionBuffer::default);
-            buffer.reset_for_restart();
-            info!(
-                "firehose restart detected; restarting slot {} from beginning (no resume target)",
-                slot
-            );
+        }
+        if slot <= state.last_finalized_slot {
+            return Err(format!(
+                "late transaction for slot {slot} (last finalized slot {})",
+                state.last_finalized_slot
+            ));
+        }
+        if slot > state.highest_seen_slot {
+            state.highest_seen_slot = slot;
         }
         let buffer = state
             .slots
@@ -1800,46 +1842,7 @@ impl TransactionScheduler {
         hash: Hash,
     ) -> Result<Vec<ReadyEntry>, String> {
         let mut state = self.state.lock().expect("transaction scheduler lock");
-        if slot <= state.last_finalized_slot {
-            return Err(format!(
-                "late entry for slot {slot} (last finalized slot {})",
-                state.last_finalized_slot
-            ));
-        }
-        if slot > state.highest_seen_slot {
-            state.highest_seen_slot = slot;
-        }
-        let (buffer_has_data, processed_entry_count, processed_tx_count) = {
-            let buffer = state
-                .slots
-                .entry(slot)
-                .or_insert_with(SlotExecutionBuffer::default);
-            (
-                buffer.has_any_data(),
-                buffer.processed_entry_count,
-                buffer.processed_tx_count,
-            )
-        };
-        let mut resume_target_for_slot: Option<ResumeTarget> = None;
-        let mut reset_without_resume = false;
-        if entry_index == 0
-            && buffer_has_data
-            && processed_entry_count == 0
-            && processed_tx_count == 0
-        {
-            let mut resume_target = self.resume_target.lock().expect("resume target lock");
-            if let Some(target) = resume_target.take() {
-                if target.slot == slot {
-                    resume_target_for_slot = Some(target);
-                } else {
-                    *resume_target = Some(target);
-                    reset_without_resume = true;
-                }
-            } else {
-                reset_without_resume = true;
-            }
-        }
-        if let Some(target) = resume_target_for_slot {
+        if let Some(target) = self.restart_tracker.take_if_slot(slot) {
             state.inferred_blocks.remove(&slot);
             let buffer = state
                 .slots
@@ -1851,17 +1854,15 @@ impl TransactionScheduler {
                 "firehose restart detected; resuming slot {} from entry {} tx_index {}",
                 slot, target.entry_index, target.tx_start
             );
-        } else if reset_without_resume {
-            state.inferred_blocks.remove(&slot);
-            let buffer = state
-                .slots
-                .entry(slot)
-                .or_insert_with(SlotExecutionBuffer::default);
-            buffer.reset_for_restart();
-            info!(
-                "firehose restart detected; restarting slot {} from beginning (no resume target)",
-                slot
-            );
+        }
+        if slot <= state.last_finalized_slot {
+            return Err(format!(
+                "late entry for slot {slot} (last finalized slot {})",
+                state.last_finalized_slot
+            ));
+        }
+        if slot > state.highest_seen_slot {
+            state.highest_seen_slot = slot;
         }
         let buffer = state
             .slots
@@ -4017,6 +4018,7 @@ async fn run_geyser_replay(
     snapshot_archive: &Path,
     shutdown: Arc<AtomicBool>,
     cursor: Arc<ReplayCursor>,
+    restart_tracker: Arc<RestartTracker>,
     snapshot_verifier: Option<Arc<SnapshotVerifier>>,
 ) -> Result<(), String> {
     let libpath = plugin_library_path()?;
@@ -4103,7 +4105,11 @@ async fn run_geyser_replay(
         epoch,
     )
     .await?;
-    let scheduler = Arc::new(TransactionScheduler::new(replay_start, slot_presence));
+    let scheduler = Arc::new(TransactionScheduler::new(
+        replay_start,
+        slot_presence,
+        restart_tracker.clone(),
+    ));
     let firehose_gate = Arc::new(Mutex::new(()));
     let enable_program_cache_prune = env_truthy_default(
         "JETSTREAMER_PROGRAM_CACHE_PRUNE",
@@ -4734,7 +4740,8 @@ async fn extract_tarball(archive: &Path, dest_dir: &Path) -> Result<(), String> 
 async fn main() {
     let shutdown = Arc::new(AtomicBool::new(false));
     let cursor = Arc::new(ReplayCursor::new());
-    setup_logger(shutdown.clone(), cursor.clone());
+    let restart_tracker = Arc::new(RestartTracker::new());
+    setup_logger(shutdown.clone(), cursor.clone(), restart_tracker.clone());
     {
         let shutdown = shutdown.clone();
         if let Err(err) = ctrlc::set_handler(move || {
@@ -4882,6 +4889,7 @@ async fn main() {
         &dest_path,
         shutdown,
         cursor,
+        restart_tracker,
         snapshot_verifier,
     )
     .await

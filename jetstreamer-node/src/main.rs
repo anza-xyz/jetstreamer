@@ -419,13 +419,7 @@ impl BankReplay {
                             }
                             std::thread::sleep(Duration::from_millis(10));
                         };
-                        if let Some(target) = scheduler.current_resume_target() {
-                            scheduler.set_resume_target(
-                                target.slot,
-                                target.entry_index,
-                                target.tx_start,
-                            );
-                        } else if let Some((
+                        if let Some((
                             slot,
                             entry_index,
                             tx_start,
@@ -435,6 +429,10 @@ impl BankReplay {
                             _elapsed,
                         )) = cursor.inflight_snapshot()
                         {
+                            info!(
+                                "firehose pause resume target source: inflight slot {} entry {} tx_index {}",
+                                slot, entry_index, tx_start
+                            );
                             scheduler.set_resume_target(
                                 slot,
                                 entry_index as usize,
@@ -442,11 +440,27 @@ impl BankReplay {
                             );
                         } else {
                             let (slot, entry_index, tx_start, _tx_count, _sig) = cursor.snapshot();
-                            scheduler.set_resume_target(
-                                slot,
-                                entry_index as usize,
-                                tx_start as usize,
-                            );
+                            if slot > 0 {
+                                info!(
+                                    "firehose pause resume target source: cursor slot {} entry {} tx_index {}",
+                                    slot, entry_index, tx_start
+                                );
+                                scheduler.set_resume_target(
+                                    slot,
+                                    entry_index as usize,
+                                    tx_start as usize,
+                                );
+                            } else if let Some(target) = scheduler.current_resume_target() {
+                                info!(
+                                    "firehose pause resume target source: scheduler slot {} entry {} tx_index {}",
+                                    target.slot, target.entry_index, target.tx_start
+                                );
+                                scheduler.set_resume_target(
+                                    target.slot,
+                                    target.entry_index,
+                                    target.tx_start,
+                                );
+                            }
                         }
                         let (done_tx, done_rx) = std::sync::mpsc::channel();
                         let bank_forks = Arc::clone(&bank_forks);
@@ -1795,6 +1809,22 @@ impl TransactionScheduler {
         })
     }
 
+    fn take_resume_target(&self, slot: Slot) -> Option<ResumeTarget> {
+        let mut guard = self.resume_target.lock().expect("resume target lock");
+        let target = guard.as_ref()?;
+        if target.slot == slot {
+            return guard.take();
+        }
+        if target.slot < slot {
+            warn!(
+                "resume target missed: target_slot={} current_slot={}",
+                target.slot, slot
+            );
+            *guard = None;
+        }
+        None
+    }
+
     fn insert_transaction(
         &self,
         slot: Slot,
@@ -1803,7 +1833,9 @@ impl TransactionScheduler {
         expected_status: Result<(), TransactionError>,
     ) -> Result<Vec<ReadyEntry>, String> {
         let mut state = self.state.lock().expect("transaction scheduler lock");
-        if let Some(target) = self.restart_tracker.take_if_slot(slot) {
+        if let Some(target) = self.restart_tracker.take_if_slot(slot)
+            .or_else(|| self.take_resume_target(slot))
+        {
             state.inferred_blocks.remove(&slot);
             let buffer = state
                 .slots
@@ -1812,7 +1844,7 @@ impl TransactionScheduler {
             buffer.reset_for_restart();
             buffer.apply_resume_counts(target.entry_index, target.tx_start);
             info!(
-                "firehose restart detected; resuming slot {} from entry {} tx_index {}",
+                "firehose resume detected; resuming slot {} from entry {} tx_index {}",
                 slot, target.entry_index, target.tx_start
             );
         }
@@ -1842,7 +1874,9 @@ impl TransactionScheduler {
         hash: Hash,
     ) -> Result<Vec<ReadyEntry>, String> {
         let mut state = self.state.lock().expect("transaction scheduler lock");
-        if let Some(target) = self.restart_tracker.take_if_slot(slot) {
+        if let Some(target) = self.restart_tracker.take_if_slot(slot)
+            .or_else(|| self.take_resume_target(slot))
+        {
             state.inferred_blocks.remove(&slot);
             let buffer = state
                 .slots
@@ -1851,7 +1885,7 @@ impl TransactionScheduler {
             buffer.reset_for_restart();
             buffer.apply_resume_counts(target.entry_index, target.tx_start);
             info!(
-                "firehose restart detected; resuming slot {} from entry {} tx_index {}",
+                "firehose resume detected; resuming slot {} from entry {} tx_index {}",
                 slot, target.entry_index, target.tx_start
             );
         }
@@ -2134,21 +2168,6 @@ impl SlotExecutionBuffer {
         tx_count: usize,
         hash: Hash,
     ) -> Result<(), String> {
-        if entry_index > self.next_entry_index
-            && self.pending_entries.is_empty()
-            && self.processed_tx_count == 0
-            && self.processed_entry_count == 0
-            && self.expected_tx_count.is_none()
-            && self.expected_entry_count.is_none()
-        {
-            warn!(
-                "entry index jumped on fresh slot buffer: setting next_entry_index from {} to {} (start_index={}, tx_count={})",
-                self.next_entry_index, entry_index, start_index, tx_count
-            );
-            self.next_entry_index = entry_index;
-            self.processed_entry_count = entry_index as u64;
-            self.processed_tx_count = start_index as u64;
-        }
         if entry_index < self.next_entry_index {
             // Duplicate entry after a firehose restart; already processed.
             return Ok(());

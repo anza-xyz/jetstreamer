@@ -1684,6 +1684,10 @@ impl TransactionScheduler {
             entry_index,
             tx_start,
         });
+        info!(
+            "firehose pause recorded resume target: slot {} entry {} tx_index {}",
+            slot, entry_index, tx_start
+        );
     }
 
     fn insert_transaction(
@@ -1727,7 +1731,7 @@ impl TransactionScheduler {
         } else if !buffer_has_data {
             if let Ok(mut resume_target) = self.resume_target.lock() {
                 if let Some(target) = resume_target.take() {
-                    if target.slot == slot && target.tx_start > 0 {
+                    if target.slot == slot && (target.entry_index > 0 || target.tx_start > 0) {
                         resume_target_for_slot = Some(target);
                     } else {
                         *resume_target = Some(target);
@@ -1802,7 +1806,7 @@ impl TransactionScheduler {
         } else if !buffer_has_data {
             if let Ok(mut resume_target) = self.resume_target.lock() {
                 if let Some(target) = resume_target.take() {
-                    if target.slot == slot && target.tx_start > 0 {
+                    if target.slot == slot && (target.entry_index > 0 || target.tx_start > 0) {
                         resume_target_for_slot = Some(target);
                     } else {
                         *resume_target = Some(target);

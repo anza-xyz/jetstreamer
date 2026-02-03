@@ -419,7 +419,13 @@ impl BankReplay {
                             }
                             std::thread::sleep(Duration::from_millis(10));
                         };
-                        if let Some((
+                        if let Some(target) = scheduler.current_resume_target() {
+                            scheduler.set_resume_target(
+                                target.slot,
+                                target.entry_index,
+                                target.tx_start,
+                            );
+                        } else if let Some((
                             slot,
                             entry_index,
                             tx_start,
@@ -1690,6 +1696,26 @@ impl TransactionScheduler {
         );
     }
 
+    fn current_resume_target(&self) -> Option<ResumeTarget> {
+        let state = self.state.lock().expect("transaction scheduler lock");
+        let slot = state.current_slot;
+        if slot == 0 {
+            return None;
+        }
+        if let Some(buffer) = state.slots.get(&slot) {
+            return Some(ResumeTarget {
+                slot,
+                entry_index: buffer.processed_entry_count as usize,
+                tx_start: buffer.processed_tx_count as usize,
+            });
+        }
+        Some(ResumeTarget {
+            slot,
+            entry_index: 0,
+            tx_start: 0,
+        })
+    }
+
     fn insert_transaction(
         &self,
         slot: Slot,
@@ -1728,16 +1754,6 @@ impl TransactionScheduler {
                     *resume_target = Some(target);
                 }
             }
-        } else if !buffer_has_data {
-            if let Ok(mut resume_target) = self.resume_target.lock() {
-                if let Some(target) = resume_target.take() {
-                    if target.slot == slot && (target.entry_index > 0 || target.tx_start > 0) {
-                        resume_target_for_slot = Some(target);
-                    } else {
-                        *resume_target = Some(target);
-                    }
-                }
-            }
         }
         if let Some(target) = resume_target_for_slot {
             state.inferred_blocks.remove(&slot);
@@ -1750,6 +1766,15 @@ impl TransactionScheduler {
             info!(
                 "firehose restart detected; resuming slot {} from entry {} tx_index {}",
                 slot, target.entry_index, target.tx_start
+            );
+        } else if index == 0
+            && buffer_has_data
+            && processed_entry_count == 0
+            && processed_tx_count == 0
+        {
+            info!(
+                "firehose restart detected; no resume target for slot {}",
+                slot
             );
         }
         let buffer = state
@@ -1803,16 +1828,6 @@ impl TransactionScheduler {
                     *resume_target = Some(target);
                 }
             }
-        } else if !buffer_has_data {
-            if let Ok(mut resume_target) = self.resume_target.lock() {
-                if let Some(target) = resume_target.take() {
-                    if target.slot == slot && (target.entry_index > 0 || target.tx_start > 0) {
-                        resume_target_for_slot = Some(target);
-                    } else {
-                        *resume_target = Some(target);
-                    }
-                }
-            }
         }
         if let Some(target) = resume_target_for_slot {
             state.inferred_blocks.remove(&slot);
@@ -1825,6 +1840,15 @@ impl TransactionScheduler {
             info!(
                 "firehose restart detected; resuming slot {} from entry {} tx_index {}",
                 slot, target.entry_index, target.tx_start
+            );
+        } else if entry_index == 0
+            && buffer_has_data
+            && processed_entry_count == 0
+            && processed_tx_count == 0
+        {
+            info!(
+                "firehose restart detected; no resume target for slot {}",
+                slot
             );
         }
         let buffer = state

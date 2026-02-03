@@ -387,20 +387,6 @@ impl BankReplay {
                     std::thread::spawn(move || {
                         let start = Instant::now();
                         let mut last_progress = Instant::now();
-                        let _firehose_guard = loop {
-                            if let Ok(guard) = firehose_gate.try_lock() {
-                                break guard;
-                            }
-                            if last_progress.elapsed() >= PROGRAM_CACHE_PRUNE_PROGRESS_INTERVAL {
-                                warn!(
-                                    "bank_for_slot waiting on firehose gate for program cache prune: slot {}",
-                                    prune_slot
-                                );
-                                last_progress = Instant::now();
-                            }
-                            std::thread::sleep(Duration::from_millis(10));
-                        };
-                        last_progress = Instant::now();
                         let _execution_guard = loop {
                             if let Ok(guard) = execution_gate.try_lock() {
                                 break guard;
@@ -408,6 +394,20 @@ impl BankReplay {
                             if last_progress.elapsed() >= PROGRAM_CACHE_PRUNE_PROGRESS_INTERVAL {
                                 warn!(
                                     "bank_for_slot waiting on execution gate for program cache prune: slot {}",
+                                    prune_slot
+                                );
+                                last_progress = Instant::now();
+                            }
+                            std::thread::sleep(Duration::from_millis(10));
+                        };
+                        last_progress = Instant::now();
+                        let _firehose_guard = loop {
+                            if let Ok(guard) = firehose_gate.try_lock() {
+                                break guard;
+                            }
+                            if last_progress.elapsed() >= PROGRAM_CACHE_PRUNE_PROGRESS_INTERVAL {
+                                warn!(
+                                    "bank_for_slot waiting on firehose gate for program cache prune: slot {}",
                                     prune_slot
                                 );
                                 last_progress = Instant::now();

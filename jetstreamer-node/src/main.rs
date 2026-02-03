@@ -2133,18 +2133,16 @@ impl SlotExecutionBuffer {
         tx_count: usize,
         hash: Hash,
     ) -> Result<(), String> {
-        if self.next_entry_index == 0
-            && entry_index > 0
+        if entry_index > self.next_entry_index
             && self.pending_entries.is_empty()
-            && self.txs.iter().all(|value| value.is_none())
             && self.processed_tx_count == 0
             && self.processed_entry_count == 0
             && self.expected_tx_count.is_none()
             && self.expected_entry_count.is_none()
         {
             warn!(
-                "entry index jumped on fresh slot buffer: setting next_entry_index from 0 to {} (start_index={}, tx_count={})",
-                entry_index, start_index, tx_count
+                "entry index jumped on fresh slot buffer: setting next_entry_index from {} to {} (start_index={}, tx_count={})",
+                self.next_entry_index, entry_index, start_index, tx_count
             );
             self.next_entry_index = entry_index;
             self.processed_entry_count = entry_index as u64;

@@ -1715,16 +1715,8 @@ impl TransactionScheduler {
             )
         };
         let mut resume_target_for_slot: Option<ResumeTarget> = None;
-        let mut reset_for_restart = false;
-        if index == 0
-            && buffer_has_data
-            && processed_entry_count == 0
-            && processed_tx_count == 0
-        {
-            let mut resume_target = self
-                .resume_target
-                .lock()
-                .expect("resume target lock");
+        if index == 0 && buffer_has_data && processed_entry_count == 0 && processed_tx_count == 0 {
+            let mut resume_target = self.resume_target.lock().expect("resume target lock");
             if let Some(target) = resume_target.take() {
                 if target.slot == slot {
                     resume_target_for_slot = Some(target);
@@ -1732,7 +1724,6 @@ impl TransactionScheduler {
                     *resume_target = Some(target);
                 }
             }
-            reset_for_restart = true;
         } else if !buffer_has_data {
             if let Ok(mut resume_target) = self.resume_target.lock() {
                 if let Some(target) = resume_target.take() {
@@ -1744,25 +1735,23 @@ impl TransactionScheduler {
                 }
             }
         }
-        if reset_for_restart {
-            state.inferred_blocks.remove(&slot);
-        }
-        let buffer = state
-            .slots
-            .entry(slot)
-            .or_insert_with(SlotExecutionBuffer::default);
-        if reset_for_restart {
-            buffer.reset_for_restart();
-        }
         if let Some(target) = resume_target_for_slot {
+            state.inferred_blocks.remove(&slot);
+            let buffer = state
+                .slots
+                .entry(slot)
+                .or_insert_with(SlotExecutionBuffer::default);
+            buffer.reset_for_restart();
             buffer.apply_resume_counts(target.entry_index, target.tx_start);
             info!(
                 "firehose restart detected; resuming slot {} from entry {} tx_index {}",
                 slot, target.entry_index, target.tx_start
             );
-        } else if reset_for_restart {
-            info!("firehose restart detected; resetting slot buffer for slot {slot}");
         }
+        let buffer = state
+            .slots
+            .entry(slot)
+            .or_insert_with(SlotExecutionBuffer::default);
         buffer.insert_transaction(index, tx, expected_status)?;
         self.advance_ready_locked(&mut state)
     }
@@ -1797,16 +1786,12 @@ impl TransactionScheduler {
             )
         };
         let mut resume_target_for_slot: Option<ResumeTarget> = None;
-        let mut reset_for_restart = false;
         if entry_index == 0
             && buffer_has_data
             && processed_entry_count == 0
             && processed_tx_count == 0
         {
-            let mut resume_target = self
-                .resume_target
-                .lock()
-                .expect("resume target lock");
+            let mut resume_target = self.resume_target.lock().expect("resume target lock");
             if let Some(target) = resume_target.take() {
                 if target.slot == slot {
                     resume_target_for_slot = Some(target);
@@ -1814,7 +1799,6 @@ impl TransactionScheduler {
                     *resume_target = Some(target);
                 }
             }
-            reset_for_restart = true;
         } else if !buffer_has_data {
             if let Ok(mut resume_target) = self.resume_target.lock() {
                 if let Some(target) = resume_target.take() {
@@ -1826,25 +1810,23 @@ impl TransactionScheduler {
                 }
             }
         }
-        if reset_for_restart {
-            state.inferred_blocks.remove(&slot);
-        }
-        let buffer = state
-            .slots
-            .entry(slot)
-            .or_insert_with(SlotExecutionBuffer::default);
-        if reset_for_restart {
-            buffer.reset_for_restart();
-        }
         if let Some(target) = resume_target_for_slot {
+            state.inferred_blocks.remove(&slot);
+            let buffer = state
+                .slots
+                .entry(slot)
+                .or_insert_with(SlotExecutionBuffer::default);
+            buffer.reset_for_restart();
             buffer.apply_resume_counts(target.entry_index, target.tx_start);
             info!(
                 "firehose restart detected; resuming slot {} from entry {} tx_index {}",
                 slot, target.entry_index, target.tx_start
             );
-        } else if reset_for_restart {
-            info!("firehose restart detected; resetting slot buffer for slot {slot}");
         }
+        let buffer = state
+            .slots
+            .entry(slot)
+            .or_insert_with(SlotExecutionBuffer::default);
         buffer.push_entry(entry_index, start_index, tx_count, hash)?;
         self.advance_ready_locked(&mut state)
     }

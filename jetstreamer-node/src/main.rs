@@ -1745,6 +1745,7 @@ impl TransactionScheduler {
             )
         };
         let mut resume_target_for_slot: Option<ResumeTarget> = None;
+        let mut reset_without_resume = false;
         if index == 0 && buffer_has_data && processed_entry_count == 0 && processed_tx_count == 0 {
             let mut resume_target = self.resume_target.lock().expect("resume target lock");
             if let Some(target) = resume_target.take() {
@@ -1752,7 +1753,10 @@ impl TransactionScheduler {
                     resume_target_for_slot = Some(target);
                 } else {
                     *resume_target = Some(target);
+                    reset_without_resume = true;
                 }
+            } else {
+                reset_without_resume = true;
             }
         }
         if let Some(target) = resume_target_for_slot {
@@ -1767,13 +1771,15 @@ impl TransactionScheduler {
                 "firehose restart detected; resuming slot {} from entry {} tx_index {}",
                 slot, target.entry_index, target.tx_start
             );
-        } else if index == 0
-            && buffer_has_data
-            && processed_entry_count == 0
-            && processed_tx_count == 0
-        {
+        } else if reset_without_resume {
+            state.inferred_blocks.remove(&slot);
+            let buffer = state
+                .slots
+                .entry(slot)
+                .or_insert_with(SlotExecutionBuffer::default);
+            buffer.reset_for_restart();
             info!(
-                "firehose restart detected; no resume target for slot {}",
+                "firehose restart detected; restarting slot {} from beginning (no resume target)",
                 slot
             );
         }
@@ -1815,6 +1821,7 @@ impl TransactionScheduler {
             )
         };
         let mut resume_target_for_slot: Option<ResumeTarget> = None;
+        let mut reset_without_resume = false;
         if entry_index == 0
             && buffer_has_data
             && processed_entry_count == 0
@@ -1826,7 +1833,10 @@ impl TransactionScheduler {
                     resume_target_for_slot = Some(target);
                 } else {
                     *resume_target = Some(target);
+                    reset_without_resume = true;
                 }
+            } else {
+                reset_without_resume = true;
             }
         }
         if let Some(target) = resume_target_for_slot {
@@ -1841,13 +1851,15 @@ impl TransactionScheduler {
                 "firehose restart detected; resuming slot {} from entry {} tx_index {}",
                 slot, target.entry_index, target.tx_start
             );
-        } else if entry_index == 0
-            && buffer_has_data
-            && processed_entry_count == 0
-            && processed_tx_count == 0
-        {
+        } else if reset_without_resume {
+            state.inferred_blocks.remove(&slot);
+            let buffer = state
+                .slots
+                .entry(slot)
+                .or_insert_with(SlotExecutionBuffer::default);
+            buffer.reset_for_restart();
             info!(
-                "firehose restart detected; no resume target for slot {}",
+                "firehose restart detected; restarting slot {} from beginning (no resume target)",
                 slot
             );
         }

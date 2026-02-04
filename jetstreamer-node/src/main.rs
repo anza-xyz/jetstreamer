@@ -1132,22 +1132,14 @@ impl log::Log for AbortOnErrorLogger {
             if let Some((restart_slot, _item_index)) = parse_firehose_restart_info(&message) {
                 let mut entry_index = 0usize;
                 let mut tx_start = 0usize;
-                if let Some((
-                    inflight_slot,
-                    inflight_entry,
-                    inflight_tx_start,
-                    _tx_count,
-                    _sig,
-                    _stage,
-                    _elapsed,
-                )) = self.cursor.inflight_snapshot()
-                {
-                    if inflight_slot == restart_slot {
-                        entry_index = inflight_entry as usize;
-                        tx_start = inflight_tx_start as usize;
-                    }
-                } else {
-                    let (slot, entry, tx_start_snapshot, _tx_count, _sig) = self.cursor.snapshot();
+                let inflight_for_slot = self
+                    .cursor
+                    .inflight_snapshot()
+                    .map(|(slot, _, _, _, _, _, _)| slot == restart_slot)
+                    .unwrap_or(false);
+                if !inflight_for_slot {
+                    let (slot, entry, tx_start_snapshot, _tx_count, _sig) =
+                        self.cursor.snapshot();
                     if slot == restart_slot {
                         entry_index = entry as usize;
                         tx_start = tx_start_snapshot as usize;

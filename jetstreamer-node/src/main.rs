@@ -1128,13 +1128,33 @@ impl log::Log for AbortOnErrorLogger {
     fn log(&self, record: &log::Record) {
         if record.target().starts_with("jetstreamer::firehose") {
             let message = record.args().to_string();
-            if let Some(restart_slot) = parse_firehose_restart_slot(&message) {
-                let (_slot, entry_index, tx_start, _tx_count, _sig) = self.cursor.snapshot();
-                self.restart_tracker.mark_restart(
-                    restart_slot,
-                    entry_index as usize,
-                    tx_start as usize,
-                );
+            if let Some((restart_slot, _item_index)) = parse_firehose_restart_info(&message) {
+                let mut entry_index = 0usize;
+                let mut tx_start = 0usize;
+                if let Some((
+                    inflight_slot,
+                    inflight_entry,
+                    inflight_tx_start,
+                    _tx_count,
+                    _sig,
+                    _stage,
+                    _elapsed,
+                )) = self.cursor.inflight_snapshot()
+                {
+                    if inflight_slot == restart_slot {
+                        entry_index = inflight_entry as usize;
+                        tx_start = inflight_tx_start as usize;
+                    }
+                } else {
+                    let (slot, entry, tx_start_snapshot, _tx_count, _sig) =
+                        self.cursor.snapshot();
+                    if slot == restart_slot {
+                        entry_index = entry as usize;
+                        tx_start = tx_start_snapshot as usize;
+                    }
+                }
+                self.restart_tracker
+                    .mark_restart(restart_slot, entry_index, tx_start);
             }
         }
         if record.target() == "solana_program_runtime::loaded_programs"
@@ -1218,19 +1238,26 @@ fn setup_logger(
     }
 }
 
-fn parse_firehose_restart_slot(message: &str) -> Option<u64> {
+fn parse_firehose_restart_info(message: &str) -> Option<(u64, u64)> {
     let needle = "restarting from slot ";
     let start = message.find(needle)? + needle.len();
     let after = &message[start..];
-    let digits: String = after
+    let slot_digits: String = after
         .chars()
         .take_while(|ch| ch.is_ascii_digit())
         .collect();
-    if digits.is_empty() {
-        None
+    let slot: u64 = slot_digits.parse().ok()?;
+    let index = if let Some(index_start) = after.find(" at index ") {
+        let after_index = &after[index_start + " at index ".len()..];
+        let index_digits: String = after_index
+            .chars()
+            .take_while(|ch| ch.is_ascii_digit())
+            .collect();
+        index_digits.parse().unwrap_or(0)
     } else {
-        digits.parse().ok()
-    }
+        0
+    };
+    Some((slot, index))
 }
 
 impl ReplayFailure {
@@ -1789,6 +1816,44 @@ impl TransactionScheduler {
         );
     }
 
+    fn apply_restart_locked(&self, state: &mut SchedulerState, target: ResumeTarget) {
+        let restart_slot = target.slot;
+        let mut resume_entry = target.entry_index;
+        let mut resume_tx = target.tx_start;
+        if let Some(buffer) = state.slots.get(&restart_slot) {
+            resume_entry = resume_entry.max(buffer.processed_entry_count as usize);
+            resume_tx = resume_tx.max(buffer.processed_tx_count as usize);
+        }
+        state
+            .slots
+            .retain(|slot, _| *slot < restart_slot);
+        state
+            .inferred_blocks
+            .retain(|slot, _| *slot < restart_slot);
+        if state.current_slot >= restart_slot {
+            state.current_slot = restart_slot;
+        }
+        if state.last_finalized_slot >= restart_slot {
+            state.last_finalized_slot = restart_slot.saturating_sub(1);
+        }
+        state.highest_seen_slot = state
+            .slots
+            .keys()
+            .copied()
+            .max()
+            .unwrap_or(state.last_finalized_slot);
+        let buffer = state
+            .slots
+            .entry(restart_slot)
+            .or_insert_with(SlotExecutionBuffer::default);
+        buffer.reset_for_restart();
+        buffer.apply_resume_counts(resume_entry, resume_tx);
+        info!(
+            "firehose restart detected; restarting slot {} from entry {} tx_index {}",
+            restart_slot, resume_entry, resume_tx
+        );
+    }
+
     fn current_resume_target(&self) -> Option<ResumeTarget> {
         let state = self.state.lock().expect("transaction scheduler lock");
         let slot = state.current_slot;
@@ -1831,11 +1896,11 @@ impl TransactionScheduler {
         index: usize,
         tx: VersionedTransaction,
         expected_status: Result<(), TransactionError>,
-    ) -> Result<Vec<ReadyEntry>, String> {
+    ) -> Result<(Vec<ReadyEntry>, bool), String> {
         let mut state = self.state.lock().expect("transaction scheduler lock");
-        if let Some(target) = self.restart_tracker.take_if_slot(slot)
-            .or_else(|| self.take_resume_target(slot))
-        {
+        if let Some(target) = self.restart_tracker.take_if_slot(slot) {
+            self.apply_restart_locked(&mut state, target);
+        } else if let Some(target) = self.take_resume_target(slot) {
             state.inferred_blocks.remove(&slot);
             let buffer = state
                 .slots
@@ -1861,8 +1926,9 @@ impl TransactionScheduler {
             .slots
             .entry(slot)
             .or_insert_with(SlotExecutionBuffer::default);
-        buffer.insert_transaction(index, tx, expected_status)?;
-        self.advance_ready_locked(&mut state)
+        let inserted = buffer.insert_transaction(index, tx, expected_status)?;
+        let ready = self.advance_ready_locked(&mut state)?;
+        Ok((ready, inserted))
     }
 
     fn push_entry(
@@ -1872,11 +1938,11 @@ impl TransactionScheduler {
         start_index: usize,
         tx_count: usize,
         hash: Hash,
-    ) -> Result<Vec<ReadyEntry>, String> {
+    ) -> Result<(Vec<ReadyEntry>, bool), String> {
         let mut state = self.state.lock().expect("transaction scheduler lock");
-        if let Some(target) = self.restart_tracker.take_if_slot(slot)
-            .or_else(|| self.take_resume_target(slot))
-        {
+        if let Some(target) = self.restart_tracker.take_if_slot(slot) {
+            self.apply_restart_locked(&mut state, target);
+        } else if let Some(target) = self.take_resume_target(slot) {
             state.inferred_blocks.remove(&slot);
             let buffer = state
                 .slots
@@ -1902,8 +1968,9 @@ impl TransactionScheduler {
             .slots
             .entry(slot)
             .or_insert_with(SlotExecutionBuffer::default);
-        buffer.push_entry(entry_index, start_index, tx_count, hash)?;
-        self.advance_ready_locked(&mut state)
+        let inserted = buffer.push_entry(entry_index, start_index, tx_count, hash)?;
+        let ready = self.advance_ready_locked(&mut state)?;
+        Ok((ready, inserted))
     }
 
     fn record_block_metadata(
@@ -2134,10 +2201,10 @@ impl SlotExecutionBuffer {
         index: usize,
         tx: VersionedTransaction,
         expected_status: Result<(), TransactionError>,
-    ) -> Result<(), String> {
+    ) -> Result<bool, String> {
         if (index as u64) < self.processed_tx_count {
             // Duplicate transaction after a firehose restart; already processed.
-            return Ok(());
+            return Ok(false);
         }
         if self.txs.len() <= index {
             self.txs.resize_with(index + 1, || None);
@@ -2147,7 +2214,7 @@ impl SlotExecutionBuffer {
             let incoming_sig = tx.signatures.get(0);
             if existing_sig == incoming_sig && existing.expected_status == expected_status {
                 // Duplicate delivery of the same transaction; ignore.
-                return Ok(());
+                return Ok(false);
             }
             return Err(format!(
                 "duplicate transaction at index {index} (existing_sig={:?}, incoming_sig={:?})",
@@ -2158,7 +2225,7 @@ impl SlotExecutionBuffer {
             tx,
             expected_status,
         });
-        Ok(())
+        Ok(true)
     }
 
     fn push_entry(
@@ -2167,10 +2234,10 @@ impl SlotExecutionBuffer {
         start_index: usize,
         tx_count: usize,
         hash: Hash,
-    ) -> Result<(), String> {
+    ) -> Result<bool, String> {
         if entry_index < self.next_entry_index {
             // Duplicate entry after a firehose restart; already processed.
-            return Ok(());
+            return Ok(false);
         }
         if entry_index != self.next_entry_index {
             return Err(format!(
@@ -2185,7 +2252,7 @@ impl SlotExecutionBuffer {
             tx_count,
             hash,
         });
-        Ok(())
+        Ok(true)
     }
 
     fn drain_ready_entries(&mut self, slot: Slot) -> Result<Vec<ReadyEntry>, String> {
@@ -2209,11 +2276,19 @@ impl SlotExecutionBuffer {
             }
 
             let end = entry.start_index.saturating_add(entry.tx_count);
+            let processed_tx = self.processed_tx_count as usize;
+            if processed_tx >= end {
+                let _entry = self.pending_entries.pop_front().expect("pending entry");
+                self.processed_entry_count = self.processed_entry_count.saturating_add(1);
+                continue;
+            }
+            let effective_start = entry.start_index.max(processed_tx);
+            let effective_count = end.saturating_sub(effective_start);
             if self.txs.len() < end {
                 break;
             }
             let mut missing = false;
-            for idx in entry.start_index..end {
+            for idx in effective_start..end {
                 if self.txs[idx].is_none() {
                     missing = true;
                     break;
@@ -2224,22 +2299,22 @@ impl SlotExecutionBuffer {
             }
 
             let entry = self.pending_entries.pop_front().expect("pending entry");
-            let mut txs = Vec::with_capacity(entry.tx_count);
-            for idx in entry.start_index..end {
+            let mut txs = Vec::with_capacity(effective_count);
+            for idx in effective_start..end {
                 let tx = self.txs[idx].take().expect("transaction present");
                 txs.push(tx);
             }
             self.processed_entry_count = self.processed_entry_count.saturating_add(1);
             self.processed_tx_count = self
                 .processed_tx_count
-                .saturating_add(entry.tx_count as u64);
+                .saturating_add(effective_count as u64);
             ready.push(ReadyEntry {
                 slot,
                 entry_index: entry.entry_index,
-                start_index: entry.start_index,
+                start_index: effective_start,
                 txs,
                 hash: entry.hash,
-                tx_count: entry.tx_count,
+                tx_count: effective_count,
             });
         }
         Ok(ready)
@@ -2417,15 +2492,19 @@ impl TransactionNotifier for BankTransactionNotifier {
             .firehose_gate
             .lock()
             .expect("firehose gate lock poisoned");
-        self.progress.note_tx_slot(slot);
-        self.progress.inc_tx();
+        let mut inserted_tx = false;
         match self.scheduler.insert_transaction(
             slot,
             transaction_slot_index,
             transaction.clone(),
             transaction_status_meta.status.clone(),
         ) {
-            Ok(ready_entries) => {
+            Ok((ready_entries, inserted)) => {
+                inserted_tx = inserted;
+                if inserted_tx {
+                    self.progress.note_tx_slot(slot);
+                    self.progress.inc_tx();
+                }
                 if !ready_entries.is_empty() {
                     if let Err(err) = self.ready_sender.send(ready_entries) {
                         self.failure
@@ -2437,7 +2516,7 @@ impl TransactionNotifier for BankTransactionNotifier {
         }
 
         if let Some(delegate) = self.delegate.as_ref() {
-            if slot >= self.live_start_slot {
+            if slot >= self.live_start_slot && inserted_tx {
                 delegate.notify_transaction(
                     slot,
                     transaction_slot_index,
@@ -2474,7 +2553,7 @@ impl EntryNotifier for BankEntryNotifier {
             .firehose_gate
             .lock()
             .expect("firehose gate lock poisoned");
-        self.progress.note_entry_slot(slot);
+        let mut inserted_entry = false;
         match self.scheduler.push_entry(
             slot,
             index,
@@ -2482,7 +2561,11 @@ impl EntryNotifier for BankEntryNotifier {
             entry.num_transactions as usize,
             entry.hash,
         ) {
-            Ok(ready_entries) => {
+            Ok((ready_entries, inserted)) => {
+                inserted_entry = inserted;
+                if inserted_entry {
+                    self.progress.note_entry_slot(slot);
+                }
                 if !ready_entries.is_empty() {
                     if let Err(err) = self.ready_sender.send(ready_entries) {
                         self.failure
@@ -2494,7 +2577,7 @@ impl EntryNotifier for BankEntryNotifier {
         }
 
         if let Some(delegate) = self.delegate.as_ref() {
-            if slot >= self.live_start_slot {
+            if slot >= self.live_start_slot && inserted_entry {
                 delegate.notify_entry(slot, index, entry, starting_transaction_index);
             }
         }
@@ -4431,6 +4514,8 @@ async fn run_geyser_replay(
                             );
                         } else if stalled_for >= inflight_fail_after {
                             let snapshot = scheduler.snapshot();
+                            let abort_on_stall =
+                                snapshot.buffered_slots == 0 && snapshot.buffer.is_none();
                             let (
                                 cursor_slot,
                                 cursor_entry,
@@ -4465,9 +4550,19 @@ async fn run_geyser_replay(
                                     .unwrap_or_else(|| "<none>".to_string()),
                                 inflight_sig.as_deref().unwrap_or("<none>"),
                             );
-                            failure.record(message.clone());
-                            eprintln!("{message}");
-                            std::process::exit(1);
+                            if abort_on_stall {
+                                failure.record(message.clone());
+                                eprintln!("{message}");
+                                std::process::exit(1);
+                            } else {
+                                warn!(
+                                    "{message} (skipping abort; buffered_slots={} buffer_present={})",
+                                    snapshot.buffered_slots,
+                                    snapshot.buffer.is_some()
+                                );
+                                last_account_change = Instant::now();
+                                last_account_log = Instant::now();
+                            }
                         }
                     }
                     if stalled_for >= stall_interval && last_account_log.elapsed() >= stall_interval

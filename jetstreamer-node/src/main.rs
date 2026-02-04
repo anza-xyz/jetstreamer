@@ -968,7 +968,8 @@ impl RestartTracker {
 
     fn mark_restart(&self, slot: Slot, entry_index: usize, tx_start: usize) {
         self.slot.store(slot, Ordering::Relaxed);
-        self.entry_index.store(entry_index as u64, Ordering::Relaxed);
+        self.entry_index
+            .store(entry_index as u64, Ordering::Relaxed);
         self.tx_start.store(tx_start as u64, Ordering::Relaxed);
         self.pending.store(true, Ordering::Relaxed);
     }
@@ -1146,8 +1147,7 @@ impl log::Log for AbortOnErrorLogger {
                         tx_start = inflight_tx_start as usize;
                     }
                 } else {
-                    let (slot, entry, tx_start_snapshot, _tx_count, _sig) =
-                        self.cursor.snapshot();
+                    let (slot, entry, tx_start_snapshot, _tx_count, _sig) = self.cursor.snapshot();
                     if slot == restart_slot {
                         entry_index = entry as usize;
                         tx_start = tx_start_snapshot as usize;
@@ -1242,10 +1242,7 @@ fn parse_firehose_restart_info(message: &str) -> Option<(u64, u64)> {
     let needle = "restarting from slot ";
     let start = message.find(needle)? + needle.len();
     let after = &message[start..];
-    let slot_digits: String = after
-        .chars()
-        .take_while(|ch| ch.is_ascii_digit())
-        .collect();
+    let slot_digits: String = after.chars().take_while(|ch| ch.is_ascii_digit()).collect();
     let slot: u64 = slot_digits.parse().ok()?;
     let index = if let Some(index_start) = after.find(" at index ") {
         let after_index = &after[index_start + " at index ".len()..];
@@ -1824,12 +1821,8 @@ impl TransactionScheduler {
             resume_entry = resume_entry.max(buffer.processed_entry_count as usize);
             resume_tx = resume_tx.max(buffer.processed_tx_count as usize);
         }
-        state
-            .slots
-            .retain(|slot, _| *slot < restart_slot);
-        state
-            .inferred_blocks
-            .retain(|slot, _| *slot < restart_slot);
+        state.slots.retain(|slot, _| *slot < restart_slot);
+        state.inferred_blocks.retain(|slot, _| *slot < restart_slot);
         if state.current_slot >= restart_slot {
             state.current_slot = restart_slot;
         }

@@ -2442,7 +2442,7 @@ impl TransactionNotifier for BankTransactionNotifier {
         transaction: &VersionedTransaction,
     ) {
         self.backpressure
-            .wait_for_capacity(&self.scheduler, &self.failure.shutdown);
+            .wait_for_capacity(&self.scheduler, &self.progress, &self.failure.shutdown);
         let _firehose_guard = self
             .firehose_gate
             .lock()
@@ -2506,7 +2506,7 @@ impl EntryNotifier for BankEntryNotifier {
         starting_transaction_index: usize,
     ) {
         self.backpressure
-            .wait_for_capacity(&self.scheduler, &self.failure.shutdown);
+            .wait_for_capacity(&self.scheduler, &self.progress, &self.failure.shutdown);
         let _firehose_guard = self
             .firehose_gate
             .lock()
@@ -2567,7 +2567,7 @@ impl BlockMetadataNotifier for BankBlockMetadataNotifier {
         entry_count: u64,
     ) {
         self.backpressure
-            .wait_for_capacity(&self.scheduler, &self.failure.shutdown);
+            .wait_for_capacity(&self.scheduler, &self.progress, &self.failure.shutdown);
         let _firehose_guard = self
             .firehose_gate
             .lock()
@@ -2664,7 +2664,12 @@ impl Backpressure {
         }
     }
 
-    fn wait_for_capacity(&self, scheduler: &TransactionScheduler, shutdown: &Arc<AtomicBool>) {
+    fn wait_for_capacity(
+        &self,
+        scheduler: &TransactionScheduler,
+        progress: &ReplayProgress,
+        shutdown: &Arc<AtomicBool>,
+    ) {
         if self.max_rss_bytes == 0 && self.max_buffered_slots == 0 {
             return;
         }
@@ -2672,9 +2677,13 @@ impl Backpressure {
             if shutdown.load(Ordering::Relaxed) {
                 break;
             }
+            let snapshot = scheduler.snapshot();
+            let buffered_slots_current = snapshot.buffered_slots;
+            let has_progress = progress.tx_count.load(Ordering::Relaxed) > 0
+                || progress.last_entry_slot.load(Ordering::Relaxed) > 0;
             let mut over_limit = false;
             let mut rss_bytes = None;
-            if self.max_rss_bytes > 0 {
+            if self.max_rss_bytes > 0 && (buffered_slots_current > 0 || has_progress) {
                 rss_bytes = read_rss_bytes();
                 if let Some(rss) = rss_bytes {
                     if rss > self.max_rss_bytes {
@@ -2682,11 +2691,8 @@ impl Backpressure {
                     }
                 }
             }
-            let mut buffered_slots = None;
             if self.max_buffered_slots > 0 {
-                let snapshot = scheduler.snapshot();
-                buffered_slots = Some(snapshot.buffered_slots);
-                if snapshot.buffered_slots > self.max_buffered_slots {
+                if buffered_slots_current > self.max_buffered_slots {
                     over_limit = true;
                 }
             }
@@ -2698,9 +2704,7 @@ impl Backpressure {
                     let rss_display = rss_bytes
                         .map(format_bytes)
                         .unwrap_or_else(|| "<unknown>".to_string());
-                    let buffered_display = buffered_slots
-                        .map(|value| value.to_string())
-                        .unwrap_or_else(|| "<unknown>".to_string());
+                    let buffered_display = buffered_slots_current.to_string();
                     info!(
                         "backpressure active: rss={} buffered_slots={} (limits: rss={} buffered_slots={})",
                         rss_display,

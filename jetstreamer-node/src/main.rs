@@ -2652,6 +2652,7 @@ struct Backpressure {
     max_buffered_slots: usize,
     check_interval: Duration,
     last_log: Mutex<Instant>,
+    base_rss_bytes: AtomicU64,
 }
 
 impl Backpressure {
@@ -2661,6 +2662,7 @@ impl Backpressure {
             max_buffered_slots,
             check_interval: Duration::from_millis(100),
             last_log: Mutex::new(Instant::now()),
+            base_rss_bytes: AtomicU64::new(0),
         }
     }
 
@@ -2686,11 +2688,19 @@ impl Backpressure {
             }
             let mut over_limit = false;
             let mut rss_bytes = None;
+            let mut rss_delta = None;
             if self.max_rss_bytes > 0 && (buffered_slots_current > 0 || has_progress) {
                 rss_bytes = read_rss_bytes();
                 if let Some(rss) = rss_bytes {
-                    if rss > self.max_rss_bytes {
-                        over_limit = true;
+                    let base = self.base_rss_bytes.load(Ordering::Relaxed);
+                    if base == 0 {
+                        self.base_rss_bytes.store(rss, Ordering::Relaxed);
+                    } else {
+                        let delta = rss.saturating_sub(base);
+                        rss_delta = Some(delta);
+                        if delta > self.max_rss_bytes {
+                            over_limit = true;
+                        }
                     }
                 }
             }
@@ -2707,10 +2717,14 @@ impl Backpressure {
                     let rss_display = rss_bytes
                         .map(format_bytes)
                         .unwrap_or_else(|| "<unknown>".to_string());
+                    let delta_display = rss_delta
+                        .map(format_bytes)
+                        .unwrap_or_else(|| "<unknown>".to_string());
                     let buffered_display = buffered_slots_current.to_string();
                     info!(
-                        "backpressure active: rss={} buffered_slots={} (limits: rss={} buffered_slots={})",
+                        "backpressure active: rss={} delta={} buffered_slots={} (limits: rss_delta={} buffered_slots={})",
                         rss_display,
+                        delta_display,
                         buffered_display,
                         if self.max_rss_bytes > 0 {
                             format_bytes(self.max_rss_bytes)

@@ -383,7 +383,7 @@ impl BankReplay {
                 let bank_forks = Arc::clone(&self.bank_forks);
                         let execution_gate = self.execution_gate.clone();
                         let firehose_gate = self.firehose_gate.clone();
-                        let cursor = self.cursor.clone();
+                        let _cursor = self.cursor.clone();
                         let scheduler = self.scheduler.clone();
                 if inflight
                     .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
@@ -1749,6 +1749,7 @@ impl TransactionScheduler {
         }
     }
 
+    #[allow(dead_code)]
     fn set_resume_target(&self, slot: Slot, entry_index: usize, tx_start: usize) {
         if slot == 0 {
             return;
@@ -1804,6 +1805,7 @@ impl TransactionScheduler {
         );
     }
 
+    #[allow(dead_code)]
     fn current_resume_target(&self) -> Option<ResumeTarget> {
         let state = self.state.lock().expect("transaction scheduler lock");
         let slot = state.current_slot;
@@ -2425,6 +2427,7 @@ struct BankTransactionNotifier {
     delegate: Option<Arc<dyn TransactionNotifier + Send + Sync + 'static>>,
     live_start_slot: Slot,
     firehose_gate: Arc<Mutex<()>>,
+    backpressure: Arc<Backpressure>,
 }
 
 impl TransactionNotifier for BankTransactionNotifier {
@@ -2438,6 +2441,8 @@ impl TransactionNotifier for BankTransactionNotifier {
         transaction_status_meta: &TransactionStatusMeta,
         transaction: &VersionedTransaction,
     ) {
+        self.backpressure
+            .wait_for_capacity(&self.scheduler, &self.failure.shutdown);
         let _firehose_guard = self
             .firehose_gate
             .lock()
@@ -2489,6 +2494,7 @@ struct BankEntryNotifier {
     delegate: Option<Arc<dyn EntryNotifier + Send + Sync + 'static>>,
     live_start_slot: Slot,
     firehose_gate: Arc<Mutex<()>>,
+    backpressure: Arc<Backpressure>,
 }
 
 impl EntryNotifier for BankEntryNotifier {
@@ -2499,6 +2505,8 @@ impl EntryNotifier for BankEntryNotifier {
         entry: &solana_entry::entry::EntrySummary,
         starting_transaction_index: usize,
     ) {
+        self.backpressure
+            .wait_for_capacity(&self.scheduler, &self.failure.shutdown);
         let _firehose_guard = self
             .firehose_gate
             .lock()
@@ -2542,6 +2550,7 @@ struct BankBlockMetadataNotifier {
     delegate: Option<BlockMetadataNotifierArc>,
     live_start_slot: Slot,
     firehose_gate: Arc<Mutex<()>>,
+    backpressure: Arc<Backpressure>,
 }
 
 impl BlockMetadataNotifier for BankBlockMetadataNotifier {
@@ -2557,6 +2566,8 @@ impl BlockMetadataNotifier for BankBlockMetadataNotifier {
         executed_transaction_count: u64,
         entry_count: u64,
     ) {
+        self.backpressure
+            .wait_for_capacity(&self.scheduler, &self.failure.shutdown);
         let _firehose_guard = self
             .firehose_gate
             .lock()
@@ -2632,6 +2643,84 @@ fn format_bytes(bytes: u64) -> String {
         format!("{:.2}KiB", value / KB)
     } else {
         format!("{bytes}B")
+    }
+}
+
+#[derive(Debug)]
+struct Backpressure {
+    max_rss_bytes: u64,
+    max_buffered_slots: usize,
+    check_interval: Duration,
+    last_log: Mutex<Instant>,
+}
+
+impl Backpressure {
+    fn new(max_rss_bytes: u64, max_buffered_slots: usize) -> Self {
+        Self {
+            max_rss_bytes,
+            max_buffered_slots,
+            check_interval: Duration::from_millis(100),
+            last_log: Mutex::new(Instant::now()),
+        }
+    }
+
+    fn wait_for_capacity(&self, scheduler: &TransactionScheduler, shutdown: &Arc<AtomicBool>) {
+        if self.max_rss_bytes == 0 && self.max_buffered_slots == 0 {
+            return;
+        }
+        loop {
+            if shutdown.load(Ordering::Relaxed) {
+                break;
+            }
+            let mut over_limit = false;
+            let mut rss_bytes = None;
+            if self.max_rss_bytes > 0 {
+                rss_bytes = read_rss_bytes();
+                if let Some(rss) = rss_bytes {
+                    if rss > self.max_rss_bytes {
+                        over_limit = true;
+                    }
+                }
+            }
+            let mut buffered_slots = None;
+            if self.max_buffered_slots > 0 {
+                let snapshot = scheduler.snapshot();
+                buffered_slots = Some(snapshot.buffered_slots);
+                if snapshot.buffered_slots > self.max_buffered_slots {
+                    over_limit = true;
+                }
+            }
+            if !over_limit {
+                break;
+            }
+            if let Ok(mut guard) = self.last_log.lock() {
+                if guard.elapsed() >= Duration::from_secs(5) {
+                    let rss_display = rss_bytes
+                        .map(format_bytes)
+                        .unwrap_or_else(|| "<unknown>".to_string());
+                    let buffered_display = buffered_slots
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "<unknown>".to_string());
+                    info!(
+                        "backpressure active: rss={} buffered_slots={} (limits: rss={} buffered_slots={})",
+                        rss_display,
+                        buffered_display,
+                        if self.max_rss_bytes > 0 {
+                            format_bytes(self.max_rss_bytes)
+                        } else {
+                            "disabled".to_string()
+                        },
+                        if self.max_buffered_slots > 0 {
+                            self.max_buffered_slots.to_string()
+                        } else {
+                            "disabled".to_string()
+                        }
+                    );
+                    *guard = Instant::now();
+                }
+            }
+            std::thread::sleep(self.check_interval);
+        }
     }
 }
 
@@ -4173,6 +4262,28 @@ async fn run_geyser_replay(
     } else {
         info!("program cache pruning disabled");
     }
+    let max_rss_gb = env::var("JETSTREAMER_MAX_RSS_GB")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(50);
+    let max_rss_bytes = max_rss_gb.saturating_mul(1024_u64.pow(3));
+    if max_rss_bytes > 0 {
+        info!(
+            "backpressure enabled: max_rss={}",
+            format_bytes(max_rss_bytes)
+        );
+    }
+    let max_buffered_slots = env::var("JETSTREAMER_MAX_BUFFERED_SLOTS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(10_000);
+    if max_buffered_slots > 0 {
+        info!(
+            "backpressure enabled: max_buffered_slots={}",
+            max_buffered_slots
+        );
+    }
+    let backpressure = Arc::new(Backpressure::new(max_rss_bytes, max_buffered_slots));
     let bank_replay = Arc::new(BankReplay::new(
         bank,
         snapshot_verifier.clone(),
@@ -4206,6 +4317,7 @@ async fn run_geyser_replay(
         delegate: service.get_transaction_notifier(),
         live_start_slot: epoch_start,
         firehose_gate: firehose_gate.clone(),
+        backpressure: backpressure.clone(),
     });
     let entry_notifier = Arc::new(BankEntryNotifier {
         progress: progress.clone(),
@@ -4215,6 +4327,7 @@ async fn run_geyser_replay(
         delegate: service.get_entry_notifier(),
         live_start_slot: epoch_start,
         firehose_gate: firehose_gate.clone(),
+        backpressure: backpressure.clone(),
     });
     let block_metadata_notifier = Arc::new(BankBlockMetadataNotifier {
         scheduler: scheduler.clone(),
@@ -4224,6 +4337,7 @@ async fn run_geyser_replay(
         delegate: service.get_block_metadata_notifier(),
         live_start_slot: epoch_start,
         firehose_gate: firehose_gate.clone(),
+        backpressure: backpressure.clone(),
     });
     let notifiers = GeyserNotifiers {
         transaction_notifier: Some(transaction_notifier.clone()),

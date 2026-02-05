@@ -381,10 +381,10 @@ impl BankReplay {
             if let Some(prune_slot) = prune_request {
                 let inflight = self.prune_inflight.clone();
                 let bank_forks = Arc::clone(&self.bank_forks);
-                let execution_gate = self.execution_gate.clone();
-                let firehose_gate = self.firehose_gate.clone();
-                let cursor = self.cursor.clone();
-                let scheduler = self.scheduler.clone();
+                        let execution_gate = self.execution_gate.clone();
+                        let firehose_gate = self.firehose_gate.clone();
+                        let cursor = self.cursor.clone();
+                        let scheduler = self.scheduler.clone();
                 if inflight
                     .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
                     .is_ok()
@@ -419,49 +419,9 @@ impl BankReplay {
                             }
                             std::thread::sleep(Duration::from_millis(10));
                         };
-                        if let Some((
-                            slot,
-                            entry_index,
-                            tx_start,
-                            _tx_count,
-                            _sig,
-                            _stage,
-                            _elapsed,
-                        )) = cursor.inflight_snapshot()
-                        {
-                            info!(
-                                "firehose pause resume target source: inflight slot {} entry {} tx_index {}",
-                                slot, entry_index, tx_start
-                            );
-                            scheduler.set_resume_target(
-                                slot,
-                                entry_index as usize,
-                                tx_start as usize,
-                            );
-                        } else {
-                            let (slot, entry_index, tx_start, _tx_count, _sig) = cursor.snapshot();
-                            if slot > 0 {
-                                info!(
-                                    "firehose pause resume target source: cursor slot {} entry {} tx_index {}",
-                                    slot, entry_index, tx_start
-                                );
-                                scheduler.set_resume_target(
-                                    slot,
-                                    entry_index as usize,
-                                    tx_start as usize,
-                                );
-                            } else if let Some(target) = scheduler.current_resume_target() {
-                                info!(
-                                    "firehose pause resume target source: scheduler slot {} entry {} tx_index {}",
-                                    target.slot, target.entry_index, target.tx_start
-                                );
-                                scheduler.set_resume_target(
-                                    target.slot,
-                                    target.entry_index,
-                                    target.tx_start,
-                                );
-                            }
-                        }
+                        // Pruning pauses firehose delivery but does not imply a restart. Avoid
+                        // recording a resume target here to prevent skipping data on normal resume.
+                        scheduler.clear_resume_target();
                         let (done_tx, done_rx) = std::sync::mpsc::channel();
                         let bank_forks = Arc::clone(&bank_forks);
                         std::thread::spawn(move || {
@@ -1803,6 +1763,11 @@ impl TransactionScheduler {
             "firehose pause recorded resume target: slot {} entry {} tx_index {}",
             slot, entry_index, tx_start
         );
+    }
+
+    fn clear_resume_target(&self) {
+        let mut guard = self.resume_target.lock().expect("resume target lock");
+        *guard = None;
     }
 
     fn apply_restart_locked(&self, state: &mut SchedulerState, target: ResumeTarget) {

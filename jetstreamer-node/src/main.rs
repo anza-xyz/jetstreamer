@@ -2680,7 +2680,10 @@ impl Backpressure {
             let snapshot = scheduler.snapshot();
             let buffered_slots_current = snapshot.buffered_slots;
             let has_progress = progress.tx_count.load(Ordering::Relaxed) > 0
-                || progress.last_entry_slot.load(Ordering::Relaxed) > 0;
+                || progress.account_update_count.load(Ordering::Relaxed) > 0;
+            if buffered_slots_current == 0 && !has_progress {
+                break;
+            }
             let mut over_limit = false;
             let mut rss_bytes = None;
             if self.max_rss_bytes > 0 && (buffered_slots_current > 0 || has_progress) {

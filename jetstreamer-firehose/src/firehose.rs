@@ -37,7 +37,7 @@ use tokio::{
 use crate::{
     LOG_MODULE, SharedError,
     epochs::{epoch_to_slot_range, fetch_epoch_stream, slot_to_epoch},
-    index::{SLOT_OFFSET_INDEX, SlotOffsetIndexError},
+    index::{SLOT_OFFSET_INDEX, SlotOffsetIndexError, slot_to_offset},
     node_reader::NodeReader,
     utils,
 };
@@ -83,6 +83,49 @@ fn is_shutdown_error(err: &FirehoseError) -> bool {
         | FirehoseError::OnStatsHandlerError(inner) => is_interrupted(inner.as_ref()),
         _ => false,
     }
+}
+
+async fn find_previous_indexed_slot(
+    local_start: u64,
+    epoch_start: u64,
+    log_target: &str,
+) -> Result<Option<u64>, FirehoseError> {
+    if local_start <= epoch_start {
+        return Ok(None);
+    }
+    let mut candidate = local_start.saturating_sub(1);
+    let mut skipped = 0u64;
+    loop {
+        match slot_to_offset(candidate).await {
+            Ok(_) => {
+                if skipped > 0 {
+                    log::info!(
+                        target: log_target,
+                        "slot {} missing in index; seeking back {} slots to {}",
+                        local_start.saturating_sub(1),
+                        skipped,
+                        candidate
+                    );
+                }
+                return Ok(Some(candidate));
+            }
+            Err(SlotOffsetIndexError::SlotNotFound(..)) => {
+                if candidate <= epoch_start {
+                    break;
+                }
+                skipped += 1;
+                candidate = candidate.saturating_sub(1);
+            }
+            Err(err) => return Err(FirehoseError::SlotOffsetIndexError(err)),
+        }
+    }
+    log::warn!(
+        target: log_target,
+        "no indexed slot found before {} (epoch start {}); reading from epoch start",
+        local_start,
+        epoch_start
+    );
+    Ok(None)
 }
 
 /// Errors that can occur while streaming the firehose. Errors that can occur while streaming
@@ -871,15 +914,36 @@ where
                         }
 
                     if local_start > epoch_start {
-                        // Seek to the previous slot so the stream includes all nodes
-                        // (transactions, entries, rewards) that precede the block payload for
-                        // `local_start`.
-                        let seek_slot = local_start.saturating_sub(1);
-                        let seek_fut = reader.seek_to_slot(seek_slot);
-                        match timeout(OP_TIMEOUT, seek_fut).await {
+                        // Seek to the nearest previous indexed slot so the stream includes all
+                        // nodes (transactions, entries, rewards) that precede `local_start`.
+                        let seek_slot = match timeout(
+                            OP_TIMEOUT,
+                            find_previous_indexed_slot(local_start, epoch_start, &log_target),
+                        )
+                        .await
+                        {
                             Ok(res) => res.map_err(|e| (e, current_slot.unwrap_or(slot_range.start)))?,
                             Err(_) => {
-                                return Err((FirehoseError::OperationTimeout("seek_to_slot"), current_slot.unwrap_or(slot_range.start)));
+                                return Err((
+                                    FirehoseError::OperationTimeout(
+                                        "seek_to_previous_indexed_slot",
+                                    ),
+                                    current_slot.unwrap_or(slot_range.start),
+                                ));
+                            }
+                        };
+                        if let Some(seek_slot) = seek_slot {
+                            let seek_fut = reader.seek_to_slot(seek_slot);
+                            match timeout(OP_TIMEOUT, seek_fut).await {
+                                Ok(res) => {
+                                    res.map_err(|e| (e, current_slot.unwrap_or(slot_range.start)))?
+                                }
+                                Err(_) => {
+                                    return Err((
+                                        FirehoseError::OperationTimeout("seek_to_slot"),
+                                        current_slot.unwrap_or(slot_range.start),
+                                    ));
+                                }
                             }
                         }
                     }
@@ -1835,15 +1899,36 @@ async fn firehose_geyser_thread(
                 current_slot = None;
 
                 if local_start > epoch_start {
-                    // Seek to the slot immediately preceding the requested range so the reader
-                    // captures the full node set (transactions, entries, rewards) for the
-                    // target block on the next iteration.
-                    let seek_slot = local_start.saturating_sub(1);
-                    let seek_fut = reader.seek_to_slot(seek_slot);
-                    match timeout(OP_TIMEOUT, seek_fut).await {
+                    // Seek to the nearest previous indexed slot so the reader captures the full
+                    // node set (transactions, entries, rewards) for the target block.
+                    let seek_slot = match timeout(
+                        OP_TIMEOUT,
+                        find_previous_indexed_slot(local_start, epoch_start, &log_target),
+                    )
+                    .await
+                    {
                         Ok(res) => res.map_err(|e| (e, current_slot.unwrap_or(slot_range.start)))?,
                         Err(_) => {
-                            return Err((FirehoseError::OperationTimeout("seek_to_slot"), current_slot.unwrap_or(slot_range.start)));
+                            return Err((
+                                FirehoseError::OperationTimeout(
+                                    "seek_to_previous_indexed_slot",
+                                ),
+                                current_slot.unwrap_or(slot_range.start),
+                            ));
+                        }
+                    };
+                    if let Some(seek_slot) = seek_slot {
+                        let seek_fut = reader.seek_to_slot(seek_slot);
+                        match timeout(OP_TIMEOUT, seek_fut).await {
+                            Ok(res) => {
+                                res.map_err(|e| (e, current_slot.unwrap_or(slot_range.start)))?
+                            }
+                            Err(_) => {
+                                return Err((
+                                    FirehoseError::OperationTimeout("seek_to_slot"),
+                                    current_slot.unwrap_or(slot_range.start),
+                                ));
+                            }
                         }
                     }
                 }
@@ -2463,6 +2548,122 @@ async fn assert_solscan_slot_non_vote_counts(
     );
 }
 
+#[cfg(test)]
+async fn log_slot_node_summary(slot: u64) -> Result<(), SharedError> {
+    use crate::node::Node;
+    use crate::index::slot_to_offset;
+
+    let epoch = slot_to_epoch(slot);
+    let client = crate::network::create_http_client();
+    let stream = fetch_epoch_stream(epoch, &client).await;
+    let mut reader = NodeReader::new(stream);
+    reader
+        .seek_to_slot(slot)
+        .await
+        .map_err(|err| Box::new(err) as SharedError)?;
+
+    let nodes = reader.read_until_block().await?;
+    let mut transactions = 0u64;
+    let mut entries = 0u64;
+    let mut entry_tx_total = 0u64;
+    let mut dataframes = 0u64;
+    let mut rewards = 0u64;
+    let mut subsets = 0u64;
+    let mut epochs = 0u64;
+    let mut block_slot = None;
+    let mut block_entries = None;
+    let first_kind = nodes
+        .0
+        .first()
+        .map(|node| node.get_node())
+        .map(|node| match node {
+            Node::Transaction(_) => "transaction",
+            Node::Entry(_) => "entry",
+            Node::Block(_) => "block",
+            Node::Subset(_) => "subset",
+            Node::Epoch(_) => "epoch",
+            Node::Rewards(_) => "rewards",
+            Node::DataFrame(_) => "dataframe",
+        })
+        .unwrap_or("none");
+
+    for node in &nodes.0 {
+        match node.get_node() {
+            Node::Transaction(_) => {
+                transactions += 1;
+            }
+            Node::Entry(entry) => {
+                entries += 1;
+                entry_tx_total += entry.transactions.len() as u64;
+            }
+            Node::Block(block) => {
+                block_slot = Some(block.slot);
+                block_entries = Some(block.entries.len());
+            }
+            Node::Subset(_) => {
+                subsets += 1;
+            }
+            Node::Epoch(_) => {
+                epochs += 1;
+            }
+            Node::Rewards(_) => {
+                rewards += 1;
+            }
+            Node::DataFrame(_) => {
+                dataframes += 1;
+            }
+        }
+    }
+
+    log::info!(
+        target: LOG_MODULE,
+        "slot {slot} node summary: total_nodes={}, first_kind={}, tx_nodes={}, entry_nodes={}, entry_tx_total={}, block_slot={:?}, block_entries={:?}, dataframes={}, rewards={}, subsets={}, epochs={}",
+        nodes.len(),
+        first_kind,
+        transactions,
+        entries,
+        entry_tx_total,
+        block_slot,
+        block_entries,
+        dataframes,
+        rewards,
+        subsets,
+        epochs
+    );
+
+    if slot > 0 {
+        let mut found_previous = None;
+        for delta in 1..=5 {
+            let candidate = slot.saturating_sub(delta);
+            match slot_to_offset(candidate).await {
+                Ok(offset) => {
+                    found_previous = Some((candidate, offset));
+                    break;
+                }
+                Err(err) => {
+                    log::info!(
+                        target: LOG_MODULE,
+                        "slot {slot} previous lookup {candidate} failed: {err}"
+                    );
+                }
+            }
+        }
+        if let Some((candidate, offset)) = found_previous {
+            log::info!(
+                target: LOG_MODULE,
+                "slot {slot} nearest previous offset within 5 slots: slot {candidate} @ {offset}"
+            );
+        } else {
+            log::info!(
+                target: LOG_MODULE,
+                "slot {slot} no previous offsets found within 5 slots"
+            );
+        }
+    }
+
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn test_firehose_epoch_800() {
     use dashmap::DashSet;
@@ -2684,6 +2885,24 @@ async fn test_firehose_epoch_720_slot_311175860_solscan_non_vote_counts() {
 async fn test_firehose_epoch_720_slot_311134608_solscan_non_vote_counts() {
     solana_logger::setup_with_default("info");
     assert_solscan_slot_non_vote_counts(311_134_608, 1_086, 169).await;
+}
+
+#[cfg(test)]
+#[ignore]
+#[serial]
+#[tokio::test(flavor = "multi_thread")]
+async fn debug_epoch_720_slot_311173980_node_summary() {
+    solana_logger::setup_with_default("info");
+    const SLOTS: &[u64] = &[
+        311_173_980,
+        311_225_232,
+        311_175_860,
+        311_134_608,
+        376_273_722,
+    ];
+    for slot in SLOTS {
+        log_slot_node_summary(*slot).await.expect("slot summary");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

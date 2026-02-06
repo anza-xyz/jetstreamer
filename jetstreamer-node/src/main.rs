@@ -2683,13 +2683,20 @@ impl Backpressure {
             let buffered_slots_current = snapshot.buffered_slots;
             let has_progress = progress.tx_count.load(Ordering::Relaxed) > 0
                 || progress.account_update_count.load(Ordering::Relaxed) > 0;
+            let buffer_backlog = snapshot
+                .buffer
+                .as_ref()
+                .map(|buffer| buffer.pending_entries > 0 || buffer.buffered_txs > 0)
+                .unwrap_or(false);
             if buffered_slots_current == 0 && !has_progress {
                 break;
             }
             let mut over_limit = false;
             let mut rss_bytes = None;
             let mut rss_delta = None;
-            if self.max_rss_bytes > 0 && (buffered_slots_current > 0 || has_progress) {
+            if self.max_rss_bytes > 0
+                && (buffer_backlog || buffered_slots_current > 1 || has_progress)
+            {
                 rss_bytes = read_rss_bytes();
                 if let Some(rss) = rss_bytes {
                     let base = self.base_rss_bytes.load(Ordering::Relaxed);
@@ -2705,7 +2712,9 @@ impl Backpressure {
                 }
             }
             if self.max_buffered_slots > 0 {
-                if buffered_slots_current > self.max_buffered_slots {
+                if buffered_slots_current > self.max_buffered_slots
+                    && (buffer_backlog || buffered_slots_current > 1)
+                {
                     over_limit = true;
                 }
             }

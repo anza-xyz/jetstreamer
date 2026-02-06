@@ -126,6 +126,13 @@ impl Transaction {
     }
 }
 
+/// Parses a versioned transaction payload from a raw byte slice.
+pub fn parse_versioned_transaction_from_slice(
+    data: &[u8],
+) -> Result<solana_transaction::versioned::VersionedTransaction, SharedError> {
+    Ok(VersionedTransactionSchema::deserialize(data)?)
+}
+
 mod wincode_schema {
     use {
         solana_address::Address,

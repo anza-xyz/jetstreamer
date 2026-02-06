@@ -1031,7 +1031,18 @@ where
                                         && let Some(on_tx_cb) = on_tx.as_ref()
                                     {
                                         let error_slot = current_slot.unwrap_or(slot_range.start);
-                                        let versioned_tx = tx.as_parsed().map_err(|err| {
+                                        let reassembled_tx = nodes
+                                            .reassemble_dataframes(tx.data.clone())
+                                            .map_err(|err| {
+                                                (
+                                                    FirehoseError::NodeDecodingError(item_index, err),
+                                                    error_slot,
+                                                )
+                                            })?;
+                                        let versioned_tx = crate::transaction::parse_versioned_transaction_from_slice(
+                                            &reassembled_tx,
+                                        )
+                                        .map_err(|err| {
                                             (
                                                 FirehoseError::NodeDecodingError(item_index, err),
                                                 error_slot,
@@ -2055,8 +2066,13 @@ async fn firehose_geyser_thread(
                         use crate::node::Node::*;
                         match node {
                             Transaction(tx) => {
-                                let versioned_tx = tx.as_parsed()?;
-                                let reassembled_metadata = nodes.reassemble_dataframes(tx.metadata.clone())?;
+                                let reassembled_tx = nodes.reassemble_dataframes(tx.data.clone())?;
+                                let versioned_tx =
+                                    crate::transaction::parse_versioned_transaction_from_slice(
+                                        &reassembled_tx,
+                                    )?;
+                                let reassembled_metadata =
+                                    nodes.reassemble_dataframes(tx.metadata.clone())?;
 
                                 let as_native_metadata = decode_transaction_status_meta_from_frame(
                                     block.slot,

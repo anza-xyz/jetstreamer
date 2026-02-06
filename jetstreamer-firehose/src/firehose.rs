@@ -3014,7 +3014,6 @@ async fn debug_epoch_720_slot_311173980_node_summary() {
     }
 }
 
-
 #[tokio::test(flavor = "multi_thread")]
 async fn test_firehose_epoch_850_has_logs() {
     use std::sync::atomic::{AtomicU64, Ordering};

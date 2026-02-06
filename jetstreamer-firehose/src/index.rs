@@ -757,9 +757,7 @@ impl CidOffsetIndex {
             .ok_or_else(|| {
                 SlotOffsetIndexError::IndexFormatError(
                     self.object.url().clone(),
-                    format!(
-                        "bucket data range overflow (offset {data_start}, len {data_len})"
-                    ),
+                    format!("bucket data range overflow (offset {data_start}, len {data_len})"),
                 )
             })?;
         let data = self.object.fetch_range(data_start, data_end, true).await?;
@@ -1754,5 +1752,4 @@ mod tests {
             .expect("beta should be present");
         assert_eq!(got, expected);
     }
-
 }

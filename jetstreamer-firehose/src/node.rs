@@ -112,14 +112,13 @@ impl NodesWithCids {
                 let next_dataframe = next_node_un.get_node().get_dataframe().unwrap();
                 data.extend(next_dataframe.data.to_vec());
                 frame_count = frame_count.saturating_add(1);
-                if let Some(total) = declared_total {
-                    if frame_count > total {
+                if let Some(total) = declared_total
+                    && frame_count > total {
                         return Err(Box::new(std::io::Error::other(std::format!(
                             "dataframe chain exceeded declared total {}",
                             total
                         ))));
                     }
-                }
                 next_arr.clone_from(&next_dataframe.next);
             }
         }

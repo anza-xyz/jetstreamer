@@ -17,7 +17,6 @@ use agave_snapshots::{
     snapshot_hash::SnapshotHash,
     streaming_unarchive_snapshot,
 };
-use bs58;
 use cid::{Cid, multibase::Base};
 use crossbeam_channel::unbounded;
 use dashmap::DashMap;
@@ -341,8 +340,8 @@ impl BankReplay {
             set_alpenglow_ticks(&next_bank);
             self.cursor.update_inflight_stage("insert_bank");
             let bank_with_scheduler = guard.insert(next_bank);
-            if let Some(interval) = self.root_interval {
-                if interval > 0 {
+            if let Some(interval) = self.root_interval
+                && interval > 0 {
                     let root_slot = parent_slot.saturating_sub(parent_slot % interval);
                     let last_root = self.last_root_set.load(Ordering::Relaxed);
                     if root_slot > 0 && root_slot > last_root {
@@ -375,7 +374,6 @@ impl BankReplay {
                         }
                     }
                 }
-            }
             self.cursor.update_inflight_stage("clone_without_scheduler");
             let next_bank = bank_with_scheduler.clone_without_scheduler();
             drop(guard);
@@ -1012,11 +1010,10 @@ impl ReplayCursor {
     }
 
     fn update_inflight_stage(&self, stage: &'static str) {
-        if let Ok(mut guard) = self.inflight.lock() {
-            if let Some(ref mut entry) = *guard {
+        if let Ok(mut guard) = self.inflight.lock()
+            && let Some(ref mut entry) = *guard {
                 entry.stage = stage;
             }
-        }
     }
 
     fn finish_inflight(&self) {
@@ -1797,7 +1794,7 @@ impl TransactionScheduler {
         let buffer = state
             .slots
             .entry(restart_slot)
-            .or_insert_with(SlotExecutionBuffer::default);
+            .or_default();
         buffer.reset_for_restart();
         buffer.apply_resume_counts(resume_entry, resume_tx);
         info!(
@@ -1858,7 +1855,7 @@ impl TransactionScheduler {
             let buffer = state
                 .slots
                 .entry(slot)
-                .or_insert_with(SlotExecutionBuffer::default);
+                .or_default();
             buffer.reset_for_restart();
             buffer.apply_resume_counts(target.entry_index, target.tx_start);
             info!(
@@ -1878,7 +1875,7 @@ impl TransactionScheduler {
         let buffer = state
             .slots
             .entry(slot)
-            .or_insert_with(SlotExecutionBuffer::default);
+            .or_default();
         let inserted = buffer.insert_transaction(index, tx, expected_status)?;
         let ready = self.advance_ready_locked(&mut state)?;
         Ok((ready, inserted))
@@ -1900,7 +1897,7 @@ impl TransactionScheduler {
             let buffer = state
                 .slots
                 .entry(slot)
-                .or_insert_with(SlotExecutionBuffer::default);
+                .or_default();
             buffer.reset_for_restart();
             buffer.apply_resume_counts(target.entry_index, target.tx_start);
             info!(
@@ -1920,7 +1917,7 @@ impl TransactionScheduler {
         let buffer = state
             .slots
             .entry(slot)
-            .or_insert_with(SlotExecutionBuffer::default);
+            .or_default();
         let inserted = buffer.push_entry(entry_index, start_index, tx_count, hash)?;
         let ready = self.advance_ready_locked(&mut state)?;
         Ok((ready, inserted))
@@ -1950,17 +1947,16 @@ impl TransactionScheduler {
         if slot > state.highest_seen_slot {
             state.highest_seen_slot = slot;
         }
-        if let Some((inferred_tx, inferred_entry)) = state.inferred_blocks.remove(&slot) {
-            if inferred_tx != expected_tx_count || inferred_entry != expected_entry_count {
+        if let Some((inferred_tx, inferred_entry)) = state.inferred_blocks.remove(&slot)
+            && (inferred_tx != expected_tx_count || inferred_entry != expected_entry_count) {
                 return Err(format!(
                     "block metadata mismatch for slot {slot}: inferred txs {inferred_tx} entries {inferred_entry}, got txs {expected_tx_count} entries {expected_entry_count}"
                 ));
             }
-        }
         let buffer = state
             .slots
             .entry(slot)
-            .or_insert_with(SlotExecutionBuffer::default);
+            .or_default();
         buffer.set_expected_counts(expected_tx_count, expected_entry_count)?;
         self.advance_ready_locked(&mut state)
     }
@@ -2037,14 +2033,13 @@ impl TransactionScheduler {
             let current_slot = state.current_slot;
             match self.presence.is_missing(current_slot) {
                 Some(true) => {
-                    if let Some(buffer) = state.slots.remove(&current_slot) {
-                        if buffer.has_any_data() {
+                    if let Some(buffer) = state.slots.remove(&current_slot)
+                        && buffer.has_any_data() {
                             return Err(format!(
                                 "slot {} marked leader skipped but contains buffered data",
                                 current_slot
                             ));
                         }
-                    }
                     state.last_finalized_slot = current_slot;
                     state.current_slot = current_slot.saturating_add(1);
                     continue;
@@ -2059,12 +2054,11 @@ impl TransactionScheduler {
 
             let mut drained = buffer.drain_ready_entries(current_slot)?;
             ready.append(&mut drained);
-            if state.highest_seen_slot > current_slot {
-                if let Some((txs, entries)) = buffer.infer_expected_counts_if_missing(current_slot)
+            if state.highest_seen_slot > current_slot
+                && let Some((txs, entries)) = buffer.infer_expected_counts_if_missing(current_slot)
                 {
                     state.inferred_blocks.insert(current_slot, (txs, entries));
                 }
-            }
 
             let should_finalize = buffer.should_finalize(current_slot)?;
             if !should_finalize {
@@ -2163,8 +2157,8 @@ impl SlotExecutionBuffer {
             self.txs.resize_with(index + 1, || None);
         }
         if let Some(existing) = &self.txs[index] {
-            let existing_sig = existing.tx.signatures.get(0);
-            let incoming_sig = tx.signatures.get(0);
+            let existing_sig = existing.tx.signatures.first();
+            let incoming_sig = tx.signatures.first();
             if existing_sig == incoming_sig && existing.expected_status == expected_status {
                 // Duplicate delivery of the same transaction; ignore.
                 return Ok(false);
@@ -2458,18 +2452,17 @@ impl TransactionNotifier for BankTransactionNotifier {
                     self.progress.note_tx_slot(slot);
                     self.progress.inc_tx();
                 }
-                if !ready_entries.is_empty() {
-                    if let Err(err) = self.ready_sender.send(ready_entries) {
+                if !ready_entries.is_empty()
+                    && let Err(err) = self.ready_sender.send(ready_entries) {
                         self.failure
                             .record(format!("ready entry channel closed: {err}"));
                     }
-                }
             }
             Err(err) => self.failure.record(err),
         }
 
-        if let Some(delegate) = self.delegate.as_ref() {
-            if slot >= self.live_start_slot && inserted_tx {
+        if let Some(delegate) = self.delegate.as_ref()
+            && slot >= self.live_start_slot && inserted_tx {
                 delegate.notify_transaction(
                     slot,
                     transaction_slot_index,
@@ -2480,7 +2473,6 @@ impl TransactionNotifier for BankTransactionNotifier {
                     transaction,
                 );
             }
-        }
     }
 }
 
@@ -2519,21 +2511,19 @@ impl EntryNotifier for BankEntryNotifier {
                 if inserted_entry {
                     self.progress.note_entry_slot(slot);
                 }
-                if !ready_entries.is_empty() {
-                    if let Err(err) = self.ready_sender.send(ready_entries) {
+                if !ready_entries.is_empty()
+                    && let Err(err) = self.ready_sender.send(ready_entries) {
                         self.failure
                             .record(format!("ready entry channel closed: {err}"));
                     }
-                }
             }
             Err(err) => self.failure.record(err),
         }
 
-        if let Some(delegate) = self.delegate.as_ref() {
-            if slot >= self.live_start_slot && inserted_entry {
+        if let Some(delegate) = self.delegate.as_ref()
+            && slot >= self.live_start_slot && inserted_entry {
                 delegate.notify_entry(slot, index, entry, starting_transaction_index);
             }
-        }
     }
 }
 
@@ -2586,18 +2576,17 @@ impl BlockMetadataNotifier for BankBlockMetadataNotifier {
             .record_block_metadata(slot, executed_transaction_count, entry_count)
         {
             Ok(ready_entries) => {
-                if !ready_entries.is_empty() {
-                    if let Err(err) = self.ready_sender.send(ready_entries) {
+                if !ready_entries.is_empty()
+                    && let Err(err) = self.ready_sender.send(ready_entries) {
                         self.failure
                             .record(format!("ready entry channel closed: {err}"));
                     }
-                }
             }
             Err(err) => self.failure.record(err),
         }
 
-        if let Some(delegate) = self.delegate.as_ref() {
-            if slot >= self.live_start_slot {
+        if let Some(delegate) = self.delegate.as_ref()
+            && slot >= self.live_start_slot {
                 delegate.notify_block_metadata(
                     parent_slot,
                     parent_blockhash,
@@ -2610,7 +2599,6 @@ impl BlockMetadataNotifier for BankBlockMetadataNotifier {
                     entry_count,
                 );
             }
-        }
     }
 }
 
@@ -2643,7 +2631,6 @@ fn read_rss_bytes() -> Option<u64> {
     for line in status.lines() {
         if let Some(value) = line.strip_prefix("VmRSS:") {
             let kb = value
-                .trim()
                 .split_whitespace()
                 .next()?
                 .parse::<u64>()
@@ -3542,8 +3529,8 @@ fn load_bank_from_snapshot_archive(
             let start = Instant::now();
             for path in receiver.iter() {
                 count += 1;
-                if let Some(interval) = log_interval {
-                    if last_log.elapsed() >= interval {
+                if let Some(interval) = log_interval
+                    && last_log.elapsed() >= interval {
                         let elapsed = start.elapsed().as_secs_f64();
                         let rate = if elapsed > 0.0 {
                             count as f64 / elapsed
@@ -3567,7 +3554,6 @@ fn load_bank_from_snapshot_archive(
                         }
                         last_log = Instant::now();
                     }
-                }
             }
             if count > 0 {
                 let elapsed = start.elapsed().as_secs_f64();
@@ -3844,12 +3830,11 @@ async fn download_with_ripget(
     dest: &Path,
     shutdown: Arc<AtomicBool>,
 ) -> Result<(), String> {
-    if let Ok(metadata) = fs::metadata(dest) {
-        if metadata.len() > 0 {
+    if let Ok(metadata) = fs::metadata(dest)
+        && metadata.len() > 0 {
             info!("compact index already cached at {}", dest.display());
             return Ok(());
         }
-    }
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent)
             .map_err(|err| format!("failed to create {}: {err}", parent.display()))?;
@@ -4373,8 +4358,8 @@ async fn run_geyser_replay(
                             cursor_sig,
                         ) = cursor.snapshot();
                         let mut expected_after_slot: Option<Slot> = None;
-                        if let Some(buffer) = snapshot.buffer.as_ref() {
-                            if buffer.expected_tx_count.is_none()
+                        if let Some(buffer) = snapshot.buffer.as_ref()
+                            && buffer.expected_tx_count.is_none()
                                 && buffer.expected_entry_count.is_none()
                                 && buffer.processed_entry_count > 0
                                 && buffer.pending_entries == 0
@@ -4383,7 +4368,6 @@ async fn run_geyser_replay(
                                 expected_after_slot =
                                     scheduler.expected_block_metadata_after(snapshot.current_slot);
                             }
-                        }
                         let last_tx_slot = progress.last_tx_slot.load(Ordering::Relaxed);
                         let last_entry_slot = progress.last_entry_slot.load(Ordering::Relaxed);
                         let last_block_meta_slot =
@@ -4718,11 +4702,10 @@ async fn run_geyser_replay(
 
     match scheduler.drain_ready_entries() {
         Ok(ready_entries) => {
-            if !ready_entries.is_empty() {
-                if let Err(err) = ready_sender.send(ready_entries) {
+            if !ready_entries.is_empty()
+                && let Err(err) = ready_sender.send(ready_entries) {
                     failure.record(format!("ready entry channel closed: {err}"));
                 }
-            }
         }
         Err(err) => failure.record(err),
     }

@@ -2378,6 +2378,91 @@ use serial_test::serial;
 #[cfg(test)]
 use std::sync::{Mutex, OnceLock};
 
+#[cfg(test)]
+async fn assert_solscan_slot_non_vote_counts(
+    slot: u64,
+    transfer_count: u64,
+    defi_swaps_count: u64,
+) {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::Arc;
+
+    let expected_non_vote = transfer_count + defi_swaps_count;
+    let found = Arc::new(AtomicBool::new(false));
+    let observed_total = Arc::new(AtomicU64::new(0));
+    let observed_non_vote = Arc::new(AtomicU64::new(0));
+
+    let found_block = found.clone();
+    let observed_total_block = observed_total.clone();
+    let target_slot_block = slot;
+    let target_slot_tx = slot;
+    let observed_non_vote_tx = observed_non_vote.clone();
+
+    firehose(
+        1,
+        target_slot_block..(target_slot_block + 1),
+        Some(move |_thread_id: usize, block: BlockData| {
+            let found_block = found_block.clone();
+            let observed_total_block = observed_total_block.clone();
+            async move {
+                if block.slot() == target_slot_block {
+                    assert!(
+                        !block.was_skipped(),
+                        "slot {target_slot_block} was marked leader skipped",
+                    );
+                    if let BlockData::Block {
+                        executed_transaction_count,
+                        ..
+                    } = block
+                    {
+                        found_block.store(true, Ordering::Relaxed);
+                        observed_total_block
+                            .store(executed_transaction_count, Ordering::Relaxed);
+                    }
+                }
+                Ok(())
+            }
+            .boxed()
+        }),
+        Some(move |_thread_id: usize, transaction: TransactionData| {
+            let observed_non_vote_tx = observed_non_vote_tx.clone();
+            async move {
+                if transaction.slot == target_slot_tx && !transaction.is_vote {
+                    observed_non_vote_tx.fetch_add(1, Ordering::Relaxed);
+                }
+                Ok(())
+            }
+            .boxed()
+        }),
+        None::<OnEntryFn>,
+        None::<OnRewardFn>,
+        None::<OnErrorFn>,
+        None::<OnStatsTrackingFn>,
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        found.load(Ordering::Relaxed),
+        "target slot {slot} was not processed"
+    );
+    let observed_total = observed_total.load(Ordering::Relaxed);
+    let observed_non_vote = observed_non_vote.load(Ordering::Relaxed);
+    assert!(
+        observed_total > 0,
+        "slot {slot} executed transaction count was zero"
+    );
+    assert!(
+        observed_total >= expected_non_vote,
+        "slot {slot} executed transaction count {observed_total} is below expected non-vote {expected_non_vote}"
+    );
+    assert_eq!(
+        observed_non_vote, expected_non_vote,
+        "slot {slot} non-vote transaction count mismatch (transfer {transfer_count}, defi swaps {defi_swaps_count})"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn test_firehose_epoch_800() {
     use dashmap::DashSet;
@@ -2567,6 +2652,38 @@ async fn test_firehose_target_slot_transactions() {
         EXPECTED_TRANSACTIONS,
         "recorded transaction count mismatch"
     );
+}
+
+#[cfg(test)]
+#[serial]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_firehose_epoch_720_slot_311173980_solscan_non_vote_counts() {
+    solana_logger::setup_with_default("info");
+    assert_solscan_slot_non_vote_counts(311_173_980, 1_197, 211).await;
+}
+
+#[cfg(test)]
+#[serial]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_firehose_epoch_720_slot_311225232_solscan_non_vote_counts() {
+    solana_logger::setup_with_default("info");
+    assert_solscan_slot_non_vote_counts(311_225_232, 888, 157).await;
+}
+
+#[cfg(test)]
+#[serial]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_firehose_epoch_720_slot_311175860_solscan_non_vote_counts() {
+    solana_logger::setup_with_default("info");
+    assert_solscan_slot_non_vote_counts(311_175_860, 527, 110).await;
+}
+
+#[cfg(test)]
+#[serial]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_firehose_epoch_720_slot_311134608_solscan_non_vote_counts() {
+    solana_logger::setup_with_default("info");
+    assert_solscan_slot_non_vote_counts(311_134_608, 1_086, 169).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]

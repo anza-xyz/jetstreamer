@@ -341,49 +341,50 @@ impl BankReplay {
             self.cursor.update_inflight_stage("insert_bank");
             let bank_with_scheduler = guard.insert(next_bank);
             if let Some(interval) = self.root_interval
-                && interval > 0 {
-                    let root_slot = parent_slot.saturating_sub(parent_slot % interval);
-                    let last_root = self.last_root_set.load(Ordering::Relaxed);
-                    if root_slot > 0 && root_slot > last_root {
-                        self.cursor.update_inflight_stage("root_set");
-                        let root_start = Instant::now();
-                        if guard.get(root_slot).is_some() {
-                            guard.set_root(root_slot, None, None);
-                        } else {
-                            warn!(
-                                "bank_for_slot program cache prune skipped: missing root bank slot {}",
-                                root_slot
-                            );
-                        }
-                        self.last_root_set.store(root_slot, Ordering::Relaxed);
-                        let set_elapsed = root_start.elapsed();
-                        if set_elapsed >= BANK_FOR_SLOT_WARN_AFTER {
-                            warn!(
-                                "bank_for_slot root set slow: slot {} took {:.3}s",
-                                root_slot,
-                                set_elapsed.as_secs_f64()
-                            );
-                        }
-                        if self.enable_program_cache_prune {
-                            prune_request = Some(root_slot);
-                        } else {
-                            warn!(
-                                "bank_for_slot skipping program cache prune at slot {} (debug)",
-                                root_slot
-                            );
-                        }
+                && interval > 0
+            {
+                let root_slot = parent_slot.saturating_sub(parent_slot % interval);
+                let last_root = self.last_root_set.load(Ordering::Relaxed);
+                if root_slot > 0 && root_slot > last_root {
+                    self.cursor.update_inflight_stage("root_set");
+                    let root_start = Instant::now();
+                    if guard.get(root_slot).is_some() {
+                        guard.set_root(root_slot, None, None);
+                    } else {
+                        warn!(
+                            "bank_for_slot program cache prune skipped: missing root bank slot {}",
+                            root_slot
+                        );
+                    }
+                    self.last_root_set.store(root_slot, Ordering::Relaxed);
+                    let set_elapsed = root_start.elapsed();
+                    if set_elapsed >= BANK_FOR_SLOT_WARN_AFTER {
+                        warn!(
+                            "bank_for_slot root set slow: slot {} took {:.3}s",
+                            root_slot,
+                            set_elapsed.as_secs_f64()
+                        );
+                    }
+                    if self.enable_program_cache_prune {
+                        prune_request = Some(root_slot);
+                    } else {
+                        warn!(
+                            "bank_for_slot skipping program cache prune at slot {} (debug)",
+                            root_slot
+                        );
                     }
                 }
+            }
             self.cursor.update_inflight_stage("clone_without_scheduler");
             let next_bank = bank_with_scheduler.clone_without_scheduler();
             drop(guard);
             if let Some(prune_slot) = prune_request {
                 let inflight = self.prune_inflight.clone();
                 let bank_forks = Arc::clone(&self.bank_forks);
-                        let execution_gate = self.execution_gate.clone();
-                        let firehose_gate = self.firehose_gate.clone();
-                        let _cursor = self.cursor.clone();
-                        let scheduler = self.scheduler.clone();
+                let execution_gate = self.execution_gate.clone();
+                let firehose_gate = self.firehose_gate.clone();
+                let _cursor = self.cursor.clone();
+                let scheduler = self.scheduler.clone();
                 if inflight
                     .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
                     .is_ok()
@@ -1011,9 +1012,10 @@ impl ReplayCursor {
 
     fn update_inflight_stage(&self, stage: &'static str) {
         if let Ok(mut guard) = self.inflight.lock()
-            && let Some(ref mut entry) = *guard {
-                entry.stage = stage;
-            }
+            && let Some(ref mut entry) = *guard
+        {
+            entry.stage = stage;
+        }
     }
 
     fn finish_inflight(&self) {
@@ -1096,8 +1098,7 @@ impl log::Log for AbortOnErrorLogger {
                     .map(|(slot, _, _, _, _, _, _)| slot == restart_slot)
                     .unwrap_or(false);
                 if !inflight_for_slot {
-                    let (slot, entry, tx_start_snapshot, _tx_count, _sig) =
-                        self.cursor.snapshot();
+                    let (slot, entry, tx_start_snapshot, _tx_count, _sig) = self.cursor.snapshot();
                     if slot == restart_slot {
                         entry_index = entry as usize;
                         tx_start = tx_start_snapshot as usize;
@@ -1791,10 +1792,7 @@ impl TransactionScheduler {
             .copied()
             .max()
             .unwrap_or(state.last_finalized_slot);
-        let buffer = state
-            .slots
-            .entry(restart_slot)
-            .or_default();
+        let buffer = state.slots.entry(restart_slot).or_default();
         buffer.reset_for_restart();
         buffer.apply_resume_counts(resume_entry, resume_tx);
         info!(
@@ -1852,10 +1850,7 @@ impl TransactionScheduler {
             self.apply_restart_locked(&mut state, target);
         } else if let Some(target) = self.take_resume_target(slot) {
             state.inferred_blocks.remove(&slot);
-            let buffer = state
-                .slots
-                .entry(slot)
-                .or_default();
+            let buffer = state.slots.entry(slot).or_default();
             buffer.reset_for_restart();
             buffer.apply_resume_counts(target.entry_index, target.tx_start);
             info!(
@@ -1872,10 +1867,7 @@ impl TransactionScheduler {
         if slot > state.highest_seen_slot {
             state.highest_seen_slot = slot;
         }
-        let buffer = state
-            .slots
-            .entry(slot)
-            .or_default();
+        let buffer = state.slots.entry(slot).or_default();
         let inserted = buffer.insert_transaction(index, tx, expected_status)?;
         let ready = self.advance_ready_locked(&mut state)?;
         Ok((ready, inserted))
@@ -1894,10 +1886,7 @@ impl TransactionScheduler {
             self.apply_restart_locked(&mut state, target);
         } else if let Some(target) = self.take_resume_target(slot) {
             state.inferred_blocks.remove(&slot);
-            let buffer = state
-                .slots
-                .entry(slot)
-                .or_default();
+            let buffer = state.slots.entry(slot).or_default();
             buffer.reset_for_restart();
             buffer.apply_resume_counts(target.entry_index, target.tx_start);
             info!(
@@ -1914,10 +1903,7 @@ impl TransactionScheduler {
         if slot > state.highest_seen_slot {
             state.highest_seen_slot = slot;
         }
-        let buffer = state
-            .slots
-            .entry(slot)
-            .or_default();
+        let buffer = state.slots.entry(slot).or_default();
         let inserted = buffer.push_entry(entry_index, start_index, tx_count, hash)?;
         let ready = self.advance_ready_locked(&mut state)?;
         Ok((ready, inserted))
@@ -1948,15 +1934,13 @@ impl TransactionScheduler {
             state.highest_seen_slot = slot;
         }
         if let Some((inferred_tx, inferred_entry)) = state.inferred_blocks.remove(&slot)
-            && (inferred_tx != expected_tx_count || inferred_entry != expected_entry_count) {
-                return Err(format!(
-                    "block metadata mismatch for slot {slot}: inferred txs {inferred_tx} entries {inferred_entry}, got txs {expected_tx_count} entries {expected_entry_count}"
-                ));
-            }
-        let buffer = state
-            .slots
-            .entry(slot)
-            .or_default();
+            && (inferred_tx != expected_tx_count || inferred_entry != expected_entry_count)
+        {
+            return Err(format!(
+                "block metadata mismatch for slot {slot}: inferred txs {inferred_tx} entries {inferred_entry}, got txs {expected_tx_count} entries {expected_entry_count}"
+            ));
+        }
+        let buffer = state.slots.entry(slot).or_default();
         buffer.set_expected_counts(expected_tx_count, expected_entry_count)?;
         self.advance_ready_locked(&mut state)
     }
@@ -2034,12 +2018,13 @@ impl TransactionScheduler {
             match self.presence.is_missing(current_slot) {
                 Some(true) => {
                     if let Some(buffer) = state.slots.remove(&current_slot)
-                        && buffer.has_any_data() {
-                            return Err(format!(
-                                "slot {} marked leader skipped but contains buffered data",
-                                current_slot
-                            ));
-                        }
+                        && buffer.has_any_data()
+                    {
+                        return Err(format!(
+                            "slot {} marked leader skipped but contains buffered data",
+                            current_slot
+                        ));
+                    }
                     state.last_finalized_slot = current_slot;
                     state.current_slot = current_slot.saturating_add(1);
                     continue;
@@ -2056,9 +2041,9 @@ impl TransactionScheduler {
             ready.append(&mut drained);
             if state.highest_seen_slot > current_slot
                 && let Some((txs, entries)) = buffer.infer_expected_counts_if_missing(current_slot)
-                {
-                    state.inferred_blocks.insert(current_slot, (txs, entries));
-                }
+            {
+                state.inferred_blocks.insert(current_slot, (txs, entries));
+            }
 
             let should_finalize = buffer.should_finalize(current_slot)?;
             if !should_finalize {
@@ -2453,26 +2438,29 @@ impl TransactionNotifier for BankTransactionNotifier {
                     self.progress.inc_tx();
                 }
                 if !ready_entries.is_empty()
-                    && let Err(err) = self.ready_sender.send(ready_entries) {
-                        self.failure
-                            .record(format!("ready entry channel closed: {err}"));
-                    }
+                    && let Err(err) = self.ready_sender.send(ready_entries)
+                {
+                    self.failure
+                        .record(format!("ready entry channel closed: {err}"));
+                }
             }
             Err(err) => self.failure.record(err),
         }
 
         if let Some(delegate) = self.delegate.as_ref()
-            && slot >= self.live_start_slot && inserted_tx {
-                delegate.notify_transaction(
-                    slot,
-                    transaction_slot_index,
-                    signature,
-                    message_hash,
-                    is_vote,
-                    transaction_status_meta,
-                    transaction,
-                );
-            }
+            && slot >= self.live_start_slot
+            && inserted_tx
+        {
+            delegate.notify_transaction(
+                slot,
+                transaction_slot_index,
+                signature,
+                message_hash,
+                is_vote,
+                transaction_status_meta,
+                transaction,
+            );
+        }
     }
 }
 
@@ -2512,18 +2500,21 @@ impl EntryNotifier for BankEntryNotifier {
                     self.progress.note_entry_slot(slot);
                 }
                 if !ready_entries.is_empty()
-                    && let Err(err) = self.ready_sender.send(ready_entries) {
-                        self.failure
-                            .record(format!("ready entry channel closed: {err}"));
-                    }
+                    && let Err(err) = self.ready_sender.send(ready_entries)
+                {
+                    self.failure
+                        .record(format!("ready entry channel closed: {err}"));
+                }
             }
             Err(err) => self.failure.record(err),
         }
 
         if let Some(delegate) = self.delegate.as_ref()
-            && slot >= self.live_start_slot && inserted_entry {
-                delegate.notify_entry(slot, index, entry, starting_transaction_index);
-            }
+            && slot >= self.live_start_slot
+            && inserted_entry
+        {
+            delegate.notify_entry(slot, index, entry, starting_transaction_index);
+        }
     }
 }
 
@@ -2577,28 +2568,30 @@ impl BlockMetadataNotifier for BankBlockMetadataNotifier {
         {
             Ok(ready_entries) => {
                 if !ready_entries.is_empty()
-                    && let Err(err) = self.ready_sender.send(ready_entries) {
-                        self.failure
-                            .record(format!("ready entry channel closed: {err}"));
-                    }
+                    && let Err(err) = self.ready_sender.send(ready_entries)
+                {
+                    self.failure
+                        .record(format!("ready entry channel closed: {err}"));
+                }
             }
             Err(err) => self.failure.record(err),
         }
 
         if let Some(delegate) = self.delegate.as_ref()
-            && slot >= self.live_start_slot {
-                delegate.notify_block_metadata(
-                    parent_slot,
-                    parent_blockhash,
-                    slot,
-                    blockhash,
-                    rewards,
-                    block_time,
-                    block_height,
-                    executed_transaction_count,
-                    entry_count,
-                );
-            }
+            && slot >= self.live_start_slot
+        {
+            delegate.notify_block_metadata(
+                parent_slot,
+                parent_blockhash,
+                slot,
+                blockhash,
+                rewards,
+                block_time,
+                block_height,
+                executed_transaction_count,
+                entry_count,
+            );
+        }
     }
 }
 
@@ -2630,11 +2623,7 @@ fn read_rss_bytes() -> Option<u64> {
     let status = std::fs::read_to_string("/proc/self/status").ok()?;
     for line in status.lines() {
         if let Some(value) = line.strip_prefix("VmRSS:") {
-            let kb = value
-                .split_whitespace()
-                .next()?
-                .parse::<u64>()
-                .ok()?;
+            let kb = value.split_whitespace().next()?.parse::<u64>().ok()?;
             return kb.checked_mul(1024);
         }
     }
@@ -3530,30 +3519,31 @@ fn load_bank_from_snapshot_archive(
             for path in receiver.iter() {
                 count += 1;
                 if let Some(interval) = log_interval
-                    && last_log.elapsed() >= interval {
-                        let elapsed = start.elapsed().as_secs_f64();
-                        let rate = if elapsed > 0.0 {
-                            count as f64 / elapsed
+                    && last_log.elapsed() >= interval
+                {
+                    let elapsed = start.elapsed().as_secs_f64();
+                    let rate = if elapsed > 0.0 {
+                        count as f64 / elapsed
+                    } else {
+                        0.0
+                    };
+                    let last_display = path.display().to_string();
+                    if let Some(total) = total_entries {
+                        let percent = if total > 0 {
+                            (count as f64 * 100.0 / total as f64).min(100.0)
                         } else {
                             0.0
                         };
-                        let last_display = path.display().to_string();
-                        if let Some(total) = total_entries {
-                            let percent = if total > 0 {
-                                (count as f64 * 100.0 / total as f64).min(100.0)
-                            } else {
-                                0.0
-                            };
-                            info!(
-                                "snapshot unpack progress: files={count}/{total} ({percent:.2}%) rate={rate:.1} files/s last={last_display}"
-                            );
-                        } else {
-                            info!(
-                                "snapshot unpack progress: files={count} rate={rate:.1} files/s last={last_display}"
-                            );
-                        }
-                        last_log = Instant::now();
+                        info!(
+                            "snapshot unpack progress: files={count}/{total} ({percent:.2}%) rate={rate:.1} files/s last={last_display}"
+                        );
+                    } else {
+                        info!(
+                            "snapshot unpack progress: files={count} rate={rate:.1} files/s last={last_display}"
+                        );
                     }
+                    last_log = Instant::now();
+                }
             }
             if count > 0 {
                 let elapsed = start.elapsed().as_secs_f64();
@@ -3831,10 +3821,11 @@ async fn download_with_ripget(
     shutdown: Arc<AtomicBool>,
 ) -> Result<(), String> {
     if let Ok(metadata) = fs::metadata(dest)
-        && metadata.len() > 0 {
-            info!("compact index already cached at {}", dest.display());
-            return Ok(());
-        }
+        && metadata.len() > 0
+    {
+        info!("compact index already cached at {}", dest.display());
+        return Ok(());
+    }
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent)
             .map_err(|err| format!("failed to create {}: {err}", parent.display()))?;
@@ -4360,14 +4351,14 @@ async fn run_geyser_replay(
                         let mut expected_after_slot: Option<Slot> = None;
                         if let Some(buffer) = snapshot.buffer.as_ref()
                             && buffer.expected_tx_count.is_none()
-                                && buffer.expected_entry_count.is_none()
-                                && buffer.processed_entry_count > 0
-                                && buffer.pending_entries == 0
-                                && buffer.buffered_txs == 0
-                            {
-                                expected_after_slot =
-                                    scheduler.expected_block_metadata_after(snapshot.current_slot);
-                            }
+                            && buffer.expected_entry_count.is_none()
+                            && buffer.processed_entry_count > 0
+                            && buffer.pending_entries == 0
+                            && buffer.buffered_txs == 0
+                        {
+                            expected_after_slot =
+                                scheduler.expected_block_metadata_after(snapshot.current_slot);
+                        }
                         let last_tx_slot = progress.last_tx_slot.load(Ordering::Relaxed);
                         let last_entry_slot = progress.last_entry_slot.load(Ordering::Relaxed);
                         let last_block_meta_slot =
@@ -4703,9 +4694,10 @@ async fn run_geyser_replay(
     match scheduler.drain_ready_entries() {
         Ok(ready_entries) => {
             if !ready_entries.is_empty()
-                && let Err(err) = ready_sender.send(ready_entries) {
-                    failure.record(format!("ready entry channel closed: {err}"));
-                }
+                && let Err(err) = ready_sender.send(ready_entries)
+            {
+                failure.record(format!("ready entry channel closed: {err}"));
+            }
         }
         Err(err) => failure.record(err),
     }

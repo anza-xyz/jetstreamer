@@ -1110,10 +1110,11 @@ impl log::Log for AbortOnErrorLogger {
                         tx_start = tx_start_snapshot as usize;
                     }
                 } else {
-                    let (slot, entry, tx_start_snapshot, _tx_count, _sig) = self.cursor.snapshot();
+                    let (slot, entry, tx_start_snapshot, tx_count, _sig) =
+                        self.cursor.snapshot();
                     if slot == restart_slot {
-                        entry_index = entry as usize;
-                        tx_start = tx_start_snapshot as usize;
+                        entry_index = entry.saturating_add(1) as usize;
+                        tx_start = tx_start_snapshot.saturating_add(tx_count) as usize;
                     }
                 }
                 self.restart_tracker

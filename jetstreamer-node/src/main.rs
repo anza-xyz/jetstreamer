@@ -1782,8 +1782,14 @@ impl TransactionScheduler {
 
     fn apply_restart_locked(&self, state: &mut SchedulerState, target: ResumeTarget) {
         let restart_slot = target.slot;
-        let resume_entry = target.entry_index;
-        let resume_tx = target.tx_start;
+        let mut resume_entry = target.entry_index;
+        let mut resume_tx = target.tx_start;
+        // Preserve any progress already recorded for the restart slot so we don't
+        // re-execute transactions if the firehose restarts mid-slot.
+        if let Some(buffer) = state.slots.remove(&restart_slot) {
+            resume_entry = resume_entry.max(buffer.processed_entry_count as usize);
+            resume_tx = resume_tx.max(buffer.processed_tx_count as usize);
+        }
         state.slots.retain(|slot, _| *slot < restart_slot);
         state.inferred_blocks.retain(|slot, _| *slot < restart_slot);
         if state.current_slot >= restart_slot {

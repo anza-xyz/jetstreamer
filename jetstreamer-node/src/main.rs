@@ -647,6 +647,15 @@ impl BankReplay {
                         entry.entry_index,
                         err
                     );
+                } else {
+                    // Only advance the replay cursor after a successful tick registration.
+                    self.cursor.update(
+                        entry.slot,
+                        entry.entry_index,
+                        entry.start_index,
+                        entry.tx_count,
+                        signature.clone(),
+                    );
                 }
                 let elapsed = start.elapsed();
                 self.note_entry_duration(&entry, elapsed, None);
@@ -659,13 +668,6 @@ impl BankReplay {
                 Ok(bank) => {
                     self.maybe_prune_program_cache_by_deployment_slot(&bank);
                     self.cursor.update_inflight_stage("try_process");
-                    self.cursor.update(
-                        entry.slot,
-                        entry.entry_index,
-                        entry.start_index,
-                        entry.tx_count,
-                        signature.clone(),
-                    );
                     if let Some(debug_sig) = self.debug_signature.as_ref() {
                         for (offset, scheduled) in entry.txs.iter().enumerate() {
                             if scheduled.tx.signatures.first() == Some(debug_sig) {
@@ -774,6 +776,14 @@ impl BankReplay {
                             panic!("{message}");
                         }
                     }
+                    // Advance the replay cursor only after successful execution/verification.
+                    self.cursor.update(
+                        entry.slot,
+                        entry.entry_index,
+                        entry.start_index,
+                        entry.tx_count,
+                        signature.clone(),
+                    );
                     let elapsed = start.elapsed();
                     self.note_entry_duration(&entry, elapsed, signature.as_deref());
                     if elapsed >= ENTRY_EXEC_WARN_AFTER {
@@ -1772,12 +1782,8 @@ impl TransactionScheduler {
 
     fn apply_restart_locked(&self, state: &mut SchedulerState, target: ResumeTarget) {
         let restart_slot = target.slot;
-        let mut resume_entry = target.entry_index;
-        let mut resume_tx = target.tx_start;
-        if let Some(buffer) = state.slots.get(&restart_slot) {
-            resume_entry = resume_entry.max(buffer.processed_entry_count as usize);
-            resume_tx = resume_tx.max(buffer.processed_tx_count as usize);
-        }
+        let resume_entry = target.entry_index;
+        let resume_tx = target.tx_start;
         state.slots.retain(|slot, _| *slot < restart_slot);
         state.inferred_blocks.retain(|slot, _| *slot < restart_slot);
         if state.current_slot >= restart_slot {

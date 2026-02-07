@@ -216,33 +216,41 @@ impl<R: AsyncRead + Unpin + AsyncSeek + Len> NodeReader<R> {
                 .map_err(FirehoseError::SeekToSlotError)?;
         };
 
-        let epoch = slot_to_epoch(slot);
-
-        let res = slot_to_offset(slot).await;
-        if let Err(SlotOffsetIndexError::SlotNotFound(..)) = res {
-            log::warn!(
-                target: LOG_MODULE,
-                "Slot {} not found in index, seeking to next slot",
-                slot
-            );
-            // Box the recursive call to avoid infinitely sized future
-            return Box::pin(self.seek_to_slot_inner(slot + 1)).await;
+        let mut current = slot;
+        loop {
+            let epoch = slot_to_epoch(current);
+            match slot_to_offset(current).await {
+                Ok(offset) => {
+                    log::info!(
+                        target: LOG_MODULE,
+                        "Seeking to slot {} in epoch {} @ offset {}",
+                        current,
+                        epoch,
+                        offset
+                    );
+                    wait_for_seek_hit_slot().await;
+                    self.reader
+                        .seek(SeekFrom::Start(offset))
+                        .await
+                        .map_err(|e| FirehoseError::SeekToSlotError(Box::new(e)))?;
+                    return Ok(());
+                }
+                Err(SlotOffsetIndexError::SlotNotFound(..)) => {
+                    log::warn!(
+                        target: LOG_MODULE,
+                        "Slot {} not found in index, seeking to next slot",
+                        current
+                    );
+                    if current == u64::MAX {
+                        return Err(FirehoseError::SeekToSlotError(Box::new(
+                            std::io::Error::other("slot search exhausted u64 range"),
+                        )));
+                    }
+                    current = current.saturating_add(1);
+                }
+                Err(err) => return Err(FirehoseError::SeekToSlotError(Box::new(err))),
+            }
         }
-        let offset = res?;
-        log::info!(
-            target: LOG_MODULE,
-            "Seeking to slot {} in epoch {} @ offset {}",
-            slot,
-            epoch,
-            offset
-        );
-        wait_for_seek_hit_slot().await;
-        self.reader
-            .seek(SeekFrom::Start(offset))
-            .await
-            .map_err(|e| FirehoseError::SeekToSlotError(Box::new(e)))?;
-
-        Ok(())
     }
 
     #[allow(clippy::should_implement_trait)]

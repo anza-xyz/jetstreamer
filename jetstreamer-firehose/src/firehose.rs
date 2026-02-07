@@ -37,7 +37,7 @@ use tokio::{
 use crate::{
     LOG_MODULE, SharedError,
     epochs::{epoch_to_slot_range, fetch_epoch_stream, slot_to_epoch},
-    index::{SLOT_OFFSET_INDEX, SlotOffsetIndexError},
+    index::{SLOT_OFFSET_INDEX, SlotOffsetIndexError, slot_to_offset},
     node_reader::NodeReader,
     utils,
 };
@@ -83,6 +83,49 @@ fn is_shutdown_error(err: &FirehoseError) -> bool {
         | FirehoseError::OnStatsHandlerError(inner) => is_interrupted(inner.as_ref()),
         _ => false,
     }
+}
+
+async fn find_previous_indexed_slot(
+    local_start: u64,
+    epoch_start: u64,
+    log_target: &str,
+) -> Result<Option<u64>, FirehoseError> {
+    if local_start <= epoch_start {
+        return Ok(None);
+    }
+    let mut candidate = local_start.saturating_sub(1);
+    let mut skipped = 0u64;
+    loop {
+        match slot_to_offset(candidate).await {
+            Ok(_) => {
+                if skipped > 0 {
+                    log::info!(
+                        target: log_target,
+                        "slot {} missing in index; seeking back {} slots to {}",
+                        local_start.saturating_sub(1),
+                        skipped,
+                        candidate
+                    );
+                }
+                return Ok(Some(candidate));
+            }
+            Err(SlotOffsetIndexError::SlotNotFound(..)) => {
+                if candidate <= epoch_start {
+                    break;
+                }
+                skipped += 1;
+                candidate = candidate.saturating_sub(1);
+            }
+            Err(err) => return Err(FirehoseError::SlotOffsetIndexError(err)),
+        }
+    }
+    log::warn!(
+        target: log_target,
+        "no indexed slot found before {} (epoch start {}); reading from epoch start",
+        local_start,
+        epoch_start
+    );
+    Ok(None)
 }
 
 /// Errors that can occur while streaming the firehose. Errors that can occur while streaming
@@ -385,6 +428,87 @@ fn decode_transaction_status_meta_from_frame(
     }
 }
 
+#[derive(Debug, Default)]
+struct DecodedRewards {
+    keyed_rewards: Vec<(Address, RewardInfo)>,
+    num_partitions: Option<u64>,
+}
+
+impl DecodedRewards {
+    fn empty() -> Self {
+        Self {
+            keyed_rewards: Vec::new(),
+            num_partitions: None,
+        }
+    }
+}
+
+fn decode_rewards_from_frame(
+    slot: u64,
+    reassembled_rewards: Vec<u8>,
+) -> Result<DecodedRewards, SharedError> {
+    if reassembled_rewards.is_empty() {
+        // Early epochs sometimes omit rewards payloads entirely.
+        return Ok(DecodedRewards::empty());
+    }
+
+    match utils::decompress_zstd(reassembled_rewards.clone()) {
+        Ok(decompressed) => decode_rewards_from_bytes(slot, decompressed.as_slice()).map_err(
+            |err| {
+                Box::new(std::io::Error::other(format!(
+                    "decode rewards (slot {slot}): {err}"
+                ))) as SharedError
+            },
+        ),
+        Err(decomp_err) => decode_rewards_from_bytes(slot, reassembled_rewards.as_slice()).map_err(
+            |err| {
+                Box::new(std::io::Error::other(format!(
+                    "rewards not zstd-compressed for slot {slot}; raw decode failed (raw_err={err}, decompress_err={decomp_err})"
+                ))) as SharedError
+            },
+        ),
+    }
+}
+
+fn decode_rewards_from_bytes(slot: u64, bytes: &[u8]) -> Result<DecodedRewards, SharedError> {
+    let epoch = slot_to_epoch(slot);
+    let proto_attempt: Result<solana_storage_proto::convert::generated::Rewards, _> =
+        prost_011::Message::decode(bytes);
+    match proto_attempt {
+        Ok(proto) => {
+            let num_partitions = proto.num_partitions.as_ref().map(|p| p.num_partitions);
+            let keyed_rewards = convert_proto_rewards(&proto).map_err(|err| {
+                Box::new(std::io::Error::other(format!(
+                    "convert rewards proto failed (epoch {epoch}): {err}"
+                ))) as SharedError
+            })?;
+            Ok(DecodedRewards {
+                keyed_rewards,
+                num_partitions,
+            })
+        }
+        Err(proto_err) => {
+            let stored: solana_storage_proto::StoredExtendedRewards =
+                bincode::deserialize(bytes).map_err(|bin_err| {
+                    Box::new(std::io::Error::other(format!(
+                        "protobuf decode rewards failed (epoch {epoch}); bincode failed too: {bin_err}; protobuf error: {proto_err}"
+                    ))) as SharedError
+                })?;
+            let proto: solana_storage_proto::convert::generated::Rewards = stored.into();
+            let num_partitions = proto.num_partitions.as_ref().map(|p| p.num_partitions);
+            let keyed_rewards = convert_proto_rewards(&proto).map_err(|err| {
+                Box::new(std::io::Error::other(format!(
+                    "convert rewards bincode fallback failed (epoch {epoch}); protobuf error: {proto_err}; conversion error: {err}"
+                ))) as SharedError
+            })?;
+            Ok(DecodedRewards {
+                keyed_rewards,
+                num_partitions,
+            })
+        }
+    }
+}
+
 fn decode_transaction_status_meta(
     slot: u64,
     metadata_bytes: &[u8],
@@ -520,6 +644,52 @@ mod metadata_decode_tests {
         let decoded =
             decode_transaction_status_meta_from_frame(0, raw_bytes).expect("decode fallback");
         assert_eq!(decoded, TransactionStatusMeta::from(stored));
+    }
+}
+
+#[cfg(test)]
+mod rewards_decode_tests {
+    use super::decode_rewards_from_bytes;
+    use solana_sdk_ids::vote::id as vote_program_id;
+    use solana_storage_proto::StoredExtendedRewards;
+    use solana_transaction_status::{Reward, RewardType};
+
+    #[test]
+    fn decodes_protobuf_rewards() {
+        let pubkey = vote_program_id().to_string();
+        let proto = solana_storage_proto::convert::generated::Rewards {
+            rewards: vec![solana_storage_proto::convert::generated::Reward {
+                pubkey,
+                lamports: 5,
+                post_balance: 10,
+                reward_type: solana_storage_proto::convert::generated::RewardType::Fee as i32,
+                commission: "1".to_string(),
+            }],
+            num_partitions: Some(solana_storage_proto::convert::generated::NumPartitions {
+                num_partitions: 2,
+            }),
+        };
+        let bytes = prost_011::Message::encode_to_vec(&proto);
+        let decoded = decode_rewards_from_bytes(0, &bytes).expect("decode proto rewards");
+        assert_eq!(decoded.keyed_rewards.len(), 1);
+        assert_eq!(decoded.num_partitions, Some(2));
+    }
+
+    #[test]
+    fn decodes_bincode_rewards() {
+        let pubkey = vote_program_id().to_string();
+        let reward = Reward {
+            pubkey,
+            lamports: 7,
+            post_balance: 9,
+            reward_type: Some(RewardType::Rent),
+            commission: Some(3),
+        };
+        let stored_rewards: StoredExtendedRewards = vec![reward.into()];
+        let bytes = bincode::serialize(&stored_rewards).expect("bincode serialize");
+        let decoded = decode_rewards_from_bytes(0, &bytes).expect("decode bincode rewards");
+        assert_eq!(decoded.keyed_rewards.len(), 1);
+        assert_eq!(decoded.num_partitions, None);
     }
 }
 
@@ -881,15 +1051,36 @@ where
                         }
 
                     if local_start > epoch_start {
-                        // Seek to the previous slot so the stream includes all nodes
-                        // (transactions, entries, rewards) that precede the block payload for
-                        // `local_start`.
-                        let seek_slot = local_start.saturating_sub(1);
-                        let seek_fut = reader.seek_to_slot(seek_slot);
-                        match timeout(OP_TIMEOUT, seek_fut).await {
+                        // Seek to the nearest previous indexed slot so the stream includes all
+                        // nodes (transactions, entries, rewards) that precede `local_start`.
+                        let seek_slot = match timeout(
+                            OP_TIMEOUT,
+                            find_previous_indexed_slot(local_start, epoch_start, &log_target),
+                        )
+                        .await
+                        {
                             Ok(res) => res.map_err(|e| (e, current_slot.unwrap_or(slot_range.start)))?,
                             Err(_) => {
-                                return Err((FirehoseError::OperationTimeout("seek_to_slot"), current_slot.unwrap_or(slot_range.start)));
+                                return Err((
+                                    FirehoseError::OperationTimeout(
+                                        "seek_to_previous_indexed_slot",
+                                    ),
+                                    current_slot.unwrap_or(slot_range.start),
+                                ));
+                            }
+                        };
+                        if let Some(seek_slot) = seek_slot {
+                            let seek_fut = reader.seek_to_slot(seek_slot);
+                            match timeout(OP_TIMEOUT, seek_fut).await {
+                                Ok(res) => {
+                                    res.map_err(|e| (e, current_slot.unwrap_or(slot_range.start)))?
+                                }
+                                Err(_) => {
+                                    return Err((
+                                        FirehoseError::OperationTimeout("seek_to_slot"),
+                                        current_slot.unwrap_or(slot_range.start),
+                                    ));
+                                }
                             }
                         }
                     }
@@ -991,7 +1182,7 @@ where
                         let mut entry_index: usize = 0;
                         let mut this_block_executed_transaction_count: u64 = 0;
                         let mut this_block_entry_count: u64 = 0;
-                        let mut this_block_rewards: Vec<(Address, RewardInfo)> = Vec::new();
+                        let mut this_block_rewards = DecodedRewards::empty();
 
                         for node_with_cid in &nodes.0 {
                             item_index += 1;
@@ -1264,13 +1455,16 @@ where
                                             slot,
                                             last_counted_slot,
                                         );
-                                        this_block_rewards.clear();
+                                        this_block_rewards = DecodedRewards::empty();
                                         continue;
                                     }
 
                                     if block_enabled {
                                         if let Some(on_block_cb) = on_block.as_ref() {
-                                            let keyed_rewards = std::mem::take(&mut this_block_rewards);
+                                            let DecodedRewards {
+                                                keyed_rewards,
+                                                num_partitions,
+                                            } = std::mem::take(&mut this_block_rewards);
                                             if slot > last_emitted_slot {
                                                 last_emitted_slot = slot;
                                                 on_block_cb(
@@ -1282,7 +1476,7 @@ where
                                                         blockhash: latest_entry_blockhash,
                                                         rewards: KeyedRewardsAndNumPartitions {
                                                             keyed_rewards,
-                                                            num_partitions: None,
+                                                            num_partitions,
                                                         },
                                                         block_time: Some(block.meta.blocktime as i64),
                                                         block_height: block.meta.block_height,
@@ -1301,7 +1495,7 @@ where
                                             }
                                         }
                                     } else {
-                                        this_block_rewards.clear();
+                                        this_block_rewards = DecodedRewards::empty();
                                     }
                                     previous_blockhash = latest_entry_blockhash;
 
@@ -1379,7 +1573,7 @@ where
                                                 )
                                             })?;
                                         if reassembled.is_empty() {
-                                            this_block_rewards.clear();
+                                            this_block_rewards = DecodedRewards::empty();
                                             if reward_enabled
                                                 && let Some(on_reward_cb) = on_reward.as_ref()
                                             {
@@ -1401,35 +1595,17 @@ where
                                             continue;
                                         }
 
-                                        let decompressed = utils::decompress_zstd(reassembled)
-                                            .map_err(|err| {
-                                                (
-                                                    FirehoseError::NodeDecodingError(
-                                                        item_index,
-                                                        err,
-                                                    ),
-                                                    error_slot,
-                                                )
-                                            })?;
-
-                                        let decoded =
-                                            prost_011::Message::decode(decompressed.as_slice())
+                                        let decoded_rewards =
+                                            decode_rewards_from_frame(block.slot, reassembled)
                                                 .map_err(|err| {
                                                     (
                                                         FirehoseError::NodeDecodingError(
                                                             item_index,
-                                                            Box::new(err),
+                                                            err,
                                                         ),
                                                         error_slot,
                                                     )
                                                 })?;
-                                        let keyed_rewards = convert_proto_rewards(&decoded)
-                                            .map_err(|err| {
-                                                (
-                                                    FirehoseError::NodeDecodingError(item_index, err),
-                                                    error_slot,
-                                                )
-                                            })?;
                                         if reward_enabled
                                             && let Some(on_reward_cb) = on_reward.as_ref()
                                         {
@@ -1437,7 +1613,7 @@ where
                                                 thread_index,
                                                 RewardsData {
                                                     slot: block.slot,
-                                                    rewards: keyed_rewards.clone(),
+                                                    rewards: decoded_rewards.keyed_rewards.clone(),
                                                 },
                                             )
                                             .await
@@ -1448,10 +1624,10 @@ where
                                                 )
                                             })?;
                                         }
-                                        this_block_rewards = keyed_rewards;
+                                        this_block_rewards = decoded_rewards;
                                         if let Some(ref mut stats) = thread_stats {
                                             stats.rewards_processed +=
-                                                this_block_rewards.len() as u64;
+                                                this_block_rewards.keyed_rewards.len() as u64;
                                         }
                                     }
                                 }
@@ -1907,15 +2083,36 @@ async fn firehose_geyser_thread(
                 current_slot = None;
 
                 if local_start > epoch_start {
-                    // Seek to the slot immediately preceding the requested range so the reader
-                    // captures the full node set (transactions, entries, rewards) for the
-                    // target block on the next iteration.
-                    let seek_slot = local_start.saturating_sub(1);
-                    let seek_fut = reader.seek_to_slot(seek_slot);
-                    match timeout(OP_TIMEOUT, seek_fut).await {
+                    // Seek to the nearest previous indexed slot so the reader captures the full
+                    // node set (transactions, entries, rewards) for the target block.
+                    let seek_slot = match timeout(
+                        OP_TIMEOUT,
+                        find_previous_indexed_slot(local_start, epoch_start, &log_target),
+                    )
+                    .await
+                    {
                         Ok(res) => res.map_err(|e| (e, current_slot.unwrap_or(slot_range.start)))?,
                         Err(_) => {
-                            return Err((FirehoseError::OperationTimeout("seek_to_slot"), current_slot.unwrap_or(slot_range.start)));
+                            return Err((
+                                FirehoseError::OperationTimeout(
+                                    "seek_to_previous_indexed_slot",
+                                ),
+                                current_slot.unwrap_or(slot_range.start),
+                            ));
+                        }
+                    };
+                    if let Some(seek_slot) = seek_slot {
+                        let seek_fut = reader.seek_to_slot(seek_slot);
+                        match timeout(OP_TIMEOUT, seek_fut).await {
+                            Ok(res) => {
+                                res.map_err(|e| (e, current_slot.unwrap_or(slot_range.start)))?
+                            }
+                            Err(_) => {
+                                return Err((
+                                    FirehoseError::OperationTimeout("seek_to_slot"),
+                                    current_slot.unwrap_or(slot_range.start),
+                                ));
+                            }
                         }
                     }
                 }
@@ -2016,7 +2213,7 @@ async fn firehose_geyser_thread(
                     let mut entry_index: usize = 0;
                     let mut this_block_executed_transaction_count: u64 = 0;
                     let mut this_block_entry_count: u64 = 0;
-                    let mut this_block_rewards: Vec<(Address, RewardInfo)> = Vec::new();
+                    let mut this_block_rewards = DecodedRewards::empty();
 
                     if slot <= last_counted_slot {
                         log::debug!(
@@ -2025,7 +2222,6 @@ async fn firehose_geyser_thread(
                             slot,
                             last_counted_slot,
                         );
-                        this_block_rewards.clear();
                         continue;
                     }
 
@@ -2153,7 +2349,10 @@ async fn firehose_geyser_thread(
                                     last_counted_slot = block.slot;
                                     return Ok(());
                                 }
-                                let keyed_rewards = std::mem::take(&mut this_block_rewards);
+                                let DecodedRewards {
+                                    keyed_rewards,
+                                    num_partitions,
+                                } = std::mem::take(&mut this_block_rewards);
                                 let block_meta_notifier = block_meta_notifier_maybe.as_ref().unwrap();
                                 block_meta_notifier.notify_block_metadata(
                                     block.meta.parent_slot,
@@ -2162,7 +2361,7 @@ async fn firehose_geyser_thread(
                                     todo_latest_entry_blockhash.to_string().as_str(),
                                     &KeyedRewardsAndNumPartitions {
                                         keyed_rewards,
-                                        num_partitions: None,
+                                        num_partitions,
                                     },
                                     Some(block.meta.blocktime as i64),
                                     block.meta.block_height,
@@ -2176,15 +2375,14 @@ async fn firehose_geyser_thread(
                             Subset(_subset) => (),
                             Epoch(_epoch) => (),
                             Rewards(rewards) => {
-                                if !rewards.is_complete() {
-                                    let reassembled = nodes.reassemble_dataframes(rewards.data.clone())?;
-                                    let decompressed = utils::decompress_zstd(reassembled)?;
-                                    let decoded = prost_011::Message::decode(decompressed.as_slice()).map_err(|err| {
-                                        Box::new(std::io::Error::other(
-                                            std::format!("Error decoding rewards: {:?}", err),
-                                        ))
-                                    })?;
-                                    this_block_rewards = convert_proto_rewards(&decoded)?;
+                                let reassembled = nodes.reassemble_dataframes(rewards.data.clone())?;
+                                if !reassembled.is_empty() {
+                                    this_block_rewards = decode_rewards_from_frame(
+                                        block.slot,
+                                        reassembled,
+                                    )?;
+                                } else {
+                                    this_block_rewards = DecodedRewards::empty();
                                 }
                             }
                             DataFrame(_data_frame) => (),
@@ -2465,6 +2663,203 @@ use serial_test::serial;
 #[cfg(test)]
 use std::sync::{Mutex, OnceLock};
 
+#[cfg(test)]
+async fn assert_slot_min_executed_transactions(slot: u64, min_executed: u64) {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    let found = Arc::new(AtomicBool::new(false));
+    let observed_total = Arc::new(AtomicU64::new(0));
+    let observed_non_vote = Arc::new(AtomicU64::new(0));
+
+    let found_block = found.clone();
+    let observed_total_block = observed_total.clone();
+    let target_slot_block = slot;
+    let target_slot_tx = slot;
+    let observed_non_vote_tx = observed_non_vote.clone();
+
+    firehose(
+        1,
+        target_slot_block..(target_slot_block + 1),
+        Some(move |_thread_id: usize, block: BlockData| {
+            let found_block = found_block.clone();
+            let observed_total_block = observed_total_block.clone();
+            async move {
+                if block.slot() == target_slot_block {
+                    assert!(
+                        !block.was_skipped(),
+                        "slot {target_slot_block} was marked leader skipped",
+                    );
+                    if let BlockData::Block {
+                        executed_transaction_count,
+                        ..
+                    } = block
+                    {
+                        found_block.store(true, Ordering::Relaxed);
+                        observed_total_block.store(executed_transaction_count, Ordering::Relaxed);
+                    }
+                }
+                Ok(())
+            }
+            .boxed()
+        }),
+        Some(move |_thread_id: usize, transaction: TransactionData| {
+            let observed_non_vote_tx = observed_non_vote_tx.clone();
+            async move {
+                if transaction.slot == target_slot_tx && !transaction.is_vote {
+                    observed_non_vote_tx.fetch_add(1, Ordering::Relaxed);
+                }
+                Ok(())
+            }
+            .boxed()
+        }),
+        None::<OnEntryFn>,
+        None::<OnRewardFn>,
+        None::<OnErrorFn>,
+        None::<OnStatsTrackingFn>,
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        found.load(Ordering::Relaxed),
+        "target slot {slot} was not processed"
+    );
+    let observed_total = observed_total.load(Ordering::Relaxed);
+    let observed_non_vote = observed_non_vote.load(Ordering::Relaxed);
+    assert!(
+        observed_total > 0,
+        "slot {slot} executed transaction count was zero"
+    );
+    assert!(
+        observed_total >= min_executed,
+        "slot {slot} executed transaction count {observed_total} is below expected minimum {min_executed}"
+    );
+    log::info!(
+        target: LOG_MODULE,
+        "slot {slot} executed_tx_count={}, non_vote_tx_count={}",
+        observed_total,
+        observed_non_vote
+    );
+}
+
+#[cfg(test)]
+async fn log_slot_node_summary(slot: u64) -> Result<(), SharedError> {
+    use crate::index::slot_to_offset;
+    use crate::node::Node;
+
+    let epoch = slot_to_epoch(slot);
+    let client = crate::network::create_http_client();
+    let stream = fetch_epoch_stream(epoch, &client).await;
+    let mut reader = NodeReader::new(stream);
+    reader
+        .seek_to_slot(slot)
+        .await
+        .map_err(|err| Box::new(err) as SharedError)?;
+
+    let nodes = reader.read_until_block().await?;
+    let mut transactions = 0u64;
+    let mut entries = 0u64;
+    let mut entry_tx_total = 0u64;
+    let mut dataframes = 0u64;
+    let mut rewards = 0u64;
+    let mut subsets = 0u64;
+    let mut epochs = 0u64;
+    let mut block_slot = None;
+    let mut block_entries = None;
+    let first_kind = nodes
+        .0
+        .first()
+        .map(|node| node.get_node())
+        .map(|node| match node {
+            Node::Transaction(_) => "transaction",
+            Node::Entry(_) => "entry",
+            Node::Block(_) => "block",
+            Node::Subset(_) => "subset",
+            Node::Epoch(_) => "epoch",
+            Node::Rewards(_) => "rewards",
+            Node::DataFrame(_) => "dataframe",
+        })
+        .unwrap_or("none");
+
+    for node in &nodes.0 {
+        match node.get_node() {
+            Node::Transaction(_) => {
+                transactions += 1;
+            }
+            Node::Entry(entry) => {
+                entries += 1;
+                entry_tx_total += entry.transactions.len() as u64;
+            }
+            Node::Block(block) => {
+                block_slot = Some(block.slot);
+                block_entries = Some(block.entries.len());
+            }
+            Node::Subset(_) => {
+                subsets += 1;
+            }
+            Node::Epoch(_) => {
+                epochs += 1;
+            }
+            Node::Rewards(_) => {
+                rewards += 1;
+            }
+            Node::DataFrame(_) => {
+                dataframes += 1;
+            }
+        }
+    }
+
+    log::info!(
+        target: LOG_MODULE,
+        "slot {slot} node summary: total_nodes={}, first_kind={}, tx_nodes={}, entry_nodes={}, entry_tx_total={}, block_slot={:?}, block_entries={:?}, dataframes={}, rewards={}, subsets={}, epochs={}",
+        nodes.len(),
+        first_kind,
+        transactions,
+        entries,
+        entry_tx_total,
+        block_slot,
+        block_entries,
+        dataframes,
+        rewards,
+        subsets,
+        epochs
+    );
+
+    if slot > 0 {
+        let mut found_previous = None;
+        for delta in 1..=5 {
+            let candidate = slot.saturating_sub(delta);
+            match slot_to_offset(candidate).await {
+                Ok(offset) => {
+                    found_previous = Some((candidate, offset));
+                    break;
+                }
+                Err(err) => {
+                    log::info!(
+                        target: LOG_MODULE,
+                        "slot {slot} previous lookup {candidate} failed: {err}"
+                    );
+                }
+            }
+        }
+        if let Some((candidate, offset)) = found_previous {
+            log::info!(
+                target: LOG_MODULE,
+                "slot {slot} nearest previous offset within 5 slots: slot {candidate} @ {offset}"
+            );
+        } else {
+            log::info!(
+                target: LOG_MODULE,
+                "slot {slot} no previous offsets found within 5 slots"
+            );
+        }
+    }
+
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn test_firehose_epoch_800() {
     use dashmap::DashSet;
@@ -2654,6 +3049,56 @@ async fn test_firehose_target_slot_transactions() {
         EXPECTED_TRANSACTIONS,
         "recorded transaction count mismatch"
     );
+}
+
+#[cfg(test)]
+#[serial]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_firehose_epoch_720_slot_311173980_solscan_non_vote_counts() {
+    solana_logger::setup_with_default("info");
+    assert_slot_min_executed_transactions(311_173_980, 1_197 + 211).await;
+}
+
+#[cfg(test)]
+#[serial]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_firehose_epoch_720_slot_311225232_solscan_non_vote_counts() {
+    solana_logger::setup_with_default("info");
+    assert_slot_min_executed_transactions(311_225_232, 888 + 157).await;
+}
+
+#[cfg(test)]
+#[serial]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_firehose_epoch_720_slot_311175860_solscan_non_vote_counts() {
+    solana_logger::setup_with_default("info");
+    assert_slot_min_executed_transactions(311_175_860, 527 + 110).await;
+}
+
+#[cfg(test)]
+#[serial]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_firehose_epoch_720_slot_311134608_solscan_non_vote_counts() {
+    solana_logger::setup_with_default("info");
+    assert_slot_min_executed_transactions(311_134_608, 1_086 + 169).await;
+}
+
+#[cfg(test)]
+#[ignore]
+#[serial]
+#[tokio::test(flavor = "multi_thread")]
+async fn debug_epoch_720_slot_311173980_node_summary() {
+    solana_logger::setup_with_default("info");
+    const SLOTS: &[u64] = &[
+        311_173_980,
+        311_225_232,
+        311_175_860,
+        311_134_608,
+        376_273_722,
+    ];
+    for slot in SLOTS {
+        log_slot_node_summary(*slot).await.expect("slot summary");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

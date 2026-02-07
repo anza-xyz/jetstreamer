@@ -134,6 +134,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::{signal, sync::broadcast};
+use url::Url;
 
 /// Re-exported statistics types produced by [`firehose`].
 pub use jetstreamer_firehose::firehose::{
@@ -288,8 +289,7 @@ impl PluginRunner {
 
         let clickhouse = if clickhouse_enabled {
             let client = Arc::new(
-                Client::default()
-                    .with_url(&self.clickhouse_dsn)
+                build_clickhouse_client(&self.clickhouse_dsn)
                     .with_option("async_insert", "1")
                     .with_option("wait_for_async_insert", "0"),
             );
@@ -812,6 +812,28 @@ impl PluginRunner {
             }),
         }
     }
+}
+
+fn build_clickhouse_client(dsn: &str) -> Client {
+    let mut client = Client::default();
+    if let Ok(mut url) = Url::parse(dsn) {
+        let username = url.username().to_string();
+        let password = url.password().map(|value| value.to_string());
+        if !username.is_empty() || password.is_some() {
+            let _ = url.set_username("");
+            let _ = url.set_password(None);
+        }
+        client = client.with_url(url.as_str());
+        if !username.is_empty() {
+            client = client.with_user(username);
+        }
+        if let Some(password) = password {
+            client = client.with_password(password);
+        }
+    } else {
+        client = client.with_url(dsn);
+    }
+    client
 }
 
 /// Errors that can arise while running plugins against the firehose.

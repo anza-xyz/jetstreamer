@@ -1102,12 +1102,14 @@ impl log::Log for AbortOnErrorLogger {
             if let Some((restart_slot, _item_index)) = parse_firehose_restart_info(&message) {
                 let mut entry_index = 0usize;
                 let mut tx_start = 0usize;
-                let inflight_for_slot = self
-                    .cursor
-                    .inflight_snapshot()
-                    .map(|(slot, _, _, _, _, _, _)| slot == restart_slot)
-                    .unwrap_or(false);
-                if !inflight_for_slot {
+                if let Some((slot, entry, tx_start_snapshot, _tx_count, _sig, _stage, _elapsed)) =
+                    self.cursor.inflight_snapshot()
+                {
+                    if slot == restart_slot {
+                        entry_index = entry as usize;
+                        tx_start = tx_start_snapshot as usize;
+                    }
+                } else {
                     let (slot, entry, tx_start_snapshot, _tx_count, _sig) = self.cursor.snapshot();
                     if slot == restart_slot {
                         entry_index = entry as usize;
@@ -1782,14 +1784,8 @@ impl TransactionScheduler {
 
     fn apply_restart_locked(&self, state: &mut SchedulerState, target: ResumeTarget) {
         let restart_slot = target.slot;
-        let mut resume_entry = target.entry_index;
-        let mut resume_tx = target.tx_start;
-        // Preserve any progress already recorded for the restart slot so we don't
-        // re-execute transactions if the firehose restarts mid-slot.
-        if let Some(buffer) = state.slots.remove(&restart_slot) {
-            resume_entry = resume_entry.max(buffer.processed_entry_count as usize);
-            resume_tx = resume_tx.max(buffer.processed_tx_count as usize);
-        }
+        let resume_entry = target.entry_index;
+        let resume_tx = target.tx_start;
         state.slots.retain(|slot, _| *slot < restart_slot);
         state.inferred_blocks.retain(|slot, _| *slot < restart_slot);
         if state.current_slot >= restart_slot {

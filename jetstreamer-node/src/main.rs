@@ -4893,22 +4893,6 @@ async fn extract_tarball(archive: &Path, dest_dir: &Path) -> Result<(), String> 
     let archive = archive.to_path_buf();
     let dest_dir = dest_dir.to_path_buf();
     tokio::task::spawn_blocking(move || {
-        fn remove_path_if_exists(path: &Path) -> Result<(), String> {
-            if !path.exists() {
-                return Ok(());
-            }
-            let metadata = fs::symlink_metadata(path)
-                .map_err(|err| format!("failed to read {}: {err}", path.display()))?;
-            if metadata.is_dir() {
-                fs::remove_dir_all(path)
-                    .map_err(|err| format!("failed to remove {}: {err}", path.display()))?;
-            } else {
-                fs::remove_file(path)
-                    .map_err(|err| format!("failed to remove {}: {err}", path.display()))?;
-            }
-            Ok(())
-        }
-
         fs::create_dir_all(&dest_dir)
             .map_err(|err| format!("failed to create {}: {err}", dest_dir.display()))?;
         remove_path_if_exists(&dest_dir.join("accounts"))?;
@@ -4957,6 +4941,61 @@ async fn extract_tarball(archive: &Path, dest_dir: &Path) -> Result<(), String> 
     })
     .await
     .map_err(|err| format!("snapshot unarchive task failed: {err}"))?
+}
+
+fn remove_path_if_exists(path: &Path) -> Result<(), String> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let metadata =
+        fs::symlink_metadata(path).map_err(|err| format!("failed to read {}: {err}", path.display()))?;
+    if metadata.is_dir() {
+        fs::remove_dir_all(path)
+            .map_err(|err| format!("failed to remove {}: {err}", path.display()))?;
+    } else {
+        fs::remove_file(path).map_err(|err| format!("failed to remove {}: {err}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn clear_ledger_accounts_state(ledger_dir: &Path) -> Result<(), String> {
+    let mut cleared = Vec::new();
+    for name in ["accounts", "accounts-index", ARCHIVE_ACCOUNTS_DIR, BANK_SNAPSHOTS_DIR] {
+        let path = ledger_dir.join(name);
+        if path.exists() {
+            remove_path_if_exists(&path)?;
+            cleared.push(path);
+        }
+    }
+    let version_file = ledger_dir.join(SNAPSHOT_VERSION_FILE);
+    if version_file.exists() {
+        remove_path_if_exists(&version_file)?;
+        cleared.push(version_file);
+    }
+    if ledger_dir.is_dir() {
+        let read_dir = fs::read_dir(ledger_dir)
+            .map_err(|err| format!("failed to read {}: {err}", ledger_dir.display()))?;
+        for entry in read_dir {
+            let entry = entry.map_err(|err| format!("failed to read {}: {err}", ledger_dir.display()))?;
+            let file_name = entry.file_name();
+            let name = file_name.to_string_lossy();
+            if name.starts_with(".snapshot-extract-") {
+                let path = entry.path();
+                remove_path_if_exists(&path)?;
+                cleared.push(path);
+            }
+        }
+    }
+    if cleared.is_empty() {
+        info!("ledger accounts state already clean in {}", ledger_dir.display());
+    } else {
+        info!(
+            "cleared ledger accounts state ({} path(s)) in {}",
+            cleared.len(),
+            ledger_dir.display()
+        );
+    }
+    Ok(())
 }
 
 #[tokio::main]
@@ -5026,6 +5065,17 @@ async fn main() {
             }
         },
     };
+
+    if env_truthy_default("JETSTREAMER_CLEAR_ACCOUNTS_ON_START", true) {
+        if let Err(err) = clear_ledger_accounts_state(&dest_dir) {
+            eprintln!("error: {err}");
+            exit(1);
+        }
+    } else {
+        info!(
+            "ledger accounts cleanup disabled via JETSTREAMER_CLEAR_ACCOUNTS_ON_START"
+        );
+    }
 
     let target_slot = epoch_to_slot(epoch).saturating_sub(1);
     let mut extracted_snapshot = false;

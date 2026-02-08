@@ -626,7 +626,7 @@ impl BankReplay {
         };
         let header = message.header();
         let static_keys = message.static_account_keys();
-        error!(
+        warn!(
             "mismatch detail: slot={} entry={} tx_index={} offset={} bank_slot={} expected={:?} actual={:?} sigs={:?}",
             entry.slot,
             entry.entry_index,
@@ -637,7 +637,7 @@ impl BankReplay {
             actual,
             signatures
         );
-        error!(
+        warn!(
             "mismatch detail: message_version={} recent_blockhash={} header(required_signatures={}, readonly_signed={}, readonly_unsigned={})",
             version,
             message.recent_blockhash(),
@@ -645,7 +645,7 @@ impl BankReplay {
             header.num_readonly_signed_accounts,
             header.num_readonly_unsigned_accounts
         );
-        error!(
+        warn!(
             "mismatch detail: entry_start_index={} entry_tx_count={} entry_hash={}",
             entry.start_index,
             entry.tx_count,
@@ -654,7 +654,7 @@ impl BankReplay {
 
         let (cursor_slot, cursor_entry, cursor_tx_start, cursor_tx_count, cursor_sig) =
             self.cursor.snapshot();
-        error!(
+        warn!(
             "mismatch detail: cursor slot={} entry={} tx_start={} tx_count={} sig={}",
             cursor_slot,
             cursor_entry,
@@ -665,7 +665,7 @@ impl BankReplay {
         if let Some((slot, entry_idx, tx_start, tx_count, sig, stage, elapsed)) =
             self.cursor.inflight_snapshot()
         {
-            error!(
+            warn!(
                 "mismatch detail: inflight slot={} entry={} tx_start={} tx_count={} stage={} elapsed={:.3}s sig={}",
                 slot,
                 entry_idx,
@@ -677,7 +677,7 @@ impl BankReplay {
             );
         }
         let snapshot = self.scheduler.snapshot();
-        error!(
+        warn!(
             "mismatch detail: scheduler current_slot={} last_finalized={} buffered_slots={} highest_seen_slot={} presence={:?} buffer={:?}",
             snapshot.current_slot,
             snapshot.last_finalized_slot,
@@ -691,7 +691,7 @@ impl BankReplay {
             let signer = message.is_signer(index);
             let writable = message.is_maybe_writable(index, None);
             let invoked = message.is_invoked(index);
-            error!(
+            warn!(
                 "mismatch detail: key[{}]={} signer={} writable={} invoked_as_program={} source=static",
                 index,
                 key,
@@ -703,7 +703,7 @@ impl BankReplay {
 
         if let Some(lookups) = message.address_table_lookups() {
             for (idx, lookup) in lookups.iter().enumerate() {
-                error!(
+                warn!(
                     "mismatch detail: address_table_lookup[{}] account_key={} writable_indexes={:?} readonly_indexes={:?}",
                     idx,
                     lookup.account_key,
@@ -719,7 +719,7 @@ impl BankReplay {
                 .get(program_index)
                 .map(|key| key.to_string())
                 .unwrap_or_else(|| format!("<lookup:{}>", program_index));
-            error!(
+            warn!(
                 "mismatch detail: ix[{}] program_index={} program={} accounts={:?} data_len={} data_xxh64={:x}",
                 ix_idx,
                 program_index,

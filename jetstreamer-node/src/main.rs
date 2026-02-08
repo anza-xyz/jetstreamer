@@ -27,7 +27,7 @@ use jetstreamer_firehose::{
 use jetstreamer_node::snapshots::{
     DEFAULT_BUCKET, download_snapshot_at_or_before_slot, list_epoch_snapshots,
 };
-use log::{info, warn};
+use log::{error, info, warn};
 use reqwest::{Client, Url, header::RANGE};
 use serde_cbor::Value;
 use solana_account::AccountSharedData;
@@ -59,7 +59,8 @@ use solana_signature::Signature;
 use solana_svm::transaction_processor::ExecutionRecordingConfig;
 use solana_svm_timings::ExecuteTimings;
 use solana_transaction::{
-    TransactionError, sanitized::SanitizedTransaction, versioned::VersionedTransaction,
+    TransactionError, VersionedMessage, sanitized::SanitizedTransaction,
+    versioned::VersionedTransaction,
 };
 use solana_transaction_status::TransactionStatusMeta;
 use tar::Archive as TarArchive;
@@ -607,6 +608,129 @@ impl BankReplay {
         }
     }
 
+    fn log_mismatch_details(
+        &self,
+        bank: &Bank,
+        entry: &ReadyEntry,
+        tx_index: usize,
+        offset: usize,
+        expected: &Result<(), TransactionError>,
+        actual: &Result<(), TransactionError>,
+        tx: &VersionedTransaction,
+    ) {
+        let signatures: Vec<String> = tx.signatures.iter().map(|sig| sig.to_string()).collect();
+        let message = &tx.message;
+        let version = match message {
+            VersionedMessage::Legacy(_) => "legacy",
+            VersionedMessage::V0(_) => "v0",
+        };
+        let header = message.header();
+        let static_keys = message.static_account_keys();
+        error!(
+            "mismatch detail: slot={} entry={} tx_index={} offset={} bank_slot={} expected={:?} actual={:?} sigs={:?}",
+            entry.slot,
+            entry.entry_index,
+            tx_index,
+            offset,
+            bank.slot(),
+            expected,
+            actual,
+            signatures
+        );
+        error!(
+            "mismatch detail: message_version={} recent_blockhash={} header(required_signatures={}, readonly_signed={}, readonly_unsigned={})",
+            version,
+            message.recent_blockhash(),
+            header.num_required_signatures,
+            header.num_readonly_signed_accounts,
+            header.num_readonly_unsigned_accounts
+        );
+        error!(
+            "mismatch detail: entry_start_index={} entry_tx_count={} entry_hash={}",
+            entry.start_index,
+            entry.tx_count,
+            entry.hash
+        );
+
+        let (cursor_slot, cursor_entry, cursor_tx_start, cursor_tx_count, cursor_sig) =
+            self.cursor.snapshot();
+        error!(
+            "mismatch detail: cursor slot={} entry={} tx_start={} tx_count={} sig={}",
+            cursor_slot,
+            cursor_entry,
+            cursor_tx_start,
+            cursor_tx_count,
+            cursor_sig.as_deref().unwrap_or("<unknown>")
+        );
+        if let Some((slot, entry_idx, tx_start, tx_count, sig, stage, elapsed)) =
+            self.cursor.inflight_snapshot()
+        {
+            error!(
+                "mismatch detail: inflight slot={} entry={} tx_start={} tx_count={} stage={} elapsed={:.3}s sig={}",
+                slot,
+                entry_idx,
+                tx_start,
+                tx_count,
+                stage,
+                elapsed.as_secs_f64(),
+                sig.as_deref().unwrap_or("<unknown>")
+            );
+        }
+        let snapshot = self.scheduler.snapshot();
+        error!(
+            "mismatch detail: scheduler current_slot={} last_finalized={} buffered_slots={} highest_seen_slot={} presence={:?} buffer={:?}",
+            snapshot.current_slot,
+            snapshot.last_finalized_slot,
+            snapshot.buffered_slots,
+            snapshot.highest_seen_slot,
+            snapshot.presence,
+            snapshot.buffer
+        );
+
+        for (index, key) in static_keys.iter().enumerate() {
+            let signer = message.is_signer(index);
+            let writable = message.is_maybe_writable(index, None);
+            let invoked = message.is_invoked(index);
+            error!(
+                "mismatch detail: key[{}]={} signer={} writable={} invoked_as_program={} source=static",
+                index,
+                key,
+                signer,
+                writable,
+                invoked
+            );
+        }
+
+        if let Some(lookups) = message.address_table_lookups() {
+            for (idx, lookup) in lookups.iter().enumerate() {
+                error!(
+                    "mismatch detail: address_table_lookup[{}] account_key={} writable_indexes={:?} readonly_indexes={:?}",
+                    idx,
+                    lookup.account_key,
+                    lookup.writable_indexes,
+                    lookup.readonly_indexes
+                );
+            }
+        }
+
+        for (ix_idx, ix) in message.instructions().iter().enumerate() {
+            let program_index = ix.program_id_index as usize;
+            let program_id = static_keys
+                .get(program_index)
+                .map(|key| key.to_string())
+                .unwrap_or_else(|| format!("<lookup:{}>", program_index));
+            error!(
+                "mismatch detail: ix[{}] program_index={} program={} accounts={:?} data_len={} data_xxh64={:x}",
+                ix_idx,
+                program_index,
+                program_id,
+                ix.accounts,
+                ix.data.len(),
+                xxh64(&ix.data, 0)
+            );
+        }
+    }
+
     fn process_ready_entries(&self, entries: Vec<ReadyEntry>) {
         for entry in entries {
             let gate_start = Instant::now();
@@ -764,6 +888,24 @@ impl BankReplay {
                                 .and_then(|scheduled| scheduled.tx.signatures.first())
                                 .map(|sig| sig.to_string())
                                 .unwrap_or_else(|| "<missing-signature>".to_string());
+                            if let Some(scheduled) = entry.txs.get(offset) {
+                                self.log_mismatch_details(
+                                    &bank,
+                                    &entry,
+                                    tx_index,
+                                    offset,
+                                    &expected,
+                                    &actual,
+                                    &scheduled.tx,
+                                );
+                            } else {
+                                error!(
+                                    "mismatch detail: missing scheduled tx at offset {} (slot {} entry {})",
+                                    offset,
+                                    entry.slot,
+                                    entry.entry_index
+                                );
+                            }
                             let message = format!(
                                 "transaction execution mismatch at slot {} entry {} index {} sig {}: expected {:?}, got {:?}",
                                 entry.slot,
@@ -1146,6 +1288,13 @@ impl log::Log for AbortOnErrorLogger {
                 );
             }
             return;
+        }
+
+        if record.target() == "solana_accounts_db::accounts_db" {
+            let message = record.args().to_string();
+            if message.starts_with("remove_dead_slots_metadata") {
+                return;
+            }
         }
 
         self.inner.log(record);

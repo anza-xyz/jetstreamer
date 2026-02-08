@@ -38,6 +38,7 @@ use solana_accounts_db::{
         AccountForGeyser, AccountsUpdateNotifier, AccountsUpdateNotifierInterface,
     },
 };
+use solana_address::Address;
 use solana_clock::{MAX_PROCESSING_AGE, Slot};
 use solana_genesis_utils::{MAX_GENESIS_ARCHIVE_UNPACKED_SIZE, open_genesis_config};
 use solana_geyser_plugin_manager::block_metadata_notifier_interface::{
@@ -2362,10 +2363,11 @@ impl AccountsUpdateNotifierInterface for ProgressAccountsUpdateNotifier {
         pubkey: &solana_pubkey::Pubkey,
         write_version: u64,
     ) {
+        let address = Address::new_from_array(pubkey.to_bytes());
         if !LOGGED_FIRST_ACCOUNT_UPDATE.swap(true, Ordering::SeqCst) {
             info!(
                 "first account update: slot={} pubkey={} write_version={}",
-                slot, pubkey, write_version
+                slot, address, write_version
             );
         }
         self.progress.note_account_update_slot(slot);

@@ -24,6 +24,7 @@ ripget = "0.1"
 serde_json.workspace = true
 solana-account.workspace = true
 solana-accounts-db.workspace = true
+solana-address.workspace = true
 solana-clock.workspace = true
 solana-genesis-utils.workspace = true
 solana-geyser-plugin-manager.workspace = true

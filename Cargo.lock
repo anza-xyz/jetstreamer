@@ -4142,6 +4142,7 @@ dependencies = [
  "serde_json",
  "solana-account",
  "solana-accounts-db",
+ "solana-address 1.1.0",
  "solana-clock",
  "solana-entry",
  "solana-genesis-utils",

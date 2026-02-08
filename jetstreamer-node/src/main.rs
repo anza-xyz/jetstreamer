@@ -95,6 +95,7 @@ const ENTRY_EXEC_FAIL_AFTER: Duration = Duration::from_secs(300);
 const BANK_FOR_SLOT_WARN_AFTER: Duration = Duration::from_secs(5);
 const PROGRAM_CACHE_PRUNE_PROGRESS_INTERVAL: Duration = Duration::from_secs(30);
 const DEFAULT_PROGRAM_CACHE_PRUNE_ENABLED: bool = true;
+const MISMATCH_RETRY_ATTEMPTS: usize = 1;
 static LOGGED_FIRST_ACCOUNT_UPDATE: AtomicBool = AtomicBool::new(false);
 static LOGGED_PROGRAM_CACHE_ASSIGN_FAIL: AtomicBool = AtomicBool::new(false);
 static PROGRAM_CACHE_ASSIGN_FAIL_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -731,6 +732,71 @@ impl BankReplay {
         }
     }
 
+    fn retry_mismatch_transaction(
+        &self,
+        bank: &Bank,
+        entry: &ReadyEntry,
+        tx_index: usize,
+        offset: usize,
+        attempt: usize,
+        expected: &Result<(), TransactionError>,
+        tx: &VersionedTransaction,
+    ) -> Option<Result<(), TransactionError>> {
+        self.cursor.update_inflight_stage("mismatch_retry_prepare");
+        let batch = match bank.prepare_entry_batch(vec![tx.clone()]) {
+            Ok(batch) => batch,
+            Err(err) => {
+                warn!(
+                    "mismatch retry: failed to prepare batch at slot {} entry {} tx_index {} attempt {}: {}",
+                    entry.slot,
+                    entry.entry_index,
+                    tx_index,
+                    attempt,
+                    err
+                );
+                return None;
+            }
+        };
+        self.cursor.update_inflight_stage("mismatch_retry_execute");
+        let mut timings = ExecuteTimings::default();
+        let (commit_results, _balance_collector) = bank.load_execute_and_commit_transactions(
+            &batch,
+            MAX_PROCESSING_AGE,
+            ExecutionRecordingConfig::new_single_setting(false),
+            &mut timings,
+            None,
+        );
+        let retry_result = commit_results
+            .into_iter()
+            .next()
+            .map(|commit_result| commit_result.and_then(|committed| committed.status));
+        match retry_result {
+            Some(actual) => {
+                warn!(
+                    "mismatch retry: slot={} entry={} tx_index={} offset={} attempt={} expected={:?} actual={:?}",
+                    entry.slot,
+                    entry.entry_index,
+                    tx_index,
+                    offset,
+                    attempt,
+                    expected,
+                    actual
+                );
+                Some(actual)
+            }
+            None => {
+                warn!(
+                    "mismatch retry: no result at slot {} entry {} tx_index {} attempt {}",
+                    entry.slot,
+                    entry.entry_index,
+                    tx_index,
+                    attempt
+                );
+                None
+            }
+        }
+    }
+
     fn process_ready_entries(&self, entries: Vec<ReadyEntry>) {
         for entry in entries {
             let gate_start = Instant::now();
@@ -888,6 +954,39 @@ impl BankReplay {
                                 .and_then(|scheduled| scheduled.tx.signatures.first())
                                 .map(|sig| sig.to_string())
                                 .unwrap_or_else(|| "<missing-signature>".to_string());
+                            let mut resolved = false;
+                            if MISMATCH_RETRY_ATTEMPTS > 0 {
+                                if let Some(scheduled) = entry.txs.get(offset) {
+                                    for attempt in 1..=MISMATCH_RETRY_ATTEMPTS {
+                                        if let Some(retry_result) = self.retry_mismatch_transaction(
+                                            &bank,
+                                            &entry,
+                                            tx_index,
+                                            offset,
+                                            attempt,
+                                            &expected,
+                                            &scheduled.tx,
+                                        ) {
+                                            if retry_result == expected {
+                                                warn!(
+                                                    "mismatch resolved after retry: slot {} entry {} tx_index {} sig {}",
+                                                    entry.slot,
+                                                    entry.entry_index,
+                                                    tx_index,
+                                                    signature
+                                                );
+                                                resolved = true;
+                                                break;
+                                            }
+                                        } else {
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            if resolved {
+                                continue;
+                            }
                             if let Some(scheduled) = entry.txs.get(offset) {
                                 self.log_mismatch_details(
                                     &bank,

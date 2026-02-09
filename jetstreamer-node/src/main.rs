@@ -96,6 +96,7 @@ const BANK_FOR_SLOT_WARN_AFTER: Duration = Duration::from_secs(5);
 const PROGRAM_CACHE_PRUNE_PROGRESS_INTERVAL: Duration = Duration::from_secs(30);
 const DEFAULT_PROGRAM_CACHE_PRUNE_ENABLED: bool = true;
 const MISMATCH_RETRY_ATTEMPTS: usize = 1;
+const POST_FIREHOSE_INCOMPLETE_RETRY_ATTEMPTS: usize = 1;
 static LOGGED_FIRST_ACCOUNT_UPDATE: AtomicBool = AtomicBool::new(false);
 static LOGGED_PROGRAM_CACHE_ASSIGN_FAIL: AtomicBool = AtomicBool::new(false);
 static PROGRAM_CACHE_ASSIGN_FAIL_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -648,9 +649,7 @@ impl BankReplay {
         );
         warn!(
             "mismatch detail: entry_start_index={} entry_tx_count={} entry_hash={}",
-            entry.start_index,
-            entry.tx_count,
-            entry.hash
+            entry.start_index, entry.tx_count, entry.hash
         );
 
         let (cursor_slot, cursor_entry, cursor_tx_start, cursor_tx_count, cursor_sig) =
@@ -694,11 +693,7 @@ impl BankReplay {
             let invoked = message.is_invoked(index);
             warn!(
                 "mismatch detail: key[{}]={} signer={} writable={} invoked_as_program={} source=static",
-                index,
-                key,
-                signer,
-                writable,
-                invoked
+                index, key, signer, writable, invoked
             );
         }
 
@@ -706,10 +701,7 @@ impl BankReplay {
             for (idx, lookup) in lookups.iter().enumerate() {
                 warn!(
                     "mismatch detail: address_table_lookup[{}] account_key={} writable_indexes={:?} readonly_indexes={:?}",
-                    idx,
-                    lookup.account_key,
-                    lookup.writable_indexes,
-                    lookup.readonly_indexes
+                    idx, lookup.account_key, lookup.writable_indexes, lookup.readonly_indexes
                 );
             }
         }
@@ -748,11 +740,7 @@ impl BankReplay {
             Err(err) => {
                 warn!(
                     "mismatch retry: failed to prepare batch at slot {} entry {} tx_index {} attempt {}: {}",
-                    entry.slot,
-                    entry.entry_index,
-                    tx_index,
-                    attempt,
-                    err
+                    entry.slot, entry.entry_index, tx_index, attempt, err
                 );
                 return None;
             }
@@ -774,23 +762,14 @@ impl BankReplay {
             Some(actual) => {
                 warn!(
                     "mismatch retry: slot={} entry={} tx_index={} offset={} attempt={} expected={:?} actual={:?}",
-                    entry.slot,
-                    entry.entry_index,
-                    tx_index,
-                    offset,
-                    attempt,
-                    expected,
-                    actual
+                    entry.slot, entry.entry_index, tx_index, offset, attempt, expected, actual
                 );
                 Some(actual)
             }
             None => {
                 warn!(
                     "mismatch retry: no result at slot {} entry {} tx_index {} attempt {}",
-                    entry.slot,
-                    entry.entry_index,
-                    tx_index,
-                    attempt
+                    entry.slot, entry.entry_index, tx_index, attempt
                 );
                 None
             }
@@ -1000,9 +979,7 @@ impl BankReplay {
                             } else {
                                 error!(
                                     "mismatch detail: missing scheduled tx at offset {} (slot {} entry {})",
-                                    offset,
-                                    entry.slot,
-                                    entry.entry_index
+                                    offset, entry.slot, entry.entry_index
                                 );
                             }
                             let message = format!(
@@ -1352,8 +1329,7 @@ impl log::Log for AbortOnErrorLogger {
                         tx_start = tx_start_snapshot as usize;
                     }
                 } else {
-                    let (slot, entry, tx_start_snapshot, tx_count, _sig) =
-                        self.cursor.snapshot();
+                    let (slot, entry, tx_start_snapshot, tx_count, _sig) = self.cursor.snapshot();
                     if slot == restart_slot {
                         entry_index = entry.saturating_add(1) as usize;
                         tx_start = tx_start_snapshot.saturating_add(tx_count) as usize;
@@ -1980,6 +1956,22 @@ struct SlotBufferSnapshot {
     next_entry_index: usize,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum IncompleteReason {
+    BufferedData,
+    MissingBlockData,
+}
+
+#[derive(Debug)]
+struct IncompleteSlotInfo {
+    slot: Slot,
+    entry_index: usize,
+    tx_start: usize,
+    reason: IncompleteReason,
+    snapshot: Option<SlotBufferSnapshot>,
+    presence: Option<SlotPresenceState>,
+}
+
 #[derive(Debug)]
 struct SchedulerSnapshot {
     current_slot: Slot,
@@ -2237,6 +2229,63 @@ impl TransactionScheduler {
         }
 
         Ok(())
+    }
+
+    fn first_incomplete_slot(&self, end_inclusive: Slot) -> Option<IncompleteSlotInfo> {
+        let state = self.state.lock().expect("transaction scheduler lock");
+        let mut buffered: Option<(Slot, SlotBufferSnapshot, usize, usize)> = None;
+        for (slot, buffer) in state.slots.iter() {
+            if *slot <= end_inclusive && buffer.has_any_data() {
+                let snapshot = SlotBufferSnapshot {
+                    expected_tx_count: buffer.expected_tx_count,
+                    expected_entry_count: buffer.expected_entry_count,
+                    processed_tx_count: buffer.processed_tx_count,
+                    processed_entry_count: buffer.processed_entry_count,
+                    pending_entries: buffer.pending_entries.len(),
+                    buffered_txs: buffer.buffered_transaction_count(),
+                    next_entry_index: buffer.next_entry_index,
+                };
+                let entry_index = buffer.processed_entry_count as usize;
+                let tx_start = buffer.processed_tx_count as usize;
+                let replace = buffered
+                    .as_ref()
+                    .map(|(existing_slot, _, _, _)| *slot < *existing_slot)
+                    .unwrap_or(true);
+                if replace {
+                    buffered = Some((*slot, snapshot, entry_index, tx_start));
+                }
+            }
+        }
+        if let Some((slot, snapshot, entry_index, tx_start)) = buffered {
+            return Some(IncompleteSlotInfo {
+                slot,
+                entry_index,
+                tx_start,
+                reason: IncompleteReason::BufferedData,
+                snapshot: Some(snapshot),
+                presence: self.presence.state(slot),
+            });
+        }
+
+        let mut slot = state.current_slot;
+        while slot <= end_inclusive {
+            match self.presence.state(slot) {
+                Some(SlotPresenceState::Missing) => slot = slot.saturating_add(1),
+                Some(SlotPresenceState::Present) => {
+                    return Some(IncompleteSlotInfo {
+                        slot,
+                        entry_index: 0,
+                        tx_start: 0,
+                        reason: IncompleteReason::MissingBlockData,
+                        snapshot: None,
+                        presence: Some(SlotPresenceState::Present),
+                    });
+                }
+                None => break,
+            }
+        }
+
+        None
     }
 
     fn snapshot(&self) -> SchedulerSnapshot {
@@ -4916,49 +4965,107 @@ async fn run_geyser_replay(
         })
     };
 
-    info!("starting firehose replay with {} thread(s)", threads);
-    let firehose_result = tokio::task::spawn_blocking({
-        let slot_range = slot_range.clone();
-        let notifiers = notifiers;
-        let confirmed_bank_sender = confirmed_bank_sender.clone();
-        let index_base_url = index_base_url.clone();
-        let client = client.clone();
-        let shutdown = shutdown.clone();
-        move || {
-            let rt = match tokio::runtime::Runtime::new() {
-                Ok(rt) => Arc::new(rt),
-                Err(err) => {
-                    return Err((FirehoseError::OnLoadError(Box::new(err)), slot_range.start));
-                }
+    let mut firehose_start = slot_range.start;
+    let mut incomplete_retries = 0usize;
+    let mut firehose_error: Option<String> = None;
+    loop {
+        info!(
+            "starting firehose replay with {} thread(s) (attempt {} from slot {})",
+            threads,
+            incomplete_retries.saturating_add(1),
+            firehose_start
+        );
+        let firehose_result = tokio::task::spawn_blocking({
+            let slot_range = firehose_start..slot_range.end;
+            let notifiers = GeyserNotifiers {
+                transaction_notifier: notifiers.transaction_notifier.clone(),
+                entry_notifier: notifiers.entry_notifier.clone(),
+                block_metadata_notifier: notifiers.block_metadata_notifier.clone(),
             };
-            firehose_geyser_with_notifiers(
-                rt,
-                slot_range,
-                notifiers,
-                confirmed_bank_sender,
-                &index_base_url,
-                &client,
-                shutdown,
-                async { Ok(()) },
-                threads,
-            )
+            let confirmed_bank_sender = confirmed_bank_sender.clone();
+            let index_base_url = index_base_url.clone();
+            let client = client.clone();
+            let shutdown = shutdown.clone();
+            move || {
+                let rt = match tokio::runtime::Runtime::new() {
+                    Ok(rt) => Arc::new(rt),
+                    Err(err) => {
+                        return Err((FirehoseError::OnLoadError(Box::new(err)), slot_range.start));
+                    }
+                };
+                firehose_geyser_with_notifiers(
+                    rt,
+                    slot_range,
+                    notifiers,
+                    confirmed_bank_sender,
+                    &index_base_url,
+                    &client,
+                    shutdown,
+                    async { Ok(()) },
+                    threads,
+                )
+            }
+        })
+        .await
+        .map_err(|err| format!("firehose task failed: {err}"))?;
+        if let Err((err, slot)) = firehose_result {
+            firehose_error = Some(format!("firehose error at slot {slot}: {err}"));
+            break;
         }
-    })
-    .await
-    .map_err(|err| format!("firehose task failed: {err}"))?;
+
+        match scheduler.drain_ready_entries() {
+            Ok(ready_entries) => {
+                if !ready_entries.is_empty()
+                    && let Err(err) = ready_sender.send(ready_entries)
+                {
+                    failure.record(format!("ready entry channel closed: {err}"));
+                }
+            }
+            Err(err) => failure.record(err),
+        }
+
+        if let Err(err) = scheduler.verify_complete(end_inclusive) {
+            if incomplete_retries < POST_FIREHOSE_INCOMPLETE_RETRY_ATTEMPTS {
+                if let Some(incomplete) = scheduler.first_incomplete_slot(end_inclusive) {
+                    warn!(
+                        "post-firehose replay incomplete: {err}; retrying from slot {} entry {} tx_index {} reason={:?} presence={:?}",
+                        incomplete.slot,
+                        incomplete.entry_index,
+                        incomplete.tx_start,
+                        incomplete.reason,
+                        incomplete.presence
+                    );
+                    if let Some(snapshot) = &incomplete.snapshot {
+                        warn!(
+                            "post-firehose replay incomplete: slot {} expected_txs={:?} expected_entries={:?} processed_txs={} processed_entries={} pending_entries={} buffered_txs={} next_entry_index={}",
+                            incomplete.slot,
+                            snapshot.expected_tx_count,
+                            snapshot.expected_entry_count,
+                            snapshot.processed_tx_count,
+                            snapshot.processed_entry_count,
+                            snapshot.pending_entries,
+                            snapshot.buffered_txs,
+                            snapshot.next_entry_index
+                        );
+                    }
+                    restart_tracker.mark_restart(
+                        incomplete.slot,
+                        incomplete.entry_index,
+                        incomplete.tx_start,
+                    );
+                    firehose_start = incomplete.slot;
+                    incomplete_retries = incomplete_retries.saturating_add(1);
+                    continue;
+                }
+            }
+            failure.record(err);
+        }
+        break;
+    }
     progress_done.store(true, Ordering::Relaxed);
     let _ = progress_handle.join();
-    firehose_result.map_err(|(err, slot)| format!("firehose error at slot {slot}: {err}"))?;
-
-    match scheduler.drain_ready_entries() {
-        Ok(ready_entries) => {
-            if !ready_entries.is_empty()
-                && let Err(err) = ready_sender.send(ready_entries)
-            {
-                failure.record(format!("ready entry channel closed: {err}"));
-            }
-        }
-        Err(err) => failure.record(err),
+    if let Some(err) = firehose_error {
+        failure.record(err);
     }
     drop(transaction_notifier);
     drop(entry_notifier);
@@ -5046,20 +5153,26 @@ fn remove_path_if_exists(path: &Path) -> Result<(), String> {
     if !path.exists() {
         return Ok(());
     }
-    let metadata =
-        fs::symlink_metadata(path).map_err(|err| format!("failed to read {}: {err}", path.display()))?;
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|err| format!("failed to read {}: {err}", path.display()))?;
     if metadata.is_dir() {
         fs::remove_dir_all(path)
             .map_err(|err| format!("failed to remove {}: {err}", path.display()))?;
     } else {
-        fs::remove_file(path).map_err(|err| format!("failed to remove {}: {err}", path.display()))?;
+        fs::remove_file(path)
+            .map_err(|err| format!("failed to remove {}: {err}", path.display()))?;
     }
     Ok(())
 }
 
 fn clear_ledger_accounts_state(ledger_dir: &Path) -> Result<(), String> {
     let mut cleared = Vec::new();
-    for name in ["accounts", "accounts-index", ARCHIVE_ACCOUNTS_DIR, BANK_SNAPSHOTS_DIR] {
+    for name in [
+        "accounts",
+        "accounts-index",
+        ARCHIVE_ACCOUNTS_DIR,
+        BANK_SNAPSHOTS_DIR,
+    ] {
         let path = ledger_dir.join(name);
         if path.exists() {
             remove_path_if_exists(&path)?;
@@ -5075,7 +5188,8 @@ fn clear_ledger_accounts_state(ledger_dir: &Path) -> Result<(), String> {
         let read_dir = fs::read_dir(ledger_dir)
             .map_err(|err| format!("failed to read {}: {err}", ledger_dir.display()))?;
         for entry in read_dir {
-            let entry = entry.map_err(|err| format!("failed to read {}: {err}", ledger_dir.display()))?;
+            let entry =
+                entry.map_err(|err| format!("failed to read {}: {err}", ledger_dir.display()))?;
             let file_name = entry.file_name();
             let name = file_name.to_string_lossy();
             if name.starts_with(".snapshot-extract-") {
@@ -5086,7 +5200,10 @@ fn clear_ledger_accounts_state(ledger_dir: &Path) -> Result<(), String> {
         }
     }
     if cleared.is_empty() {
-        info!("ledger accounts state already clean in {}", ledger_dir.display());
+        info!(
+            "ledger accounts state already clean in {}",
+            ledger_dir.display()
+        );
     } else {
         info!(
             "cleared ledger accounts state ({} path(s)) in {}",
@@ -5171,9 +5288,7 @@ async fn main() {
             exit(1);
         }
     } else {
-        info!(
-            "ledger accounts cleanup disabled via JETSTREAMER_CLEAR_ACCOUNTS_ON_START"
-        );
+        info!("ledger accounts cleanup disabled via JETSTREAMER_CLEAR_ACCOUNTS_ON_START");
     }
 
     let target_slot = epoch_to_slot(epoch).saturating_sub(1);

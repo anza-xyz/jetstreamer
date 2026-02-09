@@ -934,8 +934,8 @@ impl BankReplay {
                                 .map(|sig| sig.to_string())
                                 .unwrap_or_else(|| "<missing-signature>".to_string());
                             let mut resolved = false;
-                            if MISMATCH_RETRY_ATTEMPTS > 0 {
-                                if let Some(scheduled) = entry.txs.get(offset) {
+                            if MISMATCH_RETRY_ATTEMPTS > 0
+                                && let Some(scheduled) = entry.txs.get(offset) {
                                     for attempt in 1..=MISMATCH_RETRY_ATTEMPTS {
                                         if let Some(retry_result) = self.retry_mismatch_transaction(
                                             &bank,
@@ -962,7 +962,6 @@ impl BankReplay {
                                         }
                                     }
                                 }
-                            }
                             if resolved {
                                 continue;
                             }
@@ -5025,8 +5024,8 @@ async fn run_geyser_replay(
         }
 
         if let Err(err) = scheduler.verify_complete(end_inclusive) {
-            if incomplete_retries < POST_FIREHOSE_INCOMPLETE_RETRY_ATTEMPTS {
-                if let Some(incomplete) = scheduler.first_incomplete_slot(end_inclusive) {
+            if incomplete_retries < POST_FIREHOSE_INCOMPLETE_RETRY_ATTEMPTS
+                && let Some(incomplete) = scheduler.first_incomplete_slot(end_inclusive) {
                     warn!(
                         "post-firehose replay incomplete: {err}; retrying from slot {} entry {} tx_index {} reason={:?} presence={:?}",
                         incomplete.slot,
@@ -5057,7 +5056,6 @@ async fn run_geyser_replay(
                     incomplete_retries = incomplete_retries.saturating_add(1);
                     continue;
                 }
-            }
             failure.record(err);
         }
         break;

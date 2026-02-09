@@ -5280,7 +5280,7 @@ async fn main() {
         },
     };
 
-    if env_truthy_default("JETSTREAMER_CLEAR_ACCOUNTS_ON_START", true) {
+    if env_truthy_default("JETSTREAMER_CLEAR_ACCOUNTS_ON_START", false) {
         if let Err(err) = clear_ledger_accounts_state(&dest_dir) {
             eprintln!("error: {err}");
             exit(1);

@@ -1162,14 +1162,22 @@ impl RestartTracker {
         self.pending.store(true, Ordering::Relaxed);
     }
 
-    fn take_if_slot(&self, slot: Slot) -> Option<ResumeTarget> {
+    fn take_if_applicable(&self, slot: Slot) -> Option<ResumeTarget> {
         if !self.pending.load(Ordering::Relaxed) {
             return None;
         }
-        if self.slot.load(Ordering::Relaxed) != slot {
+        let target_slot = self.slot.load(Ordering::Relaxed);
+        if slot > target_slot {
             return None;
         }
         self.pending.store(false, Ordering::Relaxed);
+        if slot != target_slot {
+            return Some(ResumeTarget {
+                slot,
+                entry_index: 0,
+                tx_start: 0,
+            });
+        }
         Some(ResumeTarget {
             slot,
             entry_index: self.entry_index.load(Ordering::Relaxed) as usize,
@@ -2095,7 +2103,7 @@ impl TransactionScheduler {
         expected_status: Result<(), TransactionError>,
     ) -> Result<(Vec<ReadyEntry>, bool), String> {
         let mut state = self.state.lock().expect("transaction scheduler lock");
-        if let Some(target) = self.restart_tracker.take_if_slot(slot) {
+        if let Some(target) = self.restart_tracker.take_if_applicable(slot) {
             self.apply_restart_locked(&mut state, target);
         } else if let Some(target) = self.take_resume_target(slot) {
             state.inferred_blocks.remove(&slot);
@@ -2131,7 +2139,7 @@ impl TransactionScheduler {
         hash: Hash,
     ) -> Result<(Vec<ReadyEntry>, bool), String> {
         let mut state = self.state.lock().expect("transaction scheduler lock");
-        if let Some(target) = self.restart_tracker.take_if_slot(slot) {
+        if let Some(target) = self.restart_tracker.take_if_applicable(slot) {
             self.apply_restart_locked(&mut state, target);
         } else if let Some(target) = self.take_resume_target(slot) {
             state.inferred_blocks.remove(&slot);

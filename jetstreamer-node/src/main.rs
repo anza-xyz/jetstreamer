@@ -8,7 +8,7 @@ use std::{
         Arc, Mutex, RwLock,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use agave_snapshots::{
@@ -56,7 +56,11 @@ use solana_runtime::{
     runtime_config::RuntimeConfig, snapshot_bank_utils, snapshot_utils,
 };
 use solana_signature::Signature;
-use solana_svm::transaction_processor::ExecutionRecordingConfig;
+use solana_svm::{
+    transaction_error_metrics::TransactionErrorMetrics,
+    transaction_processing_result::TransactionProcessingResultExtensions,
+    transaction_processor::{ExecutionRecordingConfig, TransactionProcessingConfig},
+};
 use solana_svm_timings::ExecuteTimings;
 use solana_transaction::{
     TransactionError, VersionedMessage, sanitized::SanitizedTransaction,
@@ -95,7 +99,7 @@ const ENTRY_EXEC_FAIL_AFTER: Duration = Duration::from_secs(300);
 const BANK_FOR_SLOT_WARN_AFTER: Duration = Duration::from_secs(5);
 const PROGRAM_CACHE_PRUNE_PROGRESS_INTERVAL: Duration = Duration::from_secs(30);
 const DEFAULT_PROGRAM_CACHE_PRUNE_ENABLED: bool = true;
-const MISMATCH_RETRY_ATTEMPTS: usize = 1;
+const MISMATCH_RETRY_ATTEMPTS: usize = 10;
 const POST_FIREHOSE_INCOMPLETE_RETRY_ATTEMPTS: usize = 1;
 static LOGGED_FIRST_ACCOUNT_UPDATE: AtomicBool = AtomicBool::new(false);
 static LOGGED_PROGRAM_CACHE_ASSIGN_FAIL: AtomicBool = AtomicBool::new(false);
@@ -724,6 +728,182 @@ impl BankReplay {
         }
     }
 
+    fn dump_mismatch_artifacts(
+        &self,
+        bank: &Bank,
+        entry: &ReadyEntry,
+        tx_index: usize,
+        offset: usize,
+        expected: &Result<(), TransactionError>,
+        actual: &Result<(), TransactionError>,
+        tx: Option<&VersionedTransaction>,
+    ) {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
+        let (cursor_slot, cursor_entry, cursor_tx_start, cursor_tx_count, cursor_sig) =
+            self.cursor.snapshot();
+        let inflight = self.cursor.inflight_snapshot();
+        let scheduler = self.scheduler.snapshot();
+
+        let mut dump = serde_json::json!({
+            "version": 1,
+            "timestamp_unix": now.as_secs(),
+            "timestamp_nanos": now.subsec_nanos(),
+            "slot": entry.slot,
+            "entry_index": entry.entry_index,
+            "tx_index": tx_index,
+            "offset": offset,
+            "bank_slot": bank.slot(),
+            "expected": format!("{expected:?}"),
+            "actual": format!("{actual:?}"),
+            "entry": {
+                "start_index": entry.start_index,
+                "tx_count": entry.tx_count,
+                "hash": entry.hash.to_string(),
+            },
+            "cursor": {
+                "slot": cursor_slot,
+                "entry": cursor_entry,
+                "tx_start": cursor_tx_start,
+                "tx_count": cursor_tx_count,
+                "sig": cursor_sig.as_deref().unwrap_or("<unknown>"),
+            },
+            "inflight": inflight.as_ref().map(|(slot, entry_idx, tx_start, tx_count, sig, stage, elapsed)| {
+                serde_json::json!({
+                    "slot": slot,
+                    "entry": entry_idx,
+                    "tx_start": tx_start,
+                    "tx_count": tx_count,
+                    "sig": sig.as_deref().unwrap_or("<unknown>"),
+                    "stage": stage,
+                    "elapsed_secs": elapsed.as_secs_f64(),
+                })
+            }),
+            "scheduler": {
+                "current_slot": scheduler.current_slot,
+                "last_finalized": scheduler.last_finalized_slot,
+                "buffered_slots": scheduler.buffered_slots,
+                "highest_seen_slot": scheduler.highest_seen_slot,
+                "presence": format!("{:?}", scheduler.presence),
+                "buffer": format!("{:?}", scheduler.buffer),
+            },
+        });
+
+        if let Some(tx) = tx {
+            let signatures: Vec<String> = tx.signatures.iter().map(|sig| sig.to_string()).collect();
+            let message = &tx.message;
+            let version = match message {
+                VersionedMessage::Legacy(_) => "legacy",
+                VersionedMessage::V0(_) => "v0",
+            };
+            let header = message.header();
+            let static_keys = message.static_account_keys();
+            let static_keys_dump: Vec<serde_json::Value> = static_keys
+                .iter()
+                .enumerate()
+                .map(|(index, key)| {
+                    serde_json::json!({
+                        "index": index,
+                        "key": key.to_string(),
+                        "signer": message.is_signer(index),
+                        "writable": message.is_maybe_writable(index, None),
+                        "invoked_as_program": message.is_invoked(index),
+                        "source": "static",
+                    })
+                })
+                .collect();
+            let lookup_dump: Vec<serde_json::Value> = message
+                .address_table_lookups()
+                .map(|lookups| {
+                    lookups
+                        .iter()
+                        .enumerate()
+                        .map(|(idx, lookup)| {
+                            serde_json::json!({
+                                "index": idx,
+                                "account_key": lookup.account_key.to_string(),
+                                "writable_indexes": lookup.writable_indexes,
+                                "readonly_indexes": lookup.readonly_indexes,
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let instructions_dump: Vec<serde_json::Value> = message
+                .instructions()
+                .iter()
+                .enumerate()
+                .map(|(ix_idx, ix)| {
+                    let program_index = ix.program_id_index as usize;
+                    let program_id = static_keys
+                        .get(program_index)
+                        .map(|key| key.to_string())
+                        .unwrap_or_else(|| format!("<lookup:{}>", program_index));
+                    serde_json::json!({
+                        "index": ix_idx,
+                        "program_index": program_index,
+                        "program": program_id,
+                        "accounts": ix.accounts,
+                        "data_len": ix.data.len(),
+                        "data_xxh64": format!("{:x}", xxh64(&ix.data, 0)),
+                        "data_bs58": bs58::encode(&ix.data).into_string(),
+                    })
+                })
+                .collect();
+
+            dump["transaction"] = serde_json::json!({
+                "signatures": signatures,
+                "message_version": version,
+                "recent_blockhash": message.recent_blockhash().to_string(),
+                "header": {
+                    "required_signatures": header.num_required_signatures,
+                    "readonly_signed": header.num_readonly_signed_accounts,
+                    "readonly_unsigned": header.num_readonly_unsigned_accounts,
+                },
+                "static_keys": static_keys_dump,
+                "address_table_lookups": lookup_dump,
+                "instructions": instructions_dump,
+            });
+        }
+
+        let sig_for_name = tx
+            .and_then(|tx| tx.signatures.first())
+            .map(|sig| sig.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        let dump_dir = Path::new("mismatch-dumps");
+        if let Err(err) = fs::create_dir_all(dump_dir) {
+            warn!(
+                "mismatch dump: failed to create {}: {}",
+                dump_dir.display(),
+                err
+            );
+            return;
+        }
+        let file_name = format!(
+            "mismatch-slot{}-entry{}-tx{}-offset{}-sig{}-{}.json",
+            entry.slot,
+            entry.entry_index,
+            tx_index,
+            offset,
+            sig_for_name,
+            now.as_secs()
+        );
+        let path = dump_dir.join(file_name);
+        match serde_json::to_string_pretty(&dump) {
+            Ok(serialized) => {
+                if let Err(err) = fs::write(&path, serialized) {
+                    warn!("mismatch dump: failed to write {}: {}", path.display(), err);
+                } else {
+                    warn!("mismatch dump: wrote {}", path.display());
+                }
+            }
+            Err(err) => {
+                warn!("mismatch dump: failed to serialize: {err}");
+            }
+        }
+    }
+
     fn retry_mismatch_transaction(
         &self,
         bank: &Bank,
@@ -747,17 +927,22 @@ impl BankReplay {
         };
         self.cursor.update_inflight_stage("mismatch_retry_execute");
         let mut timings = ExecuteTimings::default();
-        let (commit_results, _balance_collector) = bank.load_execute_and_commit_transactions(
+        let mut error_metrics = TransactionErrorMetrics::default();
+        let output = bank.load_and_execute_transactions(
             &batch,
             MAX_PROCESSING_AGE,
-            ExecutionRecordingConfig::new_single_setting(false),
             &mut timings,
-            None,
+            &mut error_metrics,
+            TransactionProcessingConfig {
+                recording_config: ExecutionRecordingConfig::new_single_setting(false),
+                ..TransactionProcessingConfig::default()
+            },
         );
-        let retry_result = commit_results
+        let retry_result = output
+            .processing_results
             .into_iter()
             .next()
-            .map(|commit_result| commit_result.and_then(|committed| committed.status));
+            .map(|processing_result| processing_result.flattened_result());
         match retry_result {
             Some(actual) => {
                 warn!(
@@ -935,33 +1120,38 @@ impl BankReplay {
                                 .unwrap_or_else(|| "<missing-signature>".to_string());
                             let mut resolved = false;
                             if MISMATCH_RETRY_ATTEMPTS > 0
-                                && let Some(scheduled) = entry.txs.get(offset) {
-                                    for attempt in 1..=MISMATCH_RETRY_ATTEMPTS {
-                                        if let Some(retry_result) = self.retry_mismatch_transaction(
-                                            &bank,
-                                            &entry,
-                                            tx_index,
-                                            offset,
-                                            attempt,
-                                            &expected,
-                                            &scheduled.tx,
-                                        ) {
-                                            if retry_result == expected {
-                                                warn!(
-                                                    "mismatch resolved after retry: slot {} entry {} tx_index {} sig {}",
-                                                    entry.slot,
-                                                    entry.entry_index,
-                                                    tx_index,
-                                                    signature
-                                                );
-                                                resolved = true;
-                                                break;
-                                            }
-                                        } else {
+                                && let Some(scheduled) = entry.txs.get(offset)
+                            {
+                                for attempt in 1..=MISMATCH_RETRY_ATTEMPTS {
+                                    if attempt > 1 {
+                                        let backoff_ms =
+                                            50_u64.saturating_mul(1_u64 << (attempt - 2));
+                                        std::thread::sleep(Duration::from_millis(
+                                            backoff_ms.min(300_000),
+                                        ));
+                                    }
+                                    if let Some(retry_result) = self.retry_mismatch_transaction(
+                                        &bank,
+                                        &entry,
+                                        tx_index,
+                                        offset,
+                                        attempt,
+                                        &expected,
+                                        &scheduled.tx,
+                                    ) {
+                                        if retry_result == expected {
+                                            warn!(
+                                                "mismatch resolved after retry: slot {} entry {} tx_index {} sig {}",
+                                                entry.slot, entry.entry_index, tx_index, signature
+                                            );
+                                            resolved = true;
                                             break;
                                         }
+                                    } else {
+                                        break;
                                     }
                                 }
+                            }
                             if resolved {
                                 continue;
                             }
@@ -975,10 +1165,22 @@ impl BankReplay {
                                     &actual,
                                     &scheduled.tx,
                                 );
+                                self.dump_mismatch_artifacts(
+                                    &bank,
+                                    &entry,
+                                    tx_index,
+                                    offset,
+                                    &expected,
+                                    &actual,
+                                    Some(&scheduled.tx),
+                                );
                             } else {
                                 error!(
                                     "mismatch detail: missing scheduled tx at offset {} (slot {} entry {})",
                                     offset, entry.slot, entry.entry_index
+                                );
+                                self.dump_mismatch_artifacts(
+                                    &bank, &entry, tx_index, offset, &expected, &actual, None,
                                 );
                             }
                             let message = format!(
@@ -5033,37 +5235,38 @@ async fn run_geyser_replay(
 
         if let Err(err) = scheduler.verify_complete(end_inclusive) {
             if incomplete_retries < POST_FIREHOSE_INCOMPLETE_RETRY_ATTEMPTS
-                && let Some(incomplete) = scheduler.first_incomplete_slot(end_inclusive) {
+                && let Some(incomplete) = scheduler.first_incomplete_slot(end_inclusive)
+            {
+                warn!(
+                    "post-firehose replay incomplete: {err}; retrying from slot {} entry {} tx_index {} reason={:?} presence={:?}",
+                    incomplete.slot,
+                    incomplete.entry_index,
+                    incomplete.tx_start,
+                    incomplete.reason,
+                    incomplete.presence
+                );
+                if let Some(snapshot) = &incomplete.snapshot {
                     warn!(
-                        "post-firehose replay incomplete: {err}; retrying from slot {} entry {} tx_index {} reason={:?} presence={:?}",
+                        "post-firehose replay incomplete: slot {} expected_txs={:?} expected_entries={:?} processed_txs={} processed_entries={} pending_entries={} buffered_txs={} next_entry_index={}",
                         incomplete.slot,
-                        incomplete.entry_index,
-                        incomplete.tx_start,
-                        incomplete.reason,
-                        incomplete.presence
+                        snapshot.expected_tx_count,
+                        snapshot.expected_entry_count,
+                        snapshot.processed_tx_count,
+                        snapshot.processed_entry_count,
+                        snapshot.pending_entries,
+                        snapshot.buffered_txs,
+                        snapshot.next_entry_index
                     );
-                    if let Some(snapshot) = &incomplete.snapshot {
-                        warn!(
-                            "post-firehose replay incomplete: slot {} expected_txs={:?} expected_entries={:?} processed_txs={} processed_entries={} pending_entries={} buffered_txs={} next_entry_index={}",
-                            incomplete.slot,
-                            snapshot.expected_tx_count,
-                            snapshot.expected_entry_count,
-                            snapshot.processed_tx_count,
-                            snapshot.processed_entry_count,
-                            snapshot.pending_entries,
-                            snapshot.buffered_txs,
-                            snapshot.next_entry_index
-                        );
-                    }
-                    restart_tracker.mark_restart(
-                        incomplete.slot,
-                        incomplete.entry_index,
-                        incomplete.tx_start,
-                    );
-                    firehose_start = incomplete.slot;
-                    incomplete_retries = incomplete_retries.saturating_add(1);
-                    continue;
                 }
+                restart_tracker.mark_restart(
+                    incomplete.slot,
+                    incomplete.entry_index,
+                    incomplete.tx_start,
+                );
+                firehose_start = incomplete.slot;
+                incomplete_retries = incomplete_retries.saturating_add(1);
+                continue;
+            }
             failure.record(err);
         }
         break;

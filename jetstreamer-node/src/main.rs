@@ -1093,6 +1093,7 @@ impl BankReplay {
                         .into_iter()
                         .map(|commit_result| commit_result.and_then(|committed| committed.status))
                         .collect();
+                    drop(batch);
                     self.cursor.update_inflight_stage("post_process");
 
                     if results.len() != expected_statuses.len() {

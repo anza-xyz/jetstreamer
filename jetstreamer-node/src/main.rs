@@ -1370,21 +1370,24 @@ impl RestartTracker {
             return None;
         }
         let target_slot = self.slot.load(Ordering::Relaxed);
-        if slot > target_slot {
-            return None;
-        }
         self.pending.store(false, Ordering::Relaxed);
-        if slot != target_slot {
-            return Some(ResumeTarget {
-                slot,
-                entry_index: 0,
-                tx_start: 0,
-            });
-        }
+        let resume_slot = if slot < target_slot {
+            slot
+        } else {
+            target_slot
+        };
+        let (entry_index, tx_start) = if resume_slot == target_slot {
+            (
+                self.entry_index.load(Ordering::Relaxed) as usize,
+                self.tx_start.load(Ordering::Relaxed) as usize,
+            )
+        } else {
+            (0, 0)
+        };
         Some(ResumeTarget {
-            slot,
-            entry_index: self.entry_index.load(Ordering::Relaxed) as usize,
-            tx_start: self.tx_start.load(Ordering::Relaxed) as usize,
+            slot: resume_slot,
+            entry_index,
+            tx_start,
         })
     }
 }

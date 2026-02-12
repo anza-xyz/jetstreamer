@@ -3159,7 +3159,7 @@ fn epoch_to_slot(epoch: u64) -> u64 {
 }
 
 fn usage(program: &str) -> String {
-    format!("Usage: {program} <epoch> [dest-dir] [--verify]")
+    format!("Usage: {program} <epoch> [dest-dir] [--verify|--no-verify]")
 }
 
 fn snapshot_filename(uri: &str) -> Result<&str, String> {
@@ -4193,7 +4193,7 @@ fn load_bank_from_snapshot_archive(
     let bank_hash = bank.get_snapshot_hash();
     let archive_hash = *full_snapshot.hash();
     if bank_hash != archive_hash {
-        if env_truthy("JETSTREAMER_ENFORCE_ARCHIVE_HASH") {
+        if env_truthy_default("JETSTREAMER_ENFORCE_ARCHIVE_HASH", true) {
             return Err(format!(
                 "snapshot archive hash mismatch: deserialized bank: {bank_hash:?}, snapshot archive: {archive_hash:?}"
             ));
@@ -5470,10 +5470,12 @@ async fn main() {
     };
 
     let mut dest_dir_arg = None;
-    let mut verify_snapshots = false;
+    let mut verify_snapshots = env_truthy_default("JETSTREAMER_VERIFY_SNAPSHOTS", true);
     for arg in args {
         if arg == "--verify" {
             verify_snapshots = true;
+        } else if arg == "--no-verify" {
+            verify_snapshots = false;
         } else if arg.starts_with('-') {
             eprintln!("unknown option '{arg}'");
             eprintln!("{}", usage(&program));
@@ -5498,7 +5500,7 @@ async fn main() {
         },
     };
 
-    if env_truthy_default("JETSTREAMER_CLEAR_ACCOUNTS_ON_START", false) {
+    if env_truthy_default("JETSTREAMER_CLEAR_ACCOUNTS_ON_START", true) {
         if let Err(err) = clear_ledger_accounts_state(&dest_dir) {
             eprintln!("error: {err}");
             exit(1);

@@ -4778,7 +4778,7 @@ async fn run_geyser_replay(
                 .ok()
                 .and_then(|value| value.parse::<u64>().ok())
                 .map(Duration::from_secs)
-                .unwrap_or(Duration::from_secs(30));
+                .unwrap_or(Duration::from_secs(1800));
             let inflight_warn_after = ENTRY_EXEC_WARN_AFTER;
             let inflight_fail_after = ENTRY_EXEC_FAIL_AFTER;
             let mut phase_start = None::<Instant>;

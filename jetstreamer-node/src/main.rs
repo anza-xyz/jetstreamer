@@ -227,7 +227,7 @@ impl Drop for InFlightGuard {
 
 impl BankReplay {
     fn new(
-        bank: Bank,
+        mut bank: Bank,
         snapshot_verifier: Option<Arc<SnapshotVerifier>>,
         root_interval: Option<u64>,
         failure: Arc<ReplayFailure>,
@@ -236,6 +236,8 @@ impl BankReplay {
         firehose_gate: Arc<Mutex<()>>,
         enable_program_cache_prune: bool,
     ) -> Self {
+        // Ensure program cache respects deployment slots during replay.
+        bank.set_check_program_modification_slot(true);
         let mut leader_schedule_cache = LeaderScheduleCache::new_from_bank(&bank);
         leader_schedule_cache.set_max_schedules(usize::MAX);
         let debug_signature = env::var("JETSTREAMER_DEBUG_SIG")
@@ -343,7 +345,8 @@ impl BankReplay {
                 .slot_leader_at(slot, Some(&parent))
                 .unwrap_or_else(|| *parent.collector_id());
             self.cursor.update_inflight_stage("new_from_parent");
-            let next_bank = Bank::new_from_parent(parent, &collector_id, slot);
+            let mut next_bank = Bank::new_from_parent(parent, &collector_id, slot);
+            next_bank.set_check_program_modification_slot(true);
             self.cursor.update_inflight_stage("set_alpenglow_ticks");
             set_alpenglow_ticks(&next_bank);
             self.cursor.update_inflight_stage("insert_bank");

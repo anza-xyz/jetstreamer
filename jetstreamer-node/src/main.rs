@@ -18,7 +18,7 @@ use agave_snapshots::{
     streaming_unarchive_snapshot,
 };
 use cid::{Cid, multibase::Base};
-use crossbeam_channel::unbounded;
+use crossbeam_channel::{bounded, unbounded};
 use dashmap::DashMap;
 use jetstreamer_firehose::{
     epochs::{BASE_URL, epoch_to_slot_range, slot_to_epoch},
@@ -99,8 +99,9 @@ const ENTRY_EXEC_FAIL_AFTER: Duration = Duration::from_secs(300);
 const BANK_FOR_SLOT_WARN_AFTER: Duration = Duration::from_secs(5);
 const PROGRAM_CACHE_PRUNE_PROGRESS_INTERVAL: Duration = Duration::from_secs(30);
 const DEFAULT_PROGRAM_CACHE_PRUNE_ENABLED: bool = true;
+const DEFAULT_READY_ENTRY_QUEUE_CAPACITY: usize = 1024;
 const MISMATCH_RETRY_ATTEMPTS: usize = 10;
-const POST_FIREHOSE_INCOMPLETE_RETRY_ATTEMPTS: usize = 1;
+const DEFAULT_POST_FIREHOSE_INCOMPLETE_RETRY_ATTEMPTS: usize = 0;
 static LOGGED_FIRST_ACCOUNT_UPDATE: AtomicBool = AtomicBool::new(false);
 static LOGGED_PROGRAM_CACHE_ASSIGN_FAIL: AtomicBool = AtomicBool::new(false);
 static PROGRAM_CACHE_ASSIGN_FAIL_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -2927,7 +2928,7 @@ struct BankTransactionNotifier {
     progress: Arc<ReplayProgress>,
     scheduler: Arc<TransactionScheduler>,
     failure: Arc<ReplayFailure>,
-    ready_sender: crossbeam_channel::Sender<Vec<ReadyEntry>>,
+    ready_sender: crossbeam_channel::Sender<ReadyEntry>,
     delegate: Option<Arc<dyn TransactionNotifier + Send + Sync + 'static>>,
     live_start_slot: Slot,
     firehose_gate: Arc<Mutex<()>>,
@@ -2961,12 +2962,7 @@ impl TransactionNotifier for BankTransactionNotifier {
                     self.progress.note_tx_slot(slot);
                     self.progress.inc_tx();
                 }
-                if !ready_entries.is_empty()
-                    && let Err(err) = self.ready_sender.send(ready_entries)
-                {
-                    self.failure
-                        .record(format!("ready entry channel closed: {err}"));
-                }
+                send_ready_entries(&self.ready_sender, &self.failure, ready_entries);
             }
             Err(err) => self.failure.record(err),
         }
@@ -2992,7 +2988,7 @@ struct BankEntryNotifier {
     progress: Arc<ReplayProgress>,
     scheduler: Arc<TransactionScheduler>,
     failure: Arc<ReplayFailure>,
-    ready_sender: crossbeam_channel::Sender<Vec<ReadyEntry>>,
+    ready_sender: crossbeam_channel::Sender<ReadyEntry>,
     delegate: Option<Arc<dyn EntryNotifier + Send + Sync + 'static>>,
     live_start_slot: Slot,
     firehose_gate: Arc<Mutex<()>>,
@@ -3023,12 +3019,7 @@ impl EntryNotifier for BankEntryNotifier {
                 if inserted_entry {
                     self.progress.note_entry_slot(slot);
                 }
-                if !ready_entries.is_empty()
-                    && let Err(err) = self.ready_sender.send(ready_entries)
-                {
-                    self.failure
-                        .record(format!("ready entry channel closed: {err}"));
-                }
+                send_ready_entries(&self.ready_sender, &self.failure, ready_entries);
             }
             Err(err) => self.failure.record(err),
         }
@@ -3046,7 +3037,7 @@ struct BankBlockMetadataNotifier {
     scheduler: Arc<TransactionScheduler>,
     progress: Arc<ReplayProgress>,
     failure: Arc<ReplayFailure>,
-    ready_sender: crossbeam_channel::Sender<Vec<ReadyEntry>>,
+    ready_sender: crossbeam_channel::Sender<ReadyEntry>,
     delegate: Option<BlockMetadataNotifierArc>,
     live_start_slot: Slot,
     firehose_gate: Arc<Mutex<()>>,
@@ -3091,12 +3082,7 @@ impl BlockMetadataNotifier for BankBlockMetadataNotifier {
             .record_block_metadata(slot, executed_transaction_count, entry_count)
         {
             Ok(ready_entries) => {
-                if !ready_entries.is_empty()
-                    && let Err(err) = self.ready_sender.send(ready_entries)
-                {
-                    self.failure
-                        .record(format!("ready entry channel closed: {err}"));
-                }
+                send_ready_entries(&self.ready_sender, &self.failure, ready_entries);
             }
             Err(err) => self.failure.record(err),
         }
@@ -3115,6 +3101,19 @@ impl BlockMetadataNotifier for BankBlockMetadataNotifier {
                 executed_transaction_count,
                 entry_count,
             );
+        }
+    }
+}
+
+fn send_ready_entries(
+    ready_sender: &crossbeam_channel::Sender<ReadyEntry>,
+    failure: &ReplayFailure,
+    ready_entries: Vec<ReadyEntry>,
+) {
+    for entry in ready_entries {
+        if let Err(err) = ready_sender.send(entry) {
+            failure.record(format!("ready entry channel closed: {err}"));
+            break;
         }
     }
 }
@@ -4235,6 +4234,21 @@ fn firehose_threads() -> u64 {
         .unwrap_or(1)
 }
 
+fn ready_entry_queue_capacity() -> usize {
+    env::var("JETSTREAMER_READY_ENTRY_QUEUE_CAPACITY")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_READY_ENTRY_QUEUE_CAPACITY)
+}
+
+fn post_firehose_incomplete_retry_attempts() -> usize {
+    env::var("JETSTREAMER_POST_FIREHOSE_INCOMPLETE_RETRY_ATTEMPTS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_POST_FIREHOSE_INCOMPLETE_RETRY_ATTEMPTS)
+}
+
 fn local_index_path(cache_dir: &Path, url: &Url) -> Result<PathBuf, String> {
     let path = url.path().trim_start_matches('/');
     if path.is_empty() {
@@ -4707,15 +4721,17 @@ async fn run_geyser_replay(
         firehose_gate.clone(),
         enable_program_cache_prune,
     ));
-    let (ready_sender, ready_receiver) = unbounded::<Vec<ReadyEntry>>();
+    let ready_queue_capacity = ready_entry_queue_capacity();
+    info!("ready entry queue capacity: {}", ready_queue_capacity);
+    let (ready_sender, ready_receiver) = bounded::<ReadyEntry>(ready_queue_capacity);
     let ready_shutdown = shutdown.clone();
     let ready_bank_replay = bank_replay.clone();
     let ready_handle = std::thread::spawn(move || {
-        while let Ok(entries) = ready_receiver.recv() {
+        while let Ok(entry) = ready_receiver.recv() {
             if ready_shutdown.load(Ordering::Relaxed) {
                 break;
             }
-            ready_bank_replay.process_ready_entries(entries);
+            ready_bank_replay.process_ready_entries(vec![entry]);
         }
     });
     let slot_range = replay_start..(end_inclusive + 1);
@@ -4759,6 +4775,11 @@ async fn run_geyser_replay(
         info!("forcing firehose threads to 1 for bank replay");
         threads = 1;
     }
+    let post_firehose_retries = post_firehose_incomplete_retry_attempts();
+    info!(
+        "post-firehose incomplete retry attempts: {}",
+        post_firehose_retries
+    );
 
     let progress_done = Arc::new(AtomicBool::new(false));
     let progress_handle = {
@@ -5231,17 +5252,13 @@ async fn run_geyser_replay(
 
         match scheduler.drain_ready_entries() {
             Ok(ready_entries) => {
-                if !ready_entries.is_empty()
-                    && let Err(err) = ready_sender.send(ready_entries)
-                {
-                    failure.record(format!("ready entry channel closed: {err}"));
-                }
+                send_ready_entries(&ready_sender, &failure, ready_entries);
             }
             Err(err) => failure.record(err),
         }
 
         if let Err(err) = scheduler.verify_complete(end_inclusive) {
-            if incomplete_retries < POST_FIREHOSE_INCOMPLETE_RETRY_ATTEMPTS
+            if incomplete_retries < post_firehose_retries
                 && let Some(incomplete) = scheduler.first_incomplete_slot(end_inclusive)
             {
                 warn!(

@@ -4248,7 +4248,6 @@ fn post_firehose_incomplete_retry_attempts() -> usize {
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(DEFAULT_POST_FIREHOSE_INCOMPLETE_RETRY_ATTEMPTS)
 }
-
 fn local_index_path(cache_dir: &Path, url: &Url) -> Result<PathBuf, String> {
     let path = url.path().trim_start_matches('/');
     if path.is_empty() {

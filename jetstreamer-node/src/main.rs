@@ -2884,7 +2884,6 @@ struct ProgressAccountsUpdateNotifier {
     progress: Arc<ReplayProgress>,
     delegate: Option<AccountsUpdateNotifier>,
     live_start_slot: Slot,
-    warned_late_forward: AtomicBool,
 }
 
 impl AccountsUpdateNotifierInterface for ProgressAccountsUpdateNotifier {
@@ -2915,19 +2914,6 @@ impl AccountsUpdateNotifierInterface for ProgressAccountsUpdateNotifier {
         if let Some(delegate) = self.delegate.as_ref() {
             if slot >= self.live_start_slot {
                 delegate.notify_account_update(slot, account, txn, pubkey, write_version);
-            } else {
-                // Some account updates can arrive late and still correspond to main-phase replay.
-                // Once we've advanced into the live epoch, forward them rather than dropping.
-                let latest = self.progress.latest_slot.load(Ordering::Relaxed);
-                if latest >= self.live_start_slot {
-                    if !self.warned_late_forward.swap(true, Ordering::SeqCst) {
-                        warn!(
-                            "forwarding late account updates after live start: update_slot={} live_start_slot={} latest_slot={}",
-                            slot, self.live_start_slot, latest
-                        );
-                    }
-                    delegate.notify_account_update(slot, account, txn, pubkey, write_version);
-                }
             }
         }
     }
@@ -4657,7 +4643,6 @@ async fn run_geyser_replay(
             progress: progress.clone(),
             delegate,
             live_start_slot: epoch_start,
-            warned_late_forward: AtomicBool::new(false),
         }) as AccountsUpdateNotifier);
     info!("accounts update notifier wired into snapshot load: true");
 

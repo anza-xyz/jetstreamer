@@ -102,6 +102,7 @@ const DEFAULT_PROGRAM_CACHE_PRUNE_ENABLED: bool = false;
 const DEFAULT_READY_ENTRY_QUEUE_CAPACITY: usize = 1000;
 const MISMATCH_RETRY_ATTEMPTS: usize = 10;
 const DEFAULT_POST_FIREHOSE_INCOMPLETE_RETRY_ATTEMPTS: usize = 0;
+const EMPTY_SLOT_BUFFER_GAP_LIMIT: u64 = 512;
 static LOGGED_FIRST_ACCOUNT_UPDATE: AtomicBool = AtomicBool::new(false);
 static LOGGED_PROGRAM_CACHE_ASSIGN_FAIL: AtomicBool = AtomicBool::new(false);
 static PROGRAM_CACHE_ASSIGN_FAIL_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -1374,17 +1375,26 @@ impl RestartTracker {
             return None;
         }
         let target_slot = self.slot.load(Ordering::Relaxed);
+        let target_entry_index = self.entry_index.load(Ordering::Relaxed) as usize;
+        let target_tx_start = self.tx_start.load(Ordering::Relaxed) as usize;
         self.pending.store(false, Ordering::Relaxed);
+        // Firehose can report a restart slot and then resume from a later slot. If we have no
+        // resume cursor for that restart target, rolling scheduler state back to that slot
+        // creates an empty "present" slot that never receives data and blocks replay forever.
+        if slot > target_slot && target_entry_index == 0 && target_tx_start == 0 {
+            warn!(
+                "ignoring stale restart target: target_slot={} current_slot={} (no resume cursor)",
+                target_slot, slot
+            );
+            return None;
+        }
         let resume_slot = if slot < target_slot {
             slot
         } else {
             target_slot
         };
         let (entry_index, tx_start) = if resume_slot == target_slot {
-            (
-                self.entry_index.load(Ordering::Relaxed) as usize,
-                self.tx_start.load(Ordering::Relaxed) as usize,
-            )
+            (target_entry_index, target_tx_start)
         } else {
             (0, 0)
         };
@@ -2539,6 +2549,22 @@ impl TransactionScheduler {
         let mut ready = Vec::new();
         loop {
             let current_slot = state.current_slot;
+            if state.highest_seen_slot > current_slot {
+                let current_has_data = state
+                    .slots
+                    .get(&current_slot)
+                    .map(|buffer| buffer.has_any_data())
+                    .unwrap_or(false);
+                if !current_has_data {
+                    let gap = state.highest_seen_slot.saturating_sub(current_slot);
+                    if gap >= EMPTY_SLOT_BUFFER_GAP_LIMIT {
+                        return Err(format!(
+                            "scheduler stalled: current slot {} has no buffered data while highest seen slot is {} (gap {})",
+                            current_slot, state.highest_seen_slot, gap
+                        ));
+                    }
+                }
+            }
             match self.presence.is_missing(current_slot) {
                 Some(true) => {
                     if let Some(buffer) = state.slots.remove(&current_slot)
@@ -2928,7 +2954,7 @@ struct BankTransactionNotifier {
     progress: Arc<ReplayProgress>,
     scheduler: Arc<TransactionScheduler>,
     failure: Arc<ReplayFailure>,
-    ready_sender: crossbeam_channel::Sender<ReadyEntry>,
+    ready_sender: crossbeam_channel::Sender<Vec<ReadyEntry>>,
     delegate: Option<Arc<dyn TransactionNotifier + Send + Sync + 'static>>,
     live_start_slot: Slot,
     firehose_gate: Arc<Mutex<()>>,
@@ -2988,7 +3014,7 @@ struct BankEntryNotifier {
     progress: Arc<ReplayProgress>,
     scheduler: Arc<TransactionScheduler>,
     failure: Arc<ReplayFailure>,
-    ready_sender: crossbeam_channel::Sender<ReadyEntry>,
+    ready_sender: crossbeam_channel::Sender<Vec<ReadyEntry>>,
     delegate: Option<Arc<dyn EntryNotifier + Send + Sync + 'static>>,
     live_start_slot: Slot,
     firehose_gate: Arc<Mutex<()>>,
@@ -3037,7 +3063,7 @@ struct BankBlockMetadataNotifier {
     scheduler: Arc<TransactionScheduler>,
     progress: Arc<ReplayProgress>,
     failure: Arc<ReplayFailure>,
-    ready_sender: crossbeam_channel::Sender<ReadyEntry>,
+    ready_sender: crossbeam_channel::Sender<Vec<ReadyEntry>>,
     delegate: Option<BlockMetadataNotifierArc>,
     live_start_slot: Slot,
     firehose_gate: Arc<Mutex<()>>,
@@ -3106,15 +3132,12 @@ impl BlockMetadataNotifier for BankBlockMetadataNotifier {
 }
 
 fn send_ready_entries(
-    ready_sender: &crossbeam_channel::Sender<ReadyEntry>,
+    ready_sender: &crossbeam_channel::Sender<Vec<ReadyEntry>>,
     failure: &ReplayFailure,
     ready_entries: Vec<ReadyEntry>,
 ) {
-    for entry in ready_entries {
-        if let Err(err) = ready_sender.send(entry) {
-            failure.record(format!("ready entry channel closed: {err}"));
-            break;
-        }
+    if !ready_entries.is_empty() && let Err(err) = ready_sender.send(ready_entries) {
+        failure.record(format!("ready entry channel closed: {err}"));
     }
 }
 
@@ -4722,15 +4745,15 @@ async fn run_geyser_replay(
     ));
     let ready_queue_capacity = ready_entry_queue_capacity();
     info!("ready entry queue capacity: {}", ready_queue_capacity);
-    let (ready_sender, ready_receiver) = bounded::<ReadyEntry>(ready_queue_capacity);
+    let (ready_sender, ready_receiver) = bounded::<Vec<ReadyEntry>>(ready_queue_capacity);
     let ready_shutdown = shutdown.clone();
     let ready_bank_replay = bank_replay.clone();
     let ready_handle = std::thread::spawn(move || {
-        while let Ok(entry) = ready_receiver.recv() {
+        while let Ok(entries) = ready_receiver.recv() {
             if ready_shutdown.load(Ordering::Relaxed) {
                 break;
             }
-            ready_bank_replay.process_ready_entries(vec![entry]);
+            ready_bank_replay.process_ready_entries(entries);
         }
     });
     let slot_range = replay_start..(end_inclusive + 1);

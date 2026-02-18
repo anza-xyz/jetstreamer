@@ -13,7 +13,8 @@ use std::{
     time::Instant,
 };
 
-const ACCOUNT_UPDATE_ENCODE_BUFFER_SIZE: usize = 1024;
+// Solana account data can be up to 10 MiB. Keep a safety margin for encoding overhead.
+const ACCOUNT_UPDATE_ENCODE_BUFFER_SIZE: usize = 12 * 1024 * 1024;
 
 thread_local! {
     static ENCODER: RefCell<DedupeEncoder> = RefCell::new(DedupeEncoder::new());
@@ -119,8 +120,10 @@ impl GeyserPlugin for JetstreamerNodeGeyserPlugin {
                     Ok(len) => len,
                     Err(Error::WriterOutOfSpace) => {
                         panic!(
-                            "account update for slot {slot} exceeded {} byte encode buffer",
-                            ACCOUNT_UPDATE_ENCODE_BUFFER_SIZE
+                            "account update exceeded encode buffer: slot={slot} pubkey={} data_len={} buffer_len={}",
+                            ac.pubkey,
+                            ac.data.len(),
+                            ACCOUNT_UPDATE_ENCODE_BUFFER_SIZE,
                         )
                     }
                     Err(err) => panic!("failed to encode account update for slot {slot}: {err:?}"),

@@ -9,8 +9,12 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
+const ACCOUNT_UPDATE_ENCODE_BUFFER_SIZE: usize = 1024;
+
 thread_local! {
     static ENCODER: RefCell<DedupeEncoder> = RefCell::new(DedupeEncoder::new());
+    static ACCOUNT_UPDATE_ENCODE_BUFFER: RefCell<[u8; ACCOUNT_UPDATE_ENCODE_BUFFER_SIZE]> =
+        RefCell::new([0u8; ACCOUNT_UPDATE_ENCODE_BUFFER_SIZE]);
 }
 
 #[derive(Debug)]
@@ -61,7 +65,7 @@ impl GeyserPlugin for JetstreamerNodeGeyserPlugin {
     fn update_account(
         &self,
         account: agave_geyser_plugin_interface::geyser_plugin_interface::ReplicaAccountInfoVersions,
-        _slot: u64,
+        slot: u64,
         is_startup: bool,
     ) -> Result<()> {
         if is_startup {
@@ -71,17 +75,32 @@ impl GeyserPlugin for JetstreamerNodeGeyserPlugin {
         self.account_updates.fetch_add(1, Ordering::Relaxed);
         let ac: AccountUpdate = account.into();
         //info!("account update: {:?}", ac);
-        let mut out: Vec<u8> = vec![];
-        ENCODER.with(|encoder| {
-            ac.encode_ext(&mut out, Some(&mut *encoder.borrow_mut()))
-                .unwrap();
+        let encoded_len = ACCOUNT_UPDATE_ENCODE_BUFFER.with(|buffer| {
+            let mut buffer = buffer.borrow_mut();
+            let mut cursor = Cursor::new(&mut buffer[..]);
+
+            let encoded_len = ENCODER.with(|encoder| {
+                match ac.encode_ext(&mut cursor, Some(&mut *encoder.borrow_mut())) {
+                    Ok(len) => len,
+                    Err(Error::WriterOutOfSpace) => {
+                        panic!(
+                            "account update for slot {slot} exceeded {} byte encode buffer",
+                            ACCOUNT_UPDATE_ENCODE_BUFFER_SIZE
+                        )
+                    }
+                    Err(err) => panic!("failed to encode account update for slot {slot}: {err:?}"),
+                }
+            });
+
+            debug_assert_eq!(encoded_len, cursor.position());
+            encoded_len
         });
 
         self.total_in_memory_account_update_size
             .fetch_add(ac.memory_size() as u64, Ordering::Relaxed);
 
         self.total_encoded_account_update_size
-            .fetch_add(out.len() as u64, Ordering::Relaxed);
+            .fetch_add(encoded_len as u64, Ordering::Relaxed);
         Ok(())
     }
 

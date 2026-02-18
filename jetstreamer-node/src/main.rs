@@ -3122,7 +3122,9 @@ fn send_ready_entries(
     failure: &ReplayFailure,
     ready_entries: Vec<ReadyEntry>,
 ) {
-    if !ready_entries.is_empty() && let Err(err) = ready_sender.send(ready_entries) {
+    if !ready_entries.is_empty()
+        && let Err(err) = ready_sender.send(ready_entries)
+    {
         failure.record(format!("ready entry channel closed: {err}"));
     }
 }

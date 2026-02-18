@@ -6,7 +6,11 @@ use lencode::prelude::*;
 use log::info;
 use std::{
     cell::RefCell,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Instant,
 };
 
 const ACCOUNT_UPDATE_ENCODE_BUFFER_SIZE: usize = 1024;
@@ -24,6 +28,36 @@ struct JetstreamerNodeGeyserPlugin {
     transactions: AtomicU64,
     total_in_memory_account_update_size: AtomicU64,
     total_encoded_account_update_size: AtomicU64,
+    last_throughput_sample: Mutex<Option<ThroughputSample>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ThroughputSample {
+    at: Instant,
+    transactions: u64,
+    account_updates: u64,
+    memory_size: u64,
+    encoded_size: u64,
+}
+
+fn format_bytes_f64(bytes: f64) -> String {
+    const UNITS: [&str; 6] = ["B", "KB", "MB", "GB", "TB", "PB"];
+    if bytes < 1024.0 {
+        return format!("{bytes:.0} B");
+    }
+
+    let mut value = bytes;
+    let mut unit_index = 0usize;
+    while value >= 1024.0 && unit_index + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit_index += 1;
+    }
+
+    format!("{value:.2} {}", UNITS[unit_index])
+}
+
+fn format_bytes(bytes: u64) -> String {
+    format_bytes_f64(bytes as f64)
 }
 
 impl Default for JetstreamerNodeGeyserPlugin {
@@ -34,6 +68,7 @@ impl Default for JetstreamerNodeGeyserPlugin {
             transactions: AtomicU64::new(0),
             total_in_memory_account_update_size: AtomicU64::new(0),
             total_encoded_account_update_size: AtomicU64::new(0),
+            last_throughput_sample: Mutex::new(None),
         }
     }
 }
@@ -131,15 +166,70 @@ impl GeyserPlugin for JetstreamerNodeGeyserPlugin {
         }
         let transactions = self.transactions.load(Ordering::Relaxed);
         let account_updates = self.account_updates.load(Ordering::Relaxed);
+        let total_memory_size = self
+            .total_in_memory_account_update_size
+            .load(Ordering::Relaxed);
+        let total_encoded_size = self
+            .total_encoded_account_update_size
+            .load(Ordering::Relaxed);
+        let now = Instant::now();
+        let throughput = self
+            .last_throughput_sample
+            .lock()
+            .ok()
+            .and_then(|mut last_sample| {
+                let rates = last_sample.as_ref().and_then(|previous| {
+                    let elapsed = now.duration_since(previous.at).as_secs_f64();
+                    if elapsed <= 0.0 {
+                        return None;
+                    }
+
+                    Some((
+                        transactions.saturating_sub(previous.transactions) as f64 / elapsed,
+                        account_updates.saturating_sub(previous.account_updates) as f64 / elapsed,
+                        total_memory_size.saturating_sub(previous.memory_size) as f64 / elapsed,
+                        total_encoded_size.saturating_sub(previous.encoded_size) as f64 / elapsed,
+                    ))
+                });
+
+                *last_sample = Some(ThroughputSample {
+                    at: now,
+                    transactions,
+                    account_updates,
+                    memory_size: total_memory_size,
+                    encoded_size: total_encoded_size,
+                });
+
+                rates
+            });
+
+        let (txs_per_sec, accounts_per_sec, memory_per_sec, encoded_per_sec) = match throughput {
+            Some((txs, accounts, memory, encoded)) => (
+                format!("{txs:.2}"),
+                format!("{accounts:.2}"),
+                format!("{}/s", format_bytes_f64(memory)),
+                format!("{}/s", format_bytes_f64(encoded)),
+            ),
+            None => (
+                "n/a".to_string(),
+                "n/a".to_string(),
+                "n/a".to_string(),
+                "n/a".to_string(),
+            ),
+        };
         info!(
-            "block slot {} total_txs={} total_account_updates={} memory_size={} encoded_size={}",
+            "block slot {} total_txs={} total_account_updates={} memory_size={} ({}) encoded_size={} ({}) txs_per_sec={} accounts_per_sec={} memory_per_sec={} encoded_per_sec={}",
             slot,
             transactions,
             account_updates,
-            self.total_in_memory_account_update_size
-                .load(Ordering::Relaxed),
-            self.total_encoded_account_update_size
-                .load(Ordering::Relaxed)
+            format_bytes(total_memory_size),
+            total_memory_size,
+            format_bytes(total_encoded_size),
+            total_encoded_size,
+            txs_per_sec,
+            accounts_per_sec,
+            memory_per_sec,
+            encoded_per_sec,
         );
         Ok(())
     }

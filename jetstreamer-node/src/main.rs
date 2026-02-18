@@ -5135,6 +5135,18 @@ async fn run_geyser_replay(
                     } else {
                         latest
                     };
+                    let accounts_per_sec = if account_updates == 0 {
+                        "n/a".to_string()
+                    } else if let Some(start) = phase_start {
+                        let elapsed = start.elapsed().as_secs_f64();
+                        if elapsed <= 0.0 {
+                            "n/a".to_string()
+                        } else {
+                            format!("{:.2}", (account_updates as f64) / elapsed)
+                        }
+                    } else {
+                        "n/a".to_string()
+                    };
                     let eta = if processed == 0 {
                         "unknown".to_string()
                     } else if let Some(start) = phase_start {
@@ -5155,7 +5167,7 @@ async fn run_geyser_replay(
                         "unknown".to_string()
                     };
                     info!(
-                        "warmup slot {display_slot}/{warmup_end} ({percent:.2}%) txs={tx_count} accounts={account_updates} eta={eta} (epoch {epoch} starts at {epoch_start})"
+                        "warmup slot {display_slot}/{warmup_end} ({percent:.2}%) txs={tx_count} accounts={account_updates} accounts_per_sec={accounts_per_sec} eta={eta} (epoch {epoch} starts at {epoch_start})"
                     );
                 } else {
                     if in_warmup {

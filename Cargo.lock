@@ -4173,6 +4173,7 @@ dependencies = [
  "jetstreamer-horizon",
  "lencode",
  "log",
+ "serde_json",
 ]
 
 [[package]]

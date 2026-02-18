@@ -3169,7 +3169,7 @@ fn epoch_to_slot(epoch: u64) -> u64 {
 }
 
 fn usage(program: &str) -> String {
-    format!("Usage: {program} <epoch> [dest-dir] [--verify|--no-verify]")
+    format!("Usage: {program} <epoch> [dest-dir] [--verify|--no-verify] [--no-packing|--packing]")
 }
 
 fn snapshot_filename(uri: &str) -> Result<&str, String> {
@@ -3368,11 +3368,17 @@ fn plugin_library_path() -> Result<PathBuf, String> {
     ))
 }
 
-fn write_geyser_config(dest_dir: &Path, libpath: &Path) -> Result<PathBuf, String> {
+fn write_geyser_config(
+    dest_dir: &Path,
+    libpath: &Path,
+    no_packing: bool,
+) -> Result<PathBuf, String> {
     let config_path = dest_dir.join("jetstreamer-node-geyser.json");
     let config = serde_json::json!({
         "libpath": libpath.display().to_string(),
         "name": PLUGIN_NAME,
+        "no_packing": no_packing,
+        "log_every_n_blocks": 10,
     });
     let contents =
         serde_json::to_string_pretty(&config).map_err(|err| format!("config json error: {err}"))?;
@@ -4616,13 +4622,14 @@ async fn run_geyser_replay(
     epoch: u64,
     ledger_dir: &Path,
     snapshot_archive: &Path,
+    no_packing: bool,
     shutdown: Arc<AtomicBool>,
     cursor: Arc<ReplayCursor>,
     restart_tracker: Arc<RestartTracker>,
     snapshot_verifier: Option<Arc<SnapshotVerifier>>,
 ) -> Result<(), String> {
     let libpath = plugin_library_path()?;
-    let config_path = write_geyser_config(ledger_dir, &libpath)?;
+    let config_path = write_geyser_config(ledger_dir, &libpath, no_packing)?;
     let (confirmed_bank_sender, confirmed_bank_receiver) = unbounded();
     let config_files = [config_path];
 
@@ -5509,11 +5516,16 @@ async fn main() {
 
     let mut dest_dir_arg = None;
     let mut verify_snapshots = env_truthy_default("JETSTREAMER_VERIFY_SNAPSHOTS", true);
+    let mut no_packing = false;
     for arg in args {
         if arg == "--verify" {
             verify_snapshots = true;
         } else if arg == "--no-verify" {
             verify_snapshots = false;
+        } else if arg == "--no-packing" {
+            no_packing = true;
+        } else if arg == "--packing" {
+            no_packing = false;
         } else if arg.starts_with('-') {
             eprintln!("unknown option '{arg}'");
             eprintln!("{}", usage(&program));
@@ -5630,6 +5642,7 @@ async fn main() {
         epoch,
         &dest_dir,
         &dest_path,
+        no_packing,
         shutdown,
         cursor,
         restart_tracker,

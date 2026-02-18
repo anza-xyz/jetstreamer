@@ -15,3 +15,4 @@ jetstreamer-horizon.workspace = true
 agave-geyser-plugin-interface.workspace = true
 log.workspace = true
 lencode.workspace = true
+serde_json.workspace = true

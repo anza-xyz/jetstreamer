@@ -3,9 +3,10 @@ use agave_geyser_plugin_interface::geyser_plugin_interface::{
 };
 use jetstreamer_horizon::account_updates::AccountUpdate;
 use lencode::prelude::*;
-use log::info;
+use log::{info, warn};
 use std::{
     cell::RefCell,
+    fs,
     sync::{
         Mutex,
         atomic::{AtomicU64, Ordering},
@@ -15,6 +16,7 @@ use std::{
 
 // Solana account data can be up to 10 MiB. Keep a safety margin for encoding overhead.
 const ACCOUNT_UPDATE_ENCODE_BUFFER_SIZE: usize = 12 * 1024 * 1024;
+const DEFAULT_LOG_EVERY_N_BLOCKS: u64 = 10;
 
 thread_local! {
     static ENCODER: RefCell<DedupeEncoder> = RefCell::new(DedupeEncoder::new());
@@ -29,6 +31,8 @@ struct JetstreamerNodeGeyserPlugin {
     transactions: AtomicU64,
     total_in_memory_account_update_size: AtomicU64,
     total_encoded_account_update_size: AtomicU64,
+    no_packing: bool,
+    log_every_n_blocks: u64,
     last_throughput_sample: Mutex<Option<ThroughputSample>>,
 }
 
@@ -37,8 +41,6 @@ struct ThroughputSample {
     at: Instant,
     transactions: u64,
     account_updates: u64,
-    memory_size: u64,
-    encoded_size: u64,
 }
 
 fn format_bytes_f64(bytes: f64) -> String {
@@ -61,6 +63,18 @@ fn format_bytes(bytes: u64) -> String {
     format_bytes_f64(bytes as f64)
 }
 
+fn account_data_len(
+    account: &agave_geyser_plugin_interface::geyser_plugin_interface::ReplicaAccountInfoVersions<
+        '_,
+    >,
+) -> usize {
+    match account {
+        agave_geyser_plugin_interface::geyser_plugin_interface::ReplicaAccountInfoVersions::V0_0_1(info) => info.data.len(),
+        agave_geyser_plugin_interface::geyser_plugin_interface::ReplicaAccountInfoVersions::V0_0_2(info) => info.data.len(),
+        agave_geyser_plugin_interface::geyser_plugin_interface::ReplicaAccountInfoVersions::V0_0_3(info) => info.data.len(),
+    }
+}
+
 impl Default for JetstreamerNodeGeyserPlugin {
     fn default() -> Self {
         Self {
@@ -69,6 +83,8 @@ impl Default for JetstreamerNodeGeyserPlugin {
             transactions: AtomicU64::new(0),
             total_in_memory_account_update_size: AtomicU64::new(0),
             total_encoded_account_update_size: AtomicU64::new(0),
+            no_packing: false,
+            log_every_n_blocks: DEFAULT_LOG_EVERY_N_BLOCKS,
             last_throughput_sample: Mutex::new(None),
         }
     }
@@ -87,14 +103,49 @@ impl GeyserPlugin for JetstreamerNodeGeyserPlugin {
     }
 
     fn on_load(&mut self, config_file: &str, is_reload: bool) -> Result<()> {
+        let mut no_packing = false;
+        let mut log_every_n_blocks = DEFAULT_LOG_EVERY_N_BLOCKS;
+        match fs::read_to_string(config_file) {
+            Ok(contents) => match serde_json::from_str::<serde_json::Value>(&contents) {
+                Ok(config) => {
+                    no_packing = config
+                        .get("no_packing")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false);
+                    log_every_n_blocks = config
+                        .get("log_every_n_blocks")
+                        .and_then(serde_json::Value::as_u64)
+                        .filter(|value| *value > 0)
+                        .unwrap_or(DEFAULT_LOG_EVERY_N_BLOCKS);
+                }
+                Err(err) => {
+                    warn!(
+                        "failed to parse geyser config {}; using defaults: {}",
+                        config_file, err
+                    );
+                }
+            },
+            Err(err) => {
+                warn!(
+                    "failed to read geyser config {}; using defaults: {}",
+                    config_file, err
+                );
+            }
+        }
+
+        self.no_packing = no_packing;
+        self.log_every_n_blocks = log_every_n_blocks;
         info!(
-            "loaded geyser plugin config={} reload={}",
-            config_file, is_reload
+            "loaded geyser plugin config={} reload={} no_packing={} log_every_n_blocks={}",
+            config_file, is_reload, self.no_packing, self.log_every_n_blocks
         );
         ENCODER.with(|encoder| {
             let mut encoder = encoder.borrow_mut();
             encoder.clear();
         });
+        if let Ok(mut sample) = self.last_throughput_sample.lock() {
+            *sample = None;
+        }
         Ok(())
     }
 
@@ -109,8 +160,15 @@ impl GeyserPlugin for JetstreamerNodeGeyserPlugin {
             return Ok(());
         }
         self.account_updates.fetch_add(1, Ordering::Relaxed);
+        let memory_size = core::mem::size_of::<AccountUpdate>() + account_data_len(&account);
+        self.total_in_memory_account_update_size
+            .fetch_add(memory_size as u64, Ordering::Relaxed);
+
+        if self.no_packing {
+            return Ok(());
+        }
+
         let ac: AccountUpdate = account.into();
-        //info!("account update: {:?}", ac);
         let encoded_len = ACCOUNT_UPDATE_ENCODE_BUFFER.with(|buffer| {
             let mut buffer = buffer.borrow_mut();
             let mut cursor = Cursor::new(&mut buffer[..]);
@@ -133,9 +191,6 @@ impl GeyserPlugin for JetstreamerNodeGeyserPlugin {
             debug_assert_eq!(encoded_len, cursor.position());
             encoded_len
         });
-
-        self.total_in_memory_account_update_size
-            .fetch_add(ac.memory_size() as u64, Ordering::Relaxed);
 
         self.total_encoded_account_update_size
             .fetch_add(encoded_len as u64, Ordering::Relaxed);
@@ -167,6 +222,12 @@ impl GeyserPlugin for JetstreamerNodeGeyserPlugin {
         if slot == u64::MAX {
             return Ok(());
         }
+
+        let log_every_n_blocks = self.log_every_n_blocks.max(1);
+        if slot % log_every_n_blocks != 0 {
+            return Ok(());
+        }
+
         let transactions = self.transactions.load(Ordering::Relaxed);
         let account_updates = self.account_updates.load(Ordering::Relaxed);
         let total_memory_size = self
@@ -190,8 +251,6 @@ impl GeyserPlugin for JetstreamerNodeGeyserPlugin {
                     Some((
                         transactions.saturating_sub(previous.transactions) as f64 / elapsed,
                         account_updates.saturating_sub(previous.account_updates) as f64 / elapsed,
-                        total_memory_size.saturating_sub(previous.memory_size) as f64 / elapsed,
-                        total_encoded_size.saturating_sub(previous.encoded_size) as f64 / elapsed,
                     ))
                 });
 
@@ -199,40 +258,24 @@ impl GeyserPlugin for JetstreamerNodeGeyserPlugin {
                     at: now,
                     transactions,
                     account_updates,
-                    memory_size: total_memory_size,
-                    encoded_size: total_encoded_size,
                 });
 
                 rates
             });
 
-        let (txs_per_sec, accounts_per_sec, memory_per_sec, encoded_per_sec) = match throughput {
-            Some((txs, accounts, memory, encoded)) => (
-                format!("{txs:.2}"),
-                format!("{accounts:.2}"),
-                format!("{}/s", format_bytes_f64(memory)),
-                format!("{}/s", format_bytes_f64(encoded)),
-            ),
-            None => (
-                "n/a".to_string(),
-                "n/a".to_string(),
-                "n/a".to_string(),
-                "n/a".to_string(),
-            ),
+        let (txs_per_sec, accounts_per_sec) = match throughput {
+            Some((txs, accounts)) => (format!("{txs:.2}"), format!("{accounts:.2}")),
+            None => ("n/a".to_string(), "n/a".to_string()),
         };
         info!(
-            "block slot {} total_txs={} total_account_updates={} memory_size={} ({}) encoded_size={} ({}) txs_per_sec={} accounts_per_sec={} memory_per_sec={} encoded_per_sec={}",
+            "block slot {} total_txs={} total_account_updates={} memory_size={} encoded_size={} txs_per_sec={} accounts_per_sec={}",
             slot,
             transactions,
             account_updates,
             format_bytes(total_memory_size),
-            total_memory_size,
             format_bytes(total_encoded_size),
-            total_encoded_size,
             txs_per_sec,
             accounts_per_sec,
-            memory_per_sec,
-            encoded_per_sec,
         );
         Ok(())
     }

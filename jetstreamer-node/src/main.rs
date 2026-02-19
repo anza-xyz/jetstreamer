@@ -3115,7 +3115,9 @@ fn epoch_to_slot(epoch: u64) -> u64 {
 }
 
 fn usage(program: &str) -> String {
-    format!("Usage: {program} <epoch> [dest-dir] [--verify|--no-verify]")
+    format!(
+        "Usage: {program} <epoch> [dest-dir] [--verify|--no-verify] [--packing|--no-packing]"
+    )
 }
 
 fn snapshot_filename(uri: &str) -> Result<&str, String> {
@@ -4512,6 +4514,7 @@ async fn run_geyser_replay(
     shutdown: Arc<AtomicBool>,
     cursor: Arc<ReplayCursor>,
     restart_tracker: Arc<RestartTracker>,
+    packing_enabled: bool,
     snapshot_verifier: Option<Arc<SnapshotVerifier>>,
 ) -> Result<(), String> {
     let (confirmed_bank_sender, confirmed_bank_receiver) = unbounded();
@@ -4520,8 +4523,17 @@ async fn run_geyser_replay(
     let (epoch_start, end_inclusive) = epoch_to_slot_range(epoch);
     let progress = Arc::new(ReplayProgress::new(epoch_start));
     let failure = Arc::new(ReplayFailure::new(shutdown.clone()));
+    plugin::set_packing_enabled(packing_enabled);
     plugin::reset();
     info!("direct in-process plugin notifier enabled");
+    info!(
+        "account update packing {}",
+        if packing_enabled {
+            "enabled"
+        } else {
+            "disabled (--no-packing)"
+        }
+    );
     let accounts_update_notifier: Option<AccountsUpdateNotifier> =
         Some(Arc::new(ProgressAccountsUpdateNotifier {
             progress: progress.clone(),
@@ -5384,11 +5396,16 @@ async fn main() {
 
     let mut dest_dir_arg = None;
     let mut verify_snapshots = env_truthy_default("JETSTREAMER_VERIFY_SNAPSHOTS", true);
+    let mut packing_enabled = true;
     for arg in args {
         if arg == "--verify" {
             verify_snapshots = true;
         } else if arg == "--no-verify" {
             verify_snapshots = false;
+        } else if arg == "--packing" {
+            packing_enabled = true;
+        } else if arg == "--no-packing" {
+            packing_enabled = false;
         } else if arg.starts_with('-') {
             eprintln!("unknown option '{arg}'");
             eprintln!("{}", usage(&program));
@@ -5508,6 +5525,7 @@ async fn main() {
         shutdown,
         cursor,
         restart_tracker,
+        packing_enabled,
         snapshot_verifier,
     )
     .await

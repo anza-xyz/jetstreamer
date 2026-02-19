@@ -13,7 +13,7 @@ use std::{
     cell::RefCell,
     sync::{
         Mutex,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Instant,
 };
@@ -40,6 +40,7 @@ static ACCOUNT_UPDATES: AtomicU64 = AtomicU64::new(0);
 static TRANSACTIONS: AtomicU64 = AtomicU64::new(0);
 static TOTAL_IN_MEMORY_ACCOUNT_UPDATE_SIZE: AtomicU64 = AtomicU64::new(0);
 static TOTAL_ENCODED_ACCOUNT_UPDATE_SIZE: AtomicU64 = AtomicU64::new(0);
+static PACKING_ENABLED: AtomicBool = AtomicBool::new(true);
 static LAST_THROUGHPUT_SAMPLE: Mutex<Option<ThroughputSample>> = Mutex::new(None);
 
 pub fn reset() {
@@ -58,6 +59,10 @@ pub fn reset() {
 
 pub fn notify_startup_account() {
     STARTUP_ACCOUNTS.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn set_packing_enabled(enabled: bool) {
+    PACKING_ENABLED.store(enabled, Ordering::Relaxed);
 }
 
 pub fn notify_end_of_startup() {
@@ -91,6 +96,9 @@ pub fn notify_account_update(
     ACCOUNT_UPDATES.fetch_add(1, Ordering::Relaxed);
     let memory_size = core::mem::size_of::<AccountUpdate>() + account.data().len();
     TOTAL_IN_MEMORY_ACCOUNT_UPDATE_SIZE.fetch_add(memory_size as u64, Ordering::Relaxed);
+    if !PACKING_ENABLED.load(Ordering::Relaxed) {
+        return;
+    }
 
     let account_update = AccountUpdate {
         pubkey: Address::new_from_array(pubkey.to_bytes()),

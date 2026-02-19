@@ -4135,6 +4135,8 @@ dependencies = [
  "dashmap",
  "env_logger",
  "jetstreamer-firehose",
+ "jetstreamer-horizon",
+ "lencode",
  "log",
  "reqwest 0.12.24",
  "ripget",
@@ -4163,17 +4165,6 @@ dependencies = [
  "thiserror 2.0.17",
  "tokio",
  "xxhash-rust",
-]
-
-[[package]]
-name = "jetstreamer-node-geyser"
-version = "0.4.1"
-dependencies = [
- "agave-geyser-plugin-interface",
- "jetstreamer-horizon",
- "lencode",
- "log",
- "serde_json",
 ]
 
 [[package]]

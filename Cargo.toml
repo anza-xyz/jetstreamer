@@ -3,7 +3,6 @@ members = [
     "jetstreamer-firehose",
     "jetstreamer-horizon",
     "jetstreamer-node",
-    "jetstreamer-node/geyser-plugin",
     "jetstreamer-plugin",
     "jetstreamer-utils",
 ]
@@ -38,7 +37,6 @@ jetstreamer-firehose = { path = "jetstreamer-firehose", version = "0.4.1" }
 jetstreamer-plugin = { path = "jetstreamer-plugin", version = "0.4.1" }
 jetstreamer-utils = { path = "jetstreamer-utils", version = "0.4.1" }
 jetstreamer-node = { path = "jetstreamer-node", version = "0.4.1" }
-jetstreamer-node-geyser = { path = "jetstreamer-node/geyser-plugin", version = "0.4.1" }
 jetstreamer-horizon = { path = "jetstreamer-horizon", version = "0.4.1" }
 tokio = "1"
 futures-util = { version = "0", default-features = false }

@@ -41,10 +41,7 @@ use solana_accounts_db::{
 use solana_address::Address;
 use solana_clock::{MAX_PROCESSING_AGE, Slot};
 use solana_genesis_utils::{MAX_GENESIS_ARCHIVE_UNPACKED_SIZE, open_genesis_config};
-use solana_geyser_plugin_manager::block_metadata_notifier_interface::{
-    BlockMetadataNotifier, BlockMetadataNotifierArc,
-};
-use solana_geyser_plugin_manager::geyser_plugin_service::GeyserPluginService;
+use solana_geyser_plugin_manager::block_metadata_notifier_interface::BlockMetadataNotifier;
 use solana_hash::Hash;
 use solana_ledger::{
     blockstore_processor::set_alpenglow_ticks, entry_notifier_interface::EntryNotifier,
@@ -71,6 +68,8 @@ use tar::Archive as TarArchive;
 use tokio::process::Command;
 use xxhash_rust::xxh64::xxh64;
 
+mod plugin;
+
 const RIPGET_LOG_INTERVAL_SECS: u64 = 5;
 const SNAPSHOT_UNPACK_LOG_INTERVAL_SECS: u64 = 5;
 const SNAPSHOT_PRECOUNT_BUFFER_BYTES: usize = 16 * 1024 * 1024;
@@ -83,8 +82,6 @@ const METADATA_KEY_KIND: &[u8] = b"index_kind";
 const METADATA_KEY_EPOCH: &[u8] = b"epoch";
 const CAR_HEADER_PREFETCH_BYTES: u64 = 4 * 1024;
 
-const PLUGIN_NAME: &str = "jetstreamer-node-geyser";
-const PLUGIN_LIB_BASENAME: &str = "jetstreamer_node_geyser";
 const BANK_SNAPSHOTS_DIR: &str = "snapshots";
 const ACCOUNTS_HARDLINKS_DIR: &str = "accounts_hardlinks";
 const GENESIS_ARCHIVE: &str = "genesis.tar.bz2";
@@ -2882,16 +2879,12 @@ struct ReadyEntry {
 #[derive(Debug)]
 struct ProgressAccountsUpdateNotifier {
     progress: Arc<ReplayProgress>,
-    delegate: Option<AccountsUpdateNotifier>,
     live_start_slot: Slot,
 }
 
 impl AccountsUpdateNotifierInterface for ProgressAccountsUpdateNotifier {
     fn snapshot_notifications_enabled(&self) -> bool {
-        self.delegate
-            .as_ref()
-            .map(|delegate| delegate.snapshot_notifications_enabled())
-            .unwrap_or(false)
+        true
     }
 
     fn notify_account_update(
@@ -2911,28 +2904,22 @@ impl AccountsUpdateNotifierInterface for ProgressAccountsUpdateNotifier {
         }
         self.progress.note_account_update_slot(slot);
         self.progress.inc_account_update();
-        if let Some(delegate) = self.delegate.as_ref() {
-            if slot >= self.live_start_slot {
-                delegate.notify_account_update(slot, account, txn, pubkey, write_version);
-            }
+        if slot >= self.live_start_slot {
+            plugin::notify_account_update(slot, account, txn, pubkey, write_version);
         }
     }
 
     fn notify_account_restore_from_snapshot(
         &self,
-        slot: Slot,
-        write_version: u64,
-        account: &AccountForGeyser<'_>,
+        _slot: Slot,
+        _write_version: u64,
+        _account: &AccountForGeyser<'_>,
     ) {
-        if let Some(delegate) = self.delegate.as_ref() {
-            delegate.notify_account_restore_from_snapshot(slot, write_version, account);
-        }
+        plugin::notify_startup_account();
     }
 
     fn notify_end_of_restore_from_snapshot(&self) {
-        if let Some(delegate) = self.delegate.as_ref() {
-            delegate.notify_end_of_restore_from_snapshot();
-        }
+        plugin::notify_end_of_startup();
     }
 }
 
@@ -2941,7 +2928,6 @@ struct BankTransactionNotifier {
     scheduler: Arc<TransactionScheduler>,
     failure: Arc<ReplayFailure>,
     ready_sender: crossbeam_channel::Sender<Vec<ReadyEntry>>,
-    delegate: Option<Arc<dyn TransactionNotifier + Send + Sync + 'static>>,
     live_start_slot: Slot,
     firehose_gate: Arc<Mutex<()>>,
 }
@@ -2979,11 +2965,8 @@ impl TransactionNotifier for BankTransactionNotifier {
             Err(err) => self.failure.record(err),
         }
 
-        if let Some(delegate) = self.delegate.as_ref()
-            && slot >= self.live_start_slot
-            && inserted_tx
-        {
-            delegate.notify_transaction(
+        if slot >= self.live_start_slot && inserted_tx {
+            plugin::notify_transaction(
                 slot,
                 transaction_slot_index,
                 signature,
@@ -3001,8 +2984,6 @@ struct BankEntryNotifier {
     scheduler: Arc<TransactionScheduler>,
     failure: Arc<ReplayFailure>,
     ready_sender: crossbeam_channel::Sender<Vec<ReadyEntry>>,
-    delegate: Option<Arc<dyn EntryNotifier + Send + Sync + 'static>>,
-    live_start_slot: Slot,
     firehose_gate: Arc<Mutex<()>>,
 }
 
@@ -3018,7 +2999,6 @@ impl EntryNotifier for BankEntryNotifier {
             .firehose_gate
             .lock()
             .expect("firehose gate lock poisoned");
-        let mut inserted_entry = false;
         match self.scheduler.push_entry(
             slot,
             index,
@@ -3027,20 +3007,12 @@ impl EntryNotifier for BankEntryNotifier {
             entry.hash,
         ) {
             Ok((ready_entries, inserted)) => {
-                inserted_entry = inserted;
-                if inserted_entry {
+                if inserted {
                     self.progress.note_entry_slot(slot);
                 }
                 send_ready_entries(&self.ready_sender, &self.failure, ready_entries);
             }
             Err(err) => self.failure.record(err),
-        }
-
-        if let Some(delegate) = self.delegate.as_ref()
-            && slot >= self.live_start_slot
-            && inserted_entry
-        {
-            delegate.notify_entry(slot, index, entry, starting_transaction_index);
         }
     }
 }
@@ -3050,7 +3022,6 @@ struct BankBlockMetadataNotifier {
     progress: Arc<ReplayProgress>,
     failure: Arc<ReplayFailure>,
     ready_sender: crossbeam_channel::Sender<Vec<ReadyEntry>>,
-    delegate: Option<BlockMetadataNotifierArc>,
     live_start_slot: Slot,
     firehose_gate: Arc<Mutex<()>>,
 }
@@ -3058,13 +3029,13 @@ struct BankBlockMetadataNotifier {
 impl BlockMetadataNotifier for BankBlockMetadataNotifier {
     fn notify_block_metadata(
         &self,
-        parent_slot: u64,
-        parent_blockhash: &str,
+        _parent_slot: u64,
+        _parent_blockhash: &str,
         slot: u64,
-        blockhash: &str,
-        rewards: &solana_runtime::bank::KeyedRewardsAndNumPartitions,
-        block_time: Option<solana_clock::UnixTimestamp>,
-        block_height: Option<u64>,
+        _blockhash: &str,
+        _rewards: &solana_runtime::bank::KeyedRewardsAndNumPartitions,
+        _block_time: Option<solana_clock::UnixTimestamp>,
+        _block_height: Option<u64>,
         executed_transaction_count: u64,
         entry_count: u64,
     ) {
@@ -3073,19 +3044,6 @@ impl BlockMetadataNotifier for BankBlockMetadataNotifier {
             .lock()
             .expect("firehose gate lock poisoned");
         if slot == u64::MAX {
-            if let Some(delegate) = self.delegate.as_ref() {
-                delegate.notify_block_metadata(
-                    parent_slot,
-                    parent_blockhash,
-                    slot,
-                    blockhash,
-                    rewards,
-                    block_time,
-                    block_height,
-                    executed_transaction_count,
-                    entry_count,
-                );
-            }
             return;
         }
         self.progress.note_block_meta_slot(slot);
@@ -3099,20 +3057,8 @@ impl BlockMetadataNotifier for BankBlockMetadataNotifier {
             Err(err) => self.failure.record(err),
         }
 
-        if let Some(delegate) = self.delegate.as_ref()
-            && slot >= self.live_start_slot
-        {
-            delegate.notify_block_metadata(
-                parent_slot,
-                parent_blockhash,
-                slot,
-                blockhash,
-                rewards,
-                block_time,
-                block_height,
-                executed_transaction_count,
-                entry_count,
-            );
+        if slot >= self.live_start_slot {
+            plugin::notify_block(slot);
         }
     }
 }
@@ -3169,7 +3115,7 @@ fn epoch_to_slot(epoch: u64) -> u64 {
 }
 
 fn usage(program: &str) -> String {
-    format!("Usage: {program} <epoch> [dest-dir] [--verify|--no-verify] [--no-packing|--packing]")
+    format!("Usage: {program} <epoch> [dest-dir] [--verify|--no-verify]")
 }
 
 fn snapshot_filename(uri: &str) -> Result<&str, String> {
@@ -3325,65 +3271,6 @@ async fn snapshot_expectations_for_epoch(
         }
     }
     Ok(expected)
-}
-
-fn plugin_library_filename() -> String {
-    if cfg!(target_os = "windows") {
-        format!("{PLUGIN_LIB_BASENAME}.dll")
-    } else if cfg!(target_os = "macos") {
-        format!("lib{PLUGIN_LIB_BASENAME}.dylib")
-    } else {
-        format!("lib{PLUGIN_LIB_BASENAME}.so")
-    }
-}
-
-fn suggested_plugin_build_command(profile_dir: &Path) -> String {
-    let profile = profile_dir.file_name().and_then(|name| name.to_str());
-    if matches!(profile, Some("release")) {
-        "cargo build -p jetstreamer-node-geyser --release".to_string()
-    } else {
-        "cargo build -p jetstreamer-node-geyser".to_string()
-    }
-}
-
-fn plugin_library_path() -> Result<PathBuf, String> {
-    if let Ok(path) = env::var("JETSTREAMER_NODE_GEYSER_LIB") {
-        return Ok(PathBuf::from(path));
-    }
-
-    let exe = env::current_exe()
-        .map_err(|err| format!("failed to read current executable path: {err}"))?;
-    let profile_dir = exe
-        .parent()
-        .ok_or_else(|| "failed to resolve executable directory".to_string())?;
-    let lib_path = profile_dir.join(plugin_library_filename());
-    if lib_path.exists() {
-        return Ok(lib_path);
-    }
-
-    Err(format!(
-        "geyser plugin library not found at {} (build with `{}`)",
-        lib_path.display(),
-        suggested_plugin_build_command(profile_dir),
-    ))
-}
-
-fn write_geyser_config(
-    dest_dir: &Path,
-    libpath: &Path,
-    no_packing: bool,
-) -> Result<PathBuf, String> {
-    let config_path = dest_dir.join("jetstreamer-node-geyser.json");
-    let config = serde_json::json!({
-        "libpath": libpath.display().to_string(),
-        "name": PLUGIN_NAME,
-        "no_packing": no_packing,
-        "log_every_n_blocks": 10,
-    });
-    let contents =
-        serde_json::to_string_pretty(&config).map_err(|err| format!("config json error: {err}"))?;
-    fs::write(&config_path, contents).map_err(|err| format!("failed to write config: {err}"))?;
-    Ok(config_path)
 }
 
 async fn ensure_genesis_archive(ledger_dir: &Path) -> Result<(), String> {
@@ -4622,35 +4509,22 @@ async fn run_geyser_replay(
     epoch: u64,
     ledger_dir: &Path,
     snapshot_archive: &Path,
-    no_packing: bool,
     shutdown: Arc<AtomicBool>,
     cursor: Arc<ReplayCursor>,
     restart_tracker: Arc<RestartTracker>,
     snapshot_verifier: Option<Arc<SnapshotVerifier>>,
 ) -> Result<(), String> {
-    let libpath = plugin_library_path()?;
-    let config_path = write_geyser_config(ledger_dir, &libpath, no_packing)?;
     let (confirmed_bank_sender, confirmed_bank_receiver) = unbounded();
-    let config_files = [config_path];
-
-    let service = GeyserPluginService::new(confirmed_bank_receiver, true, &config_files)
-        .map_err(|err| format!("failed to load geyser plugin: {err}"))?;
+    let confirmed_bank_handle =
+        std::thread::spawn(move || while confirmed_bank_receiver.recv().is_ok() {});
     let (epoch_start, end_inclusive) = epoch_to_slot_range(epoch);
     let progress = Arc::new(ReplayProgress::new(epoch_start));
     let failure = Arc::new(ReplayFailure::new(shutdown.clone()));
-    let delegate = service.get_accounts_update_notifier();
-    if let Some(delegate) = delegate.as_ref() {
-        info!(
-            "geyser account updates enabled: snapshot_notifications={}",
-            delegate.snapshot_notifications_enabled()
-        );
-    } else {
-        warn!("geyser account updates not enabled; updates will not be forwarded to plugin");
-    }
+    plugin::reset();
+    info!("direct in-process plugin notifier enabled");
     let accounts_update_notifier: Option<AccountsUpdateNotifier> =
         Some(Arc::new(ProgressAccountsUpdateNotifier {
             progress: progress.clone(),
-            delegate,
             live_start_slot: epoch_start,
         }) as AccountsUpdateNotifier);
     info!("accounts update notifier wired into snapshot load: true");
@@ -4759,7 +4633,6 @@ async fn run_geyser_replay(
         scheduler: scheduler.clone(),
         failure: failure.clone(),
         ready_sender: ready_sender.clone(),
-        delegate: service.get_transaction_notifier(),
         live_start_slot: epoch_start,
         firehose_gate: firehose_gate.clone(),
     });
@@ -4768,8 +4641,6 @@ async fn run_geyser_replay(
         scheduler: scheduler.clone(),
         failure: failure.clone(),
         ready_sender: ready_sender.clone(),
-        delegate: service.get_entry_notifier(),
-        live_start_slot: epoch_start,
         firehose_gate: firehose_gate.clone(),
     });
     let block_metadata_notifier = Arc::new(BankBlockMetadataNotifier {
@@ -4777,7 +4648,6 @@ async fn run_geyser_replay(
         progress: progress.clone(),
         failure: failure.clone(),
         ready_sender: ready_sender.clone(),
-        delegate: service.get_block_metadata_notifier(),
         live_start_slot: epoch_start,
         firehose_gate: firehose_gate.clone(),
     });
@@ -5339,9 +5209,7 @@ async fn run_geyser_replay(
 
     // Allow slot status observer to exit cleanly on shutdown.
     drop(confirmed_bank_sender);
-    service
-        .join()
-        .map_err(|err| format!("geyser service join failed: {err:?}"))?;
+    let _ = confirmed_bank_handle.join();
 
     if let Some(message) = failure.error_message() {
         return Err(message);
@@ -5516,16 +5384,11 @@ async fn main() {
 
     let mut dest_dir_arg = None;
     let mut verify_snapshots = env_truthy_default("JETSTREAMER_VERIFY_SNAPSHOTS", true);
-    let mut no_packing = false;
     for arg in args {
         if arg == "--verify" {
             verify_snapshots = true;
         } else if arg == "--no-verify" {
             verify_snapshots = false;
-        } else if arg == "--no-packing" {
-            no_packing = true;
-        } else if arg == "--packing" {
-            no_packing = false;
         } else if arg.starts_with('-') {
             eprintln!("unknown option '{arg}'");
             eprintln!("{}", usage(&program));
@@ -5642,7 +5505,6 @@ async fn main() {
         epoch,
         &dest_dir,
         &dest_path,
-        no_packing,
         shutdown,
         cursor,
         restart_tracker,

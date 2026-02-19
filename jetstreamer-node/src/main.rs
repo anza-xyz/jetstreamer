@@ -95,7 +95,10 @@ const ENTRY_EXEC_WARN_AFTER: Duration = Duration::from_secs(5);
 const ENTRY_EXEC_FAIL_AFTER: Duration = Duration::from_secs(300);
 const BANK_FOR_SLOT_WARN_AFTER: Duration = Duration::from_secs(5);
 const PROGRAM_CACHE_PRUNE_PROGRESS_INTERVAL: Duration = Duration::from_secs(30);
+const ACCOUNTS_MAINTENANCE_PROGRESS_INTERVAL: Duration = Duration::from_secs(30);
 const DEFAULT_PROGRAM_CACHE_PRUNE_ENABLED: bool = false;
+const DEFAULT_ACCOUNTS_MAINTENANCE_ENABLED: bool = true;
+const DEFAULT_ACCOUNTS_MAINTENANCE_ROOT_STRIDE: u64 = 1;
 const DEFAULT_READY_ENTRY_QUEUE_CAPACITY: usize = 8192;
 const MISMATCH_RETRY_ATTEMPTS: usize = 10;
 const DEFAULT_POST_FIREHOSE_INCOMPLETE_RETRY_ATTEMPTS: usize = 0;
@@ -201,11 +204,14 @@ struct BankReplay {
     scheduler: Arc<TransactionScheduler>,
     debug_signature: Option<Signature>,
     prune_inflight: Arc<AtomicBool>,
+    accounts_maintenance_inflight: Arc<AtomicBool>,
     last_root_set: Arc<AtomicU64>,
     cached_bank: Mutex<Option<CachedBank>>,
     execution_gate: Arc<Mutex<()>>,
     firehose_gate: Arc<Mutex<()>>,
     enable_program_cache_prune: bool,
+    enable_accounts_maintenance: bool,
+    accounts_maintenance_root_stride: u64,
 }
 
 #[derive(Debug)]
@@ -234,6 +240,8 @@ impl BankReplay {
         scheduler: Arc<TransactionScheduler>,
         firehose_gate: Arc<Mutex<()>>,
         enable_program_cache_prune: bool,
+        enable_accounts_maintenance: bool,
+        accounts_maintenance_root_stride: u64,
     ) -> Self {
         // Ensure program cache respects deployment slots during replay.
         bank.set_check_program_modification_slot(true);
@@ -263,11 +271,14 @@ impl BankReplay {
             scheduler,
             debug_signature,
             prune_inflight: Arc::new(AtomicBool::new(false)),
+            accounts_maintenance_inflight: Arc::new(AtomicBool::new(false)),
             last_root_set: Arc::new(AtomicU64::new(0)),
             cached_bank,
             execution_gate: Arc::new(Mutex::new(())),
             firehose_gate,
             enable_program_cache_prune,
+            enable_accounts_maintenance,
+            accounts_maintenance_root_stride: accounts_maintenance_root_stride.max(1),
         }
     }
 
@@ -336,6 +347,7 @@ impl BankReplay {
             let frozen_bank = parent.clone();
             let parent_slot = parent.slot();
             let mut prune_request = None::<Slot>;
+            let mut accounts_maintenance_request = None::<Slot>;
             self.cursor.update_inflight_stage("set_root");
             self.leader_schedule_cache.set_root(&frozen_bank);
             self.cursor.update_inflight_stage("slot_leader_at");
@@ -383,11 +395,84 @@ impl BankReplay {
                             root_slot
                         );
                     }
+                    if self.enable_accounts_maintenance {
+                        let root_index = root_slot / interval;
+                        if root_index % self.accounts_maintenance_root_stride == 0 {
+                            accounts_maintenance_request = Some(root_slot);
+                        }
+                    }
                 }
             }
             self.cursor.update_inflight_stage("clone_without_scheduler");
             let next_bank = bank_with_scheduler.clone_without_scheduler();
             drop(guard);
+            if let Some(root_slot) = accounts_maintenance_request {
+                let inflight = self.accounts_maintenance_inflight.clone();
+                let bank_forks = Arc::clone(&self.bank_forks);
+                if inflight
+                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+                {
+                    std::thread::spawn(move || {
+                        let start = Instant::now();
+                        let mut last_progress = Instant::now();
+                        let root_bank = loop {
+                            match bank_forks.try_read() {
+                                Ok(guard) => {
+                                    let bank = guard.get(root_slot);
+                                    drop(guard);
+                                    break bank;
+                                }
+                                Err(_) => {
+                                    if last_progress.elapsed()
+                                        >= ACCOUNTS_MAINTENANCE_PROGRESS_INTERVAL
+                                    {
+                                        warn!(
+                                            "accounts maintenance waiting on bank forks read lock: slot {}",
+                                            root_slot
+                                        );
+                                        last_progress = Instant::now();
+                                    }
+                                    std::thread::sleep(Duration::from_millis(10));
+                                }
+                            }
+                        };
+                        let Some(root_bank) = root_bank else {
+                            warn!(
+                                "accounts maintenance skipped: missing root bank slot {}",
+                                root_slot
+                            );
+                            inflight.store(false, Ordering::SeqCst);
+                            return;
+                        };
+                        info!("accounts maintenance starting at root slot {}", root_slot);
+                        root_bank.force_flush_accounts_cache();
+                        // Use the previous rooted bank as the clean anchor so cleaning stops at
+                        // `root_slot - 2`, which is slightly more conservative.
+                        let clean_bank = bank_forks
+                            .read()
+                            .ok()
+                            .and_then(|guard| guard.get(root_slot.saturating_sub(1)))
+                            .unwrap_or_else(|| Arc::clone(&root_bank));
+                        let clean_anchor_slot = clean_bank.slot();
+                        clean_bank.clean_accounts();
+                        let shrunk_slots = root_bank.shrink_candidate_slots();
+                        info!(
+                            "accounts maintenance finished at root slot {} in {:.3}s (clean_anchor_slot={} shrunk_slots={})",
+                            root_slot,
+                            start.elapsed().as_secs_f64(),
+                            clean_anchor_slot,
+                            shrunk_slots
+                        );
+                        inflight.store(false, Ordering::SeqCst);
+                    });
+                } else {
+                    warn!(
+                        "accounts maintenance skipped at root slot {} (already running)",
+                        root_slot
+                    );
+                }
+            }
             if let Some(prune_slot) = prune_request {
                 let inflight = self.prune_inflight.clone();
                 let bank_forks = Arc::clone(&self.bank_forks);
@@ -3671,6 +3756,29 @@ fn bank_root_interval() -> Option<u64> {
     }
 }
 
+fn accounts_maintenance_root_stride() -> u64 {
+    match env::var("JETSTREAMER_ACCOUNTS_MAINTENANCE_ROOT_STRIDE") {
+        Ok(value) => {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                return DEFAULT_ACCOUNTS_MAINTENANCE_ROOT_STRIDE;
+            }
+            match trimmed.parse::<u64>() {
+                Ok(0) => 1,
+                Ok(stride) => stride,
+                Err(err) => {
+                    warn!(
+                        "invalid JETSTREAMER_ACCOUNTS_MAINTENANCE_ROOT_STRIDE '{value}': {err}; using default {}",
+                        DEFAULT_ACCOUNTS_MAINTENANCE_ROOT_STRIDE
+                    );
+                    DEFAULT_ACCOUNTS_MAINTENANCE_ROOT_STRIDE
+                }
+            }
+        }
+        Err(_) => DEFAULT_ACCOUNTS_MAINTENANCE_ROOT_STRIDE,
+    }
+}
+
 fn skip_snapshot_verify() -> bool {
     env_truthy("JETSTREAMER_SKIP_SNAPSHOT_VERIFY")
 }
@@ -4613,6 +4721,23 @@ async fn run_geyser_replay(
     } else {
         info!("program cache pruning disabled");
     }
+    let enable_accounts_maintenance = env_truthy_default(
+        "JETSTREAMER_ACCOUNTS_MAINTENANCE",
+        DEFAULT_ACCOUNTS_MAINTENANCE_ENABLED,
+    );
+    let accounts_maintenance_root_stride = accounts_maintenance_root_stride();
+    if enable_accounts_maintenance {
+        if root_interval.is_some() {
+            info!(
+                "accounts maintenance enabled (flush+clean+shrink every {} root(s))",
+                accounts_maintenance_root_stride
+            );
+        } else {
+            info!("accounts maintenance enabled but rooting is disabled");
+        }
+    } else {
+        info!("accounts maintenance disabled");
+    }
     let bank_replay = Arc::new(BankReplay::new(
         bank,
         snapshot_verifier.clone(),
@@ -4622,6 +4747,8 @@ async fn run_geyser_replay(
         scheduler.clone(),
         firehose_gate.clone(),
         enable_program_cache_prune,
+        enable_accounts_maintenance,
+        accounts_maintenance_root_stride,
     ));
     let ready_queue_capacity = ready_entry_queue_capacity();
     info!("ready entry queue capacity: {}", ready_queue_capacity);

@@ -5172,7 +5172,7 @@ impl Bank {
     //
     // This fn is meant to be called by the snapshot handler in Accounts Background Service.  If
     // calling from elsewhere, ensure the same invariants hold/expectations are met.
-    pub(crate) fn clean_accounts(&self) {
+    pub fn clean_accounts(&self) {
         // Don't clean the slot we're snapshotting because it may have zero-lamport
         // accounts that were included in the bank delta hash when the bank was frozen,
         // and if we clean them here, any newly created snapshot's hash for this bank

@@ -23,8 +23,9 @@ const LOG_EVERY_N_BLOCKS: u64 = 10;
 
 thread_local! {
     static ENCODER: RefCell<DedupeEncoder> = RefCell::new(DedupeEncoder::new());
-    static ACCOUNT_UPDATE_ENCODE_BUFFER: RefCell<[u8; ACCOUNT_UPDATE_ENCODE_BUFFER_SIZE]> =
-        RefCell::new([0u8; ACCOUNT_UPDATE_ENCODE_BUFFER_SIZE]);
+    // Keep the large encode buffer on the heap; some notifier threads have small stacks.
+    static ACCOUNT_UPDATE_ENCODE_BUFFER: RefCell<Vec<u8>> =
+        RefCell::new(vec![0u8; ACCOUNT_UPDATE_ENCODE_BUFFER_SIZE]);
 }
 
 #[derive(Debug, Clone, Copy)]

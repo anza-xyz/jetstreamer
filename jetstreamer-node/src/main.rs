@@ -102,7 +102,7 @@ const DEFAULT_ACCOUNTS_MAINTENANCE_ROOT_STRIDE: u64 = 1;
 const DEFAULT_READY_ENTRY_QUEUE_CAPACITY: usize = 8192;
 const MISMATCH_RETRY_ATTEMPTS: usize = 10;
 const DEFAULT_POST_FIREHOSE_INCOMPLETE_RETRY_ATTEMPTS: usize = 0;
-const EMPTY_SLOT_BUFFER_GAP_LIMIT: u64 = 512;
+const DEFAULT_EMPTY_SLOT_BUFFER_GAP_LIMIT: u64 = 0;
 static LOGGED_FIRST_ACCOUNT_UPDATE: AtomicBool = AtomicBool::new(false);
 static LOGGED_PROGRAM_CACHE_ASSIGN_FAIL: AtomicBool = AtomicBool::new(false);
 static PROGRAM_CACHE_ASSIGN_FAIL_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -2235,6 +2235,7 @@ struct TransactionScheduler {
     presence: Arc<SlotPresenceMap>,
     resume_target: Mutex<Option<ResumeTarget>>,
     restart_tracker: Arc<RestartTracker>,
+    empty_slot_buffer_gap_limit: u64,
 }
 
 #[derive(Debug)]
@@ -2296,6 +2297,7 @@ impl TransactionScheduler {
         start_slot: Slot,
         presence: Arc<SlotPresenceMap>,
         restart_tracker: Arc<RestartTracker>,
+        empty_slot_buffer_gap_limit: u64,
     ) -> Self {
         Self {
             state: Mutex::new(SchedulerState {
@@ -2308,6 +2310,7 @@ impl TransactionScheduler {
             presence,
             resume_target: Mutex::new(None),
             restart_tracker,
+            empty_slot_buffer_gap_limit,
         }
     }
 
@@ -2639,10 +2642,12 @@ impl TransactionScheduler {
                     .unwrap_or(false);
                 if !current_has_data {
                     let gap = state.highest_seen_slot.saturating_sub(current_slot);
-                    if gap >= EMPTY_SLOT_BUFFER_GAP_LIMIT {
+                    if self.empty_slot_buffer_gap_limit > 0
+                        && gap >= self.empty_slot_buffer_gap_limit
+                    {
                         return Err(format!(
-                            "scheduler stalled: current slot {} has no buffered data while highest seen slot is {} (gap {})",
-                            current_slot, state.highest_seen_slot, gap
+                            "scheduler stalled: current slot {} has no buffered data while highest seen slot is {} (gap {}, limit {})",
+                            current_slot, state.highest_seen_slot, gap, self.empty_slot_buffer_gap_limit
                         ));
                     }
                 }
@@ -4262,6 +4267,29 @@ fn post_firehose_incomplete_retry_attempts() -> usize {
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(DEFAULT_POST_FIREHOSE_INCOMPLETE_RETRY_ATTEMPTS)
 }
+
+fn empty_slot_buffer_gap_limit() -> u64 {
+    match env::var("JETSTREAMER_EMPTY_SLOT_BUFFER_GAP_LIMIT") {
+        Ok(value) => {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                return DEFAULT_EMPTY_SLOT_BUFFER_GAP_LIMIT;
+            }
+            match trimmed.parse::<u64>() {
+                Ok(limit) => limit,
+                Err(err) => {
+                    warn!(
+                        "invalid JETSTREAMER_EMPTY_SLOT_BUFFER_GAP_LIMIT '{value}': {err}; using default {}",
+                        DEFAULT_EMPTY_SLOT_BUFFER_GAP_LIMIT
+                    );
+                    DEFAULT_EMPTY_SLOT_BUFFER_GAP_LIMIT
+                }
+            }
+        }
+        Err(_) => DEFAULT_EMPTY_SLOT_BUFFER_GAP_LIMIT,
+    }
+}
+
 fn local_index_path(cache_dir: &Path, url: &Url) -> Result<PathBuf, String> {
     let path = url.path().trim_start_matches('/');
     if path.is_empty() {
@@ -4705,10 +4733,17 @@ async fn run_geyser_replay(
         epoch,
     )
     .await?;
+    let gap_limit = empty_slot_buffer_gap_limit();
+    if gap_limit > 0 {
+        info!("empty-slot gap guard enabled (limit={gap_limit})");
+    } else {
+        info!("empty-slot gap guard disabled");
+    }
     let scheduler = Arc::new(TransactionScheduler::new(
         replay_start,
         slot_presence,
         restart_tracker.clone(),
+        gap_limit,
     ));
     let firehose_gate = Arc::new(Mutex::new(()));
     let enable_program_cache_prune = env_truthy_default(

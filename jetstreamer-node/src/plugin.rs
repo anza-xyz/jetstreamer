@@ -4,11 +4,8 @@ use log::info;
 use solana_account::{AccountSharedData, ReadableAccount};
 use solana_address::Address;
 use solana_clock::Slot;
-use solana_hash::Hash;
 use solana_pubkey::Pubkey;
-use solana_signature::Signature;
-use solana_transaction::{sanitized::SanitizedTransaction, versioned::VersionedTransaction};
-use solana_transaction_status::TransactionStatusMeta;
+use solana_transaction::sanitized::SanitizedTransaction;
 use std::{
     cell::RefCell,
     sync::{
@@ -35,22 +32,34 @@ struct ThroughputSample {
     account_updates: u64,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct TransactionCursor {
+    slot: Slot,
+    next_tx_index: u64,
+}
+
 static STARTUP_ACCOUNTS: AtomicU64 = AtomicU64::new(0);
 static ACCOUNT_UPDATES: AtomicU64 = AtomicU64::new(0);
 static TRANSACTIONS: AtomicU64 = AtomicU64::new(0);
+static LAST_ACCOUNT_UPDATE_SLOT: AtomicU64 = AtomicU64::new(0);
 static TOTAL_IN_MEMORY_ACCOUNT_UPDATE_SIZE: AtomicU64 = AtomicU64::new(0);
 static TOTAL_ENCODED_ACCOUNT_UPDATE_SIZE: AtomicU64 = AtomicU64::new(0);
 static PACKING_ENABLED: AtomicBool = AtomicBool::new(true);
 static LAST_THROUGHPUT_SAMPLE: Mutex<Option<ThroughputSample>> = Mutex::new(None);
+static TRANSACTION_CURSOR: Mutex<Option<TransactionCursor>> = Mutex::new(None);
 
 pub fn reset() {
     STARTUP_ACCOUNTS.store(0, Ordering::Relaxed);
     ACCOUNT_UPDATES.store(0, Ordering::Relaxed);
     TRANSACTIONS.store(0, Ordering::Relaxed);
+    LAST_ACCOUNT_UPDATE_SLOT.store(0, Ordering::Relaxed);
     TOTAL_IN_MEMORY_ACCOUNT_UPDATE_SIZE.store(0, Ordering::Relaxed);
     TOTAL_ENCODED_ACCOUNT_UPDATE_SIZE.store(0, Ordering::Relaxed);
     if let Ok(mut sample) = LAST_THROUGHPUT_SAMPLE.lock() {
         *sample = None;
+    }
+    if let Ok(mut cursor) = TRANSACTION_CURSOR.lock() {
+        *cursor = None;
     }
     ENCODER.with(|encoder| {
         encoder.borrow_mut().clear();
@@ -74,16 +83,61 @@ pub fn notify_end_of_startup() {
     );
 }
 
-pub fn notify_transaction(
-    _slot: Slot,
-    _transaction_slot_index: usize,
-    _signature: &Signature,
-    _message_hash: &Hash,
-    _is_vote: bool,
-    _transaction_status_meta: &TransactionStatusMeta,
-    _transaction: &VersionedTransaction,
-) {
-    TRANSACTIONS.fetch_add(1, Ordering::Relaxed);
+pub fn notify_transaction_range(slot: Slot, start_index: usize, count: usize) {
+    if count == 0 {
+        return;
+    }
+    let start_index = start_index as u64;
+    let count = count as u64;
+    let end_index = start_index
+        .checked_add(count)
+        .expect("transaction range overflow");
+
+    if let Ok(mut cursor_guard) = TRANSACTION_CURSOR.lock() {
+        match cursor_guard.as_mut() {
+            Some(cursor) if slot < cursor.slot => {
+                panic!(
+                    "transaction notify went backwards: slot={} previous_slot={} start_index={} previous_next_index={}",
+                    slot, cursor.slot, start_index, cursor.next_tx_index
+                );
+            }
+            Some(cursor) if slot == cursor.slot => {
+                if start_index != cursor.next_tx_index {
+                    panic!(
+                        "transaction notify gap/overlap in slot {}: start_index={} expected_start={}",
+                        slot, start_index, cursor.next_tx_index
+                    );
+                }
+                cursor.next_tx_index = end_index;
+            }
+            Some(cursor) => {
+                if start_index != 0 {
+                    panic!(
+                        "transaction notify new slot {} did not restart at index 0 (start_index={}, previous_slot={}, previous_next_index={})",
+                        slot, start_index, cursor.slot, cursor.next_tx_index
+                    );
+                }
+                *cursor = TransactionCursor {
+                    slot,
+                    next_tx_index: end_index,
+                };
+            }
+            None => {
+                if start_index != 0 {
+                    panic!(
+                        "first transaction notify for slot {} did not start at index 0 (start_index={})",
+                        slot, start_index
+                    );
+                }
+                *cursor_guard = Some(TransactionCursor {
+                    slot,
+                    next_tx_index: end_index,
+                });
+            }
+        }
+    }
+
+    TRANSACTIONS.fetch_add(count, Ordering::Relaxed);
 }
 
 pub fn notify_account_update(
@@ -93,6 +147,28 @@ pub fn notify_account_update(
     pubkey: &Pubkey,
     write_version: u64,
 ) {
+    let mut observed_slot = LAST_ACCOUNT_UPDATE_SLOT.load(Ordering::Relaxed);
+    loop {
+        if observed_slot != 0 && slot < observed_slot {
+            panic!(
+                "account update slot went backwards: slot={} previous_slot={}",
+                slot, observed_slot
+            );
+        }
+        if slot <= observed_slot {
+            break;
+        }
+        match LAST_ACCOUNT_UPDATE_SLOT.compare_exchange(
+            observed_slot,
+            slot,
+            Ordering::SeqCst,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => break,
+            Err(actual) => observed_slot = actual,
+        }
+    }
+
     ACCOUNT_UPDATES.fetch_add(1, Ordering::Relaxed);
     let memory_size = core::mem::size_of::<AccountUpdate>() + account.data().len();
     TOTAL_IN_MEMORY_ACCOUNT_UPDATE_SIZE.fetch_add(memory_size as u64, Ordering::Relaxed);

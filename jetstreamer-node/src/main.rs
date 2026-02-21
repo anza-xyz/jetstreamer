@@ -103,9 +103,7 @@ const DEFAULT_READY_ENTRY_QUEUE_CAPACITY: usize = 8192;
 const MISMATCH_RETRY_ATTEMPTS: usize = 10;
 const DEFAULT_POST_FIREHOSE_INCOMPLETE_RETRY_ATTEMPTS: usize = 16;
 const DEFAULT_EMPTY_SLOT_BUFFER_GAP_LIMIT: u64 = 0;
-const DEFAULT_IMMEDIATE_RESTART_ATTEMPTS: usize = 16;
-const IMMEDIATE_RESTART_STALL_AFTER: Duration = Duration::from_secs(30);
-const IMMEDIATE_RESTART_SLOT_GAP: u64 = 256;
+const DEFAULT_FIREHOSE_BACKPRESSURE_SLOT_GAP_LIMIT: u64 = 128;
 static LOGGED_FIRST_ACCOUNT_UPDATE: AtomicBool = AtomicBool::new(false);
 static LOGGED_PROGRAM_CACHE_ASSIGN_FAIL: AtomicBool = AtomicBool::new(false);
 static PROGRAM_CACHE_ASSIGN_FAIL_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -212,6 +210,7 @@ struct BankReplay {
     cached_bank: Mutex<Option<CachedBank>>,
     execution_gate: Arc<Mutex<()>>,
     firehose_gate: Arc<Mutex<()>>,
+    live_start_slot: Slot,
     enable_program_cache_prune: bool,
     enable_accounts_maintenance: bool,
     accounts_maintenance_root_stride: u64,
@@ -242,6 +241,7 @@ impl BankReplay {
         cursor: Arc<ReplayCursor>,
         scheduler: Arc<TransactionScheduler>,
         firehose_gate: Arc<Mutex<()>>,
+        live_start_slot: Slot,
         enable_program_cache_prune: bool,
         enable_accounts_maintenance: bool,
         accounts_maintenance_root_stride: u64,
@@ -279,6 +279,7 @@ impl BankReplay {
             cached_bank,
             execution_gate: Arc::new(Mutex::new(())),
             firehose_gate,
+            live_start_slot,
             enable_program_cache_prune,
             enable_accounts_maintenance,
             accounts_maintenance_root_stride: accounts_maintenance_root_stride.max(1),
@@ -1287,6 +1288,13 @@ impl BankReplay {
                             panic!("{message}");
                         }
                     }
+                    if entry.slot >= self.live_start_slot {
+                        plugin::notify_transaction_range(
+                            entry.slot,
+                            entry.start_index,
+                            entry.tx_count,
+                        );
+                    }
                     // Advance the replay cursor only after successful execution/verification.
                     self.cursor.update(
                         entry.slot,
@@ -1435,6 +1443,7 @@ struct RestartTracker {
     slot: AtomicU64,
     entry_index: AtomicU64,
     tx_start: AtomicU64,
+    allow_stale_skip: AtomicBool,
 }
 
 impl RestartTracker {
@@ -1444,14 +1453,23 @@ impl RestartTracker {
             slot: AtomicU64::new(0),
             entry_index: AtomicU64::new(0),
             tx_start: AtomicU64::new(0),
+            allow_stale_skip: AtomicBool::new(false),
         }
     }
 
-    fn mark_restart(&self, slot: Slot, entry_index: usize, tx_start: usize) {
+    fn mark_restart(
+        &self,
+        slot: Slot,
+        entry_index: usize,
+        tx_start: usize,
+        allow_stale_skip: bool,
+    ) {
         self.slot.store(slot, Ordering::Relaxed);
         self.entry_index
             .store(entry_index as u64, Ordering::Relaxed);
         self.tx_start.store(tx_start as u64, Ordering::Relaxed);
+        self.allow_stale_skip
+            .store(allow_stale_skip, Ordering::Relaxed);
         self.pending.store(true, Ordering::Relaxed);
     }
 
@@ -1462,11 +1480,13 @@ impl RestartTracker {
         let target_slot = self.slot.load(Ordering::Relaxed);
         let target_entry_index = self.entry_index.load(Ordering::Relaxed) as usize;
         let target_tx_start = self.tx_start.load(Ordering::Relaxed) as usize;
+        let allow_stale_skip = self.allow_stale_skip.load(Ordering::Relaxed);
         self.pending.store(false, Ordering::Relaxed);
         // Firehose can report a restart slot and then resume from a later slot. If we have no
         // resume cursor for that restart target, rolling scheduler state back to that slot
         // creates an empty "present" slot that never receives data and blocks replay forever.
-        if slot > target_slot && target_entry_index == 0 && target_tx_start == 0 {
+        if allow_stale_skip && slot > target_slot && target_entry_index == 0 && target_tx_start == 0
+        {
             warn!(
                 "ignoring stale restart target: target_slot={} current_slot={} (no resume cursor)",
                 target_slot, slot
@@ -1648,7 +1668,7 @@ impl log::Log for AbortOnErrorLogger {
                     }
                 }
                 self.restart_tracker
-                    .mark_restart(restart_slot, entry_index, tx_start);
+                    .mark_restart(restart_slot, entry_index, tx_start, true);
             }
         }
         if record.target() == "solana_program_runtime::loaded_programs"
@@ -2571,23 +2591,14 @@ impl TransactionScheduler {
                 }
             }
         }
-        if let Some((slot, snapshot, entry_index, tx_start)) = buffered {
-            return Some(IncompleteSlotInfo {
-                slot,
-                entry_index,
-                tx_start,
-                reason: IncompleteReason::BufferedData,
-                snapshot: Some(snapshot),
-                presence: self.presence.state(slot),
-            });
-        }
 
         let mut slot = state.current_slot;
+        let mut missing: Option<IncompleteSlotInfo> = None;
         while slot <= end_inclusive {
             match self.presence.state(slot) {
                 Some(SlotPresenceState::Missing) => slot = slot.saturating_add(1),
                 Some(SlotPresenceState::Present) => {
-                    return Some(IncompleteSlotInfo {
+                    missing = Some(IncompleteSlotInfo {
                         slot,
                         entry_index: 0,
                         tx_start: 0,
@@ -2595,12 +2606,38 @@ impl TransactionScheduler {
                         snapshot: None,
                         presence: Some(SlotPresenceState::Present),
                     });
+                    break;
                 }
                 None => break,
             }
         }
 
-        None
+        match (buffered, missing) {
+            (Some((slot, snapshot, entry_index, tx_start)), Some(missing)) => {
+                if missing.slot <= slot {
+                    Some(missing)
+                } else {
+                    Some(IncompleteSlotInfo {
+                        slot,
+                        entry_index,
+                        tx_start,
+                        reason: IncompleteReason::BufferedData,
+                        snapshot: Some(snapshot),
+                        presence: self.presence.state(slot),
+                    })
+                }
+            }
+            (Some((slot, snapshot, entry_index, tx_start)), None) => Some(IncompleteSlotInfo {
+                slot,
+                entry_index,
+                tx_start,
+                reason: IncompleteReason::BufferedData,
+                snapshot: Some(snapshot),
+                presence: self.presence.state(slot),
+            }),
+            (None, Some(missing)) => Some(missing),
+            (None, None) => None,
+        }
     }
 
     fn snapshot(&self) -> SchedulerSnapshot {
@@ -2650,7 +2687,10 @@ impl TransactionScheduler {
                     {
                         return Err(format!(
                             "scheduler stalled: current slot {} has no buffered data while highest seen slot is {} (gap {}, limit {})",
-                            current_slot, state.highest_seen_slot, gap, self.empty_slot_buffer_gap_limit
+                            current_slot,
+                            state.highest_seen_slot,
+                            gap,
+                            self.empty_slot_buffer_gap_limit
                         ));
                     }
                 }
@@ -3021,7 +3061,10 @@ struct BankTransactionNotifier {
     scheduler: Arc<TransactionScheduler>,
     failure: Arc<ReplayFailure>,
     ready_sender: crossbeam_channel::Sender<Vec<ReadyEntry>>,
-    live_start_slot: Slot,
+    shutdown: Arc<AtomicBool>,
+    active_firehose_stop: Arc<Mutex<Option<Arc<AtomicBool>>>>,
+    backpressure_stop_requested: Arc<AtomicBool>,
+    firehose_backpressure_slot_gap_limit: u64,
     firehose_gate: Arc<Mutex<()>>,
 }
 
@@ -3030,17 +3073,26 @@ impl TransactionNotifier for BankTransactionNotifier {
         &self,
         slot: Slot,
         transaction_slot_index: usize,
-        signature: &Signature,
-        message_hash: &Hash,
-        is_vote: bool,
+        _signature: &Signature,
+        _message_hash: &Hash,
+        _is_vote: bool,
         transaction_status_meta: &TransactionStatusMeta,
         transaction: &VersionedTransaction,
     ) {
+        if !enforce_firehose_backpressure(
+            slot,
+            &self.scheduler,
+            &self.shutdown,
+            &self.active_firehose_stop,
+            &self.backpressure_stop_requested,
+            self.firehose_backpressure_slot_gap_limit,
+        ) {
+            return;
+        }
         let _firehose_guard = self
             .firehose_gate
             .lock()
             .expect("firehose gate lock poisoned");
-        let mut inserted_tx = false;
         match self.scheduler.insert_transaction(
             slot,
             transaction_slot_index,
@@ -3048,26 +3100,13 @@ impl TransactionNotifier for BankTransactionNotifier {
             transaction_status_meta.status.clone(),
         ) {
             Ok((ready_entries, inserted)) => {
-                inserted_tx = inserted;
-                if inserted_tx {
+                if inserted {
                     self.progress.note_tx_slot(slot);
                     self.progress.inc_tx();
                 }
                 send_ready_entries(&self.ready_sender, &self.failure, ready_entries);
             }
             Err(err) => self.failure.record(err),
-        }
-
-        if slot >= self.live_start_slot && inserted_tx {
-            plugin::notify_transaction(
-                slot,
-                transaction_slot_index,
-                signature,
-                message_hash,
-                is_vote,
-                transaction_status_meta,
-                transaction,
-            );
         }
     }
 }
@@ -3077,6 +3116,10 @@ struct BankEntryNotifier {
     scheduler: Arc<TransactionScheduler>,
     failure: Arc<ReplayFailure>,
     ready_sender: crossbeam_channel::Sender<Vec<ReadyEntry>>,
+    shutdown: Arc<AtomicBool>,
+    active_firehose_stop: Arc<Mutex<Option<Arc<AtomicBool>>>>,
+    backpressure_stop_requested: Arc<AtomicBool>,
+    firehose_backpressure_slot_gap_limit: u64,
     firehose_gate: Arc<Mutex<()>>,
 }
 
@@ -3088,6 +3131,16 @@ impl EntryNotifier for BankEntryNotifier {
         entry: &solana_entry::entry::EntrySummary,
         starting_transaction_index: usize,
     ) {
+        if !enforce_firehose_backpressure(
+            slot,
+            &self.scheduler,
+            &self.shutdown,
+            &self.active_firehose_stop,
+            &self.backpressure_stop_requested,
+            self.firehose_backpressure_slot_gap_limit,
+        ) {
+            return;
+        }
         let _firehose_guard = self
             .firehose_gate
             .lock()
@@ -3116,6 +3169,10 @@ struct BankBlockMetadataNotifier {
     failure: Arc<ReplayFailure>,
     ready_sender: crossbeam_channel::Sender<Vec<ReadyEntry>>,
     live_start_slot: Slot,
+    shutdown: Arc<AtomicBool>,
+    active_firehose_stop: Arc<Mutex<Option<Arc<AtomicBool>>>>,
+    backpressure_stop_requested: Arc<AtomicBool>,
+    firehose_backpressure_slot_gap_limit: u64,
     firehose_gate: Arc<Mutex<()>>,
 }
 
@@ -3132,13 +3189,23 @@ impl BlockMetadataNotifier for BankBlockMetadataNotifier {
         executed_transaction_count: u64,
         entry_count: u64,
     ) {
+        if slot == u64::MAX {
+            return;
+        }
+        if !enforce_firehose_backpressure(
+            slot,
+            &self.scheduler,
+            &self.shutdown,
+            &self.active_firehose_stop,
+            &self.backpressure_stop_requested,
+            self.firehose_backpressure_slot_gap_limit,
+        ) {
+            return;
+        }
         let _firehose_guard = self
             .firehose_gate
             .lock()
             .expect("firehose gate lock poisoned");
-        if slot == u64::MAX {
-            return;
-        }
         self.progress.note_block_meta_slot(slot);
         match self
             .scheduler
@@ -3166,6 +3233,54 @@ fn send_ready_entries(
     {
         failure.record(format!("ready entry channel closed: {err}"));
     }
+}
+
+fn enforce_firehose_backpressure(
+    incoming_slot: Slot,
+    scheduler: &TransactionScheduler,
+    shutdown: &Arc<AtomicBool>,
+    active_firehose_stop: &Arc<Mutex<Option<Arc<AtomicBool>>>>,
+    backpressure_stop_requested: &Arc<AtomicBool>,
+    slot_gap_limit: u64,
+) -> bool {
+    if shutdown.load(Ordering::Relaxed) {
+        return false;
+    }
+    if slot_gap_limit == 0 {
+        return true;
+    }
+    if backpressure_stop_requested.load(Ordering::Relaxed) {
+        return false;
+    }
+
+    let snapshot = scheduler.snapshot();
+    let scheduler_gap = snapshot
+        .highest_seen_slot
+        .saturating_sub(snapshot.current_slot);
+    let incoming_gap = incoming_slot.saturating_sub(snapshot.current_slot);
+    let effective_gap = scheduler_gap.max(incoming_gap);
+    if effective_gap < slot_gap_limit {
+        return true;
+    }
+
+    if !backpressure_stop_requested.swap(true, Ordering::SeqCst) {
+        warn!(
+            "firehose backpressure triggered: incoming_slot={} scheduler_current_slot={} highest_seen_slot={} gap={} limit={} buffered_slots={} (requesting firehose stop)",
+            incoming_slot,
+            snapshot.current_slot,
+            snapshot.highest_seen_slot,
+            effective_gap,
+            slot_gap_limit,
+            snapshot.buffered_slots
+        );
+        if let Ok(guard) = active_firehose_stop.lock()
+            && let Some(stop_signal) = guard.as_ref()
+        {
+            stop_signal.store(true, Ordering::SeqCst);
+        }
+    }
+
+    false
 }
 
 fn format_eta(duration: Duration) -> String {
@@ -3208,9 +3323,7 @@ fn epoch_to_slot(epoch: u64) -> u64 {
 }
 
 fn usage(program: &str) -> String {
-    format!(
-        "Usage: {program} <epoch> [dest-dir] [--verify|--no-verify] [--packing|--no-packing]"
-    )
+    format!("Usage: {program} <epoch> [dest-dir] [--verify|--no-verify] [--packing|--no-packing]")
 }
 
 fn snapshot_filename(uri: &str) -> Result<&str, String> {
@@ -4271,11 +4384,26 @@ fn post_firehose_incomplete_retry_attempts() -> usize {
         .unwrap_or(DEFAULT_POST_FIREHOSE_INCOMPLETE_RETRY_ATTEMPTS)
 }
 
-fn immediate_restart_attempts() -> usize {
-    env::var("JETSTREAMER_IMMEDIATE_RESTART_ATTEMPTS")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(DEFAULT_IMMEDIATE_RESTART_ATTEMPTS)
+fn firehose_backpressure_slot_gap_limit() -> u64 {
+    match env::var("JETSTREAMER_FIREHOSE_BACKPRESSURE_SLOT_GAP_LIMIT") {
+        Ok(value) => {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                return DEFAULT_FIREHOSE_BACKPRESSURE_SLOT_GAP_LIMIT;
+            }
+            match trimmed.parse::<u64>() {
+                Ok(limit) => limit,
+                Err(err) => {
+                    warn!(
+                        "invalid JETSTREAMER_FIREHOSE_BACKPRESSURE_SLOT_GAP_LIMIT '{value}': {err}; using default {}",
+                        DEFAULT_FIREHOSE_BACKPRESSURE_SLOT_GAP_LIMIT
+                    );
+                    DEFAULT_FIREHOSE_BACKPRESSURE_SLOT_GAP_LIMIT
+                }
+            }
+        }
+        Err(_) => DEFAULT_FIREHOSE_BACKPRESSURE_SLOT_GAP_LIMIT,
+    }
 }
 
 fn empty_slot_buffer_gap_limit() -> u64 {
@@ -4755,6 +4883,15 @@ async fn run_geyser_replay(
         restart_tracker.clone(),
         gap_limit,
     ));
+    let firehose_backpressure_slot_gap_limit = firehose_backpressure_slot_gap_limit();
+    if firehose_backpressure_slot_gap_limit > 0 {
+        info!(
+            "firehose backpressure enabled (slot_gap_limit={})",
+            firehose_backpressure_slot_gap_limit
+        );
+    } else {
+        info!("firehose backpressure disabled");
+    }
     let firehose_gate = Arc::new(Mutex::new(()));
     let enable_program_cache_prune = env_truthy_default(
         "JETSTREAMER_PROGRAM_CACHE_PRUNE",
@@ -4791,6 +4928,7 @@ async fn run_geyser_replay(
         cursor.clone(),
         scheduler.clone(),
         firehose_gate.clone(),
+        epoch_start,
         enable_program_cache_prune,
         enable_accounts_maintenance,
         accounts_maintenance_root_stride,
@@ -4812,12 +4950,17 @@ async fn run_geyser_replay(
 
     let client = Client::new();
     let index_base_url = resolve_remote_index_base_url()?;
+    let active_firehose_stop = Arc::new(Mutex::new(None::<Arc<AtomicBool>>));
+    let backpressure_stop_requested = Arc::new(AtomicBool::new(false));
     let transaction_notifier = Arc::new(BankTransactionNotifier {
         progress: progress.clone(),
         scheduler: scheduler.clone(),
         failure: failure.clone(),
         ready_sender: ready_sender.clone(),
-        live_start_slot: epoch_start,
+        shutdown: shutdown.clone(),
+        active_firehose_stop: active_firehose_stop.clone(),
+        backpressure_stop_requested: backpressure_stop_requested.clone(),
+        firehose_backpressure_slot_gap_limit,
         firehose_gate: firehose_gate.clone(),
     });
     let entry_notifier = Arc::new(BankEntryNotifier {
@@ -4825,6 +4968,10 @@ async fn run_geyser_replay(
         scheduler: scheduler.clone(),
         failure: failure.clone(),
         ready_sender: ready_sender.clone(),
+        shutdown: shutdown.clone(),
+        active_firehose_stop: active_firehose_stop.clone(),
+        backpressure_stop_requested: backpressure_stop_requested.clone(),
+        firehose_backpressure_slot_gap_limit,
         firehose_gate: firehose_gate.clone(),
     });
     let block_metadata_notifier = Arc::new(BankBlockMetadataNotifier {
@@ -4833,6 +4980,10 @@ async fn run_geyser_replay(
         failure: failure.clone(),
         ready_sender: ready_sender.clone(),
         live_start_slot: epoch_start,
+        shutdown: shutdown.clone(),
+        active_firehose_stop: active_firehose_stop.clone(),
+        backpressure_stop_requested: backpressure_stop_requested.clone(),
+        firehose_backpressure_slot_gap_limit,
         firehose_gate: firehose_gate.clone(),
     });
     let notifiers = GeyserNotifiers {
@@ -4846,21 +4997,10 @@ async fn run_geyser_replay(
         threads = 1;
     }
     let post_firehose_retries = post_firehose_incomplete_retry_attempts();
-    let immediate_restart_limit = immediate_restart_attempts();
     info!(
         "post-firehose incomplete retry attempts: {}",
         post_firehose_retries
     );
-    info!(
-        "immediate replay restart attempts: {} (stall_after={}s slot_gap>={})",
-        immediate_restart_limit,
-        IMMEDIATE_RESTART_STALL_AFTER.as_secs(),
-        IMMEDIATE_RESTART_SLOT_GAP
-    );
-
-    let active_firehose_stop = Arc::new(Mutex::new(None::<Arc<AtomicBool>>));
-    let immediate_restart_requested = Arc::new(AtomicBool::new(false));
-    let immediate_restart_target = Arc::new(Mutex::new(None::<ResumeTarget>));
 
     let progress_done = Arc::new(AtomicBool::new(false));
     let progress_handle = {
@@ -4870,9 +5010,6 @@ async fn run_geyser_replay(
         let failure = failure.clone();
         let progress_done = progress_done.clone();
         let shutdown = shutdown.clone();
-        let active_firehose_stop = active_firehose_stop.clone();
-        let immediate_restart_requested = immediate_restart_requested.clone();
-        let immediate_restart_target = immediate_restart_target.clone();
         std::thread::spawn(move || {
             let has_warmup = replay_start < epoch_start;
             let warmup_end = epoch_start.saturating_sub(1);
@@ -5079,45 +5216,6 @@ async fn run_geyser_replay(
                 } else if tx_advanced {
                     let stalled_slots = latest.saturating_sub(last_account_update_slot_seen);
                     let stalled_for = last_account_change.elapsed();
-                    if stalled_for >= IMMEDIATE_RESTART_STALL_AFTER
-                        && stalled_slots >= IMMEDIATE_RESTART_SLOT_GAP
-                        && inflight_elapsed.is_none()
-                    {
-                        let snapshot = scheduler.snapshot();
-                        let scheduler_gap =
-                            snapshot.highest_seen_slot.saturating_sub(snapshot.current_slot);
-                        if scheduler_gap >= IMMEDIATE_RESTART_SLOT_GAP
-                            && !immediate_restart_requested.load(Ordering::Relaxed)
-                            && let Some(incomplete) = scheduler.first_incomplete_slot(end_inclusive)
-                        {
-                            let target = ResumeTarget {
-                                slot: incomplete.slot,
-                                entry_index: incomplete.entry_index,
-                                tx_start: incomplete.tx_start,
-                            };
-                            if let Ok(mut guard) = immediate_restart_target.lock() {
-                                *guard = Some(target);
-                            }
-                            immediate_restart_requested.store(true, Ordering::SeqCst);
-                            warn!(
-                                "requesting immediate replay restart: account updates stalled for {:.1}s (stalled_slots={} scheduler_gap={} latest_slot={} restart_slot={} entry={} tx_index={} reason={:?} presence={:?})",
-                                stalled_for.as_secs_f64(),
-                                stalled_slots,
-                                scheduler_gap,
-                                latest,
-                                target.slot,
-                                target.entry_index,
-                                target.tx_start,
-                                incomplete.reason,
-                                incomplete.presence
-                            );
-                            if let Ok(guard) = active_firehose_stop.lock()
-                                && let Some(stop_signal) = guard.as_ref()
-                            {
-                                stop_signal.store(true, Ordering::SeqCst);
-                            }
-                        }
-                    }
                     if stalled_slots > 5 && latest > last_account_update_slot_seen {
                         let inflight_overdue = inflight_elapsed
                             .map(|elapsed| elapsed >= inflight_fail_after)
@@ -5339,13 +5437,9 @@ async fn run_geyser_replay(
 
     let mut firehose_start = slot_range.start;
     let mut incomplete_retries = 0usize;
-    let mut immediate_retries = 0usize;
     let mut firehose_error: Option<String> = None;
     loop {
-        if let Ok(mut guard) = immediate_restart_target.lock() {
-            *guard = None;
-        }
-        immediate_restart_requested.store(false, Ordering::SeqCst);
+        backpressure_stop_requested.store(false, Ordering::SeqCst);
 
         info!(
             "starting firehose replay with {} thread(s) (attempt {} from slot {})",
@@ -5409,43 +5503,7 @@ async fn run_geyser_replay(
             *guard = None;
         }
 
-        if immediate_restart_requested.swap(false, Ordering::SeqCst) {
-            let target = immediate_restart_target
-                .lock()
-                .ok()
-                .and_then(|mut guard| guard.take())
-                .or_else(|| {
-                    scheduler
-                        .first_incomplete_slot(end_inclusive)
-                        .map(|incomplete| ResumeTarget {
-                            slot: incomplete.slot,
-                            entry_index: incomplete.entry_index,
-                            tx_start: incomplete.tx_start,
-                        })
-                });
-            if let Some(target) = target {
-                if immediate_retries < immediate_restart_limit {
-                    immediate_retries = immediate_retries.saturating_add(1);
-                    warn!(
-                        "immediate replay restart: retrying from slot {} entry {} tx_index {} (attempt {}/{})",
-                        target.slot,
-                        target.entry_index,
-                        target.tx_start,
-                        immediate_retries,
-                        immediate_restart_limit
-                    );
-                    restart_tracker.mark_restart(target.slot, target.entry_index, target.tx_start);
-                    firehose_start = target.slot;
-                    continue;
-                }
-                failure.record(format!(
-                    "immediate replay restart limit exceeded ({}) at slot {} entry {} tx_index {}",
-                    immediate_restart_limit, target.slot, target.entry_index, target.tx_start
-                ));
-                break;
-            }
-            warn!("immediate replay restart requested but no incomplete slot found");
-        }
+        let stopped_by_backpressure = backpressure_stop_requested.load(Ordering::Relaxed);
 
         if let Err((err, slot)) = firehose_result {
             firehose_error = Some(format!("firehose error at slot {slot}: {err}"));
@@ -5460,9 +5518,17 @@ async fn run_geyser_replay(
         }
 
         if let Err(err) = scheduler.verify_complete(end_inclusive) {
-            if incomplete_retries < post_firehose_retries
-                && let Some(incomplete) = scheduler.first_incomplete_slot(end_inclusive)
-            {
+            if let Some(incomplete) = scheduler.first_incomplete_slot(end_inclusive) {
+                let consume_retry_budget = !stopped_by_backpressure;
+                if consume_retry_budget && incomplete_retries >= post_firehose_retries {
+                    failure.record(err);
+                    break;
+                }
+                if stopped_by_backpressure {
+                    warn!(
+                        "firehose run stopped by backpressure; retrying from earliest incomplete slot"
+                    );
+                }
                 warn!(
                     "post-firehose replay incomplete: {err}; retrying from slot {} entry {} tx_index {} reason={:?} presence={:?}",
                     incomplete.slot,
@@ -5488,9 +5554,12 @@ async fn run_geyser_replay(
                     incomplete.slot,
                     incomplete.entry_index,
                     incomplete.tx_start,
+                    false,
                 );
                 firehose_start = incomplete.slot;
-                incomplete_retries = incomplete_retries.saturating_add(1);
+                if consume_retry_budget {
+                    incomplete_retries = incomplete_retries.saturating_add(1);
+                }
                 continue;
             }
             failure.record(err);

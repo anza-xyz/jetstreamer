@@ -101,8 +101,11 @@ const DEFAULT_ACCOUNTS_MAINTENANCE_ENABLED: bool = true;
 const DEFAULT_ACCOUNTS_MAINTENANCE_ROOT_STRIDE: u64 = 1;
 const DEFAULT_READY_ENTRY_QUEUE_CAPACITY: usize = 8192;
 const MISMATCH_RETRY_ATTEMPTS: usize = 10;
-const DEFAULT_POST_FIREHOSE_INCOMPLETE_RETRY_ATTEMPTS: usize = 0;
+const DEFAULT_POST_FIREHOSE_INCOMPLETE_RETRY_ATTEMPTS: usize = 16;
 const DEFAULT_EMPTY_SLOT_BUFFER_GAP_LIMIT: u64 = 0;
+const DEFAULT_IMMEDIATE_RESTART_ATTEMPTS: usize = 16;
+const IMMEDIATE_RESTART_STALL_AFTER: Duration = Duration::from_secs(30);
+const IMMEDIATE_RESTART_SLOT_GAP: u64 = 256;
 static LOGGED_FIRST_ACCOUNT_UPDATE: AtomicBool = AtomicBool::new(false);
 static LOGGED_PROGRAM_CACHE_ASSIGN_FAIL: AtomicBool = AtomicBool::new(false);
 static PROGRAM_CACHE_ASSIGN_FAIL_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -4268,6 +4271,13 @@ fn post_firehose_incomplete_retry_attempts() -> usize {
         .unwrap_or(DEFAULT_POST_FIREHOSE_INCOMPLETE_RETRY_ATTEMPTS)
 }
 
+fn immediate_restart_attempts() -> usize {
+    env::var("JETSTREAMER_IMMEDIATE_RESTART_ATTEMPTS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_IMMEDIATE_RESTART_ATTEMPTS)
+}
+
 fn empty_slot_buffer_gap_limit() -> u64 {
     match env::var("JETSTREAMER_EMPTY_SLOT_BUFFER_GAP_LIMIT") {
         Ok(value) => {
@@ -4836,10 +4846,21 @@ async fn run_geyser_replay(
         threads = 1;
     }
     let post_firehose_retries = post_firehose_incomplete_retry_attempts();
+    let immediate_restart_limit = immediate_restart_attempts();
     info!(
         "post-firehose incomplete retry attempts: {}",
         post_firehose_retries
     );
+    info!(
+        "immediate replay restart attempts: {} (stall_after={}s slot_gap>={})",
+        immediate_restart_limit,
+        IMMEDIATE_RESTART_STALL_AFTER.as_secs(),
+        IMMEDIATE_RESTART_SLOT_GAP
+    );
+
+    let active_firehose_stop = Arc::new(Mutex::new(None::<Arc<AtomicBool>>));
+    let immediate_restart_requested = Arc::new(AtomicBool::new(false));
+    let immediate_restart_target = Arc::new(Mutex::new(None::<ResumeTarget>));
 
     let progress_done = Arc::new(AtomicBool::new(false));
     let progress_handle = {
@@ -4849,6 +4870,9 @@ async fn run_geyser_replay(
         let failure = failure.clone();
         let progress_done = progress_done.clone();
         let shutdown = shutdown.clone();
+        let active_firehose_stop = active_firehose_stop.clone();
+        let immediate_restart_requested = immediate_restart_requested.clone();
+        let immediate_restart_target = immediate_restart_target.clone();
         std::thread::spawn(move || {
             let has_warmup = replay_start < epoch_start;
             let warmup_end = epoch_start.saturating_sub(1);
@@ -5055,6 +5079,45 @@ async fn run_geyser_replay(
                 } else if tx_advanced {
                     let stalled_slots = latest.saturating_sub(last_account_update_slot_seen);
                     let stalled_for = last_account_change.elapsed();
+                    if stalled_for >= IMMEDIATE_RESTART_STALL_AFTER
+                        && stalled_slots >= IMMEDIATE_RESTART_SLOT_GAP
+                        && inflight_elapsed.is_none()
+                    {
+                        let snapshot = scheduler.snapshot();
+                        let scheduler_gap =
+                            snapshot.highest_seen_slot.saturating_sub(snapshot.current_slot);
+                        if scheduler_gap >= IMMEDIATE_RESTART_SLOT_GAP
+                            && !immediate_restart_requested.load(Ordering::Relaxed)
+                            && let Some(incomplete) = scheduler.first_incomplete_slot(end_inclusive)
+                        {
+                            let target = ResumeTarget {
+                                slot: incomplete.slot,
+                                entry_index: incomplete.entry_index,
+                                tx_start: incomplete.tx_start,
+                            };
+                            if let Ok(mut guard) = immediate_restart_target.lock() {
+                                *guard = Some(target);
+                            }
+                            immediate_restart_requested.store(true, Ordering::SeqCst);
+                            warn!(
+                                "requesting immediate replay restart: account updates stalled for {:.1}s (stalled_slots={} scheduler_gap={} latest_slot={} restart_slot={} entry={} tx_index={} reason={:?} presence={:?})",
+                                stalled_for.as_secs_f64(),
+                                stalled_slots,
+                                scheduler_gap,
+                                latest,
+                                target.slot,
+                                target.entry_index,
+                                target.tx_start,
+                                incomplete.reason,
+                                incomplete.presence
+                            );
+                            if let Ok(guard) = active_firehose_stop.lock()
+                                && let Some(stop_signal) = guard.as_ref()
+                            {
+                                stop_signal.store(true, Ordering::SeqCst);
+                            }
+                        }
+                    }
                     if stalled_slots > 5 && latest > last_account_update_slot_seen {
                         let inflight_overdue = inflight_elapsed
                             .map(|elapsed| elapsed >= inflight_fail_after)
@@ -5276,14 +5339,37 @@ async fn run_geyser_replay(
 
     let mut firehose_start = slot_range.start;
     let mut incomplete_retries = 0usize;
+    let mut immediate_retries = 0usize;
     let mut firehose_error: Option<String> = None;
     loop {
+        if let Ok(mut guard) = immediate_restart_target.lock() {
+            *guard = None;
+        }
+        immediate_restart_requested.store(false, Ordering::SeqCst);
+
         info!(
             "starting firehose replay with {} thread(s) (attempt {} from slot {})",
             threads,
             incomplete_retries.saturating_add(1),
             firehose_start
         );
+        let firehose_stop = Arc::new(AtomicBool::new(false));
+        if let Ok(mut guard) = active_firehose_stop.lock() {
+            *guard = Some(firehose_stop.clone());
+        }
+        let shutdown_watcher = {
+            let shutdown = shutdown.clone();
+            let firehose_stop = firehose_stop.clone();
+            std::thread::spawn(move || {
+                while !firehose_stop.load(Ordering::Relaxed) {
+                    if shutdown.load(Ordering::Relaxed) {
+                        firehose_stop.store(true, Ordering::SeqCst);
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            })
+        };
         let firehose_result = tokio::task::spawn_blocking({
             let slot_range = firehose_start..slot_range.end;
             let notifiers = GeyserNotifiers {
@@ -5294,7 +5380,7 @@ async fn run_geyser_replay(
             let confirmed_bank_sender = confirmed_bank_sender.clone();
             let index_base_url = index_base_url.clone();
             let client = client.clone();
-            let shutdown = shutdown.clone();
+            let firehose_stop = firehose_stop.clone();
             move || {
                 let rt = match tokio::runtime::Runtime::new() {
                     Ok(rt) => Arc::new(rt),
@@ -5309,7 +5395,7 @@ async fn run_geyser_replay(
                     confirmed_bank_sender,
                     &index_base_url,
                     &client,
-                    shutdown,
+                    firehose_stop,
                     async { Ok(()) },
                     threads,
                 )
@@ -5317,6 +5403,50 @@ async fn run_geyser_replay(
         })
         .await
         .map_err(|err| format!("firehose task failed: {err}"))?;
+        firehose_stop.store(true, Ordering::SeqCst);
+        let _ = shutdown_watcher.join();
+        if let Ok(mut guard) = active_firehose_stop.lock() {
+            *guard = None;
+        }
+
+        if immediate_restart_requested.swap(false, Ordering::SeqCst) {
+            let target = immediate_restart_target
+                .lock()
+                .ok()
+                .and_then(|mut guard| guard.take())
+                .or_else(|| {
+                    scheduler
+                        .first_incomplete_slot(end_inclusive)
+                        .map(|incomplete| ResumeTarget {
+                            slot: incomplete.slot,
+                            entry_index: incomplete.entry_index,
+                            tx_start: incomplete.tx_start,
+                        })
+                });
+            if let Some(target) = target {
+                if immediate_retries < immediate_restart_limit {
+                    immediate_retries = immediate_retries.saturating_add(1);
+                    warn!(
+                        "immediate replay restart: retrying from slot {} entry {} tx_index {} (attempt {}/{})",
+                        target.slot,
+                        target.entry_index,
+                        target.tx_start,
+                        immediate_retries,
+                        immediate_restart_limit
+                    );
+                    restart_tracker.mark_restart(target.slot, target.entry_index, target.tx_start);
+                    firehose_start = target.slot;
+                    continue;
+                }
+                failure.record(format!(
+                    "immediate replay restart limit exceeded ({}) at slot {} entry {} tx_index {}",
+                    immediate_restart_limit, target.slot, target.entry_index, target.tx_start
+                ));
+                break;
+            }
+            warn!("immediate replay restart requested but no incomplete slot found");
+        }
+
         if let Err((err, slot)) = firehose_result {
             firehose_error = Some(format!("firehose error at slot {slot}: {err}"));
             break;

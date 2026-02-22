@@ -41,7 +41,6 @@ struct TransactionCursor {
 static STARTUP_ACCOUNTS: AtomicU64 = AtomicU64::new(0);
 static ACCOUNT_UPDATES: AtomicU64 = AtomicU64::new(0);
 static TRANSACTIONS: AtomicU64 = AtomicU64::new(0);
-static LAST_ACCOUNT_UPDATE_SLOT: AtomicU64 = AtomicU64::new(0);
 static TOTAL_IN_MEMORY_ACCOUNT_UPDATE_SIZE: AtomicU64 = AtomicU64::new(0);
 static TOTAL_ENCODED_ACCOUNT_UPDATE_SIZE: AtomicU64 = AtomicU64::new(0);
 static PACKING_ENABLED: AtomicBool = AtomicBool::new(true);
@@ -52,7 +51,6 @@ pub fn reset() {
     STARTUP_ACCOUNTS.store(0, Ordering::Relaxed);
     ACCOUNT_UPDATES.store(0, Ordering::Relaxed);
     TRANSACTIONS.store(0, Ordering::Relaxed);
-    LAST_ACCOUNT_UPDATE_SLOT.store(0, Ordering::Relaxed);
     TOTAL_IN_MEMORY_ACCOUNT_UPDATE_SIZE.store(0, Ordering::Relaxed);
     TOTAL_ENCODED_ACCOUNT_UPDATE_SIZE.store(0, Ordering::Relaxed);
     if let Ok(mut sample) = LAST_THROUGHPUT_SAMPLE.lock() {
@@ -147,28 +145,6 @@ pub fn notify_account_update(
     pubkey: &Pubkey,
     write_version: u64,
 ) {
-    let mut observed_slot = LAST_ACCOUNT_UPDATE_SLOT.load(Ordering::Relaxed);
-    loop {
-        if observed_slot != 0 && slot < observed_slot {
-            panic!(
-                "account update slot went backwards: slot={} previous_slot={}",
-                slot, observed_slot
-            );
-        }
-        if slot <= observed_slot {
-            break;
-        }
-        match LAST_ACCOUNT_UPDATE_SLOT.compare_exchange(
-            observed_slot,
-            slot,
-            Ordering::SeqCst,
-            Ordering::Relaxed,
-        ) {
-            Ok(_) => break,
-            Err(actual) => observed_slot = actual,
-        }
-    }
-
     ACCOUNT_UPDATES.fetch_add(1, Ordering::Relaxed);
     let memory_size = core::mem::size_of::<AccountUpdate>() + account.data().len();
     TOTAL_IN_MEMORY_ACCOUNT_UPDATE_SIZE.fetch_add(memory_size as u64, Ordering::Relaxed);

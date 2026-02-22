@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     env, fs,
     path::{Path, PathBuf},
     process::{Stdio, exit},
@@ -104,6 +104,7 @@ const MISMATCH_RETRY_ATTEMPTS: usize = 10;
 const DEFAULT_POST_FIREHOSE_INCOMPLETE_RETRY_ATTEMPTS: usize = 16;
 const DEFAULT_EMPTY_SLOT_BUFFER_GAP_LIMIT: u64 = 0;
 const DEFAULT_FIREHOSE_BACKPRESSURE_SLOT_GAP_LIMIT: u64 = 128;
+const DEFAULT_FORCE_MISSING_BLOCK_RETRY_LIMIT: usize = 4;
 static LOGGED_FIRST_ACCOUNT_UPDATE: AtomicBool = AtomicBool::new(false);
 static LOGGED_PROGRAM_CACHE_ASSIGN_FAIL: AtomicBool = AtomicBool::new(false);
 static PROGRAM_CACHE_ASSIGN_FAIL_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -1823,11 +1824,6 @@ impl SlotPresenceMap {
         self.states.get(idx).copied()
     }
 
-    fn is_missing(&self, slot: Slot) -> Option<bool> {
-        self.state(slot)
-            .map(|state| state == SlotPresenceState::Missing)
-    }
-
     fn next_present_after(&self, slot: Slot) -> Option<Slot> {
         if slot < self.start || slot > self.end_inclusive {
             return None;
@@ -2267,6 +2263,7 @@ struct SchedulerState {
     current_slot: Slot,
     slots: HashMap<Slot, SlotExecutionBuffer>,
     inferred_blocks: HashMap<Slot, (u64, u64)>,
+    forced_missing: HashSet<Slot>,
     highest_seen_slot: Slot,
 }
 
@@ -2328,6 +2325,7 @@ impl TransactionScheduler {
                 current_slot: start_slot,
                 slots: HashMap::new(),
                 inferred_blocks: HashMap::new(),
+                forced_missing: HashSet::new(),
                 highest_seen_slot: start_slot.saturating_sub(1),
             }),
             presence,
@@ -2357,6 +2355,22 @@ impl TransactionScheduler {
     fn clear_resume_target(&self) {
         let mut guard = self.resume_target.lock().expect("resume target lock");
         *guard = None;
+    }
+
+    fn slot_presence_locked(
+        &self,
+        state: &SchedulerState,
+        slot: Slot,
+    ) -> Option<SlotPresenceState> {
+        if state.forced_missing.contains(&slot) {
+            return Some(SlotPresenceState::Missing);
+        }
+        self.presence.state(slot)
+    }
+
+    fn is_missing_locked(&self, state: &SchedulerState, slot: Slot) -> Option<bool> {
+        self.slot_presence_locked(state, slot)
+            .map(|presence| presence == SlotPresenceState::Missing)
     }
 
     fn apply_restart_locked(&self, state: &mut SchedulerState, target: ResumeTarget) {
@@ -2535,6 +2549,27 @@ impl TransactionScheduler {
         self.advance_ready_locked(&mut state)
     }
 
+    fn force_mark_missing(&self, slot: Slot) -> Result<Vec<ReadyEntry>, String> {
+        let mut state = self.state.lock().expect("transaction scheduler lock");
+        let presence = self.presence.state(slot);
+        if presence.is_none() {
+            return Err(format!(
+                "cannot force missing for slot {} outside scheduler range",
+                slot
+            ));
+        }
+        if let Some(buffer) = state.slots.get(&slot)
+            && buffer.has_any_data()
+        {
+            return Err(format!(
+                "cannot force missing for slot {} because buffered data exists",
+                slot
+            ));
+        }
+        state.forced_missing.insert(slot);
+        self.advance_ready_locked(&mut state)
+    }
+
     fn verify_complete(&self, end_inclusive: Slot) -> Result<(), String> {
         let state = self.state.lock().expect("transaction scheduler lock");
         for (slot, buffer) in state.slots.iter() {
@@ -2552,7 +2587,7 @@ impl TransactionScheduler {
 
         let mut slot = state.current_slot;
         while slot <= end_inclusive {
-            match self.presence.state(slot) {
+            match self.slot_presence_locked(&state, slot) {
                 Some(SlotPresenceState::Missing) => slot = slot.saturating_add(1),
                 Some(SlotPresenceState::Present) => {
                     return Err(format!(
@@ -2595,7 +2630,7 @@ impl TransactionScheduler {
         let mut slot = state.current_slot;
         let mut missing: Option<IncompleteSlotInfo> = None;
         while slot <= end_inclusive {
-            match self.presence.state(slot) {
+            match self.slot_presence_locked(&state, slot) {
                 Some(SlotPresenceState::Missing) => slot = slot.saturating_add(1),
                 Some(SlotPresenceState::Present) => {
                     missing = Some(IncompleteSlotInfo {
@@ -2623,7 +2658,7 @@ impl TransactionScheduler {
                         tx_start,
                         reason: IncompleteReason::BufferedData,
                         snapshot: Some(snapshot),
-                        presence: self.presence.state(slot),
+                        presence: self.slot_presence_locked(&state, slot),
                     })
                 }
             }
@@ -2633,7 +2668,7 @@ impl TransactionScheduler {
                 tx_start,
                 reason: IncompleteReason::BufferedData,
                 snapshot: Some(snapshot),
-                presence: self.presence.state(slot),
+                presence: self.slot_presence_locked(&state, slot),
             }),
             (None, Some(missing)) => Some(missing),
             (None, None) => None,
@@ -2643,7 +2678,7 @@ impl TransactionScheduler {
     fn snapshot(&self) -> SchedulerSnapshot {
         let state = self.state.lock().expect("transaction scheduler lock");
         let current_slot = state.current_slot;
-        let presence = self.presence.state(current_slot);
+        let presence = self.slot_presence_locked(&state, current_slot);
         let buffer = state
             .slots
             .get(&current_slot)
@@ -2695,7 +2730,7 @@ impl TransactionScheduler {
                     }
                 }
             }
-            match self.presence.is_missing(current_slot) {
+            match self.is_missing_locked(state, current_slot) {
                 Some(true) => {
                     if let Some(buffer) = state.slots.remove(&current_slot)
                         && buffer.has_any_data()
@@ -4406,6 +4441,29 @@ fn firehose_backpressure_slot_gap_limit() -> u64 {
     }
 }
 
+fn force_missing_block_retry_limit() -> usize {
+    match env::var("JETSTREAMER_FORCE_MISSING_BLOCK_RETRY_LIMIT") {
+        Ok(value) => {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                return DEFAULT_FORCE_MISSING_BLOCK_RETRY_LIMIT;
+            }
+            match trimmed.parse::<usize>() {
+                Ok(limit) if limit > 0 => limit,
+                Ok(_) => DEFAULT_FORCE_MISSING_BLOCK_RETRY_LIMIT,
+                Err(err) => {
+                    warn!(
+                        "invalid JETSTREAMER_FORCE_MISSING_BLOCK_RETRY_LIMIT '{value}': {err}; using default {}",
+                        DEFAULT_FORCE_MISSING_BLOCK_RETRY_LIMIT
+                    );
+                    DEFAULT_FORCE_MISSING_BLOCK_RETRY_LIMIT
+                }
+            }
+        }
+        Err(_) => DEFAULT_FORCE_MISSING_BLOCK_RETRY_LIMIT,
+    }
+}
+
 fn empty_slot_buffer_gap_limit() -> u64 {
     match env::var("JETSTREAMER_EMPTY_SLOT_BUFFER_GAP_LIMIT") {
         Ok(value) => {
@@ -4997,9 +5055,14 @@ async fn run_geyser_replay(
         threads = 1;
     }
     let post_firehose_retries = post_firehose_incomplete_retry_attempts();
+    let force_missing_retry_limit = force_missing_block_retry_limit();
     info!(
         "post-firehose incomplete retry attempts: {}",
         post_firehose_retries
+    );
+    info!(
+        "force-missing retry limit for persistent missing block data: {}",
+        force_missing_retry_limit
     );
 
     let progress_done = Arc::new(AtomicBool::new(false));
@@ -5438,6 +5501,8 @@ async fn run_geyser_replay(
     let mut firehose_start = slot_range.start;
     let mut incomplete_retries = 0usize;
     let mut firehose_error: Option<String> = None;
+    let mut persistent_missing_slot: Option<Slot> = None;
+    let mut persistent_missing_count = 0usize;
     loop {
         backpressure_stop_requested.store(false, Ordering::SeqCst);
 
@@ -5519,6 +5584,43 @@ async fn run_geyser_replay(
 
         if let Err(err) = scheduler.verify_complete(end_inclusive) {
             if let Some(incomplete) = scheduler.first_incomplete_slot(end_inclusive) {
+                if matches!(incomplete.reason, IncompleteReason::MissingBlockData) {
+                    if persistent_missing_slot == Some(incomplete.slot) {
+                        persistent_missing_count = persistent_missing_count.saturating_add(1);
+                    } else {
+                        persistent_missing_slot = Some(incomplete.slot);
+                        persistent_missing_count = 1;
+                    }
+                } else {
+                    persistent_missing_slot = None;
+                    persistent_missing_count = 0;
+                }
+
+                if matches!(incomplete.reason, IncompleteReason::MissingBlockData)
+                    && persistent_missing_count >= force_missing_retry_limit
+                {
+                    warn!(
+                        "forcing slot {} to missing after {} consecutive missing-block-data retries",
+                        incomplete.slot, persistent_missing_count
+                    );
+                    match scheduler.force_mark_missing(incomplete.slot) {
+                        Ok(ready_entries) => {
+                            send_ready_entries(&ready_sender, &failure, ready_entries);
+                            persistent_missing_slot = None;
+                            persistent_missing_count = 0;
+                            firehose_start = scheduler.snapshot().current_slot;
+                            continue;
+                        }
+                        Err(force_err) => {
+                            failure.record(format!(
+                                "failed to force slot {} missing after persistent missing block data: {}",
+                                incomplete.slot, force_err
+                            ));
+                            break;
+                        }
+                    }
+                }
+
                 let consume_retry_budget = !stopped_by_backpressure;
                 if consume_retry_budget && incomplete_retries >= post_firehose_retries {
                     failure.record(err);

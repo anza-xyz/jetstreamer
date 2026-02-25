@@ -52,6 +52,10 @@
 //!   [`jetstreamer_firehose::system::optimal_firehose_thread_count`]): number of firehose
 //!   ingestion threads. Increase this to multiplex Old Faithful HTTP requests across more
 //!   cores, or leave it unset to size the pool automatically using CPU and network heuristics.
+//! - `JETSTREAMER_SEQUENTIAL` (default `false`): when truthy, firehose uses a single worker
+//!   thread and uses ripget's parallel windowed downloader for sequential reads.
+//! - `JETSTREAMER_BUFFER_WINDOW` (default 15% of available RAM): ripget hot/cold window size
+//!   used in sequential mode. Accepts raw bytes or suffixes like `512MiB`.
 //! - `JETSTREAMER_CLICKHOUSE_DSN` (default `http://localhost:8123`): DSN passed to plugin
 //!   instances that emit ClickHouse writes.
 //! - `JETSTREAMER_CLICKHOUSE_MODE` (default `auto`): controls ClickHouse integration. Accepted
@@ -85,6 +89,8 @@
 //! | `JETSTREAMER_CLICKHOUSE_DSN` | `http://localhost:8123` | HTTP(S) DSN passed to the embedded plugin runner for ClickHouse writes. Override to target a remote ClickHouse deployment. |
 //! | `JETSTREAMER_CLICKHOUSE_MODE` | `auto` | Controls ClickHouse integration. `auto` enables output and spawns the helper only for local DSNs, `remote` enables output without spawning the helper, `local` always requests the helper, and `off` disables ClickHouse entirely. |
 //! | `JETSTREAMER_THREADS` | `auto` | Number of firehose ingestion threads. Leave unset to rely on hardware-based sizing or override with an explicit value when you know the ideal concurrency. |
+//! | `JETSTREAMER_SEQUENTIAL` | `false` | Enables single-thread firehose processing with ripget-backed sequential streaming. |
+//! | `JETSTREAMER_BUFFER_WINDOW` | `15% available RAM` | Total ripget hot/cold window size used only when `JETSTREAMER_SEQUENTIAL` is enabled. |
 //!
 //! Helper spawning only occurs when both the mode allows it (`auto`/`local`) **and** the DSN
 //! points to `localhost` or `127.0.0.1`.
@@ -207,6 +213,8 @@ fn parse_clickhouse_mode(value: &str) -> Option<ClickhouseMode> {
 ///
 /// - `JETSTREAMER_THREADS`: Number of firehose ingestion threads. When unset the value is
 ///   derived from [`jetstreamer_firehose::system::optimal_firehose_thread_count`].
+/// - `JETSTREAMER_SEQUENTIAL`: When true, runs a single firehose worker and uses ripget's
+///   parallel windowed downloader for sequential reads.
 /// - `JETSTREAMER_CLICKHOUSE_DSN`: DSN for ClickHouse ingestion; defaults to
 ///   `http://localhost:8123`.
 /// - `JETSTREAMER_CLICKHOUSE_MODE`: Controls ClickHouse integration. Accepted values are
@@ -317,6 +325,7 @@ impl Default for JetstreamerRunner {
             clickhouse_dsn,
             config: Config {
                 threads: jetstreamer_firehose::system::optimal_firehose_thread_count(),
+                sequential: false,
                 slot_range: 0..0,
                 clickhouse_enabled: clickhouse_settings.enabled,
                 spawn_clickhouse: clickhouse_settings.spawn_helper && clickhouse_settings.enabled,
@@ -346,8 +355,20 @@ impl JetstreamerRunner {
     }
 
     /// Sets the number of firehose ingestion threads.
+    ///
+    /// When sequential mode is enabled, this value is used as ripget parallel range
+    /// concurrency while firehose itself runs one worker.
     pub fn with_threads(mut self, threads: usize) -> Self {
         self.config.threads = std::cmp::max(1, threads);
+        self
+    }
+
+    /// Toggles sequential firehose mode.
+    ///
+    /// When enabled, firehose uses one worker thread while retaining `JETSTREAMER_THREADS` as
+    /// the ripget parallel range count for sequential windowed downloads.
+    pub const fn with_sequential(mut self, sequential: bool) -> Self {
+        self.config.sequential = sequential;
         self
     }
 
@@ -389,6 +410,7 @@ impl JetstreamerRunner {
         }
 
         let threads = std::cmp::max(1, self.config.threads);
+        let sequential = self.config.sequential;
         let clickhouse_enabled =
             self.config.clickhouse_enabled && !self.clickhouse_dsn.trim().is_empty();
         let slot_range = self.config.slot_range.clone();
@@ -397,14 +419,15 @@ impl JetstreamerRunner {
             && should_spawn_for_dsn(&self.clickhouse_dsn);
 
         log::info!(
-            "processing slots [{}..{}) with {} firehose threads (clickhouse_enabled={})",
+            "processing slots [{}..{}) with {} configured threads (sequential={}, clickhouse_enabled={})",
             slot_range.start,
             slot_range.end,
             threads,
+            sequential,
             clickhouse_enabled
         );
 
-        let mut runner = PluginRunner::new(&self.clickhouse_dsn, threads);
+        let mut runner = PluginRunner::new(&self.clickhouse_dsn, threads, sequential);
         for plugin in &self.config.builtin_plugins {
             runner.register(plugin.instantiate());
         }
@@ -509,6 +532,8 @@ impl JetstreamerRunner {
 pub struct Config {
     /// Number of simultaneous firehose streams to spawn.
     pub threads: usize,
+    /// Whether to process with a single firehose worker and ripget-backed sequential streaming.
+    pub sequential: bool,
     /// The range of slots to process, inclusive of the start and exclusive of the end slot.
     pub slot_range: Range<u64>,
     /// Whether to connect to ClickHouse for plugin output.
@@ -551,6 +576,7 @@ impl BuiltinPlugin {
 /// - `JETSTREAMER_CLICKHOUSE_MODE`: Controls ClickHouse integration. Accepts `auto`, `remote`,
 ///   `local`, or `off`.
 /// - `JETSTREAMER_THREADS`: Number of firehose ingestion threads.
+/// - `JETSTREAMER_SEQUENTIAL`: Enables single-thread sequential firehose mode when truthy.
 ///
 /// CLI flags:
 /// - `--with-plugin <name>`: Adds one of the built-in plugins (`program-tracking` or
@@ -621,6 +647,7 @@ pub fn parse_cli_args() -> Result<Config, Box<dyn std::error::Error>> {
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or_else(jetstreamer_firehose::system::optimal_firehose_thread_count);
+    let sequential = parse_env_bool("JETSTREAMER_SEQUENTIAL", false);
 
     let spawn_clickhouse = clickhouse_settings.spawn_helper && clickhouse_enabled;
 
@@ -634,11 +661,31 @@ pub fn parse_cli_args() -> Result<Config, Box<dyn std::error::Error>> {
 
     Ok(Config {
         threads,
+        sequential,
         slot_range,
         clickhouse_enabled,
         spawn_clickhouse,
         builtin_plugins,
     })
+}
+
+fn parse_env_bool(key: &str, default: bool) -> bool {
+    match std::env::var(key) {
+        Ok(raw) => match raw.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => true,
+            "0" | "false" | "no" | "off" => false,
+            other => {
+                log::warn!(
+                    "unrecognized boolean value for {}='{}'; using default {}",
+                    key,
+                    other,
+                    default
+                );
+                default
+            }
+        },
+        Err(_) => default,
+    }
 }
 
 fn should_spawn_for_dsn(dsn: &str) -> bool {

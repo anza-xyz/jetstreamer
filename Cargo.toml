@@ -88,6 +88,7 @@ thousands = "0"
 tokio-stream = { version = "0", default-features = false }
 rangemap = "1"
 rseek = ">= 0.2"
+ripget = "0.2"
 rayon = "1"
 xxhash-rust = { version = "0.8", features = ["xxh64"] }
 dashmap = "5"

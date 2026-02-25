@@ -36,7 +36,10 @@ use tokio::{
 
 use crate::{
     LOG_MODULE, SharedError,
-    epochs::{epoch_to_slot_range, fetch_epoch_stream, slot_to_epoch},
+    epochs::{
+        FetchEpochStreamOptions, epoch_to_slot_range, fetch_epoch_stream,
+        fetch_epoch_stream_with_options, slot_to_epoch,
+    },
     index::{SLOT_OFFSET_INDEX, SlotOffsetIndexError, slot_to_offset},
     node_reader::NodeReader,
     utils,
@@ -829,10 +832,15 @@ pub struct FirehoseErrorContext {
 ///
 /// The requested `slot_range` is half-open `[start, end)`; on recoverable errors the
 /// runner restarts from the last processed slot to maintain coverage.
+///
+/// When `sequential` is `true`, the firehose uses one worker thread and opens epoch streams
+/// with ripget's parallel windowed downloader. In this mode `threads` configures ripget range
+/// concurrency rather than firehose worker partitioning.
 #[inline]
 #[allow(clippy::too_many_arguments)]
 pub async fn firehose<OnBlock, OnTransaction, OnEntry, OnRewards, OnStats, OnError>(
     threads: u64,
+    sequential: bool,
     slot_range: Range<u64>,
     on_block: Option<OnBlock>,
     on_tx: Option<OnTransaction>,
@@ -859,12 +867,23 @@ where
     let client = crate::network::create_http_client();
     log::info!(target: LOG_MODULE, "starting firehose...");
     log::info!(target: LOG_MODULE, "index base url: {}", SLOT_OFFSET_INDEX.base_url());
+    let firehose_threads = if sequential { 1 } else { threads };
+    let sequential_download_threads = std::cmp::max(1, threads as usize);
+    let sequential_buffer_window_bytes = crate::system::firehose_buffer_window_bytes();
+    if sequential {
+        log::info!(
+            target: LOG_MODULE,
+            "sequential mode enabled: firehose_threads=1, ripget_threads={}, ripget_window={} bytes",
+            sequential_download_threads,
+            sequential_buffer_window_bytes
+        );
+    }
 
     let slot_range = Arc::new(slot_range);
 
     // divide slot_range into n subranges
-    let subranges = generate_subranges(&slot_range, threads);
-    if threads > 1 {
+    let subranges = generate_subranges(&slot_range, firehose_threads);
+    if firehose_threads > 1 {
         log::debug!(target: LOG_MODULE, "⚡ thread sub-ranges: {:?}", subranges);
     }
 
@@ -915,6 +934,9 @@ where
         let shutdown_flag = shutdown_flag.clone();
         let pending_skipped_slots = pending_skipped_slots.clone();
         let thread_shutdown_rx = shutdown_signal.as_ref().map(|rx| rx.resubscribe());
+        let sequential_mode = sequential;
+        let ripget_threads = sequential_download_threads;
+        let ripget_buffer_window_bytes = sequential_buffer_window_bytes;
 
         let handle = tokio::spawn(async move {
             let transactions_since_stats = transactions_since_stats_cloned;
@@ -994,7 +1016,24 @@ where
                         return Ok(());
                     }
                     log::info!(target: &log_target, "entering epoch {}", epoch_num);
-                    let stream = match timeout(OP_TIMEOUT, fetch_epoch_stream(epoch_num, &client)).await {
+                    let stream = match timeout(OP_TIMEOUT, async {
+                        if sequential_mode {
+                            fetch_epoch_stream_with_options(
+                                epoch_num,
+                                &client,
+                                Some(FetchEpochStreamOptions {
+                                    sequential: true,
+                                    ripget_threads,
+                                    buffer_window_bytes: ripget_buffer_window_bytes,
+                                }),
+                            )
+                            .await
+                        } else {
+                            fetch_epoch_stream(epoch_num, &client).await
+                        }
+                    })
+                    .await
+                    {
                         Ok(stream) => stream,
                         Err(_) => {
                             return Err((FirehoseError::OperationTimeout("fetch_epoch_stream"), current_slot.unwrap_or(slot_range.start)));
@@ -1040,7 +1079,7 @@ where
                             stats.slot_range.start = local_start;
                         }
 
-                    if local_start > epoch_start {
+                    if !sequential_mode && local_start > epoch_start {
                         // Seek to the nearest previous indexed slot so the stream includes all
                         // nodes (transactions, entries, rewards) that precede `local_start`.
                         let seek_slot = match timeout(
@@ -2593,6 +2632,7 @@ async fn assert_slot_min_executed_transactions(slot: u64, min_executed: u64) {
 
     firehose(
         1,
+        false,
         target_slot_block..(target_slot_block + 1),
         Some(move |_thread_id: usize, block: BlockData| {
             let found_block = found_block.clone();
@@ -2802,6 +2842,7 @@ async fn test_firehose_epoch_800() {
 
     firehose(
         THREADS.try_into().unwrap(),
+        false,
         (345600000 - NUM_SLOTS_TO_COVER / 2)..(345600000 + NUM_SLOTS_TO_COVER / 2),
         Some(|thread_id: usize, block: BlockData| {
             async move {
@@ -2905,6 +2946,7 @@ async fn test_firehose_target_slot_transactions() {
 
     firehose(
         4,
+        false,
         (TARGET_SLOT - SLOT_RADIUS)..(TARGET_SLOT + SLOT_RADIUS),
         Some(|_thread_id: usize, block: BlockData| {
             async move {
@@ -3026,6 +3068,7 @@ async fn test_firehose_epoch_850_has_logs() {
 
     firehose(
         4,
+        false,
         START_SLOT..(START_SLOT + SLOT_COUNT),
         None::<OnBlockFn>,
         Some(|_thread_id: usize, transaction: TransactionData| {
@@ -3070,6 +3113,7 @@ async fn test_firehose_epoch_850_votes_present() {
 
     firehose(
         2,
+        false,
         (TARGET_SLOT - SLOT_RADIUS)..(TARGET_SLOT + SLOT_RADIUS),
         Some(|_thread_id: usize, block: BlockData| {
             async move {
@@ -3139,6 +3183,7 @@ async fn test_firehose_restart_loses_coverage_without_reset() {
 
     firehose(
         THREADS.try_into().unwrap(),
+        false,
         START_SLOT..(START_SLOT + NUM_SLOTS),
         Some(|_thread_id: usize, block: BlockData| {
             async move {
@@ -3200,6 +3245,7 @@ async fn test_firehose_gap_coverage_near_known_missing_range() {
 
     firehose(
         THREADS.try_into().unwrap(),
+        false,
         START_SLOT..(END_SLOT + 1),
         Some(|_thread_id: usize, block: BlockData| {
             async move {

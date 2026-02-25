@@ -49,6 +49,7 @@ use crate::{
 // header, seeking, reading next block). Adjust here to tune stall detection/restart
 // aggressiveness.
 const OP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const OP_TIMEOUT_SEQUENTIAL: std::time::Duration = std::time::Duration::from_secs(180);
 // Epochs earlier than this were bincode-encoded in Old Faithful.
 const BINCODE_EPOCH_CUTOFF: u64 = 157;
 
@@ -984,6 +985,11 @@ where
             // let mut triggered = false;
             while let Err((err, slot)) = async {
                 let mut last_emitted_slot = last_emitted_slot_global;
+                let op_timeout = if sequential_mode {
+                    OP_TIMEOUT_SEQUENTIAL
+                } else {
+                    OP_TIMEOUT
+                };
                 if poll_shutdown(&shutdown_flag, &mut shutdown_rx) {
                     log::info!(
                         target: &log_target,
@@ -1016,8 +1022,23 @@ where
                         return Ok(());
                     }
                     log::info!(target: &log_target, "entering epoch {}", epoch_num);
-                    let stream = match timeout(OP_TIMEOUT, async {
-                        if sequential_mode {
+                    let (epoch_start, epoch_end_inclusive) = epoch_to_slot_range(epoch_num);
+                    let local_start = std::cmp::max(slot_range.start, epoch_start);
+                    let local_end_inclusive =
+                        std::cmp::min(slot_range.end.saturating_sub(1), epoch_end_inclusive);
+                    if local_start > local_end_inclusive {
+                        log::debug!(
+                            target: &log_target,
+                            "epoch {} has no overlap with thread range ({}..{}), skipping",
+                            epoch_num,
+                            slot_range.start,
+                            slot_range.end
+                        );
+                        continue;
+                    }
+                    let use_sequential_stream = sequential_mode && local_start == epoch_start;
+                    let stream = match timeout(op_timeout, async {
+                        if use_sequential_stream {
                             fetch_epoch_stream_with_options(
                                 epoch_num,
                                 &client,
@@ -1036,36 +1057,27 @@ where
                     {
                         Ok(stream) => stream,
                         Err(_) => {
-                            return Err((FirehoseError::OperationTimeout("fetch_epoch_stream"), current_slot.unwrap_or(slot_range.start)));
+                            return Err((
+                                FirehoseError::OperationTimeout("fetch_epoch_stream"),
+                                current_slot.unwrap_or(slot_range.start),
+                            ));
                         }
                     };
                     let mut reader = NodeReader::new(stream);
 
                     let header_fut = reader.read_raw_header();
-                    let header = match timeout(OP_TIMEOUT, header_fut).await {
+                    let header = match timeout(op_timeout, header_fut).await {
                         Ok(res) => res
                             .map_err(FirehoseError::ReadHeader)
                             .map_err(|e| (e, current_slot.unwrap_or(slot_range.start)))?,
                         Err(_) => {
-                            return Err((FirehoseError::OperationTimeout("read_raw_header"), current_slot.unwrap_or(slot_range.start)));
+                            return Err((
+                                FirehoseError::OperationTimeout("read_raw_header"),
+                                current_slot.unwrap_or(slot_range.start),
+                            ));
                         }
                     };
                     log::debug!(target: &log_target, "read epoch {} header: {:?}", epoch_num, header);
-
-                    let (epoch_start, epoch_end_inclusive) = epoch_to_slot_range(epoch_num);
-                    let local_start = std::cmp::max(slot_range.start, epoch_start);
-                    let local_end_inclusive =
-                        std::cmp::min(slot_range.end.saturating_sub(1), epoch_end_inclusive);
-                    if local_start > local_end_inclusive {
-                        log::debug!(
-                            target: &log_target,
-                            "epoch {} has no overlap with thread range ({}..{}), skipping",
-                            epoch_num,
-                            slot_range.start,
-                            slot_range.end
-                        );
-                        continue;
-                    }
 
                     let mut previous_blockhash = Hash::default();
                     let mut latest_entry_blockhash = Hash::default();
@@ -1079,7 +1091,7 @@ where
                             stats.slot_range.start = local_start;
                         }
 
-                    if !sequential_mode && local_start > epoch_start {
+                    if local_start > epoch_start {
                         // Seek to the nearest previous indexed slot so the stream includes all
                         // nodes (transactions, entries, rewards) that precede `local_start`.
                         let seek_slot = match timeout(
@@ -1100,7 +1112,7 @@ where
                         };
                         if let Some(seek_slot) = seek_slot {
                             let seek_fut = reader.seek_to_slot(seek_slot);
-                            match timeout(OP_TIMEOUT, seek_fut).await {
+                            match timeout(op_timeout, seek_fut).await {
                                 Ok(res) => {
                                     res.map_err(|e| (e, current_slot.unwrap_or(slot_range.start)))?
                                 }
@@ -1127,7 +1139,7 @@ where
                             return Ok(());
                         }
                         let read_fut = reader.read_until_block();
-                        let nodes = match timeout(OP_TIMEOUT, read_fut).await {
+                        let nodes = match timeout(op_timeout, read_fut).await {
                             Ok(result) => result
                                 .map_err(FirehoseError::ReadUntilBlockError)
                                 .map_err(|e| {
@@ -3003,6 +3015,104 @@ async fn test_firehose_target_slot_transactions() {
         OBSERVED_TXS.load(Ordering::Relaxed),
         EXPECTED_TRANSACTIONS,
         "recorded transaction count mismatch"
+    );
+}
+
+#[cfg(test)]
+#[serial]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_firehose_epoch_900_boundary_window_sequential_monotonic_transactions() {
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    };
+
+    struct EnvVarGuard {
+        key: &'static str,
+        original: Option<String>,
+    }
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let original = std::env::var(key).ok();
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, original }
+        }
+    }
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(value) = &self.original {
+                unsafe {
+                    std::env::set_var(self.key, value);
+                }
+            } else {
+                unsafe {
+                    std::env::remove_var(self.key);
+                }
+            }
+        }
+    }
+
+    solana_logger::setup_with_default("info");
+    const SLOT_COUNT: u64 = 1_000;
+    const THREADS: u64 = 8;
+    const TEST_BUFFER_WINDOW: &str = "4GiB";
+
+    let (epoch_900_start, _) = epoch_to_slot_range(900);
+    let slot_range = (epoch_900_start - SLOT_COUNT)..(epoch_900_start + SLOT_COUNT);
+
+    let last_seen_tx_slot = Arc::new(Mutex::new(slot_range.start));
+    let observed_txs = Arc::new(AtomicU64::new(0));
+    let stats_tracking = StatsTracking {
+        on_stats: log_stats_handler,
+        tracking_interval_slots: 100,
+    };
+
+    let _buffer_window_guard = EnvVarGuard::set("JETSTREAMER_BUFFER_WINDOW", TEST_BUFFER_WINDOW);
+
+    firehose(
+        THREADS,
+        true,
+        slot_range.clone(),
+        None::<OnBlockFn>,
+        Some({
+            let last_seen_tx_slot = last_seen_tx_slot.clone();
+            let observed_txs = observed_txs.clone();
+            move |_thread_id: usize, transaction: TransactionData| {
+                let last_seen_tx_slot = last_seen_tx_slot.clone();
+                let observed_txs = observed_txs.clone();
+                async move {
+                    let mut previous = last_seen_tx_slot.lock().unwrap();
+                    // Old Faithful does not include leader-skipped slots, so gaps are
+                    // expected. We only enforce monotonic (non-decreasing) tx slot ordering.
+                    assert!(
+                        transaction.slot >= *previous,
+                        "transaction slot regressed: prev={}, current={}",
+                        *previous,
+                        transaction.slot
+                    );
+                    *previous = transaction.slot;
+                    observed_txs.fetch_add(1, Ordering::Relaxed);
+                    Ok(())
+                }
+                .boxed()
+            }
+        }),
+        None::<OnEntryFn>,
+        None::<OnRewardFn>,
+        None::<OnErrorFn>,
+        Some(stats_tracking),
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        observed_txs.load(Ordering::Relaxed) > 0,
+        "expected to observe at least one transaction in slots [{}, {})",
+        slot_range.start,
+        slot_range.end
     );
 }
 

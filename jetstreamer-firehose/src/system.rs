@@ -3,11 +3,10 @@ use std::cmp;
 /// Environment variable that overrides detected network throughput in megabytes.
 const NETWORK_CAPACITY_OVERRIDE_ENV: &str = "JETSTREAMER_NETWORK_CAPACITY_MB";
 const DEFAULT_NETWORK_CAPACITY_MB: u64 = 1_000;
-/// Environment variable that overrides the ripget sequential download window size.
-pub const BUFFER_WINDOW_OVERRIDE_ENV: &str = "JETSTREAMER_BUFFER_WINDOW";
 const DEFAULT_BUFFER_WINDOW_FALLBACK_BYTES: u64 = 512 * 1024 * 1024;
 const DEFAULT_BUFFER_WINDOW_PERCENT_NUMERATOR: u64 = 15;
 const DEFAULT_BUFFER_WINDOW_PERCENT_DENOMINATOR: u64 = 100;
+const DEFAULT_BUFFER_WINDOW_MAX_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
 /// Calculates an optimal number of firehose threads for the current machine.
 ///
@@ -25,14 +24,21 @@ pub fn optimal_firehose_thread_count() -> usize {
     compute_optimal_thread_count(detect_cpu_core_count(), detect_network_capacity_megabytes())
 }
 
-/// Returns the sequential download window size (in bytes) used by ripget-backed streaming.
+/// Returns the default ripget sequential download window size in bytes.
 ///
-/// When `JETSTREAMER_BUFFER_WINDOW` is set, that value is used directly. Otherwise this
-/// defaults to 15% of detected available RAM, falling back to 512 MiB when RAM cannot be
-/// detected.
+/// The default is the lower of 15% of detected available RAM and 4 GiB, falling back to 512 MiB
+/// when RAM cannot be detected.
 #[inline]
-pub fn firehose_buffer_window_bytes() -> u64 {
-    buffer_window_override().unwrap_or_else(default_buffer_window_bytes)
+pub fn default_firehose_buffer_window_bytes() -> u64 {
+    default_buffer_window_bytes()
+}
+
+/// Parses a human-readable byte size (for example `4GiB`, `512mb`, or `1073741824`).
+///
+/// Returns `None` when the input is invalid or smaller than two bytes.
+#[inline]
+pub fn parse_buffer_window_bytes(value: &str) -> Option<u64> {
+    parse_byte_size(value).filter(|parsed| *parsed >= 2)
 }
 
 #[inline(always)]
@@ -54,13 +60,6 @@ fn network_capacity_override() -> Option<u64> {
         .filter(|value| *value > 0)
 }
 
-fn buffer_window_override() -> Option<u64> {
-    std::env::var(BUFFER_WINDOW_OVERRIDE_ENV)
-        .ok()
-        .and_then(|raw| parse_byte_size(&raw))
-        .filter(|value| *value >= 2)
-}
-
 fn default_buffer_window_bytes() -> u64 {
     let computed = detect_available_memory_bytes()
         .map(compute_default_buffer_window_bytes)
@@ -73,7 +72,7 @@ fn compute_default_buffer_window_bytes(available_memory_bytes: u64) -> u64 {
     let window = (available_memory_bytes as u128)
         .saturating_mul(DEFAULT_BUFFER_WINDOW_PERCENT_NUMERATOR as u128)
         / (DEFAULT_BUFFER_WINDOW_PERCENT_DENOMINATOR as u128);
-    window.min(u64::MAX as u128) as u64
+    window.min(DEFAULT_BUFFER_WINDOW_MAX_BYTES as u128) as u64
 }
 
 fn parse_byte_size(value: &str) -> Option<u64> {
@@ -163,8 +162,8 @@ fn compute_optimal_thread_count(
 #[cfg(test)]
 mod tests {
     use super::{
-        BUFFER_WINDOW_OVERRIDE_ENV, NETWORK_CAPACITY_OVERRIDE_ENV,
-        compute_default_buffer_window_bytes, compute_optimal_thread_count, parse_byte_size,
+        NETWORK_CAPACITY_OVERRIDE_ENV, compute_default_buffer_window_bytes,
+        compute_optimal_thread_count, parse_buffer_window_bytes, parse_byte_size,
     };
     use serial_test::serial;
     use std::env;
@@ -244,6 +243,14 @@ mod tests {
     }
 
     #[test]
+    fn caps_default_window_at_four_gib() {
+        // 64 GiB -> 9.6 GiB (15%), capped to 4 GiB.
+        let available = 64u64 * 1024 * 1024 * 1024;
+        let expected = 4u64 * 1024 * 1024 * 1024;
+        assert_eq!(compute_default_buffer_window_bytes(available), expected);
+    }
+
+    #[test]
     fn parses_human_readable_buffer_window_values() {
         assert_eq!(parse_byte_size("123"), Some(123));
         assert_eq!(parse_byte_size("256mb"), Some(256_000_000));
@@ -252,19 +259,14 @@ mod tests {
     }
 
     #[test]
-    #[serial]
-    fn buffer_window_env_override_is_used_when_valid() {
-        let guard = EnvGuard::set(BUFFER_WINDOW_OVERRIDE_ENV, "512mib");
-        assert_eq!(super::firehose_buffer_window_bytes(), 536_870_912);
-        drop(guard);
+    fn parse_buffer_window_rejects_invalid_values() {
+        assert_eq!(parse_buffer_window_bytes("nope"), None);
+        assert_eq!(parse_buffer_window_bytes("1"), None);
     }
 
     #[test]
-    #[serial]
-    fn invalid_buffer_window_env_uses_fallback() {
-        let guard = EnvGuard::set(BUFFER_WINDOW_OVERRIDE_ENV, "nope");
-        assert!(super::firehose_buffer_window_bytes() >= 2);
-        drop(guard);
+    fn default_buffer_window_is_nonzero() {
+        assert!(super::default_firehose_buffer_window_bytes() >= 2);
     }
 
     struct EnvGuard {

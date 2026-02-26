@@ -91,7 +91,7 @@
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
-//!     let mut runner = PluginRunner::new("http://localhost:8123", 1, false);
+//!     let mut runner = PluginRunner::new("http://localhost:8123", 1, false, None);
 //!     runner.register(Box::new(LoggingPlugin));
 //!     let runner = Arc::new(runner);
 //!
@@ -252,6 +252,7 @@ pub struct PluginRunner {
     clickhouse_dsn: String,
     num_threads: usize,
     sequential: bool,
+    buffer_window_bytes: Option<u64>,
     db_update_interval_slots: u64,
 }
 
@@ -260,12 +261,18 @@ impl PluginRunner {
     ///
     /// When `sequential` is `true`, firehose runs with one worker and `num_threads` is used as
     /// ripget parallel download concurrency.
-    pub fn new(clickhouse_dsn: impl Display, num_threads: usize, sequential: bool) -> Self {
+    pub fn new(
+        clickhouse_dsn: impl Display,
+        num_threads: usize,
+        sequential: bool,
+        buffer_window_bytes: Option<u64>,
+    ) -> Self {
         Self {
             plugins: Arc::new(Vec::new()),
             clickhouse_dsn: clickhouse_dsn.to_string(),
             num_threads: std::cmp::max(1, num_threads),
             sequential,
+            buffer_window_bytes,
             db_update_interval_slots: 100,
         }
     }
@@ -753,6 +760,7 @@ impl PluginRunner {
         let mut firehose_future = Box::pin(firehose(
             self.num_threads as u64,
             self.sequential,
+            self.buffer_window_bytes,
             slot_range,
             Some(on_block),
             Some(on_transaction),

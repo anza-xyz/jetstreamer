@@ -837,11 +837,15 @@ pub struct FirehoseErrorContext {
 /// When `sequential` is `true`, the firehose uses one worker thread and opens epoch streams
 /// with ripget's parallel windowed downloader. In this mode `threads` configures ripget range
 /// concurrency rather than firehose worker partitioning.
+///
+/// `buffer_window_bytes` controls the ripget hot/cold window when `sequential` is enabled.
+/// Pass `None` to use the default (`min(4 GiB, 15% of available RAM)`).
 #[inline]
 #[allow(clippy::too_many_arguments)]
 pub async fn firehose<OnBlock, OnTransaction, OnEntry, OnRewards, OnStats, OnError>(
     threads: u64,
     sequential: bool,
+    buffer_window_bytes: Option<u64>,
     slot_range: Range<u64>,
     on_block: Option<OnBlock>,
     on_tx: Option<OnTransaction>,
@@ -870,7 +874,9 @@ where
     log::info!(target: LOG_MODULE, "index base url: {}", SLOT_OFFSET_INDEX.base_url());
     let firehose_threads = if sequential { 1 } else { threads };
     let sequential_download_threads = std::cmp::max(1, threads as usize);
-    let sequential_buffer_window_bytes = crate::system::firehose_buffer_window_bytes();
+    let sequential_buffer_window_bytes = buffer_window_bytes
+        .filter(|value| *value >= 2)
+        .unwrap_or_else(crate::system::default_firehose_buffer_window_bytes);
     if sequential {
         log::info!(
             target: LOG_MODULE,
@@ -2645,6 +2651,7 @@ async fn assert_slot_min_executed_transactions(slot: u64, min_executed: u64) {
     firehose(
         1,
         false,
+        None,
         target_slot_block..(target_slot_block + 1),
         Some(move |_thread_id: usize, block: BlockData| {
             let found_block = found_block.clone();
@@ -2855,6 +2862,7 @@ async fn test_firehose_epoch_800() {
     firehose(
         THREADS.try_into().unwrap(),
         false,
+        None,
         (345600000 - NUM_SLOTS_TO_COVER / 2)..(345600000 + NUM_SLOTS_TO_COVER / 2),
         Some(|thread_id: usize, block: BlockData| {
             async move {
@@ -2959,6 +2967,7 @@ async fn test_firehose_target_slot_transactions() {
     firehose(
         4,
         false,
+        None,
         (TARGET_SLOT - SLOT_RADIUS)..(TARGET_SLOT + SLOT_RADIUS),
         Some(|_thread_id: usize, block: BlockData| {
             async move {
@@ -3027,33 +3036,6 @@ async fn test_firehose_epoch_900_boundary_window_sequential_monotonic_transactio
         atomic::{AtomicU64, Ordering},
     };
 
-    struct EnvVarGuard {
-        key: &'static str,
-        original: Option<String>,
-    }
-    impl EnvVarGuard {
-        fn set(key: &'static str, value: &str) -> Self {
-            let original = std::env::var(key).ok();
-            unsafe {
-                std::env::set_var(key, value);
-            }
-            Self { key, original }
-        }
-    }
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            if let Some(value) = &self.original {
-                unsafe {
-                    std::env::set_var(self.key, value);
-                }
-            } else {
-                unsafe {
-                    std::env::remove_var(self.key);
-                }
-            }
-        }
-    }
-
     solana_logger::setup_with_default("info");
     const SLOT_COUNT: u64 = 1_000;
     const THREADS: u64 = 8;
@@ -3068,12 +3050,13 @@ async fn test_firehose_epoch_900_boundary_window_sequential_monotonic_transactio
         on_stats: log_stats_handler,
         tracking_interval_slots: 100,
     };
-
-    let _buffer_window_guard = EnvVarGuard::set("JETSTREAMER_BUFFER_WINDOW", TEST_BUFFER_WINDOW);
+    let test_buffer_window_bytes = crate::system::parse_buffer_window_bytes(TEST_BUFFER_WINDOW)
+        .expect("valid test buffer window");
 
     firehose(
         THREADS,
         true,
+        Some(test_buffer_window_bytes),
         slot_range.clone(),
         None::<OnBlockFn>,
         Some({
@@ -3179,6 +3162,7 @@ async fn test_firehose_epoch_850_has_logs() {
     firehose(
         4,
         false,
+        None,
         START_SLOT..(START_SLOT + SLOT_COUNT),
         None::<OnBlockFn>,
         Some(|_thread_id: usize, transaction: TransactionData| {
@@ -3224,6 +3208,7 @@ async fn test_firehose_epoch_850_votes_present() {
     firehose(
         2,
         false,
+        None,
         (TARGET_SLOT - SLOT_RADIUS)..(TARGET_SLOT + SLOT_RADIUS),
         Some(|_thread_id: usize, block: BlockData| {
             async move {
@@ -3294,6 +3279,7 @@ async fn test_firehose_restart_loses_coverage_without_reset() {
     firehose(
         THREADS.try_into().unwrap(),
         false,
+        None,
         START_SLOT..(START_SLOT + NUM_SLOTS),
         Some(|_thread_id: usize, block: BlockData| {
             async move {
@@ -3356,6 +3342,7 @@ async fn test_firehose_gap_coverage_near_known_missing_range() {
     firehose(
         THREADS.try_into().unwrap(),
         false,
+        None,
         START_SLOT..(END_SLOT + 1),
         Some(|_thread_id: usize, block: BlockData| {
             async move {

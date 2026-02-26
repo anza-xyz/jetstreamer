@@ -28,8 +28,8 @@ https://github.com/rpcpool/yellowstone-faithful/tree/main/geyser-plugin-runner
 - `JETSTREAMER_NETWORK_CAPACITY_MB` (default `1000`): assumed network throughput in megabytes
   per second when sizing the firehose thread pool. Increase or decrease to match your host's
   effective bandwidth.
-- `JETSTREAMER_BUFFER_WINDOW` (default `15%` of available RAM): total ripget hot/cold window
-  size used when firehose is run in sequential mode.
+- `JETSTREAMER_BUFFER_WINDOW` (default `min(4 GiB, 15% of available RAM)`): total ripget
+  hot/cold window size used when firehose is run in sequential mode.
 
 Notes:
 

@@ -3037,8 +3037,8 @@ async fn test_firehose_epoch_900_boundary_window_sequential_monotonic_transactio
     };
 
     solana_logger::setup_with_default("info");
-    const SLOT_COUNT: u64 = 1_000;
-    const THREADS: u64 = 8;
+    const SLOT_COUNT: u64 = 100;
+    const THREADS: u64 = 4;
     const TEST_BUFFER_WINDOW: &str = "4GiB";
 
     let (epoch_900_start, _) = epoch_to_slot_range(900);

@@ -38,11 +38,14 @@
 //! - `JETSTREAMER_NETWORK_CAPACITY_MB` (default `1000`): assumed network throughput in megabytes
 //!   per second used when sizing the firehose thread pool. Increase or decrease to match your
 //!   host's effective bandwidth.
-//! - `JETSTREAMER_BUFFER_WINDOW` (default lower of 4 GiB and 15% of available RAM): total
-//!   ripget hot/cold window size used when firehose is run in sequential mode.
 //!
 //! S3 transports are compiled behind the `s3-backend` Cargo feature. Enable that feature when
 //! building if you plan to stream from `s3://` URIs instead of HTTP mirrors.
+//!
+//! Sequential-mode ripget buffering is configured on the [`firehose::firehose`] call via
+//! `buffer_window_bytes`. Pass `None` to use the built-in default (`min(4 GiB, 15% of available
+//! RAM)`). If you're using [`jetstreamer`](https://crates.io/crates/jetstreamer)'s binary runner,
+//! that layer exposes `JETSTREAMER_BUFFER_WINDOW` and forwards the parsed value here.
 //!
 //! # Limitations
 //! Old Faithful currently publishes blocks, transactions, epochs, and reward metadata but does

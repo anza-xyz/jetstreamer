@@ -210,8 +210,8 @@ impl<'de> serde::Deserialize<'de> for Buffer {
 pub const MAX_ALLOWED_SECTION_SIZE: usize = 32 << 20; // 32MiB
 
 /// Decompresses a Zstandard byte stream.
-pub fn decompress_zstd(data: Vec<u8>) -> Result<Vec<u8>, SharedError> {
-    let mut decoder = zstd::Decoder::new(&data[..])?;
+pub fn decompress_zstd(data: &[u8]) -> Result<Vec<u8>, SharedError> {
+    let mut decoder = zstd::Decoder::new(data)?;
     let mut decompressed = Vec::new();
     decoder.read_to_end(&mut decompressed)?;
     Ok(decompressed)

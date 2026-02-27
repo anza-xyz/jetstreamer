@@ -5,6 +5,7 @@ use {
     crc::{CRC_64_GO_ISO, Crc},
     fnv::FnvHasher,
     std::{
+        collections::HashMap,
         fmt,
         io::{self, Read},
         vec::Vec,
@@ -39,16 +40,19 @@ impl NodeWithCid {
 pub struct NodesWithCids(
     #[doc = "Ordered collection of nodes paired with their content identifiers."]
     pub  Vec<NodeWithCid>,
+    #[doc(hidden)] HashMap<Cid, usize>,
 );
 
 impl NodesWithCids {
     /// Creates an empty [`NodesWithCids`].
-    pub const fn new() -> NodesWithCids {
-        NodesWithCids(vec![])
+    pub fn new() -> NodesWithCids {
+        NodesWithCids(vec![], HashMap::new())
     }
 
     /// Appends a node to the collection.
     pub fn push(&mut self, node_with_cid: NodeWithCid) {
+        let index = self.0.len();
+        self.1.insert(*node_with_cid.get_cid(), index);
         self.0.push(node_with_cid);
     }
 
@@ -69,45 +73,43 @@ impl NodesWithCids {
 
     /// Looks up a node by CID.
     pub fn get_by_cid(&self, cid: &Cid) -> Option<&NodeWithCid> {
-        self.0
-            .iter()
-            .find(|&node_with_cid| node_with_cid.get_cid() == cid)
+        self.1.get(cid).and_then(|index| self.0.get(*index))
     }
 
     /// Reassembles a potentially multi-part dataframe using the nodes in the collection.
     pub fn reassemble_dataframes(
         &self,
-        first_dataframe: dataframe::DataFrame,
+        first_dataframe: &dataframe::DataFrame,
     ) -> Result<Vec<u8>, SharedError> {
-        let mut data = first_dataframe.data.to_vec();
-        let mut next_arr = first_dataframe.next;
-        while next_arr.is_some() {
-            for next_cid in next_arr.clone().unwrap() {
-                let next_node = self.get_by_cid(&next_cid);
-                if next_node.is_none() {
-                    return Err(Box::new(std::io::Error::other(std::format!(
+        let mut data = Vec::with_capacity(first_dataframe.data.len());
+        data.extend_from_slice(first_dataframe.data.as_slice());
+
+        let mut next_arr = first_dataframe.next.as_deref();
+        while let Some(next_cids) = next_arr {
+            let mut next_segment = None;
+            for next_cid in next_cids {
+                let next_node = self.get_by_cid(next_cid).ok_or_else(|| {
+                    Box::new(std::io::Error::other(std::format!(
                         "Missing CID: {:?}",
                         next_cid
-                    ))));
-                }
-                let next_node_un = next_node.unwrap();
+                    ))) as SharedError
+                })?;
 
-                if !next_node_un.get_node().is_dataframe() {
-                    return Err(Box::new(std::io::Error::other(std::format!(
+                let next_dataframe = next_node.get_node().get_dataframe().ok_or_else(|| {
+                    Box::new(std::io::Error::other(std::format!(
                         "Expected DataFrame, got {:?}",
-                        next_node_un.get_node()
-                    ))));
-                }
+                        next_node.get_node()
+                    ))) as SharedError
+                })?;
 
-                let next_dataframe = next_node_un.get_node().get_dataframe().unwrap();
-                data.extend(next_dataframe.data.to_vec());
-                next_arr.clone_from(&next_dataframe.next);
+                data.extend_from_slice(next_dataframe.data.as_slice());
+                next_segment = next_dataframe.next.as_deref();
             }
+            next_arr = next_segment;
         }
 
-        if first_dataframe.hash.is_some() {
-            let wanted_hash = first_dataframe.hash.unwrap();
-            verify_hash(data.clone(), wanted_hash)?;
+        if let Some(wanted_hash) = first_dataframe.hash {
+            verify_hash(&data, wanted_hash)?;
         }
         Ok(data)
     }
@@ -152,11 +154,11 @@ impl NodesWithCids {
 }
 
 /// Validates the provided data against the expected CRC64 (or legacy FNV) hash.
-pub fn verify_hash(data: Vec<u8>, hash: u64) -> Result<(), SharedError> {
-    let crc64 = checksum_crc64(&data);
+pub fn verify_hash(data: &[u8], hash: u64) -> Result<(), SharedError> {
+    let crc64 = checksum_crc64(data);
     if crc64 != hash {
         // Maybe it's the legacy checksum function?
-        let fnv = checksum_fnv(&data);
+        let fnv = checksum_fnv(data);
         if fnv != hash {
             return Err(Box::new(std::io::Error::other(std::format!(
                 "data hash mismatch: wanted {:?}, got crc64={:?}, fnv={:?}",

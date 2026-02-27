@@ -402,7 +402,7 @@ fn decode_transaction_status_meta_from_frame(
         return Ok(solana_transaction_status::TransactionStatusMeta::default());
     }
 
-    match utils::decompress_zstd(reassembled_metadata.clone()) {
+    match utils::decompress_zstd(reassembled_metadata.as_slice()) {
         Ok(decompressed) => {
             decode_transaction_status_meta(slot, decompressed.as_slice()).map_err(|err| {
                 Box::new(std::io::Error::other(format!(
@@ -446,7 +446,7 @@ fn decode_rewards_from_frame(
         return Ok(DecodedRewards::empty());
     }
 
-    match utils::decompress_zstd(reassembled_rewards.clone()) {
+    match utils::decompress_zstd(reassembled_rewards.as_slice()) {
         Ok(decompressed) => decode_rewards_from_bytes(slot, decompressed.as_slice()).map_err(
             |err| {
                 Box::new(std::io::Error::other(format!(
@@ -1276,7 +1276,7 @@ where
                                             )
                                         })?;
                                         let reassembled_metadata = nodes
-                                            .reassemble_dataframes(tx.metadata.clone())
+                                            .reassemble_dataframes(&tx.metadata)
                                             .map_err(|err| {
                                                 (
                                                     FirehoseError::NodeDecodingError(item_index, err),
@@ -1338,8 +1338,8 @@ where
                                                 signature: *signature,
                                                 message_hash,
                                                 is_vote,
-                                                transaction_status_meta: as_native_metadata.clone(),
-                                                transaction: versioned_tx.clone(),
+                                                transaction_status_meta: as_native_metadata,
+                                                transaction: versioned_tx,
                                             },
                                         )
                                         .await
@@ -1601,7 +1601,7 @@ where
                                 Rewards(rewards) => {
                                     if reward_enabled || block_enabled {
                                         let reassembled = nodes
-                                            .reassemble_dataframes(rewards.data.clone())
+                                            .reassemble_dataframes(&rewards.data)
                                             .map_err(|err| {
                                                 (
                                                     FirehoseError::NodeDecodingError(item_index, err),
@@ -2238,7 +2238,7 @@ async fn firehose_geyser_thread(
                         match node {
                             Transaction(tx) => {
                                 let versioned_tx = tx.as_parsed()?;
-                                let reassembled_metadata = nodes.reassemble_dataframes(tx.metadata.clone())?;
+                                let reassembled_metadata = nodes.reassemble_dataframes(&tx.metadata)?;
 
                                 let as_native_metadata = decode_transaction_status_meta_from_frame(
                                     block.slot,
@@ -2345,7 +2345,7 @@ async fn firehose_geyser_thread(
                             Subset(_subset) => (),
                             Epoch(_epoch) => (),
                             Rewards(rewards) => {
-                                let reassembled = nodes.reassemble_dataframes(rewards.data.clone())?;
+                                let reassembled = nodes.reassemble_dataframes(&rewards.data)?;
                                 if !reassembled.is_empty() {
                                     this_block_rewards = decode_rewards_from_frame(
                                         block.slot,

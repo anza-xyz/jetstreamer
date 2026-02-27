@@ -5676,6 +5676,8 @@ async fn run_geyser_replay(
     drop(transaction_notifier);
     drop(entry_notifier);
     drop(block_metadata_notifier);
+    // Drop the notifier bundle too; it holds Arc clones that keep ready_sender alive.
+    drop(notifiers);
     drop(ready_sender);
     let _ = ready_handle.join();
     if let Err(err) = scheduler.verify_complete(end_inclusive) {

@@ -99,6 +99,7 @@ const ACCOUNTS_MAINTENANCE_PROGRESS_INTERVAL: Duration = Duration::from_secs(30)
 const DEFAULT_PROGRAM_CACHE_PRUNE_ENABLED: bool = false;
 const DEFAULT_ACCOUNTS_MAINTENANCE_ENABLED: bool = true;
 const DEFAULT_ACCOUNTS_MAINTENANCE_ROOT_STRIDE: u64 = 1;
+const DEFAULT_ACCOUNTS_INDEX_ON_DISK: bool = false;
 const DEFAULT_READY_ENTRY_QUEUE_CAPACITY: usize = 8192;
 const MISMATCH_RETRY_ATTEMPTS: usize = 10;
 const DEFAULT_POST_FIREHOSE_INCOMPLETE_RETRY_ATTEMPTS: usize = 16;
@@ -4376,6 +4377,15 @@ fn load_bank_from_snapshot_archive(
 }
 
 fn accounts_db_config_for_ledger(ledger_dir: &Path) -> Result<AccountsDbConfig, String> {
+    let on_disk_index = env_truthy_default(
+        "JETSTREAMER_ACCOUNTS_INDEX_ON_DISK",
+        DEFAULT_ACCOUNTS_INDEX_ON_DISK,
+    );
+    if !on_disk_index {
+        info!("accounts index configured in-memory");
+        return Ok(AccountsDbConfig::default());
+    }
+
     let index_path = ledger_dir.join("accounts-index");
     fs::create_dir_all(&index_path)
         .map_err(|err| format!("failed to create {}: {err}", index_path.display()))?;
@@ -5422,6 +5432,18 @@ async fn run_geyser_replay(
                     } else {
                         "n/a".to_string()
                     };
+                    let slots_per_sec = if processed == 0 {
+                        "n/a".to_string()
+                    } else if let Some(start) = phase_start {
+                        let elapsed = start.elapsed().as_secs_f64();
+                        if elapsed <= 0.0 {
+                            "n/a".to_string()
+                        } else {
+                            format!("{:.2}", (processed as f64) / elapsed)
+                        }
+                    } else {
+                        "n/a".to_string()
+                    };
                     let eta = if processed == 0 {
                         "unknown".to_string()
                     } else if let Some(start) = phase_start {
@@ -5442,7 +5464,7 @@ async fn run_geyser_replay(
                         "unknown".to_string()
                     };
                     info!(
-                        "warmup slot {display_slot}/{warmup_end} ({percent:.2}%) txs={tx_count} accounts={account_updates} accounts_per_sec={accounts_per_sec} eta={eta} (epoch {epoch} starts at {epoch_start})"
+                        "warmup slot {display_slot}/{warmup_end} ({percent:.2}%) txs={tx_count} accounts={account_updates} slots_per_sec={slots_per_sec} accounts_per_sec={accounts_per_sec} eta={eta} (epoch {epoch} starts at {epoch_start})"
                     );
                 } else {
                     if in_warmup {
@@ -5466,6 +5488,18 @@ async fn run_geyser_replay(
                     } else {
                         (processed as f64) * 100.0 / (main_total as f64)
                     };
+                    let slots_per_sec = if processed == 0 {
+                        "n/a".to_string()
+                    } else if let Some(start) = phase_start {
+                        let elapsed = start.elapsed().as_secs_f64();
+                        if elapsed <= 0.0 {
+                            "n/a".to_string()
+                        } else {
+                            format!("{:.2}", (processed as f64) / elapsed)
+                        }
+                    } else {
+                        "n/a".to_string()
+                    };
                     let eta = if processed == 0 {
                         "unknown".to_string()
                     } else if let Some(start) = phase_start {
@@ -5486,7 +5520,7 @@ async fn run_geyser_replay(
                         "unknown".to_string()
                     };
                     info!(
-                        "progress slot {display_slot}/{end_inclusive} ({percent:.2}%) txs={tx_count} accounts={account_updates} eta={eta}"
+                        "progress slot {display_slot}/{end_inclusive} ({percent:.2}%) txs={tx_count} accounts={account_updates} slots_per_sec={slots_per_sec} eta={eta}"
                     );
                 }
 

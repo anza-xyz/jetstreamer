@@ -474,11 +474,10 @@ impl PluginRunner {
                         );
                         return Ok(());
                     }
-                    let transaction = Arc::new(transaction);
                     for handle in plugin_handles.iter() {
                         if let Err(err) = handle
                             .plugin
-                            .on_transaction(thread_id, clickhouse.clone(), transaction.as_ref())
+                            .on_transaction(thread_id, clickhouse.clone(), &transaction)
                             .await
                         {
                             log::error!(

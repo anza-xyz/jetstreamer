@@ -16,6 +16,8 @@ pub fn create_http_client() -> Client {
     let user_agent = format!("jetstreamer/v{}", version);
     Client::builder()
         .user_agent(user_agent)
+        // Prefer rustls even when other workspace dependencies enable native-tls.
+        .use_rustls_tls()
         .build()
         .expect("failed to create HTTP client")
 }

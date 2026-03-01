@@ -4411,7 +4411,13 @@ fn firehose_threads() -> u64 {
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .filter(|value| *value > 0)
-        .unwrap_or(1)
+        .unwrap_or(16)
+}
+
+fn firehose_buffer_window_bytes() -> Option<u64> {
+    env::var("JETSTREAMER_BUFFER_WINDOW")
+        .ok()
+        .and_then(|raw| jetstreamer_firehose::system::parse_buffer_window_bytes(&raw))
 }
 
 fn ready_entry_queue_capacity() -> usize {
@@ -5059,11 +5065,15 @@ async fn run_geyser_replay(
         entry_notifier: Some(entry_notifier.clone()),
         block_metadata_notifier: Some(block_metadata_notifier.clone()),
     };
-    let mut threads = firehose_threads();
-    if threads > 1 {
-        info!("forcing firehose threads to 1 for bank replay");
-        threads = 1;
-    }
+    let threads = firehose_threads();
+    let buffer_window_bytes = firehose_buffer_window_bytes();
+    info!(
+        "firehose: sequential=true, ripget_threads={}, buffer_window={}",
+        threads,
+        buffer_window_bytes
+            .map(|b| jetstreamer_firehose::system::format_byte_size(b))
+            .unwrap_or_else(|| "default".to_string())
+    );
     let post_firehose_retries = post_firehose_incomplete_retry_attempts();
     let force_missing_retry_limit = force_missing_block_retry_limit();
     info!(
@@ -5591,6 +5601,8 @@ async fn run_geyser_replay(
                     firehose_stop,
                     async { Ok(()) },
                     threads,
+                    true,
+                    buffer_window_bytes,
                 )
             }
         })

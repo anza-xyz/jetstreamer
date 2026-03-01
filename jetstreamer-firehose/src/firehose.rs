@@ -1295,18 +1295,7 @@ where
                                         && let Some(on_tx_cb) = on_tx.as_ref()
                                     {
                                         let error_slot = current_slot.unwrap_or(slot_range.start);
-                                        let reassembled_tx = nodes
-                                            .reassemble_dataframes(tx.data.clone())
-                                            .map_err(|err| {
-                                                (
-                                                    FirehoseError::NodeDecodingError(item_index, err),
-                                                    error_slot,
-                                                )
-                                            })?;
-                                        let versioned_tx = crate::transaction::parse_versioned_transaction_from_slice(
-                                            &reassembled_tx,
-                                        )
-                                        .map_err(|err| {
+                                        let versioned_tx = tx.as_parsed().map_err(|err| {
                                             (
                                                 FirehoseError::NodeDecodingError(item_index, err),
                                                 error_slot,
@@ -1961,12 +1950,19 @@ pub fn firehose_geyser(
         Arc::new(AtomicBool::new(false)),
         on_load,
         threads,
+        false,
+        None,
     )?;
     Ok(confirmed_bank_receiver)
 }
 
+#[allow(clippy::too_many_arguments)]
 #[allow(clippy::result_large_err)]
 /// Builds a Geyser-backed firehose using caller-provided notifiers.
+///
+/// When `sequential` is `true`, a single firehose thread is used and `threads` configures
+/// ripget range-request concurrency instead. `buffer_window_bytes` controls the ripget
+/// hot/cold window; pass `None` for the default.
 pub fn firehose_geyser_with_notifiers(
     rt: Arc<tokio::runtime::Runtime>,
     slot_range: Range<u64>,
@@ -1977,6 +1973,8 @@ pub fn firehose_geyser_with_notifiers(
     shutdown: Arc<AtomicBool>,
     on_load: impl Future<Output = Result<(), SharedError>> + Send + 'static,
     threads: u64,
+    sequential: bool,
+    buffer_window_bytes: Option<u64>,
 ) -> Result<(), (FirehoseError, u64)> {
     if threads == 0 {
         return Err((
@@ -1986,6 +1984,19 @@ pub fn firehose_geyser_with_notifiers(
     }
     log::info!(target: LOG_MODULE, "starting firehose...");
     log::info!(target: LOG_MODULE, "index base url: {}", index_base_url);
+    let firehose_threads = if sequential { 1 } else { threads };
+    let sequential_download_threads = std::cmp::max(1, threads as usize);
+    let sequential_buffer_window_bytes = buffer_window_bytes
+        .filter(|value| *value >= 2)
+        .unwrap_or_else(crate::system::default_firehose_buffer_window_bytes);
+    if sequential {
+        log::info!(
+            target: LOG_MODULE,
+            "sequential mode enabled: firehose_threads=1, ripget_threads={}, ripget_window={}",
+            sequential_download_threads,
+            crate::system::format_byte_size(sequential_buffer_window_bytes)
+        );
+    }
 
     let transaction_notifier_maybe = Arc::new(notifiers.transaction_notifier);
     let entry_notifier_maybe = Arc::new(notifiers.entry_notifier);
@@ -2002,9 +2013,22 @@ pub fn firehose_geyser_with_notifiers(
     let slot_range = Arc::new(slot_range);
     let confirmed_bank_sender = Arc::new(confirmed_bank_sender);
 
+    // Build a shared ripget HTTP client so TCP connections survive across epoch transitions.
+    let shared_ripget_client: Option<ripget::Client> = if sequential {
+        Some(
+            ripget::build_client(Some(&format!(
+                "jetstreamer-firehose/{}",
+                env!("CARGO_PKG_VERSION")
+            )))
+            .expect("failed to build ripget HTTP client"),
+        )
+    } else {
+        None
+    };
+
     // divide slot_range into n subranges
-    let subranges = generate_subranges(&slot_range, threads);
-    if threads > 1 {
+    let subranges = generate_subranges(&slot_range, firehose_threads);
+    if firehose_threads > 1 {
         log::info!(target: LOG_MODULE, "⚡ thread sub-ranges: {:?}", subranges);
     }
 
@@ -2021,6 +2045,7 @@ pub fn firehose_geyser_with_notifiers(
         let client = client.clone();
         let error_counts = error_counts.clone();
         let shutdown = shutdown.clone();
+        let ripget_client = shared_ripget_client.clone();
 
         let rt_clone = rt.clone();
 
@@ -2033,9 +2058,13 @@ pub fn firehose_geyser_with_notifiers(
                     block_meta_notifier_maybe,
                     confirmed_bank_sender,
                     &client,
-                    if threads > 1 { Some(i) } else { None },
+                    if firehose_threads > 1 { Some(i) } else { None },
                     error_counts,
                     shutdown,
+                    sequential,
+                    sequential_download_threads,
+                    sequential_buffer_window_bytes,
+                    ripget_client,
                 )
                 .await
                 .unwrap();
@@ -2080,6 +2109,10 @@ async fn firehose_geyser_thread(
     thread_index: Option<usize>,
     error_counts: Arc<Vec<AtomicU32>>,
     shutdown: Arc<AtomicBool>,
+    sequential_mode: bool,
+    ripget_threads: usize,
+    ripget_buffer_window_bytes: u64,
+    ripget_client: Option<ripget::Client>,
 ) -> Result<(), (FirehoseError, u64)> {
     let start_time = std::time::Instant::now();
     let log_target = if let Some(thread_index) = thread_index {
@@ -2095,6 +2128,11 @@ async fn firehose_geyser_thread(
             if shutdown.load(Ordering::Relaxed) {
                 return Ok(());
             }
+            let op_timeout = if sequential_mode {
+                OP_TIMEOUT_SEQUENTIAL
+            } else {
+                OP_TIMEOUT
+            };
             let epoch_range = slot_to_epoch(slot_range.start)..=slot_to_epoch(slot_range.end - 1);
             log::info!(
                 target: &log_target,
@@ -2114,25 +2152,6 @@ async fn firehose_geyser_thread(
                     return Ok(());
                 }
                 log::info!(target: &log_target, "entering epoch {}", epoch_num);
-                let stream = match timeout(OP_TIMEOUT, fetch_epoch_stream(epoch_num, client)).await {
-                    Ok(stream) => stream,
-                    Err(_) => {
-                        return Err((FirehoseError::OperationTimeout("fetch_epoch_stream"), current_slot.unwrap_or(slot_range.start)));
-                    }
-                };
-                let mut reader = NodeReader::new(stream);
-
-                let header_fut = reader.read_raw_header();
-                let header = match timeout(OP_TIMEOUT, header_fut).await {
-                    Ok(res) => res
-                        .map_err(FirehoseError::ReadHeader)
-                        .map_err(|e| (e, current_slot.unwrap_or(slot_range.start)))?,
-                    Err(_) => {
-                        return Err((FirehoseError::OperationTimeout("read_raw_header"), current_slot.unwrap_or(slot_range.start)));
-                    }
-                };
-                log::debug!(target: &log_target, "read epoch {} header: {:?}", epoch_num, header);
-
                 let (epoch_start, epoch_end_inclusive) = epoch_to_slot_range(epoch_num);
                 let local_start = std::cmp::max(slot_range.start, epoch_start);
                 let local_end_inclusive =
@@ -2147,6 +2166,43 @@ async fn firehose_geyser_thread(
                     );
                     continue;
                 }
+                let use_sequential_stream = sequential_mode && local_start == epoch_start;
+                let stream = match timeout(op_timeout, async {
+                    if use_sequential_stream {
+                        fetch_epoch_stream_with_options(
+                            epoch_num,
+                            client,
+                            Some(FetchEpochStreamOptions {
+                                sequential: true,
+                                ripget_threads,
+                                buffer_window_bytes: ripget_buffer_window_bytes,
+                                ripget_client: ripget_client.clone(),
+                            }),
+                        )
+                        .await
+                    } else {
+                        fetch_epoch_stream(epoch_num, client).await
+                    }
+                })
+                .await
+                {
+                    Ok(stream) => stream,
+                    Err(_) => {
+                        return Err((FirehoseError::OperationTimeout("fetch_epoch_stream"), current_slot.unwrap_or(slot_range.start)));
+                    }
+                };
+                let mut reader = NodeReader::new(stream);
+
+                let header_fut = reader.read_raw_header();
+                let header = match timeout(op_timeout, header_fut).await {
+                    Ok(res) => res
+                        .map_err(FirehoseError::ReadHeader)
+                        .map_err(|e| (e, current_slot.unwrap_or(slot_range.start)))?,
+                    Err(_) => {
+                        return Err((FirehoseError::OperationTimeout("read_raw_header"), current_slot.unwrap_or(slot_range.start)));
+                    }
+                };
+                log::debug!(target: &log_target, "read epoch {} header: {:?}", epoch_num, header);
 
                 let mut todo_previous_blockhash = Hash::default();
                 let mut todo_latest_entry_blockhash = Hash::default();
@@ -2159,7 +2215,7 @@ async fn firehose_geyser_thread(
                     // Seek to the nearest previous indexed slot so the reader captures the full
                     // node set (transactions, entries, rewards) for the target block.
                     let seek_slot = match timeout(
-                        OP_TIMEOUT,
+                        op_timeout,
                         find_previous_indexed_slot(local_start, epoch_start, &log_target),
                     )
                     .await
@@ -2176,7 +2232,7 @@ async fn firehose_geyser_thread(
                     };
                     if let Some(seek_slot) = seek_slot {
                         let seek_fut = reader.seek_to_slot(seek_slot);
-                        match timeout(OP_TIMEOUT, seek_fut).await {
+                        match timeout(op_timeout, seek_fut).await {
                             Ok(res) => {
                                 res.map_err(|e| (e, current_slot.unwrap_or(slot_range.start)))?
                             }
@@ -2198,7 +2254,7 @@ async fn firehose_geyser_thread(
                         return Ok(());
                     }
                     let read_fut = reader.read_until_block();
-                    let nodes = match timeout(OP_TIMEOUT, read_fut).await {
+                    let nodes = match timeout(op_timeout, read_fut).await {
                         Ok(result) => result
                             .map_err(FirehoseError::ReadUntilBlockError)
                             .map_err(|e| (e, current_slot.unwrap_or(slot_range.start)))?,

@@ -270,7 +270,7 @@ pub async fn fetch_epoch_stream_with_options(
             .await
             {
                 Ok(reader) => {
-                    return EpochStream::new(BufReader::with_capacity(8 * 1024 * 1024, reader))
+                    return EpochStream::new(BufReader::with_capacity(8 * 1024 * 1024, reader));
                 }
                 Err(err) => {
                     log::warn!(

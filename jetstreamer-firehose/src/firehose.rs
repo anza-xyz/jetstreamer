@@ -880,9 +880,9 @@ where
     if sequential {
         log::info!(
             target: LOG_MODULE,
-            "sequential mode enabled: firehose_threads=1, ripget_threads={}, ripget_window={} bytes",
+            "sequential mode enabled: firehose_threads=1, ripget_threads={}, ripget_window={}",
             sequential_download_threads,
-            sequential_buffer_window_bytes
+            crate::system::format_byte_size(sequential_buffer_window_bytes)
         );
     }
 
@@ -909,10 +909,13 @@ where
 
     // Build a shared ripget HTTP client so TCP connections survive across epoch transitions.
     let shared_ripget_client: Option<ripget::Client> = if sequential {
-        Some(ripget::build_client(Some(&format!(
-            "jetstreamer-firehose/{}",
-            env!("CARGO_PKG_VERSION")
-        ))).expect("failed to build ripget HTTP client"))
+        Some(
+            ripget::build_client(Some(&format!(
+                "jetstreamer-firehose/{}",
+                env!("CARGO_PKG_VERSION")
+            )))
+            .expect("failed to build ripget HTTP client"),
+        )
     } else {
         None
     };

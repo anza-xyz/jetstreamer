@@ -101,7 +101,7 @@ impl<T: Len + AsyncRead> Len for BufReader<T> {
 }
 
 /// Controls how epoch CAR streams are opened for [`fetch_epoch_stream_with_options`].
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct FetchEpochStreamOptions {
     /// When `true`, stream bytes sequentially through ripget's windowed downloader.
     pub sequential: bool,
@@ -109,15 +109,18 @@ pub struct FetchEpochStreamOptions {
     pub ripget_threads: usize,
     /// Total hot/cold window size in bytes for ripget windowed streaming.
     pub buffer_window_bytes: u64,
+    /// Pre-built ripget HTTP client for connection reuse across epoch downloads.
+    pub ripget_client: Option<ripget::Client>,
 }
 
 impl FetchEpochStreamOptions {
     /// Returns default options that preserve the legacy seekable behavior.
-    pub const fn parallel_default() -> Self {
+    pub fn parallel_default() -> Self {
         Self {
             sequential: false,
             ripget_threads: 1,
             buffer_window_bytes: 2,
+            ripget_client: None,
         }
     }
 }
@@ -133,13 +136,17 @@ impl RipgetEpochReader {
         url: impl AsRef<str>,
         threads: usize,
         buffer_window_bytes: u64,
+        ripget_client: Option<ripget::Client>,
     ) -> Result<Self, ripget::RipgetError> {
-        let options = WindowedDownloadOptions::new(buffer_window_bytes.max(2))
+        let mut options = WindowedDownloadOptions::new(buffer_window_bytes.max(2))
             .threads(std::cmp::max(1, threads))
             .user_agent(format!(
                 "jetstreamer-firehose/{}",
                 env!("CARGO_PKG_VERSION")
             ));
+        if let Some(c) = ripget_client {
+            options = options.client(c);
+        }
         let inner = download_url_windowed(url.as_ref(), options).await?;
         let len = inner.expected_len();
         Ok(Self {
@@ -258,6 +265,7 @@ pub async fn fetch_epoch_stream_with_options(
                 request_url.clone(),
                 options.ripget_threads,
                 options.buffer_window_bytes,
+                options.ripget_client,
             )
             .await
             {

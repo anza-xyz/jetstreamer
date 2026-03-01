@@ -5853,9 +5853,9 @@ dependencies = [
 
 [[package]]
 name = "ripget"
-version = "0.2.1"
+version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cc850e6ec07cb81f15d49097ef387c1164247bb5c2c795d3e13a6ba427531916"
+checksum = "d5430a564aaf6e9413e9ad5f27b629211c0ef7c746bd034714de4e97cb312ef4"
 dependencies = [
  "clap 4.5.60",
  "env_logger",

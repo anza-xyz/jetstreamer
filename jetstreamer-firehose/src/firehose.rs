@@ -906,6 +906,17 @@ where
             }
         });
     }
+
+    // Build a shared ripget HTTP client so TCP connections survive across epoch transitions.
+    let shared_ripget_client: Option<ripget::Client> = if sequential {
+        Some(ripget::build_client(Some(&format!(
+            "jetstreamer-firehose/{}",
+            env!("CARGO_PKG_VERSION")
+        ))).expect("failed to build ripget HTTP client"))
+    } else {
+        None
+    };
+
     let mut handles = Vec::new();
     // Shared per-thread error counters
     let error_counts: Arc<Vec<AtomicU32>> =
@@ -944,6 +955,7 @@ where
         let sequential_mode = sequential;
         let ripget_threads = sequential_download_threads;
         let ripget_buffer_window_bytes = sequential_buffer_window_bytes;
+        let ripget_client = shared_ripget_client.clone();
 
         let handle = tokio::spawn(async move {
             let transactions_since_stats = transactions_since_stats_cloned;
@@ -1052,6 +1064,7 @@ where
                                     sequential: true,
                                     ripget_threads,
                                     buffer_window_bytes: ripget_buffer_window_bytes,
+                                    ripget_client: ripget_client.clone(),
                                 }),
                             )
                             .await

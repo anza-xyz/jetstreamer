@@ -1,4 +1,5 @@
 use reqwest::Client;
+use ripget::{WindowedDownload, WindowedDownloadOptions, download_url_windowed};
 use rseek::Seekable;
 use serde::Deserialize;
 use std::{fmt, io, pin::Pin};
@@ -99,6 +100,107 @@ impl<T: Len + AsyncRead> Len for BufReader<T> {
     }
 }
 
+/// Controls how epoch CAR streams are opened for [`fetch_epoch_stream_with_options`].
+#[derive(Clone, Debug)]
+pub struct FetchEpochStreamOptions {
+    /// When `true`, stream bytes sequentially through ripget's windowed downloader.
+    pub sequential: bool,
+    /// Parallel range request count used by ripget when `sequential` is enabled.
+    pub ripget_threads: usize,
+    /// Total hot/cold window size in bytes for ripget windowed streaming.
+    pub buffer_window_bytes: u64,
+    /// Pre-built ripget HTTP client for connection reuse across epoch downloads.
+    pub ripget_client: Option<ripget::Client>,
+}
+
+impl FetchEpochStreamOptions {
+    /// Returns default options that preserve the legacy seekable behavior.
+    pub fn parallel_default() -> Self {
+        Self {
+            sequential: false,
+            ripget_threads: 1,
+            buffer_window_bytes: 2,
+            ripget_client: None,
+        }
+    }
+}
+
+struct RipgetEpochReader {
+    inner: WindowedDownload,
+    len: u64,
+    position: u64,
+}
+
+impl RipgetEpochReader {
+    async fn new(
+        url: impl AsRef<str>,
+        threads: usize,
+        buffer_window_bytes: u64,
+        ripget_client: Option<ripget::Client>,
+    ) -> Result<Self, ripget::RipgetError> {
+        let mut options = WindowedDownloadOptions::new(buffer_window_bytes.max(2))
+            .threads(std::cmp::max(1, threads))
+            .user_agent(format!(
+                "jetstreamer-firehose/{}",
+                env!("CARGO_PKG_VERSION")
+            ));
+        if let Some(c) = ripget_client {
+            options = options.client(c);
+        }
+        let inner = download_url_windowed(url.as_ref(), options).await?;
+        let len = inner.expected_len();
+        Ok(Self {
+            inner,
+            len,
+            position: 0,
+        })
+    }
+}
+
+impl AsyncRead for RipgetEpochReader {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        let this = self.get_mut();
+        let before = buf.filled().len();
+        let result = Pin::new(&mut this.inner).poll_read(cx, buf);
+        if let std::task::Poll::Ready(Ok(())) = &result {
+            let after = buf.filled().len();
+            let delta = after.saturating_sub(before) as u64;
+            this.position = this.position.saturating_add(delta);
+        }
+        result
+    }
+}
+
+impl AsyncSeek for RipgetEpochReader {
+    fn start_seek(self: Pin<&mut Self>, position: SeekFrom) -> io::Result<()> {
+        if matches!(position, SeekFrom::Current(0)) {
+            return Ok(());
+        }
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "seek is not supported for ripget windowed streams",
+        ))
+    }
+
+    fn poll_complete(
+        self: Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<u64>> {
+        let this = self.get_mut();
+        std::task::Poll::Ready(Ok(this.position))
+    }
+}
+
+impl Len for RipgetEpochReader {
+    fn len(&self) -> u64 {
+        self.len
+    }
+}
+
 /// Checks the configured archive backend to determine whether an epoch CAR exists.
 pub async fn epoch_exists(epoch: u64, client: &Client) -> bool {
     let location = archive::car_location();
@@ -136,6 +238,19 @@ pub async fn epoch_exists(epoch: u64, client: &Client) -> bool {
 
 /// Fetches an epoch’s CAR file from the configured archive backend as a buffered, seekable stream.
 pub async fn fetch_epoch_stream(epoch: u64, client: &Client) -> EpochStream {
+    fetch_epoch_stream_with_options(epoch, client, None).await
+}
+
+/// Fetches an epoch’s CAR file with explicit stream options.
+///
+/// In sequential mode, arbitrary seeking is not supported and seek requests other than
+/// `SeekFrom::Current(0)` return `io::ErrorKind::Unsupported`.
+pub async fn fetch_epoch_stream_with_options(
+    epoch: u64,
+    client: &Client,
+    options: Option<FetchEpochStreamOptions>,
+) -> EpochStream {
+    let options = options.unwrap_or_else(FetchEpochStreamOptions::parallel_default);
     let location = archive::car_location();
     let path = format!("{epoch}/epoch-{epoch}.car");
 
@@ -145,6 +260,28 @@ pub async fn fetch_epoch_stream(epoch: u64, client: &Client) -> EpochStream {
             .join(&path)
             .unwrap_or_else(|err| panic!("invalid CAR URL for epoch {epoch}: {err}"));
         let request_url = url.to_string();
+        if options.sequential {
+            match RipgetEpochReader::new(
+                request_url.clone(),
+                options.ripget_threads,
+                options.buffer_window_bytes,
+                options.ripget_client,
+            )
+            .await
+            {
+                Ok(reader) => {
+                    return EpochStream::new(BufReader::with_capacity(8 * 1024 * 1024, reader));
+                }
+                Err(err) => {
+                    log::warn!(
+                        target: crate::LOG_MODULE,
+                        "ripget windowed stream failed to initialize for epoch {} ({}), falling back to seekable stream",
+                        epoch,
+                        err
+                    );
+                }
+            }
+        }
         let http_client = client.clone();
         let seekable = Seekable::new(move || http_client.get(request_url.clone())).await;
         let reader = BufReader::with_capacity(8 * 1024 * 1024, seekable);

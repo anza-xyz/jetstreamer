@@ -36,7 +36,10 @@ use tokio::{
 
 use crate::{
     LOG_MODULE, SharedError,
-    epochs::{epoch_to_slot_range, fetch_epoch_stream, slot_to_epoch},
+    epochs::{
+        FetchEpochStreamOptions, epoch_to_slot_range, fetch_epoch_stream,
+        fetch_epoch_stream_with_options, slot_to_epoch,
+    },
     index::{SLOT_OFFSET_INDEX, SlotOffsetIndexError, slot_to_offset},
     node_reader::NodeReader,
     utils,
@@ -46,6 +49,7 @@ use crate::{
 // header, seeking, reading next block). Adjust here to tune stall detection/restart
 // aggressiveness.
 const OP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const OP_TIMEOUT_SEQUENTIAL: std::time::Duration = std::time::Duration::from_secs(180);
 // Epochs earlier than this were bincode-encoded in Old Faithful.
 const BINCODE_EPOCH_CUTOFF: u64 = 157;
 
@@ -408,7 +412,7 @@ fn decode_transaction_status_meta_from_frame(
         return Ok(solana_transaction_status::TransactionStatusMeta::default());
     }
 
-    match utils::decompress_zstd(reassembled_metadata.clone()) {
+    match utils::decompress_zstd(reassembled_metadata.as_slice()) {
         Ok(decompressed) => {
             decode_transaction_status_meta(slot, decompressed.as_slice()).map_err(|err| {
                 Box::new(std::io::Error::other(format!(
@@ -452,7 +456,7 @@ fn decode_rewards_from_frame(
         return Ok(DecodedRewards::empty());
     }
 
-    match utils::decompress_zstd(reassembled_rewards.clone()) {
+    match utils::decompress_zstd(reassembled_rewards.as_slice()) {
         Ok(decompressed) => decode_rewards_from_bytes(slot, decompressed.as_slice()).map_err(
             |err| {
                 Box::new(std::io::Error::other(format!(
@@ -839,10 +843,19 @@ pub struct FirehoseErrorContext {
 ///
 /// The requested `slot_range` is half-open `[start, end)`; on recoverable errors the
 /// runner restarts from the last processed slot to maintain coverage.
+///
+/// When `sequential` is `true`, the firehose uses one worker thread and opens epoch streams
+/// with ripget's parallel windowed downloader. In this mode `threads` configures ripget range
+/// concurrency rather than firehose worker partitioning.
+///
+/// `buffer_window_bytes` controls the ripget hot/cold window when `sequential` is enabled.
+/// Pass `None` to use the default (`min(4 GiB, 15% of available RAM)`).
 #[inline]
 #[allow(clippy::too_many_arguments)]
 pub async fn firehose<OnBlock, OnTransaction, OnEntry, OnRewards, OnStats, OnError>(
     threads: u64,
+    sequential: bool,
+    buffer_window_bytes: Option<u64>,
     slot_range: Range<u64>,
     on_block: Option<OnBlock>,
     on_tx: Option<OnTransaction>,
@@ -869,12 +882,25 @@ where
     let client = crate::network::create_http_client();
     log::info!(target: LOG_MODULE, "starting firehose...");
     log::info!(target: LOG_MODULE, "index base url: {}", SLOT_OFFSET_INDEX.base_url());
+    let firehose_threads = if sequential { 1 } else { threads };
+    let sequential_download_threads = std::cmp::max(1, threads as usize);
+    let sequential_buffer_window_bytes = buffer_window_bytes
+        .filter(|value| *value >= 2)
+        .unwrap_or_else(crate::system::default_firehose_buffer_window_bytes);
+    if sequential {
+        log::info!(
+            target: LOG_MODULE,
+            "sequential mode enabled: firehose_threads=1, ripget_threads={}, ripget_window={}",
+            sequential_download_threads,
+            crate::system::format_byte_size(sequential_buffer_window_bytes)
+        );
+    }
 
     let slot_range = Arc::new(slot_range);
 
     // divide slot_range into n subranges
-    let subranges = generate_subranges(&slot_range, threads);
-    if threads > 1 {
+    let subranges = generate_subranges(&slot_range, firehose_threads);
+    if firehose_threads > 1 {
         log::debug!(target: LOG_MODULE, "⚡ thread sub-ranges: {:?}", subranges);
     }
 
@@ -890,6 +916,20 @@ where
             }
         });
     }
+
+    // Build a shared ripget HTTP client so TCP connections survive across epoch transitions.
+    let shared_ripget_client: Option<ripget::Client> = if sequential {
+        Some(
+            ripget::build_client(Some(&format!(
+                "jetstreamer-firehose/{}",
+                env!("CARGO_PKG_VERSION")
+            )))
+            .expect("failed to build ripget HTTP client"),
+        )
+    } else {
+        None
+    };
+
     let mut handles = Vec::new();
     // Shared per-thread error counters
     let error_counts: Arc<Vec<AtomicU32>> =
@@ -925,6 +965,10 @@ where
         let shutdown_flag = shutdown_flag.clone();
         let pending_skipped_slots = pending_skipped_slots.clone();
         let thread_shutdown_rx = shutdown_signal.as_ref().map(|rx| rx.resubscribe());
+        let sequential_mode = sequential;
+        let ripget_threads = sequential_download_threads;
+        let ripget_buffer_window_bytes = sequential_buffer_window_bytes;
+        let ripget_client = shared_ripget_client.clone();
 
         let handle = tokio::spawn(async move {
             let transactions_since_stats = transactions_since_stats_cloned;
@@ -972,6 +1016,11 @@ where
             // let mut triggered = false;
             while let Err((err, slot)) = async {
                 let mut last_emitted_slot = last_emitted_slot_global;
+                let op_timeout = if sequential_mode {
+                    OP_TIMEOUT_SEQUENTIAL
+                } else {
+                    OP_TIMEOUT
+                };
                 if poll_shutdown(&shutdown_flag, &mut shutdown_rx) {
                     log::info!(
                         target: &log_target,
@@ -1004,25 +1053,6 @@ where
                         return Ok(());
                     }
                     log::info!(target: &log_target, "entering epoch {}", epoch_num);
-                    let stream = match timeout(OP_TIMEOUT, fetch_epoch_stream(epoch_num, &client)).await {
-                        Ok(stream) => stream,
-                        Err(_) => {
-                            return Err((FirehoseError::OperationTimeout("fetch_epoch_stream"), current_slot.unwrap_or(slot_range.start)));
-                        }
-                    };
-                    let mut reader = NodeReader::new(stream);
-
-                    let header_fut = reader.read_raw_header();
-                    let header = match timeout(OP_TIMEOUT, header_fut).await {
-                        Ok(res) => res
-                            .map_err(FirehoseError::ReadHeader)
-                            .map_err(|e| (e, current_slot.unwrap_or(slot_range.start)))?,
-                        Err(_) => {
-                            return Err((FirehoseError::OperationTimeout("read_raw_header"), current_slot.unwrap_or(slot_range.start)));
-                        }
-                    };
-                    log::debug!(target: &log_target, "read epoch {} header: {:?}", epoch_num, header);
-
                     let (epoch_start, epoch_end_inclusive) = epoch_to_slot_range(epoch_num);
                     let local_start = std::cmp::max(slot_range.start, epoch_start);
                     let local_end_inclusive =
@@ -1037,6 +1067,49 @@ where
                         );
                         continue;
                     }
+                    let use_sequential_stream = sequential_mode && local_start == epoch_start;
+                    let stream = match timeout(op_timeout, async {
+                        if use_sequential_stream {
+                            fetch_epoch_stream_with_options(
+                                epoch_num,
+                                &client,
+                                Some(FetchEpochStreamOptions {
+                                    sequential: true,
+                                    ripget_threads,
+                                    buffer_window_bytes: ripget_buffer_window_bytes,
+                                    ripget_client: ripget_client.clone(),
+                                }),
+                            )
+                            .await
+                        } else {
+                            fetch_epoch_stream(epoch_num, &client).await
+                        }
+                    })
+                    .await
+                    {
+                        Ok(stream) => stream,
+                        Err(_) => {
+                            return Err((
+                                FirehoseError::OperationTimeout("fetch_epoch_stream"),
+                                current_slot.unwrap_or(slot_range.start),
+                            ));
+                        }
+                    };
+                    let mut reader = NodeReader::new(stream);
+
+                    let header_fut = reader.read_raw_header();
+                    let header = match timeout(op_timeout, header_fut).await {
+                        Ok(res) => res
+                            .map_err(FirehoseError::ReadHeader)
+                            .map_err(|e| (e, current_slot.unwrap_or(slot_range.start)))?,
+                        Err(_) => {
+                            return Err((
+                                FirehoseError::OperationTimeout("read_raw_header"),
+                                current_slot.unwrap_or(slot_range.start),
+                            ));
+                        }
+                    };
+                    log::debug!(target: &log_target, "read epoch {} header: {:?}", epoch_num, header);
 
                     let mut previous_blockhash = Hash::default();
                     let mut latest_entry_blockhash = Hash::default();
@@ -1071,7 +1144,7 @@ where
                         };
                         if let Some(seek_slot) = seek_slot {
                             let seek_fut = reader.seek_to_slot(seek_slot);
-                            match timeout(OP_TIMEOUT, seek_fut).await {
+                            match timeout(op_timeout, seek_fut).await {
                                 Ok(res) => {
                                     res.map_err(|e| (e, current_slot.unwrap_or(slot_range.start)))?
                                 }
@@ -1098,7 +1171,7 @@ where
                             return Ok(());
                         }
                         let read_fut = reader.read_until_block();
-                        let nodes = match timeout(OP_TIMEOUT, read_fut).await {
+                        let nodes = match timeout(op_timeout, read_fut).await {
                             Ok(result) => result
                                 .map_err(FirehoseError::ReadUntilBlockError)
                                 .map_err(|e| {
@@ -1240,7 +1313,7 @@ where
                                             )
                                         })?;
                                         let reassembled_metadata = nodes
-                                            .reassemble_dataframes(tx.metadata.clone())
+                                            .reassemble_dataframes(&tx.metadata)
                                             .map_err(|err| {
                                                 (
                                                     FirehoseError::NodeDecodingError(item_index, err),
@@ -1302,8 +1375,8 @@ where
                                                 signature: *signature,
                                                 message_hash,
                                                 is_vote,
-                                                transaction_status_meta: as_native_metadata.clone(),
-                                                transaction: versioned_tx.clone(),
+                                                transaction_status_meta: as_native_metadata,
+                                                transaction: versioned_tx,
                                             },
                                         )
                                         .await
@@ -1565,7 +1638,7 @@ where
                                 Rewards(rewards) => {
                                     if reward_enabled || block_enabled {
                                         let reassembled = nodes
-                                            .reassemble_dataframes(rewards.data.clone())
+                                            .reassemble_dataframes(&rewards.data)
                                             .map_err(|err| {
                                                 (
                                                     FirehoseError::NodeDecodingError(item_index, err),
@@ -2262,13 +2335,8 @@ async fn firehose_geyser_thread(
                         use crate::node::Node::*;
                         match node {
                             Transaction(tx) => {
-                                let reassembled_tx = nodes.reassemble_dataframes(tx.data.clone())?;
-                                let versioned_tx =
-                                    crate::transaction::parse_versioned_transaction_from_slice(
-                                        &reassembled_tx,
-                                    )?;
-                                let reassembled_metadata =
-                                    nodes.reassemble_dataframes(tx.metadata.clone())?;
+                                let versioned_tx = tx.as_parsed()?;
+                                let reassembled_metadata = nodes.reassemble_dataframes(&tx.metadata)?;
 
                                 let as_native_metadata = decode_transaction_status_meta_from_frame(
                                     block.slot,
@@ -2375,7 +2443,7 @@ async fn firehose_geyser_thread(
                             Subset(_subset) => (),
                             Epoch(_epoch) => (),
                             Rewards(rewards) => {
-                                let reassembled = nodes.reassemble_dataframes(rewards.data.clone())?;
+                                let reassembled = nodes.reassemble_dataframes(&rewards.data)?;
                                 if !reassembled.is_empty() {
                                     this_block_rewards = decode_rewards_from_frame(
                                         block.slot,
@@ -2680,6 +2748,8 @@ async fn assert_slot_min_executed_transactions(slot: u64, min_executed: u64) {
 
     firehose(
         1,
+        false,
+        None,
         target_slot_block..(target_slot_block + 1),
         Some(move |_thread_id: usize, block: BlockData| {
             let found_block = found_block.clone();
@@ -2889,6 +2959,8 @@ async fn test_firehose_epoch_800() {
 
     firehose(
         THREADS.try_into().unwrap(),
+        false,
+        None,
         (345600000 - NUM_SLOTS_TO_COVER / 2)..(345600000 + NUM_SLOTS_TO_COVER / 2),
         Some(|thread_id: usize, block: BlockData| {
             async move {
@@ -2992,6 +3064,8 @@ async fn test_firehose_target_slot_transactions() {
 
     firehose(
         4,
+        false,
+        None,
         (TARGET_SLOT - SLOT_RADIUS)..(TARGET_SLOT + SLOT_RADIUS),
         Some(|_thread_id: usize, block: BlockData| {
             async move {
@@ -3048,6 +3122,78 @@ async fn test_firehose_target_slot_transactions() {
         OBSERVED_TXS.load(Ordering::Relaxed),
         EXPECTED_TRANSACTIONS,
         "recorded transaction count mismatch"
+    );
+}
+
+#[cfg(test)]
+#[serial]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_firehose_epoch_900_boundary_window_sequential_monotonic_transactions() {
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    };
+
+    solana_logger::setup_with_default("info");
+    const SLOT_COUNT: u64 = 100;
+    const THREADS: u64 = 4;
+    const TEST_BUFFER_WINDOW: &str = "4GiB";
+
+    let (epoch_900_start, _) = epoch_to_slot_range(900);
+    let slot_range = (epoch_900_start - SLOT_COUNT)..(epoch_900_start + SLOT_COUNT);
+
+    let last_seen_tx_slot = Arc::new(Mutex::new(slot_range.start));
+    let observed_txs = Arc::new(AtomicU64::new(0));
+    let stats_tracking = StatsTracking {
+        on_stats: log_stats_handler,
+        tracking_interval_slots: 100,
+    };
+    let test_buffer_window_bytes = crate::system::parse_buffer_window_bytes(TEST_BUFFER_WINDOW)
+        .expect("valid test buffer window");
+
+    firehose(
+        THREADS,
+        true,
+        Some(test_buffer_window_bytes),
+        slot_range.clone(),
+        None::<OnBlockFn>,
+        Some({
+            let last_seen_tx_slot = last_seen_tx_slot.clone();
+            let observed_txs = observed_txs.clone();
+            move |_thread_id: usize, transaction: TransactionData| {
+                let last_seen_tx_slot = last_seen_tx_slot.clone();
+                let observed_txs = observed_txs.clone();
+                async move {
+                    let mut previous = last_seen_tx_slot.lock().unwrap();
+                    // Old Faithful does not include leader-skipped slots, so gaps are
+                    // expected. We only enforce monotonic (non-decreasing) tx slot ordering.
+                    assert!(
+                        transaction.slot >= *previous,
+                        "transaction slot regressed: prev={}, current={}",
+                        *previous,
+                        transaction.slot
+                    );
+                    *previous = transaction.slot;
+                    observed_txs.fetch_add(1, Ordering::Relaxed);
+                    Ok(())
+                }
+                .boxed()
+            }
+        }),
+        None::<OnEntryFn>,
+        None::<OnRewardFn>,
+        None::<OnErrorFn>,
+        Some(stats_tracking),
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        observed_txs.load(Ordering::Relaxed) > 0,
+        "expected to observe at least one transaction in slots [{}, {})",
+        slot_range.start,
+        slot_range.end
     );
 }
 
@@ -3113,6 +3259,8 @@ async fn test_firehose_epoch_850_has_logs() {
 
     firehose(
         4,
+        false,
+        None,
         START_SLOT..(START_SLOT + SLOT_COUNT),
         None::<OnBlockFn>,
         Some(|_thread_id: usize, transaction: TransactionData| {
@@ -3157,6 +3305,8 @@ async fn test_firehose_epoch_850_votes_present() {
 
     firehose(
         2,
+        false,
+        None,
         (TARGET_SLOT - SLOT_RADIUS)..(TARGET_SLOT + SLOT_RADIUS),
         Some(|_thread_id: usize, block: BlockData| {
             async move {
@@ -3226,6 +3376,8 @@ async fn test_firehose_restart_loses_coverage_without_reset() {
 
     firehose(
         THREADS.try_into().unwrap(),
+        false,
+        None,
         START_SLOT..(START_SLOT + NUM_SLOTS),
         Some(|_thread_id: usize, block: BlockData| {
             async move {
@@ -3287,6 +3439,8 @@ async fn test_firehose_gap_coverage_near_known_missing_range() {
 
     firehose(
         THREADS.try_into().unwrap(),
+        false,
+        None,
         START_SLOT..(END_SLOT + 1),
         Some(|_thread_id: usize, block: BlockData| {
             async move {

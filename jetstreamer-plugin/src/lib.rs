@@ -91,7 +91,7 @@
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
-//!     let mut runner = PluginRunner::new("http://localhost:8123", 1);
+//!     let mut runner = PluginRunner::new("http://localhost:8123", 1, false, None);
 //!     runner.register(Box::new(LoggingPlugin));
 //!     let runner = Arc::new(runner);
 //!
@@ -251,16 +251,28 @@ pub struct PluginRunner {
     plugins: Arc<Vec<Arc<dyn Plugin>>>,
     clickhouse_dsn: String,
     num_threads: usize,
+    sequential: bool,
+    buffer_window_bytes: Option<u64>,
     db_update_interval_slots: u64,
 }
 
 impl PluginRunner {
     /// Creates a new runner that writes to `clickhouse_dsn` using `num_threads`.
-    pub fn new(clickhouse_dsn: impl Display, num_threads: usize) -> Self {
+    ///
+    /// When `sequential` is `true`, firehose runs with one worker and `num_threads` is used as
+    /// ripget parallel download concurrency.
+    pub fn new(
+        clickhouse_dsn: impl Display,
+        num_threads: usize,
+        sequential: bool,
+        buffer_window_bytes: Option<u64>,
+    ) -> Self {
         Self {
             plugins: Arc::new(Vec::new()),
             clickhouse_dsn: clickhouse_dsn.to_string(),
             num_threads: std::cmp::max(1, num_threads),
+            sequential,
+            buffer_window_bytes,
             db_update_interval_slots: 100,
         }
     }
@@ -411,23 +423,29 @@ impl PluginRunner {
                                 ..
                             } => {
                                 let tally = take_slot_tx_tally(*slot);
-                                if let Err(err) = record_slot_status(
-                                    db_client,
-                                    *slot,
-                                    thread_id,
-                                    *executed_transaction_count,
-                                    tally.votes,
-                                    tally.non_votes,
-                                    *block_time,
-                                )
-                                .await
-                                {
-                                    log::error!(
-                                        target: &log_target,
-                                        "failed to record slot status: {}",
-                                        err
-                                    );
-                                }
+                                let slot = *slot;
+                                let executed_transaction_count = *executed_transaction_count;
+                                let block_time = *block_time;
+                                let log_target_clone = log_target.clone();
+                                tokio::spawn(async move {
+                                    if let Err(err) = record_slot_status(
+                                        db_client,
+                                        slot,
+                                        thread_id,
+                                        executed_transaction_count,
+                                        tally.votes,
+                                        tally.non_votes,
+                                        block_time,
+                                    )
+                                    .await
+                                    {
+                                        log::error!(
+                                            target: &log_target_clone,
+                                            "failed to record slot status: {}",
+                                            err
+                                        );
+                                    }
+                                });
                             }
                             BlockData::PossibleLeaderSkipped { slot } => {
                                 // Drop any tallies that may exist for skipped slots.
@@ -462,11 +480,10 @@ impl PluginRunner {
                         );
                         return Ok(());
                     }
-                    let transaction = Arc::new(transaction);
                     for handle in plugin_handles.iter() {
                         if let Err(err) = handle
                             .plugin
-                            .on_transaction(thread_id, clickhouse.clone(), transaction.as_ref())
+                            .on_transaction(thread_id, clickhouse.clone(), &transaction)
                             .await
                         {
                             log::error!(
@@ -747,6 +764,8 @@ impl PluginRunner {
 
         let mut firehose_future = Box::pin(firehose(
             self.num_threads as u64,
+            self.sequential,
+            self.buffer_window_bytes,
             slot_range,
             Some(on_block),
             Some(on_transaction),

@@ -73,6 +73,20 @@ If `JETSTREAMER_THREADS` is omitted, Jetstreamer auto-sizes the worker pool usin
 hardware-aware heuristic exposed by
 `jetstreamer_firehose::system::optimal_firehose_thread_count`.
 
+For sequential replay mode, enable `--sequential` (or `JETSTREAMER_SEQUENTIAL=1`). In this mode
+Jetstreamer uses a single firehose worker and reuses `JETSTREAMER_THREADS` as ripget parallel
+download concurrency:
+
+```bash
+# Sequential mode with CLI flag
+JETSTREAMER_THREADS=4 cargo run --release -- 800 --sequential
+
+# Sequential mode with explicit ripget window override
+JETSTREAMER_SEQUENTIAL=1 JETSTREAMER_BUFFER_WINDOW=4GiB cargo run --release -- 800
+```
+
+`JETSTREAMER_BUFFER_WINDOW` defaults to `min(4 GiB, 15% of available RAM)` when unset.
+
 The built-in program and instruction tracking plugins now record vote and non-vote activity
 separately. `program_invocations` includes an `is_vote` flag per row, while `slot_instructions`
 stores separate vote/non-vote instruction and transaction counts.

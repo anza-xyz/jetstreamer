@@ -423,23 +423,29 @@ impl PluginRunner {
                                 ..
                             } => {
                                 let tally = take_slot_tx_tally(*slot);
-                                if let Err(err) = record_slot_status(
-                                    db_client,
-                                    *slot,
-                                    thread_id,
-                                    *executed_transaction_count,
-                                    tally.votes,
-                                    tally.non_votes,
-                                    *block_time,
-                                )
-                                .await
-                                {
-                                    log::error!(
-                                        target: &log_target,
-                                        "failed to record slot status: {}",
-                                        err
-                                    );
-                                }
+                                let slot = *slot;
+                                let executed_transaction_count = *executed_transaction_count;
+                                let block_time = *block_time;
+                                let log_target_clone = log_target.clone();
+                                tokio::spawn(async move {
+                                    if let Err(err) = record_slot_status(
+                                        db_client,
+                                        slot,
+                                        thread_id,
+                                        executed_transaction_count,
+                                        tally.votes,
+                                        tally.non_votes,
+                                        block_time,
+                                    )
+                                    .await
+                                    {
+                                        log::error!(
+                                            target: &log_target_clone,
+                                            "failed to record slot status: {}",
+                                            err
+                                        );
+                                    }
+                                });
                             }
                             BlockData::PossibleLeaderSkipped { slot } => {
                                 // Drop any tallies that may exist for skipped slots.

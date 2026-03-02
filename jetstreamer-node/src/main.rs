@@ -90,7 +90,7 @@ const SNAPSHOT_STATUS_CACHE_FILE: &str = "status_cache";
 const ACCOUNTS_SNAPSHOT_DIR: &str = "snapshot";
 const ACCOUNTS_RUN_DIR: &str = "run";
 const ARCHIVE_ACCOUNTS_DIR: &str = "accounts-run";
-const DEFAULT_ROOT_INTERVAL: u64 = 256;
+const DEFAULT_ROOT_INTERVAL: u64 = 1024;
 const ENTRY_EXEC_WARN_AFTER: Duration = Duration::from_secs(5);
 const ENTRY_EXEC_FAIL_AFTER: Duration = Duration::from_secs(300);
 const BANK_FOR_SLOT_WARN_AFTER: Duration = Duration::from_secs(5);
@@ -493,20 +493,11 @@ impl BankReplay {
                     std::thread::spawn(move || {
                         let start = Instant::now();
                         let mut last_progress = Instant::now();
-                        let _execution_guard = loop {
-                            if let Ok(guard) = execution_gate.try_lock() {
-                                break guard;
-                            }
-                            if last_progress.elapsed() >= PROGRAM_CACHE_PRUNE_PROGRESS_INTERVAL {
-                                warn!(
-                                    "bank_for_slot waiting on execution gate for program cache prune: slot {}",
-                                    prune_slot
-                                );
-                                last_progress = Instant::now();
-                            }
-                            std::thread::sleep(Duration::from_millis(10));
-                        };
-                        last_progress = Instant::now();
+                        // Acquire firehose_gate FIRST to pause firehose delivery,
+                        // allowing the ready_sender channel to drain. If we acquired
+                        // execution_gate first, replay would stall, the channel would
+                        // fill, and the firehose notifier would block while holding
+                        // firehose_gate — deadlocking with us.
                         let _firehose_guard = loop {
                             if let Ok(guard) = firehose_gate.try_lock() {
                                 break guard;
@@ -514,6 +505,20 @@ impl BankReplay {
                             if last_progress.elapsed() >= PROGRAM_CACHE_PRUNE_PROGRESS_INTERVAL {
                                 warn!(
                                     "bank_for_slot waiting on firehose gate for program cache prune: slot {}",
+                                    prune_slot
+                                );
+                                last_progress = Instant::now();
+                            }
+                            std::thread::sleep(Duration::from_millis(10));
+                        };
+                        last_progress = Instant::now();
+                        let _execution_guard = loop {
+                            if let Ok(guard) = execution_gate.try_lock() {
+                                break guard;
+                            }
+                            if last_progress.elapsed() >= PROGRAM_CACHE_PRUNE_PROGRESS_INTERVAL {
+                                warn!(
+                                    "bank_for_slot waiting on execution gate for program cache prune: slot {}",
                                     prune_slot
                                 );
                                 last_progress = Instant::now();

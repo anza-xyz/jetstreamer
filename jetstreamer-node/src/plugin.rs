@@ -43,7 +43,7 @@ static ACCOUNT_UPDATES: AtomicU64 = AtomicU64::new(0);
 static TRANSACTIONS: AtomicU64 = AtomicU64::new(0);
 static TOTAL_IN_MEMORY_ACCOUNT_UPDATE_SIZE: AtomicU64 = AtomicU64::new(0);
 static TOTAL_ENCODED_ACCOUNT_UPDATE_SIZE: AtomicU64 = AtomicU64::new(0);
-static PACKING_ENABLED: AtomicBool = AtomicBool::new(true);
+static PACKING_ENABLED: AtomicBool = AtomicBool::new(false);
 static LAST_THROUGHPUT_SAMPLE: Mutex<Option<ThroughputSample>> = Mutex::new(None);
 static TRANSACTION_CURSOR: Mutex<Option<TransactionCursor>> = Mutex::new(None);
 

@@ -82,14 +82,14 @@ pub fn format_byte_size(bytes: u64) -> String {
     const KIB: u64 = 1_024;
     if bytes >= GIB && bytes % GIB == 0 {
         format!("{} GiB", bytes / GIB)
-    } else if bytes >= MIB && bytes % MIB == 0 {
-        format!("{} MiB", bytes / MIB)
-    } else if bytes >= KIB && bytes % KIB == 0 {
-        format!("{} KiB", bytes / KIB)
     } else if bytes >= GIB {
         format!("{:.1} GiB", bytes as f64 / GIB as f64)
+    } else if bytes >= MIB && bytes % MIB == 0 {
+        format!("{} MiB", bytes / MIB)
     } else if bytes >= MIB {
         format!("{:.1} MiB", bytes as f64 / MIB as f64)
+    } else if bytes >= KIB && bytes % KIB == 0 {
+        format!("{} KiB", bytes / KIB)
     } else if bytes >= KIB {
         format!("{:.1} KiB", bytes as f64 / KIB as f64)
     } else {

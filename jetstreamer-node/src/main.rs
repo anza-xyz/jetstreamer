@@ -111,6 +111,14 @@ static LOGGED_PROGRAM_CACHE_ASSIGN_FAIL: AtomicBool = AtomicBool::new(false);
 static PROGRAM_CACHE_ASSIGN_FAIL_COUNT: AtomicU64 = AtomicU64::new(0);
 static PROGRAM_CACHE_PRUNE_DEPLOYMENT_SLOT: AtomicU64 = AtomicU64::new(0);
 
+// Phase timing counters (cumulative microseconds)
+static PHASE_GATE_WAIT_US: AtomicU64 = AtomicU64::new(0);
+static PHASE_BANK_FOR_SLOT_US: AtomicU64 = AtomicU64::new(0);
+static PHASE_PREPARE_BATCH_US: AtomicU64 = AtomicU64::new(0);
+static PHASE_EXECUTE_US: AtomicU64 = AtomicU64::new(0);
+static PHASE_POST_PROCESS_US: AtomicU64 = AtomicU64::new(0);
+static PHASE_ENTRY_COUNT: AtomicU64 = AtomicU64::new(0);
+
 struct SnapshotVerifier {
     expected: DashMap<Slot, SnapshotHash>,
     errors: DashMap<usize, String>,
@@ -1067,6 +1075,7 @@ impl BankReplay {
                 .lock()
                 .expect("execution gate lock poisoned");
             let gate_wait = gate_start.elapsed();
+            PHASE_GATE_WAIT_US.fetch_add(gate_wait.as_micros() as u64, Ordering::Relaxed);
             if gate_wait >= BANK_FOR_SLOT_WARN_AFTER {
                 warn!(
                     "entry execution gate waited {:.3}s (slot {} entry {})",
@@ -1117,8 +1126,11 @@ impl BankReplay {
 
             self.cursor.update_inflight_stage("bank_for_slot");
             let start = Instant::now();
+            let phase_bank_start = Instant::now();
             match self.bank_for_slot(entry.slot) {
                 Ok(bank) => {
+                    let bank_for_slot_us = phase_bank_start.elapsed().as_micros() as u64;
+                    PHASE_BANK_FOR_SLOT_US.fetch_add(bank_for_slot_us, Ordering::Relaxed);
                     self.maybe_prune_program_cache_by_deployment_slot(&bank);
                     self.cursor.update_inflight_stage("try_process");
                     if let Some(debug_sig) = self.debug_signature.as_ref() {
@@ -1166,6 +1178,7 @@ impl BankReplay {
                         .map(|scheduled| scheduled.expected_status.clone())
                         .collect();
                     self.cursor.update_inflight_stage("prepare_entry_batch");
+                    let phase_prepare_start = Instant::now();
                     let batch = match bank.prepare_entry_batch(txs) {
                         Ok(batch) => batch,
                         Err(err) => {
@@ -1177,7 +1190,9 @@ impl BankReplay {
                             panic!("{message}");
                         }
                     };
+                    PHASE_PREPARE_BATCH_US.fetch_add(phase_prepare_start.elapsed().as_micros() as u64, Ordering::Relaxed);
                     self.cursor.update_inflight_stage("load_execute_and_commit");
+                    let phase_exec_start = Instant::now();
                     let mut timings = ExecuteTimings::default();
                     let (commit_results, _balance_collector) = bank
                         .load_execute_and_commit_transactions(
@@ -1191,8 +1206,10 @@ impl BankReplay {
                         .into_iter()
                         .map(|commit_result| commit_result.and_then(|committed| committed.status))
                         .collect();
+                    PHASE_EXECUTE_US.fetch_add(phase_exec_start.elapsed().as_micros() as u64, Ordering::Relaxed);
                     drop(batch);
                     self.cursor.update_inflight_stage("post_process");
+                    let phase_post_start = Instant::now();
 
                     if results.len() != expected_statuses.len() {
                         let message = format!(
@@ -1302,6 +1319,8 @@ impl BankReplay {
                             entry.tx_count,
                         );
                     }
+                    PHASE_POST_PROCESS_US.fetch_add(phase_post_start.elapsed().as_micros() as u64, Ordering::Relaxed);
+                    PHASE_ENTRY_COUNT.fetch_add(1, Ordering::Relaxed);
                     // Advance the replay cursor only after successful execution/verification.
                     self.cursor.update(
                         entry.slot,
@@ -5478,9 +5497,27 @@ async fn run_geyser_replay(
                     } else {
                         "unknown".to_string()
                     };
-                    info!(
-                        "warmup slot {display_slot}/{warmup_end} ({percent:.2}%) txs={tx_count} accounts={account_updates} slots_per_sec={slots_per_sec} accounts_per_sec={accounts_per_sec} eta={eta} (epoch {epoch} starts at {epoch_start})"
-                    );
+                    let entry_count = PHASE_ENTRY_COUNT.load(Ordering::Relaxed);
+                    if entry_count > 0 {
+                        let gate_ms = PHASE_GATE_WAIT_US.load(Ordering::Relaxed) / 1000;
+                        let bank_ms = PHASE_BANK_FOR_SLOT_US.load(Ordering::Relaxed) / 1000;
+                        let prep_ms = PHASE_PREPARE_BATCH_US.load(Ordering::Relaxed) / 1000;
+                        let exec_ms = PHASE_EXECUTE_US.load(Ordering::Relaxed) / 1000;
+                        let post_ms = PHASE_POST_PROCESS_US.load(Ordering::Relaxed) / 1000;
+                        let total_ms = gate_ms + bank_ms + prep_ms + exec_ms + post_ms;
+                        let pct = |v: u64| if total_ms > 0 { (v as f64 / total_ms as f64) * 100.0 } else { 0.0 };
+                        info!(
+                            "warmup slot {display_slot}/{warmup_end} ({percent:.2}%) txs={tx_count} accounts={account_updates} slots_per_sec={slots_per_sec} accounts_per_sec={accounts_per_sec} eta={eta} (epoch {epoch} starts at {epoch_start})"
+                        );
+                        info!(
+                            "  phases ({entry_count} entries): gate={gate_ms}ms({:.0}%) bank={bank_ms}ms({:.0}%) prep={prep_ms}ms({:.0}%) exec={exec_ms}ms({:.0}%) post={post_ms}ms({:.0}%)",
+                            pct(gate_ms), pct(bank_ms), pct(prep_ms), pct(exec_ms), pct(post_ms)
+                        );
+                    } else {
+                        info!(
+                            "warmup slot {display_slot}/{warmup_end} ({percent:.2}%) txs={tx_count} accounts={account_updates} slots_per_sec={slots_per_sec} accounts_per_sec={accounts_per_sec} eta={eta} (epoch {epoch} starts at {epoch_start})"
+                        );
+                    }
                 } else {
                     if in_warmup {
                         in_warmup = false;

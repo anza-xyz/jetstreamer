@@ -1673,6 +1673,46 @@ dependencies = [
 ]
 
 [[package]]
+name = "clap"
+version = "4.5.60"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2797f34da339ce31042b27d23607e051786132987f595b02ba4f6a6dffb7030a"
+dependencies = [
+ "clap_builder",
+ "clap_derive",
+]
+
+[[package]]
+name = "clap_builder"
+version = "4.5.60"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "24a241312cea5059b13574bb9b3861cabf758b879c15190b37b6d6fd63ab6876"
+dependencies = [
+ "anstream",
+ "anstyle",
+ "clap_lex",
+ "strsim 0.11.1",
+]
+
+[[package]]
+name = "clap_derive"
+version = "4.5.55"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a92793da1a46a5f2a02a6f4c46c6496b28c43638adea8306fcb0caa1634f24e5"
+dependencies = [
+ "heck 0.5.0",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.111",
+]
+
+[[package]]
+name = "clap_lex"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3a822ea5bc7590f9d40f1ba12c0dc3c2760f3482c6984db1573ad11031420831"
+
+[[package]]
 name = "clickhouse"
 version = "0.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2145,7 +2185,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8d162beedaa69905488a8da94f5ac3edb4dd4788b732fadb7bd120b2625c1976"
 dependencies = [
  "data-encoding",
- "syn 2.0.111",
+ "syn 1.0.109",
 ]
 
 [[package]]
@@ -3177,6 +3217,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "95505c38b4572b2d910cecb0281560f54b440a19336cbbcb27bf6ce6adc6f5a8"
 
 [[package]]
+name = "heck"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
+
+[[package]]
 name = "hermit-abi"
 version = "0.1.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3484,7 +3530,7 @@ dependencies = [
  "percent-encoding 2.3.2",
  "pin-project-lite",
  "socket2 0.6.1",
- "system-configuration 0.6.1",
+ "system-configuration",
  "tokio",
  "tower-service",
  "tracing",
@@ -3808,7 +3854,7 @@ checksum = "4a5f13b858c8d314ee3e8f639011f7ccefe71f97f96e50151fb991f267928e2c"
 
 [[package]]
 name = "jetstreamer"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "clickhouse",
  "jetstreamer-firehose",
@@ -3826,7 +3872,7 @@ dependencies = [
 
 [[package]]
 name = "jetstreamer-firehose"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "aws-credential-types",
  "aws-sdk-s3",
@@ -3840,11 +3886,13 @@ dependencies = [
  "dashmap",
  "fnv",
  "futures-util",
+ "libc",
  "log",
  "multihash",
  "once_cell",
  "prost",
  "reqwest 0.12.24",
+ "ripget",
  "rseek",
  "serde",
  "serde_cbor",
@@ -3876,7 +3924,7 @@ dependencies = [
 
 [[package]]
 name = "jetstreamer-plugin"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "clickhouse",
  "dashmap",
@@ -3896,7 +3944,7 @@ dependencies = [
 
 [[package]]
 name = "jetstreamer-utils"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "ctrlc",
  "libc",
@@ -5272,7 +5320,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "119533552c9a7ffacc21e099c24a0ac8bb19c2a2a3f363de84cd9b844feab270"
 dependencies = [
  "bytes",
- "heck",
+ "heck 0.4.1",
  "itertools 0.10.5",
  "lazy_static",
  "log",
@@ -5689,7 +5737,7 @@ dependencies = [
  "serde_json",
  "serde_urlencoded",
  "sync_wrapper 0.1.2",
- "system-configuration 0.5.1",
+ "system-configuration",
  "tokio",
  "tokio-native-tls",
  "tokio-rustls 0.24.1",
@@ -5800,6 +5848,23 @@ dependencies = [
  "libc",
  "untrusted",
  "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "ripget"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d5430a564aaf6e9413e9ad5f27b629211c0ef7c746bd034714de4e97cb312ef4"
+dependencies = [
+ "clap 4.5.60",
+ "env_logger",
+ "futures-util",
+ "indicatif 0.18.3",
+ "log",
+ "reqwest 0.12.24",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-util 0.7.17",
 ]
 
 [[package]]
@@ -6904,7 +6969,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b45846c3741bc62c5695c495e4a27f830e65cbde7dd244809337768ae6ad0b6"
 dependencies = [
  "chrono",
- "clap",
+ "clap 2.34.0",
  "rpassword",
  "solana-bls-signatures",
  "solana-clock",
@@ -6951,7 +7016,7 @@ dependencies = [
  "agave-reserved-account-keys",
  "base64 0.22.1",
  "chrono",
- "clap",
+ "clap 2.34.0",
  "console 0.16.1",
  "humantime",
  "indicatif 0.18.3",
@@ -7369,7 +7434,7 @@ checksum = "5ef05bab4daca11502c90fc4febe6e9741b2a229008bfe1af8c85913d1f86515"
 dependencies = [
  "agave-logger",
  "bincode",
- "clap",
+ "clap 2.34.0",
  "crossbeam-channel",
  "log",
  "serde",
@@ -7546,7 +7611,7 @@ dependencies = [
  "assert_matches",
  "bincode",
  "bv",
- "clap",
+ "clap 2.34.0",
  "crossbeam-channel",
  "flate2",
  "indexmap 2.12.1",
@@ -10098,7 +10163,7 @@ version = "0.24.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1e385be0d24f186b4ce2f9982191e7101bb737312ad61c1f2f984f34bcf85d59"
 dependencies = [
- "heck",
+ "heck 0.4.1",
  "proc-macro2",
  "quote",
  "rustversion",
@@ -10185,18 +10250,7 @@ checksum = "ba3a3adc5c275d719af8cb4272ea1c4a6d668a777f37e115f6d11ddbc1c8e0e7"
 dependencies = [
  "bitflags 1.3.2",
  "core-foundation 0.9.4",
- "system-configuration-sys 0.5.0",
-]
-
-[[package]]
-name = "system-configuration"
-version = "0.6.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3c879d448e9d986b661742763247d3693ed13609438cf3d006f51f5368a5ba6b"
-dependencies = [
- "bitflags 2.10.0",
- "core-foundation 0.9.4",
- "system-configuration-sys 0.6.0",
+ "system-configuration-sys",
 ]
 
 [[package]]
@@ -10204,16 +10258,6 @@ name = "system-configuration-sys"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a75fb188eb626b924683e3b95e3a48e63551fcfb51949de2f06a9d91dbee93c9"
-dependencies = [
- "core-foundation-sys",
- "libc",
-]
-
-[[package]]
-name = "system-configuration-sys"
-version = "0.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8e1d1b10ced5ca923a1fcb8d03e96b8d3268065d724548c0211415ff6ac6bac4"
 dependencies = [
  "core-foundation-sys",
  "libc",

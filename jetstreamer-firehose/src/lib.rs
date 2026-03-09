@@ -42,6 +42,11 @@
 //! S3 transports are compiled behind the `s3-backend` Cargo feature. Enable that feature when
 //! building if you plan to stream from `s3://` URIs instead of HTTP mirrors.
 //!
+//! Sequential-mode ripget buffering is configured on the [`firehose::firehose`] call via
+//! `buffer_window_bytes`. Pass `None` to use the built-in default (`min(4 GiB, 15% of available
+//! RAM)`). If you're using [`jetstreamer`](https://crates.io/crates/jetstreamer)'s binary runner,
+//! that layer exposes `JETSTREAMER_BUFFER_WINDOW` and forwards the parsed value here.
+//!
 //! # Limitations
 //! Old Faithful currently publishes blocks, transactions, epochs, and reward metadata but does
 //! not ship account updates. The firehose mirrors that limitation; plan on a separate data
@@ -131,6 +136,8 @@
 //!
 //!     firehose::firehose(
 //!         4,
+//!         false,
+//!         None,
 //!         slot_range,
 //!         Some(block_handler()),
 //!         Some(tx_handler()),

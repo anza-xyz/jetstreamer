@@ -52,6 +52,10 @@
 //!   [`jetstreamer_firehose::system::optimal_firehose_thread_count`]): number of firehose
 //!   ingestion threads. Increase this to multiplex Old Faithful HTTP requests across more
 //!   cores, or leave it unset to size the pool automatically using CPU and network heuristics.
+//! - `JETSTREAMER_SEQUENTIAL` (default `false`): when truthy, firehose uses a single worker
+//!   thread and uses ripget's parallel windowed downloader for sequential reads.
+//! - `JETSTREAMER_BUFFER_WINDOW` (default lower of 4 GiB and 15% of available RAM): ripget
+//!   hot/cold window size used in sequential mode. Accepts raw bytes or suffixes like `512MiB`.
 //! - `JETSTREAMER_CLICKHOUSE_DSN` (default `http://localhost:8123`): DSN passed to plugin
 //!   instances that emit ClickHouse writes.
 //! - `JETSTREAMER_CLICKHOUSE_MODE` (default `auto`): controls ClickHouse integration. Accepted
@@ -85,6 +89,8 @@
 //! | `JETSTREAMER_CLICKHOUSE_DSN` | `http://localhost:8123` | HTTP(S) DSN passed to the embedded plugin runner for ClickHouse writes. Override to target a remote ClickHouse deployment. |
 //! | `JETSTREAMER_CLICKHOUSE_MODE` | `auto` | Controls ClickHouse integration. `auto` enables output and spawns the helper only for local DSNs, `remote` enables output without spawning the helper, `local` always requests the helper, and `off` disables ClickHouse entirely. |
 //! | `JETSTREAMER_THREADS` | `auto` | Number of firehose ingestion threads. Leave unset to rely on hardware-based sizing or override with an explicit value when you know the ideal concurrency. |
+//! | `JETSTREAMER_SEQUENTIAL` | `false` | Enables single-thread firehose processing with ripget-backed sequential streaming. |
+//! | `JETSTREAMER_BUFFER_WINDOW` | `min(4 GiB, 15% available RAM)` | Total ripget hot/cold window size used only when `JETSTREAMER_SEQUENTIAL` is enabled. |
 //!
 //! Helper spawning only occurs when both the mode allows it (`auto`/`local`) **and** the DSN
 //! points to `localhost` or `127.0.0.1`.
@@ -207,6 +213,8 @@ fn parse_clickhouse_mode(value: &str) -> Option<ClickhouseMode> {
 ///
 /// - `JETSTREAMER_THREADS`: Number of firehose ingestion threads. When unset the value is
 ///   derived from [`jetstreamer_firehose::system::optimal_firehose_thread_count`].
+/// - `JETSTREAMER_SEQUENTIAL`: When true, runs a single firehose worker and uses ripget's
+///   parallel windowed downloader for sequential reads.
 /// - `JETSTREAMER_CLICKHOUSE_DSN`: DSN for ClickHouse ingestion; defaults to
 ///   `http://localhost:8123`.
 /// - `JETSTREAMER_CLICKHOUSE_MODE`: Controls ClickHouse integration. Accepted values are
@@ -317,6 +325,8 @@ impl Default for JetstreamerRunner {
             clickhouse_dsn,
             config: Config {
                 threads: jetstreamer_firehose::system::optimal_firehose_thread_count(),
+                sequential: false,
+                buffer_window_bytes: None,
                 slot_range: 0..0,
                 clickhouse_enabled: clickhouse_settings.enabled,
                 spawn_clickhouse: clickhouse_settings.spawn_helper && clickhouse_settings.enabled,
@@ -346,8 +356,28 @@ impl JetstreamerRunner {
     }
 
     /// Sets the number of firehose ingestion threads.
+    ///
+    /// When sequential mode is enabled, this value is used as ripget parallel range
+    /// concurrency while firehose itself runs one worker.
     pub fn with_threads(mut self, threads: usize) -> Self {
         self.config.threads = std::cmp::max(1, threads);
+        self
+    }
+
+    /// Toggles sequential firehose mode.
+    ///
+    /// When enabled, firehose uses one worker thread while retaining `JETSTREAMER_THREADS` as
+    /// the ripget parallel range count for sequential windowed downloads.
+    pub const fn with_sequential(mut self, sequential: bool) -> Self {
+        self.config.sequential = sequential;
+        self
+    }
+
+    /// Sets the ripget sequential download window size in bytes.
+    ///
+    /// This value is only used when sequential mode is enabled.
+    pub const fn with_buffer_window_bytes(mut self, buffer_window_bytes: Option<u64>) -> Self {
+        self.config.buffer_window_bytes = buffer_window_bytes;
         self
     }
 
@@ -389,6 +419,8 @@ impl JetstreamerRunner {
         }
 
         let threads = std::cmp::max(1, self.config.threads);
+        let sequential = self.config.sequential;
+        let buffer_window_bytes = self.config.buffer_window_bytes;
         let clickhouse_enabled =
             self.config.clickhouse_enabled && !self.clickhouse_dsn.trim().is_empty();
         let slot_range = self.config.slot_range.clone();
@@ -397,14 +429,21 @@ impl JetstreamerRunner {
             && should_spawn_for_dsn(&self.clickhouse_dsn);
 
         log::info!(
-            "processing slots [{}..{}) with {} firehose threads (clickhouse_enabled={})",
+            "processing slots [{}..{}) with {} configured threads (sequential={}, buffer_window_bytes={:?}, clickhouse_enabled={})",
             slot_range.start,
             slot_range.end,
             threads,
+            sequential,
+            buffer_window_bytes,
             clickhouse_enabled
         );
 
-        let mut runner = PluginRunner::new(&self.clickhouse_dsn, threads);
+        let mut runner = PluginRunner::new(
+            &self.clickhouse_dsn,
+            threads,
+            sequential,
+            buffer_window_bytes,
+        );
         for plugin in &self.config.builtin_plugins {
             runner.register(plugin.instantiate());
         }
@@ -509,6 +548,10 @@ impl JetstreamerRunner {
 pub struct Config {
     /// Number of simultaneous firehose streams to spawn.
     pub threads: usize,
+    /// Whether to process with a single firehose worker and ripget-backed sequential streaming.
+    pub sequential: bool,
+    /// Optional override for ripget sequential window size in bytes.
+    pub buffer_window_bytes: Option<u64>,
     /// The range of slots to process, inclusive of the start and exclusive of the end slot.
     pub slot_range: Range<u64>,
     /// Whether to connect to ClickHouse for plugin output.
@@ -551,11 +594,15 @@ impl BuiltinPlugin {
 /// - `JETSTREAMER_CLICKHOUSE_MODE`: Controls ClickHouse integration. Accepts `auto`, `remote`,
 ///   `local`, or `off`.
 /// - `JETSTREAMER_THREADS`: Number of firehose ingestion threads.
+/// - `JETSTREAMER_SEQUENTIAL`: Enables single-thread sequential firehose mode when truthy.
+/// - `JETSTREAMER_BUFFER_WINDOW`: Optional ripget sequential window size (for example `4GiB`).
 ///
 /// CLI flags:
 /// - `--with-plugin <name>`: Adds one of the built-in plugins (`program-tracking` or
 ///   `instruction-tracking`). When omitted, the CLI defaults to `program-tracking`.
 /// - `--no-plugins`: Disables all built-in plugins (overrides the default and any `--with-plugin`).
+/// - `--sequential`: Enables single-thread sequential firehose mode.
+/// - `--buffer-window <size>`: Overrides ripget sequential window size (for example `4GiB`).
 ///
 /// # Examples
 ///
@@ -575,6 +622,8 @@ pub fn parse_cli_args() -> Result<Config, Box<dyn std::error::Error>> {
     let mut first_arg: Option<String> = None;
     let mut builtin_plugins = Vec::new();
     let mut no_plugins = false;
+    let mut sequential_cli = false;
+    let mut buffer_window_cli: Option<String> = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--with-plugin" => {
@@ -590,6 +639,15 @@ pub fn parse_cli_args() -> Result<Config, Box<dyn std::error::Error>> {
             }
             "--no-plugins" => {
                 no_plugins = true;
+            }
+            "--sequential" => {
+                sequential_cli = true;
+            }
+            "--buffer-window" => {
+                let raw = args
+                    .next()
+                    .ok_or_else(|| "--buffer-window requires a value like 4GiB".to_string())?;
+                buffer_window_cli = Some(raw);
             }
             _ if first_arg.is_none() => first_arg = Some(arg),
             other => return Err(format!("unrecognized argument '{other}'").into()),
@@ -621,6 +679,17 @@ pub fn parse_cli_args() -> Result<Config, Box<dyn std::error::Error>> {
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or_else(jetstreamer_firehose::system::optimal_firehose_thread_count);
+    let sequential = if sequential_cli {
+        true
+    } else {
+        parse_env_bool("JETSTREAMER_SEQUENTIAL", false)
+    };
+    let buffer_window_raw = if let Some(cli) = buffer_window_cli {
+        Some(cli)
+    } else {
+        std::env::var("JETSTREAMER_BUFFER_WINDOW").ok()
+    };
+    let buffer_window_bytes = parse_optional_buffer_window_bytes(buffer_window_raw.as_deref())?;
 
     let spawn_clickhouse = clickhouse_settings.spawn_helper && clickhouse_enabled;
 
@@ -634,11 +703,47 @@ pub fn parse_cli_args() -> Result<Config, Box<dyn std::error::Error>> {
 
     Ok(Config {
         threads,
+        sequential,
+        buffer_window_bytes,
         slot_range,
         clickhouse_enabled,
         spawn_clickhouse,
         builtin_plugins,
     })
+}
+
+fn parse_optional_buffer_window_bytes(
+    raw: Option<&str>,
+) -> Result<Option<u64>, Box<dyn std::error::Error>> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let parsed = jetstreamer_firehose::system::parse_buffer_window_bytes(raw).ok_or_else(|| {
+        format!(
+            "invalid buffer window '{}'; expected integer bytes or suffix like 4GiB/512MiB",
+            raw
+        )
+    })?;
+    Ok(Some(parsed))
+}
+
+fn parse_env_bool(key: &str, default: bool) -> bool {
+    match std::env::var(key) {
+        Ok(raw) => match raw.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => true,
+            "0" | "false" | "no" | "off" => false,
+            other => {
+                log::warn!(
+                    "unrecognized boolean value for {}='{}'; using default {}",
+                    key,
+                    other,
+                    default
+                );
+                default
+            }
+        },
+        Err(_) => default,
+    }
 }
 
 fn should_spawn_for_dsn(dsn: &str) -> bool {

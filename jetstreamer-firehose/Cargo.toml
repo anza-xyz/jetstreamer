@@ -41,7 +41,7 @@ solana-signature.workspace = true
 solana-sdk-ids.workspace = true
 prost_011.workspace = true
 solana-entry.workspace = true
-reqwest.workspace = true
+reqwest = { workspace = true, features = ["rustls-tls", "stream"] }
 tokio.workspace = true
 futures-util.workspace = true
 serde = { workspace = true, features = ["derive"] }
@@ -53,6 +53,7 @@ wincode.workspace = true
 solana-logger.workspace = true
 log.workspace = true
 rseek.workspace = true
+ripget.workspace = true
 crc.workspace = true
 serde_cbor.workspace = true
 fnv.workspace = true
@@ -64,6 +65,7 @@ xxhash-rust.workspace = true
 dashmap.workspace = true
 once_cell.workspace = true
 url.workspace = true
+libc.workspace = true
 
 aws-credential-types = { workspace = true, optional = true }
 aws-sdk-s3 = { workspace = true, optional = true }

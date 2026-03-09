@@ -167,12 +167,14 @@ impl Plugin for ProgramTrackingPlugin {
 
             let rows = Self::take_slot_events(slot, block_time);
 
-            if let Some(db_client) = db.as_ref()
+            if let Some(db_client) = db
                 && !rows.is_empty()
             {
-                write_program_events(Arc::clone(db_client), rows)
-                    .await
-                    .map_err(|err| -> Box<dyn std::error::Error + Send + Sync> { Box::new(err) })?;
+                tokio::spawn(async move {
+                    if let Err(err) = write_program_events(db_client, rows).await {
+                        log::error!("failed to write program events: {}", err);
+                    }
+                });
             }
 
             Ok(())

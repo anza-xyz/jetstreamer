@@ -128,12 +128,14 @@ impl Plugin for InstructionTrackingPlugin {
                 .into_iter()
                 .collect::<Vec<_>>();
 
-            if let Some(db_client) = db.as_ref()
+            if let Some(db_client) = db
                 && !rows.is_empty()
             {
-                write_instruction_events(Arc::clone(db_client), rows)
-                    .await
-                    .map_err(|err| -> Box<dyn std::error::Error + Send + Sync> { Box::new(err) })?;
+                tokio::spawn(async move {
+                    if let Err(err) = write_instruction_events(db_client, rows).await {
+                        log::error!("failed to write instruction events: {}", err);
+                    }
+                });
             }
 
             Ok(())

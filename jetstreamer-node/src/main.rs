@@ -1190,7 +1190,10 @@ impl BankReplay {
                             panic!("{message}");
                         }
                     };
-                    PHASE_PREPARE_BATCH_US.fetch_add(phase_prepare_start.elapsed().as_micros() as u64, Ordering::Relaxed);
+                    PHASE_PREPARE_BATCH_US.fetch_add(
+                        phase_prepare_start.elapsed().as_micros() as u64,
+                        Ordering::Relaxed,
+                    );
                     self.cursor.update_inflight_stage("load_execute_and_commit");
                     let phase_exec_start = Instant::now();
                     let mut timings = ExecuteTimings::default();
@@ -1206,7 +1209,10 @@ impl BankReplay {
                         .into_iter()
                         .map(|commit_result| commit_result.and_then(|committed| committed.status))
                         .collect();
-                    PHASE_EXECUTE_US.fetch_add(phase_exec_start.elapsed().as_micros() as u64, Ordering::Relaxed);
+                    PHASE_EXECUTE_US.fetch_add(
+                        phase_exec_start.elapsed().as_micros() as u64,
+                        Ordering::Relaxed,
+                    );
                     drop(batch);
                     self.cursor.update_inflight_stage("post_process");
                     let phase_post_start = Instant::now();
@@ -1319,7 +1325,10 @@ impl BankReplay {
                             entry.tx_count,
                         );
                     }
-                    PHASE_POST_PROCESS_US.fetch_add(phase_post_start.elapsed().as_micros() as u64, Ordering::Relaxed);
+                    PHASE_POST_PROCESS_US.fetch_add(
+                        phase_post_start.elapsed().as_micros() as u64,
+                        Ordering::Relaxed,
+                    );
                     PHASE_ENTRY_COUNT.fetch_add(1, Ordering::Relaxed);
                     // Advance the replay cursor only after successful execution/verification.
                     self.cursor.update(
@@ -5505,13 +5514,23 @@ async fn run_geyser_replay(
                         let exec_ms = PHASE_EXECUTE_US.load(Ordering::Relaxed) / 1000;
                         let post_ms = PHASE_POST_PROCESS_US.load(Ordering::Relaxed) / 1000;
                         let total_ms = gate_ms + bank_ms + prep_ms + exec_ms + post_ms;
-                        let pct = |v: u64| if total_ms > 0 { (v as f64 / total_ms as f64) * 100.0 } else { 0.0 };
+                        let pct = |v: u64| {
+                            if total_ms > 0 {
+                                (v as f64 / total_ms as f64) * 100.0
+                            } else {
+                                0.0
+                            }
+                        };
                         info!(
                             "warmup slot {display_slot}/{warmup_end} ({percent:.2}%) txs={tx_count} accounts={account_updates} slots_per_sec={slots_per_sec} accounts_per_sec={accounts_per_sec} eta={eta} (epoch {epoch} starts at {epoch_start})"
                         );
                         info!(
                             "  phases ({entry_count} entries): gate={gate_ms}ms({:.0}%) bank={bank_ms}ms({:.0}%) prep={prep_ms}ms({:.0}%) exec={exec_ms}ms({:.0}%) post={post_ms}ms({:.0}%)",
-                            pct(gate_ms), pct(bank_ms), pct(prep_ms), pct(exec_ms), pct(post_ms)
+                            pct(gate_ms),
+                            pct(bank_ms),
+                            pct(prep_ms),
+                            pct(exec_ms),
+                            pct(post_ms)
                         );
                     } else {
                         info!(

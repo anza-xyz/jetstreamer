@@ -1,6 +1,6 @@
 use crate::LOG_MODULE;
 use crate::SharedError;
-use crate::epochs::slot_to_epoch;
+use crate::epochs::{epoch_to_slot_range, slot_to_epoch};
 use crate::firehose::FirehoseError;
 use crate::index::{SlotOffsetIndexError, slot_to_offset};
 use crate::node::{Node, NodeWithCid, NodesWithCids, parse_any_from_cbordata};
@@ -252,6 +252,72 @@ impl<R: AsyncRead + Unpin + AsyncSeek + Len> NodeReader<R> {
             }
         }
     }
+
+    /// Seeks to the slot immediately before `target_slot` so that the next
+    /// [`read_until_block`](Self::read_until_block) call reads the preceding
+    /// slot's block node, and the *following* read captures `target_slot`'s
+    /// full data (transactions, entries, and block).
+    ///
+    /// This is necessary because `seek_to_slot` positions the reader at the
+    /// block node's offset, but transactions and entries for a slot are stored
+    /// *before* the block node in the CAR file. Without this, the first slot
+    /// in a range would be missing its transactions.
+    ///
+    /// If no preceding slot exists in the index (e.g. `target_slot` is the
+    /// first slot in its epoch), this is a no-op — the reader stays at the
+    /// beginning of the epoch so the full data is read sequentially.
+    pub async fn seek_before_slot(&mut self, target_slot: u64) -> Result<(), FirehoseError> {
+        let epoch_start = epoch_to_slot_range(slot_to_epoch(target_slot)).0;
+
+        // Walk backwards from target_slot - 1 to the epoch start looking for
+        // a slot that exists in the index.
+        let mut probe = target_slot.saturating_sub(1);
+        while probe >= epoch_start {
+            match slot_to_offset(probe).await {
+                Ok(offset) => {
+                    let epoch = slot_to_epoch(probe);
+                    log::info!(
+                        target: LOG_MODULE,
+                        "Seeking before slot {} → landed on slot {} in epoch {} @ offset {}",
+                        target_slot,
+                        probe,
+                        epoch,
+                        offset
+                    );
+
+                    if self.header.is_empty() {
+                        self.read_raw_header()
+                            .await
+                            .map_err(FirehoseError::SeekToSlotError)?;
+                    }
+
+                    wait_for_seek_hit_slot().await;
+                    self.reader
+                        .seek(SeekFrom::Start(offset))
+                        .await
+                        .map_err(|e| FirehoseError::SeekToSlotError(Box::new(e)))?;
+                    return Ok(());
+                }
+                Err(SlotOffsetIndexError::SlotNotFound(..)) => {
+                    if probe == epoch_start {
+                        break;
+                    }
+                    probe -= 1;
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+
+        // No preceding slot found — stay at the beginning of the epoch so the
+        // sequential read picks up the target slot's full data naturally.
+        log::info!(
+            target: LOG_MODULE,
+            "No preceding slot found for {}; reading from epoch start",
+            target_slot
+        );
+        Ok(())
+    }
+
 
     #[allow(clippy::should_implement_trait)]
     /// Reads the next raw node from the Old Faithful stream without parsing it.

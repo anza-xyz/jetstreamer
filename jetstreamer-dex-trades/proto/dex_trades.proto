@@ -1,0 +1,67 @@
+syntax = "proto3";
+
+package dex_trades;
+
+// Unified swap record for all Solana DEX protocols.
+//
+// Token convention:
+//   token_bought = what the user received (output of swap)
+//   token_sold   = what the user sent (input to swap)
+message SwapRecord {
+  // Block identity
+  uint64 block_slot = 1;
+  int64  block_time = 2;   // Unix seconds
+  string block_date = 3;   // YYYY-MM-DD (partition key)
+
+  // Transaction identity
+  string tx_id    = 4;     // base58 signature
+  uint32 tx_index = 5;     // index within the block
+
+  // Instruction identity
+  uint32 instruction_index       = 6;  // outer instruction index (1-based)
+  uint32 inner_instruction_index = 7;  // inner index (1-based, 0 if outer)
+  bool   is_inner_instruction    = 8;
+  string instruction_type        = 9;  // e.g. "buy", "sell", "swap"
+
+  // Program identity
+  string outer_program = 10;
+  string inner_program = 11;
+
+  // Pool & signer
+  string pool_address = 12;
+  string signer       = 13;
+
+  // Token bought (user received)
+  string token_bought_mint          = 14;
+  string token_bought_vault         = 15;
+  double token_bought_amount        = 16; // human-readable (decimal-adjusted)
+  uint32 token_bought_decimals      = 17;
+  double token_bought_vault_reserve = 18;
+
+  // Token sold (user sent)
+  string token_sold_mint          = 19;
+  string token_sold_vault         = 20;
+  double token_sold_amount        = 21;
+  double token_sold_vault_reserve = 22;
+  uint32 token_sold_decimals      = 23;
+
+  // Fees (in SOL)
+  double txn_fee      = 24;
+  double priority_fee = 25;
+  double jito_tips    = 26;
+
+  // CLMM-specific pool state
+  string sqrt_price       = 27; // raw u128 string, empty for AMMs
+  bool   has_direction    = 28; // true if is_base_to_quote is meaningful
+  bool   is_base_to_quote = 29; // trade direction for CLMM sqrt_price
+
+  // Compute
+  uint64 compute_units_consumed = 30;
+}
+
+// Batch of swap records, typically one per slot.
+message DexTradesBatch {
+  uint64 slot = 1;
+  int64  block_time = 2;
+  repeated SwapRecord records = 3;
+}

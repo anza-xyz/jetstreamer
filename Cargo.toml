@@ -1,5 +1,5 @@
 [workspace]
-members = ["jetstreamer-firehose", "jetstreamer-plugin", "jetstreamer-utils"]
+members = ["jetstreamer-firehose", "jetstreamer-plugin", "jetstreamer-utils", "jetstreamer-dex-trades"]
 
 [workspace.package]
 edition = "2024"
@@ -30,6 +30,7 @@ verify-transaction-signatures = ["jetstreamer-firehose/verify-transaction-signat
 jetstreamer-firehose = { path = "jetstreamer-firehose", version = "0.5.0" }
 jetstreamer-plugin = { path = "jetstreamer-plugin", version = "0.5.0" }
 jetstreamer-utils = { path = "jetstreamer-utils", version = "0.5.0" }
+jetstreamer-dex-trades = { path = "jetstreamer-dex-trades", version = "0.5.0" }
 tokio = "1"
 futures-util = { version = "0", default-features = false }
 futures = "0"
@@ -102,6 +103,8 @@ aws-credential-types = "1"
 aws-sdk-s3 = "1"
 aws-smithy-types = "1"
 aws-types = "1"
+chrono = { version = "0.4", default-features = false }
+byteorder = "1.5"
 
 [dependencies]
 tokio.workspace = true
@@ -110,6 +113,7 @@ log.workspace = true
 jetstreamer-firehose.workspace = true
 jetstreamer-plugin.workspace = true
 jetstreamer-utils.workspace = true
+jetstreamer-dex-trades.workspace = true
 url.workspace = true
 solana-sysvar.workspace = true
 solana-blake3-hasher.workspace = true

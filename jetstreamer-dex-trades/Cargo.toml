@@ -1,0 +1,48 @@
+[package]
+name = "jetstreamer-dex-trades"
+description = "Solana DEX trades decoder plugin for Jetstreamer — decodes swaps from 28+ DEX programs into protobuf SwapRecords"
+keywords.workspace = true
+edition.workspace = true
+version.workspace = true
+authors = ["topledger", "sam0x17", "anza-team"]
+license.workspace = true
+repository.workspace = true
+documentation.workspace = true
+
+[dependencies]
+jetstreamer-firehose.workspace = true
+jetstreamer-plugin.workspace = true
+
+# Solana types
+solana-address.workspace = true
+solana-message.workspace = true
+solana-transaction-status.workspace = true
+
+# Serialization
+borsh = "0.10"
+byteorder.workspace = true
+base64.workspace = true
+bs58.workspace = true
+
+# Protobuf
+prost.workspace = true
+
+# Async
+tokio.workspace = true
+futures-util.workspace = true
+
+# Data structures
+dashmap.workspace = true
+once_cell.workspace = true
+
+# Time
+chrono.workspace = true
+
+# Logging
+log.workspace = true
+
+# ClickHouse — required by the Plugin trait signature
+clickhouse.workspace = true
+
+[build-dependencies]
+prost-build = "0.13"

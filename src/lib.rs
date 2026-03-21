@@ -123,6 +123,7 @@
 pub use jetstreamer_firehose as firehose;
 pub use jetstreamer_plugin as plugin;
 pub use jetstreamer_utils as utils;
+pub use jetstreamer_dex_trades as dex_trades;
 
 use core::ops::Range;
 use jetstreamer_firehose::{epochs::slot_to_epoch, index::get_index_base_url};
@@ -569,6 +570,8 @@ pub enum BuiltinPlugin {
     ProgramTracking,
     /// Instruction Tracking.
     InstructionTracking,
+    /// DEX Trades — decodes swaps from 28+ Solana DEX programs.
+    DexTrades,
 }
 
 impl BuiltinPlugin {
@@ -576,6 +579,7 @@ impl BuiltinPlugin {
         match value {
             "program-tracking" => Some(Self::ProgramTracking),
             "instruction-tracking" => Some(Self::InstructionTracking),
+            "dex-trades" => Some(Self::DexTrades),
             _ => None,
         }
     }
@@ -584,6 +588,7 @@ impl BuiltinPlugin {
         match self {
             Self::ProgramTracking => Box::new(ProgramTrackingPlugin::new()),
             Self::InstructionTracking => Box::new(InstructionTrackingPlugin::new()),
+            Self::DexTrades => Box::new(jetstreamer_dex_trades::DexTradesPlugin::new()),
         }
     }
 }
@@ -632,7 +637,7 @@ pub fn parse_cli_args() -> Result<Config, Box<dyn std::error::Error>> {
                     .ok_or_else(|| "--with-plugin requires a plugin name".to_string())?;
                 let plugin = BuiltinPlugin::from_flag(&plugin_name).ok_or_else(|| {
                     format!(
-                        "unknown plugin '{plugin_name}'. expected 'program-tracking' or 'instruction-tracking'"
+                        "unknown plugin '{plugin_name}'. expected 'program-tracking', 'instruction-tracking', or 'dex-trades'"
                     )
                 })?;
                 builtin_plugins.push(plugin);

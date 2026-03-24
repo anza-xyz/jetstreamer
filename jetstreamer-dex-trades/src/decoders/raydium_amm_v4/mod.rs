@@ -4,7 +4,7 @@ use crate::registry::DexDecoder;
 use crate::token_transfers::{get_swap_amounts, get_token_account_info};
 use crate::transaction_ext::TransactionExt;
 use crate::types::SwapRecord;
-use base64::{engine::general_purpose::STANDARD, Engine};
+use base64::{Engine, engine::general_purpose::STANDARD};
 use byteorder::{LittleEndian, ReadBytesExt};
 use jetstreamer_firehose::firehose::TransactionData;
 use std::collections::HashMap;
@@ -65,6 +65,12 @@ pub struct RaydiumAmmV4Decoder {
     event_cache: RwLock<HashMap<String, HashMap<String, SwapInstructionLog>>>,
 }
 
+impl Default for RaydiumAmmV4Decoder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RaydiumAmmV4Decoder {
     pub fn new() -> Self {
         Self {
@@ -101,12 +107,11 @@ impl DexDecoder for RaydiumAmmV4Decoder {
 
         for (position, log_messages) in &log_map {
             for msg in log_messages {
-                if let Some(ray_data) = msg.strip_prefix("ray_log: ") {
-                    if let Ok(bytes) = STANDARD.decode(ray_data) {
-                        if let Some(log) = SwapInstructionLog::deserialize(&bytes) {
-                            events.insert(position.clone(), log);
-                        }
-                    }
+                if let Some(ray_data) = msg.strip_prefix("ray_log: ")
+                    && let Ok(bytes) = STANDARD.decode(ray_data)
+                    && let Some(log) = SwapInstructionLog::deserialize(&bytes)
+                {
+                    events.insert(position.clone(), log);
                 }
             }
         }
@@ -213,16 +218,14 @@ impl RaydiumAmmV4Decoder {
 
                 record.token_sold_mint = vault_a_info.mint.clone();
                 record.token_sold_vault = vault_a.to_string();
-                record.token_sold_amount =
-                    log.amount_in as f64 / 10f64.powi(sold_dec as i32);
+                record.token_sold_amount = log.amount_in as f64 / 10f64.powi(sold_dec as i32);
                 record.token_sold_decimals = sold_dec;
                 record.token_sold_vault_reserve =
                     log.pool_coin as f64 / 10f64.powi(sold_dec as i32);
 
                 record.token_bought_mint = vault_b_info.mint.clone();
                 record.token_bought_vault = vault_b.to_string();
-                record.token_bought_amount =
-                    log.out_amount as f64 / 10f64.powi(bought_dec as i32);
+                record.token_bought_amount = log.out_amount as f64 / 10f64.powi(bought_dec as i32);
                 record.token_bought_decimals = bought_dec;
                 record.token_bought_vault_reserve =
                     log.pool_pc as f64 / 10f64.powi(bought_dec as i32);
@@ -234,16 +237,13 @@ impl RaydiumAmmV4Decoder {
 
                 record.token_sold_mint = vault_b_info.mint.clone();
                 record.token_sold_vault = vault_b.to_string();
-                record.token_sold_amount =
-                    log.amount_in as f64 / 10f64.powi(sold_dec as i32);
+                record.token_sold_amount = log.amount_in as f64 / 10f64.powi(sold_dec as i32);
                 record.token_sold_decimals = sold_dec;
-                record.token_sold_vault_reserve =
-                    log.pool_pc as f64 / 10f64.powi(sold_dec as i32);
+                record.token_sold_vault_reserve = log.pool_pc as f64 / 10f64.powi(sold_dec as i32);
 
                 record.token_bought_mint = vault_a_info.mint.clone();
                 record.token_bought_vault = vault_a.to_string();
-                record.token_bought_amount =
-                    log.out_amount as f64 / 10f64.powi(bought_dec as i32);
+                record.token_bought_amount = log.out_amount as f64 / 10f64.powi(bought_dec as i32);
                 record.token_bought_decimals = bought_dec;
                 record.token_bought_vault_reserve =
                     log.pool_coin as f64 / 10f64.powi(bought_dec as i32);
@@ -266,8 +266,7 @@ impl RaydiumAmmV4Decoder {
         let outer_idx = ix.instruction_index() as usize;
         let inner_idx = ix.inner_instruction_index() as usize;
 
-        let swap =
-            get_swap_amounts(tx, outer_idx, inner_idx, vault_a, vault_b, None, false)?;
+        let swap = get_swap_amounts(tx, outer_idx, inner_idx, vault_a, vault_b, None, false)?;
 
         let mut record = SwapRecord::default();
         record.instruction_index = ix.instruction_index();

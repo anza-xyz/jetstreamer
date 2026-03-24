@@ -151,11 +151,7 @@ impl DexRegistry {
     ///
     /// `block_time` must be supplied because the public `TransactionData`
     /// struct does not include it.
-    pub fn decode_transaction(
-        &self,
-        tx: &TransactionData,
-        block_time: i64,
-    ) -> Vec<SwapRecord> {
+    pub fn decode_transaction(&self, tx: &TransactionData, block_time: i64) -> Vec<SwapRecord> {
         if tx.is_vote_transaction() || tx.is_failed() {
             return Vec::new();
         }
@@ -242,31 +238,31 @@ mod tests {
         let program_ids = registry.supported_program_ids();
 
         let expected = [
-            "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",  // Pump Fun
-            "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA",  // Pump AMM
-            "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8",  // Raydium AMM V4
-            "CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C",  // Raydium CPMM
-            "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK",  // Raydium CLMM
-            "LanMV9sAd7wArD4vJFi2qDdfnVhFxYSUg6eADduJ3uj",  // Raydium LaunchLab
-            "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc",  // Orca Whirlpool
-            "9W959DqEETiGZocYWCQPaJ6sBmUzgfxXfqGeTEdp3aQP",  // Orca V2
-            "cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG",  // Meteora DAMM V2
-            "dbcij3LWUppWqq96dh6gJWwBifmcGfLSB5D4DuSMaqN",  // Meteora DBC
-            "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo",  // Meteora DLMM
-            "Eo7WjKq67rjJQSZxS6z3YkapzY3eMj6Xy8X5EQVn5UaB",  // Meteora Pools
-            "MNFSTqtC93rEfYHB6hF82sKdZpUDFWkViLByLd1k1Ms",  // Manifest
-            "AQU1FRd7papthgdrwPTTq5JacJh8YtwEXaBfKU3bTz45",  // Aquifer
-            "obriQD1zbpyLz95G5n7nJe6a4DPjpFwa5XYPoNm113y",  // Obric V2
-            "swapNyd8XiQwJ6ianp9snpu4brUqFxadzvHebnAXjJZ",  // Stabble Stable
-            "swapFpHZwjELNnjvThjajtiVmkz3yPQEHjLtka2fwHW",  // Stabble Weighted
-            "EewxydAPCCVuNEyrVN68PuSYdQ7wKn27V9Gjeoi8dy3S",  // Lifinity V1
-            "2wT8Yq49kHgDzXuPxZSaeLaH1qbmGXtEyPy64bL7aD3c",  // Lifinity V2
-            "FUTARELBfJfQ8RDGhg1wdhddq1odMAJUePHFuBYfUxKq",  // Futarchy AMM
-            "HpNfyc2Saw7RKkQd8nEL4khUcuPhQ7WwY1B2qjx8jxFq",  // PancakeSwap CLMM
-            "REALQqNEomY6cQGZJUGwywTBD2UmDT32rZcNnfxQ5N2",  // Byreal CLMM
-            "SoLFiHG9TfgtdUXUjWAxi3LtvYuFyDLVhBWxdMZxyCe",  // SolFi V1
-            "SV2EYYJyRz2YhfXwXnhNAevDEui5Q6yrfyo13WtupPF",  // SolFi V2
-            "ALPHAQmeA7bjrVuccPsYPiCvsi428SNwte66Srvs4pHA",  // AlphaQ
+            "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P", // Pump Fun
+            "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA", // Pump AMM
+            "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8", // Raydium AMM V4
+            "CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C", // Raydium CPMM
+            "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK", // Raydium CLMM
+            "LanMV9sAd7wArD4vJFi2qDdfnVhFxYSUg6eADduJ3uj", // Raydium LaunchLab
+            "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc", // Orca Whirlpool
+            "9W959DqEETiGZocYWCQPaJ6sBmUzgfxXfqGeTEdp3aQP", // Orca V2
+            "cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG", // Meteora DAMM V2
+            "dbcij3LWUppWqq96dh6gJWwBifmcGfLSB5D4DuSMaqN", // Meteora DBC
+            "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo", // Meteora DLMM
+            "Eo7WjKq67rjJQSZxS6z3YkapzY3eMj6Xy8X5EQVn5UaB", // Meteora Pools
+            "MNFSTqtC93rEfYHB6hF82sKdZpUDFWkViLByLd1k1Ms", // Manifest
+            "AQU1FRd7papthgdrwPTTq5JacJh8YtwEXaBfKU3bTz45", // Aquifer
+            "obriQD1zbpyLz95G5n7nJe6a4DPjpFwa5XYPoNm113y", // Obric V2
+            "swapNyd8XiQwJ6ianp9snpu4brUqFxadzvHebnAXjJZ", // Stabble Stable
+            "swapFpHZwjELNnjvThjajtiVmkz3yPQEHjLtka2fwHW", // Stabble Weighted
+            "EewxydAPCCVuNEyrVN68PuSYdQ7wKn27V9Gjeoi8dy3S", // Lifinity V1
+            "2wT8Yq49kHgDzXuPxZSaeLaH1qbmGXtEyPy64bL7aD3c", // Lifinity V2
+            "FUTARELBfJfQ8RDGhg1wdhddq1odMAJUePHFuBYfUxKq", // Futarchy AMM
+            "HpNfyc2Saw7RKkQd8nEL4khUcuPhQ7WwY1B2qjx8jxFq", // PancakeSwap CLMM
+            "REALQqNEomY6cQGZJUGwywTBD2UmDT32rZcNnfxQ5N2", // Byreal CLMM
+            "SoLFiHG9TfgtdUXUjWAxi3LtvYuFyDLVhBWxdMZxyCe", // SolFi V1
+            "SV2EYYJyRz2YhfXwXnhNAevDEui5Q6yrfyo13WtupPF", // SolFi V2
+            "ALPHAQmeA7bjrVuccPsYPiCvsi428SNwte66Srvs4pHA", // AlphaQ
         ];
 
         for program_id in &expected {
@@ -284,11 +280,7 @@ mod tests {
         let program_ids = registry.supported_program_ids();
         let mut seen = std::collections::HashSet::new();
         for id in &program_ids {
-            assert!(
-                seen.insert(id),
-                "duplicate program ID registered: {}",
-                id
-            );
+            assert!(seen.insert(id), "duplicate program ID registered: {}", id);
         }
     }
 }

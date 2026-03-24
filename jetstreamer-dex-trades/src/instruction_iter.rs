@@ -146,7 +146,7 @@ impl Iterator for AllInstructionIter {
 
             if !self.in_inner_mode {
                 let ix = &self.instructions[outer_array_index];
-                let program_id = self.account_keys.get(ix.program_id_index as usize)?.clone();
+                let program_id = *self.account_keys.get(ix.program_id_index as usize)?;
                 let accounts = ix
                     .accounts
                     .iter()
@@ -171,10 +171,9 @@ impl Iterator for AllInstructionIter {
 
                 if inner_array_index < inner_set.instructions.len() {
                     let inner_ix = &inner_set.instructions[inner_array_index];
-                    let program_id = self
+                    let program_id = *self
                         .account_keys
-                        .get(inner_ix.instruction.program_id_index as usize)?
-                        .clone();
+                        .get(inner_ix.instruction.program_id_index as usize)?;
                     let accounts: Vec<Address> = inner_ix
                         .instruction
                         .accounts

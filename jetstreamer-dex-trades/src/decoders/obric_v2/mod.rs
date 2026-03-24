@@ -1,7 +1,7 @@
 use crate::instruction_iter::Instruction;
+use crate::registry::DexDecoder;
 use crate::token_transfers::{get_swap_amounts_partial, get_token_account_info};
 use crate::types::SwapRecord;
-use crate::registry::DexDecoder;
 use jetstreamer_firehose::firehose::TransactionData;
 
 const PROGRAM_ID: &str = "obriQD1zbpyLz95G5n7nJe6a4DPjpFwa5XYPoNm113y";
@@ -61,23 +61,23 @@ impl DexDecoder for ObricV2Decoder {
             &quote_info,
         )?;
 
-        let sold = partial.sold.unwrap_or_else(|| {
-            crate::token_transfers::TransferInfo {
+        let sold = partial
+            .sold
+            .unwrap_or_else(|| crate::token_transfers::TransferInfo {
                 mint: base_info.mint.clone(),
                 vault: base_vault.clone(),
                 amount: 0,
                 decimals: base_info.decimals,
-            }
-        });
+            });
 
-        let bought = partial.bought.unwrap_or_else(|| {
-            crate::token_transfers::TransferInfo {
+        let bought = partial
+            .bought
+            .unwrap_or_else(|| crate::token_transfers::TransferInfo {
                 mint: quote_info.mint.clone(),
                 vault: quote_vault.clone(),
                 amount: 0,
                 decimals: quote_info.decimals,
-            }
-        });
+            });
 
         let _ = data;
 
@@ -102,10 +102,12 @@ impl DexDecoder for ObricV2Decoder {
 
         let sold_vault_info = get_token_account_info(tx, &record.token_sold_vault);
         let bought_vault_info = get_token_account_info(tx, &record.token_bought_vault);
-        record.token_sold_vault_reserve =
-            sold_vault_info.map(|i| i.post_balance_scaled()).unwrap_or(0.0);
-        record.token_bought_vault_reserve =
-            bought_vault_info.map(|i| i.post_balance_scaled()).unwrap_or(0.0);
+        record.token_sold_vault_reserve = sold_vault_info
+            .map(|i| i.post_balance_scaled())
+            .unwrap_or(0.0);
+        record.token_bought_vault_reserve = bought_vault_info
+            .map(|i| i.post_balance_scaled())
+            .unwrap_or(0.0);
 
         Some(record)
     }

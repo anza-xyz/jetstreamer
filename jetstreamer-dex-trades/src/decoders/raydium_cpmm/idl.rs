@@ -25,7 +25,7 @@ pub struct SwapEvent {
 
 pub mod events {
     use super::*;
-    use base64::{engine::general_purpose::STANDARD, Engine};
+    use base64::{Engine, engine::general_purpose::STANDARD};
 
     /// Decode a SwapEvent from a base64-encoded `Program data:` log entry.
     /// The decoded bytes start with the SwapEvent discriminator (8 bytes)

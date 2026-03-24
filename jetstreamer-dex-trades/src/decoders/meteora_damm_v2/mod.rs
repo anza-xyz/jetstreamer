@@ -19,11 +19,17 @@ const VAULT_B_INDEX: usize = 4;
 
 struct EventCache {
     events: VecDeque<idl::SwapEvent>,
-    truncated: bool,
+    _truncated: bool,
 }
 
 pub struct MeteoraDammV2Decoder {
     cache: RwLock<HashMap<String, EventCache>>,
+}
+
+impl Default for MeteoraDammV2Decoder {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl MeteoraDammV2Decoder {
@@ -72,8 +78,7 @@ impl MeteoraDammV2Decoder {
             // A → B: selling A, buying B
             record.token_sold_mint = info_a.mint.clone();
             record.token_sold_vault = vault_a.to_string();
-            record.token_sold_amount =
-                event.amount_in as f64 / 10f64.powi(info_a.decimals as i32);
+            record.token_sold_amount = event.amount_in as f64 / 10f64.powi(info_a.decimals as i32);
             record.token_sold_decimals = info_a.decimals;
             record.token_sold_vault_reserve = info_a.post_balance_scaled();
 
@@ -87,8 +92,7 @@ impl MeteoraDammV2Decoder {
             // B → A: selling B, buying A
             record.token_sold_mint = info_b.mint.clone();
             record.token_sold_vault = vault_b.to_string();
-            record.token_sold_amount =
-                event.amount_in as f64 / 10f64.powi(info_b.decimals as i32);
+            record.token_sold_amount = event.amount_in as f64 / 10f64.powi(info_b.decimals as i32);
             record.token_sold_decimals = info_b.decimals;
             record.token_sold_vault_reserve = info_b.post_balance_scaled();
 
@@ -191,7 +195,13 @@ impl DexDecoder for MeteoraDammV2Decoder {
 
         let tx_id = tx.signature.to_string();
         let mut cache = self.cache.write().unwrap();
-        cache.insert(tx_id, EventCache { events, truncated });
+        cache.insert(
+            tx_id,
+            EventCache {
+                events,
+                _truncated: truncated,
+            },
+        );
     }
 
     fn decode_instruction(
@@ -206,10 +216,10 @@ impl DexDecoder for MeteoraDammV2Decoder {
 
         let tx_id = tx.signature.to_string();
 
-        if let Some(event) = self.pop_event(&tx_id) {
-            if let Some(record) = self.decode_from_event(tx, ix, outer_program, &event) {
-                return Some(record);
-            }
+        if let Some(event) = self.pop_event(&tx_id)
+            && let Some(record) = self.decode_from_event(tx, ix, outer_program, &event)
+        {
+            return Some(record);
         }
 
         self.decode_from_transfers(tx, ix, outer_program)

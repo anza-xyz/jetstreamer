@@ -50,15 +50,17 @@ impl DexTradesPlugin {
     }
 
     /// Create a plugin with a callback that receives `(slot, protobuf_bytes)`.
-    pub fn with_batch_callback(
-        callback: impl Fn(u64, Vec<u8>) + Send + Sync + 'static,
-    ) -> Self {
+    pub fn with_batch_callback(callback: impl Fn(u64, Vec<u8>) + Send + Sync + 'static) -> Self {
         Self {
             on_batch: Some(Arc::new(callback)),
         }
     }
 
-    fn flush_slot(slot: u64, block_time: i64, on_batch: &Option<Arc<dyn Fn(u64, Vec<u8>) + Send + Sync>>) {
+    fn flush_slot(
+        slot: u64,
+        block_time: i64,
+        on_batch: &Option<Arc<dyn Fn(u64, Vec<u8>) + Send + Sync>>,
+    ) {
         if let Some((_, records)) = PENDING_BY_SLOT.remove(&slot) {
             if records.is_empty() {
                 return;
@@ -86,21 +88,43 @@ impl DexTradesPlugin {
                          txn_fee:     {:.9}  priority_fee: {:.9}  jito_tips: {:.9}\n\
                          sqrt_price:  {}  direction: {}\n\
                          CU consumed: {}",
-                        slot, block_date, i + 1, records.len(),
+                        slot,
+                        block_date,
+                        i + 1,
+                        records.len(),
                         r.tx_id,
-                        r.tx_index, r.instruction_index, r.inner_instruction_index, r.is_inner_instruction,
+                        r.tx_index,
+                        r.instruction_index,
+                        r.inner_instruction_index,
+                        r.is_inner_instruction,
                         r.instruction_type,
                         r.outer_program,
                         r.inner_program,
                         r.pool_address,
                         r.signer,
-                        r.token_bought_mint, r.token_bought_decimals, r.token_bought_amount,
-                        r.token_bought_vault, r.token_bought_vault_reserve,
-                        r.token_sold_mint, r.token_sold_decimals, r.token_sold_amount,
-                        r.token_sold_vault, r.token_sold_vault_reserve,
-                        r.txn_fee, r.priority_fee, r.jito_tips,
-                        if r.sqrt_price.is_empty() { "-" } else { &r.sqrt_price },
-                        match r.is_base_to_quote { Some(true) => "base→quote", Some(false) => "quote→base", None => "-" },
+                        r.token_bought_mint,
+                        r.token_bought_decimals,
+                        r.token_bought_amount,
+                        r.token_bought_vault,
+                        r.token_bought_vault_reserve,
+                        r.token_sold_mint,
+                        r.token_sold_decimals,
+                        r.token_sold_amount,
+                        r.token_sold_vault,
+                        r.token_sold_vault_reserve,
+                        r.txn_fee,
+                        r.priority_fee,
+                        r.jito_tips,
+                        if r.sqrt_price.is_empty() {
+                            "-"
+                        } else {
+                            &r.sqrt_price
+                        },
+                        match r.is_base_to_quote {
+                            Some(true) => "base→quote",
+                            Some(false) => "quote→base",
+                            None => "-",
+                        },
                         r.compute_units_consumed,
                     );
                 }

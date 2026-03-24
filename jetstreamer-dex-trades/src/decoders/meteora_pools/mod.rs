@@ -56,26 +56,27 @@ impl DexDecoder for MeteoraPoolsDecoder {
         let truncated = LogParser::is_truncated(&logs);
 
         if !truncated {
-            let position = format!("{}.{}", ix.instruction_index(), ix.inner_instruction_index());
+            let position = format!(
+                "{}.{}",
+                ix.instruction_index(),
+                ix.inner_instruction_index()
+            );
             let data_events = LogParser::extract_program_data_by_position(&logs, PROGRAM_ID);
             if let Some(events) = data_events.get(&position) {
                 for event_data in events {
                     if let Ok(decoded) = base64::Engine::decode(
                         &base64::engine::general_purpose::STANDARD,
                         event_data,
-                    ) {
-                        if let Some(_event) = idl::events::decode_swap_event(&decoded) {
-                            // Event has no direction info — must still use transfers
-                            // to determine which token was bought vs sold.
-                        }
+                    ) && let Some(_event) = idl::events::decode_swap_event(&decoded)
+                    {
+                        // Event has no direction info — must still use transfers
+                        // to determine which token was bought vs sold.
                     }
                 }
             }
         }
 
-        let swap = get_swap_amounts(
-            tx, outer_idx, inner_idx, &vault_a, &vault_b, None, false,
-        )?;
+        let swap = get_swap_amounts(tx, outer_idx, inner_idx, &vault_a, &vault_b, None, false)?;
 
         let vault_a_reserve = get_token_account_info(tx, &vault_a)
             .map(|i| i.post_balance_scaled())

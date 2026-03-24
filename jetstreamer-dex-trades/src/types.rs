@@ -249,10 +249,12 @@ mod tests {
     #[test]
     fn test_swap_record_validate_missing_pool_is_ok_for_poolless() {
         let mut record = sample_swap_record();
-        record.outer_program =
-            "AQU1FRd7papthgdrwPTTq5JacJh8YtwEXaBfKU3bTz45".to_string();
+        record.outer_program = "AQU1FRd7papthgdrwPTTq5JacJh8YtwEXaBfKU3bTz45".to_string();
         record.pool_address = String::new();
-        assert!(record.validate().is_ok(), "poolless programs should pass without pool_address");
+        assert!(
+            record.validate().is_ok(),
+            "poolless programs should pass without pool_address"
+        );
     }
 
     #[test]
@@ -266,7 +268,10 @@ mod tests {
         assert_eq!(proto.tx_id, record.tx_id);
         assert_eq!(proto.tx_index, record.tx_index);
         assert_eq!(proto.instruction_index, record.instruction_index);
-        assert_eq!(proto.inner_instruction_index, record.inner_instruction_index);
+        assert_eq!(
+            proto.inner_instruction_index,
+            record.inner_instruction_index
+        );
         assert_eq!(proto.is_inner_instruction, record.is_inner_instruction);
         assert_eq!(proto.instruction_type, record.instruction_type);
         assert_eq!(proto.outer_program, record.outer_program);
@@ -307,7 +312,10 @@ mod tests {
         let decoded = crate::proto::DexTradesBatch::decode(bytes.as_slice()).unwrap();
         assert_eq!(decoded.slot, 280_000_000);
         assert_eq!(decoded.records.len(), 1);
-        assert_eq!(decoded.records[0].tx_id, "5VERv8NMvzbJMEkV8xnrLkEaWRtSz9Cos");
+        assert_eq!(
+            decoded.records[0].tx_id,
+            "5VERv8NMvzbJMEkV8xnrLkEaWRtSz9Cos"
+        );
     }
 
     #[test]

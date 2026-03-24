@@ -31,6 +31,7 @@ fn read_option_u64(cursor: &mut Cursor<&[u8]>) -> Option<Option<u64>> {
 
 /// Pump AMM BuyEvent — variable size due to optional coin_creator fields (V0 vs V1).
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct BuyEvent {
     pub timestamp: i64,
     pub base_amount_out: u64,
@@ -120,6 +121,7 @@ impl BuyEvent {
 
 /// Pump AMM SellEvent — variable size due to optional coin_creator fields.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct SellEvent {
     pub timestamp: i64,
     pub base_amount_in: u64,

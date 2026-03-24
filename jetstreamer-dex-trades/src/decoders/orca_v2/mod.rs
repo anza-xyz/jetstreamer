@@ -30,14 +30,13 @@ impl DexDecoder for OrcaV2Decoder {
         }
 
         let accounts = ix.accounts();
-        let pool = accounts.get(0)?.to_string();
+        let pool = accounts.first()?.to_string();
         let vault_a = accounts.get(4)?.to_string();
         let vault_b = accounts.get(5)?.to_string();
 
         let outer_idx = ix.instruction_index() as usize;
         let inner_idx = ix.inner_instruction_index() as usize;
-        let amounts =
-            get_swap_amounts(tx, outer_idx, inner_idx, &vault_a, &vault_b, None, false)?;
+        let amounts = get_swap_amounts(tx, outer_idx, inner_idx, &vault_a, &vault_b, None, false)?;
 
         let mut record = SwapRecord::default();
         record.instruction_index = ix.instruction_index();

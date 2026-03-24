@@ -12,6 +12,7 @@ pub const EVENT_WRAPPER_DISC: [u8; 8] = [228, 69, 165, 46, 81, 203, 154, 29];
 
 /// Meteora Pools swap event — contains amounts and fees but NO direction info.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct SwapEvent {
     pub in_amount: u64,
     pub out_amount: u64,

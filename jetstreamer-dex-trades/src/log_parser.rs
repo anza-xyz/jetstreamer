@@ -63,15 +63,14 @@ impl LogParser {
                 if let Some(pos) = stack.iter().rposition(|ctx| ctx.program_id == program_id) {
                     stack.remove(pos);
                 }
-            } else if let Some(log_msg) = log.strip_prefix("Program log: ") {
-                if let Some(ctx) = stack.last() {
-                    if ctx.program_id == target_program {
-                        result
-                            .entry(ctx.instruction_position.clone())
-                            .or_default()
-                            .push(log_msg.to_string());
-                    }
-                }
+            } else if let Some(log_msg) = log.strip_prefix("Program log: ")
+                && let Some(ctx) = stack.last()
+                && ctx.program_id == target_program
+            {
+                result
+                    .entry(ctx.instruction_position.clone())
+                    .or_default()
+                    .push(log_msg.to_string());
             }
         }
 
@@ -99,15 +98,14 @@ impl LogParser {
                 if let Some(pos) = stack.iter().rposition(|ctx| ctx.program_id == program_id) {
                     stack.remove(pos);
                 }
-            } else if let Some(data) = log.strip_prefix("Program data: ") {
-                if let Some(ctx) = stack.last() {
-                    if ctx.program_id == target_program {
-                        result
-                            .entry(ctx.instruction_position.clone())
-                            .or_default()
-                            .push(data.to_string());
-                    }
-                }
+            } else if let Some(data) = log.strip_prefix("Program data: ")
+                && let Some(ctx) = stack.last()
+                && ctx.program_id == target_program
+            {
+                result
+                    .entry(ctx.instruction_position.clone())
+                    .or_default()
+                    .push(data.to_string());
             }
         }
 

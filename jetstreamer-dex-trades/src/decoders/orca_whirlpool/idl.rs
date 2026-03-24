@@ -40,7 +40,7 @@ impl SwapEvent {
 
 pub mod events {
     use super::*;
-    use base64::{engine::general_purpose::STANDARD, Engine};
+    use base64::{Engine, engine::general_purpose::STANDARD};
 
     pub fn decode_swap_event_from_log(data: &str) -> Option<SwapEvent> {
         let bytes = STANDARD.decode(data).ok()?;

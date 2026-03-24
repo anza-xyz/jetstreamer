@@ -26,6 +26,12 @@ pub struct RaydiumLaunchLabDecoder {
     cache: RwLock<HashMap<String, EventCache>>,
 }
 
+impl Default for RaydiumLaunchLabDecoder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RaydiumLaunchLabDecoder {
     pub fn new() -> Self {
         Self {
@@ -99,9 +105,7 @@ impl DexDecoder for RaydiumLaunchLabDecoder {
 
         let tx_id = tx.signature.to_string();
         let mut cache = self.cache.write().unwrap();
-        let event = cache
-            .get_mut(&tx_id)
-            .and_then(|e| e.events.pop_front());
+        let event = cache.get_mut(&tx_id).and_then(|e| e.events.pop_front());
         drop(cache);
 
         if let Some(event) = event {
@@ -147,16 +151,14 @@ impl RaydiumLaunchLabDecoder {
 
             record.token_sold_mint = base_info.mint.clone();
             record.token_sold_vault = base_vault_addr;
-            record.token_sold_amount =
-                event.input_amount as f64 / 10f64.powi(in_dec as i32);
+            record.token_sold_amount = event.input_amount as f64 / 10f64.powi(in_dec as i32);
             record.token_sold_decimals = in_dec;
             record.token_sold_vault_reserve =
                 event.input_vault_after as f64 / 10f64.powi(in_dec as i32);
 
             record.token_bought_mint = quote_info.mint.clone();
             record.token_bought_vault = quote_vault_addr;
-            record.token_bought_amount =
-                event.output_amount as f64 / 10f64.powi(out_dec as i32);
+            record.token_bought_amount = event.output_amount as f64 / 10f64.powi(out_dec as i32);
             record.token_bought_decimals = out_dec;
             record.token_bought_vault_reserve =
                 event.output_vault_after as f64 / 10f64.powi(out_dec as i32);
@@ -167,16 +169,14 @@ impl RaydiumLaunchLabDecoder {
 
             record.token_sold_mint = quote_info.mint.clone();
             record.token_sold_vault = quote_vault_addr;
-            record.token_sold_amount =
-                event.input_amount as f64 / 10f64.powi(in_dec as i32);
+            record.token_sold_amount = event.input_amount as f64 / 10f64.powi(in_dec as i32);
             record.token_sold_decimals = in_dec;
             record.token_sold_vault_reserve =
                 event.input_vault_after as f64 / 10f64.powi(in_dec as i32);
 
             record.token_bought_mint = base_info.mint.clone();
             record.token_bought_vault = base_vault_addr;
-            record.token_bought_amount =
-                event.output_amount as f64 / 10f64.powi(out_dec as i32);
+            record.token_bought_amount = event.output_amount as f64 / 10f64.powi(out_dec as i32);
             record.token_bought_decimals = out_dec;
             record.token_bought_vault_reserve =
                 event.output_vault_after as f64 / 10f64.powi(out_dec as i32);

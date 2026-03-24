@@ -62,9 +62,7 @@ pub struct PartialSwapAmounts {
 /// Get token account info from pre/post token balances.
 pub fn get_token_account_info(tx: &TransactionData, account: &str) -> Option<TokenAccountInfo> {
     let account_keys = get_all_account_keys(tx);
-    let account_index = account_keys
-        .iter()
-        .position(|k| k.to_string() == account)?;
+    let account_index = account_keys.iter().position(|k| k.to_string() == account)?;
 
     let pre_balances = tx
         .transaction_status_meta
@@ -131,7 +129,7 @@ pub fn get_swap_amounts(
         if t.destination == vault_a {
             let entry = &mut vault_a_in;
             if take_largest {
-                if entry.as_ref().map_or(true, |e| t.amount > e.0) {
+                if entry.as_ref().is_none_or(|e| t.amount > e.0) {
                     *entry = Some((t.amount, t.source.clone(), t.mint.clone()));
                 }
             } else if entry.is_none() {
@@ -140,7 +138,7 @@ pub fn get_swap_amounts(
         } else if t.source == vault_a {
             let entry = &mut vault_a_out;
             if take_largest {
-                if entry.as_ref().map_or(true, |e| t.amount > e.0) {
+                if entry.as_ref().is_none_or(|e| t.amount > e.0) {
                     *entry = Some((t.amount, t.destination.clone(), t.mint.clone()));
                 }
             } else if entry.is_none() {
@@ -151,7 +149,7 @@ pub fn get_swap_amounts(
         if t.destination == vault_b {
             let entry = &mut vault_b_in;
             if take_largest {
-                if entry.as_ref().map_or(true, |e| t.amount > e.0) {
+                if entry.as_ref().is_none_or(|e| t.amount > e.0) {
                     *entry = Some((t.amount, t.source.clone(), t.mint.clone()));
                 }
             } else if entry.is_none() {
@@ -160,7 +158,7 @@ pub fn get_swap_amounts(
         } else if t.source == vault_b {
             let entry = &mut vault_b_out;
             if take_largest {
-                if entry.as_ref().map_or(true, |e| t.amount > e.0) {
+                if entry.as_ref().is_none_or(|e| t.amount > e.0) {
                     *entry = Some((t.amount, t.destination.clone(), t.mint.clone()));
                 }
             } else if entry.is_none() {
@@ -170,36 +168,39 @@ pub fn get_swap_amounts(
     }
 
     // Determine direction: user sends to one vault, receives from the other
-    let (sold_vault, sold_amount, sold_mint, bought_vault, bought_amount, bought_mint) =
-        if vault_a_in.is_some() && vault_b_out.is_some() {
-            let a_in = vault_a_in.unwrap();
-            let b_out = vault_b_out.unwrap();
-            (
-                vault_a.to_string(),
-                a_in.0,
-                a_in.2,
-                vault_b.to_string(),
-                b_out.0,
-                b_out.2,
-            )
-        } else if vault_b_in.is_some() && vault_a_out.is_some() {
-            let b_in = vault_b_in.unwrap();
-            let a_out = vault_a_out.unwrap();
-            (
-                vault_b.to_string(),
-                b_in.0,
-                b_in.2,
-                vault_a.to_string(),
-                a_out.0,
-                a_out.2,
-            )
-        } else {
+    let (sold_vault, sold_amount, sold_mint, bought_vault, bought_amount, bought_mint) = match (
+        &vault_a_in,
+        &vault_b_out,
+        &vault_b_in,
+        &vault_a_out,
+    ) {
+        (Some(a_in), Some(b_out), _, _) => (
+            vault_a.to_string(),
+            a_in.0,
+            a_in.2.clone(),
+            vault_b.to_string(),
+            b_out.0,
+            b_out.2.clone(),
+        ),
+        (_, _, Some(b_in), Some(a_out)) => (
+            vault_b.to_string(),
+            b_in.0,
+            b_in.2.clone(),
+            vault_a.to_string(),
+            a_out.0,
+            a_out.2.clone(),
+        ),
+        _ => {
             log::debug!(
                 "get_swap_amounts: no matching transfer pattern (vault_a_in={}, vault_a_out={}, vault_b_in={}, vault_b_out={})",
-                vault_a_in.is_some(), vault_a_out.is_some(), vault_b_in.is_some(), vault_b_out.is_some()
+                vault_a_in.is_some(),
+                vault_a_out.is_some(),
+                vault_b_in.is_some(),
+                vault_b_out.is_some()
             );
             return None;
-        };
+        }
+    };
 
     let sold_info = get_token_account_info(tx, &sold_vault)?;
     let bought_info = get_token_account_info(tx, &bought_vault)?;
@@ -355,10 +356,10 @@ fn extract_transfers(
             .map(|a| a.to_string())
             .unwrap_or_default();
 
-        if let Some(excluded) = exclude_accounts {
-            if excluded.contains(&source.as_str()) || excluded.contains(&destination.as_str()) {
-                continue;
-            }
+        if let Some(excluded) = exclude_accounts
+            && (excluded.contains(&source.as_str()) || excluded.contains(&destination.as_str()))
+        {
+            continue;
         }
 
         // Resolve mint from token balances

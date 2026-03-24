@@ -4,6 +4,7 @@ use std::io::Cursor;
 const PUBKEY_LEN: usize = 32;
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct TradeEvent {
     pub mint: [u8; 32],
     pub sol_amount: u64,

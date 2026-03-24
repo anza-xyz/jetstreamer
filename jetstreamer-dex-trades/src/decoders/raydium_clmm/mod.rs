@@ -26,6 +26,12 @@ pub struct RaydiumClmmDecoder {
     cache: RwLock<HashMap<String, EventCache>>,
 }
 
+impl Default for RaydiumClmmDecoder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RaydiumClmmDecoder {
     pub fn new() -> Self {
         Self {
@@ -99,9 +105,7 @@ impl DexDecoder for RaydiumClmmDecoder {
 
         let tx_id = tx.signature.to_string();
         let mut cache = self.cache.write().unwrap();
-        let event = cache
-            .get_mut(&tx_id)
-            .and_then(|e| e.events.pop_front());
+        let event = cache.get_mut(&tx_id).and_then(|e| e.events.pop_front());
         drop(cache);
 
         if let Some(event) = event {
@@ -144,27 +148,23 @@ impl RaydiumClmmDecoder {
             // Selling token_0 → buying token_1
             record.token_sold_mint = info_0.mint.clone();
             record.token_sold_vault = vault_0;
-            record.token_sold_amount =
-                event.amount_0 as f64 / 10f64.powi(info_0.decimals as i32);
+            record.token_sold_amount = event.amount_0 as f64 / 10f64.powi(info_0.decimals as i32);
             record.token_sold_decimals = info_0.decimals;
 
             record.token_bought_mint = info_1.mint.clone();
             record.token_bought_vault = vault_1;
-            record.token_bought_amount =
-                event.amount_1 as f64 / 10f64.powi(info_1.decimals as i32);
+            record.token_bought_amount = event.amount_1 as f64 / 10f64.powi(info_1.decimals as i32);
             record.token_bought_decimals = info_1.decimals;
         } else {
             // Selling token_1 → buying token_0
             record.token_sold_mint = info_1.mint.clone();
             record.token_sold_vault = vault_1;
-            record.token_sold_amount =
-                event.amount_1 as f64 / 10f64.powi(info_1.decimals as i32);
+            record.token_sold_amount = event.amount_1 as f64 / 10f64.powi(info_1.decimals as i32);
             record.token_sold_decimals = info_1.decimals;
 
             record.token_bought_mint = info_0.mint.clone();
             record.token_bought_vault = vault_0;
-            record.token_bought_amount =
-                event.amount_0 as f64 / 10f64.powi(info_0.decimals as i32);
+            record.token_bought_amount = event.amount_0 as f64 / 10f64.powi(info_0.decimals as i32);
             record.token_bought_decimals = info_0.decimals;
         }
 
@@ -186,15 +186,7 @@ impl RaydiumClmmDecoder {
         let outer_idx = ix.instruction_index() as usize;
         let inner_idx = ix.inner_instruction_index() as usize;
 
-        let swap = get_swap_amounts(
-            tx,
-            outer_idx,
-            inner_idx,
-            &vault_a,
-            &vault_b,
-            None,
-            false,
-        )?;
+        let swap = get_swap_amounts(tx, outer_idx, inner_idx, &vault_a, &vault_b, None, false)?;
 
         let mut record = SwapRecord::default();
         record.instruction_index = ix.instruction_index();

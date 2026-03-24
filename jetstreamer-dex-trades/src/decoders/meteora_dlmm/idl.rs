@@ -1,5 +1,5 @@
+use base64::{Engine, engine::general_purpose::STANDARD};
 use borsh::BorshDeserialize;
-use base64::{engine::general_purpose::STANDARD, Engine};
 
 pub const SWAP_DISC: [u8; 8] = [248, 198, 158, 145, 225, 117, 135, 200];
 

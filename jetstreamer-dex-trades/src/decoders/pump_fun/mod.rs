@@ -49,10 +49,8 @@ impl DexDecoder for PumpFunDecoder {
             user.to_string()
         };
 
-        let sol_amount_scaled =
-            event.sol_amount as f64 / 10f64.powi(SOL_DECIMALS as i32);
-        let token_amount_scaled =
-            event.token_amount as f64 / 10f64.powi(TOKEN_DECIMALS as i32);
+        let sol_amount_scaled = event.sol_amount as f64 / 10f64.powi(SOL_DECIMALS as i32);
+        let token_amount_scaled = event.token_amount as f64 / 10f64.powi(TOKEN_DECIMALS as i32);
 
         let mut record = SwapRecord::default();
 

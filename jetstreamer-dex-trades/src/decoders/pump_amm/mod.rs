@@ -32,12 +32,8 @@ impl DexDecoder for PumpAmmDecoder {
         let trade_event = idl::events::decode_trade_event(data)?;
 
         match trade_event {
-            idl::events::TradeEvent::Buy(event) => {
-                self.decode_buy(tx, ix, outer_program, &event)
-            }
-            idl::events::TradeEvent::Sell(event) => {
-                self.decode_sell(tx, ix, outer_program, &event)
-            }
+            idl::events::TradeEvent::Buy(event) => self.decode_buy(tx, ix, outer_program, &event),
+            idl::events::TradeEvent::Sell(event) => self.decode_sell(tx, ix, outer_program, &event),
         }
     }
 }
@@ -59,7 +55,10 @@ impl PumpAmmDecoder {
         let quote_info = get_token_account_info(tx, &user_quote_account.to_string());
 
         let base_decimals = base_info.as_ref().map(|i| i.decimals).unwrap_or(6);
-        let quote_decimals = quote_info.as_ref().map(|i| i.decimals).unwrap_or(SOL_DECIMALS);
+        let quote_decimals = quote_info
+            .as_ref()
+            .map(|i| i.decimals)
+            .unwrap_or(SOL_DECIMALS);
         let base_mint = base_info
             .as_ref()
             .map(|i| i.mint.clone())
@@ -70,8 +69,7 @@ impl PumpAmmDecoder {
             .unwrap_or_else(|| SOL_MINT.to_string());
 
         let base_amount = event.base_amount_out as f64 / 10f64.powi(base_decimals as i32);
-        let quote_amount =
-            event.quote_amount_in as f64 / 10f64.powi(quote_decimals as i32);
+        let quote_amount = event.quote_amount_in as f64 / 10f64.powi(quote_decimals as i32);
 
         let pool_base_reserve =
             event.pool_base_token_reserves as f64 / 10f64.powi(base_decimals as i32);
@@ -119,7 +117,10 @@ impl PumpAmmDecoder {
         let quote_info = get_token_account_info(tx, &user_quote_account.to_string());
 
         let base_decimals = base_info.as_ref().map(|i| i.decimals).unwrap_or(6);
-        let quote_decimals = quote_info.as_ref().map(|i| i.decimals).unwrap_or(SOL_DECIMALS);
+        let quote_decimals = quote_info
+            .as_ref()
+            .map(|i| i.decimals)
+            .unwrap_or(SOL_DECIMALS);
         let base_mint = base_info
             .as_ref()
             .map(|i| i.mint.clone())
@@ -130,8 +131,7 @@ impl PumpAmmDecoder {
             .unwrap_or_else(|| SOL_MINT.to_string());
 
         let base_amount = event.base_amount_in as f64 / 10f64.powi(base_decimals as i32);
-        let quote_amount =
-            event.quote_amount_out as f64 / 10f64.powi(quote_decimals as i32);
+        let quote_amount = event.quote_amount_out as f64 / 10f64.powi(quote_decimals as i32);
 
         let pool_base_reserve =
             event.pool_base_token_reserves as f64 / 10f64.powi(base_decimals as i32);

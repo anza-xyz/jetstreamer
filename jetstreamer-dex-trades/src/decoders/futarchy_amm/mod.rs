@@ -1,9 +1,9 @@
 pub mod idl;
 
 use crate::instruction_iter::Instruction;
+use crate::registry::DexDecoder;
 use crate::token_transfers::get_token_account_info;
 use crate::types::SwapRecord;
-use crate::registry::DexDecoder;
 use jetstreamer_firehose::firehose::TransactionData;
 use solana_address::Address;
 use std::collections::HashMap;
@@ -20,6 +20,12 @@ struct InstructionContext {
 
 pub struct FutarchyAmmDecoder {
     context_cache: RwLock<HashMap<String, Vec<InstructionContext>>>,
+}
+
+impl Default for FutarchyAmmDecoder {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl FutarchyAmmDecoder {
@@ -68,10 +74,10 @@ impl DexDecoder for FutarchyAmmDecoder {
             let _ = data;
         }
 
-        if !contexts.is_empty() {
-            if let Ok(mut cache) = self.context_cache.write() {
-                cache.insert(tx_id, contexts);
-            }
+        if !contexts.is_empty()
+            && let Ok(mut cache) = self.context_cache.write()
+        {
+            cache.insert(tx_id, contexts);
         }
     }
 
@@ -140,12 +146,18 @@ impl FutarchyAmmDecoder {
         let base_decimals = base_info.as_ref().map(|i| i.decimals).unwrap_or(6);
         let quote_decimals = quote_info.as_ref().map(|i| i.decimals).unwrap_or(6);
 
-        let input_scaled = event.input_amount as f64 / 10f64.powi(
-            if event.swap_type == idl::SwapType::Buy { quote_decimals } else { base_decimals } as i32
-        );
-        let output_scaled = event.output_amount as f64 / 10f64.powi(
-            if event.swap_type == idl::SwapType::Buy { base_decimals } else { quote_decimals } as i32
-        );
+        let input_scaled = event.input_amount as f64
+            / 10f64.powi(if event.swap_type == idl::SwapType::Buy {
+                quote_decimals
+            } else {
+                base_decimals
+            } as i32);
+        let output_scaled = event.output_amount as f64
+            / 10f64.powi(if event.swap_type == idl::SwapType::Buy {
+                base_decimals
+            } else {
+                quote_decimals
+            } as i32);
 
         let mut record = SwapRecord::default();
         record.instruction_index = ix.instruction_index();
@@ -182,10 +194,12 @@ impl FutarchyAmmDecoder {
 
         let sold_vault_info = get_token_account_info(tx, &record.token_sold_vault);
         let bought_vault_info = get_token_account_info(tx, &record.token_bought_vault);
-        record.token_sold_vault_reserve =
-            sold_vault_info.map(|i| i.post_balance_scaled()).unwrap_or(0.0);
-        record.token_bought_vault_reserve =
-            bought_vault_info.map(|i| i.post_balance_scaled()).unwrap_or(0.0);
+        record.token_sold_vault_reserve = sold_vault_info
+            .map(|i| i.post_balance_scaled())
+            .unwrap_or(0.0);
+        record.token_bought_vault_reserve = bought_vault_info
+            .map(|i| i.post_balance_scaled())
+            .unwrap_or(0.0);
 
         Some(record)
     }
@@ -220,12 +234,18 @@ impl FutarchyAmmDecoder {
         let base_decimals = base_info.as_ref().map(|i| i.decimals).unwrap_or(6);
         let quote_decimals = quote_info.as_ref().map(|i| i.decimals).unwrap_or(6);
 
-        let input_scaled = event.input_amount as f64 / 10f64.powi(
-            if event.swap_type == idl::SwapType::Buy { quote_decimals } else { base_decimals } as i32
-        );
-        let output_scaled = event.output_amount as f64 / 10f64.powi(
-            if event.swap_type == idl::SwapType::Buy { base_decimals } else { quote_decimals } as i32
-        );
+        let input_scaled = event.input_amount as f64
+            / 10f64.powi(if event.swap_type == idl::SwapType::Buy {
+                quote_decimals
+            } else {
+                base_decimals
+            } as i32);
+        let output_scaled = event.output_amount as f64
+            / 10f64.powi(if event.swap_type == idl::SwapType::Buy {
+                base_decimals
+            } else {
+                quote_decimals
+            } as i32);
 
         let mut record = SwapRecord::default();
         record.instruction_index = ix.instruction_index();
@@ -262,10 +282,12 @@ impl FutarchyAmmDecoder {
 
         let sold_vault_info = get_token_account_info(tx, &record.token_sold_vault);
         let bought_vault_info = get_token_account_info(tx, &record.token_bought_vault);
-        record.token_sold_vault_reserve =
-            sold_vault_info.map(|i| i.post_balance_scaled()).unwrap_or(0.0);
-        record.token_bought_vault_reserve =
-            bought_vault_info.map(|i| i.post_balance_scaled()).unwrap_or(0.0);
+        record.token_sold_vault_reserve = sold_vault_info
+            .map(|i| i.post_balance_scaled())
+            .unwrap_or(0.0);
+        record.token_bought_vault_reserve = bought_vault_info
+            .map(|i| i.post_balance_scaled())
+            .unwrap_or(0.0);
 
         Some(record)
     }

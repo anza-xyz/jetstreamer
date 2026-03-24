@@ -73,14 +73,26 @@ impl DexDecoder for ZerofiDecoder {
         record.token_bought_decimals = swap.bought.decimals;
 
         record.token_sold_vault_reserve = if swap.sold.vault == vault_a {
-            vault_a_info.as_ref().map(|i| i.post_balance_scaled()).unwrap_or(0.0)
+            vault_a_info
+                .as_ref()
+                .map(|i| i.post_balance_scaled())
+                .unwrap_or(0.0)
         } else {
-            vault_b_info.as_ref().map(|i| i.post_balance_scaled()).unwrap_or(0.0)
+            vault_b_info
+                .as_ref()
+                .map(|i| i.post_balance_scaled())
+                .unwrap_or(0.0)
         };
         record.token_bought_vault_reserve = if swap.bought.vault == vault_a {
-            vault_a_info.as_ref().map(|i| i.post_balance_scaled()).unwrap_or(0.0)
+            vault_a_info
+                .as_ref()
+                .map(|i| i.post_balance_scaled())
+                .unwrap_or(0.0)
         } else {
-            vault_b_info.as_ref().map(|i| i.post_balance_scaled()).unwrap_or(0.0)
+            vault_b_info
+                .as_ref()
+                .map(|i| i.post_balance_scaled())
+                .unwrap_or(0.0)
         };
 
         Some(record)

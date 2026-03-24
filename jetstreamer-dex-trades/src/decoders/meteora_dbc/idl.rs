@@ -18,6 +18,7 @@ pub const SELL_EVENT_DISC: [u8; 8] = [62, 47, 55, 210, 224, 105, 121, 62];
 
 /// Swap event emitted by Meteora DBC via Anchor self-CPI.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct SwapEvent {
     pub pool: [u8; 32],
     pub token_a_amount: u64,

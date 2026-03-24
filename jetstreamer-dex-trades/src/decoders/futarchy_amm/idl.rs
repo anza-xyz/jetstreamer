@@ -28,7 +28,7 @@ impl SwapType {
         match val {
             0 => Some(Self::Buy),
             1 => Some(Self::Sell),
-        _ => None,
+            _ => None,
         }
     }
 

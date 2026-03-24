@@ -42,7 +42,7 @@ impl SwapEvent {
 
 pub mod events {
     use super::*;
-    use base64::{engine::general_purpose::STANDARD, Engine};
+    use base64::{Engine, engine::general_purpose::STANDARD};
 
     /// Decode a SwapEvent from a base64-encoded `Program data:` log entry.
     pub fn decode_swap_event_from_log(data: &str) -> Option<SwapEvent> {

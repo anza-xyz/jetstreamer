@@ -26,6 +26,12 @@ pub struct RaydiumCpmmDecoder {
     cache: RwLock<HashMap<String, EventCache>>,
 }
 
+impl Default for RaydiumCpmmDecoder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RaydiumCpmmDecoder {
     pub fn new() -> Self {
         Self {
@@ -99,9 +105,7 @@ impl DexDecoder for RaydiumCpmmDecoder {
 
         let tx_id = tx.signature.to_string();
         let mut cache = self.cache.write().unwrap();
-        let event = cache
-            .get_mut(&tx_id)
-            .and_then(|e| e.events.pop_front());
+        let event = cache.get_mut(&tx_id).and_then(|e| e.events.pop_front());
         drop(cache);
 
         if let Some(event) = event {

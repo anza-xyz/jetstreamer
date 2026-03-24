@@ -60,24 +60,22 @@ impl DexDecoder for MeteoraDbcDecoder {
                 ix.instruction_index(),
                 ix.inner_instruction_index()
             );
-            let data_events =
-                LogParser::extract_program_data_by_position(&logs, PROGRAM_ID);
+            let data_events = LogParser::extract_program_data_by_position(&logs, PROGRAM_ID);
             if let Some(events) = data_events.get(&position) {
                 for event_data in events {
                     if let Ok(decoded) = base64::Engine::decode(
                         &base64::engine::general_purpose::STANDARD,
                         event_data,
-                    ) {
-                        if let Some((event, _)) = idl::events::decode_swap_event(&decoded) {
-                            return self.decode_from_event(
-                                tx,
-                                ix,
-                                outer_program,
-                                &accounts,
-                                &event,
-                                is_buy,
-                            );
-                        }
+                    ) && let Some((event, _)) = idl::events::decode_swap_event(&decoded)
+                    {
+                        return self.decode_from_event(
+                            tx,
+                            ix,
+                            outer_program,
+                            &accounts,
+                            &event,
+                            is_buy,
+                        );
                     }
                 }
             }
@@ -110,10 +108,8 @@ impl MeteoraDbcDecoder {
         let base_decimals = base_info.as_ref().map(|i| i.decimals).unwrap_or(6);
         let quote_decimals = quote_info.as_ref().map(|i| i.decimals).unwrap_or(6);
 
-        let token_a_amount =
-            event.token_a_amount as f64 / 10f64.powi(base_decimals as i32);
-        let token_b_amount =
-            event.token_b_amount as f64 / 10f64.powi(quote_decimals as i32);
+        let token_a_amount = event.token_a_amount as f64 / 10f64.powi(base_decimals as i32);
+        let token_b_amount = event.token_b_amount as f64 / 10f64.powi(quote_decimals as i32);
 
         let base_reserve = base_info
             .as_ref()
@@ -176,7 +172,13 @@ impl MeteoraDbcDecoder {
         let outer_idx = ix.instruction_index() as usize;
         let inner_idx = ix.inner_instruction_index() as usize;
         let swap = get_swap_amounts(
-            tx, outer_idx, inner_idx, &base_vault, &quote_vault, None, false,
+            tx,
+            outer_idx,
+            inner_idx,
+            &base_vault,
+            &quote_vault,
+            None,
+            false,
         )?;
 
         let base_reserve = get_token_account_info(tx, &base_vault)

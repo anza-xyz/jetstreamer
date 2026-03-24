@@ -1,3 +1,10 @@
+#![allow(
+    clippy::field_reassign_with_default,
+    clippy::too_many_arguments,
+    clippy::large_enum_variant,
+    clippy::type_complexity
+)]
+
 //! Solana DEX trades decoder plugin for Jetstreamer.
 //!
 //! Decodes swap transactions from 28+ Solana DEX programs into a unified
@@ -40,14 +47,14 @@
 //! // registry.decode_transaction(&tx_data) returns Vec<SwapRecord>
 //! ```
 
-pub mod instruction_iter;
-pub mod transaction_ext;
-pub mod log_parser;
-pub mod token_transfers;
-pub mod types;
-pub mod registry;
-pub mod plugin;
 pub mod decoders;
+pub mod instruction_iter;
+pub mod log_parser;
+pub mod plugin;
+pub mod registry;
+pub mod token_transfers;
+pub mod transaction_ext;
+pub mod types;
 
 /// Generated protobuf types.
 pub mod proto {

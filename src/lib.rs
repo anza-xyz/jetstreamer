@@ -120,10 +120,10 @@
 //! Epochs at or above `157` work with the bundled Geyser plugin interface, while compute unit
 //! accounting first appears at epoch `450`.
 
+pub use jetstreamer_dex_trades as dex_trades;
 pub use jetstreamer_firehose as firehose;
 pub use jetstreamer_plugin as plugin;
 pub use jetstreamer_utils as utils;
-pub use jetstreamer_dex_trades as dex_trades;
 
 use core::ops::Range;
 use jetstreamer_firehose::{epochs::slot_to_epoch, index::get_index_base_url};

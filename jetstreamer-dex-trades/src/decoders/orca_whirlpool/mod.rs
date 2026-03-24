@@ -40,11 +40,17 @@ const TWO_HOP_V2_V2B_IDX: usize = 12;
 
 struct EventCache {
     events: VecDeque<idl::SwapEvent>,
-    truncated: bool,
+    _truncated: bool,
 }
 
 pub struct OrcaWhirlpoolDecoder {
     cache: RwLock<HashMap<String, EventCache>>,
+}
+
+impl Default for OrcaWhirlpoolDecoder {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl OrcaWhirlpoolDecoder {
@@ -57,11 +63,6 @@ impl OrcaWhirlpoolDecoder {
     fn pop_event(&self, tx_id: &str) -> Option<idl::SwapEvent> {
         let mut cache = self.cache.write().unwrap();
         cache.get_mut(tx_id).and_then(|c| c.events.pop_front())
-    }
-
-    fn is_truncated(&self, tx_id: &str) -> bool {
-        let cache = self.cache.read().unwrap();
-        cache.get(tx_id).map(|c| c.truncated).unwrap_or(false)
     }
 
     fn decode_from_event(
@@ -97,29 +98,25 @@ impl OrcaWhirlpoolDecoder {
         if event.zero_for_one {
             record.token_sold_mint = info_0.mint.clone();
             record.token_sold_vault = vault_0;
-            record.token_sold_amount =
-                event.amount_0 as f64 / 10f64.powi(info_0.decimals as i32);
+            record.token_sold_amount = event.amount_0 as f64 / 10f64.powi(info_0.decimals as i32);
             record.token_sold_decimals = info_0.decimals;
             record.token_sold_vault_reserve = info_0.post_balance_scaled();
 
             record.token_bought_mint = info_1.mint.clone();
             record.token_bought_vault = vault_1;
-            record.token_bought_amount =
-                event.amount_1 as f64 / 10f64.powi(info_1.decimals as i32);
+            record.token_bought_amount = event.amount_1 as f64 / 10f64.powi(info_1.decimals as i32);
             record.token_bought_decimals = info_1.decimals;
             record.token_bought_vault_reserve = info_1.post_balance_scaled();
         } else {
             record.token_sold_mint = info_1.mint.clone();
             record.token_sold_vault = vault_1;
-            record.token_sold_amount =
-                event.amount_1 as f64 / 10f64.powi(info_1.decimals as i32);
+            record.token_sold_amount = event.amount_1 as f64 / 10f64.powi(info_1.decimals as i32);
             record.token_sold_decimals = info_1.decimals;
             record.token_sold_vault_reserve = info_1.post_balance_scaled();
 
             record.token_bought_mint = info_0.mint.clone();
             record.token_bought_vault = vault_0;
-            record.token_bought_amount =
-                event.amount_0 as f64 / 10f64.powi(info_0.decimals as i32);
+            record.token_bought_amount = event.amount_0 as f64 / 10f64.powi(info_0.decimals as i32);
             record.token_bought_decimals = info_0.decimals;
             record.token_bought_vault_reserve = info_0.post_balance_scaled();
         }
@@ -219,7 +216,13 @@ impl DexDecoder for OrcaWhirlpoolDecoder {
 
         let tx_id = tx.signature.to_string();
         let mut cache = self.cache.write().unwrap();
-        cache.insert(tx_id, EventCache { events, truncated });
+        cache.insert(
+            tx_id,
+            EventCache {
+                events,
+                _truncated: truncated,
+            },
+        );
     }
 
     fn decode_instruction(
@@ -246,12 +249,11 @@ impl DexDecoder for OrcaWhirlpoolDecoder {
 
         let tx_id = tx.signature.to_string();
 
-        if let Some(event) = self.pop_event(&tx_id) {
-            if let Some(record) =
+        if let Some(event) = self.pop_event(&tx_id)
+            && let Some(record) =
                 self.decode_from_event(tx, ix, outer_program, instruction_type, &event)
-            {
-                return Some(record);
-            }
+        {
+            return Some(record);
         }
 
         self.decode_from_transfers(
@@ -276,15 +278,7 @@ impl DexDecoder for OrcaWhirlpoolDecoder {
             return Vec::new();
         }
 
-        let hops: &[(
-            &str,
-            usize,
-            usize,
-            usize,
-            usize,
-            usize,
-            usize,
-        )] = match &data[..8] {
+        let hops: &[(&str, usize, usize, usize, usize, usize, usize)] = match &data[..8] {
             d if d == idl::TWO_HOP_SWAP_DISC => &[(
                 "twoHopSwap",
                 TWO_HOP_POOL_ONE_IDX,
@@ -316,13 +310,12 @@ impl DexDecoder for OrcaWhirlpoolDecoder {
         let mut records = Vec::new();
 
         for &(pool_idx, va_idx, vb_idx) in &[(p1, v1a, v1b), (p2, v2a, v2b)] {
-            if let Some(event) = self.pop_event(&tx_id) {
-                if let Some(record) =
+            if let Some(event) = self.pop_event(&tx_id)
+                && let Some(record) =
                     self.decode_from_event(tx, ix, outer_program, instruction_type, &event)
-                {
-                    records.push(record);
-                    continue;
-                }
+            {
+                records.push(record);
+                continue;
             }
 
             if let Some(record) = self.decode_from_transfers(

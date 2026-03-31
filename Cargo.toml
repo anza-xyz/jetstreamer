@@ -93,12 +93,25 @@ tempfile = "3"
 libc = "0"
 
 [dependencies]
-tokio.workspace = true
+tokio = { workspace = true, features = ["fs", "macros", "rt-multi-thread", "sync", "time"] }
 solana-logger.workspace = true
 log.workspace = true
 jetstreamer-firehose.workspace = true
 jetstreamer-plugin.workspace = true
 jetstreamer-utils.workspace = true
+anyhow.workspace = true
+futures-util.workspace = true
+bs58.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+solana-message.workspace = true
+solana-sdk = "=3.0.0"
+solana-transaction-status.workspace = true
+clap = { version = "4", features = ["derive", "env"] }
+reqwest = { version = "0.12", features = ["brotli", "deflate", "gzip", "json", "rustls-tls"] }
+spl-token-interface = "=2.0.0"
+spl-token-2022-interface = "=2.0.0"
+sha2 = "0.10"
 
 [dev-dependencies]
 clickhouse.workspace = true

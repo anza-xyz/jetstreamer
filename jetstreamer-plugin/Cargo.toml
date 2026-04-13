@@ -26,3 +26,10 @@ dashmap.workspace = true
 once_cell.workspace = true
 solana-sdk-ids.workspace = true
 url.workspace = true
+
+[dev-dependencies]
+serial_test.workspace = true
+solana-hash.workspace = true
+solana-transaction.workspace = true
+solana-transaction-status.workspace = true
+solana-runtime.workspace = true

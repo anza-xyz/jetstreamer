@@ -260,6 +260,267 @@ fn clamp_block_time(block_time: Option<i64>) -> u32 {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Plugin;
+    use jetstreamer_firehose::firehose::{BlockData, TransactionData};
+    use serial_test::serial;
+    use solana_hash::Hash;
+    use solana_message::VersionedMessage;
+    use solana_message::legacy::Message as LegacyMessage;
+    use solana_runtime::bank::KeyedRewardsAndNumPartitions;
+    use solana_transaction::versioned::VersionedTransaction;
+    use solana_transaction_status::TransactionStatusMeta;
+
+    fn make_tx(slot: u64, account_keys: Vec<Address>) -> TransactionData {
+        let message = LegacyMessage {
+            account_keys,
+            ..LegacyMessage::default()
+        };
+        TransactionData {
+            slot,
+            transaction_slot_index: 0,
+            signature: Default::default(),
+            message_hash: Hash::default(),
+            is_vote: false,
+            transaction_status_meta: TransactionStatusMeta {
+                status: Ok(()),
+                fee: 0,
+                pre_balances: vec![],
+                post_balances: vec![],
+                inner_instructions: None,
+                log_messages: None,
+                pre_token_balances: None,
+                post_token_balances: None,
+                rewards: None,
+                loaded_addresses: Default::default(),
+                return_data: None,
+                compute_units_consumed: Some(0),
+                cost_units: None,
+            },
+            transaction: VersionedTransaction {
+                signatures: vec![],
+                message: VersionedMessage::Legacy(message),
+            },
+        }
+    }
+
+    fn make_block(slot: u64, block_time: Option<i64>) -> BlockData {
+        BlockData::Block {
+            slot,
+            parent_slot: slot.saturating_sub(1),
+            blockhash: Hash::default(),
+            parent_blockhash: Hash::default(),
+            rewards: KeyedRewardsAndNumPartitions {
+                keyed_rewards: vec![],
+                num_partitions: None,
+            },
+            block_time,
+            block_height: Some(slot),
+            executed_transaction_count: 0,
+            entry_count: 0,
+        }
+    }
+
+    fn clear_pending() {
+        PENDING_BY_SLOT.clear();
+    }
+
+    #[test]
+    fn clamp_block_time_none_returns_zero() {
+        assert_eq!(clamp_block_time(None), 0);
+    }
+
+    #[test]
+    fn clamp_block_time_negative_returns_zero() {
+        assert_eq!(clamp_block_time(Some(-100)), 0);
+    }
+
+    #[test]
+    fn clamp_block_time_overflow_returns_max() {
+        assert_eq!(clamp_block_time(Some(u32::MAX as i64 + 1)), u32::MAX);
+    }
+
+    #[test]
+    fn clamp_block_time_normal() {
+        assert_eq!(clamp_block_time(Some(1_700_000_000)), 1_700_000_000);
+    }
+
+    #[serial]
+    #[tokio::test]
+    async fn single_transaction_counts_all_account_keys() {
+        clear_pending();
+        let plugin = PubkeyStatsPlugin::new();
+        let key_a = Address::from([1u8; 32]);
+        let key_b = Address::from([2u8; 32]);
+        let key_c = Address::from([3u8; 32]);
+        let tx = make_tx(100, vec![key_a, key_b, key_c]);
+
+        plugin.on_transaction(0, None, &tx).await.unwrap();
+
+        let events = PubkeyStatsPlugin::take_slot_events(100, Some(1_700_000_000));
+        assert_eq!(events.len(), 3);
+        for event in &events {
+            assert_eq!(event.num_mentions, 1);
+            assert_eq!(event.slot, 100);
+            assert_eq!(event.timestamp, 1_700_000_000);
+        }
+    }
+
+    #[serial]
+    #[tokio::test]
+    async fn duplicate_keys_in_single_transaction_accumulate() {
+        clear_pending();
+        let plugin = PubkeyStatsPlugin::new();
+        let key_a = Address::from([1u8; 32]);
+        let tx = make_tx(200, vec![key_a, key_a, key_a]);
+
+        plugin.on_transaction(0, None, &tx).await.unwrap();
+
+        let events = PubkeyStatsPlugin::take_slot_events(200, None);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].num_mentions, 3);
+        assert_eq!(events[0].pubkey, key_a);
+    }
+
+    #[serial]
+    #[tokio::test]
+    async fn multiple_transactions_same_slot_accumulate() {
+        clear_pending();
+        let plugin = PubkeyStatsPlugin::new();
+        let key_a = Address::from([10u8; 32]);
+        let key_b = Address::from([20u8; 32]);
+
+        let tx1 = make_tx(300, vec![key_a, key_b]);
+        let tx2 = make_tx(300, vec![key_a]);
+
+        plugin.on_transaction(0, None, &tx1).await.unwrap();
+        plugin.on_transaction(0, None, &tx2).await.unwrap();
+
+        let events = PubkeyStatsPlugin::take_slot_events(300, None);
+        assert_eq!(events.len(), 2);
+        let a_event = events.iter().find(|e| e.pubkey == key_a).unwrap();
+        let b_event = events.iter().find(|e| e.pubkey == key_b).unwrap();
+        assert_eq!(a_event.num_mentions, 2);
+        assert_eq!(b_event.num_mentions, 1);
+    }
+
+    #[serial]
+    #[tokio::test]
+    async fn different_slots_are_independent() {
+        clear_pending();
+        let plugin = PubkeyStatsPlugin::new();
+        let key = Address::from([42u8; 32]);
+
+        let tx1 = make_tx(400, vec![key]);
+        let tx2 = make_tx(401, vec![key]);
+
+        plugin.on_transaction(0, None, &tx1).await.unwrap();
+        plugin.on_transaction(0, None, &tx2).await.unwrap();
+
+        let events_400 = PubkeyStatsPlugin::take_slot_events(400, None);
+        let events_401 = PubkeyStatsPlugin::take_slot_events(401, None);
+        assert_eq!(events_400.len(), 1);
+        assert_eq!(events_401.len(), 1);
+        assert_eq!(events_400[0].num_mentions, 1);
+        assert_eq!(events_401[0].num_mentions, 1);
+    }
+
+    #[serial]
+    #[tokio::test]
+    async fn take_slot_events_drains_slot() {
+        clear_pending();
+        let plugin = PubkeyStatsPlugin::new();
+        let tx = make_tx(500, vec![Address::from([1u8; 32])]);
+        plugin.on_transaction(0, None, &tx).await.unwrap();
+
+        let first = PubkeyStatsPlugin::take_slot_events(500, None);
+        let second = PubkeyStatsPlugin::take_slot_events(500, None);
+        assert_eq!(first.len(), 1);
+        assert!(second.is_empty());
+    }
+
+    #[serial]
+    #[tokio::test]
+    async fn drain_all_pending_collects_all_slots() {
+        clear_pending();
+        let plugin = PubkeyStatsPlugin::new();
+
+        let tx1 = make_tx(600, vec![Address::from([1u8; 32])]);
+        let tx2 = make_tx(601, vec![Address::from([2u8; 32])]);
+        let tx3 = make_tx(602, vec![Address::from([3u8; 32])]);
+
+        plugin.on_transaction(0, None, &tx1).await.unwrap();
+        plugin.on_transaction(0, None, &tx2).await.unwrap();
+        plugin.on_transaction(0, None, &tx3).await.unwrap();
+
+        let events = PubkeyStatsPlugin::drain_all_pending(Some(1_000));
+        assert_eq!(events.len(), 3);
+        assert!(PENDING_BY_SLOT.is_empty());
+    }
+
+    #[serial]
+    #[tokio::test]
+    async fn empty_account_keys_produces_no_events() {
+        clear_pending();
+        let plugin = PubkeyStatsPlugin::new();
+        let tx = make_tx(700, vec![]);
+        plugin.on_transaction(0, None, &tx).await.unwrap();
+        assert!(PENDING_BY_SLOT.is_empty());
+    }
+
+    #[serial]
+    #[tokio::test]
+    async fn on_block_drains_pending_slot() {
+        clear_pending();
+        let plugin = PubkeyStatsPlugin::new();
+        let tx = make_tx(800, vec![Address::from([1u8; 32])]);
+        plugin.on_transaction(0, None, &tx).await.unwrap();
+        assert!(!PENDING_BY_SLOT.is_empty());
+
+        let block = make_block(800, Some(1_700_000_000));
+        plugin.on_block(0, None, &block).await.unwrap();
+
+        // on_block without db just drains, doesn't write
+        assert!(!PENDING_BY_SLOT.contains_key(&800));
+    }
+
+    #[serial]
+    #[tokio::test]
+    async fn skipped_block_does_not_drain() {
+        clear_pending();
+        let plugin = PubkeyStatsPlugin::new();
+        let tx = make_tx(900, vec![Address::from([1u8; 32])]);
+        plugin.on_transaction(0, None, &tx).await.unwrap();
+
+        let skipped = BlockData::PossibleLeaderSkipped { slot: 900 };
+        plugin.on_block(0, None, &skipped).await.unwrap();
+
+        assert!(PENDING_BY_SLOT.contains_key(&900));
+        clear_pending();
+    }
+
+    #[test]
+    fn plugin_name() {
+        assert_eq!(PubkeyStatsPlugin::new().name(), "Pubkey Stats");
+    }
+
+    #[serial]
+    #[test]
+    fn slot_clamped_to_u32_max() {
+        let slot = u64::from(u32::MAX) + 100;
+        PENDING_BY_SLOT.clear();
+        let inner = DashMap::with_hasher(ahash::RandomState::new());
+        inner.insert(Address::from([1u8; 32]), 5);
+        PENDING_BY_SLOT.insert(slot, inner);
+
+        let events = PubkeyStatsPlugin::take_slot_events(slot, None);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].slot, u32::MAX);
+    }
+}
+
 async fn backfill_pubkey_timestamps(db: Arc<Client>) -> Result<(), clickhouse::error::Error> {
     db.query(
         r#"

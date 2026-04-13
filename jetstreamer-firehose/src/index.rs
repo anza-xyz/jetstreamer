@@ -175,8 +175,10 @@ pub static SLOT_OFFSET_INDEX: Lazy<SlotOffsetIndex> = Lazy::new(|| {
 
 static START_INSTANT: Lazy<Instant> = Lazy::new(Instant::now);
 static LAST_HIT_TIME: AtomicU64 = AtomicU64::new(0);
-static SLOT_OFFSET_RESULT_CACHE: Lazy<DashMap<u64, u64>> = Lazy::new(DashMap::new);
-static EPOCH_CACHE: Lazy<DashMap<EpochCacheKey, Arc<EpochEntry>>> = Lazy::new(DashMap::new);
+static SLOT_OFFSET_RESULT_CACHE: Lazy<DashMap<u64, u64, ahash::RandomState>> =
+    Lazy::new(|| DashMap::with_hasher(ahash::RandomState::new()));
+static EPOCH_CACHE: Lazy<DashMap<EpochCacheKey, Arc<EpochEntry>, ahash::RandomState>> =
+    Lazy::new(|| DashMap::with_hasher(ahash::RandomState::new()));
 
 #[derive(Clone, Hash, PartialEq, Eq)]
 struct EpochCacheKey {
@@ -388,7 +390,7 @@ impl SlotOffsetIndex {
 struct EpochIndexes {
     slot_index: Arc<SlotCidIndex>,
     cid_index: Arc<CidOffsetIndex>,
-    slot_cid_cache: DashMap<u64, Arc<[u8]>>,
+    slot_cid_cache: DashMap<u64, Arc<[u8]>, ahash::RandomState>,
     slot_range: RangeInclusive<u64>,
 }
 
@@ -402,7 +404,7 @@ impl EpochIndexes {
         Self {
             slot_index: Arc::new(slot_index),
             cid_index: Arc::new(cid_index),
-            slot_cid_cache: DashMap::new(),
+            slot_cid_cache: DashMap::with_hasher(ahash::RandomState::new()),
             slot_range: slot_start..=slot_end_inclusive,
         }
     }
@@ -511,7 +513,7 @@ impl RemoteIndexFile {
 struct SlotCidIndex {
     file: Arc<RemoteIndexFile>,
     header: CompactIndexHeader,
-    bucket_entries: DashMap<u32, Arc<SlotBucketEntry>>,
+    bucket_entries: DashMap<u32, Arc<SlotBucketEntry>, ahash::RandomState>,
 }
 
 impl SlotCidIndex {
@@ -545,7 +547,7 @@ impl SlotCidIndex {
         Ok(Self {
             file,
             header,
-            bucket_entries: DashMap::new(),
+            bucket_entries: DashMap::with_hasher(ahash::RandomState::new()),
         })
     }
 
@@ -629,7 +631,7 @@ impl SlotCidIndex {
 struct CidOffsetIndex {
     object: RemoteObject,
     header: CompactIndexHeader,
-    bucket_entries: DashMap<u32, Arc<RemoteBucketEntry>>,
+    bucket_entries: DashMap<u32, Arc<RemoteBucketEntry>, ahash::RandomState>,
 }
 
 impl CidOffsetIndex {
@@ -663,7 +665,7 @@ impl CidOffsetIndex {
         Ok(Self {
             object,
             header,
-            bucket_entries: DashMap::new(),
+            bucket_entries: DashMap::with_hasher(ahash::RandomState::new()),
         })
     }
 

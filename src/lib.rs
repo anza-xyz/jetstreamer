@@ -130,6 +130,7 @@ use jetstreamer_plugin::{
     Plugin, PluginRunner, PluginRunnerError,
     plugins::{
         instruction_tracking::InstructionTrackingPlugin, program_tracking::ProgramTrackingPlugin,
+        pubkey_stats::PubkeyStatsPlugin,
     },
 };
 use std::sync::Arc;
@@ -569,6 +570,8 @@ pub enum BuiltinPlugin {
     ProgramTracking,
     /// Instruction Tracking.
     InstructionTracking,
+    /// Pubkey Stats.
+    PubkeyStats,
 }
 
 impl BuiltinPlugin {
@@ -576,6 +579,7 @@ impl BuiltinPlugin {
         match value {
             "program-tracking" => Some(Self::ProgramTracking),
             "instruction-tracking" => Some(Self::InstructionTracking),
+            "pubkey-stats" => Some(Self::PubkeyStats),
             _ => None,
         }
     }
@@ -584,6 +588,7 @@ impl BuiltinPlugin {
         match self {
             Self::ProgramTracking => Box::new(ProgramTrackingPlugin::new()),
             Self::InstructionTracking => Box::new(InstructionTrackingPlugin::new()),
+            Self::PubkeyStats => Box::new(PubkeyStatsPlugin::new()),
         }
     }
 }
@@ -598,8 +603,8 @@ impl BuiltinPlugin {
 /// - `JETSTREAMER_BUFFER_WINDOW`: Optional ripget sequential window size (for example `4GiB`).
 ///
 /// CLI flags:
-/// - `--with-plugin <name>`: Adds one of the built-in plugins (`program-tracking` or
-///   `instruction-tracking`). When omitted, the CLI defaults to `program-tracking`.
+/// - `--with-plugin <name>`: Adds one of the built-in plugins (`program-tracking`,
+///   `instruction-tracking`, or `pubkey-stats`). When omitted, the CLI defaults to `program-tracking`.
 /// - `--no-plugins`: Disables all built-in plugins (overrides the default and any `--with-plugin`).
 /// - `--sequential`: Enables single-thread sequential firehose mode.
 /// - `--buffer-window <size>`: Overrides ripget sequential window size (for example `4GiB`).
@@ -632,7 +637,7 @@ pub fn parse_cli_args() -> Result<Config, Box<dyn std::error::Error>> {
                     .ok_or_else(|| "--with-plugin requires a plugin name".to_string())?;
                 let plugin = BuiltinPlugin::from_flag(&plugin_name).ok_or_else(|| {
                     format!(
-                        "unknown plugin '{plugin_name}'. expected 'program-tracking' or 'instruction-tracking'"
+                        "unknown plugin '{plugin_name}'. expected 'program-tracking', 'instruction-tracking', or 'pubkey-stats'"
                     )
                 })?;
                 builtin_plugins.push(plugin);

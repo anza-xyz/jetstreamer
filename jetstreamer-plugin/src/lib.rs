@@ -328,7 +328,8 @@ impl PluginRunner {
         }
 
         let shutting_down = Arc::new(AtomicBool::new(false));
-        let slot_buffer: Arc<DashMap<u16, Vec<PluginSlotRow>>> = Arc::new(DashMap::new());
+        let slot_buffer: Arc<DashMap<u16, Vec<PluginSlotRow>, ahash::RandomState>> =
+            Arc::new(DashMap::with_hasher(ahash::RandomState::new()));
         let clickhouse_enabled = clickhouse.is_some();
         let slots_since_flush = Arc::new(AtomicU64::new(0));
 
@@ -634,7 +635,7 @@ impl PluginRunner {
         LAST_TOTAL_TIME_NS.store(monotonic_nanos_since(run_origin), Ordering::Relaxed);
         let stats_tracking = clickhouse.clone().map(|_db| {
             let shutting_down = shutting_down.clone();
-            let thread_progress_max: Arc<DashMap<usize, f64>> = Arc::new(DashMap::new());
+            let thread_progress_max: Arc<DashMap<usize, f64, ahash::RandomState>> = Arc::new(DashMap::with_hasher(ahash::RandomState::new()));
             StatsTracking {
         on_stats: {
             let thread_progress_max = thread_progress_max.clone();
@@ -932,7 +933,8 @@ struct SlotTxTally {
     non_votes: u64,
 }
 
-static SLOT_TX_TALLY: Lazy<DashMap<u64, SlotTxTally>> = Lazy::new(DashMap::new);
+static SLOT_TX_TALLY: Lazy<DashMap<u64, SlotTxTally, ahash::RandomState>> =
+    Lazy::new(|| DashMap::with_hasher(ahash::RandomState::new()));
 
 async fn ensure_clickhouse_tables(db: &Client) -> Result<(), clickhouse::error::Error> {
     db.query(
@@ -1016,7 +1018,7 @@ async fn record_plugin_slot(
 
 async fn flush_slot_buffer(
     db: Arc<Client>,
-    buffer: Arc<DashMap<u16, Vec<PluginSlotRow>>>,
+    buffer: Arc<DashMap<u16, Vec<PluginSlotRow>, ahash::RandomState>>,
 ) -> Result<(), clickhouse::error::Error> {
     let mut rows = Vec::new();
     buffer.iter_mut().for_each(|mut entry| {

@@ -1,3 +1,4 @@
+use ahash::RandomState;
 use std::{collections::HashMap, sync::Arc};
 
 use clickhouse::{Client, Row};
@@ -12,9 +13,10 @@ use crate::{Plugin, PluginFuture};
 use jetstreamer_firehose::firehose::{BlockData, TransactionData};
 
 type SlotProgramKey = (Address, bool);
-type SlotProgramEvents = HashMap<SlotProgramKey, ProgramEvent>;
+type SlotProgramEvents = HashMap<SlotProgramKey, ProgramEvent, RandomState>;
 
-static PENDING_BY_SLOT: Lazy<DashMap<u64, SlotProgramEvents>> = Lazy::new(DashMap::new);
+static PENDING_BY_SLOT: Lazy<DashMap<u64, SlotProgramEvents, RandomState>> =
+    Lazy::new(|| DashMap::with_hasher(RandomState::new()));
 
 #[derive(Row, Deserialize, Serialize, Copy, Clone, Debug, PartialEq, Eq, Hash)]
 struct ProgramEvent {
@@ -115,7 +117,9 @@ impl Plugin for ProgramTrackingPlugin {
             let slot = transaction.slot;
             let is_vote = transaction.is_vote;
 
-            let mut slot_entry = PENDING_BY_SLOT.entry(slot).or_default();
+            let mut slot_entry = PENDING_BY_SLOT
+                .entry(slot)
+                .or_insert_with(|| HashMap::with_hasher(RandomState::new()));
             for program_id in program_ids.iter() {
                 let this_program_cu = if program_count == 0 {
                     0

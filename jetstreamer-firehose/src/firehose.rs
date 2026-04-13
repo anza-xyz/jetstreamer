@@ -397,7 +397,11 @@ fn fetch_add_if(tracking_enabled: bool, atomic: &AtomicU64, value: u64) {
     }
 }
 
-fn clear_pending_skip(map: &DashMap<usize, DashSet<u64>>, thread_id: usize, slot: u64) -> bool {
+fn clear_pending_skip(
+    map: &DashMap<usize, DashSet<u64, ahash::RandomState>, ahash::RandomState>,
+    thread_id: usize,
+    slot: u64,
+) -> bool {
     map.get(&thread_id)
         .map(|set| set.remove(&slot).is_some())
         .unwrap_or(false)
@@ -939,7 +943,9 @@ where
     let overall_blocks_processed: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
     let overall_transactions_processed: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
     let overall_entries_processed: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
-    let pending_skipped_slots: Arc<DashMap<usize, DashSet<u64>>> = Arc::new(DashMap::new());
+    let pending_skipped_slots: Arc<
+        DashMap<usize, DashSet<u64, ahash::RandomState>, ahash::RandomState>,
+    > = Arc::new(DashMap::with_hasher(ahash::RandomState::new()));
 
     for (thread_index, mut slot_range) in subranges.into_iter().enumerate() {
         let error_counts = error_counts.clone();
@@ -990,7 +996,9 @@ where
             let reward_enabled = on_reward.is_some();
             let tracking_enabled = stats_tracking.is_some();
             if block_enabled {
-                pending_skipped_slots.entry(thread_index).or_default();
+                pending_skipped_slots
+                    .entry(thread_index)
+                    .or_insert_with(|| DashSet::with_hasher(ahash::RandomState::new()));
             }
             let mut last_counted_slot = slot_range.start.saturating_sub(1);
             let mut last_emitted_slot_global = slot_range.start.saturating_sub(1);

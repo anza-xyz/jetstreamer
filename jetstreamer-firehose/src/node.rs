@@ -1,5 +1,6 @@
 use {
     crate::{SharedError, block, dataframe, entry, epoch, rewards, subset, transaction, utils},
+    ahash::RandomState,
     cid::Cid,
     core::hash::Hasher,
     crc::{CRC_64_GO_ISO, Crc},
@@ -40,13 +41,13 @@ impl NodeWithCid {
 pub struct NodesWithCids(
     #[doc = "Ordered collection of nodes paired with their content identifiers."]
     pub  Vec<NodeWithCid>,
-    #[doc(hidden)] HashMap<Cid, usize>,
+    #[doc(hidden)] HashMap<Cid, usize, RandomState>,
 );
 
 impl NodesWithCids {
     /// Creates an empty [`NodesWithCids`].
     pub fn new() -> NodesWithCids {
-        NodesWithCids(vec![], HashMap::new())
+        NodesWithCids(vec![], HashMap::with_hasher(RandomState::new()))
     }
 
     /// Appends a node to the collection.

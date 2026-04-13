@@ -41,7 +41,7 @@ solana-signature.workspace = true
 solana-sdk-ids.workspace = true
 prost_011.workspace = true
 solana-entry.workspace = true
-reqwest = { workspace = true, features = ["rustls-tls", "stream"] }
+reqwest = { workspace = true, features = ["stream"] }
 tokio.workspace = true
 futures-util.workspace = true
 serde = { workspace = true, features = ["derive"] }
@@ -62,6 +62,7 @@ zstd.workspace = true
 solana-reward-info.workspace = true
 bincode.workspace = true
 xxhash-rust.workspace = true
+ahash.workspace = true
 dashmap.workspace = true
 once_cell.workspace = true
 url.workspace = true

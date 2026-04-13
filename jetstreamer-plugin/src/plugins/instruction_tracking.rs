@@ -11,7 +11,8 @@ use solana_sdk_ids::vote::id as vote_program_id;
 use crate::{Plugin, PluginFuture};
 use jetstreamer_firehose::firehose::{BlockData, TransactionData};
 
-static PENDING_BY_SLOT: Lazy<DashMap<u64, SlotInstructionEvent>> = Lazy::new(DashMap::new);
+static PENDING_BY_SLOT: Lazy<DashMap<u64, SlotInstructionEvent, ahash::RandomState>> =
+    Lazy::new(|| DashMap::with_hasher(ahash::RandomState::new()));
 
 #[derive(Row, Deserialize, Serialize, Copy, Clone, Debug)]
 struct SlotInstructionEvent {

@@ -4040,7 +4040,7 @@ checksum = "4a5f13b858c8d314ee3e8f639011f7ccefe71f97f96e50151fb991f267928e2c"
 
 [[package]]
 name = "jetstreamer"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "clickhouse",
  "jetstreamer-firehose",
@@ -4058,8 +4058,9 @@ dependencies = [
 
 [[package]]
 name = "jetstreamer-firehose"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
+ "ahash 0.8.12",
  "aws-credential-types",
  "aws-sdk-s3",
  "aws-smithy-types",
@@ -4110,7 +4111,7 @@ dependencies = [
 
 [[package]]
 name = "jetstreamer-horizon"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "agave-geyser-plugin-interface",
  "lencode",
@@ -4127,7 +4128,7 @@ dependencies = [
 
 [[package]]
 name = "jetstreamer-node"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "agave-snapshots",
  "bs58",
@@ -4171,8 +4172,9 @@ dependencies = [
 
 [[package]]
 name = "jetstreamer-plugin"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
+ "ahash 0.8.12",
  "clickhouse",
  "dashmap",
  "futures-util",
@@ -4180,10 +4182,15 @@ dependencies = [
  "log",
  "once_cell",
  "serde",
+ "serial_test",
  "sha2 0.10.9",
  "solana-address 1.1.0",
+ "solana-hash",
  "solana-message",
+ "solana-runtime",
  "solana-sdk-ids",
+ "solana-transaction",
+ "solana-transaction-status",
  "thiserror 2.0.17",
  "tokio",
  "url 2.5.7",
@@ -4191,7 +4198,7 @@ dependencies = [
 
 [[package]]
 name = "jetstreamer-utils"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "ctrlc",
  "libc",

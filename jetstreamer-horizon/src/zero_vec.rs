@@ -1,9 +1,33 @@
+//! Fixed-capacity heap-free vector backed by an inline array.
+//!
+//! [`ZeroVec<N, T>`] stores up to `N` elements inline, tracking the current
+//! length separately. It mirrors the API of `Vec<T>` — `push`, `pop`, `clear`,
+//! `drain`, slicing via [`Deref`]/[`Index`], `Encode`/`Decode`, etc. — but
+//! never allocates on the heap. Overflowing capacity panics.
+//!
+//! Useful for hot paths that want `Vec`-like ergonomics without the allocator
+//! overhead: declare once, reuse via `clear()` + `push()` or
+//! [`extend_from_slice`][ZeroVec::extend_from_slice], or build in place via
+//! [`spare_capacity_mut`][ZeroVec::spare_capacity_mut].
+//!
+//! # Example
+//!
+//! ```
+//! use jetstreamer_horizon::zero_vec::ZeroVec;
+//!
+//! let mut buf: ZeroVec<16, u8> = ZeroVec::new();
+//! buf.extend_from_slice(b"hello ");
+//! buf.extend_from_slice(b"world");
+//! assert_eq!(&buf[..5], b"hello");
+//! assert_eq!(&buf[6..], b"world");
+//! ```
+
 use core::cmp::Ordering;
 use core::fmt;
 use core::hash::{Hash, Hasher};
 use core::mem::MaybeUninit;
-use core::ops::{Deref, DerefMut, Index, IndexMut};
-use core::slice;
+use core::ops::{Bound, Deref, DerefMut, Index, IndexMut, RangeBounds};
+use core::slice::{self, SliceIndex};
 use lencode::prelude::*;
 
 /// A fixed-capacity vector backed by an inline array.
@@ -90,6 +114,7 @@ impl<const N: usize, T> ZeroVec<N, T> {
     ///
     /// Panics if the vector is at capacity.
     #[inline(always)]
+    #[track_caller]
     pub fn push(&mut self, value: T) {
         assert!(self.len < N, "ZeroVec overflow: capacity is {N}");
         self.buf[self.len] = MaybeUninit::new(value);
@@ -146,11 +171,38 @@ impl<const N: usize, T> ZeroVec<N, T> {
         self.len = new_len;
     }
 
+    /// Removes the element at `index` and returns it, replacing its slot with
+    /// the last element (O(1)). Does not preserve ordering.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `index >= self.len`.
+    #[track_caller]
+    pub fn swap_remove(&mut self, index: usize) -> T {
+        assert!(
+            index < self.len,
+            "index {index} out of bounds (len={})",
+            self.len
+        );
+        let last = self.len - 1;
+        // SAFETY: index and last are both < len; swap them then truncate.
+        unsafe {
+            let value = self.buf[index].assume_init_read();
+            if index != last {
+                let last_val = self.buf[last].assume_init_read();
+                self.buf[index] = MaybeUninit::new(last_val);
+            }
+            self.len = last;
+            value
+        }
+    }
+
     /// Removes the element at `index`, shifting subsequent elements left.
     ///
     /// # Panics
     ///
     /// Panics if `index >= self.len`.
+    #[track_caller]
     pub fn remove(&mut self, index: usize) -> T {
         assert!(
             index < self.len,
@@ -178,6 +230,7 @@ impl<const N: usize, T> ZeroVec<N, T> {
     /// # Panics
     ///
     /// Panics if `index > self.len` or if the vector is at capacity.
+    #[track_caller]
     pub fn insert(&mut self, index: usize, value: T) {
         assert!(
             index <= self.len,
@@ -290,6 +343,148 @@ impl<const N: usize, T> ZeroVec<N, T> {
         debug_assert!(new_len <= N);
         self.len = new_len;
     }
+
+    /// Returns a mutable slice of the uninitialized tail, with length equal to
+    /// [`remaining_capacity`][Self::remaining_capacity].
+    ///
+    /// Pair with [`set_len`][Self::set_len] to append initialized elements
+    /// in place.
+    #[inline(always)]
+    pub fn spare_capacity_mut(&mut self) -> &mut [MaybeUninit<T>] {
+        &mut self.buf[self.len..]
+    }
+
+    /// Resizes the vector to `new_len`, filling new slots by calling `f`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `new_len > N`.
+    #[track_caller]
+    pub fn resize_with<F: FnMut() -> T>(&mut self, new_len: usize, mut f: F) {
+        assert!(
+            new_len <= N,
+            "ZeroVec::resize_with overflow: {new_len} > capacity {N}"
+        );
+        if new_len <= self.len {
+            self.truncate(new_len);
+        } else {
+            for i in self.len..new_len {
+                self.buf[i] = MaybeUninit::new(f());
+            }
+            self.len = new_len;
+        }
+    }
+
+    /// Moves all elements out of `other` and appends them to `self`, leaving
+    /// `other` empty.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `self.len + other.len > N`.
+    #[track_caller]
+    pub fn append<const M: usize>(&mut self, other: &mut ZeroVec<M, T>) {
+        assert!(
+            self.len + other.len <= N,
+            "ZeroVec::append overflow: {} + {} > capacity {N}",
+            self.len,
+            other.len
+        );
+        // SAFETY: both are contiguous and non-overlapping; bit-move each element.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                other.as_ptr(),
+                self.as_mut_ptr().add(self.len),
+                other.len,
+            );
+        }
+        self.len += other.len;
+        other.len = 0;
+    }
+
+    /// Removes consecutive duplicate elements.
+    #[inline(always)]
+    pub fn dedup(&mut self)
+    where
+        T: PartialEq,
+    {
+        self.dedup_by(|a, b| a == b);
+    }
+
+    /// Removes consecutive elements that compare equal under `same_bucket`.
+    pub fn dedup_by<F: FnMut(&mut T, &mut T) -> bool>(&mut self, mut same_bucket: F) {
+        if self.len < 2 {
+            return;
+        }
+        let mut write = 1;
+        for read in 1..self.len {
+            // SAFETY: `write - 1` and `read` are distinct indices within
+            // [0, len), so the two mutable references do not alias.
+            let are_same = unsafe {
+                let prev = &mut *self.buf[write - 1].as_mut_ptr();
+                let curr = &mut *self.buf[read].as_mut_ptr();
+                same_bucket(curr, prev)
+            };
+            if are_same {
+                // Drop the duplicate at `read`.
+                unsafe {
+                    self.buf[read].assume_init_drop();
+                }
+            } else {
+                if read != write {
+                    // SAFETY: move buf[read] to buf[write].
+                    unsafe {
+                        let val = self.buf[read].assume_init_read();
+                        self.buf[write] = MaybeUninit::new(val);
+                    }
+                }
+                write += 1;
+            }
+        }
+        self.len = write;
+    }
+
+    /// Removes consecutive elements whose mapped keys compare equal.
+    #[inline(always)]
+    pub fn dedup_by_key<K: PartialEq, F: FnMut(&mut T) -> K>(&mut self, mut key: F) {
+        self.dedup_by(|a, b| key(a) == key(b));
+    }
+
+    /// Drains the specified range, yielding each removed element in order.
+    ///
+    /// If the returned [`Drain`] iterator is dropped before being fully
+    /// consumed, the remaining elements are dropped and the tail is shifted.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the range is out of bounds or inverted.
+    #[track_caller]
+    pub fn drain<R: RangeBounds<usize>>(&mut self, range: R) -> Drain<'_, N, T> {
+        let start = match range.start_bound() {
+            Bound::Included(&n) => n,
+            Bound::Excluded(&n) => n + 1,
+            Bound::Unbounded => 0,
+        };
+        let end = match range.end_bound() {
+            Bound::Included(&n) => n + 1,
+            Bound::Excluded(&n) => n,
+            Bound::Unbounded => self.len,
+        };
+        assert!(start <= end, "drain: start ({start}) > end ({end})");
+        assert!(end <= self.len, "drain: end ({end}) > len ({})", self.len);
+        // Save the original length; the Drain's Drop will shift the tail down.
+        let original_len = self.len;
+        // SAFETY: temporarily lie about len so failures during Drain iteration
+        // don't double-drop elements. Drain::drop restores len = start + tail_len.
+        self.len = start;
+        Drain {
+            vec: self,
+            start,
+            end,
+            head: start,
+            tail: end,
+            original_len,
+        }
+    }
 }
 
 // --- Copy-specific methods (only available when T: Copy) ---
@@ -302,6 +497,7 @@ impl<const N: usize, T: Copy> ZeroVec<N, T> {
     ///
     /// Panics if `src.len() > N`.
     #[inline(always)]
+    #[track_caller]
     pub fn set(&mut self, src: &[T]) {
         assert!(
             src.len() <= N,
@@ -322,6 +518,7 @@ impl<const N: usize, T: Copy> ZeroVec<N, T> {
     ///
     /// Panics if remaining capacity is insufficient.
     #[inline(always)]
+    #[track_caller]
     pub fn extend_from_slice(&mut self, src: &[T]) {
         assert!(
             self.len + src.len() <= N,
@@ -340,6 +537,7 @@ impl<const N: usize, T: Copy> ZeroVec<N, T> {
     }
 
     /// Resizes the vector to `new_len`, filling new slots with `value`.
+    #[track_caller]
     pub fn resize(&mut self, new_len: usize, value: T) {
         assert!(
             new_len <= N,
@@ -353,6 +551,49 @@ impl<const N: usize, T: Copy> ZeroVec<N, T> {
             }
             self.len = new_len;
         }
+    }
+
+    /// Copies elements from `range` within the vector onto the end.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the range is out of bounds or the copied elements wouldn't
+    /// fit in remaining capacity.
+    #[track_caller]
+    pub fn extend_from_within<R: RangeBounds<usize>>(&mut self, range: R) {
+        let start = match range.start_bound() {
+            Bound::Included(&n) => n,
+            Bound::Excluded(&n) => n + 1,
+            Bound::Unbounded => 0,
+        };
+        let end = match range.end_bound() {
+            Bound::Included(&n) => n + 1,
+            Bound::Excluded(&n) => n,
+            Bound::Unbounded => self.len,
+        };
+        assert!(start <= end, "extend_from_within: start > end");
+        assert!(
+            end <= self.len,
+            "extend_from_within: end ({end}) > len ({})",
+            self.len
+        );
+        let count = end - start;
+        assert!(
+            self.len + count <= N,
+            "ZeroVec::extend_from_within overflow: {} + {count} > capacity {N}",
+            self.len
+        );
+        // SAFETY: T: Copy means we can bitwise-copy, even if source and dest
+        // overlap (copy_nonoverlapping is fine here since dest starts at
+        // self.len >= end, but use ptr::copy to be safe for edge cases).
+        unsafe {
+            core::ptr::copy(
+                self.as_ptr().add(start),
+                self.as_mut_ptr().add(self.len),
+                count,
+            );
+        }
+        self.len += count;
     }
 }
 
@@ -407,21 +648,21 @@ impl<const N: usize, T> DerefMut for ZeroVec<N, T> {
     }
 }
 
-// --- Index / IndexMut ---
+// --- Index / IndexMut (generic, matches `Vec<T>`) ---
 
-impl<const N: usize, T> Index<usize> for ZeroVec<N, T> {
-    type Output = T;
+impl<const N: usize, T, I: SliceIndex<[T]>> Index<I> for ZeroVec<N, T> {
+    type Output = I::Output;
 
     #[inline(always)]
-    fn index(&self, index: usize) -> &T {
-        &self.as_slice()[index]
+    fn index(&self, index: I) -> &I::Output {
+        Index::index(self.as_slice(), index)
     }
 }
 
-impl<const N: usize, T> IndexMut<usize> for ZeroVec<N, T> {
+impl<const N: usize, T, I: SliceIndex<[T]>> IndexMut<I> for ZeroVec<N, T> {
     #[inline(always)]
-    fn index_mut(&mut self, index: usize) -> &mut T {
-        &mut self.as_mut_slice()[index]
+    fn index_mut(&mut self, index: I) -> &mut I::Output {
+        IndexMut::index_mut(self.as_mut_slice(), index)
     }
 }
 
@@ -552,7 +793,22 @@ impl<const N: usize, T> Iterator for IntoIter<N, T> {
     }
 }
 
+impl<const N: usize, T> DoubleEndedIterator for IntoIter<N, T> {
+    fn next_back(&mut self) -> Option<T> {
+        if self.pos >= self.vec.len {
+            return None;
+        }
+        let last = self.vec.len - 1;
+        // SAFETY: last is in bounds (>= pos).
+        let val = unsafe { self.vec.buf[last].assume_init_read() };
+        self.vec.len = last;
+        Some(val)
+    }
+}
+
 impl<const N: usize, T> ExactSizeIterator for IntoIter<N, T> {}
+
+impl<const N: usize, T> core::iter::FusedIterator for IntoIter<N, T> {}
 
 impl<const N: usize, T> Drop for IntoIter<N, T> {
     fn drop(&mut self) {
@@ -564,6 +820,85 @@ impl<const N: usize, T> Drop for IntoIter<N, T> {
         }
         // Prevent ZeroVec's Drop from double-dropping.
         self.vec.len = 0;
+    }
+}
+
+/// Iterator yielding elements being drained from a `ZeroVec`.
+///
+/// Returned by [`ZeroVec::drain`]. When dropped, any unconsumed elements in
+/// the drained range are dropped and the tail (elements after the drained
+/// range) is shifted down to close the gap.
+pub struct Drain<'a, const N: usize, T: 'a> {
+    vec: &'a mut ZeroVec<N, T>,
+    // Fixed bounds of the drained range.
+    start: usize,
+    end: usize,
+    // Iteration cursors: `head` advances from `start` via `next`,
+    // `tail` retreats from `end` via `next_back`. Unconsumed elements
+    // remain in `[head, tail)`.
+    head: usize,
+    tail: usize,
+    // Length of the vec before drain() was called.
+    original_len: usize,
+}
+
+impl<'a, const N: usize, T> Iterator for Drain<'a, N, T> {
+    type Item = T;
+
+    fn next(&mut self) -> Option<T> {
+        if self.head >= self.tail {
+            return None;
+        }
+        // SAFETY: head < tail <= end <= original_len, so buf[head] was init.
+        let val = unsafe { self.vec.buf[self.head].assume_init_read() };
+        self.head += 1;
+        Some(val)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.tail - self.head;
+        (remaining, Some(remaining))
+    }
+}
+
+impl<'a, const N: usize, T> DoubleEndedIterator for Drain<'a, N, T> {
+    fn next_back(&mut self) -> Option<T> {
+        if self.head >= self.tail {
+            return None;
+        }
+        self.tail -= 1;
+        // SAFETY: tail was > head, so buf[tail] was initialized.
+        let val = unsafe { self.vec.buf[self.tail].assume_init_read() };
+        Some(val)
+    }
+}
+
+impl<'a, const N: usize, T> ExactSizeIterator for Drain<'a, N, T> {}
+
+impl<'a, const N: usize, T> core::iter::FusedIterator for Drain<'a, N, T> {}
+
+impl<'a, const N: usize, T> Drop for Drain<'a, N, T> {
+    fn drop(&mut self) {
+        // Drop any remaining (unconsumed) elements in [head, tail).
+        for i in self.head..self.tail {
+            unsafe {
+                self.vec.buf[i].assume_init_drop();
+            }
+        }
+        // Shift the tail (elements at [end..original_len]) down to close the gap.
+        let tail_len = self.original_len - self.end;
+        if tail_len > 0 {
+            // SAFETY: buf[end..original_len] is initialized. The source range
+            // and destination range may overlap; ptr::copy handles that.
+            unsafe {
+                core::ptr::copy(
+                    self.vec.as_ptr().add(self.end),
+                    self.vec.as_mut_ptr().add(self.start),
+                    tail_len,
+                );
+            }
+        }
+        self.vec.len = self.start + tail_len;
     }
 }
 
@@ -910,7 +1245,7 @@ mod tests {
         assert_eq!(v.len(), 11);
         assert!(v.starts_with(b"hello"));
         assert!(v.ends_with(b"world"));
-        assert_eq!(&v.as_slice()[0..5], b"hello");
+        assert_eq!(&v[0..5], b"hello");
     }
 
     #[test]
@@ -1104,5 +1439,189 @@ mod tests {
         let mut read_cursor = lencode::io::Cursor::new(&buf[..written]);
         let decoded: Vec<u8> = Vec::decode_ext(&mut read_cursor, None).unwrap();
         assert_eq!(decoded.as_slice(), zv.as_slice());
+    }
+
+    // --- New methods ---
+
+    #[test]
+    fn test_swap_remove() {
+        let mut v: ZeroVec<8, i32> = ZeroVec::new();
+        v.extend_from_slice(&[10, 20, 30, 40]);
+        assert_eq!(v.swap_remove(1), 20);
+        // Element at index 1 is now the former last (40); order NOT preserved.
+        assert_eq!(v.as_slice(), &[10, 40, 30]);
+        // swap_remove on the last element is a plain pop.
+        assert_eq!(v.swap_remove(2), 30);
+        assert_eq!(v.as_slice(), &[10, 40]);
+    }
+
+    #[test]
+    #[should_panic(expected = "out of bounds")]
+    fn test_swap_remove_out_of_bounds() {
+        let mut v: ZeroVec<4, i32> = ZeroVec::new();
+        v.push(1);
+        v.swap_remove(5);
+    }
+
+    #[test]
+    fn test_spare_capacity_mut() {
+        let mut v: ZeroVec<8, u8> = ZeroVec::new();
+        v.extend_from_slice(b"ab");
+        let spare = v.spare_capacity_mut();
+        assert_eq!(spare.len(), 6);
+        spare[0] = MaybeUninit::new(b'c');
+        spare[1] = MaybeUninit::new(b'd');
+        unsafe { v.set_len(4) };
+        assert_eq!(v.as_slice(), b"abcd");
+    }
+
+    #[test]
+    fn test_resize_with() {
+        let mut v: ZeroVec<8, String> = ZeroVec::new();
+        let mut count = 0;
+        v.resize_with(3, || {
+            count += 1;
+            format!("item{count}")
+        });
+        assert_eq!(v.len(), 3);
+        assert_eq!(v[0], "item1");
+        assert_eq!(v[1], "item2");
+        assert_eq!(v[2], "item3");
+        // Shrinking drops extras.
+        v.resize_with(1, || "unused".to_string());
+        assert_eq!(v.as_slice().len(), 1);
+        assert_eq!(v[0], "item1");
+    }
+
+    #[test]
+    fn test_append() {
+        let mut a: ZeroVec<8, i32> = ZeroVec::new();
+        let mut b: ZeroVec<4, i32> = ZeroVec::new();
+        a.extend_from_slice(&[1, 2, 3]);
+        b.extend_from_slice(&[4, 5]);
+        a.append(&mut b);
+        assert_eq!(a.as_slice(), &[1, 2, 3, 4, 5]);
+        assert!(b.is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "ZeroVec::append overflow")]
+    fn test_append_overflow() {
+        let mut a: ZeroVec<4, i32> = ZeroVec::new();
+        let mut b: ZeroVec<4, i32> = ZeroVec::new();
+        a.extend_from_slice(&[1, 2, 3]);
+        b.extend_from_slice(&[4, 5, 6]);
+        a.append(&mut b); // 3 + 3 > 4
+    }
+
+    #[test]
+    fn test_dedup() {
+        let mut v: ZeroVec<16, i32> = ZeroVec::new();
+        v.extend_from_slice(&[1, 1, 2, 3, 3, 3, 4, 1, 1]);
+        v.dedup();
+        assert_eq!(v.as_slice(), &[1, 2, 3, 4, 1]);
+    }
+
+    #[test]
+    fn test_dedup_by_key() {
+        let mut v: ZeroVec<8, i32> = ZeroVec::new();
+        v.extend_from_slice(&[10, 11, 12, 20, 21, 30]);
+        v.dedup_by_key(|x| *x / 10);
+        assert_eq!(v.as_slice(), &[10, 20, 30]);
+    }
+
+    #[test]
+    fn test_extend_from_within() {
+        let mut v: ZeroVec<16, u8> = ZeroVec::new();
+        v.extend_from_slice(b"abc");
+        v.extend_from_within(0..2);
+        assert_eq!(v.as_slice(), b"abcab");
+        v.extend_from_within(..);
+        assert_eq!(v.as_slice(), b"abcababcab");
+    }
+
+    #[test]
+    fn test_drain_full() {
+        let mut v: ZeroVec<8, i32> = ZeroVec::new();
+        v.extend_from_slice(&[1, 2, 3, 4, 5]);
+        let drained: Vec<i32> = v.drain(..).collect();
+        assert_eq!(drained, vec![1, 2, 3, 4, 5]);
+        assert!(v.is_empty());
+    }
+
+    #[test]
+    fn test_drain_partial() {
+        let mut v: ZeroVec<8, i32> = ZeroVec::new();
+        v.extend_from_slice(&[1, 2, 3, 4, 5]);
+        let drained: Vec<i32> = v.drain(1..4).collect();
+        assert_eq!(drained, vec![2, 3, 4]);
+        assert_eq!(v.as_slice(), &[1, 5]);
+    }
+
+    #[test]
+    fn test_drain_drop_mid_iter() {
+        // Ensure unconsumed drained elements are dropped and the tail is shifted.
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+        static DROPS: AtomicUsize = AtomicUsize::new(0);
+
+        struct D(u32);
+        impl Drop for D {
+            fn drop(&mut self) {
+                DROPS.fetch_add(1, AtomicOrdering::SeqCst);
+            }
+        }
+
+        DROPS.store(0, AtomicOrdering::SeqCst);
+        let mut v: ZeroVec<8, D> = ZeroVec::new();
+        v.push(D(1));
+        v.push(D(2));
+        v.push(D(3));
+        v.push(D(4));
+        v.push(D(5));
+        {
+            let mut it = v.drain(1..4);
+            let _first = it.next().unwrap(); // consume D(2), will drop when _first is dropped
+            // Drop it; D(3) and D(4) should be dropped by Drain::drop.
+        }
+        // After drain: v = [D(1), D(5)]. 3 drops so far (D(2), D(3), D(4)).
+        assert_eq!(DROPS.load(AtomicOrdering::SeqCst), 3);
+        assert_eq!(v.len(), 2);
+    }
+
+    #[test]
+    fn test_drain_rev() {
+        let mut v: ZeroVec<8, i32> = ZeroVec::new();
+        v.extend_from_slice(&[1, 2, 3, 4, 5]);
+        let drained: Vec<i32> = v.drain(1..4).rev().collect();
+        assert_eq!(drained, vec![4, 3, 2]);
+        assert_eq!(v.as_slice(), &[1, 5]);
+    }
+
+    #[test]
+    fn test_into_iter_rev() {
+        let mut v: ZeroVec<4, i32> = ZeroVec::new();
+        v.extend_from_slice(&[1, 2, 3]);
+        let collected: Vec<i32> = v.into_iter().rev().collect();
+        assert_eq!(collected, vec![3, 2, 1]);
+    }
+
+    #[test]
+    fn test_index_range() {
+        // Range, RangeFrom, RangeTo, RangeFull, RangeInclusive all via SliceIndex.
+        let mut v: ZeroVec<16, u8> = ZeroVec::new();
+        v.extend_from_slice(b"abcdef");
+        assert_eq!(&v[1..4], b"bcd");
+        assert_eq!(&v[..3], b"abc");
+        assert_eq!(&v[3..], b"def");
+        assert_eq!(&v[..], b"abcdef");
+        assert_eq!(&v[1..=3], b"bcd");
+    }
+
+    #[test]
+    fn test_index_range_mut() {
+        let mut v: ZeroVec<8, u8> = ZeroVec::new();
+        v.extend_from_slice(b"hello");
+        v[1..4].copy_from_slice(b"ELL");
+        assert_eq!(v.as_slice(), b"hELLo");
     }
 }

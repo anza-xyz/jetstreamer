@@ -74,7 +74,9 @@ pub static FROZEN_PUBKEY_DECODER: Lazy<Arc<FrozenDecoderState>> = Lazy::new(|| {
 #[inline]
 pub fn new_encoder_context() -> EncoderContext {
     EncoderContext {
-        dedupe: Some(DedupeEncoder::with_frozen(Arc::clone(&FROZEN_PUBKEY_ENCODER))),
+        dedupe: Some(DedupeEncoder::with_frozen(Arc::clone(
+            &FROZEN_PUBKEY_ENCODER,
+        ))),
         diff: None,
     }
 }
@@ -84,7 +86,9 @@ pub fn new_encoder_context() -> EncoderContext {
 #[inline]
 pub fn new_decoder_context() -> DecoderContext {
     DecoderContext {
-        dedupe: Some(DedupeDecoder::with_frozen(Arc::clone(&FROZEN_PUBKEY_DECODER))),
+        dedupe: Some(DedupeDecoder::with_frozen(Arc::clone(
+            &FROZEN_PUBKEY_DECODER,
+        ))),
         diff: None,
     }
 }
@@ -141,12 +145,12 @@ mod tests {
         //   ID 256..=65535 → 3 bytes
         // Verify each zone produces the expected wire length.
         let cases = [
-            (0usize, 1usize),    // ID 1 → 1 byte
-            (126, 1),            // ID 127 → 1 byte
-            (127, 2),            // ID 128 → 2 bytes
-            (254, 2),            // ID 255 → 2 bytes
-            (255, 3),            // ID 256 → 3 bytes
-            (65_534, 3),         // ID 65535 → 3 bytes
+            (0usize, 1usize), // ID 1 → 1 byte
+            (126, 1),         // ID 127 → 1 byte
+            (127, 2),         // ID 128 → 2 bytes
+            (254, 2),         // ID 255 → 2 bytes
+            (255, 3),         // ID 256 → 3 bytes
+            (65_534, 3),      // ID 65535 → 3 bytes
         ];
         for (index, expected_bytes) in cases {
             let mut ctx = new_encoder_context();
@@ -233,6 +237,9 @@ mod tests {
         popular.encode_ext(&mut buf2, Some(&mut enc)).unwrap();
 
         // Novel gets the same scratch ID it had before (first novel after frozen).
-        assert_eq!(buf, buf2, "reset should produce identical output for repeat slot");
+        assert_eq!(
+            buf, buf2,
+            "reset should produce identical output for repeat slot"
+        );
     }
 }

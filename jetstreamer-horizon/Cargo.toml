@@ -20,3 +20,4 @@ solana-address.workspace = true
 solana-clock.workspace = true
 solana-reward-info.workspace = true
 solana-transaction-context.workspace = true
+once_cell.workspace = true

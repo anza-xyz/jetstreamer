@@ -617,7 +617,7 @@ impl<const N: usize, T: Encode + 'static> Encode for ZeroVec<N, T> {
     fn encode_ext(
         &self,
         writer: &mut impl Write,
-        mut dedupe_encoder: Option<&mut DedupeEncoder>,
+        mut ctx: Option<&mut lencode::context::EncoderContext>,
     ) -> lencode::Result<usize> {
         // For u8: always write uncompressed (zero-alloc).
         // Wire format: varint(raw_len << 1 | 0) + raw_bytes
@@ -634,7 +634,7 @@ impl<const N: usize, T: Encode + 'static> Encode for ZeroVec<N, T> {
         let mut total = 0;
         total += Self::encode_len(self.len, writer)?;
         for item in self.as_slice() {
-            total += item.encode_ext(writer, dedupe_encoder.as_deref_mut())?;
+            total += item.encode_ext(writer, ctx.as_deref_mut())?;
         }
         Ok(total)
     }
@@ -644,7 +644,7 @@ impl<const N: usize, T: Decode + 'static> Decode for ZeroVec<N, T> {
     #[inline(always)]
     fn decode_ext(
         reader: &mut impl Read,
-        mut dedupe_decoder: Option<&mut DedupeDecoder>,
+        mut ctx: Option<&mut lencode::context::DecoderContext>,
     ) -> lencode::Result<Self> {
         // For u8: read uncompressed directly into inline buffer (zero-alloc).
         if core::any::TypeId::of::<T>() == core::any::TypeId::of::<u8>() {
@@ -675,7 +675,7 @@ impl<const N: usize, T: Decode + 'static> Decode for ZeroVec<N, T> {
         );
         let mut zv = Self::new();
         for _ in 0..len {
-            let item = T::decode_ext(reader, dedupe_decoder.as_deref_mut())?;
+            let item = T::decode_ext(reader, ctx.as_deref_mut())?;
             zv.buf[zv.len] = MaybeUninit::new(item);
             zv.len += 1;
         }

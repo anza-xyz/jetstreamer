@@ -1,4 +1,6 @@
 use jetstreamer_horizon::account_updates::AccountUpdate;
+use jetstreamer_horizon::dedupe::new_encoder_context;
+use lencode::context::EncoderContext;
 use lencode::prelude::*;
 use log::info;
 use solana_account::{AccountSharedData, ReadableAccount};
@@ -19,7 +21,10 @@ const ACCOUNT_UPDATE_ENCODE_BUFFER_SIZE: usize = 12 * 1024 * 1024;
 const LOG_EVERY_N_BLOCKS: u64 = 10;
 
 thread_local! {
-    static ENCODER: RefCell<DedupeEncoder> = RefCell::new(DedupeEncoder::new());
+    // Per-thread encoder context backed by the shared popular-pubkey frozen
+    // dedupe state. Building the context just clones the Arc + allocates a
+    // tiny scratch layer — the 65 535-entry primed table is shared.
+    static ENCODER: RefCell<EncoderContext> = RefCell::new(new_encoder_context());
     // Keep the large encode buffer on the heap; some notifier threads have small stacks.
     static ACCOUNT_UPDATE_ENCODE_BUFFER: RefCell<Vec<u8>> =
         RefCell::new(vec![0u8; ACCOUNT_UPDATE_ENCODE_BUFFER_SIZE]);
@@ -60,7 +65,7 @@ pub fn reset() {
         *cursor = None;
     }
     ENCODER.with(|encoder| {
-        encoder.borrow_mut().clear();
+        jetstreamer_horizon::dedupe::reset_encoder(&mut encoder.borrow_mut());
     });
 }
 

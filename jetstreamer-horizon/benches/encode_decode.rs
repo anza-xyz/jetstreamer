@@ -22,16 +22,18 @@
 //! First run pays the one-time firehose fetch (tens of seconds depending
 //! on your link); subsequent benches in the same process are in-memory.
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 use futures_util::FutureExt;
 use jetstreamer_firehose::epochs::epoch_to_slot_range;
 use jetstreamer_firehose::firehose::{
-    firehose, OnBlockFn, OnEntryFn, OnErrorFn, OnRewardFn, OnStatsTrackingFn, TransactionData,
+    OnBlockFn, OnEntryFn, OnErrorFn, OnRewardFn, OnStatsTrackingFn, TransactionData, firehose,
 };
 use jetstreamer_horizon::account_updates::{AccountUpdate, AccountUpdateView};
-use jetstreamer_horizon::dedupe::{new_decoder_context, new_encoder_context, reset_decoder, reset_encoder};
+use jetstreamer_horizon::dedupe::{
+    new_decoder_context, new_encoder_context, reset_decoder, reset_encoder,
+};
 use jetstreamer_horizon::limits::{
-    MAX_IX_ACCOUNTS, MAX_IX_DATA_LEN, MAX_TX_ACCOUNTS, MAX_TX_ACCOUNT_UPDATES, MAX_TX_ADDR_LOOKUPS,
+    MAX_IX_ACCOUNTS, MAX_IX_DATA_LEN, MAX_TX_ACCOUNT_UPDATES, MAX_TX_ACCOUNTS, MAX_TX_ADDR_LOOKUPS,
     MAX_TX_INSTRUCTIONS, MAX_TX_SIGS,
 };
 use jetstreamer_horizon::pubkey_prime::POPULAR_PUBKEYS;
@@ -541,7 +543,9 @@ fn bench_account_update_encode(c: &mut Criterion) {
             b.iter(|| {
                 reset_encoder(&mut ctx);
                 let mut cursor = Cursor::new(&mut buf[..]);
-                let n = update.encode_ext(&mut cursor, Some(&mut ctx)).expect("encode");
+                let n = update
+                    .encode_ext(&mut cursor, Some(&mut ctx))
+                    .expect("encode");
                 black_box(n);
             });
         });
@@ -564,7 +568,9 @@ fn bench_account_update_decode(c: &mut Criterion) {
         reset_encoder(&mut enc_ctx);
         let mut wire_dedupe = vec![0u8; size + 1024];
         let mut cur = Cursor::new(&mut wire_dedupe[..]);
-        let dedupe_len = src.encode_ext(&mut cur, Some(&mut enc_ctx)).expect("encode");
+        let dedupe_len = src
+            .encode_ext(&mut cur, Some(&mut enc_ctx))
+            .expect("encode");
         wire_dedupe.truncate(dedupe_len);
 
         let mut dst = AccountUpdate::new_boxed();
@@ -583,7 +589,8 @@ fn bench_account_update_decode(c: &mut Criterion) {
             b.iter(|| {
                 reset_decoder(&mut dec_ctx);
                 let mut cursor = Cursor::new(&wire_dedupe[..]);
-                dst.decode_into(&mut cursor, Some(&mut dec_ctx)).expect("decode");
+                dst.decode_into(&mut cursor, Some(&mut dec_ctx))
+                    .expect("decode");
                 black_box(&dst);
             });
         });
@@ -605,23 +612,31 @@ fn bench_transaction_encode(c: &mut Criterion) {
 
         group.throughput(Throughput::Bytes(wire_bytes as u64));
 
-        group.bench_with_input(BenchmarkId::new("no_dedupe", shape.label), shape.label, |b, _| {
-            b.iter(|| {
-                let mut cursor = Cursor::new(&mut buf[..]);
-                let n = tx.encode_ext(&mut cursor, None).expect("encode");
-                black_box(n);
-            });
-        });
+        group.bench_with_input(
+            BenchmarkId::new("no_dedupe", shape.label),
+            shape.label,
+            |b, _| {
+                b.iter(|| {
+                    let mut cursor = Cursor::new(&mut buf[..]);
+                    let n = tx.encode_ext(&mut cursor, None).expect("encode");
+                    black_box(n);
+                });
+            },
+        );
 
         let mut ctx = new_encoder_context();
-        group.bench_with_input(BenchmarkId::new("with_dedupe", shape.label), shape.label, |b, _| {
-            b.iter(|| {
-                reset_encoder(&mut ctx);
-                let mut cursor = Cursor::new(&mut buf[..]);
-                let n = tx.encode_ext(&mut cursor, Some(&mut ctx)).expect("encode");
-                black_box(n);
-            });
-        });
+        group.bench_with_input(
+            BenchmarkId::new("with_dedupe", shape.label),
+            shape.label,
+            |b, _| {
+                b.iter(|| {
+                    reset_encoder(&mut ctx);
+                    let mut cursor = Cursor::new(&mut buf[..]);
+                    let n = tx.encode_ext(&mut cursor, Some(&mut ctx)).expect("encode");
+                    black_box(n);
+                });
+            },
+        );
     }
     group.finish();
 }
@@ -642,29 +657,40 @@ fn bench_transaction_decode(c: &mut Criterion) {
         reset_encoder(&mut enc_ctx);
         let mut wire_dedupe = vec![0u8; wire_bytes * 2 + 64_000];
         let mut cur = Cursor::new(&mut wire_dedupe[..]);
-        let dedupe_len = src.encode_ext(&mut cur, Some(&mut enc_ctx)).expect("encode");
+        let dedupe_len = src
+            .encode_ext(&mut cur, Some(&mut enc_ctx))
+            .expect("encode");
         wire_dedupe.truncate(dedupe_len);
 
         let mut dst = Transaction::new_boxed();
 
         group.throughput(Throughput::Bytes(wire_bytes as u64));
-        group.bench_with_input(BenchmarkId::new("no_dedupe", shape.label), shape.label, |b, _| {
-            b.iter(|| {
-                let mut cursor = Cursor::new(&wire_plain[..]);
-                dst.decode_into(&mut cursor, None).expect("decode");
-                black_box(&dst);
-            });
-        });
+        group.bench_with_input(
+            BenchmarkId::new("no_dedupe", shape.label),
+            shape.label,
+            |b, _| {
+                b.iter(|| {
+                    let mut cursor = Cursor::new(&wire_plain[..]);
+                    dst.decode_into(&mut cursor, None).expect("decode");
+                    black_box(&dst);
+                });
+            },
+        );
 
         let mut dec_ctx = new_decoder_context();
-        group.bench_with_input(BenchmarkId::new("with_dedupe", shape.label), shape.label, |b, _| {
-            b.iter(|| {
-                reset_decoder(&mut dec_ctx);
-                let mut cursor = Cursor::new(&wire_dedupe[..]);
-                dst.decode_into(&mut cursor, Some(&mut dec_ctx)).expect("decode");
-                black_box(&dst);
-            });
-        });
+        group.bench_with_input(
+            BenchmarkId::new("with_dedupe", shape.label),
+            shape.label,
+            |b, _| {
+                b.iter(|| {
+                    reset_decoder(&mut dec_ctx);
+                    let mut cursor = Cursor::new(&wire_dedupe[..]);
+                    dst.decode_into(&mut cursor, Some(&mut dec_ctx))
+                        .expect("decode");
+                    black_box(&dst);
+                });
+            },
+        );
     }
     group.finish();
 }
@@ -704,6 +730,21 @@ fn measure_wincode_corpus(sample: &[&VersionedTransaction]) -> CompressionStats 
     }
 }
 
+/// Encodes just `signatures + message` — the VersionedTransaction wire
+/// equivalent — bypassing the `Transaction` wrapper's empty-Option and
+/// empty-ZeroVec overhead. Apples-to-apples with wincode's
+/// `VersionedTransactionSchema`.
+fn encode_sig_and_message<W: lencode::prelude::Write>(
+    scratch: &Transaction,
+    writer: &mut W,
+    mut ctx: Option<&mut lencode::context::EncoderContext>,
+) -> lencode::Result<usize> {
+    let mut total = 0;
+    total += scratch.signatures.encode_ext(writer, ctx.as_deref_mut())?;
+    total += scratch.message.encode_ext(writer, ctx)?;
+    Ok(total)
+}
+
 fn encode_corpus_with_config(
     sample: &[&VersionedTransaction],
     label: &'static str,
@@ -721,9 +762,7 @@ fn encode_corpus_with_config(
             reset_encoder(ctx);
         }
         let mut cursor = Cursor::new(&mut buf[..]);
-        let n = scratch
-            .encode_ext(&mut cursor, ctx.as_mut())
-            .expect("encode");
+        let n = encode_sig_and_message(&scratch, &mut cursor, ctx.as_mut()).expect("encode");
         total_bytes += n as u64;
     }
 
@@ -797,10 +836,7 @@ fn bench_compression_ratios(c: &mut Criterion) {
     // group. We measure one encode-under-primed-dedupe iteration, which
     // also picks up the setup cost indirectly.
     let mut group = c.benchmark_group("compression/encode_sample_10k");
-    let input_bytes: u64 = sample
-        .iter()
-        .map(|tx| tx_complexity_score(tx) as u64)
-        .sum();
+    let input_bytes: u64 = sample.iter().map(|tx| tx_complexity_score(tx) as u64).sum();
     group.throughput(Throughput::Bytes(input_bytes));
     group.sample_size(10);
     group.bench_function("dedupe_primed", |b| {
@@ -813,12 +849,184 @@ fn bench_compression_ratios(c: &mut Criterion) {
                 build_message_only_tx(&mut scratch, real);
                 reset_encoder(&mut ctx);
                 let mut cursor = Cursor::new(&mut buf[..]);
-                total += scratch
-                    .encode_ext(&mut cursor, Some(&mut ctx))
+                total += encode_sig_and_message(&scratch, &mut cursor, Some(&mut ctx))
                     .expect("encode") as u64;
             }
             black_box(total);
         });
+    });
+    group.finish();
+}
+
+// --------------------------------------------------------------------
+// Diff compression — simulates a realistic account-update stream (the
+// same accounts updated repeatedly with small mutations) and measures
+// the size savings from lencode's `DiffEncoder`.
+// --------------------------------------------------------------------
+
+/// A fake ledger of account blobs that simulates realistic mutation
+/// patterns: Zipf-ish hot/cold access, sparse byte-level changes per
+/// update, account sizes biased toward the SPL-token range.
+struct VirtualLedger {
+    /// (pubkey, current data) for each live account.
+    accounts: Vec<(Address, Vec<u8>)>,
+    rng: SplitMix64,
+}
+
+impl VirtualLedger {
+    fn new(seed: u64, n_accounts: usize) -> Self {
+        let mut rng = SplitMix64::new(seed);
+        let mut accounts = Vec::with_capacity(n_accounts);
+        for _ in 0..n_accounts {
+            let pk = rng.pubkey();
+            // Size distribution (rough Solana shape):
+            //   60 % token/stake-like (100–400 B)
+            //   30 % program state (400–2 KiB)
+            //   10 % larger (2 KiB–10 KiB)
+            let size = match rng.next_u64() % 100 {
+                0..=59 => 100 + rng.next_u64() as usize % 301,
+                60..=89 => 400 + rng.next_u64() as usize % 1600,
+                _ => 2000 + rng.next_u64() as usize % 8000,
+            };
+            let mut data = vec![0u8; size];
+            rng.fill(&mut data);
+            accounts.push((Address::new_from_array(pk), data));
+        }
+        Self { accounts, rng }
+    }
+
+    /// Returns `(pubkey, snapshot_of_new_data)` for the next update,
+    /// applied as a small mutation to an existing account (mostly hot).
+    fn next_update(&mut self) -> (Address, Vec<u8>) {
+        // 80 % of updates target the hottest 10 % of accounts; 20 % hit
+        // the long tail. Approximates real Solana's access skew.
+        let pool_len = self.accounts.len();
+        let idx = if self.rng.next_u64() % 100 < 80 {
+            (self.rng.next_u64() as usize) % pool_len.div_ceil(10).max(1)
+        } else {
+            (self.rng.next_u64() as usize) % pool_len
+        };
+        let (pk, data) = &mut self.accounts[idx];
+
+        // Sparse mutation: flip 1–5 ranges of 1–16 bytes each at random
+        // offsets. Realistic for lamport-balance / slot / counter updates.
+        let n_ranges = 1 + (self.rng.next_u64() as usize % 5);
+        for _ in 0..n_ranges {
+            if data.is_empty() {
+                break;
+            }
+            let start = (self.rng.next_u64() as usize) % data.len();
+            let remaining = data.len() - start;
+            let len = 1 + (self.rng.next_u64() as usize % 16).min(remaining - 1);
+            self.rng.fill(&mut data[start..start + len]);
+        }
+        (*pk, data.clone())
+    }
+}
+
+/// Derives a stable u64 key for the diff encoder from an `Address`.
+fn diff_key(addr: &Address) -> u64 {
+    let bytes = addr.to_bytes();
+    let mut k: u64 = 0;
+    for chunk in bytes.chunks(8) {
+        let mut buf = [0u8; 8];
+        buf[..chunk.len()].copy_from_slice(chunk);
+        k ^= u64::from_le_bytes(buf);
+    }
+    k
+}
+
+fn bench_account_update_diff_compression(c: &mut Criterion) {
+    const N_ACCOUNTS: usize = 1_000;
+    const N_UPDATES: usize = 10_000;
+
+    let mut ledger = VirtualLedger::new(0xDEADBEEF, N_ACCOUNTS);
+    let updates: Vec<(Address, Vec<u8>)> = (0..N_UPDATES).map(|_| ledger.next_update()).collect();
+
+    let total_input_bytes: u64 = updates.iter().map(|(_, d)| d.len() as u64).sum();
+
+    // --- Baseline: raw length-prefixed encoding (what our ZeroVec<u8>
+    //     encode_ext does: `varint(len << 1) + bytes`).
+    fn varint_len(mut v: u64) -> u64 {
+        if v <= 127 {
+            return 1;
+        }
+        let mut n = 0;
+        while v != 0 {
+            n += 1;
+            v >>= 8;
+        }
+        1 + n
+    }
+    let raw_total: u64 = updates
+        .iter()
+        .map(|(_, d)| varint_len((d.len() << 1) as u64) + d.len() as u64)
+        .sum();
+
+    // --- With DiffEncoder, keyed by pubkey.
+    use lencode::diff::DiffEncoder;
+    let mut diff_enc = DiffEncoder::with_capacity(N_ACCOUNTS);
+    let mut buf = Vec::with_capacity(1 << 20);
+    let mut diff_total: u64 = 0;
+    for (addr, data) in &updates {
+        diff_enc.set_key(diff_key(addr));
+        buf.clear();
+        diff_total += diff_enc.encode_blob(data, &mut buf).expect("encode") as u64;
+    }
+
+    eprintln!();
+    eprintln!(
+        "=== Diff compression over {N_UPDATES} updates to {N_ACCOUNTS} accounts \
+         (hot/cold Zipf-ish, sparse mutations) ==="
+    );
+    eprintln!(
+        "  {:<24} | {:>12}  | {:>10}  | {:>6}  | {:>7}",
+        "config", "total_bytes", "avg_B/upd", "ratio", "save"
+    );
+    eprintln!("  {}", "-".repeat(72));
+    for (label, bytes) in [
+        ("raw (len + data)", raw_total),
+        ("lencode DiffEncoder", diff_total),
+    ] {
+        let avg = bytes as f64 / N_UPDATES as f64;
+        let ratio = bytes as f64 / raw_total as f64;
+        let save = (1.0 - ratio) * 100.0;
+        eprintln!(
+            "  {:<24} | {:>12}  | {:>10.1}  | {:>6.3}  | {:>+6.1}%",
+            label, bytes, avg, ratio, save
+        );
+    }
+    eprintln!(
+        "  input (uncompressed)     | {:>12}  | {:>10.1}  |   --   |   --",
+        total_input_bytes,
+        total_input_bytes as f64 / N_UPDATES as f64,
+    );
+    eprintln!();
+
+    // Time the diff-encode path through the same stream — per-iter cost
+    // of encoding the full update batch.
+    let mut group = c.benchmark_group("compression/diff_stream");
+    group.throughput(Throughput::Bytes(total_input_bytes));
+    group.sample_size(10);
+    group.bench_function("encode_all", |b| {
+        b.iter_batched(
+            || {
+                (
+                    DiffEncoder::with_capacity(N_ACCOUNTS),
+                    Vec::with_capacity(1 << 20),
+                )
+            },
+            |(mut enc, mut buf)| {
+                let mut total = 0u64;
+                for (addr, data) in &updates {
+                    enc.set_key(diff_key(addr));
+                    buf.clear();
+                    total += enc.encode_blob(data, &mut buf).expect("encode") as u64;
+                }
+                black_box(total);
+            },
+            criterion::BatchSize::LargeInput,
+        );
     });
     group.finish();
 }
@@ -835,18 +1043,25 @@ fn bench_transaction_roundtrip(c: &mut Criterion) {
         let mut dec_ctx = new_decoder_context();
 
         group.throughput(Throughput::Bytes(wire_bytes as u64));
-        group.bench_with_input(BenchmarkId::new("with_dedupe", shape.label), shape.label, |b, _| {
-            b.iter(|| {
-                reset_encoder(&mut enc_ctx);
-                let mut cursor = Cursor::new(&mut buf[..]);
-                let wire_len = src.encode_ext(&mut cursor, Some(&mut enc_ctx)).expect("encode");
+        group.bench_with_input(
+            BenchmarkId::new("with_dedupe", shape.label),
+            shape.label,
+            |b, _| {
+                b.iter(|| {
+                    reset_encoder(&mut enc_ctx);
+                    let mut cursor = Cursor::new(&mut buf[..]);
+                    let wire_len = src
+                        .encode_ext(&mut cursor, Some(&mut enc_ctx))
+                        .expect("encode");
 
-                reset_decoder(&mut dec_ctx);
-                let mut read_cursor = Cursor::new(&buf[..wire_len]);
-                dst.decode_into(&mut read_cursor, Some(&mut dec_ctx)).expect("decode");
-                black_box(&dst);
-            });
-        });
+                    reset_decoder(&mut dec_ctx);
+                    let mut read_cursor = Cursor::new(&buf[..wire_len]);
+                    dst.decode_into(&mut read_cursor, Some(&mut dec_ctx))
+                        .expect("decode");
+                    black_box(&dst);
+                });
+            },
+        );
     }
     group.finish();
 }
@@ -868,5 +1083,6 @@ criterion_group!(
     bench_transaction_decode,
     bench_transaction_roundtrip,
     bench_compression_ratios,
+    bench_account_update_diff_compression,
 );
 criterion_main!(benches);

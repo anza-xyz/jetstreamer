@@ -23,3 +23,15 @@ solana-transaction-context.workspace = true
 solana-system-interface.workspace = true
 solana-cpi.workspace = true
 once_cell.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+jetstreamer-firehose.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread"] }
+futures-util.workspace = true
+solana-message.workspace = true
+solana-pubkey.workspace = true
+
+[[bench]]
+name = "encode_decode"
+harness = false

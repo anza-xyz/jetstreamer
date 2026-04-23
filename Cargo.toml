@@ -53,6 +53,7 @@ env_logger = "0.11"
 base64 = "0.22"
 bincode = "1"
 serial_test = "2"
+criterion = { version = "0.5", features = ["html_reports"] }
 wincode = { version = "0.2", features = ["derive", "solana-short-vec"] }
 bs58 = { version = "0", default-features = false }
 cbor = "0"

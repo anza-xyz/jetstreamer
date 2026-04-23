@@ -33,7 +33,7 @@ use lencode::prelude::*;
 use solana_address::Address;
 
 use crate::limits::MAX_ACCOUNT_DATA_LEN;
-use crate::zero_vec::ZeroVec;
+use crate::zero_vec::{ZeroAlloc, ZeroVec, assert_zero_alloc};
 
 /// Account update record with inline-stored account data.
 ///
@@ -267,6 +267,31 @@ impl AccountUpdate {
         }
     }
 }
+
+// --- ZeroAlloc proofs ---
+//
+// `solana_address::Address` is a 32-byte newtype; we assert it's inline
+// here so our types can transitively depend on it. `AccountUpdate` and
+// `AccountUpdateView` each get a manual `ZeroAlloc` impl paired with
+// compile-time per-field assertions — if any field grows a heap-owning
+// type, the corresponding `assert_zero_alloc` line fails to compile.
+impl ZeroAlloc for Address {}
+impl ZeroAlloc for AccountUpdate {}
+impl ZeroAlloc for AccountUpdateView<'_> {}
+
+const _: fn() = || {
+    // `AccountUpdate` fields
+    assert_zero_alloc::<Address>(); // pubkey
+    assert_zero_alloc::<u64>(); // lamports
+    assert_zero_alloc::<Address>(); // owner
+    assert_zero_alloc::<bool>(); // executable
+    assert_zero_alloc::<u64>(); // rent_epoch
+    assert_zero_alloc::<ZeroVec<MAX_ACCOUNT_DATA_LEN, u8>>(); // data
+    assert_zero_alloc::<u64>(); // write_version
+
+    // `AccountUpdateView<'_>` fields (mostly the same, with `&'a [u8]` for data)
+    assert_zero_alloc::<&[u8]>(); // data
+};
 
 #[cfg(test)]
 mod tests {

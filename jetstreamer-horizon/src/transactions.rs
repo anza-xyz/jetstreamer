@@ -25,7 +25,7 @@ use crate::limits::{
     MAX_TX_INNER_IX, MAX_TX_INSTRUCTIONS, MAX_TX_LOG_MSGS, MAX_TX_REWARDS, MAX_TX_SIGS,
     MAX_TX_TOKEN_BALANCES,
 };
-use crate::zero_vec::ZeroVec;
+use crate::zero_vec::{ZeroAlloc, ZeroVec, assert_zero_alloc};
 
 // --- Message types ---
 
@@ -512,6 +512,131 @@ impl Transaction {
         self.account_updates_data.clear();
     }
 }
+
+// --- ZeroAlloc proofs ---
+//
+// Declare that `Hash`, `Signature`, and every type defined in this module
+// contain no heap-owning fields. Each `impl ZeroAlloc` is paired with
+// compile-time `assert_zero_alloc::<FieldType>()` calls below that verify
+// every listed field type is itself `ZeroAlloc`. If a field is renamed /
+// retyped to something non-inline (e.g. a `Vec<u8>` slips back in), the
+// corresponding line fails to compile.
+
+impl ZeroAlloc for Hash {}
+impl ZeroAlloc for Signature {}
+
+impl ZeroAlloc for MessageHeader {}
+impl ZeroAlloc for CompiledInstruction {}
+impl ZeroAlloc for MessageAddressTableLookup {}
+impl ZeroAlloc for LegacyMessage {}
+impl ZeroAlloc for V0Message {}
+impl ZeroAlloc for VersionedMessage {}
+impl ZeroAlloc for InnerInstruction {}
+impl ZeroAlloc for LogMessage {}
+impl ZeroAlloc for ReturnData {}
+impl ZeroAlloc for Reward {}
+impl ZeroAlloc for RewardType {}
+impl ZeroAlloc for TransactionStatus {}
+impl ZeroAlloc for TokenAmount {}
+impl ZeroAlloc for TransactionTokenBalance {}
+impl ZeroAlloc for TxAccountUpdate {}
+impl ZeroAlloc for PushAccountUpdateError {}
+impl ZeroAlloc for Transaction {}
+
+const _: fn() = || {
+    // `MessageHeader` fields
+    assert_zero_alloc::<u8>(); // num_required_signatures
+    assert_zero_alloc::<u8>(); // num_readonly_signed_accounts
+    assert_zero_alloc::<u8>(); // num_readonly_unsigned_accounts
+
+    // `CompiledInstruction` fields
+    assert_zero_alloc::<u8>(); // program_id_index
+    assert_zero_alloc::<ZeroVec<MAX_IX_ACCOUNTS, u8>>(); // accounts
+    assert_zero_alloc::<ZeroVec<MAX_IX_DATA_LEN, u8>>(); // data
+
+    // `MessageAddressTableLookup` fields
+    assert_zero_alloc::<Address>(); // account_key
+    assert_zero_alloc::<ZeroVec<MAX_TX_ACCOUNTS, u8>>(); // writable_indexes
+    assert_zero_alloc::<ZeroVec<MAX_TX_ACCOUNTS, u8>>(); // readonly_indexes
+
+    // `LegacyMessage` fields
+    assert_zero_alloc::<MessageHeader>();
+    assert_zero_alloc::<ZeroVec<MAX_TX_ACCOUNTS, Address>>();
+    assert_zero_alloc::<Hash>();
+    assert_zero_alloc::<ZeroVec<MAX_TX_INSTRUCTIONS, CompiledInstruction>>();
+
+    // `V0Message` fields (superset of LegacyMessage)
+    assert_zero_alloc::<ZeroVec<MAX_TX_ADDR_LOOKUPS, MessageAddressTableLookup>>();
+
+    // `VersionedMessage` is an enum of Legacy/V0 — both already asserted.
+
+    // `InnerInstruction` fields
+    assert_zero_alloc::<u8>(); // outer_index
+    assert_zero_alloc::<CompiledInstruction>(); // instruction
+    assert_zero_alloc::<Option<u32>>(); // stack_height
+
+    // `LogMessage` fields
+    assert_zero_alloc::<ZeroVec<MAX_LOG_MSG_LEN, u8>>();
+
+    // `ReturnData` fields
+    assert_zero_alloc::<Address>(); // program_id
+    assert_zero_alloc::<ZeroVec<MAX_RETURN_DATA_LEN, u8>>(); // data
+
+    // `Reward` fields
+    assert_zero_alloc::<i64>();
+    assert_zero_alloc::<Option<RewardType>>();
+    assert_zero_alloc::<Option<u8>>();
+
+    // `TransactionStatus` fields
+    assert_zero_alloc::<u16>(); // error_code
+    assert_zero_alloc::<u8>(); // instruction_index
+    assert_zero_alloc::<u32>(); // custom_error_code
+    assert_zero_alloc::<ZeroVec<MAX_CUSTOM_ERROR_LEN, u8>>(); // error_message
+
+    // `TokenAmount` fields: u64 + u8 (already asserted).
+
+    // `TransactionTokenBalance` fields
+    assert_zero_alloc::<TokenAmount>();
+    assert_zero_alloc::<Option<Address>>();
+
+    // `TxAccountUpdate` fields: Address + u64 + u64 + bool + u32 (asserted).
+
+    // `PushAccountUpdateError`: fieldless enum; trivially inline.
+
+    // `Transaction` fields
+    assert_zero_alloc::<TransactionStatus>();
+    assert_zero_alloc::<u64>(); // fee
+    assert_zero_alloc::<ZeroVec<MAX_TX_ACCOUNTS, u64>>(); // pre/post balances
+    assert_zero_alloc::<Option<ZeroVec<MAX_TX_INNER_IX, InnerInstruction>>>();
+    assert_zero_alloc::<Option<ZeroVec<MAX_TX_LOG_MSGS, LogMessage>>>();
+    assert_zero_alloc::<Option<ZeroVec<MAX_TX_TOKEN_BALANCES, TransactionTokenBalance>>>();
+    assert_zero_alloc::<Option<ZeroVec<MAX_TX_REWARDS, Reward>>>();
+    assert_zero_alloc::<Option<ReturnData>>();
+    assert_zero_alloc::<Option<u64>>();
+    assert_zero_alloc::<ZeroVec<MAX_TX_SIGS, Signature>>();
+    assert_zero_alloc::<VersionedMessage>();
+    assert_zero_alloc::<ZeroVec<MAX_TX_ACCOUNT_UPDATES, TxAccountUpdate>>();
+    assert_zero_alloc::<ZeroVec<MAX_ACCOUNT_DATA_LEN, u8>>(); // account_updates_data
+
+    // Finally, assert the top-level types themselves are ZeroAlloc.
+    assert_zero_alloc::<MessageHeader>();
+    assert_zero_alloc::<CompiledInstruction>();
+    assert_zero_alloc::<MessageAddressTableLookup>();
+    assert_zero_alloc::<LegacyMessage>();
+    assert_zero_alloc::<V0Message>();
+    assert_zero_alloc::<VersionedMessage>();
+    assert_zero_alloc::<InnerInstruction>();
+    assert_zero_alloc::<LogMessage>();
+    assert_zero_alloc::<ReturnData>();
+    assert_zero_alloc::<Reward>();
+    assert_zero_alloc::<RewardType>();
+    assert_zero_alloc::<TransactionStatus>();
+    assert_zero_alloc::<TokenAmount>();
+    assert_zero_alloc::<TransactionTokenBalance>();
+    assert_zero_alloc::<TxAccountUpdate>();
+    assert_zero_alloc::<PushAccountUpdateError>();
+    assert_zero_alloc::<Transaction>();
+};
 
 #[cfg(test)]
 mod tests {

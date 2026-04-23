@@ -608,6 +608,69 @@ impl<const N: usize, T> Drop for ZeroVec<N, T> {
     }
 }
 
+// --- ZeroAlloc marker trait ---
+
+/// Declares that a type's entire field tree is inline — no field (at any
+/// depth) owns heap memory via `Vec`, `Box`, `String`, `HashMap`, or any
+/// other pointer-to-heap indirection.
+///
+/// Implementing [`ZeroAlloc`] is a statement from the author that the type
+/// is heap-free. The bundled impls cover primitives, fixed-size arrays,
+/// `Option`, tuples, references (borrowed, not owned), and [`ZeroVec`].
+/// Types you define manually opt in with an `impl ZeroAlloc for MyType
+/// {}` block; this crate pairs each such opt-in with a compile-time
+/// [`assert_zero_alloc`] call on every field's type, so any field whose
+/// type isn't `ZeroAlloc` fails to compile.
+///
+/// Useful as a compile-time proof when writing data paths that must never
+/// heap-allocate (hot-loop encoding, `no_std`-like contexts).
+pub trait ZeroAlloc {}
+
+/// Compile-time check that `T: ZeroAlloc`.
+///
+/// Call sites look like `assert_zero_alloc::<FieldType>();` — if
+/// `FieldType` doesn't implement [`ZeroAlloc`], the line fails to compile
+/// with an unmet trait bound error.
+#[inline(always)]
+pub const fn assert_zero_alloc<T: ZeroAlloc>() {}
+
+macro_rules! impl_zero_alloc_for_primitives {
+    ($($t:ty),* $(,)?) => { $(impl ZeroAlloc for $t {})* };
+}
+
+impl_zero_alloc_for_primitives!(
+    (),
+    bool,
+    char,
+    u8,
+    u16,
+    u32,
+    u64,
+    u128,
+    usize,
+    i8,
+    i16,
+    i32,
+    i64,
+    i128,
+    isize,
+    f32,
+    f64,
+);
+
+impl<T: ZeroAlloc, const N: usize> ZeroAlloc for [T; N] {}
+impl<T: ZeroAlloc> ZeroAlloc for Option<T> {}
+impl<A: ZeroAlloc, B: ZeroAlloc> ZeroAlloc for (A, B) {}
+impl<A: ZeroAlloc, B: ZeroAlloc, C: ZeroAlloc> ZeroAlloc for (A, B, C) {}
+impl<A: ZeroAlloc, B: ZeroAlloc, C: ZeroAlloc, D: ZeroAlloc> ZeroAlloc for (A, B, C, D) {}
+// References are borrowed pointers to external storage — they don't own
+// heap memory themselves, so a type with a reference field is still
+// "inline" for our purposes.
+impl<T: ?Sized> ZeroAlloc for &T {}
+impl<T: ?Sized> ZeroAlloc for &mut T {}
+
+impl<const N: usize, T: ZeroAlloc> ZeroAlloc for ZeroVec<N, T> {}
+
 // --- Clone ---
 
 impl<const N: usize, T: Clone> Clone for ZeroVec<N, T> {

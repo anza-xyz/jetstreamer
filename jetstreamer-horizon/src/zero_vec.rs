@@ -1564,7 +1564,7 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
         static DROPS: AtomicUsize = AtomicUsize::new(0);
 
-        struct D(u32);
+        struct D;
         impl Drop for D {
             fn drop(&mut self) {
                 DROPS.fetch_add(1, AtomicOrdering::SeqCst);
@@ -1573,11 +1573,11 @@ mod tests {
 
         DROPS.store(0, AtomicOrdering::SeqCst);
         let mut v: ZeroVec<8, D> = ZeroVec::new();
-        v.push(D(1));
-        v.push(D(2));
-        v.push(D(3));
-        v.push(D(4));
-        v.push(D(5));
+        v.push(D);
+        v.push(D);
+        v.push(D);
+        v.push(D);
+        v.push(D);
         {
             let mut it = v.drain(1..4);
             let _first = it.next().unwrap(); // consume D(2), will drop when _first is dropped

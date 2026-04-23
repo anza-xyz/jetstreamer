@@ -1038,6 +1038,63 @@ impl<const N: usize, T: Encode + 'static> Encode for ZeroVec<N, T> {
     }
 }
 
+impl<const N: usize, T: Decode + 'static> ZeroVec<N, T> {
+    /// Decodes the wire representation into `self` in place.
+    ///
+    /// Unlike [`Decode::decode_ext`], which returns a new `Self` by value
+    /// (and therefore puts a full `N * sizeof(T)` inline buffer on the
+    /// stack during the call), this method reads directly into the
+    /// existing allocation. That's critical for large `N` — a stock
+    /// `ZeroVec::<10 * 1024 * 1024, u8>::decode_ext` would overflow most
+    /// thread stacks.
+    ///
+    /// The existing contents of `self` are cleared first.
+    #[inline]
+    pub fn decode_into<R: Read>(
+        &mut self,
+        reader: &mut R,
+        mut ctx: Option<&mut lencode::context::DecoderContext>,
+    ) -> lencode::Result<()> {
+        self.clear();
+
+        // u8: read flagged header, then raw bytes directly into the buffer.
+        if core::any::TypeId::of::<T>() == core::any::TypeId::of::<u8>() {
+            let flagged = Self::decode_len(reader)?;
+            assert!(flagged & 1 == 0, "ZeroVec does not support compressed data");
+            let payload_len = flagged >> 1;
+            assert!(
+                payload_len <= N,
+                "decoded data too large for ZeroVec: {payload_len} > capacity {N}"
+            );
+            if payload_len > 0 {
+                // SAFETY: TypeId::of::<T>() == TypeId::of::<u8>() above.
+                let buf =
+                    unsafe { slice::from_raw_parts_mut(self.as_mut_ptr() as *mut u8, payload_len) };
+                reader.read(buf)?;
+            }
+            unsafe {
+                self.set_len(payload_len);
+            }
+            return Ok(());
+        }
+
+        // Non-u8: varint(count) + per-element decode. Each element decode is
+        // by value on the stack but gets moved into the buffer before the
+        // next iteration, so peak stack is sizeof(T), not N * sizeof(T).
+        let len = Self::decode_len(reader)?;
+        assert!(
+            len <= N,
+            "decoded length too large for ZeroVec: {len} > capacity {N}"
+        );
+        for _ in 0..len {
+            let item = T::decode_ext(reader, ctx.as_deref_mut())?;
+            self.buf[self.len] = MaybeUninit::new(item);
+            self.len += 1;
+        }
+        Ok(())
+    }
+}
+
 impl<const N: usize, T: Decode + 'static> Decode for ZeroVec<N, T> {
     #[inline(always)]
     fn decode_ext(

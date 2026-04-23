@@ -88,6 +88,21 @@ impl LegacyMessage {
         }
         self.instructions.clear();
     }
+
+    /// Decodes the wire form into `self` without stack-allocating the
+    /// ~680 KiB struct. Each field is decoded directly into the existing
+    /// allocation via [`ZeroVec::decode_into`].
+    pub fn decode_into<R: Read>(
+        &mut self,
+        reader: &mut R,
+        mut ctx: Option<&mut lencode::context::DecoderContext>,
+    ) -> lencode::Result<()> {
+        self.header = MessageHeader::decode_ext(reader, ctx.as_deref_mut())?;
+        self.account_keys.decode_into(reader, ctx.as_deref_mut())?;
+        self.recent_blockhash = Hash::decode_ext(reader, ctx.as_deref_mut())?;
+        self.instructions.decode_into(reader, ctx.as_deref_mut())?;
+        Ok(())
+    }
 }
 
 #[derive(Encode, Decode, Debug, Clone, PartialEq, Eq, Default)]
@@ -114,13 +129,35 @@ impl V0Message {
         self.instructions.clear();
         self.address_table_lookups.clear();
     }
+
+    /// Decodes the wire form into `self` without stack-allocating the
+    /// ~750 KiB struct. Each field is decoded directly into the existing
+    /// allocation via [`ZeroVec::decode_into`].
+    pub fn decode_into<R: Read>(
+        &mut self,
+        reader: &mut R,
+        mut ctx: Option<&mut lencode::context::DecoderContext>,
+    ) -> lencode::Result<()> {
+        self.header = MessageHeader::decode_ext(reader, ctx.as_deref_mut())?;
+        self.account_keys.decode_into(reader, ctx.as_deref_mut())?;
+        self.recent_blockhash = Hash::decode_ext(reader, ctx.as_deref_mut())?;
+        self.instructions.decode_into(reader, ctx.as_deref_mut())?;
+        self.address_table_lookups
+            .decode_into(reader, ctx.as_deref_mut())?;
+        Ok(())
+    }
 }
 
 #[derive(Encode, Decode, Debug, Clone, PartialEq, Eq)]
-#[repr(u8)]
+// `#[repr(C, u8)]` pins the discriminant to offset 0 with u8 size. That
+// layout guarantee is what makes [`VersionedMessage::decode_into`]'s
+// in-place variant swap (via `ptr::write_bytes` + a byte write to the
+// discriminant) safe — without it, Rust could niche-optimise the
+// discriminant anywhere in the struct.
+#[repr(C, u8)]
 pub enum VersionedMessage {
-    Legacy(LegacyMessage),
-    V0(V0Message),
+    Legacy(LegacyMessage) = 0,
+    V0(V0Message) = 1,
 }
 
 impl Default for VersionedMessage {
@@ -137,6 +174,61 @@ impl VersionedMessage {
         match self {
             Self::Legacy(m) => m.clear(),
             Self::V0(m) => m.clear(),
+        }
+    }
+
+    /// Decodes the wire form into `self` without stack-allocating the
+    /// ~750 KiB struct.
+    ///
+    /// If the incoming discriminant matches the currently-active variant,
+    /// decodes straight into that variant's payload in place. Otherwise,
+    /// drops the current variant, zeroes the storage, sets the
+    /// discriminant byte directly, and decodes into the new variant — no
+    /// temporary `VersionedMessage` ever lives on the stack.
+    pub fn decode_into<R: Read>(
+        &mut self,
+        reader: &mut R,
+        ctx: Option<&mut lencode::context::DecoderContext>,
+    ) -> lencode::Result<()> {
+        let disc = <Self as Decode>::decode_discriminant(reader)?;
+        match disc {
+            0 => {
+                // Ensure `self` is the Legacy variant.
+                if !matches!(self, Self::Legacy(_)) {
+                    // SAFETY: `#[repr(C, u8)]` guarantees discriminant at
+                    // byte 0. Drop the current variant, zero every byte of
+                    // the enum storage (discriminant becomes 0 = Legacy,
+                    // payload becomes an all-zero `LegacyMessage` — all of
+                    // its fields accept zero bit patterns). No
+                    // stack-allocated `LegacyMessage` temporary is needed.
+                    unsafe {
+                        core::ptr::drop_in_place(self as *mut Self);
+                        core::ptr::write_bytes(self as *mut Self, 0, 1);
+                    }
+                }
+                match self {
+                    Self::Legacy(m) => m.decode_into(reader, ctx),
+                    _ => unreachable!(),
+                }
+            }
+            1 => {
+                if !matches!(self, Self::V0(_)) {
+                    unsafe {
+                        core::ptr::drop_in_place(self as *mut Self);
+                        core::ptr::write_bytes(self as *mut Self, 0, 1);
+                        // Flip the discriminant byte from 0 (Legacy) to 1 (V0).
+                        *(self as *mut Self as *mut u8) = 1;
+                    }
+                }
+                match self {
+                    Self::V0(m) => m.decode_into(reader, ctx),
+                    _ => unreachable!(),
+                }
+            }
+            other => {
+                let _ = other;
+                Err(lencode::io::Error::InvalidData)
+            }
         }
     }
 }
@@ -511,6 +603,88 @@ impl Transaction {
         self.account_updates.clear();
         self.account_updates_data.clear();
     }
+
+    /// Decodes a wire-encoded `Transaction` directly into `self` without
+    /// routing the ~12 MiB struct through the stack.
+    ///
+    /// This is the required entry point for any tight-loop decoding: the
+    /// stock [`Decode::decode_ext`] would place the entire struct on the
+    /// stack as a by-value return, far exceeding any reasonable thread
+    /// stack. `decode_into` writes each field directly into the
+    /// already-allocated destination, using
+    /// [`ZeroVec::decode_into`][crate::zero_vec::ZeroVec::decode_into]
+    /// for the large inline buffers (most importantly the 10 MiB
+    /// `account_updates_data` arena).
+    ///
+    /// The field order must stay in sync with `#[derive(Encode, Decode)]`'s
+    /// output; both read the struct's source field order.
+    pub fn decode_into<R: Read>(
+        &mut self,
+        reader: &mut R,
+        mut ctx: Option<&mut lencode::context::DecoderContext>,
+    ) -> lencode::Result<()> {
+        // Small scalar-ish fields: decode_ext by value is fine (≤ a few KiB
+        // on the stack per call, returned into self's location).
+        self.status = TransactionStatus::decode_ext(reader, ctx.as_deref_mut())?;
+        self.fee = u64::decode_ext(reader, ctx.as_deref_mut())?;
+        self.pre_balances.decode_into(reader, ctx.as_deref_mut())?;
+        self.post_balances.decode_into(reader, ctx.as_deref_mut())?;
+
+        // Option<ZeroVec<_, _>>: decode the tag, then decode-in-place on
+        // the inner ZeroVec so we never stack-alloc the full inner buffer.
+        decode_option_zerovec_into(&mut self.inner_instructions, reader, ctx.as_deref_mut())?;
+        decode_option_zerovec_into(&mut self.log_messages, reader, ctx.as_deref_mut())?;
+        decode_option_zerovec_into(&mut self.pre_token_balances, reader, ctx.as_deref_mut())?;
+        decode_option_zerovec_into(&mut self.post_token_balances, reader, ctx.as_deref_mut())?;
+        decode_option_zerovec_into(&mut self.rewards, reader, ctx.as_deref_mut())?;
+
+        // Small Option<T> fields — by-value is fine.
+        self.return_data = Option::<ReturnData>::decode_ext(reader, ctx.as_deref_mut())?;
+        self.compute_units_consumed = Option::<u64>::decode_ext(reader, ctx.as_deref_mut())?;
+        self.cost_units = Option::<u64>::decode_ext(reader, ctx.as_deref_mut())?;
+
+        // Signatures (≤ 19 × 64 bytes): decode-in-place for uniformity.
+        self.signatures.decode_into(reader, ctx.as_deref_mut())?;
+
+        // VersionedMessage decodes directly into `self.message`'s storage
+        // with variant-swapping done in place via a byte-level discriminant
+        // write — no 750 KiB stack temporary.
+        self.message.decode_into(reader, ctx.as_deref_mut())?;
+
+        // Account-update metadata table + shared data arena.
+        self.account_updates
+            .decode_into(reader, ctx.as_deref_mut())?;
+        self.account_updates_data
+            .decode_into(reader, ctx.as_deref_mut())?;
+        Ok(())
+    }
+}
+
+/// Decodes an `Option<ZeroVec<N, T>>` in place, reading the `Option` tag then
+/// either clearing the slot or filling the contained `ZeroVec` via
+/// [`ZeroVec::decode_into`]. Avoids by-value movement of the potentially-
+/// large inner buffer.
+fn decode_option_zerovec_into<R, const N: usize, T>(
+    slot: &mut Option<ZeroVec<N, T>>,
+    reader: &mut R,
+    mut ctx: Option<&mut lencode::context::DecoderContext>,
+) -> lencode::Result<()>
+where
+    R: Read,
+    T: Decode + 'static,
+{
+    let tag = u8::decode_ext(reader, ctx.as_deref_mut())?;
+    match tag {
+        0 => {
+            *slot = None;
+        }
+        1 => {
+            let zv = slot.get_or_insert_with(ZeroVec::new);
+            zv.decode_into(reader, ctx.as_deref_mut())?;
+        }
+        _ => return Err(lencode::io::Error::InvalidData),
+    }
+    Ok(())
 }
 
 // --- ZeroAlloc proofs ---
@@ -829,6 +1003,145 @@ mod tests {
         tx.clear();
         assert!(tx.account_updates().is_empty());
         assert!(tx.account_updates_data.is_empty());
+    }
+
+    #[test]
+    fn transaction_decode_into_roundtrip_on_default_stack() {
+        // Proves `Transaction::decode_into` works on the default 2 MiB
+        // test-thread stack that the stock `Decode::decode_ext` would
+        // overflow. The full decode path — including `VersionedMessage`
+        // variant swapping — is in-place.
+        let mut src = Transaction::new_boxed();
+        src.fee = 5_000;
+        src.status.error_code = 0;
+        src.signatures.push(Signature::default());
+        src.push_account_update(&view([33u8; 32], b"hello"))
+            .unwrap();
+        src.push_account_update(&view([44u8; 32], b"world!"))
+            .unwrap();
+
+        let mut buf = vec![0u8; 1 << 20];
+        let mut cursor = lencode::io::Cursor::new(&mut buf[..]);
+        let written = src.encode_ext(&mut cursor, None).expect("encode");
+
+        let mut dst = Transaction::new_boxed();
+        let mut read_cursor = lencode::io::Cursor::new(&buf[..written]);
+        dst.decode_into(&mut read_cursor, None)
+            .expect("decode_into");
+
+        assert_eq!(dst.fee, src.fee);
+        assert_eq!(dst.account_updates().len(), 2);
+        let collected: Vec<(Address, &[u8])> = dst
+            .iter_account_updates()
+            .map(|(m, d)| (m.pubkey, d))
+            .collect();
+        assert_eq!(collected[0].0, Address::new_from_array([33u8; 32]));
+        assert_eq!(collected[0].1, b"hello");
+        assert_eq!(collected[1].0, Address::new_from_array([44u8; 32]));
+        assert_eq!(collected[1].1, b"world!");
+    }
+
+    #[test]
+    fn transaction_decode_into_is_reusable_across_decodes() {
+        // Tight-loop simulation: decode many wire-encoded transactions
+        // into the same Box<Transaction> buffer on the default test
+        // stack, with no per-iteration heap allocations.
+        let mut dst = Transaction::new_boxed();
+        for i in 0..8u8 {
+            let mut src = Transaction::new_boxed();
+            src.fee = (i as u64) * 1000;
+            src.push_account_update(&view([i; 32], &[i; 64])).unwrap();
+
+            let mut buf = vec![0u8; 1 << 16];
+            let mut cursor = lencode::io::Cursor::new(&mut buf[..]);
+            let written = src.encode_ext(&mut cursor, None).unwrap();
+
+            let mut read_cursor = lencode::io::Cursor::new(&buf[..written]);
+            dst.decode_into(&mut read_cursor, None)
+                .expect("decode_into");
+
+            assert_eq!(dst.fee, (i as u64) * 1000);
+            assert_eq!(dst.account_updates().len(), 1);
+            let (meta, data) = dst.iter_account_updates().next().unwrap();
+            assert_eq!(meta.pubkey, Address::new_from_array([i; 32]));
+            assert_eq!(data, &[i; 64][..]);
+        }
+    }
+
+    /// Heap-allocates a `VersionedMessage` without routing the ~750 KiB
+    /// struct through the stack. Used by `decode_into` tests that can't
+    /// afford to put a full message on the test thread's 2 MiB stack.
+    fn new_boxed_message() -> Box<VersionedMessage> {
+        use std::alloc::{Layout, alloc_zeroed, handle_alloc_error};
+        let layout = Layout::new::<VersionedMessage>();
+        unsafe {
+            let ptr = alloc_zeroed(layout) as *mut VersionedMessage;
+            if ptr.is_null() {
+                handle_alloc_error(layout);
+            }
+            // SAFETY: `#[repr(C, u8)]` puts the discriminant at byte 0.
+            // All-zero bytes = Legacy variant with a zero-init LegacyMessage
+            // (every field has 0 as a valid bit pattern).
+            Box::from_raw(ptr)
+        }
+    }
+
+    #[test]
+    fn versioned_message_decode_into_swaps_variants_in_place() {
+        // Start from Legacy, decode a V0 wire payload into it, then
+        // decode a Legacy wire payload back into the same slot. Neither
+        // direction stack-allocates a full message.
+        let mut dst = new_boxed_message();
+
+        // --- Legacy slot → decode V0 (variant swap) ---
+        let mut src_v0 = new_boxed_message();
+        // Flip the heap-resident default (Legacy) into V0 in place.
+        unsafe {
+            core::ptr::drop_in_place(&mut *src_v0 as *mut VersionedMessage);
+            core::ptr::write_bytes(&mut *src_v0 as *mut VersionedMessage, 0, 1);
+            *(&mut *src_v0 as *mut VersionedMessage as *mut u8) = 1;
+        }
+        if let VersionedMessage::V0(m) = &mut *src_v0 {
+            m.header.num_required_signatures = 3;
+            m.recent_blockhash = Hash::new_from_array([9u8; 32]);
+        } else {
+            panic!("expected V0 after variant write");
+        }
+
+        let mut buf = vec![0u8; 4096];
+        let mut cursor = lencode::io::Cursor::new(&mut buf[..]);
+        let written = src_v0.encode_ext(&mut cursor, None).expect("encode v0");
+
+        let mut read_cursor = lencode::io::Cursor::new(&buf[..written]);
+        dst.decode_into(&mut read_cursor, None)
+            .expect("decode_into v0");
+        match &*dst {
+            VersionedMessage::V0(m) => {
+                assert_eq!(m.header.num_required_signatures, 3);
+                assert_eq!(m.recent_blockhash, Hash::new_from_array([9u8; 32]));
+            }
+            _ => panic!("expected V0 after swap"),
+        }
+
+        // --- V0 slot → decode Legacy (swap back) ---
+        let mut src_legacy = new_boxed_message();
+        if let VersionedMessage::Legacy(m) = &mut *src_legacy {
+            m.header.num_required_signatures = 7;
+        }
+        let mut cursor = lencode::io::Cursor::new(&mut buf[..]);
+        let written = src_legacy
+            .encode_ext(&mut cursor, None)
+            .expect("encode legacy");
+
+        let mut read_cursor = lencode::io::Cursor::new(&buf[..written]);
+        dst.decode_into(&mut read_cursor, None)
+            .expect("decode_into legacy");
+        match &*dst {
+            VersionedMessage::Legacy(m) => {
+                assert_eq!(m.header.num_required_signatures, 7);
+            }
+            _ => panic!("expected Legacy after swap back"),
+        }
     }
 
     #[test]

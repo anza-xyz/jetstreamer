@@ -266,6 +266,34 @@ impl AccountUpdate {
             ReplicaAccountInfoVersions::V0_0_3(v3) => self.fill_from_v3(v3),
         }
     }
+
+    /// Decodes a wire-encoded `AccountUpdate` directly into `self` without
+    /// routing the ~10 MiB struct through the stack.
+    ///
+    /// This is the required entry point for any tight-loop decoding: the
+    /// stock [`Decode::decode_ext`] would place the entire struct on the
+    /// stack as a by-value return, blowing most thread stacks. `decode_into`
+    /// writes each field directly into the already-allocated destination —
+    /// in particular, the 10 MiB `data` buffer is filled via
+    /// [`ZeroVec::decode_into`] with zero stack pressure.
+    ///
+    /// The field order must match what [`Encode::encode_ext`] produces;
+    /// because both paths are derived from the source field order, they
+    /// stay in sync automatically.
+    pub fn decode_into<R: Read>(
+        &mut self,
+        reader: &mut R,
+        mut ctx: Option<&mut lencode::context::DecoderContext>,
+    ) -> lencode::Result<()> {
+        self.pubkey = Address::decode_ext(reader, ctx.as_deref_mut())?;
+        self.lamports = u64::decode_ext(reader, ctx.as_deref_mut())?;
+        self.owner = Address::decode_ext(reader, ctx.as_deref_mut())?;
+        self.executable = bool::decode_ext(reader, ctx.as_deref_mut())?;
+        self.rent_epoch = u64::decode_ext(reader, ctx.as_deref_mut())?;
+        self.data.decode_into(reader, ctx.as_deref_mut())?;
+        self.write_version = u64::decode_ext(reader, ctx.as_deref_mut())?;
+        Ok(())
+    }
 }
 
 // --- ZeroAlloc proofs ---
@@ -361,6 +389,83 @@ mod tests {
         });
         assert_eq!(u.lamports, 2);
         assert_eq!(u.data.as_slice(), &second[..]);
+    }
+
+    #[test]
+    fn decode_into_roundtrip_on_default_stack() {
+        // This test runs on the default test-thread stack (~2 MiB). The
+        // plain by-value `Decode::decode_ext` would overflow it; `decode_into`
+        // must fit because every big field goes through `ZeroVec::decode_into`.
+        let pk = [7u8; 32];
+        let owner = [8u8; 32];
+        let data = vec![0xBEu8; 2048];
+
+        let mut src = AccountUpdate::new_boxed();
+        src.fill_from_v1(&ReplicaAccountInfo {
+            pubkey: &pk,
+            lamports: 500_000,
+            owner: &owner,
+            executable: true,
+            rent_epoch: 12,
+            data: &data,
+            write_version: 77,
+        });
+
+        let mut buf = vec![0u8; 1 << 13];
+        let mut cursor = lencode::io::Cursor::new(&mut buf[..]);
+        let written = src.encode_ext(&mut cursor, None).unwrap();
+
+        let mut dst = AccountUpdate::new_boxed();
+        let mut read_cursor = lencode::io::Cursor::new(&buf[..written]);
+        dst.decode_into(&mut read_cursor, None)
+            .expect("decode_into");
+
+        assert_eq!(dst.pubkey, src.pubkey);
+        assert_eq!(dst.lamports, src.lamports);
+        assert_eq!(dst.owner, src.owner);
+        assert_eq!(dst.executable, src.executable);
+        assert_eq!(dst.rent_epoch, src.rent_epoch);
+        assert_eq!(dst.data.as_slice(), src.data.as_slice());
+        assert_eq!(dst.write_version, src.write_version);
+    }
+
+    #[test]
+    fn decode_into_clears_existing_data() {
+        // A second decode_into call must fully overwrite the destination
+        // (same buffer, new contents) without stale bytes leaking through.
+        let mut dst = AccountUpdate::new_boxed();
+        dst.fill_from_v1(&ReplicaAccountInfo {
+            pubkey: &[1u8; 32],
+            lamports: 1,
+            owner: &[2u8; 32],
+            executable: false,
+            rent_epoch: 0,
+            data: &vec![0xFFu8; 4096],
+            write_version: 1,
+        });
+
+        let mut src = AccountUpdate::new_boxed();
+        src.fill_from_v1(&ReplicaAccountInfo {
+            pubkey: &[3u8; 32],
+            lamports: 99,
+            owner: &[4u8; 32],
+            executable: true,
+            rent_epoch: 9,
+            data: b"short",
+            write_version: 42,
+        });
+
+        let mut buf = vec![0u8; 1 << 12];
+        let mut cursor = lencode::io::Cursor::new(&mut buf[..]);
+        let written = src.encode_ext(&mut cursor, None).unwrap();
+
+        let mut read_cursor = lencode::io::Cursor::new(&buf[..written]);
+        dst.decode_into(&mut read_cursor, None)
+            .expect("decode_into");
+
+        assert_eq!(dst.pubkey, src.pubkey);
+        assert_eq!(dst.data.as_slice(), b"short");
+        assert_eq!(dst.data.len(), 5);
     }
 
     #[test]

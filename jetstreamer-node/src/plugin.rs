@@ -28,6 +28,10 @@ thread_local! {
     // Keep the large encode buffer on the heap; some notifier threads have small stacks.
     static ACCOUNT_UPDATE_ENCODE_BUFFER: RefCell<Vec<u8>> =
         RefCell::new(vec![0u8; ACCOUNT_UPDATE_ENCODE_BUFFER_SIZE]);
+    // Reusable ~10 MiB AccountUpdate buffer, heap-allocated once per thread
+    // and overwritten in place on every notify_account_update call.
+    static ACCOUNT_UPDATE: RefCell<Box<AccountUpdate>> =
+        RefCell::new(AccountUpdate::new_boxed());
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -157,37 +161,39 @@ pub fn notify_account_update(
         return;
     }
 
-    let account_update = AccountUpdate {
-        pubkey: Address::new_from_array(pubkey.to_bytes()),
-        lamports: account.lamports(),
-        owner: Address::new_from_array(account.owner().to_bytes()),
-        executable: account.executable(),
-        rent_epoch: account.rent_epoch(),
-        data: account.data().to_vec(),
-        write_version,
-    };
+    let encoded_len = ACCOUNT_UPDATE.with(|update| {
+        let mut update = update.borrow_mut();
+        // Fill the reusable buffer in place — zero heap allocations.
+        update.pubkey = Address::new_from_array(pubkey.to_bytes());
+        update.lamports = account.lamports();
+        update.owner = Address::new_from_array(account.owner().to_bytes());
+        update.executable = account.executable();
+        update.rent_epoch = account.rent_epoch();
+        update.data.set(account.data());
+        update.write_version = write_version;
 
-    let encoded_len = ACCOUNT_UPDATE_ENCODE_BUFFER.with(|buffer| {
-        let mut buffer = buffer.borrow_mut();
-        let mut cursor = Cursor::new(&mut buffer[..]);
+        ACCOUNT_UPDATE_ENCODE_BUFFER.with(|buffer| {
+            let mut buffer = buffer.borrow_mut();
+            let mut cursor = Cursor::new(&mut buffer[..]);
 
-        let encoded_len = ENCODER.with(|encoder| {
-            match account_update.encode_ext(&mut cursor, Some(&mut *encoder.borrow_mut())) {
-                Ok(len) => len,
-                Err(Error::WriterOutOfSpace) => {
-                    panic!(
-                        "account update exceeded encode buffer: slot={slot} pubkey={} data_len={} buffer_len={}",
-                        account_update.pubkey,
-                        account_update.data.len(),
-                        ACCOUNT_UPDATE_ENCODE_BUFFER_SIZE
-                    )
+            let encoded_len = ENCODER.with(|encoder| {
+                match update.encode_ext(&mut cursor, Some(&mut *encoder.borrow_mut())) {
+                    Ok(len) => len,
+                    Err(Error::WriterOutOfSpace) => {
+                        panic!(
+                            "account update exceeded encode buffer: slot={slot} pubkey={} data_len={} buffer_len={}",
+                            update.pubkey,
+                            update.data.len(),
+                            ACCOUNT_UPDATE_ENCODE_BUFFER_SIZE
+                        )
+                    }
+                    Err(err) => panic!("failed to encode account update for slot {slot}: {err:?}"),
                 }
-                Err(err) => panic!("failed to encode account update for slot {slot}: {err:?}"),
-            }
-        });
+            });
 
-        debug_assert_eq!(encoded_len, cursor.position());
-        encoded_len
+            debug_assert_eq!(encoded_len, cursor.position());
+            encoded_len
+        })
     });
 
     TOTAL_ENCODED_ACCOUNT_UPDATE_SIZE.fetch_add(encoded_len as u64, Ordering::Relaxed);

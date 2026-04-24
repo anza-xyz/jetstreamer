@@ -191,5 +191,7 @@ pub mod transaction;
 /// Shared helpers used throughout the firehose crate.
 pub mod utils;
 
+pub use firehose::{BlockData, EntryData, RewardsData, TransactionData};
+
 /// Log target prefix used across the firehose crate.
 pub const LOG_MODULE: &str = "jetstreamer::firehose";

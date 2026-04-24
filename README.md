@@ -14,7 +14,7 @@ right hardware and network connection, Jetstreamer can stream data at over 2.7M 
 Jetstreamer plugin or geyser plugin. Higher speeds are possible with better hardware (in our
 case 64 core CPU, 30 Gbps+ network for the 2.7M TPS record).
 
-Jetstreamer exposes three companion crates:
+Jetstreamer is split across four crates:
 
 - `jetstreamer` – the primary facade that wires firehose ingestion into your plugins through
   `JetstreamerRunner`.
@@ -49,8 +49,9 @@ Geyser plugin locally, streamed over the internet from the Old Faithful archive.
 ## Quick Start
 
 To get an idea of what Jetstreamer is capable of, you can try out the demo CLI that runs
-Jetstreamer Runner with the Program Tracking plugin enabled. Pass `--with-plugin
-instruction-tracking` (or repeat the flag to run both built-ins) to change the default set:
+Jetstreamer Runner with the Program Tracking plugin enabled. The built-in plugins are
+`program-tracking`, `instruction-tracking`, and `pubkey-stats`; pass `--with-plugin <name>` to
+select one (repeat the flag to run multiple at once), or `--no-plugins` to disable the default:
 
 ### Jetstreamer Runner CLI
 
@@ -81,15 +82,19 @@ download concurrency:
 # Sequential mode with CLI flag
 JETSTREAMER_THREADS=4 cargo run --release -- 800 --sequential
 
-# Sequential mode with explicit ripget window override
-JETSTREAMER_SEQUENTIAL=1 JETSTREAMER_BUFFER_WINDOW=4GiB cargo run --release -- 800
+# Sequential mode with explicit ripget window override (either the env var or the
+# --buffer-window CLI flag works)
+JETSTREAMER_SEQUENTIAL=1 cargo run --release -- 800 --buffer-window 4GiB
 ```
 
-`JETSTREAMER_BUFFER_WINDOW` defaults to `min(4 GiB, 15% of available RAM)` when unset.
+`JETSTREAMER_BUFFER_WINDOW` (or `--buffer-window`) defaults to `min(4 GiB, 15% of available
+RAM)` when unset.
 
-The built-in program and instruction tracking plugins now record vote and non-vote activity
-separately. `program_invocations` includes an `is_vote` flag per row, while `slot_instructions`
-stores separate vote/non-vote instruction and transaction counts.
+The built-in `program-tracking` and `instruction-tracking` plugins record vote and non-vote
+activity separately: `program_invocations` includes an `is_vote` flag per row, while
+`slot_instructions` stores separate vote/non-vote instruction and transaction counts. The
+`pubkey-stats` plugin aggregates per-slot account-key mention counts into a `pubkey_mentions`
+table (with a companion `pubkeys` lookup table populated via materialised view).
 
 The CLI accepts either `<start>:<end>` slot ranges or a single epoch on the command line. See
 [`JetstreamerRunner::parse_cli_args`](https://docs.rs/jetstreamer/latest/jetstreamer/fn.parse_cli_args.html)
@@ -143,7 +148,7 @@ use std::sync::Arc;
 use clickhouse::Client;
 use jetstreamer::{
     JetstreamerRunner,
-    firehose::firehose::{BlockData, TransactionData},
+    firehose::{BlockData, TransactionData},
     firehose::epochs,
     plugin::{Plugin, PluginFuture},
 };
@@ -230,12 +235,13 @@ Jetstreamer if not kept in check.
 
 When implementing a Jetstreamer plugin, prefer buffering records locally and flushing them in
 periodic batches rather than writing on every hook invocation. The runner's built-in stats
-pulses are emitted every 100 slots by default (`jetstreamer-plugin/src/lib.rs`), which strikes
-a balance between timely metrics and avoiding tight write loops. The bundled Program Tracking
-plugin follows this model: each worker thread accumulates its desired `ProgramEvent` rows in a
-`Vec` and performs a single batch insert once 1,000 slots have elapsed
-(`jetstreamer-plugin/src/plugins/program_tracking.rs`). Structuring custom plugins with a
-similar cadence keeps ClickHouse responsive during high throughput replays.
+pulses and per-plugin flush cadence are both driven by `db_update_interval_slots` (100 slots
+by default, defined in `jetstreamer-plugin/src/lib.rs`), which strikes a balance between
+timely metrics and avoiding tight write loops. The bundled plugins follow this model: they
+accumulate per-slot events in a shared `DashMap` (see
+`jetstreamer-plugin/src/plugins/program_tracking.rs`) and the runner batch-inserts the drained
+rows on the shared flush cadence. Structuring custom plugins with a similar cadence keeps
+ClickHouse responsive during high throughput replays.
 
 ### Firehose
 

@@ -53,10 +53,21 @@ use std::sync::{Arc, Mutex};
 // Corpus: real transactions from epoch 900, slots 5k..6k.
 // --------------------------------------------------------------------
 
-/// Fetch 1 000 slots of mainnet epoch 900 via the firehose API, exactly once
-/// per process. Blocks on the first access.
-static REAL_TXS: Lazy<Vec<VersionedTransaction>> = Lazy::new(|| {
-    eprintln!("[bench] fetching real transactions from epoch 900, slots 5000..6000 …");
+/// Fetches `slot_count` slots starting at `epoch_offset_slots` past the start
+/// of `epoch` via the firehose API. Vote transactions are kept (they're
+/// ~2/3 of real traffic). Pre-filtered to what our zero-alloc bounds allow.
+fn fetch_corpus_for_epoch(
+    epoch: u64,
+    epoch_offset_slots: u64,
+    slot_count: u64,
+) -> Vec<VersionedTransaction> {
+    let (epoch_start, _) = epoch_to_slot_range(epoch);
+    let slot_start = epoch_start + epoch_offset_slots;
+    let slot_end = slot_start + slot_count;
+    eprintln!(
+        "[bench] fetching real transactions: epoch {epoch}, slots {slot_start}..{slot_end} \
+         ({slot_count} slots) …"
+    );
     let start_time = std::time::Instant::now();
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -66,30 +77,21 @@ static REAL_TXS: Lazy<Vec<VersionedTransaction>> = Lazy::new(|| {
         .expect("tokio runtime");
 
     let txs = runtime.block_on(async {
-        let (epoch_900_start, _) = epoch_to_slot_range(900);
-        let slot_start = epoch_900_start + 5_000;
-        let slot_end = slot_start + 1_000;
         let slot_range = slot_start..slot_end;
-
         let collected: Arc<Mutex<Vec<VersionedTransaction>>> =
-            Arc::new(Mutex::new(Vec::with_capacity(200_000)));
+            Arc::new(Mutex::new(Vec::with_capacity(slot_count as usize * 1100)));
 
         firehose(
             4,
             true,
             None,
-            slot_range.clone(),
+            slot_range,
             None::<OnBlockFn>,
             Some({
                 let collected = Arc::clone(&collected);
                 move |_thread_id: usize, td: TransactionData| {
                     let collected = Arc::clone(&collected);
                     async move {
-                        // Keep votes — they're ~2/3 of real mainnet traffic,
-                        // so excluding them would give a non-representative
-                        // distribution. The "vote" shape below picks a vote
-                        // tx explicitly; "typical" / "complex" land on
-                        // non-vote user transactions via percentile sort.
                         if !fits_our_bounds(&td.transaction) {
                             return Ok(());
                         }
@@ -115,16 +117,30 @@ static REAL_TXS: Lazy<Vec<VersionedTransaction>> = Lazy::new(|| {
     });
 
     eprintln!(
-        "[bench] loaded {} real transactions (votes + user) in {:.1}s",
+        "[bench]   loaded {} txs from epoch {epoch} in {:.1}s",
         txs.len(),
         start_time.elapsed().as_secs_f64()
     );
-    assert!(
-        !txs.is_empty(),
-        "firehose returned no transactions — network fetch likely failed"
-    );
+    assert!(!txs.is_empty(), "firehose returned no transactions");
     txs
-});
+}
+
+/// Main corpus: 1 000 slots of mainnet epoch 900 (within the pubkey-prime
+/// table's collection window). This is the working corpus that drives all
+/// the throughput benches.
+static REAL_TXS: Lazy<Vec<VersionedTransaction>> =
+    Lazy::new(|| fetch_corpus_for_epoch(900, 5_000, 1_000));
+
+/// Smaller corpus from epoch 700 — *before* the pubkey collection
+/// window. Used solely by the cross-epoch compression bench to measure
+/// how the prime table's hit rate degrades on out-of-range data.
+static REAL_TXS_EPOCH_700: Lazy<Vec<VersionedTransaction>> =
+    Lazy::new(|| fetch_corpus_for_epoch(700, 5_000, 100));
+
+/// Smaller corpus from epoch 960 — *after* the pubkey collection
+/// cutoff. Same role as `REAL_TXS_EPOCH_700` for the future-direction.
+static REAL_TXS_EPOCH_960: Lazy<Vec<VersionedTransaction>> =
+    Lazy::new(|| fetch_corpus_for_epoch(960, 5_000, 100));
 
 /// Complexity score — bigger = more complex tx (more keys, instructions, or
 /// instruction data). Used to pick representative percentile samples.
@@ -859,6 +875,106 @@ fn bench_compression_ratios(c: &mut Criterion) {
 }
 
 // --------------------------------------------------------------------
+// Cross-epoch compression — measure how well the 65 535-pubkey prime
+// table generalises to data from epochs *outside* its collection
+// window.
+// --------------------------------------------------------------------
+
+fn bench_cross_epoch_compression(c: &mut Criterion) {
+    // Force-load all three corpora before printing — the first hit pays
+    // the network fetch, subsequent benches reuse the in-memory corpus.
+    let _ = &*REAL_TXS;
+    let _ = &*REAL_TXS_EPOCH_700;
+    let _ = &*REAL_TXS_EPOCH_960;
+
+    eprintln!();
+    eprintln!("=== Pubkey-prime effectiveness across epochs ===");
+    eprintln!(
+        "Prime table built from a 150-epoch window of pubkey-mention data \
+         (cut off around epoch ~880-900). Comparison points:"
+    );
+    eprintln!("  • epoch 700  — ~180 epochs *before* the window started");
+    eprintln!("  • epoch 900  — within the collection window (best case)");
+    eprintln!("  • epoch 960  — ~60+ epochs *after* the cutoff");
+    eprintln!();
+
+    let n_samples_target = 10_000;
+    let corpora: [(&str, &Vec<VersionedTransaction>); 3] = [
+        ("epoch 700 (before window)", &*REAL_TXS_EPOCH_700),
+        ("epoch 900 (within window)", &*REAL_TXS),
+        ("epoch 960 (after cutoff)", &*REAL_TXS_EPOCH_960),
+    ];
+
+    for (label, corpus) in corpora {
+        let n_samples = n_samples_target.min(corpus.len());
+        let sample: Vec<&VersionedTransaction> = (0..n_samples)
+            .map(|i| &corpus[(i * corpus.len()) / n_samples])
+            .collect();
+
+        let wincode = measure_wincode_corpus(&sample);
+        let plain = encode_corpus_with_config(&sample, "lencode (no dedupe)", None);
+        let primed = encode_corpus_with_config(
+            &sample,
+            "lencode (+ primed)",
+            Some(|| new_encoder_context()),
+        );
+
+        let baseline = wincode.total_bytes as f64;
+        eprintln!("--- {label}  ({n_samples} samples) ---");
+        eprintln!(
+            "  {:<22} | {:>9}  | {:>6}  | {:>7}",
+            "config", "avg_B/tx", "ratio", "save"
+        );
+        eprintln!("  {}", "-".repeat(56));
+        for stat in [&wincode, &plain, &primed] {
+            let avg = stat.total_bytes as f64 / stat.tx_count as f64;
+            let ratio = stat.total_bytes as f64 / baseline;
+            let save = (1.0 - ratio) * 100.0;
+            eprintln!(
+                "  {:<22} | {:>9.1}  | {:>6.3}  | {:>+6.1}%",
+                stat.label, avg, ratio, save
+            );
+        }
+        eprintln!();
+    }
+
+    // Register a tiny Criterion bench so this group shows up in the
+    // standard report. Times the primed encode of the epoch-700 sample
+    // (out-of-window) for an apples-to-apples speed comparison against
+    // the in-window run from `bench_compression_ratios`.
+    let corpus_700 = &*REAL_TXS_EPOCH_700;
+    let n_700 = n_samples_target.min(corpus_700.len());
+    let sample_700: Vec<&VersionedTransaction> = (0..n_700)
+        .map(|i| &corpus_700[(i * corpus_700.len()) / n_700])
+        .collect();
+
+    let mut group = c.benchmark_group("compression/cross_epoch");
+    let input_bytes: u64 = sample_700
+        .iter()
+        .map(|tx| tx_complexity_score(tx) as u64)
+        .sum();
+    group.throughput(Throughput::Bytes(input_bytes));
+    group.sample_size(10);
+    group.bench_function("epoch_700_primed", |b| {
+        b.iter(|| {
+            let mut total: u64 = 0;
+            let mut scratch = Transaction::new_boxed();
+            let mut buf = vec![0u8; 1 << 20];
+            let mut ctx = new_encoder_context();
+            for real in &sample_700 {
+                build_message_only_tx(&mut scratch, real);
+                reset_encoder(&mut ctx);
+                let mut cursor = Cursor::new(&mut buf[..]);
+                total += encode_sig_and_message(&scratch, &mut cursor, Some(&mut ctx))
+                    .expect("encode") as u64;
+            }
+            black_box(total);
+        });
+    });
+    group.finish();
+}
+
+// --------------------------------------------------------------------
 // Diff compression — simulates a realistic account-update stream (the
 // same accounts updated repeatedly with small mutations) and measures
 // the size savings from lencode's `DiffEncoder`.
@@ -1083,6 +1199,7 @@ criterion_group!(
     bench_transaction_decode,
     bench_transaction_roundtrip,
     bench_compression_ratios,
+    bench_cross_epoch_compression,
     bench_account_update_diff_compression,
 );
 criterion_main!(benches);

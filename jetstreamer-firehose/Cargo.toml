@@ -41,7 +41,7 @@ solana-signature.workspace = true
 solana-sdk-ids.workspace = true
 prost_011.workspace = true
 solana-entry.workspace = true
-reqwest = { workspace = true, features = ["stream"] }
+reqwest = { workspace = true, features = ["stream", "json"] }
 tokio.workspace = true
 futures-util.workspace = true
 serde = { workspace = true, features = ["derive"] }

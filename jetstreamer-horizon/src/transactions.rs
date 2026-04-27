@@ -55,6 +55,23 @@ impl CompiledInstruction {
         self.accounts.clear();
         self.data.clear();
     }
+
+    /// Decodes the wire form into `self` without stack-allocating the
+    /// ~10 KiB struct. Each field is decoded directly into the existing
+    /// allocation via [`ZeroVec::decode_into`] — the alternative
+    /// `#[derive(Decode)]` path would return `Self` by value, forcing a
+    /// ~10 KiB stack temporary per instruction.
+    #[inline]
+    pub fn decode_into<R: Read>(
+        &mut self,
+        reader: &mut R,
+        mut ctx: Option<&mut lencode::context::DecoderContext>,
+    ) -> lencode::Result<()> {
+        self.program_id_index = u8::decode_ext(reader, ctx.as_deref_mut())?;
+        self.accounts.decode_into(reader, ctx.as_deref_mut())?;
+        self.data.decode_into(reader, ctx.as_deref_mut())?;
+        Ok(())
+    }
 }
 
 #[derive(Encode, Decode, Debug, Clone, PartialEq, Eq, Default)]
@@ -63,6 +80,33 @@ pub struct MessageAddressTableLookup {
     pub account_key: Address,
     pub writable_indexes: ZeroVec<MAX_TX_ACCOUNTS, u8>,
     pub readonly_indexes: ZeroVec<MAX_TX_ACCOUNTS, u8>,
+}
+
+impl MessageAddressTableLookup {
+    /// In-place clear — resets to the default empty state without a
+    /// ~576 B stack temporary.
+    #[inline]
+    pub fn clear(&mut self) {
+        self.account_key = Address::default();
+        self.writable_indexes.clear();
+        self.readonly_indexes.clear();
+    }
+
+    /// Decodes the wire form into `self` without stack-allocating the
+    /// ~576 B struct. Companion to [`CompiledInstruction::decode_into`].
+    #[inline]
+    pub fn decode_into<R: Read>(
+        &mut self,
+        reader: &mut R,
+        mut ctx: Option<&mut lencode::context::DecoderContext>,
+    ) -> lencode::Result<()> {
+        self.account_key = Address::decode_ext(reader, ctx.as_deref_mut())?;
+        self.writable_indexes
+            .decode_into(reader, ctx.as_deref_mut())?;
+        self.readonly_indexes
+            .decode_into(reader, ctx.as_deref_mut())?;
+        Ok(())
+    }
 }
 
 #[derive(Encode, Decode, Debug, Clone, PartialEq, Eq, Default)]
@@ -100,7 +144,12 @@ impl LegacyMessage {
         self.header = MessageHeader::decode_ext(reader, ctx.as_deref_mut())?;
         self.account_keys.decode_into(reader, ctx.as_deref_mut())?;
         self.recent_blockhash = Hash::decode_ext(reader, ctx.as_deref_mut())?;
-        self.instructions.decode_into(reader, ctx.as_deref_mut())?;
+        // SAFETY: `CompiledInstruction` is a composition of `u8` plus two
+        // `ZeroVec<_, u8>` fields; every field accepts the all-zero bit
+        // pattern as a valid default state.
+        unsafe {
+            decode_zerovec_in_place(&mut self.instructions, reader, ctx.as_deref_mut())?;
+        }
         Ok(())
     }
 }
@@ -141,9 +190,15 @@ impl V0Message {
         self.header = MessageHeader::decode_ext(reader, ctx.as_deref_mut())?;
         self.account_keys.decode_into(reader, ctx.as_deref_mut())?;
         self.recent_blockhash = Hash::decode_ext(reader, ctx.as_deref_mut())?;
-        self.instructions.decode_into(reader, ctx.as_deref_mut())?;
-        self.address_table_lookups
-            .decode_into(reader, ctx.as_deref_mut())?;
+        // SAFETY: both `CompiledInstruction` and `MessageAddressTableLookup`
+        // accept the all-zero bit pattern as a valid default (every field is
+        // either a scalar default, `Address::default()` = zero bytes, or a
+        // `ZeroVec<_, u8>` whose empty state is `len = 0` over an uninit
+        // buffer).
+        unsafe {
+            decode_zerovec_in_place(&mut self.instructions, reader, ctx.as_deref_mut())?;
+            decode_zerovec_in_place(&mut self.address_table_lookups, reader, ctx.as_deref_mut())?;
+        }
         Ok(())
     }
 }
@@ -245,6 +300,31 @@ pub struct InnerInstruction {
     pub outer_index: u8,
     pub instruction: CompiledInstruction,
     pub stack_height: Option<u32>,
+}
+
+impl InnerInstruction {
+    /// In-place clear — avoids the ~10 KiB stack temporary
+    /// `*self = Self::default()` would create.
+    #[inline]
+    pub fn clear(&mut self) {
+        self.outer_index = 0;
+        self.instruction.clear();
+        self.stack_height = None;
+    }
+
+    /// Decodes the wire form into `self` without stack-allocating the
+    /// ~10 KiB struct. Companion to [`CompiledInstruction::decode_into`].
+    #[inline]
+    pub fn decode_into<R: Read>(
+        &mut self,
+        reader: &mut R,
+        mut ctx: Option<&mut lencode::context::DecoderContext>,
+    ) -> lencode::Result<()> {
+        self.outer_index = u8::decode_ext(reader, ctx.as_deref_mut())?;
+        self.instruction.decode_into(reader, ctx.as_deref_mut())?;
+        self.stack_height = Option::<u32>::decode_ext(reader, ctx.as_deref_mut())?;
+        Ok(())
+    }
 }
 
 /// Single log line emitted by the transaction. Stored as UTF-8 bytes (strings
@@ -359,6 +439,30 @@ pub struct TxAccountUpdate {
     // buffer.
     pub(crate) data_offset: u32,
     pub(crate) data_len: u32,
+}
+
+impl TxAccountUpdate {
+    /// Decodes the wire form into `self` without relying on the derived
+    /// `Decode::decode_ext`'s by-value return path. With a dozen+ account
+    /// updates per transaction, decoding in place saves a per-element stack
+    /// roundtrip and lets the whole record land directly in its
+    /// `ZeroVec` slot via `decode_zerovec_in_place`.
+    #[inline]
+    pub fn decode_into<R: Read>(
+        &mut self,
+        reader: &mut R,
+        mut ctx: Option<&mut lencode::context::DecoderContext>,
+    ) -> lencode::Result<()> {
+        self.pubkey = Address::decode_ext(reader, ctx.as_deref_mut())?;
+        self.lamports = u64::decode_ext(reader, ctx.as_deref_mut())?;
+        self.owner = Address::decode_ext(reader, ctx.as_deref_mut())?;
+        self.executable = bool::decode_ext(reader, ctx.as_deref_mut())?;
+        self.rent_epoch = u64::decode_ext(reader, ctx.as_deref_mut())?;
+        self.write_version = u64::decode_ext(reader, ctx.as_deref_mut())?;
+        self.data_offset = u32::decode_ext(reader, ctx.as_deref_mut())?;
+        self.data_len = u32::decode_ext(reader, ctx.as_deref_mut())?;
+        Ok(())
+    }
 }
 
 /// Error returned by [`Transaction::push_account_update`] when either the
@@ -632,7 +736,21 @@ impl Transaction {
 
         // Option<ZeroVec<_, _>>: decode the tag, then decode-in-place on
         // the inner ZeroVec so we never stack-alloc the full inner buffer.
-        decode_option_zerovec_into(&mut self.inner_instructions, reader, ctx.as_deref_mut())?;
+        //
+        // `inner_instructions` uses the DecodeInto-aware variant so each
+        // ~10 KiB `InnerInstruction` is decoded directly into its slot in
+        // the vec rather than routed through the stack as a by-value return.
+        //
+        // SAFETY: `InnerInstruction` accepts the all-zero bit pattern as a
+        // valid default (zero `outer_index`, zero-initialised
+        // `CompiledInstruction`, `stack_height` = `None`).
+        unsafe {
+            decode_option_zerovec_in_place(
+                &mut self.inner_instructions,
+                reader,
+                ctx.as_deref_mut(),
+            )?;
+        }
         decode_option_zerovec_into(&mut self.log_messages, reader, ctx.as_deref_mut())?;
         decode_option_zerovec_into(&mut self.pre_token_balances, reader, ctx.as_deref_mut())?;
         decode_option_zerovec_into(&mut self.post_token_balances, reader, ctx.as_deref_mut())?;
@@ -652,8 +770,13 @@ impl Transaction {
         self.message.decode_into(reader, ctx.as_deref_mut())?;
 
         // Account-update metadata table + shared data arena.
-        self.account_updates
-            .decode_into(reader, ctx.as_deref_mut())?;
+        // SAFETY: `TxAccountUpdate`'s every field (`Address`, `u64`,
+        // `bool`, `u32`) accepts the all-zero bit pattern as a valid
+        // default — zero-priming an uninitialised slot before
+        // `decode_into` overwrites its fields is sound.
+        unsafe {
+            decode_zerovec_in_place(&mut self.account_updates, reader, ctx.as_deref_mut())?;
+        }
         self.account_updates_data
             .decode_into(reader, ctx.as_deref_mut())?;
         Ok(())
@@ -684,6 +807,173 @@ where
         }
         _ => return Err(lencode::io::Error::InvalidData),
     }
+    Ok(())
+}
+
+/// Like [`decode_option_zerovec_into`] but for element types that support
+/// in-place decoding via [`DecodeInto`]. Fills the contained `ZeroVec` via
+/// [`decode_zerovec_in_place`], avoiding the per-element stack roundtrip
+/// that `ZeroVec::decode_into`'s generic non-u8 path would force.
+///
+/// # Safety
+///
+/// Same contract as [`decode_zerovec_in_place`]: `T` must accept the
+/// all-zero bit pattern as a valid state.
+#[inline]
+unsafe fn decode_option_zerovec_in_place<R, const N: usize, T>(
+    slot: &mut Option<ZeroVec<N, T>>,
+    reader: &mut R,
+    mut ctx: Option<&mut lencode::context::DecoderContext>,
+) -> lencode::Result<()>
+where
+    R: Read,
+    T: DecodeInto + Decode + 'static,
+{
+    let tag = u8::decode_ext(reader, ctx.as_deref_mut())?;
+    match tag {
+        0 => {
+            *slot = None;
+        }
+        1 => {
+            let zv = slot.get_or_insert_with(ZeroVec::new);
+            // SAFETY: forwarded from the caller's contract on `T`.
+            unsafe {
+                decode_zerovec_in_place(zv, reader, ctx.as_deref_mut())?;
+            }
+        }
+        _ => return Err(lencode::io::Error::InvalidData),
+    }
+    Ok(())
+}
+
+/// Trait for types that support in-place wire decoding into an already-
+/// allocated destination — skipping the stack temporary that
+/// `Decode::decode_ext` would otherwise create as a by-value return.
+///
+/// Types with a large inline footprint (e.g. [`CompiledInstruction`] at
+/// ~10 KiB) implement this so their container types (`ZeroVec<_, T>`) can
+/// decode each element directly into its buffer slot, avoiding a per-element
+/// stack roundtrip that the derived `Decode` otherwise forces.
+pub(crate) trait DecodeInto {
+    fn decode_into<R: Read>(
+        &mut self,
+        reader: &mut R,
+        ctx: Option<&mut lencode::context::DecoderContext>,
+    ) -> lencode::Result<()>;
+}
+
+impl DecodeInto for CompiledInstruction {
+    #[inline]
+    fn decode_into<R: Read>(
+        &mut self,
+        reader: &mut R,
+        ctx: Option<&mut lencode::context::DecoderContext>,
+    ) -> lencode::Result<()> {
+        Self::decode_into(self, reader, ctx)
+    }
+}
+
+impl DecodeInto for MessageAddressTableLookup {
+    #[inline]
+    fn decode_into<R: Read>(
+        &mut self,
+        reader: &mut R,
+        ctx: Option<&mut lencode::context::DecoderContext>,
+    ) -> lencode::Result<()> {
+        Self::decode_into(self, reader, ctx)
+    }
+}
+
+impl DecodeInto for InnerInstruction {
+    #[inline]
+    fn decode_into<R: Read>(
+        &mut self,
+        reader: &mut R,
+        ctx: Option<&mut lencode::context::DecoderContext>,
+    ) -> lencode::Result<()> {
+        Self::decode_into(self, reader, ctx)
+    }
+}
+
+impl DecodeInto for TxAccountUpdate {
+    #[inline]
+    fn decode_into<R: Read>(
+        &mut self,
+        reader: &mut R,
+        ctx: Option<&mut lencode::context::DecoderContext>,
+    ) -> lencode::Result<()> {
+        Self::decode_into(self, reader, ctx)
+    }
+}
+
+/// Decodes a `ZeroVec<N, T>` in place where `T` has an in-place decoder
+/// and accepts the all-zero bit pattern as a valid default state (so
+/// uninitialised slots can be zero-primed before `decode_into` writes over
+/// their fields). Used for the large-element ZeroVec fields in
+/// transactions/messages where routing each element through the by-value
+/// `Decode::decode_ext` path would force a per-element stack roundtrip of
+/// several KiB.
+///
+/// # Safety
+///
+/// The caller asserts that the all-zero bit pattern is a valid `T` — i.e.
+/// `T` is some composition of primitive scalars, `Option<_>`, and
+/// `ZeroVec`s (all of which treat zero as the empty/default state).
+#[inline]
+unsafe fn decode_zerovec_in_place<R, const N: usize, T>(
+    vec: &mut ZeroVec<N, T>,
+    reader: &mut R,
+    mut ctx: Option<&mut lencode::context::DecoderContext>,
+) -> lencode::Result<()>
+where
+    R: Read,
+    T: DecodeInto + Decode + 'static,
+{
+    let new_len = ZeroVec::<N, T>::decode_len(reader)?;
+    assert!(
+        new_len <= N,
+        "decoded length too large for ZeroVec: {new_len} > capacity {N}"
+    );
+
+    let old_len = vec.len();
+
+    // Drop trailing slots if the new length is smaller.
+    if new_len < old_len {
+        unsafe {
+            let tail =
+                core::slice::from_raw_parts_mut(vec.as_mut_ptr().add(new_len), old_len - new_len);
+            core::ptr::drop_in_place(tail);
+            vec.set_len(new_len);
+        }
+    }
+
+    // Reuse existing slots in-place (they are already initialised).
+    let reuse = new_len.min(old_len);
+    for i in 0..reuse {
+        // SAFETY: i < reuse ≤ old_len, so the slot is initialised.
+        let slot = unsafe { &mut *(vec.as_mut_ptr().add(i)) };
+        slot.decode_into(reader, ctx.as_deref_mut())?;
+    }
+
+    // Initialise and decode new slots one at a time so that a mid-stream
+    // error leaves `vec.len()` pointing at only the fully-initialised prefix.
+    while vec.len() < new_len {
+        let idx = vec.len();
+        // SAFETY: caller guarantees `T` accepts the all-zero bit pattern as a
+        // valid state, so we can zero the slot before handing out a `&mut T`.
+        // `idx < new_len ≤ N`, so the slot is in-bounds.
+        let slot_ptr = unsafe { vec.as_mut_ptr().add(idx) };
+        unsafe {
+            core::ptr::write_bytes(slot_ptr, 0, 1);
+        }
+        let slot: &mut T = unsafe { &mut *slot_ptr };
+        slot.decode_into(reader, ctx.as_deref_mut())?;
+        // SAFETY: slot at `idx` is now initialised; advance the length.
+        unsafe {
+            vec.set_len(idx + 1);
+        }
+    }
+
     Ok(())
 }
 

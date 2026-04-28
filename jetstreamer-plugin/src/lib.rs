@@ -91,7 +91,7 @@
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
-//!     let mut runner = PluginRunner::new("http://localhost:8123", 1, false, None);
+//!     let mut runner = PluginRunner::new("http://localhost:8123", 1, false, false, None);
 //!     runner.register(Box::new(LoggingPlugin));
 //!     let runner = Arc::new(runner);
 //!

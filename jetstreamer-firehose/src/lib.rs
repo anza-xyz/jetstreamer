@@ -137,6 +137,7 @@
 //!     firehose::firehose(
 //!         4,
 //!         false,
+//!         false,
 //!         None,
 //!         slot_range,
 //!         Some(block_handler()),

@@ -245,15 +245,26 @@ mod wincode_schema {
             }
 
             let mut msg = MaybeUninit::<legacy::Message>::uninit();
-            let header_uninit = LegacyMessage::uninit_header_mut(&mut msg);
+            let mut builder = LegacyMessageUninitBuilder::from_maybe_uninit_mut(&mut msg);
 
-            MessageHeader::write_uninit_num_required_signatures(variant, header_uninit);
-            MessageHeader::read_num_readonly_signed_accounts(reader, header_uninit)?;
-            MessageHeader::read_num_readonly_unsigned_accounts(reader, header_uninit)?;
+            {
+                let mut header =
+                    MessageHeaderUninitBuilder::from_maybe_uninit_mut(builder.uninit_header_mut());
+                header.write_num_required_signatures(variant);
+                header.read_num_readonly_signed_accounts(reader)?;
+                header.read_num_readonly_unsigned_accounts(reader)?;
+                header.finish();
+            }
+            // SAFETY: the nested header builder above wrote every field of `MessageHeader`
+            // before being forgotten via `finish()`.
+            unsafe {
+                builder.assume_init_header();
+            }
 
-            LegacyMessage::read_account_keys(reader, &mut msg)?;
-            LegacyMessage::read_recent_blockhash(reader, &mut msg)?;
-            LegacyMessage::read_instructions(reader, &mut msg)?;
+            builder.read_account_keys(reader)?;
+            builder.read_recent_blockhash(reader)?;
+            builder.read_instructions(reader)?;
+            builder.finish();
 
             let msg = unsafe { msg.assume_init() };
             dst.write(solana_message::VersionedMessage::Legacy(msg));

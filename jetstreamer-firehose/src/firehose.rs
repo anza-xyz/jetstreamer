@@ -560,18 +560,19 @@ mod metadata_decode_tests {
     use solana_transaction_status::TransactionStatusMeta;
 
     fn sample_meta() -> TransactionStatusMeta {
-        let mut meta = TransactionStatusMeta::default();
-        meta.fee = 42;
-        meta.pre_balances = vec![1, 2];
-        meta.post_balances = vec![3, 4];
-        meta.log_messages = Some(vec!["hello".into()]);
-        meta.pre_token_balances = Some(Vec::new());
-        meta.post_token_balances = Some(Vec::new());
-        meta.rewards = Some(Vec::new());
-        meta.compute_units_consumed = Some(7);
-        meta.cost_units = Some(9);
-        meta.loaded_addresses = LoadedAddresses::default();
-        meta
+        TransactionStatusMeta {
+            fee: 42,
+            pre_balances: vec![1, 2],
+            post_balances: vec![3, 4],
+            log_messages: Some(vec!["hello".into()]),
+            pre_token_balances: Some(Vec::new()),
+            post_token_balances: Some(Vec::new()),
+            rewards: Some(Vec::new()),
+            compute_units_consumed: Some(7),
+            cost_units: Some(9),
+            loaded_addresses: LoadedAddresses::default(),
+            ..TransactionStatusMeta::default()
+        }
     }
 
     #[test]
@@ -2992,27 +2993,25 @@ async fn test_firehose_epoch_800() {
                 if block.was_skipped() {
                     NUM_SKIPPED_BLOCKS.fetch_add(1, Ordering::Relaxed);
                     SEEN_SKIPPED.get_or_init(DashSet::new).insert(block.slot());
-                } else {
-                    if first_time {
-                        NUM_BLOCKS.fetch_add(1, Ordering::Relaxed);
-                        if let BlockData::Block {
-                            executed_transaction_count,
-                            ..
-                        } = &block
-                        {
-                            let executed = *executed_transaction_count;
-                            let _ = MIN_TRANSACTIONS.fetch_update(
-                                Ordering::Relaxed,
-                                Ordering::Relaxed,
-                                |current| {
-                                    if executed < current {
-                                        Some(executed)
-                                    } else {
-                                        None
-                                    }
-                                },
-                            );
-                        }
+                } else if first_time {
+                    NUM_BLOCKS.fetch_add(1, Ordering::Relaxed);
+                    if let BlockData::Block {
+                        executed_transaction_count,
+                        ..
+                    } = &block
+                    {
+                        let executed = *executed_transaction_count;
+                        let _ = MIN_TRANSACTIONS.fetch_update(
+                            Ordering::Relaxed,
+                            Ordering::Relaxed,
+                            |current| {
+                                if executed < current {
+                                    Some(executed)
+                                } else {
+                                    None
+                                }
+                            },
+                        );
                     }
                 }
                 Ok(())
@@ -3277,7 +3276,7 @@ async fn test_firehose_epoch_850_has_logs() {
                 TOTAL_TXS.fetch_add(1, Ordering::Relaxed);
                 if let Some(logs) = transaction.transaction_status_meta.log_messages.as_ref() {
                     let has_logs = logs.iter().any(|msg| !msg.is_empty());
-                    assert_eq!(has_logs, true);
+                    assert!(has_logs);
                 }
                 Ok(())
             }

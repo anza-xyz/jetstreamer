@@ -146,7 +146,9 @@ pub async fn start() -> Result<ClickhouseStartResult, ClickhouseError> {
             // Quiet ClickHouse's own logs. The default is `trace`, which floods the server's
             // internal AsyncLogMessageQueue under high-throughput async inserts and triggers
             // "We've dropped N log messages in this channel due to queue overflow" warnings.
-            .arg("--logger.level=warning")
+            // Stay at `information` rather than `warning` so the "Ready for connections" line
+            // (Information level in ClickHouse) still reaches our readiness probe below.
+            .arg("--logger.level=information")
             .stdout(Stdio::piped()) // Redirect stdout to capture logs
             .stderr(Stdio::piped()) // Also capture stderr
             .current_dir(bin_dir)

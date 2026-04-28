@@ -252,6 +252,7 @@ pub struct PluginRunner {
     clickhouse_dsn: String,
     num_threads: usize,
     sequential: bool,
+    reverse: bool,
     buffer_window_bytes: Option<u64>,
     db_update_interval_slots: u64,
 }
@@ -260,11 +261,13 @@ impl PluginRunner {
     /// Creates a new runner that writes to `clickhouse_dsn` using `num_threads`.
     ///
     /// When `sequential` is `true`, firehose runs with one worker and `num_threads` is used as
-    /// ripget parallel download concurrency.
+    /// ripget parallel download concurrency. When `reverse` is `true` (sequential mode only),
+    /// epochs in the slot range are streamed from highest to lowest.
     pub fn new(
         clickhouse_dsn: impl Display,
         num_threads: usize,
         sequential: bool,
+        reverse: bool,
         buffer_window_bytes: Option<u64>,
     ) -> Self {
         Self {
@@ -272,6 +275,7 @@ impl PluginRunner {
             clickhouse_dsn: clickhouse_dsn.to_string(),
             num_threads: std::cmp::max(1, num_threads),
             sequential,
+            reverse,
             buffer_window_bytes,
             db_update_interval_slots: 100,
         }
@@ -766,6 +770,7 @@ impl PluginRunner {
         let mut firehose_future = Box::pin(firehose(
             self.num_threads as u64,
             self.sequential,
+            self.reverse,
             self.buffer_window_bytes,
             slot_range,
             Some(on_block),

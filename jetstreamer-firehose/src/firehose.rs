@@ -844,11 +844,16 @@ pub struct FirehoseErrorContext {
 ///
 /// `buffer_window_bytes` controls the ripget hot/cold window when `sequential` is enabled.
 /// Pass `None` to use the default (`min(4 GiB, 15% of available RAM)`).
+///
+/// When `reverse` is `true` (sequential mode only), epochs in the requested range are
+/// processed from highest to lowest. Within each epoch slots are still emitted in ascending
+/// order because the underlying CAR archive can only be streamed forward.
 #[inline]
 #[allow(clippy::too_many_arguments)]
 pub async fn firehose<OnBlock, OnTransaction, OnEntry, OnRewards, OnStats, OnError>(
     threads: u64,
     sequential: bool,
+    reverse: bool,
     buffer_window_bytes: Option<u64>,
     slot_range: Range<u64>,
     on_block: Option<OnBlock>,
@@ -876,6 +881,9 @@ where
     let client = crate::network::create_http_client();
     log::info!(target: LOG_MODULE, "starting firehose...");
     log::info!(target: LOG_MODULE, "index base url: {}", SLOT_OFFSET_INDEX.base_url());
+    // Reverse mode implies sequential mode; activate it automatically when caller passed
+    // `reverse: true` without `sequential: true`.
+    let sequential = sequential || reverse;
     let firehose_threads = if sequential { 1 } else { threads };
     let sequential_download_threads = std::cmp::max(1, threads as usize);
     let sequential_buffer_window_bytes = buffer_window_bytes
@@ -887,6 +895,13 @@ where
             "sequential mode enabled: firehose_threads=1, ripget_threads={}, ripget_window={}",
             sequential_download_threads,
             crate::system::format_byte_size(sequential_buffer_window_bytes)
+        );
+    }
+    let reverse_mode = reverse;
+    if reverse_mode {
+        log::info!(
+            target: LOG_MODULE,
+            "reverse mode enabled: epochs processed from highest to lowest"
         );
     }
 
@@ -962,6 +977,7 @@ where
         let pending_skipped_slots = pending_skipped_slots.clone();
         let thread_shutdown_rx = shutdown_signal.as_ref().map(|rx| rx.resubscribe());
         let sequential_mode = sequential;
+        let reverse_mode_local = reverse_mode;
         let ripget_threads = sequential_download_threads;
         let ripget_buffer_window_bytes = sequential_buffer_window_bytes;
         let ripget_client = shared_ripget_client.clone();
@@ -992,6 +1008,13 @@ where
             }
             let mut last_counted_slot = slot_range.start.saturating_sub(1);
             let mut last_emitted_slot_global = slot_range.start.saturating_sub(1);
+            // Reverse-mode state preserved across retries.
+            let mut reverse_partial_resume: Option<u64> = None;
+            let mut reverse_highest_remaining_epoch: u64 = if reverse_mode_local {
+                slot_to_epoch(slot_range.end.saturating_sub(1))
+            } else {
+                0
+            };
             let mut thread_stats = if tracking_enabled {
                 Some(ThreadStats {
                     thread_id: thread_index,
@@ -1027,7 +1050,9 @@ where
                     );
                     return Ok(());
                 }
-                let epoch_range = slot_to_epoch(slot_range.start)..=slot_to_epoch(slot_range.end - 1);
+                let lowest_epoch = slot_to_epoch(slot_range.start);
+                let highest_epoch = slot_to_epoch(slot_range.end - 1);
+                let epoch_range = lowest_epoch..=highest_epoch;
                 log::info!(
                     target: &log_target,
                     "slot range: {} (epoch {}) ... {} (epoch {})",
@@ -1041,7 +1066,18 @@ where
 
                 // for each epoch
                 let mut current_slot: Option<u64> = None;
-                for epoch_num in epoch_range.clone() {
+                let epoch_iter: Vec<u64> = if reverse_mode_local {
+                    if reverse_highest_remaining_epoch < lowest_epoch {
+                        // All epochs already completed across previous retries.
+                        return Ok(());
+                    }
+                    (lowest_epoch..=reverse_highest_remaining_epoch)
+                        .rev()
+                        .collect()
+                } else {
+                    epoch_range.clone().collect()
+                };
+                for epoch_num in epoch_iter {
                     if poll_shutdown(&shutdown_flag, &mut shutdown_rx) {
                         log::info!(
                             target: &log_target,
@@ -1052,7 +1088,16 @@ where
                     }
                     log::info!(target: &log_target, "entering epoch {}", epoch_num);
                     let (epoch_start, epoch_end_inclusive) = epoch_to_slot_range(epoch_num);
-                    let local_start = std::cmp::max(slot_range.start, epoch_start);
+                    let local_start = if reverse_mode_local {
+                        match reverse_partial_resume {
+                            Some(s) if slot_to_epoch(s) == epoch_num => {
+                                std::cmp::max(epoch_start, s)
+                            }
+                            _ => std::cmp::max(slot_range.start, epoch_start),
+                        }
+                    } else {
+                        std::cmp::max(slot_range.start, epoch_start)
+                    };
                     let local_end_inclusive =
                         std::cmp::min(slot_range.end.saturating_sub(1), epoch_end_inclusive);
                     if local_start > local_end_inclusive {
@@ -1115,6 +1160,12 @@ where
                     // from being treated as already-counted after a restart.
                     last_counted_slot = local_start.saturating_sub(1);
                     current_slot = None;
+                    if reverse_mode_local {
+                        // In reverse mode each epoch is processed forward independently;
+                        // the cross-epoch monotonic dedup check would otherwise reject every
+                        // slot below the previously processed (higher) epoch's range.
+                        last_emitted_slot = local_start.saturating_sub(1);
+                    }
                     if tracking_enabled
                         && let Some(ref mut stats) = thread_stats {
                             stats.current_slot = local_start;
@@ -1222,10 +1273,14 @@ where
                         }
                         if slot >= slot_range.end {
                             log::info!(target: &log_target, "reached end of slot range at slot {}", slot);
-                            // Return early to terminate the firehose thread cleanly. We use >=
-                            // because slot_range is half-open [start, end), so any slot equal
-                            // to end is out-of-range and must not be processed. Do not emit
-                            // synthetic skipped slots here; another thread may own the boundary.
+                            // We use >= because slot_range is half-open [start, end), so any
+                            // slot equal to end is out-of-range and must not be processed. Do
+                            // not emit synthetic skipped slots here; another thread may own the
+                            // boundary. In reverse mode we still have lower epochs to process,
+                            // so just break out of this epoch's inner loop.
+                            if reverse_mode_local {
+                                break;
+                            }
                             if block_enabled {
                                 pending_skipped_slots.remove(&thread_index);
                             }
@@ -1694,7 +1749,7 @@ where
                                 DataFrame(_data_frame) => (),
                             }
                         }
-                        if block.slot == slot_range.end - 1 {
+                        if !reverse_mode_local && block.slot == slot_range.end - 1 {
                             let finish_time = std::time::Instant::now();
                             let elapsed = finish_time.duration_since(start_time);
                             log::info!(target: &log_target, "processed slot {}", block.slot);
@@ -1726,6 +1781,19 @@ where
                                 log::debug!(target: &log_target, "threads with errors: {}", summary);
                             }
                             return Ok(());
+                        }
+                    }
+                    if reverse_mode_local {
+                        // Mark this epoch as fully processed so retries skip it.
+                        if epoch_num == reverse_highest_remaining_epoch {
+                            reverse_highest_remaining_epoch =
+                                reverse_highest_remaining_epoch.saturating_sub(1);
+                        }
+                        if matches!(
+                            reverse_partial_resume,
+                            Some(s) if slot_to_epoch(s) == epoch_num
+                        ) {
+                            reverse_partial_resume = None;
                         }
                     }
                     if let Some(expected_last_slot) = slot_range.end.checked_sub(1)
@@ -1815,7 +1883,17 @@ where
                 // Update slot range to resume from the failed slot, not the original start.
                 // Reset local tracking so we don't treat the resumed slot range as already counted.
                 // If we've already counted this slot, resume from the next one to avoid duplicates.
-                if slot <= last_counted_slot {
+                if reverse_mode_local {
+                    // In reverse mode, completed higher epochs are tracked via
+                    // reverse_highest_remaining_epoch and the within-epoch resume slot lives in
+                    // reverse_partial_resume; slot_range stays at its original bounds.
+                    let resume_slot = if slot <= last_counted_slot {
+                        last_counted_slot.saturating_add(1)
+                    } else {
+                        slot
+                    };
+                    reverse_partial_resume = Some(resume_slot);
+                } else if slot <= last_counted_slot {
                     slot_range.start = last_counted_slot.saturating_add(1);
                 } else {
                     slot_range.start = slot;
@@ -2675,6 +2753,7 @@ async fn assert_slot_min_executed_transactions(slot: u64, min_executed: u64) {
     firehose(
         1,
         false,
+        false,
         None,
         target_slot_block..(target_slot_block + 1),
         Some(move |_thread_id: usize, block: BlockData| {
@@ -2886,6 +2965,7 @@ async fn test_firehose_epoch_800() {
     firehose(
         THREADS.try_into().unwrap(),
         false,
+        false,
         None,
         (345600000 - NUM_SLOTS_TO_COVER / 2)..(345600000 + NUM_SLOTS_TO_COVER / 2),
         Some(|thread_id: usize, block: BlockData| {
@@ -2991,6 +3071,7 @@ async fn test_firehose_target_slot_transactions() {
     firehose(
         4,
         false,
+        false,
         None,
         (TARGET_SLOT - SLOT_RADIUS)..(TARGET_SLOT + SLOT_RADIUS),
         Some(|_thread_id: usize, block: BlockData| {
@@ -3080,6 +3161,7 @@ async fn test_firehose_epoch_900_boundary_window_sequential_monotonic_transactio
     firehose(
         THREADS,
         true,
+        false,
         Some(test_buffer_window_bytes),
         slot_range.clone(),
         None::<OnBlockFn>,
@@ -3186,6 +3268,7 @@ async fn test_firehose_epoch_850_has_logs() {
     firehose(
         4,
         false,
+        false,
         None,
         START_SLOT..(START_SLOT + SLOT_COUNT),
         None::<OnBlockFn>,
@@ -3231,6 +3314,7 @@ async fn test_firehose_epoch_850_votes_present() {
 
     firehose(
         2,
+        false,
         false,
         None,
         (TARGET_SLOT - SLOT_RADIUS)..(TARGET_SLOT + SLOT_RADIUS),
@@ -3303,6 +3387,7 @@ async fn test_firehose_restart_loses_coverage_without_reset() {
     firehose(
         THREADS.try_into().unwrap(),
         false,
+        false,
         None,
         START_SLOT..(START_SLOT + NUM_SLOTS),
         Some(|_thread_id: usize, block: BlockData| {
@@ -3366,6 +3451,7 @@ async fn test_firehose_gap_coverage_near_known_missing_range() {
     firehose(
         THREADS.try_into().unwrap(),
         false,
+        false,
         None,
         START_SLOT..(END_SLOT + 1),
         Some(|_thread_id: usize, block: BlockData| {
@@ -3416,5 +3502,183 @@ async fn test_firehose_gap_coverage_near_known_missing_range() {
         "missing slots in {START_SLOT}..={END_SLOT}; count={}, first few={:?}",
         missing.len(),
         &missing[..missing.len().min(10)]
+    );
+}
+
+#[cfg(test)]
+#[serial]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_firehose_sequential_reverse_crosses_epoch_boundary() {
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    };
+
+    solana_logger::setup_with_default("info");
+    const SLOT_COUNT: u64 = 100;
+
+    let (epoch_900_start, _) = epoch_to_slot_range(900);
+    let slot_range = (epoch_900_start - SLOT_COUNT)..(epoch_900_start + SLOT_COUNT);
+
+    let observed_blocks: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
+    let observed_tx_count = Arc::new(AtomicU64::new(0));
+
+    firehose(
+        1,
+        true,
+        true,
+        None,
+        slot_range.clone(),
+        Some({
+            let observed_blocks = observed_blocks.clone();
+            move |_thread_id: usize, block: BlockData| {
+                let observed_blocks = observed_blocks.clone();
+                async move {
+                    observed_blocks.lock().unwrap().push(block.slot());
+                    Ok(())
+                }
+                .boxed()
+            }
+        }),
+        Some({
+            let observed_tx_count = observed_tx_count.clone();
+            move |_thread_id: usize, _tx: TransactionData| {
+                let observed_tx_count = observed_tx_count.clone();
+                async move {
+                    observed_tx_count.fetch_add(1, Ordering::Relaxed);
+                    Ok(())
+                }
+                .boxed()
+            }
+        }),
+        None::<OnEntryFn>,
+        None::<OnRewardFn>,
+        None::<OnErrorFn>,
+        None::<OnStatsTrackingFn>,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let observed = observed_blocks.lock().unwrap().clone();
+    assert!(
+        !observed.is_empty(),
+        "expected to observe at least one block"
+    );
+    assert!(
+        observed_tx_count.load(Ordering::Relaxed) > 0,
+        "expected to observe at least one transaction"
+    );
+
+    // First observed slot must be in the higher epoch (900).
+    let first_epoch = slot_to_epoch(observed[0]);
+    assert_eq!(
+        first_epoch, 900,
+        "reverse mode must start with the highest epoch, got slot {} in epoch {}",
+        observed[0], first_epoch,
+    );
+
+    // Verify within-epoch ascending order and exactly one epoch decrease.
+    let mut transitions = 0u32;
+    let mut current_epoch = first_epoch;
+    let mut prev_slot_in_epoch: Option<u64> = None;
+    for &slot in &observed {
+        let epoch = slot_to_epoch(slot);
+        if epoch != current_epoch {
+            assert!(
+                epoch < current_epoch,
+                "epoch did not decrease across boundary: prev={current_epoch} now={epoch}",
+            );
+            transitions += 1;
+            current_epoch = epoch;
+            prev_slot_in_epoch = None;
+        }
+        if let Some(prev) = prev_slot_in_epoch {
+            assert!(
+                slot >= prev,
+                "within epoch {epoch}, slot regressed: prev={prev} now={slot}",
+            );
+        }
+        prev_slot_in_epoch = Some(slot);
+    }
+    assert_eq!(
+        transitions, 1,
+        "expected exactly one epoch transition for a range crossing one boundary",
+    );
+    assert_eq!(
+        current_epoch, 899,
+        "reverse mode should end at the lower epoch (899), got {current_epoch}",
+    );
+}
+
+#[cfg(test)]
+#[serial]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_firehose_reverse_implies_sequential() {
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    };
+
+    solana_logger::setup_with_default("info");
+    const SLOT_COUNT: u64 = 100;
+
+    let (epoch_900_start, _) = epoch_to_slot_range(900);
+    let slot_range = (epoch_900_start - SLOT_COUNT)..(epoch_900_start + SLOT_COUNT);
+
+    let observed_blocks: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
+    let observed_tx_count = Arc::new(AtomicU64::new(0));
+
+    // sequential = false, reverse = true: firehose should auto-activate sequential mode.
+    firehose(
+        4,
+        false,
+        true,
+        None,
+        slot_range.clone(),
+        Some({
+            let observed_blocks = observed_blocks.clone();
+            move |_thread_id: usize, block: BlockData| {
+                let observed_blocks = observed_blocks.clone();
+                async move {
+                    observed_blocks.lock().unwrap().push(block.slot());
+                    Ok(())
+                }
+                .boxed()
+            }
+        }),
+        Some({
+            let observed_tx_count = observed_tx_count.clone();
+            move |_thread_id: usize, _tx: TransactionData| {
+                let observed_tx_count = observed_tx_count.clone();
+                async move {
+                    observed_tx_count.fetch_add(1, Ordering::Relaxed);
+                    Ok(())
+                }
+                .boxed()
+            }
+        }),
+        None::<OnEntryFn>,
+        None::<OnRewardFn>,
+        None::<OnErrorFn>,
+        None::<OnStatsTrackingFn>,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let observed = observed_blocks.lock().unwrap().clone();
+    assert!(
+        !observed.is_empty(),
+        "expected to observe at least one block"
+    );
+    // If sequential were ignored, multiple firehose threads would interleave epochs and the
+    // first-observed slot is unlikely to be in epoch 900. The reverse-implies-sequential
+    // contract requires the first observed slot to be in the highest epoch.
+    assert_eq!(
+        slot_to_epoch(observed[0]),
+        900,
+        "reverse should imply sequential and emit highest epoch first; first slot was {}",
+        observed[0],
     );
 }

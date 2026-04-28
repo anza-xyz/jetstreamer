@@ -54,6 +54,8 @@
 //!   cores, or leave it unset to size the pool automatically using CPU and network heuristics.
 //! - `JETSTREAMER_SEQUENTIAL` (default `false`): when truthy, firehose uses a single worker
 //!   thread and uses ripget's parallel windowed downloader for sequential reads.
+//! - `JETSTREAMER_REVERSE` (default `false`): when truthy, processes epochs in the slot range
+//!   from highest to lowest. Implies `JETSTREAMER_SEQUENTIAL`.
 //! - `JETSTREAMER_BUFFER_WINDOW` (default lower of 4 GiB and 15% of available RAM): ripget
 //!   hot/cold window size used in sequential mode. Accepts raw bytes or suffixes like `512MiB`.
 //! - `JETSTREAMER_CLICKHOUSE_DSN` (default `http://localhost:8123`): DSN passed to plugin
@@ -217,6 +219,8 @@ fn parse_clickhouse_mode(value: &str) -> Option<ClickhouseMode> {
 ///   derived from [`jetstreamer_firehose::system::optimal_firehose_thread_count`].
 /// - `JETSTREAMER_SEQUENTIAL`: When true, runs a single firehose worker and uses ripget's
 ///   parallel windowed downloader for sequential reads.
+/// - `JETSTREAMER_REVERSE`: When true, processes epochs in the slot range from highest to
+///   lowest. Implies `JETSTREAMER_SEQUENTIAL`.
 /// - `JETSTREAMER_CLICKHOUSE_DSN`: DSN for ClickHouse ingestion; defaults to
 ///   `http://localhost:8123`.
 /// - `JETSTREAMER_CLICKHOUSE_MODE`: Controls ClickHouse integration. Accepted values are

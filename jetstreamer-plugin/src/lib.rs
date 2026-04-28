@@ -261,8 +261,9 @@ impl PluginRunner {
     /// Creates a new runner that writes to `clickhouse_dsn` using `num_threads`.
     ///
     /// When `sequential` is `true`, firehose runs with one worker and `num_threads` is used as
-    /// ripget parallel download concurrency. When `reverse` is `true` (sequential mode only),
-    /// epochs in the slot range are streamed from highest to lowest.
+    /// ripget parallel download concurrency. When `reverse` is `true`, epochs in the slot range
+    /// are streamed from highest to lowest; this implies sequential mode and activates it
+    /// automatically if not already set.
     pub fn new(
         clickhouse_dsn: impl Display,
         num_threads: usize,

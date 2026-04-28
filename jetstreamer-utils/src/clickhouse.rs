@@ -143,6 +143,10 @@ pub async fn start() -> Result<ClickhouseStartResult, ClickhouseError> {
         Command::new(clickhouse_path)
             .arg("server")
             //.arg("--async_insert_queue_flush_on_shutdown=1")
+            // Quiet ClickHouse's own logs. The default is `trace`, which floods the server's
+            // internal AsyncLogMessageQueue under high-throughput async inserts and triggers
+            // "We've dropped N log messages in this channel due to queue overflow" warnings.
+            .arg("--logger.level=warning")
             .stdout(Stdio::piped()) // Redirect stdout to capture logs
             .stderr(Stdio::piped()) // Also capture stderr
             .current_dir(bin_dir)

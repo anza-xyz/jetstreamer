@@ -11,11 +11,17 @@ use crate::{
 /// the crate version. If the `JETSTREAMER_VERSION` environment variable is set
 /// at build time (e.g., via CI/CD), it will be used instead, allowing git
 /// commit information to be included (e.g., `jetstreamer/v0.3.0+24d5efe-dirty`).
+///
+/// HTTP/1.1 is forced because the firehose runs hundreds of concurrent
+/// long-lived streams; HTTP/2 multiplexing on a few shared TCP connections
+/// suffers from per-stream flow-control and head-of-line blocking under that
+/// load profile, leading to `read_until_block` timeouts.
 pub fn create_http_client() -> Client {
     let version = option_env!("JETSTREAMER_VERSION").unwrap_or(env!("CARGO_PKG_VERSION"));
     let user_agent = format!("jetstreamer/v{}", version);
     Client::builder()
         .user_agent(user_agent)
+        .http1_only()
         .build()
         .expect("failed to create HTTP client")
 }

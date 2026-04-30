@@ -90,6 +90,16 @@ JETSTREAMER_SEQUENTIAL=1 cargo run --release -- 800 --buffer-window 4GiB
 `JETSTREAMER_BUFFER_WINDOW` (or `--buffer-window`) defaults to `min(4 GiB, 15% of available
 RAM)` when unset.
 
+To backfill from newest to oldest, add `--reverse` (or `JETSTREAMER_REVERSE=1`). Reverse mode
+implies sequential mode and processes epochs in the slot range from highest to lowest. Within
+each epoch, slots still come out in ascending order because Old Faithful CAR archives are
+forward-only streams.
+
+```bash
+# Backfill epochs 800..=802 starting with 802, then 801, then 800
+cargo run --release -- 345600000:1296000000 --reverse
+```
+
 The built-in `program-tracking` and `instruction-tracking` plugins record vote and non-vote
 activity separately: `program_invocations` includes an `is_vote` flag per row, while
 `slot_instructions` stores separate vote/non-vote instruction and transaction counts. The

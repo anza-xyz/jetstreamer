@@ -54,6 +54,8 @@
 //!   cores, or leave it unset to size the pool automatically using CPU and network heuristics.
 //! - `JETSTREAMER_SEQUENTIAL` (default `false`): when truthy, firehose uses a single worker
 //!   thread and uses ripget's parallel windowed downloader for sequential reads.
+//! - `JETSTREAMER_REVERSE` (default `false`): when truthy, processes epochs in the slot range
+//!   from highest to lowest. Implies `JETSTREAMER_SEQUENTIAL`.
 //! - `JETSTREAMER_BUFFER_WINDOW` (default lower of 4 GiB and 15% of available RAM): ripget
 //!   hot/cold window size used in sequential mode. Accepts raw bytes or suffixes like `512MiB`.
 //! - `JETSTREAMER_CLICKHOUSE_DSN` (default `http://localhost:8123`): DSN passed to plugin
@@ -90,6 +92,7 @@
 //! | `JETSTREAMER_CLICKHOUSE_MODE` | `auto` | Controls ClickHouse integration. `auto` enables output and spawns the helper only for local DSNs, `remote` enables output without spawning the helper, `local` always requests the helper, and `off` disables ClickHouse entirely. |
 //! | `JETSTREAMER_THREADS` | `auto` | Number of firehose ingestion threads. Leave unset to rely on hardware-based sizing or override with an explicit value when you know the ideal concurrency. |
 //! | `JETSTREAMER_SEQUENTIAL` | `false` | Enables single-thread firehose processing with ripget-backed sequential streaming. |
+//! | `JETSTREAMER_REVERSE` | `false` | Streams epochs from highest to lowest. Implies `JETSTREAMER_SEQUENTIAL`. |
 //! | `JETSTREAMER_BUFFER_WINDOW` | `min(4 GiB, 15% available RAM)` | Total ripget hot/cold window size used only when `JETSTREAMER_SEQUENTIAL` is enabled. |
 //!
 //! Helper spawning only occurs when both the mode allows it (`auto`/`local`) **and** the DSN
@@ -216,6 +219,8 @@ fn parse_clickhouse_mode(value: &str) -> Option<ClickhouseMode> {
 ///   derived from [`jetstreamer_firehose::system::optimal_firehose_thread_count`].
 /// - `JETSTREAMER_SEQUENTIAL`: When true, runs a single firehose worker and uses ripget's
 ///   parallel windowed downloader for sequential reads.
+/// - `JETSTREAMER_REVERSE`: When true, processes epochs in the slot range from highest to
+///   lowest. Implies `JETSTREAMER_SEQUENTIAL`.
 /// - `JETSTREAMER_CLICKHOUSE_DSN`: DSN for ClickHouse ingestion; defaults to
 ///   `http://localhost:8123`.
 /// - `JETSTREAMER_CLICKHOUSE_MODE`: Controls ClickHouse integration. Accepted values are
@@ -327,6 +332,7 @@ impl Default for JetstreamerRunner {
             config: Config {
                 threads: jetstreamer_firehose::system::optimal_firehose_thread_count(),
                 sequential: false,
+                reverse: false,
                 buffer_window_bytes: None,
                 slot_range: 0..0,
                 clickhouse_enabled: clickhouse_settings.enabled,
@@ -371,6 +377,19 @@ impl JetstreamerRunner {
     /// the ripget parallel range count for sequential windowed downloads.
     pub const fn with_sequential(mut self, sequential: bool) -> Self {
         self.config.sequential = sequential;
+        self
+    }
+
+    /// Toggles reverse iteration. Implies sequential mode.
+    ///
+    /// When enabled, epochs in the slot range are streamed from highest to lowest. Within
+    /// each epoch slots still come in ascending order because CAR archives can only be
+    /// streamed forward. Setting this flag also activates sequential mode automatically.
+    pub const fn with_reverse(mut self, reverse: bool) -> Self {
+        self.config.reverse = reverse;
+        if reverse {
+            self.config.sequential = true;
+        }
         self
     }
 
@@ -421,6 +440,7 @@ impl JetstreamerRunner {
 
         let threads = std::cmp::max(1, self.config.threads);
         let sequential = self.config.sequential;
+        let reverse = self.config.reverse;
         let buffer_window_bytes = self.config.buffer_window_bytes;
         let clickhouse_enabled =
             self.config.clickhouse_enabled && !self.clickhouse_dsn.trim().is_empty();
@@ -430,11 +450,12 @@ impl JetstreamerRunner {
             && should_spawn_for_dsn(&self.clickhouse_dsn);
 
         log::info!(
-            "processing slots [{}..{}) with {} configured threads (sequential={}, buffer_window_bytes={:?}, clickhouse_enabled={})",
+            "processing slots [{}..{}) with {} configured threads (sequential={}, reverse={}, buffer_window_bytes={:?}, clickhouse_enabled={})",
             slot_range.start,
             slot_range.end,
             threads,
             sequential,
+            reverse,
             buffer_window_bytes,
             clickhouse_enabled
         );
@@ -443,6 +464,7 @@ impl JetstreamerRunner {
             &self.clickhouse_dsn,
             threads,
             sequential,
+            reverse,
             buffer_window_bytes,
         );
         for plugin in &self.config.builtin_plugins {
@@ -551,6 +573,8 @@ pub struct Config {
     pub threads: usize,
     /// Whether to process with a single firehose worker and ripget-backed sequential streaming.
     pub sequential: bool,
+    /// When `true` (sequential mode only), iterate epochs from highest to lowest.
+    pub reverse: bool,
     /// Optional override for ripget sequential window size in bytes.
     pub buffer_window_bytes: Option<u64>,
     /// The range of slots to process, inclusive of the start and exclusive of the end slot.
@@ -600,6 +624,7 @@ impl BuiltinPlugin {
 ///   `local`, or `off`.
 /// - `JETSTREAMER_THREADS`: Number of firehose ingestion threads.
 /// - `JETSTREAMER_SEQUENTIAL`: Enables single-thread sequential firehose mode when truthy.
+/// - `JETSTREAMER_REVERSE`: Enables reverse epoch iteration when truthy. Implies sequential mode.
 /// - `JETSTREAMER_BUFFER_WINDOW`: Optional ripget sequential window size (for example `4GiB`).
 ///
 /// CLI flags:
@@ -607,6 +632,7 @@ impl BuiltinPlugin {
 ///   `instruction-tracking`, or `pubkey-stats`). When omitted, the CLI defaults to `program-tracking`.
 /// - `--no-plugins`: Disables all built-in plugins (overrides the default and any `--with-plugin`).
 /// - `--sequential`: Enables single-thread sequential firehose mode.
+/// - `--reverse`: Streams epochs from highest to lowest. Implies `--sequential`.
 /// - `--buffer-window <size>`: Overrides ripget sequential window size (for example `4GiB`).
 ///
 /// # Examples
@@ -628,6 +654,7 @@ pub fn parse_cli_args() -> Result<Config, Box<dyn std::error::Error>> {
     let mut builtin_plugins = Vec::new();
     let mut no_plugins = false;
     let mut sequential_cli = false;
+    let mut reverse_cli = false;
     let mut buffer_window_cli: Option<String> = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -647,6 +674,9 @@ pub fn parse_cli_args() -> Result<Config, Box<dyn std::error::Error>> {
             }
             "--sequential" => {
                 sequential_cli = true;
+            }
+            "--reverse" => {
+                reverse_cli = true;
             }
             "--buffer-window" => {
                 let raw = args
@@ -684,11 +714,12 @@ pub fn parse_cli_args() -> Result<Config, Box<dyn std::error::Error>> {
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or_else(jetstreamer_firehose::system::optimal_firehose_thread_count);
-    let sequential = if sequential_cli {
+    let reverse = if reverse_cli {
         true
     } else {
-        parse_env_bool("JETSTREAMER_SEQUENTIAL", false)
+        parse_env_bool("JETSTREAMER_REVERSE", false)
     };
+    let sequential = reverse || sequential_cli || parse_env_bool("JETSTREAMER_SEQUENTIAL", false);
     let buffer_window_raw = if let Some(cli) = buffer_window_cli {
         Some(cli)
     } else {
@@ -709,6 +740,7 @@ pub fn parse_cli_args() -> Result<Config, Box<dyn std::error::Error>> {
     Ok(Config {
         threads,
         sequential,
+        reverse,
         buffer_window_bytes,
         slot_range,
         clickhouse_enabled,

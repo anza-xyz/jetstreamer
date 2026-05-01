@@ -208,7 +208,7 @@ fn parse_clickhouse_mode(value: &str) -> Option<ClickhouseMode> {
 ///
 /// Configure the runner with the builder-style methods and finish by calling
 /// [`JetstreamerRunner::run`]. The runner also honors the process-level environment variables
-/// documented at the module level
+/// documented at the module level.
 ///
 /// ### Environment variables
 ///
@@ -311,7 +311,7 @@ fn parse_clickhouse_mode(value: &str) -> Option<ClickhouseMode> {
 ///
 /// To achieve 2M TPS+, you will need a 20+ Gbps network connection and at least a 64 core CPU.
 /// On our benchmark hardware we currently have a 100 Gbps connection and 64 cores, which has
-/// led to a record of 2.7M TPS of the course of a 12 hour run using 255 threads.
+/// led to a record of 2.7M TPS over the course of a 12 hour run using 255 threads.
 pub struct JetstreamerRunner {
     log_level: String,
     plugins: Vec<Box<dyn Plugin>>,

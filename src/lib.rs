@@ -338,6 +338,7 @@ impl Default for JetstreamerRunner {
                 clickhouse_enabled: clickhouse_settings.enabled,
                 spawn_clickhouse: clickhouse_settings.spawn_helper && clickhouse_settings.enabled,
                 builtin_plugins: Vec::new(),
+                clickhouse_dsn: None,
             },
         }
     }
@@ -424,9 +425,13 @@ impl JetstreamerRunner {
     }
 
     /// Replaces the current [`Config`] with values parsed from CLI arguments and the
-    /// environment.
+    /// environment. If `--clickhouse-dsn` was supplied, it also overrides the runner's
+    /// ClickHouse DSN.
     pub fn parse_cli_args(mut self) -> Result<Self, Box<dyn std::error::Error>> {
         self.config = parse_cli_args()?;
+        if let Some(dsn) = self.config.clickhouse_dsn.take() {
+            self.clickhouse_dsn = dsn;
+        }
         Ok(self)
     }
 
@@ -585,6 +590,9 @@ pub struct Config {
     pub spawn_clickhouse: bool,
     /// Built-in plugins requested via CLI flags.
     pub builtin_plugins: Vec<BuiltinPlugin>,
+    /// ClickHouse DSN supplied via `--clickhouse-dsn`. When set, it overrides the
+    /// `JETSTREAMER_CLICKHOUSE_DSN` env var and any prior `with_clickhouse_dsn` builder call.
+    pub clickhouse_dsn: Option<String>,
 }
 
 /// Built-in plugins that can be toggled via CLI flags.
@@ -599,13 +607,24 @@ pub enum BuiltinPlugin {
 }
 
 impl BuiltinPlugin {
-    fn from_flag(value: &str) -> Option<Self> {
-        match value {
-            "program-tracking" => Some(Self::ProgramTracking),
-            "instruction-tracking" => Some(Self::InstructionTracking),
-            "pubkey-stats" => Some(Self::PubkeyStats),
-            _ => None,
+    /// Every built-in plugin variant, in stable CLI ordering.
+    pub const ALL: &'static [BuiltinPlugin] = &[
+        Self::ProgramTracking,
+        Self::InstructionTracking,
+        Self::PubkeyStats,
+    ];
+
+    /// The CLI flag name for this plugin, as accepted by `--with-plugin`.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::ProgramTracking => "program-tracking",
+            Self::InstructionTracking => "instruction-tracking",
+            Self::PubkeyStats => "pubkey-stats",
         }
+    }
+
+    fn from_flag(value: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|p| p.name() == value)
     }
 
     fn instantiate(self) -> Box<dyn Plugin> {
@@ -631,9 +650,12 @@ impl BuiltinPlugin {
 /// - `--with-plugin <name>`: Adds one of the built-in plugins (`program-tracking`,
 ///   `instruction-tracking`, or `pubkey-stats`). When omitted, the CLI defaults to `program-tracking`.
 /// - `--no-plugins`: Disables all built-in plugins (overrides the default and any `--with-plugin`).
+/// - `--list-plugins`: Prints the names of every built-in plugin to stdout and exits.
 /// - `--sequential`: Enables single-thread sequential firehose mode.
 /// - `--reverse`: Streams epochs from highest to lowest. Implies `--sequential`.
 /// - `--buffer-window <size>`: Overrides ripget sequential window size (for example `4GiB`).
+/// - `--clickhouse-dsn <url>`: Overrides the ClickHouse DSN (takes precedence over the
+///   `JETSTREAMER_CLICKHOUSE_DSN` env var and any prior `with_clickhouse_dsn` builder call).
 ///
 /// # Examples
 ///
@@ -656,6 +678,7 @@ pub fn parse_cli_args() -> Result<Config, Box<dyn std::error::Error>> {
     let mut sequential_cli = false;
     let mut reverse_cli = false;
     let mut buffer_window_cli: Option<String> = None;
+    let mut clickhouse_dsn_cli: Option<String> = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--with-plugin" => {
@@ -663,14 +686,23 @@ pub fn parse_cli_args() -> Result<Config, Box<dyn std::error::Error>> {
                     .next()
                     .ok_or_else(|| "--with-plugin requires a plugin name".to_string())?;
                 let plugin = BuiltinPlugin::from_flag(&plugin_name).ok_or_else(|| {
-                    format!(
-                        "unknown plugin '{plugin_name}'. expected 'program-tracking', 'instruction-tracking', or 'pubkey-stats'"
-                    )
+                    let names = BuiltinPlugin::ALL
+                        .iter()
+                        .map(|p| p.name())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!("unknown plugin '{plugin_name}'. expected one of: {names}")
                 })?;
                 builtin_plugins.push(plugin);
             }
             "--no-plugins" => {
                 no_plugins = true;
+            }
+            "--list-plugins" => {
+                for plugin in BuiltinPlugin::ALL {
+                    println!("{}", plugin.name());
+                }
+                std::process::exit(0);
             }
             "--sequential" => {
                 sequential_cli = true;
@@ -683,6 +715,12 @@ pub fn parse_cli_args() -> Result<Config, Box<dyn std::error::Error>> {
                     .next()
                     .ok_or_else(|| "--buffer-window requires a value like 4GiB".to_string())?;
                 buffer_window_cli = Some(raw);
+            }
+            "--clickhouse-dsn" => {
+                let dsn = args
+                    .next()
+                    .ok_or_else(|| "--clickhouse-dsn requires a URL".to_string())?;
+                clickhouse_dsn_cli = Some(dsn);
             }
             _ if first_arg.is_none() => first_arg = Some(arg),
             other => return Err(format!("unrecognized argument '{other}'").into()),
@@ -746,6 +784,7 @@ pub fn parse_cli_args() -> Result<Config, Box<dyn std::error::Error>> {
         clickhouse_enabled,
         spawn_clickhouse,
         builtin_plugins,
+        clickhouse_dsn: clickhouse_dsn_cli,
     })
 }
 
@@ -786,4 +825,22 @@ fn parse_env_bool(key: &str, default: bool) -> bool {
 fn should_spawn_for_dsn(dsn: &str) -> bool {
     let lower = dsn.to_ascii_lowercase();
     lower.contains("localhost") || lower.contains("127.0.0.1")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn builtin_plugin_name_flag_roundtrip() {
+        for plugin in BuiltinPlugin::ALL {
+            assert_eq!(BuiltinPlugin::from_flag(plugin.name()), Some(*plugin));
+        }
+    }
+
+    #[test]
+    fn builtin_plugin_from_flag_rejects_unknown() {
+        assert!(BuiltinPlugin::from_flag("not-a-plugin").is_none());
+        assert!(BuiltinPlugin::from_flag("").is_none());
+    }
 }

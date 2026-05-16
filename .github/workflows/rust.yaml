@@ -33,7 +33,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential libudev-dev clang llvm-dev libclang-dev pkg-config libssl-dev
       - name: Run sccache-cache
-        uses: mozilla-actions/sccache-action@v0.0.9
+        uses: mozilla-actions/sccache-action@v0.0.10
       - name: cargo check (${{ matrix.name }})
         run: cargo check --workspace ${{ matrix.flags }}
 
@@ -55,7 +55,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential libudev-dev clang llvm-dev libclang-dev pkg-config libssl-dev
       - name: Run sccache-cache
-        uses: mozilla-actions/sccache-action@v0.0.9
+        uses: mozilla-actions/sccache-action@v0.0.10
       - name: cargo test (${{ matrix.name }})
         run: cargo test --workspace ${{ matrix.flags }}
 
@@ -70,7 +70,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential libudev-dev clang llvm-dev libclang-dev pkg-config libssl-dev
       - name: Run sccache-cache
-        uses: mozilla-actions/sccache-action@v0.0.9
+        uses: mozilla-actions/sccache-action@v0.0.10
       - name: Install cargo-fmt
         run: rustup component add rustfmt
       - name: cargo fmt
@@ -87,7 +87,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential libudev-dev clang llvm-dev libclang-dev pkg-config libssl-dev
       - name: Run sccache-cache
-        uses: mozilla-actions/sccache-action@v0.0.9
+        uses: mozilla-actions/sccache-action@v0.0.10
       - name: cargo doc
         run: cargo doc
 
@@ -109,7 +109,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential libudev-dev clang llvm-dev libclang-dev pkg-config libssl-dev
       - name: Run sccache-cache
-        uses: mozilla-actions/sccache-action@v0.0.9
+        uses: mozilla-actions/sccache-action@v0.0.10
       - name: Install cargo-clippy
         run: rustup component add clippy
       - name: cargo clippy (${{ matrix.name }})
@@ -126,7 +126,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential libudev-dev clang llvm-dev libclang-dev pkg-config libssl-dev
       - name: Run sccache-cache
-        uses: mozilla-actions/sccache-action@v0.0.9
+        uses: mozilla-actions/sccache-action@v0.0.10
       - name: cargo fix --workspace
         run: |
           # Run cargo fix on the project

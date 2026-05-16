@@ -425,14 +425,19 @@ impl JetstreamerRunner {
     }
 
     /// Replaces the current [`Config`] with values parsed from CLI arguments and the
-    /// environment. If `--clickhouse-dsn` was supplied, it also overrides the runner's
-    /// ClickHouse DSN.
-    pub fn parse_cli_args(mut self) -> Result<Self, Box<dyn std::error::Error>> {
-        self.config = parse_cli_args()?;
-        if let Some(dsn) = self.config.clickhouse_dsn.take() {
-            self.clickhouse_dsn = dsn;
+    /// environment, returning a [`JetstreamerInvocation`]. If `--clickhouse-dsn` was
+    /// supplied, it also overrides the runner's ClickHouse DSN.
+    pub fn parse_cli_args(mut self) -> Result<JetstreamerInvocation, Box<dyn std::error::Error>> {
+        match parse_cli_args()? {
+            CliInvocation::Run(mut config) => {
+                if let Some(dsn) = config.clickhouse_dsn.take() {
+                    self.clickhouse_dsn = dsn;
+                }
+                self.config = config;
+                Ok(JetstreamerInvocation::Run(self))
+            }
+            CliInvocation::ListPlugins => Ok(JetstreamerInvocation::ListPlugins),
         }
-        Ok(self)
     }
 
     /// Builds the plugin runtime and streams blocks through every registered [`Plugin`].
@@ -571,6 +576,25 @@ impl JetstreamerRunner {
     }
 }
 
+/// Outcome of [`parse_cli_args`]. One-shot flags like `--list-plugins` produce
+/// a non-[`Run`](Self::Run) variant so the caller — not the library — performs
+/// the action and exits.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum CliInvocation {
+    /// Run with the parsed [`Config`].
+    Run(Config),
+    /// Print every built-in plugin name (see [`BuiltinPlugin::ALL`]) and exit.
+    ListPlugins,
+}
+
+/// Outcome of [`JetstreamerRunner::parse_cli_args`]; mirrors [`CliInvocation`].
+pub enum JetstreamerInvocation {
+    /// Call [`JetstreamerRunner::run`] on the contained runner.
+    Run(JetstreamerRunner),
+    /// Print every built-in plugin name (see [`BuiltinPlugin::ALL`]) and exit.
+    ListPlugins,
+}
+
 /// Runtime configuration for [`JetstreamerRunner`].
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Config {
@@ -650,7 +674,7 @@ impl BuiltinPlugin {
 /// - `--with-plugin <name>`: Adds one of the built-in plugins (`program-tracking`,
 ///   `instruction-tracking`, or `pubkey-stats`). When omitted, the CLI defaults to `program-tracking`.
 /// - `--no-plugins`: Disables all built-in plugins (overrides the default and any `--with-plugin`).
-/// - `--list-plugins`: Prints the names of every built-in plugin to stdout and exits.
+/// - `--list-plugins`: Returns [`CliInvocation::ListPlugins`].
 /// - `--sequential`: Enables single-thread sequential firehose mode.
 /// - `--reverse`: Streams epochs from highest to lowest. Implies `--sequential`.
 /// - `--buffer-window <size>`: Overrides ripget sequential window size (for example `4GiB`).
@@ -660,16 +684,20 @@ impl BuiltinPlugin {
 /// # Examples
 ///
 /// ```no_run
-/// # use jetstreamer::parse_cli_args;
+/// # use jetstreamer::{parse_cli_args, CliInvocation};
 /// # unsafe {
 /// #     std::env::set_var("JETSTREAMER_THREADS", "3");
 /// #     std::env::set_var("JETSTREAMER_CLICKHOUSE_MODE", "off");
 /// # }
-/// let config = parse_cli_args().expect("env and CLI parsed");
-/// assert_eq!(config.threads, 3);
-/// assert!(!config.clickhouse_enabled);
+/// match parse_cli_args().expect("env and CLI parsed") {
+///     CliInvocation::Run(config) => {
+///         assert_eq!(config.threads, 3);
+///         assert!(!config.clickhouse_enabled);
+///     }
+///     CliInvocation::ListPlugins => {}
+/// }
 /// ```
-pub fn parse_cli_args() -> Result<Config, Box<dyn std::error::Error>> {
+pub fn parse_cli_args() -> Result<CliInvocation, Box<dyn std::error::Error>> {
     let mut args = std::env::args();
     args.next(); // binary name
     let mut first_arg: Option<String> = None;
@@ -699,10 +727,7 @@ pub fn parse_cli_args() -> Result<Config, Box<dyn std::error::Error>> {
                 no_plugins = true;
             }
             "--list-plugins" => {
-                for plugin in BuiltinPlugin::ALL {
-                    println!("{}", plugin.name());
-                }
-                std::process::exit(0);
+                return Ok(CliInvocation::ListPlugins);
             }
             "--sequential" => {
                 sequential_cli = true;
@@ -775,7 +800,7 @@ pub fn parse_cli_args() -> Result<Config, Box<dyn std::error::Error>> {
         builtin_plugins
     };
 
-    Ok(Config {
+    Ok(CliInvocation::Run(Config {
         threads,
         sequential,
         reverse,
@@ -785,7 +810,7 @@ pub fn parse_cli_args() -> Result<Config, Box<dyn std::error::Error>> {
         spawn_clickhouse,
         builtin_plugins,
         clickhouse_dsn: clickhouse_dsn_cli,
-    })
+    }))
 }
 
 fn parse_optional_buffer_window_bytes(

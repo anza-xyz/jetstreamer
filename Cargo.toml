@@ -78,7 +78,7 @@ solana-message = "3"
 solana-transaction = "3"
 solana-transaction-status = "3"
 solana-sdk-ids = "3"
-solana-reward-info = "3"
+solana-reward-info = "6"
 solana-sysvar = "=3.0.0"
 sha2 = "0.10"
 tonic = { version = "0", default-features = false }

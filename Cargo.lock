@@ -366,7 +366,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -377,7 +377,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2795,7 +2795,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4097,7 +4097,7 @@ dependencies = [
  "solana-ledger",
  "solana-logger",
  "solana-message",
- "solana-reward-info",
+ "solana-reward-info 6.2.0",
  "solana-rpc",
  "solana-runtime",
  "solana-sdk-ids",
@@ -6289,7 +6289,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.4.15",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -6302,7 +6302,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6381,7 +6381,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6402,7 +6402,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6922,7 +6922,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a766e1110788c36f4fa1c2b71b387a7815aa65f88ce0229841826633d93723e"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -7069,7 +7069,7 @@ dependencies = [
  "solana-nohash-hasher",
  "solana-pubkey 3.0.0",
  "solana-rayon-threadlimit",
- "solana-reward-info",
+ "solana-reward-info 3.0.0",
  "solana-sha256-hasher",
  "solana-slot-hashes",
  "solana-svm-transaction",
@@ -8854,6 +8854,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "solana-reward-info"
+version = "6.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dc553b782111862cd6c56bdeba696dcba9722a42154ef1248c5a06ca1d983797"
+
+[[package]]
 name = "solana-rpc"
 version = "3.1.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9035,7 +9041,7 @@ dependencies = [
  "solana-commitment-config",
  "solana-fee-calculator",
  "solana-inflation",
- "solana-reward-info",
+ "solana-reward-info 3.0.0",
  "solana-transaction",
  "solana-transaction-error",
  "solana-transaction-status-client-types",
@@ -9142,7 +9148,7 @@ dependencies = [
  "solana-pubkey 3.0.0",
  "solana-rayon-threadlimit",
  "solana-rent 3.1.0",
- "solana-reward-info",
+ "solana-reward-info 3.0.0",
  "solana-runtime-transaction",
  "solana-sdk-ids",
  "solana-secp256k1-program",
@@ -9981,7 +9987,7 @@ dependencies = [
  "solana-message",
  "solana-program-option",
  "solana-pubkey 3.0.0",
- "solana-reward-info",
+ "solana-reward-info 3.0.0",
  "solana-sdk-ids",
  "solana-signature",
  "solana-stake-interface",
@@ -10015,7 +10021,7 @@ dependencies = [
  "solana-instruction",
  "solana-message",
  "solana-pubkey 3.0.0",
- "solana-reward-info",
+ "solana-reward-info 3.0.0",
  "solana-signature",
  "solana-transaction",
  "solana-transaction-context",
@@ -10727,7 +10733,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -11649,7 +11655,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

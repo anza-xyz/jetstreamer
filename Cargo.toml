@@ -64,7 +64,7 @@ solana-address = "1"
 solana-hash = "3"
 solana-blake3-hasher = "=3.0.0"
 solana-epoch-rewards-hasher = "=3.1.0"
-solana-keccak-hasher = "=3.0.0"
+solana-keccak-hasher = "=3.1.0"
 solana-logger = "3"
 solana-signature = { version = "3", default-features = false }
 solana-accounts-db = "3"

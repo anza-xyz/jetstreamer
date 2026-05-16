@@ -92,7 +92,7 @@ ripget = "0.3"
 rayon = "1"
 xxhash-rust = { version = "0.8", features = ["xxh64"] }
 ahash = "0.8"
-dashmap = "5"
+dashmap = "6"
 clickhouse = { version = "0.14", default-features = false }
 interprocess = { version = "2", features = ["tokio"] }
 ctrlc = "3"

@@ -75,4 +75,4 @@ aws-types = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile.workspace = true
-serial_test = "2"
+serial_test = "3"

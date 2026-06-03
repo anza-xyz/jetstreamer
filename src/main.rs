@@ -1,10 +1,18 @@
-use jetstreamer::JetstreamerRunner;
+use jetstreamer::{BuiltinPlugin, JetstreamerInvocation, JetstreamerRunner};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    JetstreamerRunner::default()
+    match JetstreamerRunner::default()
         .with_log_level("info")
         .parse_cli_args()?
-        .run()
-        .map_err(|err| -> Box<dyn std::error::Error> { Box::new(err) })?;
+    {
+        JetstreamerInvocation::Run(runner) => runner
+            .run()
+            .map_err(|err| -> Box<dyn std::error::Error> { Box::new(err) })?,
+        JetstreamerInvocation::ListPlugins => {
+            for plugin in BuiltinPlugin::ALL {
+                println!("{}", plugin.name());
+            }
+        }
+    }
     Ok(())
 }

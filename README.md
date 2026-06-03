@@ -51,7 +51,8 @@ Geyser plugin locally, streamed over the internet from the Old Faithful archive.
 To get an idea of what Jetstreamer is capable of, you can try out the demo CLI that runs
 Jetstreamer Runner with the Program Tracking plugin enabled. The built-in plugins are
 `program-tracking`, `instruction-tracking`, and `pubkey-stats`; pass `--with-plugin <name>` to
-select one (repeat the flag to run multiple at once), or `--no-plugins` to disable the default:
+select one (repeat the flag to run multiple at once), or `--no-plugins` to disable the default.
+Run `--list-plugins` to print the names of every bundled plugin and exit.
 
 ### Jetstreamer Runner CLI
 
@@ -68,6 +69,9 @@ JETSTREAMER_THREADS=8 cargo run --release -- 358560000:367631999
 
 # Replay epoch 800 with the instruction tracking plugin instead of the default
 cargo run --release -- 800 --with-plugin instruction-tracking
+
+# Point the runner at an external ClickHouse instance (overrides JETSTREAMER_CLICKHOUSE_DSN)
+cargo run --release -- 800 --clickhouse-dsn http://clickhouse.example.com:8123
 ```
 
 If `JETSTREAMER_THREADS` is omitted, Jetstreamer auto-sizes the worker pool using the same

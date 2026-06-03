@@ -1,0 +1,141 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      crate:
+        description: "Crate to release"
+        required: true
+        type: choice
+        options:
+          - ""
+          - jetstreamer
+          - jetstreamer-plugin
+          - jetstreamer-utils
+          - jetstreamer-firehose
+      ref:
+        description: "git ref to tag (can be a branch or a commit hash)"
+        required: true
+        default: "main"
+        type: string
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      ref: ${{ steps.meta.outputs.ref }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      - name: Compute metadata
+        id: meta
+        run: |
+          version="$(cargo metadata --format-version 1 --no-deps | jq -r '.packages[] | select(.name == "'"${CRATE_NAME}"'") | .version')"
+          if [ -z "${version}" ] || [ "${version}" = "null" ]; then
+            echo "Could not resolve version for crate: ${CRATE_NAME}"
+            exit 1
+          fi
+
+          tag="${CRATE_NAME}@v${version}"
+          ref="$(git rev-parse HEAD)"
+
+          echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
+          echo "ref=${ref}" >> "${GITHUB_OUTPUT}"
+        env:
+          CRATE_NAME: ${{ inputs.crate }}
+
+      - name: Check tag does not exist
+        run: |
+          echo "checking: refs/tags/${TAG}"
+          if git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null 2>&1; then
+            echo "Tag already exists: ${TAG}. Please bump the version first (or delete the existing tag) and retry."
+            echo "Tag exists: ${TAG}" >> "${GITHUB_STEP_SUMMARY}"
+            exit 1
+          fi
+        env:
+          TAG: ${{ steps.meta.outputs.tag }}
+
+      - name: Cargo publish dry run
+        run: |
+          cargo publish -p "${CRATE_NAME}" --dry-run
+        env:
+          CRATE_NAME: ${{ inputs.crate }}
+
+      - name: Summary
+        run: |
+          echo "Tag: ${TAG}" >> "${GITHUB_STEP_SUMMARY}"
+          echo "Ref: ${REF} (https://github.com/${{ github.repository }}/commit/${REF})" >> "${GITHUB_STEP_SUMMARY}"
+        env:
+          TAG: ${{ steps.meta.outputs.tag }}
+          REF: ${{ steps.meta.outputs.ref }}
+
+  publish:
+    runs-on: ubuntu-latest
+    environment: prod
+    needs: check
+    permissions:
+      id-token: write
+      contents: write
+      attestations: write
+      artifact-metadata: write
+    steps:
+      - name: Create github app token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        id: app-token
+        with:
+          client-id: ${{ vars.CLIENT_ID }}
+          private-key: ${{ secrets.PRIVATE_KEY }}
+
+      - name: Set git config
+        run: |
+          git config --global user.email "${APP_ID}+${APP_SLUG}[bot]@users.noreply.github.com"
+          git config --global user.name "${APP_SLUG}[bot]"
+          git config --global url."https://x-access-token:${GITHUB_TOKEN}@github.com/".insteadOf https://github.com/
+        env:
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+          APP_ID: ${{ vars.APP_ID }}
+          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          persist-credentials: false
+          ref: ${{ needs.check.outputs.ref }}
+
+      - name: Package crate
+        run: cargo package -p "${CRATE_NAME}"
+        env:
+          CRATE_NAME: ${{ inputs.crate }}
+
+      - name: Generate SLSA provenance
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        with:
+          subject-path: target/package/*.crate
+
+      - name: Create crate token
+        uses: rust-lang/crates-io-auth-action@bbd81622f20ce9e2dd9622e3218b975523e45bbe # v1.0.4
+        id: auth
+
+      - run: cargo publish -p "${CRATE_NAME}"
+        env:
+          CRATE_NAME: ${{ inputs.crate }}
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+
+      - run: |
+          git tag -a "${TAG}" -m "Release ${TAG}"
+          git push origin "${TAG}"
+        env:
+          TAG: ${{ needs.check.outputs.tag }}
+
+      - name: Create Github Release
+        run: |
+          gh release create "${TAG}" --title "${TAG}" --generate-notes
+        env:
+          TAG: ${{ needs.check.outputs.tag }}
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}

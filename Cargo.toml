@@ -9,7 +9,7 @@ members = [
 
 [workspace.package]
 edition = "2024"
-version = "0.5.1"
+version = "0.6.0"
 authors = ["sam0x17", "anza-team"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/anza-xyz/jetstreamer"
@@ -33,11 +33,11 @@ s3-backend = ["jetstreamer-firehose/s3-backend"]
 verify-transaction-signatures = ["jetstreamer-firehose/verify-transaction-signatures"]
 
 [workspace.dependencies]
-jetstreamer-firehose = { path = "jetstreamer-firehose", version = "0.5.1" }
-jetstreamer-plugin = { path = "jetstreamer-plugin", version = "0.5.1" }
-jetstreamer-utils = { path = "jetstreamer-utils", version = "0.5.1" }
-jetstreamer-node = { path = "jetstreamer-node", version = "0.5.1" }
-jetstreamer-horizon = { path = "jetstreamer-horizon", version = "0.5.1" }
+jetstreamer-firehose = { path = "jetstreamer-firehose", version = "0.6.0" }
+jetstreamer-plugin = { path = "jetstreamer-plugin", version = "0.6.0" }
+jetstreamer-utils = { path = "jetstreamer-utils", version = "0.6.0" }
+jetstreamer-node = { path = "jetstreamer-node", version = "0.6.0" }
+jetstreamer-horizon = { path = "jetstreamer-horizon", version = "0.6.0" }
 tokio = "1"
 futures-util = { version = "0", default-features = false }
 futures = "0"
@@ -46,7 +46,7 @@ lencode = { version = "1.1", features = ["solana", "std"] }
 once_cell = "1"
 serde_json = { version = "1", default-features = false }
 thiserror = { version = "2", default-features = false }
-reqwest = { version = "0.12", default-features = false }
+reqwest = { version = "0.13", default-features = false }
 anyhow = { version = "1", default-features = false }
 tar = "0.4"
 env_logger = "0.11"
@@ -76,6 +76,10 @@ agave-snapshots = "3"
 solana-address = "1"
 solana-account = "3"
 solana-hash = "3"
+# NOTE: pinned to =3.0.0 (not main's =3.1.0) — the 3.1.0 hashers pull
+# solana-hash 4.x, which is incompatible with the vendored
+# solana-runtime 3.1.3 in [patch.crates-io] (vendor dir exists only on
+# this branch). Re-sync with main once the vendored runtime is updated.
 solana-blake3-hasher = "=3.0.0"
 solana-clock = "3"
 solana-epoch-rewards-hasher = "=3.0.0"
@@ -109,12 +113,12 @@ zstd = { version = "0", default-features = false }
 thousands = "0"
 tokio-stream = { version = "0", default-features = false }
 rangemap = "1"
-rseek = ">= 0.2"
-ripget = "0.2"
+rseek = "0.4"
+ripget = "0.3"
 rayon = "1"
 xxhash-rust = { version = "0.8", features = ["xxh64"] }
 ahash = "0.8"
-dashmap = "5"
+dashmap = "6"
 clickhouse = { version = "0.14", default-features = false }
 interprocess = { version = "2", features = ["tokio"] }
 ctrlc = "3"

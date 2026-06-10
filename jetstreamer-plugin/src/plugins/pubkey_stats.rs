@@ -260,6 +260,26 @@ fn clamp_block_time(block_time: Option<i64>) -> u32 {
     }
 }
 
+async fn backfill_pubkey_timestamps(db: Arc<Client>) -> Result<(), clickhouse::error::Error> {
+    db.query(
+        r#"
+        INSERT INTO pubkey_mentions
+        SELECT pm.slot,
+               ss.block_time,
+               pm.pubkey,
+               pm.num_mentions
+        FROM pubkey_mentions AS pm
+        ANY INNER JOIN jetstreamer_slot_status AS ss USING (slot)
+        WHERE pm.timestamp = toDateTime(0)
+          AND ss.block_time > toDateTime(0)
+        "#,
+    )
+    .execute()
+    .await?;
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -519,24 +539,4 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].slot, u32::MAX);
     }
-}
-
-async fn backfill_pubkey_timestamps(db: Arc<Client>) -> Result<(), clickhouse::error::Error> {
-    db.query(
-        r#"
-        INSERT INTO pubkey_mentions
-        SELECT pm.slot,
-               ss.block_time,
-               pm.pubkey,
-               pm.num_mentions
-        FROM pubkey_mentions AS pm
-        ANY INNER JOIN jetstreamer_slot_status AS ss USING (slot)
-        WHERE pm.timestamp = toDateTime(0)
-          AND ss.block_time > toDateTime(0)
-        "#,
-    )
-    .execute()
-    .await?;
-
-    Ok(())
 }

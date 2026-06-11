@@ -12,7 +12,7 @@
 [package]
 edition = "2021"
 name = "solana-program-runtime"
-version = "3.1.3"
+version = "3.1.12"
 authors = ["Anza Maintainers <maintainers@anza.xyz>"]
 build = false
 autolib = false
@@ -101,7 +101,7 @@ features = ["frozen-abi"]
 optional = true
 
 [dependencies.solana-hash]
-version = "3.0.0"
+version = "3.1.0"
 
 [dependencies.solana-instruction]
 version = "3.0.0"
@@ -144,31 +144,31 @@ features = [
 ]
 
 [dependencies.solana-svm-callback]
-version = "=3.1.3"
+version = "=3.1.12"
 features = ["agave-unstable-api"]
 
 [dependencies.solana-svm-feature-set]
-version = "=3.1.3"
+version = "=3.1.12"
 features = ["agave-unstable-api"]
 
 [dependencies.solana-svm-log-collector]
-version = "=3.1.3"
+version = "=3.1.12"
 features = ["agave-unstable-api"]
 
 [dependencies.solana-svm-measure]
-version = "=3.1.3"
+version = "=3.1.12"
 features = ["agave-unstable-api"]
 
 [dependencies.solana-svm-timings]
-version = "=3.1.3"
+version = "=3.1.12"
 features = ["agave-unstable-api"]
 
 [dependencies.solana-svm-transaction]
-version = "=3.1.3"
+version = "=3.1.12"
 features = ["agave-unstable-api"]
 
 [dependencies.solana-svm-type-overrides]
-version = "=3.1.3"
+version = "=3.1.12"
 features = ["agave-unstable-api"]
 
 [dependencies.solana-system-interface]
@@ -182,7 +182,7 @@ features = ["bincode"]
 version = "3.0.0"
 
 [dependencies.solana-transaction-context]
-version = "=3.1.3"
+version = "=3.1.12"
 features = [
     "agave-unstable-api",
     "bincode",
@@ -217,11 +217,11 @@ default-features = false
 version = "3.0.0"
 
 [dev-dependencies.solana-transaction]
-version = "3.0.1"
+version = "3.0.2"
 features = ["dev-context-only-utils"]
 
 [dev-dependencies.solana-transaction-context]
-version = "=3.1.3"
+version = "=3.1.12"
 features = [
     "agave-unstable-api",
     "bincode",
@@ -238,7 +238,9 @@ manual_let_else = "deny"
 used_underscore_binding = "deny"
 
 [lints.rust]
-warnings = "deny"
+# jetstreamer patch: registry builds cap lints; vendored path builds must not
+# inherit upstream CI strictness (new dep versions introduce new deprecations).
+warnings = "warn"
 
 [lints.rust.unexpected_cfgs]
 level = "warn"

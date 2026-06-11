@@ -3,7 +3,6 @@ use qualifier_attr::{field_qualifiers, qualifiers};
 use {
     crate::{
         account_overrides::AccountOverrides,
-        nonce_info::NonceInfo,
         rent_calculator::{
             check_rent_state_with_account, get_account_rent_state, RENT_EXEMPT_RENT_EPOCH,
         },
@@ -67,34 +66,34 @@ pub(crate) enum TransactionLoadResult {
 }
 
 #[derive(PartialEq, Eq, Debug, Clone)]
-#[cfg_attr(feature = "svm-internal", field_qualifiers(nonce(pub)))]
+#[cfg_attr(feature = "svm-internal", field_qualifiers(nonce_address(pub)))]
 pub struct CheckedTransactionDetails {
-    pub(crate) nonce: Option<NonceInfo>,
-    pub(crate) compute_budget_and_limits: Result<SVMTransactionExecutionAndFeeBudgetLimits>,
+    pub(crate) nonce_address: Option<Pubkey>,
+    pub(crate) compute_budget_and_limits: SVMTransactionExecutionAndFeeBudgetLimits,
 }
 
 #[cfg(feature = "dev-context-only-utils")]
 impl Default for CheckedTransactionDetails {
     fn default() -> Self {
         Self {
-            nonce: None,
-            compute_budget_and_limits: Ok(SVMTransactionExecutionAndFeeBudgetLimits {
+            nonce_address: None,
+            compute_budget_and_limits: SVMTransactionExecutionAndFeeBudgetLimits {
                 budget: SVMTransactionExecutionBudget::default(),
                 loaded_accounts_data_size_limit: NonZeroU32::new(32)
                     .expect("Failed to set loaded_accounts_bytes"),
                 fee_details: FeeDetails::default(),
-            }),
+            },
         }
     }
 }
 
 impl CheckedTransactionDetails {
     pub fn new(
-        nonce: Option<NonceInfo>,
-        compute_budget_and_limits: Result<SVMTransactionExecutionAndFeeBudgetLimits>,
+        nonce_address: Option<Pubkey>,
+        compute_budget_and_limits: SVMTransactionExecutionAndFeeBudgetLimits,
     ) -> Self {
         Self {
-            nonce,
+            nonce_address,
             compute_budget_and_limits,
         }
     }

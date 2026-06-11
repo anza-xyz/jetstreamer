@@ -3,7 +3,6 @@
 use {
     crate::{
         bank::{bank_hash_details, Bank, SquashTiming},
-        bank_hash_cache::DumpedSlotSubscription,
         installed_scheduler_pool::{
             BankWithScheduler, InstalledSchedulerPoolArc, SchedulingContext,
         },
@@ -100,7 +99,6 @@ pub struct BankForks {
     in_vote_only_mode: Arc<AtomicBool>,
     highest_slot_at_startup: Slot,
     scheduler_pool: Option<InstalledSchedulerPoolArc>,
-    dumped_slot_subscribers: Vec<DumpedSlotSubscription>,
 }
 
 impl Index<u64> for BankForks {
@@ -155,7 +153,6 @@ impl BankForks {
             in_vote_only_mode: Arc::new(AtomicBool::new(false)),
             highest_slot_at_startup: 0,
             scheduler_pool: None,
-            dumped_slot_subscribers: vec![],
         }));
 
         root_bank.set_fork_graph_in_program_cache(Arc::downgrade(&bank_forks));
@@ -349,25 +346,11 @@ impl BankForks {
         self.banks[&self.highest_slot()].clone_with_scheduler()
     }
 
-    /// Register to be notified when a bank has been dumped (due to duplicate block handling)
-    /// from bank_forks.
-    pub fn register_dumped_slot_subscriber(&mut self, notifier: DumpedSlotSubscription) {
-        self.dumped_slot_subscribers.push(notifier);
-    }
-
-    /// Clears associated banks from BankForks and notifies subscribers that a dump has occured.
+    /// Clears associated banks from BankForks.
     pub fn dump_slots<'a, I>(&mut self, slots: I) -> (Vec<(Slot, BankId)>, Vec<BankWithScheduler>)
     where
         I: Iterator<Item = &'a Slot>,
     {
-        // Notify subscribers. It is fine that the lock is immediately released, since the bank_forks
-        // lock is held until the end of this function, so subscribers will not be able to interact
-        // with bank_forks anyway.
-        for subscriber in &self.dumped_slot_subscribers {
-            let mut lock = subscriber.lock().unwrap();
-            *lock = true;
-        }
-
         slots
             .map(|slot| {
                 // Clear the banks from BankForks
@@ -474,6 +457,7 @@ impl BankForks {
     }
 
     pub fn prune_program_cache(&self, root: Slot) {
+        // jetstreamer patch: timing + missing-root diagnostics for replay.
         if let Some(root_bank) = self.banks.get(&root) {
             let start = Instant::now();
             info!(

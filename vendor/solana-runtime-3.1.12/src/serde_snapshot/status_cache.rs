@@ -354,6 +354,7 @@ enum SerdeInstructionError {
 
 impl From<SerdeInstructionError> for InstructionError {
     fn from(err: SerdeInstructionError) -> Self {
+        // jetstreamer patch: variants referenced here are deprecated upstream.
         #[allow(deprecated)]
         match err {
             SerdeInstructionError::GenericError => Self::GenericError,
@@ -426,6 +427,7 @@ impl From<SerdeInstructionError> for InstructionError {
 
 impl From<InstructionError> for SerdeInstructionError {
     fn from(err: InstructionError) -> Self {
+        // jetstreamer patch: variants referenced here are deprecated upstream.
         #[allow(deprecated)]
         match err {
             InstructionError::GenericError => Self::GenericError,

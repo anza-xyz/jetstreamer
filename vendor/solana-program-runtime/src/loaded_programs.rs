@@ -1,5 +1,6 @@
 use {
     crate::invoke_context::{BuiltinFunctionWithContext, InvokeContext},
+    // jetstreamer patch: info/warn for prune instrumentation.
     log::{debug, error, info, log_enabled, trace, warn},
     percentage::PercentageInteger,
     solana_clock::{Epoch, Slot},
@@ -22,6 +23,7 @@ use {
         collections::{hash_map::Entry, HashMap},
         fmt::{Debug, Formatter},
         sync::Weak,
+        // jetstreamer patch: prune timing instrumentation.
         time::{Duration, Instant},
     },
 };
@@ -879,6 +881,9 @@ impl<FG: ForkGraph> ProgramCache<FG> {
                                 ProgramCacheEntryType::Unloaded(_),
                                 ProgramCacheEntryType::Loaded(_),
                             ) => {}
+                            // jetstreamer patch: single-threaded replay force-loads
+                            // can legitimately re-assign an already-loaded program;
+                            // tolerate the overwrite instead of flagging corruption.
                             (
                                 ProgramCacheEntryType::Loaded(_),
                                 ProgramCacheEntryType::Loaded(_),
@@ -943,6 +948,9 @@ impl<FG: ForkGraph> ProgramCache<FG> {
         new_root_slot: Slot,
         upcoming_environments: Option<ProgramRuntimeEnvironments>,
     ) {
+        // jetstreamer patch: spin on try_read with periodic warnings instead of
+        // silently skipping the prune when the fork graph is contended, plus
+        // prune size/timing instrumentation.
         let start = Instant::now();
         let Some(fork_graph) = self.fork_graph.clone() else {
             error!("Program cache doesn't have fork graph.");
@@ -1174,11 +1182,13 @@ impl<FG: ForkGraph> ProgramCache<FG> {
                                 ));
                                 cooperative_loading_task = Some(*key);
                             }
+                            // jetstreamer patch: re-claim any outstanding
+                            // cooperative load to avoid deadlock during
+                            // single-threaded replay (the original owner will
+                            // never finish the task).
                             Entry::Occupied(mut entry) => {
                                 let (slot, owner) = *entry.get();
                                 let current = thread::current().id();
-                                // Re-claim any outstanding cooperative load to avoid deadlock
-                                // during single-threaded replay.
                                 debug!(
                                     "program cache cooperative load re-claimed for {key:?} (slot {slot}, owner={owner:?})"
                                 );

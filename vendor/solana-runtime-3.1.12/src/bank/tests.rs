@@ -311,8 +311,8 @@ fn test_bank_new() {
     let rent = from_account::<sysvar::rent::Rent, _>(&rent_account).unwrap();
 
     assert_eq!(rent.burn_percent, 5);
-    assert_eq!(rent.exemption_threshold, 1.2);
-    assert_eq!(rent.lamports_per_byte_year, 5);
+    assert_eq!(rent.exemption_threshold, 1.0);
+    assert_eq!(rent.lamports_per_byte_year, 6);
 }
 
 pub(crate) fn create_simple_test_bank(lamports: u64) -> Bank {
@@ -584,7 +584,8 @@ impl Bank {
         reward_calc_tracer: Option<impl RewardCalcTracer>,
     ) -> StakeDelegationsMap {
         let stakes = self.stakes_cache.stakes();
-        let stake_delegations = self.filter_stake_delegations(&stakes);
+        let stake_delegations = stakes.stake_delegations_vec();
+        let stake_delegations = self.filter_stake_delegations(stake_delegations);
         // Obtain all unique voter pubkeys from stake delegations.
         fn merge(mut acc: HashSet<Pubkey>, other: HashSet<Pubkey>) -> HashSet<Pubkey> {
             if acc.len() < other.len() {
@@ -596,6 +597,7 @@ impl Bank {
         let voter_pubkeys = thread_pool.install(|| {
             stake_delegations
                 .par_iter()
+                .filter_map(|stake_delegation| stake_delegation)
                 .fold(
                     HashSet::default,
                     |mut voter_pubkeys, (_stake_pubkey, stake_account)| {
@@ -663,7 +665,8 @@ impl Bank {
         };
         thread_pool.install(|| {
             stake_delegations
-                .into_par_iter()
+                .par_iter()
+                .filter_map(|stake_delegation| stake_delegation)
                 .for_each(push_stake_delegation);
         });
         stake_delegations_map
@@ -4682,12 +4685,10 @@ fn test_check_ro_durable_nonce_fails() {
         bank.process_transaction(&tx),
         Err(TransactionError::BlockhashNotFound)
     );
-    let (_, lamports_per_signature) = bank.last_blockhash_and_lamports_per_signature();
     assert_eq!(
-        bank.check_load_and_advance_message_nonce_account(
+        bank.check_nonce_transaction_validity(
             &new_sanitized_message(tx.message().clone()),
             &bank.next_durable_nonce(),
-            lamports_per_signature,
         ),
         None
     );
@@ -5294,8 +5295,9 @@ fn test_fuzz_instructions() {
 // new feature that affects the bank hash, you should update this test to use a
 // test matrix that tests the bank hash calculation with and without your
 // added feature.
-#[test]
-fn test_bank_hash_consistency() {
+#[test_case(false ; "legacy")]
+#[test_case(true ; "deprecate rent exemption threshold")]
+fn test_bank_hash_consistency(deprecate_rent_exemption_threshold: bool) {
     let genesis_config = GenesisConfig {
         // Override the creation time to ensure bank hash consistency
         creation_time: 0,
@@ -5309,7 +5311,11 @@ fn test_bank_hash_consistency() {
 
     // Set the feature set to all enabled so that we detect any inconsistencies
     // in the hash computation that may arise from feature set changes
-    let feature_set = FeatureSet::all_enabled();
+    let mut feature_set = FeatureSet::all_enabled();
+
+    if !deprecate_rent_exemption_threshold {
+        feature_set.deactivate(&feature_set::deprecate_rent_exemption_threshold::id());
+    }
 
     let mut bank = Arc::new(Bank::new_from_genesis(
         &genesis_config,
@@ -5329,7 +5335,11 @@ fn test_bank_hash_consistency() {
             assert_eq!(bank.epoch(), 0);
             assert_eq!(
                 bank.hash().to_string(),
-                "EzyLJJki4ALhQAq5wbmiNctDhytQckGJRXnk9APKXv7r",
+                if deprecate_rent_exemption_threshold {
+                    "3KVpZkLPRXLUakJJkf9vqSapmy4a7rHVwgWa4y82mtjA"
+                } else {
+                    "EzyLJJki4ALhQAq5wbmiNctDhytQckGJRXnk9APKXv7r"
+                },
             );
         }
 
@@ -5337,14 +5347,22 @@ fn test_bank_hash_consistency() {
             assert_eq!(bank.epoch(), 1);
             assert_eq!(
                 bank.hash().to_string(),
-                "6h1KzSuTW6MwkgjtEbrv6AyUZ2NHtSxCQi8epjHDFYh8"
+                if deprecate_rent_exemption_threshold {
+                    "HvCfM9MQCvCDH4zW39G7UqKDB4PLR5GaqVSf9Jfe5XnS"
+                } else {
+                    "6h1KzSuTW6MwkgjtEbrv6AyUZ2NHtSxCQi8epjHDFYh8"
+                }
             );
         }
         if bank.slot == 128 {
             assert_eq!(bank.epoch(), 2);
             assert_eq!(
                 bank.hash().to_string(),
-                "4GX3883TVK7SQfbPUHem4HXcqdHU2DZVAB6yEXspn2qe"
+                if deprecate_rent_exemption_threshold {
+                    "GS2G4uVus4U97woniYLW1f2BWqoZFGFrpSQXto7PnjTT"
+                } else {
+                    "4GX3883TVK7SQfbPUHem4HXcqdHU2DZVAB6yEXspn2qe"
+                }
             );
             break;
         }
@@ -12450,6 +12468,48 @@ fn test_startup_from_snapshot_after_precompile_transition() {
 
     // Simulate starting up from snapshot finishing the initialization for a frozen bank
     bank.compute_and_apply_features_after_snapshot_restore();
+}
+
+#[test]
+fn test_genesis_deprecate_rent_exemption_enabled() {
+    let GenesisConfigInfo { genesis_config, .. } = genesis_utils::create_genesis_config(100_000);
+
+    let bank = Bank::new_for_tests(&genesis_config);
+    let rent_account = bank.get_account(&Rent::id()).unwrap();
+    let accounts_db_rent = bincode::deserialize::<Rent>(rent_account.data()).unwrap();
+    let rent_collector_rent = bank.rent_collector.rent.clone();
+    let tx_processor_rent = bank
+        .transaction_processor
+        .sysvar_cache()
+        .get_rent()
+        .unwrap()
+        .as_ref()
+        .clone();
+
+    assert_eq!(accounts_db_rent, tx_processor_rent);
+    assert_eq!(accounts_db_rent, rent_collector_rent);
+    assert!(accounts_db_rent.exemption_threshold == 1.0);
+}
+
+#[test]
+fn test_genesis_deprecate_rent_exemption_disabled() {
+    let (genesis_config, ..) = create_genesis_config(100_000);
+
+    let bank = Bank::new_for_tests(&genesis_config);
+    let rent_account = bank.get_account(&Rent::id()).unwrap();
+    let accounts_db_rent = bincode::deserialize::<Rent>(rent_account.data()).unwrap();
+    let rent_collector_rent = bank.rent_collector.rent.clone();
+    let tx_processor_rent = bank
+        .transaction_processor
+        .sysvar_cache()
+        .get_rent()
+        .unwrap()
+        .as_ref()
+        .clone();
+
+    assert_eq!(accounts_db_rent, tx_processor_rent);
+    assert_eq!(accounts_db_rent, rent_collector_rent);
+    assert!(accounts_db_rent.exemption_threshold == 2.0);
 }
 
 #[test]

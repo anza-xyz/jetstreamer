@@ -1,4 +1,5 @@
 pub mod account_updates;
+pub mod archive;
 pub mod dedupe;
 pub mod limits;
 pub mod pubkey_prime;

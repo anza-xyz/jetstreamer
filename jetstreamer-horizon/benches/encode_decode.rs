@@ -84,6 +84,7 @@ fn fetch_corpus_for_epoch(
         firehose(
             4,
             true,
+            false,
             None,
             slot_range,
             None::<OnBlockFn>,
@@ -1191,6 +1192,277 @@ fn estimate_tx_size(tx: &Transaction) -> usize {
         + 1024
 }
 
+// --------------------------------------------------------------------
+// Archive epoch estimator — writes simulated slots of real transactions
+// + realistic account updates through the actual ArchiveWriter and
+// projects full-epoch storage size and processing time.
+// --------------------------------------------------------------------
+
+/// Simulated ledger backing the archive estimate: persistent account
+/// states mutated across slots so the archive's diff encoder sees
+/// realistic cross-slot repetition.
+struct EstimatorLedger {
+    /// ~3.7 KiB vote-state blobs, one per simulated validator. Touched
+    /// every slot with small scattered mutations (tower updates).
+    vote_accounts: Vec<(Address, Vec<u8>)>,
+    /// Mixed-size user accounts (token balances, program state), Zipf-ish
+    /// hot/cold access with sparse mutations.
+    user_accounts: Vec<(Address, Vec<u8>)>,
+    rng: SplitMix64,
+}
+
+impl EstimatorLedger {
+    fn new(seed: u64) -> Self {
+        let mut rng = SplitMix64::new(seed);
+        let vote_accounts = (0..1_500)
+            .map(|_| {
+                let mut pk = [0u8; 32];
+                rng.fill(&mut pk);
+                let mut data = vec![0u8; 3_762];
+                rng.fill(&mut data);
+                (Address::new_from_array(pk), data)
+            })
+            .collect();
+        let user_accounts = (0..50_000)
+            .map(|_| {
+                let pk_arr = rng.pubkey();
+                let size = match rng.next_u64() % 100 {
+                    0..=59 => 165,
+                    60..=89 => 400 + rng.next_u64() as usize % 1_600,
+                    _ => 2_000 + rng.next_u64() as usize % 8_000,
+                };
+                let mut data = vec![0u8; size];
+                rng.fill(&mut data);
+                (Address::new_from_array(pk_arr), data)
+            })
+            .collect();
+        Self {
+            vote_accounts,
+            user_accounts,
+            rng,
+        }
+    }
+
+    /// Touch a vote account (small scattered mutation, ~48 bytes).
+    fn touch_vote(&mut self, validator: usize) -> (Address, Vec<u8>) {
+        let idx = validator % self.vote_accounts.len();
+        let (pk, data) = &mut self.vote_accounts[idx];
+        for _ in 0..6 {
+            let off = (self.rng.next_u64() as usize) % data.len().saturating_sub(8).max(1);
+            let v = self.rng.next_u64().to_le_bytes();
+            data[off..off + 8].copy_from_slice(&v);
+        }
+        (*pk, data.clone())
+    }
+
+    /// Touch a user account (Zipf-ish: 80 % of touches hit the hottest 10 %).
+    fn touch_user(&mut self) -> (Address, Vec<u8>) {
+        let pool = self.user_accounts.len();
+        let idx = if self.rng.next_u64() % 100 < 80 {
+            (self.rng.next_u64() as usize) % (pool / 10).max(1)
+        } else {
+            (self.rng.next_u64() as usize) % pool
+        };
+        let (pk, data) = &mut self.user_accounts[idx];
+        let n = 1 + (self.rng.next_u64() as usize % 4);
+        for _ in 0..n {
+            if data.is_empty() {
+                break;
+            }
+            let off = (self.rng.next_u64() as usize) % data.len();
+            data[off] = data[off].wrapping_add(1);
+        }
+        (*pk, data.clone())
+    }
+}
+
+/// Writes `n_slots` simulated slots (real corpus transactions + ledger
+/// account updates) through the real `ArchiveWriter`. Returns
+/// (stats, file_bytes, wall_seconds).
+fn write_simulated_archive(
+    corpus: &[VersionedTransaction],
+    n_slots: u64,
+    config: jetstreamer_horizon::archive::ArchiveWriterConfig,
+) -> (jetstreamer_horizon::archive::ArchiveStats, u64, f64) {
+    use jetstreamer_horizon::archive::{ArchiveWriter, BlockMeta, EntryRecord};
+
+    let vote_program = Address::new_from_array(POPULAR_PUBKEYS[0]);
+    let mut ledger = EstimatorLedger::new(0xE57);
+    let mut scratch = Transaction::new_boxed();
+    let mut rng = SplitMix64::new(0xE58);
+
+    let started = std::time::Instant::now();
+    let sink = std::io::Cursor::new(Vec::new());
+    let mut writer = ArchiveWriter::new(sink, 900, 0, n_slots, config).expect("writer");
+
+    let mut corpus_pos = 0usize;
+    let mut last_blockhash = solana_hash::Hash::default();
+    for slot in 0..n_slots {
+        writer.begin_slot(slot).expect("begin_slot");
+
+        // Real mainnet averages ~1 100 txs/slot (votes included).
+        let txs_this_slot = 1_050 + (rng.next_u64() % 100) as usize;
+        let mut entries = Vec::with_capacity(96);
+        let mut tx_in_entry = 0u32;
+        for _ in 0..txs_this_slot {
+            let real = &corpus[corpus_pos % corpus.len()];
+            corpus_pos += 1;
+
+            scratch.clear();
+            populate_from_real(&mut scratch, real);
+
+            // Attach realistic account updates.
+            let is_vote = match &real.message {
+                solana_message::VersionedMessage::Legacy(m) => m
+                    .account_keys
+                    .iter()
+                    .any(|k| Address::new_from_array(k.to_bytes()) == vote_program),
+                solana_message::VersionedMessage::V0(m) => m
+                    .account_keys
+                    .iter()
+                    .any(|k| Address::new_from_array(k.to_bytes()) == vote_program),
+            };
+            if is_vote {
+                let validator = (rng.next_u64() as usize) % 1_500;
+                let (pk, data) = ledger.touch_vote(validator);
+                push_estimator_update(&mut scratch, &mut rng, pk, &data);
+            } else {
+                let n_updates = 2 + (rng.next_u64() % 5) as usize;
+                for _ in 0..n_updates {
+                    let (pk, data) = ledger.touch_user();
+                    push_estimator_update(&mut scratch, &mut rng, pk, &data);
+                }
+            }
+
+            writer.write_transaction(&scratch).expect("write_tx");
+            tx_in_entry += 1;
+            if tx_in_entry == 16 {
+                entries.push(EntryRecord {
+                    num_hashes: 800,
+                    tx_count: tx_in_entry,
+                });
+                tx_in_entry = 0;
+            }
+        }
+        if tx_in_entry > 0 {
+            entries.push(EntryRecord {
+                num_hashes: 800,
+                tx_count: tx_in_entry,
+            });
+        }
+        // 64 ticks per slot.
+        for _ in 0..64 {
+            entries.push(EntryRecord {
+                num_hashes: 12_500,
+                tx_count: 0,
+            });
+        }
+
+        let mut bh = [0u8; 32];
+        rng.fill(&mut bh);
+        let blockhash = solana_hash::Hash::new_from_array(bh);
+        let meta = BlockMeta {
+            parent_slot: slot.saturating_sub(1),
+            parent_blockhash: last_blockhash,
+            blockhash,
+            block_time: Some(1_750_000_000 + slot as i64),
+            block_height: Some(slot),
+            executed_transaction_count: txs_this_slot as u64,
+            entry_count: entries.len() as u64,
+            rewards: vec![],
+            num_partitions: None,
+        };
+        writer.end_slot(&meta, &entries).expect("end_slot");
+        last_blockhash = blockhash;
+    }
+
+    let (sink, stats) = writer.finish().expect("finish");
+    let elapsed = started.elapsed().as_secs_f64();
+    (stats, sink.into_inner().len() as u64, elapsed)
+}
+
+fn push_estimator_update(tx: &mut Transaction, rng: &mut SplitMix64, pubkey: Address, data: &[u8]) {
+    let _ = tx.push_account_update(&AccountUpdateView {
+        pubkey,
+        lamports: rng.next_u64(),
+        owner: Address::new_from_array(POPULAR_PUBKEYS[3]),
+        executable: false,
+        rent_epoch: u64::MAX,
+        write_version: rng.next_u64(),
+        data,
+    });
+}
+
+fn bench_archive_epoch_estimate(c: &mut Criterion) {
+    use jetstreamer_horizon::archive::{ArchiveWriterConfig, Compression};
+
+    let corpus = &*REAL_TXS;
+    const SLOTS: u64 = 256;
+    const EPOCH_SLOTS: f64 = 432_000.0;
+    // Current measured replay rate on the reference box (slots/sec).
+    const REPLAY_SLOTS_PER_SEC: f64 = 3.75;
+
+    eprintln!();
+    eprintln!(
+        "=== Archive epoch estimate ({SLOTS} simulated slots, ~1.1k real txs/slot, \
+         realistic account updates) ==="
+    );
+    eprintln!(
+        "  {:<22} | {:>10}  | {:>9}  | {:>9}  | {:>8}  | {:>9}",
+        "config", "bytes/slot", "GB/epoch", "slots/s", "write h", "total h"
+    );
+    eprintln!("  {}", "-".repeat(84));
+
+    for (label, config) in [
+        ("zstd, bucket=128", ArchiveWriterConfig::default()),
+        (
+            "none, bucket=128",
+            ArchiveWriterConfig {
+                compression: Compression::None,
+                ..Default::default()
+            },
+        ),
+        (
+            "zstd, bucket=1",
+            ArchiveWriterConfig {
+                bucket_slots: 1,
+                ..Default::default()
+            },
+        ),
+    ] {
+        let (stats, file_bytes, secs) = write_simulated_archive(corpus, SLOTS, config);
+        let bytes_per_slot = file_bytes as f64 / SLOTS as f64;
+        let gb_per_epoch = bytes_per_slot * EPOCH_SLOTS / 1e9;
+        let write_slots_per_sec = SLOTS as f64 / secs;
+        let write_hours = EPOCH_SLOTS / write_slots_per_sec / 3600.0;
+        // Write happens concurrently with replay; the pipeline rate is
+        // bounded by the slower stage.
+        let pipeline_rate = write_slots_per_sec.min(REPLAY_SLOTS_PER_SEC);
+        let total_hours = EPOCH_SLOTS / pipeline_rate / 3600.0;
+        eprintln!(
+            "  {:<22} | {:>10.0}  | {:>9.1}  | {:>9.1}  | {:>8.2}  | {:>9.1}",
+            label, bytes_per_slot, gb_per_epoch, write_slots_per_sec, write_hours, total_hours
+        );
+        let _ = stats;
+    }
+    eprintln!(
+        "  (total h = bounded by replay at {REPLAY_SLOTS_PER_SEC} slots/s; 3-day budget = 72 h)"
+    );
+    eprintln!();
+
+    // Small criterion-tracked timing sample (16 slots through the writer).
+    let mut group = c.benchmark_group("archive/write");
+    group.sample_size(10);
+    group.bench_function("16_slots_zstd_b128", |b| {
+        b.iter(|| {
+            let (_, file_bytes, _) =
+                write_simulated_archive(corpus, 16, ArchiveWriterConfig::default());
+            black_box(file_bytes);
+        });
+    });
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_account_update_encode,
@@ -1201,5 +1473,6 @@ criterion_group!(
     bench_compression_ratios,
     bench_cross_epoch_compression,
     bench_account_update_diff_compression,
+    bench_archive_epoch_estimate,
 );
 criterion_main!(benches);

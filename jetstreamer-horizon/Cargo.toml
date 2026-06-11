@@ -23,9 +23,13 @@ solana-transaction-context.workspace = true
 solana-system-interface.workspace = true
 solana-cpi.workspace = true
 once_cell.workspace = true
+zstd.workspace = true
+xxhash-rust.workspace = true
+thiserror.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
+tempfile.workspace = true
 jetstreamer-firehose.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread"] }
 futures-util.workspace = true

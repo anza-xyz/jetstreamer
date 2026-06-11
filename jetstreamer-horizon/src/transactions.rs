@@ -787,7 +787,7 @@ impl Transaction {
 /// either clearing the slot or filling the contained `ZeroVec` via
 /// [`ZeroVec::decode_into`]. Avoids by-value movement of the potentially-
 /// large inner buffer.
-fn decode_option_zerovec_into<R, const N: usize, T>(
+pub(crate) fn decode_option_zerovec_into<R, const N: usize, T>(
     slot: &mut Option<ZeroVec<N, T>>,
     reader: &mut R,
     mut ctx: Option<&mut lencode::context::DecoderContext>,

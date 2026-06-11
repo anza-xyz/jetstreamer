@@ -4237,7 +4237,11 @@ dependencies = [
  "solana-transaction",
  "solana-transaction-context",
  "solana-transaction-status",
+ "tempfile",
+ "thiserror 2.0.17",
  "tokio",
+ "xxhash-rust",
+ "zstd",
 ]
 
 [[package]]

@@ -3162,7 +3162,7 @@ impl AccountsUpdateNotifierInterface for ProgressAccountsUpdateNotifier {
         self.progress.note_account_update_slot(slot);
         self.progress.inc_account_update();
         if slot >= self.live_start_slot {
-            plugin::notify_account_update(slot, account, txn, pubkey, write_version);
+            plugin::notify_account_update(account);
             if let Some(recorder) = horizon::recorder() {
                 let txn_signature = txn.map(|tx| *tx.signature());
                 recorder.record_account_update(slot, pubkey, account, txn_signature, write_version);
@@ -3360,6 +3360,7 @@ impl BlockMetadataNotifier for BankBlockMetadataNotifier {
                     executed_transaction_count,
                     entry_count,
                 );
+                recorder.maybe_log_progress(slot);
             }
         }
     }
@@ -3466,11 +3467,10 @@ fn epoch_to_slot(epoch: u64) -> u64 {
 
 fn usage(program: &str) -> String {
     format!(
-        "Usage: {program} <epoch> [dest-dir] [--verify|--no-verify] [--packing|--no-packing] \
-         [--horizon|--horizon-output=PATH]\n\
+        "Usage: {program} <epoch> [dest-dir] [--verify|--no-verify] [--horizon-output=PATH]\n\
          \n\
-         --horizon               write a horizon archive to <dest-dir>/epoch-<epoch>.horizon\n\
-         --horizon-output=PATH   write a horizon archive to PATH"
+         Replays <epoch> and writes a horizon archive to\n\
+         <dest-dir>/epoch-<epoch>.horizon (override with --horizon-output=PATH)."
     )
 }
 
@@ -4975,9 +4975,8 @@ async fn run_geyser_replay(
     shutdown: Arc<AtomicBool>,
     cursor: Arc<ReplayCursor>,
     restart_tracker: Arc<RestartTracker>,
-    packing_enabled: bool,
     snapshot_verifier: Option<Arc<SnapshotVerifier>>,
-    horizon_output: Option<PathBuf>,
+    horizon_output: PathBuf,
 ) -> Result<(), String> {
     let (confirmed_bank_sender, confirmed_bank_receiver) = unbounded();
     let confirmed_bank_handle =
@@ -4985,17 +4984,8 @@ async fn run_geyser_replay(
     let (epoch_start, end_inclusive) = epoch_to_slot_range(epoch);
     let progress = Arc::new(ReplayProgress::new(epoch_start));
     let failure = Arc::new(ReplayFailure::new(shutdown.clone()));
-    plugin::set_packing_enabled(packing_enabled);
     plugin::reset();
     info!("direct in-process plugin notifier enabled");
-    info!(
-        "account update packing {}",
-        if packing_enabled {
-            "enabled"
-        } else {
-            "disabled (--no-packing)"
-        }
-    );
     let accounts_update_notifier: Option<AccountsUpdateNotifier> =
         Some(Arc::new(ProgressAccountsUpdateNotifier {
             progress: progress.clone(),
@@ -5065,22 +5055,20 @@ async fn run_geyser_replay(
     } else {
         info!("empty-slot gap guard disabled");
     }
-    if let Some(path) = &horizon_output {
-        horizon::init(
-            path,
-            epoch,
-            epoch_start,
-            end_inclusive - epoch_start + 1,
-            slot_presence.clone(),
-        )?;
-        info!(
-            "horizon archive recording enabled: {} (epoch {}, slots {}..={})",
-            path.display(),
-            epoch,
-            epoch_start,
-            end_inclusive
-        );
-    }
+    horizon::init(
+        &horizon_output,
+        epoch,
+        epoch_start,
+        end_inclusive - epoch_start + 1,
+        slot_presence.clone(),
+    )?;
+    info!(
+        "horizon archive recording to {} (epoch {}, slots {}..={})",
+        horizon_output.display(),
+        epoch,
+        epoch_start,
+        end_inclusive
+    );
     let scheduler = Arc::new(TransactionScheduler::new(
         replay_start,
         slot_presence,
@@ -6076,22 +6064,13 @@ async fn main() {
 
     let mut dest_dir_arg = None;
     let mut verify_snapshots = env_truthy_default("JETSTREAMER_VERIFY_SNAPSHOTS", true);
-    let mut packing_enabled = true;
-    let mut horizon_requested = false;
     let mut horizon_output: Option<PathBuf> = None;
     for arg in args {
         if arg == "--verify" {
             verify_snapshots = true;
         } else if arg == "--no-verify" {
             verify_snapshots = false;
-        } else if arg == "--packing" {
-            packing_enabled = true;
-        } else if arg == "--no-packing" {
-            packing_enabled = false;
-        } else if arg == "--horizon" {
-            horizon_requested = true;
         } else if let Some(path) = arg.strip_prefix("--horizon-output=") {
-            horizon_requested = true;
             horizon_output = Some(PathBuf::from(path));
         } else if arg.starts_with('-') {
             eprintln!("unknown option '{arg}'");
@@ -6117,11 +6096,8 @@ async fn main() {
         },
     };
 
-    let horizon_output = if horizon_requested {
-        Some(horizon_output.unwrap_or_else(|| dest_dir.join(format!("epoch-{epoch}.horizon"))))
-    } else {
-        None
-    };
+    let horizon_output =
+        horizon_output.unwrap_or_else(|| dest_dir.join(format!("epoch-{epoch}.horizon")));
 
     if env_truthy_default("JETSTREAMER_CLEAR_ACCOUNTS_ON_START", false) {
         if let Err(err) = clear_ledger_accounts_state(&dest_dir) {
@@ -6218,7 +6194,6 @@ async fn main() {
         shutdown,
         cursor,
         restart_tracker,
-        packing_enabled,
         snapshot_verifier,
         horizon_output,
     )

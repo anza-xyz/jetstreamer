@@ -206,6 +206,40 @@ impl HorizonRecorder {
         self.state.lock().expect("horizon recorder lock poisoned")
     }
 
+    /// Logs writer progress every `LOG_PROGRESS_EVERY_N_SLOTS` slots.
+    /// Called from the block-metadata notifier alongside the existing
+    /// periodic replay log.
+    pub fn maybe_log_progress(&self, slot: Slot) {
+        const LOG_PROGRESS_EVERY_N_SLOTS: u64 = 100;
+        if !slot.is_multiple_of(LOG_PROGRESS_EVERY_N_SLOTS) {
+            return;
+        }
+        let state = self.lock();
+        let stats = *state.writer.stats();
+        let emitted = state.last_emitted;
+        drop(state);
+        let ratio = if stats.uncompressed_payload_bytes > 0 {
+            format!(
+                "{:.1}%",
+                stats.bytes_written as f64 * 100.0 / stats.uncompressed_payload_bytes as f64
+            )
+        } else {
+            "n/a".to_string()
+        };
+        info!(
+            target: "jetstreamer_node_horizon",
+            "horizon progress: emitted_slot={} slots={} blocks={} txs={} tx_updates={} orphan_updates={} written={} ({} of raw payload)",
+            emitted.map(|s| s.to_string()).unwrap_or_else(|| "none".to_string()),
+            stats.slots,
+            stats.blocks,
+            stats.transactions,
+            stats.account_updates,
+            stats.orphan_account_updates,
+            stats.bytes_written,
+            ratio,
+        );
+    }
+
     /// Buffers the original chain's block metadata (firehose thread).
     /// Idempotent per slot — firehose restarts may re-deliver.
     #[allow(clippy::too_many_arguments)] // mirrors the geyser notification's field set

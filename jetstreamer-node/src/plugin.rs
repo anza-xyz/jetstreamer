@@ -1,38 +1,15 @@
-use jetstreamer_horizon::account_updates::AccountUpdate;
-use jetstreamer_horizon::dedupe::new_encoder_context;
-use lencode::context::EncoderContext;
-use lencode::prelude::*;
 use log::info;
 use solana_account::{AccountSharedData, ReadableAccount};
-use solana_address::Address;
 use solana_clock::Slot;
-use solana_pubkey::Pubkey;
-use solana_transaction::sanitized::SanitizedTransaction;
 use std::{
-    cell::RefCell,
     sync::{
         Mutex,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicU64, Ordering},
     },
     time::Instant,
 };
 
-const ACCOUNT_UPDATE_ENCODE_BUFFER_SIZE: usize = 12 * 1024 * 1024;
 const LOG_EVERY_N_BLOCKS: u64 = 10;
-
-thread_local! {
-    // Per-thread encoder context backed by the shared popular-pubkey frozen
-    // dedupe state. Building the context just clones the Arc + allocates a
-    // tiny scratch layer — the 65 535-entry primed table is shared.
-    static ENCODER: RefCell<EncoderContext> = RefCell::new(new_encoder_context());
-    // Keep the large encode buffer on the heap; some notifier threads have small stacks.
-    static ACCOUNT_UPDATE_ENCODE_BUFFER: RefCell<Vec<u8>> =
-        RefCell::new(vec![0u8; ACCOUNT_UPDATE_ENCODE_BUFFER_SIZE]);
-    // Reusable ~10 MiB AccountUpdate buffer, heap-allocated once per thread
-    // and overwritten in place on every notify_account_update call.
-    static ACCOUNT_UPDATE: RefCell<Box<AccountUpdate>> =
-        RefCell::new(AccountUpdate::new_boxed());
-}
 
 #[derive(Debug, Clone, Copy)]
 struct ThroughputSample {
@@ -50,9 +27,7 @@ struct TransactionCursor {
 static STARTUP_ACCOUNTS: AtomicU64 = AtomicU64::new(0);
 static ACCOUNT_UPDATES: AtomicU64 = AtomicU64::new(0);
 static TRANSACTIONS: AtomicU64 = AtomicU64::new(0);
-static TOTAL_IN_MEMORY_ACCOUNT_UPDATE_SIZE: AtomicU64 = AtomicU64::new(0);
-static TOTAL_ENCODED_ACCOUNT_UPDATE_SIZE: AtomicU64 = AtomicU64::new(0);
-static PACKING_ENABLED: AtomicBool = AtomicBool::new(false);
+static TOTAL_ACCOUNT_UPDATE_DATA_BYTES: AtomicU64 = AtomicU64::new(0);
 static LAST_THROUGHPUT_SAMPLE: Mutex<Option<ThroughputSample>> = Mutex::new(None);
 static TRANSACTION_CURSOR: Mutex<Option<TransactionCursor>> = Mutex::new(None);
 
@@ -60,25 +35,17 @@ pub fn reset() {
     STARTUP_ACCOUNTS.store(0, Ordering::Relaxed);
     ACCOUNT_UPDATES.store(0, Ordering::Relaxed);
     TRANSACTIONS.store(0, Ordering::Relaxed);
-    TOTAL_IN_MEMORY_ACCOUNT_UPDATE_SIZE.store(0, Ordering::Relaxed);
-    TOTAL_ENCODED_ACCOUNT_UPDATE_SIZE.store(0, Ordering::Relaxed);
+    TOTAL_ACCOUNT_UPDATE_DATA_BYTES.store(0, Ordering::Relaxed);
     if let Ok(mut sample) = LAST_THROUGHPUT_SAMPLE.lock() {
         *sample = None;
     }
     if let Ok(mut cursor) = TRANSACTION_CURSOR.lock() {
         *cursor = None;
     }
-    ENCODER.with(|encoder| {
-        jetstreamer_horizon::dedupe::reset_encoder(&mut encoder.borrow_mut());
-    });
 }
 
 pub fn notify_startup_account() {
     STARTUP_ACCOUNTS.fetch_add(1, Ordering::Relaxed);
-}
-
-pub fn set_packing_enabled(enabled: bool) {
-    PACKING_ENABLED.store(enabled, Ordering::Relaxed);
 }
 
 pub fn notify_end_of_startup() {
@@ -147,56 +114,9 @@ pub fn notify_transaction_range(slot: Slot, start_index: usize, count: usize) {
     TRANSACTIONS.fetch_add(count, Ordering::Relaxed);
 }
 
-pub fn notify_account_update(
-    slot: Slot,
-    account: &AccountSharedData,
-    _txn: &Option<&SanitizedTransaction>,
-    pubkey: &Pubkey,
-    write_version: u64,
-) {
+pub fn notify_account_update(account: &AccountSharedData) {
     ACCOUNT_UPDATES.fetch_add(1, Ordering::Relaxed);
-    let memory_size = core::mem::size_of::<AccountUpdate>() + account.data().len();
-    TOTAL_IN_MEMORY_ACCOUNT_UPDATE_SIZE.fetch_add(memory_size as u64, Ordering::Relaxed);
-    if !PACKING_ENABLED.load(Ordering::Relaxed) {
-        return;
-    }
-
-    let encoded_len = ACCOUNT_UPDATE.with(|update| {
-        let mut update = update.borrow_mut();
-        // Fill the reusable buffer in place — zero heap allocations.
-        update.pubkey = Address::new_from_array(pubkey.to_bytes());
-        update.lamports = account.lamports();
-        update.owner = Address::new_from_array(account.owner().to_bytes());
-        update.executable = account.executable();
-        update.rent_epoch = account.rent_epoch();
-        update.data.set(account.data());
-        update.write_version = write_version;
-
-        ACCOUNT_UPDATE_ENCODE_BUFFER.with(|buffer| {
-            let mut buffer = buffer.borrow_mut();
-            let mut cursor = Cursor::new(&mut buffer[..]);
-
-            let encoded_len = ENCODER.with(|encoder| {
-                match update.encode_ext(&mut cursor, Some(&mut *encoder.borrow_mut())) {
-                    Ok(len) => len,
-                    Err(Error::WriterOutOfSpace) => {
-                        panic!(
-                            "account update exceeded encode buffer: slot={slot} pubkey={} data_len={} buffer_len={}",
-                            update.pubkey,
-                            update.data.len(),
-                            ACCOUNT_UPDATE_ENCODE_BUFFER_SIZE
-                        )
-                    }
-                    Err(err) => panic!("failed to encode account update for slot {slot}: {err:?}"),
-                }
-            });
-
-            debug_assert_eq!(encoded_len, cursor.position());
-            encoded_len
-        })
-    });
-
-    TOTAL_ENCODED_ACCOUNT_UPDATE_SIZE.fetch_add(encoded_len as u64, Ordering::Relaxed);
+    TOTAL_ACCOUNT_UPDATE_DATA_BYTES.fetch_add(account.data().len() as u64, Ordering::Relaxed);
 }
 
 pub fn notify_block(slot: Slot) {
@@ -206,8 +126,7 @@ pub fn notify_block(slot: Slot) {
 
     let transactions = TRANSACTIONS.load(Ordering::Relaxed);
     let account_updates = ACCOUNT_UPDATES.load(Ordering::Relaxed);
-    let total_memory_size = TOTAL_IN_MEMORY_ACCOUNT_UPDATE_SIZE.load(Ordering::Relaxed);
-    let total_encoded_size = TOTAL_ENCODED_ACCOUNT_UPDATE_SIZE.load(Ordering::Relaxed);
+    let total_data_bytes = TOTAL_ACCOUNT_UPDATE_DATA_BYTES.load(Ordering::Relaxed);
 
     let now = Instant::now();
     let throughput = LAST_THROUGHPUT_SAMPLE
@@ -242,12 +161,11 @@ pub fn notify_block(slot: Slot) {
 
     info!(
         target: "jetstreamer_node_geyser",
-        "block slot {} total_txs={} total_account_updates={} memory_size={} encoded_size={} txs_per_sec={} accounts_per_sec={}",
+        "block slot {} total_txs={} total_account_updates={} account_data={} txs_per_sec={} accounts_per_sec={}",
         slot,
         transactions,
         account_updates,
-        format_bytes(total_memory_size),
-        format_bytes(total_encoded_size),
+        format_bytes(total_data_bytes),
         txs_per_sec,
         accounts_per_sec
     );

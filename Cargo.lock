@@ -4353,6 +4353,7 @@ version = "0.6.0"
 dependencies = [
  "agave-geyser-plugin-interface",
  "criterion",
+ "env_logger",
  "futures-util",
  "jetstreamer-firehose",
  "lencode",

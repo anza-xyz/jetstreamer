@@ -13,7 +13,9 @@ use xxhash_rust::xxh64::xxh64;
 
 use crate::account_updates::{AccountUpdateView, PushAccountUpdateError};
 use crate::dedupe::{new_decoder_context, reset_decoder};
-use crate::transactions::{Transaction, TransactionStatus, decode_option_zerovec_into};
+use crate::transactions::{
+    Transaction, TransactionStatus, decode_option_log_messages_into, decode_option_zerovec_into,
+};
 
 use super::format::*;
 
@@ -511,7 +513,7 @@ fn read_tx_record(
         .loaded_readonly_addresses
         .decode_into(reader, Some(ctx))?;
     decode_option_zerovec_into(&mut scratch.inner_instructions, reader, Some(ctx))?;
-    decode_option_zerovec_into(&mut scratch.log_messages, reader, Some(ctx))?;
+    decode_option_log_messages_into(&mut scratch.log_messages, reader, Some(ctx))?;
     decode_option_zerovec_into(&mut scratch.pre_token_balances, reader, Some(ctx))?;
     decode_option_zerovec_into(&mut scratch.post_token_balances, reader, Some(ctx))?;
     decode_option_zerovec_into(&mut scratch.rewards, reader, Some(ctx))?;

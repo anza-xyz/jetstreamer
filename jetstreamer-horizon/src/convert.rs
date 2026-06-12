@@ -38,9 +38,8 @@ use solana_transaction_status::{
 };
 
 use crate::limits::{
-    MAX_IX_ACCOUNTS, MAX_IX_DATA_LEN, MAX_LOG_MSG_LEN, MAX_RETURN_DATA_LEN, MAX_TX_ACCOUNTS,
-    MAX_TX_ADDR_LOOKUPS, MAX_TX_INSTRUCTIONS, MAX_TX_LOG_MSGS, MAX_TX_REWARDS, MAX_TX_SIGS,
-    MAX_TX_TOKEN_BALANCES,
+    MAX_IX_ACCOUNTS, MAX_IX_DATA_LEN, MAX_RETURN_DATA_LEN, MAX_TX_ACCOUNTS, MAX_TX_ADDR_LOOKUPS,
+    MAX_TX_INSTRUCTIONS, MAX_TX_LOG_MSGS, MAX_TX_REWARDS, MAX_TX_SIGS, MAX_TX_TOKEN_BALANCES,
 };
 use crate::transactions::{
     CompiledInstruction, InnerInstruction, LegacyMessage, Reward, RewardType, TokenAmount,
@@ -603,16 +602,22 @@ fn populate_inner_instructions(
 
 #[inline(never)]
 fn populate_log_messages(
-    dst: &mut Option<ZeroVec<MAX_TX_LOG_MSGS, crate::transactions::LogMessage>>,
+    dst: &mut Option<crate::transactions::LogMessages>,
     logs: &[String],
 ) -> Result<(), ConvertError> {
     check_capacity("log_messages", logs.len(), MAX_TX_LOG_MSGS)?;
-    let list = dst.get_or_insert_with(ZeroVec::new);
-    list.clear();
+    let arena = dst.get_or_insert_with(Default::default);
+    arena.clear();
+    let mut total = 0usize;
     for line in logs {
-        check_capacity("log_message", line.len(), MAX_LOG_MSG_LEN)?;
-        let slot = push_in_place(list, "log_messages")?;
-        slot.bytes.set(line.as_bytes());
+        total += line.len();
+        arena
+            .push(line.as_bytes())
+            .map_err(|_| ConvertError::CapacityExceeded {
+                field: "log_messages.data",
+                len: total,
+                max: crate::limits::MAX_TX_LOG_DATA,
+            })?;
     }
     Ok(())
 }
@@ -934,7 +939,7 @@ mod tests {
         assert_eq!(inner.as_slice()[0].instruction.data.as_slice(), &[9, 9, 9]);
 
         let logs = dst.log_messages.as_ref().expect("logs");
-        assert_eq!(logs.as_slice()[0].bytes.as_slice(), b"Program log: hi");
+        assert_eq!(logs.iter().next().unwrap(), b"Program log: hi");
 
         let pre_tb = dst.pre_token_balances.as_ref().expect("token balances");
         assert_eq!(pre_tb.as_slice()[0].ui_token_amount.amount, 1_500_000);
@@ -1003,14 +1008,17 @@ mod tests {
             }),
         };
         let meta = TransactionStatusMeta {
-            log_messages: Some(vec!["x".repeat(MAX_LOG_MSG_LEN + 1)]),
+            log_messages: Some(vec![
+                "x".repeat(crate::limits::MAX_TX_LOG_DATA / 2 + 1),
+                "y".repeat(crate::limits::MAX_TX_LOG_DATA / 2 + 1),
+            ]),
             ..TransactionStatusMeta::default()
         };
         let mut dst = Transaction::new_boxed();
         assert!(matches!(
             populate_transaction(&mut dst, &tx, &meta),
             Err(ConvertError::CapacityExceeded {
-                field: "log_message",
+                field: "log_messages.data",
                 ..
             })
         ));

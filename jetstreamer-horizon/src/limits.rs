@@ -45,21 +45,36 @@ pub const MAX_TX_ACCOUNT_UPDATES: usize = solana_transaction::sanitized::MAX_TX_
 /// Max return-data payload. Mirrors [`solana_cpi::MAX_RETURN_DATA`].
 pub const MAX_RETURN_DATA_LEN: usize = solana_cpi::MAX_RETURN_DATA;
 
-/// Max number of top-level instructions in a transaction message. Practical:
-/// bounded by packet size (~1 232 bytes) — 64 is comfortably higher than any
-/// real transaction.
+/// Max number of top-level instructions in a transaction message.
+/// Practical: matches the execution-trace depth limit, which bounds every
+/// transaction that *executes*. Known gap: the packet alone would allow
+/// ~366 minimal (3-byte) instructions in a committed-but-failed spam
+/// transaction. Instructions are stored inline (~10.5 KiB per slot, twice —
+/// once per message variant), so raising this multiplies the in-memory
+/// `Transaction` size and the variant-swap memset cost; if a preflight
+/// scan of a target epoch ever reports a transaction above this cap, the
+/// fix is to restructure instructions as a flat arena (like
+/// [`crate::transactions::LogMessages`]), not to bump this constant.
 pub const MAX_TX_INSTRUCTIONS: usize = 64;
 
 /// Max number of signatures in a transaction. Practical: the message header
 /// field is u8 but packet size caps this far lower.
 pub const MAX_TX_SIGS: usize = 19;
 
-/// Max bytes in a single log message. Practical bound; actual limit is CU-driven.
-pub const MAX_LOG_MSG_LEN: usize = 2048;
+/// Max number of log lines per transaction. Provable bound: `sol_log`
+/// consumes at least `syscall_base_cost` (100 CU) per call, so the 1.4M CU
+/// budget caps charged lines at ~14 000; runtime-generated invoke/success
+/// lines add at most one pair per traced instruction.
+pub const MAX_TX_LOG_MSGS: usize = 16_384;
 
-/// Max number of log messages per transaction. Practical bound; the CU budget
-/// (~1.4M) and per-log CU cost cap real-world usage far below this.
-pub const MAX_TX_LOG_MSGS: usize = 256;
+/// Combined byte cap for all of a transaction's log lines (stored in a flat
+/// arena — see [`crate::transactions::LogMessages`] — so neither line count
+/// nor single-line length is independently capped). Provable bound for
+/// modern epochs: log syscalls consume at least one CU per byte, so the
+/// 1.4M CU budget caps charged bytes at ~1.4 MiB; uncharged runtime lines
+/// (invoke/success/return-data) add a few KiB. Sized ~3× that ceiling for
+/// headroom on epochs with older compute-cost models.
+pub const MAX_TX_LOG_DATA: usize = 4 * 1024 * 1024;
 
 /// Max number of rewards attached to a transaction. Practical — real
 /// transactions attach at most one or two (vote/stake).

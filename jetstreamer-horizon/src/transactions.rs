@@ -20,10 +20,10 @@ use solana_signature::Signature;
 
 use crate::account_updates::{AccountUpdateView, AccountUpdates};
 use crate::limits::{
-    MAX_ACCOUNT_DATA_LEN, MAX_CUSTOM_ERROR_LEN, MAX_IX_ACCOUNTS, MAX_IX_DATA_LEN, MAX_LOG_MSG_LEN,
+    MAX_ACCOUNT_DATA_LEN, MAX_CUSTOM_ERROR_LEN, MAX_IX_ACCOUNTS, MAX_IX_DATA_LEN,
     MAX_RETURN_DATA_LEN, MAX_TX_ACCOUNT_UPDATES, MAX_TX_ACCOUNTS, MAX_TX_ADDR_LOOKUPS,
-    MAX_TX_INNER_IX, MAX_TX_INSTRUCTIONS, MAX_TX_LOG_MSGS, MAX_TX_REWARDS, MAX_TX_SIGS,
-    MAX_TX_TOKEN_BALANCES,
+    MAX_TX_INNER_IX, MAX_TX_INSTRUCTIONS, MAX_TX_LOG_DATA, MAX_TX_LOG_MSGS, MAX_TX_REWARDS,
+    MAX_TX_SIGS, MAX_TX_TOKEN_BALANCES,
 };
 use crate::zero_vec::{ZeroAlloc, ZeroVec, assert_zero_alloc};
 
@@ -377,12 +377,101 @@ impl InnerInstruction {
     }
 }
 
-/// Single log line emitted by the transaction. Stored as UTF-8 bytes (strings
-/// are heap-allocated by default).
+/// A transaction's log lines, stored as a flat arena: per-line lengths plus
+/// one shared UTF-8 byte buffer.
+///
+/// Log volume is bounded by the compute budget in *total bytes*
+/// ([`MAX_TX_LOG_DATA`]), while line count and single-line length vary
+/// wildly within that envelope (mainnet has transactions with hundreds of
+/// short lines and others with multi-KiB single lines). The arena caps the
+/// total without capping either dimension independently — and without the
+/// per-line padding a fixed-size line type would waste.
 #[derive(Encode, Decode, Debug, Clone, PartialEq, Eq, Default)]
 #[repr(C)]
-pub struct LogMessage {
-    pub bytes: ZeroVec<MAX_LOG_MSG_LEN, u8>,
+pub struct LogMessages {
+    lens: ZeroVec<MAX_TX_LOG_MSGS, u32>,
+    data: ZeroVec<MAX_TX_LOG_DATA, u8>,
+}
+
+/// Error pushing a log line into [`LogMessages`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PushLogError {
+    /// The per-transaction line-count table is full ([`MAX_TX_LOG_MSGS`]).
+    LinesFull,
+    /// The shared byte arena is full ([`MAX_TX_LOG_DATA`]).
+    DataFull,
+}
+
+impl core::fmt::Display for PushLogError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::LinesFull => write!(f, "log line count exceeds {MAX_TX_LOG_MSGS}"),
+            Self::DataFull => write!(f, "total log bytes exceed {MAX_TX_LOG_DATA}"),
+        }
+    }
+}
+
+impl std::error::Error for PushLogError {}
+
+impl LogMessages {
+    /// Appends one log line, copying its bytes into the shared arena.
+    pub fn push(&mut self, line: &[u8]) -> Result<(), PushLogError> {
+        if self.lens.len() >= MAX_TX_LOG_MSGS {
+            return Err(PushLogError::LinesFull);
+        }
+        if self.data.len() + line.len() > MAX_TX_LOG_DATA {
+            return Err(PushLogError::DataFull);
+        }
+        self.lens.push(line.len() as u32);
+        self.data.extend_from_slice(line);
+        Ok(())
+    }
+
+    /// Number of log lines.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.lens.len()
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.lens.is_empty()
+    }
+
+    /// Total bytes across all lines.
+    #[inline]
+    pub fn data_len(&self) -> usize {
+        self.data.len()
+    }
+
+    /// Iterates over the log lines as byte slices, in push order.
+    pub fn iter(&self) -> impl Iterator<Item = &[u8]> {
+        self.lens.iter().scan(0usize, |offset, len| {
+            let start = *offset;
+            let end = start + *len as usize;
+            *offset = end;
+            Some(&self.data.as_slice()[start..end])
+        })
+    }
+
+    /// In-place reset (keeps the inline buffers).
+    #[inline]
+    pub fn clear(&mut self) {
+        self.lens.clear();
+        self.data.clear();
+    }
+
+    /// Decodes the wire form into `self` without stack-allocating the
+    /// multi-MiB struct.
+    pub fn decode_into<R: Read>(
+        &mut self,
+        reader: &mut R,
+        mut ctx: Option<&mut lencode::context::DecoderContext>,
+    ) -> lencode::Result<()> {
+        self.lens.decode_into(reader, ctx.as_deref_mut())?;
+        self.data.decode_into(reader, ctx)?;
+        Ok(())
+    }
 }
 
 /// Return data from a transaction. Inline-bounded counterpart to
@@ -523,7 +612,7 @@ pub struct Transaction {
     pub loaded_readonly_addresses: ZeroVec<MAX_TX_ACCOUNTS, Address>,
     /// Inner-instruction trace, flattened (each entry carries its outer index).
     pub inner_instructions: Option<ZeroVec<MAX_TX_INNER_IX, InnerInstruction>>,
-    pub log_messages: Option<ZeroVec<MAX_TX_LOG_MSGS, LogMessage>>,
+    pub log_messages: Option<LogMessages>,
     pub pre_token_balances: Option<ZeroVec<MAX_TX_TOKEN_BALANCES, TransactionTokenBalance>>,
     pub post_token_balances: Option<ZeroVec<MAX_TX_TOKEN_BALANCES, TransactionTokenBalance>>,
     pub rewards: Option<ZeroVec<MAX_TX_REWARDS, Reward>>,
@@ -694,7 +783,7 @@ impl Transaction {
                 ctx.as_deref_mut(),
             )?;
         }
-        decode_option_zerovec_into(&mut self.log_messages, reader, ctx.as_deref_mut())?;
+        decode_option_log_messages_into(&mut self.log_messages, reader, ctx.as_deref_mut())?;
         decode_option_zerovec_into(&mut self.pre_token_balances, reader, ctx.as_deref_mut())?;
         decode_option_zerovec_into(&mut self.post_token_balances, reader, ctx.as_deref_mut())?;
         decode_option_zerovec_into(&mut self.rewards, reader, ctx.as_deref_mut())?;
@@ -739,6 +828,30 @@ where
         1 => {
             let zv = slot.get_or_insert_with(ZeroVec::new);
             zv.decode_into(reader, ctx)?;
+        }
+        _ => return Err(lencode::io::Error::InvalidData),
+    }
+    Ok(())
+}
+
+/// Decodes an `Option<LogMessages>` in place — `Option` tag, then the
+/// arena's two `ZeroVec`s via [`LogMessages::decode_into`]. Companion to
+/// [`decode_option_zerovec_into`]; the `get_or_insert_with` lives in this
+/// dedicated frame so the multi-MiB inline reservation debug builds make
+/// for the temporary never stacks up with other fields' decodes.
+pub(crate) fn decode_option_log_messages_into<R: Read>(
+    slot: &mut Option<LogMessages>,
+    reader: &mut R,
+    mut ctx: Option<&mut lencode::context::DecoderContext>,
+) -> lencode::Result<()> {
+    let tag = u8::decode_ext(reader, ctx.as_deref_mut())?;
+    match tag {
+        0 => {
+            *slot = None;
+        }
+        1 => {
+            let logs = slot.get_or_insert_with(LogMessages::default);
+            logs.decode_into(reader, ctx)?;
         }
         _ => return Err(lencode::io::Error::InvalidData),
     }
@@ -858,7 +971,8 @@ impl ZeroAlloc for LegacyMessage {}
 impl ZeroAlloc for V0Message {}
 impl ZeroAlloc for VersionedMessage {}
 impl ZeroAlloc for InnerInstruction {}
-impl ZeroAlloc for LogMessage {}
+impl ZeroAlloc for LogMessages {}
+impl ZeroAlloc for PushLogError {}
 impl ZeroAlloc for ReturnData {}
 impl ZeroAlloc for Reward {}
 impl ZeroAlloc for RewardType {}
@@ -901,8 +1015,9 @@ const _: fn() = || {
     assert_zero_alloc::<CompiledInstruction>(); // instruction
     assert_zero_alloc::<Option<u32>>(); // stack_height
 
-    // `LogMessage` fields
-    assert_zero_alloc::<ZeroVec<MAX_LOG_MSG_LEN, u8>>();
+    // `LogMessages` fields
+    assert_zero_alloc::<ZeroVec<MAX_TX_LOG_MSGS, u32>>(); // lens
+    assert_zero_alloc::<ZeroVec<MAX_TX_LOG_DATA, u8>>(); // data
 
     // `ReturnData` fields
     assert_zero_alloc::<Address>(); // program_id
@@ -935,7 +1050,7 @@ const _: fn() = || {
     assert_zero_alloc::<ZeroVec<MAX_TX_ACCOUNTS, u64>>(); // pre/post balances
     assert_zero_alloc::<ZeroVec<MAX_TX_ACCOUNTS, Address>>(); // loaded writable/readonly addresses
     assert_zero_alloc::<Option<ZeroVec<MAX_TX_INNER_IX, InnerInstruction>>>();
-    assert_zero_alloc::<Option<ZeroVec<MAX_TX_LOG_MSGS, LogMessage>>>();
+    assert_zero_alloc::<Option<LogMessages>>();
     assert_zero_alloc::<Option<ZeroVec<MAX_TX_TOKEN_BALANCES, TransactionTokenBalance>>>();
     assert_zero_alloc::<Option<ZeroVec<MAX_TX_REWARDS, Reward>>>();
     assert_zero_alloc::<Option<ReturnData>>();
@@ -953,7 +1068,7 @@ const _: fn() = || {
     assert_zero_alloc::<V0Message>();
     assert_zero_alloc::<VersionedMessage>();
     assert_zero_alloc::<InnerInstruction>();
-    assert_zero_alloc::<LogMessage>();
+    assert_zero_alloc::<LogMessages>();
     assert_zero_alloc::<ReturnData>();
     assert_zero_alloc::<Reward>();
     assert_zero_alloc::<RewardType>();

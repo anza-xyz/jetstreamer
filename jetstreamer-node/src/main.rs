@@ -6099,13 +6099,17 @@ async fn main() {
     let horizon_output =
         horizon_output.unwrap_or_else(|| dest_dir.join(format!("epoch-{epoch}.horizon")));
 
-    if env_truthy_default("JETSTREAMER_CLEAR_ACCOUNTS_ON_START", false) {
+    // Replay mutates the unpacked snapshot state in place (new appendvecs,
+    // accounts index), so a crashed run leaves the staging dirs dirty.
+    // Start every run from a clean unpack of the retained snapshot archive;
+    // set JETSTREAMER_CLEAR_ACCOUNTS_ON_START=false to skip.
+    if env_truthy_default("JETSTREAMER_CLEAR_ACCOUNTS_ON_START", true) {
         if let Err(err) = clear_ledger_accounts_state(&dest_dir) {
             eprintln!("error: {err}");
             exit(1);
         }
     } else {
-        info!("ledger accounts cleanup disabled via JETSTREAMER_CLEAR_ACCOUNTS_ON_START");
+        info!("ledger accounts cleanup disabled via JETSTREAMER_CLEAR_ACCOUNTS_ON_START=false");
     }
 
     let target_slot = epoch_to_slot(epoch).saturating_sub(1);

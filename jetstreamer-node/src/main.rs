@@ -28,6 +28,7 @@ use jetstreamer_node::snapshots::{
     DEFAULT_BUCKET, download_snapshot_at_or_before_slot, list_epoch_snapshots,
 };
 use log::{error, info, warn};
+use rayon::prelude::*;
 use reqwest::{Client, Url, header::RANGE};
 use serde_cbor::Value;
 use solana_account::AccountSharedData;
@@ -51,7 +52,9 @@ use solana_rpc::transaction_notifier_interface::TransactionNotifier;
 use solana_runtime::{
     bank::Bank, bank_forks::BankForks, installed_scheduler_pool::BankWithScheduler,
     runtime_config::RuntimeConfig, snapshot_bank_utils, snapshot_utils,
+    transaction_batch::TransactionBatch,
 };
+use solana_runtime_transaction::runtime_transaction::RuntimeTransaction;
 use solana_signature::Signature;
 use solana_svm::{
     transaction_error_metrics::TransactionErrorMetrics,
@@ -103,6 +106,10 @@ const DEFAULT_ACCOUNTS_MAINTENANCE_ROOT_STRIDE: u64 = 1;
 const DEFAULT_ACCOUNTS_INDEX_ON_DISK: bool = false;
 const DEFAULT_READY_ENTRY_QUEUE_CAPACITY: usize = 8192;
 const MISMATCH_RETRY_ATTEMPTS: usize = 10;
+/// Max prepared entry batches accumulated into one parallel execution wave.
+const MAX_WAVE_BATCHES: usize = 64;
+/// Max transactions accumulated into one parallel execution wave.
+const MAX_WAVE_TXS: usize = 256;
 const DEFAULT_POST_FIREHOSE_INCOMPLETE_RETRY_ATTEMPTS: usize = 16;
 const DEFAULT_EMPTY_SLOT_BUFFER_GAP_LIMIT: u64 = 0;
 const DEFAULT_FIREHOSE_BACKPRESSURE_SLOT_GAP_LIMIT: u64 = 128;
@@ -225,6 +232,55 @@ struct BankReplay {
     enable_program_cache_prune: bool,
     enable_accounts_maintenance: bool,
     accounts_maintenance_root_stride: u64,
+    /// Pool for executing mutually non-conflicting entry batches in
+    /// parallel (see [`BankReplay::process_slot_entries`]).
+    replay_pool: rayon::ThreadPool,
+}
+
+/// A prepared entry batch awaiting wave execution. Holds its account
+/// locks (via the contained [`TransactionBatch`]) from preparation until
+/// the wave flushes, which is what makes lock failures on later entries a
+/// reliable conflict signal.
+struct PendingEntryBatch<'a> {
+    entry: ReadyEntry,
+    batch: TransactionBatch<'a, 'a, RuntimeTransaction<SanitizedTransaction>>,
+}
+
+/// Executes one prepared entry batch and flattens commit results into
+/// per-transaction statuses. Safe to call concurrently for batches whose
+/// account locks do not overlap (the bank commits batches independently).
+fn execute_entry_batch(
+    bank: &Bank,
+    batch: &TransactionBatch<'_, '_, RuntimeTransaction<SanitizedTransaction>>,
+) -> Vec<Result<(), TransactionError>> {
+    let mut timings = ExecuteTimings::default();
+    let (commit_results, _balance_collector) = bank.load_execute_and_commit_transactions(
+        batch,
+        MAX_PROCESSING_AGE,
+        ExecutionRecordingConfig::new_single_setting(false),
+        &mut timings,
+        None,
+    );
+    commit_results
+        .into_iter()
+        .map(|commit_result| commit_result.and_then(|committed| committed.status))
+        .collect()
+}
+
+/// Number of threads for the wave-execution pool. Defaults to all cores
+/// minus a little headroom for the firehose/recorder threads.
+fn replay_thread_count() -> usize {
+    env::var("JETSTREAMER_REPLAY_THREADS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(8)
+                .saturating_sub(2)
+                .clamp(1, 32)
+        })
 }
 
 #[derive(Debug)]
@@ -276,6 +332,14 @@ impl BankReplay {
                 bank,
             }))
         };
+        let replay_threads = replay_thread_count();
+        info!("replay wave execution threads: {replay_threads}");
+        let replay_pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(replay_threads)
+            .thread_name(|i| format!("replayWave{i:02}"))
+            .stack_size(16 * 1024 * 1024)
+            .build()
+            .expect("failed to build replay thread pool");
         Self {
             bank_forks,
             snapshot_verifier,
@@ -295,6 +359,7 @@ impl BankReplay {
             enable_program_cache_prune,
             enable_accounts_maintenance,
             accounts_maintenance_root_stride: accounts_maintenance_root_stride.max(1),
+            replay_pool,
         }
     }
 
@@ -1073,38 +1138,88 @@ impl BankReplay {
     }
 
     fn process_ready_entries(&self, entries: Vec<ReadyEntry>) {
-        for mut entry in entries {
-            let gate_start = Instant::now();
-            let _execution_guard = self
-                .execution_gate
-                .lock()
-                .expect("execution gate lock poisoned");
-            let gate_wait = gate_start.elapsed();
-            PHASE_GATE_WAIT_US.fetch_add(gate_wait.as_micros() as u64, Ordering::Relaxed);
-            if gate_wait >= BANK_FOR_SLOT_WARN_AFTER {
-                warn!(
-                    "entry execution gate waited {:.3}s (slot {} entry {})",
-                    gate_wait.as_secs_f64(),
-                    entry.slot,
-                    entry.entry_index
-                );
+        // Entries arrive strictly slot-ordered; process each slot's
+        // contiguous run as one group so its bank is fetched once and
+        // entry batches can be wave-scheduled against shared locks.
+        let mut entries = entries.into_iter().peekable();
+        while let Some(first) = entries.peek() {
+            let slot = first.slot;
+            let mut group = Vec::new();
+            while entries.peek().is_some_and(|entry| entry.slot == slot) {
+                group.push(entries.next().expect("peeked entry"));
             }
-            let signature = entry
-                .txs
-                .first()
-                .and_then(|scheduled| scheduled.tx.signatures.first())
-                .map(|sig| sig.to_string());
-            self.cursor.start_inflight(
-                entry.slot,
-                entry.entry_index,
-                entry.start_index,
-                entry.tx_count,
-                signature.clone(),
+            self.process_slot_entries(slot, group);
+        }
+    }
+
+    /// Replays one slot's contiguous run of ready entries.
+    ///
+    /// Mirrors agave's `blockstore_processor` replay strategy: consecutive
+    /// entry batches are *prepared* in order — each batch holding its
+    /// account locks — and accumulated into a wave. The bank's lock table
+    /// is the conflict detector: a lock failure means the new entry
+    /// conflicts with a pending batch, so the wave is flushed (executed)
+    /// first. Batches within a wave are therefore mutually non-conflicting
+    /// and safe to execute in parallel, while conflicting transactions
+    /// retain their original cross-wave order — preserving per-account
+    /// write order, which both consensus state and the horizon archive
+    /// depend on. Ticks act as barriers, exactly as in agave.
+    ///
+    /// All result verification, transaction-range notification, cursor
+    /// advancement, and archive recording happen sequentially in original
+    /// entry order after each wave executes.
+    fn process_slot_entries(&self, slot: Slot, group: Vec<ReadyEntry>) {
+        let gate_start = Instant::now();
+        let _execution_guard = self
+            .execution_gate
+            .lock()
+            .expect("execution gate lock poisoned");
+        let gate_wait = gate_start.elapsed();
+        PHASE_GATE_WAIT_US.fetch_add(gate_wait.as_micros() as u64, Ordering::Relaxed);
+        if gate_wait >= BANK_FOR_SLOT_WARN_AFTER {
+            warn!(
+                "entry execution gate waited {:.3}s (slot {})",
+                gate_wait.as_secs_f64(),
+                slot
             );
-            let _inflight_guard = InFlightGuard {
-                cursor: self.cursor.clone(),
-            };
+        }
+
+        let phase_bank_start = Instant::now();
+        let bank = match self.bank_for_slot(slot) {
+            Ok(bank) => bank,
+            Err(err) => {
+                log::debug!(
+                    "skipping {} ready entries at slot {}: {}",
+                    group.len(),
+                    slot,
+                    err
+                );
+                return;
+            }
+        };
+        PHASE_BANK_FOR_SLOT_US.fetch_add(
+            phase_bank_start.elapsed().as_micros() as u64,
+            Ordering::Relaxed,
+        );
+        self.maybe_prune_program_cache_by_deployment_slot(&bank);
+
+        let mut pending: Vec<PendingEntryBatch<'_>> = Vec::new();
+        let mut pending_tx_count = 0usize;
+        for entry in group {
             if entry.tx_count == 0 {
+                // Tick barrier: everything that PoH-precedes the tick must
+                // be committed before it registers.
+                self.flush_pending(&bank, &mut pending, &mut pending_tx_count);
+                self.cursor.start_inflight(
+                    entry.slot,
+                    entry.entry_index,
+                    entry.start_index,
+                    0,
+                    None,
+                );
+                let _inflight_guard = InFlightGuard {
+                    cursor: self.cursor.clone(),
+                };
                 self.cursor.update_inflight_stage("register_tick");
                 let start = Instant::now();
                 if let Err(err) = self.register_tick(entry.slot, entry.hash) {
@@ -1131,259 +1246,283 @@ impl BankReplay {
                         entry.entry_index,
                         entry.start_index,
                         entry.tx_count,
-                        signature.clone(),
+                        None,
                     );
                 }
-                let elapsed = start.elapsed();
-                self.note_entry_duration(&entry, elapsed, None);
+                self.note_entry_duration(&entry, start.elapsed(), None);
                 continue;
             }
 
-            self.cursor.update_inflight_stage("bank_for_slot");
-            let start = Instant::now();
-            let phase_bank_start = Instant::now();
-            match self.bank_for_slot(entry.slot) {
-                Ok(bank) => {
-                    let bank_for_slot_us = phase_bank_start.elapsed().as_micros() as u64;
-                    PHASE_BANK_FOR_SLOT_US.fetch_add(bank_for_slot_us, Ordering::Relaxed);
-                    self.maybe_prune_program_cache_by_deployment_slot(&bank);
-                    self.cursor.update_inflight_stage("try_process");
-                    if let Some(debug_sig) = self.debug_signature.as_ref() {
-                        for (offset, scheduled) in entry.txs.iter().enumerate() {
-                            if scheduled.tx.signatures.first() == Some(debug_sig) {
-                                let tx_index = entry.start_index.saturating_add(offset);
-                                let message = &scheduled.tx.message;
-                                let static_keys = message.static_account_keys();
-                                let mut program_ids =
-                                    Vec::with_capacity(message.instructions().len());
-                                for ix in message.instructions() {
-                                    let program_id = static_keys
-                                        .get(ix.program_id_index as usize)
-                                        .map(|key| bs58::encode(key.to_bytes()).into_string())
-                                        .unwrap_or_else(|| "<unknown>".to_string());
-                                    program_ids.push(program_id);
-                                }
-                                info!(
-                                    "debug tx match: slot={} entry={} tx_index={} sig={} instrs={} programs={:?}",
-                                    entry.slot,
-                                    entry.entry_index,
-                                    tx_index,
-                                    debug_sig,
-                                    message.instructions().len(),
-                                    program_ids
-                                );
-                                info!(
-                                    "debug tx accounts: slot={} entry={} tx_index={} keys={}",
-                                    entry.slot,
-                                    entry.entry_index,
-                                    tx_index,
-                                    static_keys.len()
-                                );
-                            }
+            if let Some(debug_sig) = self.debug_signature.as_ref() {
+                for (offset, scheduled) in entry.txs.iter().enumerate() {
+                    if scheduled.tx.signatures.first() == Some(debug_sig) {
+                        let tx_index = entry.start_index.saturating_add(offset);
+                        let message = &scheduled.tx.message;
+                        let static_keys = message.static_account_keys();
+                        let mut program_ids = Vec::with_capacity(message.instructions().len());
+                        for ix in message.instructions() {
+                            let program_id = static_keys
+                                .get(ix.program_id_index as usize)
+                                .map(|key| bs58::encode(key.to_bytes()).into_string())
+                                .unwrap_or_else(|| "<unknown>".to_string());
+                            program_ids.push(program_id);
                         }
-                    }
-                    let txs: Vec<VersionedTransaction> = entry
-                        .txs
-                        .iter()
-                        .map(|scheduled| scheduled.tx.clone())
-                        .collect();
-                    let expected_statuses: Vec<Result<(), TransactionError>> = entry
-                        .txs
-                        .iter()
-                        .map(|scheduled| scheduled.expected_status.clone())
-                        .collect();
-                    self.cursor.update_inflight_stage("prepare_entry_batch");
-                    let phase_prepare_start = Instant::now();
-                    let batch = match bank.prepare_entry_batch(txs) {
-                        Ok(batch) => batch,
-                        Err(err) => {
-                            let message = format!(
-                                "transaction batch prepare failed at slot {} entry {}: {}",
-                                entry.slot, entry.entry_index, err
-                            );
-                            self.failure.record(message.clone());
-                            panic!("{message}");
-                        }
-                    };
-                    PHASE_PREPARE_BATCH_US.fetch_add(
-                        phase_prepare_start.elapsed().as_micros() as u64,
-                        Ordering::Relaxed,
-                    );
-                    self.cursor.update_inflight_stage("load_execute_and_commit");
-                    let phase_exec_start = Instant::now();
-                    let mut timings = ExecuteTimings::default();
-                    let (commit_results, _balance_collector) = bank
-                        .load_execute_and_commit_transactions(
-                            &batch,
-                            MAX_PROCESSING_AGE,
-                            ExecutionRecordingConfig::new_single_setting(false),
-                            &mut timings,
-                            None,
-                        );
-                    let results: Vec<Result<(), TransactionError>> = commit_results
-                        .into_iter()
-                        .map(|commit_result| commit_result.and_then(|committed| committed.status))
-                        .collect();
-                    PHASE_EXECUTE_US.fetch_add(
-                        phase_exec_start.elapsed().as_micros() as u64,
-                        Ordering::Relaxed,
-                    );
-                    drop(batch);
-                    self.cursor.update_inflight_stage("post_process");
-                    let phase_post_start = Instant::now();
-
-                    if results.len() != expected_statuses.len() {
-                        let message = format!(
-                            "transaction result length mismatch at slot {} entry {}: expected {} results, got {}",
+                        info!(
+                            "debug tx match: slot={} entry={} tx_index={} sig={} instrs={} programs={:?}",
                             entry.slot,
                             entry.entry_index,
-                            expected_statuses.len(),
-                            results.len()
+                            tx_index,
+                            debug_sig,
+                            message.instructions().len(),
+                            program_ids
                         );
-                        self.failure.record(message.clone());
-                        panic!("{message}");
-                    }
-
-                    for (offset, (actual, expected)) in
-                        results.into_iter().zip(expected_statuses).enumerate()
-                    {
-                        if actual != expected {
-                            let tx_index = entry.start_index.saturating_add(offset);
-                            let signature = entry
-                                .txs
-                                .get(offset)
-                                .and_then(|scheduled| scheduled.tx.signatures.first())
-                                .map(|sig| sig.to_string())
-                                .unwrap_or_else(|| "<missing-signature>".to_string());
-                            let mut resolved = false;
-                            if MISMATCH_RETRY_ATTEMPTS > 0
-                                && let Some(scheduled) = entry.txs.get(offset)
-                            {
-                                for attempt in 1..=MISMATCH_RETRY_ATTEMPTS {
-                                    if attempt > 1 {
-                                        let backoff_ms =
-                                            50_u64.saturating_mul(1_u64 << (attempt - 2));
-                                        std::thread::sleep(Duration::from_millis(
-                                            backoff_ms.min(300_000),
-                                        ));
-                                    }
-                                    if let Some(retry_result) = self.retry_mismatch_transaction(
-                                        &bank,
-                                        &entry,
-                                        tx_index,
-                                        offset,
-                                        attempt,
-                                        &expected,
-                                        &scheduled.tx,
-                                    ) {
-                                        if retry_result == expected {
-                                            warn!(
-                                                "mismatch resolved after retry: slot {} entry {} tx_index {} sig {}",
-                                                entry.slot, entry.entry_index, tx_index, signature
-                                            );
-                                            resolved = true;
-                                            break;
-                                        }
-                                    } else {
-                                        break;
-                                    }
-                                }
-                            }
-                            if resolved {
-                                continue;
-                            }
-                            if let Some(scheduled) = entry.txs.get(offset) {
-                                self.log_mismatch_details(
-                                    &bank,
-                                    &entry,
-                                    tx_index,
-                                    offset,
-                                    &expected,
-                                    &actual,
-                                    &scheduled.tx,
-                                );
-                                self.dump_mismatch_artifacts(
-                                    &bank,
-                                    &entry,
-                                    tx_index,
-                                    offset,
-                                    &expected,
-                                    &actual,
-                                    Some(&scheduled.tx),
-                                );
-                            } else {
-                                error!(
-                                    "mismatch detail: missing scheduled tx at offset {} (slot {} entry {})",
-                                    offset, entry.slot, entry.entry_index
-                                );
-                                self.dump_mismatch_artifacts(
-                                    &bank, &entry, tx_index, offset, &expected, &actual, None,
-                                );
-                            }
-                            let message = format!(
-                                "transaction execution mismatch at slot {} entry {} index {} sig {}: expected {:?}, got {:?}",
-                                entry.slot,
-                                entry.entry_index,
-                                tx_index,
-                                signature,
-                                expected,
-                                actual
-                            );
-                            self.failure.record(message.clone());
-                            panic!("{message}");
-                        }
-                    }
-                    if entry.slot >= self.live_start_slot {
-                        plugin::notify_transaction_range(
-                            entry.slot,
-                            entry.start_index,
-                            entry.tx_count,
-                        );
-                    }
-                    PHASE_POST_PROCESS_US.fetch_add(
-                        phase_post_start.elapsed().as_micros() as u64,
-                        Ordering::Relaxed,
-                    );
-                    PHASE_ENTRY_COUNT.fetch_add(1, Ordering::Relaxed);
-                    // Advance the replay cursor only after successful execution/verification.
-                    self.cursor.update(
-                        entry.slot,
-                        entry.entry_index,
-                        entry.start_index,
-                        entry.tx_count,
-                        signature.clone(),
-                    );
-                    let elapsed = start.elapsed();
-                    self.note_entry_duration(&entry, elapsed, signature.as_deref());
-                    if elapsed >= ENTRY_EXEC_WARN_AFTER {
-                        self.log_slow_entry_details(&entry);
-                    }
-                    if entry.slot >= self.live_start_slot
-                        && let Some(recorder) = horizon::recorder()
-                    {
-                        let txs = std::mem::take(&mut entry.txs)
-                            .into_iter()
-                            .map(|scheduled| (scheduled.tx, scheduled.status_meta))
-                            .collect();
-                        recorder.record_committed_entry(
+                        info!(
+                            "debug tx accounts: slot={} entry={} tx_index={} keys={}",
                             entry.slot,
                             entry.entry_index,
-                            entry.num_hashes,
-                            txs,
+                            tx_index,
+                            static_keys.len()
                         );
                     }
-                }
-                Err(err) => {
-                    log::debug!(
-                        "skipping transaction execution at slot {} entry {}: {}",
-                        entry.slot,
-                        entry.entry_index,
-                        err
-                    );
-                    let elapsed = start.elapsed();
-                    self.note_entry_duration(&entry, elapsed, None);
                 }
             }
+
+            let phase_prepare_start = Instant::now();
+            let build_txs = |entry: &ReadyEntry| -> Vec<VersionedTransaction> {
+                entry
+                    .txs
+                    .iter()
+                    .map(|scheduled| scheduled.tx.clone())
+                    .collect()
+            };
+            let prepare = |txs: Vec<VersionedTransaction>| match bank.prepare_entry_batch(txs) {
+                Ok(batch) => batch,
+                Err(err) => {
+                    let message = format!(
+                        "transaction batch prepare failed at slot {} entry {}: {}",
+                        entry.slot, entry.entry_index, err
+                    );
+                    self.failure.record(message.clone());
+                    panic!("{message}");
+                }
+            };
+            let mut batch = prepare(build_txs(&entry));
+            if batch.lock_results().iter().any(|result| result.is_err()) {
+                // Conflict with a lock held by a pending batch: flush the
+                // wave (committing everything that PoH-precedes this
+                // entry), then re-prepare. If lock errors persist with no
+                // pending locks held, the entry conflicts with itself —
+                // fall through and let result verification surface it.
+                drop(batch);
+                self.flush_pending(&bank, &mut pending, &mut pending_tx_count);
+                batch = prepare(build_txs(&entry));
+            }
+            PHASE_PREPARE_BATCH_US.fetch_add(
+                phase_prepare_start.elapsed().as_micros() as u64,
+                Ordering::Relaxed,
+            );
+
+            pending_tx_count += entry.tx_count;
+            pending.push(PendingEntryBatch { entry, batch });
+            if pending.len() >= MAX_WAVE_BATCHES || pending_tx_count >= MAX_WAVE_TXS {
+                self.flush_pending(&bank, &mut pending, &mut pending_tx_count);
+            }
+        }
+        self.flush_pending(&bank, &mut pending, &mut pending_tx_count);
+    }
+
+    /// Executes the accumulated wave of mutually non-conflicting entry
+    /// batches (in parallel when there is more than one), then verifies,
+    /// notifies, and records each entry sequentially in original order.
+    fn flush_pending(
+        &self,
+        bank: &Arc<Bank>,
+        pending: &mut Vec<PendingEntryBatch<'_>>,
+        pending_tx_count: &mut usize,
+    ) {
+        if pending.is_empty() {
+            return;
+        }
+        *pending_tx_count = 0;
+        let wave = std::mem::take(pending);
+
+        let first = &wave[0].entry;
+        let signature = first
+            .txs
+            .first()
+            .and_then(|scheduled| scheduled.tx.signatures.first())
+            .map(|sig| sig.to_string());
+        self.cursor.start_inflight(
+            first.slot,
+            first.entry_index,
+            first.start_index,
+            wave.iter().map(|pb| pb.entry.tx_count).sum(),
+            signature,
+        );
+        let _inflight_guard = InFlightGuard {
+            cursor: self.cursor.clone(),
+        };
+        self.cursor.update_inflight_stage("execute_wave");
+
+        let phase_exec_start = Instant::now();
+        let results: Vec<Vec<Result<(), TransactionError>>> = if wave.len() == 1 {
+            vec![execute_entry_batch(bank, &wave[0].batch)]
+        } else {
+            self.replay_pool.install(|| {
+                wave.par_iter()
+                    .map(|pb| execute_entry_batch(bank, &pb.batch))
+                    .collect()
+            })
+        };
+        let wave_elapsed = phase_exec_start.elapsed();
+        PHASE_EXECUTE_US.fetch_add(wave_elapsed.as_micros() as u64, Ordering::Relaxed);
+
+        self.cursor.update_inflight_stage("post_process");
+        for (pb, results) in wave.into_iter().zip(results) {
+            let PendingEntryBatch { entry, batch } = pb;
+            drop(batch); // release the entry's account locks
+            self.post_process_entry(bank, entry, results, wave_elapsed);
+        }
+    }
+
+    /// Verifies one executed entry against its expected statuses and
+    /// performs the in-order side effects: transaction-range notification,
+    /// cursor advancement, and archive recording.
+    fn post_process_entry(
+        &self,
+        bank: &Arc<Bank>,
+        mut entry: ReadyEntry,
+        results: Vec<Result<(), TransactionError>>,
+        elapsed: Duration,
+    ) {
+        let phase_post_start = Instant::now();
+        if results.len() != entry.txs.len() {
+            let message = format!(
+                "transaction result length mismatch at slot {} entry {}: expected {} results, got {}",
+                entry.slot,
+                entry.entry_index,
+                entry.txs.len(),
+                results.len()
+            );
+            self.failure.record(message.clone());
+            panic!("{message}");
+        }
+
+        for (offset, actual) in results.into_iter().enumerate() {
+            let expected = entry.txs[offset].expected_status.clone();
+            if actual != expected {
+                let tx_index = entry.start_index.saturating_add(offset);
+                let signature = entry
+                    .txs
+                    .get(offset)
+                    .and_then(|scheduled| scheduled.tx.signatures.first())
+                    .map(|sig| sig.to_string())
+                    .unwrap_or_else(|| "<missing-signature>".to_string());
+                let mut resolved = false;
+                if MISMATCH_RETRY_ATTEMPTS > 0
+                    && let Some(scheduled) = entry.txs.get(offset)
+                {
+                    for attempt in 1..=MISMATCH_RETRY_ATTEMPTS {
+                        if attempt > 1 {
+                            let backoff_ms = 50_u64.saturating_mul(1_u64 << (attempt - 2));
+                            std::thread::sleep(Duration::from_millis(backoff_ms.min(300_000)));
+                        }
+                        if let Some(retry_result) = self.retry_mismatch_transaction(
+                            bank,
+                            &entry,
+                            tx_index,
+                            offset,
+                            attempt,
+                            &expected,
+                            &scheduled.tx,
+                        ) {
+                            if retry_result == expected {
+                                warn!(
+                                    "mismatch resolved after retry: slot {} entry {} tx_index {} sig {}",
+                                    entry.slot, entry.entry_index, tx_index, signature
+                                );
+                                resolved = true;
+                                break;
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                if resolved {
+                    continue;
+                }
+                if let Some(scheduled) = entry.txs.get(offset) {
+                    self.log_mismatch_details(
+                        bank,
+                        &entry,
+                        tx_index,
+                        offset,
+                        &expected,
+                        &actual,
+                        &scheduled.tx,
+                    );
+                    self.dump_mismatch_artifacts(
+                        bank,
+                        &entry,
+                        tx_index,
+                        offset,
+                        &expected,
+                        &actual,
+                        Some(&scheduled.tx),
+                    );
+                } else {
+                    error!(
+                        "mismatch detail: missing scheduled tx at offset {} (slot {} entry {})",
+                        offset, entry.slot, entry.entry_index
+                    );
+                    self.dump_mismatch_artifacts(
+                        bank, &entry, tx_index, offset, &expected, &actual, None,
+                    );
+                }
+                let message = format!(
+                    "transaction execution mismatch at slot {} entry {} index {} sig {}: expected {:?}, got {:?}",
+                    entry.slot, entry.entry_index, tx_index, signature, expected, actual
+                );
+                self.failure.record(message.clone());
+                panic!("{message}");
+            }
+        }
+
+        if entry.slot >= self.live_start_slot {
+            plugin::notify_transaction_range(entry.slot, entry.start_index, entry.tx_count);
+        }
+        PHASE_POST_PROCESS_US.fetch_add(
+            phase_post_start.elapsed().as_micros() as u64,
+            Ordering::Relaxed,
+        );
+        PHASE_ENTRY_COUNT.fetch_add(1, Ordering::Relaxed);
+
+        let signature = entry
+            .txs
+            .first()
+            .and_then(|scheduled| scheduled.tx.signatures.first())
+            .map(|sig| sig.to_string());
+        // Advance the replay cursor only after successful execution/verification.
+        self.cursor.update(
+            entry.slot,
+            entry.entry_index,
+            entry.start_index,
+            entry.tx_count,
+            signature.clone(),
+        );
+        self.note_entry_duration(&entry, elapsed, signature.as_deref());
+        if elapsed >= ENTRY_EXEC_WARN_AFTER {
+            self.log_slow_entry_details(&entry);
+        }
+        if entry.slot >= self.live_start_slot
+            && let Some(recorder) = horizon::recorder()
+        {
+            let txs = std::mem::take(&mut entry.txs)
+                .into_iter()
+                .map(|scheduled| (scheduled.tx, scheduled.status_meta))
+                .collect();
+            recorder.record_committed_entry(entry.slot, entry.entry_index, entry.num_hashes, txs);
         }
     }
 
@@ -5233,6 +5372,10 @@ async fn run_geyser_replay(
             let inflight_fail_after = ENTRY_EXEC_FAIL_AFTER;
             let mut phase_start = None::<Instant>;
             let mut in_warmup = has_warmup;
+            // Slots already replayed when the main phase's timer started;
+            // excluded from the rate so the first post-warmup ticks don't
+            // divide warmup-era progress by near-zero elapsed time.
+            let mut main_rate_baseline: u64 = 0;
             let mut last_seen_slot = progress.latest_slot.load(Ordering::Relaxed);
             let mut last_seen_change = Instant::now();
             let mut last_stall_log = Instant::now();
@@ -5630,6 +5773,10 @@ async fn run_geyser_replay(
                     if in_warmup {
                         in_warmup = false;
                         phase_start = Some(Instant::now());
+                        main_rate_baseline = latest
+                            .clamp(epoch_start, end_inclusive)
+                            .saturating_sub(epoch_start)
+                            .saturating_add(1);
                         progress.reset_counts();
                         last_seen_tx_count = 0;
                         last_account_updates = 0;
@@ -5648,26 +5795,27 @@ async fn run_geyser_replay(
                     } else {
                         (processed as f64) * 100.0 / (main_total as f64)
                     };
-                    let slots_per_sec = if processed == 0 {
+                    let processed_this_phase = processed.saturating_sub(main_rate_baseline);
+                    let slots_per_sec = if processed_this_phase == 0 {
                         "n/a".to_string()
                     } else if let Some(start) = phase_start {
                         let elapsed = start.elapsed().as_secs_f64();
                         if elapsed <= 0.0 {
                             "n/a".to_string()
                         } else {
-                            format!("{:.2}", (processed as f64) / elapsed)
+                            format!("{:.2}", (processed_this_phase as f64) / elapsed)
                         }
                     } else {
                         "n/a".to_string()
                     };
-                    let eta = if processed == 0 {
+                    let eta = if processed_this_phase == 0 {
                         "unknown".to_string()
                     } else if let Some(start) = phase_start {
                         let elapsed = start.elapsed().as_secs_f64();
                         if elapsed <= 0.0 {
                             "unknown".to_string()
                         } else {
-                            let rate = (processed as f64) / elapsed;
+                            let rate = (processed_this_phase as f64) / elapsed;
                             if rate <= 0.0 {
                                 "unknown".to_string()
                             } else {

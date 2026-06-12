@@ -68,6 +68,7 @@ use tar::Archive as TarArchive;
 use tokio::process::Command;
 use xxhash_rust::xxh64::xxh64;
 
+mod horizon;
 mod plugin;
 
 const RIPGET_LOG_INTERVAL_SECS: u64 = 5;
@@ -1072,7 +1073,7 @@ impl BankReplay {
     }
 
     fn process_ready_entries(&self, entries: Vec<ReadyEntry>) {
-        for entry in entries {
+        for mut entry in entries {
             let gate_start = Instant::now();
             let _execution_guard = self
                 .execution_gate
@@ -1114,6 +1115,16 @@ impl BankReplay {
                         err
                     );
                 } else {
+                    if entry.slot >= self.live_start_slot
+                        && let Some(recorder) = horizon::recorder()
+                    {
+                        recorder.record_committed_entry(
+                            entry.slot,
+                            entry.entry_index,
+                            entry.num_hashes,
+                            Vec::new(),
+                        );
+                    }
                     // Only advance the replay cursor after a successful tick registration.
                     self.cursor.update(
                         entry.slot,
@@ -1347,6 +1358,20 @@ impl BankReplay {
                     if elapsed >= ENTRY_EXEC_WARN_AFTER {
                         self.log_slow_entry_details(&entry);
                     }
+                    if entry.slot >= self.live_start_slot
+                        && let Some(recorder) = horizon::recorder()
+                    {
+                        let txs = std::mem::take(&mut entry.txs)
+                            .into_iter()
+                            .map(|scheduled| (scheduled.tx, scheduled.status_meta))
+                            .collect();
+                        recorder.record_committed_entry(
+                            entry.slot,
+                            entry.entry_index,
+                            entry.num_hashes,
+                            txs,
+                        );
+                    }
                 }
                 Err(err) => {
                     log::debug!(
@@ -1360,6 +1385,20 @@ impl BankReplay {
                 }
             }
         }
+    }
+
+    /// Freezes the most recently replayed bank so its end-of-slot account
+    /// updates (fee distribution, …) reach geyser. Idempotent.
+    fn freeze_latest_bank(&self) -> Result<(), String> {
+        let bank = {
+            let guard = self
+                .bank_forks
+                .read()
+                .map_err(|_| "bank forks lock poisoned".to_string())?;
+            guard.working_bank()
+        };
+        bank.freeze();
+        Ok(())
     }
 
     fn verify_latest_bank(&self) -> Result<(), String> {
@@ -2481,7 +2520,7 @@ impl TransactionScheduler {
         slot: Slot,
         index: usize,
         tx: VersionedTransaction,
-        expected_status: Result<(), TransactionError>,
+        status_meta: TransactionStatusMeta,
     ) -> Result<(Vec<ReadyEntry>, bool), String> {
         let mut state = self.state.lock().expect("transaction scheduler lock");
         if let Some(target) = self.restart_tracker.take_if_applicable(slot) {
@@ -2506,7 +2545,7 @@ impl TransactionScheduler {
             state.highest_seen_slot = slot;
         }
         let buffer = state.slots.entry(slot).or_default();
-        let inserted = buffer.insert_transaction(index, tx, expected_status)?;
+        let inserted = buffer.insert_transaction(index, tx, status_meta)?;
         let ready = self.advance_ready_locked(&mut state)?;
         Ok((ready, inserted))
     }
@@ -2518,6 +2557,7 @@ impl TransactionScheduler {
         start_index: usize,
         tx_count: usize,
         hash: Hash,
+        num_hashes: u64,
     ) -> Result<(Vec<ReadyEntry>, bool), String> {
         let mut state = self.state.lock().expect("transaction scheduler lock");
         if let Some(target) = self.restart_tracker.take_if_applicable(slot) {
@@ -2542,7 +2582,7 @@ impl TransactionScheduler {
             state.highest_seen_slot = slot;
         }
         let buffer = state.slots.entry(slot).or_default();
-        let inserted = buffer.push_entry(entry_index, start_index, tx_count, hash)?;
+        let inserted = buffer.push_entry(entry_index, start_index, tx_count, hash, num_hashes)?;
         let ready = self.advance_ready_locked(&mut state)?;
         Ok((ready, inserted))
     }
@@ -2886,7 +2926,7 @@ impl SlotExecutionBuffer {
         &mut self,
         index: usize,
         tx: VersionedTransaction,
-        expected_status: Result<(), TransactionError>,
+        status_meta: TransactionStatusMeta,
     ) -> Result<bool, String> {
         if (index as u64) < self.processed_tx_count {
             // Duplicate transaction after a firehose restart; already processed.
@@ -2898,7 +2938,7 @@ impl SlotExecutionBuffer {
         if let Some(existing) = &self.txs[index] {
             let existing_sig = existing.tx.signatures.first();
             let incoming_sig = tx.signatures.first();
-            if existing_sig == incoming_sig && existing.expected_status == expected_status {
+            if existing_sig == incoming_sig && existing.expected_status == status_meta.status {
                 // Duplicate delivery of the same transaction; ignore.
                 return Ok(false);
             }
@@ -2909,7 +2949,8 @@ impl SlotExecutionBuffer {
         }
         self.txs[index] = Some(ScheduledTransaction {
             tx,
-            expected_status,
+            expected_status: status_meta.status.clone(),
+            status_meta,
         });
         Ok(true)
     }
@@ -2920,6 +2961,7 @@ impl SlotExecutionBuffer {
         start_index: usize,
         tx_count: usize,
         hash: Hash,
+        num_hashes: u64,
     ) -> Result<bool, String> {
         if entry_index < self.next_entry_index {
             // Duplicate entry after a firehose restart; already processed.
@@ -2937,6 +2979,7 @@ impl SlotExecutionBuffer {
             start_index,
             tx_count,
             hash,
+            num_hashes,
         });
         Ok(true)
     }
@@ -2956,6 +2999,7 @@ impl SlotExecutionBuffer {
                     start_index: entry.start_index,
                     txs: Vec::new(),
                     hash: entry.hash,
+                    num_hashes: entry.num_hashes,
                     tx_count: 0,
                 });
                 continue;
@@ -3000,6 +3044,7 @@ impl SlotExecutionBuffer {
                 start_index: effective_start,
                 txs,
                 hash: entry.hash,
+                num_hashes: entry.num_hashes,
                 tx_count: effective_count,
             });
         }
@@ -3065,12 +3110,16 @@ struct PendingEntry {
     start_index: usize,
     tx_count: usize,
     hash: Hash,
+    num_hashes: u64,
 }
 
 #[derive(Debug)]
 struct ScheduledTransaction {
     tx: VersionedTransaction,
     expected_status: Result<(), TransactionError>,
+    /// Full original chain metadata (from the CAR stream), carried through
+    /// so the horizon recorder can archive it alongside replay output.
+    status_meta: TransactionStatusMeta,
 }
 
 #[derive(Debug)]
@@ -3080,6 +3129,7 @@ struct ReadyEntry {
     start_index: usize,
     txs: Vec<ScheduledTransaction>,
     hash: Hash,
+    num_hashes: u64,
     tx_count: usize,
 }
 
@@ -3113,6 +3163,10 @@ impl AccountsUpdateNotifierInterface for ProgressAccountsUpdateNotifier {
         self.progress.inc_account_update();
         if slot >= self.live_start_slot {
             plugin::notify_account_update(slot, account, txn, pubkey, write_version);
+            if let Some(recorder) = horizon::recorder() {
+                let txn_signature = txn.map(|tx| *tx.signature());
+                recorder.record_account_update(slot, pubkey, account, txn_signature, write_version);
+            }
         }
     }
 
@@ -3171,7 +3225,7 @@ impl TransactionNotifier for BankTransactionNotifier {
             slot,
             transaction_slot_index,
             transaction.clone(),
-            transaction_status_meta.status.clone(),
+            transaction_status_meta.clone(),
         ) {
             Ok((ready_entries, inserted)) => {
                 if inserted {
@@ -3225,6 +3279,7 @@ impl EntryNotifier for BankEntryNotifier {
             starting_transaction_index,
             entry.num_transactions as usize,
             entry.hash,
+            entry.num_hashes,
         ) {
             Ok((ready_entries, inserted)) => {
                 if inserted {
@@ -3293,6 +3348,19 @@ impl BlockMetadataNotifier for BankBlockMetadataNotifier {
 
         if slot >= self.live_start_slot {
             plugin::notify_block(slot);
+            if let Some(recorder) = horizon::recorder() {
+                recorder.record_block_meta(
+                    slot,
+                    _parent_slot,
+                    _parent_blockhash,
+                    _blockhash,
+                    _rewards,
+                    _block_time,
+                    _block_height,
+                    executed_transaction_count,
+                    entry_count,
+                );
+            }
         }
     }
 }
@@ -3397,7 +3465,13 @@ fn epoch_to_slot(epoch: u64) -> u64 {
 }
 
 fn usage(program: &str) -> String {
-    format!("Usage: {program} <epoch> [dest-dir] [--verify|--no-verify] [--packing|--no-packing]")
+    format!(
+        "Usage: {program} <epoch> [dest-dir] [--verify|--no-verify] [--packing|--no-packing] \
+         [--horizon|--horizon-output=PATH]\n\
+         \n\
+         --horizon               write a horizon archive to <dest-dir>/epoch-<epoch>.horizon\n\
+         --horizon-output=PATH   write a horizon archive to PATH"
+    )
 }
 
 fn snapshot_filename(uri: &str) -> Result<&str, String> {
@@ -4903,6 +4977,7 @@ async fn run_geyser_replay(
     restart_tracker: Arc<RestartTracker>,
     packing_enabled: bool,
     snapshot_verifier: Option<Arc<SnapshotVerifier>>,
+    horizon_output: Option<PathBuf>,
 ) -> Result<(), String> {
     let (confirmed_bank_sender, confirmed_bank_receiver) = unbounded();
     let confirmed_bank_handle =
@@ -4990,6 +5065,22 @@ async fn run_geyser_replay(
     } else {
         info!("empty-slot gap guard disabled");
     }
+    if let Some(path) = &horizon_output {
+        horizon::init(
+            path,
+            epoch,
+            epoch_start,
+            end_inclusive - epoch_start + 1,
+            slot_presence.clone(),
+        )?;
+        info!(
+            "horizon archive recording enabled: {} (epoch {}, slots {}..={})",
+            path.display(),
+            epoch,
+            epoch_start,
+            end_inclusive
+        );
+    }
     let scheduler = Arc::new(TransactionScheduler::new(
         replay_start,
         slot_presence,
@@ -5051,14 +5142,18 @@ async fn run_geyser_replay(
     let (ready_sender, ready_receiver) = bounded::<Vec<ReadyEntry>>(ready_queue_capacity);
     let ready_shutdown = shutdown.clone();
     let ready_bank_replay = bank_replay.clone();
-    let ready_handle = std::thread::spawn(move || {
-        while let Ok(entries) = ready_receiver.recv() {
-            if ready_shutdown.load(Ordering::Relaxed) {
-                break;
+    let ready_handle = std::thread::Builder::new()
+        .name("readyEntries".to_string())
+        .stack_size(64 * 1024 * 1024)
+        .spawn(move || {
+            while let Ok(entries) = ready_receiver.recv() {
+                if ready_shutdown.load(Ordering::Relaxed) {
+                    break;
+                }
+                ready_bank_replay.process_ready_entries(entries);
             }
-            ready_bank_replay.process_ready_entries(entries);
-        }
-    });
+        })
+        .expect("failed to spawn ready entry thread");
     let slot_range = replay_start..(end_inclusive + 1);
 
     let client = Client::new();
@@ -5811,6 +5906,13 @@ async fn run_geyser_replay(
         info!("snapshot verification complete");
     }
 
+    if let Some(recorder) = horizon::recorder() {
+        // Freeze the final bank so its end-of-slot account updates are
+        // recorded before the archive closes.
+        bank_replay.freeze_latest_bank()?;
+        recorder.finish()?;
+    }
+
     Ok(())
 }
 
@@ -5975,6 +6077,8 @@ async fn main() {
     let mut dest_dir_arg = None;
     let mut verify_snapshots = env_truthy_default("JETSTREAMER_VERIFY_SNAPSHOTS", true);
     let mut packing_enabled = true;
+    let mut horizon_requested = false;
+    let mut horizon_output: Option<PathBuf> = None;
     for arg in args {
         if arg == "--verify" {
             verify_snapshots = true;
@@ -5984,6 +6088,11 @@ async fn main() {
             packing_enabled = true;
         } else if arg == "--no-packing" {
             packing_enabled = false;
+        } else if arg == "--horizon" {
+            horizon_requested = true;
+        } else if let Some(path) = arg.strip_prefix("--horizon-output=") {
+            horizon_requested = true;
+            horizon_output = Some(PathBuf::from(path));
         } else if arg.starts_with('-') {
             eprintln!("unknown option '{arg}'");
             eprintln!("{}", usage(&program));
@@ -6006,6 +6115,12 @@ async fn main() {
                 exit(1);
             }
         },
+    };
+
+    let horizon_output = if horizon_requested {
+        Some(horizon_output.unwrap_or_else(|| dest_dir.join(format!("epoch-{epoch}.horizon"))))
+    } else {
+        None
     };
 
     if env_truthy_default("JETSTREAMER_CLEAR_ACCOUNTS_ON_START", false) {
@@ -6105,6 +6220,7 @@ async fn main() {
         restart_tracker,
         packing_enabled,
         snapshot_verifier,
+        horizon_output,
     )
     .await
     {

@@ -504,6 +504,12 @@ fn read_tx_record(
     scratch.fee = u64::decode_ext(reader, Some(ctx))?;
     scratch.pre_balances.decode_into(reader, Some(ctx))?;
     scratch.post_balances.decode_into(reader, Some(ctx))?;
+    scratch
+        .loaded_writable_addresses
+        .decode_into(reader, Some(ctx))?;
+    scratch
+        .loaded_readonly_addresses
+        .decode_into(reader, Some(ctx))?;
     decode_option_zerovec_into(&mut scratch.inner_instructions, reader, Some(ctx))?;
     decode_option_zerovec_into(&mut scratch.log_messages, reader, Some(ctx))?;
     decode_option_zerovec_into(&mut scratch.pre_token_balances, reader, Some(ctx))?;

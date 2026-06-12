@@ -236,6 +236,52 @@ impl VersionedMessage {
         }
     }
 
+    /// Forces `self` into the `Legacy` variant in place and returns the
+    /// cleared payload, without stack-allocating a `LegacyMessage`.
+    ///
+    /// If `self` is already `Legacy`, the existing payload is cleared and
+    /// reused; otherwise the storage is variant-swapped in place (same
+    /// mechanism as [`Self::decode_into`]).
+    pub fn force_legacy_mut(&mut self) -> &mut LegacyMessage {
+        if !matches!(self, Self::Legacy(_)) {
+            // SAFETY: `#[repr(C, u8)]` pins the discriminant at byte 0.
+            // Zeroing the storage yields discriminant 0 (Legacy) over an
+            // all-zero `LegacyMessage`, which is a valid default state.
+            unsafe {
+                core::ptr::drop_in_place(self as *mut Self);
+                core::ptr::write_bytes(self as *mut Self, 0, 1);
+            }
+        }
+        match self {
+            Self::Legacy(m) => {
+                m.clear();
+                m
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    /// Forces `self` into the `V0` variant in place and returns the cleared
+    /// payload. Companion to [`Self::force_legacy_mut`].
+    pub fn force_v0_mut(&mut self) -> &mut V0Message {
+        if !matches!(self, Self::V0(_)) {
+            // SAFETY: as above, then flip the discriminant byte to 1 (V0);
+            // an all-zero `V0Message` payload is a valid default state.
+            unsafe {
+                core::ptr::drop_in_place(self as *mut Self);
+                core::ptr::write_bytes(self as *mut Self, 0, 1);
+                *(self as *mut Self as *mut u8) = 1;
+            }
+        }
+        match self {
+            Self::V0(m) => {
+                m.clear();
+                m
+            }
+            _ => unreachable!(),
+        }
+    }
+
     /// Decodes the wire form into `self` without stack-allocating the
     /// ~750 KiB struct.
     ///
@@ -467,6 +513,14 @@ pub struct Transaction {
     pub fee: u64,
     pub pre_balances: ZeroVec<MAX_TX_ACCOUNTS, u64>,
     pub post_balances: ZeroVec<MAX_TX_ACCOUNTS, u64>,
+    /// Writable addresses resolved from the message's address-table lookups
+    /// at execution time. Empty for legacy messages. Required to map
+    /// `pre_balances` / `post_balances` indices back to pubkeys for v0
+    /// transactions — the resolved set depends on on-chain ALT state at the
+    /// transaction's slot and is not recoverable from the message alone.
+    pub loaded_writable_addresses: ZeroVec<MAX_TX_ACCOUNTS, Address>,
+    /// Readonly addresses resolved from the message's address-table lookups.
+    pub loaded_readonly_addresses: ZeroVec<MAX_TX_ACCOUNTS, Address>,
     /// Inner-instruction trace, flattened (each entry carries its outer index).
     pub inner_instructions: Option<ZeroVec<MAX_TX_INNER_IX, InnerInstruction>>,
     pub log_messages: Option<ZeroVec<MAX_TX_LOG_MSGS, LogMessage>>,
@@ -522,6 +576,8 @@ impl Transaction {
         self.fee = 0;
         self.pre_balances.clear();
         self.post_balances.clear();
+        self.loaded_writable_addresses.clear();
+        self.loaded_readonly_addresses.clear();
         self.inner_instructions = None;
         self.log_messages = None;
         self.pre_token_balances = None;
@@ -616,6 +672,10 @@ impl Transaction {
         self.fee = u64::decode_ext(reader, ctx.as_deref_mut())?;
         self.pre_balances.decode_into(reader, ctx.as_deref_mut())?;
         self.post_balances.decode_into(reader, ctx.as_deref_mut())?;
+        self.loaded_writable_addresses
+            .decode_into(reader, ctx.as_deref_mut())?;
+        self.loaded_readonly_addresses
+            .decode_into(reader, ctx.as_deref_mut())?;
 
         // Option<ZeroVec<_, _>>: decode the tag, then decode-in-place on
         // the inner ZeroVec so we never stack-alloc the full inner buffer.
@@ -873,6 +933,7 @@ const _: fn() = || {
     assert_zero_alloc::<TransactionStatus>();
     assert_zero_alloc::<u64>(); // fee
     assert_zero_alloc::<ZeroVec<MAX_TX_ACCOUNTS, u64>>(); // pre/post balances
+    assert_zero_alloc::<ZeroVec<MAX_TX_ACCOUNTS, Address>>(); // loaded writable/readonly addresses
     assert_zero_alloc::<Option<ZeroVec<MAX_TX_INNER_IX, InnerInstruction>>>();
     assert_zero_alloc::<Option<ZeroVec<MAX_TX_LOG_MSGS, LogMessage>>>();
     assert_zero_alloc::<Option<ZeroVec<MAX_TX_TOKEN_BALANCES, TransactionTokenBalance>>>();

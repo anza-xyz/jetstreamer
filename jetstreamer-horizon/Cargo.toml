@@ -10,9 +10,12 @@ keywords.workspace = true
 
 [dependencies]
 lencode.workspace = true
+solana-pubkey.workspace = true
 agave-geyser-plugin-interface.workspace = true
 solana-message.workspace = true
 solana-transaction.workspace = true
+solana-transaction-error.workspace = true
+solana-instruction-error.workspace = true
 solana-transaction-status.workspace = true
 solana-hash.workspace = true
 solana-signature.workspace = true
@@ -29,6 +32,7 @@ thiserror.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
+solana-account-decoder-client-types.workspace = true
 tempfile.workspace = true
 jetstreamer-firehose.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread"] }

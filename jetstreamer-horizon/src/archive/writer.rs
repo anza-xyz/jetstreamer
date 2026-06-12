@@ -399,6 +399,8 @@ impl<W: std::io::Write> ArchiveWriter<W> {
         tx.fee.encode_ext(buf, Some(ctx))?;
         tx.pre_balances.encode_ext(buf, Some(ctx))?;
         tx.post_balances.encode_ext(buf, Some(ctx))?;
+        tx.loaded_writable_addresses.encode_ext(buf, Some(ctx))?;
+        tx.loaded_readonly_addresses.encode_ext(buf, Some(ctx))?;
         tx.inner_instructions.encode_ext(buf, Some(ctx))?;
         tx.log_messages.encode_ext(buf, Some(ctx))?;
         tx.pre_token_balances.encode_ext(buf, Some(ctx))?;

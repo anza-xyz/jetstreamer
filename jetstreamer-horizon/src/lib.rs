@@ -1,6 +1,7 @@
 pub mod account_updates;
 pub mod archive;
 pub mod block_metas;
+pub mod convert;
 pub mod dedupe;
 pub mod entries;
 pub mod epochs;

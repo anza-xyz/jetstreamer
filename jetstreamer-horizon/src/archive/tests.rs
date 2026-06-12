@@ -96,6 +96,14 @@ fn build_tx(rng: &mut Rng, ledger: &mut Ledger, n_updates: usize) -> Box<Transac
         m.recent_blockhash = Hash::new_from_array(bh);
     }
 
+    // Exercise the loaded-address sections (deterministic, dedupe-friendly).
+    let lw_idx = (rng.next() as usize) % POPULAR_PUBKEYS.len();
+    tx.loaded_writable_addresses
+        .push(Address::new_from_array(POPULAR_PUBKEYS[lw_idx]));
+    let lr_idx = (rng.next() as usize) % POPULAR_PUBKEYS.len();
+    tx.loaded_readonly_addresses
+        .push(Address::new_from_array(POPULAR_PUBKEYS[lr_idx]));
+
     for u in 0..n_updates {
         let (pk, data) = ledger.touch((rng.next() as usize).wrapping_add(u));
         tx.push_account_update(&AccountUpdateView {
@@ -156,6 +164,10 @@ impl MetaSnapshot {
     }
 }
 
+/// Comparable snapshot of one transaction: (fee, sig0, n_updates, concat
+/// of update data, loaded writable+readonly addresses).
+type TxSnapshot = (u64, Signature, usize, Vec<u8>, Vec<Address>);
+
 /// Expected snapshot of a written slot for later comparison.
 #[derive(Debug, Clone, PartialEq)]
 struct ExpectedSlot {
@@ -163,8 +175,7 @@ struct ExpectedSlot {
     skipped: bool,
     meta: Option<MetaSnapshot>,
     entries: Vec<EntryRecord>,
-    // per tx: (fee, sig0, n_updates, concat of update data)
-    txs: Vec<(u64, Signature, usize, Vec<u8>)>,
+    txs: Vec<TxSnapshot>,
 }
 
 /// Collecting visitor used to verify reads.
@@ -195,8 +206,15 @@ impl SlotVisitor for Collector {
         for (_, d) in tx.iter_account_updates() {
             data.extend_from_slice(d);
         }
-        last.txs
-            .push((tx.fee, tx.signatures[0], tx.account_updates().len(), data));
+        let mut loaded: Vec<Address> = tx.loaded_writable_addresses.as_slice().to_vec();
+        loaded.extend_from_slice(tx.loaded_readonly_addresses.as_slice());
+        last.txs.push((
+            tx.fee,
+            tx.signatures[0],
+            tx.account_updates().len(),
+            data,
+            loaded,
+        ));
     }
 
     fn on_block(&mut self, notification: &BlockNotification, entries: &[EntryRecord]) {
@@ -293,7 +311,15 @@ fn write_archive(
             for (_, d) in tx.iter_account_updates() {
                 data.extend_from_slice(d);
             }
-            exp_txs.push((tx.fee, tx.signatures[0], tx.account_updates().len(), data));
+            let mut loaded: Vec<Address> = tx.loaded_writable_addresses.as_slice().to_vec();
+            loaded.extend_from_slice(tx.loaded_readonly_addresses.as_slice());
+            exp_txs.push((
+                tx.fee,
+                tx.signatures[0],
+                tx.account_updates().len(),
+                data,
+                loaded,
+            ));
         }
 
         // Post-transaction orphan update: simulate fee distribution to the

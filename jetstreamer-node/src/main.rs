@@ -1143,6 +1143,12 @@ impl BankReplay {
         // entry batches can be wave-scheduled against shared locks.
         let mut entries = entries.into_iter().peekable();
         while let Some(first) = entries.peek() {
+            // Bail between slot groups on shutdown — a drained batch can
+            // hold minutes of execution work, and an aborting run has no
+            // use for it (in-memory replay state is not resumable).
+            if self.failure.shutdown_requested() {
+                return;
+            }
             let slot = first.slot;
             let mut group = Vec::new();
             while entries.peek().is_some_and(|entry| entry.slot == slot) {
@@ -2015,6 +2021,10 @@ impl ReplayFailure {
 
     fn error_message(&self) -> Option<String> {
         self.error.lock().expect("replay failure lock").clone()
+    }
+
+    fn shutdown_requested(&self) -> bool {
+        self.shutdown.load(Ordering::Relaxed)
     }
 }
 

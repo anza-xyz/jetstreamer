@@ -666,7 +666,10 @@ used_underscore_binding = "deny"
 [lints.rust]
 # jetstreamer patch: registry builds cap lints; vendored path builds must not
 # inherit upstream CI strictness (new dep versions introduce new deprecations).
+# Deprecations are upstream's own (rent fields slated for removal in v4) and
+# not actionable in a vendored snapshot, so silence them entirely.
 warnings = "warn"
+deprecated = "allow"
 
 [lints.rust.unexpected_cfgs]
 level = "warn"

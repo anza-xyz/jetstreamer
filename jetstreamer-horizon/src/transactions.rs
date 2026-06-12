@@ -18,7 +18,7 @@ use solana_address::Address;
 use solana_hash::Hash;
 use solana_signature::Signature;
 
-use crate::account_updates::AccountUpdateView;
+use crate::account_updates::{AccountUpdateView, AccountUpdates};
 use crate::limits::{
     MAX_ACCOUNT_DATA_LEN, MAX_CUSTOM_ERROR_LEN, MAX_IX_ACCOUNTS, MAX_IX_DATA_LEN, MAX_LOG_MSG_LEN,
     MAX_RETURN_DATA_LEN, MAX_TX_ACCOUNT_UPDATES, MAX_TX_ACCOUNTS, MAX_TX_ADDR_LOOKUPS,
@@ -69,7 +69,7 @@ impl CompiledInstruction {
     ) -> lencode::Result<()> {
         self.program_id_index = u8::decode_ext(reader, ctx.as_deref_mut())?;
         self.accounts.decode_into(reader, ctx.as_deref_mut())?;
-        self.data.decode_into(reader, ctx.as_deref_mut())?;
+        self.data.decode_into(reader, ctx)?;
         Ok(())
     }
 }
@@ -103,8 +103,7 @@ impl MessageAddressTableLookup {
         self.account_key = Address::decode_ext(reader, ctx.as_deref_mut())?;
         self.writable_indexes
             .decode_into(reader, ctx.as_deref_mut())?;
-        self.readonly_indexes
-            .decode_into(reader, ctx.as_deref_mut())?;
+        self.readonly_indexes.decode_into(reader, ctx)?;
         Ok(())
     }
 }
@@ -148,7 +147,7 @@ impl LegacyMessage {
         // `ZeroVec<_, u8>` fields; every field accepts the all-zero bit
         // pattern as a valid default state.
         unsafe {
-            decode_zerovec_in_place(&mut self.instructions, reader, ctx.as_deref_mut())?;
+            decode_zerovec_in_place(&mut self.instructions, reader, ctx)?;
         }
         Ok(())
     }
@@ -197,7 +196,7 @@ impl V0Message {
         // buffer).
         unsafe {
             decode_zerovec_in_place(&mut self.instructions, reader, ctx.as_deref_mut())?;
-            decode_zerovec_in_place(&mut self.address_table_lookups, reader, ctx.as_deref_mut())?;
+            decode_zerovec_in_place(&mut self.address_table_lookups, reader, ctx)?;
         }
         Ok(())
     }
@@ -209,6 +208,11 @@ impl V0Message {
 // in-place variant swap (via `ptr::write_bytes` + a byte write to the
 // discriminant) safe — without it, Rust could niche-optimise the
 // discriminant anywhere in the struct.
+//
+// The variant size difference is intentional: both variants are large
+// inline types by design (zero-alloc), and values live behind the owning
+// `Transaction`'s heap allocation — never moved by value.
+#[allow(clippy::large_enum_variant)]
 #[repr(C, u8)]
 pub enum VersionedMessage {
     Legacy(LegacyMessage) = 0,
@@ -322,7 +326,7 @@ impl InnerInstruction {
     ) -> lencode::Result<()> {
         self.outer_index = u8::decode_ext(reader, ctx.as_deref_mut())?;
         self.instruction.decode_into(reader, ctx.as_deref_mut())?;
-        self.stack_height = Option::<u32>::decode_ext(reader, ctx.as_deref_mut())?;
+        self.stack_height = Option::<u32>::decode_ext(reader, ctx)?;
         Ok(())
     }
 }
@@ -415,85 +419,12 @@ impl TransactionStatus {
 
 // --- Nested account update (flat arena layout) ---
 
-/// Metadata entry describing a single account update nested inside a
-/// [`Transaction`].
+/// Metadata entry for an account update nested in a [`Transaction`].
 ///
-/// The account's actual `data` bytes live in the transaction's shared
-/// arena. External callers cannot construct valid offset/length fields
-/// pointing into that private arena; they must go through
-/// [`Transaction::push_account_update`] to record an update and
-/// [`Transaction::iter_account_updates`] to read back the metadata paired
-/// with its data slice.
-#[derive(Encode, Decode, Debug, Clone, Copy, PartialEq, Eq, Default)]
-#[repr(C)]
-pub struct TxAccountUpdate {
-    pub pubkey: Address,
-    pub lamports: u64,
-    pub owner: Address,
-    pub executable: bool,
-    pub rent_epoch: u64,
-    pub write_version: u64,
-    // These are offsets into `Transaction::account_updates_data` (a private
-    // field) and only make sense when paired with it. Keep them crate-private
-    // to stop external callers from trying to resolve them against their own
-    // buffer.
-    pub(crate) data_offset: u32,
-    pub(crate) data_len: u32,
-}
-
-impl TxAccountUpdate {
-    /// Decodes the wire form into `self` without relying on the derived
-    /// `Decode::decode_ext`'s by-value return path. With a dozen+ account
-    /// updates per transaction, decoding in place saves a per-element stack
-    /// roundtrip and lets the whole record land directly in its
-    /// `ZeroVec` slot via `decode_zerovec_in_place`.
-    #[inline]
-    pub fn decode_into<R: Read>(
-        &mut self,
-        reader: &mut R,
-        mut ctx: Option<&mut lencode::context::DecoderContext>,
-    ) -> lencode::Result<()> {
-        self.pubkey = Address::decode_ext(reader, ctx.as_deref_mut())?;
-        self.lamports = u64::decode_ext(reader, ctx.as_deref_mut())?;
-        self.owner = Address::decode_ext(reader, ctx.as_deref_mut())?;
-        self.executable = bool::decode_ext(reader, ctx.as_deref_mut())?;
-        self.rent_epoch = u64::decode_ext(reader, ctx.as_deref_mut())?;
-        self.write_version = u64::decode_ext(reader, ctx.as_deref_mut())?;
-        self.data_offset = u32::decode_ext(reader, ctx.as_deref_mut())?;
-        self.data_len = u32::decode_ext(reader, ctx.as_deref_mut())?;
-        Ok(())
-    }
-}
-
-/// Error returned by [`Transaction::push_account_update`] when either the
-/// per-transaction metadata slot limit or the shared data arena is exhausted.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PushAccountUpdateError {
-    /// Metadata array already holds [`MAX_TX_ACCOUNT_UPDATES`] entries.
-    MetaFull,
-    /// Appending this update's `data` would exceed [`MAX_ACCOUNT_DATA_LEN`]
-    /// across the whole transaction.
-    DataArenaFull,
-}
-
-impl core::fmt::Display for PushAccountUpdateError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::MetaFull => write!(
-                f,
-                "transaction already has MAX_TX_ACCOUNT_UPDATES={} account updates",
-                MAX_TX_ACCOUNT_UPDATES
-            ),
-            Self::DataArenaFull => write!(
-                f,
-                "account-update data arena is full (MAX_ACCOUNT_DATA_LEN={} bytes)",
-                MAX_ACCOUNT_DATA_LEN
-            ),
-        }
-    }
-}
-
-impl std::error::Error for PushAccountUpdateError {}
+/// Alias of [`AccountUpdateMeta`](crate::account_updates::AccountUpdateMeta);
+/// the arena machinery lives in [`crate::account_updates`].
+pub use crate::account_updates::AccountUpdateMeta as TxAccountUpdate;
+pub use crate::account_updates::PushAccountUpdateError;
 
 // --- TransactionTokenBalance ---
 
@@ -530,6 +461,7 @@ pub struct TransactionTokenBalance {
 /// field-by-field.
 #[derive(Encode, Decode, Debug)]
 #[repr(C)]
+#[derive(Default)]
 pub struct Transaction {
     pub status: TransactionStatus,
     pub fee: u64,
@@ -550,36 +482,12 @@ pub struct Transaction {
     pub message: VersionedMessage,
     // --- Account-update arena (flat layout, private) ---
     //
-    // These two fields implement the flat metadata-plus-shared-data-arena
-    // layout. They are kept private so callers cannot put them into an
-    // inconsistent state (e.g. a metadata entry whose offset/length points
-    // outside the arena). Use [`Self::push_account_update`], the read-only
-    // accessors, and [`Self::iter_account_updates`] to work with them.
-    account_updates: ZeroVec<MAX_TX_ACCOUNT_UPDATES, TxAccountUpdate>,
-    account_updates_data: ZeroVec<MAX_ACCOUNT_DATA_LEN, u8>,
-}
-
-impl Default for Transaction {
-    fn default() -> Self {
-        Self {
-            status: TransactionStatus::default(),
-            fee: 0,
-            pre_balances: ZeroVec::new(),
-            post_balances: ZeroVec::new(),
-            inner_instructions: None,
-            log_messages: None,
-            pre_token_balances: None,
-            post_token_balances: None,
-            rewards: None,
-            return_data: None,
-            compute_units_consumed: None,
-            cost_units: None,
-            signatures: ZeroVec::new(),
-            message: VersionedMessage::default(),
-            account_updates: ZeroVec::new(),
-            account_updates_data: ZeroVec::new(),
-        }
-    }
+    // Kept private so callers cannot put metadata and data into an
+    // inconsistent state. Use [`Self::push_account_update`], the read-only
+    // accessors, and [`Self::iter_account_updates`] to work with it.
+    // Wire-layout note: `AccountUpdates` encodes as its two ZeroVec fields
+    // in declaration order, identical to the previous inline pair.
+    account_updates: AccountUpdates<MAX_TX_ACCOUNT_UPDATES, MAX_ACCOUNT_DATA_LEN>,
 }
 
 impl Transaction {
@@ -655,26 +563,7 @@ impl Transaction {
         &mut self,
         view: &AccountUpdateView<'_>,
     ) -> Result<(), PushAccountUpdateError> {
-        if self.account_updates.len() >= MAX_TX_ACCOUNT_UPDATES {
-            return Err(PushAccountUpdateError::MetaFull);
-        }
-        let data_len = view.data.len();
-        if self.account_updates_data.len() + data_len > MAX_ACCOUNT_DATA_LEN {
-            return Err(PushAccountUpdateError::DataArenaFull);
-        }
-        let data_offset = self.account_updates_data.len() as u32;
-        self.account_updates_data.extend_from_slice(view.data);
-        self.account_updates.push(TxAccountUpdate {
-            pubkey: view.pubkey,
-            lamports: view.lamports,
-            owner: view.owner,
-            executable: view.executable,
-            rent_epoch: view.rent_epoch,
-            write_version: view.write_version,
-            data_offset,
-            data_len: data_len as u32,
-        });
-        Ok(())
+        self.account_updates.push(view)
     }
 
     /// Returns a read-only view of the account-update metadata table. Use
@@ -686,18 +575,13 @@ impl Transaction {
     /// [`Self::iter_account_updates`] to walk metadata paired with data.
     #[inline]
     pub fn account_updates(&self) -> &[TxAccountUpdate] {
-        self.account_updates.as_slice()
+        self.account_updates.updates()
     }
 
     /// Iterates over this transaction's account updates, yielding each
     /// metadata entry paired with its data slice.
     pub fn iter_account_updates(&self) -> impl Iterator<Item = (&TxAccountUpdate, &[u8])> {
-        let data = self.account_updates_data.as_slice();
-        self.account_updates.iter().map(move |meta| {
-            let start = meta.data_offset as usize;
-            let end = start + meta.data_len as usize;
-            (meta, &data[start..end])
-        })
+        self.account_updates.iter()
     }
 
     /// Empties the account-update metadata table and shared data arena
@@ -705,7 +589,6 @@ impl Transaction {
     #[inline]
     pub fn clear_account_updates(&mut self) {
         self.account_updates.clear();
-        self.account_updates_data.clear();
     }
 
     /// Decodes a wire-encoded `Transaction` directly into `self` without
@@ -769,16 +652,8 @@ impl Transaction {
         // write — no 750 KiB stack temporary.
         self.message.decode_into(reader, ctx.as_deref_mut())?;
 
-        // Account-update metadata table + shared data arena.
-        // SAFETY: `TxAccountUpdate`'s every field (`Address`, `u64`,
-        // `bool`, `u32`) accepts the all-zero bit pattern as a valid
-        // default — zero-priming an uninitialised slot before
-        // `decode_into` overwrites its fields is sound.
-        unsafe {
-            decode_zerovec_in_place(&mut self.account_updates, reader, ctx.as_deref_mut())?;
-        }
-        self.account_updates_data
-            .decode_into(reader, ctx.as_deref_mut())?;
+        // Account-update arena (metadata table + shared data), in place.
+        self.account_updates.decode_into(reader, ctx)?;
         Ok(())
     }
 }
@@ -803,7 +678,7 @@ where
         }
         1 => {
             let zv = slot.get_or_insert_with(ZeroVec::new);
-            zv.decode_into(reader, ctx.as_deref_mut())?;
+            zv.decode_into(reader, ctx)?;
         }
         _ => return Err(lencode::io::Error::InvalidData),
     }
@@ -838,7 +713,7 @@ where
             let zv = slot.get_or_insert_with(ZeroVec::new);
             // SAFETY: forwarded from the caller's contract on `T`.
             unsafe {
-                decode_zerovec_in_place(zv, reader, ctx.as_deref_mut())?;
+                decode_zerovec_in_place(zv, reader, ctx)?;
             }
         }
         _ => return Err(lencode::io::Error::InvalidData),
@@ -854,13 +729,7 @@ where
 /// ~10 KiB) implement this so their container types (`ZeroVec<_, T>`) can
 /// decode each element directly into its buffer slot, avoiding a per-element
 /// stack roundtrip that the derived `Decode` otherwise forces.
-pub(crate) trait DecodeInto {
-    fn decode_into<R: Read>(
-        &mut self,
-        reader: &mut R,
-        ctx: Option<&mut lencode::context::DecoderContext>,
-    ) -> lencode::Result<()>;
-}
+pub(crate) use crate::zero_vec::DecodeInto;
 
 impl DecodeInto for CompiledInstruction {
     #[inline]
@@ -895,17 +764,6 @@ impl DecodeInto for InnerInstruction {
     }
 }
 
-impl DecodeInto for TxAccountUpdate {
-    #[inline]
-    fn decode_into<R: Read>(
-        &mut self,
-        reader: &mut R,
-        ctx: Option<&mut lencode::context::DecoderContext>,
-    ) -> lencode::Result<()> {
-        Self::decode_into(self, reader, ctx)
-    }
-}
-
 /// Decodes a `ZeroVec<N, T>` in place where `T` has an in-place decoder
 /// and accepts the all-zero bit pattern as a valid default state (so
 /// uninitialised slots can be zero-primed before `decode_into` writes over
@@ -919,63 +777,7 @@ impl DecodeInto for TxAccountUpdate {
 /// The caller asserts that the all-zero bit pattern is a valid `T` — i.e.
 /// `T` is some composition of primitive scalars, `Option<_>`, and
 /// `ZeroVec`s (all of which treat zero as the empty/default state).
-#[inline]
-unsafe fn decode_zerovec_in_place<R, const N: usize, T>(
-    vec: &mut ZeroVec<N, T>,
-    reader: &mut R,
-    mut ctx: Option<&mut lencode::context::DecoderContext>,
-) -> lencode::Result<()>
-where
-    R: Read,
-    T: DecodeInto + Decode + 'static,
-{
-    let new_len = ZeroVec::<N, T>::decode_len(reader)?;
-    assert!(
-        new_len <= N,
-        "decoded length too large for ZeroVec: {new_len} > capacity {N}"
-    );
-
-    let old_len = vec.len();
-
-    // Drop trailing slots if the new length is smaller.
-    if new_len < old_len {
-        unsafe {
-            let tail =
-                core::slice::from_raw_parts_mut(vec.as_mut_ptr().add(new_len), old_len - new_len);
-            core::ptr::drop_in_place(tail);
-            vec.set_len(new_len);
-        }
-    }
-
-    // Reuse existing slots in-place (they are already initialised).
-    let reuse = new_len.min(old_len);
-    for i in 0..reuse {
-        // SAFETY: i < reuse ≤ old_len, so the slot is initialised.
-        let slot = unsafe { &mut *(vec.as_mut_ptr().add(i)) };
-        slot.decode_into(reader, ctx.as_deref_mut())?;
-    }
-
-    // Initialise and decode new slots one at a time so that a mid-stream
-    // error leaves `vec.len()` pointing at only the fully-initialised prefix.
-    while vec.len() < new_len {
-        let idx = vec.len();
-        // SAFETY: caller guarantees `T` accepts the all-zero bit pattern as a
-        // valid state, so we can zero the slot before handing out a `&mut T`.
-        // `idx < new_len ≤ N`, so the slot is in-bounds.
-        let slot_ptr = unsafe { vec.as_mut_ptr().add(idx) };
-        unsafe {
-            core::ptr::write_bytes(slot_ptr, 0, 1);
-        }
-        let slot: &mut T = unsafe { &mut *slot_ptr };
-        slot.decode_into(reader, ctx.as_deref_mut())?;
-        // SAFETY: slot at `idx` is now initialised; advance the length.
-        unsafe {
-            vec.set_len(idx + 1);
-        }
-    }
-
-    Ok(())
-}
+pub(crate) use crate::zero_vec::decode_zerovec_in_place;
 
 // --- ZeroAlloc proofs ---
 //
@@ -1003,8 +805,8 @@ impl ZeroAlloc for RewardType {}
 impl ZeroAlloc for TransactionStatus {}
 impl ZeroAlloc for TokenAmount {}
 impl ZeroAlloc for TransactionTokenBalance {}
-impl ZeroAlloc for TxAccountUpdate {}
-impl ZeroAlloc for PushAccountUpdateError {}
+// ZeroAlloc for TxAccountUpdate (= AccountUpdateMeta) and
+// PushAccountUpdateError lives with the arena in account_updates.rs.
 impl ZeroAlloc for Transaction {}
 
 const _: fn() = || {
@@ -1103,6 +905,10 @@ const _: fn() = || {
 };
 
 #[cfg(test)]
+// Building large inline types via `Default::default()` + field assignment
+// is deliberate here: a full struct-literal would materialise the whole
+// multi-KiB value as a stack temporary before moving it.
+#[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
 
@@ -1135,7 +941,7 @@ mod tests {
         assert!(tx.log_messages.is_none());
         assert_eq!(tx.signatures.len(), 0);
         assert!(tx.account_updates().is_empty());
-        assert!(tx.account_updates_data.is_empty());
+        assert!(tx.account_updates.data_len() == 0);
     }
 
     #[test]
@@ -1242,7 +1048,7 @@ mod tests {
 
         assert_eq!(tx.account_updates().len(), 2);
         // Private arena: the two data blobs are concatenated back-to-back.
-        assert_eq!(tx.account_updates_data.len(), 5 + 11);
+        assert_eq!(tx.account_updates.data_len(), 5 + 11);
         assert_eq!(
             tx.account_updates()[0].pubkey,
             Address::new_from_array(a_pk)
@@ -1288,11 +1094,11 @@ mod tests {
         tx.push_account_update(&view([5u8; 32], b"payload"))
             .unwrap();
         assert_eq!(tx.account_updates().len(), 1);
-        assert_eq!(tx.account_updates_data.len(), 7);
+        assert_eq!(tx.account_updates.data_len(), 7);
 
         tx.clear();
         assert!(tx.account_updates().is_empty());
-        assert!(tx.account_updates_data.is_empty());
+        assert!(tx.account_updates.data_len() == 0);
     }
 
     #[test]
@@ -1445,7 +1251,7 @@ mod tests {
 
         tx.clear_account_updates();
         assert!(tx.account_updates().is_empty());
-        assert!(tx.account_updates_data.is_empty());
+        assert!(tx.account_updates.data_len() == 0);
         assert_eq!(tx.fee, 42);
     }
 

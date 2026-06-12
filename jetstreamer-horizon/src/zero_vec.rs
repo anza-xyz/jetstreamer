@@ -608,6 +608,92 @@ impl<const N: usize, T> Drop for ZeroVec<N, T> {
     }
 }
 
+// --- In-place element decoding ---
+
+/// In-place wire decoding: reads a value's fields directly into an already
+/// allocated destination — skipping the stack temporary that
+/// `Decode::decode_ext` would otherwise create as a by-value return.
+///
+/// Types with a large inline footprint implement this so their container
+/// types (`ZeroVec<_, T>`) can decode each element directly into its buffer
+/// slot via [`decode_zerovec_in_place`], avoiding a per-element stack
+/// roundtrip of several KiB.
+pub(crate) trait DecodeInto {
+    fn decode_into<R: Read>(
+        &mut self,
+        reader: &mut R,
+        ctx: Option<&mut lencode::context::DecoderContext>,
+    ) -> lencode::Result<()>;
+}
+
+/// Decodes a `ZeroVec<N, T>` in place where `T` has an in-place decoder
+/// and accepts the all-zero bit pattern as a valid default state (so
+/// uninitialised slots can be zero-primed before `decode_into` writes over
+/// their fields).
+///
+/// # Safety
+///
+/// The caller asserts that the all-zero bit pattern is a valid `T` — i.e.
+/// `T` is some composition of primitive scalars, `Option<_>`, and
+/// `ZeroVec`s (all of which treat zero as the empty/default state).
+#[inline]
+pub(crate) unsafe fn decode_zerovec_in_place<R, const N: usize, T>(
+    vec: &mut ZeroVec<N, T>,
+    reader: &mut R,
+    mut ctx: Option<&mut lencode::context::DecoderContext>,
+) -> lencode::Result<()>
+where
+    R: Read,
+    T: DecodeInto + Decode + 'static,
+{
+    let new_len = ZeroVec::<N, T>::decode_len(reader)?;
+    assert!(
+        new_len <= N,
+        "decoded length too large for ZeroVec: {new_len} > capacity {N}"
+    );
+
+    let old_len = vec.len();
+
+    // Drop trailing slots if the new length is smaller.
+    if new_len < old_len {
+        unsafe {
+            let tail =
+                core::slice::from_raw_parts_mut(vec.as_mut_ptr().add(new_len), old_len - new_len);
+            core::ptr::drop_in_place(tail);
+            vec.set_len(new_len);
+        }
+    }
+
+    // Reuse existing slots in-place (they are already initialised).
+    let reuse = new_len.min(old_len);
+    for i in 0..reuse {
+        // SAFETY: i < reuse ≤ old_len, so the slot is initialised.
+        let slot = unsafe { &mut *(vec.as_mut_ptr().add(i)) };
+        slot.decode_into(reader, ctx.as_deref_mut())?;
+    }
+
+    // Initialise and decode new slots one at a time so that a mid-stream
+    // error leaves `vec.len()` pointing at only the fully-initialised prefix.
+    while vec.len() < new_len {
+        let idx = vec.len();
+        // SAFETY: caller guarantees `T` accepts the all-zero bit pattern as a
+        // valid state, so we can zero the slot before handing out a `&mut T`.
+        // `idx < new_len ≤ N`, so the slot is in-bounds.
+        let slot_ptr = unsafe { vec.as_mut_ptr().add(idx) };
+        unsafe {
+            core::ptr::write_bytes(slot_ptr, 0, 1);
+        }
+        let slot: &mut T = unsafe { &mut *slot_ptr };
+        slot.decode_into(reader, ctx.as_deref_mut())?;
+        // SAFETY: slot at `idx` is now initialised; advance the length.
+        unsafe {
+            vec.set_len(idx + 1);
+        }
+    }
+
+    Ok(())
+}
+
 // --- ZeroAlloc marker trait ---
 
 /// Declares that a type's entire field tree is inline — no field (at any

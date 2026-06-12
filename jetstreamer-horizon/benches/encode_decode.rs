@@ -346,8 +346,10 @@ fn copy_v0(dst: &mut V0Message, src: &solana_message::v0::Message) {
         dst.instructions.push(ours);
     }
     for lookup in &src.address_table_lookups {
-        let mut ours = MessageAddressTableLookup::default();
-        ours.account_key = Address::new_from_array(lookup.account_key.to_bytes());
+        let mut ours = MessageAddressTableLookup {
+            account_key: Address::new_from_array(lookup.account_key.to_bytes()),
+            ..Default::default()
+        };
         ours.writable_indexes
             .extend_from_slice(&lookup.writable_indexes);
         ours.readonly_indexes
@@ -494,7 +496,7 @@ const SHAPES: &[Shape] = &[
 
 fn build_transaction(shape: &Shape) -> Box<Transaction> {
     let corpus = &*REAL_TXS;
-    let idx = (shape.pick)(&*CORPUS_PICKS);
+    let idx = (shape.pick)(&CORPUS_PICKS);
     let real = &corpus[idx];
     let mut tx = Transaction::new_boxed();
     populate_from_real(&mut tx, real);
@@ -819,13 +821,10 @@ fn bench_compression_ratios(c: &mut Criterion) {
     let fresh_dedupe = encode_corpus_with_config(
         &sample,
         "lencode (dedupe)",
-        Some(|| lencode::context::EncoderContext::with_dedupe()),
+        Some(lencode::context::EncoderContext::with_dedupe),
     );
-    let primed_dedupe = encode_corpus_with_config(
-        &sample,
-        "lencode (+ primed)",
-        Some(|| new_encoder_context()),
-    );
+    let primed_dedupe =
+        encode_corpus_with_config(&sample, "lencode (+ primed)", Some(new_encoder_context));
 
     let configs = [&wincode_baseline, &no_dedupe, &fresh_dedupe, &primed_dedupe];
     let baseline = wincode_baseline.total_bytes as f64;
@@ -914,11 +913,8 @@ fn bench_cross_epoch_compression(c: &mut Criterion) {
 
         let wincode = measure_wincode_corpus(&sample);
         let plain = encode_corpus_with_config(&sample, "lencode (no dedupe)", None);
-        let primed = encode_corpus_with_config(
-            &sample,
-            "lencode (+ primed)",
-            Some(|| new_encoder_context()),
-        );
+        let primed =
+            encode_corpus_with_config(&sample, "lencode (+ primed)", Some(new_encoder_context));
 
         let baseline = wincode.total_bytes as f64;
         eprintln!("--- {label}  ({n_samples} samples) ---");
@@ -1284,7 +1280,7 @@ fn write_simulated_archive(
     n_slots: u64,
     config: jetstreamer_horizon::archive::ArchiveWriterConfig,
 ) -> (jetstreamer_horizon::archive::ArchiveStats, u64, f64) {
-    use jetstreamer_horizon::archive::{ArchiveWriter, BlockMeta, EntryRecord};
+    use jetstreamer_horizon::archive::{ArchiveWriter, EntryRecord};
 
     let vote_program = Address::new_from_array(POPULAR_PUBKEYS[0]);
     let mut ledger = EstimatorLedger::new(0xE57);
@@ -1294,6 +1290,8 @@ fn write_simulated_archive(
     let started = std::time::Instant::now();
     let sink = std::io::Cursor::new(Vec::new());
     let mut writer = ArchiveWriter::new(sink, 900, 0, n_slots, config).expect("writer");
+    // Reusable boxed BlockMeta (the type is ~40 MiB with its orphan arenas).
+    let mut meta_scratch = jetstreamer_horizon::block_metas::BlockMeta::new_boxed();
 
     let mut corpus_pos = 0usize;
     let mut last_blockhash = solana_hash::Hash::default();
@@ -1361,18 +1359,16 @@ fn write_simulated_archive(
         let mut bh = [0u8; 32];
         rng.fill(&mut bh);
         let blockhash = solana_hash::Hash::new_from_array(bh);
-        let meta = BlockMeta {
-            parent_slot: slot.saturating_sub(1),
-            parent_blockhash: last_blockhash,
-            blockhash,
-            block_time: Some(1_750_000_000 + slot as i64),
-            block_height: Some(slot),
-            executed_transaction_count: txs_this_slot as u64,
-            entry_count: entries.len() as u64,
-            rewards: vec![],
-            num_partitions: None,
-        };
-        writer.end_slot(&meta, &entries).expect("end_slot");
+        meta_scratch.clear();
+        meta_scratch.slot = slot;
+        meta_scratch.parent_slot = slot.saturating_sub(1);
+        meta_scratch.parent_blockhash = last_blockhash;
+        meta_scratch.blockhash = blockhash;
+        meta_scratch.block_time = Some(1_750_000_000 + slot as i64);
+        meta_scratch.block_height = Some(slot);
+        meta_scratch.executed_transaction_count = txs_this_slot as u64;
+        meta_scratch.entry_count = entries.len() as u64;
+        writer.end_slot(&meta_scratch, &entries).expect("end_slot");
         last_blockhash = blockhash;
     }
 

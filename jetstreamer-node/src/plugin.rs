@@ -200,7 +200,7 @@ pub fn notify_account_update(
 }
 
 pub fn notify_block(slot: Slot) {
-    if slot == u64::MAX || slot % LOG_EVERY_N_BLOCKS != 0 {
+    if slot == u64::MAX || !slot.is_multiple_of(LOG_EVERY_N_BLOCKS) {
         return;
     }
 

@@ -1,6 +1,9 @@
 pub mod account_updates;
 pub mod archive;
+pub mod block_metas;
 pub mod dedupe;
+pub mod entries;
+pub mod epochs;
 pub mod limits;
 pub mod pubkey_prime;
 pub mod transactions;

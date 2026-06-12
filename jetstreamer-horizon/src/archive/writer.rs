@@ -10,10 +10,48 @@ use lencode::prelude::*;
 use solana_hash::Hash;
 use xxhash_rust::xxh64::xxh64;
 
+use crate::account_updates::AccountUpdateView;
 use crate::dedupe::{new_encoder_context, reset_encoder};
 use crate::transactions::Transaction;
 
 use super::format::*;
+
+/// Encodes one account-update record (transaction-owned or orphan): the
+/// metadata fields through the dedupe context, then the data blob through
+/// the per-account diff encoder. Single wire shape shared by every update
+/// section in a slot frame.
+fn encode_update_record(
+    view: &AccountUpdateView<'_>,
+    buf: &mut Vec<u8>,
+    ctx: &mut EncoderContext,
+    diff: &mut DiffEncoder,
+) -> Result<(), ArchiveFormatError> {
+    view.pubkey.encode_ext(buf, Some(ctx))?;
+    view.lamports.encode_ext(buf, Some(ctx))?;
+    view.owner.encode_ext(buf, Some(ctx))?;
+    view.executable.encode_ext(buf, Some(ctx))?;
+    view.rent_epoch.encode_ext(buf, Some(ctx))?;
+    view.write_version.encode_ext(buf, Some(ctx))?;
+    diff.set_key(account_diff_key(&view.pubkey));
+    diff.encode_blob(view.data, buf)?;
+    Ok(())
+}
+
+/// Encodes a block's metadata scalars + rewards (everything except the
+/// orphan-update arenas, which travel as their own frame sections, and the
+/// slot, which the frame header carries).
+fn encode_block_meta_fields(meta: &BlockMeta, buf: &mut Vec<u8>) -> Result<(), ArchiveFormatError> {
+    meta.parent_slot.encode_ext(buf, None)?;
+    meta.parent_blockhash.encode_ext(buf, None)?;
+    meta.blockhash.encode_ext(buf, None)?;
+    meta.block_time.encode_ext(buf, None)?;
+    meta.block_height.encode_ext(buf, None)?;
+    meta.executed_transaction_count.encode_ext(buf, None)?;
+    meta.entry_count.encode_ext(buf, None)?;
+    meta.rewards.encode_ext(buf, None)?;
+    meta.num_partitions.encode_ext(buf, None)?;
+    Ok(())
+}
 
 /// Configuration for [`ArchiveWriter`].
 #[derive(Debug, Clone)]
@@ -54,8 +92,13 @@ pub struct ArchiveStats {
     pub blocks: u64,
     /// Number of transactions written.
     pub transactions: u64,
-    /// Number of account updates written.
+    /// Number of transaction-owned account updates written.
     pub account_updates: u64,
+    /// Number of runtime-direct ("orphan") account updates written —
+    /// block pre/post sections plus epoch-attributed updates.
+    pub orphan_account_updates: u64,
+    /// Number of epoch notifications written.
+    pub epochs: u64,
     /// Sum of raw account-update data bytes presented to the diff encoder.
     pub account_data_bytes_in: u64,
 }
@@ -102,9 +145,20 @@ pub struct ArchiveWriter<W: std::io::Write> {
     last_slot: Option<u64>,
 
     // --- per-slot staging ---
+    //
+    // Four section buffers staged in arrival order (epoch → pre-orphans →
+    // txs → post-orphans). They share the bucket's dedupe/diff encoder
+    // state, so arrival order *is* wire order — the decoder replays the
+    // same sequence.
     staging_slot: Option<u64>,
+    staging_has_epoch: bool,
+    staging_epoch_bytes: Vec<u8>,
+    staging_pre_count: u32,
+    staging_pre_bytes: Vec<u8>,
     staging_tx_count: u32,
     staging_tx_bytes: Vec<u8>,
+    staging_post_count: u32,
+    staging_post_bytes: Vec<u8>,
 }
 
 impl<W: std::io::Write> ArchiveWriter<W> {
@@ -125,7 +179,7 @@ impl<W: std::io::Write> ArchiveWriter<W> {
             slot_count,
             prime_table_id: *PRIME_TABLE_ID,
             flags: 0,
-            meta: EpochMeta {
+            meta: ArchiveMeta {
                 created_unix_ms: std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_millis() as u64)
@@ -165,8 +219,14 @@ impl<W: std::io::Write> ArchiveWriter<W> {
             last_blockhash: Hash::default(),
             last_slot: None,
             staging_slot: None,
+            staging_has_epoch: false,
+            staging_epoch_bytes: Vec::with_capacity(64 << 10),
+            staging_pre_count: 0,
+            staging_pre_bytes: Vec::with_capacity(1 << 20),
             staging_tx_count: 0,
             staging_tx_bytes: Vec::with_capacity(4 << 20),
+            staging_post_count: 0,
+            staging_post_bytes: Vec::with_capacity(256 << 10),
         })
     }
 
@@ -217,7 +277,9 @@ impl<W: std::io::Write> ArchiveWriter<W> {
         Ok(())
     }
 
-    /// Opens a block frame for `slot`. Follow with any number of
+    /// Opens a block frame for `slot`. Follow with (in arrival order): an
+    /// optional [`write_epoch_meta`](Self::write_epoch_meta), any number of
+    /// [`write_orphan_update`](Self::write_orphan_update) /
     /// [`write_transaction`](Self::write_transaction) calls, then
     /// [`end_slot`](Self::end_slot).
     pub fn begin_slot(&mut self, slot: u64) -> Result<(), ArchiveFormatError> {
@@ -227,8 +289,90 @@ impl<W: std::io::Write> ArchiveWriter<W> {
         );
         self.check_slot(slot)?;
         self.staging_slot = Some(slot);
+        self.staging_has_epoch = false;
+        self.staging_epoch_bytes.clear();
+        self.staging_pre_count = 0;
+        self.staging_pre_bytes.clear();
         self.staging_tx_count = 0;
         self.staging_tx_bytes.clear();
+        self.staging_post_count = 0;
+        self.staging_post_bytes.clear();
+        Ok(())
+    }
+
+    /// Records the epoch notification on this slot's frame (the epoch's
+    /// first block). Must be called before any orphan update or transaction
+    /// of the slot — epoch transition work precedes everything else in the
+    /// bank, and the wire stream preserves that order.
+    ///
+    /// The meta's scalar fields encode plainly; its `updates` arena goes
+    /// through the bucket's dedupe + diff encoders like any other account
+    /// updates.
+    pub fn write_epoch_meta(&mut self, meta: &EpochMeta) -> Result<(), ArchiveFormatError> {
+        assert!(
+            self.staging_slot.is_some(),
+            "write_epoch_meta called outside begin_slot/end_slot"
+        );
+        assert!(
+            !self.staging_has_epoch,
+            "write_epoch_meta called twice for one slot"
+        );
+        assert!(
+            self.staging_pre_count == 0 && self.staging_tx_count == 0,
+            "write_epoch_meta must precede orphan updates and transactions"
+        );
+        let buf = &mut self.staging_epoch_bytes;
+        meta.epoch.encode_ext(buf, None)?;
+        meta.start_slot.encode_ext(buf, None)?;
+        meta.slot_count.encode_ext(buf, None)?;
+        meta.first_block_slot.encode_ext(buf, None)?;
+        meta.num_reward_partitions.encode_ext(buf, None)?;
+        (meta.updates.len() as u64).encode_ext(buf, None)?;
+        for (update, data) in meta.updates.iter() {
+            let view = AccountUpdateView {
+                pubkey: update.pubkey,
+                lamports: update.lamports,
+                owner: update.owner,
+                executable: update.executable,
+                rent_epoch: update.rent_epoch,
+                write_version: update.write_version,
+                data,
+            };
+            encode_update_record(&view, buf, &mut self.enc_ctx, &mut self.diff)?;
+            self.stats.orphan_account_updates += 1;
+            self.stats.account_data_bytes_in += data.len() as u64;
+        }
+        self.staging_has_epoch = true;
+        self.stats.epochs += 1;
+        Ok(())
+    }
+
+    /// Records one runtime-direct ("orphan") account update — a write the
+    /// bank performed with no owning transaction.
+    ///
+    /// Phase is automatic: updates written before the slot's first
+    /// transaction land in the block's pre-transaction group (sysvar
+    /// rewrites, epoch-reward credits); updates written after land in the
+    /// post-transaction group (fee distribution, incinerator, historical
+    /// rent). This matches geyser notification arrival order, so callers
+    /// simply forward updates as they arrive.
+    pub fn write_orphan_update(
+        &mut self,
+        view: &AccountUpdateView<'_>,
+    ) -> Result<(), ArchiveFormatError> {
+        assert!(
+            self.staging_slot.is_some(),
+            "write_orphan_update called outside begin_slot/end_slot"
+        );
+        let (buf, count) = if self.staging_tx_count == 0 {
+            (&mut self.staging_pre_bytes, &mut self.staging_pre_count)
+        } else {
+            (&mut self.staging_post_bytes, &mut self.staging_post_count)
+        };
+        encode_update_record(view, buf, &mut self.enc_ctx, &mut self.diff)?;
+        *count += 1;
+        self.stats.orphan_account_updates += 1;
+        self.stats.account_data_bytes_in += view.data.len() as u64;
         Ok(())
     }
 
@@ -266,14 +410,16 @@ impl<W: std::io::Write> ArchiveWriter<W> {
 
         (tx.account_updates().len() as u64).encode_ext(buf, Some(ctx))?;
         for (meta, data) in tx.iter_account_updates() {
-            meta.pubkey.encode_ext(buf, Some(ctx))?;
-            meta.lamports.encode_ext(buf, Some(ctx))?;
-            meta.owner.encode_ext(buf, Some(ctx))?;
-            meta.executable.encode_ext(buf, Some(ctx))?;
-            meta.rent_epoch.encode_ext(buf, Some(ctx))?;
-            meta.write_version.encode_ext(buf, Some(ctx))?;
-            self.diff.set_key(account_diff_key(&meta.pubkey));
-            self.diff.encode_blob(data, buf)?;
+            let view = AccountUpdateView {
+                pubkey: meta.pubkey,
+                lamports: meta.lamports,
+                owner: meta.owner,
+                executable: meta.executable,
+                rent_epoch: meta.rent_epoch,
+                write_version: meta.write_version,
+                data,
+            };
+            encode_update_record(&view, buf, ctx, &mut self.diff)?;
             self.stats.account_updates += 1;
             self.stats.account_data_bytes_in += data.len() as u64;
         }
@@ -283,13 +429,24 @@ impl<W: std::io::Write> ArchiveWriter<W> {
         Ok(())
     }
 
-    /// Closes the current slot frame: appends the staged transaction
-    /// bytes, block metadata, and entry records to the bucket.
+    /// Closes the current slot frame: assembles the staged sections in
+    /// arrival order (epoch, pre-orphans, transactions, post-orphans), then
+    /// the block metadata scalars and entry records.
+    ///
+    /// The passed `meta`'s `pre_updates` / `post_updates` arenas are **not**
+    /// encoded — orphan updates enter the frame exclusively through
+    /// [`write_orphan_update`](Self::write_orphan_update) so their dedupe /
+    /// diff encoder state matches wire order. (Readers reconstruct the
+    /// arenas from the sections, so consumers still see them grouped.)
     pub fn end_slot(
         &mut self,
         meta: &BlockMeta,
         entries: &[EntryRecord],
     ) -> Result<(), ArchiveFormatError> {
+        debug_assert!(
+            meta.pre_updates.is_empty() && meta.post_updates.is_empty(),
+            "end_slot ignores meta's orphan arenas; use write_orphan_update"
+        );
         let slot = self
             .staging_slot
             .take()
@@ -298,11 +455,28 @@ impl<W: std::io::Write> ArchiveWriter<W> {
         let buf = &mut self.bucket_buf;
         slot.encode_ext(buf, None)?;
         buf.push(SlotKind::Block as u8);
+
+        // Section 1: optional epoch notification.
+        buf.push(self.staging_has_epoch as u8);
+        buf.extend_from_slice(&self.staging_epoch_bytes);
+
+        // Section 2: pre-transaction orphan updates.
+        (self.staging_pre_count as u64).encode_ext(buf, None)?;
+        buf.extend_from_slice(&self.staging_pre_bytes);
+
+        // Section 3: transactions.
         (self.staging_tx_count as u64).encode_ext(buf, None)?;
         buf.extend_from_slice(&self.staging_tx_bytes);
-        // BlockMeta and entries are stateless (no dedupe/diff context); see
-        // `BlockMeta` docs for why.
-        meta.encode_ext(buf, None)?;
+
+        // Section 4: post-transaction orphan updates.
+        (self.staging_post_count as u64).encode_ext(buf, None)?;
+        buf.extend_from_slice(&self.staging_post_bytes);
+
+        // Section 5: block metadata scalars + rewards (stateless; the
+        // frame's slot is authoritative, so meta.slot isn't re-encoded).
+        encode_block_meta_fields(meta, buf)?;
+
+        // Section 6: entry records.
         (entries.len() as u64).encode_ext(buf, None)?;
         for e in entries {
             e.encode_ext(buf, None)?;

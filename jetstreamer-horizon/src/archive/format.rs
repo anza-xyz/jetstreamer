@@ -8,7 +8,6 @@ use solana_hash::Hash;
 use xxhash_rust::xxh64::xxh64;
 
 use crate::pubkey_prime::POPULAR_PUBKEYS;
-use crate::transactions::Reward;
 
 /// Magic bytes opening every horizon archive file ("JSHZN" + version byte
 /// space + two NULs).
@@ -51,9 +50,11 @@ pub enum Compression {
     Zstd = 1,
 }
 
-/// Extensible epoch-level metadata, lencode-encoded inside [`FileHeader`].
+/// Extensible archive-creation metadata, lencode-encoded inside
+/// [`FileHeader`]. (Runtime epoch *notifications* are a different thing —
+/// see [`crate::epochs::EpochMeta`].)
 #[derive(Encode, Decode, Debug, Clone, PartialEq, Eq, Default)]
-pub struct EpochMeta {
+pub struct ArchiveMeta {
     /// Unix timestamp (milliseconds) when the archive write began.
     pub created_unix_ms: u64,
     /// Version string of the writer binary (UTF-8).
@@ -83,8 +84,8 @@ pub struct FileHeader {
     pub prime_table_id: u64,
     /// Reserved flag bits.
     pub flags: u64,
-    /// Extensible epoch metadata.
-    pub meta: EpochMeta,
+    /// Extensible archive-creation metadata.
+    pub meta: ArchiveMeta,
 }
 
 /// Per-bucket header, written immediately before the bucket payload.
@@ -166,43 +167,11 @@ impl Footer {
     }
 }
 
-/// Block-level metadata stored at the end of a non-skipped slot frame.
-///
-/// Encoded *without* a dedupe context (plain lencode): rewards appear only
-/// on epoch-boundary slots and their pubkeys (stake accounts) are mostly
-/// novel, so dedupe would buy little while complicating the
-/// encode-order/decode-order contract for the frame.
-#[derive(Encode, Decode, Debug, Clone, PartialEq, Eq, Default)]
-pub struct BlockMeta {
-    /// Parent slot number.
-    pub parent_slot: u64,
-    /// Parent block's blockhash (PoH chain anchor for this slot).
-    pub parent_blockhash: Hash,
-    /// This block's blockhash (== hash of the slot's final entry).
-    pub blockhash: Hash,
-    /// Optional Unix timestamp.
-    pub block_time: Option<i64>,
-    /// Optional ledger block height.
-    pub block_height: Option<u64>,
-    /// Number of executed transactions in the block.
-    pub executed_transaction_count: u64,
-    /// Number of PoH entries in the block.
-    pub entry_count: u64,
-    /// Rewards issued in this block (epoch-boundary slots).
-    pub rewards: Vec<Reward>,
-    /// Number of reward partitions, when partitioned rewards are active.
-    pub num_partitions: Option<u64>,
-}
-
-/// One PoH entry record: enough to recompute the entry hash chain when
-/// paired with the slot's transactions, at ~2-4 bytes instead of 32+.
-#[derive(Encode, Decode, Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct EntryRecord {
-    /// Number of PoH hashes since the previous entry.
-    pub num_hashes: u64,
-    /// Number of transactions in this entry (0 = tick).
-    pub tx_count: u32,
-}
+// Block metadata and entry records are the crate-level notification types;
+// re-exported here because they are part of the archive wire contract.
+pub use crate::block_metas::{BlockMeta, BlockNotification, SkippedSlot};
+pub use crate::entries::EntryRecord;
+pub use crate::epochs::EpochMeta;
 
 /// Slot frame discriminant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -298,7 +267,7 @@ mod tests {
             slot_count: 432_000,
             prime_table_id: *PRIME_TABLE_ID,
             flags: 0,
-            meta: EpochMeta {
+            meta: ArchiveMeta {
                 created_unix_ms: 1_750_000_000_000,
                 writer_version: b"test".to_vec(),
                 reserved: vec![],

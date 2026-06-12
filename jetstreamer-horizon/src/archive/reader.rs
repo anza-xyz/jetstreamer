@@ -11,22 +11,29 @@ use solana_address::Address;
 use solana_hash::Hash;
 use xxhash_rust::xxh64::xxh64;
 
-use crate::account_updates::AccountUpdateView;
+use crate::account_updates::{AccountUpdateView, PushAccountUpdateError};
 use crate::dedupe::{new_decoder_context, reset_decoder};
 use crate::transactions::{Transaction, TransactionStatus, decode_option_zerovec_into};
 
 use super::format::*;
 
 /// Callbacks invoked by [`ArchiveReader::read_slots`], in firehose order:
-/// every transaction of a slot first, then the slot's block metadata.
+/// epoch notification first (boundary slots), then every transaction of
+/// the slot, then the slot's block notification — with the block's
+/// runtime-direct ("orphan") account updates delivered grouped on the
+/// [`BlockNotification`]'s pre/post arenas.
 pub trait SlotVisitor {
-    /// A leader-skipped slot.
-    fn on_skipped(&mut self, _slot: u64) {}
+    /// Epoch notification (fires before the boundary slot's transactions).
+    /// `meta` points at the reader's reusable scratch — copy out what you
+    /// need.
+    fn on_epoch(&mut self, _meta: &EpochMeta) {}
     /// One decoded transaction (with nested account updates). `tx` points
     /// at the reader's reusable scratch buffer — copy out what you need.
     fn on_transaction(&mut self, _slot: u64, _tx_index: u32, _tx: &Transaction) {}
-    /// End of a block frame: metadata + PoH entry records.
-    fn on_block(&mut self, _slot: u64, _meta: &BlockMeta, _entries: &[EntryRecord]) {}
+    /// End of a slot frame: the block notification (full block with
+    /// metadata + grouped orphan updates, or a leader-skipped marker) plus
+    /// the block's PoH entry records (empty for skipped slots).
+    fn on_block(&mut self, _notification: &BlockNotification, _entries: &[EntryRecord]) {}
 }
 
 /// Streaming archive reader over any `Read + Seek` source.
@@ -56,6 +63,14 @@ pub struct ArchiveReader<R: std::io::Read + std::io::Seek> {
     dec_ctx: DecoderContext,
     diff: DiffDecoder,
     scratch: Box<Transaction>,
+    // Two permanent notification scratches — one pinned to each variant.
+    // Swapping a single scratch's variant would memset the whole ~40 MiB
+    // enum on every skipped→block boundary (measured ~400 µs per swap);
+    // with pinned variants the zeroing happens exactly twice, here at
+    // construction.
+    block_scratch: Box<BlockNotification>,
+    skipped_scratch: Box<BlockNotification>,
+    epoch_scratch: Box<EpochMeta>,
     entries_scratch: Vec<EntryRecord>,
     last_blockhash: Hash,
 }
@@ -123,6 +138,14 @@ impl<R: std::io::Read + std::io::Seek> ArchiveReader<R> {
             dec_ctx: new_decoder_context(),
             diff: DiffDecoder::with_capacity(64 * 1024),
             scratch: Transaction::new_boxed(),
+            block_scratch: {
+                // Pin to the Block variant once (one-time 40 MiB zeroing).
+                let mut b = BlockNotification::new_boxed();
+                set_notification_block(&mut b);
+                b
+            },
+            skipped_scratch: BlockNotification::new_boxed(), // already Skipped
+            epoch_scratch: EpochMeta::new_boxed(),
             entries_scratch: Vec::with_capacity(2048),
             last_blockhash: Hash::default(),
         })
@@ -280,11 +303,57 @@ impl<R: std::io::Read + std::io::Seek> ArchiveReader<R> {
 
         match kind {
             SlotKind::Skipped => {
+                set_notification_skipped(&mut self.skipped_scratch, slot);
+                self.entries_scratch.clear();
                 if emit {
-                    visitor.on_skipped(slot);
+                    visitor.on_block(&self.skipped_scratch, &self.entries_scratch);
                 }
             }
             SlotKind::Block => {
+                let meta = set_notification_block(&mut self.block_scratch);
+                meta.clear();
+                meta.slot = slot;
+
+                // Section 1: optional epoch notification.
+                let mut flag = [0u8; 1];
+                cur.read(&mut flag)?;
+                if flag[0] == 1 {
+                    self.epoch_scratch.clear();
+                    self.epoch_scratch.epoch = u64::decode_ext(&mut cur, None)?;
+                    self.epoch_scratch.start_slot = u64::decode_ext(&mut cur, None)?;
+                    self.epoch_scratch.slot_count = u64::decode_ext(&mut cur, None)?;
+                    self.epoch_scratch.first_block_slot = u64::decode_ext(&mut cur, None)?;
+                    self.epoch_scratch.num_reward_partitions =
+                        Option::<u64>::decode_ext(&mut cur, None)?;
+                    let n = u64::decode_ext(&mut cur, None)?;
+                    for _ in 0..n {
+                        let updates = &mut self.epoch_scratch.updates;
+                        decode_update_record_into(
+                            &mut cur,
+                            &mut self.dec_ctx,
+                            &mut self.diff,
+                            |view| updates.push(view),
+                        )?;
+                    }
+                    if emit {
+                        visitor.on_epoch(&self.epoch_scratch);
+                    }
+                }
+
+                // Section 2: pre-transaction orphan updates → grouped onto
+                // the notification's pre arena.
+                let pre_count = u64::decode_ext(&mut cur, None)?;
+                for _ in 0..pre_count {
+                    let pre = &mut meta.pre_updates;
+                    decode_update_record_into(
+                        &mut cur,
+                        &mut self.dec_ctx,
+                        &mut self.diff,
+                        |view| pre.push(view),
+                    )?;
+                }
+
+                // Section 3: transactions.
                 let tx_count = u64::decode_ext(&mut cur, None)? as u32;
                 for tx_index in 0..tx_count {
                     read_tx_record(
@@ -297,7 +366,35 @@ impl<R: std::io::Read + std::io::Seek> ArchiveReader<R> {
                         visitor.on_transaction(slot, tx_index, &self.scratch);
                     }
                 }
-                let meta = BlockMeta::decode_ext(&mut cur, None)?;
+
+                // Section 4: post-transaction orphan updates.
+                let meta = match &mut *self.block_scratch {
+                    BlockNotification::Block(m) => m,
+                    _ => unreachable!(),
+                };
+                let post_count = u64::decode_ext(&mut cur, None)?;
+                for _ in 0..post_count {
+                    let post = &mut meta.post_updates;
+                    decode_update_record_into(
+                        &mut cur,
+                        &mut self.dec_ctx,
+                        &mut self.diff,
+                        |view| post.push(view),
+                    )?;
+                }
+
+                // Section 5: block metadata scalars + rewards.
+                meta.parent_slot = u64::decode_ext(&mut cur, None)?;
+                meta.parent_blockhash = Hash::decode_ext(&mut cur, None)?;
+                meta.blockhash = Hash::decode_ext(&mut cur, None)?;
+                meta.block_time = Option::<i64>::decode_ext(&mut cur, None)?;
+                meta.block_height = Option::<u64>::decode_ext(&mut cur, None)?;
+                meta.executed_transaction_count = u64::decode_ext(&mut cur, None)?;
+                meta.entry_count = u64::decode_ext(&mut cur, None)?;
+                meta.rewards.decode_into(&mut cur, None)?;
+                meta.num_partitions = Option::<u64>::decode_ext(&mut cur, None)?;
+
+                // Section 6: entry records.
                 let entry_count = u64::decode_ext(&mut cur, None)? as usize;
                 self.entries_scratch.clear();
                 for _ in 0..entry_count {
@@ -314,7 +411,7 @@ impl<R: std::io::Read + std::io::Seek> ArchiveReader<R> {
                 self.last_blockhash = meta.blockhash;
 
                 if emit {
-                    visitor.on_block(slot, &meta, &self.entries_scratch);
+                    visitor.on_block(&self.block_scratch, &self.entries_scratch);
                 }
             }
         }
@@ -324,6 +421,71 @@ impl<R: std::io::Read + std::io::Seek> ArchiveReader<R> {
         self.last_decoded_slot = Some(slot);
         Ok(emit)
     }
+}
+
+/// Forces the notification scratch into the `Skipped` variant in place
+/// (no ~40 MiB stack temporary) and sets the slot.
+fn set_notification_skipped(scratch: &mut BlockNotification, slot: u64) {
+    if !matches!(scratch, BlockNotification::Skipped(_)) {
+        // SAFETY: `#[repr(C, u8)]` pins the discriminant at byte 0; zeroed
+        // storage = Skipped(slot 0), a valid value.
+        unsafe {
+            core::ptr::drop_in_place(scratch as *mut BlockNotification);
+            core::ptr::write_bytes(scratch as *mut BlockNotification, 0, 1);
+        }
+    }
+    match scratch {
+        BlockNotification::Skipped(s) => s.slot = slot,
+        _ => unreachable!(),
+    }
+}
+
+/// Forces the notification scratch into the `Block` variant in place and
+/// returns a mutable reference to its `BlockMeta`.
+fn set_notification_block(scratch: &mut BlockNotification) -> &mut BlockMeta {
+    if !matches!(scratch, BlockNotification::Block(_)) {
+        // SAFETY: as above; zero the storage then flip the discriminant to
+        // 1 (Block) — an all-zero BlockMeta payload is valid.
+        unsafe {
+            core::ptr::drop_in_place(scratch as *mut BlockNotification);
+            core::ptr::write_bytes(scratch as *mut BlockNotification, 0, 1);
+            *(scratch as *mut BlockNotification as *mut u8) = 1;
+        }
+    }
+    match scratch {
+        BlockNotification::Block(m) => m,
+        _ => unreachable!(),
+    }
+}
+
+/// Decodes one account-update record (metadata via the dedupe context,
+/// data blob via the diff decoder) and hands it to `store` as a borrowed
+/// view. Exact mirror of the writer's `encode_update_record`.
+fn decode_update_record_into(
+    reader: &mut impl Read,
+    ctx: &mut DecoderContext,
+    diff: &mut DiffDecoder,
+    store: impl FnOnce(&AccountUpdateView<'_>) -> Result<(), PushAccountUpdateError>,
+) -> Result<(), ArchiveFormatError> {
+    let pubkey = Address::decode_ext(reader, Some(ctx))?;
+    let lamports = u64::decode_ext(reader, Some(ctx))?;
+    let owner = Address::decode_ext(reader, Some(ctx))?;
+    let executable = bool::decode_ext(reader, Some(ctx))?;
+    let rent_epoch = u64::decode_ext(reader, Some(ctx))?;
+    let write_version = u64::decode_ext(reader, Some(ctx))?;
+    diff.set_key(account_diff_key(&pubkey));
+    let data = diff.decode_blob(reader)?;
+    store(&AccountUpdateView {
+        pubkey,
+        lamports,
+        owner,
+        executable,
+        rent_epoch,
+        write_version,
+        data: &data,
+    })
+    .map_err(|_| ArchiveFormatError::Encode(lencode::io::Error::InvalidData))?;
+    Ok(())
 }
 
 /// Decodes one transaction record into `scratch`. Exact mirror of
@@ -353,25 +515,7 @@ fn read_tx_record(
 
     let au_count = u64::decode_ext(reader, Some(ctx))?;
     for _ in 0..au_count {
-        let pubkey = Address::decode_ext(reader, Some(ctx))?;
-        let lamports = u64::decode_ext(reader, Some(ctx))?;
-        let owner = Address::decode_ext(reader, Some(ctx))?;
-        let executable = bool::decode_ext(reader, Some(ctx))?;
-        let rent_epoch = u64::decode_ext(reader, Some(ctx))?;
-        let write_version = u64::decode_ext(reader, Some(ctx))?;
-        diff.set_key(account_diff_key(&pubkey));
-        let data = diff.decode_blob(reader)?;
-        scratch
-            .push_account_update(&AccountUpdateView {
-                pubkey,
-                lamports,
-                owner,
-                executable,
-                rent_epoch,
-                write_version,
-                data: &data,
-            })
-            .map_err(|_| ArchiveFormatError::Encode(lencode::io::Error::InvalidData))?;
+        decode_update_record_into(reader, ctx, diff, |view| scratch.push_account_update(view))?;
     }
     Ok(())
 }

@@ -243,6 +243,7 @@ impl Drop for InFlightGuard {
 }
 
 impl BankReplay {
+    #[allow(clippy::too_many_arguments)] // replay wiring carries its full context set
     fn new(
         mut bank: Bank,
         snapshot_verifier: Option<Arc<SnapshotVerifier>>,
@@ -720,6 +721,7 @@ impl BankReplay {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn log_mismatch_details(
         &self,
         bank: &Bank,
@@ -834,6 +836,7 @@ impl BankReplay {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn dump_mismatch_artifacts(
         &self,
         bank: &Bank,
@@ -1010,6 +1013,7 @@ impl BankReplay {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn retry_mismatch_transaction(
         &self,
         bank: &Bank,
@@ -1620,6 +1624,7 @@ impl ReplayCursor {
         }
     }
 
+    #[allow(clippy::type_complexity)] // diagnostic snapshot tuple, single internal caller
     fn inflight_snapshot(
         &self,
     ) -> Option<(u64, u64, u64, u64, Option<String>, &'static str, Duration)> {
@@ -4888,6 +4893,7 @@ async fn build_slot_presence_map(
     .map_err(|err| format!("slot presence task failed: {err}"))?
 }
 
+#[allow(clippy::too_many_arguments)] // top-level replay entry point: CLI params map 1:1
 async fn run_geyser_replay(
     epoch: u64,
     ledger_dir: &Path,
@@ -5104,7 +5110,7 @@ async fn run_geyser_replay(
         "firehose: sequential=true, ripget_threads={}, buffer_window={}",
         threads,
         buffer_window_bytes
-            .map(|b| jetstreamer_firehose::system::format_byte_size(b))
+            .map(jetstreamer_firehose::system::format_byte_size)
             .unwrap_or_else(|| "default".to_string())
     );
     let post_firehose_retries = post_firehose_incomplete_retry_attempts();

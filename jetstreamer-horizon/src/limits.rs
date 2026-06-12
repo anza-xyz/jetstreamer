@@ -73,6 +73,37 @@ pub const MAX_TX_TOKEN_BALANCES: usize = MAX_TX_ACCOUNTS;
 /// typical custom error strings are tiny program-defined messages.
 pub const MAX_CUSTOM_ERROR_LEN: usize = 256;
 
+/// Max rewards in a single block's reward list. Practical: partitioned
+/// epoch-reward distribution credits at most 4 096 stake accounts per slot;
+/// headroom for the boundary slot's vote-reward burst.
+pub const MAX_BLOCK_REWARDS: usize = 8_192;
+
+/// Max runtime-direct ("orphan") account updates attached to one block's
+/// pre-transaction phase. Practical: dominated by the epoch-boundary
+/// vote-reward burst (one write per vote account) plus per-slot sysvars and
+/// a 4 096-entry stake reward partition.
+pub const MAX_SLOT_PRE_UPDATES: usize = 16_384;
+
+/// Combined data-byte cap for one block's pre-transaction orphan updates.
+/// Practical: worst case ≈ vote-reward burst (thousands of ~3.7 KiB vote
+/// states) + SlotHashes (~20 KiB) + a stake partition (~1 MiB).
+pub const MAX_SLOT_PRE_UPDATE_DATA: usize = 32 * 1024 * 1024;
+
+/// Max orphan updates in one block's post-transaction (freeze) phase.
+/// Practical: fee distribution to the leader, incinerator, and a historical
+/// rent-collection partition.
+pub const MAX_SLOT_POST_UPDATES: usize = 4_096;
+
+/// Combined data-byte cap for one block's post-transaction orphan updates.
+pub const MAX_SLOT_POST_UPDATE_DATA: usize = 8 * 1024 * 1024;
+
+/// Max account updates attributed directly to an epoch notification
+/// (feature activations, builtin migrations at the boundary bank).
+pub const MAX_EPOCH_UPDATES: usize = 4_096;
+
+/// Combined data-byte cap for epoch-attributed account updates.
+pub const MAX_EPOCH_UPDATE_DATA: usize = 8 * 1024 * 1024;
+
 #[cfg(test)]
 mod tests {
     use super::*;

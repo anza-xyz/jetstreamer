@@ -291,7 +291,203 @@ impl AccountUpdate {
         self.executable = bool::decode_ext(reader, ctx.as_deref_mut())?;
         self.rent_epoch = u64::decode_ext(reader, ctx.as_deref_mut())?;
         self.data.decode_into(reader, ctx.as_deref_mut())?;
+        self.write_version = u64::decode_ext(reader, ctx)?;
+        Ok(())
+    }
+}
+
+// --- Flat account-update arena (metadata table + shared data arena) ---
+
+/// Metadata entry describing one account update stored in an
+/// [`AccountUpdates`] arena.
+///
+/// The account's actual `data` bytes live in the arena's shared data
+/// buffer. External callers cannot construct valid offset/length fields
+/// pointing into that private buffer; they must go through
+/// [`AccountUpdates::push`] to record an update and
+/// [`AccountUpdates::iter`] to read back the metadata paired with its
+/// data slice.
+#[derive(Encode, Decode, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(C)]
+pub struct AccountUpdateMeta {
+    pub pubkey: Address,
+    pub lamports: u64,
+    pub owner: Address,
+    pub executable: bool,
+    pub rent_epoch: u64,
+    pub write_version: u64,
+    // Offsets into the owning arena's data buffer; only meaningful when
+    // paired with it — kept crate-private so external callers can't resolve
+    // them against the wrong buffer.
+    pub(crate) data_offset: u32,
+    pub(crate) data_len: u32,
+}
+
+impl AccountUpdateMeta {
+    /// Decodes the wire form into `self` without relying on the derived
+    /// `Decode::decode_ext`'s by-value return path, so whole records can
+    /// land directly in their `ZeroVec` slots via
+    /// `decode_zerovec_in_place`.
+    #[inline]
+    pub fn decode_into<R: Read>(
+        &mut self,
+        reader: &mut R,
+        mut ctx: Option<&mut lencode::context::DecoderContext>,
+    ) -> lencode::Result<()> {
+        self.pubkey = Address::decode_ext(reader, ctx.as_deref_mut())?;
+        self.lamports = u64::decode_ext(reader, ctx.as_deref_mut())?;
+        self.owner = Address::decode_ext(reader, ctx.as_deref_mut())?;
+        self.executable = bool::decode_ext(reader, ctx.as_deref_mut())?;
+        self.rent_epoch = u64::decode_ext(reader, ctx.as_deref_mut())?;
         self.write_version = u64::decode_ext(reader, ctx.as_deref_mut())?;
+        self.data_offset = u32::decode_ext(reader, ctx.as_deref_mut())?;
+        self.data_len = u32::decode_ext(reader, ctx)?;
+        Ok(())
+    }
+}
+
+impl crate::zero_vec::DecodeInto for AccountUpdateMeta {
+    #[inline]
+    fn decode_into<R: Read>(
+        &mut self,
+        reader: &mut R,
+        ctx: Option<&mut lencode::context::DecoderContext>,
+    ) -> lencode::Result<()> {
+        Self::decode_into(self, reader, ctx)
+    }
+}
+
+/// Error returned by [`AccountUpdates::push`] when either the metadata
+/// table or the shared data arena is exhausted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PushAccountUpdateError {
+    /// Metadata table already holds its maximum number of entries.
+    MetaFull,
+    /// Appending this update's `data` would exceed the arena's data
+    /// capacity.
+    DataArenaFull,
+}
+
+impl core::fmt::Display for PushAccountUpdateError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::MetaFull => write!(f, "account-update metadata table is full"),
+            Self::DataArenaFull => write!(f, "account-update data arena is full"),
+        }
+    }
+}
+
+impl std::error::Error for PushAccountUpdateError {}
+
+/// Fixed-capacity set of account updates: a metadata table plus a shared
+/// data arena, fully inline (zero heap allocations).
+///
+/// This is the flat layout used wherever account updates are grouped under
+/// an owning notification — nested inside a
+/// [`Transaction`](crate::transactions::Transaction), or attached to a
+/// block / epoch notification for runtime-direct ("orphan") writes such as
+/// sysvar rewrites, fee distribution, and epoch reward credits.
+///
+/// `MAX` bounds the number of updates; `DATA` bounds the *combined* data
+/// bytes across all of them, so memory stays proportional to real usage
+/// instead of `MAX × worst-case-account-size`.
+#[derive(Encode, Decode, Debug, PartialEq, Eq)]
+#[repr(C)]
+pub struct AccountUpdates<const MAX: usize, const DATA: usize> {
+    meta: ZeroVec<MAX, AccountUpdateMeta>,
+    data: ZeroVec<DATA, u8>,
+}
+
+impl<const MAX: usize, const DATA: usize> Default for AccountUpdates<MAX, DATA> {
+    fn default() -> Self {
+        Self {
+            meta: ZeroVec::new(),
+            data: ZeroVec::new(),
+        }
+    }
+}
+
+impl<const MAX: usize, const DATA: usize> AccountUpdates<MAX, DATA> {
+    /// Appends an account update, copying its `data` bytes into the shared
+    /// arena and recording a metadata entry referencing them.
+    pub fn push(&mut self, view: &AccountUpdateView<'_>) -> Result<(), PushAccountUpdateError> {
+        if self.meta.len() >= MAX {
+            return Err(PushAccountUpdateError::MetaFull);
+        }
+        let data_len = view.data.len();
+        if self.data.len() + data_len > DATA {
+            return Err(PushAccountUpdateError::DataArenaFull);
+        }
+        let data_offset = self.data.len() as u32;
+        self.data.extend_from_slice(view.data);
+        self.meta.push(AccountUpdateMeta {
+            pubkey: view.pubkey,
+            lamports: view.lamports,
+            owner: view.owner,
+            executable: view.executable,
+            rent_epoch: view.rent_epoch,
+            write_version: view.write_version,
+            data_offset,
+            data_len: data_len as u32,
+        });
+        Ok(())
+    }
+
+    /// Read-only view of the metadata table.
+    #[inline]
+    pub fn updates(&self) -> &[AccountUpdateMeta] {
+        self.meta.as_slice()
+    }
+
+    /// Number of updates stored.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.meta.len()
+    }
+
+    /// `true` if no updates are stored.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.meta.is_empty()
+    }
+
+    /// Bytes currently used in the shared data arena.
+    #[inline]
+    pub fn data_len(&self) -> usize {
+        self.data.len()
+    }
+
+    /// Iterates updates, yielding each metadata entry paired with its data
+    /// slice.
+    pub fn iter(&self) -> impl Iterator<Item = (&AccountUpdateMeta, &[u8])> {
+        let data = self.data.as_slice();
+        self.meta.iter().map(move |meta| {
+            let start = meta.data_offset as usize;
+            let end = start + meta.data_len as usize;
+            (meta, &data[start..end])
+        })
+    }
+
+    /// Empties the metadata table and data arena without heap activity.
+    #[inline]
+    pub fn clear(&mut self) {
+        self.meta.clear();
+        self.data.clear();
+    }
+
+    /// Decodes the wire form into `self` without stack-allocating the
+    /// (potentially huge) arena.
+    pub fn decode_into<R: Read>(
+        &mut self,
+        reader: &mut R,
+        mut ctx: Option<&mut lencode::context::DecoderContext>,
+    ) -> lencode::Result<()> {
+        // SAFETY: `AccountUpdateMeta` is a composition of `Address`, scalar
+        // integers, and `bool`; every field accepts the all-zero bit pattern.
+        unsafe {
+            crate::zero_vec::decode_zerovec_in_place(&mut self.meta, reader, ctx.as_deref_mut())?;
+        }
+        self.data.decode_into(reader, ctx)?;
         Ok(())
     }
 }
@@ -306,6 +502,9 @@ impl AccountUpdate {
 impl ZeroAlloc for Address {}
 impl ZeroAlloc for AccountUpdate {}
 impl ZeroAlloc for AccountUpdateView<'_> {}
+impl ZeroAlloc for AccountUpdateMeta {}
+impl ZeroAlloc for PushAccountUpdateError {}
+impl<const MAX: usize, const DATA: usize> ZeroAlloc for AccountUpdates<MAX, DATA> {}
 
 const _: fn() = || {
     // `AccountUpdate` fields
@@ -319,6 +518,14 @@ const _: fn() = || {
 
     // `AccountUpdateView<'_>` fields (mostly the same, with `&'a [u8]` for data)
     assert_zero_alloc::<&[u8]>(); // data
+
+    // `AccountUpdateMeta` fields: Address ×2, scalars, u32 offsets.
+    assert_zero_alloc::<u32>(); // data_offset / data_len
+
+    // `AccountUpdates<MAX, DATA>` fields (capacities arbitrary for the proof).
+    assert_zero_alloc::<ZeroVec<4, AccountUpdateMeta>>(); // meta
+    assert_zero_alloc::<ZeroVec<4, u8>>(); // data
+    assert_zero_alloc::<AccountUpdates<4, 4>>();
 };
 
 #[cfg(test)]
@@ -499,5 +706,146 @@ mod tests {
         assert!(written >= 32 + 32 + 1 + 3 + 1024);
         assert!(written <= 32 + 32 + 1 + 3 + 1024 + 8 + 8 + 8); // worst-case varints
         assert_eq!(&buf[..32], &pk);
+    }
+
+    // --- AccountUpdates arena ---
+
+    fn arena_view<'a>(tag: u8, data: &'a [u8]) -> AccountUpdateView<'a> {
+        AccountUpdateView {
+            pubkey: Address::new_from_array([tag; 32]),
+            lamports: tag as u64 * 1_000,
+            owner: Address::new_from_array([0xEE; 32]),
+            executable: tag.is_multiple_of(2),
+            rent_epoch: u64::MAX,
+            write_version: tag as u64,
+            data,
+        }
+    }
+
+    #[test]
+    fn arena_push_iter_roundtrip() {
+        let mut a: AccountUpdates<8, 1024> = AccountUpdates::default();
+        a.push(&arena_view(1, b"first")).unwrap();
+        a.push(&arena_view(2, b"second-data")).unwrap();
+        a.push(&arena_view(3, b"")).unwrap(); // empty data is legal
+
+        assert_eq!(a.len(), 3);
+        assert_eq!(a.data_len(), 5 + 11);
+        let collected: Vec<(u64, Vec<u8>)> = a
+            .iter()
+            .map(|(m, d)| (m.write_version, d.to_vec()))
+            .collect();
+        assert_eq!(
+            collected,
+            vec![
+                (1, b"first".to_vec()),
+                (2, b"second-data".to_vec()),
+                (3, vec![]),
+            ]
+        );
+
+        // Wire roundtrip via derived Encode + decode_into.
+        let mut buf = vec![0u8; 8192];
+        let mut cur = lencode::io::Cursor::new(&mut buf[..]);
+        let n = a.encode_ext(&mut cur, None).unwrap();
+        let mut b: AccountUpdates<8, 1024> = AccountUpdates::default();
+        let mut rd = lencode::io::Cursor::new(&buf[..n]);
+        b.decode_into(&mut rd, None).unwrap();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn arena_meta_overflow() {
+        let mut a: AccountUpdates<2, 1024> = AccountUpdates::default();
+        a.push(&arena_view(1, b"x")).unwrap();
+        a.push(&arena_view(2, b"y")).unwrap();
+        assert_eq!(
+            a.push(&arena_view(3, b"z")),
+            Err(PushAccountUpdateError::MetaFull)
+        );
+        // Failed push must not corrupt state.
+        assert_eq!(a.len(), 2);
+        assert_eq!(a.data_len(), 2);
+    }
+
+    #[test]
+    fn arena_data_overflow() {
+        let mut a: AccountUpdates<8, 10> = AccountUpdates::default();
+        a.push(&arena_view(1, b"12345678")).unwrap();
+        assert_eq!(
+            a.push(&arena_view(2, b"abc")),
+            Err(PushAccountUpdateError::DataArenaFull)
+        );
+        assert_eq!(a.len(), 1);
+        assert_eq!(a.data_len(), 8);
+        // Exactly filling the remainder is fine.
+        a.push(&arena_view(3, b"ab")).unwrap();
+        assert_eq!(a.data_len(), 10);
+    }
+
+    #[test]
+    fn arena_clear_and_reuse() {
+        let mut a: AccountUpdates<4, 256> = AccountUpdates::default();
+        for round in 0..10u8 {
+            a.clear();
+            assert!(a.is_empty());
+            a.push(&arena_view(round, &[round; 32])).unwrap();
+            a.push(&arena_view(round.wrapping_add(1), &[round; 16]))
+                .unwrap();
+            assert_eq!(a.len(), 2);
+            assert_eq!(a.data_len(), 48);
+            let (m, d) = a.iter().next().unwrap();
+            assert_eq!(m.write_version, round as u64);
+            assert_eq!(d, &[round; 32][..]);
+        }
+    }
+
+    #[test]
+    fn arena_decode_into_shrinks_and_grows() {
+        // decode_into must handle a scratch that previously held MORE
+        // updates (shrink) and FEWER updates (grow) than the incoming wire.
+        let mut big: AccountUpdates<8, 1024> = AccountUpdates::default();
+        for i in 0..6u8 {
+            big.push(&arena_view(i, &[i; 8])).unwrap();
+        }
+        let mut small: AccountUpdates<8, 1024> = AccountUpdates::default();
+        small.push(&arena_view(9, b"only-one")).unwrap();
+
+        let mut buf = vec![0u8; 8192];
+
+        // big wire → scratch holding small (grow path)
+        let mut cur = lencode::io::Cursor::new(&mut buf[..]);
+        let n = big.encode_ext(&mut cur, None).unwrap();
+        let mut scratch = small;
+        let mut rd = lencode::io::Cursor::new(&buf[..n]);
+        scratch.decode_into(&mut rd, None).unwrap();
+        assert_eq!(scratch, big);
+
+        // small wire → scratch holding big (shrink path)
+        let mut small2: AccountUpdates<8, 1024> = AccountUpdates::default();
+        small2.push(&arena_view(7, b"tiny")).unwrap();
+        let mut cur = lencode::io::Cursor::new(&mut buf[..]);
+        let n = small2.encode_ext(&mut cur, None).unwrap();
+        let mut rd = lencode::io::Cursor::new(&buf[..n]);
+        scratch.decode_into(&mut rd, None).unwrap();
+        assert_eq!(scratch, small2);
+    }
+
+    #[test]
+    fn arena_at_full_capacity() {
+        let mut a: AccountUpdates<3, 96> = AccountUpdates::default();
+        for i in 0..3u8 {
+            a.push(&arena_view(i, &[i; 32])).unwrap();
+        }
+        assert_eq!(a.len(), 3);
+        assert_eq!(a.data_len(), 96);
+        // Roundtrip at exact capacity.
+        let mut buf = vec![0u8; 4096];
+        let mut cur = lencode::io::Cursor::new(&mut buf[..]);
+        let n = a.encode_ext(&mut cur, None).unwrap();
+        let mut b: AccountUpdates<3, 96> = AccountUpdates::default();
+        let mut rd = lencode::io::Cursor::new(&buf[..n]);
+        b.decode_into(&mut rd, None).unwrap();
+        assert_eq!(a, b);
     }
 }

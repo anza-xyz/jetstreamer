@@ -39,3 +39,7 @@ solana-pubkey.workspace = true
 [[bench]]
 name = "encode_decode"
 harness = false
+
+[[bench]]
+name = "notification_types"
+harness = false

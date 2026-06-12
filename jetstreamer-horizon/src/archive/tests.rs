@@ -112,12 +112,56 @@ fn build_tx(rng: &mut Rng, ledger: &mut Ledger, n_updates: usize) -> Box<Transac
     tx
 }
 
+/// Comparable snapshot of a `BlockMeta` (the real type is ~40 MiB and not
+/// `Clone`; tests compare scalar fields + flattened orphan updates).
+#[derive(Debug, Clone, PartialEq, Default)]
+struct MetaSnapshot {
+    parent_slot: u64,
+    parent_blockhash: Hash,
+    blockhash: Hash,
+    block_time: Option<i64>,
+    block_height: Option<u64>,
+    executed_transaction_count: u64,
+    entry_count: u64,
+    n_rewards: usize,
+    num_partitions: Option<u64>,
+    // (write_version, data) per orphan update, in order.
+    pre: Vec<(u64, Vec<u8>)>,
+    post: Vec<(u64, Vec<u8>)>,
+}
+
+impl MetaSnapshot {
+    fn of(meta: &BlockMeta) -> Self {
+        Self {
+            parent_slot: meta.parent_slot,
+            parent_blockhash: meta.parent_blockhash,
+            blockhash: meta.blockhash,
+            block_time: meta.block_time,
+            block_height: meta.block_height,
+            executed_transaction_count: meta.executed_transaction_count,
+            entry_count: meta.entry_count,
+            n_rewards: meta.rewards.len(),
+            num_partitions: meta.num_partitions,
+            pre: meta
+                .pre_updates
+                .iter()
+                .map(|(m, d)| (m.write_version, d.to_vec()))
+                .collect(),
+            post: meta
+                .post_updates
+                .iter()
+                .map(|(m, d)| (m.write_version, d.to_vec()))
+                .collect(),
+        }
+    }
+}
+
 /// Expected snapshot of a written slot for later comparison.
 #[derive(Debug, Clone, PartialEq)]
 struct ExpectedSlot {
     slot: u64,
     skipped: bool,
-    meta: Option<BlockMeta>,
+    meta: Option<MetaSnapshot>,
     entries: Vec<EntryRecord>,
     // per tx: (fee, sig0, n_updates, concat of update data)
     txs: Vec<(u64, Signature, usize, Vec<u8>)>,
@@ -127,17 +171,13 @@ struct ExpectedSlot {
 #[derive(Default)]
 struct Collector {
     slots: Vec<ExpectedSlot>,
+    // (epoch, n_updates) per on_epoch callback.
+    epochs: Vec<(u64, usize)>,
 }
 
 impl SlotVisitor for Collector {
-    fn on_skipped(&mut self, slot: u64) {
-        self.slots.push(ExpectedSlot {
-            slot,
-            skipped: true,
-            meta: None,
-            entries: vec![],
-            txs: vec![],
-        });
+    fn on_epoch(&mut self, meta: &EpochMeta) {
+        self.epochs.push((meta.epoch, meta.updates.len()));
     }
 
     fn on_transaction(&mut self, slot: u64, tx_index: u32, tx: &Transaction) {
@@ -159,21 +199,35 @@ impl SlotVisitor for Collector {
             .push((tx.fee, tx.signatures[0], tx.account_updates().len(), data));
     }
 
-    fn on_block(&mut self, slot: u64, meta: &BlockMeta, entries: &[EntryRecord]) {
-        // Blocks with zero transactions never got a slot pushed by
-        // on_transaction — push one now.
-        if self.slots.last().map(|s| s.slot) != Some(slot) {
-            self.slots.push(ExpectedSlot {
-                slot,
-                skipped: false,
-                meta: None,
-                entries: vec![],
-                txs: vec![],
-            });
+    fn on_block(&mut self, notification: &BlockNotification, entries: &[EntryRecord]) {
+        let slot = notification.slot();
+        match notification {
+            BlockNotification::Skipped(_) => {
+                self.slots.push(ExpectedSlot {
+                    slot,
+                    skipped: true,
+                    meta: None,
+                    entries: vec![],
+                    txs: vec![],
+                });
+            }
+            BlockNotification::Block(meta) => {
+                // Blocks with zero transactions never got a slot pushed by
+                // on_transaction — push one now.
+                if self.slots.last().map(|s| s.slot) != Some(slot) {
+                    self.slots.push(ExpectedSlot {
+                        slot,
+                        skipped: false,
+                        meta: None,
+                        entries: vec![],
+                        txs: vec![],
+                    });
+                }
+                let last = self.slots.last_mut().unwrap();
+                last.meta = Some(MetaSnapshot::of(meta));
+                last.entries = entries.to_vec();
+            }
         }
-        let last = self.slots.last_mut().unwrap();
-        last.meta = Some(meta.clone());
-        last.entries = entries.to_vec();
     }
 }
 
@@ -207,6 +261,28 @@ fn write_archive(
         }
 
         writer.begin_slot(slot).unwrap();
+
+        // Pre-transaction orphan updates: simulate per-slot sysvar rewrites
+        // (same accounts touched every slot — exercises diff compression on
+        // the orphan path too).
+        let mut exp_pre = Vec::new();
+        for sysvar in 0..2usize {
+            let (pk, data) = ledger.touch(sysvar);
+            let write_version = slot * 100 + sysvar as u64;
+            writer
+                .write_orphan_update(&AccountUpdateView {
+                    pubkey: pk,
+                    lamports: 1,
+                    owner: Address::new_from_array(POPULAR_PUBKEYS[2]),
+                    executable: false,
+                    rent_epoch: u64::MAX,
+                    write_version,
+                    data: &data,
+                })
+                .unwrap();
+            exp_pre.push((write_version, data));
+        }
+
         let n_txs = 1 + (rng.next() % 4) as usize;
         let mut exp_txs = Vec::new();
         for _ in 0..n_txs {
@@ -220,20 +296,38 @@ fn write_archive(
             exp_txs.push((tx.fee, tx.signatures[0], tx.account_updates().len(), data));
         }
 
+        // Post-transaction orphan update: simulate fee distribution to the
+        // leader at freeze.
+        let mut exp_post = Vec::new();
+        {
+            let (pk, data) = ledger.touch(3);
+            let write_version = slot * 100 + 99;
+            writer
+                .write_orphan_update(&AccountUpdateView {
+                    pubkey: pk,
+                    lamports: 5_000,
+                    owner: Address::new_from_array(POPULAR_PUBKEYS[2]),
+                    executable: false,
+                    rent_epoch: u64::MAX,
+                    write_version,
+                    data: &data,
+                })
+                .unwrap();
+            exp_post.push((write_version, data));
+        }
+
         let mut bh = [0u8; 32];
         rng.fill(&mut bh);
         let blockhash = Hash::new_from_array(bh);
-        let meta = BlockMeta {
-            parent_slot: slot.saturating_sub(1),
-            parent_blockhash: last_blockhash,
-            blockhash,
-            block_time: Some(1_750_000_000 + slot as i64),
-            block_height: Some(slot.saturating_sub(1_000)),
-            executed_transaction_count: n_txs as u64,
-            entry_count: 3,
-            rewards: vec![],
-            num_partitions: None,
-        };
+        let mut meta = BlockMeta::new_boxed();
+        meta.slot = slot;
+        meta.parent_slot = slot.saturating_sub(1);
+        meta.parent_blockhash = last_blockhash;
+        meta.blockhash = blockhash;
+        meta.block_time = Some(1_750_000_000 + slot as i64);
+        meta.block_height = Some(slot.saturating_sub(1_000));
+        meta.executed_transaction_count = n_txs as u64;
+        meta.entry_count = 3;
         let entries = vec![
             EntryRecord {
                 num_hashes: 12_500,
@@ -251,10 +345,13 @@ fn write_archive(
         writer.end_slot(&meta, &entries).unwrap();
         last_blockhash = blockhash;
 
+        let mut snapshot = MetaSnapshot::of(&meta);
+        snapshot.pre = exp_pre;
+        snapshot.post = exp_post;
         expected.push(ExpectedSlot {
             slot,
             skipped: false,
-            meta: Some(meta),
+            meta: Some(snapshot),
             entries,
             txs: exp_txs,
         });
@@ -409,6 +506,66 @@ fn forward_jump_within_bucket_streams_through() {
     assert_eq!(reader.bucket_loads(), 2);
     let expected_1010 = expected.iter().find(|s| s.slot >= 1_010).unwrap();
     assert_eq!(&c.slots[0], expected_1010);
+}
+
+#[test]
+fn epoch_meta_roundtrips_on_boundary_block() {
+    let sink = std::io::Cursor::new(Vec::new());
+    let mut writer =
+        ArchiveWriter::new(sink, 900, 1_000, 100, ArchiveWriterConfig::default()).unwrap();
+
+    // Boundary block: epoch meta (with one epoch-attributed update), one
+    // pre-orphan, one tx-free block.
+    writer.begin_slot(1_000).unwrap();
+    let mut epoch = EpochMeta::new_boxed();
+    epoch.epoch = 900;
+    epoch.start_slot = 1_000;
+    epoch.slot_count = 100;
+    epoch.first_block_slot = 1_000;
+    epoch.num_reward_partitions = Some(3);
+    epoch
+        .updates
+        .push(&AccountUpdateView {
+            pubkey: Address::new_from_array([0xAB; 32]),
+            lamports: 1,
+            owner: Address::new_from_array([0xCD; 32]),
+            executable: true,
+            rent_epoch: u64::MAX,
+            write_version: 1,
+            data: b"feature-activation",
+        })
+        .unwrap();
+    writer.write_epoch_meta(&epoch).unwrap();
+    writer
+        .write_orphan_update(&AccountUpdateView {
+            pubkey: Address::new_from_array([0x11; 32]),
+            lamports: 2,
+            owner: Address::new_from_array([0x22; 32]),
+            executable: false,
+            rent_epoch: u64::MAX,
+            write_version: 2,
+            data: b"clock",
+        })
+        .unwrap();
+    let mut meta = BlockMeta::new_boxed();
+    meta.slot = 1_000;
+    meta.blockhash = Hash::new_from_array([1u8; 32]);
+    writer.end_slot(&meta, &[]).unwrap();
+    let (sink, stats) = writer.finish().unwrap();
+    assert_eq!(stats.epochs, 1);
+    assert_eq!(stats.orphan_account_updates, 2); // 1 epoch-attributed + 1 pre
+
+    let bytes = sink.into_inner();
+    let mut reader = ArchiveReader::open(std::io::Cursor::new(&bytes[..])).unwrap();
+    let mut collector = Collector::default();
+    reader.read_slots(0, u64::MAX, &mut collector).unwrap();
+    assert_eq!(collector.epochs, vec![(900, 1)]);
+    assert_eq!(collector.slots.len(), 1);
+    let slot = &collector.slots[0];
+    assert!(!slot.skipped);
+    let meta = slot.meta.as_ref().unwrap();
+    assert_eq!(meta.pre, vec![(2u64, b"clock".to_vec())]);
+    assert!(meta.post.is_empty());
 }
 
 #[test]

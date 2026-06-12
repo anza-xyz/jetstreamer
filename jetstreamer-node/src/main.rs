@@ -5846,6 +5846,10 @@ async fn run_geyser_replay(
     let mut persistent_missing_slot: Option<Slot> = None;
     let mut persistent_missing_count = 0usize;
     loop {
+        if shutdown.load(Ordering::Relaxed) {
+            info!("shutdown requested; abandoning replay");
+            break;
+        }
         backpressure_stop_requested.store(false, Ordering::SeqCst);
 
         info!(
@@ -5910,6 +5914,11 @@ async fn run_geyser_replay(
         let _ = shutdown_watcher.join();
         if let Ok(mut guard) = active_firehose_stop.lock() {
             *guard = None;
+        }
+
+        if shutdown.load(Ordering::Relaxed) {
+            info!("shutdown requested; abandoning replay");
+            break;
         }
 
         let stopped_by_backpressure = backpressure_stop_requested.load(Ordering::Relaxed);
@@ -6181,7 +6190,10 @@ async fn main() {
         let shutdown = shutdown.clone();
         if let Err(err) = ctrlc::set_handler(move || {
             if !shutdown.swap(true, Ordering::SeqCst) {
-                eprintln!("CTRL+C received, shutting down...");
+                eprintln!("CTRL+C received, shutting down... (press again to force-exit)");
+            } else {
+                eprintln!("CTRL+C received again, force-exiting");
+                exit(130);
             }
         }) {
             eprintln!("failed to set CTRL+C handler: {err}");

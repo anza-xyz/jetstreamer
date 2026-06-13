@@ -284,9 +284,9 @@ struct BankReplay {
 /// locks (via the contained [`TransactionBatch`]) from preparation until
 /// the wave flushes, which is what makes lock failures on later entries a
 /// reliable conflict signal.
-struct PendingEntryBatch<'a> {
+struct PendingEntryBatch<'a, 'b> {
     entry: ReadyEntry,
-    batch: TransactionBatch<'a, 'a, RuntimeTransaction<SanitizedTransaction>>,
+    batch: TransactionBatch<'a, 'b, RuntimeTransaction<SanitizedTransaction>>,
 }
 
 /// Executes one prepared entry batch and flattens commit results into
@@ -1252,9 +1252,54 @@ impl BankReplay {
         );
         self.maybe_prune_program_cache_by_deployment_slot(&bank);
 
-        let mut pending: Vec<PendingEntryBatch<'_>> = Vec::new();
+        // Phase 1: sanitize every transaction in the slot in parallel — the
+        // CPU-heavy message-hash + address-table-resolution step that
+        // dominated serial replay. This is safe to do up front: ALT
+        // resolution within slot S depends only on table state from
+        // slots <= S-1 (same-slot extensions aren't usable until the next
+        // slot), so the result is identical to sanitizing each entry just
+        // before it executes. Ticks (empty entries) get an empty Vec.
+        let phase_prepare_start = Instant::now();
+        let sanitized: Vec<Vec<RuntimeTransaction<SanitizedTransaction>>> = self
+            .replay_pool
+            .install(|| {
+                group
+                    .par_iter()
+                    .map(|entry| {
+                        entry
+                            .txs
+                            .iter()
+                            .map(|scheduled| bank.sanitize_entry_transaction(scheduled.tx.clone()))
+                            .collect::<Result<Vec<_>, _>>()
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .into_iter()
+            .zip(group.iter())
+            .map(|(result, entry)| {
+                result.unwrap_or_else(|err| {
+                    let message = format!(
+                        "transaction sanitize failed at slot {} entry {}: {}",
+                        entry.slot, entry.entry_index, err
+                    );
+                    self.failure.record(message.clone());
+                    panic!("{message}");
+                })
+            })
+            .collect();
+        PHASE_PREPARE_BATCH_US.fetch_add(
+            phase_prepare_start.elapsed().as_micros() as u64,
+            Ordering::Relaxed,
+        );
+
+        // Phase 2: walk entries in order, locking pre-sanitized batches into
+        // waves. The bank's lock table is the conflict detector; a lock
+        // failure flushes the pending wave so the conflicting entry sees its
+        // predecessors committed. Batches borrow `sanitized`, which outlives
+        // every wave, so a re-lock after a flush is free (no re-sanitize).
+        let mut pending: Vec<PendingEntryBatch<'_, '_>> = Vec::new();
         let mut pending_tx_count = 0usize;
-        for entry in group {
+        for (i, entry) in group.into_iter().enumerate() {
             if entry.tx_count == 0 {
                 // Tick barrier: everything that PoH-precedes the tick must
                 // be committed before it registers.
@@ -1336,40 +1381,21 @@ impl BankReplay {
                 }
             }
 
-            let phase_prepare_start = Instant::now();
-            let build_txs = |entry: &ReadyEntry| -> Vec<VersionedTransaction> {
-                entry
-                    .txs
-                    .iter()
-                    .map(|scheduled| scheduled.tx.clone())
-                    .collect()
-            };
-            let prepare = |txs: Vec<VersionedTransaction>| match bank.prepare_entry_batch(txs) {
-                Ok(batch) => batch,
-                Err(err) => {
-                    let message = format!(
-                        "transaction batch prepare failed at slot {} entry {}: {}",
-                        entry.slot, entry.entry_index, err
-                    );
-                    self.failure.record(message.clone());
-                    panic!("{message}");
-                }
-            };
-            let mut batch = prepare(build_txs(&entry));
+            let lock_start = Instant::now();
+            let sanitized_txs = sanitized[i].as_slice();
+            let mut batch = bank.prepare_sanitized_batch(sanitized_txs);
             if batch.lock_results().iter().any(|result| result.is_err()) {
                 // Conflict with a lock held by a pending batch: flush the
-                // wave (committing everything that PoH-precedes this
-                // entry), then re-prepare. If lock errors persist with no
-                // pending locks held, the entry conflicts with itself —
-                // fall through and let result verification surface it.
+                // wave (committing everything that PoH-precedes this entry),
+                // then re-lock. If lock errors persist with no pending locks
+                // held, the entry conflicts with itself — fall through and
+                // let result verification surface it.
                 drop(batch);
                 self.flush_pending(&bank, &mut pending, &mut pending_tx_count);
-                batch = prepare(build_txs(&entry));
+                batch = bank.prepare_sanitized_batch(sanitized_txs);
             }
-            PHASE_PREPARE_BATCH_US.fetch_add(
-                phase_prepare_start.elapsed().as_micros() as u64,
-                Ordering::Relaxed,
-            );
+            PHASE_PREPARE_BATCH_US
+                .fetch_add(lock_start.elapsed().as_micros() as u64, Ordering::Relaxed);
 
             pending_tx_count += entry.tx_count;
             pending.push(PendingEntryBatch { entry, batch });
@@ -1386,7 +1412,7 @@ impl BankReplay {
     fn flush_pending(
         &self,
         bank: &Arc<Bank>,
-        pending: &mut Vec<PendingEntryBatch<'_>>,
+        pending: &mut Vec<PendingEntryBatch<'_, '_>>,
         pending_tx_count: &mut usize,
     ) {
         if pending.is_empty() {
@@ -4614,43 +4640,23 @@ fn load_bank_from_snapshot_archive(
             )
         })?;
 
-    let hardlinks_dir = bank_snapshot.snapshot_dir.join(ACCOUNTS_HARDLINKS_DIR);
-    let mut hardlinks_done = hardlinks_marker.is_file();
-    if hardlinks_done && !hardlinks_dir.is_dir() {
-        warn!(
-            "hardlinks marker found but {} is missing; re-linking accounts",
-            hardlinks_dir.display()
-        );
-        let _ = fs::remove_file(&hardlinks_marker);
-        hardlinks_done = false;
-    }
-    if !hardlinks_done {
-        ensure_accounts_hardlinks_for_archive(&bank_snapshot, &account_run_dir)?;
-        write_stage_marker(&hardlinks_marker)?;
-    }
-
+    // Replay consumes the hardlink farm and live run dirs in place
+    // (clean/shrink unlink farm entries; new appendvecs land in run/), so
+    // both are rebuilt from the pristine unpacked appendvecs on every
+    // load — that is what makes restarts safe without re-extracting. The
+    // legacy stage markers for these steps are ignored and removed.
+    let _ = fs::remove_file(&hardlinks_marker);
+    let _ = fs::remove_file(&run_paths_marker);
+    let farm_start = Instant::now();
+    ensure_accounts_hardlinks_for_archive(&bank_snapshot, &account_run_dir)?;
     let account_run_paths = account_run_paths_from_snapshot(&bank_snapshot.snapshot_dir)?;
-    let mut run_paths_done = run_paths_marker.is_file();
-    if run_paths_done {
-        for path in &account_run_paths {
-            if !path.is_dir() {
-                warn!(
-                    "account paths marker found but {} is missing; recreating",
-                    path.display()
-                );
-                let _ = fs::remove_file(&run_paths_marker);
-                run_paths_done = false;
-                break;
-            }
-        }
+    for path in &account_run_paths {
+        reset_dir(path)?;
     }
-    if !run_paths_done {
-        for path in &account_run_paths {
-            fs::create_dir_all(path)
-                .map_err(|err| format!("failed to create {}: {err}", path.display()))?;
-        }
-        write_stage_marker(&run_paths_marker)?;
-    }
+    info!(
+        "rebuilt accounts hardlink farm and run dirs in {:.1}s",
+        farm_start.elapsed().as_secs_f64()
+    );
 
     let bank = snapshot_bank_utils::bank_from_snapshot_dir(
         &account_run_paths,
@@ -6182,13 +6188,22 @@ fn remove_path_if_exists(path: &Path) -> Result<(), String> {
 
 fn clear_ledger_accounts_state(ledger_dir: &Path) -> Result<(), String> {
     let mut cleared = Vec::new();
-    for name in [
-        "accounts",
-        "accounts-index",
-        ARCHIVE_ACCOUNTS_DIR,
-        BANK_SNAPSHOTS_DIR,
-    ] {
+    for name in ["accounts", "accounts-index", BANK_SNAPSHOTS_DIR] {
         let path = ledger_dir.join(name);
+        if path.exists() {
+            remove_path_if_exists(&path)?;
+            cleared.push(path);
+        }
+    }
+    // The archive loader's unpacked appendvecs (accounts-run root files)
+    // and bank-snapshot staging (.snapshot-extract-*) are pristine: replay
+    // only mutates the hardlink farm (accounts-run/snapshot), the live run
+    // dir (accounts-run/run), and dir-loader artifacts. Keeping the
+    // pristine unpack lets restarts skip the multi-minute re-extract — the
+    // loader rebuilds the hardlink farm and run dirs fresh on every load.
+    let archive_accounts = ledger_dir.join(ARCHIVE_ACCOUNTS_DIR);
+    for sub in [ACCOUNTS_SNAPSHOT_DIR, "run"] {
+        let path = archive_accounts.join(sub);
         if path.exists() {
             remove_path_if_exists(&path)?;
             cleared.push(path);
@@ -6198,21 +6213,6 @@ fn clear_ledger_accounts_state(ledger_dir: &Path) -> Result<(), String> {
     if version_file.exists() {
         remove_path_if_exists(&version_file)?;
         cleared.push(version_file);
-    }
-    if ledger_dir.is_dir() {
-        let read_dir = fs::read_dir(ledger_dir)
-            .map_err(|err| format!("failed to read {}: {err}", ledger_dir.display()))?;
-        for entry in read_dir {
-            let entry =
-                entry.map_err(|err| format!("failed to read {}: {err}", ledger_dir.display()))?;
-            let file_name = entry.file_name();
-            let name = file_name.to_string_lossy();
-            if name.starts_with(".snapshot-extract-") {
-                let path = entry.path();
-                remove_path_if_exists(&path)?;
-                cleared.push(path);
-            }
-        }
     }
     if cleared.is_empty() {
         info!(
@@ -6363,7 +6363,12 @@ async fn main() {
         }
     };
 
-    if env_truthy("JETSTREAMER_SKIP_EXTRACT") {
+    if !env_truthy("JETSTREAMER_LOAD_FROM_DIR") {
+        // The default archive loader unpacks into its own staging
+        // (`.snapshot-extract-*` + accounts-run); the ledger-root
+        // extraction below only feeds the dir loader.
+        println!("Skipping ledger-root extraction (archive loader manages its own staging)");
+    } else if env_truthy("JETSTREAMER_SKIP_EXTRACT") {
         println!("Skipping extraction because JETSTREAMER_SKIP_EXTRACT is set");
     } else if extracted_snapshot {
         println!(

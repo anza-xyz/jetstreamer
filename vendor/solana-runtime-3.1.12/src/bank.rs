@@ -3005,6 +3005,29 @@ impl Bank {
         ))
     }
 
+    /// jetstreamer patch: sanitize a single entry transaction exactly as
+    /// [`Bank::prepare_entry_batch`] does, but without taking account
+    /// locks. Lets a replayer sanitize an entry's transactions in parallel
+    /// (the CPU-heavy message-hash + ALT-resolution step) and then lock
+    /// serially via [`Bank::prepare_sanitized_batch`], preserving exact
+    /// account-lock ordering.
+    pub fn sanitize_entry_transaction(
+        &self,
+        tx: VersionedTransaction,
+    ) -> Result<RuntimeTransaction<SanitizedTransaction>> {
+        let enable_static_instruction_limit = self
+            .feature_set
+            .is_active(&agave_feature_set::static_instruction_limit::id());
+        RuntimeTransaction::try_create(
+            tx,
+            MessageHash::Compute,
+            None,
+            self,
+            self.get_reserved_account_keys(),
+            enable_static_instruction_limit,
+        )
+    }
+
     /// Attempt to take locks on the accounts in a transaction batch
     pub fn try_lock_accounts(&self, txs: &[impl TransactionWithMeta]) -> Vec<Result<()>> {
         self.try_lock_accounts_with_results(txs, txs.iter().map(|_| Ok(())))

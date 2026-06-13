@@ -135,6 +135,13 @@ static PHASE_POST_PROCESS_US: AtomicU64 = AtomicU64::new(0);
 static PHASE_ENTRY_COUNT: AtomicU64 = AtomicU64::new(0);
 static PHASE_WAVE_COUNT: AtomicU64 = AtomicU64::new(0);
 static PHASE_WAVE_BATCHES: AtomicU64 = AtomicU64::new(0);
+/// Time the ready-entry thread spends blocked waiting for the firehose to
+/// deliver entries. High vs. the accounted busy time ⇒ input-bound.
+static PHASE_RECV_WAIT_US: AtomicU64 = AtomicU64::new(0);
+/// Sum of ready-channel backlog sampled at each blocking recv, and the
+/// number of samples — their ratio is the average pending depth.
+static PHASE_RECV_BACKLOG: AtomicU64 = AtomicU64::new(0);
+static PHASE_RECV_COUNT: AtomicU64 = AtomicU64::new(0);
 
 /// One-line summary of the replay phase counters (None until any entry
 /// has been processed). Shared by the warmup and main progress logs.
@@ -164,8 +171,29 @@ fn phases_summary() -> Option<String> {
     };
     let sanitize_ms = PHASE_SANITIZE_US.load(Ordering::Relaxed) / 1000;
     let lock_ms = PHASE_LOCK_US.load(Ordering::Relaxed) / 1000;
+    // Input-vs-compute diagnostic: recv_wait is time the coordinator was
+    // blocked waiting for firehose input (idle), so `busy%` =
+    // accounted / (accounted + recv_wait) is its duty cycle. Near 100% ⇒
+    // compute-bound; well below ⇒ starved by firehose I/O. `backlog` is the
+    // average ready-channel depth at each wait (deep ⇒ compute-bound).
+    let recv_wait_ms = PHASE_RECV_WAIT_US.load(Ordering::Relaxed) / 1000;
+    let recv_count = PHASE_RECV_COUNT.load(Ordering::Relaxed).max(1);
+    let avg_backlog = PHASE_RECV_BACKLOG.load(Ordering::Relaxed) as f64 / recv_count as f64;
+    let busy_pct = if total_ms + recv_wait_ms > 0 {
+        total_ms as f64 * 100.0 / (total_ms + recv_wait_ms) as f64
+    } else {
+        0.0
+    };
+    // Recorder-mutex held/wait, summed across the parallel exec workers.
+    // `held` is serial (one holder at a time) so held ≈ exec ⇒ the recorder
+    // mutex is serializing execution; `wait` ≫ 0 ⇒ workers are blocking on it.
+    let (rec_held_us, rec_wait_us) = horizon::recorder_contention_us();
+    let rec_held_ms = rec_held_us / 1000;
+    let rec_wait_ms = rec_wait_us / 1000;
     Some(format!(
-        "  phases ({entry_count} entries, {waves} waves, avg {avg_wave:.1} batches/wave): \
+        "  phases ({entry_count} entries, {waves} waves, avg {avg_wave:.1} batches/wave, \
+         busy={busy_pct:.0}% recv_wait={recv_wait_ms}ms avg_backlog={avg_backlog:.0} \
+         recorder_held={rec_held_ms}ms recorder_wait={rec_wait_ms}ms): \
          gate={gate_ms}ms({:.0}%) bank={bank_ms}ms({:.0}%) \
          prep={prep_ms}ms({:.0}%)[sanitize={sanitize_ms}ms({:.0}%) lock={lock_ms}ms({:.0}%)] \
          exec={exec_ms}ms({:.0}%) post={post_ms}ms({:.0}%)",
@@ -5353,7 +5381,21 @@ async fn run_geyser_replay(
             // so slot groups span whole stretches of the slot — that is
             // what gives the wave scheduler real parallelism to exploit.
             const COALESCE_CAP: usize = 4096;
-            while let Ok(mut entries) = ready_receiver.recv() {
+            loop {
+                // Time the blocking wait separately: if this dominates wall
+                // time, replay is starved by firehose input (download/decode),
+                // not bound by execution. The backlog depth right after the
+                // wait is the corroborating signal — a deep queue means
+                // compute-bound, a near-empty one means input-bound.
+                let recv_start = Instant::now();
+                let mut entries = match ready_receiver.recv() {
+                    Ok(entries) => entries,
+                    Err(_) => break,
+                };
+                PHASE_RECV_WAIT_US
+                    .fetch_add(recv_start.elapsed().as_micros() as u64, Ordering::Relaxed);
+                PHASE_RECV_BACKLOG.fetch_add(ready_receiver.len() as u64, Ordering::Relaxed);
+                PHASE_RECV_COUNT.fetch_add(1, Ordering::Relaxed);
                 if ready_shutdown.load(Ordering::Relaxed) {
                     break;
                 }

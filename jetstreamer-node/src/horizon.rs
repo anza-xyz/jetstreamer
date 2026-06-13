@@ -64,6 +64,25 @@ use crate::{SlotPresenceMap, SlotPresenceState};
 
 static RECORDER: OnceLock<HorizonRecorder> = OnceLock::new();
 
+// Diagnostic counters for the per-account-update hot path. The recorder
+// mutex is taken once per account write (~30k/s) from whatever thread is
+// committing the batch — i.e. concurrently from the parallel execution
+// workers — so if `held`/`wait` approach replay wall-time, the recorder is
+// serializing execution at its own mutex rather than execution being the
+// true floor.
+static RECORDER_HELD_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static RECORDER_WAIT_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// (mutex-held µs, mutex-wait µs) accumulated across the account-update hot
+/// path since process start. Read by the progress logger.
+pub fn recorder_contention_us() -> (u64, u64) {
+    use std::sync::atomic::Ordering;
+    (
+        RECORDER_HELD_US.load(Ordering::Relaxed),
+        RECORDER_WAIT_US.load(Ordering::Relaxed),
+    )
+}
+
 /// Installs the global recorder. Call once, before replay starts.
 pub fn init(
     path: &Path,
@@ -307,7 +326,14 @@ impl HorizonRecorder {
             write_version,
             data: account.data().to_vec(),
         };
+        use std::sync::atomic::Ordering;
+        let wait_start = std::time::Instant::now();
         let mut state = self.lock();
+        let held_start = std::time::Instant::now();
+        RECORDER_WAIT_US.fetch_add(
+            held_start.duration_since(wait_start).as_micros() as u64,
+            Ordering::Relaxed,
+        );
         if state.finished {
             return;
         }
@@ -322,6 +348,7 @@ impl HorizonRecorder {
             None if assembly.txs.is_empty() => assembly.pre_orphans.push(update),
             None => assembly.post_orphans.push(update),
         }
+        RECORDER_HELD_US.fetch_add(held_start.elapsed().as_micros() as u64, Ordering::Relaxed);
     }
 
     /// Records a verified, committed entry (replay thread, entry order).

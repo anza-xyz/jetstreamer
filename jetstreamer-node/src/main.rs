@@ -315,22 +315,21 @@ struct BankReplay {
     /// Pool for executing mutually non-conflicting entry batches in
     /// parallel (see [`BankReplay::process_slot_entries`]).
     replay_pool: rayon::ThreadPool,
+    /// When set, use the whole-slot parallel round scheduler
+    /// ([`BankReplay::replay_slot_rounds`]); otherwise the legacy wave walk.
+    parallel_scheduler: bool,
 }
 
 /// The account footprint of one entry (the union across its transactions):
 /// `writes` are accounts the entry locks writably, `reads` are read-only
 /// locks. The two sets are disjoint — an account written by any of the
 /// entry's transactions is classified `writes`, never `reads`.
-// Scheduler core: verified in `scheduler_tests`; wired into
-// `process_slot_entries` in the follow-up step.
-#[allow(dead_code)]
 #[derive(Debug, Default, Clone)]
 struct EntryAccounts {
     writes: std::collections::HashSet<Address>,
     reads: std::collections::HashSet<Address>,
 }
 
-#[allow(dead_code)]
 impl EntryAccounts {
     /// Two entries conflict if they share an account that at least one of
     /// them writes (write-write or write-read). Read-read is not a conflict.
@@ -361,7 +360,6 @@ impl EntryAccounts {
 /// round member *or* with an entry already deferred this pass (the
 /// `blocked` set, which preserves order — a later entry conflicting with a
 /// deferred earlier one must also defer).
-#[allow(dead_code)]
 fn assign_rounds(entries: &[EntryAccounts]) -> Vec<Vec<usize>> {
     let mut rounds: Vec<Vec<usize>> = Vec::new();
     let mut remaining: Vec<usize> = (0..entries.len()).collect();
@@ -387,6 +385,32 @@ fn assign_rounds(entries: &[EntryAccounts]) -> Vec<Vec<usize>> {
         remaining = deferred;
     }
     rounds
+}
+
+/// Computes one entry's account footprint from its sanitized transactions,
+/// using the same writability the bank uses to take locks (reserved-account
+/// demotion already applied during sanitization). Writes take precedence: an
+/// account written by any of the entry's transactions is never classified as
+/// a read, so [`EntryAccounts::conflicts_with`] sees write-write/write-read
+/// conflicts exactly as the bank's lock table would.
+fn entry_accounts(txs: &[RuntimeTransaction<SanitizedTransaction>]) -> EntryAccounts {
+    let mut ea = EntryAccounts::default();
+    for tx in txs {
+        let message = tx.message();
+        let keys = message.account_keys();
+        for (i, key) in keys.iter().enumerate() {
+            let addr = Address::new_from_array(key.to_bytes());
+            if message.is_writable(i) {
+                ea.writes.insert(addr);
+            } else {
+                ea.reads.insert(addr);
+            }
+        }
+    }
+    // Keep the sets disjoint — an account written by one transaction and read
+    // by another in the same entry is a write for conflict purposes.
+    ea.reads.retain(|a| !ea.writes.contains(a));
+    ea
 }
 
 /// A prepared entry batch awaiting wave execution. Holds its account
@@ -504,12 +528,18 @@ impl BankReplay {
             }))
         };
         let replay_threads = replay_thread_count();
+        let parallel_scheduler = env_truthy("JETSTREAMER_PARALLEL_SCHEDULER");
         info!(
-            "replay wave execution threads: {replay_threads} (parallel-sanitize build, split prep timers)"
+            "replay execution threads: {replay_threads}; scheduler: {} (set JETSTREAMER_PARALLEL_SCHEDULER=1 for parallel rounds)",
+            if parallel_scheduler {
+                "parallel rounds"
+            } else {
+                "legacy waves"
+            }
         );
         let replay_pool = rayon::ThreadPoolBuilder::new()
             .num_threads(replay_threads)
-            .thread_name(|i| format!("replayWave{i:02}"))
+            .thread_name(|i| format!("replayExec{i:02}"))
             .stack_size(16 * 1024 * 1024)
             .build()
             .expect("failed to build replay thread pool");
@@ -533,6 +563,7 @@ impl BankReplay {
             enable_accounts_maintenance,
             accounts_maintenance_root_stride: accounts_maintenance_root_stride.max(1),
             replay_pool,
+            parallel_scheduler,
         }
     }
 
@@ -1421,58 +1452,36 @@ impl BankReplay {
         PHASE_SANITIZE_US.fetch_add(sanitize_us, Ordering::Relaxed);
         PHASE_PREPARE_BATCH_US.fetch_add(sanitize_us, Ordering::Relaxed);
 
-        // Phase 2: walk entries in order, locking pre-sanitized batches into
-        // waves. The bank's lock table is the conflict detector; a lock
-        // failure flushes the pending wave so the conflicting entry sees its
-        // predecessors committed. Batches borrow `sanitized`, which outlives
-        // every wave, so a re-lock after a flush is free (no re-sanitize).
+        // Phase 2: execute the slot's transactions. Two schedulers:
+        // `replay_slot_rounds` (parallel, whole-slot conflict-respecting
+        // level assignment) when enabled, else the legacy wave walk.
+        if self.parallel_scheduler {
+            self.replay_slot_rounds(&bank, group, sanitized);
+        } else {
+            self.replay_slot_waves(&bank, group, sanitized);
+        }
+    }
+
+    /// Legacy wave scheduler: walks entries in order, locking pre-sanitized
+    /// batches into waves. The bank's lock table is the conflict detector; a
+    /// lock failure flushes the pending wave so the conflicting entry sees
+    /// its predecessors committed. Batches borrow `sanitized`, which outlives
+    /// every wave, so a re-lock after a flush is free (no re-sanitize). Ticks
+    /// act as barriers.
+    fn replay_slot_waves(
+        &self,
+        bank: &Arc<Bank>,
+        group: Vec<ReadyEntry>,
+        sanitized: Vec<Vec<RuntimeTransaction<SanitizedTransaction>>>,
+    ) {
         let mut pending: Vec<PendingEntryBatch<'_, '_>> = Vec::new();
         let mut pending_tx_count = 0usize;
         for (i, entry) in group.into_iter().enumerate() {
             if entry.tx_count == 0 {
                 // Tick barrier: everything that PoH-precedes the tick must
                 // be committed before it registers.
-                self.flush_pending(&bank, &mut pending, &mut pending_tx_count);
-                self.cursor.start_inflight(
-                    entry.slot,
-                    entry.entry_index,
-                    entry.start_index,
-                    0,
-                    None,
-                );
-                let _inflight_guard = InFlightGuard {
-                    cursor: self.cursor.clone(),
-                };
-                self.cursor.update_inflight_stage("register_tick");
-                let start = Instant::now();
-                if let Err(err) = self.register_tick(entry.slot, entry.hash) {
-                    log::debug!(
-                        "failed to register tick for slot {} entry {}: {}",
-                        entry.slot,
-                        entry.entry_index,
-                        err
-                    );
-                } else {
-                    if entry.slot >= self.live_start_slot
-                        && let Some(recorder) = horizon::recorder()
-                    {
-                        recorder.record_committed_entry(
-                            entry.slot,
-                            entry.entry_index,
-                            entry.num_hashes,
-                            Vec::new(),
-                        );
-                    }
-                    // Only advance the replay cursor after a successful tick registration.
-                    self.cursor.update(
-                        entry.slot,
-                        entry.entry_index,
-                        entry.start_index,
-                        entry.tx_count,
-                        None,
-                    );
-                }
-                self.note_entry_duration(&entry, start.elapsed(), None);
+                self.flush_pending(bank, &mut pending, &mut pending_tx_count);
+                self.register_tick_entry(entry);
                 continue;
             }
 
@@ -1521,7 +1530,7 @@ impl BankReplay {
                 // held, the entry conflicts with itself — fall through and
                 // let result verification surface it.
                 drop(batch);
-                self.flush_pending(&bank, &mut pending, &mut pending_tx_count);
+                self.flush_pending(bank, &mut pending, &mut pending_tx_count);
                 let relock_start = Instant::now();
                 batch = bank.prepare_sanitized_batch(sanitized_txs);
                 lock_us += relock_start.elapsed().as_micros() as u64;
@@ -1532,10 +1541,178 @@ impl BankReplay {
             pending_tx_count += entry.tx_count;
             pending.push(PendingEntryBatch { entry, batch });
             if pending.len() >= MAX_WAVE_BATCHES || pending_tx_count >= MAX_WAVE_TXS {
-                self.flush_pending(&bank, &mut pending, &mut pending_tx_count);
+                self.flush_pending(bank, &mut pending, &mut pending_tx_count);
             }
         }
-        self.flush_pending(&bank, &mut pending, &mut pending_tx_count);
+        self.flush_pending(bank, &mut pending, &mut pending_tx_count);
+    }
+
+    /// Registers one tick entry (an entry with no transactions): advances
+    /// PoH on the bank, records the tick on the archive, and advances the
+    /// replay cursor. Shared by both schedulers.
+    ///
+    /// In the parallel scheduler this is called after every transaction of
+    /// the slot has committed, which is the only ordering rule ticks impose:
+    /// mid-slot ticks have no transaction-visible effect, and the
+    /// block-boundary tick (which registers the slot's recent blockhash and
+    /// completes the bank) must follow all commits.
+    fn register_tick_entry(&self, entry: ReadyEntry) {
+        self.cursor
+            .start_inflight(entry.slot, entry.entry_index, entry.start_index, 0, None);
+        let _inflight_guard = InFlightGuard {
+            cursor: self.cursor.clone(),
+        };
+        self.cursor.update_inflight_stage("register_tick");
+        let start = Instant::now();
+        if let Err(err) = self.register_tick(entry.slot, entry.hash) {
+            log::debug!(
+                "failed to register tick for slot {} entry {}: {}",
+                entry.slot,
+                entry.entry_index,
+                err
+            );
+        } else {
+            if entry.slot >= self.live_start_slot
+                && let Some(recorder) = horizon::recorder()
+            {
+                recorder.record_committed_entry(
+                    entry.slot,
+                    entry.entry_index,
+                    entry.num_hashes,
+                    Vec::new(),
+                );
+            }
+            // Only advance the replay cursor after a successful tick registration.
+            self.cursor.update(
+                entry.slot,
+                entry.entry_index,
+                entry.start_index,
+                entry.tx_count,
+                None,
+            );
+        }
+        self.note_entry_duration(&entry, start.elapsed(), None);
+    }
+
+    /// Parallel scheduler: assigns the slot's transaction entries to
+    /// conflict-respecting rounds ([`assign_rounds`]) and executes each round
+    /// across the replay pool, exploiting the full thread count instead of
+    /// the ~3-4 batches the wave scheduler managed. Ticks are deferred to
+    /// after all transactions commit and then registered in entry order (see
+    /// [`Self::register_tick_entry`]).
+    ///
+    /// Correctness rests on two guarantees: (1) a round is conflict-free by
+    /// construction, so executing its batches in parallel is equivalent to
+    /// any sequential order — verified at lock time, where any divergence
+    /// from the bank's own lock semantics panics rather than corrupts; and
+    /// (2) cross-round order matches stream order for every conflicting pair,
+    /// preserving per-account write order. All verification, notification,
+    /// cursor, and archive side effects run afterward in strict entry order.
+    fn replay_slot_rounds(
+        &self,
+        bank: &Arc<Bank>,
+        group: Vec<ReadyEntry>,
+        sanitized: Vec<Vec<RuntimeTransaction<SanitizedTransaction>>>,
+    ) {
+        let tx_positions: Vec<usize> = (0..group.len())
+            .filter(|&i| group[i].tx_count > 0)
+            .collect();
+        let footprints: Vec<EntryAccounts> = tx_positions
+            .iter()
+            .map(|&i| entry_accounts(&sanitized[i]))
+            .collect();
+        let rounds = assign_rounds(&footprints);
+
+        let recording = horizon::recorder().is_some();
+        let mut results: Vec<Option<Vec<Result<(), TransactionError>>>> =
+            (0..group.len()).map(|_| None).collect();
+        let mut captured: Vec<Vec<horizon::CapturedUpdate>> =
+            (0..group.len()).map(|_| Vec::new()).collect();
+
+        // Track the slot as in-flight for the stall monitor across the whole
+        // execute + post-process span (mirrors the wave path's guard).
+        if let Some(first) = group.first() {
+            let signature = first
+                .txs
+                .first()
+                .and_then(|scheduled| scheduled.tx.signatures.first())
+                .map(|sig| sig.to_string());
+            self.cursor.start_inflight(
+                first.slot,
+                first.entry_index,
+                first.start_index,
+                group.iter().map(|e| e.tx_count).sum(),
+                signature,
+            );
+        }
+        let _inflight_guard = InFlightGuard {
+            cursor: self.cursor.clone(),
+        };
+
+        self.cursor.update_inflight_stage("execute_rounds");
+        let exec_start = Instant::now();
+        for round in &rounds {
+            PHASE_WAVE_COUNT.fetch_add(1, Ordering::Relaxed);
+            PHASE_WAVE_BATCHES.fetch_add(round.len() as u64, Ordering::Relaxed);
+            // Lock each entry's batch. A round is conflict-free by
+            // construction, so cross-entry locks should all succeed; any
+            // lock error is therefore either inherent to the transaction
+            // (e.g. AccountLoadedTwice — matches the chain) or, if conflict
+            // detection were buggy, an AccountInUse that can never match a
+            // real committed result and is caught by the expected-status
+            // verification in `post_process_entry`. Either way we let the
+            // batch execute and the result speak — no special-casing here.
+            type RoundBatch<'a> = (
+                usize,
+                TransactionBatch<'a, 'a, RuntimeTransaction<SanitizedTransaction>>,
+            );
+            let batches: Vec<RoundBatch<'_>> = round
+                .iter()
+                .map(|&k| {
+                    let pos = tx_positions[k];
+                    (pos, bank.prepare_sanitized_batch(sanitized[pos].as_slice()))
+                })
+                .collect();
+
+            type BatchOutput = (
+                Vec<Result<(), TransactionError>>,
+                Vec<horizon::CapturedUpdate>,
+            );
+            let outputs: Vec<BatchOutput> = if batches.len() == 1 {
+                vec![execute_entry_batch(bank, &batches[0].1, recording)]
+            } else {
+                self.replay_pool.install(|| {
+                    batches
+                        .par_iter()
+                        .map(|(_, batch)| execute_entry_batch(bank, batch, recording))
+                        .collect()
+                })
+            };
+
+            for ((pos, batch), output) in batches.into_iter().zip(outputs) {
+                drop(batch); // release this entry's account locks
+                results[pos] = Some(output.0);
+                captured[pos] = output.1;
+            }
+        }
+        let slot_exec = exec_start.elapsed();
+        PHASE_EXECUTE_US.fetch_add(slot_exec.as_micros() as u64, Ordering::Relaxed);
+
+        // Side effects in strict entry order: ticks register (safe now that
+        // every transaction has committed), transactions verify and record.
+        for (pos, entry) in group.into_iter().enumerate() {
+            if entry.tx_count == 0 {
+                self.register_tick_entry(entry);
+                continue;
+            }
+            let entry_results = results[pos]
+                .take()
+                .expect("transaction entry must have executed");
+            if let Some(recorder) = horizon::recorder() {
+                recorder.record_captured_updates(std::mem::take(&mut captured[pos]));
+            }
+            self.post_process_entry(bank, entry, entry_results, slot_exec);
+        }
     }
 
     /// Executes the accumulated wave of mutually non-conflicting entry

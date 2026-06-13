@@ -126,6 +126,10 @@ static PROGRAM_CACHE_PRUNE_DEPLOYMENT_SLOT: AtomicU64 = AtomicU64::new(0);
 static PHASE_GATE_WAIT_US: AtomicU64 = AtomicU64::new(0);
 static PHASE_BANK_FOR_SLOT_US: AtomicU64 = AtomicU64::new(0);
 static PHASE_PREPARE_BATCH_US: AtomicU64 = AtomicU64::new(0);
+/// Wall-clock of the parallel per-slot sanitize phase (subset of prep).
+static PHASE_SANITIZE_US: AtomicU64 = AtomicU64::new(0);
+/// Serial per-entry account-locking time (subset of prep).
+static PHASE_LOCK_US: AtomicU64 = AtomicU64::new(0);
 static PHASE_EXECUTE_US: AtomicU64 = AtomicU64::new(0);
 static PHASE_POST_PROCESS_US: AtomicU64 = AtomicU64::new(0);
 static PHASE_ENTRY_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -158,13 +162,18 @@ fn phases_summary() -> Option<String> {
     } else {
         0.0
     };
+    let sanitize_ms = PHASE_SANITIZE_US.load(Ordering::Relaxed) / 1000;
+    let lock_ms = PHASE_LOCK_US.load(Ordering::Relaxed) / 1000;
     Some(format!(
         "  phases ({entry_count} entries, {waves} waves, avg {avg_wave:.1} batches/wave): \
-         gate={gate_ms}ms({:.0}%) bank={bank_ms}ms({:.0}%) prep={prep_ms}ms({:.0}%) \
+         gate={gate_ms}ms({:.0}%) bank={bank_ms}ms({:.0}%) \
+         prep={prep_ms}ms({:.0}%)[sanitize={sanitize_ms}ms({:.0}%) lock={lock_ms}ms({:.0}%)] \
          exec={exec_ms}ms({:.0}%) post={post_ms}ms({:.0}%)",
         pct(gate_ms),
         pct(bank_ms),
         pct(prep_ms),
+        pct(sanitize_ms),
+        pct(lock_ms),
         pct(exec_ms),
         pct(post_ms)
     ))
@@ -376,7 +385,9 @@ impl BankReplay {
             }))
         };
         let replay_threads = replay_thread_count();
-        info!("replay wave execution threads: {replay_threads}");
+        info!(
+            "replay wave execution threads: {replay_threads} (parallel-sanitize build, split prep timers)"
+        );
         let replay_pool = rayon::ThreadPoolBuilder::new()
             .num_threads(replay_threads)
             .thread_name(|i| format!("replayWave{i:02}"))
@@ -1287,10 +1298,9 @@ impl BankReplay {
                 })
             })
             .collect();
-        PHASE_PREPARE_BATCH_US.fetch_add(
-            phase_prepare_start.elapsed().as_micros() as u64,
-            Ordering::Relaxed,
-        );
+        let sanitize_us = phase_prepare_start.elapsed().as_micros() as u64;
+        PHASE_SANITIZE_US.fetch_add(sanitize_us, Ordering::Relaxed);
+        PHASE_PREPARE_BATCH_US.fetch_add(sanitize_us, Ordering::Relaxed);
 
         // Phase 2: walk entries in order, locking pre-sanitized batches into
         // waves. The bank's lock table is the conflict detector; a lock
@@ -1381,9 +1391,10 @@ impl BankReplay {
                 }
             }
 
-            let lock_start = Instant::now();
             let sanitized_txs = sanitized[i].as_slice();
+            let lock_start = Instant::now();
             let mut batch = bank.prepare_sanitized_batch(sanitized_txs);
+            let mut lock_us = lock_start.elapsed().as_micros() as u64;
             if batch.lock_results().iter().any(|result| result.is_err()) {
                 // Conflict with a lock held by a pending batch: flush the
                 // wave (committing everything that PoH-precedes this entry),
@@ -1392,10 +1403,12 @@ impl BankReplay {
                 // let result verification surface it.
                 drop(batch);
                 self.flush_pending(&bank, &mut pending, &mut pending_tx_count);
+                let relock_start = Instant::now();
                 batch = bank.prepare_sanitized_batch(sanitized_txs);
+                lock_us += relock_start.elapsed().as_micros() as u64;
             }
-            PHASE_PREPARE_BATCH_US
-                .fetch_add(lock_start.elapsed().as_micros() as u64, Ordering::Relaxed);
+            PHASE_LOCK_US.fetch_add(lock_us, Ordering::Relaxed);
+            PHASE_PREPARE_BATCH_US.fetch_add(lock_us, Ordering::Relaxed);
 
             pending_tx_count += entry.tx_count;
             pending.push(PendingEntryBatch { entry, batch });

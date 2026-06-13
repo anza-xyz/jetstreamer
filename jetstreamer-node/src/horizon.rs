@@ -83,6 +83,17 @@ pub fn recorder_contention_us() -> (u64, u64) {
     )
 }
 
+/// Lock-free mirror of the archive's running on-disk size, updated as
+/// buckets flush. Zero until recording is enabled and the first bucket
+/// flushes.
+static ARCHIVE_BYTES_WRITTEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Current horizon archive size in bytes (0 if recording is disabled).
+/// Lock-free — safe to call from the progress thread.
+pub fn archive_bytes_written() -> u64 {
+    ARCHIVE_BYTES_WRITTEN.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Installs the global recorder. Call once, before replay starts.
 pub fn init(
     path: &Path,
@@ -600,6 +611,13 @@ impl RecorderState {
         self.writer
             .end_slot(meta, &assembly.entries)
             .unwrap_or_else(|err| panic!("horizon: end_slot({slot}) failed: {err}"));
+        // Mirror the running file size into a lock-free atomic so the
+        // progress thread can read it without contending the recorder mutex.
+        // `bytes_written` steps up as buckets flush (every ~128 slots).
+        ARCHIVE_BYTES_WRITTEN.store(
+            self.writer.stats().bytes_written,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         self.last_emitted = Some(slot);
     }
 }

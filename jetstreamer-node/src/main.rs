@@ -5934,8 +5934,11 @@ async fn run_geyser_replay(
                     } else {
                         "unknown".to_string()
                     };
+                    let horizon_size = jetstreamer_firehose::system::format_byte_size(
+                        horizon::archive_bytes_written(),
+                    );
                     info!(
-                        "progress slot {display_slot}/{end_inclusive} ({percent:.2}%) txs={tx_count} accounts={account_updates} slots_per_sec={slots_per_sec} eta={eta}"
+                        "progress slot {display_slot}/{end_inclusive} ({percent:.2}%) txs={tx_count} accounts={account_updates} slots_per_sec={slots_per_sec} eta={eta} horizon={horizon_size}"
                     );
                     if let Some(phases) = phases_summary() {
                         info!("{phases}");

@@ -758,7 +758,7 @@ mod tests {
         let presence = presence_map(100, &states);
 
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("test.horizon");
+        let path = dir.path().join("test.jet");
         let recorder =
             HorizonRecorder::create(&path, 42, 100, 10, presence).expect("create recorder");
 
@@ -890,7 +890,7 @@ mod tests {
         let states = vec![SlotPresenceState::Present; 3];
         let presence = presence_map(200, &states);
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("bad.horizon");
+        let path = dir.path().join("bad.jet");
         let recorder =
             HorizonRecorder::create(&path, 1, 200, 3, presence).expect("create recorder");
         // Only slot 202 gets data; 200-201 are gaps the index says exist.

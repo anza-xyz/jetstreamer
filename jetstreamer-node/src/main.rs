@@ -3731,7 +3731,7 @@ fn usage(program: &str) -> String {
         "Usage: {program} <epoch> [dest-dir] [--verify|--no-verify] [--horizon-output=PATH]\n\
          \n\
          Replays <epoch> and writes a horizon archive to\n\
-         <dest-dir>/epoch-<epoch>.horizon (override with --horizon-output=PATH)."
+         <dest-dir>/epoch-<epoch>.jet (override with --horizon-output=PATH)."
     )
 }
 
@@ -6364,7 +6364,7 @@ async fn main() {
     };
 
     let horizon_output =
-        horizon_output.unwrap_or_else(|| dest_dir.join(format!("epoch-{epoch}.horizon")));
+        horizon_output.unwrap_or_else(|| dest_dir.join(format!("epoch-{epoch}.jet")));
 
     // Replay mutates the unpacked snapshot state in place (new appendvecs,
     // accounts index), so a crashed run leaves the staging dirs dirty.

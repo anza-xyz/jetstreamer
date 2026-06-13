@@ -42,6 +42,18 @@ pub const MAX_TX_ADDR_LOOKUPS: usize = solana_transaction::sanitized::MAX_TX_ACC
 /// accounts can be mutated by a transaction.
 pub const MAX_TX_ACCOUNT_UPDATES: usize = solana_transaction::sanitized::MAX_TX_ACCOUNT_LOCKS;
 
+/// Combined data-byte budget for *all* of a transaction's account updates
+/// (the shared arena behind [`MAX_TX_ACCOUNT_UPDATES`] meta entries). This
+/// is the *sum* of every written account's post-state data, distinct from
+/// [`MAX_ACCOUNT_DATA_LEN`], which bounds a *single* account. Provable
+/// bound: written accounts are a subset of a transaction's loaded
+/// accounts, whose total data is capped at 64 MiB by
+/// `MAX_LOADED_ACCOUNTS_DATA_SIZE_BYTES`; sized at 2× that for
+/// realloc/account-creation headroom. Account updates come from replay
+/// geyser (not the CAR), so this cannot be preflight-scanned — the bound
+/// must hold by protocol.
+pub const MAX_TX_ACCOUNT_UPDATE_DATA: usize = 128 * 1024 * 1024;
+
 /// Max return-data payload. Mirrors [`solana_cpi::MAX_RETURN_DATA`].
 pub const MAX_RETURN_DATA_LEN: usize = solana_cpi::MAX_RETURN_DATA;
 

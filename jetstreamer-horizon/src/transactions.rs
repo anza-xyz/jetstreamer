@@ -20,8 +20,8 @@ use solana_signature::Signature;
 
 use crate::account_updates::{AccountUpdateView, AccountUpdates};
 use crate::limits::{
-    MAX_ACCOUNT_DATA_LEN, MAX_CUSTOM_ERROR_LEN, MAX_IX_ACCOUNTS, MAX_IX_DATA_LEN,
-    MAX_RETURN_DATA_LEN, MAX_TX_ACCOUNT_UPDATES, MAX_TX_ACCOUNTS, MAX_TX_ADDR_LOOKUPS,
+    MAX_CUSTOM_ERROR_LEN, MAX_IX_ACCOUNTS, MAX_IX_DATA_LEN, MAX_RETURN_DATA_LEN,
+    MAX_TX_ACCOUNT_UPDATE_DATA, MAX_TX_ACCOUNT_UPDATES, MAX_TX_ACCOUNTS, MAX_TX_ADDR_LOOKUPS,
     MAX_TX_INNER_IX, MAX_TX_INSTRUCTIONS, MAX_TX_LOG_DATA, MAX_TX_LOG_MSGS, MAX_TX_REWARDS,
     MAX_TX_SIGS, MAX_TX_TOKEN_BALANCES,
 };
@@ -630,7 +630,7 @@ pub struct Transaction {
     // accessors, and [`Self::iter_account_updates`] to work with it.
     // Wire-layout note: `AccountUpdates` encodes as its two ZeroVec fields
     // in declaration order, identical to the previous inline pair.
-    account_updates: AccountUpdates<MAX_TX_ACCOUNT_UPDATES, MAX_ACCOUNT_DATA_LEN>,
+    account_updates: AccountUpdates<MAX_TX_ACCOUNT_UPDATES, MAX_TX_ACCOUNT_UPDATE_DATA>,
 }
 
 impl Transaction {
@@ -1058,7 +1058,7 @@ const _: fn() = || {
     assert_zero_alloc::<ZeroVec<MAX_TX_SIGS, Signature>>();
     assert_zero_alloc::<VersionedMessage>();
     assert_zero_alloc::<ZeroVec<MAX_TX_ACCOUNT_UPDATES, TxAccountUpdate>>();
-    assert_zero_alloc::<ZeroVec<MAX_ACCOUNT_DATA_LEN, u8>>(); // account_updates_data
+    assert_zero_alloc::<ZeroVec<MAX_TX_ACCOUNT_UPDATE_DATA, u8>>(); // account_updates_data
 
     // Finally, assert the top-level types themselves are ZeroAlloc.
     assert_zero_alloc::<MessageHeader>();

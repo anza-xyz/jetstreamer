@@ -317,6 +317,78 @@ struct BankReplay {
     replay_pool: rayon::ThreadPool,
 }
 
+/// The account footprint of one entry (the union across its transactions):
+/// `writes` are accounts the entry locks writably, `reads` are read-only
+/// locks. The two sets are disjoint — an account written by any of the
+/// entry's transactions is classified `writes`, never `reads`.
+// Scheduler core: verified in `scheduler_tests`; wired into
+// `process_slot_entries` in the follow-up step.
+#[allow(dead_code)]
+#[derive(Debug, Default, Clone)]
+struct EntryAccounts {
+    writes: std::collections::HashSet<Address>,
+    reads: std::collections::HashSet<Address>,
+}
+
+#[allow(dead_code)]
+impl EntryAccounts {
+    /// Two entries conflict if they share an account that at least one of
+    /// them writes (write-write or write-read). Read-read is not a conflict.
+    fn conflicts_with(&self, other: &EntryAccounts) -> bool {
+        self.writes
+            .iter()
+            .any(|a| other.writes.contains(a) || other.reads.contains(a))
+            || self.reads.iter().any(|a| other.writes.contains(a))
+    }
+}
+
+/// Assigns each entry to an execution round (level) so that:
+/// 1. entries within a round are mutually conflict-free (safe to execute in
+///    parallel), and
+/// 2. for any conflicting pair `i < j`, `i` lands in a strictly earlier
+///    round than `j` — preserving per-account write order, which the bank
+///    state and the horizon archive both depend on.
+///
+/// Returns rounds in execution order; entry indices within a round stay
+/// ascending. This is the agave-equivalent "execute non-conflicting
+/// transactions in parallel, conflicting ones in sequence" rule, but
+/// computed over a whole slot at once rather than greedily flushing on the
+/// first conflict (which is what limited the old wave scheduler to ~3-4
+/// batches when ~30 threads were available).
+///
+/// Greedy multi-pass: each pass scans the still-unscheduled entries in
+/// order, placing an entry in the current round unless it conflicts with a
+/// round member *or* with an entry already deferred this pass (the
+/// `blocked` set, which preserves order — a later entry conflicting with a
+/// deferred earlier one must also defer).
+#[allow(dead_code)]
+fn assign_rounds(entries: &[EntryAccounts]) -> Vec<Vec<usize>> {
+    let mut rounds: Vec<Vec<usize>> = Vec::new();
+    let mut remaining: Vec<usize> = (0..entries.len()).collect();
+    while !remaining.is_empty() {
+        let mut round: Vec<usize> = Vec::new();
+        let mut deferred: Vec<usize> = Vec::new();
+        let mut round_acc = EntryAccounts::default();
+        let mut blocked = EntryAccounts::default();
+        for &i in &remaining {
+            let e = &entries[i];
+            if e.conflicts_with(&blocked) || e.conflicts_with(&round_acc) {
+                // Must run after something not yet scheduled this round.
+                blocked.writes.extend(e.writes.iter().copied());
+                blocked.reads.extend(e.reads.iter().copied());
+                deferred.push(i);
+            } else {
+                round_acc.writes.extend(e.writes.iter().copied());
+                round_acc.reads.extend(e.reads.iter().copied());
+                round.push(i);
+            }
+        }
+        rounds.push(round);
+        remaining = deferred;
+    }
+    rounds
+}
+
 /// A prepared entry batch awaiting wave execution. Holds its account
 /// locks (via the contained [`TransactionBatch`]) from preparation until
 /// the wave flushes, which is what makes lock failures on later entries a
@@ -327,12 +399,25 @@ struct PendingEntryBatch<'a, 'b> {
 }
 
 /// Executes one prepared entry batch and flattens commit results into
-/// per-transaction statuses. Safe to call concurrently for batches whose
+/// per-transaction statuses, returning them alongside the account updates
+/// captured during commit. Safe to call concurrently for batches whose
 /// account locks do not overlap (the bank commits batches independently).
+///
+/// Capture is thread-local: the geyser notifier appends each
+/// transaction-owned account write to this thread's buffer (lock-free),
+/// which we drain here — so a whole batch's updates come back ordered with
+/// no recorder-mutex contention between the parallel execution workers.
 fn execute_entry_batch(
     bank: &Bank,
     batch: &TransactionBatch<'_, '_, RuntimeTransaction<SanitizedTransaction>>,
-) -> Vec<Result<(), TransactionError>> {
+    recording: bool,
+) -> (
+    Vec<Result<(), TransactionError>>,
+    Vec<horizon::CapturedUpdate>,
+) {
+    if recording {
+        horizon::begin_capture();
+    }
     let mut timings = ExecuteTimings::default();
     let (commit_results, _balance_collector) = bank.load_execute_and_commit_transactions(
         batch,
@@ -341,10 +426,16 @@ fn execute_entry_batch(
         &mut timings,
         None,
     );
-    commit_results
+    let results = commit_results
         .into_iter()
         .map(|commit_result| commit_result.and_then(|committed| committed.status))
-        .collect()
+        .collect();
+    let captured = if recording {
+        horizon::take_captured()
+    } else {
+        Vec::new()
+    };
+    (results, captured)
 }
 
 /// Number of threads for the wave-execution pool. Defaults to all cores
@@ -1482,13 +1573,18 @@ impl BankReplay {
         };
         self.cursor.update_inflight_stage("execute_wave");
 
+        let recording = horizon::recorder().is_some();
         let phase_exec_start = Instant::now();
-        let results: Vec<Vec<Result<(), TransactionError>>> = if wave.len() == 1 {
-            vec![execute_entry_batch(bank, &wave[0].batch)]
+        type BatchOutput = (
+            Vec<Result<(), TransactionError>>,
+            Vec<horizon::CapturedUpdate>,
+        );
+        let outputs: Vec<BatchOutput> = if wave.len() == 1 {
+            vec![execute_entry_batch(bank, &wave[0].batch, recording)]
         } else {
             self.replay_pool.install(|| {
                 wave.par_iter()
-                    .map(|pb| execute_entry_batch(bank, &pb.batch))
+                    .map(|pb| execute_entry_batch(bank, &pb.batch, recording))
                     .collect()
             })
         };
@@ -1496,9 +1592,15 @@ impl BankReplay {
         PHASE_EXECUTE_US.fetch_add(wave_elapsed.as_micros() as u64, Ordering::Relaxed);
 
         self.cursor.update_inflight_stage("post_process");
-        for (pb, results) in wave.into_iter().zip(results) {
+        for (pb, (results, captured)) in wave.into_iter().zip(outputs) {
             let PendingEntryBatch { entry, batch } = pb;
             drop(batch); // release the entry's account locks
+            // Merge this batch's lock-free-captured account updates on the
+            // coordinator (serial, off the parallel execution path) before
+            // recording the entry.
+            if let Some(recorder) = horizon::recorder() {
+                recorder.record_captured_updates(captured);
+            }
             self.post_process_entry(bank, entry, results, wave_elapsed);
         }
     }
@@ -3424,10 +3526,11 @@ impl AccountsUpdateNotifierInterface for ProgressAccountsUpdateNotifier {
         self.progress.inc_account_update();
         if slot >= self.live_start_slot {
             plugin::notify_account_update(account);
-            if let Some(recorder) = horizon::recorder() {
-                let txn_signature = txn.map(|tx| *tx.signature());
-                recorder.record_account_update(slot, pubkey, account, txn_signature, write_version);
-            }
+            // Lock-free on the hot path: transaction-owned writes land in a
+            // thread-local capture buffer (drained per batch by the
+            // executor); only runtime-direct orphan writes take the lock.
+            let txn_signature = txn.map(|tx| *tx.signature());
+            horizon::note_account_update(slot, pubkey, account, txn_signature, write_version);
         }
     }
 
@@ -6477,5 +6580,166 @@ async fn main() {
     {
         eprintln!("error: {err}");
         exit(1);
+    }
+}
+
+#[cfg(test)]
+mod scheduler_tests {
+    use super::{EntryAccounts, assign_rounds};
+    use solana_address::Address;
+    use std::collections::HashSet;
+
+    fn addr(byte: u8) -> Address {
+        Address::new_from_array([byte; 32])
+    }
+
+    fn entry(writes: &[u8], reads: &[u8]) -> EntryAccounts {
+        EntryAccounts {
+            writes: writes.iter().map(|&b| addr(b)).collect(),
+            reads: reads.iter().map(|&b| addr(b)).collect(),
+        }
+    }
+
+    /// Flattens rounds back to (entry_index -> round_index) for assertions.
+    fn round_of(rounds: &[Vec<usize>]) -> std::collections::HashMap<usize, usize> {
+        let mut map = std::collections::HashMap::new();
+        for (r, members) in rounds.iter().enumerate() {
+            for &i in members {
+                map.insert(i, r);
+            }
+        }
+        map
+    }
+
+    /// Every entry is scheduled exactly once, and round membership is ascending.
+    fn check_partition(entries: &[EntryAccounts], rounds: &[Vec<usize>]) {
+        let mut seen = HashSet::new();
+        for members in rounds {
+            assert!(
+                members.windows(2).all(|w| w[0] < w[1]),
+                "round not ascending"
+            );
+            for &i in members {
+                assert!(seen.insert(i), "entry {i} scheduled twice");
+            }
+        }
+        assert_eq!(seen.len(), entries.len(), "not all entries scheduled");
+    }
+
+    /// The two core invariants: (a) no two entries in the same round
+    /// conflict; (b) any conflicting pair i<j has round(i) < round(j).
+    fn check_invariants(entries: &[EntryAccounts], rounds: &[Vec<usize>]) {
+        check_partition(entries, rounds);
+        // (a) intra-round conflict-free.
+        for members in rounds {
+            for (a, &i) in members.iter().enumerate() {
+                for &j in &members[a + 1..] {
+                    assert!(
+                        !entries[i].conflicts_with(&entries[j]),
+                        "entries {i},{j} conflict but share a round"
+                    );
+                }
+            }
+        }
+        // (b) conflicting pairs are strictly ordered across rounds.
+        let r = round_of(rounds);
+        for i in 0..entries.len() {
+            for j in (i + 1)..entries.len() {
+                if entries[i].conflicts_with(&entries[j]) {
+                    assert!(
+                        r[&i] < r[&j],
+                        "conflicting {i}<{j} not ordered: round({i})={}, round({j})={}",
+                        r[&i],
+                        r[&j]
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn all_independent_one_round() {
+        let entries = vec![entry(&[1], &[]), entry(&[2], &[]), entry(&[3], &[])];
+        let rounds = assign_rounds(&entries);
+        assert_eq!(rounds.len(), 1, "independent entries should be one round");
+        check_invariants(&entries, &rounds);
+    }
+
+    #[test]
+    fn write_write_chain_serializes() {
+        // All write X → must be N rounds in order.
+        let entries = vec![entry(&[1], &[]), entry(&[1], &[]), entry(&[1], &[])];
+        let rounds = assign_rounds(&entries);
+        assert_eq!(rounds.len(), 3);
+        check_invariants(&entries, &rounds);
+    }
+
+    #[test]
+    fn readers_share_round_after_writer() {
+        // A writes X; B,C read X. Expect round0=[A], round1=[B,C].
+        let entries = vec![entry(&[1], &[]), entry(&[], &[1]), entry(&[], &[1])];
+        let rounds = assign_rounds(&entries);
+        check_invariants(&entries, &rounds);
+        assert_eq!(rounds, vec![vec![0], vec![1, 2]]);
+    }
+
+    #[test]
+    fn read_read_no_conflict() {
+        let entries = vec![entry(&[], &[1]), entry(&[], &[1]), entry(&[], &[1])];
+        let rounds = assign_rounds(&entries);
+        assert_eq!(rounds.len(), 1, "shared reads must not serialize");
+        check_invariants(&entries, &rounds);
+    }
+
+    #[test]
+    fn independent_entry_jumps_ahead_of_conflicting_one() {
+        // A writes X, B writes X (conflicts A), C writes Y (independent).
+        // C should join A in round 0; B alone in round 1.
+        let entries = vec![entry(&[1], &[]), entry(&[1], &[]), entry(&[2], &[])];
+        let rounds = assign_rounds(&entries);
+        check_invariants(&entries, &rounds);
+        assert_eq!(rounds, vec![vec![0, 2], vec![1]]);
+    }
+
+    #[test]
+    fn order_preserved_through_transitive_block() {
+        // A writes X; B reads X (defer past A); C writes X (defer past B).
+        // Hot-account chain → 3 ordered rounds.
+        let entries = vec![entry(&[1], &[]), entry(&[], &[1]), entry(&[1], &[])];
+        let rounds = assign_rounds(&entries);
+        check_invariants(&entries, &rounds);
+    }
+
+    #[test]
+    fn shared_read_then_late_writer_defers_correctly() {
+        // A reads X, B reads X (round 0 with A), C writes X (must be after both).
+        let entries = vec![entry(&[], &[1]), entry(&[], &[1]), entry(&[1], &[])];
+        let rounds = assign_rounds(&entries);
+        check_invariants(&entries, &rounds);
+        assert_eq!(rounds[0], vec![0, 1]);
+        assert_eq!(rounds[1], vec![2]);
+    }
+
+    #[test]
+    fn mixed_realistic_pattern_holds_invariants() {
+        // A spread of independent + hot-account entries; just assert the
+        // invariants hold (exact partition is an implementation detail).
+        let entries = vec![
+            entry(&[1], &[10]),
+            entry(&[2], &[10]),
+            entry(&[1], &[]),
+            entry(&[3], &[2]),
+            entry(&[], &[10]),
+            entry(&[2], &[1]),
+            entry(&[4], &[]),
+        ];
+        let rounds = assign_rounds(&entries);
+        check_invariants(&entries, &rounds);
+    }
+
+    #[test]
+    fn empty_input() {
+        let rounds = assign_rounds(&[]);
+        assert!(rounds.is_empty());
     }
 }

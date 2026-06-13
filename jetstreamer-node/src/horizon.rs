@@ -127,6 +127,24 @@ struct OwnedAccountUpdate {
 }
 
 impl OwnedAccountUpdate {
+    /// Copies a live geyser notification into an owned update (the only
+    /// allocation/copy on the account-update path — the `data` memcpy).
+    fn capture(
+        pubkey: &solana_pubkey::Pubkey,
+        account: &AccountSharedData,
+        write_version: u64,
+    ) -> Self {
+        Self {
+            pubkey: Address::new_from_array(pubkey.to_bytes()),
+            lamports: account.lamports(),
+            owner: Address::new_from_array(account.owner().to_bytes()),
+            executable: account.executable(),
+            rent_epoch: account.rent_epoch(),
+            write_version,
+            data: account.data().to_vec(),
+        }
+    }
+
     fn as_view(&self) -> AccountUpdateView<'_> {
         AccountUpdateView {
             pubkey: self.pubkey,
@@ -137,6 +155,67 @@ impl OwnedAccountUpdate {
             write_version: self.write_version,
             data: &self.data,
         }
+    }
+}
+
+/// A captured account update awaiting merge into the recorder, tagged with
+/// its slot and owning-transaction signature (`None` for orphan writes).
+pub struct CapturedUpdate {
+    slot: Slot,
+    signature: Option<Signature>,
+    update: OwnedAccountUpdate,
+}
+
+thread_local! {
+    /// Per-thread capture buffer. When `Some`, account-update notifications
+    /// land here instead of taking the recorder mutex; the same thread that
+    /// enabled capture drains it (see [`begin_capture`] / [`take_captured`]).
+    /// Each batch executes on a single thread, so the captured updates are
+    /// perfectly ordered with no cross-thread merge.
+    static CAPTURE: std::cell::RefCell<Option<Vec<CapturedUpdate>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Enables capture on the current thread (call before executing a batch).
+pub fn begin_capture() {
+    CAPTURE.with(|c| *c.borrow_mut() = Some(Vec::new()));
+}
+
+/// Disables capture on the current thread and returns what was collected.
+pub fn take_captured() -> Vec<CapturedUpdate> {
+    CAPTURE.with(|c| c.borrow_mut().take().unwrap_or_default())
+}
+
+/// Records one geyser account update. On a capturing thread (inside batch
+/// execution) it pushes lock-free into the thread-local buffer; otherwise
+/// (runtime-direct orphan writes on the coordinator) it falls back to the
+/// recorder's locking path. No-op when recording is disabled.
+pub fn note_account_update(
+    slot: Slot,
+    pubkey: &solana_pubkey::Pubkey,
+    account: &AccountSharedData,
+    signature: Option<Signature>,
+    write_version: u64,
+) {
+    let Some(recorder) = recorder() else {
+        return;
+    };
+    let update = OwnedAccountUpdate::capture(pubkey, account, write_version);
+    let captured = CAPTURE.with(|c| {
+        if let Some(buf) = c.borrow_mut().as_mut() {
+            buf.push(CapturedUpdate {
+                slot,
+                signature,
+                update,
+            });
+            None
+        } else {
+            Some(update)
+        }
+    });
+    // Not on a capturing thread → orphan write; record directly.
+    if let Some(update) = captured {
+        recorder.record_owned_update(slot, signature, update);
     }
 }
 
@@ -320,6 +399,12 @@ impl HorizonRecorder {
     /// Records one geyser account update (replay thread, bank execution
     /// order). `txn_signature` is the owning transaction's first signature
     /// for transaction stores, `None` for runtime-direct (orphan) writes.
+    ///
+    /// Direct (locking) record entry point. In production the orphan path
+    /// reaches the recorder via [`note_account_update`] and transaction
+    /// updates via the lock-free capture path, so this is exercised mainly
+    /// by tests driving a recorder instance directly.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn record_account_update(
         &self,
         slot: Slot,
@@ -328,15 +413,18 @@ impl HorizonRecorder {
         txn_signature: Option<Signature>,
         write_version: u64,
     ) {
-        let update = OwnedAccountUpdate {
-            pubkey: Address::new_from_array(pubkey.to_bytes()),
-            lamports: account.lamports(),
-            owner: Address::new_from_array(account.owner().to_bytes()),
-            executable: account.executable(),
-            rent_epoch: account.rent_epoch(),
-            write_version,
-            data: account.data().to_vec(),
-        };
+        let update = OwnedAccountUpdate::capture(pubkey, account, write_version);
+        self.record_owned_update(slot, txn_signature, update);
+    }
+
+    /// Records a pre-built owned update through the recorder mutex. Shared
+    /// by the orphan direct path and the batched capture-merge path.
+    fn record_owned_update(
+        &self,
+        slot: Slot,
+        signature: Option<Signature>,
+        update: OwnedAccountUpdate,
+    ) {
         use std::sync::atomic::Ordering;
         let wait_start = std::time::Instant::now();
         let mut state = self.lock();
@@ -345,19 +433,32 @@ impl HorizonRecorder {
             held_start.duration_since(wait_start).as_micros() as u64,
             Ordering::Relaxed,
         );
-        if state.finished {
+        if !state.finished {
+            state.route_update(slot, signature, update);
+        }
+        RECORDER_HELD_US.fetch_add(held_start.elapsed().as_micros() as u64, Ordering::Relaxed);
+    }
+
+    /// Records a whole batch's worth of transaction-owned account updates,
+    /// captured lock-free during execution (see [`begin_capture`]). Taken
+    /// once per batch on the coordinator thread — off the hot path — so the
+    /// recorder mutex sees per-entry frequency, not per-account-write.
+    pub fn record_captured_updates(&self, captured: Vec<CapturedUpdate>) {
+        if captured.is_empty() {
             return;
         }
-        state.emit_complete_below(slot);
-        let assembly = state.assemblies.entry(slot).or_default();
-        match txn_signature {
-            Some(sig) => assembly.tx_updates.entry(sig).or_default().push(update),
-            // Phase routing matches the writer's wire semantics: orphan
-            // writes before the slot's first committed transaction are
-            // slot-start work (sysvars, epoch-reward credits), after it
-            // slot-end work (fee distribution at freeze).
-            None if assembly.txs.is_empty() => assembly.pre_orphans.push(update),
-            None => assembly.post_orphans.push(update),
+        use std::sync::atomic::Ordering;
+        let wait_start = std::time::Instant::now();
+        let mut state = self.lock();
+        let held_start = std::time::Instant::now();
+        RECORDER_WAIT_US.fetch_add(
+            held_start.duration_since(wait_start).as_micros() as u64,
+            Ordering::Relaxed,
+        );
+        if !state.finished {
+            for c in captured {
+                state.route_update(c.slot, c.signature, c.update);
+            }
         }
         RECORDER_HELD_US.fetch_add(held_start.elapsed().as_micros() as u64, Ordering::Relaxed);
     }
@@ -461,6 +562,25 @@ impl HorizonRecorder {
 }
 
 impl RecorderState {
+    /// Files one update into the right slot assembly: keyed by signature for
+    /// transaction-owned writes, or pre/post-transaction orphan groups for
+    /// runtime-direct writes (phase decided by whether the slot has seen its
+    /// first committed transaction yet — matching the writer's wire order).
+    fn route_update(
+        &mut self,
+        slot: Slot,
+        signature: Option<Signature>,
+        update: OwnedAccountUpdate,
+    ) {
+        self.emit_complete_below(slot);
+        let assembly = self.assemblies.entry(slot).or_default();
+        match signature {
+            Some(sig) => assembly.tx_updates.entry(sig).or_default().push(update),
+            None if assembly.txs.is_empty() => assembly.pre_orphans.push(update),
+            None => assembly.post_orphans.push(update),
+        }
+    }
+
     /// Emits every buffered assembly with slot < `boundary`. Activity for
     /// `boundary` proves those slots' banks froze (their post-orphans are
     /// in), and stream order guarantees their input-side block metadata

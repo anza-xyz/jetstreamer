@@ -102,7 +102,10 @@ const PROGRAM_CACHE_PRUNE_PROGRESS_INTERVAL: Duration = Duration::from_secs(30);
 const ACCOUNTS_MAINTENANCE_PROGRESS_INTERVAL: Duration = Duration::from_secs(30);
 const DEFAULT_PROGRAM_CACHE_PRUNE_ENABLED: bool = true;
 const DEFAULT_ACCOUNTS_MAINTENANCE_ENABLED: bool = true;
-const DEFAULT_ACCOUNTS_MAINTENANCE_ROOT_STRIDE: u64 = 1;
+// Roots are set every `DEFAULT_ROOT_INTERVAL` slots; running the accounts
+// maintenance pass (flush + clean + shrink, ~30-40s of replay-visible drag)
+// on every 10th root spaces it to roughly 10k slots.
+const DEFAULT_ACCOUNTS_MAINTENANCE_ROOT_STRIDE: u64 = 10;
 const DEFAULT_ACCOUNTS_INDEX_ON_DISK: bool = false;
 const DEFAULT_READY_ENTRY_QUEUE_CAPACITY: usize = 8192;
 const MISMATCH_RETRY_ATTEMPTS: usize = 10;
@@ -126,6 +129,46 @@ static PHASE_PREPARE_BATCH_US: AtomicU64 = AtomicU64::new(0);
 static PHASE_EXECUTE_US: AtomicU64 = AtomicU64::new(0);
 static PHASE_POST_PROCESS_US: AtomicU64 = AtomicU64::new(0);
 static PHASE_ENTRY_COUNT: AtomicU64 = AtomicU64::new(0);
+static PHASE_WAVE_COUNT: AtomicU64 = AtomicU64::new(0);
+static PHASE_WAVE_BATCHES: AtomicU64 = AtomicU64::new(0);
+
+/// One-line summary of the replay phase counters (None until any entry
+/// has been processed). Shared by the warmup and main progress logs.
+fn phases_summary() -> Option<String> {
+    let entry_count = PHASE_ENTRY_COUNT.load(Ordering::Relaxed);
+    if entry_count == 0 {
+        return None;
+    }
+    let gate_ms = PHASE_GATE_WAIT_US.load(Ordering::Relaxed) / 1000;
+    let bank_ms = PHASE_BANK_FOR_SLOT_US.load(Ordering::Relaxed) / 1000;
+    let prep_ms = PHASE_PREPARE_BATCH_US.load(Ordering::Relaxed) / 1000;
+    let exec_ms = PHASE_EXECUTE_US.load(Ordering::Relaxed) / 1000;
+    let post_ms = PHASE_POST_PROCESS_US.load(Ordering::Relaxed) / 1000;
+    let total_ms = gate_ms + bank_ms + prep_ms + exec_ms + post_ms;
+    let pct = |v: u64| {
+        if total_ms > 0 {
+            (v as f64 / total_ms as f64) * 100.0
+        } else {
+            0.0
+        }
+    };
+    let waves = PHASE_WAVE_COUNT.load(Ordering::Relaxed);
+    let avg_wave = if waves > 0 {
+        PHASE_WAVE_BATCHES.load(Ordering::Relaxed) as f64 / waves as f64
+    } else {
+        0.0
+    };
+    Some(format!(
+        "  phases ({entry_count} entries, {waves} waves, avg {avg_wave:.1} batches/wave): \
+         gate={gate_ms}ms({:.0}%) bank={bank_ms}ms({:.0}%) prep={prep_ms}ms({:.0}%) \
+         exec={exec_ms}ms({:.0}%) post={post_ms}ms({:.0}%)",
+        pct(gate_ms),
+        pct(bank_ms),
+        pct(prep_ms),
+        pct(exec_ms),
+        pct(post_ms)
+    ))
+}
 
 struct SnapshotVerifier {
     expected: DashMap<Slot, SnapshotHash>,
@@ -1351,6 +1394,8 @@ impl BankReplay {
         }
         *pending_tx_count = 0;
         let wave = std::mem::take(pending);
+        PHASE_WAVE_COUNT.fetch_add(1, Ordering::Relaxed);
+        PHASE_WAVE_BATCHES.fetch_add(wave.len() as u64, Ordering::Relaxed);
 
         let first = &wave[0].entry;
         let signature = first
@@ -5283,9 +5328,21 @@ async fn run_geyser_replay(
         .name("readyEntries".to_string())
         .stack_size(64 * 1024 * 1024)
         .spawn(move || {
-            while let Ok(entries) = ready_receiver.recv() {
+            // The scheduler drains ready entries per firehose notification,
+            // so individual messages typically hold only a couple of
+            // entries. Coalesce everything already queued before replaying
+            // so slot groups span whole stretches of the slot — that is
+            // what gives the wave scheduler real parallelism to exploit.
+            const COALESCE_CAP: usize = 4096;
+            while let Ok(mut entries) = ready_receiver.recv() {
                 if ready_shutdown.load(Ordering::Relaxed) {
                     break;
+                }
+                while entries.len() < COALESCE_CAP {
+                    match ready_receiver.try_recv() {
+                        Ok(more) => entries.extend(more),
+                        Err(_) => break,
+                    }
                 }
                 ready_bank_replay.process_ready_entries(entries);
             }
@@ -5748,32 +5805,11 @@ async fn run_geyser_replay(
                     } else {
                         "unknown".to_string()
                     };
-                    let entry_count = PHASE_ENTRY_COUNT.load(Ordering::Relaxed);
-                    if entry_count > 0 {
-                        let gate_ms = PHASE_GATE_WAIT_US.load(Ordering::Relaxed) / 1000;
-                        let bank_ms = PHASE_BANK_FOR_SLOT_US.load(Ordering::Relaxed) / 1000;
-                        let prep_ms = PHASE_PREPARE_BATCH_US.load(Ordering::Relaxed) / 1000;
-                        let exec_ms = PHASE_EXECUTE_US.load(Ordering::Relaxed) / 1000;
-                        let post_ms = PHASE_POST_PROCESS_US.load(Ordering::Relaxed) / 1000;
-                        let total_ms = gate_ms + bank_ms + prep_ms + exec_ms + post_ms;
-                        let pct = |v: u64| {
-                            if total_ms > 0 {
-                                (v as f64 / total_ms as f64) * 100.0
-                            } else {
-                                0.0
-                            }
-                        };
+                    if let Some(phases) = phases_summary() {
                         info!(
                             "warmup slot {display_slot}/{warmup_end} ({percent:.2}%) txs={tx_count} accounts={account_updates} slots_per_sec={slots_per_sec} accounts_per_sec={accounts_per_sec} eta={eta} (epoch {epoch} starts at {epoch_start})"
                         );
-                        info!(
-                            "  phases ({entry_count} entries): gate={gate_ms}ms({:.0}%) bank={bank_ms}ms({:.0}%) prep={prep_ms}ms({:.0}%) exec={exec_ms}ms({:.0}%) post={post_ms}ms({:.0}%)",
-                            pct(gate_ms),
-                            pct(bank_ms),
-                            pct(prep_ms),
-                            pct(exec_ms),
-                            pct(post_ms)
-                        );
+                        info!("{phases}");
                     } else {
                         info!(
                             "warmup slot {display_slot}/{warmup_end} ({percent:.2}%) txs={tx_count} accounts={account_updates} slots_per_sec={slots_per_sec} accounts_per_sec={accounts_per_sec} eta={eta} (epoch {epoch} starts at {epoch_start})"
@@ -5840,6 +5876,9 @@ async fn run_geyser_replay(
                     info!(
                         "progress slot {display_slot}/{end_inclusive} ({percent:.2}%) txs={tx_count} accounts={account_updates} slots_per_sec={slots_per_sec} eta={eta}"
                     );
+                    if let Some(phases) = phases_summary() {
+                        info!("{phases}");
+                    }
                 }
 
                 let assign_fail = PROGRAM_CACHE_ASSIGN_FAIL_COUNT.load(Ordering::Relaxed);

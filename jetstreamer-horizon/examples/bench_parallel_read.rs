@@ -3,22 +3,19 @@
 //! The archive is bucket-parallel: every 128-slot bucket is a self-contained
 //! zstd frame with its own encoder reset, so disjoint slot sub-ranges decode
 //! independently. This benchmark finds the aggregate decode-throughput
-//! ceiling on the current machine, sweeping thread count *past* the core
-//! count — decode has stalls (memory bandwidth, allocation, zstd) that
-//! oversubscription can hide, so the sweet spot is often a few× the cores.
+//! ceiling on the current machine.
 //!
-//! Method (strong scaling, cache-hot):
-//! 1. Pick a contiguous mid-epoch working region, bucket-aligned, sized to
-//!    stay resident in the page cache and to have at least one bucket per
-//!    thread at the top of the sweep.
-//! 2. Measure a single-core baseline on a small warm chunk.
-//! 3. Warm the whole region, then for each thread count N split it into N
-//!    disjoint bucket-aligned sub-ranges (one fresh `ArchiveReader` each) and
-//!    decode. Total work is constant, so aggregate tx/s rises until the
-//!    machine saturates; the peak N is the sweet spot.
+//! Zero-config: it auto-detects the core count and sweeps thread counts as
+//! multiples of it (1×, 2×, **4×**, 6×, 8×), centered on the empirical sweet
+//! spot of ~4× cores — decode has stalls (memory bandwidth, per-blob
+//! allocation, zstd) that oversubscription hides, so the peak typically sits
+//! a few× past the core count. The working region is sized and warmed into
+//! the page cache so the sweep measures the CPU/memory ceiling, not disk.
 //!
-//! Usage:
-//! `cargo run --release -p jetstreamer-horizon --example bench_parallel_read -- <path> [region_buckets] [threads_max]`
+//! Usage (no args needed):
+//! `cargo run --release -p jetstreamer-horizon --example bench_parallel_read -- <path>`
+//!
+//! Optional overrides: `<path> [region_buckets] [max_threads]`.
 
 use std::io::BufReader;
 use std::time::Instant;
@@ -85,21 +82,20 @@ fn main() {
     let mut args = std::env::args().skip(1);
     let path = args
         .next()
-        .expect("usage: bench_parallel_read <path> [region_buckets] [threads_max]");
+        .expect("usage: bench_parallel_read <path> [region_buckets] [max_threads]");
     let cores = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(8);
-    // Enough buckets to keep every thread fed at the top of the sweep, while
-    // staying cache-resident. Default ≈ 256 buckets (~15 GiB of file).
-    let region_buckets: u64 = args
-        .next()
-        .map(|v| v.parse().expect("region_buckets"))
-        .unwrap_or(256);
-    // Sweep through heavy oversubscription (default up to 8× cores).
-    let threads_max: usize = args
-        .next()
-        .map(|v| v.parse().expect("threads_max"))
-        .unwrap_or(cores * 8);
+
+    // Thread counts swept as multiples of the core count, centered on 4×.
+    let multipliers = [1usize, 2, 4, 6, 8];
+    let max_threads: usize = args
+        .next() // (skipped if only path given)
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(cores * multipliers.last().copied().unwrap_or(8));
+    // Region: enough buckets that every thread gets at least one at the top
+    // of the sweep, with a couple to spare; default ~8× cores (min 256).
+    let region_buckets_arg: Option<u64> = args.next().and_then(|v| v.parse().ok());
 
     let (slot_start, slot_count) = {
         let file = std::fs::File::open(&path).expect("open");
@@ -107,53 +103,48 @@ fn main() {
         let h = reader.header();
         (h.slot_start, h.slot_count)
     };
-    let region_buckets = region_buckets.min(slot_count / BUCKET_SLOTS);
+    let total_buckets = slot_count / BUCKET_SLOTS;
+    let region_buckets = region_buckets_arg
+        .unwrap_or_else(|| (max_threads as u64).max(256))
+        .min(total_buckets);
     let region_slots = region_buckets * BUCKET_SLOTS;
     // Centre the region mid-epoch (bucket-aligned; slot_start is aligned).
     let mid = slot_start + (slot_count / 2 / BUCKET_SLOTS) * BUCKET_SLOTS;
     let region_start = mid.min(slot_start + slot_count - region_slots);
 
     eprintln!(
-        "machine: {cores} cores | region: slots {region_start}..{} ({region_buckets} buckets, ~{:.1} GiB of file)",
-        region_start + region_slots,
+        "machine: {cores} cores | region: {region_buckets} buckets (~{:.1} GiB of file), \
+         sweeping threads = {{1,2,4,6,8}}× cores (4× = {} highlighted)",
         region_slots as f64 * 470_000.0 / (1u64 << 30) as f64,
+        cores * 4,
     );
 
-    // Single-core baseline on a small warm chunk (16 buckets).
+    // Single-core baseline (warm a small chunk, then time it).
     let base_buckets = region_buckets.min(16);
-    decode_range(&path, region_start, base_buckets * BUCKET_SLOTS); // warm
+    decode_range(&path, region_start, base_buckets * BUCKET_SLOTS);
     let bstart = Instant::now();
     let base_txs = decode_range(&path, region_start, base_buckets * BUCKET_SLOTS);
-    let base_secs = bstart.elapsed().as_secs_f64();
-    let baseline_tps = base_txs as f64 / base_secs;
-    eprintln!(
-        "single-core baseline: {:.0} tx/s ({base_txs} txs / {base_secs:.2}s over {base_buckets} buckets)\n",
-        baseline_tps,
-    );
+    let baseline_tps = base_txs as f64 / bstart.elapsed().as_secs_f64();
+    eprintln!("single-core baseline: {:.0} tx/s", baseline_tps);
 
-    // Warm the whole region (parallel, fast) and learn its tx count.
-    let (warm_wall, region_txs) = parallel_decode(&path, region_start, region_buckets, cores);
-    eprintln!(
-        "warmed region: {region_txs} txs (parallel warm {warm_wall:.1}s)\n",
-        region_txs = region_txs,
-    );
+    // Warm the whole region into cache (and learn its tx count).
+    let (_, region_txs) = parallel_decode(&path, region_start, region_buckets, cores);
+    eprintln!("warmed region: {region_txs} txs\n");
 
-    // Start at 8 — the per-core figure comes from the baseline, and low N on
-    // a large region is needlessly slow (strong scaling = more work/thread).
-    let mut sweep: Vec<usize> = vec![8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 255, 384, 512]
-        .into_iter()
-        .filter(|&n| n <= threads_max && (n as u64) <= region_buckets)
+    // Build the sweep from the multipliers, clamped to region/arg limits.
+    let mut sweep: Vec<usize> = multipliers
+        .iter()
+        .map(|&m| cores * m)
+        .filter(|&n| n <= max_threads && (n as u64) <= region_buckets)
         .collect();
-    if !sweep.contains(&cores) && cores <= threads_max {
-        sweep.push(cores);
-        sweep.sort_unstable();
-    }
+    sweep.dedup();
 
     println!(
-        "{:>7}  {:>9}  {:>14}  {:>12}",
+        "{:>8}  {:>9}  {:>14}  {:>11}",
         "threads", "wall (s)", "agg tx/s", "core-equiv"
     );
     let mut best = (0usize, 0.0f64);
+    let mut at_4x = 0.0f64;
     for &n in &sweep {
         let (wall, txs) = parallel_decode(&path, region_start, region_buckets, n);
         assert_eq!(
@@ -164,8 +155,12 @@ fn main() {
         if agg > best.1 {
             best = (n, agg);
         }
+        if n == cores * 4 {
+            at_4x = agg;
+        }
+        let mark = if n == cores * 4 { "  <- 4x" } else { "" };
         println!(
-            "{:>7}  {:>9.2}  {:>14.0}  {:>11.1}x",
+            "{:>8}  {:>9.2}  {:>14.0}  {:>10.1}x{mark}",
             n,
             wall,
             agg,
@@ -179,5 +174,20 @@ fn main() {
         best.0,
         best.1 / baseline_tps.max(1.0),
         cores,
+    );
+    if at_4x > 0.0 {
+        println!(
+            "4x cores ({} threads): {:.0} tx/s ({:.1}x single core)",
+            cores * 4,
+            at_4x,
+            at_4x / baseline_tps.max(1.0),
+        );
+    }
+    // Whole-epoch projection at the measured peak.
+    let full_epoch_txs = 514_000_000u64;
+    println!(
+        "=> a full ~514M-tx epoch reads back in ~{:.1} min at peak ({:.0} tx/s)",
+        full_epoch_txs as f64 / best.1 / 60.0,
+        best.1,
     );
 }

@@ -528,9 +528,9 @@ impl BankReplay {
             }))
         };
         let replay_threads = replay_thread_count();
-        let parallel_scheduler = env_truthy("JETSTREAMER_PARALLEL_SCHEDULER");
+        let parallel_scheduler = env_truthy_default("JETSTREAMER_PARALLEL_SCHEDULER", true);
         info!(
-            "replay execution threads: {replay_threads}; scheduler: {} (set JETSTREAMER_PARALLEL_SCHEDULER=1 for parallel rounds)",
+            "replay execution threads: {replay_threads}; scheduler: {} (set JETSTREAMER_PARALLEL_SCHEDULER=0 for legacy waves)",
             if parallel_scheduler {
                 "parallel rounds"
             } else {
@@ -6660,9 +6660,38 @@ async fn main() {
     }
 
     let target_slot = epoch_to_slot(epoch).saturating_sub(1);
+    // A local snapshot only bootstraps `epoch` cheaply if it lands within the
+    // previous epoch (at or after the start of `epoch - 1`). Anything older is
+    // still usable, but it forces a warmup replay across every slot between the
+    // snapshot and the epoch boundary — e.g. reusing epoch N's boundary
+    // snapshot to run epoch N+1 re-executes all of epoch N first (~432k slots,
+    // roughly doubling the run). `find_existing_snapshot_archive` only bounds
+    // the candidate from above (slot <= target_slot), so a leftover snapshot
+    // from the prior epoch's run gets picked up here; reject it and download
+    // the real boundary snapshot instead.
+    let min_snapshot_slot = epoch_to_slot(epoch.saturating_sub(1));
+    let existing_snapshot = match find_existing_snapshot_archive(&dest_dir, target_slot) {
+        Ok(Some(candidate)) if candidate.slot < min_snapshot_slot => {
+            println!(
+                "Ignoring snapshot {} at slot {}: epoch {} needs a snapshot at or after slot {} \
+                 (reusing it would warm up across {} slots); downloading the boundary snapshot",
+                candidate.path.display(),
+                candidate.slot,
+                epoch,
+                min_snapshot_slot,
+                epoch_to_slot(epoch).saturating_sub(candidate.slot),
+            );
+            None
+        }
+        Ok(other) => other,
+        Err(err) => {
+            eprintln!("error: {err}");
+            exit(1);
+        }
+    };
     let mut extracted_snapshot = false;
-    let dest_path = match find_existing_snapshot_archive(&dest_dir, target_slot) {
-        Ok(Some(candidate)) => {
+    let dest_path = match existing_snapshot {
+        Some(candidate) => {
             extracted_snapshot = match has_extracted_snapshot(&dest_dir, candidate.slot) {
                 Ok(has_snapshot) => has_snapshot,
                 Err(err) => {
@@ -6683,7 +6712,7 @@ async fn main() {
             }
             candidate.path
         }
-        Ok(None) => {
+        None => {
             match download_snapshot_at_or_before_slot(epoch, target_slot, &dest_dir).await {
                 Ok(path) => {
                     println!("Downloaded snapshot to {}", path.display());
@@ -6694,10 +6723,6 @@ async fn main() {
                     exit(1);
                 }
             }
-        }
-        Err(err) => {
-            eprintln!("error: {err}");
-            exit(1);
         }
     };
 

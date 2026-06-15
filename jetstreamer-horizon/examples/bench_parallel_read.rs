@@ -103,7 +103,10 @@ fn main() {
 
     // Upper bound on threads we might probe (hard cap so the region and
     // memory stay bounded); the adaptive sweep usually stops well before it.
-    let max_threads = (cores * 8).max(8);
+    // Capped at 192 regardless of core count: high-core servers peak *below*
+    // their core count, and even low-core machines peak by a few× cores, so
+    // there is no reason to materialise a region for thousands of threads.
+    let max_threads = (cores * 8).clamp(8, 192);
     // Region holds one distinct chunk per thread at the hard cap.
     let region_buckets = ((max_threads as u64) * per_thread).min(total_buckets);
     let max_threads = (region_buckets / per_thread) as usize; // re-clamp to region
@@ -136,6 +139,7 @@ fn main() {
     // well above it (unified-memory machines) without a fixed ceiling.
     let mut results: Vec<(usize, f64)> = Vec::new();
     let mut best_tps = 0.0f64;
+    let mut best_n = 1usize;
     let mut declines = 0;
     let mut n = 1usize;
     loop {
@@ -163,6 +167,7 @@ fn main() {
 
         if med > best_tps {
             best_tps = med;
+            best_n = n;
         }
         declines = if med < best_tps * 0.90 {
             declines + 1
@@ -171,10 +176,13 @@ fn main() {
         };
         // Stop once throughput has clearly rolled over past the peak (two
         // consecutive points below 90% of the best seen — robust to a single
-        // noisy dip, since a recovery resets the counter).
+        // noisy dip, since a recovery resets the counter), OR once we are
+        // well past the peak thread count and into a flat sub-peak tail (so a
+        // gently-declining plateau doesn't drag the sweep to the cap).
         let rolled_over = declines >= 2;
+        let flat_tail = n >= best_n * 2 && med < best_tps * PLATEAU_BAND;
         let next = ((n as f64 * 1.4).ceil() as usize).min(max_threads);
-        if rolled_over || n >= max_threads || results.iter().any(|&(m, _)| m == next) {
+        if rolled_over || flat_tail || n >= max_threads || results.iter().any(|&(m, _)| m == next) {
             break;
         }
         n = next;

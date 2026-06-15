@@ -1,19 +1,22 @@
 //! Parallel read-throughput benchmark for a horizon archive — maps the
-//! throughput-vs-threads curve and reports the plateau.
+//! throughput-vs-threads curve from low thread counts up, then reports the
+//! plateau and its midpoint.
 //!
 //! The archive is bucket-parallel: every 128-slot bucket is a self-contained
-//! zstd frame with its own encoder reset, so disjoint slot sub-ranges decode
-//! independently. Aggregate decode throughput rises as threads are added,
-//! then flattens into a broad plateau and slowly falls under heavy
-//! oversubscription (contention: memory bandwidth, per-blob allocation). The
-//! plateau is wide and a little noisy, so there is no single "optimal" thread
-//! count to converge on — this benchmark instead sweeps fixed multiples of
-//! the core count, takes a median of repeated runs to suppress noise, and
-//! reports the plateau range plus a recommended thread count (the smallest
-//! that reaches peak throughput, for the least memory/overhead).
+//! zstd frame, so disjoint slot sub-ranges decode independently. Aggregate
+//! decode throughput rises as threads are added, reaches a broad plateau,
+//! then falls once contention (memory bandwidth, per-blob allocation)
+//! dominates. The peak is machine-specific and is often *below* the core
+//! count for cache-hot decode, so the sweep starts low.
+//!
+//! Each thread decodes a fixed, small number of buckets (so low-N probes are
+//! cheap and the sweep can start at one thread); aggregate throughput is
+//! `total_txs / wall`. The sweep brackets the curve, a median of repeated
+//! runs suppresses noise, and the plateau (thread counts within a few % of
+//! peak) is reported with its midpoint as the recommended thread count.
 //!
 //! Zero-config. Usage:
-//! `cargo run --release -p jetstreamer-horizon --example bench_parallel_read -- <path> [runs] [region_buckets]`
+//! `cargo run --release -p jetstreamer-horizon --example bench_parallel_read -- <path> [runs] [buckets_per_thread]`
 
 use std::io::BufReader;
 use std::time::Instant;
@@ -22,12 +25,8 @@ use jetstreamer_horizon::archive::{ArchiveReader, BlockNotification, EntryRecord
 use jetstreamer_horizon::transactions::Transaction;
 
 const BUCKET_SLOTS: u64 = 128;
-/// Thread counts swept, as multiples of the core count (dense around 1×,
-/// where the peak sits, with a couple of oversubscribed points to show the
-/// falloff).
-const MULTIPLIERS: &[f64] = &[0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0];
-/// A point counts as "on the plateau" if its median is within this fraction
-/// of the best median.
+/// A thread count is "on the plateau" if its median throughput is within this
+/// fraction of the best median.
 const PLATEAU_BAND: f64 = 0.95;
 
 #[derive(Default)]
@@ -53,26 +52,22 @@ fn decode_range(path: &str, start: u64, count: u64) -> u64 {
     counter.transactions
 }
 
-/// Splits `region_buckets` into `n` contiguous bucket groups and decodes them
-/// concurrently (one reader per thread); returns (wall_seconds, total_txs).
-fn parallel_decode(path: &str, region_start: u64, region_buckets: u64, n: usize) -> (f64, u64) {
-    let base = region_buckets / n as u64;
-    let extra = region_buckets % n as u64;
+/// Runs `n` threads, each decoding its own `per_thread` buckets from a
+/// distinct offset (thread `t` takes buckets `[t*per_thread, ..)`). Fixed
+/// per-thread work, so the wall time is roughly constant across `n` until
+/// contention sets in — total throughput = total_txs / wall. Returns
+/// (wall_seconds, total_txs).
+fn measure(path: &str, region_start: u64, n: usize, per_thread: u64) -> (f64, u64) {
     let start = Instant::now();
     let totals: Vec<u64> = std::thread::scope(|scope| {
-        let mut handles = Vec::new();
-        let mut cursor = 0u64;
-        for t in 0..n as u64 {
-            let buckets = base + if t < extra { 1 } else { 0 };
-            if buckets == 0 {
-                continue;
-            }
-            let sub_start = region_start + cursor * BUCKET_SLOTS;
-            let sub_count = buckets * BUCKET_SLOTS;
-            cursor += buckets;
-            let path = path.to_string();
-            handles.push(scope.spawn(move || decode_range(&path, sub_start, sub_count)));
-        }
+        let handles: Vec<_> = (0..n as u64)
+            .map(|t| {
+                let path = path.to_string();
+                let sub_start = region_start + t * per_thread * BUCKET_SLOTS;
+                let sub_count = per_thread * BUCKET_SLOTS;
+                scope.spawn(move || decode_range(&path, sub_start, sub_count))
+            })
+            .collect();
         handles
             .into_iter()
             .map(|h| h.join().expect("thread"))
@@ -91,8 +86,9 @@ fn main() {
     let path = args
         .first()
         .cloned()
-        .expect("usage: bench_parallel_read <path> [runs] [region_buckets]");
+        .expect("usage: bench_parallel_read <path> [runs] [buckets_per_thread]");
     let runs: usize = args.get(1).and_then(|v| v.parse().ok()).unwrap_or(3).max(1);
+    let per_thread: u64 = args.get(2).and_then(|v| v.parse().ok()).unwrap_or(2).max(1);
     let cores = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(8);
@@ -105,57 +101,49 @@ fn main() {
     };
     let total_buckets = slot_count / BUCKET_SLOTS;
 
-    // Distinct thread counts from the multipliers.
-    let mut thread_counts: Vec<usize> = MULTIPLIERS
-        .iter()
-        .map(|m| ((m * cores as f64).round() as usize).max(1))
-        .collect();
-    thread_counts.dedup();
-    let max_threads = *thread_counts.iter().max().unwrap();
-
-    // Region: at least one bucket per thread at the top of the sweep, sized
-    // to stay resident in the page cache.
-    let region_buckets = args
-        .get(2)
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or((max_threads as u64).max(256))
-        .min(total_buckets);
-    thread_counts.retain(|&n| (n as u64) <= region_buckets);
+    // Upper bound on threads we might probe (hard cap so the region and
+    // memory stay bounded); the adaptive sweep usually stops well before it.
+    let max_threads = (cores * 8).max(8);
+    // Region holds one distinct chunk per thread at the hard cap.
+    let region_buckets = ((max_threads as u64) * per_thread).min(total_buckets);
+    let max_threads = (region_buckets / per_thread) as usize; // re-clamp to region
     let region_slots = region_buckets * BUCKET_SLOTS;
     let mid = slot_start + (slot_count / 2 / BUCKET_SLOTS) * BUCKET_SLOTS;
     let region_start = mid.min(slot_start + slot_count - region_slots);
 
     eprintln!(
-        "machine: {cores} cores | region: {region_buckets} buckets (~{:.1} GiB of file) | \
-         {runs} runs/point, median reported",
+        "machine: {cores} cores | region: {region_buckets} buckets (~{:.1} GiB) | \
+         {per_thread} buckets/thread, {runs} runs/point (median) | adaptive sweep, cap {max_threads} threads",
         region_slots as f64 * 470_000.0 / (1u64 << 30) as f64,
     );
 
-    // Single-core baseline (warm, then time).
-    let base_buckets = region_buckets.min(16);
-    decode_range(&path, region_start, base_buckets * BUCKET_SLOTS);
+    // Single-core baseline (warm, then time `per_thread` buckets on one thread).
+    decode_range(&path, region_start, per_thread * BUCKET_SLOTS);
     let bstart = Instant::now();
-    let base_txs = decode_range(&path, region_start, base_buckets * BUCKET_SLOTS);
+    let base_txs = decode_range(&path, region_start, per_thread * BUCKET_SLOTS);
     let baseline_tps = base_txs as f64 / bstart.elapsed().as_secs_f64();
-    eprintln!("single-core baseline: {baseline_tps:.0} tx/s");
-
-    // Warm the whole region into cache and learn its tx count.
-    let (_, region_txs) = parallel_decode(&path, region_start, region_buckets, cores);
-    eprintln!("warmed region: {region_txs} txs\n");
+    eprintln!("single-core baseline: {baseline_tps:.0} tx/s\n");
 
     println!(
         "{:>8}  {:>7}  {:>13}  {:>11}  {:>17}",
         "threads", "x cores", "median tx/s", "core-equiv", "spread (min..max)"
     );
+
+    // Adaptive geometric sweep from 1 thread up: keep climbing while
+    // throughput is still improving, and stop once it has clearly rolled
+    // over (two consecutive points below 90% of the best seen). This finds
+    // the peak whether it sits below the core count (big NUMA servers) or
+    // well above it (unified-memory machines) without a fixed ceiling.
     let mut results: Vec<(usize, f64)> = Vec::new();
-    for &n in &thread_counts {
+    let mut best_tps = 0.0f64;
+    let mut declines = 0;
+    let mut n = 1usize;
+    loop {
+        // One warm run (drop, populates page cache) then `runs` measured.
+        measure(&path, region_start, n, per_thread);
         let samples: Vec<f64> = (0..runs)
             .map(|_| {
-                let (wall, txs) = parallel_decode(&path, region_start, region_buckets, n);
-                assert_eq!(
-                    txs, region_txs,
-                    "parallel decode lost/duplicated transactions"
-                );
+                let (wall, txs) = measure(&path, region_start, n, per_thread);
                 txs as f64 / wall
             })
             .collect();
@@ -172,26 +160,53 @@ fn main() {
             lo / 1e6,
             hi / 1e6,
         );
-    }
 
-    // Peak (best median) and the plateau (points within PLATEAU_BAND of it).
-    let (peak_n, peak_tps) = results
+        if med > best_tps {
+            best_tps = med;
+        }
+        declines = if med < best_tps * 0.90 {
+            declines + 1
+        } else {
+            0
+        };
+        // Stop once throughput has clearly rolled over past the peak (two
+        // consecutive points below 90% of the best seen — robust to a single
+        // noisy dip, since a recovery resets the counter).
+        let rolled_over = declines >= 2;
+        let next = ((n as f64 * 1.4).ceil() as usize).min(max_threads);
+        if rolled_over || n >= max_threads || results.iter().any(|&(m, _)| m == next) {
+            break;
+        }
+        n = next;
+    }
+    // Did the sweep observe the roll-over, or did it stop at the cap still
+    // climbing? (The latter means the true peak may be higher.)
+    let capped_while_climbing = results.last().unwrap().1 >= best_tps * 0.97;
+
+    // Peak, then walk outward to the contiguous plateau (>= PLATEAU_BAND of peak).
+    let peak_idx = results
         .iter()
-        .cloned()
-        .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
-        .unwrap();
-    let plateau: Vec<usize> = results
-        .iter()
-        .filter(|(_, tps)| *tps >= peak_tps * PLATEAU_BAND)
-        .map(|(n, _)| *n)
-        .collect();
-    let (plat_lo, plat_hi) = (
-        *plateau.iter().min().unwrap(),
-        *plateau.iter().max().unwrap(),
-    );
+        .enumerate()
+        .max_by(|a, b| a.1.1.partial_cmp(&b.1.1).unwrap())
+        .unwrap()
+        .0;
+    let peak_tps = results[peak_idx].1;
+    let threshold = peak_tps * PLATEAU_BAND;
+    let mut lo_i = peak_idx;
+    while lo_i > 0 && results[lo_i - 1].1 >= threshold {
+        lo_i -= 1;
+    }
+    let mut hi_i = peak_idx;
+    while hi_i + 1 < results.len() && results[hi_i + 1].1 >= threshold {
+        hi_i += 1;
+    }
+    let (plat_lo, plat_hi) = (results[lo_i].0, results[hi_i].0);
+    // Geometric midpoint of the plateau — the robust recommendation, away
+    // from the noisy edges.
+    let mid_threads = ((plat_lo as f64 * plat_hi as f64).sqrt().round() as usize).max(1);
 
     println!(
-        "\npeak: {peak_tps:.0} tx/s (~{:.1}x single core, {:.0}% of {cores} cores) around {peak_n} threads",
+        "\npeak: {peak_tps:.0} tx/s (~{:.1}x single core, {:.0}% of {cores} cores)",
         peak_tps / baseline_tps.max(1.0),
         peak_tps / baseline_tps.max(1.0) / cores as f64 * 100.0,
     );
@@ -201,9 +216,15 @@ fn main() {
         plat_lo as f64 / cores as f64,
         plat_hi as f64 / cores as f64,
     );
+    if capped_while_climbing && plat_hi == *results.iter().map(|(n, _)| n).max().unwrap() {
+        println!(
+            "note: throughput was still climbing at the {plat_hi}-thread cap — the true peak may be \
+             higher; re-run with a larger cap (raise buckets/thread or pass more threads)."
+        );
+    }
     println!(
-        "recommended: {plat_lo} threads (~{:.2}x cores) — smallest that reaches peak throughput",
-        plat_lo as f64 / cores as f64,
+        "recommended: {mid_threads} threads (~{:.2}x cores) — midpoint of the plateau",
+        mid_threads as f64 / cores as f64,
     );
     println!(
         "=> a full ~514M-tx epoch reads back in ~{:.1} min at peak",

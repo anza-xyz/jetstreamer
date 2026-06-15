@@ -511,22 +511,57 @@ impl BankReplay {
     ) -> Self {
         // Ensure program cache respects deployment slots during replay.
         bank.set_check_program_modification_slot(true);
-        let mut leader_schedule_cache = LeaderScheduleCache::new_from_bank(&bank);
-        leader_schedule_cache.set_max_schedules(usize::MAX);
-        let debug_signature = env::var("JETSTREAMER_DEBUG_SIG")
-            .ok()
-            .and_then(|value| Signature::from_str(value.trim()).ok());
         let bank_forks = BankForks::new_rw_arc(bank);
-        let cached_bank = {
+        Self::from_bank_forks(
+            bank_forks,
+            snapshot_verifier,
+            root_interval,
+            failure,
+            cursor,
+            scheduler,
+            firehose_gate,
+            live_start_slot,
+            enable_program_cache_prune,
+            enable_accounts_maintenance,
+            accounts_maintenance_root_stride,
+        )
+    }
+
+    /// Builds a replayer over an existing `bank_forks`, reusing the in-memory
+    /// bank instead of loading a snapshot. This is how a multi-epoch run
+    /// chains epochs: epoch N finishes with its working bank at the N/N+1
+    /// boundary, and that same `bank_forks` is handed straight to epoch N+1 —
+    /// no snapshot reload, no warmup replay.
+    #[allow(clippy::too_many_arguments)]
+    fn from_bank_forks(
+        bank_forks: Arc<RwLock<BankForks>>,
+        snapshot_verifier: Option<Arc<SnapshotVerifier>>,
+        root_interval: Option<u64>,
+        failure: Arc<ReplayFailure>,
+        cursor: Arc<ReplayCursor>,
+        scheduler: Arc<TransactionScheduler>,
+        firehose_gate: Arc<Mutex<()>>,
+        live_start_slot: Slot,
+        enable_program_cache_prune: bool,
+        enable_accounts_maintenance: bool,
+        accounts_maintenance_root_stride: u64,
+    ) -> Self {
+        let (mut leader_schedule_cache, cached_bank) = {
             let guard = bank_forks
                 .read()
                 .expect("bank forks lock poisoned during init");
             let bank = guard.working_bank();
-            Mutex::new(Some(CachedBank {
+            let leader_schedule_cache = LeaderScheduleCache::new_from_bank(&bank);
+            let cached_bank = Mutex::new(Some(CachedBank {
                 slot: bank.slot(),
                 bank,
-            }))
+            }));
+            (leader_schedule_cache, cached_bank)
         };
+        leader_schedule_cache.set_max_schedules(usize::MAX);
+        let debug_signature = env::var("JETSTREAMER_DEBUG_SIG")
+            .ok()
+            .and_then(|value| Signature::from_str(value.trim()).ok());
         let replay_threads = replay_thread_count();
         let parallel_scheduler = env_truthy_default("JETSTREAMER_PARALLEL_SCHEDULER", true);
         info!(
@@ -565,6 +600,12 @@ impl BankReplay {
             replay_pool,
             parallel_scheduler,
         }
+    }
+
+    /// The shared bank forks, so a finished epoch can hand its live bank to the
+    /// next epoch in a range run.
+    fn bank_forks(&self) -> Arc<RwLock<BankForks>> {
+        self.bank_forks.clone()
     }
 
     fn cached_bank_for_slot(&self, slot: Slot) -> Option<Arc<Bank>> {
@@ -4006,12 +4047,48 @@ fn epoch_to_slot(epoch: u64) -> u64 {
     epoch_to_slot_range(epoch).0
 }
 
+/// Parses the epoch argument as either a single epoch (`950`) or an inclusive
+/// range (`950-955`; the Rust forms `950..=955` inclusive and `950..955`
+/// exclusive are also accepted). Returns `(start, end_inclusive)`.
+fn parse_epoch_range(arg: &str) -> Result<(u64, u64), String> {
+    let parse = |s: &str| -> Result<u64, String> {
+        s.trim()
+            .parse::<u64>()
+            .map_err(|err| format!("invalid epoch '{}': {err}", s.trim()))
+    };
+    let (start, end) = if let Some((a, b)) = arg.split_once("..=") {
+        (parse(a)?, parse(b)?)
+    } else if let Some((a, b)) = arg.split_once("..") {
+        let (start, end) = (parse(a)?, parse(b)?);
+        if end <= start {
+            return Err(format!(
+                "empty epoch range '{arg}': end must be greater than start"
+            ));
+        }
+        (start, end - 1)
+    } else if let Some((a, b)) = arg.split_once('-') {
+        (parse(a)?, parse(b)?)
+    } else {
+        let only = parse(arg)?;
+        (only, only)
+    };
+    if end < start {
+        return Err(format!(
+            "invalid epoch range '{arg}': end {end} is before start {start}"
+        ));
+    }
+    Ok((start, end))
+}
+
 fn usage(program: &str) -> String {
     format!(
-        "Usage: {program} <epoch> [dest-dir] [--verify|--no-verify] [--horizon-output=PATH]\n\
+        "Usage: {program} <epoch|range> [dest-dir] [--verify|--no-verify] [--horizon-output=PATH]\n\
          \n\
-         Replays <epoch> and writes a horizon archive to\n\
-         <dest-dir>/epoch-<epoch>.jet (override with --horizon-output=PATH)."
+         <epoch|range> is a single epoch (950) or an inclusive range (950-955).\n\
+         Replays each epoch and writes a horizon archive to <dest-dir>/epoch-<N>.jet.\n\
+         A range runs in one process, keeping the bank in memory across epoch\n\
+         boundaries (no snapshot reload or warmup between epochs).\n\
+         --horizon-output applies only to a single epoch."
     )
 }
 
@@ -5498,7 +5575,10 @@ async fn run_geyser_replay(
     restart_tracker: Arc<RestartTracker>,
     snapshot_verifier: Option<Arc<SnapshotVerifier>>,
     horizon_output: PathBuf,
-) -> Result<(), String> {
+    // When set, reuse this bank (carried from the previous epoch in a range
+    // run) instead of loading a snapshot — no reload, no warmup.
+    existing_bank_forks: Option<Arc<RwLock<BankForks>>>,
+) -> Result<Arc<RwLock<BankForks>>, String> {
     let (confirmed_bank_sender, confirmed_bank_receiver) = unbounded();
     let confirmed_bank_handle =
         std::thread::spawn(move || while confirmed_bank_receiver.recv().is_ok() {});
@@ -5507,43 +5587,65 @@ async fn run_geyser_replay(
     let failure = Arc::new(ReplayFailure::new(shutdown.clone()));
     plugin::reset();
     info!("direct in-process plugin notifier enabled");
-    let accounts_update_notifier: Option<AccountsUpdateNotifier> =
-        Some(Arc::new(ProgressAccountsUpdateNotifier {
-            progress: progress.clone(),
-            live_start_slot: epoch_start,
-        }) as AccountsUpdateNotifier);
-    info!("accounts update notifier wired into snapshot load: true");
-
-    ensure_genesis_archive(ledger_dir).await?;
-    info!("loading bank from snapshot");
     let ledger_dir = ledger_dir.to_path_buf();
-    let ledger_dir_for_load = ledger_dir.clone();
-    let snapshot_archive = snapshot_archive.to_path_buf();
-    let use_dir_loader = env_truthy("JETSTREAMER_LOAD_FROM_DIR");
-    let bank = tokio::task::spawn_blocking(move || {
-        if use_dir_loader {
-            load_bank_from_snapshot(&ledger_dir_for_load, accounts_update_notifier)
-        } else {
-            load_bank_from_snapshot_archive(
-                &ledger_dir_for_load,
-                &snapshot_archive,
-                accounts_update_notifier,
-            )
-        }
-    })
-    .await
-    .map_err(|err| format!("snapshot load task failed: {err}"))??;
-    info!(
-        "bank accounts update notifier active: {}",
-        bank.rc.accounts.accounts_db.has_accounts_update_notifier()
-    );
     let root_interval = bank_root_interval();
     if let Some(interval) = root_interval {
         info!("bank root pruning interval: {interval}");
     } else {
         info!("bank root pruning disabled");
     }
-    let snapshot_slot = bank.slot();
+
+    // Either reuse the bank carried from the previous epoch (range chaining —
+    // no snapshot load and no warmup), or load a fresh bank from the snapshot
+    // archive. The geyser account-update notifier is wired in at load time and
+    // travels with the accounts-db, so the reused bank already has it.
+    enum BankSource {
+        Reuse(Arc<RwLock<BankForks>>),
+        Fresh(Box<Bank>),
+    }
+    let (bank_source, snapshot_slot) = match existing_bank_forks {
+        Some(bank_forks) => {
+            let slot = bank_forks
+                .read()
+                .map_err(|_| "bank forks lock poisoned".to_string())?
+                .working_bank()
+                .slot();
+            info!("reusing in-memory bank from previous epoch at slot {slot}; skipping snapshot load");
+            (BankSource::Reuse(bank_forks), slot)
+        }
+        None => {
+            let accounts_update_notifier: Option<AccountsUpdateNotifier> =
+                Some(Arc::new(ProgressAccountsUpdateNotifier {
+                    progress: progress.clone(),
+                    live_start_slot: epoch_start,
+                }) as AccountsUpdateNotifier);
+            info!("accounts update notifier wired into snapshot load: true");
+            ensure_genesis_archive(&ledger_dir).await?;
+            info!("loading bank from snapshot");
+            let ledger_dir_for_load = ledger_dir.clone();
+            let snapshot_archive = snapshot_archive.to_path_buf();
+            let use_dir_loader = env_truthy("JETSTREAMER_LOAD_FROM_DIR");
+            let bank = tokio::task::spawn_blocking(move || {
+                if use_dir_loader {
+                    load_bank_from_snapshot(&ledger_dir_for_load, accounts_update_notifier)
+                } else {
+                    load_bank_from_snapshot_archive(
+                        &ledger_dir_for_load,
+                        &snapshot_archive,
+                        accounts_update_notifier,
+                    )
+                }
+            })
+            .await
+            .map_err(|err| format!("snapshot load task failed: {err}"))??;
+            info!(
+                "bank accounts update notifier active: {}",
+                bank.rc.accounts.accounts_db.has_accounts_update_notifier()
+            );
+            let slot = bank.slot();
+            (BankSource::Fresh(Box::new(bank)), slot)
+        }
+    };
     let replay_start = if snapshot_slot.saturating_add(1) < epoch_start {
         snapshot_slot.saturating_add(1)
     } else {
@@ -5633,19 +5735,34 @@ async fn run_geyser_replay(
     } else {
         info!("accounts maintenance disabled");
     }
-    let bank_replay = Arc::new(BankReplay::new(
-        bank,
-        snapshot_verifier.clone(),
-        root_interval,
-        failure.clone(),
-        cursor.clone(),
-        scheduler.clone(),
-        firehose_gate.clone(),
-        epoch_start,
-        enable_program_cache_prune,
-        enable_accounts_maintenance,
-        accounts_maintenance_root_stride,
-    ));
+    let bank_replay = Arc::new(match bank_source {
+        BankSource::Fresh(bank) => BankReplay::new(
+            *bank,
+            snapshot_verifier.clone(),
+            root_interval,
+            failure.clone(),
+            cursor.clone(),
+            scheduler.clone(),
+            firehose_gate.clone(),
+            epoch_start,
+            enable_program_cache_prune,
+            enable_accounts_maintenance,
+            accounts_maintenance_root_stride,
+        ),
+        BankSource::Reuse(bank_forks) => BankReplay::from_bank_forks(
+            bank_forks,
+            snapshot_verifier.clone(),
+            root_interval,
+            failure.clone(),
+            cursor.clone(),
+            scheduler.clone(),
+            firehose_gate.clone(),
+            epoch_start,
+            enable_program_cache_prune,
+            enable_accounts_maintenance,
+            accounts_maintenance_root_stride,
+        ),
+    });
     let ready_queue_capacity = ready_entry_queue_capacity();
     info!("ready entry queue capacity: {}", ready_queue_capacity);
     let (ready_sender, ready_receiver) = bounded::<Vec<ReadyEntry>>(ready_queue_capacity);
@@ -6444,14 +6561,19 @@ async fn run_geyser_replay(
         info!("snapshot verification complete");
     }
 
-    if let Some(recorder) = horizon::recorder() {
+    if horizon::recorder().is_some() {
         // Freeze the final bank so its end-of-slot account updates are
         // recorded before the archive closes.
         bank_replay.freeze_latest_bank()?;
-        recorder.finish()?;
+        // Finalize and tear down this epoch's archive so the next epoch in a
+        // range run can install its own.
+        horizon::finish()?;
     }
 
-    Ok(())
+    // Hand the live bank forks back so a range run can chain straight into the
+    // next epoch without reloading a snapshot.
+    let bank_forks = bank_replay.bank_forks();
+    Ok(bank_forks)
 }
 
 async fn extract_tarball(archive: &Path, dest_dir: &Path) -> Result<(), String> {
@@ -6600,10 +6722,10 @@ async fn main() {
         return;
     }
 
-    let epoch: u64 = match epoch_arg.parse() {
-        Ok(epoch) => epoch,
+    let (start_epoch, end_epoch) = match parse_epoch_range(&epoch_arg) {
+        Ok(range) => range,
         Err(err) => {
-            eprintln!("invalid epoch '{epoch_arg}': {err}");
+            eprintln!("{err}");
             eprintln!("{}", usage(&program));
             exit(2);
         }
@@ -6643,8 +6765,14 @@ async fn main() {
         },
     };
 
-    let horizon_output =
-        horizon_output.unwrap_or_else(|| dest_dir.join(format!("epoch-{epoch}.jet")));
+    if horizon_output.is_some() && start_epoch != end_epoch {
+        eprintln!(
+            "--horizon-output cannot be used with an epoch range ({start_epoch}-{end_epoch}); \
+             each epoch is written to <dest-dir>/epoch-<N>.jet"
+        );
+        exit(2);
+    }
+    let horizon_output_override = horizon_output;
 
     // Replay mutates the unpacked snapshot state in place (new appendvecs,
     // accounts index), so a crashed run leaves the staging dirs dirty.
@@ -6659,17 +6787,19 @@ async fn main() {
         info!("ledger accounts cleanup disabled via JETSTREAMER_CLEAR_ACCOUNTS_ON_START=false");
     }
 
-    let target_slot = epoch_to_slot(epoch).saturating_sub(1);
-    // A local snapshot only bootstraps `epoch` cheaply if it lands within the
-    // previous epoch (at or after the start of `epoch - 1`). Anything older is
-    // still usable, but it forces a warmup replay across every slot between the
-    // snapshot and the epoch boundary — e.g. reusing epoch N's boundary
-    // snapshot to run epoch N+1 re-executes all of epoch N first (~432k slots,
-    // roughly doubling the run). `find_existing_snapshot_archive` only bounds
-    // the candidate from above (slot <= target_slot), so a leftover snapshot
-    // from the prior epoch's run gets picked up here; reject it and download
-    // the real boundary snapshot instead.
-    let min_snapshot_slot = epoch_to_slot(epoch.saturating_sub(1));
+    // The snapshot bootstraps only the first epoch of the run; later epochs in
+    // a range chain off the in-memory bank.
+    let target_slot = epoch_to_slot(start_epoch).saturating_sub(1);
+    // A local snapshot only bootstraps `start_epoch` cheaply if it lands within
+    // the previous epoch (at or after the start of `start_epoch - 1`). Anything
+    // older is still usable, but it forces a warmup replay across every slot
+    // between the snapshot and the epoch boundary — e.g. reusing epoch N's
+    // boundary snapshot to run epoch N+1 re-executes all of epoch N first
+    // (~432k slots, roughly doubling the run). `find_existing_snapshot_archive`
+    // only bounds the candidate from above (slot <= target_slot), so a leftover
+    // snapshot from the prior epoch's run gets picked up here; reject it and
+    // download the real boundary snapshot instead.
+    let min_snapshot_slot = epoch_to_slot(start_epoch.saturating_sub(1));
     let existing_snapshot = match find_existing_snapshot_archive(&dest_dir, target_slot) {
         Ok(Some(candidate)) if candidate.slot < min_snapshot_slot => {
             println!(
@@ -6677,9 +6807,9 @@ async fn main() {
                  (reusing it would warm up across {} slots); downloading the boundary snapshot",
                 candidate.path.display(),
                 candidate.slot,
-                epoch,
+                start_epoch,
                 min_snapshot_slot,
-                epoch_to_slot(epoch).saturating_sub(candidate.slot),
+                epoch_to_slot(start_epoch).saturating_sub(candidate.slot),
             );
             None
         }
@@ -6713,7 +6843,7 @@ async fn main() {
             candidate.path
         }
         None => {
-            match download_snapshot_at_or_before_slot(epoch, target_slot, &dest_dir).await {
+            match download_snapshot_at_or_before_slot(start_epoch, target_slot, &dest_dir).await {
                 Ok(path) => {
                     println!("Downloaded snapshot to {}", path.display());
                     path
@@ -6747,41 +6877,68 @@ async fn main() {
         println!("Extraction complete");
     }
 
-    let snapshot_verifier = if verify_snapshots {
-        info!("collecting canonical snapshot hashes for epoch {epoch}");
-        let expected = match snapshot_expectations_for_epoch(epoch).await {
-            Ok(expected) => expected,
+    // Replay each epoch in the range. The first epoch loads the snapshot; each
+    // subsequent epoch reuses the in-memory bank handed back by the previous
+    // one (carried_bank_forks), so there is no snapshot reload and no warmup
+    // between epochs. Verification hashes and the `.jet` output path are
+    // resolved per epoch.
+    let total_epochs = end_epoch - start_epoch + 1;
+    let mut carried_bank_forks: Option<Arc<RwLock<BankForks>>> = None;
+    for epoch in start_epoch..=end_epoch {
+        if shutdown.load(Ordering::SeqCst) {
+            info!("shutdown requested; stopping before epoch {epoch}");
+            break;
+        }
+        if total_epochs > 1 {
+            info!(
+                "=== epoch {epoch} ({}/{total_epochs}) ===",
+                epoch - start_epoch + 1
+            );
+        }
+        let horizon_output = horizon_output_override
+            .clone()
+            .unwrap_or_else(|| dest_dir.join(format!("epoch-{epoch}.jet")));
+
+        let snapshot_verifier = if verify_snapshots {
+            info!("collecting canonical snapshot hashes for epoch {epoch}");
+            let expected = match snapshot_expectations_for_epoch(epoch).await {
+                Ok(expected) => expected,
+                Err(err) => {
+                    eprintln!("error: {err}");
+                    exit(1);
+                }
+            };
+            info!(
+                "snapshot verification enabled for {} snapshot(s)",
+                expected.len()
+            );
+            Some(Arc::new(SnapshotVerifier::new(
+                expected,
+                Some(shutdown.clone()),
+            )))
+        } else {
+            None
+        };
+
+        match run_geyser_replay(
+            epoch,
+            &dest_dir,
+            &dest_path,
+            shutdown.clone(),
+            cursor.clone(),
+            restart_tracker.clone(),
+            snapshot_verifier,
+            horizon_output,
+            carried_bank_forks.take(),
+        )
+        .await
+        {
+            Ok(bank_forks) => carried_bank_forks = Some(bank_forks),
             Err(err) => {
                 eprintln!("error: {err}");
                 exit(1);
             }
-        };
-        info!(
-            "snapshot verification enabled for {} snapshot(s)",
-            expected.len()
-        );
-        Some(Arc::new(SnapshotVerifier::new(
-            expected,
-            Some(shutdown.clone()),
-        )))
-    } else {
-        None
-    };
-
-    if let Err(err) = run_geyser_replay(
-        epoch,
-        &dest_dir,
-        &dest_path,
-        shutdown,
-        cursor,
-        restart_tracker,
-        snapshot_verifier,
-        horizon_output,
-    )
-    .await
-    {
-        eprintln!("error: {err}");
-        exit(1);
+        }
     }
 }
 

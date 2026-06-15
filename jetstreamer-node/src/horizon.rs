@@ -42,7 +42,7 @@ use std::fs::File;
 use std::io::BufWriter;
 use std::path::Path;
 use std::str::FromStr;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use jetstreamer_horizon::account_updates::AccountUpdateView;
 use jetstreamer_horizon::archive::{
@@ -62,7 +62,13 @@ use solana_transaction_status::TransactionStatusMeta;
 
 use crate::{SlotPresenceMap, SlotPresenceState};
 
-static RECORDER: OnceLock<HorizonRecorder> = OnceLock::new();
+/// The active archive recorder. Swappable so one process can record an entire
+/// range of epochs back to back, writing an independent `.jet` per epoch: each
+/// epoch installs a fresh recorder via [`init`] and tears it down via
+/// [`finish`]. The holder is only written at epoch boundaries (when replay is
+/// paused), so reads on the account-update hot path are effectively
+/// uncontended.
+static RECORDER: RwLock<Option<Arc<HorizonRecorder>>> = RwLock::new(None);
 
 // Diagnostic counters for the per-account-update hot path. The recorder
 // mutex is taken once per account write (~30k/s) from whatever thread is
@@ -94,24 +100,48 @@ pub fn archive_bytes_written() -> u64 {
     ARCHIVE_BYTES_WRITTEN.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Installs the global recorder. Call once, before replay starts.
+/// Installs the active recorder for one epoch's archive. Call before that
+/// epoch's replay starts; pair with [`finish`] when it ends. Errors if a
+/// recorder is still installed (the previous epoch must be finished first).
 pub fn init(
     path: &Path,
     epoch: u64,
     slot_start: Slot,
     slot_count: u64,
-    presence: std::sync::Arc<SlotPresenceMap>,
+    presence: Arc<SlotPresenceMap>,
 ) -> Result<(), String> {
     let recorder = HorizonRecorder::create(path, epoch, slot_start, slot_count, presence)?;
-    RECORDER
-        .set(recorder)
-        .map_err(|_| "horizon recorder already initialized".to_string())
+    let mut slot = RECORDER
+        .write()
+        .map_err(|_| "horizon recorder lock poisoned".to_string())?;
+    if slot.is_some() {
+        return Err("horizon recorder already initialized".to_string());
+    }
+    *slot = Some(Arc::new(recorder));
+    Ok(())
 }
 
-/// Returns the recorder when archive output is enabled.
+/// Finalizes and removes the active recorder (writes the footer + bucket
+/// index), returning its stats. No-op returning `Ok(None)` when recording is
+/// disabled. Clears the slot so the next epoch's [`init`] can install a fresh
+/// archive.
+pub fn finish() -> Result<Option<ArchiveStats>, String> {
+    let recorder = RECORDER
+        .write()
+        .map_err(|_| "horizon recorder lock poisoned".to_string())?
+        .take();
+    match recorder {
+        Some(recorder) => recorder.finish().map(Some),
+        None => Ok(None),
+    }
+}
+
+/// Returns the active recorder when archive output is enabled. The returned
+/// handle keeps the recorder alive for the duration of the call even if a
+/// concurrent [`finish`] runs (which it never does during replay).
 #[inline]
-pub fn recorder() -> Option<&'static HorizonRecorder> {
-    RECORDER.get()
+pub fn recorder() -> Option<Arc<HorizonRecorder>> {
+    RECORDER.read().ok()?.clone()
 }
 
 /// One account update, owned (the geyser notification's buffers are only

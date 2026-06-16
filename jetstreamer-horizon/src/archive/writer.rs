@@ -78,7 +78,7 @@ impl Default for ArchiveWriterConfig {
 }
 
 /// Aggregate counters reported by [`ArchiveWriter::finish`].
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Encode, Decode, Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ArchiveStats {
     /// Total bytes written to the sink (header + buckets + index + footer).
     pub bytes_written: u64,
@@ -165,7 +165,7 @@ pub struct ArchiveWriter<W: std::io::Write> {
 /// same archive file after a crash (see [`ArchiveWriter::checkpoint`] and
 /// [`ArchiveWriter::resume`]). At this point the file on disk is a valid
 /// header-plus-buckets prefix with no footer yet.
-#[derive(Debug, Clone)]
+#[derive(Encode, Decode, Debug, Clone)]
 pub struct ArchiveCheckpoint {
     /// Byte length of the durable prefix — where appended buckets resume.
     pub file_offset: u64,
@@ -177,6 +177,21 @@ pub struct ArchiveCheckpoint {
     pub last_blockhash: Hash,
     /// Last slot written (monotonicity guard on resume).
     pub last_slot: Option<u64>,
+}
+
+impl ArchiveCheckpoint {
+    /// Serializes this checkpoint (lencode) for persisting in a resume manifest.
+    pub fn encode_to_vec(&self) -> Result<Vec<u8>, ArchiveFormatError> {
+        let mut out = Vec::new();
+        self.encode_ext(&mut out, None)?;
+        Ok(out)
+    }
+
+    /// Decodes a checkpoint previously written by [`Self::encode_to_vec`].
+    pub fn decode_from_slice(bytes: &[u8]) -> Result<Self, ArchiveFormatError> {
+        let mut cur = bytes;
+        Ok(Self::decode_ext(&mut cur, None)?)
+    }
 }
 
 impl<W: std::io::Write> ArchiveWriter<W> {

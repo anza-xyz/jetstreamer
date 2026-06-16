@@ -12,7 +12,7 @@ use std::{
 };
 
 use agave_snapshots::{
-    ArchiveFormat, ArchiveFormatDecompressor,
+    ArchiveFormat, ArchiveFormatDecompressor, ZstdConfig,
     snapshot_archive_info::{FullSnapshotArchiveInfo, SnapshotArchiveInfoGetter},
     snapshot_hash::SnapshotHash,
     streaming_unarchive_snapshot,
@@ -6704,6 +6704,130 @@ fn clear_ledger_accounts_state(ledger_dir: &Path) -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+/// Directory holding the in-progress crash checkpoint for `epoch`.
+fn checkpoint_dir(dest_dir: &Path, epoch: u64) -> PathBuf {
+    dest_dir.join("checkpoints").join(epoch.to_string())
+}
+
+/// Writes a full bank snapshot for the (frozen) `bank` into `dir`, returning
+/// the `snapshot-<slot>-<hash>.tar.zst` path — the same format the normal
+/// loader reads, so resume just loads it like any boundary snapshot.
+fn write_checkpoint_snapshot(bank: &Bank, dir: &Path) -> Result<PathBuf, String> {
+    let bank_snapshots_dir = dir.join("bank-snapshots");
+    fs::create_dir_all(&bank_snapshots_dir)
+        .map_err(|err| format!("failed to create {}: {err}", bank_snapshots_dir.display()))?;
+    let info = snapshot_bank_utils::bank_to_full_snapshot_archive(
+        &bank_snapshots_dir,
+        bank,
+        None,
+        dir,
+        dir,
+        ArchiveFormat::TarZstd {
+            config: ZstdConfig::default(),
+        },
+    )
+    .map_err(|err| format!("checkpoint snapshot at slot {} failed: {err}", bank.slot()))?;
+    Ok(info.path().to_path_buf())
+}
+
+/// Persisted pointer to a crash checkpoint.
+struct CheckpointRecord {
+    epoch: u64,
+    /// First slot to replay on resume; the archive prefix covers
+    /// `[epoch_start, resume_slot - 1]` and the bank snapshot is at
+    /// `resume_slot - 1`.
+    resume_slot: Slot,
+    bank_snapshot: PathBuf,
+    jet_path: PathBuf,
+    last_emitted: Slot,
+    epoch_meta_written: bool,
+}
+
+/// Atomically writes the checkpoint manifest plus the lencode'd archive-state
+/// sidecar (temp files + rename; the manifest rename is the commit point).
+fn write_checkpoint_manifest(
+    dir: &Path,
+    record: &CheckpointRecord,
+    archive: &jetstreamer_horizon::archive::ArchiveCheckpoint,
+) -> Result<(), String> {
+    fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+    let sidecar = dir.join("archive-checkpoint.bin");
+    let sidecar_tmp = dir.join("archive-checkpoint.bin.tmp");
+    let bytes = archive
+        .encode_to_vec()
+        .map_err(|e| format!("encode archive checkpoint: {e}"))?;
+    fs::write(&sidecar_tmp, &bytes).map_err(|e| format!("write sidecar: {e}"))?;
+    fs::rename(&sidecar_tmp, &sidecar).map_err(|e| format!("commit sidecar: {e}"))?;
+
+    let manifest = serde_json::json!({
+        "epoch": record.epoch,
+        "resume_slot": record.resume_slot,
+        "bank_snapshot": record.bank_snapshot,
+        "jet_path": record.jet_path,
+        "archive_checkpoint": sidecar,
+        "last_emitted": record.last_emitted,
+        "epoch_meta_written": record.epoch_meta_written,
+    });
+    let manifest_path = dir.join("manifest.json");
+    let manifest_tmp = dir.join("manifest.json.tmp");
+    let json =
+        serde_json::to_vec_pretty(&manifest).map_err(|e| format!("serialize manifest: {e}"))?;
+    fs::write(&manifest_tmp, &json).map_err(|e| format!("write manifest: {e}"))?;
+    fs::rename(&manifest_tmp, &manifest_path).map_err(|e| format!("commit manifest: {e}"))?;
+    Ok(())
+}
+
+/// Loads a checkpoint for `epoch` if one exists, returning the resume record
+/// and the recorder checkpoint needed to resume appending to the archive.
+fn load_checkpoint(
+    dest_dir: &Path,
+    epoch: u64,
+) -> Result<Option<(CheckpointRecord, horizon::RecorderCheckpoint)>, String> {
+    let manifest_path = checkpoint_dir(dest_dir, epoch).join("manifest.json");
+    if !manifest_path.is_file() {
+        return Ok(None);
+    }
+    let v: serde_json::Value =
+        serde_json::from_slice(&fs::read(&manifest_path).map_err(|e| format!("read manifest: {e}"))?)
+            .map_err(|e| format!("parse manifest: {e}"))?;
+    let get_u64 = |k: &str| v[k].as_u64().ok_or_else(|| format!("manifest missing {k}"));
+    let get_path = |k: &str| {
+        v[k].as_str()
+            .map(PathBuf::from)
+            .ok_or_else(|| format!("manifest missing {k}"))
+    };
+    let record = CheckpointRecord {
+        epoch: get_u64("epoch")?,
+        resume_slot: get_u64("resume_slot")?,
+        bank_snapshot: get_path("bank_snapshot")?,
+        jet_path: get_path("jet_path")?,
+        last_emitted: get_u64("last_emitted")?,
+        epoch_meta_written: v["epoch_meta_written"].as_bool().unwrap_or(false),
+    };
+    let sidecar = get_path("archive_checkpoint")?;
+    let archive = jetstreamer_horizon::archive::ArchiveCheckpoint::decode_from_slice(
+        &fs::read(&sidecar).map_err(|e| format!("read archive checkpoint: {e}"))?,
+    )
+    .map_err(|e| format!("decode archive checkpoint: {e}"))?;
+    let recorder_cp = horizon::RecorderCheckpoint {
+        archive,
+        last_emitted: record.last_emitted,
+        epoch_meta_written: record.epoch_meta_written,
+    };
+    Ok(Some((record, recorder_cp)))
+}
+
+/// Removes the checkpoint directory for `epoch` (after the epoch finishes
+/// cleanly, so a later run doesn't resume a stale checkpoint).
+fn clear_checkpoint(dest_dir: &Path, epoch: u64) {
+    let dir = checkpoint_dir(dest_dir, epoch);
+    if dir.exists()
+        && let Err(err) = fs::remove_dir_all(&dir)
+    {
+        warn!("failed to remove checkpoint dir {}: {err}", dir.display());
+    }
 }
 
 #[tokio::main]

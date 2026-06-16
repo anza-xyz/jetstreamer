@@ -433,6 +433,26 @@ fn roundtrip_zstd_bucket_128() {
 }
 
 #[test]
+fn archive_checkpoint_serialization_roundtrips() {
+    let config = ArchiveWriterConfig::default();
+    let mut writer =
+        ArchiveWriter::new(std::io::Cursor::new(Vec::new()), 900, 1_000, 300, config).unwrap();
+    writer.write_skipped_slot(1_000).unwrap();
+    writer.write_skipped_slot(1_001).unwrap();
+    let cp = writer.checkpoint().unwrap();
+
+    let bytes = cp.encode_to_vec().unwrap();
+    let decoded = ArchiveCheckpoint::decode_from_slice(&bytes).unwrap();
+
+    assert_eq!(decoded.file_offset, cp.file_offset);
+    assert_eq!(decoded.index, cp.index);
+    assert_eq!(decoded.stats, cp.stats);
+    assert_eq!(decoded.last_blockhash, cp.last_blockhash);
+    assert_eq!(decoded.last_slot, cp.last_slot);
+    assert!(!cp.index.is_empty());
+}
+
+#[test]
 fn checkpoint_resume_matches_uninterrupted() {
     let config = ArchiveWriterConfig::default();
     // Reference archive, written straight through.

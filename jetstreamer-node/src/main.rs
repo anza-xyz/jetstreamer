@@ -116,7 +116,11 @@ const MAX_WAVE_TXS: usize = 256;
 const DEFAULT_POST_FIREHOSE_INCOMPLETE_RETRY_ATTEMPTS: usize = 16;
 const DEFAULT_EMPTY_SLOT_BUFFER_GAP_LIMIT: u64 = 0;
 const DEFAULT_FIREHOSE_BACKPRESSURE_SLOT_GAP_LIMIT: u64 = 128;
-const DEFAULT_FORCE_MISSING_BLOCK_RETRY_LIMIT: usize = 4;
+// Consecutive retries on a single persistently-missing-block-data slot before
+// aborting the run. A present slot's block data is required (it is never
+// force-skipped), so this is how many re-fetch attempts a transient
+// old-faithful hiccup gets to recover before we give up cleanly.
+const DEFAULT_FORCE_MISSING_BLOCK_RETRY_LIMIT: usize = 16;
 static LOGGED_FIRST_ACCOUNT_UPDATE: AtomicBool = AtomicBool::new(false);
 static LOGGED_PROGRAM_CACHE_ASSIGN_FAIL: AtomicBool = AtomicBool::new(false);
 static PROGRAM_CACHE_ASSIGN_FAIL_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -3216,6 +3220,17 @@ impl TransactionScheduler {
             return Err(format!(
                 "cannot force missing for slot {} outside scheduler range",
                 slot
+            ));
+        }
+        // A slot the old-faithful index marks Present has a real block. Skipping
+        // it would silently drop that block, which the horizon recorder refuses
+        // (it panics mid-run). Such a slot's data is required, so never
+        // force-skip it — surface a clear error so the caller can retry or abort.
+        if presence == Some(SlotPresenceState::Present) {
+            return Err(format!(
+                "slot {slot} is present in the old-faithful index but its block data never \
+                 arrived; refusing to force-skip a real block. The data may be transiently \
+                 unavailable (re-run) or missing from old-faithful (needs a fallback source)."
             ));
         }
         if let Some(buffer) = state.slots.get(&slot)
@@ -6462,10 +6477,12 @@ async fn run_geyser_replay(
                 if matches!(incomplete.reason, IncompleteReason::MissingBlockData)
                     && persistent_missing_count >= force_missing_retry_limit
                 {
-                    warn!(
-                        "forcing slot {} to missing after {} consecutive missing-block-data retries",
-                        incomplete.slot, persistent_missing_count
-                    );
+                    // The slot is present in the old-faithful index but its block
+                    // data still hasn't arrived after this many retries. Skipping
+                    // it would drop a real block (the horizon recorder refuses and
+                    // would panic mid-run), so abort cleanly. `force_mark_missing`
+                    // only succeeds for genuinely non-present slots; for a present
+                    // slot it returns the actionable error we surface here.
                     match scheduler.force_mark_missing(incomplete.slot) {
                         Ok(ready_entries) => {
                             send_ready_entries(&ready_sender, &failure, ready_entries);
@@ -6476,8 +6493,8 @@ async fn run_geyser_replay(
                         }
                         Err(force_err) => {
                             failure.record(format!(
-                                "failed to force slot {} missing after persistent missing block data: {}",
-                                incomplete.slot, force_err
+                                "aborting at slot {} after {} consecutive missing-block-data retries: {}",
+                                incomplete.slot, persistent_missing_count, force_err
                             ));
                             break;
                         }

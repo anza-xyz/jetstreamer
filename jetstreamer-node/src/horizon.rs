@@ -38,15 +38,16 @@
 //! the node's replay machinery already treats divergence as fatal.
 
 use std::collections::{BTreeMap, HashMap};
-use std::fs::File;
-use std::io::BufWriter;
+use std::fs::{File, OpenOptions};
+use std::io::{BufWriter, Seek, SeekFrom};
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex, RwLock};
 
 use jetstreamer_horizon::account_updates::AccountUpdateView;
 use jetstreamer_horizon::archive::{
-    ArchiveStats, ArchiveWriter, ArchiveWriterConfig, BlockMeta, EntryRecord, EpochMeta,
+    ArchiveCheckpoint, ArchiveStats, ArchiveWriter, ArchiveWriterConfig, BlockMeta, EntryRecord,
+    EpochMeta,
 };
 use jetstreamer_horizon::convert;
 use jetstreamer_horizon::transactions::Transaction;
@@ -132,6 +133,43 @@ pub fn finish() -> Result<Option<ArchiveStats>, String> {
         .take();
     match recorder {
         Some(recorder) => recorder.finish().map(Some),
+        None => Ok(None),
+    }
+}
+
+/// Installs a recorder that resumes appending to an existing archive from a
+/// crash checkpoint, instead of creating a fresh one (cf. [`init`]). The header
+/// is not rewritten; recording continues from `checkpoint.last_emitted + 1`.
+pub fn resume_init(
+    path: &Path,
+    epoch: u64,
+    slot_start: Slot,
+    slot_count: u64,
+    presence: Arc<SlotPresenceMap>,
+    checkpoint: RecorderCheckpoint,
+) -> Result<(), String> {
+    let recorder =
+        HorizonRecorder::resume(path, epoch, slot_start, slot_count, presence, checkpoint)?;
+    let mut slot = RECORDER
+        .write()
+        .map_err(|_| "horizon recorder lock poisoned".to_string())?;
+    if slot.is_some() {
+        return Err("horizon recorder already initialized".to_string());
+    }
+    *slot = Some(Arc::new(recorder));
+    Ok(())
+}
+
+/// Checkpoints the active recorder at `resume_slot`: flushes everything through
+/// `resume_slot - 1` into a durable, fsync'd archive prefix and returns the
+/// state needed to resume after a crash. The recorder stays installed and keeps
+/// recording. Returns `Ok(None)` when recording is disabled.
+pub fn checkpoint(resume_slot: Slot) -> Result<Option<RecorderCheckpoint>, String> {
+    let guard = RECORDER
+        .read()
+        .map_err(|_| "horizon recorder lock poisoned".to_string())?;
+    match guard.as_ref() {
+        Some(recorder) => recorder.checkpoint(resume_slot).map(Some),
         None => Ok(None),
     }
 }
@@ -298,6 +336,18 @@ struct RecorderState {
     finished: bool,
 }
 
+/// Everything needed to resume appending to an archive after a crash: the
+/// writer-level [`ArchiveCheckpoint`] plus the recorder's slot-tracking state.
+/// The owning run persists this (alongside the bank snapshot and resume slot)
+/// in the checkpoint manifest.
+pub struct RecorderCheckpoint {
+    pub archive: ArchiveCheckpoint,
+    /// Last slot emitted into the durable prefix (`resume_slot - 1`).
+    pub last_emitted: Slot,
+    /// Whether the epoch-meta frame was already written (rides the first block).
+    pub epoch_meta_written: bool,
+}
+
 pub struct HorizonRecorder {
     state: Mutex<RecorderState>,
 }
@@ -338,6 +388,119 @@ impl HorizonRecorder {
                 presence,
                 finished: false,
             }),
+        })
+    }
+
+    /// Resumes appending to an existing archive file from a [`RecorderCheckpoint`].
+    /// The file is truncated back to the durable prefix (dropping any partial
+    /// bucket from the crashed run) and reopened for appending; the header is
+    /// not rewritten. `slot_start`/`slot_count` are the *whole-epoch* archive
+    /// coordinates (the archive remains one file for the epoch).
+    fn resume(
+        path: &Path,
+        epoch: u64,
+        slot_start: Slot,
+        slot_count: u64,
+        presence: std::sync::Arc<SlotPresenceMap>,
+        checkpoint: RecorderCheckpoint,
+    ) -> Result<Self, String> {
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .map_err(|err| {
+                format!(
+                    "failed to open horizon archive {} for resume: {err}",
+                    path.display()
+                )
+            })?;
+        file.set_len(checkpoint.archive.file_offset).map_err(|err| {
+            format!("failed to truncate horizon archive to checkpoint prefix: {err}")
+        })?;
+        file.seek(SeekFrom::End(0))
+            .map_err(|err| format!("failed to seek to end of horizon archive: {err}"))?;
+        let writer = ArchiveWriter::resume(
+            BufWriter::with_capacity(8 << 20, file),
+            slot_start,
+            slot_count,
+            ArchiveWriterConfig::default(),
+            checkpoint.archive,
+        );
+        Ok(HorizonRecorder {
+            state: Mutex::new(RecorderState {
+                writer,
+                epoch,
+                slot_start,
+                slot_end_inclusive: slot_start + slot_count - 1,
+                assemblies: BTreeMap::new(),
+                block_metas: BTreeMap::new(),
+                last_emitted: Some(checkpoint.last_emitted),
+                epoch_meta_written: checkpoint.epoch_meta_written,
+                tx_scratch: Transaction::new_boxed(),
+                meta_scratch: BlockMeta::new_boxed(),
+                epoch_scratch: EpochMeta::new_boxed(),
+                presence,
+                finished: false,
+            }),
+        })
+    }
+
+    /// Flushes everything through `resume_slot - 1` (so the archive prefix is
+    /// complete up to there), checkpoints + fsyncs the writer, and returns the
+    /// state needed to resume after a crash. The recorder stays installed and
+    /// keeps recording from `resume_slot` onward.
+    ///
+    /// The caller must freeze the bank at `resume_slot - 1` first (so the last
+    /// slot's post-transaction orphan updates are recorded) and must have
+    /// quiesced the replay (no data for slots >= `resume_slot` buffered).
+    pub fn checkpoint(&self, resume_slot: Slot) -> Result<RecorderCheckpoint, String> {
+        let mut state = self.lock();
+        if state.finished {
+            return Err("horizon recorder already finished".to_string());
+        }
+        // Emit all complete assemblies for slots < resume_slot.
+        state.emit_complete_below(resume_slot);
+        // Fill any trailing leader-skipped slots up to resume_slot - 1.
+        let next = state
+            .last_emitted
+            .map(|s| s + 1)
+            .unwrap_or(state.slot_start);
+        for slot in next..resume_slot {
+            state.check_gap_slot_skipped(slot);
+            state.writer.write_skipped_slot(slot).map_err(|err| {
+                format!("horizon: failed to write skipped slot {slot} at checkpoint: {err}")
+            })?;
+        }
+        // Anything still buffered means the replay was not quiesced — refuse
+        // rather than checkpoint an inconsistent prefix.
+        if let Some((&slot, _)) = state.assemblies.first_key_value() {
+            return Err(format!(
+                "horizon: cannot checkpoint at slot {resume_slot}: slot {slot} still buffered \
+                 (replay not quiesced)"
+            ));
+        }
+        if let Some((&slot, _)) = state.block_metas.first_key_value() {
+            return Err(format!(
+                "horizon: cannot checkpoint at slot {resume_slot}: block metadata for slot {slot} \
+                 was never emitted"
+            ));
+        }
+        // The durable prefix now covers [slot_start, resume_slot - 1].
+        state.last_emitted = Some(resume_slot - 1);
+        let archive = state
+            .writer
+            .checkpoint()
+            .map_err(|err| format!("horizon: writer checkpoint failed: {err}"))?;
+        state
+            .writer
+            .sink_ref()
+            .get_ref()
+            .sync_all()
+            .map_err(|err| format!("horizon: failed to fsync archive at checkpoint: {err}"))?;
+        Ok(RecorderCheckpoint {
+            archive,
+            last_emitted: resume_slot - 1,
+            epoch_meta_written: state.epoch_meta_written,
         })
     }
 

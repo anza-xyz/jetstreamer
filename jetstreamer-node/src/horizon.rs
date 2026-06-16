@@ -414,9 +414,10 @@ impl HorizonRecorder {
                     path.display()
                 )
             })?;
-        file.set_len(checkpoint.archive.file_offset).map_err(|err| {
-            format!("failed to truncate horizon archive to checkpoint prefix: {err}")
-        })?;
+        file.set_len(checkpoint.archive.file_offset)
+            .map_err(|err| {
+                format!("failed to truncate horizon archive to checkpoint prefix: {err}")
+            })?;
         file.seek(SeekFrom::End(0))
             .map_err(|err| format!("failed to seek to end of horizon archive: {err}"))?;
         let writer = ArchiveWriter::resume(

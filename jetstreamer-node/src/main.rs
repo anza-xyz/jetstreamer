@@ -121,6 +121,10 @@ const DEFAULT_FIREHOSE_BACKPRESSURE_SLOT_GAP_LIMIT: u64 = 128;
 // force-skipped), so this is how many re-fetch attempts a transient
 // old-faithful hiccup gets to recover before we give up cleanly.
 const DEFAULT_FORCE_MISSING_BLOCK_RETRY_LIMIT: usize = 16;
+const DEFAULT_CHECKPOINT_INTERVAL_SLOTS: u64 = 50_000;
+/// Bucket size the archive writer resets encoder state on; checkpoints land on
+/// these boundaries so the durable prefix ends on a whole bucket.
+const CHECKPOINT_BUCKET_SLOTS: u64 = 128;
 static LOGGED_FIRST_ACCOUNT_UPDATE: AtomicBool = AtomicBool::new(false);
 static LOGGED_PROGRAM_CACHE_ASSIGN_FAIL: AtomicBool = AtomicBool::new(false);
 static PROGRAM_CACHE_ASSIGN_FAIL_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -610,6 +614,15 @@ impl BankReplay {
     /// next epoch in a range run.
     fn bank_forks(&self) -> Arc<RwLock<BankForks>> {
         self.bank_forks.clone()
+    }
+
+    /// The current working bank (e.g. to snapshot it at a checkpoint boundary).
+    fn working_bank(&self) -> Result<Arc<Bank>, String> {
+        let guard = self
+            .bank_forks
+            .read()
+            .map_err(|_| "bank forks lock poisoned".to_string())?;
+        Ok(guard.working_bank())
     }
 
     fn cached_bank_for_slot(&self, slot: Slot) -> Option<Arc<Bank>> {
@@ -5618,6 +5631,17 @@ async fn run_geyser_replay(
         Reuse(Arc<RwLock<BankForks>>),
         Fresh(Box<Bank>),
     }
+    // A crash checkpoint for this epoch (only on a fresh run, never a chained
+    // reuse) means resume mid-epoch: load the checkpoint's bank snapshot and
+    // append to the existing archive instead of starting the epoch over.
+    let (resume_record, resume_recorder_cp) = if existing_bank_forks.is_none() {
+        match load_checkpoint(&ledger_dir, epoch)? {
+            Some((record, recorder_cp)) => (Some(record), Some(recorder_cp)),
+            None => (None, None),
+        }
+    } else {
+        (None, None)
+    };
     let (bank_source, snapshot_slot) = match existing_bank_forks {
         Some(bank_forks) => {
             let slot = bank_forks
@@ -5625,7 +5649,9 @@ async fn run_geyser_replay(
                 .map_err(|_| "bank forks lock poisoned".to_string())?
                 .working_bank()
                 .slot();
-            info!("reusing in-memory bank from previous epoch at slot {slot}; skipping snapshot load");
+            info!(
+                "reusing in-memory bank from previous epoch at slot {slot}; skipping snapshot load"
+            );
             (BankSource::Reuse(bank_forks), slot)
         }
         None => {
@@ -5636,9 +5662,21 @@ async fn run_geyser_replay(
                 }) as AccountsUpdateNotifier);
             info!("accounts update notifier wired into snapshot load: true");
             ensure_genesis_archive(&ledger_dir).await?;
-            info!("loading bank from snapshot");
+            let load_path = match &resume_record {
+                Some(record) => {
+                    info!(
+                        "resuming epoch {epoch} from checkpoint at resume slot {} (bank snapshot {})",
+                        record.resume_slot,
+                        record.bank_snapshot.display()
+                    );
+                    record.bank_snapshot.clone()
+                }
+                None => {
+                    info!("loading bank from snapshot");
+                    snapshot_archive.to_path_buf()
+                }
+            };
             let ledger_dir_for_load = ledger_dir.clone();
-            let snapshot_archive = snapshot_archive.to_path_buf();
             let use_dir_loader = env_truthy("JETSTREAMER_LOAD_FROM_DIR");
             let bank = tokio::task::spawn_blocking(move || {
                 if use_dir_loader {
@@ -5646,7 +5684,7 @@ async fn run_geyser_replay(
                 } else {
                     load_bank_from_snapshot_archive(
                         &ledger_dir_for_load,
-                        &snapshot_archive,
+                        &load_path,
                         accounts_update_notifier,
                     )
                 }
@@ -5661,11 +5699,11 @@ async fn run_geyser_replay(
             (BankSource::Fresh(Box::new(bank)), slot)
         }
     };
-    let replay_start = if snapshot_slot.saturating_add(1) < epoch_start {
-        snapshot_slot.saturating_add(1)
-    } else {
-        epoch_start
-    };
+    // Replay every slot after the loaded bank. For a fresh boundary snapshot
+    // this warms up to epoch_start; for a resume checkpoint the snapshot is
+    // mid-epoch, so replay starts at resume_slot (= snapshot_slot + 1) — which
+    // is why this must not be clamped up to epoch_start.
+    let replay_start = snapshot_slot.saturating_add(1);
     if replay_start < epoch_start {
         info!(
             "warming up replay from slot {} to {} (epoch {} starts at {})",
@@ -5693,20 +5731,40 @@ async fn run_geyser_replay(
     } else {
         info!("empty-slot gap guard disabled");
     }
-    horizon::init(
-        &horizon_output,
-        epoch,
-        epoch_start,
-        end_inclusive - epoch_start + 1,
-        slot_presence.clone(),
-    )?;
-    info!(
-        "horizon archive recording to {} (epoch {}, slots {}..={})",
-        horizon_output.display(),
-        epoch,
-        epoch_start,
-        end_inclusive
-    );
+    match resume_recorder_cp {
+        Some(recorder_cp) => {
+            horizon::resume_init(
+                &horizon_output,
+                epoch,
+                epoch_start,
+                end_inclusive - epoch_start + 1,
+                slot_presence.clone(),
+                recorder_cp,
+            )?;
+            info!(
+                "horizon archive resuming append to {} (epoch {}, from slot {})",
+                horizon_output.display(),
+                epoch,
+                replay_start
+            );
+        }
+        None => {
+            horizon::init(
+                &horizon_output,
+                epoch,
+                epoch_start,
+                end_inclusive - epoch_start + 1,
+                slot_presence.clone(),
+            )?;
+            info!(
+                "horizon archive recording to {} (epoch {}, slots {}..={})",
+                horizon_output.display(),
+                epoch,
+                epoch_start,
+                end_inclusive
+            );
+        }
+    }
     let scheduler = Arc::new(TransactionScheduler::new(
         replay_start,
         slot_presence,
@@ -5821,7 +5879,6 @@ async fn run_geyser_replay(
             }
         })
         .expect("failed to spawn ready entry thread");
-    let slot_range = replay_start..(end_inclusive + 1);
 
     let client = Client::new();
     let index_base_url = resolve_remote_index_base_url()?;
@@ -6365,188 +6422,232 @@ async fn run_geyser_replay(
         })
     };
 
-    let mut firehose_start = slot_range.start;
-    let mut incomplete_retries = 0usize;
-    let mut firehose_error: Option<String> = None;
-    let mut persistent_missing_slot: Option<Slot> = None;
-    let mut persistent_missing_count = 0usize;
-    loop {
-        if shutdown.load(Ordering::Relaxed) {
-            info!("shutdown requested; abandoning replay");
-            break;
-        }
-        backpressure_stop_requested.store(false, Ordering::SeqCst);
-
+    let checkpoint_interval = checkpoint_interval_slots();
+    if checkpoint_interval > 0 {
         info!(
-            "starting firehose replay with {} thread(s) (attempt {} from slot {})",
-            threads,
-            incomplete_retries.saturating_add(1),
-            firehose_start
+            "checkpointing every {checkpoint_interval} slots (resume on crash; set \
+             JETSTREAMER_CHECKPOINT_INTERVAL_SLOTS=0 to disable)"
         );
-        let firehose_stop = Arc::new(AtomicBool::new(false));
-        if let Ok(mut guard) = active_firehose_stop.lock() {
-            *guard = Some(firehose_stop.clone());
-        }
-        let shutdown_watcher = {
-            let shutdown = shutdown.clone();
-            let firehose_stop = firehose_stop.clone();
-            std::thread::spawn(move || {
-                while !firehose_stop.load(Ordering::Relaxed) {
-                    if shutdown.load(Ordering::Relaxed) {
-                        firehose_stop.store(true, Ordering::SeqCst);
-                        break;
+    }
+    let mut firehose_error: Option<String> = None;
+    let mut chunk_start = replay_start;
+    'chunks: loop {
+        // Replay through the next checkpoint boundary (resume_slot = chunk_end +
+        // 1, bucket-aligned) or the epoch end. Checkpoints only land inside the
+        // recorded epoch (>= epoch_start), so any warmup runs in the first chunk.
+        let chunk_end = if checkpoint_interval == 0 {
+            end_inclusive
+        } else {
+            let base = chunk_start.max(epoch_start);
+            let next_k = (base - epoch_start) / checkpoint_interval + 1;
+            (epoch_start + next_k * checkpoint_interval - 1).min(end_inclusive)
+        };
+        let mut firehose_start = chunk_start;
+        let mut incomplete_retries = 0usize;
+        let mut persistent_missing_slot: Option<Slot> = None;
+        let mut persistent_missing_count = 0usize;
+        loop {
+            if shutdown.load(Ordering::Relaxed) {
+                info!("shutdown requested; abandoning replay");
+                break;
+            }
+            backpressure_stop_requested.store(false, Ordering::SeqCst);
+
+            info!(
+                "starting firehose replay with {} thread(s) (attempt {} from slot {})",
+                threads,
+                incomplete_retries.saturating_add(1),
+                firehose_start
+            );
+            let firehose_stop = Arc::new(AtomicBool::new(false));
+            if let Ok(mut guard) = active_firehose_stop.lock() {
+                *guard = Some(firehose_stop.clone());
+            }
+            let shutdown_watcher = {
+                let shutdown = shutdown.clone();
+                let firehose_stop = firehose_stop.clone();
+                std::thread::spawn(move || {
+                    while !firehose_stop.load(Ordering::Relaxed) {
+                        if shutdown.load(Ordering::Relaxed) {
+                            firehose_stop.store(true, Ordering::SeqCst);
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(50));
                     }
-                    std::thread::sleep(Duration::from_millis(50));
+                })
+            };
+            let firehose_result = tokio::task::spawn_blocking({
+                let slot_range = firehose_start..(chunk_end + 1);
+                let notifiers = GeyserNotifiers {
+                    transaction_notifier: notifiers.transaction_notifier.clone(),
+                    entry_notifier: notifiers.entry_notifier.clone(),
+                    block_metadata_notifier: notifiers.block_metadata_notifier.clone(),
+                };
+                let confirmed_bank_sender = confirmed_bank_sender.clone();
+                let index_base_url = index_base_url.clone();
+                let client = client.clone();
+                let firehose_stop = firehose_stop.clone();
+                move || {
+                    let rt = match tokio::runtime::Runtime::new() {
+                        Ok(rt) => Arc::new(rt),
+                        Err(err) => {
+                            return Err((
+                                FirehoseError::OnLoadError(Box::new(err)),
+                                slot_range.start,
+                            ));
+                        }
+                    };
+                    firehose_geyser_with_notifiers(
+                        rt,
+                        slot_range,
+                        notifiers,
+                        confirmed_bank_sender,
+                        &index_base_url,
+                        &client,
+                        firehose_stop,
+                        async { Ok(()) },
+                        threads,
+                        true,
+                        buffer_window_bytes,
+                    )
                 }
             })
-        };
-        let firehose_result = tokio::task::spawn_blocking({
-            let slot_range = firehose_start..slot_range.end;
-            let notifiers = GeyserNotifiers {
-                transaction_notifier: notifiers.transaction_notifier.clone(),
-                entry_notifier: notifiers.entry_notifier.clone(),
-                block_metadata_notifier: notifiers.block_metadata_notifier.clone(),
-            };
-            let confirmed_bank_sender = confirmed_bank_sender.clone();
-            let index_base_url = index_base_url.clone();
-            let client = client.clone();
-            let firehose_stop = firehose_stop.clone();
-            move || {
-                let rt = match tokio::runtime::Runtime::new() {
-                    Ok(rt) => Arc::new(rt),
-                    Err(err) => {
-                        return Err((FirehoseError::OnLoadError(Box::new(err)), slot_range.start));
-                    }
-                };
-                firehose_geyser_with_notifiers(
-                    rt,
-                    slot_range,
-                    notifiers,
-                    confirmed_bank_sender,
-                    &index_base_url,
-                    &client,
-                    firehose_stop,
-                    async { Ok(()) },
-                    threads,
-                    true,
-                    buffer_window_bytes,
-                )
+            .await
+            .map_err(|err| format!("firehose task failed: {err}"))?;
+            firehose_stop.store(true, Ordering::SeqCst);
+            let _ = shutdown_watcher.join();
+            if let Ok(mut guard) = active_firehose_stop.lock() {
+                *guard = None;
             }
-        })
-        .await
-        .map_err(|err| format!("firehose task failed: {err}"))?;
-        firehose_stop.store(true, Ordering::SeqCst);
-        let _ = shutdown_watcher.join();
-        if let Ok(mut guard) = active_firehose_stop.lock() {
-            *guard = None;
-        }
 
-        if shutdown.load(Ordering::Relaxed) {
-            info!("shutdown requested; abandoning replay");
-            break;
-        }
-
-        let stopped_by_backpressure = backpressure_stop_requested.load(Ordering::Relaxed);
-
-        if let Err((err, slot)) = firehose_result {
-            firehose_error = Some(format!("firehose error at slot {slot}: {err}"));
-            break;
-        }
-
-        match scheduler.drain_ready_entries() {
-            Ok(ready_entries) => {
-                send_ready_entries(&ready_sender, &failure, ready_entries);
+            if shutdown.load(Ordering::Relaxed) {
+                info!("shutdown requested; abandoning replay");
+                break;
             }
-            Err(err) => failure.record(err),
-        }
 
-        if let Err(err) = scheduler.verify_complete(end_inclusive) {
-            if let Some(incomplete) = scheduler.first_incomplete_slot(end_inclusive) {
-                if matches!(incomplete.reason, IncompleteReason::MissingBlockData) {
-                    if persistent_missing_slot == Some(incomplete.slot) {
-                        persistent_missing_count = persistent_missing_count.saturating_add(1);
-                    } else {
-                        persistent_missing_slot = Some(incomplete.slot);
-                        persistent_missing_count = 1;
-                    }
-                } else {
-                    persistent_missing_slot = None;
-                    persistent_missing_count = 0;
+            let stopped_by_backpressure = backpressure_stop_requested.load(Ordering::Relaxed);
+
+            if let Err((err, slot)) = firehose_result {
+                firehose_error = Some(format!("firehose error at slot {slot}: {err}"));
+                break;
+            }
+
+            match scheduler.drain_ready_entries() {
+                Ok(ready_entries) => {
+                    send_ready_entries(&ready_sender, &failure, ready_entries);
                 }
+                Err(err) => failure.record(err),
+            }
 
-                if matches!(incomplete.reason, IncompleteReason::MissingBlockData)
-                    && persistent_missing_count >= force_missing_retry_limit
-                {
-                    // The slot is present in the old-faithful index but its block
-                    // data still hasn't arrived after this many retries. Skipping
-                    // it would drop a real block (the horizon recorder refuses and
-                    // would panic mid-run), so abort cleanly. `force_mark_missing`
-                    // only succeeds for genuinely non-present slots; for a present
-                    // slot it returns the actionable error we surface here.
-                    match scheduler.force_mark_missing(incomplete.slot) {
-                        Ok(ready_entries) => {
-                            send_ready_entries(&ready_sender, &failure, ready_entries);
-                            persistent_missing_slot = None;
-                            persistent_missing_count = 0;
-                            firehose_start = scheduler.snapshot().current_slot;
-                            continue;
+            if let Err(err) = scheduler.verify_complete(chunk_end) {
+                if let Some(incomplete) = scheduler.first_incomplete_slot(chunk_end) {
+                    if matches!(incomplete.reason, IncompleteReason::MissingBlockData) {
+                        if persistent_missing_slot == Some(incomplete.slot) {
+                            persistent_missing_count = persistent_missing_count.saturating_add(1);
+                        } else {
+                            persistent_missing_slot = Some(incomplete.slot);
+                            persistent_missing_count = 1;
                         }
-                        Err(force_err) => {
-                            failure.record(format!(
+                    } else {
+                        persistent_missing_slot = None;
+                        persistent_missing_count = 0;
+                    }
+
+                    if matches!(incomplete.reason, IncompleteReason::MissingBlockData)
+                        && persistent_missing_count >= force_missing_retry_limit
+                    {
+                        // The slot is present in the old-faithful index but its block
+                        // data still hasn't arrived after this many retries. Skipping
+                        // it would drop a real block (the horizon recorder refuses and
+                        // would panic mid-run), so abort cleanly. `force_mark_missing`
+                        // only succeeds for genuinely non-present slots; for a present
+                        // slot it returns the actionable error we surface here.
+                        match scheduler.force_mark_missing(incomplete.slot) {
+                            Ok(ready_entries) => {
+                                send_ready_entries(&ready_sender, &failure, ready_entries);
+                                persistent_missing_slot = None;
+                                persistent_missing_count = 0;
+                                firehose_start = scheduler.snapshot().current_slot;
+                                continue;
+                            }
+                            Err(force_err) => {
+                                failure.record(format!(
                                 "aborting at slot {} after {} consecutive missing-block-data retries: {}",
                                 incomplete.slot, persistent_missing_count, force_err
                             ));
-                            break;
+                                break;
+                            }
                         }
                     }
-                }
 
-                let consume_retry_budget = !stopped_by_backpressure;
-                if consume_retry_budget && incomplete_retries >= post_firehose_retries {
-                    failure.record(err);
-                    break;
-                }
-                if stopped_by_backpressure {
+                    let consume_retry_budget = !stopped_by_backpressure;
+                    if consume_retry_budget && incomplete_retries >= post_firehose_retries {
+                        failure.record(err);
+                        break;
+                    }
+                    if stopped_by_backpressure {
+                        warn!(
+                            "firehose run stopped by backpressure; retrying from earliest incomplete slot"
+                        );
+                    }
                     warn!(
-                        "firehose run stopped by backpressure; retrying from earliest incomplete slot"
-                    );
-                }
-                warn!(
-                    "post-firehose replay incomplete: {err}; retrying from slot {} entry {} tx_index {} reason={:?} presence={:?}",
-                    incomplete.slot,
-                    incomplete.entry_index,
-                    incomplete.tx_start,
-                    incomplete.reason,
-                    incomplete.presence
-                );
-                if let Some(snapshot) = &incomplete.snapshot {
-                    warn!(
-                        "post-firehose replay incomplete: slot {} expected_txs={:?} expected_entries={:?} processed_txs={} processed_entries={} pending_entries={} buffered_txs={} next_entry_index={}",
+                        "post-firehose replay incomplete: {err}; retrying from slot {} entry {} tx_index {} reason={:?} presence={:?}",
                         incomplete.slot,
-                        snapshot.expected_tx_count,
-                        snapshot.expected_entry_count,
-                        snapshot.processed_tx_count,
-                        snapshot.processed_entry_count,
-                        snapshot.pending_entries,
-                        snapshot.buffered_txs,
-                        snapshot.next_entry_index
+                        incomplete.entry_index,
+                        incomplete.tx_start,
+                        incomplete.reason,
+                        incomplete.presence
                     );
+                    if let Some(snapshot) = &incomplete.snapshot {
+                        warn!(
+                            "post-firehose replay incomplete: slot {} expected_txs={:?} expected_entries={:?} processed_txs={} processed_entries={} pending_entries={} buffered_txs={} next_entry_index={}",
+                            incomplete.slot,
+                            snapshot.expected_tx_count,
+                            snapshot.expected_entry_count,
+                            snapshot.processed_tx_count,
+                            snapshot.processed_entry_count,
+                            snapshot.pending_entries,
+                            snapshot.buffered_txs,
+                            snapshot.next_entry_index
+                        );
+                    }
+                    restart_tracker.mark_restart(
+                        incomplete.slot,
+                        incomplete.entry_index,
+                        incomplete.tx_start,
+                        false,
+                    );
+                    firehose_start = incomplete.slot;
+                    if consume_retry_budget {
+                        incomplete_retries = incomplete_retries.saturating_add(1);
+                    }
+                    continue;
                 }
-                restart_tracker.mark_restart(
-                    incomplete.slot,
-                    incomplete.entry_index,
-                    incomplete.tx_start,
-                    false,
-                );
-                firehose_start = incomplete.slot;
-                if consume_retry_budget {
-                    incomplete_retries = incomplete_retries.saturating_add(1);
-                }
-                continue;
+                failure.record(err);
             }
-            failure.record(err);
+            break;
         }
-        break;
+        // The chunk's retry loop ended. Abort the whole replay on shutdown, a
+        // firehose error, or a recorded failure (force-missing abort, retry
+        // budget exhausted); otherwise [chunk_start, chunk_end] replayed cleanly.
+        if shutdown.load(Ordering::Relaxed)
+            || firehose_error.is_some()
+            || failure.error_message().is_some()
+        {
+            break 'chunks;
+        }
+        if chunk_end >= end_inclusive {
+            break 'chunks;
+        }
+        // Quiesced at chunk_end: write a crash checkpoint, then keep replaying
+        // (appending to the same archive) from the next slot.
+        if let Err(err) =
+            write_replay_checkpoint(&bank_replay, &ledger_dir, epoch, chunk_end, &horizon_output)
+        {
+            failure.record(format!("checkpoint at slot {chunk_end} failed: {err}"));
+            break 'chunks;
+        }
+        chunk_start = chunk_end + 1;
     }
     progress_done.store(true, Ordering::Relaxed);
     let _ = progress_handle.join();
@@ -6586,6 +6687,10 @@ async fn run_geyser_replay(
         // range run can install its own.
         horizon::finish()?;
     }
+
+    // The epoch finished cleanly — drop its crash checkpoint so a re-run starts
+    // fresh rather than resuming a now-complete archive.
+    clear_checkpoint(&ledger_dir, epoch);
 
     // Hand the live bank forks back so a range run can chain straight into the
     // next epoch without reloading a snapshot.
@@ -6789,9 +6894,10 @@ fn load_checkpoint(
     if !manifest_path.is_file() {
         return Ok(None);
     }
-    let v: serde_json::Value =
-        serde_json::from_slice(&fs::read(&manifest_path).map_err(|e| format!("read manifest: {e}"))?)
-            .map_err(|e| format!("parse manifest: {e}"))?;
+    let v: serde_json::Value = serde_json::from_slice(
+        &fs::read(&manifest_path).map_err(|e| format!("read manifest: {e}"))?,
+    )
+    .map_err(|e| format!("parse manifest: {e}"))?;
     let get_u64 = |k: &str| v[k].as_u64().ok_or_else(|| format!("manifest missing {k}"));
     let get_path = |k: &str| {
         v[k].as_str()
@@ -6828,6 +6934,75 @@ fn clear_checkpoint(dest_dir: &Path, epoch: u64) {
     {
         warn!("failed to remove checkpoint dir {}: {err}", dir.display());
     }
+}
+
+/// Slots between mid-epoch crash checkpoints, snapped down to a bucket boundary
+/// (so the durable archive prefix always ends on a whole bucket). 0 disables.
+/// Override with `JETSTREAMER_CHECKPOINT_INTERVAL_SLOTS`.
+fn checkpoint_interval_slots() -> u64 {
+    let raw = match env::var("JETSTREAMER_CHECKPOINT_INTERVAL_SLOTS") {
+        Ok(v) => match v.trim().parse::<u64>() {
+            Ok(n) => n,
+            Err(err) => {
+                warn!(
+                    "invalid JETSTREAMER_CHECKPOINT_INTERVAL_SLOTS '{v}': {err}; using default {}",
+                    DEFAULT_CHECKPOINT_INTERVAL_SLOTS
+                );
+                DEFAULT_CHECKPOINT_INTERVAL_SLOTS
+            }
+        },
+        Err(_) => DEFAULT_CHECKPOINT_INTERVAL_SLOTS,
+    };
+    if raw == 0 {
+        0
+    } else {
+        (raw / CHECKPOINT_BUCKET_SLOTS).max(1) * CHECKPOINT_BUCKET_SLOTS
+    }
+}
+
+/// Writes a crash checkpoint at `chunk_end`: freezes the bank there, flushes the
+/// archive to a durable fsync'd prefix, snapshots the bank, and commits the
+/// manifest. The caller must have quiesced the replay through `chunk_end`.
+fn write_replay_checkpoint(
+    bank_replay: &BankReplay,
+    dest_dir: &Path,
+    epoch: u64,
+    chunk_end: Slot,
+    jet_path: &Path,
+) -> Result<(), String> {
+    bank_replay.freeze_latest_bank()?;
+    let bank = bank_replay.working_bank()?;
+    // Key the checkpoint to the bank's *actual* slot, not chunk_end: if chunk_end
+    // is leader-skipped, the working bank sits at the last block slot before it.
+    // The archive prefix + bank snapshot + resume slot must all agree on that
+    // slot; the gap up to chunk_end is leader-skipped and is re-derived on resume.
+    let bank_slot = bank.slot();
+    if bank_slot > chunk_end {
+        return Err(format!(
+            "checkpoint: working bank at slot {bank_slot} is past chunk end {chunk_end}"
+        ));
+    }
+    let resume_slot = bank_slot + 1;
+    let Some(recorder_cp) = horizon::checkpoint(resume_slot)? else {
+        return Ok(()); // recording disabled
+    };
+    let dir = checkpoint_dir(dest_dir, epoch);
+    let snapshot_path = write_checkpoint_snapshot(&bank, &dir)?;
+    let record = CheckpointRecord {
+        epoch,
+        resume_slot,
+        bank_snapshot: snapshot_path,
+        jet_path: jet_path.to_path_buf(),
+        last_emitted: recorder_cp.last_emitted,
+        epoch_meta_written: recorder_cp.epoch_meta_written,
+    };
+    write_checkpoint_manifest(&dir, &record, &recorder_cp.archive)?;
+    info!(
+        "checkpoint committed at slot {bank_slot} (chunk target {chunk_end}, resume slot \
+         {resume_slot}); bank snapshot {}",
+        record.bank_snapshot.display()
+    );
+    Ok(())
 }
 
 #[tokio::main]

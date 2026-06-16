@@ -64,7 +64,12 @@ impl TransactionNotifier for Probe {
         _status_meta: &TransactionStatusMeta,
         _transaction: &VersionedTransaction,
     ) {
-        self.slots.lock().unwrap().entry(slot).or_default().delivered_txs += 1;
+        self.slots
+            .lock()
+            .unwrap()
+            .entry(slot)
+            .or_default()
+            .delivered_txs += 1;
     }
 }
 
@@ -167,7 +172,10 @@ fn main() {
         }
     }
 
-    println!("\n{:>12}  {:<9}  {:>13}  {:>15}  verdict", "slot", "block-meta", "txs (got/decl)", "entries (got/decl)");
+    println!(
+        "\n{:>12}  {:<9}  {:>13}  {:>15}  verdict",
+        "slot", "block-meta", "txs (got/decl)", "entries (got/decl)"
+    );
     let g = probe.slots.lock().unwrap();
     let mut complete = 0u64;
     let mut problem = Vec::new();

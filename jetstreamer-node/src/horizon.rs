@@ -414,6 +414,23 @@ impl HorizonRecorder {
                     path.display()
                 )
             })?;
+        // The checkpoint prefix was fsync'd before its manifest committed, so
+        // the file must be at least that long. If it is shorter (external
+        // truncation / disk loss), `set_len` would zero-extend and corrupt the
+        // archive — refuse instead.
+        let len = file
+            .metadata()
+            .map_err(|err| format!("failed to stat horizon archive {}: {err}", path.display()))?
+            .len();
+        if len < checkpoint.archive.file_offset {
+            return Err(format!(
+                "horizon archive {} is {len} bytes, shorter than the checkpoint prefix {}; \
+                 refusing to resume (the durable prefix is missing — clear the checkpoint to \
+                 restart this epoch fresh)",
+                path.display(),
+                checkpoint.archive.file_offset
+            ));
+        }
         file.set_len(checkpoint.archive.file_offset)
             .map_err(|err| {
                 format!("failed to truncate horizon archive to checkpoint prefix: {err}")

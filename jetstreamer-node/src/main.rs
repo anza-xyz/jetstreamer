@@ -7092,12 +7092,28 @@ fn load_checkpoint(
             .map(PathBuf::from)
             .ok_or_else(|| format!("manifest missing {k}"))
     };
+    let resume_slot = get_u64("resume_slot")?;
+    // Back-compat: pre-incremental checkpoints stored a single `bank_snapshot`
+    // (a fresh full snapshot every checkpoint). Adopt it as the base full so a
+    // run on the new binary resumes such a checkpoint instead of erroring on the
+    // schema change; the old snapshot was taken at the bank slot resume_slot - 1.
+    // The next checkpoint then writes an incremental against it, and prune drops
+    // the stale staging dir, so the old layout is absorbed rather than orphaned.
+    let (full_snapshot, full_snapshot_slot, incremental_snapshot) =
+        match v["full_snapshot"].as_str() {
+            Some(full) => (
+                PathBuf::from(full),
+                get_u64("full_snapshot_slot")?,
+                v["incremental_snapshot"].as_str().map(PathBuf::from),
+            ),
+            None => (get_path("bank_snapshot")?, resume_slot.saturating_sub(1), None),
+        };
     let record = CheckpointRecord {
         epoch: get_u64("epoch")?,
-        resume_slot: get_u64("resume_slot")?,
-        full_snapshot: get_path("full_snapshot")?,
-        full_snapshot_slot: get_u64("full_snapshot_slot")?,
-        incremental_snapshot: v["incremental_snapshot"].as_str().map(PathBuf::from),
+        resume_slot,
+        full_snapshot,
+        full_snapshot_slot,
+        incremental_snapshot,
         jet_path: get_path("jet_path")?,
         last_emitted: get_u64("last_emitted")?,
         epoch_meta_written: v["epoch_meta_written"].as_bool().unwrap_or(false),

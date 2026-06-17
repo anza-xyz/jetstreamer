@@ -13,7 +13,9 @@ use std::{
 
 use agave_snapshots::{
     ArchiveFormat, ArchiveFormatDecompressor, ZstdConfig,
-    snapshot_archive_info::{FullSnapshotArchiveInfo, SnapshotArchiveInfoGetter},
+    snapshot_archive_info::{
+        FullSnapshotArchiveInfo, IncrementalSnapshotArchiveInfo, SnapshotArchiveInfoGetter,
+    },
     snapshot_hash::SnapshotHash,
     streaming_unarchive_snapshot,
 };
@@ -5685,29 +5687,42 @@ async fn run_geyser_replay(
                 }) as AccountsUpdateNotifier);
             info!("accounts update notifier wired into snapshot load: true");
             ensure_genesis_archive(&ledger_dir).await?;
-            let load_path = match &resume_record {
-                Some(record) => {
-                    info!(
-                        "resuming epoch {epoch} from checkpoint at resume slot {} (bank snapshot {})",
-                        record.resume_slot,
-                        record.bank_snapshot.display()
-                    );
-                    record.bank_snapshot.clone()
+            // On resume, rebuild the bank from the checkpoint's base full plus its
+            // (optional) incremental snapshot; on a fresh run, load the
+            // epoch-boundary snapshot.
+            let resume_snapshots = resume_record.as_ref().map(|record| {
+                info!(
+                    "resuming epoch {epoch} from checkpoint at resume slot {} (full {}{})",
+                    record.resume_slot,
+                    record.full_snapshot.display(),
+                    match &record.incremental_snapshot {
+                        Some(p) => format!(", incremental {}", p.display()),
+                        None => String::new(),
+                    }
+                );
+                (
+                    record.full_snapshot.clone(),
+                    record.incremental_snapshot.clone(),
+                )
+            });
+            let ledger_dir_for_load = ledger_dir.clone();
+            let use_dir_loader = env_truthy("JETSTREAMER_LOAD_FROM_DIR");
+            let snapshot_archive_path = snapshot_archive.to_path_buf();
+            let bank = tokio::task::spawn_blocking(move || match resume_snapshots {
+                Some((full_path, incremental_path)) => load_bank_from_checkpoint_snapshots(
+                    &ledger_dir_for_load,
+                    &full_path,
+                    incremental_path.as_deref(),
+                    accounts_update_notifier,
+                ),
+                None if use_dir_loader => {
+                    load_bank_from_snapshot(&ledger_dir_for_load, accounts_update_notifier)
                 }
                 None => {
                     info!("loading bank from snapshot");
-                    snapshot_archive.to_path_buf()
-                }
-            };
-            let ledger_dir_for_load = ledger_dir.clone();
-            let use_dir_loader = env_truthy("JETSTREAMER_LOAD_FROM_DIR");
-            let bank = tokio::task::spawn_blocking(move || {
-                if use_dir_loader {
-                    load_bank_from_snapshot(&ledger_dir_for_load, accounts_update_notifier)
-                } else {
                     load_bank_from_snapshot_archive(
                         &ledger_dir_for_load,
-                        &load_path,
+                        &snapshot_archive_path,
                         accounts_update_notifier,
                     )
                 }
@@ -5722,6 +5737,13 @@ async fn run_geyser_replay(
             (BankSource::Fresh(Box::new(bank)), slot)
         }
     };
+    // Tracks this epoch's base full snapshot (slot + path) so checkpoints after
+    // the first write incrementals against it. Seeded from the resume checkpoint
+    // so a resumed epoch keeps extending its existing full instead of rewriting
+    // one; None on a fresh or chained epoch, whose first checkpoint writes a full.
+    let mut full_snapshot: Option<(Slot, PathBuf)> = resume_record
+        .as_ref()
+        .map(|record| (record.full_snapshot_slot, record.full_snapshot.clone()));
     // Replay every slot after the loaded bank. For a fresh boundary snapshot
     // this warms up to epoch_start; for a resume checkpoint the snapshot is
     // mid-epoch, so replay starts at resume_slot (= snapshot_slot + 1) — which
@@ -6704,9 +6726,14 @@ async fn run_geyser_replay(
         }
         // Quiesced at chunk_end: write a crash checkpoint, then keep replaying
         // (appending to the same archive) from the next slot.
-        if let Err(err) =
-            write_replay_checkpoint(&bank_replay, &ledger_dir, epoch, chunk_end, &horizon_output)
-        {
+        if let Err(err) = write_replay_checkpoint(
+            &bank_replay,
+            &ledger_dir,
+            epoch,
+            chunk_end,
+            &horizon_output,
+            &mut full_snapshot,
+        ) {
             failure.record(format!("checkpoint at slot {chunk_end} failed: {err}"));
             break 'chunks;
         }
@@ -6882,7 +6909,7 @@ fn checkpoint_dir(dest_dir: &Path, epoch: u64) -> PathBuf {
 /// Writes a full bank snapshot for the (frozen) `bank` into `dir`, returning
 /// the `snapshot-<slot>-<hash>.tar.zst` path — the same format the normal
 /// loader reads, so resume just loads it like any boundary snapshot.
-fn write_checkpoint_snapshot(bank: &Bank, dir: &Path) -> Result<PathBuf, String> {
+fn write_full_checkpoint_snapshot(bank: &Bank, dir: &Path) -> Result<PathBuf, String> {
     let bank_snapshots_dir = dir.join("bank-snapshots");
     fs::create_dir_all(&bank_snapshots_dir)
         .map_err(|err| format!("failed to create {}: {err}", bank_snapshots_dir.display()))?;
@@ -6896,18 +6923,114 @@ fn write_checkpoint_snapshot(bank: &Bank, dir: &Path) -> Result<PathBuf, String>
             config: ZstdConfig::default(),
         },
     )
-    .map_err(|err| format!("checkpoint snapshot at slot {} failed: {err}", bank.slot()))?;
+    .map_err(|err| format!("full checkpoint snapshot at slot {} failed: {err}", bank.slot()))?;
     Ok(info.path().to_path_buf())
+}
+
+/// Writes an incremental snapshot capturing only the accounts changed since the
+/// full snapshot at `full_slot` — cheap relative to a full snapshot, so most
+/// checkpoints write one of these instead.
+fn write_incremental_checkpoint_snapshot(
+    bank: &Bank,
+    dir: &Path,
+    full_slot: Slot,
+) -> Result<PathBuf, String> {
+    let bank_snapshots_dir = dir.join("bank-snapshots");
+    fs::create_dir_all(&bank_snapshots_dir)
+        .map_err(|err| format!("failed to create {}: {err}", bank_snapshots_dir.display()))?;
+    let info = snapshot_bank_utils::bank_to_incremental_snapshot_archive(
+        &bank_snapshots_dir,
+        bank,
+        full_slot,
+        None,
+        dir,
+        dir,
+        ArchiveFormat::TarZstd {
+            config: ZstdConfig::default(),
+        },
+    )
+    .map_err(|err| {
+        format!(
+            "incremental checkpoint snapshot at slot {} (base {full_slot}) failed: {err}",
+            bank.slot()
+        )
+    })?;
+    Ok(info.path().to_path_buf())
+}
+
+/// Loads a bank from a full snapshot plus an optional incremental snapshot (the
+/// resume path). Uses Solana's archive loader, which unpacks both archives and
+/// reconstructs the bank at the incremental's slot.
+fn load_bank_from_checkpoint_snapshots(
+    ledger_dir: &Path,
+    full_path: &Path,
+    incremental_path: Option<&Path>,
+    accounts_update_notifier: Option<AccountsUpdateNotifier>,
+) -> Result<Bank, String> {
+    let full_info = FullSnapshotArchiveInfo::new_from_path(full_path.to_path_buf())
+        .map_err(|err| format!("failed to parse full snapshot {}: {err}", full_path.display()))?;
+    let incremental_info = match incremental_path {
+        Some(path) => Some(
+            IncrementalSnapshotArchiveInfo::new_from_path(path.to_path_buf()).map_err(|err| {
+                format!(
+                    "failed to parse incremental snapshot {}: {err}",
+                    path.display()
+                )
+            })?,
+        ),
+        None => None,
+    };
+    let genesis_config = open_genesis_config(ledger_dir, MAX_GENESIS_ARCHIVE_UNPACKED_SIZE)
+        .map_err(|err| format!("failed to load genesis config: {err}"))?;
+    let runtime_config = RuntimeConfig::default();
+    let accounts_db_config = accounts_db_config_for_ledger(ledger_dir)?;
+    let exit = Arc::new(AtomicBool::new(false));
+    let limit_load_slot_count_from_snapshot = if skip_snapshot_verify() {
+        Some(usize::MAX)
+    } else {
+        None
+    };
+    let account_paths = vec![ledger_dir.join("accounts")];
+    for path in &account_paths {
+        fs::create_dir_all(path)
+            .map_err(|err| format!("failed to create {}: {err}", path.display()))?;
+    }
+    let bank_snapshots_dir = ledger_dir.join(BANK_SNAPSHOTS_DIR);
+    fs::create_dir_all(&bank_snapshots_dir)
+        .map_err(|err| format!("failed to create {}: {err}", bank_snapshots_dir.display()))?;
+
+    snapshot_bank_utils::bank_from_snapshot_archives(
+        &account_paths,
+        &bank_snapshots_dir,
+        &full_info,
+        incremental_info.as_ref(),
+        &genesis_config,
+        &runtime_config,
+        None,
+        limit_load_slot_count_from_snapshot,
+        false,
+        false,
+        false,
+        accounts_db_config,
+        accounts_update_notifier,
+        exit,
+    )
+    .map_err(|err| format!("failed to build bank from checkpoint snapshots: {err}"))
 }
 
 /// Persisted pointer to a crash checkpoint.
 struct CheckpointRecord {
     epoch: u64,
     /// First slot to replay on resume; the archive prefix covers
-    /// `[epoch_start, resume_slot - 1]` and the bank snapshot is at
-    /// `resume_slot - 1`.
+    /// `[epoch_start, resume_slot - 1]` and the bank state at `resume_slot - 1`
+    /// is reconstructed from the snapshots below.
     resume_slot: Slot,
-    bank_snapshot: PathBuf,
+    /// Base full snapshot (written at the epoch's first checkpoint) and its slot.
+    full_snapshot: PathBuf,
+    full_snapshot_slot: Slot,
+    /// Incremental snapshot since the full — present at every checkpoint except
+    /// the first one, which is just the full.
+    incremental_snapshot: Option<PathBuf>,
     jet_path: PathBuf,
     last_emitted: Slot,
     epoch_meta_written: bool,
@@ -6932,7 +7055,9 @@ fn write_checkpoint_manifest(
     let manifest = serde_json::json!({
         "epoch": record.epoch,
         "resume_slot": record.resume_slot,
-        "bank_snapshot": record.bank_snapshot,
+        "full_snapshot": record.full_snapshot,
+        "full_snapshot_slot": record.full_snapshot_slot,
+        "incremental_snapshot": record.incremental_snapshot,
         "jet_path": record.jet_path,
         "archive_checkpoint": sidecar,
         "last_emitted": record.last_emitted,
@@ -6970,7 +7095,9 @@ fn load_checkpoint(
     let record = CheckpointRecord {
         epoch: get_u64("epoch")?,
         resume_slot: get_u64("resume_slot")?,
-        bank_snapshot: get_path("bank_snapshot")?,
+        full_snapshot: get_path("full_snapshot")?,
+        full_snapshot_slot: get_u64("full_snapshot_slot")?,
+        incremental_snapshot: v["incremental_snapshot"].as_str().map(PathBuf::from),
         jet_path: get_path("jet_path")?,
         last_emitted: get_u64("last_emitted")?,
         epoch_meta_written: v["epoch_meta_written"].as_bool().unwrap_or(false),
@@ -7032,6 +7159,7 @@ fn write_replay_checkpoint(
     epoch: u64,
     chunk_end: Slot,
     jet_path: &Path,
+    full_snapshot: &mut Option<(Slot, PathBuf)>,
 ) -> Result<(), String> {
     let bank_slot = bank_replay.working_bank()?.slot();
     // The first chunk ends at epoch_start so a checkpoint lands as recording
@@ -7064,44 +7192,74 @@ fn write_replay_checkpoint(
         return Ok(()); // recording disabled
     };
     let dir = checkpoint_dir(dest_dir, epoch);
-    info!("checkpoint at slot {bank_slot}: writing bank snapshot (can take a few minutes)");
-    let snapshot_path = write_checkpoint_snapshot(&bank, &dir)?;
+    // The epoch's first checkpoint writes the base full snapshot (~330 GB);
+    // every later one rewrites a single incremental against it, so the dominant
+    // full-snapshot cost is paid once per epoch instead of once per checkpoint.
+    let (full_path, full_slot, incremental_path) = match full_snapshot.as_ref() {
+        Some((full_slot, full_path)) if bank_slot > *full_slot => {
+            info!(
+                "checkpoint at slot {bank_slot}: writing incremental snapshot since slot \
+                 {full_slot} (can take a minute)"
+            );
+            let incr = write_incremental_checkpoint_snapshot(&bank, &dir, *full_slot)?;
+            (full_path.clone(), *full_slot, Some(incr))
+        }
+        _ => {
+            info!("checkpoint at slot {bank_slot}: writing full snapshot (can take a few minutes)");
+            let full = write_full_checkpoint_snapshot(&bank, &dir)?;
+            *full_snapshot = Some((bank_slot, full.clone()));
+            (full, bank_slot, None)
+        }
+    };
     let record = CheckpointRecord {
         epoch,
         resume_slot,
-        bank_snapshot: snapshot_path,
+        full_snapshot: full_path,
+        full_snapshot_slot: full_slot,
+        incremental_snapshot: incremental_path,
         jet_path: jet_path.to_path_buf(),
         last_emitted: recorder_cp.last_emitted,
         epoch_meta_written: recorder_cp.epoch_meta_written,
     };
     write_checkpoint_manifest(&dir, &record, &recorder_cp.archive)?;
-    // The manifest now points at the new snapshot, so it is safe to delete the
-    // previous checkpoint's snapshot(s) — otherwise each ~75-100 GB archive
-    // would accumulate (~9 per epoch). Done after the manifest commit so a crash
-    // mid-write never leaves the manifest pointing at a deleted snapshot.
-    prune_old_checkpoint_snapshots(&dir, &record.bank_snapshot);
+    // The manifest now points at the current full + incremental, so superseded
+    // incrementals are safe to delete. Done after the manifest commit so a crash
+    // mid-prune never leaves the manifest pointing at a removed snapshot.
+    prune_old_checkpoint_snapshots(
+        &dir,
+        &record.full_snapshot,
+        record.incremental_snapshot.as_deref(),
+    );
     info!(
         "checkpoint committed at slot {bank_slot} (chunk target {chunk_end}, resume slot \
-         {resume_slot}); bank snapshot {}",
-        record.bank_snapshot.display()
+         {resume_slot}); full {}{}",
+        record.full_snapshot.display(),
+        match &record.incremental_snapshot {
+            Some(p) => format!(", incremental {}", p.display()),
+            None => String::new(),
+        }
     );
     Ok(())
 }
 
-/// Removes every `snapshot-*.tar.zst` in `dir` except `keep` (the snapshot the
-/// freshly-committed manifest references), plus the bank-snapshot staging dir.
-fn prune_old_checkpoint_snapshots(dir: &Path, keep: &Path) {
+/// Removes superseded snapshot archives in `dir`, keeping the base full snapshot
+/// `keep_full` and (if any) the latest incremental `keep_incremental` that the
+/// freshly-committed manifest references, plus the bank-snapshot staging dir.
+/// Earlier incrementals are obsolete once a newer one supersedes them.
+fn prune_old_checkpoint_snapshots(dir: &Path, keep_full: &Path, keep_incremental: Option<&Path>) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        if path == keep {
+        if path == keep_full || Some(path.as_path()) == keep_incremental {
             continue;
         }
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if name.starts_with("snapshot-") && name.ends_with(".tar.zst") {
+        let is_snapshot = name.ends_with(".tar.zst")
+            && (name.starts_with("snapshot-") || name.starts_with("incremental-snapshot-"));
+        if is_snapshot {
             let _ = fs::remove_file(&path);
         }
     }

@@ -6,7 +6,7 @@ use std::{
     str::FromStr,
     sync::{
         Arc, Mutex, RwLock,
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -150,6 +150,12 @@ static PHASE_RECV_WAIT_US: AtomicU64 = AtomicU64::new(0);
 /// number of samples — their ratio is the average pending depth.
 static PHASE_RECV_BACKLOG: AtomicU64 = AtomicU64::new(0);
 static PHASE_RECV_COUNT: AtomicU64 = AtomicU64::new(0);
+/// Ready-entry batches submitted to the `readyEntries` thread but not yet
+/// executed (incremented at send, decremented after `process_ready_entries`).
+/// A checkpoint waits for this to reach 0 so it never freezes the bank while
+/// the exec pool is still committing the chunk's tail. One replay pipeline is
+/// active at a time, so a single process-wide counter is sufficient.
+static READY_INFLIGHT: AtomicI64 = AtomicI64::new(0);
 
 /// One-line summary of the replay phase counters (None until any entry
 /// has been processed). Shared by the warmup and main progress logs.
@@ -3999,9 +4005,14 @@ fn send_ready_entries(
     failure: &ReplayFailure,
     ready_entries: Vec<ReadyEntry>,
 ) {
-    if !ready_entries.is_empty()
-        && let Err(err) = ready_sender.send(ready_entries)
-    {
+    if ready_entries.is_empty() {
+        return;
+    }
+    // Count this batch as in-flight before it enters the channel so a
+    // concurrent checkpoint never sees a false-idle window (see READY_INFLIGHT).
+    READY_INFLIGHT.fetch_add(1, Ordering::SeqCst);
+    if let Err(err) = ready_sender.send(ready_entries) {
+        READY_INFLIGHT.fetch_sub(1, Ordering::SeqCst);
         failure.record(format!("ready entry channel closed: {err}"));
     }
 }
@@ -5857,6 +5868,7 @@ async fn run_geyser_replay(
     let ready_queue_capacity = ready_entry_queue_capacity();
     info!("ready entry queue capacity: {}", ready_queue_capacity);
     let (ready_sender, ready_receiver) = bounded::<Vec<ReadyEntry>>(ready_queue_capacity);
+    READY_INFLIGHT.store(0, Ordering::SeqCst);
     let ready_shutdown = shutdown.clone();
     let ready_bank_replay = bank_replay.clone();
     let ready_handle = std::thread::Builder::new()
@@ -5880,20 +5892,28 @@ async fn run_geyser_replay(
                     Ok(entries) => entries,
                     Err(_) => break,
                 };
+                // One submitted batch recv'd; track coalesced batches so the
+                // in-flight counter is decremented by exactly what we execute.
+                let mut batches = 1i64;
                 PHASE_RECV_WAIT_US
                     .fetch_add(recv_start.elapsed().as_micros() as u64, Ordering::Relaxed);
                 PHASE_RECV_BACKLOG.fetch_add(ready_receiver.len() as u64, Ordering::Relaxed);
                 PHASE_RECV_COUNT.fetch_add(1, Ordering::Relaxed);
                 if ready_shutdown.load(Ordering::Relaxed) {
+                    READY_INFLIGHT.fetch_sub(batches, Ordering::SeqCst);
                     break;
                 }
                 while entries.len() < COALESCE_CAP {
                     match ready_receiver.try_recv() {
-                        Ok(more) => entries.extend(more),
+                        Ok(more) => {
+                            entries.extend(more);
+                            batches += 1;
+                        }
                         Err(_) => break,
                     }
                 }
                 ready_bank_replay.process_ready_entries(entries);
+                READY_INFLIGHT.fetch_sub(batches, Ordering::SeqCst);
             }
         })
         .expect("failed to spawn ready entry thread");
@@ -6455,10 +6475,16 @@ async fn run_geyser_replay(
         // recorded epoch (>= epoch_start), so any warmup runs in the first chunk.
         let chunk_end = if checkpoint_interval == 0 {
             end_inclusive
+        } else if chunk_start <= epoch_start {
+            // First chunk: the warmup (if any) plus the epoch's first slot, so a
+            // checkpoint lands the instant recording begins. An early crash then
+            // resumes at epoch_start instead of redoing the warmup, and a chained
+            // epoch gets a checkpoint before its first full interval (so a crash
+            // in that window resumes the epoch rather than restarting the range).
+            epoch_start.min(end_inclusive)
         } else {
-            let base = chunk_start.max(epoch_start);
-            let next_k = (base - epoch_start) / checkpoint_interval + 1;
-            (epoch_start + next_k * checkpoint_interval - 1).min(end_inclusive)
+            let k = (chunk_start - epoch_start) / checkpoint_interval + 1;
+            (epoch_start + k * checkpoint_interval - 1).min(end_inclusive)
         };
         let mut firehose_start = chunk_start;
         let mut incomplete_retries = 0usize;
@@ -6655,6 +6681,20 @@ async fn run_geyser_replay(
             break 'chunks;
         }
         if chunk_end >= end_inclusive {
+            break 'chunks;
+        }
+        // `verify_complete` confirmed the *scheduler* drained, but the
+        // readyEntries thread + exec pool may still be committing the chunk's
+        // tail. Wait for every submitted batch to finish executing before the
+        // checkpoint freezes the bank — otherwise freeze races with
+        // `commit_transactions` and panics.
+        while READY_INFLIGHT.load(Ordering::SeqCst) > 0 {
+            if shutdown.load(Ordering::Relaxed) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        if shutdown.load(Ordering::Relaxed) {
             break 'chunks;
         }
         // Quiesced at chunk_end: write a crash checkpoint, then keep replaying
@@ -6988,21 +7028,28 @@ fn write_replay_checkpoint(
     chunk_end: Slot,
     jet_path: &Path,
 ) -> Result<(), String> {
-    bank_replay.freeze_latest_bank()?;
-    // Root the working bank through our own path before snapshotting, so the
-    // snapshot's internal squash doesn't root the accounts-db out-of-band.
-    bank_replay.root_working_bank()?;
-    let bank = bank_replay.working_bank()?;
+    let bank_slot = bank_replay.working_bank()?.slot();
+    // The first chunk ends at epoch_start so a checkpoint lands as recording
+    // begins — but if epoch_start (or the first chunk's tail) is leader-skipped,
+    // the bank can still be in the warmup region (< epoch_start) where nothing
+    // is recorded yet. Skip; the periodic checkpoints cover it.
+    if bank_slot < epoch_to_slot(epoch) {
+        return Ok(());
+    }
     // Key the checkpoint to the bank's *actual* slot, not chunk_end: if chunk_end
     // is leader-skipped, the working bank sits at the last block slot before it.
     // The archive prefix + bank snapshot + resume slot must all agree on that
     // slot; the gap up to chunk_end is leader-skipped and is re-derived on resume.
-    let bank_slot = bank.slot();
     if bank_slot > chunk_end {
         return Err(format!(
             "checkpoint: working bank at slot {bank_slot} is past chunk end {chunk_end}"
         ));
     }
+    bank_replay.freeze_latest_bank()?;
+    // Root the working bank through our own path before snapshotting, so the
+    // snapshot's internal squash doesn't root the accounts-db out-of-band.
+    bank_replay.root_working_bank()?;
+    let bank = bank_replay.working_bank()?;
     let resume_slot = bank_slot + 1;
     let Some(recorder_cp) = horizon::checkpoint(resume_slot)? else {
         return Ok(()); // recording disabled

@@ -631,22 +631,16 @@ impl BankReplay {
         Ok(guard.working_bank())
     }
 
-    /// Roots the (frozen) working bank through `bank_forks` and records it as
-    /// the last root. A full-snapshot internally calls `bank.squash()`, which
-    /// roots the accounts-db to that slot; doing it here first keeps our own
-    /// root tracking consistent, so the next periodic root never tries to root
-    /// backward. Call right before snapshotting at a checkpoint boundary.
-    fn root_working_bank(&self) -> Result<(), String> {
-        let mut guard = self
-            .bank_forks
-            .write()
-            .map_err(|_| "bank forks lock poisoned".to_string())?;
-        let slot = guard.working_bank().slot();
-        if guard.get(slot).is_some() {
-            guard.set_root(slot, None, None);
+    /// Records `slot` as the last root so the next periodic root never tries to
+    /// root backward of it. The checkpoint's full-snapshot internally calls
+    /// `bank.squash()`, which roots the accounts-db to that slot; we only need
+    /// our own root tracking to stay consistent. We deliberately do NOT call
+    /// `bank_forks.set_root` here: on a freshly warped accounts-db that
+    /// synchronously prunes + cleans and can stall the run for minutes.
+    fn note_snapshot_root(&self, slot: Slot) {
+        if slot > self.last_root_set.load(Ordering::Relaxed) {
             self.last_root_set.store(slot, Ordering::Relaxed);
         }
-        Ok(())
     }
 
     fn cached_bank_for_slot(&self, slot: Slot) -> Option<Arc<Bank>> {
@@ -6688,9 +6682,20 @@ async fn run_geyser_replay(
         // tail. Wait for every submitted batch to finish executing before the
         // checkpoint freezes the bank — otherwise freeze races with
         // `commit_transactions` and panics.
+        let quiesce_start = Instant::now();
+        let mut last_quiesce_warn = quiesce_start;
         while READY_INFLIGHT.load(Ordering::SeqCst) > 0 {
             if shutdown.load(Ordering::Relaxed) {
                 break;
+            }
+            if last_quiesce_warn.elapsed() >= Duration::from_secs(15) {
+                warn!(
+                    "checkpoint at slot {chunk_end}: waited {}s for exec pipeline to drain \
+                     ({} batches still in flight)",
+                    quiesce_start.elapsed().as_secs(),
+                    READY_INFLIGHT.load(Ordering::SeqCst)
+                );
+                last_quiesce_warn = Instant::now();
             }
             std::thread::sleep(Duration::from_millis(5));
         }
@@ -7045,16 +7050,21 @@ fn write_replay_checkpoint(
             "checkpoint: working bank at slot {bank_slot} is past chunk end {chunk_end}"
         ));
     }
+    info!("checkpoint at slot {bank_slot}: freezing bank");
     bank_replay.freeze_latest_bank()?;
-    // Root the working bank through our own path before snapshotting, so the
-    // snapshot's internal squash doesn't root the accounts-db out-of-band.
-    bank_replay.root_working_bank()?;
+    // The full-snapshot below internally squashes (roots) the bank to its slot;
+    // record that as our last root so the next periodic root never goes backward
+    // of it. We do NOT call bank_forks.set_root here — on a freshly warped
+    // accounts-db that synchronously prunes + cleans and can stall for minutes.
+    bank_replay.note_snapshot_root(bank_slot);
     let bank = bank_replay.working_bank()?;
     let resume_slot = bank_slot + 1;
+    info!("checkpoint at slot {bank_slot}: flushing archive prefix");
     let Some(recorder_cp) = horizon::checkpoint(resume_slot)? else {
         return Ok(()); // recording disabled
     };
     let dir = checkpoint_dir(dest_dir, epoch);
+    info!("checkpoint at slot {bank_slot}: writing bank snapshot (can take a few minutes)");
     let snapshot_path = write_checkpoint_snapshot(&bank, &dir)?;
     let record = CheckpointRecord {
         epoch,
@@ -7065,12 +7075,38 @@ fn write_replay_checkpoint(
         epoch_meta_written: recorder_cp.epoch_meta_written,
     };
     write_checkpoint_manifest(&dir, &record, &recorder_cp.archive)?;
+    // The manifest now points at the new snapshot, so it is safe to delete the
+    // previous checkpoint's snapshot(s) — otherwise each ~75-100 GB archive
+    // would accumulate (~9 per epoch). Done after the manifest commit so a crash
+    // mid-write never leaves the manifest pointing at a deleted snapshot.
+    prune_old_checkpoint_snapshots(&dir, &record.bank_snapshot);
     info!(
         "checkpoint committed at slot {bank_slot} (chunk target {chunk_end}, resume slot \
          {resume_slot}); bank snapshot {}",
         record.bank_snapshot.display()
     );
     Ok(())
+}
+
+/// Removes every `snapshot-*.tar.zst` in `dir` except `keep` (the snapshot the
+/// freshly-committed manifest references), plus the bank-snapshot staging dir.
+fn prune_old_checkpoint_snapshots(dir: &Path, keep: &Path) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path == keep {
+            continue;
+        }
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with("snapshot-") && name.ends_with(".tar.zst") {
+            let _ = fs::remove_file(&path);
+        }
+    }
+    // Staging dir is rebuilt by each snapshot; drop it to reclaim space.
+    let _ = fs::remove_dir_all(dir.join("bank-snapshots"));
 }
 
 #[tokio::main]

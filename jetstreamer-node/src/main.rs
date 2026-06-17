@@ -625,6 +625,24 @@ impl BankReplay {
         Ok(guard.working_bank())
     }
 
+    /// Roots the (frozen) working bank through `bank_forks` and records it as
+    /// the last root. A full-snapshot internally calls `bank.squash()`, which
+    /// roots the accounts-db to that slot; doing it here first keeps our own
+    /// root tracking consistent, so the next periodic root never tries to root
+    /// backward. Call right before snapshotting at a checkpoint boundary.
+    fn root_working_bank(&self) -> Result<(), String> {
+        let mut guard = self
+            .bank_forks
+            .write()
+            .map_err(|_| "bank forks lock poisoned".to_string())?;
+        let slot = guard.working_bank().slot();
+        if guard.get(slot).is_some() {
+            guard.set_root(slot, None, None);
+            self.last_root_set.store(slot, Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
     fn cached_bank_for_slot(&self, slot: Slot) -> Option<Arc<Bank>> {
         let guard = self.cached_bank.lock().ok()?;
         guard
@@ -6971,6 +6989,9 @@ fn write_replay_checkpoint(
     jet_path: &Path,
 ) -> Result<(), String> {
     bank_replay.freeze_latest_bank()?;
+    // Root the working bank through our own path before snapshotting, so the
+    // snapshot's internal squash doesn't root the accounts-db out-of-band.
+    bank_replay.root_working_bank()?;
     let bank = bank_replay.working_bank()?;
     // Key the checkpoint to the bank's *actual* slot, not chunk_end: if chunk_end
     // is leader-skipped, the working bank sits at the last block slot before it.
@@ -7103,104 +7124,129 @@ async fn main() {
         info!("ledger accounts cleanup disabled via JETSTREAMER_CLEAR_ACCOUNTS_ON_START=false");
     }
 
-    // The snapshot bootstraps only the first epoch of the run; later epochs in
-    // a range chain off the in-memory bank.
-    let target_slot = epoch_to_slot(start_epoch).saturating_sub(1);
-    // A local snapshot only bootstraps `start_epoch` cheaply if it lands within
-    // the previous epoch (at or after the start of `start_epoch - 1`). Anything
-    // older is still usable, but it forces a warmup replay across every slot
-    // between the snapshot and the epoch boundary — e.g. reusing epoch N's
-    // boundary snapshot to run epoch N+1 re-executes all of epoch N first
-    // (~432k slots, roughly doubling the run). `find_existing_snapshot_archive`
-    // only bounds the candidate from above (slot <= target_slot), so a leftover
-    // snapshot from the prior epoch's run gets picked up here; reject it and
-    // download the real boundary snapshot instead.
-    let min_snapshot_slot = epoch_to_slot(start_epoch.saturating_sub(1));
-    let existing_snapshot = match find_existing_snapshot_archive(&dest_dir, target_slot) {
-        Ok(Some(candidate)) if candidate.slot < min_snapshot_slot => {
-            println!(
-                "Ignoring snapshot {} at slot {}: epoch {} needs a snapshot at or after slot {} \
-                 (reusing it would warm up across {} slots); downloading the boundary snapshot",
-                candidate.path.display(),
-                candidate.slot,
-                start_epoch,
-                min_snapshot_slot,
-                epoch_to_slot(start_epoch).saturating_sub(candidate.slot),
-            );
-            None
-        }
-        Ok(other) => other,
-        Err(err) => {
-            eprintln!("error: {err}");
-            exit(1);
-        }
-    };
-    let mut extracted_snapshot = false;
-    let dest_path = match existing_snapshot {
-        Some(candidate) => {
-            extracted_snapshot = match has_extracted_snapshot(&dest_dir, candidate.slot) {
-                Ok(has_snapshot) => has_snapshot,
-                Err(err) => {
-                    eprintln!("error: {err}");
-                    exit(1);
-                }
-            };
-            if extracted_snapshot {
-                println!(
-                    "Found existing snapshot archive at {} with extracted data; skipping download",
-                    candidate.path.display()
-                );
-            } else {
-                println!(
-                    "Found existing snapshot archive at {}; skipping download",
-                    candidate.path.display()
-                );
-            }
-            candidate.path
-        }
-        None => {
-            match download_snapshot_at_or_before_slot(start_epoch, target_slot, &dest_dir).await {
-                Ok(path) => {
-                    println!("Downloaded snapshot to {}", path.display());
-                    path
-                }
-                Err(err) => {
-                    eprintln!("error: {err}");
-                    exit(1);
-                }
-            }
-        }
-    };
-
-    if !env_truthy("JETSTREAMER_LOAD_FROM_DIR") {
-        // The default archive loader unpacks into its own staging
-        // (`.snapshot-extract-*` + accounts-run); the ledger-root
-        // extraction below only feeds the dir loader.
-        println!("Skipping ledger-root extraction (archive loader manages its own staging)");
-    } else if env_truthy("JETSTREAMER_SKIP_EXTRACT") {
-        println!("Skipping extraction because JETSTREAMER_SKIP_EXTRACT is set");
-    } else if extracted_snapshot {
-        println!(
-            "Skipping extraction because snapshot data already exists in {}",
-            dest_dir.display()
+    // On a crash mid-range, the in-progress epoch left a checkpoint; resume the
+    // range there — every earlier epoch already finalized its `.jet`. If no
+    // epoch has a checkpoint, start fresh from start_epoch.
+    let effective_start = (start_epoch..=end_epoch)
+        .find(|&e| checkpoint_dir(&dest_dir, e).join("manifest.json").is_file())
+        .unwrap_or(start_epoch);
+    if effective_start > start_epoch {
+        info!(
+            "resuming range at epoch {effective_start} (epochs {start_epoch}..={} already complete)",
+            effective_start - 1
         );
-    } else {
-        println!("Extracting snapshot into {}", dest_dir.display());
-        if let Err(err) = extract_tarball(&dest_path, &dest_dir).await {
-            eprintln!("error: {err}");
-            exit(1);
-        }
-        println!("Extraction complete");
     }
+    let resuming_from_checkpoint = checkpoint_dir(&dest_dir, effective_start)
+        .join("manifest.json")
+        .is_file();
+
+    // Resolve the bootstrap snapshot only when *not* resuming from a checkpoint:
+    // a resume loads the checkpoint's own bank snapshot instead. The snapshot
+    // bootstraps only the first epoch actually run; later epochs in a range
+    // chain off the in-memory bank.
+    let dest_path = if resuming_from_checkpoint {
+        info!("epoch {effective_start} has a checkpoint; resuming from its bank snapshot");
+        PathBuf::new()
+    } else {
+        let target_slot = epoch_to_slot(effective_start).saturating_sub(1);
+        // A local snapshot only bootstraps `effective_start` cheaply if it lands
+        // within the previous epoch (at or after the start of
+        // `effective_start - 1`). Anything older still works but forces a warmup
+        // replay across every intervening slot — e.g. reusing epoch N's boundary
+        // snapshot to run N+1 re-executes all of N first (~432k slots).
+        // `find_existing_snapshot_archive` only bounds the candidate from above
+        // (slot <= target_slot), so a leftover snapshot from the prior epoch's
+        // run gets picked up here; reject it and download the boundary snapshot.
+        let min_snapshot_slot = epoch_to_slot(effective_start.saturating_sub(1));
+        let existing_snapshot = match find_existing_snapshot_archive(&dest_dir, target_slot) {
+            Ok(Some(candidate)) if candidate.slot < min_snapshot_slot => {
+                println!(
+                    "Ignoring snapshot {} at slot {}: epoch {} needs a snapshot at or after slot {} \
+                     (reusing it would warm up across {} slots); downloading the boundary snapshot",
+                    candidate.path.display(),
+                    candidate.slot,
+                    effective_start,
+                    min_snapshot_slot,
+                    epoch_to_slot(effective_start).saturating_sub(candidate.slot),
+                );
+                None
+            }
+            Ok(other) => other,
+            Err(err) => {
+                eprintln!("error: {err}");
+                exit(1);
+            }
+        };
+        let mut extracted_snapshot = false;
+        let dest_path = match existing_snapshot {
+            Some(candidate) => {
+                extracted_snapshot = match has_extracted_snapshot(&dest_dir, candidate.slot) {
+                    Ok(has_snapshot) => has_snapshot,
+                    Err(err) => {
+                        eprintln!("error: {err}");
+                        exit(1);
+                    }
+                };
+                if extracted_snapshot {
+                    println!(
+                        "Found existing snapshot archive at {} with extracted data; skipping download",
+                        candidate.path.display()
+                    );
+                } else {
+                    println!(
+                        "Found existing snapshot archive at {}; skipping download",
+                        candidate.path.display()
+                    );
+                }
+                candidate.path
+            }
+            None => {
+                match download_snapshot_at_or_before_slot(effective_start, target_slot, &dest_dir)
+                    .await
+                {
+                    Ok(path) => {
+                        println!("Downloaded snapshot to {}", path.display());
+                        path
+                    }
+                    Err(err) => {
+                        eprintln!("error: {err}");
+                        exit(1);
+                    }
+                }
+            }
+        };
+
+        if !env_truthy("JETSTREAMER_LOAD_FROM_DIR") {
+            // The default archive loader unpacks into its own staging
+            // (`.snapshot-extract-*` + accounts-run); the ledger-root
+            // extraction below only feeds the dir loader.
+            println!("Skipping ledger-root extraction (archive loader manages its own staging)");
+        } else if env_truthy("JETSTREAMER_SKIP_EXTRACT") {
+            println!("Skipping extraction because JETSTREAMER_SKIP_EXTRACT is set");
+        } else if extracted_snapshot {
+            println!(
+                "Skipping extraction because snapshot data already exists in {}",
+                dest_dir.display()
+            );
+        } else {
+            println!("Extracting snapshot into {}", dest_dir.display());
+            if let Err(err) = extract_tarball(&dest_path, &dest_dir).await {
+                eprintln!("error: {err}");
+                exit(1);
+            }
+            println!("Extraction complete");
+        }
+        dest_path
+    };
 
     // Replay each epoch in the range. The first epoch loads the snapshot; each
     // subsequent epoch reuses the in-memory bank handed back by the previous
     // one (carried_bank_forks), so there is no snapshot reload and no warmup
     // between epochs. Verification hashes and the `.jet` output path are
     // resolved per epoch.
-    let total_epochs = end_epoch - start_epoch + 1;
+    let total_epochs = end_epoch - effective_start + 1;
     let mut carried_bank_forks: Option<Arc<RwLock<BankForks>>> = None;
-    for epoch in start_epoch..=end_epoch {
+    for epoch in effective_start..=end_epoch {
         if shutdown.load(Ordering::SeqCst) {
             info!("shutdown requested; stopping before epoch {epoch}");
             break;
@@ -7208,7 +7254,7 @@ async fn main() {
         if total_epochs > 1 {
             info!(
                 "=== epoch {epoch} ({}/{total_epochs}) ===",
-                epoch - start_epoch + 1
+                epoch - effective_start + 1
             );
         }
         let horizon_output = horizon_output_override

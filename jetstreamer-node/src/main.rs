@@ -6,16 +6,14 @@ use std::{
     str::FromStr,
     sync::{
         Arc, Mutex, RwLock,
-        atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use agave_snapshots::{
-    ArchiveFormat, ArchiveFormatDecompressor, ZstdConfig,
-    snapshot_archive_info::{
-        FullSnapshotArchiveInfo, IncrementalSnapshotArchiveInfo, SnapshotArchiveInfoGetter,
-    },
+    ArchiveFormat, ArchiveFormatDecompressor,
+    snapshot_archive_info::{FullSnapshotArchiveInfo, SnapshotArchiveInfoGetter},
     snapshot_hash::SnapshotHash,
     streaming_unarchive_snapshot,
 };
@@ -118,15 +116,7 @@ const MAX_WAVE_TXS: usize = 256;
 const DEFAULT_POST_FIREHOSE_INCOMPLETE_RETRY_ATTEMPTS: usize = 16;
 const DEFAULT_EMPTY_SLOT_BUFFER_GAP_LIMIT: u64 = 0;
 const DEFAULT_FIREHOSE_BACKPRESSURE_SLOT_GAP_LIMIT: u64 = 128;
-// Consecutive retries on a single persistently-missing-block-data slot before
-// aborting the run. A present slot's block data is required (it is never
-// force-skipped), so this is how many re-fetch attempts a transient
-// old-faithful hiccup gets to recover before we give up cleanly.
 const DEFAULT_FORCE_MISSING_BLOCK_RETRY_LIMIT: usize = 16;
-const DEFAULT_CHECKPOINT_INTERVAL_SLOTS: u64 = 50_000;
-/// Bucket size the archive writer resets encoder state on; checkpoints land on
-/// these boundaries so the durable prefix ends on a whole bucket.
-const CHECKPOINT_BUCKET_SLOTS: u64 = 128;
 static LOGGED_FIRST_ACCOUNT_UPDATE: AtomicBool = AtomicBool::new(false);
 static LOGGED_PROGRAM_CACHE_ASSIGN_FAIL: AtomicBool = AtomicBool::new(false);
 static PROGRAM_CACHE_ASSIGN_FAIL_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -152,12 +142,6 @@ static PHASE_RECV_WAIT_US: AtomicU64 = AtomicU64::new(0);
 /// number of samples — their ratio is the average pending depth.
 static PHASE_RECV_BACKLOG: AtomicU64 = AtomicU64::new(0);
 static PHASE_RECV_COUNT: AtomicU64 = AtomicU64::new(0);
-/// Ready-entry batches submitted to the `readyEntries` thread but not yet
-/// executed (incremented at send, decremented after `process_ready_entries`).
-/// A checkpoint waits for this to reach 0 so it never freezes the bank while
-/// the exec pool is still committing the chunk's tail. One replay pipeline is
-/// active at a time, so a single process-wide counter is sufficient.
-static READY_INFLIGHT: AtomicI64 = AtomicI64::new(0);
 
 /// One-line summary of the replay phase counters (None until any entry
 /// has been processed). Shared by the warmup and main progress logs.
@@ -622,27 +606,6 @@ impl BankReplay {
     /// next epoch in a range run.
     fn bank_forks(&self) -> Arc<RwLock<BankForks>> {
         self.bank_forks.clone()
-    }
-
-    /// The current working bank (e.g. to snapshot it at a checkpoint boundary).
-    fn working_bank(&self) -> Result<Arc<Bank>, String> {
-        let guard = self
-            .bank_forks
-            .read()
-            .map_err(|_| "bank forks lock poisoned".to_string())?;
-        Ok(guard.working_bank())
-    }
-
-    /// Records `slot` as the last root so the next periodic root never tries to
-    /// root backward of it. The checkpoint's full-snapshot internally calls
-    /// `bank.squash()`, which roots the accounts-db to that slot; we only need
-    /// our own root tracking to stay consistent. We deliberately do NOT call
-    /// `bank_forks.set_root` here: on a freshly warped accounts-db that
-    /// synchronously prunes + cleans and can stall the run for minutes.
-    fn note_snapshot_root(&self, slot: Slot) {
-        if slot > self.last_root_set.load(Ordering::Relaxed) {
-            self.last_root_set.store(slot, Ordering::Relaxed);
-        }
     }
 
     fn cached_bank_for_slot(&self, slot: Slot) -> Option<Arc<Bank>> {
@@ -3255,17 +3218,6 @@ impl TransactionScheduler {
                 slot
             ));
         }
-        // A slot the old-faithful index marks Present has a real block. Skipping
-        // it would silently drop that block, which the horizon recorder refuses
-        // (it panics mid-run). Such a slot's data is required, so never
-        // force-skip it — surface a clear error so the caller can retry or abort.
-        if presence == Some(SlotPresenceState::Present) {
-            return Err(format!(
-                "slot {slot} is present in the old-faithful index but its block data never \
-                 arrived; refusing to force-skip a real block. The data may be transiently \
-                 unavailable (re-run) or missing from old-faithful (needs a fallback source)."
-            ));
-        }
         if let Some(buffer) = state.slots.get(&slot)
             && buffer.has_any_data()
         {
@@ -4001,14 +3953,9 @@ fn send_ready_entries(
     failure: &ReplayFailure,
     ready_entries: Vec<ReadyEntry>,
 ) {
-    if ready_entries.is_empty() {
-        return;
-    }
-    // Count this batch as in-flight before it enters the channel so a
-    // concurrent checkpoint never sees a false-idle window (see READY_INFLIGHT).
-    READY_INFLIGHT.fetch_add(1, Ordering::SeqCst);
-    if let Err(err) = ready_sender.send(ready_entries) {
-        READY_INFLIGHT.fetch_sub(1, Ordering::SeqCst);
+    if !ready_entries.is_empty()
+        && let Err(err) = ready_sender.send(ready_entries)
+    {
         failure.record(format!("ready entry channel closed: {err}"));
     }
 }
@@ -5656,17 +5603,6 @@ async fn run_geyser_replay(
         Reuse(Arc<RwLock<BankForks>>),
         Fresh(Box<Bank>),
     }
-    // A crash checkpoint for this epoch (only on a fresh run, never a chained
-    // reuse) means resume mid-epoch: load the checkpoint's bank snapshot and
-    // append to the existing archive instead of starting the epoch over.
-    let (resume_record, resume_recorder_cp) = if existing_bank_forks.is_none() {
-        match load_checkpoint(&ledger_dir, epoch)? {
-            Some((record, recorder_cp)) => (Some(record), Some(recorder_cp)),
-            None => (None, None),
-        }
-    } else {
-        (None, None)
-    };
     let (bank_source, snapshot_slot) = match existing_bank_forks {
         Some(bank_forks) => {
             let slot = bank_forks
@@ -5674,9 +5610,7 @@ async fn run_geyser_replay(
                 .map_err(|_| "bank forks lock poisoned".to_string())?
                 .working_bank()
                 .slot();
-            info!(
-                "reusing in-memory bank from previous epoch at slot {slot}; skipping snapshot load"
-            );
+            info!("reusing in-memory bank from previous epoch at slot {slot}; skipping snapshot load");
             (BankSource::Reuse(bank_forks), slot)
         }
         None => {
@@ -5687,42 +5621,17 @@ async fn run_geyser_replay(
                 }) as AccountsUpdateNotifier);
             info!("accounts update notifier wired into snapshot load: true");
             ensure_genesis_archive(&ledger_dir).await?;
-            // On resume, rebuild the bank from the checkpoint's base full plus its
-            // (optional) incremental snapshot; on a fresh run, load the
-            // epoch-boundary snapshot.
-            let resume_snapshots = resume_record.as_ref().map(|record| {
-                info!(
-                    "resuming epoch {epoch} from checkpoint at resume slot {} (full {}{})",
-                    record.resume_slot,
-                    record.full_snapshot.display(),
-                    match &record.incremental_snapshot {
-                        Some(p) => format!(", incremental {}", p.display()),
-                        None => String::new(),
-                    }
-                );
-                (
-                    record.full_snapshot.clone(),
-                    record.incremental_snapshot.clone(),
-                )
-            });
+            info!("loading bank from snapshot");
             let ledger_dir_for_load = ledger_dir.clone();
+            let snapshot_archive = snapshot_archive.to_path_buf();
             let use_dir_loader = env_truthy("JETSTREAMER_LOAD_FROM_DIR");
-            let snapshot_archive_path = snapshot_archive.to_path_buf();
-            let bank = tokio::task::spawn_blocking(move || match resume_snapshots {
-                Some((full_path, incremental_path)) => load_bank_from_checkpoint_snapshots(
-                    &ledger_dir_for_load,
-                    &full_path,
-                    incremental_path.as_deref(),
-                    accounts_update_notifier,
-                ),
-                None if use_dir_loader => {
+            let bank = tokio::task::spawn_blocking(move || {
+                if use_dir_loader {
                     load_bank_from_snapshot(&ledger_dir_for_load, accounts_update_notifier)
-                }
-                None => {
-                    info!("loading bank from snapshot");
+                } else {
                     load_bank_from_snapshot_archive(
                         &ledger_dir_for_load,
-                        &snapshot_archive_path,
+                        &snapshot_archive,
                         accounts_update_notifier,
                     )
                 }
@@ -5737,18 +5646,11 @@ async fn run_geyser_replay(
             (BankSource::Fresh(Box::new(bank)), slot)
         }
     };
-    // Tracks this epoch's base full snapshot (slot + path) so checkpoints after
-    // the first write incrementals against it. Seeded from the resume checkpoint
-    // so a resumed epoch keeps extending its existing full instead of rewriting
-    // one; None on a fresh or chained epoch, whose first checkpoint writes a full.
-    let mut full_snapshot: Option<(Slot, PathBuf)> = resume_record
-        .as_ref()
-        .map(|record| (record.full_snapshot_slot, record.full_snapshot.clone()));
-    // Replay every slot after the loaded bank. For a fresh boundary snapshot
-    // this warms up to epoch_start; for a resume checkpoint the snapshot is
-    // mid-epoch, so replay starts at resume_slot (= snapshot_slot + 1) — which
-    // is why this must not be clamped up to epoch_start.
-    let replay_start = snapshot_slot.saturating_add(1);
+    let replay_start = if snapshot_slot.saturating_add(1) < epoch_start {
+        snapshot_slot.saturating_add(1)
+    } else {
+        epoch_start
+    };
     if replay_start < epoch_start {
         info!(
             "warming up replay from slot {} to {} (epoch {} starts at {})",
@@ -5776,40 +5678,20 @@ async fn run_geyser_replay(
     } else {
         info!("empty-slot gap guard disabled");
     }
-    match resume_recorder_cp {
-        Some(recorder_cp) => {
-            horizon::resume_init(
-                &horizon_output,
-                epoch,
-                epoch_start,
-                end_inclusive - epoch_start + 1,
-                slot_presence.clone(),
-                recorder_cp,
-            )?;
-            info!(
-                "horizon archive resuming append to {} (epoch {}, from slot {})",
-                horizon_output.display(),
-                epoch,
-                replay_start
-            );
-        }
-        None => {
-            horizon::init(
-                &horizon_output,
-                epoch,
-                epoch_start,
-                end_inclusive - epoch_start + 1,
-                slot_presence.clone(),
-            )?;
-            info!(
-                "horizon archive recording to {} (epoch {}, slots {}..={})",
-                horizon_output.display(),
-                epoch,
-                epoch_start,
-                end_inclusive
-            );
-        }
-    }
+    horizon::init(
+        &horizon_output,
+        epoch,
+        epoch_start,
+        end_inclusive - epoch_start + 1,
+        slot_presence.clone(),
+    )?;
+    info!(
+        "horizon archive recording to {} (epoch {}, slots {}..={})",
+        horizon_output.display(),
+        epoch,
+        epoch_start,
+        end_inclusive
+    );
     let scheduler = Arc::new(TransactionScheduler::new(
         replay_start,
         slot_presence,
@@ -5884,7 +5766,6 @@ async fn run_geyser_replay(
     let ready_queue_capacity = ready_entry_queue_capacity();
     info!("ready entry queue capacity: {}", ready_queue_capacity);
     let (ready_sender, ready_receiver) = bounded::<Vec<ReadyEntry>>(ready_queue_capacity);
-    READY_INFLIGHT.store(0, Ordering::SeqCst);
     let ready_shutdown = shutdown.clone();
     let ready_bank_replay = bank_replay.clone();
     let ready_handle = std::thread::Builder::new()
@@ -5908,31 +5789,24 @@ async fn run_geyser_replay(
                     Ok(entries) => entries,
                     Err(_) => break,
                 };
-                // One submitted batch recv'd; track coalesced batches so the
-                // in-flight counter is decremented by exactly what we execute.
-                let mut batches = 1i64;
                 PHASE_RECV_WAIT_US
                     .fetch_add(recv_start.elapsed().as_micros() as u64, Ordering::Relaxed);
                 PHASE_RECV_BACKLOG.fetch_add(ready_receiver.len() as u64, Ordering::Relaxed);
                 PHASE_RECV_COUNT.fetch_add(1, Ordering::Relaxed);
                 if ready_shutdown.load(Ordering::Relaxed) {
-                    READY_INFLIGHT.fetch_sub(batches, Ordering::SeqCst);
                     break;
                 }
                 while entries.len() < COALESCE_CAP {
                     match ready_receiver.try_recv() {
-                        Ok(more) => {
-                            entries.extend(more);
-                            batches += 1;
-                        }
+                        Ok(more) => entries.extend(more),
                         Err(_) => break,
                     }
                 }
                 ready_bank_replay.process_ready_entries(entries);
-                READY_INFLIGHT.fetch_sub(batches, Ordering::SeqCst);
             }
         })
         .expect("failed to spawn ready entry thread");
+    let slot_range = replay_start..(end_inclusive + 1);
 
     let client = Client::new();
     let index_base_url = resolve_remote_index_base_url()?;
@@ -6476,268 +6350,186 @@ async fn run_geyser_replay(
         })
     };
 
-    let checkpoint_interval = checkpoint_interval_slots();
-    if checkpoint_interval > 0 {
-        info!(
-            "checkpointing every {checkpoint_interval} slots (resume on crash; set \
-             JETSTREAMER_CHECKPOINT_INTERVAL_SLOTS=0 to disable)"
-        );
-    }
+    let mut firehose_start = slot_range.start;
+    let mut incomplete_retries = 0usize;
     let mut firehose_error: Option<String> = None;
-    let mut chunk_start = replay_start;
-    'chunks: loop {
-        // Replay through the next checkpoint boundary (resume_slot = chunk_end +
-        // 1, bucket-aligned) or the epoch end. Checkpoints only land inside the
-        // recorded epoch (>= epoch_start), so any warmup runs in the first chunk.
-        let chunk_end = if checkpoint_interval == 0 {
-            end_inclusive
-        } else if chunk_start <= epoch_start {
-            // First chunk: the warmup (if any) plus the epoch's first slot, so a
-            // checkpoint lands the instant recording begins. An early crash then
-            // resumes at epoch_start instead of redoing the warmup, and a chained
-            // epoch gets a checkpoint before its first full interval (so a crash
-            // in that window resumes the epoch rather than restarting the range).
-            epoch_start.min(end_inclusive)
-        } else {
-            let k = (chunk_start - epoch_start) / checkpoint_interval + 1;
-            (epoch_start + k * checkpoint_interval - 1).min(end_inclusive)
-        };
-        let mut firehose_start = chunk_start;
-        let mut incomplete_retries = 0usize;
-        let mut persistent_missing_slot: Option<Slot> = None;
-        let mut persistent_missing_count = 0usize;
-        loop {
-            if shutdown.load(Ordering::Relaxed) {
-                info!("shutdown requested; abandoning replay");
-                break;
-            }
-            backpressure_stop_requested.store(false, Ordering::SeqCst);
-
-            info!(
-                "starting firehose replay with {} thread(s) (attempt {} from slot {})",
-                threads,
-                incomplete_retries.saturating_add(1),
-                firehose_start
-            );
-            let firehose_stop = Arc::new(AtomicBool::new(false));
-            if let Ok(mut guard) = active_firehose_stop.lock() {
-                *guard = Some(firehose_stop.clone());
-            }
-            let shutdown_watcher = {
-                let shutdown = shutdown.clone();
-                let firehose_stop = firehose_stop.clone();
-                std::thread::spawn(move || {
-                    while !firehose_stop.load(Ordering::Relaxed) {
-                        if shutdown.load(Ordering::Relaxed) {
-                            firehose_stop.store(true, Ordering::SeqCst);
-                            break;
-                        }
-                        std::thread::sleep(Duration::from_millis(50));
-                    }
-                })
-            };
-            let firehose_result = tokio::task::spawn_blocking({
-                let slot_range = firehose_start..(chunk_end + 1);
-                let notifiers = GeyserNotifiers {
-                    transaction_notifier: notifiers.transaction_notifier.clone(),
-                    entry_notifier: notifiers.entry_notifier.clone(),
-                    block_metadata_notifier: notifiers.block_metadata_notifier.clone(),
-                };
-                let confirmed_bank_sender = confirmed_bank_sender.clone();
-                let index_base_url = index_base_url.clone();
-                let client = client.clone();
-                let firehose_stop = firehose_stop.clone();
-                move || {
-                    let rt = match tokio::runtime::Runtime::new() {
-                        Ok(rt) => Arc::new(rt),
-                        Err(err) => {
-                            return Err((
-                                FirehoseError::OnLoadError(Box::new(err)),
-                                slot_range.start,
-                            ));
-                        }
-                    };
-                    firehose_geyser_with_notifiers(
-                        rt,
-                        slot_range,
-                        notifiers,
-                        confirmed_bank_sender,
-                        &index_base_url,
-                        &client,
-                        firehose_stop,
-                        async { Ok(()) },
-                        threads,
-                        true,
-                        buffer_window_bytes,
-                    )
-                }
-            })
-            .await
-            .map_err(|err| format!("firehose task failed: {err}"))?;
-            firehose_stop.store(true, Ordering::SeqCst);
-            let _ = shutdown_watcher.join();
-            if let Ok(mut guard) = active_firehose_stop.lock() {
-                *guard = None;
-            }
-
-            if shutdown.load(Ordering::Relaxed) {
-                info!("shutdown requested; abandoning replay");
-                break;
-            }
-
-            let stopped_by_backpressure = backpressure_stop_requested.load(Ordering::Relaxed);
-
-            if let Err((err, slot)) = firehose_result {
-                firehose_error = Some(format!("firehose error at slot {slot}: {err}"));
-                break;
-            }
-
-            match scheduler.drain_ready_entries() {
-                Ok(ready_entries) => {
-                    send_ready_entries(&ready_sender, &failure, ready_entries);
-                }
-                Err(err) => failure.record(err),
-            }
-
-            if let Err(err) = scheduler.verify_complete(chunk_end) {
-                if let Some(incomplete) = scheduler.first_incomplete_slot(chunk_end) {
-                    if matches!(incomplete.reason, IncompleteReason::MissingBlockData) {
-                        if persistent_missing_slot == Some(incomplete.slot) {
-                            persistent_missing_count = persistent_missing_count.saturating_add(1);
-                        } else {
-                            persistent_missing_slot = Some(incomplete.slot);
-                            persistent_missing_count = 1;
-                        }
-                    } else {
-                        persistent_missing_slot = None;
-                        persistent_missing_count = 0;
-                    }
-
-                    if matches!(incomplete.reason, IncompleteReason::MissingBlockData)
-                        && persistent_missing_count >= force_missing_retry_limit
-                    {
-                        // The slot is present in the old-faithful index but its block
-                        // data still hasn't arrived after this many retries. Skipping
-                        // it would drop a real block (the horizon recorder refuses and
-                        // would panic mid-run), so abort cleanly. `force_mark_missing`
-                        // only succeeds for genuinely non-present slots; for a present
-                        // slot it returns the actionable error we surface here.
-                        match scheduler.force_mark_missing(incomplete.slot) {
-                            Ok(ready_entries) => {
-                                send_ready_entries(&ready_sender, &failure, ready_entries);
-                                persistent_missing_slot = None;
-                                persistent_missing_count = 0;
-                                firehose_start = scheduler.snapshot().current_slot;
-                                continue;
-                            }
-                            Err(force_err) => {
-                                failure.record(format!(
-                                "aborting at slot {} after {} consecutive missing-block-data retries: {}",
-                                incomplete.slot, persistent_missing_count, force_err
-                            ));
-                                break;
-                            }
-                        }
-                    }
-
-                    let consume_retry_budget = !stopped_by_backpressure;
-                    if consume_retry_budget && incomplete_retries >= post_firehose_retries {
-                        failure.record(err);
-                        break;
-                    }
-                    if stopped_by_backpressure {
-                        warn!(
-                            "firehose run stopped by backpressure; retrying from earliest incomplete slot"
-                        );
-                    }
-                    warn!(
-                        "post-firehose replay incomplete: {err}; retrying from slot {} entry {} tx_index {} reason={:?} presence={:?}",
-                        incomplete.slot,
-                        incomplete.entry_index,
-                        incomplete.tx_start,
-                        incomplete.reason,
-                        incomplete.presence
-                    );
-                    if let Some(snapshot) = &incomplete.snapshot {
-                        warn!(
-                            "post-firehose replay incomplete: slot {} expected_txs={:?} expected_entries={:?} processed_txs={} processed_entries={} pending_entries={} buffered_txs={} next_entry_index={}",
-                            incomplete.slot,
-                            snapshot.expected_tx_count,
-                            snapshot.expected_entry_count,
-                            snapshot.processed_tx_count,
-                            snapshot.processed_entry_count,
-                            snapshot.pending_entries,
-                            snapshot.buffered_txs,
-                            snapshot.next_entry_index
-                        );
-                    }
-                    restart_tracker.mark_restart(
-                        incomplete.slot,
-                        incomplete.entry_index,
-                        incomplete.tx_start,
-                        false,
-                    );
-                    firehose_start = incomplete.slot;
-                    if consume_retry_budget {
-                        incomplete_retries = incomplete_retries.saturating_add(1);
-                    }
-                    continue;
-                }
-                failure.record(err);
-            }
+    let mut persistent_missing_slot: Option<Slot> = None;
+    let mut persistent_missing_count = 0usize;
+    loop {
+        if shutdown.load(Ordering::Relaxed) {
+            info!("shutdown requested; abandoning replay");
             break;
         }
-        // The chunk's retry loop ended. Abort the whole replay on shutdown, a
-        // firehose error, or a recorded failure (force-missing abort, retry
-        // budget exhausted); otherwise [chunk_start, chunk_end] replayed cleanly.
-        if shutdown.load(Ordering::Relaxed)
-            || firehose_error.is_some()
-            || failure.error_message().is_some()
-        {
-            break 'chunks;
+        backpressure_stop_requested.store(false, Ordering::SeqCst);
+
+        info!(
+            "starting firehose replay with {} thread(s) (attempt {} from slot {})",
+            threads,
+            incomplete_retries.saturating_add(1),
+            firehose_start
+        );
+        let firehose_stop = Arc::new(AtomicBool::new(false));
+        if let Ok(mut guard) = active_firehose_stop.lock() {
+            *guard = Some(firehose_stop.clone());
         }
-        if chunk_end >= end_inclusive {
-            break 'chunks;
-        }
-        // `verify_complete` confirmed the *scheduler* drained, but the
-        // readyEntries thread + exec pool may still be committing the chunk's
-        // tail. Wait for every submitted batch to finish executing before the
-        // checkpoint freezes the bank — otherwise freeze races with
-        // `commit_transactions` and panics.
-        let quiesce_start = Instant::now();
-        let mut last_quiesce_warn = quiesce_start;
-        while READY_INFLIGHT.load(Ordering::SeqCst) > 0 {
-            if shutdown.load(Ordering::Relaxed) {
-                break;
+        let shutdown_watcher = {
+            let shutdown = shutdown.clone();
+            let firehose_stop = firehose_stop.clone();
+            std::thread::spawn(move || {
+                while !firehose_stop.load(Ordering::Relaxed) {
+                    if shutdown.load(Ordering::Relaxed) {
+                        firehose_stop.store(true, Ordering::SeqCst);
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            })
+        };
+        let firehose_result = tokio::task::spawn_blocking({
+            let slot_range = firehose_start..slot_range.end;
+            let notifiers = GeyserNotifiers {
+                transaction_notifier: notifiers.transaction_notifier.clone(),
+                entry_notifier: notifiers.entry_notifier.clone(),
+                block_metadata_notifier: notifiers.block_metadata_notifier.clone(),
+            };
+            let confirmed_bank_sender = confirmed_bank_sender.clone();
+            let index_base_url = index_base_url.clone();
+            let client = client.clone();
+            let firehose_stop = firehose_stop.clone();
+            move || {
+                let rt = match tokio::runtime::Runtime::new() {
+                    Ok(rt) => Arc::new(rt),
+                    Err(err) => {
+                        return Err((FirehoseError::OnLoadError(Box::new(err)), slot_range.start));
+                    }
+                };
+                firehose_geyser_with_notifiers(
+                    rt,
+                    slot_range,
+                    notifiers,
+                    confirmed_bank_sender,
+                    &index_base_url,
+                    &client,
+                    firehose_stop,
+                    async { Ok(()) },
+                    threads,
+                    true,
+                    buffer_window_bytes,
+                )
             }
-            if last_quiesce_warn.elapsed() >= Duration::from_secs(15) {
-                warn!(
-                    "checkpoint at slot {chunk_end}: waited {}s for exec pipeline to drain \
-                     ({} batches still in flight)",
-                    quiesce_start.elapsed().as_secs(),
-                    READY_INFLIGHT.load(Ordering::SeqCst)
-                );
-                last_quiesce_warn = Instant::now();
-            }
-            std::thread::sleep(Duration::from_millis(5));
+        })
+        .await
+        .map_err(|err| format!("firehose task failed: {err}"))?;
+        firehose_stop.store(true, Ordering::SeqCst);
+        let _ = shutdown_watcher.join();
+        if let Ok(mut guard) = active_firehose_stop.lock() {
+            *guard = None;
         }
+
         if shutdown.load(Ordering::Relaxed) {
-            break 'chunks;
+            info!("shutdown requested; abandoning replay");
+            break;
         }
-        // Quiesced at chunk_end: write a crash checkpoint, then keep replaying
-        // (appending to the same archive) from the next slot.
-        if let Err(err) = write_replay_checkpoint(
-            &bank_replay,
-            &ledger_dir,
-            epoch,
-            chunk_end,
-            &horizon_output,
-            &mut full_snapshot,
-        ) {
-            failure.record(format!("checkpoint at slot {chunk_end} failed: {err}"));
-            break 'chunks;
+
+        let stopped_by_backpressure = backpressure_stop_requested.load(Ordering::Relaxed);
+
+        if let Err((err, slot)) = firehose_result {
+            firehose_error = Some(format!("firehose error at slot {slot}: {err}"));
+            break;
         }
-        chunk_start = chunk_end + 1;
+
+        match scheduler.drain_ready_entries() {
+            Ok(ready_entries) => {
+                send_ready_entries(&ready_sender, &failure, ready_entries);
+            }
+            Err(err) => failure.record(err),
+        }
+
+        if let Err(err) = scheduler.verify_complete(end_inclusive) {
+            if let Some(incomplete) = scheduler.first_incomplete_slot(end_inclusive) {
+                if matches!(incomplete.reason, IncompleteReason::MissingBlockData) {
+                    if persistent_missing_slot == Some(incomplete.slot) {
+                        persistent_missing_count = persistent_missing_count.saturating_add(1);
+                    } else {
+                        persistent_missing_slot = Some(incomplete.slot);
+                        persistent_missing_count = 1;
+                    }
+                } else {
+                    persistent_missing_slot = None;
+                    persistent_missing_count = 0;
+                }
+
+                if matches!(incomplete.reason, IncompleteReason::MissingBlockData)
+                    && persistent_missing_count >= force_missing_retry_limit
+                {
+                    warn!(
+                        "forcing slot {} to missing after {} consecutive missing-block-data retries",
+                        incomplete.slot, persistent_missing_count
+                    );
+                    match scheduler.force_mark_missing(incomplete.slot) {
+                        Ok(ready_entries) => {
+                            send_ready_entries(&ready_sender, &failure, ready_entries);
+                            persistent_missing_slot = None;
+                            persistent_missing_count = 0;
+                            firehose_start = scheduler.snapshot().current_slot;
+                            continue;
+                        }
+                        Err(force_err) => {
+                            failure.record(format!(
+                                "failed to force slot {} missing after persistent missing block data: {}",
+                                incomplete.slot, force_err
+                            ));
+                            break;
+                        }
+                    }
+                }
+
+                let consume_retry_budget = !stopped_by_backpressure;
+                if consume_retry_budget && incomplete_retries >= post_firehose_retries {
+                    failure.record(err);
+                    break;
+                }
+                if stopped_by_backpressure {
+                    warn!(
+                        "firehose run stopped by backpressure; retrying from earliest incomplete slot"
+                    );
+                }
+                warn!(
+                    "post-firehose replay incomplete: {err}; retrying from slot {} entry {} tx_index {} reason={:?} presence={:?}",
+                    incomplete.slot,
+                    incomplete.entry_index,
+                    incomplete.tx_start,
+                    incomplete.reason,
+                    incomplete.presence
+                );
+                if let Some(snapshot) = &incomplete.snapshot {
+                    warn!(
+                        "post-firehose replay incomplete: slot {} expected_txs={:?} expected_entries={:?} processed_txs={} processed_entries={} pending_entries={} buffered_txs={} next_entry_index={}",
+                        incomplete.slot,
+                        snapshot.expected_tx_count,
+                        snapshot.expected_entry_count,
+                        snapshot.processed_tx_count,
+                        snapshot.processed_entry_count,
+                        snapshot.pending_entries,
+                        snapshot.buffered_txs,
+                        snapshot.next_entry_index
+                    );
+                }
+                restart_tracker.mark_restart(
+                    incomplete.slot,
+                    incomplete.entry_index,
+                    incomplete.tx_start,
+                    false,
+                );
+                firehose_start = incomplete.slot;
+                if consume_retry_budget {
+                    incomplete_retries = incomplete_retries.saturating_add(1);
+                }
+                continue;
+            }
+            failure.record(err);
+        }
+        break;
     }
     progress_done.store(true, Ordering::Relaxed);
     let _ = progress_handle.join();
@@ -6777,10 +6569,6 @@ async fn run_geyser_replay(
         // range run can install its own.
         horizon::finish()?;
     }
-
-    // The epoch finished cleanly — drop its crash checkpoint so a re-run starts
-    // fresh rather than resuming a now-complete archive.
-    clear_checkpoint(&ledger_dir, epoch);
 
     // Hand the live bank forks back so a range run can chain straight into the
     // next epoch without reloading a snapshot.
@@ -6901,386 +6689,15 @@ fn clear_ledger_accounts_state(ledger_dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Directory holding the in-progress crash checkpoint for `epoch`.
-fn checkpoint_dir(dest_dir: &Path, epoch: u64) -> PathBuf {
-    dest_dir.join("checkpoints").join(epoch.to_string())
-}
-
-/// Writes a full bank snapshot for the (frozen) `bank` into `dir`, returning
-/// the `snapshot-<slot>-<hash>.tar.zst` path — the same format the normal
-/// loader reads, so resume just loads it like any boundary snapshot.
-fn write_full_checkpoint_snapshot(bank: &Bank, dir: &Path) -> Result<PathBuf, String> {
-    let bank_snapshots_dir = dir.join("bank-snapshots");
-    fs::create_dir_all(&bank_snapshots_dir)
-        .map_err(|err| format!("failed to create {}: {err}", bank_snapshots_dir.display()))?;
-    let info = snapshot_bank_utils::bank_to_full_snapshot_archive(
-        &bank_snapshots_dir,
-        bank,
-        None,
-        dir,
-        dir,
-        ArchiveFormat::TarZstd {
-            config: ZstdConfig::default(),
-        },
-    )
-    .map_err(|err| format!("full checkpoint snapshot at slot {} failed: {err}", bank.slot()))?;
-    Ok(info.path().to_path_buf())
-}
-
-/// Writes an incremental snapshot capturing only the accounts changed since the
-/// full snapshot at `full_slot` — cheap relative to a full snapshot, so most
-/// checkpoints write one of these instead.
-fn write_incremental_checkpoint_snapshot(
-    bank: &Bank,
-    dir: &Path,
-    full_slot: Slot,
-) -> Result<PathBuf, String> {
-    let bank_snapshots_dir = dir.join("bank-snapshots");
-    fs::create_dir_all(&bank_snapshots_dir)
-        .map_err(|err| format!("failed to create {}: {err}", bank_snapshots_dir.display()))?;
-    let info = snapshot_bank_utils::bank_to_incremental_snapshot_archive(
-        &bank_snapshots_dir,
-        bank,
-        full_slot,
-        None,
-        dir,
-        dir,
-        ArchiveFormat::TarZstd {
-            config: ZstdConfig::default(),
-        },
-    )
-    .map_err(|err| {
-        format!(
-            "incremental checkpoint snapshot at slot {} (base {full_slot}) failed: {err}",
-            bank.slot()
-        )
-    })?;
-    Ok(info.path().to_path_buf())
-}
-
-/// Loads a bank from a full snapshot plus an optional incremental snapshot (the
-/// resume path). Uses Solana's archive loader, which unpacks both archives and
-/// reconstructs the bank at the incremental's slot.
-fn load_bank_from_checkpoint_snapshots(
-    ledger_dir: &Path,
-    full_path: &Path,
-    incremental_path: Option<&Path>,
-    accounts_update_notifier: Option<AccountsUpdateNotifier>,
-) -> Result<Bank, String> {
-    let full_info = FullSnapshotArchiveInfo::new_from_path(full_path.to_path_buf())
-        .map_err(|err| format!("failed to parse full snapshot {}: {err}", full_path.display()))?;
-    let incremental_info = match incremental_path {
-        Some(path) => Some(
-            IncrementalSnapshotArchiveInfo::new_from_path(path.to_path_buf()).map_err(|err| {
-                format!(
-                    "failed to parse incremental snapshot {}: {err}",
-                    path.display()
-                )
-            })?,
-        ),
-        None => None,
+/// Returns true if `path` is a fully finalized horizon archive. The reader only
+/// opens once the footer + bucket index are present and the index checksum
+/// matches, so a crash-truncated `.jet` (header written, no footer) reports
+/// false and is re-run. Used for epoch-level resume of a range.
+fn epoch_archive_complete(path: &Path) -> bool {
+    let Ok(file) = fs::File::open(path) else {
+        return false;
     };
-    let genesis_config = open_genesis_config(ledger_dir, MAX_GENESIS_ARCHIVE_UNPACKED_SIZE)
-        .map_err(|err| format!("failed to load genesis config: {err}"))?;
-    let runtime_config = RuntimeConfig::default();
-    let accounts_db_config = accounts_db_config_for_ledger(ledger_dir)?;
-    let exit = Arc::new(AtomicBool::new(false));
-    let limit_load_slot_count_from_snapshot = if skip_snapshot_verify() {
-        Some(usize::MAX)
-    } else {
-        None
-    };
-    let account_paths = vec![ledger_dir.join("accounts")];
-    for path in &account_paths {
-        fs::create_dir_all(path)
-            .map_err(|err| format!("failed to create {}: {err}", path.display()))?;
-    }
-    let bank_snapshots_dir = ledger_dir.join(BANK_SNAPSHOTS_DIR);
-    fs::create_dir_all(&bank_snapshots_dir)
-        .map_err(|err| format!("failed to create {}: {err}", bank_snapshots_dir.display()))?;
-
-    snapshot_bank_utils::bank_from_snapshot_archives(
-        &account_paths,
-        &bank_snapshots_dir,
-        &full_info,
-        incremental_info.as_ref(),
-        &genesis_config,
-        &runtime_config,
-        None,
-        limit_load_slot_count_from_snapshot,
-        false,
-        false,
-        false,
-        accounts_db_config,
-        accounts_update_notifier,
-        exit,
-    )
-    .map_err(|err| format!("failed to build bank from checkpoint snapshots: {err}"))
-}
-
-/// Persisted pointer to a crash checkpoint.
-struct CheckpointRecord {
-    epoch: u64,
-    /// First slot to replay on resume; the archive prefix covers
-    /// `[epoch_start, resume_slot - 1]` and the bank state at `resume_slot - 1`
-    /// is reconstructed from the snapshots below.
-    resume_slot: Slot,
-    /// Base full snapshot (written at the epoch's first checkpoint) and its slot.
-    full_snapshot: PathBuf,
-    full_snapshot_slot: Slot,
-    /// Incremental snapshot since the full — present at every checkpoint except
-    /// the first one, which is just the full.
-    incremental_snapshot: Option<PathBuf>,
-    jet_path: PathBuf,
-    last_emitted: Slot,
-    epoch_meta_written: bool,
-}
-
-/// Atomically writes the checkpoint manifest plus the lencode'd archive-state
-/// sidecar (temp files + rename; the manifest rename is the commit point).
-fn write_checkpoint_manifest(
-    dir: &Path,
-    record: &CheckpointRecord,
-    archive: &jetstreamer_horizon::archive::ArchiveCheckpoint,
-) -> Result<(), String> {
-    fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
-    let sidecar = dir.join("archive-checkpoint.bin");
-    let sidecar_tmp = dir.join("archive-checkpoint.bin.tmp");
-    let bytes = archive
-        .encode_to_vec()
-        .map_err(|e| format!("encode archive checkpoint: {e}"))?;
-    fs::write(&sidecar_tmp, &bytes).map_err(|e| format!("write sidecar: {e}"))?;
-    fs::rename(&sidecar_tmp, &sidecar).map_err(|e| format!("commit sidecar: {e}"))?;
-
-    let manifest = serde_json::json!({
-        "epoch": record.epoch,
-        "resume_slot": record.resume_slot,
-        "full_snapshot": record.full_snapshot,
-        "full_snapshot_slot": record.full_snapshot_slot,
-        "incremental_snapshot": record.incremental_snapshot,
-        "jet_path": record.jet_path,
-        "archive_checkpoint": sidecar,
-        "last_emitted": record.last_emitted,
-        "epoch_meta_written": record.epoch_meta_written,
-    });
-    let manifest_path = dir.join("manifest.json");
-    let manifest_tmp = dir.join("manifest.json.tmp");
-    let json =
-        serde_json::to_vec_pretty(&manifest).map_err(|e| format!("serialize manifest: {e}"))?;
-    fs::write(&manifest_tmp, &json).map_err(|e| format!("write manifest: {e}"))?;
-    fs::rename(&manifest_tmp, &manifest_path).map_err(|e| format!("commit manifest: {e}"))?;
-    Ok(())
-}
-
-/// Loads a checkpoint for `epoch` if one exists, returning the resume record
-/// and the recorder checkpoint needed to resume appending to the archive.
-fn load_checkpoint(
-    dest_dir: &Path,
-    epoch: u64,
-) -> Result<Option<(CheckpointRecord, horizon::RecorderCheckpoint)>, String> {
-    let manifest_path = checkpoint_dir(dest_dir, epoch).join("manifest.json");
-    if !manifest_path.is_file() {
-        return Ok(None);
-    }
-    let v: serde_json::Value = serde_json::from_slice(
-        &fs::read(&manifest_path).map_err(|e| format!("read manifest: {e}"))?,
-    )
-    .map_err(|e| format!("parse manifest: {e}"))?;
-    let get_u64 = |k: &str| v[k].as_u64().ok_or_else(|| format!("manifest missing {k}"));
-    let get_path = |k: &str| {
-        v[k].as_str()
-            .map(PathBuf::from)
-            .ok_or_else(|| format!("manifest missing {k}"))
-    };
-    let resume_slot = get_u64("resume_slot")?;
-    // Back-compat: pre-incremental checkpoints stored a single `bank_snapshot`
-    // (a fresh full snapshot every checkpoint). Adopt it as the base full so a
-    // run on the new binary resumes such a checkpoint instead of erroring on the
-    // schema change; the old snapshot was taken at the bank slot resume_slot - 1.
-    // The next checkpoint then writes an incremental against it, and prune drops
-    // the stale staging dir, so the old layout is absorbed rather than orphaned.
-    let (full_snapshot, full_snapshot_slot, incremental_snapshot) =
-        match v["full_snapshot"].as_str() {
-            Some(full) => (
-                PathBuf::from(full),
-                get_u64("full_snapshot_slot")?,
-                v["incremental_snapshot"].as_str().map(PathBuf::from),
-            ),
-            None => (get_path("bank_snapshot")?, resume_slot.saturating_sub(1), None),
-        };
-    let record = CheckpointRecord {
-        epoch: get_u64("epoch")?,
-        resume_slot,
-        full_snapshot,
-        full_snapshot_slot,
-        incremental_snapshot,
-        jet_path: get_path("jet_path")?,
-        last_emitted: get_u64("last_emitted")?,
-        epoch_meta_written: v["epoch_meta_written"].as_bool().unwrap_or(false),
-    };
-    let sidecar = get_path("archive_checkpoint")?;
-    let archive = jetstreamer_horizon::archive::ArchiveCheckpoint::decode_from_slice(
-        &fs::read(&sidecar).map_err(|e| format!("read archive checkpoint: {e}"))?,
-    )
-    .map_err(|e| format!("decode archive checkpoint: {e}"))?;
-    let recorder_cp = horizon::RecorderCheckpoint {
-        archive,
-        last_emitted: record.last_emitted,
-        epoch_meta_written: record.epoch_meta_written,
-    };
-    Ok(Some((record, recorder_cp)))
-}
-
-/// Removes the checkpoint directory for `epoch` (after the epoch finishes
-/// cleanly, so a later run doesn't resume a stale checkpoint).
-fn clear_checkpoint(dest_dir: &Path, epoch: u64) {
-    let dir = checkpoint_dir(dest_dir, epoch);
-    if dir.exists()
-        && let Err(err) = fs::remove_dir_all(&dir)
-    {
-        warn!("failed to remove checkpoint dir {}: {err}", dir.display());
-    }
-}
-
-/// Slots between mid-epoch crash checkpoints, snapped down to a bucket boundary
-/// (so the durable archive prefix always ends on a whole bucket). 0 disables.
-/// Override with `JETSTREAMER_CHECKPOINT_INTERVAL_SLOTS`.
-fn checkpoint_interval_slots() -> u64 {
-    let raw = match env::var("JETSTREAMER_CHECKPOINT_INTERVAL_SLOTS") {
-        Ok(v) => match v.trim().parse::<u64>() {
-            Ok(n) => n,
-            Err(err) => {
-                warn!(
-                    "invalid JETSTREAMER_CHECKPOINT_INTERVAL_SLOTS '{v}': {err}; using default {}",
-                    DEFAULT_CHECKPOINT_INTERVAL_SLOTS
-                );
-                DEFAULT_CHECKPOINT_INTERVAL_SLOTS
-            }
-        },
-        Err(_) => DEFAULT_CHECKPOINT_INTERVAL_SLOTS,
-    };
-    if raw == 0 {
-        0
-    } else {
-        (raw / CHECKPOINT_BUCKET_SLOTS).max(1) * CHECKPOINT_BUCKET_SLOTS
-    }
-}
-
-/// Writes a crash checkpoint at `chunk_end`: freezes the bank there, flushes the
-/// archive to a durable fsync'd prefix, snapshots the bank, and commits the
-/// manifest. The caller must have quiesced the replay through `chunk_end`.
-fn write_replay_checkpoint(
-    bank_replay: &BankReplay,
-    dest_dir: &Path,
-    epoch: u64,
-    chunk_end: Slot,
-    jet_path: &Path,
-    full_snapshot: &mut Option<(Slot, PathBuf)>,
-) -> Result<(), String> {
-    let bank_slot = bank_replay.working_bank()?.slot();
-    // The first chunk ends at epoch_start so a checkpoint lands as recording
-    // begins — but if epoch_start (or the first chunk's tail) is leader-skipped,
-    // the bank can still be in the warmup region (< epoch_start) where nothing
-    // is recorded yet. Skip; the periodic checkpoints cover it.
-    if bank_slot < epoch_to_slot(epoch) {
-        return Ok(());
-    }
-    // Key the checkpoint to the bank's *actual* slot, not chunk_end: if chunk_end
-    // is leader-skipped, the working bank sits at the last block slot before it.
-    // The archive prefix + bank snapshot + resume slot must all agree on that
-    // slot; the gap up to chunk_end is leader-skipped and is re-derived on resume.
-    if bank_slot > chunk_end {
-        return Err(format!(
-            "checkpoint: working bank at slot {bank_slot} is past chunk end {chunk_end}"
-        ));
-    }
-    info!("checkpoint at slot {bank_slot}: freezing bank");
-    bank_replay.freeze_latest_bank()?;
-    // The full-snapshot below internally squashes (roots) the bank to its slot;
-    // record that as our last root so the next periodic root never goes backward
-    // of it. We do NOT call bank_forks.set_root here — on a freshly warped
-    // accounts-db that synchronously prunes + cleans and can stall for minutes.
-    bank_replay.note_snapshot_root(bank_slot);
-    let bank = bank_replay.working_bank()?;
-    let resume_slot = bank_slot + 1;
-    info!("checkpoint at slot {bank_slot}: flushing archive prefix");
-    let Some(recorder_cp) = horizon::checkpoint(resume_slot)? else {
-        return Ok(()); // recording disabled
-    };
-    let dir = checkpoint_dir(dest_dir, epoch);
-    // The epoch's first checkpoint writes the base full snapshot (~330 GB);
-    // every later one rewrites a single incremental against it, so the dominant
-    // full-snapshot cost is paid once per epoch instead of once per checkpoint.
-    let (full_path, full_slot, incremental_path) = match full_snapshot.as_ref() {
-        Some((full_slot, full_path)) if bank_slot > *full_slot => {
-            info!(
-                "checkpoint at slot {bank_slot}: writing incremental snapshot since slot \
-                 {full_slot} (can take a minute)"
-            );
-            let incr = write_incremental_checkpoint_snapshot(&bank, &dir, *full_slot)?;
-            (full_path.clone(), *full_slot, Some(incr))
-        }
-        _ => {
-            info!("checkpoint at slot {bank_slot}: writing full snapshot (can take a few minutes)");
-            let full = write_full_checkpoint_snapshot(&bank, &dir)?;
-            *full_snapshot = Some((bank_slot, full.clone()));
-            (full, bank_slot, None)
-        }
-    };
-    let record = CheckpointRecord {
-        epoch,
-        resume_slot,
-        full_snapshot: full_path,
-        full_snapshot_slot: full_slot,
-        incremental_snapshot: incremental_path,
-        jet_path: jet_path.to_path_buf(),
-        last_emitted: recorder_cp.last_emitted,
-        epoch_meta_written: recorder_cp.epoch_meta_written,
-    };
-    write_checkpoint_manifest(&dir, &record, &recorder_cp.archive)?;
-    // The manifest now points at the current full + incremental, so superseded
-    // incrementals are safe to delete. Done after the manifest commit so a crash
-    // mid-prune never leaves the manifest pointing at a removed snapshot.
-    prune_old_checkpoint_snapshots(
-        &dir,
-        &record.full_snapshot,
-        record.incremental_snapshot.as_deref(),
-    );
-    info!(
-        "checkpoint committed at slot {bank_slot} (chunk target {chunk_end}, resume slot \
-         {resume_slot}); full {}{}",
-        record.full_snapshot.display(),
-        match &record.incremental_snapshot {
-            Some(p) => format!(", incremental {}", p.display()),
-            None => String::new(),
-        }
-    );
-    Ok(())
-}
-
-/// Removes superseded snapshot archives in `dir`, keeping the base full snapshot
-/// `keep_full` and (if any) the latest incremental `keep_incremental` that the
-/// freshly-committed manifest references, plus the bank-snapshot staging dir.
-/// Earlier incrementals are obsolete once a newer one supersedes them.
-fn prune_old_checkpoint_snapshots(dir: &Path, keep_full: &Path, keep_incremental: Option<&Path>) {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path == keep_full || Some(path.as_path()) == keep_incremental {
-            continue;
-        }
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        let is_snapshot = name.ends_with(".tar.zst")
-            && (name.starts_with("snapshot-") || name.starts_with("incremental-snapshot-"));
-        if is_snapshot {
-            let _ = fs::remove_file(&path);
-        }
-    }
-    // Staging dir is rebuilt by each snapshot; drop it to reclaim space.
-    let _ = fs::remove_dir_all(dir.join("bank-snapshots"));
+    jetstreamer_horizon::archive::ArchiveReader::open(std::io::BufReader::new(file)).is_ok()
 }
 
 #[tokio::main]
@@ -7368,6 +6785,38 @@ async fn main() {
     }
     let horizon_output_override = horizon_output;
 
+    // Epoch-level resume for ranges: if an earlier run already finalized some
+    // leading epochs (their `.jet` has a valid footer), skip them and restart at
+    // the first incomplete one. Completed epochs are immutable, so this only
+    // avoids redoing them; the resumed epoch bootstraps from a boundary snapshot
+    // exactly like a fresh start (the in-memory bank from the prior epoch is gone
+    // after a crash). Scoped to ranges so a single-epoch re-run still regenerates.
+    let effective_start = if start_epoch != end_epoch {
+        let mut first_incomplete = start_epoch;
+        while first_incomplete <= end_epoch
+            && epoch_archive_complete(&dest_dir.join(format!("epoch-{first_incomplete}.jet")))
+        {
+            println!("epoch {first_incomplete} already complete; skipping");
+            first_incomplete += 1;
+        }
+        if first_incomplete > end_epoch {
+            println!(
+                "all epochs {start_epoch}-{end_epoch} already complete in {}; nothing to do",
+                dest_dir.display()
+            );
+            return;
+        }
+        if first_incomplete != start_epoch {
+            println!(
+                "resuming range at epoch {first_incomplete} (epochs {start_epoch}-{} already done)",
+                first_incomplete - 1
+            );
+        }
+        first_incomplete
+    } else {
+        start_epoch
+    };
+
     // Replay mutates the unpacked snapshot state in place (new appendvecs,
     // accounts index), so a crashed run leaves the staging dirs dirty.
     // Start every run from a clean unpack of the retained snapshot archive;
@@ -7381,120 +6830,95 @@ async fn main() {
         info!("ledger accounts cleanup disabled via JETSTREAMER_CLEAR_ACCOUNTS_ON_START=false");
     }
 
-    // On a crash mid-range, the in-progress epoch left a checkpoint; resume the
-    // range there — every earlier epoch already finalized its `.jet`. If no
-    // epoch has a checkpoint, start fresh from start_epoch.
-    let effective_start = (start_epoch..=end_epoch)
-        .find(|&e| checkpoint_dir(&dest_dir, e).join("manifest.json").is_file())
-        .unwrap_or(start_epoch);
-    if effective_start > start_epoch {
-        info!(
-            "resuming range at epoch {effective_start} (epochs {start_epoch}..={} already complete)",
-            effective_start - 1
-        );
-    }
-    let resuming_from_checkpoint = checkpoint_dir(&dest_dir, effective_start)
-        .join("manifest.json")
-        .is_file();
-
-    // Resolve the bootstrap snapshot only when *not* resuming from a checkpoint:
-    // a resume loads the checkpoint's own bank snapshot instead. The snapshot
-    // bootstraps only the first epoch actually run; later epochs in a range
-    // chain off the in-memory bank.
-    let dest_path = if resuming_from_checkpoint {
-        info!("epoch {effective_start} has a checkpoint; resuming from its bank snapshot");
-        PathBuf::new()
-    } else {
-        let target_slot = epoch_to_slot(effective_start).saturating_sub(1);
-        // A local snapshot only bootstraps `effective_start` cheaply if it lands
-        // within the previous epoch (at or after the start of
-        // `effective_start - 1`). Anything older still works but forces a warmup
-        // replay across every intervening slot — e.g. reusing epoch N's boundary
-        // snapshot to run N+1 re-executes all of N first (~432k slots).
-        // `find_existing_snapshot_archive` only bounds the candidate from above
-        // (slot <= target_slot), so a leftover snapshot from the prior epoch's
-        // run gets picked up here; reject it and download the boundary snapshot.
-        let min_snapshot_slot = epoch_to_slot(effective_start.saturating_sub(1));
-        let existing_snapshot = match find_existing_snapshot_archive(&dest_dir, target_slot) {
-            Ok(Some(candidate)) if candidate.slot < min_snapshot_slot => {
-                println!(
-                    "Ignoring snapshot {} at slot {}: epoch {} needs a snapshot at or after slot {} \
-                     (reusing it would warm up across {} slots); downloading the boundary snapshot",
-                    candidate.path.display(),
-                    candidate.slot,
-                    effective_start,
-                    min_snapshot_slot,
-                    epoch_to_slot(effective_start).saturating_sub(candidate.slot),
-                );
-                None
-            }
-            Ok(other) => other,
-            Err(err) => {
-                eprintln!("error: {err}");
-                exit(1);
-            }
-        };
-        let mut extracted_snapshot = false;
-        let dest_path = match existing_snapshot {
-            Some(candidate) => {
-                extracted_snapshot = match has_extracted_snapshot(&dest_dir, candidate.slot) {
-                    Ok(has_snapshot) => has_snapshot,
-                    Err(err) => {
-                        eprintln!("error: {err}");
-                        exit(1);
-                    }
-                };
-                if extracted_snapshot {
-                    println!(
-                        "Found existing snapshot archive at {} with extracted data; skipping download",
-                        candidate.path.display()
-                    );
-                } else {
-                    println!(
-                        "Found existing snapshot archive at {}; skipping download",
-                        candidate.path.display()
-                    );
-                }
-                candidate.path
-            }
-            None => {
-                match download_snapshot_at_or_before_slot(effective_start, target_slot, &dest_dir)
-                    .await
-                {
-                    Ok(path) => {
-                        println!("Downloaded snapshot to {}", path.display());
-                        path
-                    }
-                    Err(err) => {
-                        eprintln!("error: {err}");
-                        exit(1);
-                    }
-                }
-            }
-        };
-
-        if !env_truthy("JETSTREAMER_LOAD_FROM_DIR") {
-            // The default archive loader unpacks into its own staging
-            // (`.snapshot-extract-*` + accounts-run); the ledger-root
-            // extraction below only feeds the dir loader.
-            println!("Skipping ledger-root extraction (archive loader manages its own staging)");
-        } else if env_truthy("JETSTREAMER_SKIP_EXTRACT") {
-            println!("Skipping extraction because JETSTREAMER_SKIP_EXTRACT is set");
-        } else if extracted_snapshot {
+    // The snapshot bootstraps only the first epoch actually run (effective_start);
+    // later epochs in a range chain off the in-memory bank.
+    let target_slot = epoch_to_slot(effective_start).saturating_sub(1);
+    // A local snapshot only bootstraps `effective_start` cheaply if it lands
+    // within the previous epoch (at or after the start of `effective_start - 1`).
+    // Anything older is still usable, but it forces a warmup replay across every
+    // slot between the snapshot and the epoch boundary — e.g. reusing epoch N's
+    // boundary snapshot to run epoch N+1 re-executes all of epoch N first
+    // (~432k slots, roughly doubling the run). `find_existing_snapshot_archive`
+    // only bounds the candidate from above (slot <= target_slot), so a leftover
+    // snapshot from the prior epoch's run gets picked up here; reject it and
+    // download the real boundary snapshot instead.
+    let min_snapshot_slot = epoch_to_slot(effective_start.saturating_sub(1));
+    let existing_snapshot = match find_existing_snapshot_archive(&dest_dir, target_slot) {
+        Ok(Some(candidate)) if candidate.slot < min_snapshot_slot => {
             println!(
-                "Skipping extraction because snapshot data already exists in {}",
-                dest_dir.display()
+                "Ignoring snapshot {} at slot {}: epoch {} needs a snapshot at or after slot {} \
+                 (reusing it would warm up across {} slots); downloading the boundary snapshot",
+                candidate.path.display(),
+                candidate.slot,
+                effective_start,
+                min_snapshot_slot,
+                epoch_to_slot(effective_start).saturating_sub(candidate.slot),
             );
-        } else {
-            println!("Extracting snapshot into {}", dest_dir.display());
-            if let Err(err) = extract_tarball(&dest_path, &dest_dir).await {
-                eprintln!("error: {err}");
-                exit(1);
-            }
-            println!("Extraction complete");
+            None
         }
-        dest_path
+        Ok(other) => other,
+        Err(err) => {
+            eprintln!("error: {err}");
+            exit(1);
+        }
     };
+    let mut extracted_snapshot = false;
+    let dest_path = match existing_snapshot {
+        Some(candidate) => {
+            extracted_snapshot = match has_extracted_snapshot(&dest_dir, candidate.slot) {
+                Ok(has_snapshot) => has_snapshot,
+                Err(err) => {
+                    eprintln!("error: {err}");
+                    exit(1);
+                }
+            };
+            if extracted_snapshot {
+                println!(
+                    "Found existing snapshot archive at {} with extracted data; skipping download",
+                    candidate.path.display()
+                );
+            } else {
+                println!(
+                    "Found existing snapshot archive at {}; skipping download",
+                    candidate.path.display()
+                );
+            }
+            candidate.path
+        }
+        None => {
+            match download_snapshot_at_or_before_slot(effective_start, target_slot, &dest_dir).await {
+                Ok(path) => {
+                    println!("Downloaded snapshot to {}", path.display());
+                    path
+                }
+                Err(err) => {
+                    eprintln!("error: {err}");
+                    exit(1);
+                }
+            }
+        }
+    };
+
+    if !env_truthy("JETSTREAMER_LOAD_FROM_DIR") {
+        // The default archive loader unpacks into its own staging
+        // (`.snapshot-extract-*` + accounts-run); the ledger-root
+        // extraction below only feeds the dir loader.
+        println!("Skipping ledger-root extraction (archive loader manages its own staging)");
+    } else if env_truthy("JETSTREAMER_SKIP_EXTRACT") {
+        println!("Skipping extraction because JETSTREAMER_SKIP_EXTRACT is set");
+    } else if extracted_snapshot {
+        println!(
+            "Skipping extraction because snapshot data already exists in {}",
+            dest_dir.display()
+        );
+    } else {
+        println!("Extracting snapshot into {}", dest_dir.display());
+        if let Err(err) = extract_tarball(&dest_path, &dest_dir).await {
+            eprintln!("error: {err}");
+            exit(1);
+        }
+        println!("Extraction complete");
+    }
 
     // Replay each epoch in the range. The first epoch loads the snapshot; each
     // subsequent epoch reuses the in-memory bank handed back by the previous

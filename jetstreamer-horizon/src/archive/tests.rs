@@ -256,39 +256,15 @@ fn write_archive(
     n_slots: u64,
     config: ArchiveWriterConfig,
 ) -> (Vec<u8>, Vec<ExpectedSlot>, ArchiveStats) {
-    write_archive_ckpt(slot_start, n_slots, config, None)
-}
-
-/// Like [`write_archive`], but when `checkpoint_at` is `Some(slot)` it takes a
-/// writer checkpoint just before emitting that slot, drops the writer, and
-/// resumes appending to the same buffer — the in-memory equivalent of a crash
-/// and restart on the durable prefix.
-fn write_archive_ckpt(
-    slot_start: u64,
-    n_slots: u64,
-    config: ArchiveWriterConfig,
-    checkpoint_at: Option<u64>,
-) -> (Vec<u8>, Vec<ExpectedSlot>, ArchiveStats) {
     let mut rng = Rng(42);
     let mut ledger = Ledger::new(7, 64);
     let sink = std::io::Cursor::new(Vec::new());
-    let config_for_resume = config.clone();
     let mut writer = ArchiveWriter::new(sink, 900, slot_start, n_slots, config).unwrap();
     let mut expected = Vec::new();
     let mut last_blockhash = Hash::default();
 
     for i in 0..n_slots {
         let slot = slot_start + i;
-        if checkpoint_at == Some(slot) {
-            // Crash-resume rehearsal: checkpoint, drop the writer, reopen the
-            // durable prefix, and resume appending. The output must come out
-            // identical to an uninterrupted write.
-            let cp = writer.checkpoint().unwrap();
-            let mut cursor = writer.into_sink();
-            cursor.set_position(cp.file_offset);
-            writer =
-                ArchiveWriter::resume(cursor, slot_start, n_slots, config_for_resume.clone(), cp);
-        }
         // Every 7th slot is leader-skipped.
         if i % 7 == 3 {
             writer.write_skipped_slot(slot).unwrap();
@@ -430,49 +406,6 @@ fn roundtrip_zstd_bucket_128() {
     let got = read_all(&bytes, 0, u64::MAX, true);
     assert_eq!(got.len(), expected.len());
     assert_eq!(got, expected);
-}
-
-#[test]
-fn archive_checkpoint_serialization_roundtrips() {
-    let config = ArchiveWriterConfig::default();
-    let mut writer =
-        ArchiveWriter::new(std::io::Cursor::new(Vec::new()), 900, 1_000, 300, config).unwrap();
-    writer.write_skipped_slot(1_000).unwrap();
-    writer.write_skipped_slot(1_001).unwrap();
-    let cp = writer.checkpoint().unwrap();
-
-    let bytes = cp.encode_to_vec().unwrap();
-    let decoded = ArchiveCheckpoint::decode_from_slice(&bytes).unwrap();
-
-    assert_eq!(decoded.file_offset, cp.file_offset);
-    assert_eq!(decoded.index, cp.index);
-    assert_eq!(decoded.stats, cp.stats);
-    assert_eq!(decoded.last_blockhash, cp.last_blockhash);
-    assert_eq!(decoded.last_slot, cp.last_slot);
-    assert!(!cp.index.is_empty());
-}
-
-#[test]
-fn checkpoint_resume_matches_uninterrupted() {
-    let config = ArchiveWriterConfig::default();
-    // Reference archive, written straight through.
-    let (ref_bytes, _exp, ref_stats) = write_archive(1_000, 300, config.clone());
-    let ref_slots = read_all(&ref_bytes, 0, u64::MAX, true);
-
-    // Same synthetic data, but checkpoint + resume mid-bucket at slot 1_137.
-    let (ck_bytes, _exp2, ck_stats) = write_archive_ckpt(1_000, 300, config, Some(1_137));
-    let ck_slots = read_all(&ck_bytes, 0, u64::MAX, true);
-
-    // Bucket layout differs (the checkpoint forces an early flush), but every
-    // decoded slot — txs, account updates, orphans, blockhash chain — and the
-    // running stats must match an uninterrupted write.
-    assert_eq!(ref_slots, ck_slots);
-    assert_eq!(ref_stats.slots, ck_stats.slots);
-    assert_eq!(ref_stats.blocks, ck_stats.blocks);
-    assert_eq!(ref_stats.transactions, ck_stats.transactions);
-    assert_eq!(ref_stats.account_updates, ck_stats.account_updates);
-    // The forced early flush adds at least one extra bucket boundary.
-    assert!(ck_stats.buckets > ref_stats.buckets);
 }
 
 #[test]

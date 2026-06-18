@@ -78,7 +78,7 @@ impl Default for ArchiveWriterConfig {
 }
 
 /// Aggregate counters reported by [`ArchiveWriter::finish`].
-#[derive(Encode, Decode, Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ArchiveStats {
     /// Total bytes written to the sink (header + buckets + index + footer).
     pub bytes_written: u64,
@@ -159,39 +159,6 @@ pub struct ArchiveWriter<W: std::io::Write> {
     staging_tx_bytes: Vec<u8>,
     staging_post_count: u32,
     staging_post_bytes: Vec<u8>,
-}
-
-/// State captured at a bucket boundary, sufficient to resume appending to the
-/// same archive file after a crash (see [`ArchiveWriter::checkpoint`] and
-/// [`ArchiveWriter::resume`]). At this point the file on disk is a valid
-/// header-plus-buckets prefix with no footer yet.
-#[derive(Encode, Decode, Debug, Clone)]
-pub struct ArchiveCheckpoint {
-    /// Byte length of the durable prefix — where appended buckets resume.
-    pub file_offset: u64,
-    /// Bucket index accumulated so far (needed to write the footer at finish).
-    pub index: Vec<BucketIndexEntry>,
-    /// Running stats so the resumed writer's totals stay correct.
-    pub stats: ArchiveStats,
-    /// Blockhash of the last emitted block (PoH anchor for the next bucket).
-    pub last_blockhash: Hash,
-    /// Last slot written (monotonicity guard on resume).
-    pub last_slot: Option<u64>,
-}
-
-impl ArchiveCheckpoint {
-    /// Serializes this checkpoint (lencode) for persisting in a resume manifest.
-    pub fn encode_to_vec(&self) -> Result<Vec<u8>, ArchiveFormatError> {
-        let mut out = Vec::new();
-        self.encode_ext(&mut out, None)?;
-        Ok(out)
-    }
-
-    /// Decodes a checkpoint previously written by [`Self::encode_to_vec`].
-    pub fn decode_from_slice(bytes: &[u8]) -> Result<Self, ArchiveFormatError> {
-        let mut cur = bytes;
-        Ok(Self::decode_ext(&mut cur, None)?)
-    }
 }
 
 impl<W: std::io::Write> ArchiveWriter<W> {
@@ -608,81 +575,5 @@ impl<W: std::io::Write> ArchiveWriter<W> {
     /// Read-only view of the running stats.
     pub fn stats(&self) -> &ArchiveStats {
         &self.stats
-    }
-
-    /// Flushes the current bucket and the sink, returning a checkpoint that can
-    /// later resume appending to this same archive file. After this call the
-    /// file is a valid header-plus-buckets prefix (no footer yet); the caller
-    /// is responsible for fsync'ing the underlying file for crash durability
-    /// (reach it via [`ArchiveWriter::sink_ref`]). Must be called between
-    /// slots (no open `begin_slot`/`end_slot` frame).
-    pub fn checkpoint(&mut self) -> Result<ArchiveCheckpoint, ArchiveFormatError> {
-        assert!(
-            self.staging_slot.is_none(),
-            "checkpoint called with an open slot frame (missing end_slot)"
-        );
-        self.flush_bucket()?;
-        self.sink.flush()?;
-        Ok(ArchiveCheckpoint {
-            file_offset: self.file_offset,
-            index: self.index.clone(),
-            stats: self.stats,
-            last_blockhash: self.last_blockhash,
-            last_slot: self.last_slot,
-        })
-    }
-
-    /// Borrows the sink, e.g. to fsync the underlying file at a checkpoint.
-    pub fn sink_ref(&self) -> &W {
-        &self.sink
-    }
-
-    /// Consumes the writer and returns the sink *without* writing a footer —
-    /// used to hand the still-open archive file to a resuming writer.
-    pub fn into_sink(self) -> W {
-        self.sink
-    }
-
-    /// Resumes appending to an archive previously left at a [`checkpoint`]. The
-    /// `sink` must be positioned at `checkpoint.file_offset` (the file
-    /// truncated to that length and opened for appending); the file header must
-    /// already be present and is *not* re-written. `slot_start`, `slot_count`,
-    /// and `config` must match the original archive.
-    ///
-    /// [`checkpoint`]: ArchiveWriter::checkpoint
-    pub fn resume(
-        sink: W,
-        slot_start: u64,
-        slot_count: u64,
-        config: ArchiveWriterConfig,
-        checkpoint: ArchiveCheckpoint,
-    ) -> Self {
-        assert!(config.bucket_slots >= 1, "bucket_slots must be >= 1");
-        Self {
-            sink,
-            slot_start,
-            slot_end: slot_start + slot_count,
-            config,
-            file_offset: checkpoint.file_offset,
-            index: checkpoint.index,
-            stats: checkpoint.stats,
-            bucket_buf: Vec::with_capacity(8 << 20),
-            bucket_first_slot: None,
-            bucket_slot_count: 0,
-            bucket_poh_anchor: Hash::default(),
-            enc_ctx: new_encoder_context(),
-            diff: DiffEncoder::with_capacity(64 * 1024),
-            last_blockhash: checkpoint.last_blockhash,
-            last_slot: checkpoint.last_slot,
-            staging_slot: None,
-            staging_has_epoch: false,
-            staging_epoch_bytes: Vec::with_capacity(64 << 10),
-            staging_pre_count: 0,
-            staging_pre_bytes: Vec::with_capacity(1 << 20),
-            staging_tx_count: 0,
-            staging_tx_bytes: Vec::with_capacity(4 << 20),
-            staging_post_count: 0,
-            staging_post_bytes: Vec::with_capacity(256 << 10),
-        }
     }
 }

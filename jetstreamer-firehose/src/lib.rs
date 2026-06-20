@@ -173,6 +173,9 @@ pub mod epoch;
 pub mod epochs;
 /// Streaming interface for fetching and parsing firehose blocks.
 pub mod firehose;
+/// Horizon-native firehose: streams `.jet` archives via async `rseek`
+/// seeking, driving zero-copy `SlotVisitor` callbacks.
+pub mod firehose_horizon;
 /// Slot offset index client for locating blocks in Old Faithful CAR archives.
 pub mod index;
 /// Helpers for working with network metadata and endpoints.

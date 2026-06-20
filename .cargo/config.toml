@@ -1,7 +1,6 @@
-[alias]
-clickhouse-server = "run --release -p jetstreamer-utils --bin clickhouse-server"
-clickhouse-client = "run --release -p jetstreamer-utils --bin clickhouse-client"
-
-# fix for Tahoe
-[target.aarch64-apple-darwin]
-linker = "rust-lld"
+[env]
+# Debug builds materialise full-size temporaries for the multi-MiB inline
+# zero-alloc types (release elides them); give cargo-spawned threads (test
+# harness, debug runs) stacks that absorb that. Production deployments set
+# their own thread stack sizes explicitly where it matters.
+RUST_MIN_STACK = "67108864"

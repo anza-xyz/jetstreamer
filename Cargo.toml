@@ -1,5 +1,11 @@
 [workspace]
-members = ["jetstreamer-firehose", "jetstreamer-plugin", "jetstreamer-utils"]
+members = [
+    "jetstreamer-firehose",
+    "jetstreamer-horizon",
+    "jetstreamer-node",
+    "jetstreamer-plugin",
+    "jetstreamer-utils",
+]
 
 [workspace.package]
 edition = "2024"
@@ -30,18 +36,24 @@ verify-transaction-signatures = ["jetstreamer-firehose/verify-transaction-signat
 jetstreamer-firehose = { path = "jetstreamer-firehose", version = "0.6.0" }
 jetstreamer-plugin = { path = "jetstreamer-plugin", version = "0.6.0" }
 jetstreamer-utils = { path = "jetstreamer-utils", version = "0.6.0" }
+jetstreamer-node = { path = "jetstreamer-node", version = "0.6.0" }
+jetstreamer-horizon = { path = "jetstreamer-horizon", version = "0.6.0" }
 tokio = "1"
 futures-util = { version = "0", default-features = false }
 futures = "0"
 log = "0"
+lencode = { version = "1.1", features = ["solana", "std"] }
 once_cell = "1"
 serde_json = { version = "1", default-features = false }
 thiserror = { version = "2", default-features = false }
 reqwest = { version = "0.13", default-features = false }
 anyhow = { version = "1", default-features = false }
+tar = "0.4"
+env_logger = "0.11"
 base64 = "0.22"
 bincode = "1"
 serial_test = "2"
+criterion = { version = "0.5", features = ["html_reports"] }
 wincode = { version = "0.2", features = ["derive", "solana-short-vec"] }
 bs58 = { version = "0", default-features = false }
 cbor = "0"
@@ -60,12 +72,16 @@ protobuf-src = "1"
 serde = { version = "1", default-features = false }
 serde_cbor = "0"
 agave-geyser-plugin-interface = "3"
+agave-snapshots = "3"
 solana-address = "1"
+solana-account = "3"
 solana-hash = "3"
 solana-blake3-hasher = "=3.1.0"
+solana-clock = "3"
 solana-epoch-rewards-hasher = "=3.1.0"
 solana-keccak-hasher = "=3.1.0"
 solana-logger = "3"
+solana-pubkey = "3"
 solana-signature = { version = "3", default-features = false }
 solana-accounts-db = "3"
 solana-entry = "3"
@@ -73,13 +89,23 @@ solana-ledger = "3"
 solana-geyser-plugin-manager = { version = "3", features = ["agave-unstable-api"] }
 solana-rpc = "3"
 solana-runtime = "3"
+solana-runtime-transaction = "3"
 solana-storage-proto = "3"
 solana-message = "3"
 solana-transaction = "3"
+solana-account-decoder-client-types = "3"
+solana-transaction-error = "3"
+solana-instruction-error = "2"
 solana-transaction-status = "3"
 solana-sdk-ids = "3"
 solana-reward-info = "3"
+solana-svm = "3"
+solana-svm-timings = "3"
 solana-sysvar = "=3.0.0"
+solana-transaction-context = "3"
+solana-system-interface = "2"
+solana-cpi = "3"
+solana-genesis-utils = { version = "3", features = ["agave-unstable-api"] }
 sha2 = "0.10"
 tonic = { version = "0", default-features = false }
 tonic-build = "0"
@@ -105,7 +131,7 @@ aws-smithy-types = "1"
 aws-types = "1"
 
 [dependencies]
-tokio.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 solana-logger.workspace = true
 log.workspace = true
 jetstreamer-firehose.workspace = true
@@ -128,3 +154,8 @@ opt-level = 3
 [profile.release.package."*"]
 opt-level = 3
 codegen-units = 1
+
+[patch.crates-io]
+solana-program-runtime = { path = "vendor/solana-program-runtime" }
+solana-svm = { path = "vendor/solana-svm" }
+solana-runtime = { path = "vendor/solana-runtime-3.1.12" }

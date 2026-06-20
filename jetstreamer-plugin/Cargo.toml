@@ -11,6 +11,7 @@ documentation.workspace = true
 
 [dependencies]
 jetstreamer-firehose.workspace = true
+jetstreamer-horizon.workspace = true
 
 serde.workspace = true
 solana-message.workspace = true

@@ -131,7 +131,7 @@ aws-smithy-types = "1"
 aws-types = "1"
 
 [dependencies]
-tokio.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 solana-logger.workspace = true
 log.workspace = true
 jetstreamer-firehose.workspace = true

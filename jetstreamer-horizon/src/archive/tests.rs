@@ -397,6 +397,42 @@ fn read_all(bytes: &[u8], start_slot: u64, max_slots: u64, verify: bool) -> Vec<
     collector.slots
 }
 
+/// Drives the source-agnostic path the horizon firehose uses: parse the
+/// framing from raw byte ranges (as a network reader would fetch them),
+/// then feed each bucket's bytes to one reused `BucketDecoder`. The decoded
+/// result must match `ArchiveReader` exactly.
+#[test]
+fn bucket_decoder_matches_archive_reader() {
+    let (bytes, expected, _) = write_archive(1_000, 300, ArchiveWriterConfig::default());
+
+    let (header, _hlen) = parse_file_header(&bytes[..]).unwrap();
+    let footer =
+        Footer::from_bytes(bytes[bytes.len() - FOOTER_LEN..].try_into().unwrap()).unwrap();
+    let index = parse_bucket_index(
+        &bytes[footer.index_offset as usize
+            ..(footer.index_offset + footer.index_len) as usize],
+        &footer,
+    )
+    .unwrap();
+
+    let reader = ArchiveReader::open(std::io::Cursor::new(&bytes[..])).unwrap();
+    assert_eq!(index.len(), reader.bucket_count());
+
+    let mut decoder = BucketDecoder::new();
+    decoder.verify_chain = true;
+    let mut collector = Collector::default();
+    for entry in &index {
+        let raw = &bytes[entry.offset as usize..(entry.offset + entry.len) as usize];
+        decoder
+            .decode_bucket(raw, 0, u64::MAX, &mut collector)
+            .unwrap();
+    }
+    assert_eq!(collector.slots, expected);
+
+    // Mid-bucket slot maps to the right bucket (bucket 1 covers 1_128..1_256).
+    assert_eq!(bucket_containing(&header, &index, 1_171), 1);
+}
+
 #[test]
 fn roundtrip_zstd_bucket_128() {
     let (bytes, expected, stats) = write_archive(1_000, 300, ArchiveWriterConfig::default());

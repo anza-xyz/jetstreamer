@@ -3227,6 +3227,11 @@ impl TransactionScheduler {
             ));
         }
         state.forced_missing.insert(slot);
+        // Tell the recorder this slot is a deliberate force-skip (its block
+        // data is genuinely unavailable from old-faithful despite the index
+        // marking it present) so the gap-fill records it as leader-skipped
+        // rather than panicking on a seemingly-dropped present block.
+        horizon::note_force_skipped(slot);
         self.advance_ready_locked(&mut state)
     }
 

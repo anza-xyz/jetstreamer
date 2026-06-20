@@ -84,6 +84,7 @@
 //! firehose-style callbacks (block, entries, transactions with account
 //! updates) without ever seeking backward — suitable for HTTP range
 //! readers as well as local files.
+mod bucket;
 mod format;
 mod reader;
 mod writer;
@@ -91,6 +92,7 @@ mod writer;
 #[cfg(test)]
 mod tests;
 
+pub use bucket::*;
 pub use format::*;
 pub use reader::*;
 pub use writer::*;

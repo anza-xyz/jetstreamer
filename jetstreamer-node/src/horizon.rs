@@ -37,7 +37,7 @@
 //! Integrity violations panic: the archive is the product of the run, and
 //! the node's replay machinery already treats divergence as fatal.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
 use std::io::BufWriter;
 use std::path::Path;
@@ -50,7 +50,7 @@ use jetstreamer_horizon::archive::{
 };
 use jetstreamer_horizon::convert;
 use jetstreamer_horizon::transactions::Transaction;
-use log::info;
+use log::{info, warn};
 use solana_account::{AccountSharedData, ReadableAccount};
 use solana_address::Address;
 use solana_clock::Slot;
@@ -142,6 +142,18 @@ pub fn finish() -> Result<Option<ArchiveStats>, String> {
 #[inline]
 pub fn recorder() -> Option<Arc<HorizonRecorder>> {
     RECORDER.read().ok()?.clone()
+}
+
+/// Notifies the active recorder (if any) that the replay deliberately
+/// force-skipped `slot` after exhausting fetch retries — its block data is
+/// unavailable from old-faithful even though the index marks it present
+/// (the block genuinely does not exist). The recorder then records it as
+/// leader-skipped instead of treating the gap as a silent drop, which would
+/// otherwise panic. No-op when recording is disabled.
+pub fn note_force_skipped(slot: Slot) {
+    if let Some(recorder) = recorder() {
+        recorder.lock().force_skipped.insert(slot);
+    }
 }
 
 /// One account update, owned (the geyser notification's buffers are only
@@ -295,6 +307,11 @@ struct RecorderState {
     meta_scratch: Box<BlockMeta>,
     epoch_scratch: Box<EpochMeta>,
     presence: std::sync::Arc<SlotPresenceMap>,
+    /// Slots the replay deliberately force-skipped after exhausting fetch
+    /// retries. Their block data is genuinely unavailable (the old-faithful
+    /// index marks them present, but the block does not exist), so the gap-fill
+    /// records them as leader-skipped instead of treating them as silent drops.
+    force_skipped: HashSet<Slot>,
     finished: bool,
 }
 
@@ -336,6 +353,7 @@ impl HorizonRecorder {
                 meta_scratch: BlockMeta::new_boxed(),
                 epoch_scratch: EpochMeta::new_boxed(),
                 presence,
+                force_skipped: HashSet::new(),
                 finished: false,
             }),
         })
@@ -625,16 +643,29 @@ impl RecorderState {
         }
     }
 
-    /// Verifies a gap slot really was leader-skipped according to the
-    /// old-faithful index; a present-but-missing block would silently
-    /// corrupt the archive.
+    /// Verifies a gap slot really was leader-skipped before recording it as
+    /// such. A slot the old-faithful index marks present must either have been
+    /// replayed (not a gap) or deliberately force-skipped by the replay after
+    /// exhausting fetch retries (its block data genuinely does not exist — the
+    /// index is wrong). A present gap slot that was *not* force-skipped is a
+    /// silent drop and would corrupt the archive, so it still panics.
     fn check_gap_slot_skipped(&self, slot: Slot) {
-        if self.presence.state(slot) == Some(SlotPresenceState::Present) {
-            panic!(
-                "horizon: slot {slot} has block data in the old-faithful index but was never \
-                 replayed; refusing to record it as leader-skipped"
-            );
+        if self.presence.state(slot) != Some(SlotPresenceState::Present) {
+            return; // genuinely leader-skipped per the index
         }
+        if self.force_skipped.contains(&slot) {
+            warn!(
+                target: "jetstreamer_node_horizon",
+                "horizon: recording slot {slot} as leader-skipped — the old-faithful index marks \
+                 it present, but its block data was unavailable after exhausting fetch retries \
+                 (block does not exist)"
+            );
+            return;
+        }
+        panic!(
+            "horizon: slot {slot} has block data in the old-faithful index but was never \
+             replayed; refusing to record it as leader-skipped"
+        );
     }
 
     fn emit_slot(&mut self, slot: Slot, mut assembly: SlotAssembly) {
@@ -1060,5 +1091,43 @@ mod tests {
         );
         recorder.record_committed_entry(202, 0, 1, Vec::new());
         let _ = recorder.finish();
+    }
+
+    /// A present gap slot the replay *deliberately* force-skipped (block data
+    /// genuinely unavailable) is recorded as leader-skipped, not panicked.
+    #[test]
+    fn force_skipped_present_slot_records_as_skipped() {
+        let states = vec![SlotPresenceState::Present; 3];
+        let presence = presence_map(200, &states);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("forced.jet");
+        let recorder =
+            HorizonRecorder::create(&path, 1, 200, 3, presence).expect("create recorder");
+        // 200-201 have no fetchable block (their blocks don't exist despite the
+        // index); the replay force-skipped them.
+        {
+            let mut state = recorder.lock();
+            state.force_skipped.insert(200);
+            state.force_skipped.insert(201);
+        }
+        recorder.record_block_meta(
+            202,
+            199,
+            &Hash::default().to_string(),
+            &Hash::default().to_string(),
+            &KeyedRewardsAndNumPartitions {
+                keyed_rewards: vec![],
+                num_partitions: None,
+            },
+            None,
+            None,
+            0,
+            1,
+        );
+        recorder.record_committed_entry(202, 0, 1, Vec::new());
+        let stats = recorder.finish().expect("finish should not panic");
+        // 3 slots: 200 + 201 recorded skipped, 202 a block.
+        assert_eq!(stats.slots, 3);
+        assert_eq!(stats.blocks, 1);
     }
 }

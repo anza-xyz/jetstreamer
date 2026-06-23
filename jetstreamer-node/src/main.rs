@@ -5625,7 +5625,8 @@ async fn run_geyser_replay(
                     live_start_slot: epoch_start,
                 }) as AccountsUpdateNotifier);
             info!("accounts update notifier wired into snapshot load: true");
-            ensure_genesis_archive(&ledger_dir).await?;
+            // Genesis archive is fetched up front in main() (before the replay
+            // loop), so replay never touches gcloud/GCS.
             info!("loading bank from snapshot");
             let ledger_dir_for_load = ledger_dir.clone();
             let snapshot_archive = snapshot_archive.to_path_buf();
@@ -6925,11 +6926,44 @@ async fn main() {
         println!("Extraction complete");
     }
 
+    // Fetch the genesis archive up front too (idempotent; gcloud/GCS), so the
+    // replay never shells out to gcloud once it starts. After this point, no
+    // code path touches gcloud — only old-faithful and local files.
+    if let Err(err) = ensure_genesis_archive(&dest_dir).await {
+        eprintln!("error: {err}");
+        exit(1);
+    }
+
+    // Pre-fetch every epoch's canonical snapshot hashes up front, while the
+    // gcloud/GCS session is fresh. A multi-epoch range can run for days, and
+    // listing epoch N+1's snapshots mid-run risks a stale session aborting the
+    // whole range long after the replay no longer needs the network. Empty when
+    // verification is disabled.
+    let mut snapshot_expectations: BTreeMap<u64, BTreeMap<Slot, SnapshotHash>> = BTreeMap::new();
+    if verify_snapshots {
+        for epoch in effective_start..=end_epoch {
+            info!("collecting canonical snapshot hashes for epoch {epoch}");
+            match snapshot_expectations_for_epoch(epoch).await {
+                Ok(expected) => {
+                    info!(
+                        "snapshot verification: {} snapshot(s) prefetched for epoch {epoch}",
+                        expected.len()
+                    );
+                    snapshot_expectations.insert(epoch, expected);
+                }
+                Err(err) => {
+                    eprintln!("error: {err}");
+                    exit(1);
+                }
+            }
+        }
+    }
+
     // Replay each epoch in the range. The first epoch loads the snapshot; each
     // subsequent epoch reuses the in-memory bank handed back by the previous
     // one (carried_bank_forks), so there is no snapshot reload and no warmup
-    // between epochs. Verification hashes and the `.jet` output path are
-    // resolved per epoch.
+    // between epochs. Verification hashes were prefetched above; the `.jet`
+    // output path is resolved per epoch.
     let total_epochs = end_epoch - effective_start + 1;
     let mut carried_bank_forks: Option<Arc<RwLock<BankForks>>> = None;
     for epoch in effective_start..=end_epoch {
@@ -6948,14 +6982,7 @@ async fn main() {
             .unwrap_or_else(|| dest_dir.join(format!("epoch-{epoch}.jet")));
 
         let snapshot_verifier = if verify_snapshots {
-            info!("collecting canonical snapshot hashes for epoch {epoch}");
-            let expected = match snapshot_expectations_for_epoch(epoch).await {
-                Ok(expected) => expected,
-                Err(err) => {
-                    eprintln!("error: {err}");
-                    exit(1);
-                }
-            };
+            let expected = snapshot_expectations.remove(&epoch).unwrap_or_default();
             info!(
                 "snapshot verification enabled for {} snapshot(s)",
                 expected.len()

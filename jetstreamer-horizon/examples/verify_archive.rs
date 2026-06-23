@@ -42,6 +42,8 @@ struct Tally {
     last_report: Instant,
     last_report_txs: u64,
     slots_seen: u64,
+    /// Total slot frames this run will read, for ETA.
+    target_slots: u64,
 }
 
 impl Default for Tally {
@@ -63,8 +65,32 @@ impl Default for Tally {
             last_report: now,
             last_report_txs: 0,
             slots_seen: 0,
+            target_slots: 0,
         }
     }
+}
+
+/// Formats an integer with thousands separators (e.g. `1234567` → `1,234,567`).
+fn commas(n: u64) -> String {
+    let s = n.to_string();
+    let len = s.len();
+    let mut out = String::with_capacity(len + len / 3);
+    for (i, ch) in s.chars().enumerate() {
+        if i > 0 && (len - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// Formats a duration in seconds as `HH:MM:SS` (or `--:--:--` when unknown).
+fn fmt_hms(secs: f64) -> String {
+    if !secs.is_finite() || secs < 0.0 {
+        return "--:--:--".to_string();
+    }
+    let s = secs as u64;
+    format!("{:02}:{:02}:{:02}", s / 3600, (s % 3600) / 60, s % 60)
 }
 
 impl SlotVisitor for Tally {
@@ -123,10 +149,25 @@ impl SlotVisitor for Tally {
             let now = Instant::now();
             let window = now.duration_since(self.last_report).as_secs_f64();
             let inst_tps = (self.transactions - self.last_report_txs) as f64 / window;
-            let avg_tps = self.transactions as f64 / self.start.elapsed().as_secs_f64().max(0.001);
+            let total_elapsed = self.start.elapsed().as_secs_f64().max(0.001);
+            let avg_tps = self.transactions as f64 / total_elapsed;
+            let pct = if self.target_slots > 0 {
+                self.slots_seen as f64 * 100.0 / self.target_slots as f64
+            } else {
+                0.0
+            };
+            let slot_rate = self.slots_seen as f64 / total_elapsed;
+            let remaining = self.target_slots.saturating_sub(self.slots_seen);
+            let eta = remaining as f64 / slot_rate.max(1e-9);
             eprintln!(
-                "[verify] slot {} | {} slots, {} txs | decode tps: {:.0} (inst) / {:.0} (avg)",
-                slot, self.slots_seen, self.transactions, inst_tps, avg_tps,
+                "[verify] {:.1}% | slot {} | {} slots, {} txs | decode tps: {} (inst) / {} (avg) | eta {}",
+                pct,
+                slot,
+                commas(self.slots_seen),
+                commas(self.transactions),
+                commas(inst_tps.round() as u64),
+                commas(avg_tps.round() as u64),
+                fmt_hms(eta),
             );
             self.last_report = now;
             self.last_report_txs = self.transactions;
@@ -172,7 +213,10 @@ fn main() {
     // large cap consumes the entire file.
     let read_from = start_slot_arg.unwrap_or(slot_start);
     let to_read = slot_count.min(max_slots);
-    let mut tally = Tally::default();
+    let mut tally = Tally {
+        target_slots: to_read,
+        ..Default::default()
+    };
     let visited = reader
         .read_slots(read_from, to_read, &mut tally)
         .unwrap_or_else(|e| panic!("read_slots failed: {e}"));

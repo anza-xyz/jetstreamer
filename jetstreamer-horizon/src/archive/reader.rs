@@ -7,7 +7,10 @@
 //! path. Mirrors [`ArchiveWriter`](super::ArchiveWriter)'s wire layout.
 use lencode::prelude::*;
 
-use super::bucket::{BucketDecoder, SlotVisitor, bucket_containing, parse_bucket_index, read_io_varint};
+use super::bucket::{
+    BucketDecoder, PayloadByteStats, SlotVisitor, bucket_containing, parse_bucket_index,
+    read_io_varint,
+};
 use super::format::*;
 
 /// Streaming archive reader over any `Read + Seek` source.
@@ -103,6 +106,13 @@ impl<R: std::io::Read + std::io::Seek> ArchiveReader<R> {
     /// calls were made.
     pub fn bucket_loads(&self) -> u64 {
         self.bucket_loads
+    }
+
+    /// Per-category breakdown of the uncompressed-payload bytes decoded so far
+    /// (transaction-field bytes vs account-update bytes vs everything else).
+    /// After a full pass over the archive this is the whole file's split.
+    pub fn payload_byte_stats(&self) -> PayloadByteStats {
+        self.decoder.byte_stats()
     }
 
     /// Streams slots to `visitor`, starting at the first stored slot ≥

@@ -415,8 +415,10 @@ fn bucket_decoder_matches_archive_reader() {
     )
     .unwrap();
 
-    let reader = ArchiveReader::open(std::io::Cursor::new(&bytes[..])).unwrap();
+    let mut reader = ArchiveReader::open(std::io::Cursor::new(&bytes[..])).unwrap();
     assert_eq!(index.len(), reader.bucket_count());
+    let mut reader_collector = Collector::default();
+    reader.read_slots(0, u64::MAX, &mut reader_collector).unwrap();
 
     let mut decoder = BucketDecoder::new();
     decoder.verify_chain = true;
@@ -428,6 +430,19 @@ fn bucket_decoder_matches_archive_reader() {
             .unwrap();
     }
     assert_eq!(collector.slots, expected);
+
+    // Payload byte tally: the standalone decoder and the ArchiveReader (which
+    // wraps a BucketDecoder) must agree, every category is populated for this
+    // synthetic archive, and the categories sum to the total.
+    let stats = decoder.byte_stats();
+    assert_eq!(stats, reader.payload_byte_stats());
+    assert!(stats.transaction_bytes > 0);
+    assert!(stats.account_update_bytes > 0);
+    assert!(stats.other_bytes > 0);
+    assert_eq!(
+        stats.total(),
+        stats.transaction_bytes + stats.account_update_bytes + stats.other_bytes
+    );
 
     // Mid-bucket slot maps to the right bucket (bucket 1 covers 1_128..1_256).
     assert_eq!(bucket_containing(&header, &index, 1_171), 1);

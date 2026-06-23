@@ -42,6 +42,32 @@ pub trait SlotVisitor {
     fn on_block(&mut self, _notification: &BlockNotification, _entries: &[EntryRecord]) {}
 }
 
+/// Per-category breakdown of the *uncompressed payload* bytes a decoder has
+/// processed — the deduped + diff-encoded stream within buckets, before the
+/// per-bucket zstd. Accumulated across every [`BucketDecoder::decode_slot_frame`]
+/// call; query [`BucketDecoder::byte_stats`]. This is the in-archive
+/// representation (account data is already diff-encoded here), not raw bytes.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PayloadByteStats {
+    /// Transaction-record bytes, excluding each transaction's own account
+    /// updates (signatures, message, status/meta, balances, logs, etc.).
+    pub transaction_bytes: u64,
+    /// Account-update bytes — the account-state write stream (metadata +
+    /// diff-encoded data blobs) across tx-owned, runtime-direct orphan, and
+    /// epoch updates.
+    pub account_update_bytes: u64,
+    /// Everything else: block metadata + rewards, entry records, epoch
+    /// scalars, and per-slot framing.
+    pub other_bytes: u64,
+}
+
+impl PayloadByteStats {
+    /// Total payload bytes accounted for (the sum of the three categories).
+    pub fn total(&self) -> u64 {
+        self.transaction_bytes + self.account_update_bytes + self.other_bytes
+    }
+}
+
 /// Decodes slot frames from a single bucket's raw bytes, holding the
 /// per-bucket reset state (dedupe scratch, diff decoder, payload buffer,
 /// and reusable record scratches). Reuse one instance across many buckets:
@@ -72,6 +98,9 @@ pub struct BucketDecoder {
     epoch_scratch: Box<EpochMeta>,
     entries_scratch: Vec<EntryRecord>,
     last_blockhash: Hash,
+    /// Running per-category payload-byte tally (cheap; per-section, not
+    /// per-record). Queried via [`Self::byte_stats`].
+    byte_stats: PayloadByteStats,
 }
 
 impl Default for BucketDecoder {
@@ -103,7 +132,14 @@ impl BucketDecoder {
             epoch_scratch: EpochMeta::new_boxed(),
             entries_scratch: Vec::with_capacity(2048),
             last_blockhash: Hash::default(),
+            byte_stats: PayloadByteStats::default(),
         }
+    }
+
+    /// The running per-category payload-byte tally accumulated across every
+    /// [`decode_slot_frame`](Self::decode_slot_frame) since construction.
+    pub fn byte_stats(&self) -> PayloadByteStats {
+        self.byte_stats
     }
 
     /// Loads and validates one bucket frame (`BucketHeader ++ stored
@@ -194,6 +230,11 @@ impl BucketDecoder {
         let kind = SlotKind::try_from(kind[0])?;
         let emit = slot >= start_slot;
 
+        // Per-category payload byte tally for this frame (account updates and
+        // transaction fields; everything else is derived at the end).
+        let mut au_bytes: usize = 0;
+        let mut tx_field_bytes: usize = 0;
+
         match kind {
             SlotKind::Skipped => {
                 set_notification_skipped(&mut self.skipped_scratch, slot);
@@ -219,6 +260,7 @@ impl BucketDecoder {
                     self.epoch_scratch.num_reward_partitions =
                         Option::<u64>::decode_ext(&mut cur, None)?;
                     let n = u64::decode_ext(&mut cur, None)?;
+                    let upd_start = cur.position();
                     for _ in 0..n {
                         let updates = &mut self.epoch_scratch.updates;
                         decode_update_record_into(
@@ -228,6 +270,7 @@ impl BucketDecoder {
                             |view| updates.push(view),
                         )?;
                     }
+                    au_bytes += cur.position() - upd_start;
                     if emit {
                         visitor.on_epoch(&self.epoch_scratch);
                     }
@@ -236,6 +279,7 @@ impl BucketDecoder {
                 // Section 2: pre-transaction orphan updates → grouped onto
                 // the notification's pre arena.
                 let pre_count = u64::decode_ext(&mut cur, None)?;
+                let pre_start = cur.position();
                 for _ in 0..pre_count {
                     let pre = &mut meta.pre_updates;
                     decode_update_record_into(
@@ -245,16 +289,20 @@ impl BucketDecoder {
                         |view| pre.push(view),
                     )?;
                 }
+                au_bytes += cur.position() - pre_start;
 
                 // Section 3: transactions.
                 let tx_count = u64::decode_ext(&mut cur, None)? as u32;
                 for tx_index in 0..tx_count {
-                    read_tx_record(
+                    let tx_start = cur.position();
+                    let tx_au = read_tx_record(
                         &mut cur,
                         &mut self.scratch,
                         &mut self.dec_ctx,
                         &mut self.diff,
                     )?;
+                    tx_field_bytes += (cur.position() - tx_start) - tx_au;
+                    au_bytes += tx_au;
                     if emit {
                         visitor.on_transaction(slot, tx_index, &self.scratch);
                     }
@@ -266,6 +314,7 @@ impl BucketDecoder {
                     _ => unreachable!(),
                 };
                 let post_count = u64::decode_ext(&mut cur, None)?;
+                let post_start = cur.position();
                 for _ in 0..post_count {
                     let post = &mut meta.post_updates;
                     decode_update_record_into(
@@ -275,6 +324,7 @@ impl BucketDecoder {
                         |view| post.push(view),
                     )?;
                 }
+                au_bytes += cur.position() - post_start;
 
                 // Section 5: block metadata scalars + rewards.
                 meta.parent_slot = u64::decode_ext(&mut cur, None)?;
@@ -309,7 +359,11 @@ impl BucketDecoder {
             }
         }
 
-        self.pos += cur.position();
+        let frame_bytes = cur.position();
+        self.byte_stats.account_update_bytes += au_bytes as u64;
+        self.byte_stats.transaction_bytes += tx_field_bytes as u64;
+        self.byte_stats.other_bytes += (frame_bytes - au_bytes - tx_field_bytes) as u64;
+        self.pos += frame_bytes;
         self.slots_remaining -= 1;
         self.last_decoded_slot = Some(slot);
         Ok(emit)
@@ -451,40 +505,39 @@ fn decode_update_record_into(
 
 /// Decodes one transaction record into `scratch`. Exact mirror of
 /// [`ArchiveWriter::write_transaction`](super::ArchiveWriter::write_transaction).
+/// Returns the byte span consumed by the transaction's own account updates, so
+/// the caller can split transaction-field bytes from account-update bytes.
 fn read_tx_record(
-    reader: &mut impl Read,
+    cur: &mut lencode::io::Cursor<&[u8]>,
     scratch: &mut Transaction,
     ctx: &mut DecoderContext,
     diff: &mut DiffDecoder,
-) -> Result<(), ArchiveFormatError> {
+) -> Result<usize, ArchiveFormatError> {
     scratch.clear();
 
-    scratch.signatures.decode_into(reader, Some(ctx))?;
-    scratch.message.decode_into(reader, Some(ctx))?;
-    scratch.status = TransactionStatus::decode_ext(reader, Some(ctx))?;
-    scratch.fee = u64::decode_ext(reader, Some(ctx))?;
-    scratch.pre_balances.decode_into(reader, Some(ctx))?;
-    scratch.post_balances.decode_into(reader, Some(ctx))?;
-    scratch
-        .loaded_writable_addresses
-        .decode_into(reader, Some(ctx))?;
-    scratch
-        .loaded_readonly_addresses
-        .decode_into(reader, Some(ctx))?;
-    decode_option_zerovec_into(&mut scratch.inner_instructions, reader, Some(ctx))?;
-    decode_option_log_messages_into(&mut scratch.log_messages, reader, Some(ctx))?;
-    decode_option_zerovec_into(&mut scratch.pre_token_balances, reader, Some(ctx))?;
-    decode_option_zerovec_into(&mut scratch.post_token_balances, reader, Some(ctx))?;
-    decode_option_zerovec_into(&mut scratch.rewards, reader, Some(ctx))?;
-    scratch.return_data = Option::decode_ext(reader, Some(ctx))?;
-    scratch.compute_units_consumed = Option::decode_ext(reader, Some(ctx))?;
-    scratch.cost_units = Option::decode_ext(reader, Some(ctx))?;
+    scratch.signatures.decode_into(cur, Some(ctx))?;
+    scratch.message.decode_into(cur, Some(ctx))?;
+    scratch.status = TransactionStatus::decode_ext(cur, Some(ctx))?;
+    scratch.fee = u64::decode_ext(cur, Some(ctx))?;
+    scratch.pre_balances.decode_into(cur, Some(ctx))?;
+    scratch.post_balances.decode_into(cur, Some(ctx))?;
+    scratch.loaded_writable_addresses.decode_into(cur, Some(ctx))?;
+    scratch.loaded_readonly_addresses.decode_into(cur, Some(ctx))?;
+    decode_option_zerovec_into(&mut scratch.inner_instructions, cur, Some(ctx))?;
+    decode_option_log_messages_into(&mut scratch.log_messages, cur, Some(ctx))?;
+    decode_option_zerovec_into(&mut scratch.pre_token_balances, cur, Some(ctx))?;
+    decode_option_zerovec_into(&mut scratch.post_token_balances, cur, Some(ctx))?;
+    decode_option_zerovec_into(&mut scratch.rewards, cur, Some(ctx))?;
+    scratch.return_data = Option::decode_ext(cur, Some(ctx))?;
+    scratch.compute_units_consumed = Option::decode_ext(cur, Some(ctx))?;
+    scratch.cost_units = Option::decode_ext(cur, Some(ctx))?;
 
-    let au_count = u64::decode_ext(reader, Some(ctx))?;
+    let au_count = u64::decode_ext(cur, Some(ctx))?;
+    let au_start = cur.position();
     for _ in 0..au_count {
-        decode_update_record_into(reader, ctx, diff, |view| scratch.push_account_update(view))?;
+        decode_update_record_into(cur, ctx, diff, |view| scratch.push_account_update(view))?;
     }
-    Ok(())
+    Ok(cur.position() - au_start)
 }
 
 /// Reads a lencode varint directly from a `std::io::Read` stream.

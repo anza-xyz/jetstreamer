@@ -31,6 +31,9 @@ struct Tally {
     orphan_updates: u64,
     entries: u64,
     rewards: u64,
+    /// Reconstructed (raw, post-diff-decode) account-data bytes across all
+    /// updates — the actual account-state volume the archive represents.
+    raw_account_data_bytes: u64,
     /// Running totals to spot-check internal consistency.
     block_meta_tx_count: u64,
     last_slot: Option<u64>,
@@ -53,6 +56,7 @@ impl Default for Tally {
             orphan_updates: 0,
             entries: 0,
             rewards: 0,
+            raw_account_data_bytes: 0,
             block_meta_tx_count: 0,
             last_slot: None,
             start: now,
@@ -75,11 +79,17 @@ impl SlotVisitor for Tally {
             meta.updates.len(),
         );
         self.orphan_updates += meta.updates.len() as u64;
+        for (_, data) in meta.updates.iter() {
+            self.raw_account_data_bytes += data.len() as u64;
+        }
     }
 
     fn on_transaction(&mut self, _slot: u64, _tx_index: u32, tx: &Transaction) {
         self.transactions += 1;
         self.tx_account_updates += tx.account_updates().len() as u64;
+        for (_, data) in tx.iter_account_updates() {
+            self.raw_account_data_bytes += data.len() as u64;
+        }
     }
 
     fn on_block(&mut self, notification: &BlockNotification, entries: &[EntryRecord]) {
@@ -101,6 +111,9 @@ impl SlotVisitor for Tally {
                 self.rewards += meta.rewards.len() as u64;
                 self.orphan_updates += meta.pre_updates.len() as u64;
                 self.orphan_updates += meta.post_updates.len() as u64;
+                for (_, data) in meta.pre_updates.iter().chain(meta.post_updates.iter()) {
+                    self.raw_account_data_bytes += data.len() as u64;
+                }
                 self.block_meta_tx_count += meta.executed_transaction_count;
             }
         }
@@ -184,6 +197,45 @@ fn main() {
         "  block-meta tx total: {} (vs decoded {})",
         tally.block_meta_tx_count, tally.transactions
     );
+
+    // Transaction vs account-state byte split of the uncompressed payload
+    // (the deduped + diff-encoded stream, before each bucket's zstd).
+    let bytes = reader.payload_byte_stats();
+    let total = bytes.total().max(1);
+    let pct = |b: u64| b as f64 * 100.0 / total as f64;
+    println!("\n=== payload byte breakdown (uncompressed: deduped + diff-encoded, pre-zstd) ===");
+    println!(
+        "  transaction-field bytes: {:>16} ({:.1}%)",
+        bytes.transaction_bytes,
+        pct(bytes.transaction_bytes)
+    );
+    println!(
+        "  account-update bytes:    {:>16} ({:.1}%)",
+        bytes.account_update_bytes,
+        pct(bytes.account_update_bytes)
+    );
+    println!(
+        "  other (meta/entries):    {:>16} ({:.1}%)",
+        bytes.other_bytes,
+        pct(bytes.other_bytes)
+    );
+    println!("  total payload:           {:>16}", bytes.total());
+    if bytes.transaction_bytes > 0 {
+        println!(
+            "  tx : account-state ratio (payload bytes): 1 : {:.2}",
+            bytes.account_update_bytes as f64 / bytes.transaction_bytes as f64
+        );
+    }
+    println!(
+        "  reconstructed (raw) account data: {} bytes",
+        tally.raw_account_data_bytes
+    );
+    if bytes.account_update_bytes > 0 {
+        println!(
+            "  account-data dedupe+diff ratio (raw / in-archive): {:.1}x",
+            tally.raw_account_data_bytes as f64 / bytes.account_update_bytes as f64
+        );
+    }
 
     // Internal consistency: the sum of each block's declared
     // executed_transaction_count must equal the transactions we decoded.

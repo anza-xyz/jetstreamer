@@ -40,6 +40,12 @@ tokio = { workspace = true, features = ["rt-multi-thread"] }
 futures-util.workspace = true
 solana-message.workspace = true
 solana-pubkey.workspace = true
+# verify_archive --full: canonical PoH recompute + seed fetch
+solana-entry.workspace = true
+solana-transaction.workspace = true
+solana-signature.workspace = true
+reqwest = { workspace = true, features = ["blocking", "json"] }
+serde_json.workspace = true
 
 [[bench]]
 name = "encode_decode"

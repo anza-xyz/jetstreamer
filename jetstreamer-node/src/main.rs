@@ -6941,6 +6941,11 @@ async fn main() {
     // verification is disabled.
     let mut snapshot_expectations: BTreeMap<u64, BTreeMap<Slot, SnapshotHash>> = BTreeMap::new();
     if verify_snapshots {
+        info!(
+            "=== prefetching all snapshot metadata for epochs {effective_start}-{end_epoch} up \
+             front; this is the last gcloud/GCS access — the replay below uses only old-faithful \
+             and local files ==="
+        );
         for epoch in effective_start..=end_epoch {
             info!("collecting canonical snapshot hashes for epoch {epoch}");
             match snapshot_expectations_for_epoch(epoch).await {
@@ -6957,6 +6962,7 @@ async fn main() {
                 }
             }
         }
+        info!("=== gcloud/GCS prefetch complete; no further gcloud access for the rest of the run ===");
     }
 
     // Replay each epoch in the range. The first epoch loads the snapshot; each

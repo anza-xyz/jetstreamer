@@ -22,7 +22,7 @@ Jetstreamer is split across four crates:
   Faithful CAR archives at scale.
 - `jetstreamer-plugin` – a trait-based framework for building structured observers with
   ClickHouse-friendly batching and runtime metrics.
-- `jetstreamer-utils` - utils used by the Jetstreamer ecosystem.
+- `jetstreamer-utils` – shared helpers used across the Jetstreamer ecosystem.
 
 Every crate ships with rich module-level documentation and runnable examples. Visit
 [docs.rs/jetstreamer](https://docs.rs/jetstreamer) to explore the API surface in detail.

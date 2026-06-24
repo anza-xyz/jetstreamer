@@ -28,6 +28,7 @@ https://github.com/rpcpool/yellowstone-faithful/tree/main/geyser-plugin-runner
 - `JETSTREAMER_NETWORK_CAPACITY_MB` (default `1000`): assumed network throughput in megabytes
   per second when sizing the firehose thread pool. Increase or decrease to match your host's
   effective bandwidth.
+
 Notes:
 
 - `JETSTREAMER_HTTP_BASE_URL` and `JETSTREAMER_COMPACT_INDEX_BASE_URL` accept both full HTTP(S)

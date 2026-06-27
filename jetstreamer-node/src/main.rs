@@ -96,7 +96,18 @@ const ACCOUNTS_RUN_DIR: &str = "run";
 const ARCHIVE_ACCOUNTS_DIR: &str = "accounts-run";
 const DEFAULT_ROOT_INTERVAL: u64 = 1024;
 const ENTRY_EXEC_WARN_AFTER: Duration = Duration::from_secs(5);
-const ENTRY_EXEC_FAIL_AFTER: Duration = Duration::from_secs(300);
+/// Wall-clock budget for a single entry's execution before the replay aborts
+/// (a stuck/pathological transaction). Override with
+/// `JETSTREAMER_ENTRY_EXEC_TIMEOUT_SECS` (e.g. raise it to let a genuinely-slow
+/// but finite transaction through, or lower it to fail fast while diagnosing).
+static ENTRY_EXEC_FAIL_AFTER: std::sync::LazyLock<Duration> = std::sync::LazyLock::new(|| {
+    let secs = std::env::var("JETSTREAMER_ENTRY_EXEC_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&s| s > 0)
+        .unwrap_or(300);
+    Duration::from_secs(secs)
+});
 const BANK_FOR_SLOT_WARN_AFTER: Duration = Duration::from_secs(5);
 const PROGRAM_CACHE_PRUNE_PROGRESS_INTERVAL: Duration = Duration::from_secs(30);
 const ACCOUNTS_MAINTENANCE_PROGRESS_INTERVAL: Duration = Duration::from_secs(30);
@@ -979,7 +990,7 @@ impl BankReplay {
                 signature.unwrap_or("<none>")
             );
         }
-        if elapsed >= ENTRY_EXEC_FAIL_AFTER {
+        if elapsed >= *ENTRY_EXEC_FAIL_AFTER {
             let message = format!(
                 "entry execution exceeded timeout: slot {} entry {} txs={} elapsed={:.3}s sig={}",
                 entry.slot,
@@ -5900,7 +5911,7 @@ async fn run_geyser_replay(
                 .map(Duration::from_secs)
                 .unwrap_or(Duration::from_secs(1800));
             let inflight_warn_after = ENTRY_EXEC_WARN_AFTER;
-            let inflight_fail_after = ENTRY_EXEC_FAIL_AFTER;
+            let inflight_fail_after = *ENTRY_EXEC_FAIL_AFTER;
             let mut phase_start = None::<Instant>;
             let mut in_warmup = has_warmup;
             // Slots already replayed when the main phase's timer started;

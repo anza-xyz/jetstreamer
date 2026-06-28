@@ -2087,6 +2087,25 @@ impl ReplayProgress {
     }
 }
 
+/// Cross-epoch progress for a multi-epoch range run, shared across every
+/// `run_geyser_replay` call so the per-epoch progress thread can also report
+/// overall span progress + ETA. `None` for a single-epoch run.
+struct RangeProgress {
+    /// First slot of the first epoch in the (resumed) range.
+    overall_start_slot: Slot,
+    /// Last slot of the last epoch in the range.
+    overall_end_slot: Slot,
+    /// First and total epoch counts (for the "epoch i/N" readout). `first_epoch`
+    /// is the resume point, so `total_epochs` counts only epochs actually run.
+    first_epoch: u64,
+    total_epochs: u64,
+    /// `(wall baseline, slot baseline)` captured at the first post-warmup tick of
+    /// the whole run; overall rate = `(latest - slot_baseline) / elapsed`. Set
+    /// once and persisted across epochs so the ETA reflects the true multi-epoch
+    /// pace rather than just the current epoch.
+    baseline: Mutex<Option<(Instant, Slot)>>,
+}
+
 #[derive(Debug)]
 struct ReplayFailure {
     shutdown: Arc<AtomicBool>,
@@ -5594,6 +5613,8 @@ async fn run_geyser_replay(
     // When set, reuse this bank (carried from the previous epoch in a range
     // run) instead of loading a snapshot — no reload, no warmup.
     existing_bank_forks: Option<Arc<RwLock<BankForks>>>,
+    // Cross-epoch progress for a multi-epoch range run (None for single epoch).
+    range_progress: Option<Arc<RangeProgress>>,
 ) -> Result<Arc<RwLock<BankForks>>, String> {
     let (confirmed_bank_sender, confirmed_bank_receiver) = unbounded();
     let confirmed_bank_handle =
@@ -5896,6 +5917,7 @@ async fn run_geyser_replay(
         let failure = failure.clone();
         let progress_done = progress_done.clone();
         let shutdown = shutdown.clone();
+        let range_progress = range_progress.clone();
         std::thread::spawn(move || {
             let has_warmup = replay_start < epoch_start;
             let warmup_end = epoch_start.saturating_sub(1);
@@ -5910,6 +5932,27 @@ async fn run_geyser_replay(
                 .and_then(|value| value.parse::<u64>().ok())
                 .map(Duration::from_secs)
                 .unwrap_or(Duration::from_secs(1800));
+            // The per-wave phase breakdown is verbose; emit it far less often
+            // than the progress line (which still ticks every loop). 0 disables.
+            let phases_interval = env::var("JETSTREAMER_PHASES_LOG_SECS")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .map(Duration::from_secs)
+                .unwrap_or(Duration::from_secs(60));
+            let mut last_phases_log: Option<Instant> = None;
+            let mut maybe_log_phases = |force: bool| {
+                if phases_interval.is_zero() {
+                    return;
+                }
+                let due = last_phases_log
+                    .is_none_or(|last: Instant| last.elapsed() >= phases_interval);
+                if (force || due)
+                    && let Some(phases) = phases_summary()
+                {
+                    info!("{phases}");
+                    last_phases_log = Some(Instant::now());
+                }
+            };
             let inflight_warn_after = ENTRY_EXEC_WARN_AFTER;
             let inflight_fail_after = *ENTRY_EXEC_FAIL_AFTER;
             let mut phase_start = None::<Instant>;
@@ -6280,16 +6323,10 @@ async fn run_geyser_replay(
                     } else {
                         "unknown".to_string()
                     };
-                    if let Some(phases) = phases_summary() {
-                        info!(
-                            "warmup slot {display_slot}/{warmup_end} ({percent:.2}%) txs={tx_count} accounts={account_updates} slots_per_sec={slots_per_sec} accounts_per_sec={accounts_per_sec} eta={eta} (epoch {epoch} starts at {epoch_start})"
-                        );
-                        info!("{phases}");
-                    } else {
-                        info!(
-                            "warmup slot {display_slot}/{warmup_end} ({percent:.2}%) txs={tx_count} accounts={account_updates} slots_per_sec={slots_per_sec} accounts_per_sec={accounts_per_sec} eta={eta} (epoch {epoch} starts at {epoch_start})"
-                        );
-                    }
+                    info!(
+                        "warmup slot {display_slot}/{warmup_end} ({percent:.2}%) txs={tx_count} accounts={account_updates} slots_per_sec={slots_per_sec} accounts_per_sec={accounts_per_sec} eta={eta} (epoch {epoch} starts at {epoch_start})"
+                    );
+                    maybe_log_phases(false);
                 } else {
                     if in_warmup {
                         in_warmup = false;
@@ -6354,9 +6391,43 @@ async fn run_geyser_replay(
                     info!(
                         "progress slot {display_slot}/{end_inclusive} ({percent:.2}%) txs={tx_count} accounts={account_updates} slots_per_sec={slots_per_sec} eta={eta} horizon={horizon_size}"
                     );
-                    if let Some(phases) = phases_summary() {
-                        info!("{phases}");
+                    // Overall span progress + ETA across the whole multi-epoch
+                    // run, on its own line. The rate baseline is captured once
+                    // (first main-phase tick of the run) and shared across
+                    // epochs, so the ETA reflects the true range-wide pace.
+                    if let Some(rp) = range_progress.as_ref() {
+                        let overall_total = rp
+                            .overall_end_slot
+                            .saturating_sub(rp.overall_start_slot)
+                            .saturating_add(1);
+                        let overall_done = display_slot
+                            .saturating_sub(rp.overall_start_slot)
+                            .saturating_add(1);
+                        let overall_percent = if overall_total == 0 {
+                            100.0
+                        } else {
+                            (overall_done as f64) * 100.0 / (overall_total as f64)
+                        };
+                        let epoch_idx = epoch.saturating_sub(rp.first_epoch).saturating_add(1);
+                        let mut baseline = rp.baseline.lock().unwrap();
+                        let (base_instant, base_slot) =
+                            *baseline.get_or_insert((Instant::now(), display_slot));
+                        drop(baseline);
+                        let elapsed = base_instant.elapsed().as_secs_f64();
+                        let advanced = display_slot.saturating_sub(base_slot);
+                        let overall_eta = if advanced == 0 || elapsed <= 0.0 {
+                            "unknown".to_string()
+                        } else {
+                            let rate = (advanced as f64) / elapsed;
+                            let remaining = rp.overall_end_slot.saturating_sub(display_slot);
+                            format_eta(Duration::from_secs(((remaining as f64) / rate).ceil() as u64))
+                        };
+                        info!(
+                            "overall slot {display_slot}/{} ({overall_percent:.2}%) epoch {epoch_idx}/{} eta={overall_eta}",
+                            rp.overall_end_slot, rp.total_epochs
+                        );
                     }
+                    maybe_log_phases(false);
                 }
 
                 let assign_fail = PROGRAM_CACHE_ASSIGN_FAIL_COUNT.load(Ordering::Relaxed);
@@ -6982,6 +7053,19 @@ async fn main() {
     // between epochs. Verification hashes were prefetched above; the `.jet`
     // output path is resolved per epoch.
     let total_epochs = end_epoch - effective_start + 1;
+    // Shared cross-epoch progress so the per-epoch progress thread can also
+    // report overall span % + ETA. Only meaningful for a multi-epoch run.
+    let range_progress = if total_epochs > 1 {
+        Some(Arc::new(RangeProgress {
+            overall_start_slot: epoch_to_slot_range(effective_start).0,
+            overall_end_slot: epoch_to_slot_range(end_epoch).1,
+            first_epoch: effective_start,
+            total_epochs,
+            baseline: Mutex::new(None),
+        }))
+    } else {
+        None
+    };
     let mut carried_bank_forks: Option<Arc<RwLock<BankForks>>> = None;
     for epoch in effective_start..=end_epoch {
         if shutdown.load(Ordering::SeqCst) {
@@ -7022,6 +7106,7 @@ async fn main() {
             snapshot_verifier,
             horizon_output,
             carried_bank_forks.take(),
+            range_progress.clone(),
         )
         .await
         {

@@ -5615,12 +5615,25 @@ async fn run_geyser_replay(
     existing_bank_forks: Option<Arc<RwLock<BankForks>>>,
     // Cross-epoch progress for a multi-epoch range run (None for single epoch).
     range_progress: Option<Arc<RangeProgress>>,
+    // Progress counters shared across every epoch of a range. The accounts-db
+    // update notifier is created once (at the first epoch's snapshot load) and
+    // carried with the reused bank, so it forever points at whatever
+    // `ReplayProgress` it captured. Sharing one instance keeps every chained
+    // epoch's counter (and the account-update stall watchdog) live; a per-epoch
+    // instance would leave chained epochs stuck at accounts=0 and falsely abort.
+    // Counters are reset per epoch below, so sharing does not accumulate.
+    carried_progress: Option<Arc<ReplayProgress>>,
 ) -> Result<Arc<RwLock<BankForks>>, String> {
     let (confirmed_bank_sender, confirmed_bank_receiver) = unbounded();
     let confirmed_bank_handle =
         std::thread::spawn(move || while confirmed_bank_receiver.recv().is_ok() {});
     let (epoch_start, end_inclusive) = epoch_to_slot_range(epoch);
-    let progress = Arc::new(ReplayProgress::new(epoch_start));
+    let progress =
+        carried_progress.unwrap_or_else(|| Arc::new(ReplayProgress::new(epoch_start)));
+    // Fresh per-epoch baseline: a chained epoch reuses the shared instance, so
+    // clear last-run counts before this epoch's replay begins (no notifications
+    // are in flight here — the previous epoch's replay has fully returned).
+    progress.reset_counts();
     let failure = Arc::new(ReplayFailure::new(shutdown.clone()));
     plugin::reset();
     info!("direct in-process plugin notifier enabled");
@@ -7066,6 +7079,13 @@ async fn main() {
     } else {
         None
     };
+    // One progress instance shared across every epoch in the range. The
+    // accounts-db notifier, created at the first epoch's load and carried with
+    // the reused bank, captures this and keeps updating it for chained epochs —
+    // otherwise their per-epoch counter stays at 0 and the stall watchdog aborts.
+    let shared_progress = Arc::new(ReplayProgress::new(
+        epoch_to_slot_range(effective_start).0,
+    ));
     let mut carried_bank_forks: Option<Arc<RwLock<BankForks>>> = None;
     for epoch in effective_start..=end_epoch {
         if shutdown.load(Ordering::SeqCst) {
@@ -7107,6 +7127,7 @@ async fn main() {
             horizon_output,
             carried_bank_forks.take(),
             range_progress.clone(),
+            Some(shared_progress.clone()),
         )
         .await
         {

@@ -96,16 +96,19 @@ const ACCOUNTS_RUN_DIR: &str = "run";
 const ARCHIVE_ACCOUNTS_DIR: &str = "accounts-run";
 const DEFAULT_ROOT_INTERVAL: u64 = 1024;
 const ENTRY_EXEC_WARN_AFTER: Duration = Duration::from_secs(5);
-/// Wall-clock budget for a single entry's execution before the replay aborts
-/// (a stuck/pathological transaction). Override with
-/// `JETSTREAMER_ENTRY_EXEC_TIMEOUT_SECS` (e.g. raise it to let a genuinely-slow
-/// but finite transaction through, or lower it to fail fast while diagnosing).
+/// Wall-clock budget for a single *in-flight* entry before the replay aborts
+/// (a genuinely hung transaction). Pathological-but-finite mainnet txs have
+/// been observed to take ~6-7 minutes and then complete with verified results
+/// (e.g. epoch 944 slot 407838634 at 422s), so the default is generous — a
+/// false abort costs a multi-day range run, a true hang costs one hour.
+/// Entries that complete are never aborted regardless of how long they took.
+/// Override with `JETSTREAMER_ENTRY_EXEC_TIMEOUT_SECS`.
 static ENTRY_EXEC_FAIL_AFTER: std::sync::LazyLock<Duration> = std::sync::LazyLock::new(|| {
     let secs = std::env::var("JETSTREAMER_ENTRY_EXEC_TIMEOUT_SECS")
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
         .filter(|&s| s > 0)
-        .unwrap_or(300);
+        .unwrap_or(3600);
     Duration::from_secs(secs)
 });
 const BANK_FOR_SLOT_WARN_AFTER: Duration = Duration::from_secs(5);
@@ -990,17 +993,21 @@ impl BankReplay {
                 signature.unwrap_or("<none>")
             );
         }
+        // This runs after the entry has *completed*: its results are committed
+        // and verified against expected statuses like any other entry, so no
+        // matter how far past the budget it ran, aborting here would only
+        // discard finished work (a 422s tx once killed a 40h range run this
+        // way). The timeout abort lives in the progress thread's in-flight
+        // detector, which is the only place a true hang is observable.
         if elapsed >= *ENTRY_EXEC_FAIL_AFTER {
-            let message = format!(
-                "entry execution exceeded timeout: slot {} entry {} txs={} elapsed={:.3}s sig={}",
+            warn!(
+                "entry execution exceeded timeout budget but completed: slot {} entry {} txs={} elapsed={:.3}s sig={}",
                 entry.slot,
                 entry.entry_index,
                 entry.tx_count,
                 elapsed.as_secs_f64(),
                 signature.unwrap_or("<none>")
             );
-            self.failure.record(message.clone());
-            panic!("{message}");
         }
     }
 

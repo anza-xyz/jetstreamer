@@ -4055,7 +4055,7 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "jetstreamer"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "clickhouse",
  "jetstreamer-firehose",
@@ -4073,7 +4073,7 @@ dependencies = [
 
 [[package]]
 name = "jetstreamer-firehose"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "ahash 0.8.12",
  "aws-credential-types",
@@ -4126,7 +4126,7 @@ dependencies = [
 
 [[package]]
 name = "jetstreamer-plugin"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "ahash 0.8.12",
  "clickhouse",
@@ -4152,7 +4152,7 @@ dependencies = [
 
 [[package]]
 name = "jetstreamer-utils"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "ctrlc",
  "libc",

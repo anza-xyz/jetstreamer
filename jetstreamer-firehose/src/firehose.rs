@@ -40,7 +40,7 @@ use crate::{
         FetchEpochStreamOptions, epoch_to_slot_range, fetch_epoch_stream,
         fetch_epoch_stream_with_options, slot_to_epoch,
     },
-    index::{SLOT_OFFSET_INDEX, SlotOffsetIndexError, slot_to_offset},
+    index::{SLOT_OFFSET_INDEX, SlotOffsetIndexError},
     node_reader::NodeReader,
     utils,
 };
@@ -87,49 +87,6 @@ fn is_shutdown_error(err: &FirehoseError) -> bool {
         | FirehoseError::OnStatsHandlerError(inner) => is_interrupted(inner.as_ref()),
         _ => false,
     }
-}
-
-async fn find_previous_indexed_slot(
-    local_start: u64,
-    epoch_start: u64,
-    log_target: &str,
-) -> Result<Option<u64>, FirehoseError> {
-    if local_start <= epoch_start {
-        return Ok(None);
-    }
-    let mut candidate = local_start.saturating_sub(1);
-    let mut skipped = 0u64;
-    loop {
-        match slot_to_offset(candidate).await {
-            Ok(_) => {
-                if skipped > 0 {
-                    log::info!(
-                        target: log_target,
-                        "slot {} missing in index; seeking back {} slots to {}",
-                        local_start.saturating_sub(1),
-                        skipped,
-                        candidate
-                    );
-                }
-                return Ok(Some(candidate));
-            }
-            Err(SlotOffsetIndexError::SlotNotFound(..)) => {
-                if candidate <= epoch_start {
-                    break;
-                }
-                skipped += 1;
-                candidate = candidate.saturating_sub(1);
-            }
-            Err(err) => return Err(FirehoseError::SlotOffsetIndexError(err)),
-        }
-    }
-    log::warn!(
-        target: log_target,
-        "no indexed slot found before {} (epoch start {}); reading from epoch start",
-        local_start,
-        epoch_start
-    );
-    Ok(None)
 }
 
 /// Errors that can occur while streaming the firehose. Errors that can occur while streaming
@@ -1174,36 +1131,19 @@ where
                         }
 
                     if local_start > epoch_start {
-                        // Seek to the nearest previous indexed slot so the stream includes all
-                        // nodes (transactions, entries, rewards) that precede `local_start`.
-                        let seek_slot = match timeout(
-                            OP_TIMEOUT,
-                            find_previous_indexed_slot(local_start, epoch_start, &log_target),
-                        )
-                        .await
-                        {
-                            Ok(res) => res.map_err(|e| (e, current_slot.unwrap_or(slot_range.start)))?,
+                        // Seek to the start of `local_start`'s data; the index maps each slot to
+                        // the byte range containing all of its nodes (transactions, entries,
+                        // rewards, block), and the seek skips forward over missing slots. Errors
+                        // are attributed to `local_start` so retries invalidate and resume the
+                        // epoch actually being sought.
+                        let seek_fut = reader.seek_to_slot(local_start);
+                        match timeout(op_timeout, seek_fut).await {
+                            Ok(res) => res.map_err(|e| (e, local_start))?,
                             Err(_) => {
                                 return Err((
-                                    FirehoseError::OperationTimeout(
-                                        "seek_to_previous_indexed_slot",
-                                    ),
-                                    current_slot.unwrap_or(slot_range.start),
+                                    FirehoseError::OperationTimeout("seek_to_slot"),
+                                    local_start,
                                 ));
-                            }
-                        };
-                        if let Some(seek_slot) = seek_slot {
-                            let seek_fut = reader.seek_to_slot(seek_slot);
-                            match timeout(op_timeout, seek_fut).await {
-                                Ok(res) => {
-                                    res.map_err(|e| (e, current_slot.unwrap_or(slot_range.start)))?
-                                }
-                                Err(_) => {
-                                    return Err((
-                                        FirehoseError::OperationTimeout("seek_to_slot"),
-                                        current_slot.unwrap_or(slot_range.start),
-                                    ));
-                                }
                             }
                         }
                     }
@@ -2171,36 +2111,19 @@ async fn firehose_geyser_thread(
                 current_slot = None;
 
                 if local_start > epoch_start {
-                    // Seek to the nearest previous indexed slot so the reader captures the full
-                    // node set (transactions, entries, rewards) for the target block.
-                    let seek_slot = match timeout(
-                        OP_TIMEOUT,
-                        find_previous_indexed_slot(local_start, epoch_start, &log_target),
-                    )
-                    .await
-                    {
-                        Ok(res) => res.map_err(|e| (e, current_slot.unwrap_or(slot_range.start)))?,
+                    // Seek to the start of `local_start`'s data; the index maps each slot to
+                    // the byte range containing all of its nodes (transactions, entries,
+                    // rewards, block), and the seek skips forward over missing slots. Errors
+                    // are attributed to `local_start` so retries invalidate and resume the
+                    // epoch actually being sought.
+                    let seek_fut = reader.seek_to_slot(local_start);
+                    match timeout(OP_TIMEOUT, seek_fut).await {
+                        Ok(res) => res.map_err(|e| (e, local_start))?,
                         Err(_) => {
                             return Err((
-                                FirehoseError::OperationTimeout(
-                                    "seek_to_previous_indexed_slot",
-                                ),
-                                current_slot.unwrap_or(slot_range.start),
+                                FirehoseError::OperationTimeout("seek_to_slot"),
+                                local_start,
                             ));
-                        }
-                    };
-                    if let Some(seek_slot) = seek_slot {
-                        let seek_fut = reader.seek_to_slot(seek_slot);
-                        match timeout(OP_TIMEOUT, seek_fut).await {
-                            Ok(res) => {
-                                res.map_err(|e| (e, current_slot.unwrap_or(slot_range.start)))?
-                            }
-                            Err(_) => {
-                                return Err((
-                                    FirehoseError::OperationTimeout("seek_to_slot"),
-                                    current_slot.unwrap_or(slot_range.start),
-                                ));
-                            }
                         }
                     }
                 }

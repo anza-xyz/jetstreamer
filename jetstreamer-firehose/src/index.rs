@@ -1,9 +1,26 @@
-//! Helpers for resolving and loading compact index artifacts for the firehose replay engine.
+//! Helpers for resolving and loading slot index artifacts for the firehose replay engine.
+//!
+//! ## Index formats
+//!
+//! Old Faithful publishes a compact per-epoch *slot ranges* index
+//! (`{epoch}/epoch-{epoch}-slot-ranges.raw`, ~5 MB): one 12-byte little-endian record per slot
+//! — `offset: u64` followed by `length: u32` — describing the byte range of the epoch CAR file
+//! that contains every node (transactions, entries, rewards, block) belonging to that slot.
+//! Records are ordered by slot, starting at the epoch's first slot; skipped slots are encoded
+//! as an all-zero record. This is the primary index used for slot lookups.
+//!
+//! When the slot-ranges file is missing (e.g. an older mirror), the loader falls back to the
+//! legacy compactindex pair (`slot-to-cid` + `cid-to-offset-and-size`). Those indexes are
+//! deprecated upstream and will eventually stop being generated. The fallback derives the same
+//! byte-range semantics as the slot-ranges index, so lookups behave identically on both paths.
 //!
 //! ## Environment variables
 //!
-//! - `JETSTREAMER_COMPACT_INDEX_BASE_URL`: Preferred base URL for compact index files.
-//! - `JETSTREAMER_NETWORK`: Network suffix appended to on-disk cache keys and remote filenames.
+//! - `JETSTREAMER_COMPACT_INDEX_BASE_URL`: Preferred base URL for index files.
+//! - `JETSTREAMER_NETWORK`: Network suffix appended to on-disk cache keys and legacy remote
+//!   filenames.
+//! - `JETSTREAMER_FORCE_LEGACY_INDEX`: Set to `1`/`true` to skip the slot-ranges index and use
+//!   the legacy compactindex pair directly (debugging escape hatch).
 //!
 //! ### Example
 //!
@@ -52,6 +69,7 @@ use tokio::{sync::OnceCell, task::yield_now, time::sleep};
 use xxhash_rust::xxh64::xxh64;
 
 const COMPACT_INDEX_MAGIC: &[u8; 8] = b"compiszd";
+const SLOT_RANGES_RECORD_SIZE: usize = 12;
 const BUCKET_HEADER_SIZE: usize = 16;
 const HASH_PREFIX_SIZE: usize = 32;
 const SLOT_TO_CID_KIND: &[u8] = b"slot-to-cid";
@@ -78,6 +96,10 @@ pub enum SlotOffsetIndexError {
     /// Slot was not present in the index.
     #[error("slot {0} not found in index {1}")]
     SlotNotFound(u64, Url),
+    /// The index reports no present slot for an entire epoch, which cannot happen with valid
+    /// index data; the cached epoch index should be invalidated and refetched.
+    #[error("no slot in epoch {0} is present in the index")]
+    EpochHasNoIndexedSlots(u64),
     /// Request failed while fetching the index.
     #[error("network error while fetching {0}: {1}")]
     NetworkError(Url, #[source] reqwest::Error),
@@ -175,7 +197,7 @@ pub static SLOT_OFFSET_INDEX: Lazy<SlotOffsetIndex> = Lazy::new(|| {
 
 static START_INSTANT: Lazy<Instant> = Lazy::new(Instant::now);
 static LAST_HIT_TIME: AtomicU64 = AtomicU64::new(0);
-static SLOT_OFFSET_RESULT_CACHE: Lazy<DashMap<u64, u64, ahash::RandomState>> =
+static SLOT_OFFSET_RESULT_CACHE: Lazy<DashMap<u64, (u64, u64), ahash::RandomState>> =
     Lazy::new(|| DashMap::with_hasher(ahash::RandomState::new()));
 static EPOCH_CACHE: Lazy<DashMap<EpochCacheKey, Arc<EpochEntry>, ahash::RandomState>> =
     Lazy::new(|| DashMap::with_hasher(ahash::RandomState::new()));
@@ -195,24 +217,34 @@ impl EpochCacheKey {
     }
 }
 
-/// Looks up the byte offset of a slot within Old Faithful firehose CAR archives.
+/// Looks up the byte offset at which `slot`'s data begins within its Old Faithful epoch CAR
+/// archive. The offset points at the first CAR section belonging to the slot; reading forward
+/// from it yields all of the slot's nodes, ending with the slot's Block node.
 pub async fn slot_to_offset(slot: u64) -> Result<u64, SlotOffsetIndexError> {
-    if let Some(offset) = SLOT_OFFSET_RESULT_CACHE.get(&slot) {
-        return Ok(*offset);
-    }
-
-    let offset = SLOT_OFFSET_INDEX.get_offset(slot).await?;
-    SLOT_OFFSET_RESULT_CACHE.insert(slot, offset);
-    Ok(offset)
+    slot_to_range(slot).await.map(|(offset, _)| offset)
 }
 
-/// Client that resolves slot offsets using compact CAR index files from Old Faithful.
+/// Looks up the byte range `(offset, length)` covering all of `slot`'s data within its Old
+/// Faithful epoch CAR archive. Returns [`SlotOffsetIndexError::SlotNotFound`] for slots that
+/// were skipped on-chain.
+pub async fn slot_to_range(slot: u64) -> Result<(u64, u64), SlotOffsetIndexError> {
+    if let Some(range) = SLOT_OFFSET_RESULT_CACHE.get(&slot) {
+        return Ok(*range);
+    }
+
+    let range = SLOT_OFFSET_INDEX.get_range(slot).await?;
+    SLOT_OFFSET_RESULT_CACHE.insert(slot, range);
+    Ok(range)
+}
+
+/// Client that resolves slot byte ranges using per-epoch index files from Old Faithful.
 pub struct SlotOffsetIndex {
     client: Client,
     base_url: Url,
     network: String,
     cache_namespace: Arc<str>,
     backend: IndexBackend,
+    force_legacy: bool,
 }
 
 struct EpochEntry {
@@ -255,12 +287,21 @@ impl SlotOffsetIndex {
                 ));
             }
         };
+        let force_legacy = std::env::var("JETSTREAMER_FORCE_LEGACY_INDEX")
+            .map(|value| {
+                let value = value.trim();
+                value.eq_ignore_ascii_case("1")
+                    || value.eq_ignore_ascii_case("true")
+                    || value.eq_ignore_ascii_case("yes")
+            })
+            .unwrap_or(false);
         Ok(Self {
             client: crate::network::create_http_client(),
             base_url,
             network,
             cache_namespace,
             backend,
+            force_legacy,
         })
     }
 
@@ -269,13 +310,41 @@ impl SlotOffsetIndex {
         &self.base_url
     }
 
-    async fn load_epoch_indexes(
+    async fn load_epoch_indexes(&self, epoch: u64) -> Result<EpochIndexes, SlotOffsetIndexError> {
+        if !self.force_legacy {
+            match self.load_slot_ranges_index(epoch).await {
+                Ok(index) => return Ok(EpochIndexes::SlotRanges(index)),
+                Err(SlotOffsetIndexError::EpochIndexFileNotFound(url)) => {
+                    warn!(
+                        target: LOG_MODULE,
+                        "slot-ranges index not found at {url}; falling back to legacy compact \
+                         indexes (deprecated upstream)"
+                    );
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        self.load_legacy_epoch_indexes(epoch)
+            .await
+            .map(EpochIndexes::Legacy)
+    }
+
+    async fn load_slot_ranges_index(
         &self,
         epoch: u64,
-    ) -> Result<(SlotCidIndex, CidOffsetIndex), SlotOffsetIndexError> {
+    ) -> Result<SlotRangesIndex, SlotOffsetIndexError> {
+        let path = format!("{0}/epoch-{0}-slot-ranges.raw", epoch);
+        let object = self.remote_for_path(&path)?;
+        SlotRangesIndex::open(object, epoch).await
+    }
+
+    async fn load_legacy_epoch_indexes(
+        &self,
+        epoch: u64,
+    ) -> Result<LegacyEpochIndexes, SlotOffsetIndexError> {
         let car_path = format!("{epoch}/epoch-{epoch}.car");
         let car_object = self.remote_for_path(&car_path)?;
-        let (root_cid, car_url) = fetch_epoch_root(&car_object).await?;
+        let (root_cid, header_size, car_url) = fetch_epoch_header(&car_object).await?;
         let root_base32 = root_cid
             .to_string_of_base(Base::Base32Lower)
             .map_err(|err| {
@@ -320,13 +389,27 @@ impl SlotOffsetIndex {
             );
         }
 
-        Ok((slot_index, cid_index))
+        let (slot_start, slot_end_inclusive) = epoch_to_slot_range(epoch);
+        Ok(LegacyEpochIndexes::new(
+            slot_index,
+            cid_index,
+            slot_start,
+            slot_end_inclusive,
+            header_size,
+        ))
     }
 
-    /// Resolves the byte offset of `slot` within its Old Faithful CAR archive.
+    /// Resolves the byte offset at which `slot`'s data begins within its Old Faithful CAR
+    /// archive.
     pub async fn get_offset(&self, slot: u64) -> Result<u64, SlotOffsetIndexError> {
-        if let Some(offset) = SLOT_OFFSET_RESULT_CACHE.get(&slot) {
-            return Ok(*offset);
+        self.get_range(slot).await.map(|(offset, _)| offset)
+    }
+
+    /// Resolves the byte range `(offset, length)` covering all of `slot`'s data within its Old
+    /// Faithful CAR archive.
+    pub async fn get_range(&self, slot: u64) -> Result<(u64, u64), SlotOffsetIndexError> {
+        if let Some(range) = SLOT_OFFSET_RESULT_CACHE.get(&slot) {
+            return Ok(*range);
         }
 
         let epoch = slot_to_epoch(slot);
@@ -338,23 +421,14 @@ impl SlotOffsetIndex {
 
         let indexes = entry_arc
             .indexes
-            .get_or_try_init(|| async {
-                let (slot_index, cid_index) = self.load_epoch_indexes(epoch).await?;
-                let (slot_start, slot_end_inclusive) = epoch_to_slot_range(epoch);
-                Ok(Arc::new(EpochIndexes::new(
-                    slot_index,
-                    cid_index,
-                    slot_start,
-                    slot_end_inclusive,
-                )))
-            })
+            .get_or_try_init(|| async { Ok(Arc::new(self.load_epoch_indexes(epoch).await?)) })
             .await?
             .clone();
 
-        let offset = indexes.lookup_slot(slot).await?;
-        SLOT_OFFSET_RESULT_CACHE.insert(slot, offset);
+        let range = indexes.lookup_range(slot).await?;
+        SLOT_OFFSET_RESULT_CACHE.insert(slot, range);
 
-        Ok(offset)
+        Ok(range)
     }
 
     fn remote_for_path(&self, path: &str) -> Result<RemoteObject, SlotOffsetIndexError> {
@@ -387,29 +461,140 @@ impl SlotOffsetIndex {
     }
 }
 
-struct EpochIndexes {
+enum EpochIndexes {
+    SlotRanges(SlotRangesIndex),
+    Legacy(LegacyEpochIndexes),
+}
+
+impl EpochIndexes {
+    async fn lookup_range(&self, slot: u64) -> Result<(u64, u64), SlotOffsetIndexError> {
+        match self {
+            EpochIndexes::SlotRanges(index) => index.lookup_range(slot),
+            EpochIndexes::Legacy(indexes) => indexes.lookup_range(slot).await,
+        }
+    }
+}
+
+/// In-memory copy of an Old Faithful slot-ranges index file: one 12-byte little-endian
+/// `(offset: u64, length: u32)` record per slot of the epoch, ordered by slot. A record with
+/// `length == 0` marks a slot that was skipped on-chain.
+struct SlotRangesIndex {
+    file: RemoteIndexFile,
+    slot_range: RangeInclusive<u64>,
+}
+
+impl SlotRangesIndex {
+    async fn open(object: RemoteObject, epoch: u64) -> Result<Self, SlotOffsetIndexError> {
+        info!(
+            target: LOG_MODULE,
+            "Fetching slot-ranges index for epoch {epoch}"
+        );
+        let file = RemoteIndexFile::download(&object).await?;
+        let (slot_start, slot_end_inclusive) = epoch_to_slot_range(epoch);
+        Self::from_file(file, slot_start..=slot_end_inclusive)
+    }
+
+    fn from_file(
+        file: RemoteIndexFile,
+        slot_range: RangeInclusive<u64>,
+    ) -> Result<Self, SlotOffsetIndexError> {
+        let num_slots = slot_range.end() - slot_range.start() + 1;
+        let expected_len = num_slots.saturating_mul(SLOT_RANGES_RECORD_SIZE as u64);
+        let actual_len = file.bytes().len() as u64;
+        if actual_len != expected_len {
+            return Err(SlotOffsetIndexError::IndexFormatError(
+                file.url().clone(),
+                format!(
+                    "slot-ranges index is {actual_len} bytes, expected {expected_len} \
+                     ({num_slots} records of {SLOT_RANGES_RECORD_SIZE} bytes)"
+                ),
+            ));
+        }
+        Ok(Self { file, slot_range })
+    }
+
+    fn lookup_range(&self, slot: u64) -> Result<(u64, u64), SlotOffsetIndexError> {
+        if !self.slot_range.contains(&slot) {
+            return Err(SlotOffsetIndexError::IndexFormatError(
+                self.file.url().clone(),
+                format!("slot {slot} not in epoch slot range"),
+            ));
+        }
+        let record_index = (slot - self.slot_range.start()) as usize;
+        let record = self.file.slice(
+            record_index * SLOT_RANGES_RECORD_SIZE,
+            SLOT_RANGES_RECORD_SIZE,
+        )?;
+        let offset = u64::from_le_bytes(record[..8].try_into().unwrap());
+        let length = u32::from_le_bytes(record[8..12].try_into().unwrap());
+        if length == 0 {
+            return Err(SlotOffsetIndexError::SlotNotFound(
+                slot,
+                self.file.url().clone(),
+            ));
+        }
+        Ok((offset, length as u64))
+    }
+}
+
+struct LegacyEpochIndexes {
     slot_index: Arc<SlotCidIndex>,
     cid_index: Arc<CidOffsetIndex>,
     slot_cid_cache: DashMap<u64, Arc<[u8]>, ahash::RandomState>,
     slot_range: RangeInclusive<u64>,
+    /// Total size of the epoch CAR header (varint prefix plus header bytes); the offset of the
+    /// first byte of slot data in the archive.
+    data_start: u64,
 }
 
-impl EpochIndexes {
+impl LegacyEpochIndexes {
     fn new(
         slot_index: SlotCidIndex,
         cid_index: CidOffsetIndex,
         slot_start: u64,
         slot_end_inclusive: u64,
+        data_start: u64,
     ) -> Self {
         Self {
             slot_index: Arc::new(slot_index),
             cid_index: Arc::new(cid_index),
             slot_cid_cache: DashMap::with_hasher(ahash::RandomState::new()),
             slot_range: slot_start..=slot_end_inclusive,
+            data_start,
         }
     }
 
-    async fn lookup_slot(&self, slot: u64) -> Result<u64, SlotOffsetIndexError> {
+    fn slot_cid(&self, slot: u64) -> Result<Arc<[u8]>, SlotOffsetIndexError> {
+        if let Some(entry) = self.slot_cid_cache.get(&slot) {
+            return Ok(Arc::clone(entry.value()));
+        }
+        let bytes = self.slot_index.lookup(slot)?;
+        let cid = Arc::<[u8]>::from(bytes);
+        self.slot_cid_cache.insert(slot, Arc::clone(&cid));
+        Ok(cid)
+    }
+
+    async fn block_section(
+        &self,
+        cid: &[u8],
+        slot: u64,
+    ) -> Result<(u64, u32), SlotOffsetIndexError> {
+        match self.cid_index.lookup(cid).await? {
+            Some(bytes) => decode_offset_and_size(&bytes, self.cid_index.url()),
+            None => Err(SlotOffsetIndexError::SlotNotFound(
+                slot,
+                self.cid_index.url().clone(),
+            )),
+        }
+    }
+
+    /// Derives the same `(offset, length)` byte range that the slot-ranges index encodes.
+    ///
+    /// The legacy `cid-to-offset-and-size` index locates a slot's Block node section, which is
+    /// the *last* section of the slot's data in the CAR. The start of the slot's data is
+    /// therefore the end of the previous present slot's Block section, or the end of the CAR
+    /// header for the first present slot of the epoch.
+    async fn lookup_range(&self, slot: u64) -> Result<(u64, u64), SlotOffsetIndexError> {
         if !self.slot_range.contains(&slot) {
             return Err(SlotOffsetIndexError::IndexFormatError(
                 self.slot_index.url().clone(),
@@ -417,25 +602,52 @@ impl EpochIndexes {
             ));
         }
 
-        let cid = if let Some(entry) = self.slot_cid_cache.get(&slot) {
-            Arc::clone(entry.value())
-        } else {
-            let bytes = self.slot_index.lookup(slot)?;
-            let cid = Arc::<[u8]>::from(bytes);
-            self.slot_cid_cache.insert(slot, Arc::clone(&cid));
-            cid
+        let cid = self.slot_cid(slot)?;
+        let (block_offset, block_size) = self.block_section(cid.as_ref(), slot).await?;
+        let end = block_offset + block_size as u64;
+
+        let mut candidate = slot;
+        let start = loop {
+            if candidate == *self.slot_range.start() {
+                break self.data_start;
+            }
+            candidate -= 1;
+            match self.slot_cid(candidate) {
+                Ok(prev_cid) => {
+                    // The legacy compactindexes store truncated entry hashes, so lookups of
+                    // absent keys (skipped slots) can false-positive and return an unrelated
+                    // entry. Treat results that cannot precede `slot`'s data as absent and keep
+                    // scanning instead of deriving an impossible range.
+                    match self.block_section(prev_cid.as_ref(), candidate).await {
+                        Ok((prev_offset, prev_size)) => {
+                            let candidate_end = prev_offset + prev_size as u64;
+                            if candidate_end > end {
+                                warn!(
+                                    target: LOG_MODULE,
+                                    "ignoring implausible legacy index entry for slot \
+                                     {candidate} (section end {candidate_end} exceeds slot \
+                                     {slot} end {end}); treating it as skipped"
+                                );
+                                continue;
+                            }
+                            break candidate_end;
+                        }
+                        Err(SlotOffsetIndexError::SlotNotFound(..)) => continue,
+                        Err(err) => return Err(err),
+                    }
+                }
+                Err(SlotOffsetIndexError::SlotNotFound(..)) => continue,
+                Err(err) => return Err(err),
+            }
         };
 
-        let (offset, _) = match self.cid_index.lookup(cid.as_ref()).await? {
-            Some(bytes) => decode_offset_and_size(&bytes, self.cid_index.url()),
-            None => {
-                return Err(SlotOffsetIndexError::SlotNotFound(
-                    slot,
-                    self.cid_index.url().clone(),
-                ));
-            }
-        }?;
-        Ok(offset)
+        let length = end.checked_sub(start).ok_or_else(|| {
+            SlotOffsetIndexError::IndexFormatError(
+                self.cid_index.url().clone(),
+                format!("slot {slot} range end {end} precedes start {start}"),
+            )
+        })?;
+        Ok((start, length))
     }
 }
 
@@ -1143,7 +1355,11 @@ fn parse_compact_index_header(
     })
 }
 
-async fn fetch_epoch_root(object: &RemoteObject) -> Result<(Cid, Url), SlotOffsetIndexError> {
+/// Reads the epoch CAR header, returning its root CID, the total header size in bytes (varint
+/// prefix plus header body — i.e. the offset of the first byte of slot data), and the CAR URL.
+async fn fetch_epoch_header(
+    object: &RemoteObject,
+) -> Result<(Cid, u64, Url), SlotOffsetIndexError> {
     let car_url = object.url().clone();
     let mut bytes = object
         .fetch_range(0, HTTP_PREFETCH_BYTES - 1, false)
@@ -1174,7 +1390,7 @@ async fn fetch_epoch_root(object: &RemoteObject) -> Result<(Cid, Url), SlotOffse
     })?;
     let root_cid = extract_root_cid(&value)
         .map_err(|msg| SlotOffsetIndexError::CarHeaderError(car_url.clone(), msg.to_string()))?;
-    Ok((root_cid, car_url))
+    Ok((root_cid, total_needed as u64, car_url))
 }
 
 fn decode_varint(bytes: &[u8]) -> Result<(u64, usize), String> {
@@ -1480,7 +1696,20 @@ async fn fetch_s3_full(
         .key(key)
         .send()
         .await
-        .map_err(|err| SlotOffsetIndexError::S3Error(url.clone(), err.to_string()))?;
+        .map_err(|err| {
+            let missing = err.as_service_error().is_some_and(|service_err| {
+                // GetObject on a missing key returns NoSuchKey, or AccessDenied when the
+                // credentials lack s3:ListBucket. Treat both as "not found" so missing
+                // slot-ranges files fall back to the legacy indexes; genuinely broken
+                // credentials will fail the fallback fetch as well and surface there.
+                service_err.is_no_such_key() || service_err.meta().code() == Some("AccessDenied")
+            });
+            if missing {
+                SlotOffsetIndexError::EpochIndexFileNotFound(url.clone())
+            } else {
+                SlotOffsetIndexError::S3Error(url.clone(), err.to_string())
+            }
+        })?;
     let body = resp
         .body
         .collect()
@@ -1596,6 +1825,52 @@ mod tests {
         });
     }
 
+    fn synthetic_ranges_file(records: &[(u64, u32)]) -> RemoteIndexFile {
+        let mut data = Vec::with_capacity(records.len() * SLOT_RANGES_RECORD_SIZE);
+        for (offset, length) in records {
+            data.extend_from_slice(&offset.to_le_bytes());
+            data.extend_from_slice(&length.to_le_bytes());
+        }
+        RemoteIndexFile {
+            url: Url::parse("https://example.com/0/epoch-0-slot-ranges.raw").unwrap(),
+            data: Arc::from(data),
+        }
+    }
+
+    #[test]
+    fn test_slot_ranges_lookup() {
+        let index = SlotRangesIndex::from_file(
+            synthetic_ranges_file(&[(59, 100), (159, 250), (0, 0), (409, 41)]),
+            1000..=1003,
+        )
+        .expect("valid index");
+
+        assert_eq!(index.lookup_range(1000).unwrap(), (59, 100));
+        assert_eq!(index.lookup_range(1001).unwrap(), (159, 250));
+        assert!(matches!(
+            index.lookup_range(1002),
+            Err(SlotOffsetIndexError::SlotNotFound(1002, _))
+        ));
+        assert_eq!(index.lookup_range(1003).unwrap(), (409, 41));
+        assert!(matches!(
+            index.lookup_range(999),
+            Err(SlotOffsetIndexError::IndexFormatError(..))
+        ));
+        assert!(matches!(
+            index.lookup_range(1004),
+            Err(SlotOffsetIndexError::IndexFormatError(..))
+        ));
+    }
+
+    #[test]
+    fn test_slot_ranges_rejects_wrong_size() {
+        let file = synthetic_ranges_file(&[(59, 100), (159, 250)]);
+        assert!(matches!(
+            SlotRangesIndex::from_file(file, 1000..=1002),
+            Err(SlotOffsetIndexError::IndexFormatError(..))
+        ));
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[serial_test::serial]
     async fn test_epoch_800_hydration_time() {
@@ -1607,11 +1882,15 @@ mod tests {
         let index = SlotOffsetIndex::new(base).expect("slot offset index");
         let epoch = 800;
         let download_started = Instant::now();
-        let (_slot_index, _cid_index) = index
+        let indexes = index
             .load_epoch_indexes(epoch)
             .await
             .expect("download epoch indexes");
         let download_elapsed = download_started.elapsed();
+        assert!(
+            matches!(indexes, EpochIndexes::SlotRanges(_)),
+            "expected the slot-ranges index to be preferred for epoch {epoch}"
+        );
 
         let (slot_start, slot_end) = epoch_to_slot_range(epoch);
         info!(
@@ -1679,6 +1958,65 @@ mod tests {
                 elapsed
             );
         }
+    }
+
+    /// While the deprecated legacy compactindex pair is still being published, verify that the
+    /// legacy fallback path derives byte ranges identical to the slot-ranges index.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial_test::serial]
+    async fn test_epoch_800_legacy_matches_slot_ranges() {
+        init_logger();
+        SLOT_OFFSET_RESULT_CACHE.clear();
+        EPOCH_CACHE.clear();
+
+        let base = get_index_base_url().expect("base url");
+        let index = SlotOffsetIndex::new(base).expect("slot offset index");
+        let epoch = 800;
+        let ranges = index
+            .load_slot_ranges_index(epoch)
+            .await
+            .expect("download slot-ranges index");
+        let legacy = index
+            .load_legacy_epoch_indexes(epoch)
+            .await
+            .expect("download legacy indexes");
+
+        let (slot_start, slot_end) = epoch_to_slot_range(epoch);
+        let mut compared = 0usize;
+        let mut skipped = 0usize;
+        let mut slot = slot_start;
+        while compared < 12 && slot <= slot_end {
+            let new_range = ranges.lookup_range(slot);
+            let legacy_range = legacy.lookup_range(slot).await;
+            match (new_range, legacy_range) {
+                (Ok(new_range), Ok(legacy_range)) => {
+                    assert_eq!(
+                        new_range, legacy_range,
+                        "slot {slot} byte range mismatch between slot-ranges and legacy indexes"
+                    );
+                    compared += 1;
+                }
+                (
+                    Err(SlotOffsetIndexError::SlotNotFound(..)),
+                    Err(SlotOffsetIndexError::SlotNotFound(..)),
+                ) => {
+                    skipped += 1;
+                }
+                (new_range, legacy_range) => panic!(
+                    "slot {slot} presence mismatch: slot-ranges {new_range:?}, legacy {legacy_range:?}"
+                ),
+            }
+            slot += 1;
+        }
+        assert_eq!(
+            compared, 12,
+            "expected 12 comparable slots starting at {slot_start}"
+        );
+        info!(
+            target: LOG_MODULE,
+            "epoch {epoch} legacy/slot-ranges equivalence verified for {compared} slots \
+             ({skipped} skipped slots agreed)"
+        );
     }
 
     #[test]

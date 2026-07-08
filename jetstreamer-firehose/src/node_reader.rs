@@ -1,8 +1,8 @@
 use crate::LOG_MODULE;
 use crate::SharedError;
-use crate::epochs::slot_to_epoch;
+use crate::epochs::{epoch_to_slot_range, slot_to_epoch};
 use crate::firehose::FirehoseError;
-use crate::index::{SlotOffsetIndexError, slot_to_offset};
+use crate::index::{SlotOffsetIndexError, slot_to_range};
 use crate::node::{Node, NodeWithCid, NodesWithCids, parse_any_from_cbordata};
 use crate::utils;
 use cid::Cid;
@@ -204,7 +204,10 @@ impl<R: AsyncRead + Unpin + AsyncSeek + Len> NodeReader<R> {
         Ok(clone.as_slice().to_owned())
     }
 
-    /// Seeks the underlying reader to the Old Faithful CAR section that begins at `slot`.
+    /// Seeks the underlying reader to the first Old Faithful CAR section belonging to `slot`,
+    /// so that reading forward yields all of the slot's nodes (transactions, entries, rewards)
+    /// followed by its Block node. If `slot` is missing from the index (skipped on-chain), the
+    /// seek advances to the next present slot.
     pub async fn seek_to_slot(&mut self, slot: u64) -> Result<(), FirehoseError> {
         self.seek_to_slot_inner(slot).await
     }
@@ -216,11 +219,12 @@ impl<R: AsyncRead + Unpin + AsyncSeek + Len> NodeReader<R> {
                 .map_err(FirehoseError::SeekToSlotError)?;
         };
 
+        let epoch = slot_to_epoch(slot);
+        let (epoch_start, epoch_end_inclusive) = epoch_to_slot_range(epoch);
         let mut current = slot;
         loop {
-            let epoch = slot_to_epoch(current);
-            match slot_to_offset(current).await {
-                Ok(offset) => {
+            match slot_to_range(current).await {
+                Ok((offset, _)) => {
                     log::info!(
                         target: LOG_MODULE,
                         "Seeking to slot {} in epoch {} @ offset {}",
@@ -228,29 +232,73 @@ impl<R: AsyncRead + Unpin + AsyncSeek + Len> NodeReader<R> {
                         epoch,
                         offset
                     );
-                    wait_for_seek_hit_slot().await;
-                    self.reader
-                        .seek(SeekFrom::Start(offset))
-                        .await
-                        .map_err(|e| FirehoseError::SeekToSlotError(Box::new(e)))?;
-                    return Ok(());
+                    return self.seek_to_offset(offset).await;
                 }
                 Err(SlotOffsetIndexError::SlotNotFound(..)) => {
+                    if current >= epoch_end_inclusive {
+                        // No present slot remains between `slot` and the end of its epoch, and
+                        // offsets from other epochs are meaningless for this reader's CAR
+                        // stream. Position the reader just past the last present slot's data so
+                        // callers read the epoch's trailing non-block nodes and observe a clean
+                        // end-of-epoch.
+                        return self.seek_to_epoch_tail(slot, epoch, epoch_start).await;
+                    }
                     log::warn!(
                         target: LOG_MODULE,
                         "Slot {} not found in index, seeking to next slot",
                         current
                     );
-                    if current == u64::MAX {
-                        return Err(FirehoseError::SeekToSlotError(Box::new(
-                            std::io::Error::other("slot search exhausted u64 range"),
-                        )));
-                    }
-                    current = current.saturating_add(1);
+                    current += 1;
                 }
-                Err(err) => return Err(FirehoseError::SeekToSlotError(Box::new(err))),
+                // Surface index failures as SlotOffsetIndexError so callers can invalidate the
+                // cached epoch index and retry with fresh data.
+                Err(err) => return Err(FirehoseError::SlotOffsetIndexError(err)),
             }
         }
+    }
+
+    /// Seeks just past the end of the data of the last present slot preceding `slot`, for use
+    /// when no slot at or after `slot` exists in its epoch.
+    async fn seek_to_epoch_tail(
+        &mut self,
+        slot: u64,
+        epoch: u64,
+        epoch_start: u64,
+    ) -> Result<(), FirehoseError> {
+        let mut candidate = slot;
+        while candidate > epoch_start {
+            candidate -= 1;
+            match slot_to_range(candidate).await {
+                Ok((offset, length)) => {
+                    log::warn!(
+                        target: LOG_MODULE,
+                        "No slot at or after {} is present in epoch {}; seeking past the last \
+                         present slot {}",
+                        slot,
+                        epoch,
+                        candidate
+                    );
+                    return self.seek_to_offset(offset + length).await;
+                }
+                Err(SlotOffsetIndexError::SlotNotFound(..)) => continue,
+                Err(err) => return Err(FirehoseError::SlotOffsetIndexError(err)),
+            }
+        }
+        // An index that reports every slot of an epoch as skipped is corrupt; surface an index
+        // error so callers invalidate the cached epoch index and refetch instead of retrying
+        // against the same bad data forever.
+        Err(FirehoseError::SlotOffsetIndexError(
+            SlotOffsetIndexError::EpochHasNoIndexedSlots(epoch),
+        ))
+    }
+
+    async fn seek_to_offset(&mut self, offset: u64) -> Result<(), FirehoseError> {
+        wait_for_seek_hit_slot().await;
+        self.reader
+            .seek(SeekFrom::Start(offset))
+            .await
+            .map_err(|e| FirehoseError::SeekToSlotError(Box::new(e)))?;
+        Ok(())
     }
 
     #[allow(clippy::should_implement_trait)]

@@ -102,8 +102,9 @@
 //!
 //! | Variable | Default | Effect |
 //! |----------|---------|--------|
-//! | `JETSTREAMER_COMPACT_INDEX_BASE_URL` | `https://files.old-faithful.net` | Base URL for compact CAR index artifacts. Point this at your own mirror to reduce load on the public archive. |
-//! | `JETSTREAMER_NETWORK` | `mainnet` | Network suffix appended to cache namespaces and index filenames (e.g., `testnet`). |
+//! | `JETSTREAMER_COMPACT_INDEX_BASE_URL` | `https://files.old-faithful.net` | Base URL for slot index artifacts (per-epoch `slot-ranges.raw` files, plus the deprecated legacy compactindexes used as a fallback). Point this at your own mirror to reduce load on the public archive. |
+//! | `JETSTREAMER_FORCE_LEGACY_INDEX` | unset | Set to `1` to skip the slot-ranges index and resolve slot offsets using the deprecated legacy compactindex pair. |
+//! | `JETSTREAMER_NETWORK` | `mainnet` | Network suffix appended to cache namespaces and legacy index filenames (e.g., `testnet`). |
 //! | `JETSTREAMER_NETWORK_CAPACITY_MB` | `1000` | Assumed network throughput in megabytes per second used when auto-sizing firehose thread counts. |
 //!
 //! Changing the network automatically segregates cache entries, allowing you to toggle between

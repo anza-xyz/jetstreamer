@@ -23,8 +23,11 @@
 //! - `JETSTREAMER_HTTP_BASE_URL` (default `https://files.old-faithful.net`): base URL or
 //!   `s3://bucket/prefix` for CAR snapshots. Change this to point at a private mirror.
 //! - `JETSTREAMER_COMPACT_INDEX_BASE_URL` (default `https://files.old-faithful.net`): base URL
-//!   for compact CAR index artifacts. Point this at your own mirror to reduce load on the
-//!   public Old Faithful deployment. Also supports `s3://` URIs.
+//!   for slot index artifacts (the per-epoch `slot-ranges.raw` file, plus the deprecated
+//!   legacy compactindexes used as a fallback). Point this at your own mirror to reduce load
+//!   on the public Old Faithful deployment. Also supports `s3://` URIs.
+//! - `JETSTREAMER_FORCE_LEGACY_INDEX`: set to `1` to skip the slot-ranges index and resolve
+//!   slot offsets using the deprecated legacy compactindex pair.
 //! - `JETSTREAMER_ARCHIVE_BASE`: fallback URL/URI that applies to both CARs and compact
 //!   indexes when the more specific knobs are unset.
 //! - `JETSTREAMER_ARCHIVE_BACKEND` (default `http`): set to `s3` to force the S3 transport even

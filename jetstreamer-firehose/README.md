@@ -15,16 +15,21 @@ https://github.com/rpcpool/yellowstone-faithful/tree/main/geyser-plugin-runner
 - `JETSTREAMER_HTTP_BASE_URL` (default `https://files.old-faithful.net`): base URL or
   `s3://bucket/prefix` for CAR data.
 - `JETSTREAMER_COMPACT_INDEX_BASE_URL` (default `https://files.old-faithful.net`): override for
-  compact index artifacts; also accepts `s3://` URIs when mirroring Old Faithful into private
+  slot index artifacts; also accepts `s3://` URIs when mirroring Old Faithful into private
   storage.
+- `JETSTREAMER_FORCE_LEGACY_INDEX`: set to `1` to skip the per-epoch slot-ranges index
+  (`{epoch}/epoch-{epoch}-slot-ranges.raw`, ~5 MB) and resolve slot offsets with the legacy
+  compactindex pair (`slot-to-cid` + `cid-to-offset-and-size`) instead. The legacy indexes are
+  deprecated upstream; without this flag they are only used as an automatic fallback when a
+  mirror does not serve the slot-ranges file.
 - `JETSTREAMER_ARCHIVE_BASE`: shortcut that applies to both CARs and indexes when the more
   specific knobs are unset.
 - `JETSTREAMER_S3_BUCKET`, `JETSTREAMER_S3_PREFIX`, `JETSTREAMER_S3_INDEX_PREFIX`,
   `JETSTREAMER_S3_REGION`, `JETSTREAMER_S3_ENDPOINT`, `JETSTREAMER_S3_ACCESS_KEY`,
   `JETSTREAMER_S3_SECRET_KEY`, `JETSTREAMER_S3_SESSION_TOKEN`: credentials and addressing
   details used when the S3 backend is active.
-- `JETSTREAMER_NETWORK` (default `mainnet`): network identifier appended to index filenames so
-  you can point the replay engine at other clusters (for example `testnet`).
+- `JETSTREAMER_NETWORK` (default `mainnet`): network identifier appended to legacy index
+  filenames so you can point the replay engine at other clusters (for example `testnet`).
 - `JETSTREAMER_NETWORK_CAPACITY_MB` (default `1000`): assumed network throughput in megabytes
   per second when sizing the firehose thread pool. Increase or decrease to match your host's
   effective bandwidth.

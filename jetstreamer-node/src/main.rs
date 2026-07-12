@@ -4128,9 +4128,17 @@ fn usage(program: &str) -> String {
          \n\
          <epoch|range> is a single epoch (950) or an inclusive range (950-955).\n\
          Replays each epoch and writes a horizon archive to <dest-dir>/epoch-<N>.jet.\n\
-         A range runs in one process, keeping the bank in memory across epoch\n\
-         boundaries (no snapshot reload or warmup between epochs).\n\
-         --horizon-output applies only to a single epoch."
+         A range pre-downloads every epoch's boundary snapshot and snapshot hashes\n\
+         up front (the only gcloud/GCS access), then runs each epoch in its own\n\
+         child process so replay memory is fully released at every epoch boundary.\n\
+         Set JETSTREAMER_EPOCH_ISOLATION=0 to restore single-process chaining (the\n\
+         bank stays in memory across epochs; no per-epoch snapshot reload).\n\
+         JETSTREAMER_EPOCH_ATTEMPTS (default 2) bounds retries of a crashed epoch;\n\
+         JETSTREAMER_PRUNE_EPOCH_SNAPSHOTS=0 keeps each boundary snapshot archive\n\
+         after its epoch finalizes (default: deleted to reclaim disk).\n\
+         --horizon-output applies only to a single epoch.\n\
+         --epoch-hashes=PATH and --range-info=A-B are internal flags passed by the\n\
+         range supervisor to its per-epoch children."
     )
 }
 
@@ -6808,6 +6816,148 @@ fn epoch_archive_complete(path: &Path) -> bool {
     jetstreamer_horizon::archive::ArchiveReader::open(std::io::BufReader::new(file)).is_ok()
 }
 
+/// Locates epoch `epoch`'s boundary snapshot archive in `dest_dir`, downloading
+/// it (gcloud/GCS) if absent. Only a candidate landing within the previous
+/// epoch qualifies — an older archive would force a warmup replay across every
+/// slot between it and the epoch boundary (see the `min_snapshot_slot`
+/// rationale where `effective_start`'s snapshot is resolved).
+async fn ensure_epoch_boundary_snapshot(epoch: u64, dest_dir: &Path) -> Result<PathBuf, String> {
+    let target_slot = epoch_to_slot(epoch).saturating_sub(1);
+    let min_snapshot_slot = epoch_to_slot(epoch.saturating_sub(1));
+    if let Some(candidate) = find_existing_snapshot_archive(dest_dir, target_slot)?
+        && candidate.slot >= min_snapshot_slot
+    {
+        info!(
+            "epoch {epoch}: boundary snapshot already present at {}",
+            candidate.path.display()
+        );
+        return Ok(candidate.path);
+    }
+    info!("epoch {epoch}: downloading boundary snapshot (target slot {target_slot})");
+    let path = download_snapshot_at_or_before_slot(epoch, target_slot, dest_dir)
+        .await
+        .map_err(|err| format!("failed to download epoch {epoch} boundary snapshot: {err}"))?;
+    info!("epoch {epoch}: downloaded boundary snapshot to {}", path.display());
+    Ok(path)
+}
+
+/// Reads a supervisor-written per-epoch snapshot-hash file (one canonical
+/// snapshot archive filename per line) back into the expectations map. The
+/// filename format is the same one `parse_snapshot_archive_name` accepts, so
+/// writer and reader can't drift.
+fn read_epoch_hashes_file(path: &Path) -> Result<BTreeMap<Slot, SnapshotHash>, String> {
+    let contents = fs::read_to_string(path)
+        .map_err(|err| format!("failed to read snapshot hashes file {}: {err}", path.display()))?;
+    let mut expected = BTreeMap::new();
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let (slot, hash) = parse_snapshot_archive_name(line)?;
+        if expected.insert(slot, hash).is_some() {
+            return Err(format!(
+                "duplicate snapshot entry for slot {slot} in {}",
+                path.display()
+            ));
+        }
+    }
+    Ok(expected)
+}
+
+/// Runs each epoch of a range in its own child process (this same binary,
+/// invoked as `<exe> <epoch> <dest-dir> --epoch-hashes=… --range-info=…`), so
+/// every byte of replay memory — accounts-db growth, caches, the bank itself —
+/// is returned to the OS at each epoch boundary. In-process chaining was
+/// observed OOM-killed at ~745 GiB RSS two epochs into a range; isolation
+/// trades one boundary-snapshot load per epoch for a hard per-epoch memory
+/// cap. Children never touch gcloud: snapshots and hash files were staged by
+/// the caller before this runs.
+async fn run_epoch_range_supervisor(
+    effective_start: u64,
+    end_epoch: u64,
+    dest_dir: &Path,
+    verify_snapshots: bool,
+    shutdown: Arc<AtomicBool>,
+    boundary_snapshots: BTreeMap<u64, PathBuf>,
+) -> Result<(), String> {
+    let exe = env::current_exe()
+        .map_err(|err| format!("failed to resolve current executable: {err}"))?;
+    let attempts_per_epoch = env::var("JETSTREAMER_EPOCH_ATTEMPTS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|&a| a > 0)
+        .unwrap_or(2);
+    let prune_snapshots = env_truthy_default("JETSTREAMER_PRUNE_EPOCH_SNAPSHOTS", true);
+    let total = end_epoch - effective_start + 1;
+    for epoch in effective_start..=end_epoch {
+        if shutdown.load(Ordering::SeqCst) {
+            info!("shutdown requested; stopping before epoch {epoch}");
+            return Ok(());
+        }
+        let jet_path = dest_dir.join(format!("epoch-{epoch}.jet"));
+        if epoch_archive_complete(&jet_path) {
+            info!("epoch {epoch} already complete; skipping");
+            continue;
+        }
+        let hashes_path = dest_dir.join(format!("epoch-hashes-{epoch}.txt"));
+        let mut attempt = 0u32;
+        loop {
+            attempt += 1;
+            info!(
+                "=== epoch {epoch} ({}/{total}): spawning child process (attempt \
+                 {attempt}/{attempts_per_epoch}) ===",
+                epoch - effective_start + 1
+            );
+            let mut cmd = Command::new(&exe);
+            cmd.arg(epoch.to_string())
+                .arg(dest_dir.as_os_str())
+                .arg(if verify_snapshots { "--verify" } else { "--no-verify" })
+                .arg(format!("--range-info={effective_start}-{end_epoch}"));
+            if verify_snapshots {
+                cmd.arg(format!("--epoch-hashes={}", hashes_path.display()));
+            }
+            let status = cmd
+                .status()
+                .await
+                .map_err(|err| format!("failed to spawn child for epoch {epoch}: {err}"))?;
+            // The epoch is done only if its `.jet` finalized — a child
+            // interrupted by ctrl-c shuts down gracefully and exits 0 without
+            // finishing, so the exit code alone can't be trusted.
+            if status.success() && epoch_archive_complete(&jet_path) {
+                info!("epoch {epoch} child completed");
+                let _ = fs::remove_file(&hashes_path);
+                if prune_snapshots
+                    && let Some(path) = boundary_snapshots.get(&epoch)
+                {
+                    match fs::remove_file(path) {
+                        Ok(()) => info!("pruned boundary snapshot {}", path.display()),
+                        Err(err) => {
+                            warn!("failed to prune boundary snapshot {}: {err}", path.display())
+                        }
+                    }
+                }
+                break;
+            }
+            // Ctrl-C goes to the whole process group, so the child dies with a
+            // non-success status while our own flag is set — that's a shutdown,
+            // not a crash; don't burn a retry on it.
+            if shutdown.load(Ordering::SeqCst) {
+                info!("epoch {epoch} child stopped by shutdown request");
+                return Ok(());
+            }
+            if attempt >= attempts_per_epoch {
+                return Err(format!(
+                    "epoch {epoch} failed after {attempts_per_epoch} attempt(s) (last exit: {status})"
+                ));
+            }
+            warn!("epoch {epoch} child failed (exit: {status}); retrying");
+        }
+    }
+    info!("=== all epochs {effective_start}-{end_epoch} complete ===");
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() {
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -6853,6 +7003,11 @@ async fn main() {
     let mut dest_dir_arg = None;
     let mut verify_snapshots = env_truthy_default("JETSTREAMER_VERIFY_SNAPSHOTS", true);
     let mut horizon_output: Option<PathBuf> = None;
+    // Internal flags set by the range supervisor when spawning per-epoch
+    // children: pre-fetched snapshot hashes (so the child never touches
+    // gcloud) and the overall range for the child's overall-progress line.
+    let mut epoch_hashes: Option<PathBuf> = None;
+    let mut range_info: Option<(u64, u64)> = None;
     for arg in args {
         if arg == "--verify" {
             verify_snapshots = true;
@@ -6860,6 +7015,16 @@ async fn main() {
             verify_snapshots = false;
         } else if let Some(path) = arg.strip_prefix("--horizon-output=") {
             horizon_output = Some(PathBuf::from(path));
+        } else if let Some(path) = arg.strip_prefix("--epoch-hashes=") {
+            epoch_hashes = Some(PathBuf::from(path));
+        } else if let Some(spec) = arg.strip_prefix("--range-info=") {
+            match parse_epoch_range(spec) {
+                Ok(range) => range_info = Some(range),
+                Err(err) => {
+                    eprintln!("invalid --range-info: {err}");
+                    exit(2);
+                }
+            }
         } else if arg.starts_with('-') {
             eprintln!("unknown option '{arg}'");
             eprintln!("{}", usage(&program));
@@ -6889,6 +7054,10 @@ async fn main() {
             "--horizon-output cannot be used with an epoch range ({start_epoch}-{end_epoch}); \
              each epoch is written to <dest-dir>/epoch-<N>.jet"
         );
+        exit(2);
+    }
+    if epoch_hashes.is_some() && start_epoch != end_epoch {
+        eprintln!("--epoch-hashes applies only to a single-epoch (child) invocation");
         exit(2);
     }
     let horizon_output_override = horizon_output;
@@ -6994,6 +7163,18 @@ async fn main() {
             candidate.path
         }
         None => {
+            // A per-epoch child must never reach for gcloud (the supervisor
+            // pre-downloads every boundary snapshot while the session is
+            // fresh); a missing archive here is a supervisor bug, not a
+            // download opportunity.
+            if epoch_hashes.is_some() {
+                eprintln!(
+                    "error: no boundary snapshot archive for epoch {effective_start} in {} \
+                     (child mode: expected the range supervisor to have pre-downloaded it)",
+                    dest_dir.display()
+                );
+                exit(1);
+            }
             match download_snapshot_at_or_before_slot(effective_start, target_slot, &dest_dir).await {
                 Ok(path) => {
                     println!("Downloaded snapshot to {}", path.display());
@@ -7036,27 +7217,28 @@ async fn main() {
         exit(1);
     }
 
-    // Pre-fetch every epoch's canonical snapshot hashes up front, while the
-    // gcloud/GCS session is fresh. A multi-epoch range can run for days, and
-    // listing epoch N+1's snapshots mid-run risks a stale session aborting the
-    // whole range long after the replay no longer needs the network. Empty when
-    // verification is disabled.
-    let mut snapshot_expectations: BTreeMap<u64, BTreeMap<Slot, SnapshotHash>> = BTreeMap::new();
-    if verify_snapshots {
+    // Range runs default to per-epoch process isolation: each epoch replays in
+    // its own child process so all replay memory (accounts-db growth, caches)
+    // is released at every epoch boundary — in-process chaining was observed
+    // OOM-killed at ~745 GiB RSS two epochs into a range. Isolation needs every
+    // epoch's boundary snapshot on disk, so download them all now while the
+    // gcloud/GCS session is fresh (a range runs for days; mid-run gcloud access
+    // is forbidden). `dest_path` above already covers `effective_start`.
+    let total_epochs = end_epoch - effective_start + 1;
+    let epoch_isolation =
+        total_epochs > 1 && env_truthy_default("JETSTREAMER_EPOCH_ISOLATION", true);
+    let mut boundary_snapshots: BTreeMap<u64, PathBuf> = BTreeMap::new();
+    if epoch_isolation {
+        boundary_snapshots.insert(effective_start, dest_path.clone());
         info!(
-            "=== prefetching all snapshot metadata for epochs {effective_start}-{end_epoch} up \
-             front; this is the last gcloud/GCS access — the replay below uses only old-faithful \
-             and local files ==="
+            "=== per-epoch process isolation enabled; pre-downloading boundary snapshots for \
+             epochs {}-{end_epoch} (gcloud/GCS) ===",
+            effective_start + 1
         );
-        for epoch in effective_start..=end_epoch {
-            info!("collecting canonical snapshot hashes for epoch {epoch}");
-            match snapshot_expectations_for_epoch(epoch).await {
-                Ok(expected) => {
-                    info!(
-                        "snapshot verification: {} snapshot(s) prefetched for epoch {epoch}",
-                        expected.len()
-                    );
-                    snapshot_expectations.insert(epoch, expected);
+        for epoch in effective_start + 1..=end_epoch {
+            match ensure_epoch_boundary_snapshot(epoch, &dest_dir).await {
+                Ok(path) => {
+                    boundary_snapshots.insert(epoch, path);
                 }
                 Err(err) => {
                     eprintln!("error: {err}");
@@ -7064,18 +7246,111 @@ async fn main() {
                 }
             }
         }
-        info!("=== gcloud/GCS prefetch complete; no further gcloud access for the rest of the run ===");
     }
 
-    // Replay each epoch in the range. The first epoch loads the snapshot; each
-    // subsequent epoch reuses the in-memory bank handed back by the previous
-    // one (carried_bank_forks), so there is no snapshot reload and no warmup
-    // between epochs. Verification hashes were prefetched above; the `.jet`
-    // output path is resolved per epoch.
-    let total_epochs = end_epoch - effective_start + 1;
-    // Shared cross-epoch progress so the per-epoch progress thread can also
-    // report overall span % + ETA. Only meaningful for a multi-epoch run.
-    let range_progress = if total_epochs > 1 {
+    // Pre-fetch every epoch's canonical snapshot hashes up front, while the
+    // gcloud/GCS session is fresh. A multi-epoch range can run for days, and
+    // listing epoch N+1's snapshots mid-run risks a stale session aborting the
+    // whole range long after the replay no longer needs the network. Empty when
+    // verification is disabled.
+    let mut snapshot_expectations: BTreeMap<u64, BTreeMap<Slot, SnapshotHash>> = BTreeMap::new();
+    if verify_snapshots {
+        if let Some(hashes_path) = &epoch_hashes {
+            // Per-epoch child: the supervisor prefetched this epoch's hashes to
+            // a file, so the child stays gcloud-free.
+            match read_epoch_hashes_file(hashes_path) {
+                Ok(expected) => {
+                    info!(
+                        "snapshot verification: {} snapshot hash(es) loaded from {}",
+                        expected.len(),
+                        hashes_path.display()
+                    );
+                    snapshot_expectations.insert(effective_start, expected);
+                }
+                Err(err) => {
+                    eprintln!("error: {err}");
+                    exit(1);
+                }
+            }
+        } else {
+            info!(
+                "=== prefetching all snapshot metadata for epochs {effective_start}-{end_epoch} up \
+                 front; this is the last gcloud/GCS access — the replay below uses only old-faithful \
+                 and local files ==="
+            );
+            for epoch in effective_start..=end_epoch {
+                info!("collecting canonical snapshot hashes for epoch {epoch}");
+                match snapshot_expectations_for_epoch(epoch).await {
+                    Ok(expected) => {
+                        info!(
+                            "snapshot verification: {} snapshot(s) prefetched for epoch {epoch}",
+                            expected.len()
+                        );
+                        snapshot_expectations.insert(epoch, expected);
+                    }
+                    Err(err) => {
+                        eprintln!("error: {err}");
+                        exit(1);
+                    }
+                }
+            }
+            info!("=== gcloud/GCS prefetch complete; no further gcloud access for the rest of the run ===");
+        }
+    }
+
+    // Per-epoch process isolation: hand the prefetched hashes to disk (one file
+    // per epoch, read back by each child) and supervise one child process per
+    // epoch. Everything a child needs is now local; no child ever touches
+    // gcloud/GCS.
+    if epoch_isolation {
+        for (epoch, expected) in &snapshot_expectations {
+            let path = dest_dir.join(format!("epoch-hashes-{epoch}.txt"));
+            let mut contents = String::new();
+            for (slot, hash) in expected {
+                contents.push_str(&format!("snapshot-{slot}-{}.tar.zst\n", hash.0));
+            }
+            if let Err(err) = fs::write(&path, contents) {
+                eprintln!("error: failed to write {}: {err}", path.display());
+                exit(1);
+            }
+        }
+        if let Err(err) = run_epoch_range_supervisor(
+            effective_start,
+            end_epoch,
+            &dest_dir,
+            verify_snapshots,
+            shutdown.clone(),
+            boundary_snapshots,
+        )
+        .await
+        {
+            eprintln!("error: {err}");
+            exit(1);
+        }
+        return;
+    }
+
+    // Single-process fallback (JETSTREAMER_EPOCH_ISOLATION=0), or a per-epoch
+    // child of the supervisor. A chained range replays each epoch in turn: the
+    // first epoch loads the snapshot; each subsequent epoch reuses the
+    // in-memory bank handed back by the previous one (carried_bank_forks), so
+    // there is no snapshot reload and no warmup between epochs. Verification
+    // hashes were prefetched above; the `.jet` output path is resolved per
+    // epoch.
+    //
+    // Cross-epoch progress so the per-epoch progress thread can also report
+    // overall span % + ETA. A supervisor child learns the overall range via
+    // --range-info (its own range is a single epoch); a chained range builds it
+    // from its own bounds.
+    let range_progress = if let Some((first, last)) = range_info {
+        Some(Arc::new(RangeProgress {
+            overall_start_slot: epoch_to_slot_range(first).0,
+            overall_end_slot: epoch_to_slot_range(last).1,
+            first_epoch: first,
+            total_epochs: last - first + 1,
+            baseline: Mutex::new(None),
+        }))
+    } else if total_epochs > 1 {
         Some(Arc::new(RangeProgress {
             overall_start_slot: epoch_to_slot_range(effective_start).0,
             overall_end_slot: epoch_to_slot_range(end_epoch).1,

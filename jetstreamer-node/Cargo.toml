@@ -11,6 +11,13 @@ keywords.workspace = true
 [dependencies]
 agave-snapshots.workspace = true
 cid.workspace = true
+# Global allocator (same choice as agave-validator): glibc malloc never returns
+# the accounts-db churn to the OS (anon RSS grew ~520 GiB per replayed epoch →
+# OOM); jemalloc's decay does. unprefixed_malloc routes rocksdb's C mallocs
+# through jemalloc too. Not compiled on msvc (see main.rs cfg).
+tikv-jemallocator = { version = "0.6", features = [
+    "unprefixed_malloc_on_supported_platforms",
+] }
 crossbeam-channel.workspace = true
 ctrlc.workspace = true
 dashmap.workspace = true

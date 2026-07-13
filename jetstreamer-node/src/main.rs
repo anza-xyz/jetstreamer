@@ -11,6 +11,15 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+// Same allocator choice as agave-validator, for the same reason: replay churns
+// through short-lived allocations on many threads, and glibc malloc retains
+// freed memory in per-thread arenas indefinitely — anon RSS grew ~520 GiB per
+// replayed epoch and OOM'd the box. jemalloc's decay returns freed pages to
+// the OS.
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 use agave_snapshots::{
     ArchiveFormat, ArchiveFormatDecompressor,
     snapshot_archive_info::{FullSnapshotArchiveInfo, SnapshotArchiveInfoGetter},
@@ -219,6 +228,20 @@ fn phases_summary() -> Option<String> {
         pct(exec_ms),
         pct(post_ms)
     ))
+}
+
+/// This process's anonymous resident memory from `/proc/self/status`
+/// (Linux-only; `None` elsewhere). Anon RSS is the number that OOM-kills us:
+/// appendvecs are file-backed and reclaimable, the heap is not.
+fn process_anon_rss_bytes() -> Option<u64> {
+    let status = fs::read_to_string("/proc/self/status").ok()?;
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("RssAnon:") {
+            let kb: u64 = rest.trim().trim_end_matches("kB").trim().parse().ok()?;
+            return Some(kb * 1024);
+        }
+    }
+    None
 }
 
 struct SnapshotVerifier {
@@ -6416,8 +6439,11 @@ async fn run_geyser_replay(
                     let horizon_size = jetstreamer_firehose::system::format_byte_size(
                         horizon::archive_bytes_written(),
                     );
+                    let anon_rss = process_anon_rss_bytes()
+                        .map(jetstreamer_firehose::system::format_byte_size)
+                        .unwrap_or_else(|| "n/a".to_string());
                     info!(
-                        "progress slot {display_slot}/{end_inclusive} ({percent:.2}%) txs={tx_count} accounts={account_updates} slots_per_sec={slots_per_sec} eta={eta} horizon={horizon_size}"
+                        "progress slot {display_slot}/{end_inclusive} ({percent:.2}%) txs={tx_count} accounts={account_updates} slots_per_sec={slots_per_sec} eta={eta} horizon={horizon_size} mem={anon_rss}"
                     );
                     // Overall span progress + ETA across the whole multi-epoch
                     // run, on its own line. The rate baseline is captured once

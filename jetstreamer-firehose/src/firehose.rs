@@ -132,8 +132,7 @@ async fn find_previous_indexed_slot(
     Ok(None)
 }
 
-/// Errors that can occur while streaming the firehose. Errors that can occur while streaming
-/// the firehose.
+/// Errors that can occur while streaming the firehose.
 #[derive(Debug, Error)]
 pub enum FirehoseError {
     /// HTTP client error surfaced from `reqwest`.

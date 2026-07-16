@@ -174,6 +174,26 @@ async fn main() {
         }
     }
 
+    // First CTRL+C aborts the epoch loop (the embedded ClickHouse still gets
+    // its graceful stop below); a second force-exits.
+    let shutdown = Arc::new(tokio::sync::Notify::new());
+    {
+        let shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            let mut first = true;
+            while tokio::signal::ctrl_c().await.is_ok() {
+                if first {
+                    first = false;
+                    eprintln!("CTRL+C received, shutting down... (press again to force-exit)");
+                    shutdown.notify_one();
+                } else {
+                    eprintln!("CTRL+C received again, force-exiting");
+                    std::process::exit(130);
+                }
+            }
+        });
+    }
+
     let (start_epoch, end_epoch) = parse_range(&range);
     let src = if location.starts_with("http://") || location.starts_with("https://") {
         JetSource::http(&location).unwrap_or_else(|err| {
@@ -234,9 +254,17 @@ async fn main() {
             bench_counters.update_bytes.load(Ordering::Relaxed),
         );
         let start = Instant::now();
-        if let Err(err) = runner.run(src.clone(), epoch, lo..hi + 1).await {
-            failure = Some(format!("epoch {epoch}: {err}"));
-            break;
+        tokio::select! {
+            res = runner.run(src.clone(), epoch, lo..hi + 1) => {
+                if let Err(err) = res {
+                    failure = Some(format!("epoch {epoch}: {err}"));
+                    break;
+                }
+            }
+            _ = shutdown.notified() => {
+                failure = Some(format!("interrupted by CTRL+C during epoch {epoch}"));
+                break;
+            }
         }
         if bench {
             let elapsed = start.elapsed().as_secs_f64();

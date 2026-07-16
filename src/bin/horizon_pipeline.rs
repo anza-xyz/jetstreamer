@@ -9,16 +9,19 @@
 //! ```
 //!
 //! `<jet-dir-or-base-url>` is a local directory of `epoch-<N>.jet` files, or
-//! an `http(s)://` base URL serving them. `--bench` skips plugins and
-//! ClickHouse entirely and just measures decode throughput.
+//! an `http(s)://` base URL serving them. `--bench` swaps the real plugins for
+//! a counting-only plugin — the full framework path (dispatch, workers, flush
+//! cycle, ClickHouse spawned and connected as usual) with no data written —
+//! and reports decode+dispatch throughput.
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use jetstreamer_firehose::epochs::epoch_to_slot_range;
-use jetstreamer_firehose::firehose_horizon::{JetSource, firehose_horizon};
-use jetstreamer_horizon::archive::{BlockNotification, EntryRecord, SlotVisitor};
+use jetstreamer_firehose::firehose_horizon::JetSource;
+use jetstreamer_horizon::archive::{BlockNotification, EntryRecord};
 use jetstreamer_horizon::transactions::Transaction;
-use jetstreamer_plugin::horizon::HorizonPluginRunner;
+use jetstreamer_plugin::horizon::{HorizonPlugin, HorizonPluginRunner, Output, PluginWorker};
 use jetstreamer_plugin::plugins::account_writes::AccountWritesPlugin;
 use jetstreamer_plugin::plugins::pubkey_stats_horizon::PubkeyStatsHorizonPlugin;
 
@@ -39,11 +42,24 @@ fn usage() -> ! {
     std::process::exit(2);
 }
 
-/// `--bench` visitor: touches every decoded record (including each account
-/// update's bytes) and counts, so the measured rate is the full zero-copy
-/// decode + access path with no sink attached.
+/// Epoch-scoped totals the bench workers drain into at each flush.
 #[derive(Default)]
-struct BenchVisitor {
+struct BenchCounters {
+    slots: AtomicU64,
+    blocks: AtomicU64,
+    txs: AtomicU64,
+    tx_updates: AtomicU64,
+    orphan_updates: AtomicU64,
+    update_bytes: AtomicU64,
+}
+
+/// `--bench` worker: counts locally on the hot path (no shared-state
+/// contention) and drains into the shared totals on the framework's normal
+/// flush cadence. Touches every account update's bytes so the measured rate
+/// is the full decode + dispatch path; writes nothing.
+#[derive(Default)]
+struct BenchWorker {
+    counters: Arc<BenchCounters>,
     slots: u64,
     blocks: u64,
     txs: u64,
@@ -52,7 +68,7 @@ struct BenchVisitor {
     update_bytes: u64,
 }
 
-impl SlotVisitor for BenchVisitor {
+impl PluginWorker for BenchWorker {
     fn on_transaction(&mut self, _slot: u64, _tx_index: u32, tx: &Transaction) {
         self.txs += 1;
         for (_meta, data) in tx.iter_account_updates() {
@@ -71,6 +87,40 @@ impl SlotVisitor for BenchVisitor {
             }
         }
     }
+
+    fn flush(&mut self, _out: &Output) {
+        let c = &self.counters;
+        c.slots.fetch_add(std::mem::take(&mut self.slots), Ordering::Relaxed);
+        c.blocks
+            .fetch_add(std::mem::take(&mut self.blocks), Ordering::Relaxed);
+        c.txs.fetch_add(std::mem::take(&mut self.txs), Ordering::Relaxed);
+        c.tx_updates
+            .fetch_add(std::mem::take(&mut self.tx_updates), Ordering::Relaxed);
+        c.orphan_updates
+            .fetch_add(std::mem::take(&mut self.orphan_updates), Ordering::Relaxed);
+        c.update_bytes
+            .fetch_add(std::mem::take(&mut self.update_bytes), Ordering::Relaxed);
+    }
+}
+
+/// The counting-only plugin `--bench` swaps in for the real ones. Runs through
+/// the standard `HorizonPluginRunner` (ClickHouse connected as usual) but
+/// creates no tables and submits no inserts.
+struct BenchPlugin {
+    counters: Arc<BenchCounters>,
+}
+
+impl HorizonPlugin for BenchPlugin {
+    fn name(&self) -> &'static str {
+        "TPS Bench"
+    }
+
+    fn spawn_worker(&self, _thread_id: usize) -> Box<dyn PluginWorker> {
+        Box::new(BenchWorker {
+            counters: self.counters.clone(),
+            ..Default::default()
+        })
+    }
 }
 
 /// Thousands separators for benchmark readability.
@@ -84,55 +134,6 @@ fn commas(n: u64) -> String {
         out.push(c);
     }
     out
-}
-
-/// Reads epochs with a counting visitor only — no plugins, no ClickHouse —
-/// and reports decode throughput.
-async fn run_bench(src: JetSource, start_epoch: u64, end_epoch: u64, threads: usize) {
-    for epoch in start_epoch..=end_epoch {
-        let (lo, hi) = epoch_to_slot_range(epoch);
-        log::info!("bench: epoch {epoch} (slots {lo}..={hi}) with {threads} threads");
-        let start = Instant::now();
-        let visitors = match firehose_horizon(threads, src.clone(), epoch, lo..hi + 1, |_| {
-            BenchVisitor::default()
-        })
-        .await
-        {
-            Ok(v) => v,
-            Err(err) => {
-                eprintln!("error: epoch {epoch}: {err}");
-                std::process::exit(1);
-            }
-        };
-        let elapsed = start.elapsed().as_secs_f64();
-        let mut total = BenchVisitor::default();
-        for v in visitors {
-            total.slots += v.slots;
-            total.blocks += v.blocks;
-            total.txs += v.txs;
-            total.tx_updates += v.tx_updates;
-            total.orphan_updates += v.orphan_updates;
-            total.update_bytes += v.update_bytes;
-        }
-        let rate = |n: u64| commas((n as f64 / elapsed) as u64);
-        log::info!(
-            "bench: epoch {epoch} done in {elapsed:.1}s — slots={} blocks={} txs={} \
-             tx_updates={} orphan_updates={} update_bytes={}",
-            commas(total.slots),
-            commas(total.blocks),
-            commas(total.txs),
-            commas(total.tx_updates),
-            commas(total.orphan_updates),
-            commas(total.update_bytes),
-        );
-        log::info!(
-            "bench: epoch {epoch} rates — slots/s={} txs/s={} updates/s={} update_MB/s={:.1}",
-            rate(total.slots),
-            rate(total.txs),
-            rate(total.tx_updates + total.orphan_updates),
-            (total.update_bytes as f64 / elapsed) / 1_000_000.0,
-        );
-    }
 }
 
 fn parse_range(s: &str) -> (u64, u64) {
@@ -183,13 +184,10 @@ async fn main() {
         JetSource::local(&location)
     };
 
-    if bench {
-        run_bench(src, start_epoch, end_epoch, threads).await;
-        return;
-    }
-
     // Local DSN → spawn the embedded ClickHouse helper (binary unpacked into
     // bin/, same as the main jetstreamer runner) and wait until it's ready.
+    // Bench mode keeps this: the point is the full framework path with the
+    // connection present, just no data written to it.
     let spawn_clickhouse = should_spawn_for_dsn(&dsn);
     let mut clickhouse_task = None;
     if spawn_clickhouse {
@@ -213,18 +211,62 @@ async fn main() {
     }
 
     let mut runner = HorizonPluginRunner::new(dsn, threads);
-    runner.add_plugin(Arc::new(PubkeyStatsHorizonPlugin::new()));
-    runner.add_plugin(Arc::new(AccountWritesPlugin::new()));
+    let bench_counters = Arc::new(BenchCounters::default());
+    if bench {
+        runner.add_plugin(Arc::new(BenchPlugin {
+            counters: bench_counters.clone(),
+        }));
+    } else {
+        runner.add_plugin(Arc::new(PubkeyStatsHorizonPlugin::new()));
+        runner.add_plugin(Arc::new(AccountWritesPlugin::new()));
+    }
 
     let mut failure = None;
     for epoch in start_epoch..=end_epoch {
         let (lo, hi) = epoch_to_slot_range(epoch);
         log::info!("horizon pipeline: epoch {epoch} (slots {lo}..={hi}) with {threads} threads");
+        let before = (
+            bench_counters.slots.load(Ordering::Relaxed),
+            bench_counters.blocks.load(Ordering::Relaxed),
+            bench_counters.txs.load(Ordering::Relaxed),
+            bench_counters.tx_updates.load(Ordering::Relaxed),
+            bench_counters.orphan_updates.load(Ordering::Relaxed),
+            bench_counters.update_bytes.load(Ordering::Relaxed),
+        );
+        let start = Instant::now();
         if let Err(err) = runner.run(src.clone(), epoch, lo..hi + 1).await {
             failure = Some(format!("epoch {epoch}: {err}"));
             break;
         }
-        log::info!("horizon pipeline: epoch {epoch} complete");
+        if bench {
+            let elapsed = start.elapsed().as_secs_f64();
+            let slots = bench_counters.slots.load(Ordering::Relaxed) - before.0;
+            let blocks = bench_counters.blocks.load(Ordering::Relaxed) - before.1;
+            let txs = bench_counters.txs.load(Ordering::Relaxed) - before.2;
+            let tx_updates = bench_counters.tx_updates.load(Ordering::Relaxed) - before.3;
+            let orphan_updates = bench_counters.orphan_updates.load(Ordering::Relaxed) - before.4;
+            let update_bytes = bench_counters.update_bytes.load(Ordering::Relaxed) - before.5;
+            let rate = |n: u64| commas((n as f64 / elapsed) as u64);
+            log::info!(
+                "bench: epoch {epoch} done in {elapsed:.1}s — slots={} blocks={} txs={} \
+                 tx_updates={} orphan_updates={} update_bytes={}",
+                commas(slots),
+                commas(blocks),
+                commas(txs),
+                commas(tx_updates),
+                commas(orphan_updates),
+                commas(update_bytes),
+            );
+            log::info!(
+                "bench: epoch {epoch} rates — slots/s={} TPS={} updates/s={} update_MB/s={:.1}",
+                rate(slots),
+                rate(txs),
+                rate(tx_updates + orphan_updates),
+                (update_bytes as f64 / elapsed) / 1_000_000.0,
+            );
+        } else {
+            log::info!("horizon pipeline: epoch {epoch} complete");
+        }
     }
 
     // Stop the embedded server before exiting either way, so data is flushed

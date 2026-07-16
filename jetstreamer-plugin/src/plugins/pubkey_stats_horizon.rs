@@ -150,22 +150,8 @@ impl HorizonPlugin for PubkeyStatsHorizonPlugin {
         .boxed()
     }
 
-    fn on_finish(&self, db: Arc<Client>, _epoch: u64) -> PluginFuture<'_> {
-        async move {
-            db.query(
-                r#"
-                INSERT INTO pubkey_mentions
-                SELECT pm.slot, ss.block_time, pm.pubkey, pm.num_mentions
-                FROM pubkey_mentions AS pm
-                ANY INNER JOIN jetstreamer_slot_status AS ss USING (slot)
-                WHERE pm.timestamp = toDateTime(0)
-                  AND ss.block_time > toDateTime(0)
-                "#,
-            )
-            .execute()
-            .await?;
-            Ok(())
-        }
-        .boxed()
-    }
+    // No `on_finish` backfill: unlike the Old-Faithful port source, rows are
+    // stamped with the real `block_time` when the block notification finalizes
+    // the slot, so there are no timestamp=0 rows to repair (and no
+    // `jetstreamer_slot_status` table exists in the horizon pipeline).
 }

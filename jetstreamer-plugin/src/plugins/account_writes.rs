@@ -141,22 +141,6 @@ impl HorizonPlugin for AccountWritesPlugin {
         .boxed()
     }
 
-    fn on_finish(&self, db: Arc<Client>, _epoch: u64) -> PluginFuture<'_> {
-        async move {
-            db.query(
-                r#"
-                INSERT INTO account_write_stats
-                SELECT aw.slot, ss.block_time, aw.writes, aw.distinct_accounts, aw.data_bytes
-                FROM account_write_stats AS aw
-                ANY INNER JOIN jetstreamer_slot_status AS ss USING (slot)
-                WHERE aw.timestamp = toDateTime(0)
-                  AND ss.block_time > toDateTime(0)
-                "#,
-            )
-            .execute()
-            .await?;
-            Ok(())
-        }
-        .boxed()
-    }
+    // No `on_finish` backfill: rows carry the real `block_time` from the block
+    // notification at creation, so there are no timestamp=0 rows to repair.
 }

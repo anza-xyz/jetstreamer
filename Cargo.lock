@@ -4282,6 +4282,7 @@ version = "0.6.0"
 dependencies = [
  "clickhouse",
  "jetstreamer-firehose",
+ "jetstreamer-horizon",
  "jetstreamer-plugin",
  "jetstreamer-utils",
  "log",

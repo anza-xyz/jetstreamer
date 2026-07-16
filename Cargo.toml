@@ -135,6 +135,7 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 solana-logger.workspace = true
 log.workspace = true
 jetstreamer-firehose.workspace = true
+jetstreamer-horizon.workspace = true
 jetstreamer-plugin.workspace = true
 jetstreamer-utils.workspace = true
 url.workspace = true

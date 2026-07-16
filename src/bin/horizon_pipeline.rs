@@ -20,6 +20,13 @@ use jetstreamer_plugin::plugins::pubkey_stats_horizon::PubkeyStatsHorizonPlugin;
 
 const DEFAULT_DSN: &str = "http://localhost:8123";
 
+/// Same policy as the main runner: the embedded ClickHouse helper is spawned
+/// only when the DSN points at this machine.
+fn should_spawn_for_dsn(dsn: &str) -> bool {
+    let lower = dsn.to_ascii_lowercase();
+    lower.contains("localhost") || lower.contains("127.0.0.1")
+}
+
 fn usage() -> ! {
     eprintln!(
         "usage: horizon-pipeline <epoch|start:end> <jet-dir-or-base-url> \
@@ -49,7 +56,8 @@ async fn main() {
     let mut threads = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(8);
-    let mut dsn = DEFAULT_DSN.to_string();
+    let mut dsn = std::env::var("JETSTREAMER_CLICKHOUSE_DSN")
+        .unwrap_or_else(|_| DEFAULT_DSN.to_string());
     while let Some(flag) = args.next() {
         match flag.as_str() {
             "--threads" => {
@@ -73,17 +81,55 @@ async fn main() {
         JetSource::local(&location)
     };
 
+    // Local DSN → spawn the embedded ClickHouse helper (binary unpacked into
+    // bin/, same as the main jetstreamer runner) and wait until it's ready.
+    let spawn_clickhouse = should_spawn_for_dsn(&dsn);
+    let mut clickhouse_task = None;
+    if spawn_clickhouse {
+        let (mut ready_rx, clickhouse_future) =
+            jetstreamer_utils::start().await.unwrap_or_else(|err| {
+                eprintln!("error: failed to start embedded clickhouse: {err}");
+                std::process::exit(1);
+            });
+        if ready_rx.recv().await.is_none() {
+            eprintln!("error: clickhouse readiness channel closed unexpectedly");
+            std::process::exit(1);
+        }
+        clickhouse_task = Some(tokio::spawn(async move {
+            match clickhouse_future.await {
+                Ok(()) => log::info!("ClickHouse process exited gracefully."),
+                Err(()) => log::error!("ClickHouse process exited with an error."),
+            }
+        }));
+    } else {
+        log::info!("using external ClickHouse at {dsn} (no embedded spawn)");
+    }
+
     let mut runner = HorizonPluginRunner::new(dsn, threads);
     runner.add_plugin(Arc::new(PubkeyStatsHorizonPlugin::new()));
     runner.add_plugin(Arc::new(AccountWritesPlugin::new()));
 
+    let mut failure = None;
     for epoch in start_epoch..=end_epoch {
         let (lo, hi) = epoch_to_slot_range(epoch);
         log::info!("horizon pipeline: epoch {epoch} (slots {lo}..={hi}) with {threads} threads");
         if let Err(err) = runner.run(src.clone(), epoch, lo..hi + 1).await {
-            eprintln!("error: epoch {epoch}: {err}");
-            std::process::exit(1);
+            failure = Some(format!("epoch {epoch}: {err}"));
+            break;
         }
         log::info!("horizon pipeline: epoch {epoch} complete");
+    }
+
+    // Stop the embedded server before exiting either way, so data is flushed
+    // and the port is released.
+    if spawn_clickhouse {
+        jetstreamer_utils::stop().await;
+        if let Some(task) = clickhouse_task {
+            let _ = task.await;
+        }
+    }
+    if let Some(err) = failure {
+        eprintln!("error: {err}");
+        std::process::exit(1);
     }
 }

@@ -105,6 +105,8 @@
 //! }
 //! ```
 
+/// Global runtime metrics shared with frontends such as the CLI `--tui` mode.
+pub mod metrics;
 /// Built-in plugin implementations that ship with Jetstreamer.
 pub mod plugins;
 
@@ -255,6 +257,7 @@ pub struct PluginRunner {
     reverse: bool,
     buffer_window_bytes: Option<u64>,
     db_update_interval_slots: u64,
+    tui: bool,
 }
 
 impl PluginRunner {
@@ -279,7 +282,14 @@ impl PluginRunner {
             reverse,
             buffer_window_bytes,
             db_update_interval_slots: 100,
+            tui: false,
         }
+    }
+
+    /// Enables TUI support: stats pulses are always tracked (even without ClickHouse) so the
+    /// frontend has data to render.
+    pub fn set_tui(&mut self, tui: bool) {
+        self.tui = tui;
     }
 
     /// Registers an additional plugin.
@@ -352,6 +362,7 @@ impl PluginRunner {
                 let shutting_down = shutting_down.clone();
                 async move {
                     let log_target = format!("{}::T{:03}", LOG_MODULE, thread_id);
+                    metrics::note_thread_activity(thread_id);
                     if shutting_down.load(Ordering::SeqCst) {
                         log::debug!(
                             target: &log_target,
@@ -475,6 +486,7 @@ impl PluginRunner {
                 let shutting_down = shutting_down.clone();
                 async move {
                     let log_target = format!("{}::T{:03}", LOG_MODULE, thread_id);
+                    metrics::note_thread_activity(thread_id);
                     record_slot_vote_tally(transaction.slot, transaction.is_vote);
                     if plugin_handles.is_empty() {
                         return Ok(());
@@ -638,7 +650,10 @@ impl PluginRunner {
         LAST_TOTAL_SLOTS.store(0, Ordering::Relaxed);
         LAST_TOTAL_TXS.store(0, Ordering::Relaxed);
         LAST_TOTAL_TIME_NS.store(monotonic_nanos_since(run_origin), Ordering::Relaxed);
-        let stats_tracking = clickhouse.clone().map(|_db| {
+        metrics::init(if self.sequential { 1 } else { self.num_threads });
+        // Stats pulses drive both the log lines and the TUI, so track them whenever either
+        // consumer is active.
+        let stats_tracking = (clickhouse.is_some() || self.tui).then(|| {
             let shutting_down = shutting_down.clone();
             let thread_progress_max: Arc<DashMap<usize, f64, ahash::RandomState>> = Arc::new(DashMap::with_hasher(ahash::RandomState::new()));
             StatsTracking {
@@ -748,6 +763,18 @@ impl PluginRunner {
                                     overall_eta = Some("0s".into());
                                 }
                             }
+                            metrics::record_pulse(metrics::PulseSnapshot {
+                                progress_pct: overall_progress,
+                                eta: overall_eta.clone(),
+                                tps,
+                                slots_processed: processed_slots,
+                                blocks_processed: stats.blocks_processed,
+                                transactions_processed: stats.transactions_processed,
+                                entries_processed: stats.entries_processed,
+                                rewards_processed: stats.rewards_processed,
+                                total_slots: total_slot_count,
+                                elapsed_secs: elapsed_since_start as f64 / 1e9,
+                            });
                             let slots_display = human_readable_count(processed_slots);
                             let blocks_display = human_readable_count(stats.blocks_processed);
                             let txs_display = human_readable_count(stats.transactions_processed);

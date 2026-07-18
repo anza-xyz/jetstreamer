@@ -1,0 +1,83 @@
+//! Global runtime metrics shared with frontends such as the CLI `--tui` mode.
+//!
+//! The plugin runner stamps per-thread activity as data flows through its handlers and
+//! records a structured snapshot of every stats pulse; a frontend polls these from its render
+//! loop instead of scraping log lines.
+
+use dashmap::DashMap;
+use once_cell::sync::Lazy;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Instant;
+
+static ORIGIN: Lazy<Instant> = Lazy::new(Instant::now);
+static THREAD_COUNT: AtomicUsize = AtomicUsize::new(0);
+static THREAD_LAST_ACTIVITY_MS: Lazy<DashMap<usize, u64, ahash::RandomState>> =
+    Lazy::new(|| DashMap::with_hasher(ahash::RandomState::new()));
+static LATEST_PULSE: Mutex<Option<PulseSnapshot>> = Mutex::new(None);
+
+/// Structured copy of the numbers a stats pulse logs, for frontends to render.
+#[derive(Clone, Debug, Default)]
+pub struct PulseSnapshot {
+    /// Overall progress in percent, clamped to `[0, 100]`.
+    pub progress_pct: f64,
+    /// Human-readable ETA, if computable.
+    pub eta: Option<String>,
+    /// Transactions per second measured between the last two pulses.
+    pub tps: f64,
+    /// Aggregate slots processed, capped to the run's total.
+    pub slots_processed: u64,
+    /// Aggregate blocks processed.
+    pub blocks_processed: u64,
+    /// Aggregate transactions processed.
+    pub transactions_processed: u64,
+    /// Aggregate entries processed.
+    pub entries_processed: u64,
+    /// Aggregate rewards processed.
+    pub rewards_processed: u64,
+    /// Total number of slots in the run's range.
+    pub total_slots: u64,
+    /// Seconds elapsed since the run started.
+    pub elapsed_secs: f64,
+}
+
+/// Milliseconds since metrics tracking began (a process-wide monotonic clock).
+pub fn now_ms() -> u64 {
+    ORIGIN.elapsed().as_millis() as u64
+}
+
+/// Prepares metrics for a new run with `thread_count` firehose threads.
+pub fn init(thread_count: usize) {
+    Lazy::force(&ORIGIN);
+    THREAD_COUNT.store(thread_count, Ordering::Relaxed);
+    THREAD_LAST_ACTIVITY_MS.clear();
+    *LATEST_PULSE.lock().unwrap() = None;
+}
+
+/// Number of firehose threads in the current run.
+pub fn thread_count() -> usize {
+    THREAD_COUNT.load(Ordering::Relaxed)
+}
+
+/// Records that data flowed through `thread_id` just now.
+pub fn note_thread_activity(thread_id: usize) {
+    THREAD_LAST_ACTIVITY_MS.insert(thread_id, now_ms());
+}
+
+/// Milliseconds since data last flowed through `thread_id`, or `None` if the thread has not
+/// reported any data yet.
+pub fn thread_idle_ms(thread_id: usize) -> Option<u64> {
+    THREAD_LAST_ACTIVITY_MS
+        .get(&thread_id)
+        .map(|stamp| now_ms().saturating_sub(*stamp))
+}
+
+/// Stores the latest stats pulse.
+pub fn record_pulse(pulse: PulseSnapshot) {
+    *LATEST_PULSE.lock().unwrap() = Some(pulse);
+}
+
+/// Returns the most recent stats pulse, if any.
+pub fn latest_pulse() -> Option<PulseSnapshot> {
+    LATEST_PULSE.lock().unwrap().clone()
+}

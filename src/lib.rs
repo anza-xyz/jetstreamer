@@ -128,6 +128,9 @@ pub use jetstreamer_firehose as firehose;
 pub use jetstreamer_plugin as plugin;
 pub use jetstreamer_utils as utils;
 
+/// Interactive terminal dashboard rendered when the CLI runs with `--tui`.
+pub mod tui;
+
 use core::ops::Range;
 use jetstreamer_firehose::{epochs::slot_to_epoch, index::get_index_base_url};
 use jetstreamer_plugin::{
@@ -340,6 +343,7 @@ impl Default for JetstreamerRunner {
                 spawn_clickhouse: clickhouse_settings.spawn_helper && clickhouse_settings.enabled,
                 builtin_plugins: Vec::new(),
                 clickhouse_dsn: None,
+                tui: false,
             },
         }
     }
@@ -443,7 +447,13 @@ impl JetstreamerRunner {
 
     /// Builds the plugin runtime and streams blocks through every registered [`Plugin`].
     pub fn run(self) -> Result<(), PluginRunnerError> {
-        solana_logger::setup_with_default(&logger_filter(&self.log_level));
+        let tui_enabled = self.config.tui;
+        if tui_enabled {
+            // The TUI owns the terminal; capture logs into its ring buffer instead of stderr.
+            tui::init_logging(&self.log_level);
+        } else {
+            solana_logger::setup_with_default(&logger_filter(&self.log_level));
+        }
 
         if let Ok(index_url) = get_index_base_url() {
             log::info!("slot index base url: {}", index_url);
@@ -478,6 +488,7 @@ impl JetstreamerRunner {
             reverse,
             buffer_window_bytes,
         );
+        runner.set_tui(tui_enabled);
         for plugin in &self.config.builtin_plugins {
             runner.register(plugin.instantiate());
         }
@@ -546,7 +557,11 @@ impl JetstreamerRunner {
             }
         }
 
+        let tui_handle = tui_enabled.then(tui::start);
         let result = runtime.block_on(runner.run(slot_range.clone(), clickhouse_enabled));
+        if let Some(handle) = tui_handle {
+            handle.stop();
+        }
 
         if spawn_clickhouse {
             let handle = clickhouse_task.take();
@@ -618,6 +633,8 @@ pub struct Config {
     /// ClickHouse DSN supplied via `--clickhouse-dsn`. When set, it overrides the
     /// `JETSTREAMER_CLICKHOUSE_DSN` env var and any prior `with_clickhouse_dsn` builder call.
     pub clickhouse_dsn: Option<String>,
+    /// Whether to render the interactive terminal dashboard instead of log output.
+    pub tui: bool,
 }
 
 /// Built-in plugins that can be toggled via CLI flags.
@@ -681,6 +698,8 @@ impl BuiltinPlugin {
 /// - `--buffer-window <size>`: Overrides ripget sequential window size (for example `4GiB`).
 /// - `--clickhouse-dsn <url>`: Overrides the ClickHouse DSN (takes precedence over the
 ///   `JETSTREAMER_CLICKHOUSE_DSN` env var and any prior `with_clickhouse_dsn` builder call).
+/// - `--tui`: Renders an interactive terminal dashboard (TPS graph, per-thread activity,
+///   stats) instead of plain log output.
 ///
 /// # Examples
 ///
@@ -708,6 +727,7 @@ pub fn parse_cli_args() -> Result<CliInvocation, Box<dyn std::error::Error>> {
     let mut reverse_cli = false;
     let mut buffer_window_cli: Option<String> = None;
     let mut clickhouse_dsn_cli: Option<String> = None;
+    let mut tui_cli = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--with-plugin" => {
@@ -747,6 +767,9 @@ pub fn parse_cli_args() -> Result<CliInvocation, Box<dyn std::error::Error>> {
                     .next()
                     .ok_or_else(|| "--clickhouse-dsn requires a URL".to_string())?;
                 clickhouse_dsn_cli = Some(dsn);
+            }
+            "--tui" => {
+                tui_cli = true;
             }
             _ if first_arg.is_none() => first_arg = Some(arg),
             other => return Err(format!("unrecognized argument '{other}'").into()),
@@ -811,6 +834,7 @@ pub fn parse_cli_args() -> Result<CliInvocation, Box<dyn std::error::Error>> {
         spawn_clickhouse,
         builtin_plugins,
         clickhouse_dsn: clickhouse_dsn_cli,
+        tui: tui_cli,
     }))
 }
 

@@ -45,10 +45,10 @@ use crate::{
     utils,
 };
 
-// Timeout applied to each asynchronous firehose operation (fetching epoch stream, reading
-// header, seeking, reading next block). Adjust here to tune stall detection/restart
-// aggressiveness.
-const OP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Timeout applied to each asynchronous firehose operation (fetching epoch stream, reading
+/// header, seeking, reading next block). Adjust here to tune stall detection/restart
+/// aggressiveness. Public so frontends (e.g. the TUI) can derive staleness thresholds from it.
+pub const OP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 const OP_TIMEOUT_SEQUENTIAL: std::time::Duration = std::time::Duration::from_secs(180);
 // Backoff between restarts of a failed firehose thread. An immediate reconnect after a stall
 // tends to re-trigger the CDN throttling that caused it; repeated failures on the same slot

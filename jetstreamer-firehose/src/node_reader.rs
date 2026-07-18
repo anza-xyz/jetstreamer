@@ -18,9 +18,13 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt};
 use tokio::time::sleep;
 
 const MAX_VARINT_LEN_64: usize = 10;
-const MIN_SEEK_SPACING_MS: u64 = 100;
+const MIN_SEEK_SPACING_MS: u64 = 1500;
 static SEEK_START_INSTANT: Lazy<Instant> = Lazy::new(Instant::now);
 static LAST_SEEK_HIT_TIME: AtomicU64 = AtomicU64::new(0);
+
+/// Total CAR section bytes read across all readers and threads since process start. Frontends
+/// (e.g. the TUI) sample this to derive an overall data rate.
+pub static TOTAL_BYTES_READ: AtomicU64 = AtomicU64::new(0);
 
 /// Reads an unsigned LEB128-encoded integer from the provided async reader.
 pub async fn read_uvarint<R: AsyncRead + Unpin>(reader: &mut R) -> io::Result<u64> {
@@ -338,6 +342,7 @@ impl<R: AsyncRead + Unpin + AsyncSeek + Len> NodeReader<R> {
         // read whole item
         let mut item = vec![0u8; section_size as usize];
         self.reader.read_exact(&mut item).await?;
+        TOTAL_BYTES_READ.fetch_add(section_size, Ordering::Relaxed);
 
         // dump item bytes as numbers
         // println!("Item bytes: {:?}", item);

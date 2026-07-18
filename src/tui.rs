@@ -857,6 +857,14 @@ fn draw_stats(frame: &mut ratatui::Frame, area: Rect, sampler: &RateSampler) {
         stat("progress", format!("{:.1}%", pulse.progress_pct)),
         stat("ETA", pulse.eta.clone().unwrap_or_else(|| "n/a".into())),
         stat("TPS", human_count(pulse.tps.ceil() as u64)),
+        stat(
+            "avg TPS",
+            if pulse.elapsed_secs > 0.0 {
+                human_count((pulse.transactions_processed as f64 / pulse.elapsed_secs) as u64)
+            } else {
+                "n/a".into()
+            },
+        ),
         stat("thr TPS avg", avg_tps),
         stat("thr TPS min", min_tps),
         stat("thr TPS max", max_tps),

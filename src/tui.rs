@@ -34,11 +34,15 @@ use jetstreamer_firehose::node_reader::TOTAL_BYTES_READ;
 use jetstreamer_plugin::metrics;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
+use ratatui::layout::Margin;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::symbols;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Axis, Block, Borders, Chart, Dataset, GraphType, Paragraph};
+use ratatui::widgets::{
+    Axis, Block, Borders, Chart, Dataset, GraphType, Paragraph, Scrollbar, ScrollbarOrientation,
+    ScrollbarState,
+};
 
 const RENDER_INTERVAL: Duration = Duration::from_millis(250);
 const SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
@@ -57,7 +61,29 @@ const TIME_RANGES: [(&str, Option<u64>); 7] = [
 ];
 const DEFAULT_RANGE: usize = TIME_RANGES.len() - 1;
 
-static LOG_LINES: Mutex<VecDeque<(log::Level, String)>> = Mutex::new(VecDeque::new());
+/// Captured log lines plus a count of lines evicted from the front, so scroll anchors can be
+/// expressed as stable absolute line numbers even as the ring buffer rotates.
+struct LogBuffer {
+    lines: VecDeque<(log::Level, String)>,
+    dropped: u64,
+}
+
+impl LogBuffer {
+    /// Absolute index one past the newest line.
+    fn total(&self) -> u64 {
+        self.dropped + self.lines.len() as u64
+    }
+
+    /// Smallest valid viewport end for a viewport of `capacity` lines.
+    fn min_end(&self, capacity: usize) -> u64 {
+        self.dropped + self.lines.len().min(capacity) as u64
+    }
+}
+
+static LOG_LINES: Mutex<LogBuffer> = Mutex::new(LogBuffer {
+    lines: VecDeque::new(),
+    dropped: 0,
+});
 
 /// `log::Log` implementation that captures records into a ring buffer for the log pane
 /// instead of writing to the terminal (which raw-mode rendering would garble).
@@ -78,11 +104,12 @@ impl log::Log for RingLogger {
         if record.target().starts_with("clickhouse") && record.level() > log::Level::Warn {
             return;
         }
-        let mut lines = LOG_LINES.lock().unwrap();
-        if lines.len() >= LOG_BUFFER_CAP {
-            lines.pop_front();
+        let mut buffer = LOG_LINES.lock().unwrap();
+        if buffer.lines.len() >= LOG_BUFFER_CAP {
+            buffer.lines.pop_front();
+            buffer.dropped += 1;
         }
-        lines.push_back((
+        buffer.lines.push_back((
             record.level(),
             format!("{} {}", record.target(), record.args()),
         ));
@@ -109,7 +136,7 @@ pub fn init_logging(level: &str) {
 /// errors and the run summary visible in the terminal scrollback.
 pub fn dump_recent_logs(count: usize) {
     let buffer = LOG_LINES.lock().unwrap();
-    for (level, message) in buffer.iter().rev().take(count).rev() {
+    for (level, message) in buffer.lines.iter().rev().take(count).rev() {
         eprintln!("[{level}] {message}");
     }
 }
@@ -281,8 +308,12 @@ struct UiState {
     /// Stats box width in columns.
     stats_width: u16,
     drag: Option<DragTarget>,
-    /// Log scroll offset in lines from the bottom; `0` follows new lines.
-    log_scroll: usize,
+    /// Absolute line number of the log viewport's bottom edge while scrolled; `None` follows
+    /// new lines. Anchoring to an absolute position keeps the text frozen for reading while
+    /// new lines continue to arrive.
+    log_anchor: Option<u64>,
+    /// Clickable "back to live" button in the log pane title: `(x_start, x_end_exclusive, y)`.
+    live_button: Option<(u16, u16, u16)>,
     /// Forces a full clear + repaint on the next frame (initially, and again on resize).
     needs_clear: bool,
     // Last-frame geometry for hit-testing.
@@ -302,7 +333,8 @@ impl UiState {
             middle_pct: 38,
             stats_width: 42,
             drag: None,
-            log_scroll: 0,
+            log_anchor: None,
+            live_button: None,
             needs_clear: true,
             frame_area: Rect::default(),
             chart_rect: Rect::default(),
@@ -390,30 +422,44 @@ fn drain_input(state: &mut UiState) {
 }
 
 fn handle_key(state: &mut UiState, code: KeyCode) {
-    let log_capacity = (state.logs_rect.height as usize).saturating_sub(2).max(1);
+    let log_capacity = log_view_capacity(state);
     match code {
         KeyCode::Char(digit @ '1'..='7') => {
             state.selected_range = digit as usize - '1' as usize;
         }
-        KeyCode::PageUp => scroll_logs(state, log_capacity as isize),
-        KeyCode::PageDown => scroll_logs(state, -(log_capacity as isize)),
+        KeyCode::PageUp => scroll_logs(state, log_capacity as i64),
+        KeyCode::PageDown => scroll_logs(state, -(log_capacity as i64)),
         KeyCode::Up => scroll_logs(state, 1),
         KeyCode::Down => scroll_logs(state, -1),
         KeyCode::Home => {
-            let len = LOG_LINES.lock().unwrap().len();
-            state.log_scroll = len.saturating_sub(log_capacity);
+            let buffer = LOG_LINES.lock().unwrap();
+            state.log_anchor = Some(buffer.min_end(log_capacity));
         }
-        KeyCode::End => state.log_scroll = 0,
+        KeyCode::End => state.log_anchor = None,
         _ => {}
     }
 }
 
-fn scroll_logs(state: &mut UiState, delta: isize) {
-    let len = LOG_LINES.lock().unwrap().len();
-    let capacity = (state.logs_rect.height as usize).saturating_sub(2).max(1);
-    let max_scroll = len.saturating_sub(capacity);
-    let scrolled = state.log_scroll as isize + delta;
-    state.log_scroll = scrolled.clamp(0, max_scroll as isize) as usize;
+fn log_view_capacity(state: &UiState) -> usize {
+    (state.logs_rect.height as usize).saturating_sub(2).max(1)
+}
+
+/// Scrolls the log viewport by `delta` lines (positive = toward older lines). While scrolled,
+/// the viewport anchors to an absolute line number so arriving lines don't move the text;
+/// scrolling back to the newest line resumes following.
+fn scroll_logs(state: &mut UiState, delta: i64) {
+    let capacity = log_view_capacity(state);
+    let buffer = LOG_LINES.lock().unwrap();
+    let total = buffer.total();
+    let current_end = state.log_anchor.unwrap_or(total).min(total);
+    let new_end = current_end
+        .saturating_add_signed(-delta)
+        .clamp(buffer.min_end(capacity), total);
+    state.log_anchor = if new_end >= total {
+        None
+    } else {
+        Some(new_end)
+    };
 }
 
 fn handle_mouse(state: &mut UiState, mouse: MouseEvent) {
@@ -425,6 +471,14 @@ fn handle_mouse(state: &mut UiState, mouse: MouseEvent) {
                     return;
                 }
             }
+            if let Some((x_start, x_end, y)) = state.live_button
+                && mouse.row == y
+                && mouse.column >= x_start
+                && mouse.column < x_end
+            {
+                state.log_anchor = None;
+                return;
+            }
             state.drag = grab_divider(state, mouse.column, mouse.row);
         }
         MouseEventKind::Drag(MouseButton::Left) => {
@@ -434,10 +488,10 @@ fn handle_mouse(state: &mut UiState, mouse: MouseEvent) {
         }
         MouseEventKind::Up(MouseButton::Left) => state.drag = None,
         MouseEventKind::ScrollUp if rect_contains(state.logs_rect, mouse.column, mouse.row) => {
-            scroll_logs(state, LOG_SCROLL_STEP as isize);
+            scroll_logs(state, LOG_SCROLL_STEP as i64);
         }
         MouseEventKind::ScrollDown if rect_contains(state.logs_rect, mouse.column, mouse.row) => {
-            scroll_logs(state, -(LOG_SCROLL_STEP as isize));
+            scroll_logs(state, -(LOG_SCROLL_STEP as i64));
         }
         _ => {}
     }
@@ -518,7 +572,7 @@ fn draw(frame: &mut ratatui::Frame, sampler: &RateSampler, state: &mut UiState) 
     draw_tps_chart(frame, rows[1], sampler, state.selected_range);
     draw_thread_grid(frame, middle[0], sampler);
     draw_stats(frame, middle[1], sampler);
-    draw_logs(frame, rows[3], state.log_scroll);
+    draw_logs(frame, rows[3], state);
 }
 
 fn draw_range_selector(
@@ -694,13 +748,20 @@ fn draw_stats(frame: &mut ratatui::Frame, area: Rect, sampler: &RateSampler) {
     frame.render_widget(stats, area);
 }
 
-fn draw_logs(frame: &mut ratatui::Frame, area: Rect, log_scroll: usize) {
-    let capacity = (area.height as usize).saturating_sub(2);
-    let (lines, scrolled): (Vec<Line>, bool) = {
+fn draw_logs(frame: &mut ratatui::Frame, area: Rect, state: &mut UiState) {
+    let capacity = (area.height as usize).saturating_sub(2).max(1);
+    let paused = state.log_anchor.is_some();
+    let (lines, start_index, line_count) = {
         let buffer = LOG_LINES.lock().unwrap();
-        let end = buffer.len().saturating_sub(log_scroll);
+        let total = buffer.total();
+        let end_abs = state
+            .log_anchor
+            .map(|anchor| anchor.clamp(buffer.min_end(capacity), total))
+            .unwrap_or(total);
+        let end = (end_abs - buffer.dropped) as usize;
         let start = end.saturating_sub(capacity);
-        let lines = buffer
+        let lines: Vec<Line> = buffer
+            .lines
             .iter()
             .skip(start)
             .take(end - start)
@@ -714,15 +775,51 @@ fn draw_logs(frame: &mut ratatui::Frame, area: Rect, log_scroll: usize) {
                 Line::from(Span::styled(message.clone(), Style::default().fg(color)))
             })
             .collect();
-        (lines, log_scroll > 0)
+        (lines, start, buffer.lines.len())
     };
-    let title = if scrolled {
-        format!(" Logs — scrolled ↑{log_scroll} (End to follow) — q/Esc/Ctrl-C to stop ")
+
+    // Title with a clickable live/paused indicator; its span position doubles as the hitbox.
+    let prefix = " Logs ";
+    let button_text = if paused {
+        "[▶ back to live]"
     } else {
-        " Logs — wheel/PgUp to scroll — q/Esc/Ctrl-C to stop ".to_string()
+        "[● live]"
     };
+    let button_style = if paused {
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Green)
+    };
+    let hint = " wheel/PgUp scroll — q/Esc/Ctrl-C to stop ";
+    let button_x = area.x + 1 + prefix.chars().count() as u16;
+    state.live_button = Some((
+        button_x,
+        button_x + button_text.chars().count() as u16,
+        area.y,
+    ));
+    let title = Line::from(vec![
+        Span::raw(prefix),
+        Span::styled(button_text, button_style),
+        Span::raw(hint),
+    ]);
     let logs = Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(title));
     frame.render_widget(logs, area);
+
+    if line_count > capacity {
+        let mut scrollbar_state = ScrollbarState::new(line_count.saturating_sub(capacity))
+            .viewport_content_length(capacity)
+            .position(start_index);
+        frame.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight),
+            area.inner(Margin {
+                horizontal: 0,
+                vertical: 1,
+            }),
+            &mut scrollbar_state,
+        );
+    }
 }
 
 fn human_count(value: u64) -> String {

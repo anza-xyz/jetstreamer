@@ -31,7 +31,7 @@ use std::{
 use thiserror::Error;
 use tokio::{
     sync::broadcast::{self, error::TryRecvError},
-    time::timeout,
+    time::{sleep, timeout},
 };
 
 use crate::{
@@ -48,8 +48,13 @@ use crate::{
 // Timeout applied to each asynchronous firehose operation (fetching epoch stream, reading
 // header, seeking, reading next block). Adjust here to tune stall detection/restart
 // aggressiveness.
-const OP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const OP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const OP_TIMEOUT_SEQUENTIAL: std::time::Duration = std::time::Duration::from_secs(180);
+// Backoff between restarts of a failed firehose thread. An immediate reconnect after a stall
+// tends to re-trigger the CDN throttling that caused it; repeated failures on the same slot
+// double the wait up to the cap, and any forward progress resets it.
+const RETRY_BACKOFF_BASE: std::time::Duration = std::time::Duration::from_secs(1);
+const RETRY_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(32);
 // Epochs earlier than this were bincode-encoded in Old Faithful.
 const BINCODE_EPOCH_CUTOFF: u64 = 157;
 
@@ -86,6 +91,35 @@ fn is_shutdown_error(err: &FirehoseError) -> bool {
         | FirehoseError::RewardHandlerError(inner)
         | FirehoseError::OnStatsHandlerError(inner) => is_interrupted(inner.as_ref()),
         _ => false,
+    }
+}
+
+/// Per-thread restart pacing: consecutive failures on the same slot double the delay up to
+/// [`RETRY_BACKOFF_MAX`]; a failure on a different slot means forward progress was made and
+/// resets the sequence.
+struct RetryBackoff {
+    last_slot: Option<u64>,
+    consecutive: u32,
+}
+
+impl RetryBackoff {
+    const fn new() -> Self {
+        Self {
+            last_slot: None,
+            consecutive: 0,
+        }
+    }
+
+    fn next_delay(&mut self, slot: u64) -> std::time::Duration {
+        if self.last_slot == Some(slot) {
+            self.consecutive = self.consecutive.saturating_add(1);
+        } else {
+            self.last_slot = Some(slot);
+            self.consecutive = 0;
+        }
+        RETRY_BACKOFF_BASE
+            .saturating_mul(1u32 << self.consecutive.min(5))
+            .min(RETRY_BACKOFF_MAX)
     }
 }
 
@@ -992,6 +1026,7 @@ where
                 None
             };
 
+            let mut retry_backoff = RetryBackoff::new();
             // let mut triggered = false;
             while let Err((err, slot)) = async {
                 let mut last_emitted_slot = last_emitted_slot_global;
@@ -1855,6 +1890,30 @@ where
                 // of the stream and silently drop slots.
                 skip_until_index = None;
                 last_emitted_slot_global = last_emitted_slot;
+                let backoff = retry_backoff.next_delay(slot);
+                log::warn!(
+                    target: &log_target,
+                    "backing off {:?} before restarting",
+                    backoff
+                );
+                // Sleep in slices so the thread stays responsive to shutdown during the wait.
+                let deadline = std::time::Instant::now() + backoff;
+                let mut shutdown_requested = false;
+                while std::time::Instant::now() < deadline {
+                    if poll_shutdown(&shutdown_flag, &mut shutdown_rx) {
+                        shutdown_requested = true;
+                        break;
+                    }
+                    sleep(std::time::Duration::from_millis(250)).await;
+                }
+                if shutdown_requested {
+                    log::info!(
+                        target: &log_target,
+                        "shutdown requested; terminating firehose thread {}",
+                        thread_index
+                    );
+                    break;
+                }
             }
         });
         handles.push(handle);
@@ -2051,6 +2110,7 @@ async fn firehose_geyser_thread(
     let initial_slot_range = slot_range.clone();
     let mut skip_until_index = None;
     let mut last_counted_slot = slot_range.start.saturating_sub(1);
+    let mut retry_backoff = RetryBackoff::new();
     // let mut triggered = false;
     while let Err((err, slot)) = async {
             let epoch_range = slot_to_epoch(slot_range.start)..=slot_to_epoch(slot_range.end - 1);
@@ -2470,6 +2530,13 @@ async fn firehose_geyser_thread(
             // is reset to 0 each epoch restart. Keeping it can skip large portions
             // of the stream and silently drop slots.
             skip_until_index = None;
+            let backoff = retry_backoff.next_delay(slot);
+            log::warn!(
+                target: &log_target,
+                "backing off {:?} before restarting",
+                backoff
+            );
+            sleep(backoff).await;
 }
     Ok(())
 }

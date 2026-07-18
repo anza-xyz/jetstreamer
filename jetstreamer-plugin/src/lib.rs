@@ -307,8 +307,8 @@ impl PluginRunner {
         let clickhouse = if clickhouse_enabled {
             let client = Arc::new(
                 build_clickhouse_client(&self.clickhouse_dsn)
-                    .with_option("async_insert", "1")
-                    .with_option("wait_for_async_insert", "0"),
+                    .with_setting("async_insert", "1")
+                    .with_setting("wait_for_async_insert", "0"),
             );
             ensure_clickhouse_tables(client.as_ref()).await?;
             upsert_plugins(client.as_ref(), plugin_handles.as_ref()).await?;

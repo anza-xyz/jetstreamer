@@ -354,7 +354,7 @@ impl JetstreamerRunner {
     /// Overrides the log level used when initializing `solana_logger`.
     pub fn with_log_level(mut self, log_level: impl Into<String>) -> Self {
         self.log_level = log_level.into();
-        solana_logger::setup_with_default(&self.log_level);
+        solana_logger::setup_with_default(&logger_filter(&self.log_level));
         self
     }
 
@@ -443,7 +443,7 @@ impl JetstreamerRunner {
 
     /// Builds the plugin runtime and streams blocks through every registered [`Plugin`].
     pub fn run(self) -> Result<(), PluginRunnerError> {
-        solana_logger::setup_with_default(&self.log_level);
+        solana_logger::setup_with_default(&logger_filter(&self.log_level));
 
         if let Ok(index_url) = get_index_base_url() {
             log::info!("slot index base url: {}", index_url);
@@ -845,6 +845,16 @@ fn parse_env_bool(key: &str, default: bool) -> bool {
             }
         },
         Err(_) => default,
+    }
+}
+
+/// The `clickhouse` crate emits per-insert instrumentation at `info`, which floods the log at
+/// runner throughput; cap it at `warn` unless the caller filters the target explicitly.
+fn logger_filter(log_level: &str) -> String {
+    if log_level.contains("clickhouse") {
+        log_level.to_string()
+    } else {
+        format!("{},clickhouse=warn", log_level)
     }
 }
 

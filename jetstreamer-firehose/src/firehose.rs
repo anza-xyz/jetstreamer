@@ -242,7 +242,7 @@ async fn wait_for_green_threads(
             );
             return;
         }
-        sleep(std::time::Duration::from_millis(50)).await;
+        sleep(std::time::Duration::from_millis(15)).await;
     }
 }
 

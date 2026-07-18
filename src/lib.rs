@@ -474,11 +474,13 @@ impl JetstreamerRunner {
             && self.config.spawn_clickhouse
             && should_spawn_for_dsn(&self.clickhouse_dsn);
 
+        let worker_threads = std::cmp::max(1, threads.saturating_mul(WORKER_THREAD_MULTIPLIER));
         log::info!(
-            "processing slots [{}..{}) with {} configured threads (sequential={}, reverse={}, buffer_window_bytes={:?}, clickhouse_enabled={})",
+            "processing slots [{}..{}) with {} configured threads on {} tokio workers (sequential={}, reverse={}, buffer_window_bytes={:?}, clickhouse_enabled={})",
             slot_range.start,
             slot_range.end,
             threads,
+            worker_threads,
             sequential,
             reverse,
             buffer_window_bytes,
@@ -503,10 +505,7 @@ impl JetstreamerRunner {
 
         let runner = Arc::new(runner);
         let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(std::cmp::max(
-                1,
-                threads.saturating_mul(WORKER_THREAD_MULTIPLIER),
-            ))
+            .worker_threads(worker_threads)
             .enable_all()
             .thread_name("jetstreamer")
             .build()

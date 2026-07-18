@@ -97,13 +97,15 @@ fn is_shutdown_error(err: &FirehoseError) -> bool {
 /// Per-thread "data flowed" timestamps, stamped each time a firehose thread reads a full
 /// block. Drives the health-gated staggered launch and is available to frontends.
 pub mod thread_activity {
-    use dashmap::DashMap;
+    use dashmap::{DashMap, DashSet};
     use once_cell::sync::Lazy;
     use std::time::Instant;
 
     static ORIGIN: Lazy<Instant> = Lazy::new(Instant::now);
     static LAST_ACTIVITY_MS: Lazy<DashMap<usize, u64, ahash::RandomState>> =
         Lazy::new(|| DashMap::with_hasher(ahash::RandomState::new()));
+    static FINISHED: Lazy<DashSet<usize, ahash::RandomState>> =
+        Lazy::new(|| DashSet::with_hasher(ahash::RandomState::new()));
 
     /// Milliseconds since tracking began (a process-wide monotonic clock).
     pub fn now_ms() -> u64 {
@@ -114,6 +116,18 @@ pub mod thread_activity {
     pub fn reset() {
         Lazy::force(&ORIGIN);
         LAST_ACTIVITY_MS.clear();
+        FINISHED.clear();
+    }
+
+    /// Records that `thread_index` completed its entire slot range. A finished thread stops
+    /// reading forever — without this marker its idle clock would make it look stalled.
+    pub fn note_finished(thread_index: usize) {
+        FINISHED.insert(thread_index);
+    }
+
+    /// Whether `thread_index` completed its slot range.
+    pub fn is_finished(thread_index: usize) -> bool {
+        FINISHED.contains(&thread_index)
     }
 
     /// Records that `thread_index` just read data.
@@ -1893,6 +1907,7 @@ where
                             if !summary.is_empty() {
                                 log::debug!(target: &log_target, "threads with errors: {}", summary);
                             }
+                            thread_activity::note_finished(thread_index);
                             return Ok(());
                         }
                     }
@@ -1938,6 +1953,7 @@ where
                     }
                     log::info!(target: &log_target, "thread {} has finished its work", thread_index);
                     }
+                    thread_activity::note_finished(thread_index);
                     Ok(())
             }
             .await
@@ -2603,6 +2619,7 @@ async fn firehose_geyser_thread(
                             elapsed_pretty
                         );
                         log::info!(target: &log_target, "a 🚒 firehose thread finished completed its work.");
+                        thread_activity::note_finished(thread_index.unwrap_or(0));
                         // On completion, report threads with non-zero error counts for
                         // visibility.
                         let summary: String = error_counts

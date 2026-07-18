@@ -31,7 +31,7 @@ use crossterm::event::{
     MouseEventKind,
 };
 use crossterm::{execute, terminal};
-use jetstreamer_firehose::firehose::OP_TIMEOUT;
+use jetstreamer_firehose::firehose::{OP_TIMEOUT, thread_activity};
 use jetstreamer_firehose::node_reader::TOTAL_BYTES_READ;
 use jetstreamer_plugin::metrics;
 use ratatui::Terminal;
@@ -697,24 +697,32 @@ fn draw_thread_grid(frame: &mut ratatui::Frame, area: Rect) {
     let timeout_ms = OP_TIMEOUT.as_millis() as u64;
     let thread_count = metrics::thread_count();
     let mut active = 0usize;
+    let mut done = 0usize;
     let cols = ((area.width as usize).saturating_sub(3) / 2).max(1);
     let mut lines: Vec<Line> = Vec::new();
     let mut row: Vec<Span> = Vec::new();
     for thread_id in 0..thread_count {
-        let (symbol, color) = match metrics::thread_idle_ms(thread_id) {
-            None => ("·", Color::DarkGray),
-            Some(idle_ms) => {
-                if idle_ms < timeout_ms {
-                    active += 1;
-                }
-                if idle_ms < timeout_ms / 10 {
-                    ("●", Color::Green)
-                } else if idle_ms < timeout_ms / 2 {
-                    ("●", Color::Yellow)
-                } else if idle_ms < timeout_ms {
-                    ("●", Color::Rgb(255, 140, 0))
-                } else {
-                    ("●", Color::Red)
+        // A finished thread stops reading forever; without the explicit marker its idle
+        // clock would paint it red as if stalled.
+        let (symbol, color) = if thread_activity::is_finished(thread_id) {
+            done += 1;
+            ("✓", Color::Blue)
+        } else {
+            match metrics::thread_idle_ms(thread_id) {
+                None => ("·", Color::DarkGray),
+                Some(idle_ms) => {
+                    if idle_ms < timeout_ms {
+                        active += 1;
+                    }
+                    if idle_ms < timeout_ms / 10 {
+                        ("●", Color::Green)
+                    } else if idle_ms < timeout_ms / 2 {
+                        ("●", Color::Yellow)
+                    } else if idle_ms < timeout_ms {
+                        ("●", Color::Rgb(255, 140, 0))
+                    } else {
+                        ("●", Color::Red)
+                    }
                 }
             }
         };
@@ -727,7 +735,7 @@ fn draw_thread_grid(frame: &mut ratatui::Frame, area: Rect) {
     if !row.is_empty() {
         lines.push(Line::from(row));
     }
-    let title = format!(" Threads {active}/{thread_count} ");
+    let title = format!(" Threads {active}/{thread_count} ✓{done} ");
     let grid = Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(title));
     frame.render_widget(grid, area);
 }

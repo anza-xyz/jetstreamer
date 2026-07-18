@@ -679,11 +679,14 @@ fn draw_tps_chart(
                 .labels::<Vec<Span>>(vec![Span::raw(start_label), "now".into()]),
         )
         .y_axis(
+            // Top bound is exactly the window peak so the axis always carries a label with
+            // the current peak value.
             Axis::default()
-                .bounds([0.0, peak.max(1.0) * 1.1])
+                .bounds([0.0, peak.max(1.0)])
                 .labels::<Vec<Span>>(vec![
                     "0".into(),
-                    Span::raw(human_count((peak * 1.1) as u64)),
+                    Span::raw(human_count((peak / 2.0) as u64)),
+                    Span::raw(human_count(peak as u64)),
                 ]),
         );
     frame.render_widget(chart, area);

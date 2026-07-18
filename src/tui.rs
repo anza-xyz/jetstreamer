@@ -48,6 +48,11 @@ use ratatui::widgets::{
 };
 
 const RENDER_INTERVAL: Duration = Duration::from_millis(250);
+/// Cadence of full clear + repaint. Ratatui only rewrites cells it believes changed, so any
+/// external write to the terminal (stray child output, a scroll in a multiplexer without
+/// altscreen) leaves phantom content until a full repaint heals it. The clear and redraw
+/// happen back-to-back within one frame, so the heal is imperceptible.
+const HEAL_INTERVAL: Duration = Duration::from_secs(30);
 const SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 const LOG_BUFFER_CAP: usize = 2000;
 const LOG_SCROLL_STEP: usize = 3;
@@ -403,15 +408,17 @@ fn render_loop(stop: Arc<AtomicBool>) {
     };
     let mut sampler = RateSampler::new();
     let mut state = UiState::new();
+    let mut last_heal = Instant::now();
 
     while !stop.load(Ordering::SeqCst) {
         drain_input(&mut state);
-        if state.needs_clear {
+        if state.needs_clear || last_heal.elapsed() >= HEAL_INTERVAL {
             // Full clear + repaint: wipes whatever was on screen before startup (a
             // multiplexer without altscreen support — `screen` defaults to `altscreen off` —
-            // draws over live scrollback) and repairs stale cells after a resize.
+            // draws over live scrollback) and heals phantom cells left by external writes.
             let _ = terminal.clear();
             state.needs_clear = false;
+            last_heal = Instant::now();
         }
         sampler.maybe_sample();
         let _ = terminal.draw(|frame| draw(frame, &sampler, &mut state));
@@ -484,6 +491,8 @@ fn handle_key(state: &mut UiState, code: KeyCode) {
             state.log_anchor = Some(buffer.min_end(log_capacity));
         }
         KeyCode::End => state.log_anchor = None,
+        // Manual repaint for phantom content that can't wait for the heal interval.
+        KeyCode::Char('r') | KeyCode::Char('l') => state.needs_clear = true,
         _ => {}
     }
 }

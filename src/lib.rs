@@ -24,11 +24,15 @@
 //! # Replay all transactions in epoch 800 using eight HTTP multiplexing workers.
 //! JETSTREAMER_THREADS=8 cargo run --release -- 800
 //!
+//! # Or replay an inclusive epoch range.
+//! JETSTREAMER_THREADS=8 cargo run --release -- 900-950
+//!
 //! # Or replay an explicit slot range (slot ranges may cross epoch boundaries).
 //! JETSTREAMER_THREADS=8 cargo run --release -- 358560000:367631999
 //! ```
 //!
-//! The CLI accepts either `<start>:<end>` slot ranges or a single epoch. See
+//! The CLI accepts a single epoch (`950`), an inclusive `<start>-<end>` epoch range
+//! (`900-950`), or an inclusive `<start>:<end>` slot range. See
 //! [`JetstreamerRunner::parse_cli_args`] for the precise argument grammar.
 //!
 //! When `JETSTREAMER_CLICKHOUSE_MODE` is `auto` (the default) the runner inspects the DSN to

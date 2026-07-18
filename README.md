@@ -67,6 +67,9 @@ JETSTREAMER_NETWORK_CAPACITY_MB=10000 cargo run --release -- 800
 # and using 8 threads explicitly instead of using automatic thread count
 JETSTREAMER_THREADS=8 cargo run --release -- 358560000:367631999
 
+# Replay epochs 900 through 950 inclusive using epoch-range syntax
+cargo run --release -- 900-950
+
 # Replay epoch 800 with the instruction tracking plugin instead of the default
 cargo run --release -- 800 --with-plugin instruction-tracking
 
@@ -110,7 +113,8 @@ activity separately: `program_invocations` includes an `is_vote` flag per row, w
 `pubkey-stats` plugin aggregates per-slot account-key mention counts into a `pubkey_mentions`
 table (with a companion `pubkeys` lookup table populated via materialised view).
 
-The CLI accepts either `<start>:<end>` slot ranges or a single epoch on the command line. See
+The CLI accepts a single epoch (`950`), an inclusive `<start>-<end>` epoch range (`900-950`),
+or an inclusive `<start>:<end>` slot range on the command line. See
 [`JetstreamerRunner::parse_cli_args`](https://docs.rs/jetstreamer/latest/jetstreamer/fn.parse_cli_args.html)
 for the precise rules.
 

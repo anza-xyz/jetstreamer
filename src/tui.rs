@@ -44,6 +44,11 @@ const RENDER_INTERVAL: Duration = Duration::from_millis(250);
 const SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 const LOG_BUFFER_CAP: usize = 2000;
 const LOG_SCROLL_STEP: usize = 3;
+/// Frames between forced full repaints. Ratatui only rewrites cells it believes changed, so
+/// anything that touches the terminal behind its back — a multiplexer without altscreen
+/// support (`screen` defaults to `altscreen off`), stray child-process output, panics —
+/// leaves stale text on screen until a full clear.
+const FULL_REDRAW_EVERY: u32 = 8;
 
 /// Selectable graph windows: label plus trailing seconds (`None` = entire run).
 const TIME_RANGES: [(&str, Option<u64>); 7] = [
@@ -283,6 +288,8 @@ struct UiState {
     drag: Option<DragTarget>,
     /// Log scroll offset in lines from the bottom; `0` follows new lines.
     log_scroll: usize,
+    /// Forces a full clear + repaint on the next frame (set on resize).
+    needs_clear: bool,
     // Last-frame geometry for hit-testing.
     frame_area: Rect,
     chart_rect: Rect,
@@ -301,6 +308,7 @@ impl UiState {
             stats_width: 42,
             drag: None,
             log_scroll: 0,
+            needs_clear: false,
             frame_area: Rect::default(),
             chart_rect: Rect::default(),
             middle_rect: Rect::default(),
@@ -320,9 +328,15 @@ fn render_loop(stop: Arc<AtomicBool>) {
     };
     let mut sampler = RateSampler::new();
     let mut state = UiState::new();
+    let mut frame_count = 0u32;
 
     while !stop.load(Ordering::SeqCst) {
         drain_input(&mut state);
+        if state.needs_clear || frame_count.is_multiple_of(FULL_REDRAW_EVERY) {
+            let _ = terminal.clear();
+            state.needs_clear = false;
+        }
+        frame_count = frame_count.wrapping_add(1);
         sampler.maybe_sample();
         let _ = terminal.draw(|frame| draw(frame, &sampler, &mut state));
         std::thread::sleep(RENDER_INTERVAL);
@@ -373,6 +387,7 @@ fn drain_input(state: &mut UiState) {
                 }
             }
             Event::Mouse(mouse) => handle_mouse(state, mouse),
+            Event::Resize(..) => state.needs_clear = true,
             _ => {}
         }
     }

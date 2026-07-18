@@ -651,6 +651,7 @@ impl PluginRunner {
         LAST_TOTAL_TXS.store(0, Ordering::Relaxed);
         LAST_TOTAL_TIME_NS.store(monotonic_nanos_since(run_origin), Ordering::Relaxed);
         metrics::init(if self.sequential { 1 } else { self.num_threads });
+        metrics::set_run_slot_range(slot_range.start, slot_range.end);
         // Stats pulses drive both the log lines and the TUI, so track them whenever either
         // consumer is active.
         let stats_tracking = (clickhouse.is_some() || self.tui).then(|| {

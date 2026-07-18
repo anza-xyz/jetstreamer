@@ -31,6 +31,7 @@ use crossterm::event::{
     MouseEventKind,
 };
 use crossterm::{execute, terminal};
+use jetstreamer_firehose::epochs::slot_to_epoch;
 use jetstreamer_firehose::firehose::{OP_TIMEOUT, thread_activity};
 use jetstreamer_firehose::node_reader::TOTAL_BYTES_READ;
 use jetstreamer_plugin::metrics;
@@ -679,6 +680,26 @@ fn draw_range_selector(
         x += width + 1;
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    // Right-aligned: what this run is actually processing.
+    if let Some((start, end)) = metrics::run_slot_range() {
+        let end_inclusive = end.saturating_sub(1);
+        let first_epoch = slot_to_epoch(start);
+        let last_epoch = slot_to_epoch(end_inclusive);
+        let epochs = if first_epoch == last_epoch {
+            format!("epoch {first_epoch}")
+        } else {
+            format!("epochs {first_epoch}-{last_epoch}")
+        };
+        let label = format!("{epochs} | slots {start}:{end_inclusive} ");
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                label,
+                Style::default().fg(Color::DarkGray),
+            )))
+            .alignment(ratatui::layout::Alignment::Right),
+            area,
+        );
+    }
     hitboxes
 }
 

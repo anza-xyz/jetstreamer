@@ -17,6 +17,7 @@ static THREAD_LAST_ACTIVITY_MS: Lazy<DashMap<usize, u64, ahash::RandomState>> =
 static THREAD_TX_COUNTS: Lazy<DashMap<usize, u64, ahash::RandomState>> =
     Lazy::new(|| DashMap::with_hasher(ahash::RandomState::new()));
 static LATEST_PULSE: Mutex<Option<PulseSnapshot>> = Mutex::new(None);
+static RUN_SLOT_RANGE: Mutex<Option<(u64, u64)>> = Mutex::new(None);
 
 /// Structured copy of the numbers a stats pulse logs, for frontends to render.
 #[derive(Clone, Debug, Default)]
@@ -55,6 +56,17 @@ pub fn init(thread_count: usize) {
     THREAD_LAST_ACTIVITY_MS.clear();
     THREAD_TX_COUNTS.clear();
     *LATEST_PULSE.lock().unwrap() = None;
+    *RUN_SLOT_RANGE.lock().unwrap() = None;
+}
+
+/// Records the half-open slot range `[start, end)` the current run covers.
+pub fn set_run_slot_range(start: u64, end: u64) {
+    *RUN_SLOT_RANGE.lock().unwrap() = Some((start, end));
+}
+
+/// The half-open slot range `[start, end)` of the current run, if one is active.
+pub fn run_slot_range() -> Option<(u64, u64)> {
+    *RUN_SLOT_RANGE.lock().unwrap()
 }
 
 /// Number of firehose threads in the current run.

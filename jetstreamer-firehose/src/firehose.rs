@@ -106,6 +106,12 @@ pub mod thread_activity {
         Lazy::new(|| DashMap::with_hasher(ahash::RandomState::new()));
     static FINISHED: Lazy<DashSet<usize, ahash::RandomState>> =
         Lazy::new(|| DashSet::with_hasher(ahash::RandomState::new()));
+    static TX_COUNTS: Lazy<DashMap<usize, u64, ahash::RandomState>> =
+        Lazy::new(|| DashMap::with_hasher(ahash::RandomState::new()));
+    static STREAM_START_MS: Lazy<DashMap<usize, u64, ahash::RandomState>> =
+        Lazy::new(|| DashMap::with_hasher(ahash::RandomState::new()));
+    static RECYCLE_REQUESTED: Lazy<DashSet<usize, ahash::RandomState>> =
+        Lazy::new(|| DashSet::with_hasher(ahash::RandomState::new()));
 
     /// Milliseconds since tracking began (a process-wide monotonic clock).
     pub fn now_ms() -> u64 {
@@ -117,6 +123,44 @@ pub mod thread_activity {
         Lazy::force(&ORIGIN);
         LAST_ACTIVITY_MS.clear();
         FINISHED.clear();
+        TX_COUNTS.clear();
+        STREAM_START_MS.clear();
+        RECYCLE_REQUESTED.clear();
+    }
+
+    /// Adds processed transactions to `thread_index`'s cumulative count (recycle-rate input).
+    pub fn add_transactions(thread_index: usize, count: u64) {
+        *TX_COUNTS.entry(thread_index).or_insert(0) += count;
+    }
+
+    /// Cumulative transactions processed by `thread_index`.
+    pub fn tx_count(thread_index: usize) -> u64 {
+        TX_COUNTS
+            .get(&thread_index)
+            .map(|count| *count)
+            .unwrap_or(0)
+    }
+
+    /// Records that `thread_index` just (re)opened its stream.
+    pub fn note_stream_start(thread_index: usize) {
+        STREAM_START_MS.insert(thread_index, now_ms());
+    }
+
+    /// Milliseconds since `thread_index` last (re)opened its stream.
+    pub fn stream_age_ms(thread_index: usize) -> Option<u64> {
+        STREAM_START_MS
+            .get(&thread_index)
+            .map(|stamp| now_ms().saturating_sub(*stamp))
+    }
+
+    /// Asks `thread_index` to recycle its connection at the next block boundary.
+    pub fn request_recycle(thread_index: usize) {
+        RECYCLE_REQUESTED.insert(thread_index);
+    }
+
+    /// Consumes a pending recycle request for `thread_index`.
+    pub fn take_recycle(thread_index: usize) -> bool {
+        RECYCLE_REQUESTED.remove(&thread_index).is_some()
     }
 
     /// Records that `thread_index` completed its entire slot range. A finished thread stops
@@ -147,6 +191,17 @@ pub mod thread_activity {
 /// spawning the next one anyway. Overridden by `JETSTREAMER_SPAWN_GRACE_SECS`; `0` disables
 /// launch gating entirely.
 const SPAWN_GRACE_DEFAULT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Recycle threshold as a percent of the fastest thread's current rate: threads persistently
+/// below it restart their connection to shed a throughput-clamped one. Override with
+/// `JETSTREAMER_RECYCLE_PCT`; `0` disables recycling.
+fn recycle_threshold_pct() -> u64 {
+    std::env::var("JETSTREAMER_RECYCLE_PCT")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .map(|pct| pct.min(100))
+        .unwrap_or(50)
+}
 
 /// Maximum number of running-but-not-yet-green threads the launch gate allows before pausing
 /// the ramp. Override with `JETSTREAMER_SPAWN_PENDING`; `1` reproduces the strict
@@ -303,6 +358,9 @@ pub enum FirehoseError {
     OnStatsHandlerError(SharedError),
     /// Timeout reached while waiting for a firehose operation.
     OperationTimeout(&'static str),
+    /// Deliberate connection recycle (not a failure): the thread restarts its stream to shed
+    /// a throughput-clamped connection.
+    ConnectionRecycled,
     /// Transaction handler returned an error.
     TransactionHandlerError(SharedError),
     /// Entry handler returned an error.
@@ -357,6 +415,9 @@ impl Display for FirehoseError {
             }
             FirehoseError::OperationTimeout(op) => {
                 write!(f, "Timeout while waiting for operation: {}", op)
+            }
+            FirehoseError::ConnectionRecycled => {
+                write!(f, "connection recycled to refresh throughput")
             }
             FirehoseError::TransactionHandlerError(error) => {
                 write!(f, "Transaction handler error: {}", error)
@@ -1102,6 +1163,64 @@ where
     } else {
         spawn_grace_from_env()
     };
+    // Connection-recycle monitor: Cloudflare clamps long-lived connections while fresh ones
+    // get full burst throughput, and a clamped-but-flowing thread stays green forever, so
+    // health checks alone never rotate it. Every sweep, threads running well below the
+    // fastest thread's rate are asked to reconnect (a clean restart with no backoff).
+    let recycle_pct = recycle_threshold_pct();
+    let thread_total = subranges.len();
+    let recycle_monitor = (recycle_pct > 0 && !sequential && thread_total > 1).then(|| {
+        let shutdown_flag = shutdown_flag.clone();
+        tokio::spawn(async move {
+            const SWEEP: std::time::Duration = std::time::Duration::from_secs(15);
+            const MIN_STREAM_AGE_MS: u64 = 30_000;
+            let mut prev_counts: Vec<u64> = vec![0; thread_total];
+            let mut primed = false;
+            loop {
+                sleep(SWEEP).await;
+                if shutdown_flag.load(Ordering::SeqCst) {
+                    return;
+                }
+                let mut rates = vec![0u64; thread_total];
+                for (thread, prev) in prev_counts.iter_mut().enumerate() {
+                    let total = thread_activity::tx_count(thread);
+                    rates[thread] = total.saturating_sub(*prev);
+                    *prev = total;
+                }
+                // The first sweep only seeds the per-thread snapshots.
+                if !primed {
+                    primed = true;
+                    continue;
+                }
+                let fastest = rates.iter().copied().max().unwrap_or(0);
+                if fastest == 0 {
+                    continue;
+                }
+                let threshold = fastest.saturating_mul(recycle_pct) / 100;
+                let mut flagged = 0usize;
+                for (thread, rate) in rates.iter().copied().enumerate() {
+                    if thread_activity::is_finished(thread) {
+                        continue;
+                    }
+                    // Give new connections time to prove themselves before judging them.
+                    let mature = thread_activity::stream_age_ms(thread)
+                        .is_some_and(|age| age >= MIN_STREAM_AGE_MS);
+                    if mature && rate < threshold {
+                        thread_activity::request_recycle(thread);
+                        flagged += 1;
+                    }
+                }
+                if flagged > 0 {
+                    log::info!(
+                        target: LOG_MODULE,
+                        "recycle monitor: flagged {} threads below {}% of the fastest thread's rate",
+                        flagged,
+                        recycle_pct
+                    );
+                }
+            }
+        })
+    });
     for (thread_index, mut slot_range) in subranges.into_iter().enumerate() {
         if thread_index > 0
             && let Some(grace) = spawn_gate
@@ -1198,6 +1317,9 @@ where
                 } else {
                     OP_TIMEOUT
                 };
+                // Each pass through this block opens a fresh stream; the stamp shields young
+                // connections from the recycle monitor while they warm up.
+                thread_activity::note_stream_start(thread_index);
                 if poll_shutdown(&shutdown_flag, &mut shutdown_rx) {
                     log::info!(
                         target: &log_target,
@@ -1361,6 +1483,18 @@ where
                                 thread_index
                             );
                             return Ok(());
+                        }
+                        if thread_activity::take_recycle(thread_index) {
+                            log::info!(
+                                target: &log_target,
+                                "recycling connection to refresh throughput"
+                            );
+                            return Err((
+                                FirehoseError::ConnectionRecycled,
+                                current_slot
+                                    .map(|slot| slot.saturating_add(1))
+                                    .unwrap_or(slot_range.start),
+                            ));
                         }
                         let read_fut = reader.read_until_block();
                         let nodes = match timeout(op_timeout, read_fut).await {
@@ -1582,6 +1716,7 @@ where
                                         stats.transactions_processed += 1;
                                     }
                                     transactions_since_stats.fetch_add(1, Ordering::Relaxed);
+                                    thread_activity::add_transactions(thread_index, 1);
                                 }
                                 Entry(entry) => {
                                     let entry_hash = Hash::from(entry.hash.to_bytes());
@@ -1983,19 +2118,31 @@ where
                     );
                     break;
                 }
+                // A deliberate connection recycle is a clean restart, not a failure: skip the
+                // error logging, error counter, on_error callback, and retry backoff.
+                let recycled = matches!(err, FirehoseError::ConnectionRecycled);
                 let epoch = slot_to_epoch(slot);
                 let item_index = match &err {
                     FirehoseError::NodeDecodingError(item_index, _) => *item_index,
                     _ => 0,
                 };
                 let error_message = err.to_string();
-                log::error!(
-                    target: &log_target,
-                    "🧯💦🔥 firehose encountered an error at slot {} in epoch {} and will roll back one slot and retry:",
-                    slot,
-                    epoch
-                );
-                log::error!(target: &log_target, "{}", error_message);
+                if recycled {
+                    log::info!(
+                        target: &log_target,
+                        "♻️ recycling connection; resuming from slot {} in epoch {}",
+                        slot,
+                        epoch
+                    );
+                } else {
+                    log::error!(
+                        target: &log_target,
+                        "🧯💦🔥 firehose encountered an error at slot {} in epoch {} and will roll back one slot and retry:",
+                        slot,
+                        epoch
+                    );
+                    log::error!(target: &log_target, "{}", error_message);
+                }
                 if matches!(err, FirehoseError::SlotOffsetIndexError(_))
                     || error_message.contains("Unknown CID version")
                 {
@@ -2003,29 +2150,31 @@ where
                     // (or a bad seek offset that landed mid-stream).
                     SLOT_OFFSET_INDEX.invalidate_epoch(epoch);
                 }
-                if let Some(on_error_cb) = on_error.clone() {
-                    let context = FirehoseErrorContext {
-                        thread_id: thread_index,
-                        slot,
-                        epoch,
-                        error_message: error_message.clone(),
-                    };
-                    if let Err(handler_err) = on_error_cb(thread_index, context).await {
-                        log::error!(
-                            target: &log_target,
-                            "on_error handler failed: {}",
-                            handler_err
-                        );
+                if !recycled {
+                    if let Some(on_error_cb) = on_error.clone() {
+                        let context = FirehoseErrorContext {
+                            thread_id: thread_index,
+                            slot,
+                            epoch,
+                            error_message: error_message.clone(),
+                        };
+                        if let Err(handler_err) = on_error_cb(thread_index, context).await {
+                            log::error!(
+                                target: &log_target,
+                                "on_error handler failed: {}",
+                                handler_err
+                            );
+                        }
                     }
+                    // Increment this thread's error counter
+                    error_counts[thread_index].fetch_add(1, Ordering::Relaxed);
+                    log::warn!(
+                        target: &log_target,
+                        "restarting from slot {} at index {}",
+                        slot,
+                        item_index,
+                    );
                 }
-                // Increment this thread's error counter
-                error_counts[thread_index].fetch_add(1, Ordering::Relaxed);
-                log::warn!(
-                    target: &log_target,
-                    "restarting from slot {} at index {}",
-                    slot,
-                    item_index,
-                );
                 // Update slot range to resume from the failed slot, not the original start.
                 // Reset local tracking so we don't treat the resumed slot range as already counted.
                 // If we've already counted this slot, resume from the next one to avoid duplicates.
@@ -2060,29 +2209,32 @@ where
                 // of the stream and silently drop slots.
                 skip_until_index = None;
                 last_emitted_slot_global = last_emitted_slot;
-                let backoff = retry_backoff.next_delay(slot);
-                log::warn!(
-                    target: &log_target,
-                    "backing off {:?} before restarting",
-                    backoff
-                );
-                // Sleep in slices so the thread stays responsive to shutdown during the wait.
-                let deadline = std::time::Instant::now() + backoff;
-                let mut shutdown_requested = false;
-                while std::time::Instant::now() < deadline {
-                    if poll_shutdown(&shutdown_flag, &mut shutdown_rx) {
-                        shutdown_requested = true;
+                if !recycled {
+                    let backoff = retry_backoff.next_delay(slot);
+                    log::warn!(
+                        target: &log_target,
+                        "backing off {:?} before restarting",
+                        backoff
+                    );
+                    // Sleep in slices so the thread stays responsive to shutdown during the
+                    // wait.
+                    let deadline = std::time::Instant::now() + backoff;
+                    let mut shutdown_requested = false;
+                    while std::time::Instant::now() < deadline {
+                        if poll_shutdown(&shutdown_flag, &mut shutdown_rx) {
+                            shutdown_requested = true;
+                            break;
+                        }
+                        sleep(std::time::Duration::from_millis(250)).await;
+                    }
+                    if shutdown_requested {
+                        log::info!(
+                            target: &log_target,
+                            "shutdown requested; terminating firehose thread {}",
+                            thread_index
+                        );
                         break;
                     }
-                    sleep(std::time::Duration::from_millis(250)).await;
-                }
-                if shutdown_requested {
-                    log::info!(
-                        target: &log_target,
-                        "shutdown requested; terminating firehose thread {}",
-                        thread_index
-                    );
-                    break;
                 }
             }
         });
@@ -2092,6 +2244,9 @@ where
     // Wait for all threads to complete
     for handle in handles {
         handle.await.unwrap();
+    }
+    if let Some(monitor) = recycle_monitor {
+        monitor.abort();
     }
     if stats_tracking.is_some() {
         let elapsed = firehose_start.elapsed();

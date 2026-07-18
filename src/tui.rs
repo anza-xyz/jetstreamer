@@ -606,15 +606,15 @@ fn draw(frame: &mut ratatui::Frame, sampler: &RateSampler, state: &mut UiState) 
             Constraint::Min(3),
         ])
         .split(frame.area());
-    // Size the thread grid to its content — enough columns (2 cells per dot) to fit every
-    // thread in the rows available — and give the system chart all remaining width.
-    let grid_rows = (rows[2].height as usize).saturating_sub(2).max(1);
+    // Size the thread grid to its content — one cell per thread dot, packed — and give the
+    // system chart all remaining width.
+    let grid_rows = (rows[3].height as usize).saturating_sub(2).max(1);
     let thread_count = metrics::thread_count().max(1);
-    let grid_width = (thread_count.div_ceil(grid_rows) * 2 + 3) as u16;
+    let grid_width = (thread_count.div_ceil(grid_rows) + 2) as u16;
     let middle = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Length(grid_width.clamp(12, rows[2].width / 2)),
+            Constraint::Length(grid_width.clamp(8, rows[3].width / 3)),
             Constraint::Min(20),
             Constraint::Length(state.stats_width),
         ])
@@ -760,7 +760,7 @@ fn draw_thread_grid(frame: &mut ratatui::Frame, area: Rect) {
     let thread_count = metrics::thread_count();
     let mut active = 0usize;
     let mut done = 0usize;
-    let cols = ((area.width as usize).saturating_sub(3) / 2).max(1);
+    let cols = (area.width as usize).saturating_sub(2).max(1);
     let mut lines: Vec<Line> = Vec::new();
     let mut row: Vec<Span> = Vec::new();
     for thread_id in 0..thread_count {
@@ -789,8 +789,7 @@ fn draw_thread_grid(frame: &mut ratatui::Frame, area: Rect) {
             }
         };
         row.push(Span::styled(symbol, Style::default().fg(color)));
-        row.push(Span::raw(" "));
-        if row.len() / 2 >= cols {
+        if row.len() >= cols {
             lines.push(Line::from(std::mem::take(&mut row)));
         }
     }

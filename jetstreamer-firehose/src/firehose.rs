@@ -147,31 +147,63 @@ fn spawn_grace_from_env() -> Option<std::time::Duration> {
 
 /// Launch gate for the staggered thread ramp: waits until every already-running thread has
 /// read data within the "green" window (10% of [`OP_TIMEOUT`], matching the TUI thread grid)
-/// so load is only added while the source is keeping up. `grace` bounds the wait so one
-/// wedged thread cannot stall the ramp; a requested shutdown releases the gate immediately
-/// (the spawned thread observes the shutdown flag and exits right away).
+/// so load is only added while the source is keeping up.
+///
+/// `grace` bounds the wait for merely *sluggish* threads (yellow/orange in the TUI) so a
+/// flickering thread cannot stall the ramp forever — but a **red** thread (idle at or beyond
+/// the op timeout: stalled or backing off) holds the ramp outright, and the grace clock
+/// restarts whenever one is present. Spawning into visible distress only feeds the
+/// throttling that caused it. A requested shutdown releases the gate immediately (the
+/// spawned thread observes the shutdown flag and exits right away).
 async fn wait_for_green_threads(
     grace: std::time::Duration,
     shutdown_flag: &Arc<AtomicBool>,
     handles: &[tokio::task::JoinHandle<()>],
 ) {
     let green_ms = (OP_TIMEOUT.as_millis() as u64) / 10;
-    let deadline = std::time::Instant::now() + grace;
+    let red_ms = OP_TIMEOUT.as_millis() as u64;
     let spawned = handles.len();
+    let mut deadline = std::time::Instant::now() + grace;
+    let mut logged_red_hold = false;
     loop {
         if shutdown_flag.load(Ordering::SeqCst) {
             return;
         }
         // A thread that already completed its slot range stops reading forever; count it as
         // healthy rather than letting it hold the ramp to the grace timeout.
-        let all_green = handles.iter().enumerate().all(|(thread, handle)| {
-            handle.is_finished()
-                || thread_activity::idle_ms(thread).is_some_and(|idle| idle < green_ms)
-        });
+        let idle_of_running = |(thread, handle): (usize, &tokio::task::JoinHandle<()>)| {
+            if handle.is_finished() {
+                None
+            } else {
+                Some(thread_activity::idle_ms(thread))
+            }
+        };
+        let all_green = handles
+            .iter()
+            .enumerate()
+            .filter_map(idle_of_running)
+            .all(|idle| idle.is_some_and(|idle| idle < green_ms));
         if all_green {
             return;
         }
-        if std::time::Instant::now() >= deadline {
+        let any_red = handles
+            .iter()
+            .enumerate()
+            .filter_map(idle_of_running)
+            .any(|idle| idle.is_some_and(|idle| idle >= red_ms));
+        if any_red {
+            // Hold the ramp and restart the grace clock; only a red-free interval of `grace`
+            // can force a spawn past non-green threads.
+            deadline = std::time::Instant::now() + grace;
+            if !logged_red_hold {
+                logged_red_hold = true;
+                log::info!(
+                    target: LOG_MODULE,
+                    "holding thread ramp at {} threads while stalled threads recover",
+                    spawned
+                );
+            }
+        } else if std::time::Instant::now() >= deadline {
             log::info!(
                 target: LOG_MODULE,
                 "spawn grace elapsed with non-green threads; launching thread {} anyway",

@@ -694,18 +694,40 @@ fn draw_tps_chart(
                 .labels::<Vec<Span>>(vec![Span::raw(start_label), "now".into()]),
         )
         .y_axis(
-            // Readout axis rather than a true scale: 0 at the bottom, the current rate as
-            // the middle label, and the window peak at the top (the top bound is exactly the
-            // peak, so that label is also positionally accurate).
+            // Top bound is exactly the window peak, so the top label doubles as the peak
+            // readout. Labels are fixed-width so the gutter fits the floating current-value
+            // marker drawn below.
             Axis::default()
                 .bounds([0.0, peak.max(1.0)])
                 .labels::<Vec<Span>>(vec![
-                    "0".into(),
-                    Span::raw(human_count(current as u64)),
-                    Span::raw(human_count(peak as u64)),
+                    Span::raw(format!("{:>7}", "0")),
+                    Span::raw(format!("{:>7}", human_count(peak as u64))),
                 ]),
         );
     frame.render_widget(chart, area);
+
+    // Floating current-value marker: rendered in the axis gutter at the same height as the
+    // newest data point (axis labels themselves can only sit at evenly spaced positions).
+    if !history.is_empty() && area.height > 4 {
+        let plot_top = area.y + 1;
+        let plot_bottom = area.y + area.height.saturating_sub(3);
+        let rows = plot_bottom.saturating_sub(plot_top);
+        let fraction = (current / peak.max(1.0)).clamp(0.0, 1.0);
+        let row = plot_bottom - (fraction * rows as f64).round() as u16;
+        let marker_area = Rect {
+            x: area.x + 1,
+            y: row,
+            width: 7.min(area.width.saturating_sub(2)),
+            height: 1,
+        };
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                format!("{:>7}", human_count(current as u64)),
+                Style::default().fg(Color::Cyan),
+            )),
+            marker_area,
+        );
+    }
 }
 
 fn draw_thread_grid(frame: &mut ratatui::Frame, area: Rect) {

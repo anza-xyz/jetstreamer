@@ -94,6 +94,95 @@ fn is_shutdown_error(err: &FirehoseError) -> bool {
     }
 }
 
+/// Per-thread "data flowed" timestamps, stamped each time a firehose thread reads a full
+/// block. Drives the health-gated staggered launch and is available to frontends.
+pub mod thread_activity {
+    use dashmap::DashMap;
+    use once_cell::sync::Lazy;
+    use std::time::Instant;
+
+    static ORIGIN: Lazy<Instant> = Lazy::new(Instant::now);
+    static LAST_ACTIVITY_MS: Lazy<DashMap<usize, u64, ahash::RandomState>> =
+        Lazy::new(|| DashMap::with_hasher(ahash::RandomState::new()));
+
+    /// Milliseconds since tracking began (a process-wide monotonic clock).
+    pub fn now_ms() -> u64 {
+        ORIGIN.elapsed().as_millis() as u64
+    }
+
+    /// Clears stamps left over from a previous run.
+    pub fn reset() {
+        Lazy::force(&ORIGIN);
+        LAST_ACTIVITY_MS.clear();
+    }
+
+    /// Records that `thread_index` just read data.
+    pub fn note(thread_index: usize) {
+        LAST_ACTIVITY_MS.insert(thread_index, now_ms());
+    }
+
+    /// Milliseconds since `thread_index` last read data; `None` if it has not read any yet.
+    pub fn idle_ms(thread_index: usize) -> Option<u64> {
+        LAST_ACTIVITY_MS
+            .get(&thread_index)
+            .map(|stamp| now_ms().saturating_sub(*stamp))
+    }
+}
+
+/// Default launch-gate grace: how long to wait for every running thread to turn green before
+/// spawning the next one anyway. Overridden by `JETSTREAMER_SPAWN_GRACE_SECS`; `0` disables
+/// launch gating entirely.
+const SPAWN_GRACE_DEFAULT: std::time::Duration = std::time::Duration::from_secs(30);
+
+fn spawn_grace_from_env() -> Option<std::time::Duration> {
+    match std::env::var("JETSTREAMER_SPAWN_GRACE_SECS") {
+        Ok(raw) => match raw.trim().parse::<u64>() {
+            Ok(0) => None,
+            Ok(secs) => Some(std::time::Duration::from_secs(secs)),
+            Err(_) => Some(SPAWN_GRACE_DEFAULT),
+        },
+        Err(_) => Some(SPAWN_GRACE_DEFAULT),
+    }
+}
+
+/// Launch gate for the staggered thread ramp: waits until every already-running thread has
+/// read data within the "green" window (10% of [`OP_TIMEOUT`], matching the TUI thread grid)
+/// so load is only added while the source is keeping up. `grace` bounds the wait so one
+/// wedged thread cannot stall the ramp; a requested shutdown releases the gate immediately
+/// (the spawned thread observes the shutdown flag and exits right away).
+async fn wait_for_green_threads(
+    grace: std::time::Duration,
+    shutdown_flag: &Arc<AtomicBool>,
+    handles: &[tokio::task::JoinHandle<()>],
+) {
+    let green_ms = (OP_TIMEOUT.as_millis() as u64) / 10;
+    let deadline = std::time::Instant::now() + grace;
+    let spawned = handles.len();
+    loop {
+        if shutdown_flag.load(Ordering::SeqCst) {
+            return;
+        }
+        // A thread that already completed its slot range stops reading forever; count it as
+        // healthy rather than letting it hold the ramp to the grace timeout.
+        let all_green = handles.iter().enumerate().all(|(thread, handle)| {
+            handle.is_finished()
+                || thread_activity::idle_ms(thread).is_some_and(|idle| idle < green_ms)
+        });
+        if all_green {
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            log::info!(
+                target: LOG_MODULE,
+                "spawn grace elapsed with non-green threads; launching thread {} anyway",
+                spawned
+            );
+            return;
+        }
+        sleep(std::time::Duration::from_millis(250)).await;
+    }
+}
+
 /// Per-thread restart pacing: consecutive failures on the same slot double the delay up to
 /// [`RETRY_BACKOFF_MAX`]; a failure on a different slot means forward progress was made and
 /// resets the sequence.
@@ -944,7 +1033,18 @@ where
         DashMap<usize, DashSet<u64, ahash::RandomState>, ahash::RandomState>,
     > = Arc::new(DashMap::with_hasher(ahash::RandomState::new()));
 
+    thread_activity::reset();
+    let spawn_gate = if sequential {
+        None
+    } else {
+        spawn_grace_from_env()
+    };
     for (thread_index, mut slot_range) in subranges.into_iter().enumerate() {
+        if thread_index > 0
+            && let Some(grace) = spawn_gate
+        {
+            wait_for_green_threads(grace, &shutdown_flag, &handles).await;
+        }
         let error_counts = error_counts.clone();
         let client = client.clone();
         let on_block = on_block.clone();
@@ -1216,6 +1316,7 @@ where
                                 return Err((FirehoseError::OperationTimeout("read_until_block"), current_slot.map(|s| s + 1).unwrap_or(slot_range.start)));
                             }
                         };
+                        thread_activity::note(thread_index);
                         if nodes.is_empty() {
                             log::info!(
                                 target: &log_target,
@@ -2215,6 +2316,7 @@ async fn firehose_geyser_thread(
                             ));
                         }
                     };
+                    thread_activity::note(thread_index.unwrap_or(0));
                     if nodes.is_empty() {
                         log::info!(
                             target: &log_target,

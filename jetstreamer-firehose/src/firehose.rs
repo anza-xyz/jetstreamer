@@ -174,6 +174,11 @@ pub mod thread_activity {
         FINISHED.contains(&thread_index)
     }
 
+    /// Un-marks a finished thread that adopted stolen work and is running again.
+    pub fn clear_finished(thread_index: usize) {
+        FINISHED.remove(&thread_index);
+    }
+
     /// Records that `thread_index` just read data.
     pub fn note(thread_index: usize) {
         LAST_ACTIVITY_MS.insert(thread_index, now_ms());
@@ -301,6 +306,57 @@ async fn wait_for_green_threads(
     }
 }
 
+/// Shared per-thread work ledger used for work stealing. `next` is the next slot the owning
+/// thread will process (published at each block boundary); `end` is the half-open end of the
+/// slice, shrunk by thieves under the steal lock. Owners observe shrinks at block-batch
+/// boundaries, before any out-of-range data is emitted.
+struct WorkSlice {
+    next: AtomicU64,
+    end: AtomicU64,
+}
+
+/// Minimum remaining slots a slice must have to be worth splitting: half of this must cover
+/// the thief's reconnect + seek setup cost. Also serves as the safety margin guaranteeing a
+/// victim cannot race past the split point before its shrunken `end` becomes visible.
+const MIN_STEAL_SLOTS: u64 = 64;
+
+/// Splits the largest remaining slice in half and adopts its upper half for `thief`.
+/// Steals are serialized by `lock`; owners advance `next` without the lock, so the split
+/// point's [`MIN_STEAL_SLOTS`]`/2` margin above the victim's position is what keeps the two
+/// sides disjoint.
+fn steal_work(
+    registry: &[WorkSlice],
+    thief: usize,
+    lock: &std::sync::Mutex<()>,
+) -> Option<Range<u64>> {
+    let _guard = lock.lock().unwrap();
+    let mut best: Option<(usize, u64)> = None;
+    for (index, slice) in registry.iter().enumerate() {
+        if index == thief {
+            continue;
+        }
+        let remaining = slice
+            .end
+            .load(Ordering::SeqCst)
+            .saturating_sub(slice.next.load(Ordering::SeqCst));
+        if remaining >= MIN_STEAL_SLOTS && best.is_none_or(|(_, most)| remaining > most) {
+            best = Some((index, remaining));
+        }
+    }
+    let (victim, _) = best?;
+    let next = registry[victim].next.load(Ordering::SeqCst);
+    let end = registry[victim].end.load(Ordering::SeqCst);
+    let remaining = end.saturating_sub(next);
+    if remaining < MIN_STEAL_SLOTS {
+        return None;
+    }
+    let mid = next + remaining / 2;
+    registry[victim].end.store(mid, Ordering::SeqCst);
+    registry[thief].next.store(mid, Ordering::SeqCst);
+    registry[thief].end.store(end, Ordering::SeqCst);
+    Some(mid..end)
+}
+
 /// Per-thread restart pacing: consecutive failures on the same slot double the delay up to
 /// [`RETRY_BACKOFF_MAX`]; a failure on a different slot means forward progress was made and
 /// resets the sequence.
@@ -361,6 +417,9 @@ pub enum FirehoseError {
     /// Deliberate connection recycle (not a failure): the thread restarts its stream to shed
     /// a throughput-clamped connection.
     ConnectionRecycled,
+    /// The thread's slot range is fully processed (not a failure): routed through the retry
+    /// loop so the thread can adopt stolen work or retire.
+    RangeComplete,
     /// Transaction handler returned an error.
     TransactionHandlerError(SharedError),
     /// Entry handler returned an error.
@@ -418,6 +477,9 @@ impl Display for FirehoseError {
             }
             FirehoseError::ConnectionRecycled => {
                 write!(f, "connection recycled to refresh throughput")
+            }
+            FirehoseError::RangeComplete => {
+                write!(f, "slot range complete")
             }
             FirehoseError::TransactionHandlerError(error) => {
                 write!(f, "Transaction handler error: {}", error)
@@ -1169,6 +1231,26 @@ where
     // fastest thread's rate are asked to reconnect (a clean restart with no backoff).
     let recycle_pct = recycle_threshold_pct();
     let thread_total = subranges.len();
+    // Work-stealing ledger: one slice per thread, owners advance `next`, thieves shrink `end`.
+    let work_registry: Arc<Vec<WorkSlice>> = Arc::new(
+        subranges
+            .iter()
+            .map(|range| WorkSlice {
+                next: AtomicU64::new(range.start),
+                end: AtomicU64::new(range.end),
+            })
+            .collect(),
+    );
+    let steal_lock = Arc::new(std::sync::Mutex::new(()));
+    // Always on in threaded forward mode; sequential/reverse runs and single-thread runs
+    // have nothing to steal.
+    let work_stealing = !sequential && !reverse_mode && thread_total > 1;
+    if work_stealing {
+        log::info!(
+            target: LOG_MODULE,
+            "work stealing enabled: finished threads adopt half of the largest remaining range"
+        );
+    }
     let recycle_monitor = (recycle_pct > 0 && !sequential && thread_total > 1).then(|| {
         let shutdown_flag = shutdown_flag.clone();
         tokio::spawn(async move {
@@ -1227,6 +1309,8 @@ where
         {
             wait_for_green_threads(grace, &shutdown_flag, &handles).await;
         }
+        let work_registry = work_registry.clone();
+        let steal_lock = steal_lock.clone();
         let error_counts = error_counts.clone();
         let client = client.clone();
         let on_block = on_block.clone();
@@ -1263,6 +1347,13 @@ where
             let last_pulse = last_pulse_cloned;
             let mut shutdown_rx = thread_shutdown_rx;
             let start_time = firehose_start;
+            if work_stealing {
+                // The ledger is authoritative from the moment it is built: part of this
+                // thread's slice may have been stolen before it even spawned (the gated ramp
+                // can hold a spawn back for minutes while early finishers go hunting).
+                slot_range.start = work_registry[thread_index].next.load(Ordering::SeqCst);
+                slot_range.end = work_registry[thread_index].end.load(Ordering::SeqCst);
+            }
             last_pulse.store(
                 firehose_start.elapsed().as_nanos() as u64,
                 Ordering::Relaxed,
@@ -1514,6 +1605,22 @@ where
                             }
                         };
                         thread_activity::note(thread_index);
+                        // Observe work-stealing shrinks before deciding whether this batch is
+                        // in range; the `slot >= slot_range.end` guard below completes the
+                        // range before any out-of-range data is emitted.
+                        if work_stealing {
+                            let shared_end =
+                                work_registry[thread_index].end.load(Ordering::SeqCst);
+                            if shared_end < slot_range.end {
+                                log::info!(
+                                    target: &log_target,
+                                    "range end moved from {} to {} by work stealing",
+                                    slot_range.end,
+                                    shared_end
+                                );
+                                slot_range.end = shared_end;
+                            }
+                        }
                         if nodes.is_empty() {
                             log::info!(
                                 target: &log_target,
@@ -1562,7 +1669,7 @@ where
                             if block_enabled {
                                 pending_skipped_slots.remove(&thread_index);
                             }
-                            return Ok(());
+                            return Err((FirehoseError::RangeComplete, slot_range.end));
                         }
                         debug_assert!(slot < slot_range.end, "processing out-of-range slot {} (end {})", slot, slot_range.end);
                         if slot < slot_range.start {
@@ -1953,6 +2060,11 @@ where
                                     if slot > last_counted_slot {
                                         last_counted_slot = slot;
                                     }
+                                    if work_stealing {
+                                        work_registry[thread_index]
+                                            .next
+                                            .store(last_counted_slot.saturating_add(1), Ordering::SeqCst);
+                                    }
                                 }
                                 Subset(_subset) => (),
                                 Epoch(_epoch) => (),
@@ -2059,8 +2171,7 @@ where
                             if !summary.is_empty() {
                                 log::debug!(target: &log_target, "threads with errors: {}", summary);
                             }
-                            thread_activity::note_finished(thread_index);
-                            return Ok(());
+                            return Err((FirehoseError::RangeComplete, slot_range.end));
                         }
                     }
                     if reverse_mode_local {
@@ -2105,8 +2216,7 @@ where
                     }
                     log::info!(target: &log_target, "thread {} has finished its work", thread_index);
                     }
-                    thread_activity::note_finished(thread_index);
-                    Ok(())
+                    Err((FirehoseError::RangeComplete, slot_range.end))
             }
             .await
             {
@@ -2116,6 +2226,34 @@ where
                         "shutdown requested; terminating firehose thread {}",
                         thread_index
                     );
+                    break;
+                }
+                // Range completion arrives through the retry loop so the thread can adopt
+                // stolen work (restarting the loop with a new range) or retire.
+                if matches!(err, FirehoseError::RangeComplete) {
+                    if work_stealing
+                        && let Some(stolen) = steal_work(&work_registry, thread_index, &steal_lock)
+                    {
+                        log::info!(
+                            target: &log_target,
+                            "🍴 stole {} slots ({}..{}) from the largest remaining range",
+                            stolen.end - stolen.start,
+                            stolen.start,
+                            stolen.end
+                        );
+                        thread_activity::clear_finished(thread_index);
+                        slot_range = stolen;
+                        last_counted_slot = slot_range.start.saturating_sub(1);
+                        last_emitted_slot_global = slot_range.start.saturating_sub(1);
+                        reverse_partial_resume = None;
+                        skip_until_index = None;
+                        if let Some(ref mut stats) = thread_stats {
+                            stats.slot_range = slot_range.clone();
+                            stats.finish_time = None;
+                        }
+                        continue;
+                    }
+                    thread_activity::note_finished(thread_index);
                     break;
                 }
                 // A deliberate connection recycle is a clean restart, not a failure: skip the

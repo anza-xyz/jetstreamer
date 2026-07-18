@@ -42,8 +42,8 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::symbols;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Axis, Block, Borders, Chart, Dataset, GraphType, Paragraph, Scrollbar, ScrollbarOrientation,
-    ScrollbarState,
+    Axis, Block, Borders, Chart, Dataset, Gauge, GraphType, Paragraph, Scrollbar,
+    ScrollbarOrientation, ScrollbarState,
 };
 
 const RENDER_INTERVAL: Duration = Duration::from_millis(250);
@@ -362,6 +362,7 @@ struct UiState {
     // Last-frame geometry for hit-testing.
     frame_area: Rect,
     chart_rect: Rect,
+    progress_rect: Rect,
     middle_rect: Rect,
     logs_rect: Rect,
     grid_rect: Rect,
@@ -382,6 +383,7 @@ impl UiState {
             needs_clear: true,
             frame_area: Rect::default(),
             chart_rect: Rect::default(),
+            progress_rect: Rect::default(),
             middle_rect: Rect::default(),
             logs_rect: Rect::default(),
             grid_rect: Rect::default(),
@@ -550,7 +552,7 @@ fn rect_contains(rect: Rect, x: u16, y: u16) -> bool {
 /// adjacent border lines between two panes.
 fn grab_divider(state: &UiState, x: u16, y: u16) -> Option<DragTarget> {
     let chart_bottom = state.chart_rect.y + state.chart_rect.height.saturating_sub(1);
-    if y == chart_bottom || y == state.middle_rect.y {
+    if y == chart_bottom || y == state.progress_rect.y {
         return Some(DragTarget::ChartMiddle);
     }
     let middle_bottom = state.middle_rect.y + state.middle_rect.height.saturating_sub(1);
@@ -599,6 +601,7 @@ fn draw(frame: &mut ratatui::Frame, sampler: &RateSampler, state: &mut UiState) 
         .constraints([
             Constraint::Length(1),
             Constraint::Percentage(state.chart_pct),
+            Constraint::Length(3),
             Constraint::Percentage(state.middle_pct),
             Constraint::Min(3),
         ])
@@ -615,19 +618,41 @@ fn draw(frame: &mut ratatui::Frame, sampler: &RateSampler, state: &mut UiState) 
             Constraint::Min(20),
             Constraint::Length(state.stats_width),
         ])
-        .split(rows[2]);
+        .split(rows[3]);
     state.chart_rect = rows[1];
-    state.middle_rect = rows[2];
-    state.logs_rect = rows[3];
+    state.progress_rect = rows[2];
+    state.middle_rect = rows[3];
+    state.logs_rect = rows[4];
     state.grid_rect = middle[0];
     state.system_rect = middle[1];
 
     state.range_hitboxes = draw_range_selector(frame, rows[0], state.selected_range);
     draw_tps_chart(frame, rows[1], sampler, state.selected_range);
+    draw_progress(frame, rows[2]);
     draw_thread_grid(frame, middle[0]);
     draw_system_chart(frame, middle[1], sampler, state.selected_range);
     draw_stats(frame, middle[2], sampler);
-    draw_logs(frame, rows[3], state);
+    draw_logs(frame, rows[4], state);
+}
+
+/// Full-width run progress gauge; the title carries the pace facts (ETA, slots, elapsed)
+/// that used to live in the stats box.
+fn draw_progress(frame: &mut ratatui::Frame, area: Rect) {
+    let pulse = metrics::latest_pulse().unwrap_or_default();
+    let ratio = (pulse.progress_pct / 100.0).clamp(0.0, 1.0);
+    let title = format!(
+        " Progress — ETA: {} | slots {} / {} | elapsed {} ",
+        pulse.eta.clone().unwrap_or_else(|| "n/a".into()),
+        human_count(pulse.slots_processed),
+        human_count(pulse.total_slots),
+        human_duration(pulse.elapsed_secs),
+    );
+    let gauge = Gauge::default()
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .gauge_style(Style::default().fg(Color::Green).bg(Color::DarkGray))
+        .ratio(ratio)
+        .label(format!("{:.1}%", pulse.progress_pct));
+    frame.render_widget(gauge, area);
 }
 
 fn draw_range_selector(
@@ -876,8 +901,6 @@ fn draw_stats(frame: &mut ratatui::Frame, area: Rect, sampler: &RateSampler) {
         None => ("n/a".into(), "n/a".into(), "n/a".into()),
     };
     let lines = vec![
-        stat("progress", format!("{:.1}%", pulse.progress_pct)),
-        stat("ETA", pulse.eta.clone().unwrap_or_else(|| "n/a".into())),
         stat("TPS", human_count(pulse.tps.ceil() as u64)),
         stat(
             "avg TPS",
@@ -890,14 +913,6 @@ fn draw_stats(frame: &mut ratatui::Frame, area: Rect, sampler: &RateSampler) {
         stat("thread TPS avg", avg_tps),
         stat("thread TPS min", min_tps),
         stat("thread TPS max", max_tps),
-        stat(
-            "slots",
-            format!(
-                "{} / {}",
-                human_count(pulse.slots_processed),
-                human_count(pulse.total_slots)
-            ),
-        ),
         stat("blocks", human_count(pulse.blocks_processed)),
         stat("txs", human_count(pulse.transactions_processed)),
         stat("entries", human_count(pulse.entries_processed)),
@@ -911,7 +926,6 @@ fn draw_stats(frame: &mut ratatui::Frame, area: Rect, sampler: &RateSampler) {
             format!("{}/s", human_bytes(sampler.bytes_per_sec)),
         ),
         stat("data total", human_bytes(total_bytes as f64)),
-        stat("elapsed", human_duration(pulse.elapsed_secs)),
     ];
     let stats =
         Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" Stats "));

@@ -172,6 +172,8 @@ pub struct NodeReader<R: AsyncRead + AsyncSeek + Len> {
     pub header: Vec<u8>,
     /// Number of Old Faithful items that have been read so far.
     pub item_index: u64,
+    /// Whether the next seek already holds the global seek-spacing permit.
+    seek_permit_primed: bool,
 }
 
 impl<R: AsyncRead + Unpin + AsyncSeek + Len> NodeReader<R> {
@@ -181,6 +183,7 @@ impl<R: AsyncRead + Unpin + AsyncSeek + Len> NodeReader<R> {
             reader,
             header: vec![],
             item_index: 0,
+            seek_permit_primed: false,
         }
     }
 
@@ -210,6 +213,15 @@ impl<R: AsyncRead + Unpin + AsyncSeek + Len> NodeReader<R> {
     /// seek advances to the next present slot.
     pub async fn seek_to_slot(&mut self, slot: u64) -> Result<(), FirehoseError> {
         self.seek_to_slot_inner(slot).await
+    }
+
+    /// Acquires the global seek-spacing permit ahead of a [`Self::seek_to_slot`] call, so the
+    /// cross-thread pacing wait (which can queue for many seconds when hundreds of threads
+    /// seek at once) happens outside any timeout the caller wraps the seek in. The permit is
+    /// consumed by the next seek; an unprimed seek acquires it itself.
+    pub async fn prime_seek_permit(&mut self) {
+        wait_for_seek_hit_slot().await;
+        self.seek_permit_primed = true;
     }
 
     async fn seek_to_slot_inner(&mut self, slot: u64) -> Result<(), FirehoseError> {
@@ -293,7 +305,9 @@ impl<R: AsyncRead + Unpin + AsyncSeek + Len> NodeReader<R> {
     }
 
     async fn seek_to_offset(&mut self, offset: u64) -> Result<(), FirehoseError> {
-        wait_for_seek_hit_slot().await;
+        if !std::mem::take(&mut self.seek_permit_primed) {
+            wait_for_seek_hit_slot().await;
+        }
         self.reader
             .seek(SeekFrom::Start(offset))
             .await

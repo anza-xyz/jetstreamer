@@ -1170,7 +1170,11 @@ where
                         // the byte range containing all of its nodes (transactions, entries,
                         // rewards, block), and the seek skips forward over missing slots. Errors
                         // are attributed to `local_start` so retries invalidate and resume the
-                        // epoch actually being sought.
+                        // epoch actually being sought. Acquire the global seek-spacing permit
+                        // before starting the timeout clock: with hundreds of threads the permit
+                        // queue alone can exceed the op timeout, and that wait is pacing, not a
+                        // stall.
+                        reader.prime_seek_permit().await;
                         let seek_fut = reader.seek_to_slot(local_start);
                         match timeout(op_timeout, seek_fut).await {
                             Ok(res) => res.map_err(|e| (e, local_start))?,
@@ -2175,7 +2179,11 @@ async fn firehose_geyser_thread(
                     // the byte range containing all of its nodes (transactions, entries,
                     // rewards, block), and the seek skips forward over missing slots. Errors
                     // are attributed to `local_start` so retries invalidate and resume the
-                    // epoch actually being sought.
+                    // epoch actually being sought. Acquire the global seek-spacing permit
+                    // before starting the timeout clock: with hundreds of threads the permit
+                    // queue alone can exceed the op timeout, and that wait is pacing, not a
+                    // stall.
+                    reader.prime_seek_permit().await;
                     let seek_fut = reader.seek_to_slot(local_start);
                     match timeout(OP_TIMEOUT, seek_fut).await {
                         Ok(res) => res.map_err(|e| (e, local_start))?,

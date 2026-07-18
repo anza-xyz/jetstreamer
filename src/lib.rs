@@ -684,6 +684,11 @@ impl BuiltinPlugin {
 
 /// Parses command-line arguments and environment variables into a [`Config`].
 ///
+/// The first positional argument selects the work range:
+/// - `<epoch>` — a single epoch (e.g. `950`)
+/// - `<start>-<end>` — an inclusive epoch range (e.g. `900-950`)
+/// - `<start>:<end>` — an inclusive slot range (e.g. `410400000:410832000`)
+///
 /// The following environment variables are inspected:
 /// - `JETSTREAMER_CLICKHOUSE_MODE`: Controls ClickHouse integration. Accepts `auto`, `remote`,
 ///   `local`, or `off`.
@@ -790,6 +795,25 @@ pub fn parse_cli_args() -> Result<CliInvocation, Box<dyn std::error::Error>> {
         let slot_a: u64 = slot_a.parse().expect("failed to parse first slot");
         let slot_b: u64 = slot_b.parse().expect("failed to parse second slot");
         slot_a..(slot_b + 1)
+    } else if let Some((epoch_a, epoch_b)) = first_arg.split_once('-') {
+        let epoch_a: u64 = epoch_a
+            .trim()
+            .parse()
+            .map_err(|_| format!("failed to parse first epoch in range '{first_arg}'"))?;
+        let epoch_b: u64 = epoch_b
+            .trim()
+            .parse()
+            .map_err(|_| format!("failed to parse second epoch in range '{first_arg}'"))?;
+        if epoch_a > epoch_b {
+            return Err(format!(
+                "epoch range '{first_arg}' is reversed; expected <start>-<end> with start <= end"
+            )
+            .into());
+        }
+        log::info!("epochs: {epoch_a}..={epoch_b}");
+        let (start_slot, _) = jetstreamer_firehose::epochs::epoch_to_slot_range(epoch_a);
+        let (_, end_slot_inclusive) = jetstreamer_firehose::epochs::epoch_to_slot_range(epoch_b);
+        start_slot..(end_slot_inclusive + 1)
     } else {
         let epoch: u64 = first_arg.parse().expect("failed to parse epoch");
         log::info!("epoch: {}", epoch);

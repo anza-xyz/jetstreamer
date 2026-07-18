@@ -306,11 +306,13 @@ async fn wait_for_green_threads(
     }
 }
 
-/// Shared per-thread work ledger used for work stealing. `next` is the next slot the owning
-/// thread will process (published at each block boundary); `end` is the half-open end of the
-/// slice, shrunk by thieves under the steal lock. Owners observe shrinks at block-batch
-/// boundaries, before any out-of-range data is emitted.
+/// Shared per-thread work ledger used for work stealing. `start` is the beginning of the
+/// thread's current assignment (reset when it adopts stolen work), `next` is the next slot
+/// the owner will process (published at each block boundary), and `end` is the half-open end
+/// of the slice, shrunk by thieves under the steal lock. Owners observe shrinks at
+/// block-batch boundaries, before any out-of-range data is emitted.
 struct WorkSlice {
+    start: AtomicU64,
     next: AtomicU64,
     end: AtomicU64,
 }
@@ -320,30 +322,40 @@ struct WorkSlice {
 /// victim cannot race past the split point before its shrunken `end` becomes visible.
 const MIN_STEAL_SLOTS: u64 = 64;
 
-/// Splits the largest remaining slice in half and adopts its upper half for `thief`.
-/// Steals are serialized by `lock`; owners advance `next` without the lock, so the split
-/// point's [`MIN_STEAL_SLOTS`]`/2` margin above the victim's position is what keeps the two
-/// sides disjoint.
+/// Picks the thread that has made the least progress through its current assignment (lowest
+/// completed fraction, ties broken by most remaining work), splits its remaining slots in
+/// half, and adopts the upper half for `thief`. Returns the victim index and the stolen
+/// range. Steals are serialized by `lock`; owners advance `next` without the lock, so the
+/// split point's [`MIN_STEAL_SLOTS`]`/2` margin above the victim's position is what keeps
+/// the two sides disjoint.
 fn steal_work(
     registry: &[WorkSlice],
     thief: usize,
     lock: &std::sync::Mutex<()>,
-) -> Option<Range<u64>> {
+) -> Option<(usize, Range<u64>)> {
     let _guard = lock.lock().unwrap();
-    let mut best: Option<(usize, u64)> = None;
+    let mut best: Option<(usize, f64, u64)> = None;
     for (index, slice) in registry.iter().enumerate() {
         if index == thief {
             continue;
         }
-        let remaining = slice
-            .end
-            .load(Ordering::SeqCst)
-            .saturating_sub(slice.next.load(Ordering::SeqCst));
-        if remaining >= MIN_STEAL_SLOTS && best.is_none_or(|(_, most)| remaining > most) {
-            best = Some((index, remaining));
+        let start = slice.start.load(Ordering::SeqCst);
+        let next = slice.next.load(Ordering::SeqCst);
+        let end = slice.end.load(Ordering::SeqCst);
+        let remaining = end.saturating_sub(next);
+        if remaining < MIN_STEAL_SLOTS {
+            continue;
+        }
+        let assigned = end.saturating_sub(start).max(1);
+        let fraction = next.saturating_sub(start) as f64 / assigned as f64;
+        let better = best.is_none_or(|(_, best_fraction, best_remaining)| {
+            fraction < best_fraction || (fraction == best_fraction && remaining > best_remaining)
+        });
+        if better {
+            best = Some((index, fraction, remaining));
         }
     }
-    let (victim, _) = best?;
+    let (victim, _, _) = best?;
     let next = registry[victim].next.load(Ordering::SeqCst);
     let end = registry[victim].end.load(Ordering::SeqCst);
     let remaining = end.saturating_sub(next);
@@ -352,9 +364,10 @@ fn steal_work(
     }
     let mid = next + remaining / 2;
     registry[victim].end.store(mid, Ordering::SeqCst);
+    registry[thief].start.store(mid, Ordering::SeqCst);
     registry[thief].next.store(mid, Ordering::SeqCst);
     registry[thief].end.store(end, Ordering::SeqCst);
-    Some(mid..end)
+    Some((victim, mid..end))
 }
 
 /// Per-thread restart pacing: consecutive failures on the same slot double the delay up to
@@ -1236,6 +1249,7 @@ where
         subranges
             .iter()
             .map(|range| WorkSlice {
+                start: AtomicU64::new(range.start),
                 next: AtomicU64::new(range.start),
                 end: AtomicU64::new(range.end),
             })
@@ -1248,7 +1262,7 @@ where
     if work_stealing {
         log::info!(
             target: LOG_MODULE,
-            "work stealing enabled: finished threads adopt half of the largest remaining range"
+            "work stealing enabled: finished threads adopt half of the least-progressed thread's remaining work"
         );
     }
     let recycle_monitor = (recycle_pct > 0 && !sequential && thread_total > 1).then(|| {
@@ -2232,14 +2246,16 @@ where
                 // stolen work (restarting the loop with a new range) or retire.
                 if matches!(err, FirehoseError::RangeComplete) {
                     if work_stealing
-                        && let Some(stolen) = steal_work(&work_registry, thread_index, &steal_lock)
+                        && let Some((victim, stolen)) =
+                            steal_work(&work_registry, thread_index, &steal_lock)
                     {
                         log::info!(
                             target: &log_target,
-                            "🍴 stole {} slots ({}..{}) from the largest remaining range",
+                            "🍴 stole {} slots ({}..{}) from thread {} (least progress)",
                             stolen.end - stolen.start,
                             stolen.start,
-                            stolen.end
+                            stolen.end,
+                            victim
                         );
                         thread_activity::clear_finished(thread_index);
                         slot_range = stolen;

@@ -148,6 +148,17 @@ pub mod thread_activity {
 /// launch gating entirely.
 const SPAWN_GRACE_DEFAULT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Maximum number of running-but-not-yet-green threads the launch gate allows before pausing
+/// the ramp. Override with `JETSTREAMER_SPAWN_PENDING`; `1` reproduces the strict
+/// one-at-a-time ramp.
+fn spawn_pending_max() -> usize {
+    std::env::var("JETSTREAMER_SPAWN_PENDING")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .filter(|&pending| pending > 0)
+        .unwrap_or(4)
+}
+
 fn spawn_grace_from_env() -> Option<std::time::Duration> {
     match std::env::var("JETSTREAMER_SPAWN_GRACE_SECS") {
         Ok(raw) => match raw.trim().parse::<u64>() {
@@ -163,12 +174,15 @@ fn spawn_grace_from_env() -> Option<std::time::Duration> {
 /// read data within the "green" window (10% of [`OP_TIMEOUT`], matching the TUI thread grid)
 /// so load is only added while the source is keeping up.
 ///
-/// `grace` bounds the wait for merely *sluggish* threads (yellow/orange in the TUI) so a
-/// flickering thread cannot stall the ramp forever — but a **red** thread (idle at or beyond
-/// the op timeout: stalled or backing off) holds the ramp outright, and the grace clock
-/// restarts whenever one is present. Spawning into visible distress only feeds the
-/// throttling that caused it. A requested shutdown releases the gate immediately (the
-/// spawned thread observes the shutdown flag and exits right away).
+/// Up to [`spawn_pending_max`] not-yet-green threads may be in flight at once (a freshly
+/// spawned thread needs a few seconds to fetch its stream, seek, and read its first block —
+/// requiring strict all-green would serialize the ramp on that startup latency). `grace`
+/// bounds the wait for merely *sluggish* threads (yellow/orange in the TUI) so a flickering
+/// thread cannot stall the ramp forever — but a **red** thread (idle at or beyond the op
+/// timeout: stalled or backing off) holds the ramp outright, and the grace clock restarts
+/// whenever one is present. Spawning into visible distress only feeds the throttling that
+/// caused it. A requested shutdown releases the gate immediately (the spawned thread
+/// observes the shutdown flag and exits right away).
 async fn wait_for_green_threads(
     grace: std::time::Duration,
     shutdown_flag: &Arc<AtomicBool>,
@@ -176,6 +190,7 @@ async fn wait_for_green_threads(
 ) {
     let green_ms = (OP_TIMEOUT.as_millis() as u64) / 10;
     let red_ms = OP_TIMEOUT.as_millis() as u64;
+    let pending_max = spawn_pending_max();
     let spawned = handles.len();
     let mut deadline = std::time::Instant::now() + grace;
     let mut logged_red_hold = false;
@@ -192,19 +207,19 @@ async fn wait_for_green_threads(
                 Some(thread_activity::idle_ms(thread))
             }
         };
-        let all_green = handles
+        let not_yet_green = handles
             .iter()
             .enumerate()
             .filter_map(idle_of_running)
-            .all(|idle| idle.is_some_and(|idle| idle < green_ms));
-        if all_green {
-            return;
-        }
+            .filter(|idle| !idle.is_some_and(|idle| idle < green_ms))
+            .count();
         let any_red = handles
             .iter()
             .enumerate()
             .filter_map(idle_of_running)
             .any(|idle| idle.is_some_and(|idle| idle >= red_ms));
+        // Red is checked before the pending window: red threads count as not-yet-green, and
+        // a couple of them must hold the ramp rather than slip under the window.
         if any_red {
             // Hold the ramp and restart the grace clock; only a red-free interval of `grace`
             // can force a spawn past non-green threads.
@@ -217,6 +232,8 @@ async fn wait_for_green_threads(
                     spawned
                 );
             }
+        } else if not_yet_green < pending_max {
+            return;
         } else if std::time::Instant::now() >= deadline {
             log::info!(
                 target: LOG_MODULE,

@@ -642,10 +642,10 @@ fn draw_progress(frame: &mut ratatui::Frame, area: Rect) {
     let pulse = metrics::latest_pulse().unwrap_or_default();
     let ratio = (pulse.progress_pct / 100.0).clamp(0.0, 1.0);
     let title = format!(
-        " Progress — ETA: {} | slots {} / {} | elapsed {} ",
-        pulse.eta.clone().unwrap_or_else(|| "n/a".into()),
+        " Progress — slots {} / {} | ETA: {} | elapsed {} ",
         human_count(pulse.slots_processed),
         human_count(pulse.total_slots),
+        pulse.eta.clone().unwrap_or_else(|| "n/a".into()),
         human_duration(pulse.elapsed_secs),
     );
     let gauge = Gauge::default()

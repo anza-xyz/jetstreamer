@@ -629,9 +629,9 @@ fn draw_tps_chart(
     };
     let chart = Chart::new(vec![dataset])
         .block(Block::default().borders(Borders::ALL).title(format!(
-            " TPS ({label}) — current {} | peak {} ",
-            human_count(current as u64),
+            " TPS ({label}) — peak {} | current {} ",
             human_count(peak as u64),
+            human_count(current as u64),
         )))
         .x_axis(
             Axis::default()

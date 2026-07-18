@@ -839,7 +839,7 @@ fn draw_stats(frame: &mut ratatui::Frame, area: Rect, sampler: &RateSampler) {
     let stat = |label: &str, value: String| -> Line {
         Line::from(vec![
             Span::styled(
-                format!("{label:>11}: "),
+                format!("{label:>14}: "),
                 Style::default().add_modifier(Modifier::BOLD),
             ),
             Span::raw(value),
@@ -865,9 +865,9 @@ fn draw_stats(frame: &mut ratatui::Frame, area: Rect, sampler: &RateSampler) {
                 "n/a".into()
             },
         ),
-        stat("thr TPS avg", avg_tps),
-        stat("thr TPS min", min_tps),
-        stat("thr TPS max", max_tps),
+        stat("thread TPS avg", avg_tps),
+        stat("thread TPS min", min_tps),
+        stat("thread TPS max", max_tps),
         stat(
             "slots",
             format!(

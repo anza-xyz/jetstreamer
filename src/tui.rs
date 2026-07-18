@@ -740,21 +740,10 @@ fn draw_thread_grid(frame: &mut ratatui::Frame, area: Rect) {
     frame.render_widget(grid, area);
 }
 
-/// Bandwidth full-scale for the system chart: `JETSTREAMER_NETWORK_CAPACITY_MB` (megabytes
-/// per second, the same knob the thread-count heuristic uses) when set, otherwise 1 Gbps.
-static NET_FULL_SCALE_BYTES: std::sync::LazyLock<f64> = std::sync::LazyLock::new(|| {
-    std::env::var("JETSTREAMER_NETWORK_CAPACITY_MB")
-        .ok()
-        .and_then(|raw| raw.trim().parse::<u64>().ok())
-        .filter(|&mb| mb > 0)
-        .map(|mb| mb as f64 * 1_000_000.0)
-        .unwrap_or(125_000_000.0)
-});
-
 /// CPU %, memory %, and download bandwidth on one chart. Everything shares the 0–100% axis:
-/// CPU and memory are natively percentages, and bandwidth is scaled so 100% is the machine's
-/// configured capacity ([`NET_FULL_SCALE_BYTES`]) — the title states what 100% equals, and
-/// the legend shows each line's live absolute value in its color.
+/// CPU and memory are natively percentages, and bandwidth is scaled so 100% is the highest
+/// rate observed anywhere in the run — the title states what 100% equals, and the legend
+/// shows each line's live absolute value in its color.
 fn draw_system_chart(
     frame: &mut ratatui::Frame,
     area: Rect,
@@ -766,7 +755,14 @@ fn draw_system_chart(
     let cpu = downsample(window_slice(&sampler.cpu_history, window_secs), buckets);
     let mem = downsample(window_slice(&sampler.mem_history, window_secs), buckets);
     let net_abs = downsample(window_slice(&sampler.net_history, window_secs), buckets);
-    let net_full_scale = *NET_FULL_SCALE_BYTES;
+    // Full scale is the run's highest observed rate (not the window's), so trailing windows
+    // don't renormalize themselves to always touch 100%.
+    let net_full_scale = sampler
+        .net_history
+        .iter()
+        .copied()
+        .fold(0.0_f64, f64::max)
+        .max(1.0);
     let net: Vec<(f64, f64)> = net_abs
         .iter()
         .map(|&(x, v)| (x, (v / net_full_scale * 100.0).min(100.0)))

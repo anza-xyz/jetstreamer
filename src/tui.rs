@@ -321,8 +321,6 @@ enum DragTarget {
     ChartMiddle,
     /// Horizontal divider between the middle row and the log pane.
     MiddleLogs,
-    /// Vertical divider between the thread grid and the system chart.
-    GridSystem,
     /// Vertical divider between the system chart and the stats box.
     SystemStats,
 }
@@ -337,8 +335,6 @@ struct UiState {
     middle_pct: u16,
     /// Stats box width in columns.
     stats_width: u16,
-    /// Thread grid share of the space left of the stats box, in percent.
-    grid_split_pct: u16,
     drag: Option<DragTarget>,
     /// Absolute line number of the log viewport's bottom edge while scrolled; `None` follows
     /// new lines. Anchoring to an absolute position keeps the text frozen for reading while
@@ -365,7 +361,6 @@ impl UiState {
             chart_pct: 35,
             middle_pct: 38,
             stats_width: 42,
-            grid_split_pct: 50,
             drag: None,
             log_anchor: None,
             live_button: None,
@@ -549,10 +544,6 @@ fn grab_divider(state: &UiState, x: u16, y: u16) -> Option<DragTarget> {
     }
     let in_middle_rows =
         y >= state.middle_rect.y && y < state.middle_rect.y + state.middle_rect.height;
-    let grid_right = state.grid_rect.x + state.grid_rect.width.saturating_sub(1);
-    if (x == grid_right || x == grid_right + 1) && in_middle_rows {
-        return Some(DragTarget::GridSystem);
-    }
     let system_right = state.system_rect.x + state.system_rect.width.saturating_sub(1);
     if (x == system_right || x == system_right + 1) && in_middle_rows {
         return Some(DragTarget::SystemStats);
@@ -577,12 +568,6 @@ fn drag_divider(state: &mut UiState, target: DragTarget, x: u16, y: u16) {
             let total_top = pct_of_height(y).clamp(state.chart_pct + 10, 90);
             state.middle_pct = total_top - state.chart_pct;
         }
-        DragTarget::GridSystem => {
-            // The percentage is of the whole middle row (the layout splits the full row).
-            let middle_width = state.middle_rect.width.max(1) as u32;
-            let grid_cols = x.saturating_sub(state.middle_rect.x) as u32;
-            state.grid_split_pct = ((grid_cols * 100) / middle_width).clamp(10, 80) as u16;
-        }
         DragTarget::SystemStats => {
             let middle_right = state.middle_rect.x + state.middle_rect.width;
             let width = middle_right.saturating_sub(x);
@@ -603,10 +588,15 @@ fn draw(frame: &mut ratatui::Frame, sampler: &RateSampler, state: &mut UiState) 
             Constraint::Min(3),
         ])
         .split(frame.area());
+    // Size the thread grid to its content — enough columns (2 cells per dot) to fit every
+    // thread in the rows available — and give the system chart all remaining width.
+    let grid_rows = (rows[2].height as usize).saturating_sub(2).max(1);
+    let thread_count = metrics::thread_count().max(1);
+    let grid_width = (thread_count.div_ceil(grid_rows) * 2 + 3) as u16;
     let middle = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Percentage(state.grid_split_pct),
+            Constraint::Length(grid_width.clamp(12, rows[2].width / 2)),
             Constraint::Min(20),
             Constraint::Length(state.stats_width),
         ])
@@ -619,7 +609,7 @@ fn draw(frame: &mut ratatui::Frame, sampler: &RateSampler, state: &mut UiState) 
 
     state.range_hitboxes = draw_range_selector(frame, rows[0], state.selected_range);
     draw_tps_chart(frame, rows[1], sampler, state.selected_range);
-    draw_thread_grid(frame, middle[0], sampler);
+    draw_thread_grid(frame, middle[0]);
     draw_system_chart(frame, middle[1], sampler, state.selected_range);
     draw_stats(frame, middle[2], sampler);
     draw_logs(frame, rows[3], state);
@@ -699,7 +689,7 @@ fn draw_tps_chart(
     frame.render_widget(chart, area);
 }
 
-fn draw_thread_grid(frame: &mut ratatui::Frame, area: Rect, sampler: &RateSampler) {
+fn draw_thread_grid(frame: &mut ratatui::Frame, area: Rect) {
     let timeout_ms = OP_TIMEOUT.as_millis() as u64;
     let thread_count = metrics::thread_count();
     let mut active = 0usize;
@@ -733,16 +723,7 @@ fn draw_thread_grid(frame: &mut ratatui::Frame, area: Rect, sampler: &RateSample
     if !row.is_empty() {
         lines.push(Line::from(row));
     }
-    let thread_tps = match sampler.thread_tps {
-        Some((avg, min, max)) => format!(
-            " | thread TPS {} avg / {} min / {} max",
-            human_count(avg as u64),
-            human_count(min as u64),
-            human_count(max as u64)
-        ),
-        None => String::new(),
-    };
-    let title = format!(" Threads — {active}/{thread_count} active{thread_tps} ");
+    let title = format!(" Threads {active}/{thread_count} ");
     let grid = Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(title));
     frame.render_widget(grid, area);
 }

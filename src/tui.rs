@@ -199,11 +199,15 @@ struct RateSampler {
     cpu_history: Vec<f64>,
     /// Overall memory usage percent, sampled alongside `tps_history`.
     mem_history: Vec<f64>,
-    /// Download bandwidth in bytes/sec, sampled alongside `tps_history`.
+    /// Wire download bandwidth in bytes/sec (NIC counters), sampled alongside `tps_history`.
     net_history: Vec<f64>,
+    /// CAR payload rate in bytes/sec (decompressed section bytes actually consumed).
     bytes_per_sec: f64,
+    /// NIC receive rate in bytes/sec across non-loopback interfaces.
+    wire_bytes_per_sec: f64,
     thread_tps: Option<ThreadTpsAggregate>,
     system: sysinfo::System,
+    networks: sysinfo::Networks,
 }
 
 impl RateSampler {
@@ -218,8 +222,10 @@ impl RateSampler {
             mem_history: Vec::new(),
             net_history: Vec::new(),
             bytes_per_sec: 0.0,
+            wire_bytes_per_sec: 0.0,
             thread_tps: None,
             system: sysinfo::System::new(),
+            networks: sysinfo::Networks::new_with_refreshed_list(),
         }
     }
 
@@ -239,11 +245,11 @@ impl RateSampler {
         self.last_txs = txs;
         self.last_bytes = bytes;
         self.sample_thread_tps(secs);
-        self.sample_system();
+        self.sample_system(secs);
         self.last_sample = Instant::now();
     }
 
-    fn sample_system(&mut self) {
+    fn sample_system(&mut self, secs: f64) {
         self.system.refresh_cpu_usage();
         self.system.refresh_memory();
         self.cpu_history.push(self.system.global_cpu_usage() as f64);
@@ -254,7 +260,16 @@ impl RateSampler {
             0.0
         };
         self.mem_history.push(mem_pct);
-        self.net_history.push(self.bytes_per_sec);
+        // `received()` reports bytes since the previous refresh — a per-interval delta.
+        self.networks.refresh(true);
+        let received: u64 = self
+            .networks
+            .iter()
+            .filter(|(name, _)| !name.starts_with("lo"))
+            .map(|(_, data)| data.received())
+            .sum();
+        self.wire_bytes_per_sec = received as f64 / secs;
+        self.net_history.push(self.wire_bytes_per_sec);
     }
 
     /// Computes avg/min/max TPS across threads that have processed any transactions.
@@ -802,7 +817,7 @@ fn draw_system_chart(
         ),
         Span::raw(" | "),
         Span::styled(
-            format!("net {}/s", human_bytes(sampler.bytes_per_sec)),
+            format!("net {}/s", human_bytes(sampler.wire_bytes_per_sec)),
             Style::default().fg(Color::Green),
         ),
         Span::raw(format!(" (100% = {}/s) ", human_bytes(net_full_scale))),
@@ -857,6 +872,10 @@ fn draw_stats(frame: &mut ratatui::Frame, area: Rect, sampler: &RateSampler) {
         stat("txs", human_count(pulse.transactions_processed)),
         stat("entries", human_count(pulse.entries_processed)),
         stat("rewards", human_count(pulse.rewards_processed)),
+        stat(
+            "wire rate",
+            format!("{}/s", human_bytes(sampler.wire_bytes_per_sec)),
+        ),
         stat(
             "data rate",
             format!("{}/s", human_bytes(sampler.bytes_per_sec)),

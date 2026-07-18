@@ -9,8 +9,12 @@
 //!   10%, yellow under 50%, orange under 100%, red at or beyond the timeout (stalled or
 //!   backing off). Gray dots have not reported data yet.
 //! - **Stats box**: the same numbers the periodic stats log line reports, plus overall data
-//!   rate from the CAR byte counter.
-//! - **Log pane**: most recent log lines, which raw-mode rendering would otherwise garble.
+//!   rate and per-thread avg/min/max TPS.
+//! - **Log pane** (full width): recent log lines. Scroll with the mouse wheel over the pane
+//!   or PageUp/PageDown; End (or scrolling to the bottom) resumes following new lines.
+//!
+//! Pane dividers are mouse-draggable: grab the border between the graph and the middle row,
+//! between the middle row and the logs, or between the thread grid and the stats box.
 //!
 //! Press `q`, `Esc`, or `Ctrl-C` to request the same graceful shutdown as `SIGINT`.
 
@@ -21,7 +25,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{
-    DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers, MouseButton,
+    DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers, MouseButton, MouseEvent,
     MouseEventKind,
 };
 use crossterm::{execute, terminal};
@@ -38,7 +42,8 @@ use ratatui::widgets::{Axis, Block, Borders, Chart, Dataset, GraphType, Paragrap
 
 const RENDER_INTERVAL: Duration = Duration::from_millis(250);
 const SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
-const LOG_BUFFER_CAP: usize = 300;
+const LOG_BUFFER_CAP: usize = 2000;
+const LOG_SCROLL_STEP: usize = 3;
 
 /// Selectable graph windows: label plus trailing seconds (`None` = entire run).
 const TIME_RANGES: [(&str, Option<u64>); 7] = [
@@ -141,13 +146,18 @@ pub fn start() -> TuiHandle {
     }
 }
 
+/// Per-thread TPS aggregate across threads that have reported data: `(avg, min, max)`.
+type ThreadTpsAggregate = (f64, f64, f64);
+
 struct RateSampler {
     last_sample: Instant,
     last_txs: u64,
     last_bytes: u64,
+    last_thread_txs: Vec<u64>,
     /// One TPS sample per [`SAMPLE_INTERVAL`] covering the whole run.
     tps_history: Vec<f64>,
     bytes_per_sec: f64,
+    thread_tps: Option<ThreadTpsAggregate>,
 }
 
 impl RateSampler {
@@ -156,8 +166,10 @@ impl RateSampler {
             last_sample: Instant::now(),
             last_txs: 0,
             last_bytes: 0,
+            last_thread_txs: Vec::new(),
             tps_history: Vec::new(),
             bytes_per_sec: 0.0,
+            thread_tps: None,
         }
     }
 
@@ -176,7 +188,30 @@ impl RateSampler {
         self.bytes_per_sec = bytes.saturating_sub(self.last_bytes) as f64 / secs;
         self.last_txs = txs;
         self.last_bytes = bytes;
+        self.sample_thread_tps(secs);
         self.last_sample = Instant::now();
+    }
+
+    /// Computes avg/min/max TPS across threads that have processed any transactions.
+    fn sample_thread_tps(&mut self, secs: f64) {
+        let thread_count = metrics::thread_count();
+        self.last_thread_txs.resize(thread_count, 0);
+        let mut rates: Vec<f64> = Vec::with_capacity(thread_count);
+        for (thread_id, last) in self.last_thread_txs.iter_mut().enumerate() {
+            let total = metrics::thread_tx_count(thread_id);
+            if total > 0 {
+                rates.push(total.saturating_sub(*last) as f64 / secs);
+            }
+            *last = total;
+        }
+        self.thread_tps = if rates.is_empty() {
+            None
+        } else {
+            let sum: f64 = rates.iter().sum();
+            let min = rates.iter().copied().fold(f64::INFINITY, f64::min);
+            let max = rates.iter().copied().fold(0.0_f64, f64::max);
+            Some((sum / rates.len() as f64, min, max))
+        };
     }
 
     /// Samples within the selected trailing window (`None` = the whole run).
@@ -214,6 +249,57 @@ fn downsample(history: &[f64], buckets: usize) -> Vec<(f64, f64)> {
 /// Hit-test target for a clickable range label: `(x_start, x_end_exclusive, y, range_index)`.
 type RangeHitbox = (u16, u16, u16, usize);
 
+/// Divider currently being dragged.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DragTarget {
+    /// Horizontal divider between the TPS chart and the middle row.
+    ChartMiddle,
+    /// Horizontal divider between the middle row and the log pane.
+    MiddleLogs,
+    /// Vertical divider between the thread grid and the stats box.
+    GridStats,
+}
+
+/// Mutable UI state shared between input handling and drawing.
+struct UiState {
+    selected_range: usize,
+    range_hitboxes: Vec<RangeHitbox>,
+    /// Chart height as a percentage of the frame height.
+    chart_pct: u16,
+    /// Middle row (threads + stats) height as a percentage of the frame height.
+    middle_pct: u16,
+    /// Stats box width in columns.
+    stats_width: u16,
+    drag: Option<DragTarget>,
+    /// Log scroll offset in lines from the bottom; `0` follows new lines.
+    log_scroll: usize,
+    // Last-frame geometry for hit-testing.
+    frame_area: Rect,
+    chart_rect: Rect,
+    middle_rect: Rect,
+    logs_rect: Rect,
+    grid_rect: Rect,
+}
+
+impl UiState {
+    fn new() -> Self {
+        Self {
+            selected_range: DEFAULT_RANGE,
+            range_hitboxes: Vec::new(),
+            chart_pct: 35,
+            middle_pct: 38,
+            stats_width: 42,
+            drag: None,
+            log_scroll: 0,
+            frame_area: Rect::default(),
+            chart_rect: Rect::default(),
+            middle_rect: Rect::default(),
+            logs_rect: Rect::default(),
+            grid_rect: Rect::default(),
+        }
+    }
+}
+
 fn render_loop(stop: Arc<AtomicBool>) {
     let mut terminal = match setup_terminal() {
         Ok(terminal) => terminal,
@@ -223,15 +309,12 @@ fn render_loop(stop: Arc<AtomicBool>) {
         }
     };
     let mut sampler = RateSampler::new();
-    let mut selected_range = DEFAULT_RANGE;
-    let mut hitboxes: Vec<RangeHitbox> = Vec::new();
+    let mut state = UiState::new();
 
     while !stop.load(Ordering::SeqCst) {
-        drain_input(&mut selected_range, &hitboxes);
+        drain_input(&mut state);
         sampler.maybe_sample();
-        let _ = terminal.draw(|frame| {
-            hitboxes = draw(frame, &sampler, selected_range);
-        });
+        let _ = terminal.draw(|frame| draw(frame, &sampler, &mut state));
         std::thread::sleep(RENDER_INTERVAL);
     }
 
@@ -261,9 +344,8 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) {
 }
 
 /// Processes pending input. Quit keys raise `SIGINT` so the runner's existing Ctrl-C handler
-/// drives the same graceful shutdown (raw mode swallows the real Ctrl-C signal). Range labels
-/// respond to left click and the number keys `1`–`7`.
-fn drain_input(selected_range: &mut usize, hitboxes: &[RangeHitbox]) {
+/// drives the same graceful shutdown (raw mode swallows the real Ctrl-C signal).
+fn drain_input(state: &mut UiState) {
     while crossterm::event::poll(Duration::ZERO).unwrap_or(false) {
         let Ok(event) = crossterm::event::read() else {
             return;
@@ -276,50 +358,146 @@ fn drain_input(selected_range: &mut usize, hitboxes: &[RangeHitbox]) {
                     unsafe {
                         libc::raise(libc::SIGINT);
                     }
-                } else if let KeyCode::Char(digit @ '1'..='7') = key.code {
-                    *selected_range = digit as usize - '1' as usize;
+                } else {
+                    handle_key(state, key.code);
                 }
             }
-            Event::Mouse(mouse) => {
-                if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
-                    for &(x_start, x_end, y, index) in hitboxes {
-                        if mouse.row == y && mouse.column >= x_start && mouse.column < x_end {
-                            *selected_range = index;
-                            break;
-                        }
-                    }
-                }
-            }
+            Event::Mouse(mouse) => handle_mouse(state, mouse),
             _ => {}
         }
     }
 }
 
-fn draw(
-    frame: &mut ratatui::Frame,
-    sampler: &RateSampler,
-    selected_range: usize,
-) -> Vec<RangeHitbox> {
+fn handle_key(state: &mut UiState, code: KeyCode) {
+    let log_capacity = (state.logs_rect.height as usize).saturating_sub(2).max(1);
+    match code {
+        KeyCode::Char(digit @ '1'..='7') => {
+            state.selected_range = digit as usize - '1' as usize;
+        }
+        KeyCode::PageUp => scroll_logs(state, log_capacity as isize),
+        KeyCode::PageDown => scroll_logs(state, -(log_capacity as isize)),
+        KeyCode::Up => scroll_logs(state, 1),
+        KeyCode::Down => scroll_logs(state, -1),
+        KeyCode::Home => {
+            let len = LOG_LINES.lock().unwrap().len();
+            state.log_scroll = len.saturating_sub(log_capacity);
+        }
+        KeyCode::End => state.log_scroll = 0,
+        _ => {}
+    }
+}
+
+fn scroll_logs(state: &mut UiState, delta: isize) {
+    let len = LOG_LINES.lock().unwrap().len();
+    let capacity = (state.logs_rect.height as usize).saturating_sub(2).max(1);
+    let max_scroll = len.saturating_sub(capacity);
+    let scrolled = state.log_scroll as isize + delta;
+    state.log_scroll = scrolled.clamp(0, max_scroll as isize) as usize;
+}
+
+fn handle_mouse(state: &mut UiState, mouse: MouseEvent) {
+    match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            for &(x_start, x_end, y, index) in &state.range_hitboxes {
+                if mouse.row == y && mouse.column >= x_start && mouse.column < x_end {
+                    state.selected_range = index;
+                    return;
+                }
+            }
+            state.drag = grab_divider(state, mouse.column, mouse.row);
+        }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            if let Some(target) = state.drag {
+                drag_divider(state, target, mouse.column, mouse.row);
+            }
+        }
+        MouseEventKind::Up(MouseButton::Left) => state.drag = None,
+        MouseEventKind::ScrollUp if rect_contains(state.logs_rect, mouse.column, mouse.row) => {
+            scroll_logs(state, LOG_SCROLL_STEP as isize);
+        }
+        MouseEventKind::ScrollDown if rect_contains(state.logs_rect, mouse.column, mouse.row) => {
+            scroll_logs(state, -(LOG_SCROLL_STEP as isize));
+        }
+        _ => {}
+    }
+}
+
+fn rect_contains(rect: Rect, x: u16, y: u16) -> bool {
+    x >= rect.x && x < rect.x + rect.width && y >= rect.y && y < rect.y + rect.height
+}
+
+/// Identifies which divider (if any) a press at `(x, y)` grabs. Each divider is the pair of
+/// adjacent border lines between two panes.
+fn grab_divider(state: &UiState, x: u16, y: u16) -> Option<DragTarget> {
+    let chart_bottom = state.chart_rect.y + state.chart_rect.height.saturating_sub(1);
+    if y == chart_bottom || y == state.middle_rect.y {
+        return Some(DragTarget::ChartMiddle);
+    }
+    let middle_bottom = state.middle_rect.y + state.middle_rect.height.saturating_sub(1);
+    if y == middle_bottom || y == state.logs_rect.y {
+        return Some(DragTarget::MiddleLogs);
+    }
+    let grid_right = state.grid_rect.x + state.grid_rect.width.saturating_sub(1);
+    if (x == grid_right || x == grid_right + 1)
+        && y >= state.middle_rect.y
+        && y < state.middle_rect.y + state.middle_rect.height
+    {
+        return Some(DragTarget::GridStats);
+    }
+    None
+}
+
+fn drag_divider(state: &mut UiState, target: DragTarget, x: u16, y: u16) {
+    let total_height = state.frame_area.height.max(1) as u32;
+    let pct_of_height = |row: u16| -> u16 {
+        ((row.saturating_sub(state.frame_area.y) as u32 * 100) / total_height) as u16
+    };
+    match target {
+        DragTarget::ChartMiddle => {
+            // Keep the logs boundary fixed: the middle row absorbs what the chart gives up.
+            let total_top = state.chart_pct + state.middle_pct;
+            let chart_pct = pct_of_height(y).clamp(10, total_top.saturating_sub(10));
+            state.chart_pct = chart_pct;
+            state.middle_pct = total_top - chart_pct;
+        }
+        DragTarget::MiddleLogs => {
+            let total_top = pct_of_height(y).clamp(state.chart_pct + 10, 90);
+            state.middle_pct = total_top - state.chart_pct;
+        }
+        DragTarget::GridStats => {
+            let middle_right = state.middle_rect.x + state.middle_rect.width;
+            let width = middle_right.saturating_sub(x);
+            let max_width = state.middle_rect.width.saturating_sub(20);
+            state.stats_width = width.clamp(24, max_width.max(24));
+        }
+    }
+}
+
+fn draw(frame: &mut ratatui::Frame, sampler: &RateSampler, state: &mut UiState) {
+    state.frame_area = frame.area();
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),
-            Constraint::Percentage(35),
-            Constraint::Percentage(38),
-            Constraint::Min(4),
+            Constraint::Percentage(state.chart_pct),
+            Constraint::Percentage(state.middle_pct),
+            Constraint::Min(3),
         ])
         .split(frame.area());
     let middle = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(30), Constraint::Length(42)])
+        .constraints([Constraint::Min(20), Constraint::Length(state.stats_width)])
         .split(rows[2]);
+    state.chart_rect = rows[1];
+    state.middle_rect = rows[2];
+    state.logs_rect = rows[3];
+    state.grid_rect = middle[0];
 
-    let hitboxes = draw_range_selector(frame, rows[0], selected_range);
-    draw_tps_chart(frame, rows[1], sampler, selected_range);
-    draw_thread_grid(frame, middle[0]);
+    state.range_hitboxes = draw_range_selector(frame, rows[0], state.selected_range);
+    draw_tps_chart(frame, rows[1], sampler, state.selected_range);
+    draw_thread_grid(frame, middle[0], sampler);
     draw_stats(frame, middle[1], sampler);
-    draw_logs(frame, rows[3]);
-    hitboxes
+    draw_logs(frame, rows[3], state.log_scroll);
 }
 
 fn draw_range_selector(
@@ -396,7 +574,7 @@ fn draw_tps_chart(
     frame.render_widget(chart, area);
 }
 
-fn draw_thread_grid(frame: &mut ratatui::Frame, area: Rect) {
+fn draw_thread_grid(frame: &mut ratatui::Frame, area: Rect, sampler: &RateSampler) {
     let timeout_ms = OP_TIMEOUT.as_millis() as u64;
     let thread_count = metrics::thread_count();
     let mut active = 0usize;
@@ -430,13 +608,16 @@ fn draw_thread_grid(frame: &mut ratatui::Frame, area: Rect) {
     if !row.is_empty() {
         lines.push(Line::from(row));
     }
-    let title = format!(
-        " Threads — {active}/{thread_count} active (green <{:.1}s yellow <{:.1}s orange <{:.1}s red ≥{:.1}s) ",
-        timeout_ms as f64 / 10.0 / 1000.0,
-        timeout_ms as f64 / 2.0 / 1000.0,
-        timeout_ms as f64 / 1000.0,
-        timeout_ms as f64 / 1000.0,
-    );
+    let thread_tps = match sampler.thread_tps {
+        Some((avg, min, max)) => format!(
+            " | thread TPS {} avg / {} min / {} max",
+            human_count(avg as u64),
+            human_count(min as u64),
+            human_count(max as u64)
+        ),
+        None => String::new(),
+    };
+    let title = format!(" Threads — {active}/{thread_count} active{thread_tps} ");
     let grid = Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(title));
     frame.render_widget(grid, area);
 }
@@ -447,16 +628,27 @@ fn draw_stats(frame: &mut ratatui::Frame, area: Rect, sampler: &RateSampler) {
     let stat = |label: &str, value: String| -> Line {
         Line::from(vec![
             Span::styled(
-                format!("{label:>10}: "),
+                format!("{label:>11}: "),
                 Style::default().add_modifier(Modifier::BOLD),
             ),
             Span::raw(value),
         ])
     };
+    let (avg_tps, min_tps, max_tps) = match sampler.thread_tps {
+        Some((avg, min, max)) => (
+            human_count(avg as u64),
+            human_count(min as u64),
+            human_count(max as u64),
+        ),
+        None => ("n/a".into(), "n/a".into(), "n/a".into()),
+    };
     let lines = vec![
         stat("progress", format!("{:.1}%", pulse.progress_pct)),
         stat("ETA", pulse.eta.clone().unwrap_or_else(|| "n/a".into())),
         stat("TPS", human_count(pulse.tps.ceil() as u64)),
+        stat("thr TPS avg", avg_tps),
+        stat("thr TPS min", min_tps),
+        stat("thr TPS max", max_tps),
         stat(
             "slots",
             format!(
@@ -481,15 +673,16 @@ fn draw_stats(frame: &mut ratatui::Frame, area: Rect, sampler: &RateSampler) {
     frame.render_widget(stats, area);
 }
 
-fn draw_logs(frame: &mut ratatui::Frame, area: Rect) {
+fn draw_logs(frame: &mut ratatui::Frame, area: Rect, log_scroll: usize) {
     let capacity = (area.height as usize).saturating_sub(2);
-    let lines: Vec<Line> = {
+    let (lines, scrolled): (Vec<Line>, bool) = {
         let buffer = LOG_LINES.lock().unwrap();
-        buffer
+        let end = buffer.len().saturating_sub(log_scroll);
+        let start = end.saturating_sub(capacity);
+        let lines = buffer
             .iter()
-            .rev()
-            .take(capacity)
-            .rev()
+            .skip(start)
+            .take(end - start)
             .map(|(level, message)| {
                 let color = match level {
                     log::Level::Error => Color::Red,
@@ -499,13 +692,15 @@ fn draw_logs(frame: &mut ratatui::Frame, area: Rect) {
                 };
                 Line::from(Span::styled(message.clone(), Style::default().fg(color)))
             })
-            .collect()
+            .collect();
+        (lines, log_scroll > 0)
     };
-    let logs = Paragraph::new(lines).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(" Logs — q/Esc/Ctrl-C to stop "),
-    );
+    let title = if scrolled {
+        format!(" Logs — scrolled ↑{log_scroll} (End to follow) — q/Esc/Ctrl-C to stop ")
+    } else {
+        " Logs — wheel/PgUp to scroll — q/Esc/Ctrl-C to stop ".to_string()
+    };
+    let logs = Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(title));
     frame.render_widget(logs, area);
 }
 

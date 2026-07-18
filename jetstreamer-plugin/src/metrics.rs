@@ -14,6 +14,8 @@ static ORIGIN: Lazy<Instant> = Lazy::new(Instant::now);
 static THREAD_COUNT: AtomicUsize = AtomicUsize::new(0);
 static THREAD_LAST_ACTIVITY_MS: Lazy<DashMap<usize, u64, ahash::RandomState>> =
     Lazy::new(|| DashMap::with_hasher(ahash::RandomState::new()));
+static THREAD_TX_COUNTS: Lazy<DashMap<usize, u64, ahash::RandomState>> =
+    Lazy::new(|| DashMap::with_hasher(ahash::RandomState::new()));
 static LATEST_PULSE: Mutex<Option<PulseSnapshot>> = Mutex::new(None);
 
 /// Structured copy of the numbers a stats pulse logs, for frontends to render.
@@ -51,6 +53,7 @@ pub fn init(thread_count: usize) {
     Lazy::force(&ORIGIN);
     THREAD_COUNT.store(thread_count, Ordering::Relaxed);
     THREAD_LAST_ACTIVITY_MS.clear();
+    THREAD_TX_COUNTS.clear();
     *LATEST_PULSE.lock().unwrap() = None;
 }
 
@@ -62,6 +65,20 @@ pub fn thread_count() -> usize {
 /// Records that data flowed through `thread_id` just now.
 pub fn note_thread_activity(thread_id: usize) {
     THREAD_LAST_ACTIVITY_MS.insert(thread_id, now_ms());
+}
+
+/// Records one processed transaction on `thread_id` (also stamps activity).
+pub fn note_thread_transaction(thread_id: usize) {
+    note_thread_activity(thread_id);
+    *THREAD_TX_COUNTS.entry(thread_id).or_insert(0) += 1;
+}
+
+/// Total transactions processed by `thread_id` so far.
+pub fn thread_tx_count(thread_id: usize) -> u64 {
+    THREAD_TX_COUNTS
+        .get(&thread_id)
+        .map(|count| *count)
+        .unwrap_or(0)
 }
 
 /// Milliseconds since data last flowed through `thread_id`, or `None` if the thread has not

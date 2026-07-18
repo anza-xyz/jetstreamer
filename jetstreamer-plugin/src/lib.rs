@@ -486,7 +486,7 @@ impl PluginRunner {
                 let shutting_down = shutting_down.clone();
                 async move {
                     let log_target = format!("{}::T{:03}", LOG_MODULE, thread_id);
-                    metrics::note_thread_activity(thread_id);
+                    metrics::note_thread_transaction(thread_id);
                     record_slot_vote_tally(transaction.slot, transaction.is_vote);
                     if plugin_handles.is_empty() {
                         return Ok(());

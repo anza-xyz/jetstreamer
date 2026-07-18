@@ -706,7 +706,7 @@ fn draw_thread_grid(frame: &mut ratatui::Frame, area: Rect) {
         // clock would paint it red as if stalled.
         let (symbol, color) = if thread_activity::is_finished(thread_id) {
             done += 1;
-            ("✓", Color::Blue)
+            ("✓", Color::Rgb(0, 190, 190))
         } else {
             match metrics::thread_idle_ms(thread_id) {
                 None => ("·", Color::DarkGray),

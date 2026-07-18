@@ -355,10 +355,14 @@ impl JetstreamerRunner {
         Self::default()
     }
 
-    /// Overrides the log level used when initializing `solana_logger`.
+    /// Sets the log level used when [`JetstreamerRunner::run`] initializes logging.
+    ///
+    /// Logging is installed by `run` — not here — because the backend depends on the parsed
+    /// configuration: plain `solana_logger` output normally, or the TUI's in-memory log
+    /// capture when `--tui` is active (the `log` crate only allows one global logger, so
+    /// installing eagerly would lock the TUI out and let log lines garble its display).
     pub fn with_log_level(mut self, log_level: impl Into<String>) -> Self {
         self.log_level = log_level.into();
-        solana_logger::setup_with_default(&logger_filter(&self.log_level));
         self
     }
 
@@ -561,6 +565,7 @@ impl JetstreamerRunner {
         let result = runtime.block_on(runner.run(slot_range.clone(), clickhouse_enabled));
         if let Some(handle) = tui_handle {
             handle.stop();
+            tui::dump_recent_logs(30);
         }
 
         if spawn_clickhouse {

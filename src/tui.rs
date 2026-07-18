@@ -104,6 +104,16 @@ pub fn init_logging(level: &str) {
     }
 }
 
+/// Prints the most recent `count` captured log lines to stderr. Called after the dashboard
+/// exits: the ring logger stays installed for the rest of the process, so this keeps final
+/// errors and the run summary visible in the terminal scrollback.
+pub fn dump_recent_logs(count: usize) {
+    let buffer = LOG_LINES.lock().unwrap();
+    for (level, message) in buffer.iter().rev().take(count).rev() {
+        eprintln!("[{level}] {message}");
+    }
+}
+
 /// Handle to the background render thread; restores the terminal on [`TuiHandle::stop`] (or
 /// drop, as a best-effort backstop).
 pub struct TuiHandle {

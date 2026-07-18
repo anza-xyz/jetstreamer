@@ -53,7 +53,10 @@ const RENDER_INTERVAL: Duration = Duration::from_millis(250);
 /// altscreen) leaves phantom content until a full repaint heals it. The clear and redraw
 /// happen back-to-back within one frame, so the heal is imperceptible.
 const HEAL_INTERVAL: Duration = Duration::from_secs(30);
-const SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
+const SAMPLE_INTERVAL: Duration = Duration::from_millis(250);
+/// Per-thread TPS keeps a coarser cadence: at 250ms a healthy thread often has zero whole
+/// blocks in the window, which would floor `min` to 0 and make avg/max jitter.
+const THREAD_TPS_INTERVAL: Duration = Duration::from_secs(1);
 const LOG_BUFFER_CAP: usize = 2000;
 const LOG_SCROLL_STEP: usize = 3;
 
@@ -196,6 +199,7 @@ type ThreadTpsAggregate = (f64, f64, f64);
 
 struct RateSampler {
     last_sample: Instant,
+    last_thread_sample: Instant,
     last_txs: u64,
     last_bytes: u64,
     last_thread_txs: Vec<u64>,
@@ -220,6 +224,7 @@ impl RateSampler {
     fn new() -> Self {
         Self {
             last_sample: Instant::now(),
+            last_thread_sample: Instant::now(),
             last_txs: 0,
             last_bytes: 0,
             last_thread_txs: Vec::new(),
@@ -250,7 +255,11 @@ impl RateSampler {
         self.bytes_per_sec = bytes.saturating_sub(self.last_bytes) as f64 / secs;
         self.last_txs = txs;
         self.last_bytes = bytes;
-        self.sample_thread_tps(secs);
+        let thread_elapsed = self.last_thread_sample.elapsed();
+        if thread_elapsed >= THREAD_TPS_INTERVAL {
+            self.sample_thread_tps(thread_elapsed.as_secs_f64());
+            self.last_thread_sample = Instant::now();
+        }
         self.sample_system(secs);
         self.last_sample = Instant::now();
     }

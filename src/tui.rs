@@ -864,10 +864,10 @@ fn draw_system_chart(
         ),
         Span::raw(" | "),
         Span::styled(
-            format!("net {}/s", human_bytes(sampler.wire_bytes_per_sec)),
+            format!("net {}", human_bits_per_sec(sampler.wire_bytes_per_sec)),
             Style::default().fg(Color::Green),
         ),
-        Span::raw(format!(" (100% = {}/s) ", human_bytes(net_full_scale))),
+        Span::raw(format!(" (100% = {}) ", human_bits_per_sec(net_full_scale))),
     ]);
     let chart = Chart::new(datasets)
         .block(Block::default().borders(Borders::ALL).title(title))
@@ -919,7 +919,11 @@ fn draw_stats(frame: &mut ratatui::Frame, area: Rect, sampler: &RateSampler) {
         stat("rewards", human_count(pulse.rewards_processed)),
         stat(
             "wire rate",
-            format!("{}/s", human_bytes(sampler.wire_bytes_per_sec)),
+            format!(
+                "{} ({}/s)",
+                human_bits_per_sec(sampler.wire_bytes_per_sec),
+                human_bytes(sampler.wire_bytes_per_sec)
+            ),
         ),
         stat(
             "data rate",
@@ -1013,6 +1017,19 @@ fn human_count(value: u64) -> String {
         1_000_000..=999_999_999 => format!("{:.2}M", value as f64 / 1e6),
         _ => format!("{:.2}B", value as f64 / 1e9),
     }
+}
+
+/// Formats a byte rate as network-convention bits per second (decimal units, like `btm`,
+/// `iftop`, and interface specs), e.g. `3.36 Gbps`.
+fn human_bits_per_sec(bytes_per_sec: f64) -> String {
+    const UNITS: [&str; 4] = ["bps", "Kbps", "Mbps", "Gbps"];
+    let mut value = (bytes_per_sec * 8.0).max(0.0);
+    let mut unit = 0;
+    while value >= 1000.0 && unit < UNITS.len() - 1 {
+        value /= 1000.0;
+        unit += 1;
+    }
+    format!("{value:.2} {}", UNITS[unit])
 }
 
 fn human_bytes(bytes: f64) -> String {

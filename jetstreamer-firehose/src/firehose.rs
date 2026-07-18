@@ -156,7 +156,7 @@ fn spawn_pending_max() -> usize {
         .ok()
         .and_then(|raw| raw.trim().parse::<usize>().ok())
         .filter(|&pending| pending > 0)
-        .unwrap_or(16)
+        .unwrap_or(24)
 }
 
 fn spawn_grace_from_env() -> Option<std::time::Duration> {

@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 use std::vec::Vec;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt};
-use tokio::task::yield_now;
+use tokio::time::sleep;
 
 const MAX_VARINT_LEN_64: usize = 10;
 const MIN_SEEK_SPACING_MS: u64 = 100;
@@ -397,8 +397,14 @@ async fn wait_for_seek_hit_slot() {
     loop {
         let now_ms = seek_monotonic_millis();
         let last_hit = LAST_SEEK_HIT_TIME.load(Ordering::Relaxed);
-        if now_ms.saturating_sub(last_hit) < MIN_SEEK_SPACING_MS {
-            yield_now().await;
+        let since_last = now_ms.saturating_sub(last_hit);
+        if since_last < MIN_SEEK_SPACING_MS {
+            // Sleep out the remainder of the spacing window instead of spinning; with
+            // hundreds of threads queued this otherwise burns CPU for the whole drain.
+            sleep(std::time::Duration::from_millis(
+                MIN_SEEK_SPACING_MS - since_last,
+            ))
+            .await;
             continue;
         }
         if LAST_SEEK_HIT_TIME
@@ -407,7 +413,8 @@ async fn wait_for_seek_hit_slot() {
         {
             return;
         }
-        yield_now().await;
+        // Lost the race for this window; the winner's spacing interval starts now.
+        sleep(std::time::Duration::from_millis(MIN_SEEK_SPACING_MS)).await;
     }
 }
 

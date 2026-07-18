@@ -115,6 +115,7 @@ url.workspace = true
 ratatui = "0.29"
 crossterm = "0.28"
 libc = "0.2"
+sysinfo = "0.33"
 solana-sysvar.workspace = true
 solana-blake3-hasher.workspace = true
 solana-epoch-rewards-hasher.workspace = true

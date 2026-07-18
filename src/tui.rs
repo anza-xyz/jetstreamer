@@ -8,6 +8,8 @@
 //!   through it. Thresholds are percentages of the firehose operation timeout: green under
 //!   10%, yellow under 50%, orange under 100%, red at or beyond the timeout (stalled or
 //!   backing off). Gray dots have not reported data yet.
+//! - **System chart**: overall CPU %, memory %, and download bandwidth on a shared 0–100%
+//!   axis (bandwidth normalized to its in-window peak; the title states what 100% equals).
 //! - **Stats box**: the same numbers the periodic stats log line reports, plus overall data
 //!   rate and per-thread avg/min/max TPS.
 //! - **Log pane** (full width): recent log lines. Scroll with the mouse wheel over the pane
@@ -193,8 +195,15 @@ struct RateSampler {
     last_thread_txs: Vec<u64>,
     /// One TPS sample per [`SAMPLE_INTERVAL`] covering the whole run.
     tps_history: Vec<f64>,
+    /// Overall CPU usage percent, sampled alongside `tps_history`.
+    cpu_history: Vec<f64>,
+    /// Overall memory usage percent, sampled alongside `tps_history`.
+    mem_history: Vec<f64>,
+    /// Download bandwidth in bytes/sec, sampled alongside `tps_history`.
+    net_history: Vec<f64>,
     bytes_per_sec: f64,
     thread_tps: Option<ThreadTpsAggregate>,
+    system: sysinfo::System,
 }
 
 impl RateSampler {
@@ -205,8 +214,12 @@ impl RateSampler {
             last_bytes: 0,
             last_thread_txs: Vec::new(),
             tps_history: Vec::new(),
+            cpu_history: Vec::new(),
+            mem_history: Vec::new(),
+            net_history: Vec::new(),
             bytes_per_sec: 0.0,
             thread_tps: None,
+            system: sysinfo::System::new(),
         }
     }
 
@@ -226,7 +239,22 @@ impl RateSampler {
         self.last_txs = txs;
         self.last_bytes = bytes;
         self.sample_thread_tps(secs);
+        self.sample_system();
         self.last_sample = Instant::now();
+    }
+
+    fn sample_system(&mut self) {
+        self.system.refresh_cpu_usage();
+        self.system.refresh_memory();
+        self.cpu_history.push(self.system.global_cpu_usage() as f64);
+        let total_mem = self.system.total_memory();
+        let mem_pct = if total_mem > 0 {
+            self.system.used_memory() as f64 / total_mem as f64 * 100.0
+        } else {
+            0.0
+        };
+        self.mem_history.push(mem_pct);
+        self.net_history.push(self.bytes_per_sec);
     }
 
     /// Computes avg/min/max TPS across threads that have processed any transactions.
@@ -250,16 +278,16 @@ impl RateSampler {
             Some((sum / rates.len() as f64, min, max))
         };
     }
+}
 
-    /// Samples within the selected trailing window (`None` = the whole run).
-    fn windowed(&self, window_secs: Option<u64>) -> &[f64] {
-        match window_secs {
-            None => &self.tps_history,
-            Some(secs) => {
-                let samples = (secs as f64 / SAMPLE_INTERVAL.as_secs_f64()) as usize;
-                let start = self.tps_history.len().saturating_sub(samples.max(1));
-                &self.tps_history[start..]
-            }
+/// Slice of `history` covering the selected trailing window (`None` = the whole run).
+fn window_slice(history: &[f64], window_secs: Option<u64>) -> &[f64] {
+    match window_secs {
+        None => history,
+        Some(secs) => {
+            let samples = (secs as f64 / SAMPLE_INTERVAL.as_secs_f64()) as usize;
+            let start = history.len().saturating_sub(samples.max(1));
+            &history[start..]
         }
     }
 }
@@ -293,8 +321,10 @@ enum DragTarget {
     ChartMiddle,
     /// Horizontal divider between the middle row and the log pane.
     MiddleLogs,
-    /// Vertical divider between the thread grid and the stats box.
-    GridStats,
+    /// Vertical divider between the thread grid and the system chart.
+    GridSystem,
+    /// Vertical divider between the system chart and the stats box.
+    SystemStats,
 }
 
 /// Mutable UI state shared between input handling and drawing.
@@ -307,6 +337,8 @@ struct UiState {
     middle_pct: u16,
     /// Stats box width in columns.
     stats_width: u16,
+    /// Thread grid share of the space left of the stats box, in percent.
+    grid_split_pct: u16,
     drag: Option<DragTarget>,
     /// Absolute line number of the log viewport's bottom edge while scrolled; `None` follows
     /// new lines. Anchoring to an absolute position keeps the text frozen for reading while
@@ -322,6 +354,7 @@ struct UiState {
     middle_rect: Rect,
     logs_rect: Rect,
     grid_rect: Rect,
+    system_rect: Rect,
 }
 
 impl UiState {
@@ -332,6 +365,7 @@ impl UiState {
             chart_pct: 35,
             middle_pct: 38,
             stats_width: 42,
+            grid_split_pct: 50,
             drag: None,
             log_anchor: None,
             live_button: None,
@@ -341,6 +375,7 @@ impl UiState {
             middle_rect: Rect::default(),
             logs_rect: Rect::default(),
             grid_rect: Rect::default(),
+            system_rect: Rect::default(),
         }
     }
 }
@@ -512,12 +547,15 @@ fn grab_divider(state: &UiState, x: u16, y: u16) -> Option<DragTarget> {
     if y == middle_bottom || y == state.logs_rect.y {
         return Some(DragTarget::MiddleLogs);
     }
+    let in_middle_rows =
+        y >= state.middle_rect.y && y < state.middle_rect.y + state.middle_rect.height;
     let grid_right = state.grid_rect.x + state.grid_rect.width.saturating_sub(1);
-    if (x == grid_right || x == grid_right + 1)
-        && y >= state.middle_rect.y
-        && y < state.middle_rect.y + state.middle_rect.height
-    {
-        return Some(DragTarget::GridStats);
+    if (x == grid_right || x == grid_right + 1) && in_middle_rows {
+        return Some(DragTarget::GridSystem);
+    }
+    let system_right = state.system_rect.x + state.system_rect.width.saturating_sub(1);
+    if (x == system_right || x == system_right + 1) && in_middle_rows {
+        return Some(DragTarget::SystemStats);
     }
     None
 }
@@ -539,7 +577,13 @@ fn drag_divider(state: &mut UiState, target: DragTarget, x: u16, y: u16) {
             let total_top = pct_of_height(y).clamp(state.chart_pct + 10, 90);
             state.middle_pct = total_top - state.chart_pct;
         }
-        DragTarget::GridStats => {
+        DragTarget::GridSystem => {
+            // The percentage is of the whole middle row (the layout splits the full row).
+            let middle_width = state.middle_rect.width.max(1) as u32;
+            let grid_cols = x.saturating_sub(state.middle_rect.x) as u32;
+            state.grid_split_pct = ((grid_cols * 100) / middle_width).clamp(10, 80) as u16;
+        }
+        DragTarget::SystemStats => {
             let middle_right = state.middle_rect.x + state.middle_rect.width;
             let width = middle_right.saturating_sub(x);
             let max_width = state.middle_rect.width.saturating_sub(20);
@@ -561,17 +605,23 @@ fn draw(frame: &mut ratatui::Frame, sampler: &RateSampler, state: &mut UiState) 
         .split(frame.area());
     let middle = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(20), Constraint::Length(state.stats_width)])
+        .constraints([
+            Constraint::Percentage(state.grid_split_pct),
+            Constraint::Min(20),
+            Constraint::Length(state.stats_width),
+        ])
         .split(rows[2]);
     state.chart_rect = rows[1];
     state.middle_rect = rows[2];
     state.logs_rect = rows[3];
     state.grid_rect = middle[0];
+    state.system_rect = middle[1];
 
     state.range_hitboxes = draw_range_selector(frame, rows[0], state.selected_range);
     draw_tps_chart(frame, rows[1], sampler, state.selected_range);
     draw_thread_grid(frame, middle[0], sampler);
-    draw_stats(frame, middle[1], sampler);
+    draw_system_chart(frame, middle[1], sampler, state.selected_range);
+    draw_stats(frame, middle[2], sampler);
     draw_logs(frame, rows[3], state);
 }
 
@@ -609,7 +659,7 @@ fn draw_tps_chart(
     selected_range: usize,
 ) {
     let (label, window_secs) = TIME_RANGES[selected_range];
-    let history = sampler.windowed(window_secs);
+    let history = window_slice(&sampler.tps_history, window_secs);
     let points = downsample(
         history,
         (area.width as usize).saturating_sub(10).max(10) * 2,
@@ -695,6 +745,73 @@ fn draw_thread_grid(frame: &mut ratatui::Frame, area: Rect, sampler: &RateSample
     let title = format!(" Threads — {active}/{thread_count} active{thread_tps} ");
     let grid = Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(title));
     frame.render_widget(grid, area);
+}
+
+/// CPU %, memory %, and download bandwidth on one chart. Everything shares the 0–100% axis:
+/// CPU and memory are natively percentages, and bandwidth is normalized to its peak within
+/// the displayed window — the title states what 100% equals, and the legend shows each
+/// line's live absolute value in its color.
+fn draw_system_chart(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    sampler: &RateSampler,
+    selected_range: usize,
+) {
+    let (_, window_secs) = TIME_RANGES[selected_range];
+    let buckets = (area.width as usize).saturating_sub(10).max(10) * 2;
+    let cpu = downsample(window_slice(&sampler.cpu_history, window_secs), buckets);
+    let mem = downsample(window_slice(&sampler.mem_history, window_secs), buckets);
+    let net_abs = downsample(window_slice(&sampler.net_history, window_secs), buckets);
+    let net_peak = net_abs.iter().map(|&(_, v)| v).fold(0.0_f64, f64::max);
+    let net: Vec<(f64, f64)> = net_abs
+        .iter()
+        .map(|&(x, v)| {
+            (
+                x,
+                if net_peak > 0.0 {
+                    v / net_peak * 100.0
+                } else {
+                    0.0
+                },
+            )
+        })
+        .collect();
+
+    let cpu_now = sampler.cpu_history.last().copied().unwrap_or(0.0);
+    let mem_now = sampler.mem_history.last().copied().unwrap_or(0.0);
+    let datasets = vec![
+        Dataset::default()
+            .name(format!("cpu {cpu_now:.0}%"))
+            .marker(symbols::Marker::Braille)
+            .graph_type(GraphType::Line)
+            .style(Style::default().fg(Color::Magenta))
+            .data(&cpu),
+        Dataset::default()
+            .name(format!("mem {mem_now:.0}%"))
+            .marker(symbols::Marker::Braille)
+            .graph_type(GraphType::Line)
+            .style(Style::default().fg(Color::LightBlue))
+            .data(&mem),
+        Dataset::default()
+            .name(format!("net {}/s", human_bytes(sampler.bytes_per_sec)))
+            .marker(symbols::Marker::Braille)
+            .graph_type(GraphType::Line)
+            .style(Style::default().fg(Color::Green))
+            .data(&net),
+    ];
+    let chart = Chart::new(datasets)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(format!(" System — net 100% = {}/s ", human_bytes(net_peak))),
+        )
+        .x_axis(Axis::default().bounds([0.0, 1.0]))
+        .y_axis(
+            Axis::default()
+                .bounds([0.0, 100.0])
+                .labels::<Vec<Span>>(vec!["0%".into(), "100%".into()]),
+        );
+    frame.render_widget(chart, area);
 }
 
 fn draw_stats(frame: &mut ratatui::Frame, area: Rect, sampler: &RateSampler) {

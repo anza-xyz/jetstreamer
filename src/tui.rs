@@ -781,30 +781,43 @@ fn draw_system_chart(
     let mem_now = sampler.mem_history.last().copied().unwrap_or(0.0);
     let datasets = vec![
         Dataset::default()
-            .name(format!("cpu {cpu_now:.0}%"))
             .marker(symbols::Marker::Braille)
             .graph_type(GraphType::Line)
             .style(Style::default().fg(Color::Magenta))
             .data(&cpu),
         Dataset::default()
-            .name(format!("mem {mem_now:.0}%"))
             .marker(symbols::Marker::Braille)
             .graph_type(GraphType::Line)
             .style(Style::default().fg(Color::LightBlue))
             .data(&mem),
         Dataset::default()
-            .name(format!("net {}/s", human_bytes(sampler.bytes_per_sec)))
             .marker(symbols::Marker::Braille)
             .graph_type(GraphType::Line)
             .style(Style::default().fg(Color::Green))
             .data(&net),
     ];
+    // Legend lives in the title, colored to match each line, because the chart widget's
+    // built-in legend hides itself when it decides the area is too small.
+    let title = Line::from(vec![
+        Span::raw(" System "),
+        Span::styled(
+            format!("cpu {cpu_now:.0}%"),
+            Style::default().fg(Color::Magenta),
+        ),
+        Span::raw(" | "),
+        Span::styled(
+            format!("mem {mem_now:.0}%"),
+            Style::default().fg(Color::LightBlue),
+        ),
+        Span::raw(" | "),
+        Span::styled(
+            format!("net {}/s", human_bytes(sampler.bytes_per_sec)),
+            Style::default().fg(Color::Green),
+        ),
+        Span::raw(format!(" (100% = {}/s) ", human_bytes(net_peak))),
+    ]);
     let chart = Chart::new(datasets)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(format!(" System — net 100% = {}/s ", human_bytes(net_peak))),
-        )
+        .block(Block::default().borders(Borders::ALL).title(title))
         .x_axis(Axis::default().bounds([0.0, 1.0]))
         .y_axis(
             Axis::default()

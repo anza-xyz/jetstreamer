@@ -329,7 +329,15 @@ impl RateSampler {
             None
         } else {
             let sum: f64 = rates.iter().sum();
-            let min = rates.iter().copied().fold(f64::INFINITY, f64::min);
+            // Min over threads that actually moved data this interval: with hundreds of
+            // threads someone is always mid-seek or backing off, so an all-inclusive min
+            // would pin to 0 permanently and carry no signal.
+            let min = rates
+                .iter()
+                .copied()
+                .filter(|&rate| rate > 0.0)
+                .fold(f64::INFINITY, f64::min);
+            let min = if min.is_finite() { min } else { 0.0 };
             let max = rates.iter().copied().fold(0.0_f64, f64::max);
             Some((sum / rates.len() as f64, min, max))
         };

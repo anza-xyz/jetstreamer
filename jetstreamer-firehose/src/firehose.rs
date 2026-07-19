@@ -115,6 +115,7 @@ pub mod thread_activity {
         Lazy::new(|| DashSet::with_hasher(ahash::RandomState::new()));
     static RECYCLES: AtomicU64 = AtomicU64::new(0);
     static TIMEOUTS: AtomicU64 = AtomicU64::new(0);
+    static STEALS: AtomicU64 = AtomicU64::new(0);
 
     /// Milliseconds since tracking began (a process-wide monotonic clock).
     pub fn now_ms() -> u64 {
@@ -131,6 +132,17 @@ pub mod thread_activity {
         RECYCLE_REQUESTED.clear();
         RECYCLES.store(0, Ordering::Relaxed);
         TIMEOUTS.store(0, Ordering::Relaxed);
+        STEALS.store(0, Ordering::Relaxed);
+    }
+
+    /// Records a successful work steal.
+    pub fn note_steal() {
+        STEALS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Total work steals this run.
+    pub fn steal_count() -> u64 {
+        STEALS.load(Ordering::Relaxed)
     }
 
     /// Records a completed connection recycle.
@@ -2274,6 +2286,7 @@ where
                         && let Some((victim, stolen)) =
                             steal_work(&work_registry, thread_index, &steal_lock)
                     {
+                        thread_activity::note_steal();
                         log::info!(
                             target: &log_target,
                             "🥷 stole {} slots ({}..{}) from thread {} (least progress)",

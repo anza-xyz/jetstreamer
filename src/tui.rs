@@ -990,6 +990,8 @@ fn draw_stats(frame: &mut ratatui::Frame, area: Rect, sampler: &RateSampler) {
         stat("txs", human_count(pulse.transactions_processed)),
         stat("entries", human_count(pulse.entries_processed)),
         stat("rewards", human_count(pulse.rewards_processed)),
+        stat("recycles", human_count(thread_activity::recycle_count())),
+        stat("timeouts", human_count(thread_activity::timeout_count())),
         stat("wire rate", human_bits_per_sec(sampler.wire_bytes_per_sec)),
         stat("data rate", human_bits_per_sec(sampler.bytes_per_sec)),
         stat("data total", human_bytes(total_bytes as f64)),

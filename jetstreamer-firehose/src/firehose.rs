@@ -99,6 +99,7 @@ fn is_shutdown_error(err: &FirehoseError) -> bool {
 pub mod thread_activity {
     use dashmap::{DashMap, DashSet};
     use once_cell::sync::Lazy;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Instant;
 
     static ORIGIN: Lazy<Instant> = Lazy::new(Instant::now);
@@ -112,6 +113,8 @@ pub mod thread_activity {
         Lazy::new(|| DashMap::with_hasher(ahash::RandomState::new()));
     static RECYCLE_REQUESTED: Lazy<DashSet<usize, ahash::RandomState>> =
         Lazy::new(|| DashSet::with_hasher(ahash::RandomState::new()));
+    static RECYCLES: AtomicU64 = AtomicU64::new(0);
+    static TIMEOUTS: AtomicU64 = AtomicU64::new(0);
 
     /// Milliseconds since tracking began (a process-wide monotonic clock).
     pub fn now_ms() -> u64 {
@@ -126,6 +129,28 @@ pub mod thread_activity {
         TX_COUNTS.clear();
         STREAM_START_MS.clear();
         RECYCLE_REQUESTED.clear();
+        RECYCLES.store(0, Ordering::Relaxed);
+        TIMEOUTS.store(0, Ordering::Relaxed);
+    }
+
+    /// Records a completed connection recycle.
+    pub fn note_recycle() {
+        RECYCLES.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Total connection recycles this run.
+    pub fn recycle_count() -> u64 {
+        RECYCLES.load(Ordering::Relaxed)
+    }
+
+    /// Records an operation timeout (a stall that forced a restart).
+    pub fn note_timeout() {
+        TIMEOUTS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Total operation timeouts this run.
+    pub fn timeout_count() -> u64 {
+        TIMEOUTS.load(Ordering::Relaxed)
     }
 
     /// Adds processed transactions to `thread_index`'s cumulative count (recycle-rate input).
@@ -2282,6 +2307,7 @@ where
                 };
                 let error_message = err.to_string();
                 if recycled {
+                    thread_activity::note_recycle();
                     log::info!(
                         target: &log_target,
                         "♻️ recycling connection; resuming from slot {} in epoch {}",
@@ -2289,6 +2315,9 @@ where
                         epoch
                     );
                 } else {
+                    if matches!(err, FirehoseError::OperationTimeout(_)) {
+                        thread_activity::note_timeout();
+                    }
                     log::error!(
                         target: &log_target,
                         "🧯💦🔥 firehose encountered an error at slot {} in epoch {} and will roll back one slot and retry:",

@@ -54,6 +54,9 @@ const RENDER_INTERVAL: Duration = Duration::from_millis(250);
 /// happen back-to-back within one frame, so the heal is imperceptible.
 const HEAL_INTERVAL: Duration = Duration::from_secs(30);
 const SAMPLE_INTERVAL: Duration = Duration::from_millis(250);
+/// TPS is measured over a trailing window rather than per-sample deltas: block arrival is
+/// bursty, so instantaneous 250ms rates whipsaw between 0 and multi-million.
+const TPS_WINDOW: Duration = Duration::from_secs(5);
 /// Per-thread TPS keeps a coarser cadence: at 250ms a healthy thread often has zero whole
 /// blocks in the window, which would floor `min` to 0 and make avg/max jitter.
 const THREAD_TPS_INTERVAL: Duration = Duration::from_secs(1);
@@ -200,7 +203,8 @@ type ThreadTpsAggregate = (f64, f64, f64);
 struct RateSampler {
     last_sample: Instant,
     last_thread_sample: Instant,
-    last_txs: u64,
+    /// Recent `(when, cumulative_txs)` snapshots spanning [`TPS_WINDOW`].
+    tx_snapshots: VecDeque<(Instant, u64)>,
     last_bytes: u64,
     last_thread_txs: Vec<u64>,
     /// One TPS sample per [`SAMPLE_INTERVAL`] covering the whole run.
@@ -225,7 +229,7 @@ impl RateSampler {
         Self {
             last_sample: Instant::now(),
             last_thread_sample: Instant::now(),
-            last_txs: 0,
+            tx_snapshots: VecDeque::new(),
             last_bytes: 0,
             last_thread_txs: Vec::new(),
             tps_history: Vec::new(),
@@ -250,10 +254,32 @@ impl RateSampler {
             .map(|pulse| pulse.transactions_processed)
             .unwrap_or(0);
         let bytes = TOTAL_BYTES_READ.load(Ordering::Relaxed);
-        self.tps_history
-            .push(txs.saturating_sub(self.last_txs) as f64 / secs);
+        // Rolling-window TPS: rate between the newest snapshot and the oldest one still
+        // inside TPS_WINDOW.
+        let now = Instant::now();
+        self.tx_snapshots.push_back((now, txs));
+        while self
+            .tx_snapshots
+            .front()
+            .is_some_and(|&(when, _)| now.duration_since(when) > TPS_WINDOW)
+            && self.tx_snapshots.len() > 2
+        {
+            self.tx_snapshots.pop_front();
+        }
+        let tps = self
+            .tx_snapshots
+            .front()
+            .map(|&(when, oldest_txs)| {
+                let span = now.duration_since(when).as_secs_f64();
+                if span > 0.0 {
+                    txs.saturating_sub(oldest_txs) as f64 / span
+                } else {
+                    0.0
+                }
+            })
+            .unwrap_or(0.0);
+        self.tps_history.push(tps);
         self.bytes_per_sec = bytes.saturating_sub(self.last_bytes) as f64 / secs;
-        self.last_txs = txs;
         self.last_bytes = bytes;
         let thread_elapsed = self.last_thread_sample.elapsed();
         if thread_elapsed >= THREAD_TPS_INTERVAL {
@@ -938,8 +964,9 @@ fn draw_stats(frame: &mut ratatui::Frame, area: Rect, sampler: &RateSampler) {
         ),
         None => ("n/a".into(), "n/a".into(), "n/a".into()),
     };
+    let current_tps = sampler.tps_history.last().copied().unwrap_or(0.0);
     let lines = vec![
-        stat("TPS", human_count(pulse.tps.ceil() as u64)),
+        stat("TPS", human_count(current_tps.ceil() as u64)),
         stat(
             "avg TPS",
             if pulse.elapsed_secs > 0.0 {

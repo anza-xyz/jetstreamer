@@ -1307,8 +1307,17 @@ where
         tokio::spawn(async move {
             const SWEEP: std::time::Duration = std::time::Duration::from_secs(15);
             const MIN_STREAM_AGE_MS: u64 = 30_000;
+            /// Rolling rotation, not a storm: a uniform clamp puts most of the fleet under
+            /// the threshold at once, and recycling everyone simultaneously would zero
+            /// throughput. Rotating the worst few per sweep cycles the whole fleet through
+            /// fresh connections within a few minutes while the rest keep streaming.
+            const MAX_RECYCLES_PER_SWEEP: usize = 16;
             let mut prev_counts: Vec<u64> = vec![0; thread_total];
             let mut primed = false;
+            // Benchmark rate: the best 90th-percentile sweep rate observed this run. Using a
+            // percentile means ~a tenth of the fleet must sustain a rate before it becomes
+            // the bar — one anomalously fast thread can't set it.
+            let mut reference: u64 = 0;
             loop {
                 sleep(SWEEP).await;
                 if shutdown_flag.load(Ordering::SeqCst) {
@@ -1325,29 +1334,39 @@ where
                     primed = true;
                     continue;
                 }
-                let fastest = rates.iter().copied().max().unwrap_or(0);
-                if fastest == 0 {
+                let mut moving: Vec<u64> = rates.iter().copied().filter(|&r| r > 0).collect();
+                if moving.is_empty() {
                     continue;
                 }
-                let threshold = fastest.saturating_mul(recycle_pct) / 100;
-                let mut flagged = 0usize;
-                for (thread, rate) in rates.iter().copied().enumerate() {
-                    if thread_activity::is_finished(thread) {
-                        continue;
-                    }
-                    // Give new connections time to prove themselves before judging them.
-                    let mature = thread_activity::stream_age_ms(thread)
-                        .is_some_and(|age| age >= MIN_STREAM_AGE_MS);
-                    if mature && rate < threshold {
-                        thread_activity::request_recycle(thread);
-                        flagged += 1;
-                    }
+                moving.sort_unstable();
+                let p90 = moving[(moving.len() - 1) * 9 / 10];
+                reference = reference.max(p90);
+                let threshold = reference.saturating_mul(recycle_pct) / 100;
+                // Worst offenders first, capped per sweep.
+                let mut candidates: Vec<(u64, usize)> = rates
+                    .iter()
+                    .copied()
+                    .enumerate()
+                    .filter(|&(thread, rate)| {
+                        !thread_activity::is_finished(thread)
+                            && rate < threshold
+                            // Give new connections time to prove themselves first.
+                            && thread_activity::stream_age_ms(thread)
+                                .is_some_and(|age| age >= MIN_STREAM_AGE_MS)
+                    })
+                    .map(|(thread, rate)| (rate, thread))
+                    .collect();
+                candidates.sort_unstable();
+                let flagged = candidates.len().min(MAX_RECYCLES_PER_SWEEP);
+                for &(_, thread) in candidates.iter().take(MAX_RECYCLES_PER_SWEEP) {
+                    thread_activity::request_recycle(thread);
                 }
                 if flagged > 0 {
                     log::info!(
                         target: LOG_MODULE,
-                        "recycle monitor: flagged {} threads below {}% of the fastest thread's rate",
+                        "recycle monitor: rotating {} of {} threads below {}% of the best observed rate",
                         flagged,
+                        candidates.len(),
                         recycle_pct
                     );
                 }

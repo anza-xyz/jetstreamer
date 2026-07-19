@@ -146,7 +146,7 @@ use jetstreamer_plugin::{
 };
 use std::sync::Arc;
 
-const WORKER_THREAD_MULTIPLIER: usize = 4; // each plugin thread gets 4 worker threads
+const WORKER_THREAD_MULTIPLIER: usize = 1; // tokio workers per firehose thread
 
 #[derive(Clone, Copy)]
 struct ClickhouseSettings {

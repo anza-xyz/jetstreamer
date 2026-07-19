@@ -147,6 +147,10 @@ use jetstreamer_plugin::{
 use std::sync::Arc;
 
 const WORKER_THREAD_MULTIPLIER: usize = 1; // tokio workers per firehose thread
+/// Extra tokio workers beyond the firehose threads, reserved headroom for auxiliary tasks
+/// (recycle monitor, launch gate, signal handling, stats, ClickHouse inserts) so they are
+/// not queued behind streaming work when the CPU is saturated.
+const AUX_WORKER_THREADS: usize = 4;
 
 #[derive(Clone, Copy)]
 struct ClickhouseSettings {
@@ -478,7 +482,8 @@ impl JetstreamerRunner {
             && self.config.spawn_clickhouse
             && should_spawn_for_dsn(&self.clickhouse_dsn);
 
-        let worker_threads = std::cmp::max(1, threads.saturating_mul(WORKER_THREAD_MULTIPLIER));
+        let worker_threads =
+            std::cmp::max(1, threads.saturating_mul(WORKER_THREAD_MULTIPLIER)) + AUX_WORKER_THREADS;
         log::info!(
             "processing slots [{}..{}) with {} configured threads on {} tokio workers (sequential={}, reverse={}, buffer_window_bytes={:?}, clickhouse_enabled={})",
             slot_range.start,

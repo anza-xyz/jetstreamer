@@ -2276,7 +2276,7 @@ where
                     {
                         log::info!(
                             target: &log_target,
-                            "🍴 stole {} slots ({}..{}) from thread {} (least progress)",
+                            "🥷 stole {} slots ({}..{}) from thread {} (least progress)",
                             stolen.end - stolen.start,
                             stolen.start,
                             stolen.end,

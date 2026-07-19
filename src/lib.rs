@@ -146,7 +146,7 @@ use jetstreamer_plugin::{
 };
 use std::sync::Arc;
 
-const WORKER_THREAD_MULTIPLIER: usize = 1; // tokio workers per firehose thread
+const WORKER_THREAD_MULTIPLIER: usize = 4; // tokio workers per firehose thread
 /// Extra tokio workers beyond the firehose threads, reserved headroom for auxiliary tasks
 /// (recycle monitor, launch gate, signal handling, stats, ClickHouse inserts) so they are
 /// not queued behind streaming work when the CPU is saturated.

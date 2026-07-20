@@ -110,6 +110,9 @@
 //! | `JETSTREAMER_FORCE_LEGACY_INDEX` | unset | Set to `1` to skip the slot-ranges index and resolve slot offsets using the deprecated legacy compactindex pair. |
 //! | `JETSTREAMER_NETWORK` | `mainnet` | Network suffix appended to cache namespaces and legacy index filenames (e.g., `testnet`). |
 //! | `JETSTREAMER_NETWORK_CAPACITY_MB` | `1000` | Assumed network throughput in megabytes per second used when auto-sizing firehose thread counts. |
+//! | `JETSTREAMER_SPAWN_PENDING` | `24` | Maximum not-yet-green threads in flight during the health-gated thread ramp; `1` reproduces a strict one-at-a-time ramp. |
+//! | `JETSTREAMER_SPAWN_GRACE_SECS` | `30` | How long the launch gate waits for sluggish (never stalled) threads before spawning anyway; `0` disables launch gating entirely. |
+//! | `JETSTREAMER_RECYCLE_PCT` | `50` | Connection-recycle threshold as a percent of the best observed p90 per-thread rate; threads persistently below it reconnect. `0` disables recycling. |
 //!
 //! Changing the network automatically segregates cache entries, allowing you to toggle between
 //! clusters without purging state.

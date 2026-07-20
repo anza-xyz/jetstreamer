@@ -33,6 +33,29 @@ https://github.com/rpcpool/yellowstone-faithful/tree/main/geyser-plugin-runner
 - `JETSTREAMER_NETWORK_CAPACITY_MB` (default `1000`): assumed network throughput in megabytes
   per second when sizing the firehose thread pool. Increase or decrease to match your host's
   effective bandwidth.
+- `JETSTREAMER_SPAWN_PENDING` (default `24`): maximum not-yet-green threads in flight during
+  the health-gated thread ramp; `1` reproduces a strict one-at-a-time ramp.
+- `JETSTREAMER_SPAWN_GRACE_SECS` (default `30`): how long the launch gate waits for sluggish
+  (never stalled) threads before spawning anyway; `0` disables launch gating entirely.
+- `JETSTREAMER_RECYCLE_PCT` (default `50`): connection-recycle threshold as a percent of the
+  best observed p90 per-thread rate; threads persistently below it reconnect. `0` disables
+  recycling.
+
+### Adaptive connection management
+
+The threaded firehose actively manages its HTTP connection fleet to cope with CDN throttling
+(burst allowance followed by a sustained per-connection clamp):
+
+- **Health-gated launch**: threads spawn one batch at a time, only while the running fleet is
+  healthy; a stalled (red) thread freezes the ramp until it recovers.
+- **Exponential restart backoff**: failed threads wait 1s → 32s (reset on progress) before
+  reconnecting, so throttling events decay instead of amplifying into reconnect storms.
+- **Connection recycling** (♻️): threads running persistently below the fleet's demonstrated
+  rate reconnect cleanly (no backoff, no error counting) to shed throughput-clamped
+  connections. Rotation is capped per sweep so a uniform clamp is probed gradually.
+- **Work stealing** (🥷): a thread that finishes its slot range adopts half of the remaining
+  work of the least-progressed thread, keeping every connection busy until the entire range
+  completes; threads only retire when no stealable work remains.
 Notes:
 
 - `JETSTREAMER_HTTP_BASE_URL` and `JETSTREAMER_COMPACT_INDEX_BASE_URL` accept both full HTTP(S)

@@ -70,6 +70,9 @@ JETSTREAMER_THREADS=8 cargo run --release -- 358560000:367631999
 # Replay epochs 900 through 950 inclusive using epoch-range syntax
 cargo run --release -- 900-950
 
+# Replay with the live terminal dashboard (TPS graph, per-thread health, system stats)
+cargo run --release -- 950 --tui
+
 # Replay epoch 800 with the instruction tracking plugin instead of the default
 cargo run --release -- 800 --with-plugin instruction-tracking
 
@@ -117,6 +120,33 @@ The CLI accepts a single epoch (`950`), an inclusive `<start>-<end>` epoch range
 or an inclusive `<start>:<end>` slot range on the command line. See
 [`JetstreamerRunner::parse_cli_args`](https://docs.rs/jetstreamer/latest/jetstreamer/fn.parse_cli_args.html)
 for the precise rules.
+
+### TUI dashboard
+
+Add `--tui` to render a live terminal dashboard instead of plain log output:
+
+- **TPS graph** with clickable time ranges (`5m`–`12h` trailing windows, or `all` for the
+  entire run), a 5s rolling rate, and `0 / current / peak` axis labels.
+- **Progress bar** with slots, ETA, and elapsed time.
+- **Thread grid**: one dot per firehose thread, colored by data freshness (green → red as a
+  thread approaches the stall timeout; cyan ✓ = finished its work).
+- **System chart**: CPU, memory, and NIC download rate on one axis.
+- **Stats panel**: live and average TPS, per-thread TPS spread, block/transaction totals,
+  connection recycles, timeouts, work steals, and wire vs payload data rates.
+- **Scrollable log pane** with a scrollbar and a click-to-resume `live` button.
+
+Pane dividers are mouse-draggable. Press `q`, `Esc`, or `Ctrl-C` for the same graceful
+shutdown as SIGINT; the final log lines are replayed to the terminal on exit.
+
+### Throughput management
+
+The threaded firehose actively manages its connection fleet to cope with CDN throttling:
+threads launch through a health gate (pausing the ramp while any thread is stalled),
+failed threads restart with exponential backoff, persistently-slow connections are recycled
+(♻️) for fresh ones, and threads that finish their slot range steal work (🥷) from the
+least-progressed thread so every connection stays busy to the end of the run. Tune with
+`JETSTREAMER_SPAWN_PENDING`, `JETSTREAMER_SPAWN_GRACE_SECS`, and `JETSTREAMER_RECYCLE_PCT`
+(see the crate docs for details).
 
 ### ClickHouse Integration
 

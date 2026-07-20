@@ -1,24 +1,37 @@
 //! Interactive terminal dashboard rendered when the CLI runs with `--tui`.
 //!
-//! Layout:
-//! - **Range selector**: clickable time ranges (`5m`–`12h` show the trailing window, `all`
-//!   spans the entire run and compresses as it grows). Number keys `1`–`7` also select.
-//! - **TPS graph** over the selected range.
+//! Layout, top to bottom:
+//! - **Title row**: clickable time ranges (`5m`–`12h` show a trailing window, `all` spans the
+//!   entire run and compresses as it grows; number keys `1`–`7` also select), with the run's
+//!   epoch and slot range right-aligned.
+//! - **TPS graph** over the selected range. TPS is a 5s rolling window sampled at 250ms. The
+//!   y-axis reads `0 / current / peak`, with the current value drawn as a floating marker
+//!   that rides at the line's height.
+//! - **Progress gauge**: full-width bar with slots done/total, ETA, and elapsed.
 //! - **Thread grid**: one dot per firehose thread, colored by how recently data flowed
 //!   through it. Thresholds are percentages of the firehose operation timeout: green under
 //!   10%, yellow under 50%, orange under 100%, red at or beyond the timeout (stalled or
-//!   backing off). Gray dots have not reported data yet.
-//! - **System chart**: overall CPU %, memory %, and download bandwidth on a shared 0–100%
-//!   axis (bandwidth normalized to its in-window peak; the title states what 100% equals).
-//! - **Stats box**: the same numbers the periodic stats log line reports, plus overall data
-//!   rate and per-thread avg/min/max TPS.
-//! - **Log pane** (full width): recent log lines. Scroll with the mouse wheel over the pane
-//!   or PageUp/PageDown; End (or scrolling to the bottom) resumes following new lines.
+//!   backing off). Cyan ✓ marks a retired thread; gray dots have not started yet.
+//! - **System chart**: overall CPU %, memory %, and NIC download rate on a shared 0–100%
+//!   axis. Bandwidth is scaled so 100% is the run's highest observed rate; the title states
+//!   the conversion and carries a legend colored to match each line.
+//! - **Stats box**: rolling and run-average TPS, per-thread TPS avg/min/max (min counts only
+//!   threads that moved data), blocks/txs/entries/rewards, recycle/timeout/steal counters,
+//!   wire rate (NIC) vs data rate (CAR payload), and total data.
+//! - **Log pane** (full width): captured log lines. Mouse-wheel or PageUp/PageDown scrolling
+//!   anchors to absolute positions so text holds still while new lines arrive; a scrollbar
+//!   shows position and the `[● live]`/`[▶ back to live]` title button (or End) resumes
+//!   following.
 //!
-//! Pane dividers are mouse-draggable: grab the border between the graph and the middle row,
-//! between the middle row and the logs, or between the thread grid and the stats box.
+//! Pane dividers are mouse-draggable: the border between the TPS graph and the gauge, between
+//! the middle row and the logs, and between the system chart and the stats box.
 //!
-//! Press `q`, `Esc`, or `Ctrl-C` to request the same graceful shutdown as `SIGINT`.
+//! Rendering self-heals: a full clear + repaint runs at startup, on resize, on `r`/`l`, and
+//! every 30 seconds, recovering from phantom cells left by external terminal writes (e.g. a
+//! multiplexer without altscreen support — `screen` defaults to `altscreen off`).
+//!
+//! Press `q`, `Esc`, or `Ctrl-C` to request the same graceful shutdown as `SIGINT`; the last
+//! captured log lines are replayed to stderr after the dashboard exits.
 
 use std::collections::VecDeque;
 use std::io::Stdout;

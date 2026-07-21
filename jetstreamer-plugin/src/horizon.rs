@@ -21,6 +21,8 @@ use jetstreamer_firehose::firehose_horizon::{JetSource, firehose_horizon};
 use jetstreamer_horizon::archive::{BlockNotification, EntryRecord, EpochMeta, SlotVisitor};
 use jetstreamer_horizon::transactions::Transaction;
 
+pub use jetstreamer_horizon::archive::Consumption;
+
 use crate::PluginFuture;
 
 /// Slots a worker decodes between row flushes (bounds in-memory accumulation).
@@ -107,6 +109,20 @@ pub trait HorizonPlugin: Send + Sync + 'static {
     /// Creates this plugin's per-thread worker. Called once per reader thread.
     fn spawn_worker(&self, thread_id: usize) -> Box<dyn PluginWorker>;
 
+    /// Declares what this plugin's workers consume from the decoded stream.
+    /// Defaults to everything (safe). Plugins that never read account-update
+    /// data bytes should override to
+    /// `Consumption::all().without_account_update_data()` — the runner
+    /// combines all plugins' declarations, and when none consume update
+    /// data the decoder skips the per-account diff reconstruction entirely
+    /// (in state-heavy archives that is most of the decode work). With data
+    /// dropped, updates still arrive with full metadata and correct counts,
+    /// but every `data` slice is empty — a plugin that reads `data` (even
+    /// just `data.len()`) must keep the default.
+    fn consumption(&self) -> Consumption {
+        Consumption::all()
+    }
+
     /// Runs once before reading starts (e.g. `CREATE TABLE IF NOT EXISTS`).
     fn on_start(&self, _db: Arc<Client>, _epoch: u64) -> PluginFuture<'_> {
         async move { Ok(()) }.boxed()
@@ -124,6 +140,10 @@ struct Dispatch {
     workers: Vec<Box<dyn PluginWorker>>,
     output: Output,
     since_flush: u32,
+    /// Union of every registered plugin's declared consumption, computed
+    /// once by the runner: the decoder materializes a stream field iff at
+    /// least one plugin consumes it.
+    consumption: Consumption,
 }
 
 impl Dispatch {
@@ -159,6 +179,10 @@ impl SlotVisitor for Dispatch {
                 w.flush(&self.output);
             }
         }
+    }
+
+    fn consumption(&self) -> Consumption {
+        self.consumption
     }
 }
 
@@ -216,15 +240,25 @@ impl HorizonPluginRunner {
             }
         });
 
-        let output = Output {
-            tx,
-            db: db.clone(),
-        };
+        let output = Output { tx, db: db.clone() };
+        // A stream field is materialized iff at least one plugin consumes
+        // it; with no plugins nothing is consumed. Fold starts from
+        // "consumes nothing" and unions each declaration in.
+        let combined = self.plugins.iter().fold(
+            Consumption::all().without_account_update_data(),
+            |acc, p| acc.union(p.consumption()),
+        );
+        log::info!(
+            target: LOG_TARGET,
+            "combined plugin consumption: account_update_data={}",
+            combined.account_update_data
+        );
         let plugins = self.plugins.clone();
         let make_visitor = move |thread_id: usize| Dispatch {
             workers: plugins.iter().map(|p| p.spawn_worker(thread_id)).collect(),
             output: output.clone(),
             since_flush: 0,
+            consumption: combined,
         };
 
         // `make_visitor` (and its captured `output`) is dropped when this
@@ -282,6 +316,7 @@ mod tests {
             })],
             output,
             since_flush: 0,
+            consumption: Consumption::all(),
         };
 
         let note = BlockNotification::new_boxed();
@@ -295,5 +330,46 @@ mod tests {
         // finish() triggers the final flush.
         dispatch.finish();
         assert_eq!(flushes.load(Ordering::Relaxed), 2);
+    }
+
+    /// The runner materializes a stream field iff at least one plugin
+    /// consumes it (declarations default to everything).
+    #[test]
+    fn consumption_union_is_any_consumer_wins() {
+        struct Declares(Consumption);
+        impl HorizonPlugin for Declares {
+            fn name(&self) -> &'static str {
+                "declares"
+            }
+            fn spawn_worker(&self, _thread_id: usize) -> Box<dyn PluginWorker> {
+                unreachable!("not spawned in this test")
+            }
+            fn consumption(&self) -> Consumption {
+                self.0
+            }
+        }
+        struct Defaulted;
+        impl HorizonPlugin for Defaulted {
+            fn name(&self) -> &'static str {
+                "defaulted"
+            }
+            fn spawn_worker(&self, _thread_id: usize) -> Box<dyn PluginWorker> {
+                unreachable!("not spawned in this test")
+            }
+        }
+
+        let none = Consumption::all().without_account_update_data();
+        let combine = |plugins: &[&dyn HorizonPlugin]| {
+            plugins
+                .iter()
+                .fold(none, |acc, p| acc.union(p.consumption()))
+        };
+
+        // No plugins → nothing consumed.
+        assert!(!combine(&[]).account_update_data);
+        // All opted out → still nothing consumed.
+        assert!(!combine(&[&Declares(none), &Declares(none)]).account_update_data);
+        // One defaulted (consumes everything) plugin flips the union on.
+        assert!(combine(&[&Declares(none), &Defaulted]).account_update_data);
     }
 }

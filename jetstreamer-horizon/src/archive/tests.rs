@@ -406,11 +406,9 @@ fn bucket_decoder_matches_archive_reader() {
     let (bytes, expected, _) = write_archive(1_000, 300, ArchiveWriterConfig::default());
 
     let (header, _hlen) = parse_file_header(&bytes[..]).unwrap();
-    let footer =
-        Footer::from_bytes(bytes[bytes.len() - FOOTER_LEN..].try_into().unwrap()).unwrap();
+    let footer = Footer::from_bytes(bytes[bytes.len() - FOOTER_LEN..].try_into().unwrap()).unwrap();
     let index = parse_bucket_index(
-        &bytes[footer.index_offset as usize
-            ..(footer.index_offset + footer.index_len) as usize],
+        &bytes[footer.index_offset as usize..(footer.index_offset + footer.index_len) as usize],
         &footer,
     )
     .unwrap();
@@ -418,7 +416,9 @@ fn bucket_decoder_matches_archive_reader() {
     let mut reader = ArchiveReader::open(std::io::Cursor::new(&bytes[..])).unwrap();
     assert_eq!(index.len(), reader.bucket_count());
     let mut reader_collector = Collector::default();
-    reader.read_slots(0, u64::MAX, &mut reader_collector).unwrap();
+    reader
+        .read_slots(0, u64::MAX, &mut reader_collector)
+        .unwrap();
 
     let mut decoder = BucketDecoder::new();
     decoder.verify_chain = true;
@@ -767,4 +767,287 @@ fn timing_stateful_vs_reload_windows() {
         "  speedup: {:.1}x",
         reload.as_secs_f64() / stateful.as_secs_f64()
     );
+}
+
+// --- account-update skip-materialization (declared consumption) ---
+
+/// Forwarding visitor that declares it does not consume account-update
+/// data, exercising the visitor-declared consumption path end to end.
+struct DeclineData<V>(V);
+
+impl<V: SlotVisitor> SlotVisitor for DeclineData<V> {
+    fn on_epoch(&mut self, meta: &EpochMeta) {
+        self.0.on_epoch(meta);
+    }
+    fn on_transaction(&mut self, slot: u64, tx_index: u32, tx: &Transaction) {
+        self.0.on_transaction(slot, tx_index, tx);
+    }
+    fn on_block(&mut self, notification: &BlockNotification, entries: &[EntryRecord]) {
+        self.0.on_block(notification, entries);
+    }
+    fn consumption(&self) -> Consumption {
+        Consumption::all().without_account_update_data()
+    }
+}
+
+/// `expected` with every update's data elided (metadata and counts kept) —
+/// exactly what a consumption-declining decode must produce.
+fn elide_update_data(expected: &[ExpectedSlot]) -> Vec<ExpectedSlot> {
+    expected
+        .iter()
+        .cloned()
+        .map(|mut s| {
+            if let Some(meta) = &mut s.meta {
+                for (_, d) in meta.pre.iter_mut() {
+                    d.clear();
+                }
+                for (_, d) in meta.post.iter_mut() {
+                    d.clear();
+                }
+            }
+            for tx in s.txs.iter_mut() {
+                tx.3.clear();
+            }
+            s
+        })
+        .collect()
+}
+
+/// Skip mode must leave every non-update field of the stream byte-identical
+/// (fees, sigs, loaded addresses, block meta, entries, update counts and
+/// write_versions) while eliding update data — across all three update
+/// kinds (tx-owned, pre/post orphans) and leader-skipped slots. Byte
+/// tallies are cursor-position deltas so they must agree between modes.
+#[test]
+fn skip_materialization_preserves_streams_and_elides_data() {
+    let (bytes, expected, _) = write_archive(1_000, 300, ArchiveWriterConfig::default());
+    let expected_skip = elide_update_data(&expected);
+    assert_ne!(expected, expected_skip); // archive really contains update data
+
+    let mut skip_reader = ArchiveReader::open(std::io::Cursor::new(&bytes[..])).unwrap();
+    skip_reader.verify_chain = true;
+    let mut skip_visitor = DeclineData(Collector::default());
+    skip_reader
+        .read_slots(0, u64::MAX, &mut skip_visitor)
+        .unwrap();
+    assert_eq!(skip_visitor.0.slots, expected_skip);
+
+    let mut full_reader = ArchiveReader::open(std::io::Cursor::new(&bytes[..])).unwrap();
+    full_reader.verify_chain = true;
+    let mut full_collector = Collector::default();
+    full_reader
+        .read_slots(0, u64::MAX, &mut full_collector)
+        .unwrap();
+    assert_eq!(full_collector.slots, expected);
+    assert_eq!(
+        skip_reader.payload_byte_stats(),
+        full_reader.payload_byte_stats()
+    );
+}
+
+/// Same guarantee through the source-agnostic `BucketDecoder` path (the
+/// horizon firehose driver), controlled by the decoder flag directly.
+#[test]
+fn skip_materialization_bucket_decoder_path() {
+    let (bytes, expected, _) = write_archive(1_000, 300, ArchiveWriterConfig::default());
+    let expected_skip = elide_update_data(&expected);
+
+    let footer = Footer::from_bytes(bytes[bytes.len() - FOOTER_LEN..].try_into().unwrap()).unwrap();
+    let index = parse_bucket_index(
+        &bytes[footer.index_offset as usize..(footer.index_offset + footer.index_len) as usize],
+        &footer,
+    )
+    .unwrap();
+
+    let mut decoder = BucketDecoder::new();
+    decoder.materialize_account_data = false;
+    let mut collector = Collector::default();
+    for entry in &index {
+        let raw = &bytes[entry.offset as usize..(entry.offset + entry.len) as usize];
+        decoder
+            .decode_bucket(raw, 0, u64::MAX, &mut collector)
+            .unwrap();
+        assert!(!decoder.bucket_materializes_account_data());
+    }
+    assert_eq!(collector.slots, expected_skip);
+}
+
+/// A reader whose loaded bucket was latched under one materialization mode
+/// must reload (not continue in place) when the next visitor wants the
+/// other mode — otherwise a bytes-wanting visitor would resume inside a
+/// bucket whose diff store was never populated.
+#[test]
+fn switching_consumption_mid_bucket_reloads_under_new_mode() {
+    let (bytes, expected, _) = write_archive(1_000, 120, ArchiveWriterConfig::default());
+
+    let mut reader = ArchiveReader::open(std::io::Cursor::new(&bytes[..])).unwrap();
+    // First: decode part of bucket 0 with update data declined.
+    let mut skip_visitor = DeclineData(Collector::default());
+    reader.read_slots(1_000, 50, &mut skip_visitor).unwrap();
+    assert!(!skip_visitor.0.slots.is_empty());
+
+    // Then: continue mid-bucket with a full-consumption visitor. The reader
+    // must reload the bucket under materialization and reproduce every
+    // update byte exactly.
+    let mut full_collector = Collector::default();
+    reader
+        .read_slots(1_050, u64::MAX, &mut full_collector)
+        .unwrap();
+    let want: Vec<ExpectedSlot> = expected
+        .iter()
+        .filter(|s| s.slot >= 1_050)
+        .cloned()
+        .collect();
+    assert_eq!(full_collector.slots, want);
+
+    // And back: a declining visitor after a materializing one also reloads
+    // (stale materialized state is harmless, but the latch comparison is
+    // exact, so verify the elided shape too).
+    let mut skip_again = DeclineData(Collector::default());
+    reader.read_slots(1_010, 5, &mut skip_again).unwrap();
+    let want_skip: Vec<ExpectedSlot> = elide_update_data(&expected)
+        .into_iter()
+        .filter(|s| s.slot >= 1_010)
+        .take(5)
+        .collect();
+    assert_eq!(skip_again.0.slots, want_skip);
+}
+
+/// Epoch-attributed updates survive skip mode with counts intact and data
+/// elided (mirrors `epoch_meta_roundtrips_on_boundary_block`).
+#[test]
+fn skip_materialization_epoch_updates_counted_data_elided() {
+    let sink = std::io::Cursor::new(Vec::new());
+    let mut writer =
+        ArchiveWriter::new(sink, 900, 1_000, 100, ArchiveWriterConfig::default()).unwrap();
+
+    writer.begin_slot(1_000).unwrap();
+    let mut epoch = EpochMeta::new_boxed();
+    epoch.epoch = 900;
+    epoch.start_slot = 1_000;
+    epoch.slot_count = 100;
+    epoch.first_block_slot = 1_000;
+    epoch
+        .updates
+        .push(&AccountUpdateView {
+            pubkey: Address::new_from_array(POPULAR_PUBKEYS[5]),
+            lamports: 1,
+            owner: Address::new_from_array(POPULAR_PUBKEYS[2]),
+            executable: false,
+            rent_epoch: u64::MAX,
+            write_version: 7,
+            data: b"feature-activation",
+        })
+        .unwrap();
+    writer.write_epoch_meta(&epoch).unwrap();
+    writer
+        .write_orphan_update(&AccountUpdateView {
+            pubkey: Address::new_from_array(POPULAR_PUBKEYS[8]),
+            lamports: 1,
+            owner: Address::new_from_array(POPULAR_PUBKEYS[2]),
+            executable: false,
+            rent_epoch: u64::MAX,
+            write_version: 2,
+            data: b"clock",
+        })
+        .unwrap();
+    let mut meta = BlockMeta::new_boxed();
+    meta.slot = 1_000;
+    meta.blockhash = Hash::new_from_array([9; 32]);
+    writer.end_slot(&meta, &[]).unwrap();
+    let (sink, _) = writer.finish().unwrap();
+    let bytes = sink.into_inner();
+
+    /// Captures epoch update payload sizes + block pre-update data.
+    #[derive(Default)]
+    struct EpochCapture {
+        epoch_updates: Vec<(u64, usize)>, // (write_version, data len)
+        pre: Vec<(u64, Vec<u8>)>,
+    }
+    impl SlotVisitor for EpochCapture {
+        fn on_epoch(&mut self, meta: &EpochMeta) {
+            for (m, d) in meta.updates.iter() {
+                self.epoch_updates.push((m.write_version, d.len()));
+            }
+        }
+        fn on_block(&mut self, notification: &BlockNotification, _entries: &[EntryRecord]) {
+            if let BlockNotification::Block(meta) = notification {
+                for (m, d) in meta.pre_updates.iter() {
+                    self.pre.push((m.write_version, d.to_vec()));
+                }
+            }
+        }
+        fn consumption(&self) -> Consumption {
+            Consumption::all().without_account_update_data()
+        }
+    }
+
+    let mut reader = ArchiveReader::open(std::io::Cursor::new(&bytes[..])).unwrap();
+    let mut capture = EpochCapture::default();
+    reader.read_slots(0, u64::MAX, &mut capture).unwrap();
+    // Counts and write_versions intact; every data slice elided to empty.
+    assert_eq!(capture.epoch_updates, vec![(7, 0)]);
+    assert_eq!(capture.pre, vec![(2, Vec::new())]);
+}
+
+/// Wire-parity of the local skip against lencode's own `DiffEncoder`, with
+/// mode coverage asserted: mode 0 (full), mode 1 (RLE patches), and mode 2
+/// (XOR+zstd) segments must each be skipped to exactly their encoded
+/// length. This is the invariant the whole feature rests on — the skip
+/// path consuming byte-identical spans to `DiffDecoder::decode_blob`.
+#[test]
+fn skip_diff_blob_matches_encoder_output_for_all_modes() {
+    use lencode::diff::DiffEncoder;
+
+    let mut v1 = vec![0u8; 4096];
+    for (i, b) in v1.iter_mut().enumerate() {
+        *b = (i % 251) as u8;
+    }
+    // Single-byte change → RLE patches (mode 1).
+    let mut v2 = v1.clone();
+    v2[100] ^= 0xFF;
+    // Changing every 3rd byte (~33% of the blob, above the RLE half-blob
+    // cutoff) → XOR+zstd (mode 2); same pattern as lencode's own mode-2
+    // test.
+    let mut v3 = v2.clone();
+    let mut i = 0;
+    while i < v3.len() {
+        v3[i] = v3[i].wrapping_add(1);
+        i += 3;
+    }
+
+    let mut encoder = DiffEncoder::new();
+    let mut buf = Vec::new();
+    let mut boundaries = Vec::new();
+    for data in [&v1, &v2, &v3] {
+        encoder.set_key(42);
+        encoder.encode_blob(data, &mut buf).unwrap();
+        boundaries.push(buf.len());
+    }
+    // Assert the encoder actually chose three distinct modes (first byte of
+    // each segment is the varint mode flag for modes 0..=2).
+    let seg_starts = [0, boundaries[0], boundaries[1]];
+    assert_eq!(buf[seg_starts[0]], 0, "first write must be a full blob");
+    assert_eq!(buf[seg_starts[1]], 1, "single-byte change must pick RLE");
+    assert_eq!(buf[seg_starts[2]], 2, "scattered change must pick XOR+zstd");
+
+    // The skip must land exactly on each segment boundary.
+    let mut cur = lencode::io::Cursor::new(&buf[..]);
+    for boundary in &boundaries {
+        super::bucket::skip_diff_blob(&mut cur).unwrap();
+        assert_eq!(cur.position(), *boundary);
+    }
+
+    // Truncated payloads must fail cleanly, not advance past the end.
+    for boundary in &boundaries {
+        let mut truncated = lencode::io::Cursor::new(&buf[..boundary - 1]);
+        let mut last_ok = true;
+        for _ in 0..3 {
+            if super::bucket::skip_diff_blob(&mut truncated).is_err() {
+                last_ok = false;
+                break;
+            }
+        }
+        assert!(!last_ok, "skip over truncated stream must error");
+    }
 }

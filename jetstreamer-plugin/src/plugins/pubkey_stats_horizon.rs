@@ -18,7 +18,9 @@ use jetstreamer_horizon::archive::BlockNotification;
 use jetstreamer_horizon::transactions::{Transaction, VersionedMessage};
 
 use crate::PluginFuture;
-use crate::horizon::{HorizonPlugin, Output, PluginWorker, clamp_block_time, clamp_slot};
+use crate::horizon::{
+    Consumption, HorizonPlugin, Output, PluginWorker, clamp_block_time, clamp_slot,
+};
 
 #[derive(Row, Deserialize, Serialize, Copy, Clone, Debug)]
 struct PubkeyMention {
@@ -54,19 +56,26 @@ impl PluginWorker for PubkeyStatsWorker {
         }
     }
 
-    fn on_block(&mut self, notification: &BlockNotification, _entries: &[jetstreamer_horizon::archive::EntryRecord]) {
+    fn on_block(
+        &mut self,
+        notification: &BlockNotification,
+        _entries: &[jetstreamer_horizon::archive::EntryRecord],
+    ) {
         if let BlockNotification::Block(meta) = notification
             && let Some(counts) = self.pending.remove(&meta.slot)
         {
             let slot = clamp_slot(meta.slot);
             let timestamp = clamp_block_time(meta.block_time);
-            self.rows
-                .extend(counts.into_iter().map(|(pubkey, num_mentions)| PubkeyMention {
-                    slot,
-                    timestamp,
-                    pubkey,
-                    num_mentions,
-                }));
+            self.rows.extend(
+                counts
+                    .into_iter()
+                    .map(|(pubkey, num_mentions)| PubkeyMention {
+                        slot,
+                        timestamp,
+                        pubkey,
+                        num_mentions,
+                    }),
+            );
         }
     }
 
@@ -105,6 +114,13 @@ impl HorizonPlugin for PubkeyStatsHorizonPlugin {
 
     fn spawn_worker(&self, _thread_id: usize) -> Box<dyn PluginWorker> {
         Box::<PubkeyStatsWorker>::default()
+    }
+
+    /// Mentions come from transaction message account keys only — account
+    /// updates are never touched, so the decoder can skip reconstructing
+    /// their data entirely when this is the only plugin running.
+    fn consumption(&self) -> Consumption {
+        Consumption::all().without_account_update_data()
     }
 
     fn on_start(&self, db: Arc<Client>, _epoch: u64) -> PluginFuture<'_> {

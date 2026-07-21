@@ -21,7 +21,9 @@ use jetstreamer_firehose::epochs::epoch_to_slot_range;
 use jetstreamer_firehose::firehose_horizon::JetSource;
 use jetstreamer_horizon::archive::{BlockNotification, EntryRecord};
 use jetstreamer_horizon::transactions::Transaction;
-use jetstreamer_plugin::horizon::{HorizonPlugin, HorizonPluginRunner, Output, PluginWorker};
+use jetstreamer_plugin::horizon::{
+    Consumption, HorizonPlugin, HorizonPluginRunner, Output, PluginWorker,
+};
 use jetstreamer_plugin::plugins::account_writes::AccountWritesPlugin;
 use jetstreamer_plugin::plugins::pubkey_stats_horizon::PubkeyStatsHorizonPlugin;
 
@@ -37,7 +39,10 @@ fn should_spawn_for_dsn(dsn: &str) -> bool {
 fn usage() -> ! {
     eprintln!(
         "usage: horizon-pipeline <epoch|start:end> <jet-dir-or-base-url> \
-         [--threads N] [--clickhouse-dsn URL] [--bench]"
+         [--threads N] [--clickhouse-dsn URL] [--bench] [--no-account-bytes]\n\
+         --no-account-bytes (with --bench): declare account-update data \
+         unconsumed so the decoder skips diff reconstruction — benchmarks \
+         the metadata-only fast path (update counts stay real, bytes read 0)"
     );
     std::process::exit(2);
 }
@@ -90,10 +95,12 @@ impl PluginWorker for BenchWorker {
 
     fn flush(&mut self, _out: &Output) {
         let c = &self.counters;
-        c.slots.fetch_add(std::mem::take(&mut self.slots), Ordering::Relaxed);
+        c.slots
+            .fetch_add(std::mem::take(&mut self.slots), Ordering::Relaxed);
         c.blocks
             .fetch_add(std::mem::take(&mut self.blocks), Ordering::Relaxed);
-        c.txs.fetch_add(std::mem::take(&mut self.txs), Ordering::Relaxed);
+        c.txs
+            .fetch_add(std::mem::take(&mut self.txs), Ordering::Relaxed);
         c.tx_updates
             .fetch_add(std::mem::take(&mut self.tx_updates), Ordering::Relaxed);
         c.orphan_updates
@@ -108,6 +115,11 @@ impl PluginWorker for BenchWorker {
 /// creates no tables and submits no inserts.
 struct BenchPlugin {
     counters: Arc<BenchCounters>,
+    /// With `--no-account-bytes` this is false: the plugin declares it does
+    /// not consume account-update data, so the decoder skips the diff
+    /// reconstruction — benchmarking the metadata-only fast path. Update
+    /// COUNTS stay real (metas still decode); `update_bytes` reads 0.
+    consume_account_bytes: bool,
 }
 
 impl HorizonPlugin for BenchPlugin {
@@ -120,6 +132,14 @@ impl HorizonPlugin for BenchPlugin {
             counters: self.counters.clone(),
             ..Default::default()
         })
+    }
+
+    fn consumption(&self) -> Consumption {
+        if self.consume_account_bytes {
+            Consumption::all()
+        } else {
+            Consumption::all().without_account_update_data()
+        }
     }
 }
 
@@ -157,9 +177,10 @@ async fn main() {
     let mut threads = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(8);
-    let mut dsn = std::env::var("JETSTREAMER_CLICKHOUSE_DSN")
-        .unwrap_or_else(|_| DEFAULT_DSN.to_string());
+    let mut dsn =
+        std::env::var("JETSTREAMER_CLICKHOUSE_DSN").unwrap_or_else(|_| DEFAULT_DSN.to_string());
     let mut bench = false;
+    let mut no_account_bytes = false;
     while let Some(flag) = args.next() {
         match flag.as_str() {
             "--threads" => {
@@ -170,8 +191,15 @@ async fn main() {
             }
             "--clickhouse-dsn" => dsn = args.next().unwrap_or_else(|| usage()),
             "--bench" => bench = true,
+            "--no-account-bytes" => no_account_bytes = true,
             _ => usage(),
         }
+    }
+    if no_account_bytes && !bench {
+        // The real plugins declare their own consumption; forcing bytes off
+        // under them would silently zero account_write_stats.
+        eprintln!("--no-account-bytes only applies to --bench");
+        usage();
     }
 
     // First CTRL+C aborts the epoch loop (the embedded ClickHouse still gets
@@ -235,6 +263,7 @@ async fn main() {
     if bench {
         runner.add_plugin(Arc::new(BenchPlugin {
             counters: bench_counters.clone(),
+            consume_account_bytes: !no_account_bytes,
         }));
     } else {
         runner.add_plugin(Arc::new(PubkeyStatsHorizonPlugin::new()));

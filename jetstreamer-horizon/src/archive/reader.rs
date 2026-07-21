@@ -138,14 +138,24 @@ impl<R: std::io::Read + std::io::Seek> ArchiveReader<R> {
             return Ok(0);
         }
         self.decoder.verify_chain = self.verify_chain;
+        self.decoder.materialize_account_data = visitor.consumption().account_update_data;
         let target_bucket = bucket_containing(&self.header, &self.index, start_slot);
         let continue_in_place = match self.current_bucket {
             // Right bucket already loaded and we haven't decoded past the
-            // target: keep streaming from where we are.
-            Some(cur) if cur == target_bucket => self
-                .decoder
-                .last_decoded_slot()
-                .is_none_or(|last| last < start_slot),
+            // target: keep streaming from where we are — unless the loaded
+            // bucket was latched with a different account-data
+            // materialization mode than this visitor wants, in which case a
+            // reload re-decodes it under the right mode (diff state is
+            // bucket-scoped, so a bytes-wanting visitor must not continue
+            // inside a bucket whose earlier records were skipped).
+            Some(cur) if cur == target_bucket => {
+                self.decoder.bucket_materializes_account_data()
+                    == self.decoder.materialize_account_data
+                    && self
+                        .decoder
+                        .last_decoded_slot()
+                        .is_none_or(|last| last < start_slot)
+            }
             // Target is in a later bucket: jumping is strictly cheaper than
             // streaming through — encoder state resets per bucket, so the
             // intermediate buckets contribute nothing.

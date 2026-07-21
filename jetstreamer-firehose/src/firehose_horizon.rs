@@ -27,8 +27,9 @@ use rseek::Seekable;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt, BufReader, ReadBuf};
 
 use jetstreamer_horizon::archive::{
-    ArchiveFormatError, BlockNotification, BucketDecoder, BucketIndexEntry, EntryRecord, EpochMeta,
-    FOOTER_LEN, Footer, SlotVisitor, bucket_containing, parse_bucket_index, parse_file_header,
+    ArchiveFormatError, BlockNotification, BucketDecoder, BucketIndexEntry, Consumption,
+    EntryRecord, EpochMeta, FOOTER_LEN, Footer, SlotVisitor, bucket_containing, parse_bucket_index,
+    parse_file_header,
 };
 use jetstreamer_horizon::transactions::Transaction;
 
@@ -187,6 +188,9 @@ where
             let mut rx = rx;
             let mut decoder = BucketDecoder::new();
             decoder.verify_chain = false;
+            // Honor the visitor's declared consumption: unconsumed
+            // account-update data is skipped, not reconstructed.
+            decoder.materialize_account_data = visitor.consumption().account_update_data;
             'outer: while let Some(raw) = rx.blocking_recv() {
                 decoder.load_bucket_bytes(&raw)?;
                 let mut bounded = Bounded {
@@ -257,6 +261,9 @@ impl<V: SlotVisitor> SlotVisitor for Bounded<'_, V> {
             self.inner.on_block(notification, entries);
         }
     }
+    fn consumption(&self) -> Consumption {
+        self.inner.consumption()
+    }
 }
 
 /// Splits the inclusive bucket range `[start, end_inclusive]` into `threads`
@@ -296,7 +303,10 @@ async fn open_jet_stream(
             let req_url = url.to_string();
             let c = client.clone();
             let seekable = Seekable::new(move || c.get(req_url.clone())).await;
-            Ok(EpochStream::new(BufReader::with_capacity(1 << 20, seekable)))
+            Ok(EpochStream::new(BufReader::with_capacity(
+                1 << 20,
+                seekable,
+            )))
         }
     }
 }
@@ -388,7 +398,11 @@ mod tests {
         let (sink, _stats) = writer.finish().unwrap();
 
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join(format!("epoch-{epoch}.jet")), sink.into_inner()).unwrap();
+        std::fs::write(
+            dir.path().join(format!("epoch-{epoch}.jet")),
+            sink.into_inner(),
+        )
+        .unwrap();
 
         // 4 workers over 3 buckets exercises a trailing empty worker too.
         let visitors = firehose_horizon(
@@ -430,20 +444,109 @@ mod tests {
         let (sink, _stats) = writer.finish().unwrap();
 
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join(format!("epoch-{epoch}.jet")), sink.into_inner()).unwrap();
+        std::fs::write(
+            dir.path().join(format!("epoch-{epoch}.jet")),
+            sink.into_inner(),
+        )
+        .unwrap();
 
         // 50..200 spans bucket boundaries on both ends (buckets are 128 wide).
-        let visitors = firehose_horizon(
-            3,
-            JetSource::local(dir.path()),
-            epoch,
-            50..200,
-            |_tid| SlotCounter::default(),
-        )
+        let visitors = firehose_horizon(3, JetSource::local(dir.path()), epoch, 50..200, |_tid| {
+            SlotCounter::default()
+        })
         .await
         .unwrap();
 
         let skipped: u64 = visitors.iter().map(|v| v.skipped).sum();
         assert_eq!(skipped, 150, "only slots [50, 200) visited");
+    }
+
+    /// A visitor that declares it does not consume account-update data must
+    /// get elided (empty) data slices with metadata and counts intact — the
+    /// declaration travels visitor → `Bounded` → decoder through the full
+    /// async driver.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn local_jet_elides_update_data_when_declined() {
+        use jetstreamer_horizon::account_updates::AccountUpdateView;
+        use jetstreamer_horizon::block_metas::BlockMeta;
+        use solana_address::Address;
+        use solana_hash::Hash;
+
+        let epoch = 9u64;
+        let slot_start = 0u64;
+        let n = 10u64;
+
+        let mut writer = ArchiveWriter::new(
+            std::io::Cursor::new(Vec::new()),
+            epoch,
+            slot_start,
+            n,
+            ArchiveWriterConfig::default(),
+        )
+        .unwrap();
+        let owner = Address::new_from_array([7u8; 32]);
+        for i in 0..n {
+            let slot = slot_start + i;
+            writer.begin_slot(slot).unwrap();
+            writer
+                .write_orphan_update(&AccountUpdateView {
+                    pubkey: Address::new_from_array([11u8; 32]),
+                    lamports: i,
+                    owner,
+                    executable: false,
+                    rent_epoch: u64::MAX,
+                    write_version: i,
+                    data: &[0xAB; 64],
+                })
+                .unwrap();
+            let mut meta = BlockMeta::new_boxed();
+            meta.slot = slot;
+            meta.parent_slot = slot.saturating_sub(1);
+            meta.blockhash = Hash::new_from_array([i as u8 + 1; 32]);
+            writer.end_slot(&meta, &[]).unwrap();
+        }
+        let (sink, _stats) = writer.finish().unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(format!("epoch-{epoch}.jet")),
+            sink.into_inner(),
+        )
+        .unwrap();
+
+        /// Tallies orphan updates and their data bytes; declines data.
+        #[derive(Default)]
+        struct DecliningTally {
+            updates: u64,
+            data_bytes: u64,
+        }
+        impl SlotVisitor for DecliningTally {
+            fn on_block(&mut self, notification: &BlockNotification, _entries: &[EntryRecord]) {
+                if let BlockNotification::Block(meta) = notification {
+                    for (_, d) in meta.pre_updates.iter().chain(meta.post_updates.iter()) {
+                        self.updates += 1;
+                        self.data_bytes += d.len() as u64;
+                    }
+                }
+            }
+            fn consumption(&self) -> Consumption {
+                Consumption::all().without_account_update_data()
+            }
+        }
+
+        let visitors = firehose_horizon(
+            2,
+            JetSource::local(dir.path()),
+            epoch,
+            slot_start..slot_start + n,
+            |_tid| DecliningTally::default(),
+        )
+        .await
+        .unwrap();
+
+        let updates: u64 = visitors.iter().map(|v| v.updates).sum();
+        let data_bytes: u64 = visitors.iter().map(|v| v.data_bytes).sum();
+        assert_eq!(updates, n, "every update's metadata still arrives");
+        assert_eq!(data_bytes, 0, "declined update data decodes empty");
     }
 }

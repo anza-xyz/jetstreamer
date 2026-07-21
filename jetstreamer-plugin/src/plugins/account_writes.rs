@@ -89,7 +89,9 @@ impl PluginWorker for AccountWritesWorker {
         let rows = std::mem::take(&mut self.rows);
         let db = out.db();
         out.submit(async move {
-            let mut insert = db.insert::<AccountWriteStats>("account_write_stats").await?;
+            let mut insert = db
+                .insert::<AccountWriteStats>("account_write_stats")
+                .await?;
             for row in &rows {
                 insert.write(row).await?;
             }
@@ -118,6 +120,11 @@ impl HorizonPlugin for AccountWritesPlugin {
     fn spawn_worker(&self, _thread_id: usize) -> Box<dyn PluginWorker> {
         Box::<AccountWritesWorker>::default()
     }
+
+    // Keeps the default `consumption()` (everything): `data_bytes` sums
+    // `data.len()` from every update, and elided updates decode with empty
+    // data slices — dropping account-update data would silently zero the
+    // column.
 
     fn on_start(&self, db: Arc<Client>, _epoch: u64) -> PluginFuture<'_> {
         async move {

@@ -22,6 +22,64 @@ use crate::transactions::{
 
 use super::format::*;
 
+/// What a [`SlotVisitor`] actually consumes from the decoded stream, declared
+/// up front so the decoder can skip work whose output nobody reads.
+///
+/// Defaults to everything (safe). Build with [`Consumption::all`] and drop
+/// what you don't need:
+///
+/// ```
+/// use jetstreamer_horizon::archive::Consumption;
+/// let metadata_only = Consumption::all().without_account_update_data();
+/// assert!(!metadata_only.account_update_data);
+/// ```
+///
+/// Extensible: more skippable dimensions may be added, so construct via the
+/// builders rather than struct literals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Consumption {
+    /// Materialize account-update data bytes (the per-account diff
+    /// reconstruction). When `false`, every update still arrives with full
+    /// metadata (pubkey, lamports, owner, executable, rent_epoch,
+    /// write_version) and correct counts, but its `data` slice is empty —
+    /// the decoder parses the diff framing to advance and skips
+    /// reconstruction entirely. In archives dominated by account state this
+    /// skips the bulk of decode memory traffic.
+    pub account_update_data: bool,
+}
+
+impl Consumption {
+    /// Consume everything the archive stores (the default).
+    pub const fn all() -> Self {
+        Self {
+            account_update_data: true,
+        }
+    }
+
+    /// Drop account-update data bytes: updates keep metadata and counts but
+    /// their `data` slices decode empty.
+    pub const fn without_account_update_data(mut self) -> Self {
+        self.account_update_data = false;
+        self
+    }
+
+    /// The union of two declarations: a stream field is consumed if either
+    /// side consumes it. Used by fan-out visitors to combine their
+    /// children's declarations.
+    pub const fn union(self, other: Self) -> Self {
+        Self {
+            account_update_data: self.account_update_data || other.account_update_data,
+        }
+    }
+}
+
+impl Default for Consumption {
+    fn default() -> Self {
+        Self::all()
+    }
+}
+
 /// Callbacks invoked while decoding slot frames, in firehose order:
 /// epoch notification first (boundary slots), then every transaction of
 /// the slot, then the slot's block notification — with the block's
@@ -40,6 +98,13 @@ pub trait SlotVisitor {
     /// metadata + grouped orphan updates, or a leader-skipped marker) plus
     /// the block's PoH entry records (empty for skipped slots).
     fn on_block(&mut self, _notification: &BlockNotification, _entries: &[EntryRecord]) {}
+    /// Declares what this visitor consumes; drivers sample it and configure
+    /// the decoder to skip unconsumed work. Defaults to everything (safe).
+    /// Must be stable for the duration of a decode drive — drivers latch it
+    /// at bucket boundaries.
+    fn consumption(&self) -> Consumption {
+        Consumption::all()
+    }
 }
 
 /// Per-category breakdown of the *uncompressed payload* bytes a decoder has
@@ -78,7 +143,19 @@ pub struct BucketDecoder {
     /// decoding. Full SHA-256 PoH recomputation is a planned follow-up; the
     /// format already stores everything it needs.
     pub verify_chain: bool,
+    /// Materialize account-update data (the per-account diff
+    /// reconstruction). When `false`, updates decode with full metadata but
+    /// empty `data` slices, skipping reconstruction and the diff store
+    /// entirely. Latched per bucket at
+    /// [`load_bucket_bytes`](Self::load_bucket_bytes): diff records resolve
+    /// against blobs stored earlier in the *same* bucket, so flipping
+    /// mid-bucket would corrupt or fail reconstruction — the effective
+    /// setting changes only when a bucket is (re)loaded.
+    pub materialize_account_data: bool,
 
+    /// The materialization setting latched when the current bucket was
+    /// loaded (see [`Self::materialize_account_data`]).
+    bucket_materialize: bool,
     payload: Vec<u8>,
     pos: usize,
     slots_remaining: u32,
@@ -115,6 +192,8 @@ impl BucketDecoder {
     pub fn new() -> Self {
         Self {
             verify_chain: false,
+            materialize_account_data: true,
+            bucket_materialize: true,
             payload: Vec::new(),
             pos: 0,
             slots_remaining: 0,
@@ -178,6 +257,11 @@ impl BucketDecoder {
         self.last_blockhash = header.poh_start_hash;
         reset_decoder(&mut self.dec_ctx);
         self.diff.clear();
+        // Latch the materialization mode for this whole bucket: the diff
+        // store just reset, so a bucket decoded end-to-end without
+        // materialization never misses a stored blob, and the next bucket
+        // starts clean either way.
+        self.bucket_materialize = self.materialize_account_data;
         Ok(())
     }
 
@@ -189,6 +273,15 @@ impl BucketDecoder {
     /// Slot of the last frame decoded from the loaded bucket, if any.
     pub fn last_decoded_slot(&self) -> Option<u64> {
         self.last_decoded_slot
+    }
+
+    /// The materialization setting latched when the current bucket was
+    /// loaded. Drivers that keep a bucket resident across visitor changes
+    /// (e.g. [`ArchiveReader`](super::ArchiveReader)'s continue-in-place
+    /// path) must reload when this disagrees with the requested
+    /// [`Self::materialize_account_data`].
+    pub fn bucket_materializes_account_data(&self) -> bool {
+        self.bucket_materialize
     }
 
     /// Convenience: load `raw` then decode every remaining frame whose slot
@@ -229,6 +322,7 @@ impl BucketDecoder {
         cur.read(&mut kind)?;
         let kind = SlotKind::try_from(kind[0])?;
         let emit = slot >= start_slot;
+        let materialize = self.bucket_materialize;
 
         // Per-category payload byte tally for this frame (account updates and
         // transaction fields; everything else is derived at the end).
@@ -267,6 +361,7 @@ impl BucketDecoder {
                             &mut cur,
                             &mut self.dec_ctx,
                             &mut self.diff,
+                            materialize,
                             |view| updates.push(view),
                         )?;
                     }
@@ -286,6 +381,7 @@ impl BucketDecoder {
                         &mut cur,
                         &mut self.dec_ctx,
                         &mut self.diff,
+                        materialize,
                         |view| pre.push(view),
                     )?;
                 }
@@ -300,6 +396,7 @@ impl BucketDecoder {
                         &mut self.scratch,
                         &mut self.dec_ctx,
                         &mut self.diff,
+                        materialize,
                     )?;
                     tx_field_bytes += (cur.position() - tx_start) - tx_au;
                     au_bytes += tx_au;
@@ -321,6 +418,7 @@ impl BucketDecoder {
                         &mut cur,
                         &mut self.dec_ctx,
                         &mut self.diff,
+                        materialize,
                         |view| post.push(view),
                     )?;
                 }
@@ -429,8 +527,7 @@ pub fn parse_bucket_index(
 /// bucket whose `first_slot <= slot` — zero iterations for dense archives.
 /// `index` must be non-empty.
 pub fn bucket_containing(header: &FileHeader, index: &[BucketIndexEntry], slot: u64) -> usize {
-    let id =
-        (slot.saturating_sub(header.slot_start) / header.bucket_slots as u64) as usize;
+    let id = (slot.saturating_sub(header.slot_start) / header.bucket_slots as u64) as usize;
     let mut i = id.min(index.len().saturating_sub(1));
     while i > 0 && index[i].first_slot > slot {
         i -= 1;
@@ -476,10 +573,20 @@ fn set_notification_block(scratch: &mut BlockNotification) -> &mut BlockMeta {
 /// Decodes one account-update record (metadata via the dedupe context,
 /// data blob via the diff decoder) and hands it to `store` as a borrowed
 /// view. Exact mirror of the writer's `encode_update_record`.
+///
+/// The metadata decode is unconditional: pubkey/owner flow through the
+/// shared dedupe context, whose scratch table assigns positional IDs that
+/// later records in the bucket (including transaction fields) reference —
+/// skipping them would desynchronize the whole bucket. When `materialize`
+/// is `false` only the data blob is skipped: its framing is parsed to
+/// advance the cursor over exactly the bytes `DiffDecoder::decode_blob`
+/// would consume, no reconstruction happens, the diff store stays empty,
+/// and `store` receives the view with an empty `data` slice.
 fn decode_update_record_into(
     reader: &mut impl Read,
     ctx: &mut DecoderContext,
     diff: &mut DiffDecoder,
+    materialize: bool,
     store: impl FnOnce(&AccountUpdateView<'_>) -> Result<(), PushAccountUpdateError>,
 ) -> Result<(), ArchiveFormatError> {
     let pubkey = Address::decode_ext(reader, Some(ctx))?;
@@ -488,8 +595,15 @@ fn decode_update_record_into(
     let executable = bool::decode_ext(reader, Some(ctx))?;
     let rent_epoch = u64::decode_ext(reader, Some(ctx))?;
     let write_version = u64::decode_ext(reader, Some(ctx))?;
-    diff.set_key(account_diff_key(&pubkey));
-    let data = diff.decode_blob(reader)?;
+    let data: Vec<u8>;
+    let data_slice: &[u8] = if materialize {
+        diff.set_key(account_diff_key(&pubkey));
+        data = diff.decode_blob(reader)?;
+        &data
+    } else {
+        skip_diff_blob(reader)?;
+        &[]
+    };
     store(&AccountUpdateView {
         pubkey,
         lamports,
@@ -497,10 +611,80 @@ fn decode_update_record_into(
         executable,
         rent_epoch,
         write_version,
-        data: &data,
+        data: data_slice,
     })
     .map_err(|_| ArchiveFormatError::Encode(lencode::io::Error::InvalidData))?;
     Ok(())
+}
+
+/// Advances `reader` over one diff-encoded blob without reconstructing it.
+///
+/// Byte-exact framing mirror of lencode 1.1's `DiffDecoder::decode_blob`
+/// (which has no skip API): varint mode, then — mode 0: varint len + len
+/// raw bytes; mode 1: varint new_len, varint num_patches, then per patch
+/// varint gap + varint patch_len + patch_len raw bytes (gaps carry no
+/// stream bytes); mode 2: varint new_len, varint compressed_len +
+/// compressed_len raw bytes. The varints here are `u64::decode_ext`, which
+/// is the same `Lencode::decode_varint_u64` codec `decode_blob` uses, so
+/// the cursor advances over exactly the span the materializing path
+/// consumes. Touches no diff-store state; correctness relies on the
+/// bucket-scoped latch (see [`BucketDecoder::materialize_account_data`]).
+pub(crate) fn skip_diff_blob(reader: &mut impl Read) -> Result<(), ArchiveFormatError> {
+    let mode = u64::decode_ext(reader, None)?;
+    match mode {
+        0 => {
+            let len = u64::decode_ext(reader, None)? as usize;
+            skip_reader_bytes(reader, len)
+        }
+        1 => {
+            let _new_len = u64::decode_ext(reader, None)?;
+            let num_patches = u64::decode_ext(reader, None)? as usize;
+            for _ in 0..num_patches {
+                let _gap = u64::decode_ext(reader, None)?;
+                let patch_len = u64::decode_ext(reader, None)? as usize;
+                skip_reader_bytes(reader, patch_len)?;
+            }
+            Ok(())
+        }
+        2 => {
+            let _new_len = u64::decode_ext(reader, None)?;
+            let compressed_len = u64::decode_ext(reader, None)? as usize;
+            skip_reader_bytes(reader, compressed_len)
+        }
+        _ => Err(ArchiveFormatError::Encode(lencode::io::Error::InvalidData)),
+    }
+}
+
+/// Advances `reader` by `n` bytes without copying when it exposes its
+/// buffer (the in-memory bucket cursor always does), falling back to
+/// chunked discard reads otherwise.
+fn skip_reader_bytes(reader: &mut impl Read, n: usize) -> Result<(), ArchiveFormatError> {
+    match reader.buf() {
+        Some(buf) => {
+            if buf.len() < n {
+                return Err(ArchiveFormatError::Encode(
+                    lencode::io::Error::ReaderOutOfData,
+                ));
+            }
+            reader.advance(n);
+            Ok(())
+        }
+        None => {
+            let mut remaining = n;
+            let mut scratch = [0u8; 4096];
+            while remaining > 0 {
+                let take = remaining.min(scratch.len());
+                let got = reader.read(&mut scratch[..take])?;
+                if got != take {
+                    return Err(ArchiveFormatError::Encode(
+                        lencode::io::Error::ReaderOutOfData,
+                    ));
+                }
+                remaining -= take;
+            }
+            Ok(())
+        }
+    }
 }
 
 /// Decodes one transaction record into `scratch`. Exact mirror of
@@ -512,6 +696,7 @@ fn read_tx_record(
     scratch: &mut Transaction,
     ctx: &mut DecoderContext,
     diff: &mut DiffDecoder,
+    materialize: bool,
 ) -> Result<usize, ArchiveFormatError> {
     scratch.clear();
 
@@ -521,8 +706,12 @@ fn read_tx_record(
     scratch.fee = u64::decode_ext(cur, Some(ctx))?;
     scratch.pre_balances.decode_into(cur, Some(ctx))?;
     scratch.post_balances.decode_into(cur, Some(ctx))?;
-    scratch.loaded_writable_addresses.decode_into(cur, Some(ctx))?;
-    scratch.loaded_readonly_addresses.decode_into(cur, Some(ctx))?;
+    scratch
+        .loaded_writable_addresses
+        .decode_into(cur, Some(ctx))?;
+    scratch
+        .loaded_readonly_addresses
+        .decode_into(cur, Some(ctx))?;
     decode_option_zerovec_into(&mut scratch.inner_instructions, cur, Some(ctx))?;
     decode_option_log_messages_into(&mut scratch.log_messages, cur, Some(ctx))?;
     decode_option_zerovec_into(&mut scratch.pre_token_balances, cur, Some(ctx))?;
@@ -535,7 +724,9 @@ fn read_tx_record(
     let au_count = u64::decode_ext(cur, Some(ctx))?;
     let au_start = cur.position();
     for _ in 0..au_count {
-        decode_update_record_into(cur, ctx, diff, |view| scratch.push_account_update(view))?;
+        decode_update_record_into(cur, ctx, diff, materialize, |view| {
+            scratch.push_account_update(view)
+        })?;
     }
     Ok(cur.position() - au_start)
 }

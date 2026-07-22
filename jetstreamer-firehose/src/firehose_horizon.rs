@@ -43,8 +43,17 @@ const HEADER_PREFIX: usize = 16 * 1024;
 const PREFETCH_DEPTH: usize = 2;
 
 /// Where `.jet` files live. Each epoch resolves to `epoch-<N>.jet`.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub enum JetSource {
+    /// One epoch's `.jet` bytes held entirely in memory (e.g. preloaded by a
+    /// benchmark to take disk I/O out of the measurement). Serves only its
+    /// own epoch; workers share the buffer via cheap `Arc` clones.
+    Memory {
+        /// The epoch these bytes are the archive for.
+        epoch: u64,
+        /// The complete `.jet` file contents.
+        bytes: std::sync::Arc<[u8]>,
+    },
     /// A local directory holding `epoch-<N>.jet`, read with `tokio::fs`.
     LocalDir(PathBuf),
     /// A base URL under which `epoch-<N>.jet` is served, seeked with
@@ -68,6 +77,29 @@ impl JetSource {
         };
         let url = Url::parse(&normalized).map_err(|e| HorizonFirehoseError::Url(e.to_string()))?;
         Ok(Self::HttpBase(url))
+    }
+
+    /// One epoch's complete `.jet` contents held in memory. Serves only
+    /// `epoch`; requesting any other epoch errors.
+    pub fn in_memory(epoch: u64, bytes: impl Into<std::sync::Arc<[u8]>>) -> Self {
+        Self::Memory {
+            epoch,
+            bytes: bytes.into(),
+        }
+    }
+}
+
+impl std::fmt::Debug for JetSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Memory { epoch, bytes } => f
+                .debug_struct("Memory")
+                .field("epoch", epoch)
+                .field("len", &bytes.len())
+                .finish(),
+            Self::LocalDir(dir) => f.debug_tuple("LocalDir").field(dir).finish(),
+            Self::HttpBase(url) => f.debug_tuple("HttpBase").field(url).finish(),
+        }
     }
 }
 
@@ -290,6 +322,17 @@ async fn open_jet_stream(
     client: &Client,
 ) -> Result<EpochStream, HorizonFirehoseError> {
     match src {
+        JetSource::Memory { epoch: held, bytes } => {
+            if *held != epoch {
+                return Err(HorizonFirehoseError::Url(format!(
+                    "in-memory source holds epoch {held}, not {epoch}"
+                )));
+            }
+            Ok(EpochStream::new(MemJetReader {
+                bytes: bytes.clone(),
+                pos: 0,
+            }))
+        }
         JetSource::LocalDir(dir) => {
             let path = dir.join(format!("epoch-{epoch}.jet"));
             let file = tokio::fs::File::open(&path).await?;
@@ -349,6 +392,56 @@ impl AsyncSeek for LocalJetReader {
 impl Len for LocalJetReader {
     fn len(&self) -> u64 {
         self.len
+    }
+}
+
+/// A fully in-memory `.jet` as an `AsyncRead + AsyncSeek + Len` reader —
+/// every read is a memcpy from the shared buffer, always `Ready`.
+struct MemJetReader {
+    bytes: std::sync::Arc<[u8]>,
+    pos: u64,
+}
+
+impl AsyncRead for MemJetReader {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        let start = (this.pos as usize).min(this.bytes.len());
+        let n = buf.remaining().min(this.bytes.len() - start);
+        buf.put_slice(&this.bytes[start..start + n]);
+        this.pos += n as u64;
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl AsyncSeek for MemJetReader {
+    fn start_seek(self: Pin<&mut Self>, position: io::SeekFrom) -> io::Result<()> {
+        let this = self.get_mut();
+        let new = match position {
+            io::SeekFrom::Start(off) => off as i128,
+            io::SeekFrom::End(off) => this.bytes.len() as i128 + off as i128,
+            io::SeekFrom::Current(off) => this.pos as i128 + off as i128,
+        };
+        if new < 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "seek before start",
+            ));
+        }
+        this.pos = new as u64;
+        Ok(())
+    }
+    fn poll_complete(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<u64>> {
+        Poll::Ready(Ok(self.get_mut().pos))
+    }
+}
+
+impl Len for MemJetReader {
+    fn len(&self) -> u64 {
+        self.bytes.len() as u64
     }
 }
 
@@ -548,5 +641,48 @@ mod tests {
         let data_bytes: u64 = visitors.iter().map(|v| v.data_bytes).sum();
         assert_eq!(updates, n, "every update's metadata still arrives");
         assert_eq!(data_bytes, 0, "declined update data decodes empty");
+    }
+
+    /// The in-memory source must drive the exact same decode as the local
+    /// backend (and reject a mismatched epoch).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn memory_source_matches_local() {
+        let epoch = 11u64;
+        let slot_start = 0u64;
+        let n = 300u64;
+
+        let mut writer = ArchiveWriter::new(
+            std::io::Cursor::new(Vec::new()),
+            epoch,
+            slot_start,
+            n,
+            ArchiveWriterConfig::default(),
+        )
+        .unwrap();
+        for i in 0..n {
+            writer.write_skipped_slot(slot_start + i).unwrap();
+        }
+        let (sink, _stats) = writer.finish().unwrap();
+        let bytes = sink.into_inner();
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(format!("epoch-{epoch}.jet")), &bytes).unwrap();
+
+        let mem_src = JetSource::in_memory(epoch, bytes);
+        for src in [JetSource::local(dir.path()), mem_src.clone()] {
+            let visitors = firehose_horizon(3, src, epoch, slot_start..slot_start + n, |_tid| {
+                SlotCounter::default()
+            })
+            .await
+            .unwrap();
+            let skipped: u64 = visitors.iter().map(|v| v.skipped).sum();
+            assert_eq!(skipped, n, "every slot visited exactly once");
+        }
+
+        // Wrong epoch → error, not silent garbage.
+        let err = firehose_horizon(2, mem_src, epoch + 1, 0..1, |_tid| SlotCounter::default())
+            .await
+            .err();
+        assert!(err.is_some(), "mismatched epoch must be rejected");
     }
 }

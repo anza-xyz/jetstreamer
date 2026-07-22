@@ -39,10 +39,13 @@ fn should_spawn_for_dsn(dsn: &str) -> bool {
 fn usage() -> ! {
     eprintln!(
         "usage: horizon-pipeline <epoch|start:end> <jet-dir-or-base-url> \
-         [--threads N] [--clickhouse-dsn URL] [--bench] [--no-account-bytes]\n\
+         [--threads N] [--clickhouse-dsn URL] [--bench] [--no-account-bytes] [--no-preload]\n\
          --no-account-bytes (with --bench): declare account-update data \
          unconsumed so the decoder skips diff reconstruction — benchmarks \
-         the metadata-only fast path (update counts stay real, bytes read 0)"
+         the metadata-only fast path (update counts stay real, bytes read 0)\n\
+         --no-preload (with --bench): read from disk even when the epoch \
+         file would fit in RAM (by default the bench preloads it and \
+         measures pure decode)"
     );
     std::process::exit(2);
 }
@@ -143,6 +146,63 @@ impl HorizonPlugin for BenchPlugin {
     }
 }
 
+/// `MemAvailable` from `/proc/meminfo` (Linux; `None` elsewhere) — the
+/// kernel's estimate of memory allocatable without swapping.
+fn mem_available_bytes() -> Option<u64> {
+    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+    for line in meminfo.lines() {
+        if let Some(rest) = line.strip_prefix("MemAvailable:") {
+            let kb: u64 = rest.trim().trim_end_matches("kB").trim().parse().ok()?;
+            return Some(kb * 1024);
+        }
+    }
+    None
+}
+
+/// Headroom the preload leaves for decode scratches, the page cache, and
+/// everything else on the box; the file is only preloaded when
+/// `MemAvailable` covers its size plus this.
+const PRELOAD_HEADROOM_BYTES: u64 = 48 * 1024 * 1024 * 1024;
+
+/// Bench-only: if `epoch`'s `.jet` fits in RAM (with headroom), read it
+/// fully into memory and return an in-memory source, so the measured rate
+/// is pure decode with zero disk I/O. Returns `None` (with a log line
+/// saying why) when it doesn't apply; the caller falls back to `src`.
+async fn preload_epoch(src: &JetSource, epoch: u64) -> Option<JetSource> {
+    let JetSource::LocalDir(dir) = src else {
+        return None; // preloading only makes sense for local files
+    };
+    let path = dir.join(format!("epoch-{epoch}.jet"));
+    let file_len = std::fs::metadata(&path).ok()?.len();
+    let Some(available) = mem_available_bytes() else {
+        log::info!("bench: no MemAvailable (non-Linux?); reading from disk");
+        return None;
+    };
+    if available < file_len + PRELOAD_HEADROOM_BYTES {
+        log::info!(
+            "bench: epoch {epoch} not preloaded ({} file vs {} available); reading from disk",
+            commas(file_len),
+            commas(available)
+        );
+        return None;
+    }
+    log::info!(
+        "bench: preloading epoch {epoch} into RAM ({} bytes)...",
+        commas(file_len)
+    );
+    let start = Instant::now();
+    let bytes = tokio::task::spawn_blocking(move || std::fs::read(&path))
+        .await
+        .ok()?
+        .ok()?;
+    let secs = start.elapsed().as_secs_f64();
+    log::info!(
+        "bench: preloaded epoch {epoch} in {secs:.1}s ({:.2} GB/s); decode will be disk-free",
+        (bytes.len() as f64 / secs) / 1e9
+    );
+    Some(JetSource::in_memory(epoch, bytes))
+}
+
 /// Thousands separators for benchmark readability.
 fn commas(n: u64) -> String {
     let s = n.to_string();
@@ -181,6 +241,7 @@ async fn main() {
         std::env::var("JETSTREAMER_CLICKHOUSE_DSN").unwrap_or_else(|_| DEFAULT_DSN.to_string());
     let mut bench = false;
     let mut no_account_bytes = false;
+    let mut no_preload = false;
     while let Some(flag) = args.next() {
         match flag.as_str() {
             "--threads" => {
@@ -192,6 +253,7 @@ async fn main() {
             "--clickhouse-dsn" => dsn = args.next().unwrap_or_else(|| usage()),
             "--bench" => bench = true,
             "--no-account-bytes" => no_account_bytes = true,
+            "--no-preload" => no_preload = true,
             _ => usage(),
         }
     }
@@ -199,6 +261,10 @@ async fn main() {
         // The real plugins declare their own consumption; forcing bytes off
         // under them would silently zero account_write_stats.
         eprintln!("--no-account-bytes only applies to --bench");
+        usage();
+    }
+    if no_preload && !bench {
+        eprintln!("--no-preload only applies to --bench (preloading is bench-only)");
         usage();
     }
 
@@ -274,6 +340,16 @@ async fn main() {
     for epoch in start_epoch..=end_epoch {
         let (lo, hi) = epoch_to_slot_range(epoch);
         log::info!("horizon pipeline: epoch {epoch} (slots {lo}..={hi}) with {threads} threads");
+        // Bench: preload the epoch into RAM when it fits, so the timed
+        // window below measures pure decode. The buffer is dropped when the
+        // epoch's run completes, before the next preload.
+        let epoch_src = if bench && !no_preload {
+            preload_epoch(&src, epoch)
+                .await
+                .unwrap_or_else(|| src.clone())
+        } else {
+            src.clone()
+        };
         let before = (
             bench_counters.slots.load(Ordering::Relaxed),
             bench_counters.blocks.load(Ordering::Relaxed),
@@ -284,7 +360,7 @@ async fn main() {
         );
         let start = Instant::now();
         tokio::select! {
-            res = runner.run(src.clone(), epoch, lo..hi + 1) => {
+            res = runner.run(epoch_src, epoch, lo..hi + 1) => {
                 if let Err(err) = res {
                     failure = Some(format!("epoch {epoch}: {err}"));
                     break;

@@ -48,11 +48,17 @@ pub enum JetSource {
     /// One epoch's `.jet` bytes held entirely in memory (e.g. preloaded by a
     /// benchmark to take disk I/O out of the measurement). Serves only its
     /// own epoch; workers share the buffer via cheap `Arc` clones.
+    ///
+    /// `Arc<Vec<u8>>` rather than `Arc<[u8]>` deliberately: converting a
+    /// `Vec` to `Arc<[u8]>` copies the whole buffer (the slice must live
+    /// inline with the Arc header), which for a ~400 GB epoch means two
+    /// full-size allocations alive at once — an instant OOM. Wrapping the
+    /// Vec is copy-free.
     Memory {
         /// The epoch these bytes are the archive for.
         epoch: u64,
         /// The complete `.jet` file contents.
-        bytes: std::sync::Arc<[u8]>,
+        bytes: std::sync::Arc<Vec<u8>>,
     },
     /// A local directory holding `epoch-<N>.jet`, read with `tokio::fs`.
     LocalDir(PathBuf),
@@ -80,11 +86,13 @@ impl JetSource {
     }
 
     /// One epoch's complete `.jet` contents held in memory. Serves only
-    /// `epoch`; requesting any other epoch errors.
-    pub fn in_memory(epoch: u64, bytes: impl Into<std::sync::Arc<[u8]>>) -> Self {
+    /// `epoch`; requesting any other epoch errors. Takes the `Vec` by value
+    /// and never copies it — callers hand over buffers the size of a whole
+    /// epoch file.
+    pub fn in_memory(epoch: u64, bytes: Vec<u8>) -> Self {
         Self::Memory {
             epoch,
-            bytes: bytes.into(),
+            bytes: std::sync::Arc::new(bytes),
         }
     }
 }
@@ -398,7 +406,7 @@ impl Len for LocalJetReader {
 /// A fully in-memory `.jet` as an `AsyncRead + AsyncSeek + Len` reader —
 /// every read is a memcpy from the shared buffer, always `Ready`.
 struct MemJetReader {
-    bytes: std::sync::Arc<[u8]>,
+    bytes: std::sync::Arc<Vec<u8>>,
     pos: u64,
 }
 

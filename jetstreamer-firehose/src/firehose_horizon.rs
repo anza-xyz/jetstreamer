@@ -204,17 +204,46 @@ where
     let mut fetchers = Vec::with_capacity(threads);
     let mut decoders = Vec::with_capacity(threads);
     for (tid, chunk) in chunks.into_iter().enumerate() {
-        let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(PREFETCH_DEPTH);
+        let (tx, rx) = tokio::sync::mpsc::channel::<RawBucket>(PREFETCH_DEPTH);
+        // Drained fetch buffers travel back to the fetcher for reuse, so the
+        // stream path allocates a bounded handful of buffers per worker for
+        // the whole run instead of one ~bucket-sized Vec per bucket. Sized so
+        // a return can never block: at most PREFETCH_DEPTH buffers sit in
+        // `tx` plus one in each task.
+        let (recycle_tx, mut recycle_rx) =
+            tokio::sync::mpsc::channel::<Vec<u8>>(PREFETCH_DEPTH + 2);
 
         let src2 = src.clone();
         let client2 = client.clone();
         let index2 = index.clone();
         fetchers.push(tokio::spawn(async move {
+            // In-memory source: hand the decoder shared slices of the one
+            // preloaded buffer — zero per-bucket buffers, zero copies.
+            if let JetSource::Memory { bytes, .. } = &src2 {
+                for b in chunk {
+                    let e = index2[b];
+                    let bucket_start = e.offset as usize;
+                    let bucket_end = bucket_start + e.len as usize;
+                    if bucket_end > bytes.len() {
+                        return Err(HorizonFirehoseError::Truncated);
+                    }
+                    let shared = RawBucket::Shared {
+                        bytes: bytes.clone(),
+                        range: bucket_start..bucket_end,
+                    };
+                    if tx.send(shared).await.is_err() {
+                        break; // decoder finished early or errored
+                    }
+                }
+                return Ok(());
+            }
+
             let mut s = open_jet_stream(&src2, epoch, &client2).await?;
             for b in chunk {
                 let e = index2[b];
-                let raw = read_range(&mut s, e.offset, e.len as usize).await?;
-                if tx.send(raw).await.is_err() {
+                let mut buf = recycle_rx.try_recv().unwrap_or_default();
+                read_range_into(&mut s, e.offset, e.len as usize, &mut buf).await?;
+                if tx.send(RawBucket::Owned(buf)).await.is_err() {
                     break; // decoder finished early (reached end slot) or errored
                 }
             }
@@ -232,7 +261,13 @@ where
             // account-update data is skipped, not reconstructed.
             decoder.materialize_account_data = visitor.consumption().account_update_data;
             'outer: while let Some(raw) = rx.blocking_recv() {
-                decoder.load_bucket_bytes(&raw)?;
+                decoder.load_bucket_bytes(raw.as_slice())?;
+                // The decoder copied/decompressed what it needs; return the
+                // buffer to the fetcher (capacity ensures this never blocks;
+                // a closed channel just means the fetcher already finished).
+                if let RawBucket::Owned(buf) = raw {
+                    let _ = recycle_tx.try_send(buf);
+                }
                 let mut bounded = Bounded {
                     inner: &mut visitor,
                     end,
@@ -362,6 +397,27 @@ async fn open_jet_stream(
     }
 }
 
+/// One bucket's raw bytes on their way from a fetcher to its decoder:
+/// either a fetched buffer the decoder recycles back afterwards, or — for
+/// the in-memory source — a shared slice of the single preloaded file
+/// buffer (no per-bucket buffer, no copy).
+enum RawBucket {
+    Owned(Vec<u8>),
+    Shared {
+        bytes: Arc<Vec<u8>>,
+        range: Range<usize>,
+    },
+}
+
+impl RawBucket {
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Owned(buf) => buf,
+            Self::Shared { bytes, range } => &bytes[range.clone()],
+        }
+    }
+}
+
 /// Seeks to `offset` and reads exactly `len` bytes — one bucket frame (or a
 /// framing range) per call, mapping to a single HTTP range request.
 async fn read_range(stream: &mut EpochStream, offset: u64, len: usize) -> io::Result<Vec<u8>> {
@@ -369,6 +425,21 @@ async fn read_range(stream: &mut EpochStream, offset: u64, len: usize) -> io::Re
     let mut buf = vec![0u8; len];
     stream.read_exact(&mut buf).await?;
     Ok(buf)
+}
+
+/// [`read_range`] into a caller-provided (recycled) buffer: no allocation
+/// once the buffer has grown to bucket size.
+async fn read_range_into(
+    stream: &mut EpochStream,
+    offset: u64,
+    len: usize,
+    buf: &mut Vec<u8>,
+) -> io::Result<()> {
+    stream.seek(io::SeekFrom::Start(offset)).await?;
+    buf.clear();
+    buf.resize(len, 0);
+    stream.read_exact(buf).await?;
+    Ok(())
 }
 
 /// A local `.jet` file as an `AsyncRead + AsyncSeek + Len` reader, so it

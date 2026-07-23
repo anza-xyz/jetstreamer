@@ -156,6 +156,8 @@ pub struct BucketDecoder {
     /// The materialization setting latched when the current bucket was
     /// loaded (see [`Self::materialize_account_data`]).
     bucket_materialize: bool,
+    /// Reused zstd decompression context (see `load_bucket_bytes`).
+    zstd: zstd::bulk::Decompressor<'static>,
     payload: Vec<u8>,
     pos: usize,
     slots_remaining: u32,
@@ -194,6 +196,7 @@ impl BucketDecoder {
             verify_chain: false,
             materialize_account_data: true,
             bucket_materialize: true,
+            zstd: zstd::bulk::Decompressor::new().expect("failed to create zstd context"),
             payload: Vec::new(),
             pos: 0,
             slots_remaining: 0,
@@ -246,8 +249,20 @@ impl BucketDecoder {
         match header.compression {
             Compression::None => self.payload.extend_from_slice(stored),
             Compression::Zstd => {
-                self.payload = zstd::bulk::decompress(stored, header.uncompressed_len as usize)
+                // Decompress into the retained buffer with a reused context:
+                // a fresh ~600 MB Vec per bucket means thousands of huge
+                // mmap/munmap cycles per epoch, whose kernel-side cost grows
+                // with thread count. Steady state this allocates nothing.
+                self.payload.reserve(header.uncompressed_len as usize);
+                let written = self
+                    .zstd
+                    .decompress_to_buffer(stored, &mut self.payload)
                     .map_err(ArchiveFormatError::Io)?;
+                if written as u64 != header.uncompressed_len {
+                    return Err(ArchiveFormatError::BucketChecksum {
+                        first_slot: header.first_slot,
+                    });
+                }
             }
         }
 

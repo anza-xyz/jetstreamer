@@ -27,6 +27,13 @@ use jetstreamer_plugin::horizon::{
 use jetstreamer_plugin::plugins::account_writes::AccountWritesPlugin;
 use jetstreamer_plugin::plugins::pubkey_stats_horizon::PubkeyStatsHorizonPlugin;
 
+// jemalloc, for the same reason as jetstreamer-node: the decode path churns
+// huge short-lived allocations across many threads, where glibc malloc costs
+// kernel time (mmap/munmap per allocation) that grows with thread count.
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 const DEFAULT_DSN: &str = "http://localhost:8123";
 
 /// Same policy as the main runner: the embedded ClickHouse helper is spawned

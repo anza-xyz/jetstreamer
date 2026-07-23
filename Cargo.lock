@@ -4291,6 +4291,7 @@ dependencies = [
  "solana-keccak-hasher",
  "solana-logger",
  "solana-sysvar",
+ "tikv-jemallocator",
  "tokio",
  "url 2.5.8",
 ]

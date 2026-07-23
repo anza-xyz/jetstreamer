@@ -131,6 +131,13 @@ aws-smithy-types = "1"
 aws-types = "1"
 
 [dependencies]
+# Same allocator choice (and reason) as jetstreamer-node: glibc malloc's
+# handling of huge short-lived allocations under many threads costs kernel
+# time and never returns memory; jemalloc's decay does. Applies to both the
+# main CLI and horizon_pipeline binaries.
+tikv-jemallocator = { version = "0.6", features = [
+    "unprefixed_malloc_on_supported_platforms",
+] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 solana-logger.workspace = true
 log.workspace = true

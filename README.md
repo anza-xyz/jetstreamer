@@ -143,8 +143,9 @@ shutdown as SIGINT; the final log lines are replayed to the terminal on exit.
 The threaded firehose actively manages its connection fleet to cope with CDN throttling:
 threads launch through a health gate (pausing the ramp while any thread is stalled),
 failed threads restart with exponential backoff, persistently-slow connections are recycled
-(♻️) for fresh ones, and threads that finish their slot range steal work (🥷) from the
-least-progressed thread so every connection stays busy to the end of the run. Tune with
+(♻️) for fresh ones, and threads that finish their slot range steal work (🥷) — via a
+message handshake in which the least-progressed thread hands over half of its remaining
+slots — so every connection stays busy to the end of the run. Tune with
 `JETSTREAMER_SPAWN_PENDING`, `JETSTREAMER_SPAWN_GRACE_SECS`, and `JETSTREAMER_RECYCLE_PCT`
 (see the crate docs for details).
 

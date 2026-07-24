@@ -53,9 +53,11 @@ The threaded firehose actively manages its HTTP connection fleet to cope with CD
 - **Connection recycling** (♻️): threads running persistently below the fleet's demonstrated
   rate reconnect cleanly (no backoff, no error counting) to shed throughput-clamped
   connections. Rotation is capped per sweep so a uniform clamp is probed gradually.
-- **Work stealing** (🥷): a thread that finishes its slot range adopts half of the remaining
-  work of the least-progressed thread, keeping every connection busy until the entire range
-  completes; threads only retire when no stealable work remains.
+- **Work stealing** (🥷): a thread that finishes its slot range messages the least-progressed
+  thread's steal inbox to request half of its remaining work; the victim answers at a
+  quiescent point (between block batches) and computes the split from its own authoritative
+  position, so handovers can never race in-flight emission. This keeps every connection busy
+  until the entire range completes; threads only retire when no stealable work remains.
 Notes:
 
 - `JETSTREAMER_HTTP_BASE_URL` and `JETSTREAMER_COMPACT_INDEX_BASE_URL` accept both full HTTP(S)

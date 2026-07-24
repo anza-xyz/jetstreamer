@@ -1006,6 +1006,8 @@ fn draw_stats(frame: &mut ratatui::Frame, area: Rect, sampler: &RateSampler) {
         stat("recycles", human_count(thread_activity::recycle_count())),
         stat("timeouts", human_count(thread_activity::timeout_count())),
         stat("steals", human_count(thread_activity::steal_count())),
+        stat("db retries", human_count(metrics::db_retry_count())),
+        stat("db dropped", human_count(metrics::db_dropped_count())),
         stat("wire rate", human_bits_per_sec(sampler.wire_bytes_per_sec)),
         stat("data rate", human_bits_per_sec(sampler.bytes_per_sec)),
         stat("data total", human_bytes(total_bytes as f64)),

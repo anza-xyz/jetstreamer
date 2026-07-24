@@ -445,20 +445,23 @@ impl PluginRunner {
                                 let block_time = *block_time;
                                 let log_target_clone = log_target.clone();
                                 tokio::spawn(async move {
-                                    if let Err(err) = record_slot_status(
-                                        db_client,
-                                        slot,
-                                        thread_id,
-                                        executed_transaction_count,
-                                        tally.votes,
-                                        tally.non_votes,
-                                        block_time,
-                                    )
-                                    .await
-                                    {
+                                    let outcome = retry_clickhouse_write("slot status", || {
+                                        record_slot_status(
+                                            Arc::clone(&db_client),
+                                            slot,
+                                            thread_id,
+                                            executed_transaction_count,
+                                            tally.votes,
+                                            tally.non_votes,
+                                            block_time,
+                                        )
+                                    })
+                                    .await;
+                                    if let Err(err) = outcome {
                                         log::error!(
                                             target: &log_target_clone,
-                                            "failed to record slot status: {}",
+                                            "DROPPED slot status for slot {} after retries: {}",
+                                            slot,
                                             err
                                         );
                                     }
@@ -1073,6 +1076,48 @@ async fn flush_slot_buffer(
     }
     insert.end().await?;
     Ok(())
+}
+
+/// Retries a ClickHouse write with exponential backoff (0.5s doubling to a 15s cap, ~2
+/// minute total horizon) until it succeeds or the horizon is exhausted. Every Jetstreamer
+/// table is a `ReplacingMergeTree` keyed on its logical identity, so replaying a whole batch
+/// is idempotent — a rare double-commit collapses on merge. Returns the final error only
+/// after exhausting retries; callers should log that loudly, and it is counted as a dropped
+/// write in [`metrics`].
+pub(crate) async fn retry_clickhouse_write<F, Fut>(
+    what: &'static str,
+    mut write: F,
+) -> Result<(), clickhouse::error::Error>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<(), clickhouse::error::Error>>,
+{
+    const MAX_ATTEMPTS: u32 = 12;
+    let mut delay = Duration::from_millis(500);
+    let mut attempt = 1;
+    loop {
+        match write().await {
+            Ok(()) => {
+                if attempt > 1 {
+                    log::info!("clickhouse write '{what}' succeeded on attempt {attempt}");
+                }
+                return Ok(());
+            }
+            Err(err) if attempt < MAX_ATTEMPTS => {
+                metrics::note_db_retry();
+                log::warn!(
+                    "clickhouse write '{what}' failed (attempt {attempt}/{MAX_ATTEMPTS}); retrying in {delay:?}: {err}"
+                );
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(Duration::from_secs(15));
+                attempt += 1;
+            }
+            Err(err) => {
+                metrics::note_db_dropped();
+                return Err(err);
+            }
+        }
+    }
 }
 
 async fn record_slot_status(

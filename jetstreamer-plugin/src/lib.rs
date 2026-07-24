@@ -1096,14 +1096,24 @@ where
             }
             Err(err) => {
                 if started.elapsed() >= RETRY_HORIZON {
+                    let resume_hint = match (
+                        jetstreamer_firehose::firehose::resume_floor(),
+                        metrics::run_slot_range(),
+                    ) {
+                        (Some(floor), Some((_, end))) => format!(
+                            "everything below slot {floor} is fully processed; resume with: jetstreamer {floor}:{} <your original flags> (overlapping rows deduplicate via ReplacingMergeTree)",
+                            end.saturating_sub(1)
+                        ),
+                        _ => "re-run the same range to resume (overlapping rows deduplicate via ReplacingMergeTree)".to_string(),
+                    };
                     // Both sinks on purpose: the ring logger owns `log` in TUI mode, and
                     // stderr survives the process teardown.
                     log::error!(
-                        "FATAL: clickhouse write '{what}' still failing after {:?} ({attempt} attempts); aborting run to avoid silent data loss: {err}",
+                        "FATAL: clickhouse write '{what}' still failing after {:?} ({attempt} attempts); aborting run to avoid silent data loss: {err}. {resume_hint}",
                         started.elapsed()
                     );
                     eprintln!(
-                        "FATAL: clickhouse write '{what}' still failing after {:?} ({attempt} attempts); aborting run to avoid silent data loss: {err}",
+                        "FATAL: clickhouse write '{what}' still failing after {:?} ({attempt} attempts); aborting run to avoid silent data loss: {err}. {resume_hint}",
                         started.elapsed()
                     );
                     std::process::exit(1);

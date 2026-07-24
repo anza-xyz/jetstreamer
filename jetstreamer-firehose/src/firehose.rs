@@ -363,6 +363,29 @@ struct WorkSlice {
 /// the thief's reconnect + seek setup cost.
 const MIN_STEAL_SLOTS: u64 = 64;
 
+/// The active run's work ledger, stashed so out-of-band reporters (e.g. the fatal
+/// ClickHouse-abort path) can compute a safe resume point.
+static ACTIVE_WORK_LEDGER: std::sync::Mutex<Option<Arc<Vec<WorkSlice>>>> =
+    std::sync::Mutex::new(None);
+
+/// The lowest slot not yet fully processed by the active run, if one is running: everything
+/// below this is complete, so `resume_floor..original_end` is a safe (if conservative —
+/// higher threads' finished work above the floor gets re-read) resume range. Returns `None`
+/// when no run is active or every slice is complete.
+pub fn resume_floor() -> Option<u64> {
+    let ledger = ACTIVE_WORK_LEDGER.lock().unwrap();
+    ledger.as_ref().and_then(|slices| {
+        slices
+            .iter()
+            .filter_map(|slice| {
+                let next = slice.next.load(Ordering::SeqCst);
+                let end = slice.end.load(Ordering::SeqCst);
+                (next < end).then_some(next)
+            })
+            .min()
+    })
+}
+
 /// A work-steal proposal sent to a victim thread's steal inbox: "hand me half of your
 /// remaining work." The victim answers on `reply` with the granted range, or `None` when it
 /// has too little work left to split. The victim only services its inbox at quiescent points
@@ -1386,6 +1409,7 @@ where
     }
     let steal_inboxes: Arc<Vec<mpsc::UnboundedSender<StealRequest>>> =
         Arc::new(steal_inbox_senders);
+    *ACTIVE_WORK_LEDGER.lock().unwrap() = Some(work_registry.clone());
     let steal_lock = Arc::new(tokio::sync::Mutex::new(()));
     // Always on in threaded forward mode; sequential/reverse runs and single-thread runs
     // have nothing to steal.

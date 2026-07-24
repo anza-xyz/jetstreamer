@@ -175,13 +175,10 @@ impl Plugin for ProgramTrackingPlugin {
                 && !rows.is_empty()
             {
                 tokio::spawn(async move {
-                    let outcome = crate::retry_clickhouse_write("program events", || {
+                    crate::retry_clickhouse_write("program events", || {
                         write_program_events(Arc::clone(&db_client), rows.clone())
                     })
                     .await;
-                    if let Err(err) = outcome {
-                        log::error!("DROPPED program events after retries: {}", err);
-                    }
                 });
             }
 
@@ -233,14 +230,12 @@ impl Plugin for ProgramTrackingPlugin {
                     crate::retry_clickhouse_write("program events (exit flush)", || {
                         write_program_events(Arc::clone(&db_client), rows.clone())
                     })
-                    .await
-                    .map_err(|err| -> Box<dyn std::error::Error + Send + Sync> { Box::new(err) })?;
+                    .await;
                 }
                 crate::retry_clickhouse_write("program timestamp backfill", || {
                     backfill_program_timestamps(Arc::clone(&db_client))
                 })
-                .await
-                .map_err(|err| -> Box<dyn std::error::Error + Send + Sync> { Box::new(err) })?;
+                .await;
             }
             Ok(())
         }

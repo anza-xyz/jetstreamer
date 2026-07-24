@@ -139,13 +139,10 @@ impl Plugin for PubkeyStatsPlugin {
                 && !rows.is_empty()
             {
                 tokio::spawn(async move {
-                    let outcome = crate::retry_clickhouse_write("pubkey mentions", || {
+                    crate::retry_clickhouse_write("pubkey mentions", || {
                         write_pubkey_mentions(Arc::clone(&db_client), rows.clone())
                     })
                     .await;
-                    if let Err(err) = outcome {
-                        log::error!("DROPPED pubkey mentions after retries: {}", err);
-                    }
                 });
             }
 
@@ -223,14 +220,12 @@ impl Plugin for PubkeyStatsPlugin {
                     crate::retry_clickhouse_write("pubkey mentions (exit flush)", || {
                         write_pubkey_mentions(Arc::clone(&db_client), rows.clone())
                     })
-                    .await
-                    .map_err(|err| -> Box<dyn std::error::Error + Send + Sync> { Box::new(err) })?;
+                    .await;
                 }
                 crate::retry_clickhouse_write("pubkey timestamp backfill", || {
                     backfill_pubkey_timestamps(Arc::clone(&db_client))
                 })
-                .await
-                .map_err(|err| -> Box<dyn std::error::Error + Send + Sync> { Box::new(err) })?;
+                .await;
             }
             Ok(())
         }

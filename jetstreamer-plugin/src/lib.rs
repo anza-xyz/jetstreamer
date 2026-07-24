@@ -443,9 +443,8 @@ impl PluginRunner {
                                 let slot = *slot;
                                 let executed_transaction_count = *executed_transaction_count;
                                 let block_time = *block_time;
-                                let log_target_clone = log_target.clone();
                                 tokio::spawn(async move {
-                                    let outcome = retry_clickhouse_write("slot status", || {
+                                    retry_clickhouse_write("slot status", || {
                                         record_slot_status(
                                             Arc::clone(&db_client),
                                             slot,
@@ -457,14 +456,6 @@ impl PluginRunner {
                                         )
                                     })
                                     .await;
-                                    if let Err(err) = outcome {
-                                        log::error!(
-                                            target: &log_target_clone,
-                                            "DROPPED slot status for slot {} after retries: {}",
-                                            slot,
-                                            err
-                                        );
-                                    }
                                 });
                             }
                             BlockData::PossibleLeaderSkipped { slot } => {
@@ -1078,43 +1069,52 @@ async fn flush_slot_buffer(
     Ok(())
 }
 
-/// Retries a ClickHouse write with exponential backoff (0.5s doubling to a 15s cap, ~2
-/// minute total horizon) until it succeeds or the horizon is exhausted. Every Jetstreamer
-/// table is a `ReplacingMergeTree` keyed on its logical identity, so replaying a whole batch
-/// is idempotent — a rare double-commit collapses on merge. Returns the final error only
-/// after exhausting retries; callers should log that loudly, and it is counted as a dropped
-/// write in [`metrics`].
-pub(crate) async fn retry_clickhouse_write<F, Fut>(
-    what: &'static str,
-    mut write: F,
-) -> Result<(), clickhouse::error::Error>
+/// Retries a ClickHouse write with exponential backoff (0.5s doubling to a 15s cap) for up
+/// to 10 minutes. Every Jetstreamer table is a `ReplacingMergeTree` keyed on its logical
+/// identity, so replaying a whole batch is idempotent — a rare double-commit collapses on
+/// merge.
+///
+/// If the write is still failing after the full horizon, the process is terminated: silently
+/// dropping ClickHouse data is never acceptable, and a database that has been unreachable
+/// for 10 minutes means the run's output would be incomplete no matter what we do next.
+pub(crate) async fn retry_clickhouse_write<F, Fut>(what: &'static str, mut write: F)
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<(), clickhouse::error::Error>>,
 {
-    const MAX_ATTEMPTS: u32 = 12;
+    const RETRY_HORIZON: Duration = Duration::from_secs(600);
+    let started = std::time::Instant::now();
     let mut delay = Duration::from_millis(500);
-    let mut attempt = 1;
+    let mut attempt: u32 = 1;
     loop {
         match write().await {
             Ok(()) => {
                 if attempt > 1 {
                     log::info!("clickhouse write '{what}' succeeded on attempt {attempt}");
                 }
-                return Ok(());
+                return;
             }
-            Err(err) if attempt < MAX_ATTEMPTS => {
+            Err(err) => {
+                if started.elapsed() >= RETRY_HORIZON {
+                    // Both sinks on purpose: the ring logger owns `log` in TUI mode, and
+                    // stderr survives the process teardown.
+                    log::error!(
+                        "FATAL: clickhouse write '{what}' still failing after {:?} ({attempt} attempts); aborting run to avoid silent data loss: {err}",
+                        started.elapsed()
+                    );
+                    eprintln!(
+                        "FATAL: clickhouse write '{what}' still failing after {:?} ({attempt} attempts); aborting run to avoid silent data loss: {err}",
+                        started.elapsed()
+                    );
+                    std::process::exit(1);
+                }
                 metrics::note_db_retry();
                 log::warn!(
-                    "clickhouse write '{what}' failed (attempt {attempt}/{MAX_ATTEMPTS}); retrying in {delay:?}: {err}"
+                    "clickhouse write '{what}' failed (attempt {attempt}); retrying in {delay:?}: {err}"
                 );
                 tokio::time::sleep(delay).await;
                 delay = (delay * 2).min(Duration::from_secs(15));
                 attempt += 1;
-            }
-            Err(err) => {
-                metrics::note_db_dropped();
-                return Err(err);
             }
         }
     }

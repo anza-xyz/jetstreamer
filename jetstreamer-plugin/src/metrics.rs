@@ -19,7 +19,6 @@ static THREAD_TX_COUNTS: Lazy<DashMap<usize, u64, ahash::RandomState>> =
 static LATEST_PULSE: Mutex<Option<PulseSnapshot>> = Mutex::new(None);
 static RUN_SLOT_RANGE: Mutex<Option<(u64, u64)>> = Mutex::new(None);
 static DB_RETRIES: AtomicU64 = AtomicU64::new(0);
-static DB_DROPPED: AtomicU64 = AtomicU64::new(0);
 
 /// Structured copy of the numbers a stats pulse logs, for frontends to render.
 #[derive(Clone, Debug, Default)]
@@ -60,7 +59,6 @@ pub fn init(thread_count: usize) {
     *LATEST_PULSE.lock().unwrap() = None;
     *RUN_SLOT_RANGE.lock().unwrap() = None;
     DB_RETRIES.store(0, Ordering::Relaxed);
-    DB_DROPPED.store(0, Ordering::Relaxed);
 }
 
 /// Records one retried ClickHouse write attempt.
@@ -71,16 +69,6 @@ pub fn note_db_retry() {
 /// Total ClickHouse write retries this run.
 pub fn db_retry_count() -> u64 {
     DB_RETRIES.load(Ordering::Relaxed)
-}
-
-/// Records a ClickHouse write dropped after exhausting its retry horizon.
-pub fn note_db_dropped() {
-    DB_DROPPED.fetch_add(1, Ordering::Relaxed);
-}
-
-/// Total ClickHouse writes dropped this run (should be zero).
-pub fn db_dropped_count() -> u64 {
-    DB_DROPPED.load(Ordering::Relaxed)
 }
 
 /// Records the half-open slot range `[start, end)` the current run covers.

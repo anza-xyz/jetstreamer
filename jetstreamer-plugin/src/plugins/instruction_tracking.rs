@@ -133,13 +133,10 @@ impl Plugin for InstructionTrackingPlugin {
                 && !rows.is_empty()
             {
                 tokio::spawn(async move {
-                    let outcome = crate::retry_clickhouse_write("instruction events", || {
+                    crate::retry_clickhouse_write("instruction events", || {
                         write_instruction_events(Arc::clone(&db_client), rows.clone())
                     })
                     .await;
-                    if let Err(err) = outcome {
-                        log::error!("DROPPED instruction events after retries: {}", err);
-                    }
                 });
             }
 
@@ -190,14 +187,12 @@ impl Plugin for InstructionTrackingPlugin {
                     crate::retry_clickhouse_write("instruction events (exit flush)", || {
                         write_instruction_events(Arc::clone(&db_client), rows.clone())
                     })
-                    .await
-                    .map_err(|err| -> Box<dyn std::error::Error + Send + Sync> { Box::new(err) })?;
+                    .await;
                 }
                 crate::retry_clickhouse_write("instruction timestamp backfill", || {
                     backfill_instruction_timestamps(Arc::clone(&db_client))
                 })
-                .await
-                .map_err(|err| -> Box<dyn std::error::Error + Send + Sync> { Box::new(err) })?;
+                .await;
             }
             Ok(())
         }

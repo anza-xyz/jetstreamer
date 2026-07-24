@@ -143,7 +143,10 @@ fn report_byte_breakdown(bytes: PayloadByteStats, raw_account_data_bytes: u64) {
 fn report_chain_breaks(breaks: &[(u64, Hash, Hash)], blocks: u64) {
     println!("\n=== chain continuity ===");
     if breaks.is_empty() {
-        println!("  blockhash chain intact across all {} blocks", commas(blocks));
+        println!(
+            "  blockhash chain intact across all {} blocks",
+            commas(blocks)
+        );
     } else {
         println!(
             "  {} chain break(s) — a block's parent_blockhash did not match the previous block:",
@@ -517,7 +520,10 @@ fn run_scan(path: &str, threads: usize, full: bool, seed_arg: Option<Hash>) -> i
                 }))
             })
             .collect();
-        handles.into_iter().map(|h| h.join().expect("thread")).collect()
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("thread"))
+            .collect()
     });
     done.store(1, Ordering::Relaxed);
     let _ = monitor.join();
@@ -565,14 +571,22 @@ fn run_scan(path: &str, threads: usize, full: bool, seed_arg: Option<Hash>) -> i
     // the previous epoch, which the archive doesn't contain).
     let mut linkage_breaks: Vec<(u64, Hash, Hash)> = Vec::new();
     for i in 0..blocks.len() {
-        let expected = if i == 0 { seed } else { Some(blocks[i - 1].blockhash) };
+        let expected = if i == 0 {
+            seed
+        } else {
+            Some(blocks[i - 1].blockhash)
+        };
         if let Some(exp) = expected
             && blocks[i].parent_blockhash != exp
         {
             linkage_breaks.push((blocks[i].slot, exp, blocks[i].parent_blockhash));
         }
     }
-    let poh_failures: Vec<u64> = blocks.iter().filter(|b| !b.poh_ok).map(|b| b.slot).collect();
+    let poh_failures: Vec<u64> = blocks
+        .iter()
+        .filter(|b| !b.poh_ok)
+        .map(|b| b.slot)
+        .collect();
 
     let elapsed = start.elapsed().as_secs_f64();
     println!("\n=== verify summary ({elapsed:.1}s, {threads} threads) ===");
@@ -662,9 +676,7 @@ fn main() {
             "               epoch's tail blockhash to anchor the chain; if omitted it is fetched"
         );
         eprintln!("               via JETSTREAMER_RPC_URL (default mainnet-beta).");
-        eprintln!(
-            "  --threads N  parallelism for whole-file verification (default: CPU count)."
-        );
+        eprintln!("  --threads N  parallelism for whole-file verification (default: CPU count).");
         std::process::exit(2);
     }
     let path = args[0].clone();

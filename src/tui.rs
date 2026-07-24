@@ -478,7 +478,22 @@ fn render_loop(stop: Arc<AtomicBool>) {
         }
         sampler.maybe_sample();
         let _ = terminal.draw(|frame| draw(frame, &sampler, &mut state));
-        std::thread::sleep(RENDER_INTERVAL);
+        // Wait out the frame interval inside the input poll so scrolling, clicks, and drags
+        // are applied and redrawn the moment they arrive instead of at the render tick.
+        let frame_deadline = Instant::now() + RENDER_INTERVAL;
+        loop {
+            let remaining = frame_deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match crossterm::event::poll(remaining) {
+                Ok(true) => {
+                    drain_input(&mut state);
+                    let _ = terminal.draw(|frame| draw(frame, &sampler, &mut state));
+                }
+                _ => break,
+            }
+        }
     }
 
     restore_terminal(&mut terminal);

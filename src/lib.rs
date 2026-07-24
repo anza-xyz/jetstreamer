@@ -800,6 +800,35 @@ pub fn parse_cli_args() -> Result<CliInvocation, Box<dyn std::error::Error>> {
     if no_plugins && !builtin_plugins.is_empty() {
         return Err("--no-plugins cannot be combined with --with-plugin".into());
     }
+    // Record the invocation with the range positional replaced by `{range}`, so fatal error
+    // paths can print an accurate resume command. Value-taking flags are skipped as pairs so
+    // a flag value that happens to equal the positional cannot be mistaken for it.
+    {
+        const VALUE_FLAGS: [&str; 3] = ["--with-plugin", "--buffer-window", "--clickhouse-dsn"];
+        let raw: Vec<String> = std::env::args().collect();
+        let mut parts: Vec<String> = Vec::with_capacity(raw.len());
+        let mut index = 0;
+        let mut replaced = false;
+        while index < raw.len() {
+            let part = &raw[index];
+            if index > 0 && VALUE_FLAGS.contains(&part.as_str()) {
+                parts.push(part.clone());
+                if let Some(value) = raw.get(index + 1) {
+                    parts.push(value.clone());
+                }
+                index += 2;
+                continue;
+            }
+            if index > 0 && !replaced && *part == first_arg {
+                parts.push("{range}".to_string());
+                replaced = true;
+            } else {
+                parts.push(part.clone());
+            }
+            index += 1;
+        }
+        jetstreamer_plugin::metrics::set_resume_command_template(parts.join(" "));
+    }
     let slot_range = if first_arg.contains(':') {
         let (slot_a, slot_b) = first_arg
             .split_once(':')

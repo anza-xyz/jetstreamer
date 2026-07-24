@@ -1100,10 +1100,15 @@ where
                         jetstreamer_firehose::firehose::resume_floor(),
                         metrics::run_slot_range(),
                     ) {
-                        (Some(floor), Some((_, end))) => format!(
-                            "everything below slot {floor} is fully processed; resume with: jetstreamer {floor}:{} <your original flags> (overlapping rows deduplicate via ReplacingMergeTree)",
-                            end.saturating_sub(1)
-                        ),
+                        (Some(floor), Some((_, end))) => {
+                            let range = format!("{floor}:{}", end.saturating_sub(1));
+                            let command = metrics::resume_command_template()
+                                .map(|template| template.replace("{range}", &range))
+                                .unwrap_or_else(|| format!("jetstreamer {range} <your original flags>"));
+                            format!(
+                                "everything below slot {floor} is fully processed; resume with: {command} (overlapping rows deduplicate via ReplacingMergeTree)"
+                            )
+                        }
                         _ => "re-run the same range to resume (overlapping rows deduplicate via ReplacingMergeTree)".to_string(),
                     };
                     // Both sinks on purpose: the ring logger owns `log` in TUI mode, and

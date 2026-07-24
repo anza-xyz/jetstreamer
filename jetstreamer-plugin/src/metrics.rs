@@ -18,6 +18,7 @@ static THREAD_TX_COUNTS: Lazy<DashMap<usize, u64, ahash::RandomState>> =
     Lazy::new(|| DashMap::with_hasher(ahash::RandomState::new()));
 static LATEST_PULSE: Mutex<Option<PulseSnapshot>> = Mutex::new(None);
 static RUN_SLOT_RANGE: Mutex<Option<(u64, u64)>> = Mutex::new(None);
+static RESUME_COMMAND_TEMPLATE: Mutex<Option<String>> = Mutex::new(None);
 static DB_RETRIES: AtomicU64 = AtomicU64::new(0);
 
 /// Structured copy of the numbers a stats pulse logs, for frontends to render.
@@ -69,6 +70,18 @@ pub fn note_db_retry() {
 /// Total ClickHouse write retries this run.
 pub fn db_retry_count() -> u64 {
     DB_RETRIES.load(Ordering::Relaxed)
+}
+
+/// Stores the process invocation with the range positional replaced by `{range}`, used to
+/// print an accurate resume command in fatal error messages. Set once at CLI parse time and
+/// deliberately not cleared by [`init`] (it describes the process, not the run).
+pub fn set_resume_command_template(template: String) {
+    *RESUME_COMMAND_TEMPLATE.lock().unwrap() = Some(template);
+}
+
+/// The resume command template recorded at CLI parse time, if any.
+pub fn resume_command_template() -> Option<String> {
+    RESUME_COMMAND_TEMPLATE.lock().unwrap().clone()
 }
 
 /// Records the half-open slot range `[start, end)` the current run covers.

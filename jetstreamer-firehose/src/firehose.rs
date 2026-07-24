@@ -30,7 +30,10 @@ use std::{
 };
 use thiserror::Error;
 use tokio::{
-    sync::broadcast::{self, error::TryRecvError},
+    sync::{
+        broadcast::{self, error::TryRecvError},
+        mpsc, oneshot,
+    },
     time::{sleep, timeout},
 };
 
@@ -343,11 +346,13 @@ async fn wait_for_green_threads(
     }
 }
 
-/// Shared per-thread work ledger used for work stealing. `start` is the beginning of the
-/// thread's current assignment (reset when it adopts stolen work), `next` is the next slot
-/// the owner will process (published at each block boundary), and `end` is the half-open end
-/// of the slice, shrunk by thieves under the steal lock. Owners observe shrinks at
-/// block-batch boundaries, before any out-of-range data is emitted.
+/// Shared per-thread work ledger used for work-steal victim selection. `start` is the
+/// beginning of the thread's current assignment (reset when it adopts stolen work), `next`
+/// is the next slot the owner will process (published at each block boundary), and `end` is
+/// the half-open end of the slice. Every field is written **only by its owning thread**;
+/// other threads read it purely as advisory telemetry when picking a steal victim. Actual
+/// splits happen over the steal message protocol (see [`StealRequest`]), never by writing to
+/// another thread's slice.
 struct WorkSlice {
     start: AtomicU64,
     next: AtomicU64,
@@ -355,56 +360,135 @@ struct WorkSlice {
 }
 
 /// Minimum remaining slots a slice must have to be worth splitting: half of this must cover
-/// the thief's reconnect + seek setup cost. Also serves as the safety margin guaranteeing a
-/// victim cannot race past the split point before its shrunken `end` becomes visible.
+/// the thief's reconnect + seek setup cost.
 const MIN_STEAL_SLOTS: u64 = 64;
 
-/// Picks the thread that has made the least progress through its current assignment (lowest
-/// completed fraction, ties broken by most remaining work), splits its remaining slots in
-/// half, and adopts the upper half for `thief`. Returns the victim index and the stolen
-/// range. Steals are serialized by `lock`; owners advance `next` without the lock, so the
-/// split point's [`MIN_STEAL_SLOTS`]`/2` margin above the victim's position is what keeps
-/// the two sides disjoint.
-fn steal_work(
+/// A work-steal proposal sent to a victim thread's steal inbox: "hand me half of your
+/// remaining work." The victim answers on `reply` with the granted range, or `None` when it
+/// has too little work left to split. The victim only services its inbox at quiescent points
+/// (between block batches, at restart boundaries, or while parked in backoff), so a grant
+/// can never race in-flight emission — the victim's answer *is* the authoritative split.
+struct StealRequest {
+    reply: oneshot::Sender<Option<Range<u64>>>,
+}
+
+/// Services a victim's steal inbox at a quiescent point. `position` is the victim's
+/// authoritative next-slot-to-process; `allow` is false when the victim is completing its
+/// range and only draining (all requests answered `None`). A grant is committed — the local
+/// range end shrinks and the ledger is updated — only if the reply is actually delivered, so
+/// an abandoned request can never orphan slots.
+fn service_steal_inbox(
+    inbox: &mut mpsc::UnboundedReceiver<StealRequest>,
+    slot_range: &mut Range<u64>,
+    position: u64,
+    slice: &WorkSlice,
+    log_target: &str,
+    allow: bool,
+) {
+    while let Ok(request) = inbox.try_recv() {
+        let remaining = slot_range.end.saturating_sub(position);
+        if !allow || remaining < MIN_STEAL_SLOTS {
+            let _ = request.reply.send(None);
+            continue;
+        }
+        let mid = position + remaining / 2;
+        let granted = mid..slot_range.end;
+        if request.reply.send(Some(granted.clone())).is_ok() {
+            log::info!(
+                target: log_target,
+                "🥷 handed slots {}..{} to a work-stealing thread; continuing to {}",
+                granted.start,
+                granted.end,
+                mid
+            );
+            slot_range.end = mid;
+            slice.end.store(mid, Ordering::SeqCst);
+        }
+    }
+}
+
+/// Asks the least-progressed running thread for half of its remaining work, walking the
+/// candidate list until a victim grants. Candidates are ranked by lowest completed fraction
+/// of their current assignment (ties broken by most remaining), skipping threads that have
+/// not started streaming yet (they cannot answer their inbox) and threads without enough
+/// work to split.
+///
+/// Deadlock freedom: while awaiting a victim's answer, the thief keeps servicing its **own**
+/// inbox (rejecting — it has nothing to give), so every thread in every waiting state stays
+/// responsive. A request can only go permanently unanswered if the victim task exits, which
+/// drops its inbox and resolves the wait with an error. `lock` is held only around the
+/// scan-and-send (never across the reply await) to keep simultaneous thieves from bursting
+/// requests at the same victim; the victim re-validates every grant against its own
+/// authoritative position anyway.
+async fn request_steal(
     registry: &[WorkSlice],
+    inboxes: &[mpsc::UnboundedSender<StealRequest>],
+    own_inbox: &mut mpsc::UnboundedReceiver<StealRequest>,
     thief: usize,
-    lock: &std::sync::Mutex<()>,
+    lock: &tokio::sync::Mutex<()>,
 ) -> Option<(usize, Range<u64>)> {
-    let _guard = lock.lock().unwrap();
-    let mut best: Option<(usize, f64, u64)> = None;
-    for (index, slice) in registry.iter().enumerate() {
-        if index == thief {
+    let mut candidates: Vec<(f64, std::cmp::Reverse<u64>, usize)> = {
+        let _guard = lock.lock().await;
+        registry
+            .iter()
+            .enumerate()
+            .filter(|&(index, _)| {
+                index != thief
+                    && !thread_activity::is_finished(index)
+                    // A thread that has not begun streaming cannot answer its inbox.
+                    && thread_activity::stream_age_ms(index).is_some()
+            })
+            .filter_map(|(index, slice)| {
+                let start = slice.start.load(Ordering::SeqCst);
+                let next = slice.next.load(Ordering::SeqCst);
+                let end = slice.end.load(Ordering::SeqCst);
+                let remaining = end.saturating_sub(next);
+                if remaining < MIN_STEAL_SLOTS {
+                    return None;
+                }
+                let assigned = end.saturating_sub(start).max(1);
+                let fraction = next.saturating_sub(start) as f64 / assigned as f64;
+                Some((fraction, std::cmp::Reverse(remaining), index))
+            })
+            .collect()
+    };
+    candidates.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    for (_, _, victim) in candidates {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        if inboxes[victim]
+            .send(StealRequest { reply: reply_tx })
+            .is_err()
+        {
             continue;
         }
-        let start = slice.start.load(Ordering::SeqCst);
-        let next = slice.next.load(Ordering::SeqCst);
-        let end = slice.end.load(Ordering::SeqCst);
-        let remaining = end.saturating_sub(next);
-        if remaining < MIN_STEAL_SLOTS {
-            continue;
-        }
-        let assigned = end.saturating_sub(start).max(1);
-        let fraction = next.saturating_sub(start) as f64 / assigned as f64;
-        let better = best.is_none_or(|(_, best_fraction, best_remaining)| {
-            fraction < best_fraction || (fraction == best_fraction && remaining > best_remaining)
-        });
-        if better {
-            best = Some((index, fraction, remaining));
+        // Await the victim's answer while staying responsive to our own inbox.
+        let mut reply_rx = reply_rx;
+        let outcome = loop {
+            tokio::select! {
+                reply = &mut reply_rx => break reply,
+                incoming = own_inbox.recv() => {
+                    match incoming {
+                        // We are hunting because we have nothing left; refuse.
+                        Some(request) => {
+                            let _ = request.reply.send(None);
+                        }
+                        // Own inbox closed (shutdown teardown): just wait for the reply.
+                        None => break (&mut reply_rx).await,
+                    }
+                }
+            }
+        };
+        match outcome {
+            Ok(Some(stolen)) => {
+                registry[thief].start.store(stolen.start, Ordering::SeqCst);
+                registry[thief].next.store(stolen.start, Ordering::SeqCst);
+                registry[thief].end.store(stolen.end, Ordering::SeqCst);
+                return Some((victim, stolen));
+            }
+            Ok(None) | Err(_) => continue,
         }
     }
-    let (victim, _, _) = best?;
-    let next = registry[victim].next.load(Ordering::SeqCst);
-    let end = registry[victim].end.load(Ordering::SeqCst);
-    let remaining = end.saturating_sub(next);
-    if remaining < MIN_STEAL_SLOTS {
-        return None;
-    }
-    let mid = next + remaining / 2;
-    registry[victim].end.store(mid, Ordering::SeqCst);
-    registry[thief].start.store(mid, Ordering::SeqCst);
-    registry[thief].next.store(mid, Ordering::SeqCst);
-    registry[thief].end.store(end, Ordering::SeqCst);
-    Some((victim, mid..end))
+    None
 }
 
 /// Per-thread restart pacing: consecutive failures on the same slot double the delay up to
@@ -1281,7 +1365,8 @@ where
     // fastest thread's rate are asked to reconnect (a clean restart with no backoff).
     let recycle_pct = recycle_threshold_pct();
     let thread_total = subranges.len();
-    // Work-stealing ledger: one slice per thread, owners advance `next`, thieves shrink `end`.
+    // Work-stealing ledger (owner-written telemetry for victim selection) plus one steal
+    // inbox per thread for the split protocol itself.
     let work_registry: Arc<Vec<WorkSlice>> = Arc::new(
         subranges
             .iter()
@@ -1292,7 +1377,16 @@ where
             })
             .collect(),
     );
-    let steal_lock = Arc::new(std::sync::Mutex::new(()));
+    let mut steal_inbox_receivers: Vec<Option<mpsc::UnboundedReceiver<StealRequest>>> = Vec::new();
+    let mut steal_inbox_senders: Vec<mpsc::UnboundedSender<StealRequest>> = Vec::new();
+    for _ in 0..thread_total {
+        let (sender, receiver) = mpsc::unbounded_channel();
+        steal_inbox_senders.push(sender);
+        steal_inbox_receivers.push(Some(receiver));
+    }
+    let steal_inboxes: Arc<Vec<mpsc::UnboundedSender<StealRequest>>> =
+        Arc::new(steal_inbox_senders);
+    let steal_lock = Arc::new(tokio::sync::Mutex::new(()));
     // Always on in threaded forward mode; sequential/reverse runs and single-thread runs
     // have nothing to steal.
     let work_stealing = !sequential && !reverse_mode && thread_total > 1;
@@ -1381,6 +1475,10 @@ where
         }
         let work_registry = work_registry.clone();
         let steal_lock = steal_lock.clone();
+        let steal_inboxes = steal_inboxes.clone();
+        let mut steal_inbox = steal_inbox_receivers[thread_index]
+            .take()
+            .expect("steal inbox taken once per thread");
         let error_counts = error_counts.clone();
         let client = client.clone();
         let on_block = on_block.clone();
@@ -1417,13 +1515,6 @@ where
             let last_pulse = last_pulse_cloned;
             let mut shutdown_rx = thread_shutdown_rx;
             let start_time = firehose_start;
-            if work_stealing {
-                // The ledger is authoritative from the moment it is built: part of this
-                // thread's slice may have been stolen before it even spawned (the gated ramp
-                // can hold a spawn back for minutes while early finishers go hunting).
-                slot_range.start = work_registry[thread_index].next.load(Ordering::SeqCst);
-                slot_range.end = work_registry[thread_index].end.load(Ordering::SeqCst);
-            }
             last_pulse.store(
                 firehose_start.elapsed().as_nanos() as u64,
                 Ordering::Relaxed,
@@ -1481,6 +1572,19 @@ where
                 // Each pass through this block opens a fresh stream; the stamp shields young
                 // connections from the recycle monitor while they warm up.
                 thread_activity::note_stream_start(thread_index);
+                // Restart boundary is quiescent: answer any steal proposals that arrived
+                // while the previous pass was ending.
+                if work_stealing {
+                    let resume_position = slot_range.start;
+                    service_steal_inbox(
+                        &mut steal_inbox,
+                        &mut slot_range,
+                        resume_position,
+                        &work_registry[thread_index],
+                        &log_target,
+                        true,
+                    );
+                }
                 if poll_shutdown(&shutdown_flag, &mut shutdown_rx) {
                     log::info!(
                         target: &log_target,
@@ -1675,21 +1779,19 @@ where
                             }
                         };
                         thread_activity::note(thread_index);
-                        // Observe work-stealing shrinks before deciding whether this batch is
-                        // in range; the `slot >= slot_range.end` guard below completes the
-                        // range before any out-of-range data is emitted.
+                        // Quiescent point: no emission is in flight between batches, so this
+                        // is where steal proposals are answered. A grant shrinks
+                        // `slot_range.end`, and the `slot >= slot_range.end` guard below
+                        // completes the range before any out-of-range data is emitted.
                         if work_stealing {
-                            let shared_end =
-                                work_registry[thread_index].end.load(Ordering::SeqCst);
-                            if shared_end < slot_range.end {
-                                log::info!(
-                                    target: &log_target,
-                                    "range end moved from {} to {} by work stealing",
-                                    slot_range.end,
-                                    shared_end
-                                );
-                                slot_range.end = shared_end;
-                            }
+                            service_steal_inbox(
+                                &mut steal_inbox,
+                                &mut slot_range,
+                                last_counted_slot.saturating_add(1),
+                                &work_registry[thread_index],
+                                &log_target,
+                                true,
+                            );
                         }
                         if nodes.is_empty() {
                             log::info!(
@@ -2301,9 +2403,32 @@ where
                 // Range completion arrives through the retry loop so the thread can adopt
                 // stolen work (restarting the loop with a new range) or retire.
                 if matches!(err, FirehoseError::RangeComplete) {
+                    // This thread is done with its own range: publish "nothing remaining" so
+                    // hunters stop targeting it, then drain any pending steal proposals with
+                    // a refusal before going hunting itself.
+                    if work_stealing {
+                        work_registry[thread_index]
+                            .next
+                            .store(slot_range.end, Ordering::SeqCst);
+                        let drained_position = slot_range.end;
+                        service_steal_inbox(
+                            &mut steal_inbox,
+                            &mut slot_range,
+                            drained_position,
+                            &work_registry[thread_index],
+                            &log_target,
+                            false,
+                        );
+                    }
                     if work_stealing
-                        && let Some((victim, stolen)) =
-                            steal_work(&work_registry, thread_index, &steal_lock)
+                        && let Some((victim, stolen)) = request_steal(
+                            &work_registry,
+                            &steal_inboxes,
+                            &mut steal_inbox,
+                            thread_index,
+                            &steal_lock,
+                        )
+                        .await
                     {
                         thread_activity::note_steal();
                         log::info!(
@@ -2431,14 +2556,26 @@ where
                         "backing off {:?} before restarting",
                         backoff
                     );
-                    // Sleep in slices so the thread stays responsive to shutdown during the
-                    // wait.
+                    // Sleep in slices so the thread stays responsive to shutdown (and to
+                    // steal proposals — a backing-off thread is quiescent and often the
+                    // least-progressed, so it is a prime steal victim) during the wait.
                     let deadline = std::time::Instant::now() + backoff;
                     let mut shutdown_requested = false;
                     while std::time::Instant::now() < deadline {
                         if poll_shutdown(&shutdown_flag, &mut shutdown_rx) {
                             shutdown_requested = true;
                             break;
+                        }
+                        if work_stealing {
+                            let resume_position = slot_range.start;
+                            service_steal_inbox(
+                                &mut steal_inbox,
+                                &mut slot_range,
+                                resume_position,
+                                &work_registry[thread_index],
+                                &log_target,
+                                true,
+                            );
                         }
                         sleep(std::time::Duration::from_millis(250)).await;
                     }
@@ -3236,6 +3373,72 @@ fn human_readable_duration(duration: std::time::Duration) -> String {
         } else {
             format!("{secs}s")
         }
+    }
+}
+
+#[cfg(test)]
+mod steal_protocol_tests {
+    use super::*;
+
+    fn slice(start: u64, next: u64, end: u64) -> WorkSlice {
+        WorkSlice {
+            start: AtomicU64::new(start),
+            next: AtomicU64::new(next),
+            end: AtomicU64::new(end),
+        }
+    }
+
+    #[test]
+    fn test_grant_splits_remaining_and_commits() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let ledger = slice(1000, 1100, 1200);
+        let mut range = 1000..1200;
+        let (reply_tx, mut reply_rx) = oneshot::channel();
+        tx.send(StealRequest { reply: reply_tx }).unwrap();
+        service_steal_inbox(&mut rx, &mut range, 1100, &ledger, "test", true);
+        assert_eq!(reply_rx.try_recv().unwrap(), Some(1150..1200));
+        assert_eq!(range.end, 1150);
+        assert_eq!(ledger.end.load(Ordering::SeqCst), 1150);
+    }
+
+    #[test]
+    fn test_rejects_below_min_steal() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let ledger = slice(1000, 1100, 1150);
+        let mut range = 1000..1150;
+        let (reply_tx, mut reply_rx) = oneshot::channel();
+        tx.send(StealRequest { reply: reply_tx }).unwrap();
+        service_steal_inbox(&mut rx, &mut range, 1100, &ledger, "test", true);
+        assert_eq!(reply_rx.try_recv().unwrap(), None);
+        assert_eq!(range.end, 1150);
+        assert_eq!(ledger.end.load(Ordering::SeqCst), 1150);
+    }
+
+    #[test]
+    fn test_drain_mode_refuses_even_with_work() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let ledger = slice(1000, 1000, 2000);
+        let mut range = 1000..2000;
+        let (reply_tx, mut reply_rx) = oneshot::channel();
+        tx.send(StealRequest { reply: reply_tx }).unwrap();
+        service_steal_inbox(&mut rx, &mut range, 1000, &ledger, "test", false);
+        assert_eq!(reply_rx.try_recv().unwrap(), None);
+        assert_eq!(range.end, 2000);
+    }
+
+    #[test]
+    fn test_abandoned_request_does_not_commit() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let ledger = slice(1000, 1100, 1200);
+        let mut range = 1000..1200;
+        let (reply_tx, reply_rx) = oneshot::channel();
+        tx.send(StealRequest { reply: reply_tx }).unwrap();
+        // The thief gave up before the victim answered: the grant must not commit,
+        // otherwise the granted slots would be orphaned.
+        drop(reply_rx);
+        service_steal_inbox(&mut rx, &mut range, 1100, &ledger, "test", true);
+        assert_eq!(range.end, 1200);
+        assert_eq!(ledger.end.load(Ordering::SeqCst), 1200);
     }
 }
 

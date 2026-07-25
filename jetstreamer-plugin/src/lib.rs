@@ -318,7 +318,11 @@ impl PluginRunner {
             let client = Arc::new(
                 build_clickhouse_client(&self.clickhouse_dsn)
                     .with_setting("async_insert", "1")
-                    .with_setting("wait_for_async_insert", "0"),
+                    // Wait for the async buffer to flush before acking: an ack then means
+                    // durably written, so every failure is visible to the retry layer and
+                    // nothing can be lost in a post-ack flush failure. Retries may still
+                    // double-commit on ambiguous timeouts; ReplacingMergeTree absorbs that.
+                    .with_setting("wait_for_async_insert", "1"),
             );
             ensure_clickhouse_tables(client.as_ref()).await?;
             upsert_plugins(client.as_ref(), plugin_handles.as_ref()).await?;

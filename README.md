@@ -132,7 +132,8 @@ Add `--tui` to render a live terminal dashboard instead of plain log output:
   thread approaches the stall timeout; cyan ✓ = finished its work).
 - **System chart**: CPU, memory, and NIC download rate on one axis.
 - **Stats panel**: live and average TPS, per-thread TPS spread, block/transaction totals,
-  connection recycles, timeouts, work steals, and wire vs payload data rates.
+  connection recycles, timeouts, work steals, ClickHouse write retries, and wire vs payload
+  data rates.
 - **Scrollable log pane** with a scrollbar and a click-to-resume `live` button.
 
 Pane dividers are mouse-draggable. Press `q`, `Esc`, or `Ctrl-C` for the same graceful
@@ -171,6 +172,18 @@ ClickHouse instance that Jetstreamer has spawned. If you want to access data aft
 finished, you can run `cargo clickhouse-server` to bring up that server again using the data
 that is currently in the `bin` directory. It is also possible to copy a `bin` directory from
 one system to another as a way of migrating data.
+
+#### Write durability
+
+ClickHouse writes are never silently dropped. Inserts use `async_insert` with
+`wait_for_async_insert=1`, so an acknowledgment means the data was durably flushed; any
+failure is retried with exponential backoff (0.5s doubling to a 15s cap) for up to 10
+minutes, visible live as the `db retries` stat in the TUI. If a write is still failing after
+the full horizon, the run aborts loudly and prints the exact command to resume from the
+lowest unprocessed slot. Retries give at-least-once delivery: every table is a
+`ReplacingMergeTree` keyed on its logical identity, so a replayed batch deduplicates on
+merge — consumers should query with `FINAL` (or tolerate transient duplicates) when reading
+while ingestion is active.
 
 ### Writing Jetstreamer Plugins
 

@@ -17,7 +17,7 @@
 //!   the conversion and carries a legend colored to match each line.
 //! - **Stats box**: rolling and run-average TPS, per-thread TPS avg/min/max (min counts only
 //!   threads that moved data), blocks/txs/entries/rewards, recycle/timeout/steal counters,
-//!   wire rate (NIC) vs data rate (CAR payload), and total data.
+//!   ClickHouse write retries, wire rate (NIC) vs data rate (CAR payload), and total data.
 //! - **Log pane** (full width): captured log lines. Mouse-wheel or PageUp/PageDown scrolling
 //!   anchors to absolute positions so text holds still while new lines arrive; a scrollbar
 //!   shows position and the `[● live]`/`[▶ back to live]` title button (or End) resumes

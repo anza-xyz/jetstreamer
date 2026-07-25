@@ -30,6 +30,16 @@
 //! When the mode is `auto`, Jetstreamer inspects the DSN at runtime and only launches the
 //! embedded helper for local endpoints, enabling native clustering workflows out of the box.
 //!
+//! ## Write Durability
+//! Writes issued by the runner and the bundled plugins are never silently dropped. Inserts
+//! use `async_insert` with `wait_for_async_insert=1` (an acknowledgment means durably
+//! flushed), failures are retried with exponential backoff for up to 10 minutes, and a write
+//! that is still failing after the horizon aborts the run with a message that includes the
+//! exact command to resume from the lowest unprocessed slot. Retries provide at-least-once
+//! delivery: every bundled table is a `ReplacingMergeTree` keyed on its logical identity, so
+//! replayed batches deduplicate on merge — query with `FINAL` (or tolerate transient
+//! duplicates) when reading while ingestion is active.
+//!
 //! # Batching ClickHouse Writes
 //! ClickHouse (and any sinks you invoke inside hook handlers) can apply backpressure on large
 //! numbers of tiny inserts. Plugins should buffer work locally and flush in batches on a

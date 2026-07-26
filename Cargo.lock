@@ -3573,11 +3573,6 @@ name = "hashbrown"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
-dependencies = [
- "allocator-api2",
- "equivalent",
- "foldhash 0.2.0",
-]
 
 [[package]]
 name = "headers"
@@ -4777,15 +4772,15 @@ checksum = "09edd9e8b54e49e587e4f6295a7d29c3ea94d469cb40ab8ca70b288248a81db2"
 
 [[package]]
 name = "lencode"
-version = "1.1.0"
+version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cfbd9c4d48964fcc28b045df37f2b97c31c2df89f40bbcd460a97f5d28d56ed6"
+checksum = "3b83550b81db143b0b4445c2fc7fe4a0f19b9b23f089f7c2229536f1482158db"
 dependencies = [
  "agave-geyser-plugin-interface",
  "ahash 0.8.12",
  "endian-cast",
  "generic-array 1.4.3",
- "hashbrown 0.17.1",
+ "hashbrown 0.12.3",
  "lencode-macros",
  "newt-hype",
  "ruint",
@@ -4808,9 +4803,9 @@ dependencies = [
 
 [[package]]
 name = "lencode-macros"
-version = "1.1.0"
+version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eaf9861f336a970aa083dbfdcf26b6985b4b7442c9d1533939409d2f99003041"
+checksum = "8c87a91e64addd0c8bd21bf68936d2a1abafce1a64335b0cc3c78ad5d56dc98c"
 dependencies = [
  "proc-macro-crate 3.5.0",
  "proc-macro2",

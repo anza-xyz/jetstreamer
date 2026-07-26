@@ -610,11 +610,12 @@ fn decode_update_record_into(
     let executable = bool::decode_ext(reader, Some(ctx))?;
     let rent_epoch = u64::decode_ext(reader, Some(ctx))?;
     let write_version = u64::decode_ext(reader, Some(ctx))?;
-    let data: Vec<u8>;
     let data_slice: &[u8] = if materialize {
         diff.set_key(account_diff_key(&pubkey));
-        data = diff.decode_blob(reader)?;
-        &data
+        // Borrowed decode (lencode 1.2): the reconstruction stays in the
+        // diff store's slot and is copied exactly once — by `store`, into
+        // the arena. No per-update allocation.
+        diff.decode_blob_ref(reader)?
     } else {
         skip_diff_blob(reader)?;
         &[]

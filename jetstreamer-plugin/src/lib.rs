@@ -432,15 +432,8 @@ impl PluginRunner {
                                 && let Some(db_client) = clickhouse.clone()
                             {
                                 let buffer = slot_buffer.clone();
-                                let log_target_clone = log_target.clone();
-                                tokio::spawn(async move {
-                                    if let Err(err) = flush_slot_buffer(db_client, buffer).await {
-                                        log::error!(
-                                            target: &log_target_clone,
-                                            "failed to flush buffered plugin slots: {}",
-                                            err
-                                        );
-                                    }
+                                spawn_tracked_write(async move {
+                                    flush_slot_buffer(db_client, buffer).await;
                                 });
                             }
                         }
@@ -457,7 +450,7 @@ impl PluginRunner {
                                 let slot = *slot;
                                 let executed_transaction_count = *executed_transaction_count;
                                 let block_time = *block_time;
-                                tokio::spawn(async move {
+                                spawn_tracked_write(async move {
                                     retry_clickhouse_write("slot status", || {
                                         record_slot_status(
                                             Arc::clone(&db_client),
@@ -839,15 +832,13 @@ impl PluginRunner {
             }
         };
 
-        if clickhouse_enabled
-            && let Some(db_client) = clickhouse.clone()
-            && let Err(err) = flush_slot_buffer(db_client, slot_buffer.clone()).await
-        {
-            log::error!(
-                target: LOG_MODULE,
-                "failed to flush buffered plugin slots: {}",
-                err
-            );
+        // Drain outstanding fire-and-forget writes (including any parked in retry backoff)
+        // before flushing final state; past this point runtime teardown and the embedded
+        // ClickHouse shutdown cannot cancel a delivery.
+        drain_outstanding_writes().await;
+
+        if clickhouse_enabled && let Some(db_client) = clickhouse.clone() {
+            flush_slot_buffer(db_client, slot_buffer.clone()).await;
         }
 
         for handle in plugin_handles.iter() {
@@ -953,7 +944,7 @@ struct PluginRow<'a> {
     version: u32,
 }
 
-#[derive(Row, Serialize)]
+#[derive(Row, Serialize, Clone)]
 struct PluginSlotRow {
     plugin_id: u32,
     slot: u64,
@@ -1058,10 +1049,13 @@ async fn record_plugin_slot(
     Ok(())
 }
 
+/// Drains the shared slot buffer once and writes the drained rows with full retry
+/// protection. The drain happens exactly once up front — retries replay the *drained* rows,
+/// never re-drain the (now empty) buffer, so a failed attempt cannot lose them.
 async fn flush_slot_buffer(
     db: Arc<Client>,
     buffer: Arc<DashMap<u16, Vec<PluginSlotRow>, ahash::RandomState>>,
-) -> Result<(), clickhouse::error::Error> {
+) {
     let mut rows = Vec::new();
     buffer.iter_mut().for_each(|mut entry| {
         if !entry.value().is_empty() {
@@ -1070,17 +1064,88 @@ async fn flush_slot_buffer(
     });
 
     if rows.is_empty() {
-        return Ok(());
+        return;
     }
 
-    let mut insert = db
-        .insert::<PluginSlotRow>("jetstreamer_plugin_slots")
-        .await?;
-    for row in rows {
-        insert.write(&row).await?;
+    retry_clickhouse_write("plugin slot flush", || {
+        let db = Arc::clone(&db);
+        let rows = rows.clone();
+        async move {
+            let mut insert = db
+                .insert::<PluginSlotRow>("jetstreamer_plugin_slots")
+                .await?;
+            for row in &rows {
+                insert.write(row).await?;
+            }
+            insert.end().await?;
+            Ok(())
+        }
+    })
+    .await;
+}
+
+/// Number of spawned ClickHouse write tasks still in flight. Drained at shutdown so runtime
+/// teardown can never cancel a write mid-delivery (including retries parked in backoff).
+static WRITES_IN_FLIGHT: AtomicU64 = AtomicU64::new(0);
+
+/// RAII guard for one in-flight write task; decrements on drop so even a panicking task
+/// cannot leak the counter and wedge shutdown.
+struct InFlightWrite;
+
+impl InFlightWrite {
+    fn begin() -> Self {
+        WRITES_IN_FLIGHT.fetch_add(1, Ordering::SeqCst);
+        Self
     }
-    insert.end().await?;
-    Ok(())
+}
+
+impl Drop for InFlightWrite {
+    fn drop(&mut self) {
+        WRITES_IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Spawns a fire-and-forget ClickHouse write task tracked by the in-flight counter. The
+/// counter is incremented *before* spawning (in the caller's context), so by the time the
+/// firehose finishes and shutdown reaches [`drain_outstanding_writes`], every write spawned
+/// from a handler is guaranteed to be counted.
+pub(crate) fn spawn_tracked_write<F>(write: F)
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    let guard = InFlightWrite::begin();
+    tokio::spawn(async move {
+        let _guard = guard;
+        write.await;
+    });
+}
+
+/// Waits until every tracked ClickHouse write task has completed. Called during shutdown
+/// after ingestion stops and before the embedded ClickHouse helper is stopped and the tokio
+/// runtime is dropped — otherwise in-flight batches would be silently cancelled. The wait is
+/// bounded by the write tasks' own retry horizon: they either succeed or terminate the
+/// process, so this cannot hang forever.
+async fn drain_outstanding_writes() {
+    let mut last_logged = std::time::Instant::now();
+    let mut logged = false;
+    loop {
+        let in_flight = WRITES_IN_FLIGHT.load(Ordering::SeqCst);
+        if in_flight == 0 {
+            if logged {
+                log::info!(target: LOG_MODULE, "all outstanding clickhouse writes finished");
+            }
+            return;
+        }
+        if !logged || last_logged.elapsed() >= Duration::from_secs(5) {
+            log::info!(
+                target: LOG_MODULE,
+                "waiting for {in_flight} outstanding clickhouse write task(s) to finish before shutdown..."
+            );
+            last_logged = std::time::Instant::now();
+            logged = true;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 /// Retries a ClickHouse write with exponential backoff (0.5s doubling to a 15s cap) for up

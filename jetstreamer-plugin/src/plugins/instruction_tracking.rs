@@ -132,7 +132,7 @@ impl Plugin for InstructionTrackingPlugin {
             if let Some(db_client) = db
                 && !rows.is_empty()
             {
-                tokio::spawn(async move {
+                crate::spawn_tracked_write(async move {
                     crate::retry_clickhouse_write("instruction events", || {
                         write_instruction_events(Arc::clone(&db_client), rows.clone())
                     })

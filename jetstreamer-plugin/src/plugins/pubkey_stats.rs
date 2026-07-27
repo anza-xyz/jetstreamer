@@ -138,7 +138,7 @@ impl Plugin for PubkeyStatsPlugin {
             if let Some(db_client) = db
                 && !rows.is_empty()
             {
-                tokio::spawn(async move {
+                crate::spawn_tracked_write(async move {
                     crate::retry_clickhouse_write("pubkey mentions", || {
                         write_pubkey_mentions(Arc::clone(&db_client), rows.clone())
                     })

@@ -51,8 +51,12 @@ fn usage() -> ! {
          unconsumed so the decoder skips diff reconstruction — benchmarks \
          the metadata-only fast path (update counts stay real, bytes read 0)\n\
          --no-preload (with --bench): read from disk even when the epoch \
-         file would fit in RAM (by default the bench preloads it and \
-         measures pure decode)"
+         file would fit in RAM (metadata-only benches preload by default \
+         and measure pure decode)\n\
+         --threads defaults by declared plugin consumption: cores + 1/8 \
+         when no plugin consumes account-update data (CPU-bound decode), \
+         cores/2 when one does (memory-bandwidth-bound); preload likewise \
+         auto-disables in the byte-consuming regime"
     );
     std::process::exit(2);
 }
@@ -241,14 +245,7 @@ async fn main() {
     let mut args = std::env::args().skip(1);
     let range = args.next().unwrap_or_else(|| usage());
     let location = args.next().unwrap_or_else(|| usage());
-    // Default: cores + 1/8 oversubscription. Decode scales with threads until
-    // every core is saturated and then holds flat (measured on a 64-core
-    // EPYC: throughput climbs to ~72 workers and stays within ~2% out to
-    // 128), and the slight oversubscription covers per-thread stalls —
-    // 72 threads was the measured optimum on that box.
-    let mut threads = std::thread::available_parallelism()
-        .map(|n| n.get() + n.get().div_ceil(8))
-        .unwrap_or(8);
+    let mut threads_override: Option<usize> = None;
     let mut dsn =
         std::env::var("JETSTREAMER_CLICKHOUSE_DSN").unwrap_or_else(|_| DEFAULT_DSN.to_string());
     let mut bench = false;
@@ -257,10 +254,11 @@ async fn main() {
     while let Some(flag) = args.next() {
         match flag.as_str() {
             "--threads" => {
-                threads = args
-                    .next()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or_else(|| usage());
+                threads_override = Some(
+                    args.next()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or_else(|| usage()),
+                );
             }
             "--clickhouse-dsn" => dsn = args.next().unwrap_or_else(|| usage()),
             "--bench" => bench = true,
@@ -336,26 +334,68 @@ async fn main() {
         log::info!("using external ClickHouse at {dsn} (no embedded spawn)");
     }
 
-    let mut runner = HorizonPluginRunner::new(dsn, threads);
     let bench_counters = Arc::new(BenchCounters::default());
-    if bench {
-        runner.add_plugin(Arc::new(BenchPlugin {
+    let plugins: Vec<Arc<dyn HorizonPlugin>> = if bench {
+        vec![Arc::new(BenchPlugin {
             counters: bench_counters.clone(),
             consume_account_bytes: !no_account_bytes,
-        }));
+        })]
     } else {
-        runner.add_plugin(Arc::new(PubkeyStatsHorizonPlugin::new()));
-        runner.add_plugin(Arc::new(AccountWritesPlugin::new()));
+        vec![
+            Arc::new(PubkeyStatsHorizonPlugin::new()),
+            Arc::new(AccountWritesPlugin::new()),
+        ]
+    };
+
+    // The combined consumption declaration decides the operating regime
+    // (measured on a 64-core EPYC, epoch 941):
+    // - metadata-only decode is CPU-bound: throughput climbs to ~cores + 1/8
+    //   oversubscription (72 threads) and holds flat, and it drinks
+    //   compressed input faster than the disk delivers, so preloading the
+    //   epoch into RAM helps.
+    // - materializing account-update data is memory-bandwidth-bound: the
+    //   optimum is ~cores/2 (36 threads; more threads thrash cache below
+    //   peak), input demand is well under disk speed, and a preloaded
+    //   resident buffer only competes for DRAM — so no preload.
+    let consumes_bytes = plugins
+        .iter()
+        .fold(
+            Consumption::all().without_account_update_data(),
+            |acc, p| acc.union(p.consumption()),
+        )
+        .account_update_data;
+    let threads = threads_override.unwrap_or_else(|| {
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(8);
+        if consumes_bytes {
+            (cores / 2).max(1)
+        } else {
+            cores + cores.div_ceil(8)
+        }
+    });
+    let preload = bench && !no_preload && !consumes_bytes;
+    if bench && !no_preload && consumes_bytes {
+        log::info!(
+            "bench: preload disabled (account-update data is consumed; materialized decode is \
+             memory-bandwidth-bound and slower than disk feeds, so a resident buffer only \
+             competes for DRAM)"
+        );
+    }
+
+    let mut runner = HorizonPluginRunner::new(dsn, threads);
+    for plugin in &plugins {
+        runner.add_plugin(plugin.clone());
     }
 
     let mut failure = None;
     for epoch in start_epoch..=end_epoch {
         let (lo, hi) = epoch_to_slot_range(epoch);
         log::info!("horizon pipeline: epoch {epoch} (slots {lo}..={hi}) with {threads} threads");
-        // Bench: preload the epoch into RAM when it fits, so the timed
-        // window below measures pure decode. The buffer is dropped when the
-        // epoch's run completes, before the next preload.
-        let epoch_src = if bench && !no_preload {
+        // Bench, metadata-only: preload the epoch into RAM when it fits, so
+        // the timed window below measures pure decode. The buffer is dropped
+        // when the epoch's run completes, before the next preload.
+        let epoch_src = if preload {
             preload_epoch(&src, epoch)
                 .await
                 .unwrap_or_else(|| src.clone())

@@ -454,6 +454,31 @@ async fn main() {
         }
     }
 
+    // If the run was aborted mid-epoch, the cancelled run's detached writer
+    // keeps draining submitted inserts in the background; give it a bounded
+    // window to finish (acks are durable, so completed means persisted)
+    // before stopping the server it is writing to. A graceful completion has
+    // already drained to zero, so this is a no-op then.
+    let mut waited = std::time::Duration::ZERO;
+    const DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(15);
+    while runner.outstanding_writes() > 0 && waited < DRAIN_GRACE {
+        if waited.is_zero() {
+            log::info!(
+                "draining {} outstanding clickhouse write(s) before shutdown...",
+                runner.outstanding_writes()
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        waited += std::time::Duration::from_millis(200);
+    }
+    let abandoned = runner.outstanding_writes();
+    if abandoned > 0 {
+        log::warn!(
+            "abandoning {abandoned} unacknowledged clickhouse write(s) after {}s drain grace",
+            DRAIN_GRACE.as_secs()
+        );
+    }
+
     // Stop the embedded server before exiting either way, so data is flushed
     // and the port is released.
     if spawn_clickhouse {

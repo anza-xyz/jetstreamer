@@ -33,9 +33,11 @@
 //! ## Write Durability
 //! Writes issued by the runner and the bundled plugins are never silently dropped. Inserts
 //! use `async_insert` with `wait_for_async_insert=1` (an acknowledgment means durably
-//! flushed), failures are retried with exponential backoff for up to 10 minutes, and a write
-//! that is still failing after the horizon aborts the run with a message that includes the
-//! exact command to resume from the lowest unprocessed slot. Retries provide at-least-once
+//! flushed), failures are retried with exponential backoff for up to 10 minutes, in-flight
+//! write tasks are tracked and drained at shutdown (so runtime teardown never cancels a
+//! batch mid-delivery), and a write that is still failing after the horizon aborts the run
+//! with a message that includes the exact command to resume from the lowest unprocessed
+//! slot. Retries provide at-least-once
 //! delivery: every bundled table is a `ReplacingMergeTree` keyed on its logical identity, so
 //! replayed batches deduplicate on merge — query with `FINAL` (or tolerate transient
 //! duplicates) when reading while ingestion is active.

@@ -178,9 +178,10 @@ one system to another as a way of migrating data.
 ClickHouse writes are never silently dropped. Inserts use `async_insert` with
 `wait_for_async_insert=1`, so an acknowledgment means the data was durably flushed; any
 failure is retried with exponential backoff (0.5s doubling to a 15s cap) for up to 10
-minutes, visible live as the `db retries` stat in the TUI. If a write is still failing after
-the full horizon, the run aborts loudly and prints the exact command to resume from the
-lowest unprocessed slot. Retries give at-least-once delivery: every table is a
+minutes, visible live as the `db retries` stat in the TUI. In-flight write tasks are tracked
+and drained at shutdown, so finishing a run (or Ctrl-C) never cancels a batch mid-delivery.
+If a write is still failing after the full horizon, the run aborts loudly and prints the
+exact command to resume from the lowest unprocessed slot. Retries give at-least-once delivery: every table is a
 `ReplacingMergeTree` keyed on its logical identity, so a replayed batch deduplicates on
 merge — consumers should query with `FINAL` (or tolerate transient duplicates) when reading
 while ingestion is active.

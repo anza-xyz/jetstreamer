@@ -58,6 +58,18 @@ The threaded firehose actively manages its HTTP connection fleet to cope with CD
   quiescent point (between block batches) and computes the split from its own authoritative
   position, so handovers can never race in-flight emission. This keeps every connection busy
   until the entire range completes; threads only retire when no stealable work remains.
+
+### Integrity guarantees
+
+- **Premature-EOF detection**: a cleanly closed HTTP stream is ambiguous — it can mean the
+  genuine end of an epoch's data or a connection the CDN cut mid-transfer. On EOF the reader
+  consults the slot-ranges index; if any present slot remains in the thread's slice, the
+  stream was truncated and the range restarts instead of silently completing short.
+- **End-of-run coverage audit**: every completed assignment journals the interval it
+  processed, and after all threads finish the union is verified against the requested range
+  (gaps are checked against the slot index, so genuine leader-skip regions pass). A clean
+  run logs `coverage audit passed`; any hole containing real slots is reported loudly with
+  the exact slot range to re-run.
 Notes:
 
 - `JETSTREAMER_HTTP_BASE_URL` and `JETSTREAMER_COMPACT_INDEX_BASE_URL` accept both full HTTP(S)

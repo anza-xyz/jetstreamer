@@ -231,12 +231,14 @@ pub async fn start() -> Result<ClickhouseStartResult, ClickhouseError> {
                                 Some(pid) => Some(pid),
                                 None => find_orphaned_clickhouse(own_pid).await,
                             };
+                            // Messages go to both sinks: in TUI mode the ring logger owns
+                            // `log` output and a startup abort would otherwise be silent.
                             let Some(target) = target else {
-                                log::error!(
-                                    "could not identify the conflicting ClickHouse process; \
+                                let msg = "could not identify the conflicting ClickHouse process; \
                                      kill it manually (e.g. `pkill -f -- '-clickhouse server'`) \
-                                     and re-launch."
-                                );
+                                     and re-launch.";
+                                log::error!("{msg}");
+                                eprintln!("{msg}");
                                 // Dropping ready_tx surfaces a clean startup error upstream.
                                 return;
                             };
@@ -248,10 +250,17 @@ pub async fn start() -> Result<ClickhouseStartResult, ClickhouseError> {
                                 .await
                             {
                                 log::error!("Failed to send SIGTERM to ClickHouse process: {}", err);
+                                eprintln!("Failed to send SIGTERM to ClickHouse process: {}", err);
                             }
-                            log::warn!("ClickHouse process with PID {} killed.", target);
-                            log::warn!("Please re-launch.");
-                            std::process::exit(0);
+                            let msg = format!(
+                                "killed orphaned ClickHouse process (PID {}); please re-launch.",
+                                target
+                            );
+                            log::warn!("{msg}");
+                            eprintln!("{msg}");
+                            // Dropping ready_tx surfaces a clean startup error upstream
+                            // instead of silently exiting the process.
+                            return;
                         } else if line.contains("PID: ")
                             && let Some(pid_str) = line.split_whitespace().nth(1)
                                 && let Ok(pid) = pid_str.parse::<u32>() {

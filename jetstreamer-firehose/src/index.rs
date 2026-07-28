@@ -224,6 +224,15 @@ pub async fn slot_to_offset(slot: u64) -> Result<u64, SlotOffsetIndexError> {
     slot_to_range(slot).await.map(|(offset, _)| offset)
 }
 
+/// Returns the first *present* slot strictly after `after` and at most `up_to_inclusive`,
+/// or `None` when none exists or the answer is unknown (legacy-index epochs). See
+/// [`SlotOffsetIndex::next_present_slot`].
+pub async fn next_present_slot(after: u64, up_to_inclusive: u64) -> Option<u64> {
+    SLOT_OFFSET_INDEX
+        .next_present_slot(after, up_to_inclusive)
+        .await
+}
+
 /// Looks up the byte range `(offset, length)` covering all of `slot`'s data within its Old
 /// Faithful epoch CAR archive. Returns [`SlotOffsetIndexError::SlotNotFound`] for slots that
 /// were skipped on-chain.
@@ -429,6 +438,46 @@ impl SlotOffsetIndex {
         SLOT_OFFSET_RESULT_CACHE.insert(slot, range);
 
         Ok(range)
+    }
+
+    /// Returns the first *present* slot strictly after `after` and at most `up_to_inclusive`,
+    /// or `None` when no such slot exists **or the answer is unknown** (legacy compactindex
+    /// epochs cannot answer this without per-slot network lookups). Used to distinguish a
+    /// genuine end-of-epoch from a prematurely closed HTTP stream, and by the end-of-run
+    /// coverage audit; both treat `None` as "nothing provably missing".
+    pub async fn next_present_slot(&self, after: u64, up_to_inclusive: u64) -> Option<u64> {
+        let mut probe = after.saturating_add(1);
+        while probe <= up_to_inclusive {
+            let epoch = slot_to_epoch(probe);
+            let (_, epoch_end_inclusive) = epoch_to_slot_range(epoch);
+            let cache_key = EpochCacheKey::new(&self.cache_namespace, epoch);
+            let entry_arc = EPOCH_CACHE
+                .entry(cache_key.clone())
+                .or_insert_with(|| Arc::new(EpochEntry::new()))
+                .clone();
+            let indexes = entry_arc
+                .indexes
+                .get_or_try_init(|| async {
+                    Ok::<_, SlotOffsetIndexError>(Arc::new(self.load_epoch_indexes(epoch).await?))
+                })
+                .await
+                .ok()?
+                .clone();
+            match indexes.as_ref() {
+                EpochIndexes::SlotRanges(index) => {
+                    let scan_end = up_to_inclusive.min(epoch_end_inclusive);
+                    for slot in probe..=scan_end {
+                        if index.lookup_range(slot).is_ok() {
+                            return Some(slot);
+                        }
+                    }
+                }
+                // Legacy epochs cannot be scanned cheaply; report "unknown".
+                EpochIndexes::Legacy(_) => return None,
+            }
+            probe = epoch_end_inclusive.saturating_add(1);
+        }
+        None
     }
 
     fn remote_for_path(&self, path: &str) -> Result<RemoteObject, SlotOffsetIndexError> {

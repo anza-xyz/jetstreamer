@@ -577,6 +577,11 @@ pub enum FirehoseError {
     /// The thread's slot range is fully processed (not a failure): routed through the retry
     /// loop so the thread can adopt stolen work or retire.
     RangeComplete,
+    /// The HTTP stream ended (EOF) while the slot index proves present slots remain in the
+    /// thread's range — the CDN closed the connection mid-transfer. Retryable; without this
+    /// check a truncated stream is indistinguishable from a genuine end-of-epoch and the
+    /// remaining slots would be silently lost.
+    PrematureStreamEnd,
     /// Transaction handler returned an error.
     TransactionHandlerError(SharedError),
     /// Entry handler returned an error.
@@ -637,6 +642,12 @@ impl Display for FirehoseError {
             }
             FirehoseError::RangeComplete => {
                 write!(f, "slot range complete")
+            }
+            FirehoseError::PrematureStreamEnd => {
+                write!(
+                    f,
+                    "stream ended before the slot range was fully processed (connection closed mid-transfer)"
+                )
             }
             FirehoseError::TransactionHandlerError(error) => {
                 write!(f, "Transaction handler error: {}", error)
@@ -1410,6 +1421,13 @@ where
     let steal_inboxes: Arc<Vec<mpsc::UnboundedSender<StealRequest>>> =
         Arc::new(steal_inbox_senders);
     *ACTIVE_WORK_LEDGER.lock().unwrap() = Some(work_registry.clone());
+    // Coverage journal: every completed assignment records the interval it actually
+    // processed, and the end-of-run audit verifies the union covers the requested range.
+    // This turns any silent slot loss (whatever the cause) into a loud, precise error.
+    let coverage_log: Arc<std::sync::Mutex<Vec<(u64, u64)>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let overall_start = subranges.first().map(|range| range.start).unwrap_or(0);
+    let overall_end = subranges.last().map(|range| range.end).unwrap_or(0);
     let steal_lock = Arc::new(tokio::sync::Mutex::new(()));
     // Always on in threaded forward mode; sequential/reverse runs and single-thread runs
     // have nothing to steal.
@@ -1498,6 +1516,7 @@ where
             wait_for_green_threads(grace, &shutdown_flag, &handles).await;
         }
         let work_registry = work_registry.clone();
+        let coverage_log = coverage_log.clone();
         let steal_lock = steal_lock.clone();
         let steal_inboxes = steal_inboxes.clone();
         let mut steal_inbox = steal_inbox_receivers[thread_index]
@@ -1817,18 +1836,37 @@ where
                                 true,
                             );
                         }
-                        if nodes.is_empty() {
+                        let stream_ended = nodes.is_empty()
+                            || nodes
+                                .0
+                                .last()
+                                .is_some_and(|last_node| !last_node.get_node().is_block());
+                        if stream_ended {
+                            // EOF is ambiguous: it can mean the genuine end of the epoch's
+                            // data, or a connection the CDN closed mid-transfer. Consult the
+                            // slot index: if any present slot remains in this thread's slice
+                            // of the epoch, the stream was truncated and completing here
+                            // would silently drop those slots.
+                            let scan_end = local_end_inclusive.min(slot_range.end.saturating_sub(1));
+                            if let Some(missing) =
+                                crate::index::next_present_slot(last_counted_slot, scan_end).await
+                            {
+                                log::warn!(
+                                    target: &log_target,
+                                    "stream ended prematurely in epoch {} — slot {} (and possibly more) still unprocessed; restarting",
+                                    epoch_num,
+                                    missing
+                                );
+                                return Err((
+                                    FirehoseError::PrematureStreamEnd,
+                                    last_counted_slot.saturating_add(1),
+                                ));
+                            }
                             log::info!(
                                 target: &log_target,
                                 "reached end of epoch {}",
                                 epoch_num
                             );
-                            break;
-                        }
-                        if let Some(last_node) = nodes.0.last()
-                            && !last_node.get_node().is_block()
-                        {
-                            log::info!(target: &log_target, "reached end of epoch {}", epoch_num);
                             break;
                         }
                         let block = nodes
@@ -2427,6 +2465,18 @@ where
                 // Range completion arrives through the retry loop so the thread can adopt
                 // stolen work (restarting the loop with a new range) or retire.
                 if matches!(err, FirehoseError::RangeComplete) {
+                    // Journal the interval this assignment actually processed (read before
+                    // a steal adoption overwrites the ledger entry). Trailing slots between
+                    // last_counted and the assignment end are left to the audit, which
+                    // verifies such gaps contain no present slots.
+                    if work_stealing {
+                        let assignment_start =
+                            work_registry[thread_index].start.load(Ordering::SeqCst);
+                        coverage_log
+                            .lock()
+                            .unwrap()
+                            .push((assignment_start, last_counted_slot.saturating_add(1)));
+                    }
                     // This thread is done with its own range: publish "nothing remaining" so
                     // hunters stop targeting it, then drain any pending steal proposals with
                     // a refusal before going hunting itself.
@@ -2623,6 +2673,59 @@ where
     }
     if let Some(monitor) = recycle_monitor {
         monitor.abort();
+    }
+    // End-of-run coverage audit: the union of journaled intervals must cover every present
+    // slot in the requested range. Skipped when the run was interrupted (holes are expected
+    // then) or when work stealing (and thus journaling) was inactive.
+    if work_stealing && !shutdown_flag.load(Ordering::SeqCst) {
+        let mut covered = coverage_log.lock().unwrap().clone();
+        covered.retain(|(start, end)| end > start);
+        covered.sort_unstable();
+        let mut holes: Vec<(u64, u64)> = Vec::new();
+        let mut cursor = overall_start;
+        for (start, end) in covered {
+            if start > cursor {
+                holes.push((cursor, start));
+            }
+            cursor = cursor.max(end);
+        }
+        if cursor < overall_end {
+            holes.push((cursor, overall_end));
+        }
+        let mut real_holes = 0usize;
+        for (hole_start, hole_end) in &holes {
+            if let Some(missing) = crate::index::next_present_slot(
+                hole_start.saturating_sub(1),
+                hole_end.saturating_sub(1),
+            )
+            .await
+            {
+                real_holes += 1;
+                if real_holes <= 10 {
+                    log::error!(
+                        target: LOG_MODULE,
+                        "🕳️ coverage audit: slots [{}, {}) were never processed (first present slot: {})",
+                        hole_start,
+                        hole_end,
+                        missing
+                    );
+                }
+            }
+        }
+        if real_holes == 0 {
+            log::info!(
+                target: LOG_MODULE,
+                "coverage audit passed: every present slot in [{}, {}) was processed",
+                overall_start,
+                overall_end
+            );
+        } else {
+            log::error!(
+                target: LOG_MODULE,
+                "🕳️ coverage audit FAILED: {} hole(s) containing unprocessed slots — output is incomplete; re-run the listed ranges",
+                real_holes
+            );
+        }
     }
     if stats_tracking.is_some() {
         let elapsed = firehose_start.elapsed();
@@ -2913,27 +3016,32 @@ async fn firehose_geyser_thread(
                         }
                     };
                     thread_activity::note(thread_index.unwrap_or(0));
-                    if nodes.is_empty() {
-                        log::info!(
-                            target: &log_target,
-                            "reached end of epoch {}",
-                            epoch_num
-                        );
+                    let stream_ended = nodes.is_empty()
+                        || nodes
+                            .0
+                            .last()
+                            .is_some_and(|last_node| !last_node.get_node().is_block());
+                    if stream_ended {
+                        // EOF is ambiguous (genuine epoch end vs a connection the CDN closed
+                        // mid-transfer); consult the slot index before completing.
+                        let scan_end = local_end_inclusive.min(slot_range.end.saturating_sub(1));
+                        if let Some(missing) =
+                            crate::index::next_present_slot(last_counted_slot, scan_end).await
+                        {
+                            log::warn!(
+                                target: &log_target,
+                                "stream ended prematurely in epoch {} — slot {} (and possibly more) still unprocessed; restarting",
+                                epoch_num,
+                                missing
+                            );
+                            return Err((
+                                FirehoseError::PrematureStreamEnd,
+                                last_counted_slot.saturating_add(1),
+                            ));
+                        }
+                        log::info!(target: &log_target, "reached end of epoch {}", epoch_num);
                         break;
                     }
-                    // ignore epoch and subset nodes at end of car file loop { if
-                    // nodes.0.is_empty() { break; } if let Some(node) = nodes.0.last() { if
-                    //     node.get_node().is_epoch() { log::debug!(target: &log_target,
-                    //         "skipping epoch node for epoch {}", epoch_num); nodes.0.pop(); }
-                    //     else if node.get_node().is_subset() { nodes.0.pop(); } else if
-                    //     node.get_node().is_block() { break; } } } if nodes.0.is_empty() {
-                    //         log::info!(target: &log_target, "reached end of epoch {}",
-                    //             epoch_num); break; }
-                    if let Some(last_node) = nodes.0.last()
-                        && !last_node.get_node().is_block() {
-                            log::info!(target: &log_target, "reached end of epoch {}", epoch_num);
-                            break;
-                        }
                     let block = nodes
                         .get_block()
                         .map_err(FirehoseError::GetBlockError)

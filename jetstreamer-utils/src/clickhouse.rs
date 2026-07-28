@@ -43,6 +43,21 @@ fn process_log_line(line: impl AsRef<str>) {
 
 static CLICKHOUSE_PROCESS: OnceCell<u32> = OnceCell::const_new();
 
+/// Finds an orphaned embedded ClickHouse server left behind by a previous run (they are
+/// `setsid`-detached, so they outlive their parent), identified by the temp binary naming
+/// convention (`<random>-clickhouse server`), excluding our own child process.
+async fn find_orphaned_clickhouse(own_pid: Option<u32>) -> Option<u32> {
+    let output = Command::new("pgrep")
+        .args(["-f", "--", "-clickhouse server"])
+        .output()
+        .await
+        .ok()?;
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.trim().parse::<u32>().ok())
+        .find(|pid| Some(*pid) != own_pid)
+}
+
 include!(concat!(env!("OUT_DIR"), "/embed_clickhouse.rs")); // raw bytes for clickhouse binary
 
 /// Errors that can occur when managing the embedded ClickHouse process.
@@ -177,6 +192,7 @@ pub async fn start() -> Result<ClickhouseStartResult, ClickhouseError> {
     let mut stderr_reader = BufReader::new(stderr).lines();
 
     // Spawn a task to monitor both stdout and stderr for the "Ready for connections." message
+    let own_pid = clickhouse_command.id();
     tokio::spawn(async move {
         let mut ready_signal_sent = false;
         let mut other_pid: Option<u32> = None;
@@ -206,19 +222,34 @@ pub async fn start() -> Result<ClickhouseStartResult, ClickhouseError> {
                             ready_signal_sent = true;
                         } else if line.contains("DB::Server::run() @") {
                             log::warn!("ClickHouse server is already running, gracefully shutting down and restarting.");
-                            let Some(other_pid) = other_pid else {
-                                panic!("Failed to find the PID of the running ClickHouse server.");
+                            // Normally the conflicting PID was scraped from the status-file
+                            // complaint, but if the data dir was wiped while an orphaned
+                            // server (setsid-detached from a previous run) still holds the
+                            // port, no such line exists — fall back to process discovery by
+                            // the embedded binary's temp naming convention.
+                            let target = match other_pid {
+                                Some(pid) => Some(pid),
+                                None => find_orphaned_clickhouse(own_pid).await,
+                            };
+                            let Some(target) = target else {
+                                log::error!(
+                                    "could not identify the conflicting ClickHouse process; \
+                                     kill it manually (e.g. `pkill -f -- '-clickhouse server'`) \
+                                     and re-launch."
+                                );
+                                // Dropping ready_tx surfaces a clean startup error upstream.
+                                return;
                             };
                             if let Err(err) = Command::new("kill")
                                 .arg("-s")
                                 .arg("SIGTERM")
-                                .arg(other_pid.to_string())
+                                .arg(target.to_string())
                                 .status()
                                 .await
                             {
                                 log::error!("Failed to send SIGTERM to ClickHouse process: {}", err);
                             }
-                            log::warn!("ClickHouse process with PID {} killed.", other_pid);
+                            log::warn!("ClickHouse process with PID {} killed.", target);
                             log::warn!("Please re-launch.");
                             std::process::exit(0);
                         } else if line.contains("PID: ")

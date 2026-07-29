@@ -13,6 +13,7 @@ use std::future::Future;
 use std::ops::Range;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use clickhouse::Client;
 use futures_util::FutureExt;
@@ -49,13 +50,32 @@ pub fn clamp_slot(slot: u64) -> u32 {
 /// A boxed ClickHouse insert handed to the background writer.
 type WriteJob = Pin<Box<dyn Future<Output = Result<(), clickhouse::error::Error>> + Send>>;
 
+/// Insert jobs the queue holds before `submit` applies backpressure. Sized to
+/// absorb a full flush burst (every worker flushing both plugins at once)
+/// without stalling decode; beyond that, a ClickHouse that can't keep up is
+/// *supposed* to slow ingestion rather than let unacknowledged work pile up
+/// silently — that failure mode (unbounded async buildup, then dropped
+/// batches) is exactly what this design retires.
+const WRITE_QUEUE_CAP: usize = 128;
+
+/// Inserts the writer runs concurrently. Durable acks
+/// (`wait_for_async_insert=1`) make each insert wait for the server's flush,
+/// so a strictly serial writer would bottleneck on flush latency; a small
+/// pool keeps throughput without unbounded concurrency.
+const MAX_CONCURRENT_INSERTS: usize = 8;
+
 /// Sink handle given to a [`PluginWorker`] at flush time. Holds a ClickHouse
-/// client for building inserts and a channel to the background writer, so the
-/// (sync, on a decode thread) worker never awaits I/O.
+/// client for building inserts and a bounded channel to the background
+/// writer: submission is non-blocking while the writer keeps up and applies
+/// backpressure (briefly blocking the decode thread) when it doesn't.
 #[derive(Clone)]
 pub struct Output {
-    tx: tokio::sync::mpsc::UnboundedSender<WriteJob>,
+    tx: tokio::sync::mpsc::Sender<WriteJob>,
     db: Arc<Client>,
+    /// Writes submitted but not yet completed by the writer. Lets a driver
+    /// wait out the tail of the write pipeline (e.g. on ctrl-c) before
+    /// stopping the ClickHouse server under it.
+    backlog: Arc<AtomicU64>,
 }
 
 impl Output {
@@ -64,13 +84,21 @@ impl Output {
         self.db.clone()
     }
 
-    /// Hands an insert future to the background writer (non-blocking). Build
-    /// it with [`Output::db`]; the future runs off the decode thread.
+    /// Hands an insert future to the background writer. Build it with
+    /// [`Output::db`]; the future runs off the decode thread. Non-blocking
+    /// while the write queue has room; otherwise blocks the calling (decode)
+    /// thread until it does — deliberate backpressure. Must be called from a
+    /// non-async context (plugin `flush` runs on blocking decode threads;
+    /// the runner wraps its final flush pass in `block_in_place`).
     pub fn submit<Fut>(&self, job: Fut)
     where
         Fut: Future<Output = Result<(), clickhouse::error::Error>> + Send + 'static,
     {
-        let _ = self.tx.send(Box::pin(job));
+        self.backlog.fetch_add(1, Ordering::SeqCst);
+        if self.tx.blocking_send(Box::pin(job)).is_err() {
+            // Writer already gone (aborted run); nothing will run this job.
+            self.backlog.fetch_sub(1, Ordering::SeqCst);
+        }
     }
 }
 
@@ -192,6 +220,9 @@ pub struct HorizonPluginRunner {
     plugins: Vec<Arc<dyn HorizonPlugin>>,
     dsn: String,
     threads: usize,
+    /// Writes submitted but not yet completed, shared with every `Output`
+    /// this runner hands out (see [`Self::outstanding_writes`]).
+    write_backlog: Arc<AtomicU64>,
 }
 
 impl HorizonPluginRunner {
@@ -202,6 +233,7 @@ impl HorizonPluginRunner {
             plugins: Vec::new(),
             dsn: dsn.into(),
             threads: threads.max(1),
+            write_backlog: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -209,6 +241,15 @@ impl HorizonPluginRunner {
     pub fn add_plugin(&mut self, plugin: Arc<dyn HorizonPlugin>) -> &mut Self {
         self.plugins.push(plugin);
         self
+    }
+
+    /// Writes submitted but not yet completed by the background writer. A
+    /// graceful [`run`](Self::run) returns only after this reaches zero; a
+    /// driver that *cancels* `run` (ctrl-c) can poll this to give the
+    /// detached writer a bounded window to finish acknowledged-durable
+    /// inserts before tearing down the ClickHouse server they target.
+    pub fn outstanding_writes(&self) -> u64 {
+        self.write_backlog.load(Ordering::SeqCst)
     }
 
     /// Reads `epoch`'s `.jet` from `src` over `slot_range`, driving all
@@ -223,24 +264,63 @@ impl HorizonPluginRunner {
         let db = Arc::new(
             crate::build_clickhouse_client(&self.dsn)
                 .with_option("async_insert", "1")
-                .with_option("wait_for_async_insert", "0"),
+                // Durable acks: an insert completes only once the server has
+                // flushed it. Anything less lets unacknowledged batches build
+                // up server-side and fail silently under pressure; with this
+                // setting, a ClickHouse that can't keep up surfaces as
+                // backpressure (via the bounded queue) instead of data loss.
+                .with_option("wait_for_async_insert", "1"),
         );
 
         for plugin in &self.plugins {
             plugin.on_start(db.clone(), epoch).await?;
         }
 
-        // Background writer: drains insert jobs until every sender is dropped.
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<WriteJob>();
+        // Background writer: runs insert jobs with bounded concurrency until
+        // every sender is dropped, then drains to empty. Failures are logged,
+        // never silent; the backlog counter tracks every submitted job to
+        // completion.
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<WriteJob>(WRITE_QUEUE_CAP);
+        let backlog = self.write_backlog.clone();
         let writer = tokio::spawn(async move {
-            while let Some(job) = rx.recv().await {
-                if let Err(err) = job.await {
-                    log::warn!(target: LOG_TARGET, "clickhouse insert failed: {err}");
+            let mut inflight = tokio::task::JoinSet::new();
+            let log_result = |res: Result<
+                Result<(), clickhouse::error::Error>,
+                tokio::task::JoinError,
+            >| {
+                match res {
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) => {
+                        log::warn!(target: LOG_TARGET, "clickhouse insert failed: {err}");
+                    }
+                    Err(join_err) => {
+                        log::warn!(target: LOG_TARGET, "clickhouse insert task died: {join_err}");
+                    }
                 }
+            };
+            while let Some(job) = rx.recv().await {
+                while inflight.len() >= MAX_CONCURRENT_INSERTS {
+                    if let Some(res) = inflight.join_next().await {
+                        log_result(res);
+                    }
+                }
+                let backlog = backlog.clone();
+                inflight.spawn(async move {
+                    let res = job.await;
+                    backlog.fetch_sub(1, Ordering::SeqCst);
+                    res
+                });
+            }
+            while let Some(res) = inflight.join_next().await {
+                log_result(res);
             }
         });
 
-        let output = Output { tx, db: db.clone() };
+        let output = Output {
+            tx,
+            db: db.clone(),
+            backlog: self.write_backlog.clone(),
+        };
         // A stream field is materialized iff at least one plugin consumes
         // it; with no plugins nothing is consumed. Fold starts from
         // "consumes nothing" and unions each declaration in.
@@ -264,12 +344,16 @@ impl HorizonPluginRunner {
         // `make_visitor` (and its captured `output`) is dropped when this
         // await returns; each returned dispatch holds its own `output` clone
         // until `finish()`, so the channel closes only once all final flushes
-        // are submitted — then the writer drains.
+        // are submitted — then the writer drains. The final flush pass runs
+        // under `block_in_place` because `Output::submit` may block on queue
+        // backpressure (requires the multi-thread runtime).
         let dispatches =
             firehose_horizon(self.threads, src, epoch, slot_range, make_visitor).await?;
-        for dispatch in dispatches {
-            dispatch.finish();
-        }
+        tokio::task::block_in_place(|| {
+            for dispatch in dispatches {
+                dispatch.finish();
+            }
+        });
         writer.await?;
 
         for plugin in &self.plugins {
@@ -304,9 +388,10 @@ mod tests {
     fn dispatch_forwards_blocks_and_flushes_on_interval_and_finish() {
         let blocks = Arc::new(AtomicU32::new(0));
         let flushes = Arc::new(AtomicU32::new(0));
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, _rx) = tokio::sync::mpsc::channel(WRITE_QUEUE_CAP);
         let output = Output {
             tx,
+            backlog: Arc::new(AtomicU64::new(0)),
             db: Arc::new(Client::default()),
         };
         let mut dispatch = Dispatch {

@@ -67,6 +67,12 @@ JETSTREAMER_NETWORK_CAPACITY_MB=10000 cargo run --release -- 800
 # and using 8 threads explicitly instead of using automatic thread count
 JETSTREAMER_THREADS=8 cargo run --release -- 358560000:367631999
 
+# Replay epochs 900 through 950 inclusive using epoch-range syntax
+cargo run --release -- 900-950
+
+# Replay with the live terminal dashboard (TPS graph, per-thread health, system stats)
+cargo run --release -- 950 --tui
+
 # Replay epoch 800 with the instruction tracking plugin instead of the default
 cargo run --release -- 800 --with-plugin instruction-tracking
 
@@ -110,9 +116,39 @@ activity separately: `program_invocations` includes an `is_vote` flag per row, w
 `pubkey-stats` plugin aggregates per-slot account-key mention counts into a `pubkey_mentions`
 table (with a companion `pubkeys` lookup table populated via materialised view).
 
-The CLI accepts either `<start>:<end>` slot ranges or a single epoch on the command line. See
+The CLI accepts a single epoch (`950`), an inclusive `<start>-<end>` epoch range (`900-950`),
+or an inclusive `<start>:<end>` slot range on the command line. See
 [`JetstreamerRunner::parse_cli_args`](https://docs.rs/jetstreamer/latest/jetstreamer/fn.parse_cli_args.html)
 for the precise rules.
+
+### TUI dashboard
+
+Add `--tui` to render a live terminal dashboard instead of plain log output:
+
+- **TPS graph** with clickable time ranges (`5m`–`12h` trailing windows, or `all` for the
+  entire run), a 5s rolling rate, and `0 / current / peak` axis labels.
+- **Progress bar** with slots, ETA, and elapsed time.
+- **Thread grid**: one dot per firehose thread, colored by data freshness (green → red as a
+  thread approaches the stall timeout; cyan ✓ = finished its work).
+- **System chart**: CPU, memory, and NIC download rate on one axis.
+- **Stats panel**: live and average TPS, per-thread TPS spread, block/transaction totals,
+  connection recycles, timeouts, work steals, ClickHouse write retries, and wire vs payload
+  data rates.
+- **Scrollable log pane** with a scrollbar and a click-to-resume `live` button.
+
+Pane dividers are mouse-draggable. Press `q`, `Esc`, or `Ctrl-C` for the same graceful
+shutdown as SIGINT; the final log lines are replayed to the terminal on exit.
+
+### Throughput management
+
+The threaded firehose actively manages its connection fleet to cope with CDN throttling:
+threads launch through a health gate (pausing the ramp while any thread is stalled),
+failed threads restart with exponential backoff, persistently-slow connections are recycled
+(♻️) for fresh ones, and threads that finish their slot range steal work (🥷) — via a
+message handshake in which the least-progressed thread hands over half of its remaining
+slots — so every connection stays busy to the end of the run. Tune with
+`JETSTREAMER_SPAWN_PENDING`, `JETSTREAMER_SPAWN_GRACE_SECS`, and `JETSTREAMER_RECYCLE_PCT`
+(see the crate docs for details).
 
 ### ClickHouse Integration
 
@@ -136,6 +172,19 @@ ClickHouse instance that Jetstreamer has spawned. If you want to access data aft
 finished, you can run `cargo clickhouse-server` to bring up that server again using the data
 that is currently in the `bin` directory. It is also possible to copy a `bin` directory from
 one system to another as a way of migrating data.
+
+#### Write durability
+
+ClickHouse writes are never silently dropped. Inserts use `async_insert` with
+`wait_for_async_insert=1`, so an acknowledgment means the data was durably flushed; any
+failure is retried with exponential backoff (0.5s doubling to a 15s cap) for up to 10
+minutes, visible live as the `db retries` stat in the TUI. In-flight write tasks are tracked
+and drained at shutdown, so finishing a run (or Ctrl-C) never cancels a batch mid-delivery.
+If a write is still failing after the full horizon, the run aborts loudly and prints the
+exact command to resume from the lowest unprocessed slot. Retries give at-least-once delivery: every table is a
+`ReplacingMergeTree` keyed on its logical identity, so a replayed batch deduplicates on
+merge — consumers should query with `FINAL` (or tolerate transient duplicates) when reading
+while ingestion is active.
 
 ### Writing Jetstreamer Plugins
 
@@ -229,7 +278,7 @@ S3-compatible storage. Configure the backend via the following environment varia
 
 - `JETSTREAMER_ARCHIVE_BACKEND` (default `http`): set to `s3` to force the S3 client.
 - `JETSTREAMER_HTTP_BASE_URL`: base URL or `s3://bucket/prefix` for CAR files.
-- `JETSTREAMER_COMPACT_INDEX_BASE_URL`: optional override for compact indexes (also accepts `s3://` URIs).
+- `JETSTREAMER_COMPACT_INDEX_BASE_URL`: optional override for slot indexes (also accepts `s3://` URIs). Jetstreamer resolves slot offsets from the per-epoch `epoch-{N}-slot-ranges.raw` files (~5 MB each) and falls back to the deprecated legacy compactindex pair when a mirror does not serve them (`JETSTREAMER_FORCE_LEGACY_INDEX=1` forces the legacy path).
 - `JETSTREAMER_ARCHIVE_BASE`: single knob that applies to both cars and indexes when the more specific variables are unset.
 - `JETSTREAMER_S3_BUCKET`, `JETSTREAMER_S3_PREFIX`, `JETSTREAMER_S3_INDEX_PREFIX`: bucket/prefix overrides when not encoded in the `s3://` URL.
 - `JETSTREAMER_S3_REGION` and `JETSTREAMER_S3_ENDPOINT`: region plus optional custom endpoint (e.g. `https://s3.eu-central-003.backblazeb2.com`).

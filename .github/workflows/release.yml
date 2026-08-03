@@ -32,6 +32,11 @@ jobs:
           ref: ${{ inputs.ref }}
           persist-credentials: false
 
+      - name: Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libudev-dev clang llvm-dev libclang-dev pkg-config libssl-dev
+
       - name: Compute metadata
         id: meta
         run: |
@@ -107,6 +112,11 @@ jobs:
           token: ${{ steps.app-token.outputs.token }}
           persist-credentials: false
           ref: ${{ needs.check.outputs.ref }}
+
+      - name: Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libudev-dev clang llvm-dev libclang-dev pkg-config libssl-dev
 
       - name: Package crate
         run: cargo package -p "${CRATE_NAME}"

@@ -19,7 +19,7 @@ on:
 
 jobs:
   check:
-    runs-on: ubuntu-22.04-8core
+    runs-on: ubuntu-latest
     outputs:
       ref: ${{ steps.plan.outputs.ref }}
       first: ${{ steps.plan.outputs.first }}
@@ -90,7 +90,7 @@ jobs:
           FIRST: ${{ steps.plan.outputs.first }}
 
   publish:
-    runs-on: ubuntu-22.04-8core
+    runs-on: ubuntu-latest
     environment: prod
     needs: check
     permissions:

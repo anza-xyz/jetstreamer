@@ -528,8 +528,8 @@ async fn request_steal(
 fn reverse_resume_after_error(
     slot: u64,
     last_counted_slot: u64,
-    highest_remaining_epoch: u64,
-) -> (Option<u64>, u64) {
+    highest_remaining_epoch: Option<u64>,
+) -> (Option<u64>, Option<u64>) {
     let resume_slot = if slot <= last_counted_slot {
         last_counted_slot.saturating_add(1)
     } else {
@@ -541,10 +541,11 @@ fn reverse_resume_after_error(
         // Tail case: everything in `last_epoch` was processed. Only decrement the
         // highest-remaining marker when it still points at that epoch (it may already point
         // lower, e.g. when the error arrived before the first block of an earlier epoch).
-        let highest = if highest_remaining_epoch == last_epoch {
-            // May drop below the range's lowest epoch, which the retry loop treats as
-            // "all epochs complete" and exits cleanly.
-            highest_remaining_epoch.saturating_sub(1)
+        let highest = if highest_remaining_epoch == Some(last_epoch) {
+            // `checked_sub` makes "no epochs remaining" explicit as `None` — required for
+            // epoch 0, where a saturating subtraction would silently stay at 0 and replay
+            // the epoch. Dropping below the range's lowest epoch also completes the run.
+            last_epoch.checked_sub(1)
         } else {
             highest_remaining_epoch
         };
@@ -1617,12 +1618,14 @@ where
             }
             let mut last_counted_slot = slot_range.start.saturating_sub(1);
             let mut last_emitted_slot_global = slot_range.start.saturating_sub(1);
-            // Reverse-mode state preserved across retries.
+            // Reverse-mode state preserved across retries. `None` for the highest remaining
+            // epoch explicitly means "every epoch is complete" — required so completing
+            // epoch 0 is distinguishable from epoch 0 still pending.
             let mut reverse_partial_resume: Option<u64> = None;
-            let mut reverse_highest_remaining_epoch: u64 = if reverse_mode_local {
-                slot_to_epoch(slot_range.end.saturating_sub(1))
+            let mut reverse_highest_remaining_epoch: Option<u64> = if reverse_mode_local {
+                Some(slot_to_epoch(slot_range.end.saturating_sub(1)))
             } else {
-                0
+                None
             };
             let mut thread_stats = if tracking_enabled {
                 Some(ThreadStats {
@@ -1693,13 +1696,14 @@ where
                 // for each epoch
                 let mut current_slot: Option<u64> = None;
                 let epoch_iter: Vec<u64> = if reverse_mode_local {
-                    if reverse_highest_remaining_epoch < lowest_epoch {
-                        // All epochs already completed across previous retries.
+                    // All epochs already completed across previous retries?
+                    let Some(highest_remaining) = reverse_highest_remaining_epoch else {
+                        return Ok(());
+                    };
+                    if highest_remaining < lowest_epoch {
                         return Ok(());
                     }
-                    (lowest_epoch..=reverse_highest_remaining_epoch)
-                        .rev()
-                        .collect()
+                    (lowest_epoch..=highest_remaining).rev().collect()
                 } else {
                     epoch_range.clone().collect()
                 };
@@ -2449,10 +2453,10 @@ where
                         }
                     }
                     if reverse_mode_local {
-                        // Mark this epoch as fully processed so retries skip it.
-                        if epoch_num == reverse_highest_remaining_epoch {
-                            reverse_highest_remaining_epoch =
-                                reverse_highest_remaining_epoch.saturating_sub(1);
+                        // Mark this epoch as fully processed so retries skip it
+                        // (`checked_sub` yields `None` at epoch 0: nothing remains).
+                        if reverse_highest_remaining_epoch == Some(epoch_num) {
+                            reverse_highest_remaining_epoch = epoch_num.checked_sub(1);
                         }
                         if matches!(
                             reverse_partial_resume,
@@ -3557,36 +3561,36 @@ mod reverse_resume_tests {
 
     #[test]
     fn test_mid_epoch_error_resumes_in_place() {
-        let (resume, highest) = reverse_resume_after_error(388799951, 388799950, 899);
+        let (resume, highest) = reverse_resume_after_error(388799951, 388799950, Some(899));
         assert_eq!(resume, Some(388799951));
-        assert_eq!(highest, 899);
+        assert_eq!(highest, Some(899));
     }
 
     #[test]
     fn test_tail_timeout_marks_epoch_complete() {
         // Error attributed to the next epoch's first slot after the tail slot was counted:
         // the epoch slice is done; resuming from the slice start would double-emit it.
-        let (resume, highest) = reverse_resume_after_error(388800000, 388799999, 899);
+        let (resume, highest) = reverse_resume_after_error(388800000, 388799999, Some(899));
         assert_eq!(resume, None);
-        assert_eq!(highest, 898);
+        assert_eq!(highest, Some(898));
     }
 
     #[test]
     fn test_tail_error_attributed_within_epoch_marks_complete() {
         // Decoding error attributed to the already-counted tail slot: resume would be
         // tail + 1, crossing the boundary — same completion case.
-        let (resume, highest) = reverse_resume_after_error(388799999, 388799999, 899);
+        let (resume, highest) = reverse_resume_after_error(388799999, 388799999, Some(899));
         assert_eq!(resume, None);
-        assert_eq!(highest, 898);
+        assert_eq!(highest, Some(898));
     }
 
     #[test]
     fn test_seek_error_before_any_progress_keeps_epoch() {
         // First epoch (900) seek fails before any block; last_counted is still the
         // pre-range sentinel in epoch 899. The higher epoch must not be marked complete.
-        let (resume, highest) = reverse_resume_after_error(388800000, 388799899, 900);
+        let (resume, highest) = reverse_resume_after_error(388800000, 388799899, Some(900));
         assert_eq!(resume, None);
-        assert_eq!(highest, 900);
+        assert_eq!(highest, Some(900));
     }
 
     #[test]
@@ -3594,9 +3598,19 @@ mod reverse_resume_tests {
         // Epoch 900 finished (last_counted in 900); epoch 899's seek fails with the error
         // attributed inside 899. Not a tail crossing — keep a resume marker (which the
         // epoch-match check resolves to the slice start of 899).
-        let (resume, highest) = reverse_resume_after_error(388799900, 388800099, 899);
+        let (resume, highest) = reverse_resume_after_error(388799900, 388800099, Some(899));
         assert_eq!(resume, Some(388800100));
-        assert_eq!(highest, 899);
+        assert_eq!(highest, Some(899));
+    }
+
+    #[test]
+    fn test_epoch_zero_tail_error_completes_run() {
+        // Epoch 0's tail is slot 431999; the error is attributed to slot 432000 (epoch 1).
+        // "No epochs remaining" must be explicit (`None`) — a saturating subtraction would
+        // silently pin at 0 and replay epoch 0 forever.
+        let (resume, highest) = reverse_resume_after_error(432000, 431999, Some(0));
+        assert_eq!(resume, None);
+        assert_eq!(highest, None);
     }
 }
 

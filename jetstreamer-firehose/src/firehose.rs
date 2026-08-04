@@ -514,6 +514,46 @@ async fn request_steal(
     None
 }
 
+/// Decides how a reverse-mode retry resumes after an error attributed to `slot`, given that
+/// `last_counted_slot` was the last slot fully processed. Returns the new
+/// `(reverse_partial_resume, reverse_highest_remaining_epoch)`.
+///
+/// The subtlety: an error striking at an epoch slice's *tail* (after its final block was
+/// emitted, before the clean end-of-epoch break) is attributed to the next slot — which
+/// belongs to the next, **higher** epoch. Storing that as the partial-resume point poisons
+/// the retry: the epoch-match check sees a foreign epoch, discards the resume marker, and
+/// re-processes the entire slice from its start, double-emitting every slot in it. When the
+/// resume point crosses above the epoch that was actually being processed, the slice is
+/// complete — so mark the epoch done instead.
+fn reverse_resume_after_error(
+    slot: u64,
+    last_counted_slot: u64,
+    highest_remaining_epoch: u64,
+) -> (Option<u64>, u64) {
+    let resume_slot = if slot <= last_counted_slot {
+        last_counted_slot.saturating_add(1)
+    } else {
+        slot
+    };
+    let last_epoch = slot_to_epoch(last_counted_slot);
+    let error_epoch = slot_to_epoch(slot);
+    if error_epoch >= last_epoch && slot_to_epoch(resume_slot) > last_epoch {
+        // Tail case: everything in `last_epoch` was processed. Only decrement the
+        // highest-remaining marker when it still points at that epoch (it may already point
+        // lower, e.g. when the error arrived before the first block of an earlier epoch).
+        let highest = if highest_remaining_epoch == last_epoch {
+            // May drop below the range's lowest epoch, which the retry loop treats as
+            // "all epochs complete" and exits cleanly.
+            highest_remaining_epoch.saturating_sub(1)
+        } else {
+            highest_remaining_epoch
+        };
+        (None, highest)
+    } else {
+        (Some(resume_slot), highest_remaining_epoch)
+    }
+}
+
 /// Per-thread restart pacing: consecutive failures on the same slot double the delay up to
 /// [`RETRY_BACKOFF_MAX`]; a failure on a different slot means forward progress was made and
 /// resets the sequence.
@@ -2596,12 +2636,13 @@ where
                     // In reverse mode, completed higher epochs are tracked via
                     // reverse_highest_remaining_epoch and the within-epoch resume slot lives in
                     // reverse_partial_resume; slot_range stays at its original bounds.
-                    let resume_slot = if slot <= last_counted_slot {
-                        last_counted_slot.saturating_add(1)
-                    } else {
-                        slot
-                    };
-                    reverse_partial_resume = Some(resume_slot);
+                    let (resume, highest) = reverse_resume_after_error(
+                        slot,
+                        last_counted_slot,
+                        reverse_highest_remaining_epoch,
+                    );
+                    reverse_partial_resume = resume;
+                    reverse_highest_remaining_epoch = highest;
                 } else if slot <= last_counted_slot {
                     slot_range.start = last_counted_slot.saturating_add(1);
                 } else {
@@ -3505,6 +3546,57 @@ fn human_readable_duration(duration: std::time::Duration) -> String {
         } else {
             format!("{secs}s")
         }
+    }
+}
+
+#[cfg(test)]
+mod reverse_resume_tests {
+    use super::*;
+
+    // Epoch 899 spans slots 388368000..=388799999; epoch 900 starts at 388800000.
+
+    #[test]
+    fn test_mid_epoch_error_resumes_in_place() {
+        let (resume, highest) = reverse_resume_after_error(388799951, 388799950, 899);
+        assert_eq!(resume, Some(388799951));
+        assert_eq!(highest, 899);
+    }
+
+    #[test]
+    fn test_tail_timeout_marks_epoch_complete() {
+        // Error attributed to the next epoch's first slot after the tail slot was counted:
+        // the epoch slice is done; resuming from the slice start would double-emit it.
+        let (resume, highest) = reverse_resume_after_error(388800000, 388799999, 899);
+        assert_eq!(resume, None);
+        assert_eq!(highest, 898);
+    }
+
+    #[test]
+    fn test_tail_error_attributed_within_epoch_marks_complete() {
+        // Decoding error attributed to the already-counted tail slot: resume would be
+        // tail + 1, crossing the boundary — same completion case.
+        let (resume, highest) = reverse_resume_after_error(388799999, 388799999, 899);
+        assert_eq!(resume, None);
+        assert_eq!(highest, 898);
+    }
+
+    #[test]
+    fn test_seek_error_before_any_progress_keeps_epoch() {
+        // First epoch (900) seek fails before any block; last_counted is still the
+        // pre-range sentinel in epoch 899. The higher epoch must not be marked complete.
+        let (resume, highest) = reverse_resume_after_error(388800000, 388799899, 900);
+        assert_eq!(resume, None);
+        assert_eq!(highest, 900);
+    }
+
+    #[test]
+    fn test_lower_epoch_seek_error_after_higher_done_resumes() {
+        // Epoch 900 finished (last_counted in 900); epoch 899's seek fails with the error
+        // attributed inside 899. Not a tail crossing — keep a resume marker (which the
+        // epoch-match check resolves to the slice start of 899).
+        let (resume, highest) = reverse_resume_after_error(388799900, 388800099, 899);
+        assert_eq!(resume, Some(388800100));
+        assert_eq!(highest, 899);
     }
 }
 

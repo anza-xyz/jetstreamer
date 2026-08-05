@@ -1,20 +1,18 @@
 name: Release
 
+# Releases the entire workspace in dependency order with a single dispatch and a
+# single prod approval: jetstreamer-utils -> jetstreamer-firehose ->
+# jetstreamer-plugin -> jetstreamer. For each crate the three effects — crates.io
+# publish, crate@vX.Y.Z tag, GitHub release — are checked and performed
+# independently, so an interrupted release can be resumed by re-running the
+# workflow and only the missing effects are performed. Versions are bumped
+# workspace-wide in a PR before dispatching.
+
 on:
   workflow_dispatch:
     inputs:
-      crate:
-        description: "Crate to release"
-        required: true
-        type: choice
-        options:
-          - ""
-          - jetstreamer
-          - jetstreamer-plugin
-          - jetstreamer-utils
-          - jetstreamer-firehose
       ref:
-        description: "git ref to tag (can be a branch or a commit hash)"
+        description: "git ref to release (can be a branch or a commit hash)"
         required: true
         default: "main"
         type: string
@@ -23,8 +21,8 @@ jobs:
   check:
     runs-on: ubuntu-latest
     outputs:
-      tag: ${{ steps.meta.outputs.tag }}
-      ref: ${{ steps.meta.outputs.ref }}
+      ref: ${{ steps.plan.outputs.ref }}
+      first: ${{ steps.plan.outputs.first }}
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -37,47 +35,59 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential libudev-dev clang llvm-dev libclang-dev pkg-config libssl-dev
 
-      - name: Compute metadata
-        id: meta
+      - name: Compute release plan
+        id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          version="$(cargo metadata --format-version 1 --no-deps | jq -r '.packages[] | select(.name == "'"${CRATE_NAME}"'") | .version')"
-          if [ -z "${version}" ] || [ "${version}" = "null" ]; then
-            echo "Could not resolve version for crate: ${CRATE_NAME}"
+          first=""
+          work=false
+          echo "## Release plan" >> "${GITHUB_STEP_SUMMARY}"
+          for crate in jetstreamer-utils jetstreamer-firehose jetstreamer-plugin jetstreamer; do
+            version="$(cargo metadata --format-version 1 --no-deps | jq -r '.packages[] | select(.name == "'"${crate}"'") | .version')"
+            if [ -z "${version}" ] || [ "${version}" = "null" ]; then
+              echo "Could not resolve version for crate: ${crate}"
+              exit 1
+            fi
+            tag="${crate}@v${version}"
+            todo=""
+            if ! curl -fsSL --retry 3 -H "User-Agent: jetstreamer-release-workflow (github.com/anza-xyz/jetstreamer)" \
+              "https://crates.io/api/v1/crates/${crate}/${version}" 2>/dev/null | jq -e '.version.num == "'"${version}"'"' >/dev/null 2>&1; then
+              todo="publish"
+              if [ -z "${first}" ]; then
+                first="${crate}"
+              fi
+            fi
+            if ! git ls-remote --exit-code --tags origin "refs/tags/${tag}" >/dev/null 2>&1; then
+              todo="${todo:+${todo}, }tag"
+            fi
+            if ! gh release view "${tag}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+              todo="${todo:+${todo}, }github release"
+            fi
+            if [ -n "${todo}" ]; then
+              work=true
+              echo "- \`${tag}\`: needs ${todo}" >> "${GITHUB_STEP_SUMMARY}"
+            else
+              echo "- \`${tag}\`: fully released, will skip" >> "${GITHUB_STEP_SUMMARY}"
+            fi
+          done
+          if [ "${work}" = "false" ]; then
+            echo "Every crate at the current version is already fully released. Bump versions first."
             exit 1
           fi
+          echo "first=${first}" >> "${GITHUB_OUTPUT}"
+          echo "ref=$(git rev-parse HEAD)" >> "${GITHUB_OUTPUT}"
 
-          tag="${CRATE_NAME}@v${version}"
-          ref="$(git rev-parse HEAD)"
-
-          echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
-          echo "ref=${ref}" >> "${GITHUB_OUTPUT}"
+      # Because versions bump workspace-wide and publishing runs in dependency
+      # order, the first unpublished crate's workspace dependencies are always
+      # already on crates.io — so it is always dry-runnable. Later crates depend
+      # on unpublished versions and are validated by `cargo publish` itself.
+      # Skipped entirely when only tags/releases are missing (nothing to publish).
+      - name: Cargo publish dry run (first unpublished crate)
+        if: steps.plan.outputs.first != ''
+        run: cargo publish -p "${FIRST}" --dry-run
         env:
-          CRATE_NAME: ${{ inputs.crate }}
-
-      - name: Check tag does not exist
-        run: |
-          echo "checking: refs/tags/${TAG}"
-          if git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null 2>&1; then
-            echo "Tag already exists: ${TAG}. Please bump the version first (or delete the existing tag) and retry."
-            echo "Tag exists: ${TAG}" >> "${GITHUB_STEP_SUMMARY}"
-            exit 1
-          fi
-        env:
-          TAG: ${{ steps.meta.outputs.tag }}
-
-      - name: Cargo publish dry run
-        run: |
-          cargo publish -p "${CRATE_NAME}" --dry-run
-        env:
-          CRATE_NAME: ${{ inputs.crate }}
-
-      - name: Summary
-        run: |
-          echo "Tag: ${TAG}" >> "${GITHUB_STEP_SUMMARY}"
-          echo "Ref: ${REF} (https://github.com/${{ github.repository }}/commit/${REF})" >> "${GITHUB_STEP_SUMMARY}"
-        env:
-          TAG: ${{ steps.meta.outputs.tag }}
-          REF: ${{ steps.meta.outputs.ref }}
+          FIRST: ${{ steps.plan.outputs.first }}
 
   publish:
     runs-on: ubuntu-latest
@@ -118,34 +128,70 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential libudev-dev clang llvm-dev libclang-dev pkg-config libssl-dev
 
-      - name: Package crate
-        run: cargo package -p "${CRATE_NAME}"
+      # Each crate gets a freshly minted crates.io token immediately before its
+      # publish: verification builds are long enough that a single token could
+      # expire before the last crate publishes.
+      # Provenance is attested per crate, immediately after its publish and only
+      # when THIS run performed the publish — so a partially-failed release never
+      # leaves a published crate unattested, and reruns never re-attest crates
+      # they merely skipped.
+      - name: Create crate token (jetstreamer-utils)
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+        id: auth-utils
+      - name: Release jetstreamer-utils
+        id: release-utils
+        run: .github/scripts/release-crate.sh jetstreamer-utils
         env:
-          CRATE_NAME: ${{ inputs.crate }}
-
-      - name: Generate SLSA provenance
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth-utils.outputs.token }}
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+      - name: Generate SLSA provenance (jetstreamer-utils)
+        if: steps.release-utils.outputs.published == 'true'
         uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
         with:
-          subject-path: target/package/*.crate
+          subject-path: target/package/jetstreamer-utils-*.crate
 
-      - name: Create crate token
+      - name: Create crate token (jetstreamer-firehose)
         uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
-        id: auth
-
-      - run: cargo publish -p "${CRATE_NAME}"
+        id: auth-firehose
+      - name: Release jetstreamer-firehose
+        id: release-firehose
+        run: .github/scripts/release-crate.sh jetstreamer-firehose
         env:
-          CRATE_NAME: ${{ inputs.crate }}
-          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
-
-      - run: |
-          git tag -a "${TAG}" -m "Release ${TAG}"
-          git push origin "${TAG}"
-        env:
-          TAG: ${{ needs.check.outputs.tag }}
-
-      - name: Create Github Release
-        run: |
-          gh release create "${TAG}" --title "${TAG}" --generate-notes
-        env:
-          TAG: ${{ needs.check.outputs.tag }}
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth-firehose.outputs.token }}
           GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+      - name: Generate SLSA provenance (jetstreamer-firehose)
+        if: steps.release-firehose.outputs.published == 'true'
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        with:
+          subject-path: target/package/jetstreamer-firehose-*.crate
+
+      - name: Create crate token (jetstreamer-plugin)
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+        id: auth-plugin
+      - name: Release jetstreamer-plugin
+        id: release-plugin
+        run: .github/scripts/release-crate.sh jetstreamer-plugin
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth-plugin.outputs.token }}
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+      - name: Generate SLSA provenance (jetstreamer-plugin)
+        if: steps.release-plugin.outputs.published == 'true'
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        with:
+          subject-path: target/package/jetstreamer-plugin-*.crate
+
+      - name: Create crate token (jetstreamer)
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+        id: auth-jetstreamer
+      - name: Release jetstreamer
+        id: release-jetstreamer
+        run: .github/scripts/release-crate.sh jetstreamer
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth-jetstreamer.outputs.token }}
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+      - name: Generate SLSA provenance (jetstreamer)
+        if: steps.release-jetstreamer.outputs.published == 'true'
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        with:
+          # [0-9] keeps the glob from also matching jetstreamer-{utils,...}
+          subject-path: target/package/jetstreamer-[0-9]*.crate

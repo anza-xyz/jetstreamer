@@ -146,7 +146,7 @@ jobs:
           GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
       - name: Generate SLSA provenance (jetstreamer-utils)
         if: steps.release-utils.outputs.published == 'true'
-        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
         with:
           subject-path: target/package/jetstreamer-utils-*.crate
 
@@ -161,7 +161,7 @@ jobs:
           GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
       - name: Generate SLSA provenance (jetstreamer-firehose)
         if: steps.release-firehose.outputs.published == 'true'
-        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
         with:
           subject-path: target/package/jetstreamer-firehose-*.crate
 
@@ -176,7 +176,7 @@ jobs:
           GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
       - name: Generate SLSA provenance (jetstreamer-plugin)
         if: steps.release-plugin.outputs.published == 'true'
-        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
         with:
           subject-path: target/package/jetstreamer-plugin-*.crate
 
@@ -191,7 +191,7 @@ jobs:
           GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
       - name: Generate SLSA provenance (jetstreamer)
         if: steps.release-jetstreamer.outputs.published == 'true'
-        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
         with:
           # [0-9] keeps the glob from also matching jetstreamer-{utils,...}
           subject-path: target/package/jetstreamer-[0-9]*.crate

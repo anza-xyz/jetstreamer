@@ -4350,6 +4350,7 @@ name = "jetstreamer-horizon"
 version = "0.6.0"
 dependencies = [
  "agave-geyser-plugin-interface",
+ "ahash 0.8.12",
  "criterion",
  "env_logger",
  "futures-util",

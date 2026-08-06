@@ -31,6 +31,7 @@ xxhash-rust.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+ahash.workspace = true
 criterion.workspace = true
 env_logger.workspace = true
 solana-account-decoder-client-types.workspace = true

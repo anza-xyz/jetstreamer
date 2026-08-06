@@ -61,6 +61,21 @@ static CLICKHOUSE_PROCESS: AtomicU32 = AtomicU32::new(0);
 /// instance and waits for it to exit first).
 const START_ATTEMPTS: u32 = 5;
 
+/// Finds an orphaned embedded ClickHouse server left behind by a previous run (they are
+/// `setsid`-detached, so they outlive their parent), identified by the temp binary naming
+/// convention (`<random>-clickhouse server`), excluding our own child process.
+async fn find_orphaned_clickhouse(own_pid: Option<u32>) -> Option<u32> {
+    let output = Command::new("pgrep")
+        .args(["-f", "--", "-clickhouse server"])
+        .output()
+        .await
+        .ok()?;
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.trim().parse::<u32>().ok())
+        .find(|pid| Some(*pid) != own_pid)
+}
+
 include!(concat!(env!("OUT_DIR"), "/embed_clickhouse.rs")); // raw bytes for clickhouse binary
 
 /// Errors that can occur when managing the embedded ClickHouse process.
@@ -201,6 +216,7 @@ async fn supervise_server(
             stderr,
             ready_tx.clone(),
             conflict.clone(),
+            child.id(),
         ));
 
         CLICKHOUSE_PROCESS.store(child.id().unwrap_or(0), Ordering::SeqCst);
@@ -267,6 +283,7 @@ async fn pump_server_logs(
     stderr: tokio::process::ChildStderr,
     ready_tx: mpsc::Sender<()>,
     conflict: Arc<Mutex<Option<u32>>>,
+    own_pid: Option<u32>,
 ) {
     let mut stdout_reader = BufReader::new(stdout).lines();
     let mut stderr_reader = BufReader::new(stderr).lines();
@@ -324,11 +341,38 @@ async fn pump_server_logs(
                             *conflict.lock().unwrap() = Some(pid);
                         }
                         None => {
-                            log::warn!(
-                                "ClickHouse server already running but its PID was not reported; \
-                                 waiting and re-launching anyway."
-                            );
-                            *conflict.lock().unwrap() = Some(0);
+                            // No "PID:" line was scraped — happens when the data
+                            // dir was wiped while an orphaned server (setsid-
+                            // detached from a previous run) still holds the port.
+                            // Fall back to process discovery by the embedded
+                            // binary's temp naming convention.
+                            match find_orphaned_clickhouse(own_pid).await {
+                                Some(pid) => {
+                                    log::warn!(
+                                        "ClickHouse server already running (PID {pid} via process \
+                                         discovery); sending SIGTERM and re-launching automatically."
+                                    );
+                                    if let Err(err) = Command::new("kill")
+                                        .arg("-s")
+                                        .arg("SIGTERM")
+                                        .arg(pid.to_string())
+                                        .status()
+                                        .await
+                                    {
+                                        log::error!(
+                                            "Failed to send SIGTERM to ClickHouse process: {err}"
+                                        );
+                                    }
+                                    *conflict.lock().unwrap() = Some(pid);
+                                }
+                                None => {
+                                    log::warn!(
+                                        "ClickHouse server already running but its PID could not \
+                                         be determined; waiting and re-launching anyway."
+                                    );
+                                    *conflict.lock().unwrap() = Some(0);
+                                }
+                            }
                         }
                     }
                 } else if line.contains("PID: ")

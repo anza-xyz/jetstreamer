@@ -132,10 +132,11 @@ impl Plugin for InstructionTrackingPlugin {
             if let Some(db_client) = db
                 && !rows.is_empty()
             {
-                tokio::spawn(async move {
-                    if let Err(err) = write_instruction_events(db_client, rows).await {
-                        log::error!("failed to write instruction events: {}", err);
-                    }
+                crate::spawn_tracked_write(async move {
+                    crate::retry_clickhouse_write("instruction events", || {
+                        write_instruction_events(Arc::clone(&db_client), rows.clone())
+                    })
+                    .await;
                 });
             }
 
@@ -183,15 +184,15 @@ impl Plugin for InstructionTrackingPlugin {
             if let Some(db_client) = db {
                 let rows = Self::drain_all_pending(None);
                 if !rows.is_empty() {
-                    write_instruction_events(Arc::clone(&db_client), rows)
-                        .await
-                        .map_err(|err| -> Box<dyn std::error::Error + Send + Sync> {
-                            Box::new(err)
-                        })?;
+                    crate::retry_clickhouse_write("instruction events (exit flush)", || {
+                        write_instruction_events(Arc::clone(&db_client), rows.clone())
+                    })
+                    .await;
                 }
-                backfill_instruction_timestamps(db_client)
-                    .await
-                    .map_err(|err| -> Box<dyn std::error::Error + Send + Sync> { Box::new(err) })?;
+                crate::retry_clickhouse_write("instruction timestamp backfill", || {
+                    backfill_instruction_timestamps(Arc::clone(&db_client))
+                })
+                .await;
             }
             Ok(())
         }

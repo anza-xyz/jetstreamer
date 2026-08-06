@@ -23,8 +23,11 @@
 //! - `JETSTREAMER_HTTP_BASE_URL` (default `https://files.old-faithful.net`): base URL or
 //!   `s3://bucket/prefix` for CAR snapshots. Change this to point at a private mirror.
 //! - `JETSTREAMER_COMPACT_INDEX_BASE_URL` (default `https://files.old-faithful.net`): base URL
-//!   for compact CAR index artifacts. Point this at your own mirror to reduce load on the
-//!   public Old Faithful deployment. Also supports `s3://` URIs.
+//!   for slot index artifacts (the per-epoch `slot-ranges.raw` file, plus the deprecated
+//!   legacy compactindexes used as a fallback). Point this at your own mirror to reduce load
+//!   on the public Old Faithful deployment. Also supports `s3://` URIs.
+//! - `JETSTREAMER_FORCE_LEGACY_INDEX`: set to `1` to skip the slot-ranges index and resolve
+//!   slot offsets using the deprecated legacy compactindex pair.
 //! - `JETSTREAMER_ARCHIVE_BASE`: fallback URL/URI that applies to both CARs and compact
 //!   indexes when the more specific knobs are unset.
 //! - `JETSTREAMER_ARCHIVE_BACKEND` (default `http`): set to `s3` to force the S3 transport even
@@ -35,6 +38,12 @@
 //!   applied when the S3 backend is active.
 //! - `JETSTREAMER_NETWORK` (default `mainnet`): suffix appended to cache namespaces and index
 //!   filenames so you can swap between clusters without purging local state.
+//! - `JETSTREAMER_SPAWN_PENDING` (default `24`): maximum not-yet-green threads in flight
+//!   during the health-gated thread ramp; `1` reproduces a strict one-at-a-time ramp.
+//! - `JETSTREAMER_SPAWN_GRACE_SECS` (default `30`): how long the launch gate waits for
+//!   sluggish (never stalled) threads before spawning anyway; `0` disables launch gating.
+//! - `JETSTREAMER_RECYCLE_PCT` (default `50`): connection-recycle threshold as a percent of
+//!   the best observed p90 per-thread rate; `0` disables recycling.
 //! - `JETSTREAMER_NETWORK_CAPACITY_MB` (default `1000`): assumed network throughput in megabytes
 //!   per second used when sizing the firehose thread pool. Increase or decrease to match your
 //!   host's effective bandwidth.

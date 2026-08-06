@@ -24,11 +24,15 @@
 //! # Replay all transactions in epoch 800 using eight HTTP multiplexing workers.
 //! JETSTREAMER_THREADS=8 cargo run --release -- 800
 //!
+//! # Or replay an inclusive epoch range.
+//! JETSTREAMER_THREADS=8 cargo run --release -- 900-950
+//!
 //! # Or replay an explicit slot range (slot ranges may cross epoch boundaries).
 //! JETSTREAMER_THREADS=8 cargo run --release -- 358560000:367631999
 //! ```
 //!
-//! The CLI accepts either `<start>:<end>` slot ranges or a single epoch. See
+//! The CLI accepts a single epoch (`950`), an inclusive `<start>-<end>` epoch range
+//! (`900-950`), or an inclusive `<start>:<end>` slot range. See
 //! [`JetstreamerRunner::parse_cli_args`] for the precise argument grammar.
 //!
 //! When `JETSTREAMER_CLICKHOUSE_MODE` is `auto` (the default) the runner inspects the DSN to
@@ -102,9 +106,13 @@
 //!
 //! | Variable | Default | Effect |
 //! |----------|---------|--------|
-//! | `JETSTREAMER_COMPACT_INDEX_BASE_URL` | `https://files.old-faithful.net` | Base URL for compact CAR index artifacts. Point this at your own mirror to reduce load on the public archive. |
-//! | `JETSTREAMER_NETWORK` | `mainnet` | Network suffix appended to cache namespaces and index filenames (e.g., `testnet`). |
+//! | `JETSTREAMER_COMPACT_INDEX_BASE_URL` | `https://files.old-faithful.net` | Base URL for slot index artifacts (per-epoch `slot-ranges.raw` files, plus the deprecated legacy compactindexes used as a fallback). Point this at your own mirror to reduce load on the public archive. |
+//! | `JETSTREAMER_FORCE_LEGACY_INDEX` | unset | Set to `1` to skip the slot-ranges index and resolve slot offsets using the deprecated legacy compactindex pair. |
+//! | `JETSTREAMER_NETWORK` | `mainnet` | Network suffix appended to cache namespaces and legacy index filenames (e.g., `testnet`). |
 //! | `JETSTREAMER_NETWORK_CAPACITY_MB` | `1000` | Assumed network throughput in megabytes per second used when auto-sizing firehose thread counts. |
+//! | `JETSTREAMER_SPAWN_PENDING` | `24` | Maximum not-yet-green threads in flight during the health-gated thread ramp; `1` reproduces a strict one-at-a-time ramp. |
+//! | `JETSTREAMER_SPAWN_GRACE_SECS` | `30` | How long the launch gate waits for sluggish (never stalled) threads before spawning anyway; `0` disables launch gating entirely. |
+//! | `JETSTREAMER_RECYCLE_PCT` | `50` | Connection-recycle threshold as a percent of the best observed p90 per-thread rate; threads persistently below it reconnect. `0` disables recycling. |
 //!
 //! Changing the network automatically segregates cache entries, allowing you to toggle between
 //! clusters without purging state.
@@ -127,6 +135,9 @@ pub use jetstreamer_firehose as firehose;
 pub use jetstreamer_plugin as plugin;
 pub use jetstreamer_utils as utils;
 
+/// Interactive terminal dashboard rendered when the CLI runs with `--tui`.
+pub mod tui;
+
 use core::ops::Range;
 use jetstreamer_firehose::{epochs::slot_to_epoch, index::get_index_base_url};
 use jetstreamer_plugin::{
@@ -138,7 +149,11 @@ use jetstreamer_plugin::{
 };
 use std::sync::Arc;
 
-const WORKER_THREAD_MULTIPLIER: usize = 4; // each plugin thread gets 4 worker threads
+const WORKER_THREAD_MULTIPLIER: usize = 4; // tokio workers per firehose thread
+/// Extra tokio workers beyond the firehose threads, reserved headroom for auxiliary tasks
+/// (recycle monitor, launch gate, signal handling, stats, ClickHouse inserts) so they are
+/// not queued behind streaming work when the CPU is saturated.
+const AUX_WORKER_THREADS: usize = 4;
 
 #[derive(Clone, Copy)]
 struct ClickhouseSettings {
@@ -339,6 +354,7 @@ impl Default for JetstreamerRunner {
                 spawn_clickhouse: clickhouse_settings.spawn_helper && clickhouse_settings.enabled,
                 builtin_plugins: Vec::new(),
                 clickhouse_dsn: None,
+                tui: false,
             },
         }
     }
@@ -350,10 +366,14 @@ impl JetstreamerRunner {
         Self::default()
     }
 
-    /// Overrides the log level used when initializing `solana_logger`.
+    /// Sets the log level used when [`JetstreamerRunner::run`] initializes logging.
+    ///
+    /// Logging is installed by `run` — not here — because the backend depends on the parsed
+    /// configuration: plain `solana_logger` output normally, or the TUI's in-memory log
+    /// capture when `--tui` is active (the `log` crate only allows one global logger, so
+    /// installing eagerly would lock the TUI out and let log lines garble its display).
     pub fn with_log_level(mut self, log_level: impl Into<String>) -> Self {
         self.log_level = log_level.into();
-        solana_logger::setup_with_default(&self.log_level);
         self
     }
 
@@ -442,7 +462,13 @@ impl JetstreamerRunner {
 
     /// Builds the plugin runtime and streams blocks through every registered [`Plugin`].
     pub fn run(self) -> Result<(), PluginRunnerError> {
-        solana_logger::setup_with_default(&self.log_level);
+        let tui_enabled = self.config.tui;
+        if tui_enabled {
+            // The TUI owns the terminal; capture logs into its ring buffer instead of stderr.
+            tui::init_logging(&self.log_level);
+        } else {
+            solana_logger::setup_with_default(&logger_filter(&self.log_level));
+        }
 
         if let Ok(index_url) = get_index_base_url() {
             log::info!("slot index base url: {}", index_url);
@@ -459,11 +485,14 @@ impl JetstreamerRunner {
             && self.config.spawn_clickhouse
             && should_spawn_for_dsn(&self.clickhouse_dsn);
 
+        let worker_threads =
+            std::cmp::max(1, threads.saturating_mul(WORKER_THREAD_MULTIPLIER)) + AUX_WORKER_THREADS;
         log::info!(
-            "processing slots [{}..{}) with {} configured threads (sequential={}, reverse={}, buffer_window_bytes={:?}, clickhouse_enabled={})",
+            "processing slots [{}..{}) with {} configured threads on {} tokio workers (sequential={}, reverse={}, buffer_window_bytes={:?}, clickhouse_enabled={})",
             slot_range.start,
             slot_range.end,
             threads,
+            worker_threads,
             sequential,
             reverse,
             buffer_window_bytes,
@@ -477,6 +506,7 @@ impl JetstreamerRunner {
             reverse,
             buffer_window_bytes,
         );
+        runner.set_tui(tui_enabled);
         for plugin in &self.config.builtin_plugins {
             runner.register(plugin.instantiate());
         }
@@ -487,10 +517,7 @@ impl JetstreamerRunner {
 
         let runner = Arc::new(runner);
         let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(std::cmp::max(
-                1,
-                threads.saturating_mul(WORKER_THREAD_MULTIPLIER),
-            ))
+            .worker_threads(worker_threads)
             .enable_all()
             .thread_name("jetstreamer")
             .build()
@@ -545,7 +572,12 @@ impl JetstreamerRunner {
             }
         }
 
+        let tui_handle = tui_enabled.then(tui::start);
         let result = runtime.block_on(runner.run(slot_range.clone(), clickhouse_enabled));
+        if let Some(handle) = tui_handle {
+            handle.stop();
+            tui::dump_recent_logs(30);
+        }
 
         if spawn_clickhouse {
             let handle = clickhouse_task.take();
@@ -617,6 +649,8 @@ pub struct Config {
     /// ClickHouse DSN supplied via `--clickhouse-dsn`. When set, it overrides the
     /// `JETSTREAMER_CLICKHOUSE_DSN` env var and any prior `with_clickhouse_dsn` builder call.
     pub clickhouse_dsn: Option<String>,
+    /// Whether to render the interactive terminal dashboard instead of log output.
+    pub tui: bool,
 }
 
 /// Built-in plugins that can be toggled via CLI flags.
@@ -662,6 +696,11 @@ impl BuiltinPlugin {
 
 /// Parses command-line arguments and environment variables into a [`Config`].
 ///
+/// The first positional argument selects the work range:
+/// - `<epoch>` — a single epoch (e.g. `950`)
+/// - `<start>-<end>` — an inclusive epoch range (e.g. `900-950`)
+/// - `<start>:<end>` — an inclusive slot range (e.g. `410400000:410832000`)
+///
 /// The following environment variables are inspected:
 /// - `JETSTREAMER_CLICKHOUSE_MODE`: Controls ClickHouse integration. Accepts `auto`, `remote`,
 ///   `local`, or `off`.
@@ -680,6 +719,8 @@ impl BuiltinPlugin {
 /// - `--buffer-window <size>`: Overrides ripget sequential window size (for example `4GiB`).
 /// - `--clickhouse-dsn <url>`: Overrides the ClickHouse DSN (takes precedence over the
 ///   `JETSTREAMER_CLICKHOUSE_DSN` env var and any prior `with_clickhouse_dsn` builder call).
+/// - `--tui`: Renders an interactive terminal dashboard (TPS graph, per-thread activity,
+///   stats) instead of plain log output.
 ///
 /// # Examples
 ///
@@ -707,6 +748,7 @@ pub fn parse_cli_args() -> Result<CliInvocation, Box<dyn std::error::Error>> {
     let mut reverse_cli = false;
     let mut buffer_window_cli: Option<String> = None;
     let mut clickhouse_dsn_cli: Option<String> = None;
+    let mut tui_cli = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--with-plugin" => {
@@ -747,6 +789,9 @@ pub fn parse_cli_args() -> Result<CliInvocation, Box<dyn std::error::Error>> {
                     .ok_or_else(|| "--clickhouse-dsn requires a URL".to_string())?;
                 clickhouse_dsn_cli = Some(dsn);
             }
+            "--tui" => {
+                tui_cli = true;
+            }
             _ if first_arg.is_none() => first_arg = Some(arg),
             other => return Err(format!("unrecognized argument '{other}'").into()),
         }
@@ -755,6 +800,35 @@ pub fn parse_cli_args() -> Result<CliInvocation, Box<dyn std::error::Error>> {
     if no_plugins && !builtin_plugins.is_empty() {
         return Err("--no-plugins cannot be combined with --with-plugin".into());
     }
+    // Record the invocation with the range positional replaced by `{range}`, so fatal error
+    // paths can print an accurate resume command. Value-taking flags are skipped as pairs so
+    // a flag value that happens to equal the positional cannot be mistaken for it.
+    {
+        const VALUE_FLAGS: [&str; 3] = ["--with-plugin", "--buffer-window", "--clickhouse-dsn"];
+        let raw: Vec<String> = std::env::args().collect();
+        let mut parts: Vec<String> = Vec::with_capacity(raw.len());
+        let mut index = 0;
+        let mut replaced = false;
+        while index < raw.len() {
+            let part = &raw[index];
+            if index > 0 && VALUE_FLAGS.contains(&part.as_str()) {
+                parts.push(part.clone());
+                if let Some(value) = raw.get(index + 1) {
+                    parts.push(value.clone());
+                }
+                index += 2;
+                continue;
+            }
+            if index > 0 && !replaced && *part == first_arg {
+                parts.push("{range}".to_string());
+                replaced = true;
+            } else {
+                parts.push(part.clone());
+            }
+            index += 1;
+        }
+        jetstreamer_plugin::metrics::set_resume_command_template(parts.join(" "));
+    }
     let slot_range = if first_arg.contains(':') {
         let (slot_a, slot_b) = first_arg
             .split_once(':')
@@ -762,6 +836,25 @@ pub fn parse_cli_args() -> Result<CliInvocation, Box<dyn std::error::Error>> {
         let slot_a: u64 = slot_a.parse().expect("failed to parse first slot");
         let slot_b: u64 = slot_b.parse().expect("failed to parse second slot");
         slot_a..(slot_b + 1)
+    } else if let Some((epoch_a, epoch_b)) = first_arg.split_once('-') {
+        let epoch_a: u64 = epoch_a
+            .trim()
+            .parse()
+            .map_err(|_| format!("failed to parse first epoch in range '{first_arg}'"))?;
+        let epoch_b: u64 = epoch_b
+            .trim()
+            .parse()
+            .map_err(|_| format!("failed to parse second epoch in range '{first_arg}'"))?;
+        if epoch_a > epoch_b {
+            return Err(format!(
+                "epoch range '{first_arg}' is reversed; expected <start>-<end> with start <= end"
+            )
+            .into());
+        }
+        log::info!("epochs: {epoch_a}..={epoch_b}");
+        let (start_slot, _) = jetstreamer_firehose::epochs::epoch_to_slot_range(epoch_a);
+        let (_, end_slot_inclusive) = jetstreamer_firehose::epochs::epoch_to_slot_range(epoch_b);
+        start_slot..(end_slot_inclusive + 1)
     } else {
         let epoch: u64 = first_arg.parse().expect("failed to parse epoch");
         log::info!("epoch: {}", epoch);
@@ -810,6 +903,7 @@ pub fn parse_cli_args() -> Result<CliInvocation, Box<dyn std::error::Error>> {
         spawn_clickhouse,
         builtin_plugins,
         clickhouse_dsn: clickhouse_dsn_cli,
+        tui: tui_cli,
     }))
 }
 
@@ -844,6 +938,16 @@ fn parse_env_bool(key: &str, default: bool) -> bool {
             }
         },
         Err(_) => default,
+    }
+}
+
+/// The `clickhouse` crate emits per-insert instrumentation at `info`, which floods the log at
+/// runner throughput; cap it at `warn` unless the caller filters the target explicitly.
+fn logger_filter(log_level: &str) -> String {
+    if log_level.contains("clickhouse") {
+        log_level.to_string()
+    } else {
+        format!("{},clickhouse=warn", log_level)
     }
 }
 

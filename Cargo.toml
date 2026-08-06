@@ -9,7 +9,7 @@ members = [
 
 [workspace.package]
 edition = "2024"
-version = "0.6.0"
+version = "0.7.0"
 authors = ["sam0x17", "anza-team"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/anza-xyz/jetstreamer"
@@ -33,11 +33,11 @@ s3-backend = ["jetstreamer-firehose/s3-backend"]
 verify-transaction-signatures = ["jetstreamer-firehose/verify-transaction-signatures"]
 
 [workspace.dependencies]
-jetstreamer-firehose = { path = "jetstreamer-firehose", version = "0.6.0" }
-jetstreamer-plugin = { path = "jetstreamer-plugin", version = "0.6.0" }
-jetstreamer-utils = { path = "jetstreamer-utils", version = "0.6.0" }
-jetstreamer-node = { path = "jetstreamer-node", version = "0.6.0" }
-jetstreamer-horizon = { path = "jetstreamer-horizon", version = "0.6.0" }
+jetstreamer-firehose = { path = "jetstreamer-firehose", version = "0.7.0" }
+jetstreamer-plugin = { path = "jetstreamer-plugin", version = "0.7.0" }
+jetstreamer-utils = { path = "jetstreamer-utils", version = "0.7.0" }
+jetstreamer-node = { path = "jetstreamer-node", version = "0.7.0" }
+jetstreamer-horizon = { path = "jetstreamer-horizon", version = "0.7.0" }
 tokio = "1"
 futures-util = { version = "0", default-features = false }
 futures = "0"
@@ -52,7 +52,7 @@ tar = "0.4"
 env_logger = "0.11"
 base64 = "0.22"
 bincode = "1"
-serial_test = "2"
+serial_test = "3"
 criterion = { version = "0.5", features = ["html_reports"] }
 wincode = { version = "0.2", features = ["derive", "solana-short-vec"] }
 bs58 = { version = "0", default-features = false }
@@ -75,7 +75,7 @@ agave-geyser-plugin-interface = "3"
 agave-snapshots = "3"
 solana-address = "1"
 solana-account = "3"
-solana-hash = "3"
+solana-hash = "4"
 solana-blake3-hasher = "=3.1.0"
 solana-clock = "3"
 solana-epoch-rewards-hasher = "=3.1.0"
@@ -119,7 +119,7 @@ rayon = "1"
 xxhash-rust = { version = "0.8", features = ["xxh64"] }
 ahash = "0.8"
 dashmap = "6"
-clickhouse = { version = "0.14", default-features = false }
+clickhouse = { version = "0.15", default-features = false }
 interprocess = { version = "2", features = ["tokio"] }
 ctrlc = "3"
 indoc = "2"
@@ -146,6 +146,10 @@ jetstreamer-horizon.workspace = true
 jetstreamer-plugin.workspace = true
 jetstreamer-utils.workspace = true
 url.workspace = true
+ratatui = "0.29"
+crossterm = "0.28"
+libc = "0.2"
+sysinfo = "0.33"
 solana-sysvar.workspace = true
 solana-blake3-hasher.workspace = true
 solana-epoch-rewards-hasher.workspace = true

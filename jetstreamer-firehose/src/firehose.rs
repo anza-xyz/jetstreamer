@@ -30,8 +30,11 @@ use std::{
 };
 use thiserror::Error;
 use tokio::{
-    sync::broadcast::{self, error::TryRecvError},
-    time::timeout,
+    sync::{
+        broadcast::{self, error::TryRecvError},
+        mpsc, oneshot,
+    },
+    time::{sleep, timeout},
 };
 
 use crate::{
@@ -40,16 +43,21 @@ use crate::{
         FetchEpochStreamOptions, epoch_to_slot_range, fetch_epoch_stream,
         fetch_epoch_stream_with_options, slot_to_epoch,
     },
-    index::{SLOT_OFFSET_INDEX, SlotOffsetIndexError, slot_to_offset},
+    index::{SLOT_OFFSET_INDEX, SlotOffsetIndexError},
     node_reader::NodeReader,
     utils,
 };
 
-// Timeout applied to each asynchronous firehose operation (fetching epoch stream, reading
-// header, seeking, reading next block). Adjust here to tune stall detection/restart
-// aggressiveness.
-const OP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// Timeout applied to each asynchronous firehose operation (fetching epoch stream, reading
+/// header, seeking, reading next block). Adjust here to tune stall detection/restart
+/// aggressiveness. Public so frontends (e.g. the TUI) can derive staleness thresholds from it.
+pub const OP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 const OP_TIMEOUT_SEQUENTIAL: std::time::Duration = std::time::Duration::from_secs(180);
+// Backoff between restarts of a failed firehose thread. An immediate reconnect after a stall
+// tends to re-trigger the CDN throttling that caused it; repeated failures on the same slot
+// double the wait up to the cap, and any forward progress resets it.
+const RETRY_BACKOFF_BASE: std::time::Duration = std::time::Duration::from_secs(1);
+const RETRY_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(32);
 // Epochs earlier than this were bincode-encoded in Old Faithful.
 const BINCODE_EPOCH_CUTOFF: u64 = 157;
 
@@ -89,47 +97,491 @@ fn is_shutdown_error(err: &FirehoseError) -> bool {
     }
 }
 
-async fn find_previous_indexed_slot(
-    local_start: u64,
-    epoch_start: u64,
-    log_target: &str,
-) -> Result<Option<u64>, FirehoseError> {
-    if local_start <= epoch_start {
-        return Ok(None);
+/// Per-thread "data flowed" timestamps, stamped each time a firehose thread reads a full
+/// block. Drives the health-gated staggered launch and is available to frontends.
+pub mod thread_activity {
+    use dashmap::{DashMap, DashSet};
+    use once_cell::sync::Lazy;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Instant;
+
+    static ORIGIN: Lazy<Instant> = Lazy::new(Instant::now);
+    static LAST_ACTIVITY_MS: Lazy<DashMap<usize, u64, ahash::RandomState>> =
+        Lazy::new(|| DashMap::with_hasher(ahash::RandomState::new()));
+    static FINISHED: Lazy<DashSet<usize, ahash::RandomState>> =
+        Lazy::new(|| DashSet::with_hasher(ahash::RandomState::new()));
+    static TX_COUNTS: Lazy<DashMap<usize, u64, ahash::RandomState>> =
+        Lazy::new(|| DashMap::with_hasher(ahash::RandomState::new()));
+    static STREAM_START_MS: Lazy<DashMap<usize, u64, ahash::RandomState>> =
+        Lazy::new(|| DashMap::with_hasher(ahash::RandomState::new()));
+    static RECYCLE_REQUESTED: Lazy<DashSet<usize, ahash::RandomState>> =
+        Lazy::new(|| DashSet::with_hasher(ahash::RandomState::new()));
+    static RECYCLES: AtomicU64 = AtomicU64::new(0);
+    static TIMEOUTS: AtomicU64 = AtomicU64::new(0);
+    static STEALS: AtomicU64 = AtomicU64::new(0);
+
+    /// Milliseconds since tracking began (a process-wide monotonic clock).
+    pub fn now_ms() -> u64 {
+        ORIGIN.elapsed().as_millis() as u64
     }
-    let mut candidate = local_start.saturating_sub(1);
-    let mut skipped = 0u64;
+
+    /// Clears stamps left over from a previous run.
+    pub fn reset() {
+        Lazy::force(&ORIGIN);
+        LAST_ACTIVITY_MS.clear();
+        FINISHED.clear();
+        TX_COUNTS.clear();
+        STREAM_START_MS.clear();
+        RECYCLE_REQUESTED.clear();
+        RECYCLES.store(0, Ordering::Relaxed);
+        TIMEOUTS.store(0, Ordering::Relaxed);
+        STEALS.store(0, Ordering::Relaxed);
+    }
+
+    /// Records a successful work steal.
+    pub fn note_steal() {
+        STEALS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Total work steals this run.
+    pub fn steal_count() -> u64 {
+        STEALS.load(Ordering::Relaxed)
+    }
+
+    /// Records a completed connection recycle.
+    pub fn note_recycle() {
+        RECYCLES.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Total connection recycles this run.
+    pub fn recycle_count() -> u64 {
+        RECYCLES.load(Ordering::Relaxed)
+    }
+
+    /// Records an operation timeout (a stall that forced a restart).
+    pub fn note_timeout() {
+        TIMEOUTS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Total operation timeouts this run.
+    pub fn timeout_count() -> u64 {
+        TIMEOUTS.load(Ordering::Relaxed)
+    }
+
+    /// Adds processed transactions to `thread_index`'s cumulative count (recycle-rate input).
+    pub fn add_transactions(thread_index: usize, count: u64) {
+        *TX_COUNTS.entry(thread_index).or_insert(0) += count;
+    }
+
+    /// Cumulative transactions processed by `thread_index`.
+    pub fn tx_count(thread_index: usize) -> u64 {
+        TX_COUNTS
+            .get(&thread_index)
+            .map(|count| *count)
+            .unwrap_or(0)
+    }
+
+    /// Records that `thread_index` just (re)opened its stream.
+    pub fn note_stream_start(thread_index: usize) {
+        STREAM_START_MS.insert(thread_index, now_ms());
+    }
+
+    /// Milliseconds since `thread_index` last (re)opened its stream.
+    pub fn stream_age_ms(thread_index: usize) -> Option<u64> {
+        STREAM_START_MS
+            .get(&thread_index)
+            .map(|stamp| now_ms().saturating_sub(*stamp))
+    }
+
+    /// Asks `thread_index` to recycle its connection at the next block boundary.
+    pub fn request_recycle(thread_index: usize) {
+        RECYCLE_REQUESTED.insert(thread_index);
+    }
+
+    /// Consumes a pending recycle request for `thread_index`.
+    pub fn take_recycle(thread_index: usize) -> bool {
+        RECYCLE_REQUESTED.remove(&thread_index).is_some()
+    }
+
+    /// Records that `thread_index` completed its entire slot range. A finished thread stops
+    /// reading forever — without this marker its idle clock would make it look stalled.
+    pub fn note_finished(thread_index: usize) {
+        FINISHED.insert(thread_index);
+    }
+
+    /// Whether `thread_index` completed its slot range.
+    pub fn is_finished(thread_index: usize) -> bool {
+        FINISHED.contains(&thread_index)
+    }
+
+    /// Un-marks a finished thread that adopted stolen work and is running again.
+    pub fn clear_finished(thread_index: usize) {
+        FINISHED.remove(&thread_index);
+    }
+
+    /// Records that `thread_index` just read data.
+    pub fn note(thread_index: usize) {
+        LAST_ACTIVITY_MS.insert(thread_index, now_ms());
+    }
+
+    /// Milliseconds since `thread_index` last read data; `None` if it has not read any yet.
+    pub fn idle_ms(thread_index: usize) -> Option<u64> {
+        LAST_ACTIVITY_MS
+            .get(&thread_index)
+            .map(|stamp| now_ms().saturating_sub(*stamp))
+    }
+}
+
+/// Default launch-gate grace: how long to wait for every running thread to turn green before
+/// spawning the next one anyway. Overridden by `JETSTREAMER_SPAWN_GRACE_SECS`; `0` disables
+/// launch gating entirely.
+const SPAWN_GRACE_DEFAULT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Recycle threshold as a percent of the fastest thread's current rate: threads persistently
+/// below it restart their connection to shed a throughput-clamped one. Override with
+/// `JETSTREAMER_RECYCLE_PCT`; `0` disables recycling.
+fn recycle_threshold_pct() -> u64 {
+    std::env::var("JETSTREAMER_RECYCLE_PCT")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .map(|pct| pct.min(100))
+        .unwrap_or(50)
+}
+
+/// Maximum number of running-but-not-yet-green threads the launch gate allows before pausing
+/// the ramp. Override with `JETSTREAMER_SPAWN_PENDING`; `1` reproduces the strict
+/// one-at-a-time ramp.
+fn spawn_pending_max() -> usize {
+    std::env::var("JETSTREAMER_SPAWN_PENDING")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .filter(|&pending| pending > 0)
+        .unwrap_or(24)
+}
+
+fn spawn_grace_from_env() -> Option<std::time::Duration> {
+    match std::env::var("JETSTREAMER_SPAWN_GRACE_SECS") {
+        Ok(raw) => match raw.trim().parse::<u64>() {
+            Ok(0) => None,
+            Ok(secs) => Some(std::time::Duration::from_secs(secs)),
+            Err(_) => Some(SPAWN_GRACE_DEFAULT),
+        },
+        Err(_) => Some(SPAWN_GRACE_DEFAULT),
+    }
+}
+
+/// Launch gate for the staggered thread ramp: waits until every already-running thread has
+/// read data within the "green" window (10% of [`OP_TIMEOUT`], matching the TUI thread grid)
+/// so load is only added while the source is keeping up.
+///
+/// Up to [`spawn_pending_max`] not-yet-green threads may be in flight at once (a freshly
+/// spawned thread needs a few seconds to fetch its stream, seek, and read its first block —
+/// requiring strict all-green would serialize the ramp on that startup latency). `grace`
+/// bounds the wait for merely *sluggish* threads (yellow/orange in the TUI) so a flickering
+/// thread cannot stall the ramp forever — but a **red** thread (idle at or beyond the op
+/// timeout: stalled or backing off) holds the ramp outright, and the grace clock restarts
+/// whenever one is present. Spawning into visible distress only feeds the throttling that
+/// caused it. A requested shutdown releases the gate immediately (the spawned thread
+/// observes the shutdown flag and exits right away).
+async fn wait_for_green_threads(
+    grace: std::time::Duration,
+    shutdown_flag: &Arc<AtomicBool>,
+    handles: &[tokio::task::JoinHandle<()>],
+) {
+    let green_ms = (OP_TIMEOUT.as_millis() as u64) / 10;
+    let red_ms = OP_TIMEOUT.as_millis() as u64;
+    let pending_max = spawn_pending_max();
+    let spawned = handles.len();
+    let mut deadline = std::time::Instant::now() + grace;
+    let mut logged_red_hold = false;
     loop {
-        match slot_to_offset(candidate).await {
-            Ok(_) => {
-                if skipped > 0 {
-                    log::info!(
-                        target: log_target,
-                        "slot {} missing in index; seeking back {} slots to {}",
-                        local_start.saturating_sub(1),
-                        skipped,
-                        candidate
-                    );
-                }
-                return Ok(Some(candidate));
+        if shutdown_flag.load(Ordering::SeqCst) {
+            return;
+        }
+        // A thread that already completed its slot range stops reading forever; count it as
+        // healthy rather than letting it hold the ramp to the grace timeout.
+        let idle_of_running = |(thread, handle): (usize, &tokio::task::JoinHandle<()>)| {
+            if handle.is_finished() {
+                None
+            } else {
+                Some(thread_activity::idle_ms(thread))
             }
-            Err(SlotOffsetIndexError::SlotNotFound(..)) => {
-                if candidate <= epoch_start {
-                    break;
-                }
-                skipped += 1;
-                candidate = candidate.saturating_sub(1);
+        };
+        let not_yet_green = handles
+            .iter()
+            .enumerate()
+            .filter_map(idle_of_running)
+            .filter(|idle| !idle.is_some_and(|idle| idle < green_ms))
+            .count();
+        let any_red = handles
+            .iter()
+            .enumerate()
+            .filter_map(idle_of_running)
+            .any(|idle| idle.is_some_and(|idle| idle >= red_ms));
+        // Red is checked before the pending window: red threads count as not-yet-green, and
+        // a couple of them must hold the ramp rather than slip under the window.
+        if any_red {
+            // Hold the ramp and restart the grace clock; only a red-free interval of `grace`
+            // can force a spawn past non-green threads.
+            deadline = std::time::Instant::now() + grace;
+            if !logged_red_hold {
+                logged_red_hold = true;
+                log::info!(
+                    target: LOG_MODULE,
+                    "holding thread ramp at {} threads while stalled threads recover",
+                    spawned
+                );
             }
-            Err(err) => return Err(FirehoseError::SlotOffsetIndexError(err)),
+        } else if not_yet_green < pending_max {
+            return;
+        } else if std::time::Instant::now() >= deadline {
+            log::info!(
+                target: LOG_MODULE,
+                "spawn grace elapsed with non-green threads; launching thread {} anyway",
+                spawned
+            );
+            return;
+        }
+        sleep(std::time::Duration::from_millis(15)).await;
+    }
+}
+
+/// Shared per-thread work ledger used for work-steal victim selection. `start` is the
+/// beginning of the thread's current assignment (reset when it adopts stolen work), `next`
+/// is the next slot the owner will process (published at each block boundary), and `end` is
+/// the half-open end of the slice. Every field is written **only by its owning thread**;
+/// other threads read it purely as advisory telemetry when picking a steal victim. Actual
+/// splits happen over the steal message protocol (see [`StealRequest`]), never by writing to
+/// another thread's slice.
+struct WorkSlice {
+    start: AtomicU64,
+    next: AtomicU64,
+    end: AtomicU64,
+}
+
+/// Minimum remaining slots a slice must have to be worth splitting: half of this must cover
+/// the thief's reconnect + seek setup cost.
+const MIN_STEAL_SLOTS: u64 = 64;
+
+/// The active run's work ledger, stashed so out-of-band reporters (e.g. the fatal
+/// ClickHouse-abort path) can compute a safe resume point.
+static ACTIVE_WORK_LEDGER: std::sync::Mutex<Option<Arc<Vec<WorkSlice>>>> =
+    std::sync::Mutex::new(None);
+
+/// The lowest slot not yet fully processed by the active run, if one is running: everything
+/// below this is complete, so `resume_floor..original_end` is a safe (if conservative —
+/// higher threads' finished work above the floor gets re-read) resume range. Returns `None`
+/// when no run is active or every slice is complete.
+pub fn resume_floor() -> Option<u64> {
+    let ledger = ACTIVE_WORK_LEDGER.lock().unwrap();
+    ledger.as_ref().and_then(|slices| {
+        slices
+            .iter()
+            .filter_map(|slice| {
+                let next = slice.next.load(Ordering::SeqCst);
+                let end = slice.end.load(Ordering::SeqCst);
+                (next < end).then_some(next)
+            })
+            .min()
+    })
+}
+
+/// A work-steal proposal sent to a victim thread's steal inbox: "hand me half of your
+/// remaining work." The victim answers on `reply` with the granted range, or `None` when it
+/// has too little work left to split. The victim only services its inbox at quiescent points
+/// (between block batches, at restart boundaries, or while parked in backoff), so a grant
+/// can never race in-flight emission — the victim's answer *is* the authoritative split.
+struct StealRequest {
+    reply: oneshot::Sender<Option<Range<u64>>>,
+}
+
+/// Services a victim's steal inbox at a quiescent point. `position` is the victim's
+/// authoritative next-slot-to-process; `allow` is false when the victim is completing its
+/// range and only draining (all requests answered `None`). A grant is committed — the local
+/// range end shrinks and the ledger is updated — only if the reply is actually delivered, so
+/// an abandoned request can never orphan slots.
+fn service_steal_inbox(
+    inbox: &mut mpsc::UnboundedReceiver<StealRequest>,
+    slot_range: &mut Range<u64>,
+    position: u64,
+    slice: &WorkSlice,
+    log_target: &str,
+    allow: bool,
+) {
+    while let Ok(request) = inbox.try_recv() {
+        let remaining = slot_range.end.saturating_sub(position);
+        if !allow || remaining < MIN_STEAL_SLOTS {
+            let _ = request.reply.send(None);
+            continue;
+        }
+        let mid = position + remaining / 2;
+        let granted = mid..slot_range.end;
+        if request.reply.send(Some(granted.clone())).is_ok() {
+            log::info!(
+                target: log_target,
+                "🥷 handed slots {}..{} to a work-stealing thread; continuing to {}",
+                granted.start,
+                granted.end,
+                mid
+            );
+            slot_range.end = mid;
+            slice.end.store(mid, Ordering::SeqCst);
         }
     }
-    log::warn!(
-        target: log_target,
-        "no indexed slot found before {} (epoch start {}); reading from epoch start",
-        local_start,
-        epoch_start
-    );
-    Ok(None)
+}
+
+/// Asks the least-progressed running thread for half of its remaining work, walking the
+/// candidate list until a victim grants. Candidates are ranked by lowest completed fraction
+/// of their current assignment (ties broken by most remaining), skipping threads that have
+/// not started streaming yet (they cannot answer their inbox) and threads without enough
+/// work to split.
+///
+/// Deadlock freedom: while awaiting a victim's answer, the thief keeps servicing its **own**
+/// inbox (rejecting — it has nothing to give), so every thread in every waiting state stays
+/// responsive. A request can only go permanently unanswered if the victim task exits, which
+/// drops its inbox and resolves the wait with an error. `lock` is held only around the
+/// scan-and-send (never across the reply await) to keep simultaneous thieves from bursting
+/// requests at the same victim; the victim re-validates every grant against its own
+/// authoritative position anyway.
+async fn request_steal(
+    registry: &[WorkSlice],
+    inboxes: &[mpsc::UnboundedSender<StealRequest>],
+    own_inbox: &mut mpsc::UnboundedReceiver<StealRequest>,
+    thief: usize,
+    lock: &tokio::sync::Mutex<()>,
+) -> Option<(usize, Range<u64>)> {
+    let mut candidates: Vec<(f64, std::cmp::Reverse<u64>, usize)> = {
+        let _guard = lock.lock().await;
+        registry
+            .iter()
+            .enumerate()
+            .filter(|&(index, _)| {
+                index != thief
+                    && !thread_activity::is_finished(index)
+                    // A thread that has not begun streaming cannot answer its inbox.
+                    && thread_activity::stream_age_ms(index).is_some()
+            })
+            .filter_map(|(index, slice)| {
+                let start = slice.start.load(Ordering::SeqCst);
+                let next = slice.next.load(Ordering::SeqCst);
+                let end = slice.end.load(Ordering::SeqCst);
+                let remaining = end.saturating_sub(next);
+                if remaining < MIN_STEAL_SLOTS {
+                    return None;
+                }
+                let assigned = end.saturating_sub(start).max(1);
+                let fraction = next.saturating_sub(start) as f64 / assigned as f64;
+                Some((fraction, std::cmp::Reverse(remaining), index))
+            })
+            .collect()
+    };
+    candidates.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    for (_, _, victim) in candidates {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        if inboxes[victim]
+            .send(StealRequest { reply: reply_tx })
+            .is_err()
+        {
+            continue;
+        }
+        // Await the victim's answer while staying responsive to our own inbox.
+        let mut reply_rx = reply_rx;
+        let outcome = loop {
+            tokio::select! {
+                reply = &mut reply_rx => break reply,
+                incoming = own_inbox.recv() => {
+                    match incoming {
+                        // We are hunting because we have nothing left; refuse.
+                        Some(request) => {
+                            let _ = request.reply.send(None);
+                        }
+                        // Own inbox closed (shutdown teardown): just wait for the reply.
+                        None => break (&mut reply_rx).await,
+                    }
+                }
+            }
+        };
+        match outcome {
+            Ok(Some(stolen)) => {
+                registry[thief].start.store(stolen.start, Ordering::SeqCst);
+                registry[thief].next.store(stolen.start, Ordering::SeqCst);
+                registry[thief].end.store(stolen.end, Ordering::SeqCst);
+                return Some((victim, stolen));
+            }
+            Ok(None) | Err(_) => continue,
+        }
+    }
+    None
+}
+
+/// Decides how a reverse-mode retry resumes after an error attributed to `slot`, given that
+/// `last_counted_slot` was the last slot fully processed. Returns the new
+/// `(reverse_partial_resume, reverse_highest_remaining_epoch)`.
+///
+/// The subtlety: an error striking at an epoch slice's *tail* (after its final block was
+/// emitted, before the clean end-of-epoch break) is attributed to the next slot — which
+/// belongs to the next, **higher** epoch. Storing that as the partial-resume point poisons
+/// the retry: the epoch-match check sees a foreign epoch, discards the resume marker, and
+/// re-processes the entire slice from its start, double-emitting every slot in it. When the
+/// resume point crosses above the epoch that was actually being processed, the slice is
+/// complete — so mark the epoch done instead.
+fn reverse_resume_after_error(
+    slot: u64,
+    last_counted_slot: u64,
+    highest_remaining_epoch: Option<u64>,
+) -> (Option<u64>, Option<u64>) {
+    let resume_slot = if slot <= last_counted_slot {
+        last_counted_slot.saturating_add(1)
+    } else {
+        slot
+    };
+    let last_epoch = slot_to_epoch(last_counted_slot);
+    let error_epoch = slot_to_epoch(slot);
+    if error_epoch >= last_epoch && slot_to_epoch(resume_slot) > last_epoch {
+        // Tail case: everything in `last_epoch` was processed. Only decrement the
+        // highest-remaining marker when it still points at that epoch (it may already point
+        // lower, e.g. when the error arrived before the first block of an earlier epoch).
+        let highest = if highest_remaining_epoch == Some(last_epoch) {
+            // `checked_sub` makes "no epochs remaining" explicit as `None` — required for
+            // epoch 0, where a saturating subtraction would silently stay at 0 and replay
+            // the epoch. Dropping below the range's lowest epoch also completes the run.
+            last_epoch.checked_sub(1)
+        } else {
+            highest_remaining_epoch
+        };
+        (None, highest)
+    } else {
+        (Some(resume_slot), highest_remaining_epoch)
+    }
+}
+
+/// Per-thread restart pacing: consecutive failures on the same slot double the delay up to
+/// [`RETRY_BACKOFF_MAX`]; a failure on a different slot means forward progress was made and
+/// resets the sequence.
+struct RetryBackoff {
+    last_slot: Option<u64>,
+    consecutive: u32,
+}
+
+impl RetryBackoff {
+    const fn new() -> Self {
+        Self {
+            last_slot: None,
+            consecutive: 0,
+        }
+    }
+
+    fn next_delay(&mut self, slot: u64) -> std::time::Duration {
+        if self.last_slot == Some(slot) {
+            self.consecutive = self.consecutive.saturating_add(1);
+        } else {
+            self.last_slot = Some(slot);
+            self.consecutive = 0;
+        }
+        RETRY_BACKOFF_BASE
+            .saturating_mul(1u32 << self.consecutive.min(5))
+            .min(RETRY_BACKOFF_MAX)
+    }
 }
 
 /// Errors that can occur while streaming the firehose. Errors that can occur while streaming
@@ -160,6 +612,17 @@ pub enum FirehoseError {
     OnStatsHandlerError(SharedError),
     /// Timeout reached while waiting for a firehose operation.
     OperationTimeout(&'static str),
+    /// Deliberate connection recycle (not a failure): the thread restarts its stream to shed
+    /// a throughput-clamped connection.
+    ConnectionRecycled,
+    /// The thread's slot range is fully processed (not a failure): routed through the retry
+    /// loop so the thread can adopt stolen work or retire.
+    RangeComplete,
+    /// The HTTP stream ended (EOF) while the slot index proves present slots remain in the
+    /// thread's range — the CDN closed the connection mid-transfer. Retryable; without this
+    /// check a truncated stream is indistinguishable from a genuine end-of-epoch and the
+    /// remaining slots would be silently lost.
+    PrematureStreamEnd,
     /// Transaction handler returned an error.
     TransactionHandlerError(SharedError),
     /// Entry handler returned an error.
@@ -214,6 +677,18 @@ impl Display for FirehoseError {
             }
             FirehoseError::OperationTimeout(op) => {
                 write!(f, "Timeout while waiting for operation: {}", op)
+            }
+            FirehoseError::ConnectionRecycled => {
+                write!(f, "connection recycled to refresh throughput")
+            }
+            FirehoseError::RangeComplete => {
+                write!(f, "slot range complete")
+            }
+            FirehoseError::PrematureStreamEnd => {
+                write!(
+                    f,
+                    "stream ended before the slot range was fully processed (connection closed mid-transfer)"
+                )
             }
             FirehoseError::TransactionHandlerError(error) => {
                 write!(f, "Transaction handler error: {}", error)
@@ -963,7 +1438,141 @@ where
         DashMap<usize, DashSet<u64, ahash::RandomState>, ahash::RandomState>,
     > = Arc::new(DashMap::with_hasher(ahash::RandomState::new()));
 
+    thread_activity::reset();
+    let spawn_gate = if sequential {
+        None
+    } else {
+        spawn_grace_from_env()
+    };
+    // Connection-recycle monitor: Cloudflare clamps long-lived connections while fresh ones
+    // get full burst throughput, and a clamped-but-flowing thread stays green forever, so
+    // health checks alone never rotate it. Every sweep, threads running well below the
+    // fastest thread's rate are asked to reconnect (a clean restart with no backoff).
+    let recycle_pct = recycle_threshold_pct();
+    let thread_total = subranges.len();
+    // Work-stealing ledger (owner-written telemetry for victim selection) plus one steal
+    // inbox per thread for the split protocol itself.
+    let work_registry: Arc<Vec<WorkSlice>> = Arc::new(
+        subranges
+            .iter()
+            .map(|range| WorkSlice {
+                start: AtomicU64::new(range.start),
+                next: AtomicU64::new(range.start),
+                end: AtomicU64::new(range.end),
+            })
+            .collect(),
+    );
+    let mut steal_inbox_receivers: Vec<Option<mpsc::UnboundedReceiver<StealRequest>>> = Vec::new();
+    let mut steal_inbox_senders: Vec<mpsc::UnboundedSender<StealRequest>> = Vec::new();
+    for _ in 0..thread_total {
+        let (sender, receiver) = mpsc::unbounded_channel();
+        steal_inbox_senders.push(sender);
+        steal_inbox_receivers.push(Some(receiver));
+    }
+    let steal_inboxes: Arc<Vec<mpsc::UnboundedSender<StealRequest>>> =
+        Arc::new(steal_inbox_senders);
+    *ACTIVE_WORK_LEDGER.lock().unwrap() = Some(work_registry.clone());
+    // Coverage journal: every completed assignment records the interval it actually
+    // processed, and the end-of-run audit verifies the union covers the requested range.
+    // This turns any silent slot loss (whatever the cause) into a loud, precise error.
+    let coverage_log: Arc<std::sync::Mutex<Vec<(u64, u64)>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let overall_start = subranges.first().map(|range| range.start).unwrap_or(0);
+    let overall_end = subranges.last().map(|range| range.end).unwrap_or(0);
+    let steal_lock = Arc::new(tokio::sync::Mutex::new(()));
+    // Always on in threaded forward mode; sequential/reverse runs and single-thread runs
+    // have nothing to steal.
+    let work_stealing = !sequential && !reverse_mode && thread_total > 1;
+    if work_stealing {
+        log::info!(
+            target: LOG_MODULE,
+            "work stealing enabled: finished threads adopt half of the least-progressed thread's remaining work"
+        );
+    }
+    let recycle_monitor = (recycle_pct > 0 && !sequential && thread_total > 1).then(|| {
+        let shutdown_flag = shutdown_flag.clone();
+        tokio::spawn(async move {
+            const SWEEP: std::time::Duration = std::time::Duration::from_secs(15);
+            const MIN_STREAM_AGE_MS: u64 = 30_000;
+            /// Rolling rotation, not a storm: a uniform clamp puts most of the fleet under
+            /// the threshold at once, and recycling everyone simultaneously would zero
+            /// throughput. Rotating the worst few per sweep cycles the whole fleet through
+            /// fresh connections within a few minutes while the rest keep streaming.
+            const MAX_RECYCLES_PER_SWEEP: usize = 16;
+            let mut prev_counts: Vec<u64> = vec![0; thread_total];
+            let mut primed = false;
+            // Benchmark rate: the best 90th-percentile sweep rate observed this run. Using a
+            // percentile means ~a tenth of the fleet must sustain a rate before it becomes
+            // the bar — one anomalously fast thread can't set it.
+            let mut reference: u64 = 0;
+            loop {
+                sleep(SWEEP).await;
+                if shutdown_flag.load(Ordering::SeqCst) {
+                    return;
+                }
+                let mut rates = vec![0u64; thread_total];
+                for (thread, prev) in prev_counts.iter_mut().enumerate() {
+                    let total = thread_activity::tx_count(thread);
+                    rates[thread] = total.saturating_sub(*prev);
+                    *prev = total;
+                }
+                // The first sweep only seeds the per-thread snapshots.
+                if !primed {
+                    primed = true;
+                    continue;
+                }
+                let mut moving: Vec<u64> = rates.iter().copied().filter(|&r| r > 0).collect();
+                if moving.is_empty() {
+                    continue;
+                }
+                moving.sort_unstable();
+                let p90 = moving[(moving.len() - 1) * 9 / 10];
+                reference = reference.max(p90);
+                let threshold = reference.saturating_mul(recycle_pct) / 100;
+                // Worst offenders first, capped per sweep.
+                let mut candidates: Vec<(u64, usize)> = rates
+                    .iter()
+                    .copied()
+                    .enumerate()
+                    .filter(|&(thread, rate)| {
+                        !thread_activity::is_finished(thread)
+                            && rate < threshold
+                            // Give new connections time to prove themselves first.
+                            && thread_activity::stream_age_ms(thread)
+                                .is_some_and(|age| age >= MIN_STREAM_AGE_MS)
+                    })
+                    .map(|(thread, rate)| (rate, thread))
+                    .collect();
+                candidates.sort_unstable();
+                let flagged = candidates.len().min(MAX_RECYCLES_PER_SWEEP);
+                for &(_, thread) in candidates.iter().take(MAX_RECYCLES_PER_SWEEP) {
+                    thread_activity::request_recycle(thread);
+                }
+                if flagged > 0 {
+                    log::info!(
+                        target: LOG_MODULE,
+                        "recycle monitor: rotating {} of {} threads below {}% of the best observed rate",
+                        flagged,
+                        candidates.len(),
+                        recycle_pct
+                    );
+                }
+            }
+        })
+    });
     for (thread_index, mut slot_range) in subranges.into_iter().enumerate() {
+        if thread_index > 0
+            && let Some(grace) = spawn_gate
+        {
+            wait_for_green_threads(grace, &shutdown_flag, &handles).await;
+        }
+        let work_registry = work_registry.clone();
+        let coverage_log = coverage_log.clone();
+        let steal_lock = steal_lock.clone();
+        let steal_inboxes = steal_inboxes.clone();
+        let mut steal_inbox = steal_inbox_receivers[thread_index]
+            .take()
+            .expect("steal inbox taken once per thread");
         let error_counts = error_counts.clone();
         let client = client.clone();
         let on_block = on_block.clone();
@@ -1019,12 +1628,14 @@ where
             }
             let mut last_counted_slot = slot_range.start.saturating_sub(1);
             let mut last_emitted_slot_global = slot_range.start.saturating_sub(1);
-            // Reverse-mode state preserved across retries.
+            // Reverse-mode state preserved across retries. `None` for the highest remaining
+            // epoch explicitly means "every epoch is complete" — required so completing
+            // epoch 0 is distinguishable from epoch 0 still pending.
             let mut reverse_partial_resume: Option<u64> = None;
-            let mut reverse_highest_remaining_epoch: u64 = if reverse_mode_local {
-                slot_to_epoch(slot_range.end.saturating_sub(1))
+            let mut reverse_highest_remaining_epoch: Option<u64> = if reverse_mode_local {
+                Some(slot_to_epoch(slot_range.end.saturating_sub(1)))
             } else {
-                0
+                None
             };
             let mut thread_stats = if tracking_enabled {
                 Some(ThreadStats {
@@ -1045,6 +1656,7 @@ where
                 None
             };
 
+            let mut retry_backoff = RetryBackoff::new();
             // let mut triggered = false;
             while let Err((err, slot)) = async {
                 let mut last_emitted_slot = last_emitted_slot_global;
@@ -1053,6 +1665,22 @@ where
                 } else {
                     OP_TIMEOUT
                 };
+                // Each pass through this block opens a fresh stream; the stamp shields young
+                // connections from the recycle monitor while they warm up.
+                thread_activity::note_stream_start(thread_index);
+                // Restart boundary is quiescent: answer any steal proposals that arrived
+                // while the previous pass was ending.
+                if work_stealing {
+                    let resume_position = slot_range.start;
+                    service_steal_inbox(
+                        &mut steal_inbox,
+                        &mut slot_range,
+                        resume_position,
+                        &work_registry[thread_index],
+                        &log_target,
+                        true,
+                    );
+                }
                 if poll_shutdown(&shutdown_flag, &mut shutdown_rx) {
                     log::info!(
                         target: &log_target,
@@ -1078,13 +1706,14 @@ where
                 // for each epoch
                 let mut current_slot: Option<u64> = None;
                 let epoch_iter: Vec<u64> = if reverse_mode_local {
-                    if reverse_highest_remaining_epoch < lowest_epoch {
-                        // All epochs already completed across previous retries.
+                    // All epochs already completed across previous retries?
+                    let Some(highest_remaining) = reverse_highest_remaining_epoch else {
+                        return Ok(());
+                    };
+                    if highest_remaining < lowest_epoch {
                         return Ok(());
                     }
-                    (lowest_epoch..=reverse_highest_remaining_epoch)
-                        .rev()
-                        .collect()
+                    (lowest_epoch..=highest_remaining).rev().collect()
                 } else {
                     epoch_range.clone().collect()
                 };
@@ -1184,36 +1813,23 @@ where
                         }
 
                     if local_start > epoch_start {
-                        // Seek to the nearest previous indexed slot so the stream includes all
-                        // nodes (transactions, entries, rewards) that precede `local_start`.
-                        let seek_slot = match timeout(
-                            OP_TIMEOUT,
-                            find_previous_indexed_slot(local_start, epoch_start, &log_target),
-                        )
-                        .await
-                        {
-                            Ok(res) => res.map_err(|e| (e, current_slot.unwrap_or(slot_range.start)))?,
+                        // Seek to the start of `local_start`'s data; the index maps each slot to
+                        // the byte range containing all of its nodes (transactions, entries,
+                        // rewards, block), and the seek skips forward over missing slots. Errors
+                        // are attributed to `local_start` so retries invalidate and resume the
+                        // epoch actually being sought. Acquire the global seek-spacing permit
+                        // before starting the timeout clock: with hundreds of threads the permit
+                        // queue alone can exceed the op timeout, and that wait is pacing, not a
+                        // stall.
+                        reader.prime_seek_permit().await;
+                        let seek_fut = reader.seek_to_slot(local_start);
+                        match timeout(op_timeout, seek_fut).await {
+                            Ok(res) => res.map_err(|e| (e, local_start))?,
                             Err(_) => {
                                 return Err((
-                                    FirehoseError::OperationTimeout(
-                                        "seek_to_previous_indexed_slot",
-                                    ),
-                                    current_slot.unwrap_or(slot_range.start),
+                                    FirehoseError::OperationTimeout("seek_to_slot"),
+                                    local_start,
                                 ));
-                            }
-                        };
-                        if let Some(seek_slot) = seek_slot {
-                            let seek_fut = reader.seek_to_slot(seek_slot);
-                            match timeout(op_timeout, seek_fut).await {
-                                Ok(res) => {
-                                    res.map_err(|e| (e, current_slot.unwrap_or(slot_range.start)))?
-                                }
-                                Err(_) => {
-                                    return Err((
-                                        FirehoseError::OperationTimeout("seek_to_slot"),
-                                        current_slot.unwrap_or(slot_range.start),
-                                    ));
-                                }
                             }
                         }
                     }
@@ -1229,6 +1845,18 @@ where
                                 thread_index
                             );
                             return Ok(());
+                        }
+                        if thread_activity::take_recycle(thread_index) {
+                            log::info!(
+                                target: &log_target,
+                                "recycling connection to refresh throughput"
+                            );
+                            return Err((
+                                FirehoseError::ConnectionRecycled,
+                                current_slot
+                                    .map(|slot| slot.saturating_add(1))
+                                    .unwrap_or(slot_range.start),
+                            ));
                         }
                         let read_fut = reader.read_until_block();
                         let nodes = match timeout(op_timeout, read_fut).await {
@@ -1247,18 +1875,52 @@ where
                                 return Err((FirehoseError::OperationTimeout("read_until_block"), current_slot.map(|s| s + 1).unwrap_or(slot_range.start)));
                             }
                         };
-                        if nodes.is_empty() {
+                        thread_activity::note(thread_index);
+                        // Quiescent point: no emission is in flight between batches, so this
+                        // is where steal proposals are answered. A grant shrinks
+                        // `slot_range.end`, and the `slot >= slot_range.end` guard below
+                        // completes the range before any out-of-range data is emitted.
+                        if work_stealing {
+                            service_steal_inbox(
+                                &mut steal_inbox,
+                                &mut slot_range,
+                                last_counted_slot.saturating_add(1),
+                                &work_registry[thread_index],
+                                &log_target,
+                                true,
+                            );
+                        }
+                        let stream_ended = nodes.is_empty()
+                            || nodes
+                                .0
+                                .last()
+                                .is_some_and(|last_node| !last_node.get_node().is_block());
+                        if stream_ended {
+                            // EOF is ambiguous: it can mean the genuine end of the epoch's
+                            // data, or a connection the CDN closed mid-transfer. Consult the
+                            // slot index: if any present slot remains in this thread's slice
+                            // of the epoch, the stream was truncated and completing here
+                            // would silently drop those slots.
+                            let scan_end = local_end_inclusive.min(slot_range.end.saturating_sub(1));
+                            if let Some(missing) =
+                                crate::index::next_present_slot(last_counted_slot, scan_end).await
+                            {
+                                log::warn!(
+                                    target: &log_target,
+                                    "stream ended prematurely in epoch {} — slot {} (and possibly more) still unprocessed; restarting",
+                                    epoch_num,
+                                    missing
+                                );
+                                return Err((
+                                    FirehoseError::PrematureStreamEnd,
+                                    last_counted_slot.saturating_add(1),
+                                ));
+                            }
                             log::info!(
                                 target: &log_target,
                                 "reached end of epoch {}",
                                 epoch_num
                             );
-                            break;
-                        }
-                        if let Some(last_node) = nodes.0.last()
-                            && !last_node.get_node().is_block()
-                        {
-                            log::info!(target: &log_target, "reached end of epoch {}", epoch_num);
                             break;
                         }
                         let block = nodes
@@ -1295,7 +1957,7 @@ where
                             if block_enabled {
                                 pending_skipped_slots.remove(&thread_index);
                             }
-                            return Ok(());
+                            return Err((FirehoseError::RangeComplete, slot_range.end));
                         }
                         debug_assert!(slot < slot_range.end, "processing out-of-range slot {} (end {})", slot, slot_range.end);
                         if slot < slot_range.start {
@@ -1449,6 +2111,7 @@ where
                                         stats.transactions_processed += 1;
                                     }
                                     transactions_since_stats.fetch_add(1, Ordering::Relaxed);
+                                    thread_activity::add_transactions(thread_index, 1);
                                 }
                                 Entry(entry) => {
                                     let entry_hash = Hash::from(entry.hash.to_bytes());
@@ -1685,6 +2348,11 @@ where
                                     if slot > last_counted_slot {
                                         last_counted_slot = slot;
                                     }
+                                    if work_stealing {
+                                        work_registry[thread_index]
+                                            .next
+                                            .store(last_counted_slot.saturating_add(1), Ordering::SeqCst);
+                                    }
                                 }
                                 Subset(_subset) => (),
                                 Epoch(_epoch) => (),
@@ -1791,14 +2459,14 @@ where
                             if !summary.is_empty() {
                                 log::debug!(target: &log_target, "threads with errors: {}", summary);
                             }
-                            return Ok(());
+                            return Err((FirehoseError::RangeComplete, slot_range.end));
                         }
                     }
                     if reverse_mode_local {
-                        // Mark this epoch as fully processed so retries skip it.
-                        if epoch_num == reverse_highest_remaining_epoch {
-                            reverse_highest_remaining_epoch =
-                                reverse_highest_remaining_epoch.saturating_sub(1);
+                        // Mark this epoch as fully processed so retries skip it
+                        // (`checked_sub` yields `None` at epoch 0: nothing remains).
+                        if reverse_highest_remaining_epoch == Some(epoch_num) {
+                            reverse_highest_remaining_epoch = epoch_num.checked_sub(1);
                         }
                         if matches!(
                             reverse_partial_resume,
@@ -1836,7 +2504,7 @@ where
                     }
                     log::info!(target: &log_target, "thread {} has finished its work", thread_index);
                     }
-                    Ok(())
+                    Err((FirehoseError::RangeComplete, slot_range.end))
             }
             .await
             {
@@ -1848,19 +2516,101 @@ where
                     );
                     break;
                 }
+                // Range completion arrives through the retry loop so the thread can adopt
+                // stolen work (restarting the loop with a new range) or retire.
+                if matches!(err, FirehoseError::RangeComplete) {
+                    // Journal the interval this assignment actually processed (read before
+                    // a steal adoption overwrites the ledger entry). Trailing slots between
+                    // last_counted and the assignment end are left to the audit, which
+                    // verifies such gaps contain no present slots.
+                    if work_stealing {
+                        let assignment_start =
+                            work_registry[thread_index].start.load(Ordering::SeqCst);
+                        coverage_log
+                            .lock()
+                            .unwrap()
+                            .push((assignment_start, last_counted_slot.saturating_add(1)));
+                    }
+                    // This thread is done with its own range: publish "nothing remaining" so
+                    // hunters stop targeting it, then drain any pending steal proposals with
+                    // a refusal before going hunting itself.
+                    if work_stealing {
+                        work_registry[thread_index]
+                            .next
+                            .store(slot_range.end, Ordering::SeqCst);
+                        let drained_position = slot_range.end;
+                        service_steal_inbox(
+                            &mut steal_inbox,
+                            &mut slot_range,
+                            drained_position,
+                            &work_registry[thread_index],
+                            &log_target,
+                            false,
+                        );
+                    }
+                    if work_stealing
+                        && let Some((victim, stolen)) = request_steal(
+                            &work_registry,
+                            &steal_inboxes,
+                            &mut steal_inbox,
+                            thread_index,
+                            &steal_lock,
+                        )
+                        .await
+                    {
+                        thread_activity::note_steal();
+                        log::info!(
+                            target: &log_target,
+                            "🥷 stole {} slots ({}..{}) from thread {} (least progress)",
+                            stolen.end - stolen.start,
+                            stolen.start,
+                            stolen.end,
+                            victim
+                        );
+                        thread_activity::clear_finished(thread_index);
+                        slot_range = stolen;
+                        last_counted_slot = slot_range.start.saturating_sub(1);
+                        last_emitted_slot_global = slot_range.start.saturating_sub(1);
+                        reverse_partial_resume = None;
+                        skip_until_index = None;
+                        if let Some(ref mut stats) = thread_stats {
+                            stats.slot_range = slot_range.clone();
+                            stats.finish_time = None;
+                        }
+                        continue;
+                    }
+                    thread_activity::note_finished(thread_index);
+                    break;
+                }
+                // A deliberate connection recycle is a clean restart, not a failure: skip the
+                // error logging, error counter, on_error callback, and retry backoff.
+                let recycled = matches!(err, FirehoseError::ConnectionRecycled);
                 let epoch = slot_to_epoch(slot);
                 let item_index = match &err {
                     FirehoseError::NodeDecodingError(item_index, _) => *item_index,
                     _ => 0,
                 };
                 let error_message = err.to_string();
-                log::error!(
-                    target: &log_target,
-                    "🧯💦🔥 firehose encountered an error at slot {} in epoch {} and will roll back one slot and retry:",
-                    slot,
-                    epoch
-                );
-                log::error!(target: &log_target, "{}", error_message);
+                if recycled {
+                    thread_activity::note_recycle();
+                    log::info!(
+                        target: &log_target,
+                        "♻️ recycling connection; resuming from slot {} in epoch {}",
+                        slot,
+                        epoch
+                    );
+                } else {
+                    if matches!(err, FirehoseError::OperationTimeout(_)) {
+                        thread_activity::note_timeout();
+                    }
+                    log::error!(
+                        target: &log_target,
+                        "🧯💦🔥 firehose encountered an error at slot {} in epoch {} and will roll back one slot and retry:",
+                        slot,
+                        epoch
+                    );
+                    log::error!(target: &log_target, "{}", error_message);
+                }
                 if matches!(err, FirehoseError::SlotOffsetIndexError(_))
                     || error_message.contains("Unknown CID version")
                 {
@@ -1868,29 +2618,31 @@ where
                     // (or a bad seek offset that landed mid-stream).
                     SLOT_OFFSET_INDEX.invalidate_epoch(epoch);
                 }
-                if let Some(on_error_cb) = on_error.clone() {
-                    let context = FirehoseErrorContext {
-                        thread_id: thread_index,
-                        slot,
-                        epoch,
-                        error_message: error_message.clone(),
-                    };
-                    if let Err(handler_err) = on_error_cb(thread_index, context).await {
-                        log::error!(
-                            target: &log_target,
-                            "on_error handler failed: {}",
-                            handler_err
-                        );
+                if !recycled {
+                    if let Some(on_error_cb) = on_error.clone() {
+                        let context = FirehoseErrorContext {
+                            thread_id: thread_index,
+                            slot,
+                            epoch,
+                            error_message: error_message.clone(),
+                        };
+                        if let Err(handler_err) = on_error_cb(thread_index, context).await {
+                            log::error!(
+                                target: &log_target,
+                                "on_error handler failed: {}",
+                                handler_err
+                            );
+                        }
                     }
+                    // Increment this thread's error counter
+                    error_counts[thread_index].fetch_add(1, Ordering::Relaxed);
+                    log::warn!(
+                        target: &log_target,
+                        "restarting from slot {} at index {}",
+                        slot,
+                        item_index,
+                    );
                 }
-                // Increment this thread's error counter
-                error_counts[thread_index].fetch_add(1, Ordering::Relaxed);
-                log::warn!(
-                    target: &log_target,
-                    "restarting from slot {} at index {}",
-                    slot,
-                    item_index,
-                );
                 // Update slot range to resume from the failed slot, not the original start.
                 // Reset local tracking so we don't treat the resumed slot range as already counted.
                 // If we've already counted this slot, resume from the next one to avoid duplicates.
@@ -1898,12 +2650,13 @@ where
                     // In reverse mode, completed higher epochs are tracked via
                     // reverse_highest_remaining_epoch and the within-epoch resume slot lives in
                     // reverse_partial_resume; slot_range stays at its original bounds.
-                    let resume_slot = if slot <= last_counted_slot {
-                        last_counted_slot.saturating_add(1)
-                    } else {
-                        slot
-                    };
-                    reverse_partial_resume = Some(resume_slot);
+                    let (resume, highest) = reverse_resume_after_error(
+                        slot,
+                        last_counted_slot,
+                        reverse_highest_remaining_epoch,
+                    );
+                    reverse_partial_resume = resume;
+                    reverse_highest_remaining_epoch = highest;
                 } else if slot <= last_counted_slot {
                     slot_range.start = last_counted_slot.saturating_add(1);
                 } else {
@@ -1925,6 +2678,45 @@ where
                 // of the stream and silently drop slots.
                 skip_until_index = None;
                 last_emitted_slot_global = last_emitted_slot;
+                if !recycled {
+                    let backoff = retry_backoff.next_delay(slot);
+                    log::warn!(
+                        target: &log_target,
+                        "backing off {:?} before restarting",
+                        backoff
+                    );
+                    // Sleep in slices so the thread stays responsive to shutdown (and to
+                    // steal proposals — a backing-off thread is quiescent and often the
+                    // least-progressed, so it is a prime steal victim) during the wait.
+                    let deadline = std::time::Instant::now() + backoff;
+                    let mut shutdown_requested = false;
+                    while std::time::Instant::now() < deadline {
+                        if poll_shutdown(&shutdown_flag, &mut shutdown_rx) {
+                            shutdown_requested = true;
+                            break;
+                        }
+                        if work_stealing {
+                            let resume_position = slot_range.start;
+                            service_steal_inbox(
+                                &mut steal_inbox,
+                                &mut slot_range,
+                                resume_position,
+                                &work_registry[thread_index],
+                                &log_target,
+                                true,
+                            );
+                        }
+                        sleep(std::time::Duration::from_millis(250)).await;
+                    }
+                    if shutdown_requested {
+                        log::info!(
+                            target: &log_target,
+                            "shutdown requested; terminating firehose thread {}",
+                            thread_index
+                        );
+                        break;
+                    }
+                }
             }
         });
         handles.push(handle);
@@ -1933,6 +2725,62 @@ where
     // Wait for all threads to complete
     for handle in handles {
         handle.await.unwrap();
+    }
+    if let Some(monitor) = recycle_monitor {
+        monitor.abort();
+    }
+    // End-of-run coverage audit: the union of journaled intervals must cover every present
+    // slot in the requested range. Skipped when the run was interrupted (holes are expected
+    // then) or when work stealing (and thus journaling) was inactive.
+    if work_stealing && !shutdown_flag.load(Ordering::SeqCst) {
+        let mut covered = coverage_log.lock().unwrap().clone();
+        covered.retain(|(start, end)| end > start);
+        covered.sort_unstable();
+        let mut holes: Vec<(u64, u64)> = Vec::new();
+        let mut cursor = overall_start;
+        for (start, end) in covered {
+            if start > cursor {
+                holes.push((cursor, start));
+            }
+            cursor = cursor.max(end);
+        }
+        if cursor < overall_end {
+            holes.push((cursor, overall_end));
+        }
+        let mut real_holes = 0usize;
+        for (hole_start, hole_end) in &holes {
+            if let Some(missing) = crate::index::next_present_slot(
+                hole_start.saturating_sub(1),
+                hole_end.saturating_sub(1),
+            )
+            .await
+            {
+                real_holes += 1;
+                if real_holes <= 10 {
+                    log::error!(
+                        target: LOG_MODULE,
+                        "🕳️ coverage audit: slots [{}, {}) were never processed (first present slot: {})",
+                        hole_start,
+                        hole_end,
+                        missing
+                    );
+                }
+            }
+        }
+        if real_holes == 0 {
+            log::info!(
+                target: LOG_MODULE,
+                "coverage audit passed: every present slot in [{}, {}) was processed",
+                overall_start,
+                overall_end
+            );
+        } else {
+            log::error!(
+                target: LOG_MODULE,
+                "🕳️ coverage audit FAILED: {} hole(s) containing unprocessed slots — output is incomplete; re-run the listed ranges",
+                real_holes
+            );
+        }
     }
     if stats_tracking.is_some() {
         let elapsed = firehose_start.elapsed();
@@ -2210,6 +3058,7 @@ async fn firehose_geyser_thread(
     let initial_slot_range = slot_range.clone();
     let mut skip_until_index = None;
     let mut last_counted_slot = slot_range.start.saturating_sub(1);
+    let mut retry_backoff = RetryBackoff::new();
     // let mut triggered = false;
     while let Err((err, slot)) = async {
             if shutdown.load(Ordering::Relaxed) {
@@ -2299,36 +3148,23 @@ async fn firehose_geyser_thread(
                 current_slot = None;
 
                 if local_start > epoch_start {
-                    // Seek to the nearest previous indexed slot so the reader captures the full
-                    // node set (transactions, entries, rewards) for the target block.
-                    let seek_slot = match timeout(
-                        op_timeout,
-                        find_previous_indexed_slot(local_start, epoch_start, &log_target),
-                    )
-                    .await
-                    {
-                        Ok(res) => res.map_err(|e| (e, current_slot.unwrap_or(slot_range.start)))?,
+                    // Seek to the start of `local_start`'s data; the index maps each slot to
+                    // the byte range containing all of its nodes (transactions, entries,
+                    // rewards, block), and the seek skips forward over missing slots. Errors
+                    // are attributed to `local_start` so retries invalidate and resume the
+                    // epoch actually being sought. Acquire the global seek-spacing permit
+                    // before starting the timeout clock: with hundreds of threads the permit
+                    // queue alone can exceed the op timeout, and that wait is pacing, not a
+                    // stall.
+                    reader.prime_seek_permit().await;
+                    let seek_fut = reader.seek_to_slot(local_start);
+                    match timeout(op_timeout, seek_fut).await {
+                        Ok(res) => res.map_err(|e| (e, local_start))?,
                         Err(_) => {
                             return Err((
-                                FirehoseError::OperationTimeout(
-                                    "seek_to_previous_indexed_slot",
-                                ),
-                                current_slot.unwrap_or(slot_range.start),
+                                FirehoseError::OperationTimeout("seek_to_slot"),
+                                local_start,
                             ));
-                        }
-                    };
-                    if let Some(seek_slot) = seek_slot {
-                        let seek_fut = reader.seek_to_slot(seek_slot);
-                        match timeout(op_timeout, seek_fut).await {
-                            Ok(res) => {
-                                res.map_err(|e| (e, current_slot.unwrap_or(slot_range.start)))?
-                            }
-                            Err(_) => {
-                                return Err((
-                                    FirehoseError::OperationTimeout("seek_to_slot"),
-                                    current_slot.unwrap_or(slot_range.start),
-                                ));
-                            }
                         }
                     }
                 }
@@ -2358,27 +3194,33 @@ async fn firehose_geyser_thread(
                     if shutdown.load(Ordering::Relaxed) {
                         return Ok(());
                     }
-                    if nodes.is_empty() {
-                        log::info!(
-                            target: &log_target,
-                            "reached end of epoch {}",
-                            epoch_num
-                        );
+                    thread_activity::note(thread_index.unwrap_or(0));
+                    let stream_ended = nodes.is_empty()
+                        || nodes
+                            .0
+                            .last()
+                            .is_some_and(|last_node| !last_node.get_node().is_block());
+                    if stream_ended {
+                        // EOF is ambiguous (genuine epoch end vs a connection the CDN closed
+                        // mid-transfer); consult the slot index before completing.
+                        let scan_end = local_end_inclusive.min(slot_range.end.saturating_sub(1));
+                        if let Some(missing) =
+                            crate::index::next_present_slot(last_counted_slot, scan_end).await
+                        {
+                            log::warn!(
+                                target: &log_target,
+                                "stream ended prematurely in epoch {} — slot {} (and possibly more) still unprocessed; restarting",
+                                epoch_num,
+                                missing
+                            );
+                            return Err((
+                                FirehoseError::PrematureStreamEnd,
+                                last_counted_slot.saturating_add(1),
+                            ));
+                        }
+                        log::info!(target: &log_target, "reached end of epoch {}", epoch_num);
                         break;
                     }
-                    // ignore epoch and subset nodes at end of car file loop { if
-                    // nodes.0.is_empty() { break; } if let Some(node) = nodes.0.last() { if
-                    //     node.get_node().is_epoch() { log::debug!(target: &log_target,
-                    //         "skipping epoch node for epoch {}", epoch_num); nodes.0.pop(); }
-                    //     else if node.get_node().is_subset() { nodes.0.pop(); } else if
-                    //     node.get_node().is_block() { break; } } } if nodes.0.is_empty() {
-                    //         log::info!(target: &log_target, "reached end of epoch {}",
-                    //             epoch_num); break; }
-                    if let Some(last_node) = nodes.0.last()
-                        && !last_node.get_node().is_block() {
-                            log::info!(target: &log_target, "reached end of epoch {}", epoch_num);
-                            break;
-                        }
                     let block = nodes
                         .get_block()
                         .map_err(FirehoseError::GetBlockError)
@@ -2616,6 +3458,7 @@ async fn firehose_geyser_thread(
                             elapsed_pretty
                         );
                         log::info!(target: &log_target, "a 🚒 firehose thread finished completed its work.");
+                        thread_activity::note_finished(thread_index.unwrap_or(0));
                         // On completion, report threads with non-zero error counts for
                         // visibility.
                         let summary: String = error_counts
@@ -2685,6 +3528,13 @@ async fn firehose_geyser_thread(
             // is reset to 0 each epoch restart. Keeping it can skip large portions
             // of the stream and silently drop slots.
             skip_until_index = None;
+            let backoff = retry_backoff.next_delay(slot);
+            log::warn!(
+                target: &log_target,
+                "backing off {:?} before restarting",
+                backoff
+            );
+            sleep(backoff).await;
 }
     Ok(())
 }
@@ -2838,6 +3688,133 @@ fn human_readable_duration(duration: std::time::Duration) -> String {
         } else {
             format!("{secs}s")
         }
+    }
+}
+
+#[cfg(test)]
+mod reverse_resume_tests {
+    use super::*;
+
+    // Epoch 899 spans slots 388368000..=388799999; epoch 900 starts at 388800000.
+
+    #[test]
+    fn test_mid_epoch_error_resumes_in_place() {
+        let (resume, highest) = reverse_resume_after_error(388799951, 388799950, Some(899));
+        assert_eq!(resume, Some(388799951));
+        assert_eq!(highest, Some(899));
+    }
+
+    #[test]
+    fn test_tail_timeout_marks_epoch_complete() {
+        // Error attributed to the next epoch's first slot after the tail slot was counted:
+        // the epoch slice is done; resuming from the slice start would double-emit it.
+        let (resume, highest) = reverse_resume_after_error(388800000, 388799999, Some(899));
+        assert_eq!(resume, None);
+        assert_eq!(highest, Some(898));
+    }
+
+    #[test]
+    fn test_tail_error_attributed_within_epoch_marks_complete() {
+        // Decoding error attributed to the already-counted tail slot: resume would be
+        // tail + 1, crossing the boundary — same completion case.
+        let (resume, highest) = reverse_resume_after_error(388799999, 388799999, Some(899));
+        assert_eq!(resume, None);
+        assert_eq!(highest, Some(898));
+    }
+
+    #[test]
+    fn test_seek_error_before_any_progress_keeps_epoch() {
+        // First epoch (900) seek fails before any block; last_counted is still the
+        // pre-range sentinel in epoch 899. The higher epoch must not be marked complete.
+        let (resume, highest) = reverse_resume_after_error(388800000, 388799899, Some(900));
+        assert_eq!(resume, None);
+        assert_eq!(highest, Some(900));
+    }
+
+    #[test]
+    fn test_lower_epoch_seek_error_after_higher_done_resumes() {
+        // Epoch 900 finished (last_counted in 900); epoch 899's seek fails with the error
+        // attributed inside 899. Not a tail crossing — keep a resume marker (which the
+        // epoch-match check resolves to the slice start of 899).
+        let (resume, highest) = reverse_resume_after_error(388799900, 388800099, Some(899));
+        assert_eq!(resume, Some(388800100));
+        assert_eq!(highest, Some(899));
+    }
+
+    #[test]
+    fn test_epoch_zero_tail_error_completes_run() {
+        // Epoch 0's tail is slot 431999; the error is attributed to slot 432000 (epoch 1).
+        // "No epochs remaining" must be explicit (`None`) — a saturating subtraction would
+        // silently pin at 0 and replay epoch 0 forever.
+        let (resume, highest) = reverse_resume_after_error(432000, 431999, Some(0));
+        assert_eq!(resume, None);
+        assert_eq!(highest, None);
+    }
+}
+
+#[cfg(test)]
+mod steal_protocol_tests {
+    use super::*;
+
+    fn slice(start: u64, next: u64, end: u64) -> WorkSlice {
+        WorkSlice {
+            start: AtomicU64::new(start),
+            next: AtomicU64::new(next),
+            end: AtomicU64::new(end),
+        }
+    }
+
+    #[test]
+    fn test_grant_splits_remaining_and_commits() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let ledger = slice(1000, 1100, 1200);
+        let mut range = 1000..1200;
+        let (reply_tx, mut reply_rx) = oneshot::channel();
+        tx.send(StealRequest { reply: reply_tx }).unwrap();
+        service_steal_inbox(&mut rx, &mut range, 1100, &ledger, "test", true);
+        assert_eq!(reply_rx.try_recv().unwrap(), Some(1150..1200));
+        assert_eq!(range.end, 1150);
+        assert_eq!(ledger.end.load(Ordering::SeqCst), 1150);
+    }
+
+    #[test]
+    fn test_rejects_below_min_steal() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let ledger = slice(1000, 1100, 1150);
+        let mut range = 1000..1150;
+        let (reply_tx, mut reply_rx) = oneshot::channel();
+        tx.send(StealRequest { reply: reply_tx }).unwrap();
+        service_steal_inbox(&mut rx, &mut range, 1100, &ledger, "test", true);
+        assert_eq!(reply_rx.try_recv().unwrap(), None);
+        assert_eq!(range.end, 1150);
+        assert_eq!(ledger.end.load(Ordering::SeqCst), 1150);
+    }
+
+    #[test]
+    fn test_drain_mode_refuses_even_with_work() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let ledger = slice(1000, 1000, 2000);
+        let mut range = 1000..2000;
+        let (reply_tx, mut reply_rx) = oneshot::channel();
+        tx.send(StealRequest { reply: reply_tx }).unwrap();
+        service_steal_inbox(&mut rx, &mut range, 1000, &ledger, "test", false);
+        assert_eq!(reply_rx.try_recv().unwrap(), None);
+        assert_eq!(range.end, 2000);
+    }
+
+    #[test]
+    fn test_abandoned_request_does_not_commit() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let ledger = slice(1000, 1100, 1200);
+        let mut range = 1000..1200;
+        let (reply_tx, reply_rx) = oneshot::channel();
+        tx.send(StealRequest { reply: reply_tx }).unwrap();
+        // The thief gave up before the victim answered: the grant must not commit,
+        // otherwise the granted slots would be orphaned.
+        drop(reply_rx);
+        service_steal_inbox(&mut rx, &mut range, 1100, &ledger, "test", true);
+        assert_eq!(range.end, 1200);
+        assert_eq!(ledger.end.load(Ordering::SeqCst), 1200);
     }
 }
 

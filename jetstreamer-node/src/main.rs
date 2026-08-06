@@ -5666,8 +5666,7 @@ async fn run_geyser_replay(
     let confirmed_bank_handle =
         std::thread::spawn(move || while confirmed_bank_receiver.recv().is_ok() {});
     let (epoch_start, end_inclusive) = epoch_to_slot_range(epoch);
-    let progress =
-        carried_progress.unwrap_or_else(|| Arc::new(ReplayProgress::new(epoch_start)));
+    let progress = carried_progress.unwrap_or_else(|| Arc::new(ReplayProgress::new(epoch_start)));
     // Fresh per-epoch baseline: a chained epoch reuses the shared instance, so
     // clear last-run counts before this epoch's replay begins (no notifications
     // are in flight here — the previous epoch's replay has fully returned).
@@ -5698,7 +5697,9 @@ async fn run_geyser_replay(
                 .map_err(|_| "bank forks lock poisoned".to_string())?
                 .working_bank()
                 .slot();
-            info!("reusing in-memory bank from previous epoch at slot {slot}; skipping snapshot load");
+            info!(
+                "reusing in-memory bank from previous epoch at slot {slot}; skipping snapshot load"
+            );
             (BankSource::Reuse(bank_forks), slot)
         }
         None => {
@@ -5995,8 +5996,8 @@ async fn run_geyser_replay(
                 if phases_interval.is_zero() {
                     return;
                 }
-                let due = last_phases_log
-                    .is_none_or(|last: Instant| last.elapsed() >= phases_interval);
+                let due =
+                    last_phases_log.is_none_or(|last: Instant| last.elapsed() >= phases_interval);
                 if (force || due)
                     && let Some(phases) = phases_summary()
                 {
@@ -6474,7 +6475,9 @@ async fn run_geyser_replay(
                         } else {
                             let rate = (advanced as f64) / elapsed;
                             let remaining = rp.overall_end_slot.saturating_sub(display_slot);
-                            format_eta(Duration::from_secs(((remaining as f64) / rate).ceil() as u64))
+                            format_eta(Duration::from_secs(
+                                ((remaining as f64) / rate).ceil() as u64
+                            ))
                         };
                         info!(
                             "overall slot {display_slot}/{} ({overall_percent:.2}%) epoch {epoch_idx}/{} eta={overall_eta}",
@@ -6863,7 +6866,10 @@ async fn ensure_epoch_boundary_snapshot(epoch: u64, dest_dir: &Path) -> Result<P
     let path = download_snapshot_at_or_before_slot(epoch, target_slot, dest_dir)
         .await
         .map_err(|err| format!("failed to download epoch {epoch} boundary snapshot: {err}"))?;
-    info!("epoch {epoch}: downloaded boundary snapshot to {}", path.display());
+    info!(
+        "epoch {epoch}: downloaded boundary snapshot to {}",
+        path.display()
+    );
     Ok(path)
 }
 
@@ -6872,8 +6878,12 @@ async fn ensure_epoch_boundary_snapshot(epoch: u64, dest_dir: &Path) -> Result<P
 /// filename format is the same one `parse_snapshot_archive_name` accepts, so
 /// writer and reader can't drift.
 fn read_epoch_hashes_file(path: &Path) -> Result<BTreeMap<Slot, SnapshotHash>, String> {
-    let contents = fs::read_to_string(path)
-        .map_err(|err| format!("failed to read snapshot hashes file {}: {err}", path.display()))?;
+    let contents = fs::read_to_string(path).map_err(|err| {
+        format!(
+            "failed to read snapshot hashes file {}: {err}",
+            path.display()
+        )
+    })?;
     let mut expected = BTreeMap::new();
     for line in contents.lines() {
         let line = line.trim();
@@ -6907,8 +6917,8 @@ async fn run_epoch_range_supervisor(
     shutdown: Arc<AtomicBool>,
     boundary_snapshots: BTreeMap<u64, PathBuf>,
 ) -> Result<(), String> {
-    let exe = env::current_exe()
-        .map_err(|err| format!("failed to resolve current executable: {err}"))?;
+    let exe =
+        env::current_exe().map_err(|err| format!("failed to resolve current executable: {err}"))?;
     let attempts_per_epoch = env::var("JETSTREAMER_EPOCH_ATTEMPTS")
         .ok()
         .and_then(|v| v.trim().parse::<u32>().ok())
@@ -6938,7 +6948,11 @@ async fn run_epoch_range_supervisor(
             let mut cmd = Command::new(&exe);
             cmd.arg(epoch.to_string())
                 .arg(dest_dir.as_os_str())
-                .arg(if verify_snapshots { "--verify" } else { "--no-verify" })
+                .arg(if verify_snapshots {
+                    "--verify"
+                } else {
+                    "--no-verify"
+                })
                 .arg(format!("--range-info={effective_start}-{end_epoch}"));
             if verify_snapshots {
                 cmd.arg(format!("--epoch-hashes={}", hashes_path.display()));
@@ -6953,13 +6967,14 @@ async fn run_epoch_range_supervisor(
             if status.success() && epoch_archive_complete(&jet_path) {
                 info!("epoch {epoch} child completed");
                 let _ = fs::remove_file(&hashes_path);
-                if prune_snapshots
-                    && let Some(path) = boundary_snapshots.get(&epoch)
-                {
+                if prune_snapshots && let Some(path) = boundary_snapshots.get(&epoch) {
                     match fs::remove_file(path) {
                         Ok(()) => info!("pruned boundary snapshot {}", path.display()),
                         Err(err) => {
-                            warn!("failed to prune boundary snapshot {}: {err}", path.display())
+                            warn!(
+                                "failed to prune boundary snapshot {}: {err}",
+                                path.display()
+                            )
                         }
                     }
                 }
@@ -7201,7 +7216,8 @@ async fn main() {
                 );
                 exit(1);
             }
-            match download_snapshot_at_or_before_slot(effective_start, target_slot, &dest_dir).await {
+            match download_snapshot_at_or_before_slot(effective_start, target_slot, &dest_dir).await
+            {
                 Ok(path) => {
                     println!("Downloaded snapshot to {}", path.display());
                     path
@@ -7320,7 +7336,9 @@ async fn main() {
                     }
                 }
             }
-            info!("=== gcloud/GCS prefetch complete; no further gcloud access for the rest of the run ===");
+            info!(
+                "=== gcloud/GCS prefetch complete; no further gcloud access for the rest of the run ==="
+            );
         }
     }
 
@@ -7391,9 +7409,7 @@ async fn main() {
     // accounts-db notifier, created at the first epoch's load and carried with
     // the reused bank, captures this and keeps updating it for chained epochs —
     // otherwise their per-epoch counter stays at 0 and the stall watchdog aborts.
-    let shared_progress = Arc::new(ReplayProgress::new(
-        epoch_to_slot_range(effective_start).0,
-    ));
+    let shared_progress = Arc::new(ReplayProgress::new(epoch_to_slot_range(effective_start).0));
     let mut carried_bank_forks: Option<Arc<RwLock<BankForks>>> = None;
     for epoch in effective_start..=end_epoch {
         if shutdown.load(Ordering::SeqCst) {

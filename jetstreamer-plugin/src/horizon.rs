@@ -263,13 +263,13 @@ impl HorizonPluginRunner {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let db = Arc::new(
             crate::build_clickhouse_client(&self.dsn)
-                .with_option("async_insert", "1")
+                .with_setting("async_insert", "1")
                 // Durable acks: an insert completes only once the server has
                 // flushed it. Anything less lets unacknowledged batches build
                 // up server-side and fail silently under pressure; with this
                 // setting, a ClickHouse that can't keep up surfaces as
                 // backpressure (via the bounded queue) instead of data loss.
-                .with_option("wait_for_async_insert", "1"),
+                .with_setting("wait_for_async_insert", "1"),
         );
 
         for plugin in &self.plugins {

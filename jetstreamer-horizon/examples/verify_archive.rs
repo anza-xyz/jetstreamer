@@ -139,30 +139,58 @@ fn report_byte_breakdown(bytes: PayloadByteStats, raw_account_data_bytes: u64) {
     }
 }
 
-/// Prints blockhash-chain continuity (linkage) breaks.
-fn report_chain_breaks(breaks: &[(u64, Hash, Hash)], blocks: u64) {
+/// Prints blockhash-chain continuity (linkage) breaks, separating genuine
+/// mismatches from writer-resume artifacts (a zeroed `parent_blockhash` is the
+/// stream's `Hash::default()` placeholder, stamped by the first block written
+/// after a mid-epoch (re)start — the chain itself never contains a zero parent).
+/// Returns the number of GENUINE breaks; artifacts do not fail verification.
+fn report_chain_breaks(breaks: &[(u64, Hash, Hash)], blocks: u64) -> usize {
+    let (artifacts, genuine): (Vec<_>, Vec<_>) = breaks
+        .iter()
+        .partition(|(_, _, got)| *got == Hash::default());
     println!("\n=== chain continuity ===");
     if breaks.is_empty() {
         println!(
             "  blockhash chain intact across all {} blocks",
             commas(blocks)
         );
-    } else {
+        return 0;
+    }
+    if !genuine.is_empty() {
         println!(
-            "  {} chain break(s) — a block's parent_blockhash did not match the previous block:",
-            commas(breaks.len() as u64)
+            "  {} genuine chain break(s) — a block's parent_blockhash names a hash the \
+             previous block in the archive does not have:",
+            commas(genuine.len() as u64)
         );
-        for (slot, exp, got) in breaks.iter().take(20) {
+        for (slot, exp, got) in genuine.iter().take(20) {
             println!("    slot {slot}: parent={got} but previous block hash was {exp}");
         }
-        if breaks.len() > 20 {
-            println!("    … and {} more", breaks.len() - 20);
+        if genuine.len() > 20 {
+            println!("    … and {} more", genuine.len() - 20);
         }
         println!(
-            "  (a break means a slot recorded as leader-skipped actually had a real block on \
-             chain — its data was unavailable from old-faithful, so the archive has a genuine gap.)"
+            "  (the parent hash points at a block this archive does not contain — e.g. a slot \
+             recorded as leader-skipped that the chain says had a real block. Genuine data gap.)"
         );
     }
+    if !artifacts.is_empty() {
+        println!(
+            "  {} resume artifact(s) — parent_blockhash is zeroed (the writer's stream \
+             (re)started at this slot and did not know the parent hash):",
+            commas(artifacts.len() as u64)
+        );
+        for (slot, exp, _) in artifacts.iter().take(20) {
+            println!("    slot {slot}: parent=zeroed; actual previous block hash was {exp}");
+        }
+        if artifacts.len() > 20 {
+            println!("    … and {} more", artifacts.len() - 20);
+        }
+        println!(
+            "  (blocks on both sides are present and decode; this is a metadata placeholder \
+             from a mid-epoch writer restart, not a data gap. Not counted as a failure.)"
+        );
+    }
+    genuine.len()
 }
 
 impl SlotVisitor for Tally {
@@ -606,7 +634,13 @@ fn run_scan(path: &str, threads: usize, full: bool, seed_arg: Option<Hash>) -> i
     );
 
     report_byte_breakdown(byte_stats, scan.raw_account_data_bytes);
-    report_chain_breaks(&linkage_breaks, block_count);
+    let genuine_breaks = report_chain_breaks(&linkage_breaks, block_count);
+    let resume_artifacts = linkage_breaks.len() - genuine_breaks;
+    let artifact_note = if resume_artifacts > 0 {
+        format!(" ({resume_artifacts} zero-parent resume artifact(s) noted; see chain continuity)")
+    } else {
+        String::new()
+    };
 
     if full {
         println!("\n=== full PoH verification ===");
@@ -632,7 +666,7 @@ fn run_scan(path: &str, threads: usize, full: bool, seed_arg: Option<Hash>) -> i
         );
     }
 
-    let pass = linkage_breaks.is_empty() && poh_failures.is_empty() && counts_ok;
+    let pass = genuine_breaks == 0 && poh_failures.is_empty() && counts_ok;
     if pass && (!full || seed.is_some()) {
         let detail = if full {
             "every block's PoH recomputes to its stored blockhash and the chain links cleanly \
@@ -641,20 +675,21 @@ fn run_scan(path: &str, threads: usize, full: bool, seed_arg: Option<Hash>) -> i
             "all buckets checksum-verified, every slot/transaction/update decoded, blockhash \
              chain intact, tallies consistent"
         };
-        println!("\nRESULT: OK — {detail}.");
+        println!("\nRESULT: OK — {detail}.{artifact_note}");
         0
     } else if pass {
         println!(
             "\nRESULT: OK (unanchored) — all PoH hashes and internal links verify, but no seed \
-             was available to anchor the first block to the previous epoch."
+             was available to anchor the first block to the previous epoch.{artifact_note}"
         );
         0
     } else {
         println!(
-            "\nRESULT: FAIL — {} linkage break(s), {} PoH mismatch(es){}.",
-            linkage_breaks.len(),
+            "\nRESULT: FAIL — {} genuine linkage break(s), {} PoH mismatch(es){}.{}",
+            genuine_breaks,
             poh_failures.len(),
             if counts_ok { "" } else { ", tally mismatch" },
+            artifact_note,
         );
         1
     }
@@ -784,16 +819,24 @@ fn main() {
     );
 
     report_byte_breakdown(reader.payload_byte_stats(), tally.raw_account_data_bytes);
-    report_chain_breaks(&tally.chain_breaks, tally.blocks);
+    let genuine = report_chain_breaks(&tally.chain_breaks, tally.blocks);
+    let artifacts = tally.chain_breaks.len() - genuine;
 
     // This path only runs for a partial slice (whole-file verification goes
     // through the parallel scanner), so counts may be incomplete by design.
-    if tally.chain_breaks.is_empty() {
-        println!("\nRESULT: OK (partial read of {visited} slots).");
+    if genuine == 0 {
+        if artifacts > 0 {
+            println!(
+                "\nRESULT: OK (partial read of {visited} slots; {artifacts} zero-parent \
+                 resume artifact(s) noted)."
+            );
+        } else {
+            println!("\nRESULT: OK (partial read of {visited} slots).");
+        }
     } else {
         println!(
-            "\nRESULT: partial read of {visited} slots with {} chain break(s); see above.",
-            tally.chain_breaks.len()
+            "\nRESULT: partial read of {visited} slots with {genuine} genuine chain break(s); \
+             see above."
         );
         std::process::exit(1);
     }

@@ -232,6 +232,17 @@ pub mod thread_activity {
     }
 }
 
+/// Last entry hash in a block's node set — by construction the block's blockhash.
+/// Used to prime the parent-hash chain from a preceding, non-emitted slot so the
+/// first emitted block records its true `parent_blockhash` instead of
+/// `Hash::default()`.
+fn last_entry_hash(nodes: &crate::node::NodesWithCids) -> Option<Hash> {
+    nodes.0.iter().rev().find_map(|nwc| match nwc.get_node() {
+        crate::node::Node::Entry(entry) => Some(Hash::from(entry.hash.to_bytes())),
+        _ => None,
+    })
+}
+
 /// Default launch-gate grace: how long to wait for every running thread to turn green before
 /// spawning the next one anyway. Overridden by `JETSTREAMER_SPAWN_GRACE_SECS`; `0` disables
 /// launch gating entirely.
@@ -1821,8 +1832,18 @@ where
                         // before starting the timeout clock: with hundreds of threads the permit
                         // queue alone can exceed the op timeout, and that wait is pacing, not a
                         // stall.
+                        //
+                        // Enter one present slot early when the index allows: the preceding
+                        // block is decoded but not emitted (the below-start guard skips it),
+                        // which primes the parent-hash chain so the first emitted block
+                        // carries its true parent_blockhash instead of Hash::default() —
+                        // otherwise every mid-epoch (re)start stamps a zero parent into
+                        // consumers (one linkage break per retry in written archives).
+                        let seek_target = crate::index::prev_present_slot(epoch_start, local_start)
+                            .await
+                            .unwrap_or(local_start);
                         reader.prime_seek_permit().await;
-                        let seek_fut = reader.seek_to_slot(local_start);
+                        let seek_fut = reader.seek_to_slot(seek_target);
                         match timeout(op_timeout, seek_fut).await {
                             Ok(res) => res.map_err(|e| (e, local_start))?,
                             Err(_) => {
@@ -1974,6 +1995,13 @@ where
                                     slot,
                                     slot_range.start
                                 );
+                            }
+                            // Fold the skipped block's entries into the hash chain: its
+                            // last entry hash is its blockhash, i.e. the next block's
+                            // true parent.
+                            if let Some(hash) = last_entry_hash(&nodes) {
+                                latest_entry_blockhash = hash;
+                                previous_blockhash = hash;
                             }
                             continue;
                         }
@@ -3156,8 +3184,18 @@ async fn firehose_geyser_thread(
                     // before starting the timeout clock: with hundreds of threads the permit
                     // queue alone can exceed the op timeout, and that wait is pacing, not a
                     // stall.
+                    //
+                    // Enter one present slot early when the index allows: the preceding
+                    // block is decoded but not emitted (the below-start guard skips it),
+                    // which primes the parent-hash chain so the first emitted block
+                    // carries its true parent_blockhash instead of Hash::default() —
+                    // otherwise every mid-epoch (re)start stamps a zero parent into
+                    // consumers (one linkage break per retry in written archives).
+                    let seek_target = crate::index::prev_present_slot(epoch_start, local_start)
+                        .await
+                        .unwrap_or(local_start);
                     reader.prime_seek_permit().await;
-                    let seek_fut = reader.seek_to_slot(local_start);
+                    let seek_fut = reader.seek_to_slot(seek_target);
                     match timeout(op_timeout, seek_fut).await {
                         Ok(res) => res.map_err(|e| (e, local_start))?,
                         Err(_) => {
@@ -3264,6 +3302,13 @@ async fn firehose_geyser_thread(
                                 slot,
                                 local_start
                             );
+                        }
+                        // Fold the skipped block's entries into the hash chain: its
+                        // last entry hash is its blockhash, i.e. the next block's
+                        // true parent.
+                        if let Some(hash) = last_entry_hash(&nodes) {
+                            todo_latest_entry_blockhash = hash;
+                            todo_previous_blockhash = hash;
                         }
                         continue;
                     }

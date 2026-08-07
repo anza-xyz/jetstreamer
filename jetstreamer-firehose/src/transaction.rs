@@ -126,6 +126,24 @@ impl Transaction {
     }
 }
 
+/// Parses a versioned transaction payload from a raw byte slice.
+pub fn parse_versioned_transaction_from_slice(
+    data: &[u8],
+) -> Result<solana_transaction::versioned::VersionedTransaction, SharedError> {
+    Ok(VersionedTransactionSchema::deserialize(data)?)
+}
+
+/// Returns the byte size this `VersionedTransaction` would occupy if
+/// re-serialized in Solana's native wire format (the same wincode schema
+/// used by [`parse_versioned_transaction_from_slice`]). Useful as a
+/// baseline for comparing against alternative encoders.
+pub fn wincode_serialized_size(
+    tx: &solana_transaction::versioned::VersionedTransaction,
+) -> Result<usize, SharedError> {
+    use wincode::SchemaWrite;
+    Ok(VersionedTransactionSchema::size_of(tx)?)
+}
+
 mod wincode_schema {
     use {
         solana_address::Address,

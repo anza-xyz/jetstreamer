@@ -232,6 +232,17 @@ pub mod thread_activity {
     }
 }
 
+/// Last entry hash in a block's node set — by construction the block's blockhash.
+/// Used to prime the parent-hash chain from a preceding, non-emitted slot so the
+/// first emitted block records its true `parent_blockhash` instead of
+/// `Hash::default()`.
+fn last_entry_hash(nodes: &crate::node::NodesWithCids) -> Option<Hash> {
+    nodes.0.iter().rev().find_map(|nwc| match nwc.get_node() {
+        crate::node::Node::Entry(entry) => Some(Hash::from(entry.hash.to_bytes())),
+        _ => None,
+    })
+}
+
 /// Default launch-gate grace: how long to wait for every running thread to turn green before
 /// spawning the next one anyway. Overridden by `JETSTREAMER_SPAWN_GRACE_SECS`; `0` disables
 /// launch gating entirely.
@@ -704,6 +715,16 @@ impl Display for FirehoseError {
             }
         }
     }
+}
+
+/// Bundles optional Geyser notifiers for in-process replay.
+pub struct GeyserNotifiers {
+    /// Optional notifier for transaction updates.
+    pub transaction_notifier: Option<Arc<dyn TransactionNotifier + Send + Sync + 'static>>,
+    /// Optional notifier for entry updates.
+    pub entry_notifier: Option<Arc<dyn EntryNotifier + Send + Sync + 'static>>,
+    /// Optional notifier for block metadata updates.
+    pub block_metadata_notifier: Option<Arc<dyn BlockMetadataNotifier + Send + Sync + 'static>>,
 }
 
 impl From<reqwest::Error> for FirehoseError {
@@ -1811,8 +1832,18 @@ where
                         // before starting the timeout clock: with hundreds of threads the permit
                         // queue alone can exceed the op timeout, and that wait is pacing, not a
                         // stall.
+                        //
+                        // Enter one present slot early when the index allows: the preceding
+                        // block is decoded but not emitted (the below-start guard skips it),
+                        // which primes the parent-hash chain so the first emitted block
+                        // carries its true parent_blockhash instead of Hash::default() —
+                        // otherwise every mid-epoch (re)start stamps a zero parent into
+                        // consumers (one linkage break per retry in written archives).
+                        let seek_target = crate::index::prev_present_slot(epoch_start, local_start)
+                            .await
+                            .unwrap_or(local_start);
                         reader.prime_seek_permit().await;
-                        let seek_fut = reader.seek_to_slot(local_start);
+                        let seek_fut = reader.seek_to_slot(seek_target);
                         match timeout(op_timeout, seek_fut).await {
                             Ok(res) => res.map_err(|e| (e, local_start))?,
                             Err(_) => {
@@ -1964,6 +1995,13 @@ where
                                     slot,
                                     slot_range.start
                                 );
+                            }
+                            // Fold the skipped block's entries into the hash chain: its
+                            // last entry hash is its blockhash, i.e. the next block's
+                            // true parent.
+                            if let Some(hash) = last_entry_hash(&nodes) {
+                                latest_entry_blockhash = hash;
+                                previous_blockhash = hash;
                             }
                             continue;
                         }
@@ -2831,7 +2869,6 @@ pub fn firehose_geyser(
         ));
     }
     log::info!(target: LOG_MODULE, "starting firehose...");
-    log::info!(target: LOG_MODULE, "index base url: {}", index_base_url);
     let (confirmed_bank_sender, confirmed_bank_receiver) = unbounded();
     let mut entry_notifier_maybe = None;
     let mut block_meta_notifier_maybe = None;
@@ -2860,6 +2897,74 @@ pub fn firehose_geyser(
         log::debug!(target: LOG_MODULE, "geyser plugin service initialized.");
     }
 
+    let notifiers = GeyserNotifiers {
+        transaction_notifier: transaction_notifier_maybe,
+        entry_notifier: entry_notifier_maybe,
+        block_metadata_notifier: block_meta_notifier_maybe,
+    };
+
+    firehose_geyser_with_notifiers(
+        rt,
+        slot_range,
+        notifiers,
+        confirmed_bank_sender,
+        index_base_url,
+        client,
+        Arc::new(AtomicBool::new(false)),
+        on_load,
+        threads,
+        false,
+        None,
+    )?;
+    Ok(confirmed_bank_receiver)
+}
+
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::result_large_err)]
+/// Builds a Geyser-backed firehose using caller-provided notifiers.
+///
+/// When `sequential` is `true`, a single firehose thread is used and `threads` configures
+/// ripget range-request concurrency instead. `buffer_window_bytes` controls the ripget
+/// hot/cold window; pass `None` for the default.
+pub fn firehose_geyser_with_notifiers(
+    rt: Arc<tokio::runtime::Runtime>,
+    slot_range: Range<u64>,
+    notifiers: GeyserNotifiers,
+    confirmed_bank_sender: Sender<SlotNotification>,
+    index_base_url: &Url,
+    client: &Client,
+    shutdown: Arc<AtomicBool>,
+    on_load: impl Future<Output = Result<(), SharedError>> + Send + 'static,
+    threads: u64,
+    sequential: bool,
+    buffer_window_bytes: Option<u64>,
+) -> Result<(), (FirehoseError, u64)> {
+    if threads == 0 {
+        return Err((
+            FirehoseError::OnLoadError("Number of threads must be greater than 0".into()),
+            slot_range.start,
+        ));
+    }
+    log::info!(target: LOG_MODULE, "starting firehose...");
+    log::info!(target: LOG_MODULE, "index base url: {}", index_base_url);
+    let firehose_threads = if sequential { 1 } else { threads };
+    let sequential_download_threads = std::cmp::max(1, threads as usize);
+    let sequential_buffer_window_bytes = buffer_window_bytes
+        .filter(|value| *value >= 2)
+        .unwrap_or_else(crate::system::default_firehose_buffer_window_bytes);
+    if sequential {
+        log::info!(
+            target: LOG_MODULE,
+            "sequential mode enabled: firehose_threads=1, ripget_threads={}, ripget_window={}",
+            sequential_download_threads,
+            crate::system::format_byte_size(sequential_buffer_window_bytes)
+        );
+    }
+
+    let transaction_notifier_maybe = Arc::new(notifiers.transaction_notifier);
+    let entry_notifier_maybe = Arc::new(notifiers.entry_notifier);
+    let block_meta_notifier_maybe = Arc::new(notifiers.block_metadata_notifier);
+
     if entry_notifier_maybe.is_some() {
         log::debug!(target: LOG_MODULE, "entry notifications enabled")
     } else {
@@ -2869,14 +2974,24 @@ pub fn firehose_geyser(
     rt.spawn(on_load);
 
     let slot_range = Arc::new(slot_range);
-    let transaction_notifier_maybe = Arc::new(transaction_notifier_maybe);
-    let entry_notifier_maybe = Arc::new(entry_notifier_maybe);
-    let block_meta_notifier_maybe = Arc::new(block_meta_notifier_maybe);
     let confirmed_bank_sender = Arc::new(confirmed_bank_sender);
 
+    // Build a shared ripget HTTP client so TCP connections survive across epoch transitions.
+    let shared_ripget_client: Option<ripget::Client> = if sequential {
+        Some(
+            ripget::build_client(Some(&format!(
+                "jetstreamer-firehose/{}",
+                env!("CARGO_PKG_VERSION")
+            )))
+            .expect("failed to build ripget HTTP client"),
+        )
+    } else {
+        None
+    };
+
     // divide slot_range into n subranges
-    let subranges = generate_subranges(&slot_range, threads);
-    if threads > 1 {
+    let subranges = generate_subranges(&slot_range, firehose_threads);
+    if firehose_threads > 1 {
         log::info!(target: LOG_MODULE, "⚡ thread sub-ranges: {:?}", subranges);
     }
 
@@ -2892,6 +3007,8 @@ pub fn firehose_geyser(
         let confirmed_bank_sender = (*confirmed_bank_sender).clone();
         let client = client.clone();
         let error_counts = error_counts.clone();
+        let shutdown = shutdown.clone();
+        let ripget_client = shared_ripget_client.clone();
 
         let rt_clone = rt.clone();
 
@@ -2904,8 +3021,13 @@ pub fn firehose_geyser(
                     block_meta_notifier_maybe,
                     confirmed_bank_sender,
                     &client,
-                    if threads > 1 { Some(i) } else { None },
+                    if firehose_threads > 1 { Some(i) } else { None },
                     error_counts,
+                    shutdown,
+                    sequential,
+                    sequential_download_threads,
+                    sequential_buffer_window_bytes,
+                    ripget_client,
                 )
                 .await
                 .unwrap();
@@ -2935,7 +3057,7 @@ pub fn firehose_geyser(
             0,
         );
     }
-    Ok(confirmed_bank_receiver)
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2949,6 +3071,11 @@ async fn firehose_geyser_thread(
     client: &Client,
     thread_index: Option<usize>,
     error_counts: Arc<Vec<AtomicU32>>,
+    shutdown: Arc<AtomicBool>,
+    sequential_mode: bool,
+    ripget_threads: usize,
+    ripget_buffer_window_bytes: u64,
+    ripget_client: Option<ripget::Client>,
 ) -> Result<(), (FirehoseError, u64)> {
     let start_time = std::time::Instant::now();
     let log_target = if let Some(thread_index) = thread_index {
@@ -2962,6 +3089,14 @@ async fn firehose_geyser_thread(
     let mut retry_backoff = RetryBackoff::new();
     // let mut triggered = false;
     while let Err((err, slot)) = async {
+            if shutdown.load(Ordering::Relaxed) {
+                return Ok(());
+            }
+            let op_timeout = if sequential_mode {
+                OP_TIMEOUT_SEQUENTIAL
+            } else {
+                OP_TIMEOUT
+            };
             let epoch_range = slot_to_epoch(slot_range.start)..=slot_to_epoch(slot_range.end - 1);
             log::info!(
                 target: &log_target,
@@ -2977,26 +3112,10 @@ async fn firehose_geyser_thread(
             // for each epoch
             let mut current_slot: Option<u64> = None;
             for epoch_num in epoch_range.clone() {
+                if shutdown.load(Ordering::Relaxed) {
+                    return Ok(());
+                }
                 log::info!(target: &log_target, "entering epoch {}", epoch_num);
-                let stream = match timeout(OP_TIMEOUT, fetch_epoch_stream(epoch_num, client)).await {
-                    Ok(stream) => stream,
-                    Err(_) => {
-                        return Err((FirehoseError::OperationTimeout("fetch_epoch_stream"), current_slot.unwrap_or(slot_range.start)));
-                    }
-                };
-                let mut reader = NodeReader::new(stream);
-
-                let header_fut = reader.read_raw_header();
-                let header = match timeout(OP_TIMEOUT, header_fut).await {
-                    Ok(res) => res
-                        .map_err(FirehoseError::ReadHeader)
-                        .map_err(|e| (e, current_slot.unwrap_or(slot_range.start)))?,
-                    Err(_) => {
-                        return Err((FirehoseError::OperationTimeout("read_raw_header"), current_slot.unwrap_or(slot_range.start)));
-                    }
-                };
-                log::debug!(target: &log_target, "read epoch {} header: {:?}", epoch_num, header);
-
                 let (epoch_start, epoch_end_inclusive) = epoch_to_slot_range(epoch_num);
                 let local_start = std::cmp::max(slot_range.start, epoch_start);
                 let local_end_inclusive =
@@ -3011,6 +3130,43 @@ async fn firehose_geyser_thread(
                     );
                     continue;
                 }
+                let use_sequential_stream = sequential_mode && local_start == epoch_start;
+                let stream = match timeout(op_timeout, async {
+                    if use_sequential_stream {
+                        fetch_epoch_stream_with_options(
+                            epoch_num,
+                            client,
+                            Some(FetchEpochStreamOptions {
+                                sequential: true,
+                                ripget_threads,
+                                buffer_window_bytes: ripget_buffer_window_bytes,
+                                ripget_client: ripget_client.clone(),
+                            }),
+                        )
+                        .await
+                    } else {
+                        fetch_epoch_stream(epoch_num, client).await
+                    }
+                })
+                .await
+                {
+                    Ok(stream) => stream,
+                    Err(_) => {
+                        return Err((FirehoseError::OperationTimeout("fetch_epoch_stream"), current_slot.unwrap_or(slot_range.start)));
+                    }
+                };
+                let mut reader = NodeReader::new(stream);
+
+                let header_fut = reader.read_raw_header();
+                let header = match timeout(op_timeout, header_fut).await {
+                    Ok(res) => res
+                        .map_err(FirehoseError::ReadHeader)
+                        .map_err(|e| (e, current_slot.unwrap_or(slot_range.start)))?,
+                    Err(_) => {
+                        return Err((FirehoseError::OperationTimeout("read_raw_header"), current_slot.unwrap_or(slot_range.start)));
+                    }
+                };
+                log::debug!(target: &log_target, "read epoch {} header: {:?}", epoch_num, header);
 
                 let mut todo_previous_blockhash = Hash::default();
                 let mut todo_latest_entry_blockhash = Hash::default();
@@ -3028,9 +3184,19 @@ async fn firehose_geyser_thread(
                     // before starting the timeout clock: with hundreds of threads the permit
                     // queue alone can exceed the op timeout, and that wait is pacing, not a
                     // stall.
+                    //
+                    // Enter one present slot early when the index allows: the preceding
+                    // block is decoded but not emitted (the below-start guard skips it),
+                    // which primes the parent-hash chain so the first emitted block
+                    // carries its true parent_blockhash instead of Hash::default() —
+                    // otherwise every mid-epoch (re)start stamps a zero parent into
+                    // consumers (one linkage break per retry in written archives).
+                    let seek_target = crate::index::prev_present_slot(epoch_start, local_start)
+                        .await
+                        .unwrap_or(local_start);
                     reader.prime_seek_permit().await;
-                    let seek_fut = reader.seek_to_slot(local_start);
-                    match timeout(OP_TIMEOUT, seek_fut).await {
+                    let seek_fut = reader.seek_to_slot(seek_target);
+                    match timeout(op_timeout, seek_fut).await {
                         Ok(res) => res.map_err(|e| (e, local_start))?,
                         Err(_) => {
                             return Err((
@@ -3045,8 +3211,11 @@ async fn firehose_geyser_thread(
                 let mut item_index = 0;
                 let mut displayed_skip_message = false;
                 loop {
+                    if shutdown.load(Ordering::Relaxed) {
+                        return Ok(());
+                    }
                     let read_fut = reader.read_until_block();
-                    let nodes = match timeout(OP_TIMEOUT, read_fut).await {
+                    let nodes = match timeout(op_timeout, read_fut).await {
                         Ok(result) => result
                             .map_err(FirehoseError::ReadUntilBlockError)
                             .map_err(|e| (e, current_slot.unwrap_or(slot_range.start)))?,
@@ -3060,6 +3229,9 @@ async fn firehose_geyser_thread(
                             ));
                         }
                     };
+                    if shutdown.load(Ordering::Relaxed) {
+                        return Ok(());
+                    }
                     thread_activity::note(thread_index.unwrap_or(0));
                     let stream_ended = nodes.is_empty()
                         || nodes
@@ -3131,6 +3303,13 @@ async fn firehose_geyser_thread(
                                 local_start
                             );
                         }
+                        // Fold the skipped block's entries into the hash chain: its
+                        // last entry hash is its blockhash, i.e. the next block's
+                        // true parent.
+                        if let Some(hash) = last_entry_hash(&nodes) {
+                            todo_latest_entry_blockhash = hash;
+                            todo_previous_blockhash = hash;
+                        }
                         continue;
                     }
                     current_slot = Some(slot);
@@ -3147,6 +3326,10 @@ async fn firehose_geyser_thread(
                             last_counted_slot,
                         );
                         continue;
+                    }
+
+                    if shutdown.load(Ordering::Relaxed) {
+                        return Ok(());
                     }
 
                     nodes.each(|node_with_cid| -> Result<(), SharedError> {

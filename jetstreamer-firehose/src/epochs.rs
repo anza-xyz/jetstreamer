@@ -44,7 +44,10 @@ pub struct EpochStream {
 }
 
 impl EpochStream {
-    fn new<R>(reader: R) -> Self
+    /// Wraps any async seekable reader as a type-erased [`EpochStream`].
+    /// `pub(crate)` so the horizon firehose can build streams over `.jet`
+    /// objects with the same backends.
+    pub(crate) fn new<R>(reader: R) -> Self
     where
         R: AsyncRead + AsyncSeek + Len + Send + Unpin + 'static,
     {

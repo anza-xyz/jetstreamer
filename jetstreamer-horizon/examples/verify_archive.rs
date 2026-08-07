@@ -332,6 +332,9 @@ struct BlockHashes {
     parent_blockhash: Hash,
     blockhash: Hash,
     poh_ok: bool,
+    /// Full-mode PoH could not be recomputed: the stored parent hash is the
+    /// writer's zeroed resume placeholder, so there is no seed to fold from.
+    poh_unseeded: bool,
 }
 
 /// Per-thread scan visitor. Always accumulates counts + per-block identities
@@ -410,7 +413,9 @@ impl SlotVisitor for ScanVisitor {
                     self.raw_account_data_bytes += data.len() as u64;
                 }
                 self.block_meta_tx_count += meta.executed_transaction_count;
+                let poh_unseeded = self.full && meta.parent_blockhash == Hash::default();
                 let poh_ok = !self.full
+                    || poh_unseeded
                     || recompute_blockhash(&meta.parent_blockhash, entries, &self.cur_sigs)
                         == meta.blockhash;
                 self.block_hashes.push(BlockHashes {
@@ -419,6 +424,7 @@ impl SlotVisitor for ScanVisitor {
                     parent_blockhash: meta.parent_blockhash,
                     blockhash: meta.blockhash,
                     poh_ok,
+                    poh_unseeded,
                 });
             }
         }
@@ -615,6 +621,11 @@ fn run_scan(path: &str, threads: usize, full: bool, seed_arg: Option<Hash>) -> i
         .filter(|b| !b.poh_ok)
         .map(|b| b.slot)
         .collect();
+    let poh_unseeded: Vec<u64> = blocks
+        .iter()
+        .filter(|b| b.poh_unseeded)
+        .map(|b| b.slot)
+        .collect();
 
     let elapsed = start.elapsed().as_secs_f64();
     println!("\n=== verify summary ({elapsed:.1}s, {threads} threads) ===");
@@ -645,9 +656,17 @@ fn run_scan(path: &str, threads: usize, full: bool, seed_arg: Option<Hash>) -> i
     if full {
         println!("\n=== full PoH verification ===");
         println!(
-            "  PoH recompute: {} OK, {} mismatched",
-            commas(block_count - poh_failures.len() as u64),
+            "  PoH recompute: {} OK, {} mismatched{}",
+            commas(block_count - poh_failures.len() as u64 - poh_unseeded.len() as u64),
             commas(poh_failures.len() as u64),
+            if poh_unseeded.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    ", {} unverifiable (zeroed parent seed at resume points)",
+                    commas(poh_unseeded.len() as u64)
+                )
+            },
         );
         for slot in poh_failures.iter().take(20) {
             println!("    PoH mismatch at slot {slot} (recomputed hash != stored blockhash)");

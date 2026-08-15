@@ -1,4 +1,4 @@
-use jetstreamer::{BuiltinPlugin, JetstreamerInvocation, JetstreamerRunner};
+use jetstreamer::{BuiltinPlugin, JetstreamerInvocation, JetstreamerRunner, help_text};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     match JetstreamerRunner::default()
@@ -12,6 +12,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             for plugin in BuiltinPlugin::ALL {
                 println!("{}", plugin.name());
             }
+        }
+        JetstreamerInvocation::Help => println!("{}", help_text()),
+        JetstreamerInvocation::Version => {
+            println!("jetstreamer {}", env!("CARGO_PKG_VERSION"));
         }
     }
     Ok(())

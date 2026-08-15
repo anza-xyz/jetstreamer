@@ -457,6 +457,8 @@ impl JetstreamerRunner {
                 Ok(JetstreamerInvocation::Run(self))
             }
             CliInvocation::ListPlugins => Ok(JetstreamerInvocation::ListPlugins),
+            CliInvocation::Help => Ok(JetstreamerInvocation::Help),
+            CliInvocation::Version => Ok(JetstreamerInvocation::Version),
         }
     }
 
@@ -617,6 +619,10 @@ pub enum CliInvocation {
     Run(Config),
     /// Print every built-in plugin name (see [`BuiltinPlugin::ALL`]) and exit.
     ListPlugins,
+    /// Print [`help_text`] and exit successfully.
+    Help,
+    /// Print the crate version and exit successfully.
+    Version,
 }
 
 /// Outcome of [`JetstreamerRunner::parse_cli_args`]; mirrors [`CliInvocation`].
@@ -625,6 +631,10 @@ pub enum JetstreamerInvocation {
     Run(JetstreamerRunner),
     /// Print every built-in plugin name (see [`BuiltinPlugin::ALL`]) and exit.
     ListPlugins,
+    /// Print [`help_text`] and exit successfully.
+    Help,
+    /// Print the crate version and exit successfully.
+    Version,
 }
 
 /// Runtime configuration for [`JetstreamerRunner`].
@@ -742,6 +752,51 @@ pub fn parse_cli_args() -> Result<CliInvocation, Box<dyn std::error::Error>> {
     parse_cli_args_from(std::env::args())
 }
 
+/// Usage text printed in response to [`CliInvocation::Help`].
+///
+/// Lists the accepted range grammar and every flag [`parse_cli_args`] understands. Runtime
+/// tuning is done through environment variables, which are documented at the crate root rather
+/// than repeated here.
+pub fn help_text() -> String {
+    let plugins = BuiltinPlugin::ALL
+        .iter()
+        .map(|plugin| plugin.name())
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "jetstreamer {version}
+High-throughput Solana ledger streaming and plugin framework.
+
+USAGE:
+    jetstreamer <range> [OPTIONS]
+
+RANGE:
+    <epoch>            a single epoch, e.g. 950
+    <start>-<end>      an inclusive epoch range, e.g. 900-950
+    <start>:<end>      an inclusive slot range, e.g. 410400000:410832000
+                       (slot ranges may cross epoch boundaries)
+
+OPTIONS:
+    --with-plugin <name>   enable a built-in plugin; repeatable
+                           one of: {plugins}
+                           [default: {default_plugin}]
+    --no-plugins           disable all built-in plugins
+    --list-plugins         print every built-in plugin name and exit
+    --sequential           use a single worker with ripget sequential streaming
+    --reverse              stream epochs highest to lowest; implies --sequential
+    --buffer-window <size> ripget window size in sequential mode, e.g. 4GiB
+    --clickhouse-dsn <url> override the ClickHouse DSN
+    --tui                  render the interactive dashboard instead of logs
+    -h, --help             print this help and exit
+    -V, --version          print the version and exit
+
+Runtime tuning is also available through JETSTREAMER_* environment variables;
+see https://docs.rs/jetstreamer for the full list.",
+        version = env!("CARGO_PKG_VERSION"),
+        default_plugin = BuiltinPlugin::ProgramTracking.name(),
+    )
+}
+
 /// Parses a Jetstreamer invocation from an explicit argument list.
 ///
 /// Identical to [`parse_cli_args`], except the arguments are supplied by the caller instead of
@@ -803,6 +858,12 @@ where
             }
             "--list-plugins" => {
                 return Ok(CliInvocation::ListPlugins);
+            }
+            "--help" | "-h" => {
+                return Ok(CliInvocation::Help);
+            }
+            "--version" | "-V" => {
+                return Ok(CliInvocation::Version);
             }
             "--sequential" => {
                 sequential_cli = true;
@@ -1025,7 +1086,7 @@ mod tests {
     fn slot_range(rest: &[&str]) -> std::ops::Range<u64> {
         match parse_cli_args_from(args(rest)).expect("parsed") {
             CliInvocation::Run(config) => config.slot_range,
-            CliInvocation::ListPlugins => panic!("expected a run invocation"),
+            other => panic!("expected a run invocation, got {other:?}"),
         }
     }
 
@@ -1134,6 +1195,69 @@ mod tests {
             err.to_string().contains("cannot be combined"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn help_and_version_flags_are_recognized() {
+        for flag in ["--help", "-h"] {
+            assert!(
+                matches!(
+                    parse_cli_args_from(args(&[flag])).expect("parsed"),
+                    CliInvocation::Help
+                ),
+                "'{flag}' should request help"
+            );
+        }
+        for flag in ["--version", "-V"] {
+            assert!(
+                matches!(
+                    parse_cli_args_from(args(&[flag])).expect("parsed"),
+                    CliInvocation::Version
+                ),
+                "'{flag}' should request the version"
+            );
+        }
+    }
+
+    #[test]
+    fn help_short_circuits_before_the_range_argument() {
+        // Without a `--help` arm these were parsed as a malformed epoch range, because
+        // `"--help".split_once('-')` succeeds.
+        assert!(matches!(
+            parse_cli_args_from(args(&["--help"])).expect("parsed"),
+            CliInvocation::Help
+        ));
+        assert!(matches!(
+            parse_cli_args_from(args(&["--version"])).expect("parsed"),
+            CliInvocation::Version
+        ));
+    }
+
+    #[test]
+    fn help_text_documents_every_flag_the_parser_accepts() {
+        let help = help_text();
+        for flag in [
+            "--with-plugin",
+            "--no-plugins",
+            "--list-plugins",
+            "--sequential",
+            "--reverse",
+            "--buffer-window",
+            "--clickhouse-dsn",
+            "--tui",
+            "--help",
+            "--version",
+        ] {
+            assert!(help.contains(flag), "help text is missing '{flag}'");
+        }
+        for plugin in BuiltinPlugin::ALL {
+            assert!(
+                help.contains(plugin.name()),
+                "help text is missing plugin '{}'",
+                plugin.name()
+            );
+        }
+        assert!(help.contains(env!("CARGO_PKG_VERSION")));
     }
 
     #[test]

@@ -735,7 +735,7 @@ impl BuiltinPlugin {
 /// # Examples
 ///
 /// ```no_run
-/// # use jetstreamer::{parse_cli_args, CliInvocation};
+/// # use jetstreamer::{parse_cli_args, help_text, BuiltinPlugin, CliInvocation};
 /// # unsafe {
 /// #     std::env::set_var("JETSTREAMER_THREADS", "3");
 /// #     std::env::set_var("JETSTREAMER_CLICKHOUSE_MODE", "off");
@@ -745,7 +745,13 @@ impl BuiltinPlugin {
 ///         assert_eq!(config.threads, 3);
 ///         assert!(!config.clickhouse_enabled);
 ///     }
-///     CliInvocation::ListPlugins => {}
+///     CliInvocation::ListPlugins => {
+///         for plugin in BuiltinPlugin::ALL {
+///             println!("{}", plugin.name());
+///         }
+///     }
+///     CliInvocation::Help => println!("{}", help_text()),
+///     CliInvocation::Version => println!("jetstreamer {}", env!("CARGO_PKG_VERSION")),
 /// }
 /// ```
 pub fn parse_cli_args() -> Result<CliInvocation, Box<dyn std::error::Error>> {

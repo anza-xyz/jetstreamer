@@ -3483,12 +3483,18 @@ fn convert_proto_rewards(
                 2 => RewardType::Staking,
                 3 => RewardType::Voting,
                 4 => RewardType::DeactivatedStake,
-                typ => {
-                    return Err(Box::new(std::io::Error::other(format!(
-                        "unsupported reward type {}",
-                        typ
-                    ))));
-                }
+                // A reward type this build does not know is skipped, not
+                // fatal. `DeactivatedStake` is proto type 5 and appears from
+                // epoch 1017 on; until this tree moved to Agave 4.2 it made
+                // the whole rewards node fail to decode, the firehose retried
+                // the node, and a scan of a current epoch produced no rows at
+                // all. The next variant the chain gains must not cost the same
+                // again.
+                //
+                // Dropping one reward costs a rewards consumer one row.
+                // Failing the node costs every consumer the whole block, and
+                // every transaction in it.
+                _ => continue,
             },
             lamports: proto_reward.lamports,
             post_balance: proto_reward.post_balance,

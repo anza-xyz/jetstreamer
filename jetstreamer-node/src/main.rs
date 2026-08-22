@@ -3802,10 +3802,7 @@ impl SlotExecutionBuffer {
 
     fn drain_ready_entries(&mut self, slot: Slot) -> Result<Vec<ReadyEntry>, String> {
         let mut ready = Vec::new();
-        loop {
-            let Some(entry) = self.pending_entries.front() else {
-                break;
-            };
+        while let Some(entry) = self.pending_entries.front() {
             if entry.tx_count == 0 {
                 let entry = self.pending_entries.pop_front().expect("pending entry");
                 self.processed_entry_count = self.processed_entry_count.saturating_add(1);

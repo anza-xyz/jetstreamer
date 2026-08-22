@@ -155,7 +155,7 @@ fn to_versioned(tx: &htx::Transaction) -> VersionedTransaction {
                 num_readonly_unsigned_accounts: m.header.num_readonly_unsigned_accounts,
             },
             account_keys: m.account_keys.iter().map(to_pubkey).collect(),
-            recent_blockhash: to_sol_hash(&m.recent_blockhash),
+            recent_blockhash: to_sol_hash(m.recent_blockhash),
             instructions: m.instructions.iter().map(to_instruction).collect(),
         }),
         htx::VersionedMessage::V0(m) => SolVersionedMessage::V0(v0::Message {
@@ -165,13 +165,13 @@ fn to_versioned(tx: &htx::Transaction) -> VersionedTransaction {
                 num_readonly_unsigned_accounts: m.header.num_readonly_unsigned_accounts,
             },
             account_keys: m.account_keys.iter().map(to_pubkey).collect(),
-            recent_blockhash: to_sol_hash(&m.recent_blockhash),
+            recent_blockhash: to_sol_hash(m.recent_blockhash),
             instructions: m.instructions.iter().map(to_instruction).collect(),
             address_table_lookups: m
                 .address_table_lookups
                 .iter()
                 .map(|l| v0::MessageAddressTableLookup {
-                    account_key: to_pubkey(&l.account_key),
+                    account_key: to_pubkey(l.account_key),
                     writable_indexes: l.writable_indexes.as_slice().to_vec(),
                     readonly_indexes: l.readonly_indexes.as_slice().to_vec(),
                 })
@@ -361,24 +361,23 @@ impl SlotVisitor for Collector {
     fn on_transaction(&mut self, _slot: u64, _tx_index: u32, tx: &htx::Transaction) {
         if let Some((path, count, msgs)) = self.dump.as_mut() {
             let (keys, blockhash, ixs) = match &tx.message {
-                    htx::VersionedMessage::Legacy(m) => (
-                        m.account_keys.as_slice(),
-                        m.recent_blockhash,
-                        m.instructions.as_slice(),
-                    ),
-                    htx::VersionedMessage::V0(m) => (
-                        m.account_keys.as_slice(),
-                        m.recent_blockhash,
-                        m.instructions.as_slice(),
-                    ),
-                };
+                htx::VersionedMessage::Legacy(m) => (
+                    m.account_keys.as_slice(),
+                    m.recent_blockhash,
+                    m.instructions.as_slice(),
+                ),
+                htx::VersionedMessage::V0(m) => (
+                    m.account_keys.as_slice(),
+                    m.recent_blockhash,
+                    m.instructions.as_slice(),
+                ),
+            };
             msgs.push(DumpMsg {
                 account_keys: keys
                     .iter()
                     .map(|k| <[u8; 32]>::try_from(k.as_ref()).expect("32-byte key"))
                     .collect(),
-                recent_blockhash: <[u8; 32]>::try_from(blockhash.as_ref())
-                    .expect("32-byte hash"),
+                recent_blockhash: <[u8; 32]>::try_from(blockhash.as_ref()).expect("32-byte hash"),
                 instructions: ixs
                     .iter()
                     .map(|ix| DumpIx {
@@ -417,7 +416,7 @@ impl SlotVisitor for Collector {
             _ if self.dump.is_some() => {}
             _ => self.process_block(entries),
         }
-        if self.slots % 10_000 == 0 {
+        if self.slots.is_multiple_of(10_000) {
             eprintln!(
                 "processed {} slots ({} blocks, {} txs)",
                 self.slots, self.blocks, self.tx_total

@@ -107,12 +107,10 @@ impl DataFrame {
 
         let mut map = serde_json::Map::new();
         map.insert("kind".to_string(), serde_json::Value::from(self.kind));
-        if self.hash.is_none() {
-            map.insert("hash".to_string(), serde_json::Value::Null);
-        } else {
-            let hash_as_string = self.hash.unwrap().to_string();
-            map.insert("hash".to_string(), serde_json::Value::from(hash_as_string));
-        }
+        let hash = self
+            .hash
+            .map_or(serde_json::Value::Null, |hash| hash.to_string().into());
+        map.insert("hash".to_string(), hash);
         if self.index.is_none() {
             map.insert("index".to_string(), serde_json::Value::Null);
         } else {

@@ -604,7 +604,7 @@ pub enum FirehoseError {
     /// Failure while reading the Old Faithful CAR header.
     ReadHeader(SharedError),
     /// Error emitted by the Solana Geyser plugin service.
-    GeyserPluginService(GeyserPluginServiceError),
+    GeyserPluginService(Box<GeyserPluginServiceError>),
     /// Transaction notifier could not be acquired from the Geyser service.
     FailedToGetTransactionNotifier,
     /// Failure while reading data until the next block boundary.
@@ -614,7 +614,7 @@ pub enum FirehoseError {
     /// Failed to decode a node at the given index.
     NodeDecodingError(usize, SharedError),
     /// Error surfaced when querying the slot offset index.
-    SlotOffsetIndexError(SlotOffsetIndexError),
+    SlotOffsetIndexError(Box<SlotOffsetIndexError>),
     /// Failure while seeking to a slot within the Old Faithful CAR stream.
     SeekToSlotError(SharedError),
     /// Error surfaced during the plugin `on_load` stage.
@@ -735,13 +735,13 @@ impl From<reqwest::Error> for FirehoseError {
 
 impl From<GeyserPluginServiceError> for FirehoseError {
     fn from(e: GeyserPluginServiceError) -> Self {
-        FirehoseError::GeyserPluginService(e)
+        FirehoseError::GeyserPluginService(Box::new(e))
     }
 }
 
 impl From<SlotOffsetIndexError> for FirehoseError {
     fn from(e: SlotOffsetIndexError) -> Self {
-        FirehoseError::SlotOffsetIndexError(e)
+        FirehoseError::SlotOffsetIndexError(Box::new(e))
     }
 }
 
@@ -2846,7 +2846,6 @@ where
     Ok(())
 }
 
-#[allow(clippy::result_large_err)]
 /// Builds a Geyser-backed firehose and returns a slot notification stream.
 ///
 /// This helper is used by [`firehose`] when Geyser plugins need to be stood up in-process
@@ -2920,7 +2919,6 @@ pub fn firehose_geyser(
 }
 
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::result_large_err)]
 /// Builds a Geyser-backed firehose using caller-provided notifiers.
 ///
 /// When `sequential` is `true`, a single firehose thread is used and `threads` configures

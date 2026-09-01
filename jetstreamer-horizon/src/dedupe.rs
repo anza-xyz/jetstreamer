@@ -7,15 +7,18 @@
 //! [`new_decoder_context`].
 //!
 //! When encoding an [`Address`] that appears in the popular list, the wire
-//! output is a 1-3 byte varint ID instead of a full 32-byte pubkey — a ~10-16×
-//! saving on the dominant case in Solana account/transaction streams.
+//! output is a 1-3 byte ID instead of a full 32-byte pubkey, saving about 10-16x
+//! on the dominant case in Solana account/transaction streams. Archive V1
+//! uses lencode's native integer encoding; V2 uses canonical unsigned LEB128.
 //!
-//! # Per-slot reset
+//! # Per-bucket reset
 //!
-//! Call [`reset_encoder`] / [`reset_decoder`] between slot boundaries. This
+//! Call [`reset_encoder`] / [`reset_decoder`] between archive bucket
+//! boundaries. This
 //! clears only the small per-worker scratch layer (novel pubkeys seen in the
-//! current slot); the shared 65 535-entry primed table stays intact at zero
-//! cost. Slots are independently decodable — random-access seeks are safe.
+//! current bucket); the shared 65 535-entry primed table stays intact at zero
+//! cost. Buckets are independently decodable, so random-access seeks remain
+//! safe while repeated keys across their slots still deduplicate.
 //!
 //! # Example
 //!
@@ -24,17 +27,21 @@
 //! use lencode::prelude::*;
 //!
 //! let mut ctx = new_encoder_context();
-//! for slot in stream {
-//!     reset_encoder(&mut ctx);
+//! for bucket in stream {
+//!     reset_encoder(&mut ctx); // once per independently decoded bucket
+//!     for slot in bucket {
 //!     for update in slot.account_updates {
 //!         update.encode_ext(&mut writer, Some(&mut ctx)).unwrap();
+//!     }
 //!     }
 //! }
 //! ```
 use std::sync::Arc;
 
 use lencode::context::{DecoderContext, EncoderContext};
-use lencode::dedupe::{DedupeDecoder, DedupeEncoder, FrozenDecoderState, FrozenEncoderState};
+use lencode::dedupe::{
+    DedupeDecoder, DedupeEncoder, DedupeIdCodec, FrozenDecoderState, FrozenEncoderState,
+};
 use once_cell::sync::Lazy;
 use solana_address::Address;
 
@@ -43,7 +50,7 @@ use crate::pubkey_prime::POPULAR_PUBKEYS;
 /// Lazily-initialised frozen encoder state populated from [`POPULAR_PUBKEYS`].
 ///
 /// First access triggers a one-time priming pass over the 65 535-entry const
-/// slice (~10-20 ms on modern hardware). Subsequent accesses are free — the
+/// slice (about 10-20 ms on modern hardware). Subsequent accesses reuse the
 /// wrapped [`Arc`] is cloned cheaply for each worker encoder.
 pub static FROZEN_PUBKEY_ENCODER: Lazy<Arc<FrozenEncoderState>> = Lazy::new(|| {
     let mut primer = DedupeEncoder::new();
@@ -56,7 +63,7 @@ pub static FROZEN_PUBKEY_ENCODER: Lazy<Arc<FrozenEncoderState>> = Lazy::new(|| {
 
 /// Lazily-initialised frozen decoder state populated from [`POPULAR_PUBKEYS`].
 ///
-/// Mirrors [`FROZEN_PUBKEY_ENCODER`] — values are primed in the exact same
+/// Mirrors [`FROZEN_PUBKEY_ENCODER`]; values are primed in the exact same
 /// order so wire IDs align on both sides.
 pub static FROZEN_PUBKEY_DECODER: Lazy<Arc<FrozenDecoderState>> = Lazy::new(|| {
     let mut primer = DedupeDecoder::new();
@@ -73,10 +80,18 @@ pub static FROZEN_PUBKEY_DECODER: Lazy<Arc<FrozenDecoderState>> = Lazy::new(|| {
 /// scratch allocation). Use one per worker thread.
 #[inline]
 pub fn new_encoder_context() -> EncoderContext {
+    new_encoder_context_with_codec(DedupeIdCodec::Lencode)
+}
+
+/// Creates a frozen encoder context with an explicit, containing-format
+/// identified dedupe-ID codec.
+#[inline]
+pub fn new_encoder_context_with_codec(codec: DedupeIdCodec) -> EncoderContext {
     EncoderContext {
-        dedupe: Some(DedupeEncoder::with_frozen(Arc::clone(
-            &FROZEN_PUBKEY_ENCODER,
-        ))),
+        dedupe: Some(DedupeEncoder::with_frozen_codec(
+            Arc::clone(&FROZEN_PUBKEY_ENCODER),
+            codec,
+        )),
         diff: None,
     }
 }
@@ -85,17 +100,25 @@ pub fn new_encoder_context() -> EncoderContext {
 /// shared [`FROZEN_PUBKEY_DECODER`] frozen state.
 #[inline]
 pub fn new_decoder_context() -> DecoderContext {
+    new_decoder_context_with_codec(DedupeIdCodec::Lencode)
+}
+
+/// Creates a frozen decoder context matching
+/// [`new_encoder_context_with_codec`].
+#[inline]
+pub fn new_decoder_context_with_codec(codec: DedupeIdCodec) -> DecoderContext {
     DecoderContext {
-        dedupe: Some(DedupeDecoder::with_frozen(Arc::clone(
-            &FROZEN_PUBKEY_DECODER,
-        ))),
+        dedupe: Some(DedupeDecoder::with_frozen_codec(
+            Arc::clone(&FROZEN_PUBKEY_DECODER),
+            codec,
+        )),
         diff: None,
     }
 }
 
 /// Clears the scratch layer of the encoder inside `ctx`, preserving the frozen
-/// primed table. Call this at each slot boundary so per-slot novel pubkeys
-/// don't accumulate across slots (which would break random-access decoding).
+/// primed table. Archive writers call this at each bucket boundary so novel
+/// pubkeys cannot leak across independently decodable buckets.
 #[inline]
 pub fn reset_encoder(ctx: &mut EncoderContext) {
     if let Some(enc) = ctx.dedupe.as_mut() {
@@ -140,17 +163,17 @@ mod tests {
     #[test]
     fn popular_pubkey_encodes_small_in_each_varint_zone() {
         // Lencode varint sizes:
-        //   ID 1..=127  → 1 byte
-        //   ID 128..=255 → 2 bytes
-        //   ID 256..=65535 → 3 bytes
+        //   ID 1..=127: 1 byte
+        //   ID 128..=255: 2 bytes
+        //   ID 256..=65535: 3 bytes
         // Verify each zone produces the expected wire length.
         let cases = [
-            (0usize, 1usize), // ID 1 → 1 byte
-            (126, 1),         // ID 127 → 1 byte
-            (127, 2),         // ID 128 → 2 bytes
-            (254, 2),         // ID 255 → 2 bytes
-            (255, 3),         // ID 256 → 3 bytes
-            (65_534, 3),      // ID 65535 → 3 bytes
+            (0usize, 1usize), // ID 1: 1 byte
+            (126, 1),         // ID 127: 1 byte
+            (127, 2),         // ID 128: 2 bytes
+            (254, 2),         // ID 255: 2 bytes
+            (255, 3),         // ID 256: 3 bytes
+            (65_534, 3),      // ID 65535: 3 bytes
         ];
         for (index, expected_bytes) in cases {
             let mut ctx = new_encoder_context();
@@ -227,7 +250,7 @@ mod tests {
             popular
         );
 
-        // Reset between slots — novel should be re-encoded from scratch, but
+        // Reset between slots. Novel values should be re-encoded from scratch, but
         // popular should still hit the frozen layer.
         reset_encoder(&mut enc);
         reset_decoder(&mut dec);

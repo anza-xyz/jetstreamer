@@ -1,6 +1,7 @@
 //! On-disk types and constants for the horizon archive container format.
 //!
 //! See the [module docs](super) for the full layout specification.
+use lencode::diff::DiffPolicy;
 use lencode::prelude::*;
 use once_cell::sync::Lazy;
 use solana_address::Address;
@@ -16,8 +17,71 @@ pub const MAGIC: [u8; 8] = *b"JSHZN1\0\0";
 /// Magic bytes closing every horizon archive file (last 8 bytes).
 pub const MAGIC_END: [u8; 8] = *b"\0\0NZHSJ1";
 
-/// Current format version, recorded in [`FileHeader`].
-pub const FORMAT_VERSION: u16 = 1;
+/// Original archive format: native lencode dedupe IDs.
+pub const FORMAT_VERSION_V1: u16 = 1;
+
+/// Current archive format: canonical unsigned-LEB128 dedupe IDs.
+pub const FORMAT_VERSION_V2: u16 = 2;
+
+/// Current writer format version, recorded in [`FileHeader`].
+pub const FORMAT_VERSION: u16 = FORMAT_VERSION_V2;
+
+/// V2 header flag confirming canonical unsigned-LEB128 dedupe IDs.
+pub const FLAG_DEDUPE_UNSIGNED_LEB128: u64 = 1 << 0;
+
+/// Supported Horizon archive wire versions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(u16)]
+pub enum ArchiveVersion {
+    /// Existing archives written with native lencode integer IDs.
+    V1 = FORMAT_VERSION_V1,
+    /// Canonical unsigned-LEB128 IDs and extensible v2 codec framing.
+    #[default]
+    V2 = FORMAT_VERSION_V2,
+}
+
+impl ArchiveVersion {
+    /// Numeric value stored in [`FileHeader::format_version`].
+    pub const fn as_u16(self) -> u16 {
+        self as u16
+    }
+
+    /// Required header flags for this version.
+    pub const fn required_flags(self) -> u64 {
+        match self {
+            Self::V1 => 0,
+            Self::V2 => FLAG_DEDUPE_UNSIGNED_LEB128,
+        }
+    }
+}
+
+impl TryFrom<u16> for ArchiveVersion {
+    type Error = ArchiveFormatError;
+
+    fn try_from(value: u16) -> Result<Self, Self::Error> {
+        match value {
+            FORMAT_VERSION_V1 => Ok(Self::V1),
+            FORMAT_VERSION_V2 => Ok(Self::V2),
+            other => Err(ArchiveFormatError::UnsupportedVersion(other)),
+        }
+    }
+}
+
+/// Validates a file header's version/flag contract and returns the decoded
+/// version. Unknown combinations fail closed instead of guessing a codec.
+pub fn validate_archive_version(
+    format_version: u16,
+    flags: u64,
+) -> Result<ArchiveVersion, ArchiveFormatError> {
+    let version = ArchiveVersion::try_from(format_version)?;
+    if flags != version.required_flags() {
+        return Err(ArchiveFormatError::UnsupportedFlags {
+            version: format_version,
+            flags,
+        });
+    }
+    Ok(version)
+}
 
 /// Default number of slots per bucket (encoder-state reset / seek
 /// granularity). See the module docs for the tradeoff discussion.
@@ -25,6 +89,16 @@ pub const DEFAULT_BUCKET_SLOTS: u16 = 128;
 
 /// Size in bytes of the fixed-width [`Footer`] at the end of the file.
 pub const FOOTER_LEN: usize = 48;
+
+/// Defensive allocation ceiling for the length-prefixed file header.
+pub const MAX_FILE_HEADER_BYTES: u64 = 1 << 20;
+
+/// Defensive allocation ceiling for the bucket index. A 432,000-entry
+/// per-slot epoch index is well below this limit.
+pub const MAX_BUCKET_INDEX_BYTES: u64 = 64 << 20;
+
+/// Defensive bucket-count ceiling for one archive.
+pub const MAX_BUCKET_INDEX_ENTRIES: u64 = 1_000_000;
 
 /// Identifier of the compiled-in pubkey prime table: xxh64 over its raw
 /// bytes. Recorded in the header so a reader can detect that it was built
@@ -48,26 +122,30 @@ pub enum Compression {
     None = 0,
     /// Whole-payload zstd frame.
     Zstd = 1,
+    /// Whole-payload raw LZ4 block. This is a throughput-oriented v2 option;
+    /// zstd usually remains smaller for durable archives.
+    Lz4 = 2,
 }
 
-/// Extensible archive-creation metadata, lencode-encoded inside
-/// [`FileHeader`]. (Runtime epoch *notifications* are a different thing —
-/// see [`crate::epochs::EpochMeta`].)
+/// Archive-creation metadata, lencode-encoded inside [`FileHeader`]. Runtime
+/// epoch *notifications* are a different thing; see [`crate::epochs::EpochMeta`].
 #[derive(Encode, Decode, Debug, Clone, PartialEq, Eq, Default)]
 pub struct ArchiveMeta {
     /// Unix timestamp (milliseconds) when the archive write began.
     pub created_unix_ms: u64,
     /// Version string of the writer binary (UTF-8).
     pub writer_version: Vec<u8>,
-    /// Reserved for future use; decoders must tolerate unknown trailing
-    /// fields by length-prefix (see `FileHeader` encoding).
+    /// Reserved bytes for version-specific metadata. Adding fields to this
+    /// struct requires a new archive format version because readers decode it
+    /// exactly.
     pub reserved: Vec<u8>,
 }
 
 /// File-level header. Written once at offset 0, after [`MAGIC`].
 ///
-/// On the wire: `MAGIC ++ varint(len) ++ lencode(FileHeader)` so future
-/// versions can extend the struct while old readers still locate bucket 0.
+/// On the wire: `MAGIC ++ varint(len) ++ lencode(FileHeader)`. The length
+/// prefix bounds header parsing and locates bucket 0. Readers decode the
+/// payload exactly, so adding fields requires a new archive format version.
 #[derive(Encode, Decode, Debug, Clone, PartialEq, Eq)]
 pub struct FileHeader {
     /// Format version ([`FORMAT_VERSION`]).
@@ -104,8 +182,8 @@ pub struct BucketHeader {
     pub stored_len: u64,
     /// xxh64 of the stored payload bytes.
     pub xxh64: u64,
-    /// Blockhash of the last non-skipped slot *before* this bucket — the
-    /// PoH chain anchor, letting a bucket verify without its predecessor.
+    /// Blockhash of the last non-skipped slot *before* this bucket. This is the
+    /// PoH chain anchor, letting a bucket check continuity without its predecessor.
     /// All-zeros for the first bucket when the parent hash is unknown.
     pub poh_start_hash: Hash,
 }
@@ -158,6 +236,11 @@ impl Footer {
         if bytes[40..48] != MAGIC_END {
             return Err(ArchiveFormatError::BadMagic);
         }
+        if bytes[32..40] != [0; 8] {
+            return Err(ArchiveFormatError::InvalidContainerLayout(
+                "footer reserved bytes must be zero",
+            ));
+        }
         Ok(Self {
             index_offset: u64::from_le_bytes(bytes[0..8].try_into().unwrap()),
             index_len: u64::from_le_bytes(bytes[8..16].try_into().unwrap()),
@@ -207,19 +290,64 @@ pub enum ArchiveFormatError {
     BadMagic,
     #[error("unsupported format version {0}")]
     UnsupportedVersion(u16),
+    #[error("unsupported flags {flags:#018x} for format version {version}")]
+    UnsupportedFlags { version: u16, flags: u64 },
     #[error("prime table mismatch: file {file:#018x}, compiled {compiled:#018x}")]
     PrimeTableMismatch { file: u64, compiled: u64 },
     #[error("invalid slot kind byte {0}")]
     BadSlotKind(u8),
     #[error("bucket checksum mismatch at slot {first_slot}")]
     BucketChecksum { first_slot: u64 },
+    #[error("bucket index names slot {indexed}, but its header names slot {decoded}")]
+    BucketHeaderMismatch { indexed: u64, decoded: u64 },
+    #[error("bucket at slot {first_slot} has invalid slot count {slot_count}")]
+    InvalidBucketSlotCount { first_slot: u64, slot_count: u32 },
+    #[error("bucket slot sequence mismatch: expected {expected}, decoded {decoded}")]
+    UnexpectedBucketSlot { expected: u64, decoded: u64 },
+    #[error("bucket at slot {first_slot} advertises oversized payload {bytes} bytes")]
+    BucketTooLarge { first_slot: u64, bytes: u64 },
+    #[error("bucket at slot {first_slot} has {bytes} trailing payload bytes")]
+    TrailingBucketBytes { first_slot: u64, bytes: usize },
+    #[error("compression {compression:?} is not supported by format version {version}")]
+    UnsupportedCompressionForVersion {
+        version: u16,
+        compression: Compression,
+    },
+    #[error("diff policy {policy:?} is not supported by format version {version}")]
+    UnsupportedDiffPolicyForVersion { version: u16, policy: DiffPolicy },
+    #[error("archive {section} is too large: {bytes} bytes (limit {limit})")]
+    SectionTooLarge {
+        section: &'static str,
+        bytes: u64,
+        limit: u64,
+    },
+    #[error("could not allocate {bytes} bytes for archive {section}")]
+    AllocationFailed { section: &'static str, bytes: u64 },
+    #[error("invalid archive container layout: {0}")]
+    InvalidContainerLayout(&'static str),
     #[error("index checksum mismatch")]
     IndexChecksum,
     #[error("slots must be written in strictly increasing order: got {got}, last {last}")]
     NonMonotonicSlot { got: u64, last: u64 },
     #[error("slot {slot} outside file range [{start}, {end})")]
     SlotOutOfRange { slot: u64, start: u64, end: u64 },
-    #[error("PoH verification failed at slot {slot}")]
+    #[error("bucket index {index} outside archive bucket count {count}")]
+    BucketOutOfRange { index: usize, count: usize },
+    #[error(
+        "partial bucket re-encoding requires matching bucket sizes: source {source_bucket_slots}, destination {destination_bucket_slots}"
+    )]
+    ReencodeBucketSizeMismatch {
+        source_bucket_slots: u16,
+        destination_bucket_slots: u16,
+    },
+    #[error(
+        "re-encoded bucket layout mismatch: source starts at slot {source_first_slot}, destination starts at {destination_first_slot:?}"
+    )]
+    ReencodeBucketLayoutMismatch {
+        source_first_slot: u64,
+        destination_first_slot: Option<u64>,
+    },
+    #[error("blockhash chain continuity check failed at slot {slot}")]
     PohMismatch { slot: u64 },
     #[error("encode error: {0}")]
     Encode(lencode::io::Error),
@@ -231,6 +359,20 @@ impl From<lencode::io::Error> for ArchiveFormatError {
     fn from(e: lencode::io::Error) -> Self {
         Self::Encode(e)
     }
+}
+
+pub(crate) fn try_reserve_archive_buffer(
+    buffer: &mut Vec<u8>,
+    bytes: usize,
+    section: &'static str,
+) -> Result<(), ArchiveFormatError> {
+    buffer.clear();
+    buffer
+        .try_reserve_exact(bytes)
+        .map_err(|_| ArchiveFormatError::AllocationFailed {
+            section,
+            bytes: bytes as u64,
+        })
 }
 
 #[cfg(test)]
@@ -258,6 +400,24 @@ mod tests {
     }
 
     #[test]
+    fn footer_rejects_nonzero_reserved_bytes() {
+        let mut bytes = Footer {
+            index_offset: 0,
+            index_len: 0,
+            bucket_count: 0,
+            index_xxh64: 0,
+        }
+        .to_bytes();
+        bytes[32] = 1;
+        assert!(matches!(
+            Footer::from_bytes(&bytes),
+            Err(ArchiveFormatError::InvalidContainerLayout(
+                "footer reserved bytes must be zero"
+            ))
+        ));
+    }
+
+    #[test]
     fn header_roundtrip() {
         let h = FileHeader {
             format_version: FORMAT_VERSION,
@@ -266,7 +426,7 @@ mod tests {
             slot_start: 388_800_000,
             slot_count: 432_000,
             prime_table_id: *PRIME_TABLE_ID,
-            flags: 0,
+            flags: ArchiveVersion::V2.required_flags(),
             meta: ArchiveMeta {
                 created_unix_ms: 1_750_000_000_000,
                 writer_version: b"test".to_vec(),
@@ -290,6 +450,30 @@ mod tests {
     }
 
     #[test]
+    fn version_flags_fail_closed() {
+        assert_eq!(
+            validate_archive_version(FORMAT_VERSION_V1, 0).unwrap(),
+            ArchiveVersion::V1
+        );
+        assert_eq!(
+            validate_archive_version(FORMAT_VERSION_V2, FLAG_DEDUPE_UNSIGNED_LEB128).unwrap(),
+            ArchiveVersion::V2
+        );
+        assert!(matches!(
+            validate_archive_version(FORMAT_VERSION_V1, FLAG_DEDUPE_UNSIGNED_LEB128),
+            Err(ArchiveFormatError::UnsupportedFlags { .. })
+        ));
+        assert!(matches!(
+            validate_archive_version(FORMAT_VERSION_V2, 0),
+            Err(ArchiveFormatError::UnsupportedFlags { .. })
+        ));
+        assert!(matches!(
+            validate_archive_version(3, 0),
+            Err(ArchiveFormatError::UnsupportedVersion(3))
+        ));
+    }
+
+    #[test]
     fn bucket_header_roundtrip() {
         let h = BucketHeader {
             first_slot: 388_805_000,
@@ -306,5 +490,18 @@ mod tests {
         let mut rd = lencode::io::Cursor::new(&buf[..n]);
         let back = BucketHeader::decode_ext(&mut rd, None).unwrap();
         assert_eq!(back, h);
+    }
+
+    #[test]
+    fn archive_buffer_reservation_failure_is_reported() {
+        let mut buffer = Vec::new();
+        assert!(matches!(
+            try_reserve_archive_buffer(&mut buffer, usize::MAX, "test buffer"),
+            Err(ArchiveFormatError::AllocationFailed {
+                section: "test buffer",
+                ..
+            })
+        ));
+        assert!(buffer.is_empty());
     }
 }

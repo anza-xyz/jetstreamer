@@ -1,8 +1,8 @@
 //! Fixed-capacity heap-free vector backed by an inline array.
 //!
 //! [`ZeroVec<N, T>`] stores up to `N` elements inline, tracking the current
-//! length separately. It mirrors the API of `Vec<T>` — `push`, `pop`, `clear`,
-//! `drain`, slicing via [`Deref`]/[`Index`], `Encode`/`Decode`, etc. — but
+//! length separately. It mirrors the `Vec<T>` API, including `push`, `pop`,
+//! `clear`, `drain`, slicing via [`Deref`]/[`Index`], and `Encode`/`Decode`, but
 //! never allocates on the heap. Overflowing capacity panics.
 //!
 //! Useful for hot paths that want `Vec`-like ergonomics without the allocator
@@ -36,8 +36,9 @@ use lencode::prelude::*;
 /// array, tracking the current length separately. It provides most of the
 /// functionality of `Vec<T>` without ever hitting the heap allocator.
 ///
-/// In hot loops, declare a `ZeroVec` once and reuse it via [`clear`] +
-/// [`push`] / [`extend_from_slice`] to avoid per-iteration allocation overhead.
+/// In hot loops, declare a `ZeroVec` once and reuse it via [`Self::clear`] +
+/// [`Self::push`] / [`Self::extend_from_slice`] to avoid per-iteration allocation
+/// overhead.
 ///
 /// # Panics
 ///
@@ -611,7 +612,7 @@ impl<const N: usize, T> Drop for ZeroVec<N, T> {
 // --- In-place element decoding ---
 
 /// In-place wire decoding: reads a value's fields directly into an already
-/// allocated destination — skipping the stack temporary that
+/// allocated destination, skipping the stack temporary that
 /// `Decode::decode_ext` would otherwise create as a by-value return.
 ///
 /// Types with a large inline footprint implement this so their container
@@ -633,7 +634,7 @@ pub(crate) trait DecodeInto {
 ///
 /// # Safety
 ///
-/// The caller asserts that the all-zero bit pattern is a valid `T` — i.e.
+/// The caller asserts that the all-zero bit pattern is a valid `T`; that is,
 /// `T` is some composition of primitive scalars, `Option<_>`, and
 /// `ZeroVec`s (all of which treat zero as the empty/default state).
 #[inline]
@@ -647,10 +648,13 @@ where
     T: DecodeInto + Decode + 'static,
 {
     let new_len = ZeroVec::<N, T>::decode_len(reader)?;
-    assert!(
-        new_len <= N,
-        "decoded length too large for ZeroVec: {new_len} > capacity {N}"
-    );
+    // The backing array is already present, so charge one byte per logical
+    // element to enforce the reader's collection-count limit without
+    // pretending this reusable inline storage was freshly allocated.
+    reader.claim_sequence(new_len, 1)?;
+    if new_len > N {
+        return Err(lencode::io::Error::InvalidData);
+    }
 
     let old_len = vec.len();
 
@@ -696,7 +700,7 @@ where
 
 // --- ZeroAlloc marker trait ---
 
-/// Declares that a type's entire field tree is inline — no field (at any
+/// Declares that a type's entire field tree is inline, with no field at any
 /// depth) owns heap memory via `Vec`, `Box`, `String`, `HashMap`, or any
 /// other pointer-to-heap indirection.
 ///
@@ -714,7 +718,7 @@ pub trait ZeroAlloc {}
 
 /// Compile-time check that `T: ZeroAlloc`.
 ///
-/// Call sites look like `assert_zero_alloc::<FieldType>();` — if
+/// Call sites look like `assert_zero_alloc::<FieldType>();`. If
 /// `FieldType` doesn't implement [`ZeroAlloc`], the line fails to compile
 /// with an unmet trait bound error.
 #[inline(always)]
@@ -749,7 +753,7 @@ impl<T: ZeroAlloc> ZeroAlloc for Option<T> {}
 impl<A: ZeroAlloc, B: ZeroAlloc> ZeroAlloc for (A, B) {}
 impl<A: ZeroAlloc, B: ZeroAlloc, C: ZeroAlloc> ZeroAlloc for (A, B, C) {}
 impl<A: ZeroAlloc, B: ZeroAlloc, C: ZeroAlloc, D: ZeroAlloc> ZeroAlloc for (A, B, C, D) {}
-// References are borrowed pointers to external storage — they don't own
+// References are borrowed pointers to external storage; they do not own
 // heap memory themselves, so a type with a reference field is still
 // "inline" for our purposes.
 impl<T: ?Sized> ZeroAlloc for &T {}
@@ -1101,7 +1105,7 @@ impl<const N: usize, T: Encode + 'static> Encode for ZeroVec<N, T> {
     fn encode_ext(
         &self,
         writer: &mut impl Write,
-        mut ctx: Option<&mut lencode::context::EncoderContext>,
+        ctx: Option<&mut lencode::context::EncoderContext>,
     ) -> lencode::Result<usize> {
         // For u8: always write uncompressed (zero-alloc).
         // Wire format: varint(raw_len << 1 | 0) + raw_bytes
@@ -1114,12 +1118,12 @@ impl<const N: usize, T: Encode + 'static> Encode for ZeroVec<N, T> {
             return Ok(total);
         }
 
-        // Non-u8: varint(element_count) + elements
+        // Non-u8: varint(element_count) + elements. Delegate the slice so
+        // lencode can use type-specific bulk paths (notably one dedupe-table
+        // lookup for an Address slice) while retaining the same wire bytes.
         let mut total = 0;
         total += Self::encode_len(self.len, writer)?;
-        for item in self.as_slice() {
-            total += item.encode_ext(writer, ctx.as_deref_mut())?;
-        }
+        total += T::encode_slice_ext(self.as_slice(), writer, ctx)?;
         Ok(total)
     }
 }
@@ -1130,7 +1134,7 @@ impl<const N: usize, T: Decode + 'static> ZeroVec<N, T> {
     /// Unlike [`Decode::decode_ext`], which returns a new `Self` by value
     /// (and therefore puts a full `N * sizeof(T)` inline buffer on the
     /// stack during the call), this method reads directly into the
-    /// existing allocation. That's critical for large `N` — a stock
+    /// existing allocation. That matters for large `N`; a stock
     /// `ZeroVec::<10 * 1024 * 1024, u8>::decode_ext` would overflow most
     /// thread stacks.
     ///
@@ -1141,24 +1145,21 @@ impl<const N: usize, T: Decode + 'static> ZeroVec<N, T> {
         reader: &mut R,
         mut ctx: Option<&mut lencode::context::DecoderContext>,
     ) -> lencode::Result<()> {
-        self.clear();
-
         // u8: read flagged header, then raw bytes directly into the buffer.
         if core::any::TypeId::of::<T>() == core::any::TypeId::of::<u8>() {
             let flagged = Self::decode_len(reader)?;
-            assert!(flagged & 1 == 0, "ZeroVec does not support compressed data");
-            let payload_len = flagged >> 1;
-            assert!(
-                payload_len <= N,
-                "decoded data too large for ZeroVec: {payload_len} > capacity {N}"
-            );
-            if payload_len > 0 {
-                // SAFETY: TypeId::of::<T>() == TypeId::of::<u8>() above.
-                let buf =
-                    unsafe { slice::from_raw_parts_mut(self.as_mut_ptr() as *mut u8, payload_len) };
-                reader.read(buf)?;
+            if flagged & 1 != 0 {
+                return Err(lencode::io::Error::InvalidData);
             }
+            let payload_len = flagged >> 1;
+            reader.claim_blob(payload_len)?;
+            if payload_len > N {
+                return Err(lencode::io::Error::InvalidData);
+            }
+            self.clear();
+            // SAFETY: the TypeId check proves T == u8, and payload_len <= N.
             unsafe {
+                read_u8_payload_into_zerovec(self, reader, payload_len)?;
                 self.set_len(payload_len);
             }
             return Ok(());
@@ -1168,10 +1169,11 @@ impl<const N: usize, T: Decode + 'static> ZeroVec<N, T> {
         // by value on the stack but gets moved into the buffer before the
         // next iteration, so peak stack is sizeof(T), not N * sizeof(T).
         let len = Self::decode_len(reader)?;
-        assert!(
-            len <= N,
-            "decoded length too large for ZeroVec: {len} > capacity {N}"
-        );
+        reader.claim_sequence(len, 1)?;
+        if len > N {
+            return Err(lencode::io::Error::InvalidData);
+        }
+        self.clear();
         for _ in 0..len {
             let item = T::decode_ext(reader, ctx.as_deref_mut())?;
             self.buf[self.len] = MaybeUninit::new(item);
@@ -1190,19 +1192,18 @@ impl<const N: usize, T: Decode + 'static> Decode for ZeroVec<N, T> {
         // For u8: read uncompressed directly into inline buffer (zero-alloc).
         if core::any::TypeId::of::<T>() == core::any::TypeId::of::<u8>() {
             let flagged = Self::decode_len(reader)?;
-            assert!(flagged & 1 == 0, "ZeroVec does not support compressed data");
-            let payload_len = flagged >> 1;
-            assert!(
-                payload_len <= N,
-                "decoded data too large for ZeroVec: {payload_len} > capacity {N}"
-            );
-            let mut zv = Self::new();
-            if payload_len > 0 {
-                let buf =
-                    unsafe { slice::from_raw_parts_mut(zv.as_mut_ptr() as *mut u8, payload_len) };
-                reader.read(buf)?;
+            if flagged & 1 != 0 {
+                return Err(lencode::io::Error::InvalidData);
             }
+            let payload_len = flagged >> 1;
+            reader.claim_blob(payload_len)?;
+            if payload_len > N {
+                return Err(lencode::io::Error::InvalidData);
+            }
+            let mut zv = Self::new();
+            // SAFETY: the TypeId check proves T == u8, and payload_len <= N.
             unsafe {
+                read_u8_payload_into_zerovec(&mut zv, reader, payload_len)?;
                 zv.set_len(payload_len);
             }
             return Ok(zv);
@@ -1210,10 +1211,10 @@ impl<const N: usize, T: Decode + 'static> Decode for ZeroVec<N, T> {
 
         // Non-u8: varint(element_count) + elements
         let len = Self::decode_len(reader)?;
-        assert!(
-            len <= N,
-            "decoded length too large for ZeroVec: {len} > capacity {N}"
-        );
+        reader.claim_sequence(len, 1)?;
+        if len > N {
+            return Err(lencode::io::Error::InvalidData);
+        }
         let mut zv = Self::new();
         for _ in 0..len {
             let item = T::decode_ext(reader, ctx.as_deref_mut())?;
@@ -1226,6 +1227,69 @@ impl<const N: usize, T: Decode + 'static> Decode for ZeroVec<N, T> {
     fn decode_len(reader: &mut impl Read) -> lencode::Result<usize> {
         Vec::<T>::decode_len(reader)
     }
+}
+
+/// Reads exactly `payload_len` bytes into a `ZeroVec<_, u8>` without ever
+/// exposing a partially initialized prefix through the vector's safe API.
+/// Contiguous readers take one direct copy; generic streaming readers use a
+/// bounded initialized scratch buffer and tolerate short reads.
+///
+/// # Safety
+///
+/// `T` must be `u8`, and `payload_len` must not exceed `N`.
+unsafe fn read_u8_payload_into_zerovec<R: Read, const N: usize, T>(
+    vec: &mut ZeroVec<N, T>,
+    reader: &mut R,
+    payload_len: usize,
+) -> lencode::Result<()> {
+    debug_assert!(payload_len <= N);
+    if payload_len == 0 {
+        return Ok(());
+    }
+
+    if let Some(input) = reader.buf() {
+        if input.len() < payload_len {
+            return Err(lencode::io::Error::ReaderOutOfData);
+        }
+        // SAFETY: the caller proves T == u8 and the destination has
+        // payload_len in-bounds MaybeUninit slots. The source was checked
+        // above and cannot overlap the inline destination.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                input.as_ptr(),
+                vec.buf.as_mut_ptr().cast::<u8>(),
+                payload_len,
+            );
+        }
+        reader.advance(payload_len);
+        return Ok(());
+    }
+
+    let mut offset = 0usize;
+    let mut scratch = [0u8; 8 * 1024];
+    while offset < payload_len {
+        let requested = (payload_len - offset).min(scratch.len());
+        let read = reader.read(&mut scratch[..requested])?;
+        if read == 0 {
+            return Err(lencode::io::Error::ReaderOutOfData);
+        }
+        // `Read` is a safe trait, so an incorrect implementation must not be
+        // able to turn an over-reported byte count into an out-of-bounds copy.
+        if read > requested {
+            return Err(lencode::io::Error::InvalidData);
+        }
+        // SAFETY: read <= requested <= payload_len - offset, the caller
+        // proves T == u8, and the initialized scratch cannot overlap vec.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                scratch.as_ptr(),
+                vec.buf.as_mut_ptr().cast::<u8>().add(offset),
+                read,
+            );
+        }
+        offset += read;
+    }
+    Ok(())
 }
 
 // --- Write trait for ZeroVec<N, u8> so it can be used as a write target ---
@@ -1255,6 +1319,47 @@ impl<const N: usize> std::io::Write for ZeroVec<N, u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct ChunkedReader<'a> {
+        bytes: &'a [u8],
+        position: usize,
+        max_chunk: usize,
+        zero_at_eof: bool,
+    }
+
+    impl lencode::io::Read for ChunkedReader<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> lencode::Result<usize> {
+            if self.position == self.bytes.len() {
+                return if self.zero_at_eof {
+                    Ok(0)
+                } else {
+                    Err(lencode::io::Error::ReaderOutOfData)
+                };
+            }
+            let len = buf
+                .len()
+                .min(self.max_chunk)
+                .min(self.bytes.len() - self.position);
+            buf[..len].copy_from_slice(&self.bytes[self.position..self.position + len]);
+            self.position += len;
+            Ok(len)
+        }
+    }
+
+    struct OverreportingReader {
+        header_sent: bool,
+    }
+
+    impl lencode::io::Read for OverreportingReader {
+        fn read(&mut self, buf: &mut [u8]) -> lencode::Result<usize> {
+            if !self.header_sent {
+                buf[0] = 10; // flagged raw byte length 5
+                self.header_sent = true;
+                return Ok(1);
+            }
+            Ok(buf.len() + 1)
+        }
+    }
 
     #[test]
     fn test_new_is_empty() {
@@ -1489,7 +1594,7 @@ mod tests {
         v.push("c".to_string());
         let mut it = v.into_iter();
         assert_eq!(it.next(), Some("a".to_string()));
-        // Drop the iterator without consuming all — remaining elements should be dropped.
+        // Drop the iterator without consuming all; remaining elements should be dropped.
         drop(it);
     }
 
@@ -1619,6 +1724,111 @@ mod tests {
     }
 
     #[test]
+    fn decode_u8_handles_short_reads_and_rejects_zero_or_truncated_reads() {
+        let mut source: ZeroVec<16, u8> = ZeroVec::new();
+        source.set(b"short-read");
+        let mut wire = Vec::new();
+        source.encode_ext(&mut wire, None).unwrap();
+
+        let mut chunked = ChunkedReader {
+            bytes: &wire,
+            position: 0,
+            max_chunk: 1,
+            zero_at_eof: false,
+        };
+        let mut decoded: ZeroVec<16, u8> = ZeroVec::new();
+        decoded.decode_into(&mut chunked, None).unwrap();
+        assert_eq!(decoded, source);
+
+        let truncated = &wire[..wire.len() - 1];
+        let mut contiguous = lencode::io::Cursor::new(truncated);
+        let mut decoded: ZeroVec<16, u8> = ZeroVec::new();
+        assert!(matches!(
+            decoded.decode_into(&mut contiguous, None),
+            Err(lencode::io::Error::ReaderOutOfData)
+        ));
+        assert!(decoded.is_empty());
+
+        let mut zero_at_eof = ChunkedReader {
+            bytes: truncated,
+            position: 0,
+            max_chunk: 1,
+            zero_at_eof: true,
+        };
+        let mut decoded: ZeroVec<16, u8> = ZeroVec::new();
+        assert!(matches!(
+            decoded.decode_into(&mut zero_at_eof, None),
+            Err(lencode::io::Error::ReaderOutOfData)
+        ));
+        assert!(decoded.is_empty());
+
+        let mut overreporting = OverreportingReader { header_sent: false };
+        let mut decoded: ZeroVec<16, u8> = ZeroVec::new();
+        assert!(matches!(
+            decoded.decode_into(&mut overreporting, None),
+            Err(lencode::io::Error::InvalidData)
+        ));
+        assert!(decoded.is_empty());
+    }
+
+    #[test]
+    fn decode_rejects_unsupported_or_oversized_lengths_without_panicking() {
+        let mut compressed_flag = lencode::io::Cursor::new([1u8]);
+        let mut bytes: ZeroVec<8, u8> = ZeroVec::new();
+        assert!(matches!(
+            bytes.decode_into(&mut compressed_flag, None),
+            Err(lencode::io::Error::InvalidData)
+        ));
+
+        let mut oversized_bytes = Vec::new();
+        18usize.encode_ext(&mut oversized_bytes, None).unwrap(); // 9-byte flagged raw length
+        let mut cursor = lencode::io::Cursor::new(oversized_bytes);
+        assert!(matches!(
+            bytes.decode_into(&mut cursor, None),
+            Err(lencode::io::Error::InvalidData)
+        ));
+
+        let mut oversized_elements = Vec::new();
+        9usize.encode_ext(&mut oversized_elements, None).unwrap();
+        let mut cursor = lencode::io::Cursor::new(oversized_elements);
+        let mut words: ZeroVec<8, u16> = ZeroVec::new();
+        assert!(matches!(
+            words.decode_into(&mut cursor, None),
+            Err(lencode::io::Error::InvalidData)
+        ));
+
+        let mut one_element = Vec::new();
+        1usize.encode_ext(&mut one_element, None).unwrap();
+        let mut cursor = lencode::io::Cursor::new(one_element);
+        let mut nested: ZeroVec<0, crate::transactions::CompiledInstruction> = ZeroVec::new();
+        assert!(matches!(
+            unsafe { decode_zerovec_in_place(&mut nested, &mut cursor, None) },
+            Err(lencode::io::Error::InvalidData)
+        ));
+    }
+
+    #[test]
+    fn decode_uses_distinct_limited_reader_blob_and_sequence_caps() {
+        let wire = [10u8, 1, 2, 3, 4, 5]; // flagged raw byte length 5
+        let limits = lencode::io::DecodeLimits::new(wire.len(), 1, 8);
+        let cursor = lencode::io::Cursor::new(wire);
+        let mut reader = lencode::io::LimitedReader::new(cursor, limits).with_max_blob_bytes(8);
+        let mut bytes: ZeroVec<8, u8> = ZeroVec::new();
+        bytes.decode_into(&mut reader, None).unwrap();
+        assert_eq!(bytes.as_slice(), &[1, 2, 3, 4, 5]);
+
+        let encoded_count = [5u8];
+        let limits = lencode::io::DecodeLimits::new(encoded_count.len(), 4, 16);
+        let cursor = lencode::io::Cursor::new(encoded_count);
+        let mut reader = lencode::io::LimitedReader::new(cursor, limits);
+        let mut words: ZeroVec<8, u16> = ZeroVec::new();
+        assert!(matches!(
+            words.decode_into(&mut reader, None),
+            Err(lencode::io::Error::DecodeLimitExceeded)
+        ));
+    }
+
+    #[test]
     fn test_wire_compatible_with_vec_u32() {
         // Encode as Vec<u32>, decode as ZeroVec<N, u32>.
         let original: Vec<u32> = vec![1, 2, 3, 4, 5];
@@ -1634,7 +1844,7 @@ mod tests {
 
     #[test]
     fn test_zerovvec_encodes_same_as_vec_u8() {
-        // Encode as ZeroVec, decode as Vec — must round-trip.
+        // Encode as ZeroVec and decode as Vec; this must round-trip.
         let mut zv: ZeroVec<64, u8> = ZeroVec::new();
         zv.set(b"round trip test");
 

@@ -26,7 +26,9 @@ solana-transaction-context.workspace = true
 solana-system-interface.workspace = true
 solana-cpi.workspace = true
 once_cell.workspace = true
+sha2.workspace = true
 zstd.workspace = true
+lz4.workspace = true
 xxhash-rust.workspace = true
 thiserror.workspace = true
 

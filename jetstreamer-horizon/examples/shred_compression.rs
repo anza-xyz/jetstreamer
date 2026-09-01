@@ -6,14 +6,14 @@
 //! bincode-encoded and chopped into data shreds. This example rebuilds that
 //! stream per slot and compares three encodings:
 //!
-//! 1. `wire` — today's shred payload format (bincode, exactly as Turbine
+//! 1. `wire`: today's shred payload format (bincode, exactly as Turbine
 //!    ships it in agave 3.x; swap to wincode, which is byte-identical, once
 //!    the workspace reaches solana-transaction >= 3.1 with its `wincode`
-//!    feature — currently blocked by an agave =3.0.2 pin).
-//! 2. `lencode/tx` — lencode with the frozen 65,535-entry prime table, dedupe
+//!    feature, currently blocked by an agave =3.0.2 pin).
+//! 2. `lencode/tx`: lencode with the frozen 65,535-entry prime table, dedupe
 //!    scratch reset per transaction. Models SIMD-0385-style per-transaction
 //!    independent encoding (each transaction decodable alone).
-//! 3. `lencode/slot` — same, but scratch accumulates across the slot. Models a
+//! 3. `lencode/slot`: same, but scratch accumulates across the slot. Models a
 //!    leader encoding the slot stream (repeat pubkeys within the slot cost 4
 //!    bytes after first sight).
 //!
@@ -23,7 +23,7 @@
 //! 1228 bytes per packet on the wire.
 //!
 //! Data requirements: a `.jet` is sufficient. Entry hashes are not stored in
-//! the archive (deliberately), so a 32-byte placeholder stands in — it
+//! the archive (deliberately), so a 32-byte placeholder stands in. It
 //! contributes identical bytes to every encoding (hashes never dedupe), so
 //! the ratios are exact. `num_hashes`, tick structure, and transaction bytes
 //! are all real. Old Faithful CARs would additionally provide the real entry
@@ -42,6 +42,7 @@ use jetstreamer_horizon::entries::EntryRecord;
 use jetstreamer_horizon::pubkey_prime::POPULAR_PUBKEYS;
 use jetstreamer_horizon::transactions as htx;
 use lencode::prelude::*;
+use solana_address::Address;
 use solana_entry::entry::Entry;
 use solana_message::{
     Message as SolLegacyMessage, MessageHeader as SolMessageHeader,
@@ -68,22 +69,109 @@ struct DumpMsg {
     instructions: Vec<DumpIx>,
 }
 
+/// Version-neutral transaction shape used by the local lencode checkout.
+///
+/// This workspace still uses Solana v3 transaction containers for its
+/// bincode/Turbine baseline, while lencode's full reference-type feature now
+/// tracks Solana v4. Keeping the small Legacy/V0 wire shape here lets the
+/// benchmark exercise current lencode (including `Address` dedupe) without
+/// pulling two incompatible full SDK graphs into the Horizon crate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct LencodeMessageHeader {
+    num_required_signatures: u8,
+    num_readonly_signed_accounts: u8,
+    num_readonly_unsigned_accounts: u8,
+}
+
+impl Encode for LencodeMessageHeader {
+    fn encode_ext(
+        &self,
+        writer: &mut impl lencode::io::Write,
+        ctx: Option<&mut EncoderContext>,
+    ) -> lencode::Result<usize> {
+        u32::from_le_bytes([
+            self.num_required_signatures,
+            self.num_readonly_signed_accounts,
+            self.num_readonly_unsigned_accounts,
+            0,
+        ])
+        .encode_ext(writer, ctx)
+    }
+}
+
+impl Decode for LencodeMessageHeader {
+    fn decode_ext(
+        reader: &mut impl lencode::io::Read,
+        ctx: Option<&mut DecoderContext>,
+    ) -> lencode::Result<Self> {
+        let bytes = u32::decode_ext(reader, ctx)?.to_le_bytes();
+        Ok(Self {
+            num_required_signatures: bytes[0],
+            num_readonly_signed_accounts: bytes[1],
+            num_readonly_unsigned_accounts: bytes[2],
+        })
+    }
+}
+
+#[derive(Encode, Decode, Debug, Clone, PartialEq, Eq)]
+struct LencodeInstruction {
+    program_id_index: u8,
+    accounts: Vec<u8>,
+    data: Vec<u8>,
+}
+
+#[derive(Encode, Decode, Debug, Clone, PartialEq, Eq)]
+struct LencodeAddressTableLookup {
+    account_key: Address,
+    writable_indexes: Vec<u8>,
+    readonly_indexes: Vec<u8>,
+}
+
+#[derive(Encode, Decode, Debug, Clone, PartialEq, Eq)]
+struct LencodeLegacyMessage {
+    header: LencodeMessageHeader,
+    account_keys: Vec<Address>,
+    recent_blockhash: [u8; 32],
+    instructions: Vec<LencodeInstruction>,
+}
+
+#[derive(Encode, Decode, Debug, Clone, PartialEq, Eq)]
+struct LencodeV0Message {
+    header: LencodeMessageHeader,
+    account_keys: Vec<Address>,
+    recent_blockhash: [u8; 32],
+    instructions: Vec<LencodeInstruction>,
+    address_table_lookups: Vec<LencodeAddressTableLookup>,
+}
+
+#[derive(Encode, Decode, Debug, Clone, PartialEq, Eq)]
+enum LencodeMessage {
+    Legacy(LencodeLegacyMessage),
+    V0(LencodeV0Message),
+}
+
+#[derive(Encode, Decode, Debug, Clone, PartialEq, Eq)]
+struct LencodeTransaction {
+    signatures: Vec<[u8; 64]>,
+    message: LencodeMessage,
+}
+
+struct LencodeEntry {
+    num_hashes: u64,
+    transactions: Vec<LencodeTransaction>,
+}
+
 use lencode::context::{DecoderContext, EncoderContext};
 use lencode::dedupe::{DedupeDecoder, DedupeEncodeable, DedupeEncoder};
 
-// The example's own frozen dictionaries, primed as `Pubkey` — the type the
-// solana wire structs dedupe with. Horizon's shared contexts prime the same
-// 65,535 keys but as `Address` (a distinct type); mixing dedupe types in one
-// context trips lencode 1.2's multi-type bug (observed here as heap
-// corruption, not just wrong values), so the example keeps its dedupe
-// universe single-typed.
+// The example's own frozen dictionaries use the same stable `Address` type as
+// Horizon. Keeping one dedupe type per context also avoids mixing independent
+// ID spaces.
 fn frozen_encoder() -> Arc<lencode::dedupe::FrozenEncoderState> {
     let mut primer = DedupeEncoder::new();
     for pk_bytes in POPULAR_PUBKEYS.iter() {
-        let pk = solana_pubkey::Pubkey::new_from_array(*pk_bytes);
-        primer.prime::<solana_pubkey::Pubkey, <solana_pubkey::Pubkey as DedupeEncodeable>::Hasher>(
-            &pk,
-        );
+        let address = Address::new_from_array(*pk_bytes);
+        primer.prime::<Address, <Address as DedupeEncodeable>::Hasher>(&address);
     }
     Arc::new(primer.freeze())
 }
@@ -91,7 +179,7 @@ fn frozen_encoder() -> Arc<lencode::dedupe::FrozenEncoderState> {
 fn frozen_decoder() -> Arc<lencode::dedupe::FrozenDecoderState> {
     let mut primer = DedupeDecoder::new();
     for pk_bytes in POPULAR_PUBKEYS.iter() {
-        primer.prime::<solana_pubkey::Pubkey>(solana_pubkey::Pubkey::new_from_array(*pk_bytes));
+        primer.prime::<Address>(Address::new_from_array(*pk_bytes));
     }
     Arc::new(primer.freeze())
 }
@@ -184,12 +272,75 @@ fn to_versioned(tx: &htx::Transaction) -> VersionedTransaction {
     }
 }
 
+fn lencode_header(header: &SolMessageHeader) -> LencodeMessageHeader {
+    LencodeMessageHeader {
+        num_required_signatures: header.num_required_signatures,
+        num_readonly_signed_accounts: header.num_readonly_signed_accounts,
+        num_readonly_unsigned_accounts: header.num_readonly_unsigned_accounts,
+    }
+}
+
+fn lencode_address(pubkey: &solana_pubkey::Pubkey) -> Address {
+    Address::new_from_array(pubkey.to_bytes())
+}
+
+fn lencode_instruction(ix: &CompiledInstruction) -> LencodeInstruction {
+    LencodeInstruction {
+        program_id_index: ix.program_id_index,
+        accounts: ix.accounts.clone(),
+        data: ix.data.clone(),
+    }
+}
+
+fn to_lencode_transaction(tx: &VersionedTransaction) -> LencodeTransaction {
+    let signatures = tx
+        .signatures
+        .iter()
+        .map(|signature| <[u8; 64]>::try_from(signature.as_ref()).expect("signature is 64 bytes"))
+        .collect();
+    let message = match &tx.message {
+        SolVersionedMessage::Legacy(message) => LencodeMessage::Legacy(LencodeLegacyMessage {
+            header: lencode_header(&message.header),
+            account_keys: message.account_keys.iter().map(lencode_address).collect(),
+            recent_blockhash: message.recent_blockhash.to_bytes(),
+            instructions: message
+                .instructions
+                .iter()
+                .map(lencode_instruction)
+                .collect(),
+        }),
+        SolVersionedMessage::V0(message) => LencodeMessage::V0(LencodeV0Message {
+            header: lencode_header(&message.header),
+            account_keys: message.account_keys.iter().map(lencode_address).collect(),
+            recent_blockhash: message.recent_blockhash.to_bytes(),
+            instructions: message
+                .instructions
+                .iter()
+                .map(lencode_instruction)
+                .collect(),
+            address_table_lookups: message
+                .address_table_lookups
+                .iter()
+                .map(|lookup| LencodeAddressTableLookup {
+                    account_key: lencode_address(&lookup.account_key),
+                    writable_indexes: lookup.writable_indexes.clone(),
+                    readonly_indexes: lookup.readonly_indexes.clone(),
+                })
+                .collect(),
+        }),
+    };
+    LencodeTransaction {
+        signatures,
+        message,
+    }
+}
+
 /// Lencode-encodes one slot's entry stream. `reset_per_tx` selects the
 /// per-transaction mode (scratch cleared before every transaction) versus the
 /// slot-stream mode (scratch accumulates; cleared once per slot by the
 /// caller).
 fn lencode_slot(
-    entries: &[Entry],
+    entries: &[LencodeEntry],
     ctx: &mut EncoderContext,
     reset_per_tx: bool,
     buf: &mut Vec<u8>,
@@ -203,7 +354,7 @@ fn lencode_slot(
             .num_hashes
             .encode_ext(&mut *buf, Some(&mut *ctx))
             .expect("encode num_hashes");
-        buf.extend_from_slice(entry.hash.as_ref());
+        buf.extend_from_slice(&[0; 32]);
         (entry.transactions.len() as u64)
             .encode_ext(&mut *buf, Some(&mut *ctx))
             .expect("encode tx count");
@@ -280,6 +431,18 @@ impl Collector {
         }
         assert_eq!(cursor, txs.len(), "entry tx counts must cover the slot");
 
+        let lencode_stream = stream
+            .iter()
+            .map(|entry| LencodeEntry {
+                num_hashes: entry.num_hashes,
+                transactions: entry
+                    .transactions
+                    .iter()
+                    .map(to_lencode_transaction)
+                    .collect(),
+            })
+            .collect::<Vec<_>>();
+
         if std::env::var_os("SHRED_NO_BINCODE").is_none() {
             let baseline = bincode::serialize(&stream).expect("serialize entry stream");
             self.wire.add_slot(baseline.len() as u64);
@@ -300,14 +463,14 @@ impl Collector {
         });
         if std::env::var_os("SHRED_NO_LENCODE_TX").is_none() {
             reset_encoder(&mut ctx);
-            lencode_slot(&stream, &mut ctx, true, &mut buf);
+            lencode_slot(&lencode_stream, &mut ctx, true, &mut buf);
             self.lencode_tx.add_slot(buf.len() as u64);
         }
 
         // Slot-stream mode (scratch accumulates across the slot).
         if std::env::var_os("SHRED_NO_LENCODE_SLOT").is_none() {
             reset_encoder(&mut ctx);
-            lencode_slot(&stream, &mut ctx, false, &mut buf);
+            lencode_slot(&lencode_stream, &mut ctx, false, &mut buf);
             self.lencode_slot.add_slot(buf.len() as u64);
         }
         self.ctx = Some(ctx);
@@ -316,11 +479,13 @@ impl Collector {
         if std::env::var_os("SHRED_NO_ROUNDTRIP").is_none()
             && std::env::var_os("SHRED_NO_LENCODE_SLOT").is_none()
             && !self.verified
-            && !stream.is_empty()
-            && stream.iter().any(|e| !e.transactions.is_empty())
+            && !lencode_stream.is_empty()
+            && lencode_stream
+                .iter()
+                .any(|entry| !entry.transactions.is_empty())
         {
             let frozen_dec = self.frozen_dec.get_or_insert_with(frozen_decoder).clone();
-            verify_roundtrip(&stream, &buf, &frozen_dec);
+            verify_roundtrip(&lencode_stream, &buf, &frozen_dec);
             self.verified = true;
         }
         self.enc_buf = buf;
@@ -330,7 +495,7 @@ impl Collector {
 }
 
 fn verify_roundtrip(
-    stream: &[Entry],
+    stream: &[LencodeEntry],
     slot_mode_bytes: &[u8],
     frozen: &Arc<lencode::dedupe::FrozenDecoderState>,
 ) {
@@ -349,8 +514,8 @@ fn verify_roundtrip(
         let tx_count = u64::decode_ext(&mut cursor, Some(&mut ctx)).expect("decode tx count");
         assert_eq!(tx_count as usize, entry.transactions.len());
         for expected in &entry.transactions {
-            let tx =
-                VersionedTransaction::decode_ext(&mut cursor, Some(&mut ctx)).expect("decode tx");
+            let tx = LencodeTransaction::decode_ext(&mut cursor, Some(&mut ctx))
+                .expect("decode transaction");
             assert_eq!(&tx, expected, "round-trip transaction mismatch");
         }
     }

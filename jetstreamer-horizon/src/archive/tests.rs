@@ -3,6 +3,7 @@
 //! Synthetic slot streams exercise both compression layers: pubkey reuse
 //! (dedupe) and repeated small mutations to the same accounts across
 //! consecutive slots (diff).
+use lencode::prelude::{Decode, Encode};
 use solana_address::Address;
 use solana_hash::Hash;
 use solana_signature::Signature;
@@ -12,6 +13,11 @@ use crate::pubkey_prime::POPULAR_PUBKEYS;
 use crate::transactions::{Transaction, VersionedMessage};
 
 use super::*;
+
+#[test]
+fn writer_defaults_to_measured_archival_zstd_level() {
+    assert_eq!(ArchiveWriterConfig::default().zstd_level, 9);
+}
 
 // --- deterministic PRNG (splitmix64) ---
 
@@ -120,7 +126,7 @@ fn build_tx(rng: &mut Rng, ledger: &mut Ledger, n_updates: usize) -> Box<Transac
     tx
 }
 
-/// Comparable snapshot of a `BlockMeta` (the real type is ~40 MiB and not
+/// Comparable snapshot of a `BlockMeta` (`BlockMeta` is about 40 MiB and not
 /// `Clone`; tests compare scalar fields + flattened orphan updates).
 #[derive(Debug, Clone, PartialEq, Default)]
 struct MetaSnapshot {
@@ -231,7 +237,7 @@ impl SlotVisitor for Collector {
             }
             BlockNotification::Block(meta) => {
                 // Blocks with zero transactions never got a slot pushed by
-                // on_transaction — push one now.
+                // `on_transaction`; push one now.
                 if self.slots.last().map(|s| s.slot) != Some(slot) {
                     self.slots.push(ExpectedSlot {
                         slot,
@@ -281,7 +287,7 @@ fn write_archive(
         writer.begin_slot(slot).unwrap();
 
         // Pre-transaction orphan updates: simulate per-slot sysvar rewrites
-        // (same accounts touched every slot — exercises diff compression on
+        // (same accounts touched every slot, exercising diff compression on
         // the orphan path too).
         let mut exp_pre = Vec::new();
         for sysvar in 0..2usize {
@@ -397,6 +403,564 @@ fn read_all(bytes: &[u8], start_slot: u64, max_slots: u64, verify: bool) -> Vec<
     collector.slots
 }
 
+fn archive_semantic_sha256(bytes: &[u8]) -> [u8; 32] {
+    let mut reader = ArchiveReader::open(std::io::Cursor::new(bytes)).unwrap();
+    let mut digest = SemanticDigest::new();
+    for index in 0..reader.bucket_count() {
+        reader.read_bucket(index, &mut digest).unwrap();
+    }
+    digest.finish().unwrap()
+}
+
+fn archive_index(bytes: &[u8]) -> Vec<BucketIndexEntry> {
+    let footer = Footer::from_bytes(bytes[bytes.len() - FOOTER_LEN..].try_into().unwrap()).unwrap();
+    parse_bucket_index(
+        &bytes[footer.index_offset as usize..(footer.index_offset + footer.index_len) as usize],
+        &footer,
+    )
+    .unwrap()
+}
+
+fn bucket_frames(bytes: &[u8]) -> Vec<&[u8]> {
+    archive_index(bytes)
+        .into_iter()
+        .map(|entry| &bytes[entry.offset as usize..(entry.offset + entry.len) as usize])
+        .collect()
+}
+
+fn decoded_bucket_payload(raw: &[u8]) -> (BucketHeader, Vec<u8>) {
+    let mut cursor = lencode::io::Cursor::new(raw);
+    let header = BucketHeader::decode_ext(&mut cursor, None).unwrap();
+    let stored = &raw[cursor.position()..];
+    let payload = match header.compression {
+        Compression::None => stored.to_vec(),
+        Compression::Zstd => {
+            zstd::bulk::decompress(stored, header.uncompressed_len as usize).unwrap()
+        }
+        Compression::Lz4 => {
+            lz4::block::decompress(stored, Some(header.uncompressed_len as i32)).unwrap()
+        }
+    };
+    assert_eq!(payload.len() as u64, header.uncompressed_len);
+    (header, payload)
+}
+
+#[test]
+fn read_bucket_stops_at_the_requested_bucket() {
+    let (bytes, expected, _) = write_archive(1_000, 300, ArchiveWriterConfig::default());
+    let mut reader = ArchiveReader::open(std::io::Cursor::new(&bytes[..])).unwrap();
+    reader.verify_chain = true;
+    let mut collector = Collector::default();
+
+    let visited = reader.read_bucket(1, &mut collector).unwrap();
+    assert_eq!(visited, 128);
+    assert_eq!(reader.bucket_loads(), 1);
+    assert_eq!(collector.slots, expected[128..256]);
+
+    let error = reader
+        .read_bucket(reader.bucket_count(), &mut Collector::default())
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        ArchiveFormatError::BucketOutOfRange { index: 3, count: 3 }
+    ));
+}
+
+#[test]
+fn ordered_orphan_callbacks_can_skip_grouped_arena_copies() {
+    #[derive(Default)]
+    struct OrderedOrphans {
+        pre: Vec<(u64, u64, Vec<u8>)>,
+        post: Vec<(u64, u64, Vec<u8>)>,
+        grouped_updates: usize,
+    }
+
+    impl SlotVisitor for OrderedOrphans {
+        fn on_pre_account_update(&mut self, slot: u64, update: &AccountUpdateView<'_>) {
+            self.pre
+                .push((slot, update.write_version, update.data.to_vec()));
+        }
+
+        fn on_post_account_update(&mut self, slot: u64, update: &AccountUpdateView<'_>) {
+            self.post
+                .push((slot, update.write_version, update.data.to_vec()));
+        }
+
+        fn on_block(&mut self, notification: &BlockNotification, _entries: &[EntryRecord]) {
+            if let BlockNotification::Block(meta) = notification {
+                self.grouped_updates += meta.pre_updates.len() + meta.post_updates.len();
+            }
+        }
+
+        fn consumption(&self) -> Consumption {
+            Consumption::all().without_block_account_update_arenas()
+        }
+    }
+
+    let (bytes, expected, _) = write_archive(1_000, 20, ArchiveWriterConfig::default());
+    let mut reader = ArchiveReader::open(std::io::Cursor::new(&bytes[..])).unwrap();
+    let mut ordered = OrderedOrphans::default();
+    reader.read_slots(0, u64::MAX, &mut ordered).unwrap();
+
+    let expected_pre: Vec<_> = expected
+        .iter()
+        .flat_map(|slot| {
+            slot.meta.iter().flat_map(move |meta| {
+                meta.pre
+                    .iter()
+                    .map(move |(version, data)| (slot.slot, *version, data.clone()))
+            })
+        })
+        .collect();
+    let expected_post: Vec<_> = expected
+        .iter()
+        .flat_map(|slot| {
+            slot.meta.iter().flat_map(move |meta| {
+                meta.post
+                    .iter()
+                    .map(move |(version, data)| (slot.slot, *version, data.clone()))
+            })
+        })
+        .collect();
+    assert_eq!(ordered.pre, expected_pre);
+    assert_eq!(ordered.post, expected_post);
+    assert_eq!(ordered.grouped_updates, 0);
+    assert!(ordered.pre.iter().all(|(_, _, data)| !data.is_empty()));
+    assert!(ordered.post.iter().all(|(_, _, data)| !data.is_empty()));
+
+    // The default visitor contract remains unchanged: grouped arenas are
+    // still populated for ordinary consumers.
+    assert_eq!(read_all(&bytes, 0, u64::MAX, false), expected);
+}
+
+#[test]
+fn v1_reencode_is_semantically_lossless_and_bucket_byte_exact() {
+    let config = ArchiveWriterConfig {
+        format: ArchiveVersion::V1,
+        diff_policy: lencode::diff::DiffPolicy::Adaptive,
+        ..ArchiveWriterConfig::default()
+    };
+    let (source, expected, source_stats) = write_archive(1_000, 300, config.clone());
+    assert_eq!(parse_file_header(&source).unwrap().0.format_version, 1);
+
+    let sink = std::io::Cursor::new(Vec::new());
+    let (sink, stats) = reencode_archive(
+        std::io::Cursor::new(&source),
+        sink,
+        ReencodeOptions {
+            writer: config,
+            buckets: BucketSelection::All,
+        },
+    )
+    .unwrap();
+    let output = sink.into_inner();
+
+    assert_eq!(read_all(&output, 0, u64::MAX, true), expected);
+    assert_eq!(
+        parse_file_header(&output).unwrap().0.format_version,
+        FORMAT_VERSION_V1
+    );
+    assert_eq!(stats.source_file_bytes, source.len() as u64);
+    assert_eq!(stats.source_buckets, source_stats.buckets);
+    assert_eq!(stats.slots_reencoded, source_stats.slots);
+    assert_eq!(stats.source_bucket_bytes, source_stats.bucket_bytes_written);
+    assert_eq!(
+        stats.output.bucket_bytes_written,
+        source_stats.bucket_bytes_written
+    );
+    assert_eq!(stats.output.transactions, source_stats.transactions);
+    assert_eq!(stats.output.account_updates, source_stats.account_updates);
+    assert_eq!(
+        stats.output.orphan_account_updates,
+        source_stats.orphan_account_updates
+    );
+
+    let source_frames = bucket_frames(&source);
+    let output_frames = bucket_frames(&output);
+    assert_eq!(source_frames.len(), output_frames.len());
+    // Compare selected frames rather than whole files: creation metadata in
+    // the file header is intentionally regenerated, but a same-config v1
+    // replay must reproduce every byte of every bucket.
+    for index in [0, 1, source_frames.len() - 1] {
+        assert_eq!(output_frames[index], source_frames[index]);
+    }
+}
+
+#[test]
+fn v1_to_v2_reencode_preserves_semantic_sha256() {
+    let (source, _, _) = write_archive(
+        1_000,
+        20,
+        ArchiveWriterConfig {
+            format: ArchiveVersion::V1,
+            diff_policy: lencode::diff::DiffPolicy::Adaptive,
+            ..ArchiveWriterConfig::default()
+        },
+    );
+    let (sink, stats) = reencode_archive(
+        std::io::Cursor::new(&source),
+        std::io::Cursor::new(Vec::new()),
+        ReencodeOptions {
+            writer: ArchiveWriterConfig::default(),
+            buckets: BucketSelection::All,
+        },
+    )
+    .unwrap();
+    let output = sink.into_inner();
+
+    assert_eq!(
+        parse_file_header(&source).unwrap().0.format_version,
+        FORMAT_VERSION_V1
+    );
+    assert_eq!(
+        parse_file_header(&output).unwrap().0.format_version,
+        FORMAT_VERSION_V2
+    );
+    assert_eq!(
+        stats.source_semantic_sha256,
+        archive_semantic_sha256(&source)
+    );
+    assert_eq!(
+        stats.source_semantic_sha256,
+        archive_semantic_sha256(&output)
+    );
+    assert_eq!(stats.source_epoch, 900);
+    assert_eq!(stats.source_slot_start, 1_000);
+    assert_eq!(stats.source_slot_count, 20);
+    let output_header = parse_file_header(&output).unwrap().0;
+    assert_eq!(output_header.epoch, stats.source_epoch);
+    assert_eq!(output_header.slot_start, stats.source_slot_start);
+    assert_eq!(output_header.slot_count, stats.source_slot_count);
+}
+
+#[test]
+fn reencode_preserves_post_updates_on_zero_transaction_slots() {
+    let mut writer =
+        ArchiveWriter::new(Vec::new(), 900, 1_000, 1, ArchiveWriterConfig::default()).unwrap();
+    writer.begin_slot(1_000).unwrap();
+    let data = b"zero-transaction post state";
+    let update = AccountUpdateView {
+        pubkey: Address::new_from_array([7; 32]),
+        lamports: 42,
+        owner: Address::new_from_array([8; 32]),
+        executable: false,
+        rent_epoch: 9,
+        write_version: 10,
+        data,
+    };
+    writer.write_reencoded_post_update(&update).unwrap();
+
+    // Once post-transaction output has begun, accepting another transaction
+    // would silently move it ahead of the already-staged update on the wire.
+    assert!(matches!(
+        writer.write_transaction(&Transaction::new_boxed()),
+        Err(ArchiveFormatError::InvalidContainerLayout(
+            "transaction cannot follow a post-transaction orphan update"
+        ))
+    ));
+
+    let meta = BlockMeta::new_boxed();
+    writer.end_slot(&meta, &[]).unwrap();
+    let (source, _) = writer.finish().unwrap();
+    let source_slots = read_all(&source, 0, u64::MAX, true);
+    assert_eq!(source_slots.len(), 1);
+    assert!(source_slots[0].txs.is_empty());
+    let source_meta = source_slots[0].meta.as_ref().unwrap();
+    assert!(source_meta.pre.is_empty());
+    assert_eq!(source_meta.post, [(10, data.to_vec())]);
+
+    let (output, stats) = reencode_archive(
+        std::io::Cursor::new(&source),
+        Vec::new(),
+        ReencodeOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(read_all(&output, 0, u64::MAX, true), source_slots);
+    assert_eq!(
+        stats.source_semantic_sha256,
+        archive_semantic_sha256(&output)
+    );
+}
+
+#[test]
+fn reencode_rejects_source_parent_hash_break() {
+    let mut writer = ArchiveWriter::new(
+        std::io::Cursor::new(Vec::new()),
+        900,
+        1_000,
+        2,
+        ArchiveWriterConfig {
+            compression: Compression::None,
+            bucket_slots: 2,
+            ..ArchiveWriterConfig::default()
+        },
+    )
+    .unwrap();
+
+    let first_hash = Hash::new_from_array([1; 32]);
+    writer.begin_slot(1_000).unwrap();
+    {
+        let mut meta = BlockMeta::new_boxed();
+        meta.slot = 1_000;
+        meta.parent_slot = 999;
+        meta.blockhash = first_hash;
+        writer.end_slot(&meta, &[]).unwrap();
+    }
+
+    writer.begin_slot(1_001).unwrap();
+    {
+        let mut meta = BlockMeta::new_boxed();
+        meta.slot = 1_001;
+        meta.parent_slot = 1_000;
+        meta.parent_blockhash = Hash::new_from_array([9; 32]);
+        meta.blockhash = Hash::new_from_array([2; 32]);
+        writer.end_slot(&meta, &[]).unwrap();
+    }
+    let (source, _) = writer.finish().unwrap();
+
+    let error = reencode_archive(
+        std::io::Cursor::new(source.into_inner()),
+        std::io::Cursor::new(Vec::new()),
+        ReencodeOptions::default(),
+    )
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        ArchiveFormatError::PohMismatch { slot: 1_001 }
+    ));
+}
+
+#[test]
+fn sparse_reencode_preserves_selected_bucket_frames_and_poh_anchors() {
+    let config = ArchiveWriterConfig {
+        format: ArchiveVersion::V1,
+        diff_policy: lencode::diff::DiffPolicy::Adaptive,
+        ..ArchiveWriterConfig::default()
+    };
+    let (source, expected, _) = write_archive(1_000, 300, config.clone());
+    let source_frames = bucket_frames(&source);
+    let selected_source_bytes = (source_frames[0].len() + source_frames[2].len()) as u64;
+
+    let (sink, stats) = reencode_archive(
+        std::io::Cursor::new(&source),
+        std::io::Cursor::new(Vec::new()),
+        ReencodeOptions {
+            writer: config,
+            // Deliberately unordered with a duplicate: normalization must be
+            // deterministic, and bucket 2 is not adjacent to bucket 0.
+            buckets: BucketSelection::Indices(vec![2, 0, 2]),
+        },
+    )
+    .unwrap();
+    let output = sink.into_inner();
+    let output_frames = bucket_frames(&output);
+
+    assert_eq!(output_frames.len(), 2);
+    assert_eq!(output_frames[0], source_frames[0]);
+    assert_eq!(output_frames[1], source_frames[2]);
+    assert_eq!(stats.source_buckets, 2);
+    assert_eq!(stats.source_bucket_bytes, selected_source_bytes);
+    assert_eq!(stats.output.bucket_bytes_written, selected_source_bytes);
+    assert_eq!(stats.slots_reencoded, 128 + 44);
+
+    let expected: Vec<_> = expected
+        .into_iter()
+        .filter(|slot| matches!((slot.slot - 1_000) / 128, 0 | 2))
+        .collect();
+    // Verification proves bucket 2 retained its source PoH anchor instead
+    // of incorrectly chaining to the last block in selected bucket 0.
+    assert_eq!(read_all(&output, 0, u64::MAX, true), expected);
+}
+
+#[test]
+fn full_reencode_can_change_outer_compression_without_changing_payload() {
+    let (source, expected, _) = write_archive(1_000, 160, ArchiveWriterConfig::default());
+    let (sink, _) = reencode_archive(
+        std::io::Cursor::new(&source),
+        std::io::Cursor::new(Vec::new()),
+        ReencodeOptions {
+            writer: ArchiveWriterConfig {
+                compression: Compression::None,
+                ..ArchiveWriterConfig::default()
+            },
+            buckets: BucketSelection::All,
+        },
+    )
+    .unwrap();
+    let output = sink.into_inner();
+
+    assert_eq!(read_all(&output, 0, u64::MAX, true), expected);
+    let source_frames = bucket_frames(&source);
+    let output_frames = bucket_frames(&output);
+    assert_eq!(source_frames.len(), output_frames.len());
+    for (source, output) in source_frames.into_iter().zip(output_frames) {
+        let (source_header, source_payload) = decoded_bucket_payload(source);
+        let (output_header, output_payload) = decoded_bucket_payload(output);
+        assert_eq!(source_header.first_slot, output_header.first_slot);
+        assert_eq!(source_header.slot_count, output_header.slot_count);
+        assert_eq!(source_header.poh_start_hash, output_header.poh_start_hash);
+        assert_eq!(source_payload, output_payload);
+    }
+}
+
+#[test]
+fn full_reencode_can_change_bucket_geometry() {
+    let (source, expected, _) = write_archive(1_000, 300, ArchiveWriterConfig::default());
+    let (output, stats) = reencode_archive(
+        std::io::Cursor::new(&source),
+        Vec::new(),
+        ReencodeOptions {
+            writer: ArchiveWriterConfig {
+                bucket_slots: 64,
+                ..ArchiveWriterConfig::default()
+            },
+            buckets: BucketSelection::All,
+        },
+    )
+    .unwrap();
+
+    assert_eq!(parse_file_header(&output).unwrap().0.bucket_slots, 64);
+    assert_eq!(stats.slots_reencoded, 300);
+    assert_eq!(stats.output.buckets, 5);
+    assert_eq!(read_all(&output, 0, u64::MAX, true), expected);
+    assert_eq!(
+        stats.source_semantic_sha256,
+        archive_semantic_sha256(&output)
+    );
+}
+
+#[test]
+fn full_reencode_preserves_nonzero_initial_poh_anchor_when_rebucketing() {
+    let slot_start = 1_000;
+    let slot_count = 6;
+    let initial_anchor = Hash::new_from_array([0xa5; 32]);
+    let mut writer = ArchiveWriter::new(
+        Vec::new(),
+        900,
+        slot_start,
+        slot_count,
+        ArchiveWriterConfig {
+            bucket_slots: 4,
+            compression: Compression::None,
+            ..ArchiveWriterConfig::default()
+        },
+    )
+    .unwrap();
+
+    let mut last_blockhash = initial_anchor;
+    for offset in 0..slot_count {
+        let slot = slot_start + offset;
+        if offset < 3 {
+            writer.write_skipped_slot(slot).unwrap();
+            if offset == 0 {
+                writer
+                    .preserve_current_bucket_poh_anchor(slot_start, initial_anchor)
+                    .unwrap();
+            }
+            continue;
+        }
+
+        writer.begin_slot(slot).unwrap();
+        let mut meta = BlockMeta::new_boxed();
+        meta.slot = slot;
+        meta.parent_slot = slot.saturating_sub(1);
+        meta.parent_blockhash = last_blockhash;
+        meta.blockhash = Hash::new_from_array([offset as u8 + 1; 32]);
+        writer.end_slot(&meta, &[]).unwrap();
+        last_blockhash = meta.blockhash;
+    }
+    let (source, _) = writer.finish().unwrap();
+    let (source_header, _) = decoded_bucket_payload(bucket_frames(&source)[0]);
+    assert_eq!(source_header.poh_start_hash, initial_anchor);
+    let expected = read_all(&source, 0, u64::MAX, true);
+
+    // Splitting exercises the case where an all-skipped destination bucket
+    // flushes before the first source block reveals its parent hash. Merging
+    // proves the same anchor survives in the opposite direction.
+    for bucket_slots in [2, 8] {
+        let (output, stats) = reencode_archive(
+            std::io::Cursor::new(&source),
+            Vec::new(),
+            ReencodeOptions {
+                writer: ArchiveWriterConfig {
+                    bucket_slots,
+                    compression: Compression::None,
+                    ..ArchiveWriterConfig::default()
+                },
+                buckets: BucketSelection::All,
+            },
+        )
+        .unwrap();
+
+        let (output_header, _) = decoded_bucket_payload(bucket_frames(&output)[0]);
+        assert_eq!(output_header.poh_start_hash, initial_anchor);
+        assert_eq!(read_all(&output, 0, u64::MAX, true), expected);
+        assert_eq!(
+            stats.source_semantic_sha256,
+            archive_semantic_sha256(&output)
+        );
+    }
+}
+
+#[test]
+fn sparse_reencode_rejects_changed_bucket_geometry() {
+    let (source, _, _) = write_archive(1_000, 300, ArchiveWriterConfig::default());
+    let error = reencode_archive(
+        std::io::Cursor::new(&source),
+        std::io::Cursor::new(Vec::new()),
+        ReencodeOptions {
+            writer: ArchiveWriterConfig {
+                bucket_slots: 64,
+                ..ArchiveWriterConfig::default()
+            },
+            buckets: BucketSelection::Indices(vec![1]),
+        },
+    )
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        ArchiveFormatError::ReencodeBucketSizeMismatch {
+            source_bucket_slots: 128,
+            destination_bucket_slots: 64,
+        }
+    ));
+}
+
+#[test]
+fn all_stored_buckets_are_not_complete_when_source_has_holes() {
+    let config = ArchiveWriterConfig::default();
+    let (dense, _, _) = write_archive(1_000, 300, config.clone());
+    let (sparse, _) = reencode_archive(
+        std::io::Cursor::new(dense),
+        Vec::new(),
+        ReencodeOptions {
+            writer: config,
+            buckets: BucketSelection::Indices(vec![0, 2]),
+        },
+    )
+    .unwrap();
+
+    let error = reencode_archive(
+        std::io::Cursor::new(sparse),
+        Vec::new(),
+        ReencodeOptions {
+            writer: ArchiveWriterConfig {
+                bucket_slots: 64,
+                ..ArchiveWriterConfig::default()
+            },
+            buckets: BucketSelection::All,
+        },
+    )
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        ArchiveFormatError::ReencodeBucketSizeMismatch {
+            source_bucket_slots: 128,
+            destination_bucket_slots: 64,
+        }
+    ));
+}
+
 /// Drives the source-agnostic path the horizon firehose uses: parse the
 /// framing from raw byte ranges (as a network reader would fetch them),
 /// then feed each bucket's bytes to one reused `BucketDecoder`. The decoded
@@ -420,7 +984,7 @@ fn bucket_decoder_matches_archive_reader() {
         .read_slots(0, u64::MAX, &mut reader_collector)
         .unwrap();
 
-    let mut decoder = BucketDecoder::new();
+    let mut decoder = BucketDecoder::for_file_header(&header).unwrap();
     decoder.verify_chain = true;
     let mut collector = Collector::default();
     for entry in &index {
@@ -457,6 +1021,405 @@ fn roundtrip_zstd_bucket_128() {
     let got = read_all(&bytes, 0, u64::MAX, true);
     assert_eq!(got.len(), expected.len());
     assert_eq!(got, expected);
+}
+
+#[test]
+fn roundtrip_v2_lz4() {
+    let config = ArchiveWriterConfig {
+        compression: Compression::Lz4,
+        ..Default::default()
+    };
+    let (bytes, expected, _) = write_archive(1_000, 300, config);
+    let header = parse_file_header(&bytes).unwrap().0;
+    assert_eq!(header.format_version, FORMAT_VERSION_V2);
+    assert_eq!(header.flags, FLAG_DEDUPE_UNSIGNED_LEB128);
+    assert!(bucket_frames(&bytes).iter().any(|raw| {
+        let mut cursor = lencode::io::Cursor::new(*raw);
+        BucketHeader::decode_ext(&mut cursor, None)
+            .is_ok_and(|header| header.compression == Compression::Lz4)
+    }));
+    assert_eq!(read_all(&bytes, 0, u64::MAX, true), expected);
+}
+
+#[test]
+fn stored_bucket_limit_covers_codec_worst_case_bounds() {
+    let raw = MAX_BUCKET_UNCOMPRESSED_BYTES as usize;
+    let zstd_bound = zstd::zstd_safe::compress_bound(raw) as u64;
+    let lz4_bound = lz4::block::compress_bound(raw).unwrap() as u64;
+    // Bucket headers are currently 59 bytes; keep a much wider framing
+    // allowance so adding bounded header fields cannot invalidate the limit.
+    let framing_allowance = 4 << 10;
+    assert!(zstd_bound + framing_allowance <= MAX_BUCKET_STORED_BYTES);
+    assert!(lz4_bound + framing_allowance <= MAX_BUCKET_STORED_BYTES);
+}
+
+#[test]
+fn frame_work_limit_is_independent_of_resident_bucket_limit() {
+    assert!(MAX_FRAME_CUMULATIVE_DECODE_BYTES > MAX_BUCKET_UNCOMPRESSED_BYTES as usize);
+    assert_eq!(MAX_FRAME_CUMULATIVE_DECODE_BYTES, 6 << 30);
+    assert_eq!(MAX_BUCKET_CUMULATIVE_DECODE_BYTES, 64 << 30);
+}
+
+#[test]
+fn v1_rejects_v2_only_codecs() {
+    let lz4_error = ArchiveWriter::new(
+        std::io::Cursor::new(Vec::new()),
+        900,
+        1_000,
+        10,
+        ArchiveWriterConfig {
+            format: ArchiveVersion::V1,
+            compression: Compression::Lz4,
+            diff_policy: lencode::diff::DiffPolicy::Adaptive,
+            ..Default::default()
+        },
+    )
+    .err()
+    .unwrap();
+    assert!(matches!(
+        lz4_error,
+        ArchiveFormatError::UnsupportedCompressionForVersion { .. }
+    ));
+
+    let diff_error = ArchiveWriter::new(
+        std::io::Cursor::new(Vec::new()),
+        900,
+        1_000,
+        10,
+        ArchiveWriterConfig {
+            format: ArchiveVersion::V1,
+            compression: Compression::Zstd,
+            diff_policy: lencode::diff::DiffPolicy::OuterCompressed,
+            ..Default::default()
+        },
+    )
+    .err()
+    .unwrap();
+    assert!(matches!(
+        diff_error,
+        ArchiveFormatError::UnsupportedDiffPolicyForVersion { .. }
+    ));
+}
+
+#[test]
+fn decoder_rejects_valid_checksum_with_trailing_payload() {
+    let (bytes, _, _) = write_archive(
+        1_000,
+        20,
+        ArchiveWriterConfig {
+            compression: Compression::None,
+            ..Default::default()
+        },
+    );
+    let frame = bucket_frames(&bytes)[0];
+    let mut cursor = lencode::io::Cursor::new(frame);
+    let mut header = BucketHeader::decode_ext(&mut cursor, None).unwrap();
+    let mut payload = frame[cursor.position()..].to_vec();
+    payload.push(0xA5);
+    header.uncompressed_len += 1;
+    header.stored_len += 1;
+    header.xxh64 = xxhash_rust::xxh64::xxh64(&payload, 0);
+    let mut tampered = Vec::new();
+    header.encode_ext(&mut tampered, None).unwrap();
+    tampered.extend_from_slice(&payload);
+
+    let mut decoder = BucketDecoder::for_archive_version(ArchiveVersion::V2);
+    let error = decoder
+        .decode_bucket(&tampered, 0, u64::MAX, &mut Collector::default())
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        ArchiveFormatError::TrailingBucketBytes { bytes: 1, .. }
+    ));
+}
+
+#[test]
+fn v1_decoder_rejects_lz4_bucket() {
+    let (bytes, _, _) = write_archive(
+        1_000,
+        20,
+        ArchiveWriterConfig {
+            compression: Compression::Lz4,
+            ..Default::default()
+        },
+    );
+    let frame = bucket_frames(&bytes)[0];
+    let mut decoder = BucketDecoder::for_archive_version(ArchiveVersion::V1);
+    let error = decoder.load_bucket_bytes(frame).unwrap_err();
+    assert!(matches!(
+        error,
+        ArchiveFormatError::UnsupportedCompressionForVersion { .. }
+    ));
+}
+
+#[test]
+fn v1_decoder_rejects_outer_diff_with_and_without_materialization() {
+    let sink = std::io::Cursor::new(Vec::new());
+    let mut writer = ArchiveWriter::new(
+        sink,
+        900,
+        1_000,
+        2,
+        ArchiveWriterConfig {
+            compression: Compression::None,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let pubkey = Address::new_from_array(POPULAR_PUBKEYS[0]);
+    let owner = Address::new_from_array(POPULAR_PUBKEYS[1]);
+    let mut data = vec![0x5A; 256];
+    let mut parent = Hash::default();
+    for slot in 1_000..1_002 {
+        writer.begin_slot(slot).unwrap();
+        if slot == 1_001 {
+            for byte in &mut data {
+                *byte ^= 0xFF;
+            }
+        }
+        writer
+            .write_orphan_update(&AccountUpdateView {
+                pubkey,
+                lamports: 1,
+                owner,
+                executable: false,
+                rent_epoch: 0,
+                write_version: slot,
+                data: &data,
+            })
+            .unwrap();
+        let blockhash = Hash::new_from_array([slot as u8; 32]);
+        let mut meta = BlockMeta::new_boxed();
+        meta.slot = slot;
+        meta.parent_slot = slot - 1;
+        meta.parent_blockhash = parent;
+        meta.blockhash = blockhash;
+        writer.end_slot(&meta, &[]).unwrap();
+        parent = blockhash;
+    }
+    let (sink, _) = writer.finish().unwrap();
+    let bytes = sink.into_inner();
+    let frame = bucket_frames(&bytes)[0];
+
+    for materialize in [true, false] {
+        let mut decoder = BucketDecoder::for_archive_version(ArchiveVersion::V1);
+        decoder.materialize_account_data = materialize;
+        let error = decoder
+            .decode_bucket(frame, 0, u64::MAX, &mut Collector::default())
+            .unwrap_err();
+        assert!(matches!(error, ArchiveFormatError::Encode(_)));
+    }
+}
+
+#[test]
+fn decoder_rejects_zero_slot_bucket_and_index_header_mismatch() {
+    let header = BucketHeader {
+        first_slot: 1_000,
+        slot_count: 0,
+        compression: Compression::None,
+        uncompressed_len: 0,
+        stored_len: 0,
+        xxh64: xxhash_rust::xxh64::xxh64(&[], 0),
+        poh_start_hash: Hash::default(),
+    };
+    let mut raw = Vec::new();
+    header.encode_ext(&mut raw, None).unwrap();
+    let mut decoder = BucketDecoder::for_archive_version(ArchiveVersion::V2);
+    assert!(matches!(
+        decoder.load_bucket_bytes(&raw),
+        Err(ArchiveFormatError::InvalidBucketSlotCount { slot_count: 0, .. })
+    ));
+
+    let (bytes, _, _) = write_archive(1_000, 20, ArchiveWriterConfig::default());
+    let frame = bucket_frames(&bytes)[0];
+    let mut decoder = BucketDecoder::for_archive_version(ArchiveVersion::V2);
+    let error = decoder
+        .load_indexed_bucket_bytes(
+            frame,
+            BucketIndexEntry {
+                first_slot: 999,
+                offset: 0,
+                len: frame.len() as u64,
+            },
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        ArchiveFormatError::BucketHeaderMismatch {
+            indexed: 999,
+            decoded: 1_000
+        }
+    ));
+}
+
+#[test]
+fn decoder_rejects_nonconsecutive_slot_frame() {
+    let mut payload = Vec::new();
+    1_001u64.encode_ext(&mut payload, None).unwrap();
+    payload.push(SlotKind::Skipped as u8);
+    let header = BucketHeader {
+        first_slot: 1_000,
+        slot_count: 1,
+        compression: Compression::None,
+        uncompressed_len: payload.len() as u64,
+        stored_len: payload.len() as u64,
+        xxh64: xxhash_rust::xxh64::xxh64(&payload, 0),
+        poh_start_hash: Hash::default(),
+    };
+    let mut raw = Vec::new();
+    header.encode_ext(&mut raw, None).unwrap();
+    raw.extend_from_slice(&payload);
+    let mut decoder = BucketDecoder::for_archive_version(ArchiveVersion::V2);
+    let error = decoder
+        .decode_bucket(&raw, 0, u64::MAX, &mut Collector::default())
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        ArchiveFormatError::UnexpectedBucketSlot {
+            expected: 1_000,
+            decoded: 1_001
+        }
+    ));
+}
+
+#[test]
+fn container_varint_rejects_noncanonical_lengths() {
+    for malformed in [
+        &[0x80][..],
+        &[0x89][..],
+        &[0x81, 0x7F][..],
+        &[0x82, 0x80, 0x00][..],
+    ] {
+        assert!(
+            read_io_varint(&mut std::io::Cursor::new(malformed)).is_err(),
+            "accepted {malformed:02x?}"
+        );
+    }
+    assert_eq!(
+        read_io_varint(&mut std::io::Cursor::new([0x81, 0x80])).unwrap(),
+        128
+    );
+}
+
+#[test]
+fn decoder_rejects_noncanonical_epoch_presence_flag() {
+    let (bytes, _, _) = write_archive(
+        1_000,
+        1,
+        ArchiveWriterConfig {
+            compression: Compression::None,
+            ..Default::default()
+        },
+    );
+    let frame = bucket_frames(&bytes)[0];
+    let mut header_cursor = lencode::io::Cursor::new(frame);
+    let mut header = BucketHeader::decode_ext(&mut header_cursor, None).unwrap();
+    let mut payload = frame[header_cursor.position()..].to_vec();
+
+    let mut payload_cursor = lencode::io::Cursor::new(payload.as_slice());
+    assert_eq!(u64::decode_ext(&mut payload_cursor, None).unwrap(), 1_000);
+    let kind_offset = payload_cursor.position();
+    assert_eq!(payload[kind_offset], SlotKind::Block as u8);
+    assert_eq!(payload[kind_offset + 1], 0);
+    payload[kind_offset + 1] = 2;
+
+    header.xxh64 = xxhash_rust::xxh64::xxh64(&payload, 0);
+    let mut tampered = Vec::new();
+    header.encode_ext(&mut tampered, None).unwrap();
+    tampered.extend_from_slice(&payload);
+
+    let mut decoder = BucketDecoder::for_archive_version(ArchiveVersion::V2);
+    assert!(matches!(
+        decoder.decode_bucket(&tampered, 0, u64::MAX, &mut Collector::default()),
+        Err(ArchiveFormatError::InvalidContainerLayout(
+            "epoch presence flag must be 0 or 1"
+        ))
+    ));
+}
+
+#[test]
+fn decoder_rejects_checksum_valid_trailing_zstd_frame() {
+    let (bytes, _, _) = write_archive(1_000, 20, ArchiveWriterConfig::default());
+    let frame = bucket_frames(&bytes)[0];
+    let mut cursor = lencode::io::Cursor::new(frame);
+    let mut header = BucketHeader::decode_ext(&mut cursor, None).unwrap();
+    assert_eq!(header.compression, Compression::Zstd);
+    let mut stored = frame[cursor.position()..].to_vec();
+    // Empty zstd skippable frame: magic 0x184D2A50 + little-endian size 0.
+    stored.extend_from_slice(&[0x50, 0x2A, 0x4D, 0x18, 0, 0, 0, 0]);
+    header.stored_len = stored.len() as u64;
+    header.xxh64 = xxhash_rust::xxh64::xxh64(&stored, 0);
+    let mut tampered = Vec::new();
+    header.encode_ext(&mut tampered, None).unwrap();
+    tampered.extend_from_slice(&stored);
+
+    let mut decoder = BucketDecoder::for_archive_version(ArchiveVersion::V2);
+    assert!(matches!(
+        decoder.load_bucket_bytes(&tampered),
+        Err(ArchiveFormatError::TrailingBucketBytes { bytes: 8, .. })
+    ));
+}
+
+#[test]
+fn decoder_rejects_checksum_valid_trailing_lz4_bytes() {
+    let (bytes, _, _) = write_archive(
+        1_000,
+        20,
+        ArchiveWriterConfig {
+            compression: Compression::Lz4,
+            ..Default::default()
+        },
+    );
+    let frame = bucket_frames(&bytes)[0];
+    let mut cursor = lencode::io::Cursor::new(frame);
+    let mut header = BucketHeader::decode_ext(&mut cursor, None).unwrap();
+    assert_eq!(header.compression, Compression::Lz4);
+    let mut stored = frame[cursor.position()..].to_vec();
+    stored.push(0);
+    header.stored_len = stored.len() as u64;
+    header.xxh64 = xxhash_rust::xxh64::xxh64(&stored, 0);
+    let mut tampered = Vec::new();
+    header.encode_ext(&mut tampered, None).unwrap();
+    tampered.extend_from_slice(&stored);
+
+    let mut decoder = BucketDecoder::for_archive_version(ArchiveVersion::V2);
+    assert!(matches!(
+        decoder.load_bucket_bytes(&tampered),
+        Err(ArchiveFormatError::Io(error)) if error.kind() == std::io::ErrorKind::InvalidData
+    ));
+}
+
+#[test]
+fn decoder_rejects_oversized_manual_section_count_before_looping() {
+    let mut payload = Vec::new();
+    1_000u64.encode_ext(&mut payload, None).unwrap();
+    payload.push(SlotKind::Block as u8);
+    payload.push(0); // no epoch notification
+    0u64.encode_ext(&mut payload, None).unwrap(); // no pre-updates
+    (u64::from(u32::MAX) + 1)
+        .encode_ext(&mut payload, None)
+        .unwrap(); // transaction count must not truncate to zero
+
+    let header = BucketHeader {
+        first_slot: 1_000,
+        slot_count: 1,
+        compression: Compression::None,
+        uncompressed_len: payload.len() as u64,
+        stored_len: payload.len() as u64,
+        xxh64: xxhash_rust::xxh64::xxh64(&payload, 0),
+        poh_start_hash: Hash::default(),
+    };
+    let mut raw = Vec::new();
+    header.encode_ext(&mut raw, None).unwrap();
+    raw.extend_from_slice(&payload);
+
+    let mut decoder = BucketDecoder::for_archive_version(ArchiveVersion::V2);
+    assert!(matches!(
+        decoder.decode_bucket(&raw, 0, u64::MAX, &mut Collector::default()),
+        Err(ArchiveFormatError::Encode(
+            lencode::io::Error::DecodeLimitExceeded
+        ))
+    ));
 }
 
 #[test]
@@ -521,6 +1484,7 @@ fn diff_compression_shrinks_repeat_updates() {
         256,
         ArchiveWriterConfig {
             compression: Compression::None,
+            diff_policy: lencode::diff::DiffPolicy::Adaptive,
             ..Default::default()
         },
     );
@@ -530,6 +1494,7 @@ fn diff_compression_shrinks_repeat_updates() {
         ArchiveWriterConfig {
             compression: Compression::None,
             bucket_slots: 1,
+            diff_policy: lencode::diff::DiffPolicy::Adaptive,
             ..Default::default()
         },
     );
@@ -544,7 +1509,7 @@ fn diff_compression_shrinks_repeat_updates() {
 #[test]
 fn sequential_windows_continue_without_reload() {
     // Consuming the archive in many small forward windows must not
-    // re-load the bucket on each call — the reader continues in place.
+    // reload the bucket on each call; the reader continues in place.
     let (bytes, expected, _) = write_archive(1_000, 300, ArchiveWriterConfig::default());
     let mut reader = ArchiveReader::open(std::io::Cursor::new(&bytes[..])).unwrap();
     let mut collector = Collector::default();
@@ -643,6 +1608,25 @@ fn epoch_meta_roundtrips_on_boundary_block() {
     let meta = slot.meta.as_ref().unwrap();
     assert_eq!(meta.pre, vec![(2u64, b"clock".to_vec())]);
     assert!(meta.post.is_empty());
+
+    // Re-encoding must replay the epoch callback before the pre-update and
+    // preserve the complete bucket frame, including the epoch-owned update.
+    let (reencoded, reencode_stats) = reencode_archive(
+        std::io::Cursor::new(&bytes),
+        std::io::Cursor::new(Vec::new()),
+        ReencodeOptions::default(),
+    )
+    .unwrap();
+    let reencoded = reencoded.into_inner();
+    let mut reader = ArchiveReader::open(std::io::Cursor::new(&reencoded[..])).unwrap();
+    let mut reencoded_collector = Collector::default();
+    reader
+        .read_slots(0, u64::MAX, &mut reencoded_collector)
+        .unwrap();
+    assert_eq!(reencoded_collector.epochs, collector.epochs);
+    assert_eq!(reencoded_collector.slots, collector.slots);
+    assert_eq!(bucket_frames(&reencoded), bucket_frames(&bytes));
+    assert_eq!(reencode_stats.output.epochs, 1);
 }
 
 #[test]
@@ -676,11 +1660,81 @@ fn writer_rejects_non_monotonic_slots() {
     let sink = std::io::Cursor::new(Vec::new());
     let mut writer =
         ArchiveWriter::new(sink, 900, 1_000, 100, ArchiveWriterConfig::default()).unwrap();
-    writer.write_skipped_slot(1_005).unwrap();
-    let err = writer.write_skipped_slot(1_005);
+    writer.write_skipped_slot(1_000).unwrap();
+    let err = writer.write_skipped_slot(1_000);
     assert!(matches!(
         err,
         Err(ArchiveFormatError::NonMonotonicSlot { .. })
+    ));
+}
+
+#[test]
+fn writer_enforces_decodable_bucket_slot_geometry() {
+    let config = ArchiveWriterConfig {
+        bucket_slots: 4,
+        ..ArchiveWriterConfig::default()
+    };
+
+    let mut unaligned = ArchiveWriter::new(Vec::new(), 900, 1_000, 20, config.clone()).unwrap();
+    assert!(matches!(
+        unaligned.write_skipped_slot(1_001),
+        Err(ArchiveFormatError::UnexpectedBucketSlot {
+            expected: 1_000,
+            decoded: 1_001,
+        })
+    ));
+
+    let mut gapped = ArchiveWriter::new(Vec::new(), 900, 1_000, 20, config.clone()).unwrap();
+    gapped.write_skipped_slot(1_000).unwrap();
+    assert!(matches!(
+        gapped.write_skipped_slot(1_002),
+        Err(ArchiveFormatError::UnexpectedBucketSlot {
+            expected: 1_001,
+            decoded: 1_002,
+        })
+    ));
+    // Rejection happens before writer state changes, so the missing slot can
+    // still be supplied and the archive completed normally.
+    gapped.write_skipped_slot(1_001).unwrap();
+    let (bytes, _) = gapped.finish().unwrap();
+    ArchiveReader::open(std::io::Cursor::new(bytes)).unwrap();
+
+    // Omitting whole buckets remains valid for deterministic sparse samples.
+    let mut sparse = ArchiveWriter::new(Vec::new(), 900, 1_000, 20, config).unwrap();
+    sparse.write_skipped_slot(1_000).unwrap();
+    sparse.write_skipped_slot(1_008).unwrap();
+    let (bytes, _) = sparse.finish().unwrap();
+    let mut reader = ArchiveReader::open(std::io::Cursor::new(bytes)).unwrap();
+    reader.verify_chain = true;
+    let mut collector = Collector::default();
+    assert_eq!(reader.read_slots(0, u64::MAX, &mut collector).unwrap(), 2);
+    assert_eq!(
+        collector
+            .slots
+            .into_iter()
+            .map(|slot| slot.slot)
+            .collect::<Vec<_>>(),
+        [1_000, 1_008]
+    );
+}
+
+#[test]
+fn writer_rejects_zero_bucket_slots_without_panicking() {
+    let result = ArchiveWriter::new(
+        Vec::new(),
+        900,
+        1_000,
+        20,
+        ArchiveWriterConfig {
+            bucket_slots: 0,
+            ..ArchiveWriterConfig::default()
+        },
+    );
+    assert!(matches!(
+        result,
+        Err(ArchiveFormatError::InvalidContainerLayout(
+            "bucket_slots must be nonzero"
+        ))
     ));
 }
 
@@ -731,7 +1785,7 @@ fn timing_stateful_vs_reload_windows() {
     let stateful = t0.elapsed();
     let loads_a = reader.bucket_loads();
 
-    // Pattern B (old behavior): fresh reader per window — every call
+    // Pattern B (old behavior): fresh reader per window, so every call
     // re-loads the bucket and decodes from its start.
     let t0 = std::time::Instant::now();
     let mut next = 0u64;
@@ -776,11 +1830,20 @@ fn timing_stateful_vs_reload_windows() {
 struct DeclineData<V>(V);
 
 impl<V: SlotVisitor> SlotVisitor for DeclineData<V> {
+    fn on_slot_start(&mut self, slot: u64, kind: SlotKind) {
+        self.0.on_slot_start(slot, kind);
+    }
     fn on_epoch(&mut self, meta: &EpochMeta) {
         self.0.on_epoch(meta);
     }
+    fn on_pre_account_update(&mut self, slot: u64, update: &AccountUpdateView<'_>) {
+        self.0.on_pre_account_update(slot, update);
+    }
     fn on_transaction(&mut self, slot: u64, tx_index: u32, tx: &Transaction) {
         self.0.on_transaction(slot, tx_index, tx);
+    }
+    fn on_post_account_update(&mut self, slot: u64, update: &AccountUpdateView<'_>) {
+        self.0.on_post_account_update(slot, update);
     }
     fn on_block(&mut self, notification: &BlockNotification, entries: &[EntryRecord]) {
         self.0.on_block(notification, entries);
@@ -790,7 +1853,7 @@ impl<V: SlotVisitor> SlotVisitor for DeclineData<V> {
     }
 }
 
-/// `expected` with every update's data elided (metadata and counts kept) —
+/// `expected` with every update's data elided (metadata and counts kept),
 /// exactly what a consumption-declining decode must produce.
 fn elide_update_data(expected: &[ExpectedSlot]) -> Vec<ExpectedSlot> {
     expected
@@ -815,7 +1878,7 @@ fn elide_update_data(expected: &[ExpectedSlot]) -> Vec<ExpectedSlot> {
 
 /// Skip mode must leave every non-update field of the stream byte-identical
 /// (fees, sigs, loaded addresses, block meta, entries, update counts and
-/// write_versions) while eliding update data — across all three update
+/// write_versions) while eliding update data across all three update
 /// kinds (tx-owned, pre/post orphans) and leader-skipped slots. Byte
 /// tallies are cursor-position deltas so they must agree between modes.
 #[test]
@@ -851,6 +1914,7 @@ fn skip_materialization_preserves_streams_and_elides_data() {
 fn skip_materialization_bucket_decoder_path() {
     let (bytes, expected, _) = write_archive(1_000, 300, ArchiveWriterConfig::default());
     let expected_skip = elide_update_data(&expected);
+    let (header, _) = parse_file_header(&bytes).unwrap();
 
     let footer = Footer::from_bytes(bytes[bytes.len() - FOOTER_LEN..].try_into().unwrap()).unwrap();
     let index = parse_bucket_index(
@@ -859,7 +1923,7 @@ fn skip_materialization_bucket_decoder_path() {
     )
     .unwrap();
 
-    let mut decoder = BucketDecoder::new();
+    let mut decoder = BucketDecoder::for_file_header(&header).unwrap();
     decoder.materialize_account_data = false;
     let mut collector = Collector::default();
     for entry in &index {
@@ -874,7 +1938,7 @@ fn skip_materialization_bucket_decoder_path() {
 
 /// A reader whose loaded bucket was latched under one materialization mode
 /// must reload (not continue in place) when the next visitor wants the
-/// other mode — otherwise a bytes-wanting visitor would resume inside a
+/// other mode; otherwise a bytes-wanting visitor would resume inside a
 /// bucket whose diff store was never populated.
 #[test]
 fn switching_consumption_mid_bucket_reloads_under_new_mode() {
@@ -990,10 +2054,372 @@ fn skip_materialization_epoch_updates_counted_data_elided() {
     assert_eq!(capture.pre, vec![(2, Vec::new())]);
 }
 
+#[test]
+fn resource_limits_bucket_work_budget_accumulates_across_slot_frames() {
+    let mut writer = ArchiveWriter::new(
+        Vec::new(),
+        900,
+        1_000,
+        2,
+        ArchiveWriterConfig {
+            compression: Compression::None,
+            bucket_slots: 2,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let data = vec![7u8; 1_024];
+    for slot in 1_000..1_002 {
+        writer.begin_slot(slot).unwrap();
+        writer
+            .write_orphan_update(&AccountUpdateView {
+                pubkey: Address::new_from_array([1; 32]),
+                lamports: 1,
+                owner: Address::new_from_array([2; 32]),
+                executable: false,
+                rent_epoch: 0,
+                write_version: slot,
+                data: &data,
+            })
+            .unwrap();
+        let mut meta = BlockMeta::new_boxed();
+        meta.slot = slot;
+        writer.end_slot(&meta, &[]).unwrap();
+    }
+    let (archive, _) = writer.finish().unwrap();
+    let frame = bucket_frames(&archive)[0];
+
+    let mut decoder = BucketDecoder::for_archive_version(ArchiveVersion::V2);
+    decoder.load_bucket_bytes(frame).unwrap();
+    decoder
+        .decode_slot_frame(0, &mut Collector::default())
+        .unwrap();
+    let first_frame_work = decoder.bucket_decode_work_bytes();
+    assert!(first_frame_work > 0);
+    decoder.set_bucket_decode_work_limit_for_test(first_frame_work);
+    assert!(matches!(
+        decoder.decode_slot_frame(0, &mut Collector::default()),
+        Err(ArchiveFormatError::Encode(
+            lencode::io::Error::DecodeLimitExceeded
+        ))
+    ));
+}
+
+#[test]
+fn resource_limits_skipped_data_enforces_pre_phase_limits() {
+    let mut writer = ArchiveWriter::new(
+        Vec::new(),
+        900,
+        1_000,
+        1,
+        ArchiveWriterConfig {
+            compression: Compression::None,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    writer.begin_slot(1_000).unwrap();
+    for (key, byte) in [(3u8, 3u8), (4, 4)] {
+        writer
+            .write_orphan_update(&AccountUpdateView {
+                pubkey: Address::new_from_array([key; 32]),
+                lamports: 1,
+                owner: Address::new_from_array([5; 32]),
+                executable: false,
+                rent_epoch: 0,
+                write_version: u64::from(key),
+                data: &[byte; 64],
+            })
+            .unwrap();
+    }
+    let mut meta = BlockMeta::new_boxed();
+    meta.slot = 1_000;
+    writer.end_slot(&meta, &[]).unwrap();
+    let (archive, _) = writer.finish().unwrap();
+    let frame = bucket_frames(&archive)[0];
+
+    for materialize_data in [true, false] {
+        for materialize_arena in [true, false] {
+            let mut decoder = BucketDecoder::for_archive_version(ArchiveVersion::V2);
+            decoder.materialize_account_data = materialize_data;
+            decoder.materialize_block_account_update_arenas = materialize_arena;
+            decoder.set_pre_update_limits_for_test(2, 100);
+            assert!(matches!(
+                decoder.decode_bucket(frame, 0, u64::MAX, &mut Collector::default()),
+                Err(ArchiveFormatError::SectionTooLarge {
+                    section: "pre-transaction account-update data",
+                    ..
+                })
+            ));
+        }
+    }
+
+    // Count rejection happens before the decoder attempts to read records,
+    // and therefore cannot depend on either materialization mode.
+    let mut payload = Vec::new();
+    1_000u64.encode_ext(&mut payload, None).unwrap();
+    payload.push(SlotKind::Block as u8);
+    payload.push(0);
+    3u64.encode_ext(&mut payload, None).unwrap();
+    let header = BucketHeader {
+        first_slot: 1_000,
+        slot_count: 1,
+        compression: Compression::None,
+        uncompressed_len: payload.len() as u64,
+        stored_len: payload.len() as u64,
+        xxh64: xxhash_rust::xxh64::xxh64(&payload, 0),
+        poh_start_hash: Hash::default(),
+    };
+    let mut raw = Vec::new();
+    header.encode_ext(&mut raw, None).unwrap();
+    raw.extend_from_slice(&payload);
+    for materialize_data in [true, false] {
+        let mut decoder = BucketDecoder::for_archive_version(ArchiveVersion::V2);
+        decoder.materialize_account_data = materialize_data;
+        decoder.materialize_block_account_update_arenas = false;
+        decoder.set_pre_update_limits_for_test(2, usize::MAX);
+        assert!(matches!(
+            decoder.decode_bucket(&raw, 0, u64::MAX, &mut Collector::default()),
+            Err(ArchiveFormatError::SectionTooLarge {
+                section: "pre-transaction updates",
+                ..
+            })
+        ));
+    }
+}
+
+#[test]
+fn resource_limits_all_update_phases_are_consumption_independent() {
+    let mut writer = ArchiveWriter::new(
+        Vec::new(),
+        900,
+        1_000,
+        1,
+        ArchiveWriterConfig {
+            compression: Compression::None,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    writer.begin_slot(1_000).unwrap();
+    let data = [0xA5; 64];
+    let make_update = |key: u8| AccountUpdateView {
+        pubkey: Address::new_from_array([key; 32]),
+        lamports: 1,
+        owner: Address::new_from_array([99; 32]),
+        executable: false,
+        rent_epoch: 0,
+        write_version: u64::from(key),
+        data: &data,
+    };
+
+    let mut epoch = EpochMeta::new_boxed();
+    epoch.epoch = 900;
+    epoch.start_slot = 1_000;
+    epoch.slot_count = 1;
+    epoch.first_block_slot = 1_000;
+    epoch.updates.push(&make_update(1)).unwrap();
+    writer.write_epoch_meta(&epoch).unwrap();
+    writer.write_orphan_update(&make_update(2)).unwrap();
+    let mut tx = Transaction::new_boxed();
+    tx.signatures.push(Signature::default());
+    tx.push_account_update(&make_update(3)).unwrap();
+    writer.write_transaction(&tx).unwrap();
+    writer.write_reencoded_post_update(&make_update(4)).unwrap();
+    let mut meta = BlockMeta::new_boxed();
+    meta.slot = 1_000;
+    writer.end_slot(&meta, &[]).unwrap();
+    let (archive, _) = writer.finish().unwrap();
+    let frame = bucket_frames(&archive)[0];
+
+    let phases = [
+        (0usize, "epoch account updates", "epoch account-update data"),
+        (
+            1,
+            "transaction account updates",
+            "transaction account-update data",
+        ),
+        (
+            2,
+            "pre-transaction updates",
+            "pre-transaction account-update data",
+        ),
+        (
+            3,
+            "post-transaction updates",
+            "post-transaction account-update data",
+        ),
+    ];
+    for (phase, count_section, data_section) in phases {
+        for (count_limit, data_limit, expected_section) in [
+            (0, usize::MAX, count_section),
+            (usize::MAX, 32, data_section),
+        ] {
+            for materialize_data in [true, false] {
+                for materialize_arena in [true, false] {
+                    let mut limits = [
+                        (usize::MAX, usize::MAX),
+                        (usize::MAX, usize::MAX),
+                        (usize::MAX, usize::MAX),
+                        (usize::MAX, usize::MAX),
+                    ];
+                    limits[phase] = (count_limit, data_limit);
+                    let mut decoder = BucketDecoder::for_archive_version(ArchiveVersion::V2);
+                    decoder.materialize_account_data = materialize_data;
+                    decoder.materialize_block_account_update_arenas = materialize_arena;
+                    decoder.set_phase_limits_for_test(limits[0], limits[1], limits[2], limits[3]);
+                    assert!(matches!(
+                        decoder.decode_bucket(frame, 0, u64::MAX, &mut Collector::default()),
+                        Err(ArchiveFormatError::SectionTooLarge { section, .. })
+                            if section == expected_section
+                    ));
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn resource_limits_writer_bounds_growth_and_poisoned_finish() {
+    let mut writer = ArchiveWriter::new(
+        Vec::new(),
+        900,
+        1_000,
+        128,
+        ArchiveWriterConfig {
+            compression: Compression::None,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    writer.set_bucket_limit_for_test(256);
+
+    let mut failure = None;
+    for slot in 1_000..1_128 {
+        if let Err(error) = writer.begin_slot(slot) {
+            failure = Some(error);
+            break;
+        }
+        let data = [slot as u8; 96];
+        let update = writer.write_orphan_update(&AccountUpdateView {
+            pubkey: Address::new_from_array([slot as u8; 32]),
+            lamports: 1,
+            owner: Address::new_from_array([9; 32]),
+            executable: false,
+            rent_epoch: 0,
+            write_version: slot,
+            data: &data,
+        });
+        if let Err(error) = update {
+            failure = Some(error);
+            break;
+        }
+        let mut meta = BlockMeta::new_boxed();
+        meta.slot = slot;
+        if let Err(error) = writer.end_slot(&meta, &[]) {
+            failure = Some(error);
+            break;
+        }
+    }
+    assert!(matches!(
+        failure,
+        Some(ArchiveFormatError::BucketTooLarge { .. })
+    ));
+    assert!(writer.retained_payload_capacity_for_test() <= 512);
+    assert!(matches!(
+        writer.finish(),
+        Err(ArchiveFormatError::InvalidContainerLayout(
+            "archive writer is unusable after an earlier encode failure"
+        ))
+    ));
+}
+
+#[test]
+fn writer_sequence_limits_match_reader_and_reject_before_mutation() {
+    #[derive(Default)]
+    struct SequenceTally {
+        transactions: usize,
+        entries: usize,
+    }
+
+    impl SlotVisitor for SequenceTally {
+        fn on_transaction(&mut self, _slot: u64, _tx_index: u32, _tx: &Transaction) {
+            self.transactions += 1;
+        }
+
+        fn on_block(&mut self, _notification: &BlockNotification, entries: &[EntryRecord]) {
+            self.entries += entries.len();
+        }
+    }
+
+    let config = ArchiveWriterConfig {
+        compression: Compression::None,
+        ..Default::default()
+    };
+
+    // Transactions: accept the configured boundary, reject the next record
+    // before touching codec state, and leave a reader-valid boundary archive.
+    let mut writer = ArchiveWriter::new(Vec::new(), 900, 1_000, 1, config.clone()).unwrap();
+    assert_eq!(
+        writer.frame_sequence_limit_for_test(),
+        MAX_FRAME_SEQUENCE_ELEMENTS
+    );
+    writer.set_frame_sequence_limit_for_test(2);
+    writer.begin_slot(1_000).unwrap();
+    let tx = Transaction::new_boxed();
+    writer.write_transaction(&tx).unwrap();
+    writer.write_transaction(&tx).unwrap();
+    assert!(matches!(
+        writer.write_transaction(&tx),
+        Err(ArchiveFormatError::SectionTooLarge {
+            section: "transactions",
+            bytes: 3,
+            limit: 2,
+        })
+    ));
+    assert_eq!(writer.stats().transactions, 2);
+    let mut meta = BlockMeta::new_boxed();
+    meta.slot = 1_000;
+    writer.end_slot(&meta, &[]).unwrap();
+    let (bytes, _) = writer.finish().unwrap();
+
+    let mut reader = ArchiveReader::open(std::io::Cursor::new(bytes)).unwrap();
+    let mut tally = SequenceTally::default();
+    assert_eq!(reader.read_bucket(0, &mut tally).unwrap(), 1);
+    assert_eq!(tally.transactions, 2);
+    assert_eq!(tally.entries, 0);
+
+    // Entries: an over-limit end_slot must not consume the open slot. Retrying
+    // with the boundary count succeeds and the reader observes exactly it.
+    let mut writer = ArchiveWriter::new(Vec::new(), 900, 2_000, 1, config).unwrap();
+    writer.set_frame_sequence_limit_for_test(2);
+    writer.begin_slot(2_000).unwrap();
+    let mut meta = BlockMeta::new_boxed();
+    meta.slot = 2_000;
+    assert!(matches!(
+        writer.end_slot(&meta, &[EntryRecord::default(); 3]),
+        Err(ArchiveFormatError::SectionTooLarge {
+            section: "entry records",
+            bytes: 3,
+            limit: 2,
+        })
+    ));
+    writer
+        .end_slot(&meta, &[EntryRecord::default(); 2])
+        .unwrap();
+    let (bytes, _) = writer.finish().unwrap();
+
+    let mut reader = ArchiveReader::open(std::io::Cursor::new(bytes)).unwrap();
+    let mut tally = SequenceTally::default();
+    assert_eq!(reader.read_bucket(0, &mut tally).unwrap(), 1);
+    assert_eq!(tally.transactions, 0);
+    assert_eq!(tally.entries, 2);
+}
+
 /// Wire-parity of the local skip against lencode's own `DiffEncoder`, with
 /// mode coverage asserted: mode 0 (full), mode 1 (RLE patches), and mode 2
 /// (XOR+zstd) segments must each be skipped to exactly their encoded
-/// length. This is the invariant the whole feature rests on — the skip
+/// length. This is the invariant the whole feature rests on: the skip
 /// path consuming byte-identical spans to `DiffDecoder::decode_blob`.
 #[test]
 fn skip_diff_blob_matches_encoder_output_for_all_modes() {
@@ -1003,11 +2429,11 @@ fn skip_diff_blob_matches_encoder_output_for_all_modes() {
     for (i, b) in v1.iter_mut().enumerate() {
         *b = (i % 251) as u8;
     }
-    // Single-byte change → RLE patches (mode 1).
+    // A single-byte change uses RLE patches (mode 1).
     let mut v2 = v1.clone();
     v2[100] ^= 0xFF;
     // Changing every 3rd byte (~33% of the blob, above the RLE half-blob
-    // cutoff) → XOR+zstd (mode 2); same pattern as lencode's own mode-2
+    // cutoff) uses XOR+zstd (mode 2), matching lencode's own mode-2
     // test.
     let mut v3 = v2.clone();
     let mut i = 0;

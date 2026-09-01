@@ -2,7 +2,7 @@
 //!
 //! Every `Vec<T>` / `String` that appears in the original Solana
 //! `TransactionStatusMeta` / `VersionedMessage` shapes is replaced here with a
-//! fixed-capacity [`ZeroVec`][crate::zero_vec::ZeroVec] sized from
+//! fixed-capacity [`ZeroVec`] sized from
 //! [`crate::limits`]. Types in the `solana-transaction-*` crates that
 //! transitively hold `Vec` or `String` (`Reward`, `TransactionReturnData`,
 //! `InnerInstructions`, …) are replaced by zero-alloc counterparts defined
@@ -684,11 +684,12 @@ impl Transaction {
     /// bytes into the shared arena and recording a metadata entry that
     /// references them by offset/length.
     ///
-    /// Accepts an [`AccountUpdateView`] — a cheap borrowed view over the
-    /// metadata + a `&[u8]` data slice. The view lets you push directly
-    /// from a live `ReplicaAccountInfo*` record or an existing
-    /// [`AccountUpdate`] (via [`AccountUpdate::as_view`]) without staging
-    /// through an intermediate 10 MiB buffer.
+    /// Accepts an [`AccountUpdateView`], a cheap borrowed view over the
+    /// metadata and a `&[u8]` data slice. The view lets you push directly from
+    /// a live `ReplicaAccountInfo*` record or an existing
+    /// [`AccountUpdate`](crate::account_updates::AccountUpdate) through
+    /// [`AccountUpdate::as_view`](crate::account_updates::AccountUpdate::as_view)
+    /// without staging through an intermediate 10 MiB buffer.
     ///
     /// Returns an error if either the metadata table or the data arena
     /// doesn't have room for the new entry.

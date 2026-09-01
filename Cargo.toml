@@ -42,7 +42,7 @@ tokio = "1"
 futures-util = { version = "0", default-features = false }
 futures = "0"
 log = "0"
-lencode = { version = "1.2.1", features = ["solana", "std"] }
+lencode = { git = "https://github.com/sam0x17/lencode", rev = "c803d3297ec7accf341eb24609bda65ba7c6c7b1", version = "2.0.0", features = ["solana-primitives", "std"] }
 once_cell = "1"
 serde_json = { version = "1", default-features = false }
 thiserror = { version = "2", default-features = false }
@@ -111,6 +111,7 @@ sha2 = "0.10"
 tonic = { version = "0", default-features = false }
 tonic-build = "0"
 zstd = { version = "0", default-features = false }
+lz4 = "1.28"
 thousands = "0"
 tokio-stream = { version = "0", default-features = false }
 rangemap = "1"

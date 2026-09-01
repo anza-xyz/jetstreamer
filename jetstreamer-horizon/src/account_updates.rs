@@ -2,7 +2,7 @@
 //!
 //! [`AccountUpdate`] mirrors `agave-geyser-plugin-interface`'s
 //! `ReplicaAccountInfo*` shapes but stores the account's `data` inline in a
-//! fixed-capacity [`ZeroVec`][crate::zero_vec::ZeroVec] sized to the
+//! fixed-capacity [`ZeroVec`] sized to the
 //! Solana-enforced `MAX_PERMITTED_DATA_LENGTH`. Memory footprint is
 //! ~10 MiB per instance, so callers should allocate *one* per thread via a
 //! `thread_local!` and reuse it via [`AccountUpdate::fill_from_versions`] (or

@@ -8,8 +8,9 @@
 use lencode::prelude::*;
 
 use super::bucket::{
-    BucketDecoder, MAX_HEADER_ALLOCATION_BYTES, PayloadByteStats, SlotVisitor, bucket_containing,
-    parse_bucket_index, read_io_varint, validate_bucket_index_layout, validate_footer_layout,
+    BucketDecoder, ChainMismatchPolicy, MAX_HEADER_ALLOCATION_BYTES, PayloadByteStats, SlotVisitor,
+    bucket_containing, parse_bucket_index, read_io_varint, validate_bucket_index_layout,
+    validate_footer_layout,
 };
 use super::format::*;
 
@@ -21,6 +22,9 @@ pub struct ArchiveReader<R: std::io::Read + std::io::Seek> {
     /// Verify blockhash chain continuity (parent_blockhash linkage) while
     /// streaming. Forwarded to the [`BucketDecoder`] on every read.
     pub verify_chain: bool,
+    /// Policy for a detected parent-blockhash mismatch. This is consulted only
+    /// when [`Self::verify_chain`] is enabled and defaults to strict rejection.
+    pub chain_mismatch_policy: ChainMismatchPolicy,
 
     /// Index of the currently loaded bucket, if any.
     current_bucket: Option<usize>,
@@ -121,6 +125,7 @@ impl<R: std::io::Read + std::io::Seek> ArchiveReader<R> {
             header,
             index,
             verify_chain: false,
+            chain_mismatch_policy: ChainMismatchPolicy::Reject,
             current_bucket: None,
             bucket_loads: 0,
             stored_bucket: Vec::new(),
@@ -158,6 +163,12 @@ impl<R: std::io::Read + std::io::Seek> ArchiveReader<R> {
     /// After a full pass over the archive this is the whole file's split.
     pub fn payload_byte_stats(&self) -> PayloadByteStats {
         self.decoder.byte_stats()
+    }
+
+    /// Number of zero-parent chain mismatches accepted under
+    /// [`ChainMismatchPolicy::AllowZeroParentResume`] across decoded frames.
+    pub fn zero_parent_resume_artifacts(&self) -> u64 {
+        self.decoder.zero_parent_resume_artifacts()
     }
 
     /// Header of the currently loaded bucket, if any.
@@ -201,6 +212,7 @@ impl<R: std::io::Read + std::io::Seek> ArchiveReader<R> {
             });
         }
         self.decoder.verify_chain = self.verify_chain;
+        self.decoder.chain_mismatch_policy = self.chain_mismatch_policy;
         let consumption = visitor.consumption();
         self.decoder.materialize_account_data = consumption.account_update_data;
         self.decoder.materialize_block_account_update_arenas =
@@ -247,6 +259,7 @@ impl<R: std::io::Read + std::io::Seek> ArchiveReader<R> {
             return Ok(0);
         }
         self.decoder.verify_chain = self.verify_chain;
+        self.decoder.chain_mismatch_policy = self.chain_mismatch_policy;
         let consumption = visitor.consumption();
         self.decoder.materialize_account_data = consumption.account_update_data;
         self.decoder.materialize_block_account_update_arenas =

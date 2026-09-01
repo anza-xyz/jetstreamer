@@ -101,7 +101,10 @@
 //! recomputation. The current `verify_chain` option checks parent-blockhash
 //! continuity against the preceding decoded block (or the bucket's stored
 //! `poh_start_hash` anchor); it does **not** recompute PoH, and a bucket anchor
-//! is not independently authenticated.
+//! is not independently authenticated. Strict mismatch rejection is the
+//! default; [`ChainMismatchPolicy::AllowZeroParentResume`] additionally
+//! recognizes and counts the zero-parent placeholders emitted by historical
+//! writers after a mid-epoch restart, without accepting nonzero mismatches.
 //!
 //! # Integrity
 //!

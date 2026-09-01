@@ -154,6 +154,25 @@ impl Default for Consumption {
     }
 }
 
+/// How parent-blockhash mismatches are handled when chain verification is
+/// enabled.
+///
+/// Strict rejection remains the default. The historical compatibility mode
+/// exists for old archives written across a mid-epoch firehose restart: those
+/// writers could store a zero `parent_blockhash` on the first block after the
+/// restart even though the preceding block and its hash are present. No other
+/// mismatch is accepted.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ChainMismatchPolicy {
+    /// Reject every mismatch against the preceding block or bucket anchor.
+    #[default]
+    Reject,
+    /// Accept a mismatch only when the stored parent hash is zero, counting it
+    /// as a historical writer-resume artifact.
+    AllowZeroParentResume,
+}
+
 /// Callbacks invoked while decoding slot frames, in wire order: slot start,
 /// epoch notification (boundary slots), pre-transaction runtime updates,
 /// every transaction, post-transaction runtime updates, then the slot's
@@ -231,6 +250,9 @@ pub struct BucketDecoder {
     /// decoding. Full SHA-256 PoH recomputation is a planned follow-up; the
     /// format already stores everything it needs.
     pub verify_chain: bool,
+    /// Policy for a detected parent-blockhash mismatch. This is consulted only
+    /// when [`Self::verify_chain`] is enabled and defaults to strict rejection.
+    pub chain_mismatch_policy: ChainMismatchPolicy,
     /// Materialize account-update data (the per-account diff
     /// reconstruction). When `false`, updates decode with full metadata but
     /// empty `data` slices, skipping reconstruction and the diff store
@@ -275,6 +297,9 @@ pub struct BucketDecoder {
     epoch_scratch: Box<EpochMeta>,
     entries_scratch: Vec<EntryRecord>,
     last_blockhash: Hash,
+    /// Historical zero-parent resume artifacts accepted across all decoded
+    /// frames since construction. Bucket loads intentionally do not reset it.
+    zero_parent_resume_artifacts: u64,
     /// Header of the currently loaded bucket. Retained so archive
     /// re-encoders can preserve an independently decodable bucket's PoH
     /// anchor without reading or buffering the bucket twice.
@@ -320,6 +345,7 @@ impl BucketDecoder {
     pub fn for_archive_version(version: ArchiveVersion) -> Self {
         Self {
             verify_chain: false,
+            chain_mismatch_policy: ChainMismatchPolicy::Reject,
             materialize_account_data: true,
             materialize_block_account_update_arenas: true,
             archive_version: version,
@@ -356,6 +382,7 @@ impl BucketDecoder {
             epoch_scratch: EpochMeta::new_boxed(),
             entries_scratch: Vec::with_capacity(2048),
             last_blockhash: Hash::default(),
+            zero_parent_resume_artifacts: 0,
             bucket_header: None,
             byte_stats: PayloadByteStats::default(),
             bucket_decode_work_bytes: 0,
@@ -393,6 +420,15 @@ impl BucketDecoder {
     /// [`decode_slot_frame`](Self::decode_slot_frame) since construction.
     pub fn byte_stats(&self) -> PayloadByteStats {
         self.byte_stats
+    }
+
+    /// Number of zero-parent chain mismatches accepted under
+    /// [`ChainMismatchPolicy::AllowZeroParentResume`] since construction.
+    ///
+    /// This counts decoded observations, so explicitly re-reading a bucket
+    /// counts its artifacts again.
+    pub fn zero_parent_resume_artifacts(&self) -> u64 {
+        self.zero_parent_resume_artifacts
     }
 
     /// Loads and validates one bucket frame (`BucketHeader ++ stored
@@ -901,7 +937,13 @@ impl BucketDecoder {
                     && self.last_blockhash != Hash::default()
                     && meta.parent_blockhash != self.last_blockhash
                 {
-                    return Err(ArchiveFormatError::PohMismatch { slot });
+                    if self.chain_mismatch_policy == ChainMismatchPolicy::AllowZeroParentResume
+                        && meta.parent_blockhash == Hash::default()
+                    {
+                        self.zero_parent_resume_artifacts += 1;
+                    } else {
+                        return Err(ArchiveFormatError::PohMismatch { slot });
+                    }
                 }
                 self.last_blockhash = meta.blockhash;
 

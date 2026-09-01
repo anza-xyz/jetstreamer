@@ -683,6 +683,90 @@ fn reencode_preserves_post_updates_on_zero_transaction_slots() {
 }
 
 #[test]
+fn reencode_accepts_counts_and_preserves_zero_parent_resume_artifact() {
+    let mut writer = ArchiveWriter::new(
+        std::io::Cursor::new(Vec::new()),
+        900,
+        1_000,
+        2,
+        ArchiveWriterConfig {
+            format: ArchiveVersion::V1,
+            compression: Compression::None,
+            diff_policy: lencode::diff::DiffPolicy::Adaptive,
+            bucket_slots: 2,
+            ..ArchiveWriterConfig::default()
+        },
+    )
+    .unwrap();
+
+    let first_hash = Hash::new_from_array([1; 32]);
+    writer.begin_slot(1_000).unwrap();
+    {
+        let mut meta = BlockMeta::new_boxed();
+        meta.slot = 1_000;
+        meta.parent_slot = 999;
+        meta.blockhash = first_hash;
+        writer.end_slot(&meta, &[]).unwrap();
+    }
+
+    writer.begin_slot(1_001).unwrap();
+    {
+        let mut meta = BlockMeta::new_boxed();
+        meta.slot = 1_001;
+        meta.parent_slot = 1_000;
+        // Historical writers could leave this zero after a mid-epoch restart,
+        // even though the preceding block is present in the same bucket.
+        meta.parent_blockhash = Hash::default();
+        meta.blockhash = Hash::new_from_array([2; 32]);
+        writer.end_slot(&meta, &[]).unwrap();
+    }
+    let (source, _) = writer.finish().unwrap();
+    let source = source.into_inner();
+
+    let mut strict_reader = ArchiveReader::open(std::io::Cursor::new(&source)).unwrap();
+    strict_reader.verify_chain = true;
+    let strict_error = strict_reader
+        .read_slots(0, u64::MAX, &mut Collector::default())
+        .unwrap_err();
+    assert!(matches!(
+        strict_error,
+        ArchiveFormatError::PohMismatch { slot: 1_001 }
+    ));
+
+    let (output, stats) = reencode_archive(
+        std::io::Cursor::new(&source),
+        Vec::new(),
+        ReencodeOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(stats.source_zero_parent_resume_artifacts, 1);
+    assert_eq!(
+        stats.source_semantic_sha256,
+        archive_semantic_sha256(&source)
+    );
+    assert_eq!(
+        stats.source_semantic_sha256,
+        archive_semantic_sha256(&output)
+    );
+
+    let mut output_reader = ArchiveReader::open(std::io::Cursor::new(&output)).unwrap();
+    output_reader.verify_chain = true;
+    output_reader.chain_mismatch_policy = ChainMismatchPolicy::AllowZeroParentResume;
+    let mut collector = Collector::default();
+    assert_eq!(
+        output_reader
+            .read_slots(0, u64::MAX, &mut collector)
+            .unwrap(),
+        2
+    );
+    assert_eq!(output_reader.zero_parent_resume_artifacts(), 1);
+    assert_eq!(
+        collector.slots[1].meta.as_ref().unwrap().parent_blockhash,
+        Hash::default()
+    );
+}
+
+#[test]
 fn reencode_rejects_source_parent_hash_break() {
     let mut writer = ArchiveWriter::new(
         std::io::Cursor::new(Vec::new()),
@@ -690,7 +774,9 @@ fn reencode_rejects_source_parent_hash_break() {
         1_000,
         2,
         ArchiveWriterConfig {
+            format: ArchiveVersion::V1,
             compression: Compression::None,
+            diff_policy: lencode::diff::DiffPolicy::Adaptive,
             bucket_slots: 2,
             ..ArchiveWriterConfig::default()
         },

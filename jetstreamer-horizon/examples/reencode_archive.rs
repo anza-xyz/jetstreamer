@@ -30,9 +30,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use jetstreamer_horizon::archive::{
-    ArchiveReader, ArchiveVersion, BlockNotification, BucketSelection, Compression, Consumption,
-    EpochMeta, ReencodeOptions, ReencodeStats, SemanticDigest, SlotKind, SlotVisitor,
-    reencode_archive,
+    ArchiveReader, ArchiveVersion, BlockNotification, BucketSelection, ChainMismatchPolicy,
+    Compression, Consumption, EpochMeta, ReencodeOptions, ReencodeStats, SemanticDigest, SlotKind,
+    SlotVisitor, reencode_archive,
 };
 use jetstreamer_horizon::transactions::Transaction;
 use lencode::diff::DiffPolicy;
@@ -461,6 +461,7 @@ fn verify_output(
     let mut reader = ArchiveReader::open(source)
         .map_err(|error| format!("open partial output as an archive: {error}"))?;
     reader.verify_chain = true;
+    reader.chain_mismatch_policy = ChainMismatchPolicy::AllowZeroParentResume;
     let header_checks = [
         (
             "format version",
@@ -513,6 +514,7 @@ fn verify_output(
             .map_err(|error| format!("verify output bucket {index}: {error}"))?;
     }
     let decoded_payload_bytes = reader.payload_byte_stats().total();
+    let zero_parent_resume_artifacts = reader.zero_parent_resume_artifacts();
 
     let checks = [
         ("slots", decoded_slots, expected.output.slots),
@@ -546,6 +548,12 @@ fn verify_output(
     {
         return Err(format!(
             "verification {label} mismatch: decoded {decoded}, wrote {written}"
+        ));
+    }
+    if zero_parent_resume_artifacts != expected.source_zero_parent_resume_artifacts {
+        return Err(format!(
+            "verification zero-parent resume artifact mismatch: decoded {zero_parent_resume_artifacts}, source had {}",
+            expected.source_zero_parent_resume_artifacts
         ));
     }
     let output_semantic_sha256 = tally
@@ -821,6 +829,10 @@ fn print_completed(completed: &Completed) {
     println!("  source file bytes:    {}", stats.source_file_bytes);
     println!("  selected buckets:     {}", stats.source_buckets);
     println!("  slots re-encoded:     {}", stats.slots_reencoded);
+    println!(
+        "  zero-parent resumes:   {} (preserved unchanged)",
+        stats.source_zero_parent_resume_artifacts
+    );
     println!("  source bucket bytes:  {}", stats.source_bucket_bytes);
     println!(
         "  output bucket bytes:  {} ({bucket_change:+.3}%)",

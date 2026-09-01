@@ -17,7 +17,8 @@ use crate::transactions::Transaction;
 
 use super::{
     ArchiveFormatError, ArchiveReader, ArchiveStats, ArchiveWriter, ArchiveWriterConfig,
-    BlockNotification, Consumption, EntryRecord, EpochMeta, SlotKind, SlotVisitor,
+    BlockNotification, ChainMismatchPolicy, Consumption, EntryRecord, EpochMeta, SlotKind,
+    SlotVisitor,
 };
 
 /// Which independently decodable source buckets to re-encode.
@@ -57,6 +58,10 @@ pub struct ReencodeStats {
     pub source_buckets: u64,
     /// Slot frames decoded and written.
     pub slots_reencoded: u64,
+    /// Historical writer-resume artifacts in the selected source buckets:
+    /// parent-blockhash mismatches accepted only because the stored parent was
+    /// zero. Re-encoding preserves those zero values unchanged.
+    pub source_zero_parent_resume_artifacts: u64,
     /// SHA-256 of the selected source events in decoded semantic order.
     pub source_semantic_sha256: [u8; 32],
     /// Destination writer counters.
@@ -267,6 +272,7 @@ where
     let source_file_bytes = source.seek(SeekFrom::End(0))?;
     let mut reader = ArchiveReader::open(source)?;
     reader.verify_chain = true;
+    reader.chain_mismatch_policy = ChainMismatchPolicy::AllowZeroParentResume;
     let header = reader.header().clone();
     let destination_bucket_slots = options.writer.bucket_slots;
 
@@ -364,6 +370,7 @@ where
     };
 
     let (sink, output) = writer.finish()?;
+    let source_zero_parent_resume_artifacts = reader.zero_parent_resume_artifacts();
     Ok((
         sink,
         ReencodeStats {
@@ -374,6 +381,7 @@ where
             source_bucket_bytes,
             source_buckets: selected.len() as u64,
             slots_reencoded,
+            source_zero_parent_resume_artifacts,
             source_semantic_sha256,
             output,
         },

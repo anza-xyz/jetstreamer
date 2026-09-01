@@ -1,19 +1,20 @@
 //! Horizon-native firehose: streams a `.jet` archive (the horizon
 //! container) instead of an Old Faithful CAR, driving the zero-copy
-//! [`SlotVisitor`] callbacks.
+//! [`SlotVisitor`](jetstreamer_horizon::archive::SlotVisitor) callbacks.
 //!
 //! This is the network-seekable counterpart to [`firehose`](crate::firehose).
 //! Bytes are fetched **async** over the same backends the rest of the crate
-//! uses — `rseek::Seekable` for HTTP range requests, `tokio::fs` for local
-//! files — while slot-frame **decode** stays sync and zero-copy in
-//! [`jetstreamer_horizon`]'s [`BucketDecoder`]. The two are bridged per
+//! uses: `rseek::Seekable` for HTTP range requests and `tokio::fs` for local
+//! files. Slot-frame **decode** stays synchronous and zero-copy in
+//! [`jetstreamer_horizon`]'s
+//! [`BucketDecoder`](jetstreamer_horizon::archive::BucketDecoder). The two are bridged per
 //! worker by a small bounded channel: an async fetch task pulls the worker's
 //! bucket range over its own connection and hands raw bytes to a blocking
 //! decode task. The channel's depth gives one-bucket prefetch, so network
 //! latency overlaps CPU decode.
 //!
-//! `.jet` buckets are independent zstd frames, so a slot lives in exactly
-//! one bucket and each bucket range is owned by exactly one worker — there
+//! `.jet` buckets are independently compressed frames, so a slot lives in exactly
+//! one bucket and each bucket range is owned by exactly one worker, so there
 //! is no cross-worker coordination.
 use std::io;
 use std::ops::Range;
@@ -26,19 +27,23 @@ use reqwest::{Client, Url};
 use rseek::Seekable;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt, BufReader, ReadBuf};
 
+use jetstreamer_horizon::account_updates::AccountUpdateView;
 use jetstreamer_horizon::archive::{
     ArchiveFormatError, BlockNotification, BucketDecoder, BucketIndexEntry, Consumption,
-    EntryRecord, EpochMeta, FOOTER_LEN, Footer, SlotVisitor, bucket_containing, parse_bucket_index,
-    parse_file_header,
+    EntryRecord, EpochMeta, FOOTER_LEN, Footer, MAX_FILE_HEADER_BYTES, SlotKind, SlotVisitor,
+    bucket_containing, parse_bucket_index, parse_file_header, validate_bucket_index_layout,
+    validate_footer_layout,
 };
 use jetstreamer_horizon::transactions::Transaction;
 
 use crate::epochs::EpochStream;
 use crate::node_reader::Len;
 
-/// Bytes fetched from the file front to cover the header section. The
-/// `FileHeader` is small; a few KiB is always enough.
-const HEADER_PREFIX: usize = 16 * 1024;
+/// Bytes fetched from the file front to cover every header accepted by the
+/// shared archive parser: magic + the longest length prefix + the bounded
+/// header payload. Real headers are only a few dozen bytes; the larger bound
+/// keeps local and network readers' acceptance rules identical.
+const HEADER_PREFIX: usize = MAX_FILE_HEADER_BYTES as usize + 32;
 /// Buckets a fetch task may run ahead of its decoder (prefetch depth).
 const PREFETCH_DEPTH: usize = 2;
 
@@ -52,7 +57,7 @@ pub enum JetSource {
     /// `Arc<Vec<u8>>` rather than `Arc<[u8]>` deliberately: converting a
     /// `Vec` to `Arc<[u8]>` copies the whole buffer (the slice must live
     /// inline with the Arc header), which for a ~400 GB epoch means two
-    /// full-size allocations alive at once — an instant OOM. Wrapping the
+    /// full-size allocations alive at once, causing an immediate OOM. Wrapping the
     /// Vec is copy-free.
     Memory {
         /// The epoch these bytes are the archive for.
@@ -87,7 +92,7 @@ impl JetSource {
 
     /// One epoch's complete `.jet` contents held in memory. Serves only
     /// `epoch`; requesting any other epoch errors. Takes the `Vec` by value
-    /// and never copies it — callers hand over buffers the size of a whole
+    /// and never copies it. Callers hand over buffers the size of a whole
     /// epoch file.
     pub fn in_memory(epoch: u64, bytes: Vec<u8>) -> Self {
         Self::Memory {
@@ -118,9 +123,16 @@ pub enum HorizonFirehoseError {
     Io(io::Error),
     /// The fetched bytes did not decode as a valid horizon archive.
     Archive(ArchiveFormatError),
+    /// The archive header names a different epoch than the requested file.
+    EpochMismatch {
+        /// Epoch requested from the source.
+        requested: u64,
+        /// Epoch encoded in the archive header.
+        archive: u64,
+    },
     /// The `.jet` URL could not be built from the base + epoch.
     Url(String),
-    /// The file is shorter than a footer — not a horizon archive.
+    /// The file is shorter than a footer and is not a Horizon archive.
     Truncated,
     /// A worker task panicked or was cancelled.
     Join(String),
@@ -131,6 +143,10 @@ impl std::fmt::Display for HorizonFirehoseError {
         match self {
             Self::Io(e) => write!(f, "io error: {e}"),
             Self::Archive(e) => write!(f, "archive decode error: {e}"),
+            Self::EpochMismatch { requested, archive } => write!(
+                f,
+                "archive epoch mismatch: requested epoch {requested}, header names epoch {archive}"
+            ),
             Self::Url(e) => write!(f, "invalid .jet url: {e}"),
             Self::Truncated => write!(f, "file shorter than a horizon footer"),
             Self::Join(e) => write!(f, "worker task failed: {e}"),
@@ -179,16 +195,24 @@ where
     }
     let prefix_len = (HEADER_PREFIX as u64).min(total_len) as usize;
     let prefix = read_range(&mut probe, 0, prefix_len).await?;
-    let (header, _) = parse_file_header(&prefix)?;
+    let (header, header_end) = parse_file_header(&prefix)?;
+    if header.epoch != epoch {
+        return Err(HorizonFirehoseError::EpochMismatch {
+            requested: epoch,
+            archive: header.epoch,
+        });
+    }
     let footer_bytes = read_range(&mut probe, total_len - FOOTER_LEN as u64, FOOTER_LEN).await?;
     let footer_arr: [u8; FOOTER_LEN] = footer_bytes
         .as_slice()
         .try_into()
         .map_err(|_| HorizonFirehoseError::Truncated)?;
     let footer = Footer::from_bytes(&footer_arr)?;
+    validate_footer_layout(total_len, header_end as u64, &footer)?;
     let index_bytes =
         read_range(&mut probe, footer.index_offset, footer.index_len as usize).await?;
     let index: Arc<[BucketIndexEntry]> = parse_bucket_index(&index_bytes, &footer)?.into();
+    validate_bucket_index_layout(&header, header_end as u64, footer.index_offset, &index)?;
     drop(probe);
 
     if index.is_empty() || slot_range.is_empty() {
@@ -204,7 +228,7 @@ where
     let mut fetchers = Vec::with_capacity(threads);
     let mut decoders = Vec::with_capacity(threads);
     for (tid, chunk) in chunks.into_iter().enumerate() {
-        let (tx, rx) = tokio::sync::mpsc::channel::<RawBucket>(PREFETCH_DEPTH);
+        let (tx, rx) = tokio::sync::mpsc::channel::<(BucketIndexEntry, RawBucket)>(PREFETCH_DEPTH);
         // Drained fetch buffers travel back to the fetcher for reuse, so the
         // stream path allocates a bounded handful of buffers per worker for
         // the whole run instead of one ~bucket-sized Vec per bucket. Sized so
@@ -218,7 +242,7 @@ where
         let index2 = index.clone();
         fetchers.push(tokio::spawn(async move {
             // In-memory source: hand the decoder shared slices of the one
-            // preloaded buffer — zero per-bucket buffers, zero copies.
+            // preloaded buffer, with zero per-bucket buffers and zero copies.
             if let JetSource::Memory { bytes, .. } = &src2 {
                 for b in chunk {
                     let e = index2[b];
@@ -231,7 +255,7 @@ where
                         bytes: bytes.clone(),
                         range: bucket_start..bucket_end,
                     };
-                    if tx.send(shared).await.is_err() {
+                    if tx.send((e, shared)).await.is_err() {
                         break; // decoder finished early or errored
                     }
                 }
@@ -243,7 +267,7 @@ where
                 let e = index2[b];
                 let mut buf = recycle_rx.try_recv().unwrap_or_default();
                 read_range_into(&mut s, e.offset, e.len as usize, &mut buf).await?;
-                if tx.send(RawBucket::Owned(buf)).await.is_err() {
+                if tx.send((e, RawBucket::Owned(buf))).await.is_err() {
                     break; // decoder finished early (reached end slot) or errored
                 }
             }
@@ -253,15 +277,19 @@ where
         let mut visitor = make_visitor(tid);
         let start = slot_range.start;
         let end = slot_range.end;
+        let decoder_header = header.clone();
         decoders.push(tokio::task::spawn_blocking(move || {
             let mut rx = rx;
-            let mut decoder = BucketDecoder::new();
+            let mut decoder = BucketDecoder::for_file_header(&decoder_header)?;
             decoder.verify_chain = false;
             // Honor the visitor's declared consumption: unconsumed
             // account-update data is skipped, not reconstructed.
-            decoder.materialize_account_data = visitor.consumption().account_update_data;
-            'outer: while let Some(raw) = rx.blocking_recv() {
-                decoder.load_bucket_bytes(raw.as_slice())?;
+            let consumption = visitor.consumption();
+            decoder.materialize_account_data = consumption.account_update_data;
+            decoder.materialize_block_account_update_arenas =
+                consumption.block_account_update_arenas;
+            'outer: while let Some((entry, raw)) = rx.blocking_recv() {
+                decoder.load_indexed_bucket_bytes(raw.as_slice(), entry)?;
                 // The decoder copied/decompressed what it needs; return the
                 // buffer to the fetcher (capacity ensures this never blocks;
                 // a closed channel just means the fetcher already finished).
@@ -271,6 +299,7 @@ where
                 let mut bounded = Bounded {
                     inner: &mut visitor,
                     end,
+                    current_slot: None,
                 };
                 while decoder.slots_remaining() > 0 {
                     decoder.decode_slot_frame(start, &mut bounded)?;
@@ -320,15 +349,34 @@ where
 struct Bounded<'a, V: SlotVisitor> {
     inner: &'a mut V,
     end: u64,
+    current_slot: Option<u64>,
 }
 
 impl<V: SlotVisitor> SlotVisitor for Bounded<'_, V> {
+    fn on_slot_start(&mut self, slot: u64, kind: SlotKind) {
+        self.current_slot = Some(slot);
+        if slot < self.end {
+            self.inner.on_slot_start(slot, kind);
+        }
+    }
     fn on_epoch(&mut self, meta: &EpochMeta) {
-        self.inner.on_epoch(meta);
+        if self.current_slot.is_some_and(|slot| slot < self.end) {
+            self.inner.on_epoch(meta);
+        }
+    }
+    fn on_pre_account_update(&mut self, slot: u64, update: &AccountUpdateView<'_>) {
+        if slot < self.end {
+            self.inner.on_pre_account_update(slot, update);
+        }
     }
     fn on_transaction(&mut self, slot: u64, tx_index: u32, tx: &Transaction) {
         if slot < self.end {
             self.inner.on_transaction(slot, tx_index, tx);
+        }
+    }
+    fn on_post_account_update(&mut self, slot: u64, update: &AccountUpdateView<'_>) {
+        if slot < self.end {
+            self.inner.on_post_account_update(slot, update);
         }
     }
     fn on_block(&mut self, notification: &BlockNotification, entries: &[EntryRecord]) {
@@ -398,8 +446,8 @@ async fn open_jet_stream(
 }
 
 /// One bucket's raw bytes on their way from a fetcher to its decoder:
-/// either a fetched buffer the decoder recycles back afterwards, or — for
-/// the in-memory source — a shared slice of the single preloaded file
+/// either a fetched buffer the decoder recycles afterwards or, for
+/// the in-memory source, a shared slice of the single preloaded file
 /// buffer (no per-bucket buffer, no copy).
 enum RawBucket {
     Owned(Vec<u8>),
@@ -418,11 +466,12 @@ impl RawBucket {
     }
 }
 
-/// Seeks to `offset` and reads exactly `len` bytes — one bucket frame (or a
+/// Seeks to `offset` and reads exactly `len` bytes: one bucket frame (or a
 /// framing range) per call, mapping to a single HTTP range request.
 async fn read_range(stream: &mut EpochStream, offset: u64, len: usize) -> io::Result<Vec<u8>> {
     stream.seek(io::SeekFrom::Start(offset)).await?;
-    let mut buf = vec![0u8; len];
+    let mut buf = Vec::new();
+    try_resize_read_buffer(&mut buf, len)?;
     stream.read_exact(&mut buf).await?;
     Ok(buf)
 }
@@ -436,9 +485,20 @@ async fn read_range_into(
     buf: &mut Vec<u8>,
 ) -> io::Result<()> {
     stream.seek(io::SeekFrom::Start(offset)).await?;
-    buf.clear();
-    buf.resize(len, 0);
+    try_resize_read_buffer(buf, len)?;
     stream.read_exact(buf).await?;
+    Ok(())
+}
+
+fn try_resize_read_buffer(buf: &mut Vec<u8>, len: usize) -> io::Result<()> {
+    buf.clear();
+    buf.try_reserve_exact(len).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::OutOfMemory,
+            "could not allocate horizon range-read buffer",
+        )
+    })?;
+    buf.resize(len, 0);
     Ok(())
 }
 
@@ -474,7 +534,7 @@ impl Len for LocalJetReader {
     }
 }
 
-/// A fully in-memory `.jet` as an `AsyncRead + AsyncSeek + Len` reader —
+/// A fully in-memory `.jet` as an `AsyncRead + AsyncSeek + Len` reader.
 /// every read is a memcpy from the shared buffer, always `Ready`.
 struct MemJetReader {
     bytes: std::sync::Arc<Vec<u8>>,
@@ -545,9 +605,93 @@ mod tests {
         }
     }
 
+    #[test]
+    fn bounded_gates_epoch_by_enclosing_frame_not_metadata() {
+        #[derive(Default)]
+        struct EpochCounter(u64);
+
+        impl SlotVisitor for EpochCounter {
+            fn on_epoch(&mut self, _meta: &EpochMeta) {
+                self.0 += 1;
+            }
+        }
+
+        let mut counter = EpochCounter::default();
+        let mut meta = EpochMeta::new_boxed();
+        let mut bounded = Bounded {
+            inner: &mut counter,
+            end: 200,
+            current_slot: None,
+        };
+
+        // Malformed metadata claims this out-of-range frame belongs inside
+        // the request. The enclosing frame slot is authoritative, so drop it.
+        bounded.on_slot_start(200, SlotKind::Block);
+        meta.first_block_slot = 199;
+        bounded.on_epoch(&meta);
+        assert_eq!(bounded.inner.0, 0);
+
+        // Conversely, malformed metadata must not hide a notification whose
+        // enclosing frame is inside the request.
+        bounded.on_slot_start(199, SlotKind::Block);
+        meta.first_block_slot = 200;
+        bounded.on_epoch(&meta);
+        assert_eq!(bounded.inner.0, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn local_jet_rejects_mismatched_header_epoch() {
+        let archive_epoch = 7u64;
+        let requested_epoch = 8u64;
+        let slot = 1_000u64;
+        let mut writer = ArchiveWriter::new(
+            std::io::Cursor::new(Vec::new()),
+            archive_epoch,
+            slot,
+            1,
+            ArchiveWriterConfig::default(),
+        )
+        .unwrap();
+        writer.write_skipped_slot(slot).unwrap();
+        let (sink, _stats) = writer.finish().unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(format!("epoch-{requested_epoch}.jet")),
+            sink.into_inner(),
+        )
+        .unwrap();
+
+        let error = firehose_horizon(
+            1,
+            JetSource::local(dir.path()),
+            requested_epoch,
+            slot..slot + 1,
+            |_tid| SlotCounter::default(),
+        )
+        .await
+        .err()
+        .expect("mismatched archive header epoch must fail");
+        assert!(matches!(
+            error,
+            HorizonFirehoseError::EpochMismatch {
+                requested,
+                archive,
+            } if requested == requested_epoch && archive == archive_epoch
+        ));
+    }
+
+    #[test]
+    fn range_buffer_capacity_overflow_is_reported() {
+        let mut buffer = Vec::new();
+        let error = try_resize_read_buffer(&mut buffer, usize::MAX).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::OutOfMemory);
+        assert!(buffer.is_empty());
+    }
+
     /// End-to-end over the local backend: build a tiny `.jet`, run it through
-    /// the full async driver (framing → bucket partition → prefetch fetch →
-    /// blocking decode → join), and confirm every slot is visited exactly once.
+    /// the full async driver (framing, bucket partition, prefetch, blocking
+    /// decode, and join), and confirm every slot is visited exactly once.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn local_jet_drives_every_slot_once() {
         let epoch = 7u64;
@@ -634,8 +778,8 @@ mod tests {
     }
 
     /// A visitor that declares it does not consume account-update data must
-    /// get elided (empty) data slices with metadata and counts intact — the
-    /// declaration travels visitor → `Bounded` → decoder through the full
+    /// get elided (empty) data slices with metadata and counts intact. The
+    /// declaration travels from visitor to `Bounded` to decoder through the full
     /// async driver.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn local_jet_elides_update_data_when_declined() {
@@ -758,7 +902,7 @@ mod tests {
             assert_eq!(skipped, n, "every slot visited exactly once");
         }
 
-        // Wrong epoch → error, not silent garbage.
+        // A wrong epoch produces an error instead of silent garbage.
         let err = firehose_horizon(2, mem_src, epoch + 1, 0..1, |_tid| SlotCounter::default())
             .await
             .err();

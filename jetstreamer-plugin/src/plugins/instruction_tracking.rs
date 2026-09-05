@@ -267,6 +267,15 @@ fn instruction_vote_counts(transaction: &TransactionData) -> (u64, u64) {
                 );
             }
         }
+        VersionedMessage::V1(msg) => {
+            for ix in &msg.instructions {
+                classify(
+                    ix.program_id_index as usize,
+                    &mut vote_count,
+                    &mut non_vote_count,
+                );
+            }
+        }
     }
 
     if let Some(inner_sets) = transaction

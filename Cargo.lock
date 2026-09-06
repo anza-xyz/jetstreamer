@@ -5100,7 +5100,7 @@ checksum = "09edd9e8b54e49e587e4f6295a7d29c3ea94d469cb40ab8ca70b288248a81db2"
 [[package]]
 name = "lencode"
 version = "2.0.0"
-source = "git+https://github.com/sam0x17/lencode?rev=c803d3297ec7accf341eb24609bda65ba7c6c7b1#c803d3297ec7accf341eb24609bda65ba7c6c7b1"
+source = "git+https://github.com/sam0x17/lencode?rev=842566afcc8d33182bd9054e0537e69324a50fa9#842566afcc8d33182bd9054e0537e69324a50fa9"
 dependencies = [
  "ahash 0.8.12",
  "endian-cast",
@@ -5119,7 +5119,7 @@ dependencies = [
 [[package]]
 name = "lencode-macros"
 version = "2.0.0"
-source = "git+https://github.com/sam0x17/lencode?rev=c803d3297ec7accf341eb24609bda65ba7c6c7b1#c803d3297ec7accf341eb24609bda65ba7c6c7b1"
+source = "git+https://github.com/sam0x17/lencode?rev=842566afcc8d33182bd9054e0537e69324a50fa9#842566afcc8d33182bd9054e0537e69324a50fa9"
 dependencies = [
  "proc-macro-crate 3.5.0",
  "proc-macro2",

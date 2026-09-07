@@ -3,3 +3,16 @@
 /.serena
 .DS_Store
 
+/.claude
+old-faithful-sizes.tsv
+jets/*
+!jets/.gitkeep
+
+# Runtime artifacts from replay/pipeline runs in the repo root
+.snapshot-extract-*
+snapshot-*.tar.zst
+accounts-run/
+compact-indexes/
+genesis.bin
+genesis.tar.bz2
+*.jet

@@ -233,6 +233,26 @@ pub async fn next_present_slot(after: u64, up_to_inclusive: u64) -> Option<u64> 
         .await
 }
 
+/// Returns the nearest *present* slot in `[floor, before)`, scanning downward from
+/// `before - 1` over at most 64 slots (leader-skip runs are short; anything longer
+/// falls back). `None` when the window holds no present slot or the index cannot
+/// answer — callers then seek `before` directly, accepting the old behaviour.
+pub async fn prev_present_slot(floor: u64, before: u64) -> Option<u64> {
+    let mut slot = before.checked_sub(1)?;
+    for _ in 0..64 {
+        if slot < floor {
+            return None;
+        }
+        match slot_to_range(slot).await {
+            Ok(_) => return Some(slot),
+            Err(SlotOffsetIndexError::SlotNotFound(..)) => {}
+            Err(_) => return None,
+        }
+        slot = slot.checked_sub(1)?;
+    }
+    None
+}
+
 /// Looks up the byte range `(offset, length)` covering all of `slot`'s data within its Old
 /// Faithful epoch CAR archive. Returns [`SlotOffsetIndexError::SlotNotFound`] for slots that
 /// were skipped on-chain.

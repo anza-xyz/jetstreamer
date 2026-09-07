@@ -122,6 +122,9 @@ pub mod metrics;
 /// Built-in plugin implementations that ship with Jetstreamer.
 pub mod plugins;
 
+/// Horizon-native plugin framework: zero-copy plugins over `.jet` archives.
+pub mod horizon;
+
 const LOG_MODULE: &str = "jetstreamer::runner";
 
 use std::{

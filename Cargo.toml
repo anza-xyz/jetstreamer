@@ -42,7 +42,7 @@ tokio = "1"
 futures-util = { version = "0", default-features = false }
 futures = "0"
 log = "0"
-lencode = { git = "https://github.com/sam0x17/lencode", rev = "842566afcc8d33182bd9054e0537e69324a50fa9", version = "2.0.0", features = ["solana-primitives", "std"] }
+lencode = { version = "2.0.0", features = ["solana-primitives", "std"] }
 once_cell = "1"
 serde_json = { version = "1", default-features = false }
 thiserror = { version = "2", default-features = false }

@@ -5100,7 +5100,8 @@ checksum = "09edd9e8b54e49e587e4f6295a7d29c3ea94d469cb40ab8ca70b288248a81db2"
 [[package]]
 name = "lencode"
 version = "2.0.0"
-source = "git+https://github.com/sam0x17/lencode?rev=842566afcc8d33182bd9054e0537e69324a50fa9#842566afcc8d33182bd9054e0537e69324a50fa9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c48dfc06b896c0bd7ab3e39ecccaae0ec1212e0e298b3979eb266b489c86c607"
 dependencies = [
  "ahash 0.8.12",
  "endian-cast",
@@ -5119,7 +5120,8 @@ dependencies = [
 [[package]]
 name = "lencode-macros"
 version = "2.0.0"
-source = "git+https://github.com/sam0x17/lencode?rev=842566afcc8d33182bd9054e0537e69324a50fa9#842566afcc8d33182bd9054e0537e69324a50fa9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5ee1cc533b15ebb16a9e48aed62fc5dd9ad7a6ee3a51267bd7ebc00679f38c4d"
 dependencies = [
  "proc-macro-crate 3.5.0",
  "proc-macro2",

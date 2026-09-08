@@ -96,6 +96,7 @@ impl Plugin for ProgramTrackingPlugin {
             let (account_keys, instructions) = match message {
                 VersionedMessage::Legacy(msg) => (&msg.account_keys, &msg.instructions),
                 VersionedMessage::V0(msg) => (&msg.account_keys, &msg.instructions),
+                VersionedMessage::V1(msg) => (&msg.account_keys, &msg.instructions),
             };
             if instructions.is_empty() {
                 return Ok(());

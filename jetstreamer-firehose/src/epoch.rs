@@ -1,5 +1,5 @@
 use {
-    crate::{SharedError, node::Kind},
+    crate::{SharedError, node::Kind, node_reader::cid_from_cbor_link},
     cid::Cid,
     std::vec::Vec,
 };
@@ -57,11 +57,7 @@ impl Epoch {
 
             if let Some(serde_cbor::Value::Array(subsets)) = &array.get(2) {
                 for subset in subsets {
-                    if let serde_cbor::Value::Bytes(subset) = subset {
-                        epoch
-                            .subsets
-                            .push(Cid::try_from(subset[1..].to_vec()).unwrap());
-                    }
+                    epoch.subsets.push(cid_from_cbor_link(subset)?);
                 }
             }
         }

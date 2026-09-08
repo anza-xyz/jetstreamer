@@ -115,8 +115,14 @@ pub fn notify_transaction_range(slot: Slot, start_index: usize, count: usize) {
 }
 
 pub fn notify_account_update(account: &AccountSharedData) {
+    notify_account_update_data_len(account.data().len());
+}
+
+/// Records the accounting side of an update produced by an isolated runtime,
+/// where constructing a current-Agave `AccountSharedData` would be needless.
+pub fn notify_account_update_data_len(data_len: usize) {
     ACCOUNT_UPDATES.fetch_add(1, Ordering::Relaxed);
-    TOTAL_ACCOUNT_UPDATE_DATA_BYTES.fetch_add(account.data().len() as u64, Ordering::Relaxed);
+    TOTAL_ACCOUNT_UPDATE_DATA_BYTES.fetch_add(data_len as u64, Ordering::Relaxed);
 }
 
 pub fn notify_block(slot: Slot) {

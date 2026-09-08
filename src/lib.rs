@@ -121,15 +121,16 @@
 //! Old Faithful snapshots expose different metadata across the network's history. Use the
 //! table below to choose replay windows that match your requirements:
 //!
-//! | Epoch range | Slot range    | Comment |
-//! |-------------|---------------|--------------------------------------------------|
-//! | 0–156       | 0–?           | Incompatible with modern Geyser plugins          |
-//! | 157+        | ?             | Compatible with modern Geyser plugins            |
-//! | 0–449       | 0–194184610   | CU tracking not available (reported as `0`)      |
-//! | 450+        | 194184611+    | CU tracking fully available                      |
+//! | Epoch/range | Slot range        | Comment |
+//! |-------------|-------------------|-----------------------------------------------|
+//! | 0-156       | 0-67,823,999      | Bincode transaction metadata (auto-decoded)   |
+//! | 157+        | 67,824,000+       | Protobuf transaction metadata                 |
+//! | through 449 | 0-194,184,610     | CU tracking unavailable (reported as `0`)     |
+//! | from 449    | 194,184,611+      | CU tracking available                         |
 //!
-//! Epochs at or above `157` work with the bundled Geyser plugin interface, while compute unit
-//! accounting first appears at epoch `450`.
+//! The epoch-157 cutoff selects an Old Faithful input decoder. It does not
+//! select consensus execution rules. Account-update reconstruction for older
+//! slots also requires a matching historical runtime.
 
 pub use jetstreamer_firehose as firehose;
 pub use jetstreamer_plugin as plugin;

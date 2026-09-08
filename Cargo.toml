@@ -6,6 +6,10 @@ members = [
     "jetstreamer-plugin",
     "jetstreamer-utils",
 ]
+# Historical consensus workers are separate workspaces pinned to their exact
+# Rust toolchains. Their current-toolchain protocol facade is consumed only as
+# a path dependency.
+exclude = ["historical-runtime"]
 
 [workspace.package]
 edition = "2024"

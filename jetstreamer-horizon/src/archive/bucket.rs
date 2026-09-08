@@ -78,6 +78,28 @@ pub const MAX_BUCKET_CUMULATIVE_DECODE_BYTES: u64 = 64 << 30;
 /// Cumulative allocation claims accepted inside the small file header.
 pub const MAX_HEADER_ALLOCATION_BYTES: usize = 4 << 20;
 
+/// Decodes a file header while bounding both encoded input and decompressed
+/// byte blobs. Header metadata can contain an independently compressed
+/// provenance blob, so its decoded length may legitimately exceed the
+/// encoded header length.
+pub(crate) fn decode_file_header_bytes(
+    header_bytes: &[u8],
+) -> Result<FileHeader, ArchiveFormatError> {
+    let limits = DecodeLimits::new(
+        header_bytes.len(),
+        header_bytes.len(),
+        MAX_HEADER_ALLOCATION_BYTES,
+    );
+    let cursor = lencode::io::Cursor::new(header_bytes);
+    let mut reader =
+        LimitedReader::new(cursor, limits).with_max_blob_bytes(MAX_HEADER_ALLOCATION_BYTES);
+    let header = FileHeader::decode_ext(&mut reader, None)?;
+    if reader.inner().position() != header_bytes.len() {
+        return Err(ArchiveFormatError::Encode(lencode::io::Error::TrailingData));
+    }
+    Ok(header)
+}
+
 /// What a [`SlotVisitor`] actually consumes from the decoded stream, declared
 /// up front so the decoder can skip work whose output nobody reads.
 ///
@@ -1006,15 +1028,7 @@ pub fn parse_file_header(prefix: &[u8]) -> Result<(FileHeader, usize), ArchiveFo
     try_reserve_archive_buffer(&mut header_bytes, header_len, "file header")?;
     header_bytes.resize(header_len, 0);
     std::io::Read::read_exact(&mut cur, &mut header_bytes)?;
-    let header: FileHeader = decode_exact_with_limits(
-        &header_bytes,
-        None,
-        DecodeLimits::new(
-            header_bytes.len(),
-            header_bytes.len(),
-            MAX_HEADER_ALLOCATION_BYTES,
-        ),
-    )?;
+    let header = decode_file_header_bytes(&header_bytes)?;
     validate_archive_version(header.format_version, header.flags)?;
     if header.bucket_slots == 0 {
         return Err(ArchiveFormatError::InvalidContainerLayout(

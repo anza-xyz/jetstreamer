@@ -10,6 +10,8 @@ use xxhash_rust::xxh64::xxh64;
 
 use crate::pubkey_prime::POPULAR_PUBKEYS;
 
+use super::provenance::ArchiveProvenanceError;
+
 /// Magic bytes opening every horizon archive file ("JSHZN" + version byte
 /// space + two NULs).
 pub const MAGIC: [u8; 8] = *b"JSHZN1\0\0";
@@ -135,9 +137,11 @@ pub struct ArchiveMeta {
     pub created_unix_ms: u64,
     /// Version string of the writer binary (UTF-8).
     pub writer_version: Vec<u8>,
-    /// Reserved bytes for version-specific metadata. Adding fields to this
-    /// struct requires a new archive format version because readers decode it
-    /// exactly.
+    /// Reserved bytes for version-specific metadata. New writers may store the
+    /// independently versioned [`ArchiveProvenance`](super::ArchiveProvenance)
+    /// envelope here without changing this struct or the archive wire version.
+    /// Adding fields to this struct still requires a new archive format version
+    /// because readers decode it exactly.
     pub reserved: Vec<u8>,
 }
 
@@ -349,6 +353,8 @@ pub enum ArchiveFormatError {
     },
     #[error("blockhash chain continuity check failed at slot {slot}")]
     PohMismatch { slot: u64 },
+    #[error("invalid archive provenance: {0}")]
+    Provenance(#[from] ArchiveProvenanceError),
     #[error("encode error: {0}")]
     Encode(lencode::io::Error),
     #[error("io error: {0}")]

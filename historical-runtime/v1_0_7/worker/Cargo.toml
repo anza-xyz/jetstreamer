@@ -1,0 +1,26 @@
+[package]
+name = "jetstreamer-historical-worker-v1-0-7"
+version = "0.1.0"
+edition = "2018"
+license = "MIT OR Apache-2.0"
+publish = false
+build = "build.rs"
+
+[dependencies]
+bincode = "=1.2.1"
+bzip2 = "=0.3.3"
+jetstreamer-historical-protocol = { path = "../protocol" }
+rand = "=0.6.5"
+rand_chacha = "=0.1.1"
+sha2 = "=0.8.1"
+solana-runtime = { path = "../vendor/solana-runtime-1.0.7", version = "=1.0.7" }
+solana-config-program = { git = "https://github.com/solana-labs/solana.git", rev = "57abc370fa39e42e8fb84145a30395ddcf891692", version = "=1.0.7" }
+solana-merkle-tree = { git = "https://github.com/solana-labs/solana.git", rev = "57abc370fa39e42e8fb84145a30395ddcf891692", version = "=1.0.7" }
+solana-sdk = { git = "https://github.com/solana-labs/solana.git", rev = "57abc370fa39e42e8fb84145a30395ddcf891692", version = "=1.0.7" }
+solana-stake-program = { git = "https://github.com/solana-labs/solana.git", rev = "57abc370fa39e42e8fb84145a30395ddcf891692", version = "=1.0.7" }
+solana-vote-program = { git = "https://github.com/solana-labs/solana.git", rev = "57abc370fa39e42e8fb84145a30395ddcf891692", version = "=1.0.7" }
+tar = "=0.4.26"
+tempfile = "=3.1.0"
+
+[dev-dependencies]
+bs58 = "=0.3.0"

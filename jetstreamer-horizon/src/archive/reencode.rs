@@ -16,9 +16,9 @@ use crate::account_updates::AccountUpdateView;
 use crate::transactions::Transaction;
 
 use super::{
-    ArchiveFormatError, ArchiveReader, ArchiveStats, ArchiveWriter, ArchiveWriterConfig,
-    BlockNotification, ChainMismatchPolicy, Consumption, EntryRecord, EpochMeta, SlotKind,
-    SlotVisitor,
+    ARCHIVE_PROVENANCE_MAGIC, ArchiveFormatError, ArchiveReader, ArchiveStats, ArchiveWriter,
+    ArchiveWriterConfig, BlockNotification, ChainMismatchPolicy, Consumption, EntryRecord,
+    EpochMeta, SlotKind, SlotVisitor,
 };
 
 /// Which independently decodable source buckets to re-encode.
@@ -260,6 +260,9 @@ impl SlotVisitor for SemanticDigest {
 /// `source` is only read and sought. Callers are responsible for opening the
 /// destination safely; the companion CLI uses a distinct, newly-created
 /// partial file and publishes it only after successful validation.
+/// A complete semantic re-encode preserves a recognized, valid provenance
+/// envelope byte-for-byte. Bucket subsets omit it because its declared slot
+/// range would overstate the subset actually written.
 pub fn reencode_archive<R, W>(
     mut source: R,
     sink: W,
@@ -322,12 +325,31 @@ where
         .map(|&index| reader.bucket_index()[index].len)
         .sum();
 
-    let mut writer = ArchiveWriter::new(
+    let preserved_provenance = if selection_is_complete
+        && header.meta.reserved.starts_with(&ARCHIVE_PROVENANCE_MAGIC)
+        && reader.has_complete_slot_coverage()?
+    {
+        // Parse before copying so a malformed or unsupported envelope cannot
+        // be laundered into a newly verified archive. The destination retains
+        // the same declared range, so the reader's range check also proves the
+        // copied claim remains applicable.
+        reader
+            .provenance()?
+            .ok_or(ArchiveFormatError::InvalidContainerLayout(
+                "archive provenance magic decoded as absent provenance",
+            ))?;
+        header.meta.reserved.clone()
+    } else {
+        Vec::new()
+    };
+
+    let mut writer = ArchiveWriter::new_with_reserved(
         sink,
         header.epoch,
         header.slot_start,
         header.slot_count,
         options.writer,
+        preserved_provenance,
     )?;
     let mut slots_reencoded = 0u64;
 

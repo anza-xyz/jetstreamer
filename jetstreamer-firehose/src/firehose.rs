@@ -58,8 +58,33 @@ const OP_TIMEOUT_SEQUENTIAL: std::time::Duration = std::time::Duration::from_sec
 // double the wait up to the cap, and any forward progress resets it.
 const RETRY_BACKOFF_BASE: std::time::Duration = std::time::Duration::from_secs(1);
 const RETRY_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(32);
-// Epochs earlier than this were bincode-encoded in Old Faithful.
-const BINCODE_EPOCH_CUTOFF: u64 = 157;
+/// First slot whose Old Faithful transaction-status metadata is stored as
+/// protobuf. Earlier metadata is bincode-encoded. This is an archive-input
+/// boundary only; it says nothing about which Solana runtime executed a slot.
+pub const OLD_FAITHFUL_PROTOBUF_META_START_SLOT: u64 = 157 * 432_000;
+
+/// Encoding Old Faithful uses for transaction-status metadata at a slot.
+///
+/// Early archives occasionally contain protobuf-shaped records before the
+/// documented cutoff, so the bincode era retains a protobuf fallback. The
+/// protobuf era does not guess backwards: malformed protobuf is rejected.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OldFaithfulMetaEncoding {
+    /// Try historical bincode first, then protobuf for anomalous records.
+    BincodeWithProtobufFallback,
+    /// Decode protobuf directly.
+    Protobuf,
+}
+
+/// Selects the Old Faithful transaction-metadata decoder solely from `slot`.
+#[inline]
+pub const fn old_faithful_meta_encoding(slot: u64) -> OldFaithfulMetaEncoding {
+    if slot < OLD_FAITHFUL_PROTOBUF_META_START_SLOT {
+        OldFaithfulMetaEncoding::BincodeWithProtobufFallback
+    } else {
+        OldFaithfulMetaEncoding::Protobuf
+    }
+}
 
 fn poll_shutdown(
     flag: &Arc<std::sync::atomic::AtomicBool>,
@@ -539,8 +564,15 @@ async fn request_steal(
 fn reverse_resume_after_error(
     slot: u64,
     last_counted_slot: u64,
+    has_counted_slot: bool,
     highest_remaining_epoch: Option<u64>,
 ) -> (Option<u64>, Option<u64>) {
+    // `last_counted_slot == 0` is ambiguous for a range beginning at genesis:
+    // it can mean either "nothing processed" or "slot 0 processed".  Before
+    // slot 0 is counted there is no completed epoch to advance past.
+    if !has_counted_slot {
+        return (Some(0), highest_remaining_epoch);
+    }
     let resume_slot = if slot <= last_counted_slot {
         last_counted_slot.saturating_add(1)
     } else {
@@ -564,6 +596,25 @@ fn reverse_resume_after_error(
     } else {
         (Some(resume_slot), highest_remaining_epoch)
     }
+}
+
+#[inline]
+fn next_uncounted_slot(range_start: u64, last_counted_slot: u64, has_counted_slot: bool) -> u64 {
+    if has_counted_slot {
+        last_counted_slot.saturating_add(1)
+    } else {
+        range_start
+    }
+}
+
+#[inline]
+fn slot_already_counted(slot: u64, last_counted_slot: u64, has_counted_slot: bool) -> bool {
+    has_counted_slot && slot <= last_counted_slot
+}
+
+#[inline]
+fn slot_should_emit(slot: u64, last_emitted_slot: u64, has_emitted_slot: bool) -> bool {
+    !has_emitted_slot || slot > last_emitted_slot
 }
 
 /// Per-thread restart pacing: consecutive failures on the same slot double the delay up to
@@ -721,10 +772,50 @@ impl Display for FirehoseError {
 pub struct GeyserNotifiers {
     /// Optional notifier for transaction updates.
     pub transaction_notifier: Option<Arc<dyn TransactionNotifier + Send + Sync + 'static>>,
+    /// Optional transaction notifier that also receives whether Old Faithful
+    /// actually carried status metadata. The ordinary Geyser interface cannot
+    /// represent a missing metadata frame, so its compatibility path receives
+    /// `TransactionStatusMeta::default()` as before.
+    pub sourced_transaction_notifier:
+        Option<Arc<dyn SourcedTransactionNotifier + Send + Sync + 'static>>,
     /// Optional notifier for entry updates.
     pub entry_notifier: Option<Arc<dyn EntryNotifier + Send + Sync + 'static>>,
     /// Optional notifier for block metadata updates.
     pub block_metadata_notifier: Option<Arc<dyn BlockMetadataNotifier + Send + Sync + 'static>>,
+}
+
+/// A transaction notification that preserves source-metadata provenance.
+pub struct SourcedTransaction<'a> {
+    /// Slot containing the transaction.
+    pub slot: u64,
+    /// Zero-based transaction index within the slot.
+    pub transaction_slot_index: usize,
+    /// First transaction signature.
+    pub signature: &'a solana_signature::Signature,
+    /// Hash of the transaction message.
+    pub message_hash: &'a Hash,
+    /// Whether this is a simple vote transaction.
+    pub is_vote: bool,
+    /// Source status and its provenance.
+    pub status: SourcedTransactionStatus<'a>,
+    /// Original versioned transaction.
+    pub transaction: &'a VersionedTransaction,
+}
+
+/// Transaction status carried by the archive source.
+#[derive(Clone, Copy, Debug)]
+pub enum SourcedTransactionStatus<'a> {
+    /// Status metadata was present and decoded from the source record.
+    Observed(&'a solana_transaction_status::TransactionStatusMeta),
+    /// The source record carried no status metadata.
+    Missing,
+}
+
+/// Direct-replay transaction callback retaining information that the Geyser
+/// transaction interface cannot express.
+pub trait SourcedTransactionNotifier: Send + Sync {
+    /// Reports a transaction together with whether its source status exists.
+    fn notify_transaction(&self, transaction: SourcedTransaction<'_>);
 }
 
 impl From<reqwest::Error> for FirehoseError {
@@ -1009,7 +1100,7 @@ fn decode_transaction_status_meta(
 ) -> Result<solana_transaction_status::TransactionStatusMeta, SharedError> {
     let epoch = slot_to_epoch(slot);
     let mut bincode_err: Option<String> = None;
-    if epoch < BINCODE_EPOCH_CUTOFF {
+    if old_faithful_meta_encoding(slot) == OldFaithfulMetaEncoding::BincodeWithProtobufFallback {
         match bincode::deserialize::<solana_storage_proto::StoredTransactionStatusMeta>(
             metadata_bytes,
         ) {
@@ -1050,7 +1141,11 @@ fn decode_transaction_status_meta(
 
 #[cfg(test)]
 mod metadata_decode_tests {
-    use super::{decode_transaction_status_meta, decode_transaction_status_meta_from_frame};
+    use super::{
+        OLD_FAITHFUL_PROTOBUF_META_START_SLOT, OldFaithfulMetaEncoding,
+        decode_transaction_status_meta, decode_transaction_status_meta_from_frame,
+        old_faithful_meta_encoding,
+    };
     use solana_message::v0::LoadedAddresses;
     use solana_storage_proto::StoredTransactionStatusMeta;
     use solana_transaction_status::TransactionStatusMeta;
@@ -1069,6 +1164,18 @@ mod metadata_decode_tests {
             loaded_addresses: LoadedAddresses::default(),
             ..TransactionStatusMeta::default()
         }
+    }
+
+    #[test]
+    fn metadata_encoding_switches_at_the_documented_slot() {
+        assert_eq!(
+            old_faithful_meta_encoding(OLD_FAITHFUL_PROTOBUF_META_START_SLOT - 1),
+            OldFaithfulMetaEncoding::BincodeWithProtobufFallback
+        );
+        assert_eq!(
+            old_faithful_meta_encoding(OLD_FAITHFUL_PROTOBUF_META_START_SLOT),
+            OldFaithfulMetaEncoding::Protobuf
+        );
     }
 
     #[test]
@@ -1203,6 +1310,9 @@ pub struct TransactionData {
     pub is_vote: bool,
     /// Status metadata returned by the Solana runtime.
     pub transaction_status_meta: solana_transaction_status::TransactionStatusMeta,
+    /// Whether the source carried the adjacent status metadata. If false, the
+    /// value is a compatibility default rather than an observed result.
+    pub status_meta_available: bool,
     /// Fully decoded transaction.
     pub transaction: VersionedTransaction,
 }
@@ -1626,7 +1736,6 @@ where
             );
             let log_target = format!("{}::T{:03}", LOG_MODULE, thread_index);
             let mut skip_until_index = None;
-            let last_emitted_slot = slot_range.start.saturating_sub(1);
             let block_enabled = on_block.is_some();
             let tx_enabled = on_tx.is_some();
             let entry_enabled = on_entry.is_some();
@@ -1638,7 +1747,9 @@ where
                     .or_insert_with(|| DashSet::with_hasher(ahash::RandomState::new()));
             }
             let mut last_counted_slot = slot_range.start.saturating_sub(1);
+            let mut has_counted_slot = slot_range.start > 0;
             let mut last_emitted_slot_global = slot_range.start.saturating_sub(1);
+            let mut has_emitted_slot_global = slot_range.start > 0;
             // Reverse-mode state preserved across retries. `None` for the highest remaining
             // epoch explicitly means "every epoch is complete" — required so completing
             // epoch 0 is distinguishable from epoch 0 still pending.
@@ -1670,7 +1781,6 @@ where
             let mut retry_backoff = RetryBackoff::new();
             // let mut triggered = false;
             while let Err((err, slot)) = async {
-                let mut last_emitted_slot = last_emitted_slot_global;
                 let op_timeout = if sequential_mode {
                     OP_TIMEOUT_SEQUENTIAL
                 } else {
@@ -1810,12 +1920,14 @@ where
                     // Reset counters to align to the local epoch slice; prevents boundary slots
                     // from being treated as already-counted after a restart.
                     last_counted_slot = local_start.saturating_sub(1);
+                    has_counted_slot = local_start > 0;
                     current_slot = None;
                     if reverse_mode_local {
                         // In reverse mode each epoch is processed forward independently;
                         // the cross-epoch monotonic dedup check would otherwise reject every
                         // slot below the previously processed (higher) epoch's range.
-                        last_emitted_slot = local_start.saturating_sub(1);
+                        last_emitted_slot_global = local_start.saturating_sub(1);
+                        has_emitted_slot_global = local_start > 0;
                     }
                     if tracking_enabled
                         && let Some(ref mut stats) = thread_stats {
@@ -1902,10 +2014,15 @@ where
                         // `slot_range.end`, and the `slot >= slot_range.end` guard below
                         // completes the range before any out-of-range data is emitted.
                         if work_stealing {
+                            let resume_position = next_uncounted_slot(
+                                local_start,
+                                last_counted_slot,
+                                has_counted_slot,
+                            );
                             service_steal_inbox(
                                 &mut steal_inbox,
                                 &mut slot_range,
-                                last_counted_slot.saturating_add(1),
+                                resume_position,
                                 &work_registry[thread_index],
                                 &log_target,
                                 true,
@@ -1923,8 +2040,16 @@ where
                             // of the epoch, the stream was truncated and completing here
                             // would silently drop those slots.
                             let scan_end = local_end_inclusive.min(slot_range.end.saturating_sub(1));
-                            if let Some(missing) =
-                                crate::index::next_present_slot(last_counted_slot, scan_end).await
+                            let next_unprocessed = next_uncounted_slot(
+                                local_start,
+                                last_counted_slot,
+                                has_counted_slot,
+                            );
+                            if let Some(missing) = crate::index::first_present_slot_at_or_after(
+                                next_unprocessed,
+                                scan_end,
+                            )
+                            .await
                             {
                                 log::warn!(
                                     target: &log_target,
@@ -1934,7 +2059,7 @@ where
                                 );
                                 return Err((
                                     FirehoseError::PrematureStreamEnd,
-                                    last_counted_slot.saturating_add(1),
+                                    next_unprocessed,
                                 ));
                             }
                             log::info!(
@@ -2063,6 +2188,7 @@ where
                                                     error_slot,
                                                 )
                                             })?;
+                                        let status_meta_available = !reassembled_metadata.is_empty();
 
                                         let as_native_metadata = decode_transaction_status_meta_from_frame(
                                             block.slot,
@@ -2119,6 +2245,7 @@ where
                                                 message_hash,
                                                 is_vote,
                                                 transaction_status_meta: as_native_metadata,
+                                                status_meta_available,
                                                 transaction: versioned_tx,
                                             },
                                         )
@@ -2194,6 +2321,7 @@ where
                                 }
                                 Block(block) => {
                                     let prev_last_counted_slot = last_counted_slot;
+                                    let prev_has_counted_slot = has_counted_slot;
                                     let thread_stats_snapshot = thread_stats.as_ref().map(|stats| {
                                         (
                                             stats.slots_processed,
@@ -2203,11 +2331,13 @@ where
                                         )
                                     });
 
-                                    let next_expected_slot = prev_last_counted_slot.saturating_add(1);
-                                    let skip_start_from_previous = last_counted_slot.saturating_add(1);
-                                    let skip_start = skip_start_from_previous.max(next_expected_slot);
+                                    let skip_start = next_uncounted_slot(
+                                        local_start,
+                                        last_counted_slot,
+                                        has_counted_slot,
+                                    );
 
-                                    let skipped_epoch = slot_to_epoch(last_counted_slot);
+                                    let skipped_epoch = epoch_num;
                                     for skipped_slot in skip_start..slot {
                                         if slot_to_epoch(skipped_slot) != skipped_epoch {
                                             break;
@@ -2227,8 +2357,12 @@ where
                                         }
                                         if block_enabled
                                             && let Some(on_block_cb) = on_block.as_ref()
-                                            && skipped_slot > last_emitted_slot {
-                                                last_emitted_slot = skipped_slot;
+                                            && slot_should_emit(
+                                                skipped_slot,
+                                                last_emitted_slot_global,
+                                                has_emitted_slot_global,
+                                            )
+                                        {
                                                 on_block_cb(
                                                     thread_index,
                                                     BlockData::PossibleLeaderSkipped {
@@ -2242,6 +2376,8 @@ where
                                                         error_slot,
                                                     )
                                                 })?;
+                                                last_emitted_slot_global = skipped_slot;
+                                                has_emitted_slot_global = true;
                                             }
                                         if tracking_enabled {
                                             overall_slots_processed.fetch_add(1, Ordering::Relaxed);
@@ -2253,6 +2389,7 @@ where
                                             }
                                         }
                                         last_counted_slot = skipped_slot;
+                                        has_counted_slot = true;
                                     }
 
                                     let cleared_pending_skip = if block_enabled {
@@ -2265,7 +2402,12 @@ where
                                         false
                                     };
 
-                                    if slot <= last_counted_slot && !cleared_pending_skip {
+                                    if slot_already_counted(
+                                        slot,
+                                        last_counted_slot,
+                                        has_counted_slot,
+                                    ) && !cleared_pending_skip
+                                    {
                                         log::debug!(
                                             target: &log_target,
                                             "duplicate block {}, already counted (last_counted={})",
@@ -2282,8 +2424,11 @@ where
                                                 keyed_rewards,
                                                 num_partitions,
                                             } = std::mem::take(&mut this_block_rewards);
-                                            if slot > last_emitted_slot {
-                                                last_emitted_slot = slot;
+                                            if slot_should_emit(
+                                                slot,
+                                                last_emitted_slot_global,
+                                                has_emitted_slot_global,
+                                            ) {
                                                 on_block_cb(
                                                     thread_index,
                                                     BlockData::Block {
@@ -2309,6 +2454,8 @@ where
                                                         error_slot,
                                                     )
                                                 })?;
+                                                last_emitted_slot_global = slot;
+                                                has_emitted_slot_global = true;
                                             }
                                         }
                                     } else {
@@ -2369,17 +2516,26 @@ where
                                                             prev_current_slot;
                                                     }
                                                     last_counted_slot = prev_last_counted_slot;
+                                                    has_counted_slot = prev_has_counted_slot;
                                                     return Err(err);
                                                 }
                                     }
 
-                                    if slot > last_counted_slot {
+                                    if !has_counted_slot || slot > last_counted_slot {
                                         last_counted_slot = slot;
+                                        has_counted_slot = true;
                                     }
                                     if work_stealing {
                                         work_registry[thread_index]
                                             .next
-                                            .store(last_counted_slot.saturating_add(1), Ordering::SeqCst);
+                                            .store(
+                                                next_uncounted_slot(
+                                                    local_start,
+                                                    last_counted_slot,
+                                                    has_counted_slot,
+                                                ),
+                                                Ordering::SeqCst,
+                                            );
                                     }
                                 }
                                 Subset(_subset) => (),
@@ -2504,7 +2660,7 @@ where
                         }
                     }
                     if let Some(expected_last_slot) = slot_range.end.checked_sub(1)
-                        && last_counted_slot < expected_last_slot
+                        && (!has_counted_slot || last_counted_slot < expected_last_slot)
                     {
                         // Do not synthesize skipped slots during final flush; another thread may
                         // cover the remaining range (especially across epoch boundaries).
@@ -2554,10 +2710,15 @@ where
                     if work_stealing {
                         let assignment_start =
                             work_registry[thread_index].start.load(Ordering::SeqCst);
+                        let assignment_end = next_uncounted_slot(
+                            assignment_start,
+                            last_counted_slot,
+                            has_counted_slot,
+                        );
                         coverage_log
                             .lock()
                             .unwrap()
-                            .push((assignment_start, last_counted_slot.saturating_add(1)));
+                            .push((assignment_start, assignment_end));
                     }
                     // This thread is done with its own range: publish "nothing remaining" so
                     // hunters stop targeting it, then drain any pending steal proposals with
@@ -2598,7 +2759,9 @@ where
                         thread_activity::clear_finished(thread_index);
                         slot_range = stolen;
                         last_counted_slot = slot_range.start.saturating_sub(1);
+                        has_counted_slot = slot_range.start > 0;
                         last_emitted_slot_global = slot_range.start.saturating_sub(1);
+                        has_emitted_slot_global = slot_range.start > 0;
                         reverse_partial_resume = None;
                         skip_until_index = None;
                         if let Some(ref mut stats) = thread_stats {
@@ -2681,12 +2844,17 @@ where
                     let (resume, highest) = reverse_resume_after_error(
                         slot,
                         last_counted_slot,
+                        has_counted_slot,
                         reverse_highest_remaining_epoch,
                     );
                     reverse_partial_resume = resume;
                     reverse_highest_remaining_epoch = highest;
-                } else if slot <= last_counted_slot {
+                } else if slot_already_counted(slot, last_counted_slot, has_counted_slot) {
                     slot_range.start = last_counted_slot.saturating_add(1);
+                } else if !has_counted_slot {
+                    // Nothing in a genesis-starting slice has completed.  Preserve slot 0
+                    // so retries cannot lose its PoH entries or a leading skipped run.
+                    slot_range.start = 0;
                 } else {
                     slot_range.start = slot;
                 }
@@ -2705,7 +2873,6 @@ where
                 // is reset to 0 each epoch restart. Keeping it can skip large portions
                 // of the stream and silently drop slots.
                 skip_until_index = None;
-                last_emitted_slot_global = last_emitted_slot;
                 if !recycled {
                     let backoff = retry_backoff.next_delay(slot);
                     log::warn!(
@@ -2777,8 +2944,8 @@ where
         }
         let mut real_holes = 0usize;
         for (hole_start, hole_end) in &holes {
-            if let Some(missing) = crate::index::next_present_slot(
-                hole_start.saturating_sub(1),
+            if let Some(missing) = crate::index::first_present_slot_at_or_after(
+                *hole_start,
                 hole_end.saturating_sub(1),
             )
             .await
@@ -2898,6 +3065,7 @@ pub fn firehose_geyser(
 
     let notifiers = GeyserNotifiers {
         transaction_notifier: transaction_notifier_maybe,
+        sourced_transaction_notifier: None,
         entry_notifier: entry_notifier_maybe,
         block_metadata_notifier: block_meta_notifier_maybe,
     };
@@ -2960,6 +3128,7 @@ pub fn firehose_geyser_with_notifiers(
     }
 
     let transaction_notifier_maybe = Arc::new(notifiers.transaction_notifier);
+    let sourced_transaction_notifier_maybe = Arc::new(notifiers.sourced_transaction_notifier);
     let entry_notifier_maybe = Arc::new(notifiers.entry_notifier);
     let block_meta_notifier_maybe = Arc::new(notifiers.block_metadata_notifier);
 
@@ -3000,6 +3169,7 @@ pub fn firehose_geyser_with_notifiers(
 
     for (i, slot_range) in subranges.into_iter().enumerate() {
         let transaction_notifier_maybe = (*transaction_notifier_maybe).clone();
+        let sourced_transaction_notifier_maybe = (*sourced_transaction_notifier_maybe).clone();
         let entry_notifier_maybe = (*entry_notifier_maybe).clone();
         let block_meta_notifier_maybe = (*block_meta_notifier_maybe).clone();
         let confirmed_bank_sender = (*confirmed_bank_sender).clone();
@@ -3015,6 +3185,7 @@ pub fn firehose_geyser_with_notifiers(
                 firehose_geyser_thread(
                     slot_range,
                     transaction_notifier_maybe,
+                    sourced_transaction_notifier_maybe,
                     entry_notifier_maybe,
                     block_meta_notifier_maybe,
                     confirmed_bank_sender,
@@ -3063,6 +3234,9 @@ pub fn firehose_geyser_with_notifiers(
 async fn firehose_geyser_thread(
     mut slot_range: Range<u64>,
     transaction_notifier_maybe: Option<Arc<dyn TransactionNotifier + Send + Sync + 'static>>,
+    sourced_transaction_notifier_maybe: Option<
+        Arc<dyn SourcedTransactionNotifier + Send + Sync + 'static>,
+    >,
     entry_notifier_maybe: Option<Arc<dyn EntryNotifier + Send + Sync + 'static>>,
     block_meta_notifier_maybe: Option<Arc<dyn BlockMetadataNotifier + Send + Sync + 'static>>,
     confirmed_bank_sender: Sender<SlotNotification>,
@@ -3084,6 +3258,10 @@ async fn firehose_geyser_thread(
     let initial_slot_range = slot_range.clone();
     let mut skip_until_index = None;
     let mut last_counted_slot = slot_range.start.saturating_sub(1);
+    // `saturating_sub(1)` cannot distinguish "nothing processed" from slot 0.
+    // Keep that distinction explicit so a range beginning at genesis does not
+    // discard slot 0 as a duplicate.
+    let mut has_counted_slot = slot_range.start > 0;
     let mut retry_backoff = RetryBackoff::new();
     // let mut triggered = false;
     while let Err((err, slot)) = async {
@@ -3171,6 +3349,7 @@ async fn firehose_geyser_thread(
                 // Reset counters to align to the local epoch slice; prevents boundary slots
                 // from being treated as already-counted after a restart.
                 last_counted_slot = local_start.saturating_sub(1);
+                has_counted_slot = local_start > 0;
                 current_slot = None;
 
                 if local_start > epoch_start {
@@ -3240,8 +3419,16 @@ async fn firehose_geyser_thread(
                         // EOF is ambiguous (genuine epoch end vs a connection the CDN closed
                         // mid-transfer); consult the slot index before completing.
                         let scan_end = local_end_inclusive.min(slot_range.end.saturating_sub(1));
-                        if let Some(missing) =
-                            crate::index::next_present_slot(last_counted_slot, scan_end).await
+                        let next_unprocessed = next_uncounted_slot(
+                            local_start,
+                            last_counted_slot,
+                            has_counted_slot,
+                        );
+                        if let Some(missing) = crate::index::first_present_slot_at_or_after(
+                            next_unprocessed,
+                            scan_end,
+                        )
+                        .await
                         {
                             log::warn!(
                                 target: &log_target,
@@ -3251,7 +3438,7 @@ async fn firehose_geyser_thread(
                             );
                             return Err((
                                 FirehoseError::PrematureStreamEnd,
-                                last_counted_slot.saturating_add(1),
+                                next_unprocessed,
                             ));
                         }
                         log::info!(target: &log_target, "reached end of epoch {}", epoch_num);
@@ -3316,7 +3503,7 @@ async fn firehose_geyser_thread(
                     let mut this_block_entry_count: u64 = 0;
                     let mut this_block_rewards = DecodedRewards::empty();
 
-                    if slot <= last_counted_slot {
+                    if slot_already_counted(slot, last_counted_slot, has_counted_slot) {
                         log::debug!(
                             target: &log_target,
                             "duplicate block {}, already counted (last_counted={})",
@@ -3365,6 +3552,7 @@ async fn firehose_geyser_thread(
                             Transaction(tx) => {
                                 let versioned_tx = tx.as_parsed()?;
                                 let reassembled_metadata = nodes.reassemble_dataframes(&tx.metadata)?;
+                                let status_meta_available = !reassembled_metadata.is_empty();
 
                                 let as_native_metadata = decode_transaction_status_meta_from_frame(
                                     block.slot,
@@ -3405,6 +3593,23 @@ async fn firehose_geyser_thread(
                                         &versioned_tx,
                                     );
                                 }
+                                if let Some(transaction_notifier) =
+                                    sourced_transaction_notifier_maybe.as_ref()
+                                {
+                                    transaction_notifier.notify_transaction(SourcedTransaction {
+                                        slot: block.slot,
+                                        transaction_slot_index: tx.index.unwrap() as usize,
+                                        signature,
+                                        message_hash: &message_hash,
+                                        is_vote,
+                                        status: if status_meta_available {
+                                            SourcedTransactionStatus::Observed(&as_native_metadata)
+                                        } else {
+                                            SourcedTransactionStatus::Missing
+                                        },
+                                        transaction: &versioned_tx,
+                                    });
+                                }
 
                             }
                             Entry(entry) => {
@@ -3443,6 +3648,7 @@ async fn firehose_geyser_thread(
 
                                 if block_meta_notifier_maybe.is_none() {
                                     last_counted_slot = block.slot;
+                                    has_counted_slot = true;
                                     return Ok(());
                                 }
                                 let DecodedRewards {
@@ -3466,6 +3672,7 @@ async fn firehose_geyser_thread(
                                 );
                                 todo_previous_blockhash = todo_latest_entry_blockhash;
                                 last_counted_slot = block.slot;
+                                has_counted_slot = true;
                                 std::thread::yield_now();
                             }
                             Subset(_subset) => (),
@@ -3562,8 +3769,11 @@ async fn firehose_geyser_thread(
             );
             // Update slot range to resume from the failed slot, not the original start.
             // If the failing slot was already fully processed, resume from the next slot.
-            if slot <= last_counted_slot {
+            if slot_already_counted(slot, last_counted_slot, has_counted_slot) {
                 slot_range.start = last_counted_slot.saturating_add(1);
+            } else if !has_counted_slot {
+                // Preserve slot 0 until a complete block has been delivered.
+                slot_range.start = 0;
             } else {
                 slot_range.start = slot;
             }
@@ -3742,7 +3952,7 @@ mod reverse_resume_tests {
 
     #[test]
     fn test_mid_epoch_error_resumes_in_place() {
-        let (resume, highest) = reverse_resume_after_error(388799951, 388799950, Some(899));
+        let (resume, highest) = reverse_resume_after_error(388799951, 388799950, true, Some(899));
         assert_eq!(resume, Some(388799951));
         assert_eq!(highest, Some(899));
     }
@@ -3751,7 +3961,7 @@ mod reverse_resume_tests {
     fn test_tail_timeout_marks_epoch_complete() {
         // Error attributed to the next epoch's first slot after the tail slot was counted:
         // the epoch slice is done; resuming from the slice start would double-emit it.
-        let (resume, highest) = reverse_resume_after_error(388800000, 388799999, Some(899));
+        let (resume, highest) = reverse_resume_after_error(388800000, 388799999, true, Some(899));
         assert_eq!(resume, None);
         assert_eq!(highest, Some(898));
     }
@@ -3760,7 +3970,7 @@ mod reverse_resume_tests {
     fn test_tail_error_attributed_within_epoch_marks_complete() {
         // Decoding error attributed to the already-counted tail slot: resume would be
         // tail + 1, crossing the boundary — same completion case.
-        let (resume, highest) = reverse_resume_after_error(388799999, 388799999, Some(899));
+        let (resume, highest) = reverse_resume_after_error(388799999, 388799999, true, Some(899));
         assert_eq!(resume, None);
         assert_eq!(highest, Some(898));
     }
@@ -3769,7 +3979,7 @@ mod reverse_resume_tests {
     fn test_seek_error_before_any_progress_keeps_epoch() {
         // First epoch (900) seek fails before any block; last_counted is still the
         // pre-range sentinel in epoch 899. The higher epoch must not be marked complete.
-        let (resume, highest) = reverse_resume_after_error(388800000, 388799899, Some(900));
+        let (resume, highest) = reverse_resume_after_error(388800000, 388799899, true, Some(900));
         assert_eq!(resume, None);
         assert_eq!(highest, Some(900));
     }
@@ -3779,7 +3989,7 @@ mod reverse_resume_tests {
         // Epoch 900 finished (last_counted in 900); epoch 899's seek fails with the error
         // attributed inside 899. Not a tail crossing — keep a resume marker (which the
         // epoch-match check resolves to the slice start of 899).
-        let (resume, highest) = reverse_resume_after_error(388799900, 388800099, Some(899));
+        let (resume, highest) = reverse_resume_after_error(388799900, 388800099, true, Some(899));
         assert_eq!(resume, Some(388800100));
         assert_eq!(highest, Some(899));
     }
@@ -3789,9 +3999,34 @@ mod reverse_resume_tests {
         // Epoch 0's tail is slot 431999; the error is attributed to slot 432000 (epoch 1).
         // "No epochs remaining" must be explicit (`None`) — a saturating subtraction would
         // silently pin at 0 and replay epoch 0 forever.
-        let (resume, highest) = reverse_resume_after_error(432000, 431999, Some(0));
+        let (resume, highest) = reverse_resume_after_error(432000, 431999, true, Some(0));
         assert_eq!(resume, None);
         assert_eq!(highest, None);
+    }
+
+    #[test]
+    fn test_epoch_zero_error_before_first_count_retries_slot_zero() {
+        let (resume, highest) = reverse_resume_after_error(0, 0, false, Some(0));
+        assert_eq!(resume, Some(0));
+        assert_eq!(highest, Some(0));
+    }
+
+    #[test]
+    fn test_epoch_zero_error_after_first_count_advances() {
+        let (resume, highest) = reverse_resume_after_error(0, 0, true, Some(0));
+        assert_eq!(resume, Some(1));
+        assert_eq!(highest, Some(0));
+    }
+
+    #[test]
+    fn test_genesis_slot_cursor_distinguishes_unprocessed_from_counted_zero() {
+        assert_eq!(next_uncounted_slot(0, 0, false), 0);
+        assert!(!slot_already_counted(0, 0, false));
+        assert!(slot_should_emit(0, 0, false));
+
+        assert_eq!(next_uncounted_slot(0, 0, true), 1);
+        assert!(slot_already_counted(0, 0, true));
+        assert!(!slot_should_emit(0, 0, true));
     }
 }
 

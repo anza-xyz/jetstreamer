@@ -1,6 +1,8 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
-    env, fs,
+    env,
+    ffi::OsString,
+    fs,
     path::{Path, PathBuf},
     process::{Stdio, exit},
     str::FromStr,
@@ -31,10 +33,30 @@ use crossbeam_channel::{bounded, unbounded};
 use dashmap::DashMap;
 use jetstreamer_firehose::{
     epochs::{BASE_URL, epoch_to_slot_range, slot_to_epoch},
-    firehose::{FirehoseError, GeyserNotifiers, firehose_geyser_with_notifiers},
+    firehose::{
+        FirehoseError, GeyserNotifiers, SourcedTransaction, SourcedTransactionNotifier,
+        SourcedTransactionStatus, firehose_geyser_with_notifiers,
+    },
+};
+use jetstreamer_horizon::archive::{
+    AccountsHashKind, ArchiveProvenance, ArchiveProvenanceV1, ArchiveProvenanceV2,
+    ArchiveProvenanceV3, ArchiveWriterConfig, BootstrapStateKind, RuntimeAdmission,
+    RuntimeHandoffProvenance, RuntimeSegmentProvenance, RuntimeSegmentSource,
+    RuntimeStateCheckpoint, SemanticDigest, StateCommitment, StateCommitmentKind,
+    TransactionMetadataPolicy, WriteVersionNormalization, merge_runtime_segments,
+};
+use jetstreamer_node::handoff_snapshot::{
+    HANDOFF_SNAPSHOT_MANIFEST_SCHEMA_VERSION, HistoricalHandoffSnapshotManifest,
+    handoff_snapshot_manifest_path, read_and_validate_handoff_snapshot_manifest,
+    write_handoff_snapshot_manifest,
+};
+use jetstreamer_node::segment_manifest::{
+    HistoricalSegmentManifest, SegmentCheckpointSummary, SegmentRuntimeAdmission,
+    SegmentRuntimeIdentity, read_and_validate_segment_manifest, write_segment_manifest,
 };
 use jetstreamer_node::snapshots::{
-    DEFAULT_BUCKET, download_snapshot_at_or_before_slot, list_epoch_snapshots,
+    DEFAULT_BUCKET, download_snapshot_at_or_before_slot_matching,
+    list_snapshots_in_slot_range_matching,
 };
 use log::{error, info, warn};
 use rayon::prelude::*;
@@ -57,7 +79,6 @@ use solana_ledger::{
     blockstore_processor::set_alpenglow_ticks, entry_notifier_interface::EntryNotifier,
     leader_schedule_cache::LeaderScheduleCache,
 };
-use solana_rpc::transaction_notifier_interface::TransactionNotifier;
 use solana_runtime::installed_scheduler_pool::InstalledSchedulerPoolArc;
 use solana_runtime::prioritization_fee_cache::PrioritizationFeeCache;
 use solana_runtime::{
@@ -83,6 +104,9 @@ use tar::Archive as TarArchive;
 use tokio::process::Command;
 use xxhash_rust::xxh64::xxh64;
 
+mod compatibility;
+mod historical;
+mod historical_replay;
 mod horizon;
 mod plugin;
 
@@ -247,15 +271,24 @@ fn process_anon_rss_bytes() -> Option<u64> {
     None
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BankHashExpectation {
+    AccountsLtHash(SnapshotHash),
+    LegacyAccountsHash(Hash),
+}
+
 struct SnapshotVerifier {
-    expected: DashMap<Slot, SnapshotHash>,
+    expected: DashMap<Slot, BankHashExpectation>,
     errors: DashMap<usize, String>,
     error_count: AtomicUsize,
     shutdown: Option<Arc<AtomicBool>>,
 }
 
 impl SnapshotVerifier {
-    fn new(expected: BTreeMap<Slot, SnapshotHash>, shutdown: Option<Arc<AtomicBool>>) -> Self {
+    fn new(
+        expected: BTreeMap<Slot, BankHashExpectation>,
+        shutdown: Option<Arc<AtomicBool>>,
+    ) -> Self {
         let expected_map = DashMap::new();
         for (slot, hash) in expected {
             expected_map.insert(slot, hash);
@@ -275,37 +308,71 @@ impl SnapshotVerifier {
             return;
         };
 
-        let actual_hash = bank.get_snapshot_hash();
+        let (expected_hash, actual_hash, kind) = match expected_hash {
+            BankHashExpectation::AccountsLtHash(expected) => {
+                (expected.0, bank.get_snapshot_hash().0, "accounts-lt")
+            }
+            BankHashExpectation::LegacyAccountsHash(expected) => {
+                self.record_error(format!(
+                    "legacy accounts-hash checkpoint {expected} at slot {slot} was routed to the \
+                     Agave verifier; runtime selection must dispatch this span to a historical backend"
+                ));
+                return;
+            }
+        };
         if actual_hash != expected_hash {
             let message = format!(
-                "snapshot hash mismatch at slot {slot}: expected {}, got {}",
-                expected_hash.0, actual_hash.0
+                "{kind} hash mismatch at slot {slot}: expected {expected_hash}, got {actual_hash}"
             );
             warn!("{message}");
             self.record_error(message);
         } else {
-            info!("verified snapshot hash at slot {slot}");
+            info!("verified {kind} hash at slot {slot}");
+        }
+    }
+
+    fn legacy_checkpoint_slots(&self) -> Vec<Slot> {
+        let mut slots: Vec<_> = self
+            .expected
+            .iter()
+            .filter_map(|entry| {
+                matches!(entry.value(), BankHashExpectation::LegacyAccountsHash(_))
+                    .then_some(*entry.key())
+            })
+            .collect();
+        slots.sort_unstable();
+        slots
+    }
+
+    fn checkpoint_count_in_range(&self, start: Slot, end_inclusive: Slot) -> usize {
+        self.expected
+            .iter()
+            .filter(|entry| (start..=end_inclusive).contains(entry.key()))
+            .count()
+    }
+
+    fn verify_legacy_accounts_hash(&self, slot: Slot, actual_hash: Hash) {
+        let expected_hash = self.expected.remove(&slot).map(|(_, hash)| hash);
+        let Some(expected_hash) = expected_hash else {
+            return;
+        };
+        let BankHashExpectation::LegacyAccountsHash(expected_hash) = expected_hash else {
+            self.record_error(format!(
+                "accounts-lt checkpoint at slot {slot} was routed to a historical verifier"
+            ));
+            return;
+        };
+        if actual_hash != expected_hash {
+            self.record_error(format!(
+                "legacy accounts hash mismatch at slot {slot}: expected {expected_hash}, got {actual_hash}"
+            ));
+        } else {
+            info!("verified legacy accounts hash at slot {slot}");
         }
     }
 
     fn finish(&self) -> Result<(), String> {
-        let total_errors = self.error_count.load(Ordering::Relaxed);
-        if total_errors > 0 {
-            let mut entries: Vec<(usize, String)> = self
-                .errors
-                .iter()
-                .map(|entry| (*entry.key(), entry.value().clone()))
-                .collect();
-            entries.sort_by_key(|(idx, _)| *idx);
-            let total = total_errors.max(entries.len());
-            let mut message = String::from("snapshot verification failed:");
-            for (_, error) in entries.iter().take(5) {
-                message.push_str("\n- ");
-                message.push_str(error);
-            }
-            if total > 5 {
-                message.push_str(&format!("\n- ... {} more", total - 5));
-            }
+        if let Some(message) = self.error_summary() {
             return Err(message);
         }
 
@@ -324,7 +391,31 @@ impl SnapshotVerifier {
         Ok(())
     }
 
+    fn error_summary(&self) -> Option<String> {
+        let total_errors = self.error_count.load(Ordering::Relaxed);
+        if total_errors == 0 {
+            return None;
+        }
+        let mut entries: Vec<(usize, String)> = self
+            .errors
+            .iter()
+            .map(|entry| (*entry.key(), entry.value().clone()))
+            .collect();
+        entries.sort_by_key(|(idx, _)| *idx);
+        let total = total_errors.max(entries.len());
+        let mut message = String::from("snapshot verification failed:");
+        for (_, error) in entries.iter().take(5) {
+            message.push_str("\n- ");
+            message.push_str(error);
+        }
+        if total > 5 {
+            message.push_str(&format!("\n- ... {} more", total - 5));
+        }
+        Some(message)
+    }
+
     fn record_error(&self, message: String) {
+        warn!("snapshot verification failure: {message}");
         let idx = self.error_count.fetch_add(1, Ordering::Relaxed);
         self.errors.insert(idx, message);
         if let Some(shutdown) = &self.shutdown {
@@ -2058,7 +2149,14 @@ impl BankReplay {
         }
 
         for (offset, actual) in results.into_iter().enumerate() {
-            let expected = entry.txs[offset].expected_status.clone();
+            let Some(expected) = entry.txs[offset].expected_status.clone() else {
+                // Old Faithful's earliest transactions may carry an empty
+                // metadata frame. Replay is the source of truth in that case;
+                // do not reinterpret TransactionStatusMeta::default() as an
+                // observed success.
+                entry.txs[offset].status_meta.status = actual;
+                continue;
+            };
             if actual != expected {
                 let tx_index = entry.start_index.saturating_add(offset);
                 let signature = entry
@@ -2203,6 +2301,84 @@ impl BankReplay {
             verifier.verify_bank(&bank);
         }
         Ok(())
+    }
+}
+
+/// Runtime-neutral operations used by the ordered ready-entry consumer.
+/// Backend construction remains explicit so Solana SDK types never cross the
+/// historical worker boundary.
+trait ReplayExecutor: Send + Sync {
+    fn process_ready_entries(&self, entries: Vec<ReadyEntry>);
+    fn verify_latest_bank(&self) -> Result<(), String>;
+    fn freeze_latest_bank(&self) -> Result<(), String>;
+    fn historical_evidence(
+        &self,
+    ) -> Result<Option<historical_replay::HistoricalReplayEvidence>, String> {
+        Ok(None)
+    }
+    fn export_historical_snapshot(
+        &self,
+        _slot: Slot,
+        _output_directory: &Path,
+        _expected_accounts_hash: [u8; 32],
+    ) -> Result<Option<historical::HistoricalSnapshotExport>, String> {
+        Ok(None)
+    }
+    fn shutdown(&self) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+impl ReplayExecutor for BankReplay {
+    fn process_ready_entries(&self, entries: Vec<ReadyEntry>) {
+        BankReplay::process_ready_entries(self, entries);
+    }
+
+    fn verify_latest_bank(&self) -> Result<(), String> {
+        BankReplay::verify_latest_bank(self)
+    }
+
+    fn freeze_latest_bank(&self) -> Result<(), String> {
+        BankReplay::freeze_latest_bank(self)
+    }
+}
+
+impl ReplayExecutor for historical_replay::HistoricalReplay {
+    fn process_ready_entries(&self, entries: Vec<ReadyEntry>) {
+        historical_replay::HistoricalReplay::process_ready_entries(self, entries);
+    }
+
+    fn verify_latest_bank(&self) -> Result<(), String> {
+        historical_replay::HistoricalReplay::verify_latest_bank(self)
+    }
+
+    fn freeze_latest_bank(&self) -> Result<(), String> {
+        historical_replay::HistoricalReplay::freeze_latest_bank(self)
+    }
+
+    fn historical_evidence(
+        &self,
+    ) -> Result<Option<historical_replay::HistoricalReplayEvidence>, String> {
+        historical_replay::HistoricalReplay::evidence(self).map(Some)
+    }
+
+    fn export_historical_snapshot(
+        &self,
+        slot: Slot,
+        output_directory: &Path,
+        expected_accounts_hash: [u8; 32],
+    ) -> Result<Option<historical::HistoricalSnapshotExport>, String> {
+        historical_replay::HistoricalReplay::export_snapshot(
+            self,
+            slot,
+            output_directory,
+            expected_accounts_hash,
+        )
+        .map(Some)
+    }
+
+    fn shutdown(&self) -> Result<(), String> {
+        historical_replay::HistoricalReplay::shutdown(self)
     }
 }
 
@@ -3149,6 +3325,7 @@ struct TransactionScheduler {
 #[derive(Debug)]
 struct SchedulerState {
     last_finalized_slot: Slot,
+    has_finalized_slot: bool,
     current_slot: Slot,
     slots: HashMap<Slot, SlotExecutionBuffer>,
     inferred_blocks: HashMap<Slot, (u64, u64)>,
@@ -3211,6 +3388,7 @@ impl TransactionScheduler {
         Self {
             state: Mutex::new(SchedulerState {
                 last_finalized_slot: start_slot.saturating_sub(1),
+                has_finalized_slot: start_slot > 0,
                 current_slot: start_slot,
                 slots: HashMap::new(),
                 inferred_blocks: HashMap::new(),
@@ -3271,8 +3449,13 @@ impl TransactionScheduler {
         if state.current_slot >= restart_slot {
             state.current_slot = restart_slot;
         }
-        if state.last_finalized_slot >= restart_slot {
-            state.last_finalized_slot = restart_slot.saturating_sub(1);
+        if state.has_finalized_slot && state.last_finalized_slot >= restart_slot {
+            if let Some(previous_slot) = restart_slot.checked_sub(1) {
+                state.last_finalized_slot = previous_slot;
+            } else {
+                state.last_finalized_slot = 0;
+                state.has_finalized_slot = false;
+            }
         }
         state.highest_seen_slot = state
             .slots
@@ -3331,7 +3514,7 @@ impl TransactionScheduler {
         slot: Slot,
         index: usize,
         tx: VersionedTransaction,
-        status_meta: TransactionStatusMeta,
+        status_meta: Option<TransactionStatusMeta>,
     ) -> Result<(Vec<ReadyEntry>, bool), String> {
         let mut state = self.state.lock().expect("transaction scheduler lock");
         if let Some(target) = self.restart_tracker.take_if_applicable(slot) {
@@ -3346,7 +3529,7 @@ impl TransactionScheduler {
                 slot, target.entry_index, target.tx_start
             );
         }
-        if slot <= state.last_finalized_slot {
+        if state.has_finalized_slot && slot <= state.last_finalized_slot {
             return Err(format!(
                 "late transaction for slot {slot} (last finalized slot {})",
                 state.last_finalized_slot
@@ -3383,7 +3566,7 @@ impl TransactionScheduler {
                 slot, target.entry_index, target.tx_start
             );
         }
-        if slot <= state.last_finalized_slot {
+        if state.has_finalized_slot && slot <= state.last_finalized_slot {
             return Err(format!(
                 "late entry for slot {slot} (last finalized slot {})",
                 state.last_finalized_slot
@@ -3405,7 +3588,7 @@ impl TransactionScheduler {
         expected_entry_count: u64,
     ) -> Result<Vec<ReadyEntry>, String> {
         let mut state = self.state.lock().expect("transaction scheduler lock");
-        if slot <= state.last_finalized_slot {
+        if state.has_finalized_slot && slot <= state.last_finalized_slot {
             if let Some((inferred_tx, inferred_entry)) = state.inferred_blocks.remove(&slot) {
                 if inferred_tx == expected_tx_count && inferred_entry == expected_entry_count {
                     return Ok(Vec::new());
@@ -3636,6 +3819,7 @@ impl TransactionScheduler {
                         ));
                     }
                     state.last_finalized_slot = current_slot;
+                    state.has_finalized_slot = true;
                     state.current_slot = current_slot.saturating_add(1);
                     continue;
                 }
@@ -3662,6 +3846,7 @@ impl TransactionScheduler {
 
             state.slots.remove(&current_slot);
             state.last_finalized_slot = current_slot;
+            state.has_finalized_slot = true;
             state.current_slot = current_slot.saturating_add(1);
         }
 
@@ -3742,7 +3927,7 @@ impl SlotExecutionBuffer {
         &mut self,
         index: usize,
         tx: VersionedTransaction,
-        status_meta: TransactionStatusMeta,
+        status_meta: Option<TransactionStatusMeta>,
     ) -> Result<bool, String> {
         if (index as u64) < self.processed_tx_count {
             // Duplicate transaction after a firehose restart; already processed.
@@ -3754,7 +3939,10 @@ impl SlotExecutionBuffer {
         if let Some(existing) = &self.txs[index] {
             let existing_sig = existing.tx.signatures.first();
             let incoming_sig = tx.signatures.first();
-            if existing_sig == incoming_sig && existing.expected_status == status_meta.status {
+            if existing_sig == incoming_sig
+                && existing.expected_status
+                    == status_meta.as_ref().map(|metadata| metadata.status.clone())
+            {
                 // Duplicate delivery of the same transaction; ignore.
                 return Ok(false);
             }
@@ -3763,10 +3951,11 @@ impl SlotExecutionBuffer {
                 existing_sig, incoming_sig
             ));
         }
+        let expected_status = status_meta.as_ref().map(|metadata| metadata.status.clone());
         self.txs[index] = Some(ScheduledTransaction {
             tx,
-            expected_status: status_meta.status.clone(),
-            status_meta,
+            expected_status,
+            status_meta: status_meta.unwrap_or_default(),
         });
         Ok(true)
     }
@@ -3929,7 +4118,10 @@ struct PendingEntry {
 #[derive(Debug)]
 struct ScheduledTransaction {
     tx: VersionedTransaction,
-    expected_status: Result<(), TransactionError>,
+    /// `None` means the source carried no transaction metadata. In that case
+    /// replay determines the status; a default `Ok(())` must not be mistaken
+    /// for observed ground truth.
+    expected_status: Option<Result<(), TransactionError>>,
     /// Full original chain metadata (from the CAR stream), carried through
     /// so the horizon recorder can archive it alongside replay output.
     status_meta: TransactionStatusMeta,
@@ -4010,17 +4202,45 @@ struct BankTransactionNotifier {
     firehose_gate: Arc<Mutex<()>>,
 }
 
-impl TransactionNotifier for BankTransactionNotifier {
-    fn notify_transaction(
-        &self,
-        slot: Slot,
-        transaction_slot_index: usize,
-        _signature: &Signature,
-        _message_hash: &Hash,
-        _is_vote: bool,
-        transaction_status_meta: &TransactionStatusMeta,
-        transaction: &VersionedTransaction,
-    ) {
+fn validate_transaction_status_presence(
+    policy: compatibility::MissingTransactionStatus,
+    available: bool,
+    slot: Slot,
+    transaction_slot_index: usize,
+    signature: &Signature,
+) -> Result<(), String> {
+    if available || policy == compatibility::MissingTransactionStatus::Reconstruct {
+        return Ok(());
+    }
+    Err(format!(
+        "transaction status metadata is required at slot {slot} index {transaction_slot_index} signature {signature}, but the source frame is empty"
+    ))
+}
+
+impl SourcedTransactionNotifier for BankTransactionNotifier {
+    fn notify_transaction(&self, transaction: SourcedTransaction<'_>) {
+        let SourcedTransaction {
+            slot,
+            transaction_slot_index,
+            signature,
+            status,
+            transaction,
+            ..
+        } = transaction;
+        let transaction_status_meta = match status {
+            SourcedTransactionStatus::Observed(status_meta) => Some(status_meta.clone()),
+            SourcedTransactionStatus::Missing => None,
+        };
+        if let Err(error) = validate_transaction_status_presence(
+            compatibility::missing_transaction_status_at(slot),
+            transaction_status_meta.is_some(),
+            slot,
+            transaction_slot_index,
+            signature,
+        ) {
+            self.failure.record(error);
+            return;
+        }
         if !enforce_firehose_backpressure(
             slot,
             &self.scheduler,
@@ -4039,7 +4259,7 @@ impl TransactionNotifier for BankTransactionNotifier {
             slot,
             transaction_slot_index,
             transaction.clone(),
-            transaction_status_meta.clone(),
+            transaction_status_meta,
         ) {
             Ok((ready_entries, inserted)) => {
                 if inserted {
@@ -4309,12 +4529,23 @@ fn parse_epoch_range(arg: &str) -> Result<(u64, u64), String> {
             "invalid epoch range '{arg}': end {end} is before start {start}"
         ));
     }
+    const SLOTS_PER_EPOCH: u64 = 432_000;
+    if end
+        .checked_mul(SLOTS_PER_EPOCH)
+        .and_then(|slot| slot.checked_add(SLOTS_PER_EPOCH))
+        .is_none()
+    {
+        return Err(format!(
+            "invalid epoch range '{arg}': epoch {end} exceeds the representable slot range"
+        ));
+    }
     Ok((start, end))
 }
 
 fn usage(program: &str) -> String {
     format!(
         "Usage: {program} <epoch|range> [dest-dir] [--verify|--no-verify] [--horizon-output=PATH]\n\
+         \x20      [--qualification-end-slot=SLOT]\n\
          \n\
          <epoch|range> is a single epoch (950) or an inclusive range (950-955).\n\
          Replays each epoch and writes a horizon archive to <dest-dir>/epoch-<N>.jet.\n\
@@ -4327,8 +4558,13 @@ fn usage(program: &str) -> String {
          JETSTREAMER_PRUNE_EPOCH_SNAPSHOTS=0 keeps each boundary snapshot archive\n\
          after its epoch finalizes (default: deleted to reclaim disk).\n\
          --horizon-output applies only to a single epoch.\n\
-         --epoch-hashes=PATH and --range-info=A-B are internal flags passed by the\n\
-         range supervisor to its per-epoch children."
+         --qualification-end-slot runs a focused qualification from an explicit\n\
+         snapshot in the target or preceding epoch through SLOT. Recording starts\n\
+         at the later of the target epoch boundary and the snapshot successor. It\n\
+         requires a single epoch, --verify,\n\
+         --snapshot-archive, --epoch-hashes, and --horizon-output.\n\
+         --epoch-hashes=PATH, --snapshot-archive=PATH, and --range-info=A-B are\n\
+         otherwise internal flags passed by the range supervisor to its children."
     )
 }
 
@@ -4360,14 +4596,629 @@ fn parse_snapshot_archive_name(name: &str) -> Result<(Slot, SnapshotHash), Strin
     Ok((slot, SnapshotHash(hash)))
 }
 
+/// A deliberately narrow partial replay used to qualify one runtime span
+/// against a canonical post-bootstrap checkpoint.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct QualificationPlan {
+    epoch: u64,
+    bootstrap_slot: Slot,
+    replay_start: Slot,
+    output_slot_start: Slot,
+    end_inclusive: Slot,
+}
+
+impl QualificationPlan {
+    fn runtime_range(self) -> std::ops::Range<Slot> {
+        self.replay_start..self.end_inclusive.saturating_add(1)
+    }
+
+    fn slot_count(self) -> u64 {
+        self.end_inclusive - self.output_slot_start + 1
+    }
+}
+
+fn require_qualification_path<'a>(name: &str, value: Option<&'a Path>) -> Result<&'a Path, String> {
+    value
+        .filter(|path| !path.as_os_str().is_empty())
+        .ok_or_else(|| format!("--qualification-end-slot requires --{name}=PATH"))
+}
+
+/// Validates all qualification-only CLI invariants before snapshot state,
+/// workers, output files, or network clients are touched.
+fn qualification_plan(
+    start_epoch: u64,
+    end_epoch: u64,
+    end_slot: Option<Slot>,
+    explicit_verify: Option<bool>,
+    snapshot_archive: Option<&Path>,
+    epoch_hashes: Option<&Path>,
+    horizon_output: Option<&Path>,
+) -> Result<Option<QualificationPlan>, String> {
+    let Some(end_inclusive) = end_slot else {
+        return Ok(None);
+    };
+    if start_epoch != end_epoch {
+        return Err(format!(
+            "--qualification-end-slot requires one epoch, not {start_epoch}-{end_epoch}"
+        ));
+    }
+    if explicit_verify != Some(true) {
+        return Err(
+            "--qualification-end-slot requires an explicit --verify (environment defaults do not qualify)"
+                .to_string(),
+        );
+    }
+    let snapshot_archive = require_qualification_path("snapshot-archive", snapshot_archive)?;
+    require_qualification_path("epoch-hashes", epoch_hashes)?;
+    require_qualification_path("horizon-output", horizon_output)?;
+
+    let (epoch_start, epoch_end) = epoch_to_slot_range(start_epoch);
+    if !(epoch_start..=epoch_end).contains(&end_inclusive) {
+        return Err(format!(
+            "qualification end slot {end_inclusive} is outside epoch {start_epoch} ({epoch_start}..={epoch_end})"
+        ));
+    }
+    let snapshot_name = snapshot_archive
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            format!(
+                "snapshot path has no UTF-8 filename: {}",
+                snapshot_archive.display()
+            )
+        })?;
+    let (bootstrap_slot, _) = parse_snapshot_archive_name(snapshot_name)?;
+    let earliest_bootstrap = if start_epoch == 0 {
+        epoch_start
+    } else {
+        epoch_to_slot_range(start_epoch - 1).0
+    };
+    if !(earliest_bootstrap..=epoch_end).contains(&bootstrap_slot) {
+        return Err(format!(
+            "qualification snapshot slot {bootstrap_slot} is outside the target or preceding epoch ({earliest_bootstrap}..={epoch_end})"
+        ));
+    }
+    let replay_start = bootstrap_slot
+        .checked_add(1)
+        .ok_or_else(|| format!("qualification bootstrap slot {bootstrap_slot} has no successor"))?;
+    if replay_start > end_inclusive {
+        return Err(format!(
+            "qualification end slot {end_inclusive} must be after bootstrap slot {bootstrap_slot}"
+        ));
+    }
+    let output_slot_start = replay_start.max(epoch_start);
+    Ok(Some(QualificationPlan {
+        epoch: start_epoch,
+        bootstrap_slot,
+        replay_start,
+        output_slot_start,
+        end_inclusive,
+    }))
+}
+
+fn runtime_slot_range(
+    epoch: u64,
+    qualification: Option<QualificationPlan>,
+) -> std::ops::Range<Slot> {
+    if let Some(plan) = qualification {
+        debug_assert_eq!(plan.epoch, epoch);
+        plan.runtime_range()
+    } else {
+        let (start, end_inclusive) = epoch_to_slot_range(epoch);
+        start..end_inclusive.saturating_add(1)
+    }
+}
+
+fn runtime_span_selection(
+    span: &compatibility::RuntimeSpan,
+) -> Result<compatibility::RuntimeSelection, String> {
+    let compatibility::EraBackend::Available(descriptor) = span.execution.backend else {
+        return Err(format!(
+            "runtime span {}..{} unexpectedly retained unsupported era {}",
+            span.slots.start, span.slots.end, span.execution.name
+        ));
+    };
+    Ok(compatibility::RuntimeSelection {
+        backend: descriptor.backend,
+        descriptor,
+        admission: span.execution.admission,
+    })
+}
+
+/// Selects the runtime that owns the first replayed slot in a range.
+///
+/// This is deliberately narrower than `select_runtime`: callers may use the
+/// result only for bootstrap concerns which must be decided before a
+/// multi-runtime range is split (principally the accepted snapshot archive
+/// format). Execution still follows every span returned by
+/// `plan_runtime_spans`.
+fn bootstrap_runtime_selection(
+    slot_range: std::ops::Range<Slot>,
+    allow_candidate_runtime: bool,
+) -> Result<compatibility::RuntimeSelection, String> {
+    let spans = compatibility::plan_runtime_spans(slot_range, allow_candidate_runtime)?;
+    runtime_span_selection(spans.first().expect("runtime planner rejects empty ranges"))
+}
+
+/// Resolves range isolation while preserving the operator opt-out only when
+/// every epoch can be handled by one runtime. The optional epoch identifies a
+/// runtime boundary that forced isolation despite the opt-out.
+fn epoch_isolation_plan(
+    start_epoch: u64,
+    end_epoch: u64,
+    configured_isolation: bool,
+    allow_candidate_runtime: bool,
+) -> Result<(bool, Option<u64>), String> {
+    if start_epoch == end_epoch {
+        return Ok((false, None));
+    }
+    if configured_isolation {
+        return Ok((true, None));
+    }
+    for epoch in start_epoch..=end_epoch {
+        let (slot_start, slot_end_inclusive) = epoch_to_slot_range(epoch);
+        let spans = compatibility::plan_runtime_spans(
+            slot_start..slot_end_inclusive.saturating_add(1),
+            allow_candidate_runtime,
+        )?;
+        if spans.len() > 1 {
+            return Ok((true, Some(epoch)));
+        }
+    }
+    Ok((false, None))
+}
+
+/// Whether this is a historical Solana 1.0 snapshot archive.  This classifies
+/// the persisted format only; runtime selection is independently driven by
+/// the requested slot range in `compatibility`.
+fn is_legacy_snapshot_archive(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.ends_with(".tar.bz2"))
+}
+
+fn legacy_boundary_expectation(path: &Path) -> Result<BTreeMap<Slot, BankHashExpectation>, String> {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| format!("snapshot path has no UTF-8 filename: {}", path.display()))?;
+    if !name.ends_with(".tar.bz2") {
+        return Err(format!(
+            "legacy accounts-hash expectation requires a .tar.bz2 snapshot: {}",
+            path.display()
+        ));
+    }
+    let (slot, hash) = parse_snapshot_archive_name(name)?;
+    Ok(BTreeMap::from([(
+        slot,
+        BankHashExpectation::LegacyAccountsHash(hash.0),
+    )]))
+}
+
+fn initial_replay_slot(bootstrap_slot: Slot, epoch_start: Slot) -> Result<Slot, String> {
+    if bootstrap_slot >= epoch_start {
+        return Err(format!(
+            "bootstrap state at slot {bootstrap_slot} is not earlier than output epoch start {epoch_start}"
+        ));
+    }
+    bootstrap_slot.checked_add(1).ok_or_else(|| {
+        format!("bootstrap slot {bootstrap_slot} has no representable successor slot")
+    })
+}
+
+fn archive_generation_profile() -> String {
+    format!(
+        "jetstreamer-node/{}/old-faithful-to-horizon-v2@{}",
+        env!("CARGO_PKG_VERSION"),
+        env!("JETSTREAMER_BUILD_REVISION")
+    )
+}
+
+fn archive_assembly_profile() -> String {
+    format!(
+        "jetstreamer-node/{}/verified-runtime-segment-assembly-v1@{}",
+        env!("CARGO_PKG_VERSION"),
+        env!("JETSTREAMER_BUILD_REVISION")
+    )
+}
+
+fn archive_transaction_metadata_policy(slot_start: Slot) -> TransactionMetadataPolicy {
+    if slot_start < compatibility::OLD_FAITHFUL_STATUS_REQUIRED_START_SLOT {
+        TransactionMetadataPolicy::runtime_reconstructed_before(
+            compatibility::OLD_FAITHFUL_STATUS_REQUIRED_START_SLOT,
+        )
+    } else {
+        TransactionMetadataPolicy::observed()
+    }
+}
+
+fn archive_runtime_toolchain(identity: compatibility::RuntimeIdentity) -> String {
+    match identity.target {
+        Some(target) => format!("{}; target={target}", identity.rust_toolchain),
+        None => identity.rust_toolchain.to_owned(),
+    }
+}
+
+fn archive_runtime_admission(admission: compatibility::AdmissionLevel) -> RuntimeAdmission {
+    match admission {
+        compatibility::AdmissionLevel::Verified => RuntimeAdmission::Verified,
+        compatibility::AdmissionLevel::Candidate => RuntimeAdmission::Candidate,
+    }
+}
+
+fn build_archive_provenance(
+    selection: compatibility::RuntimeSelection,
+    worker_executable_sha256: Option<[u8; 32]>,
+    bootstrap_state_kind: BootstrapStateKind,
+    bootstrap_slot: Slot,
+    bootstrap_state_hash: Hash,
+    requested_slot_start: Slot,
+    requested_slot_count: u64,
+) -> Result<ArchiveProvenance, String> {
+    let identity = selection.descriptor.identity;
+    if selection.descriptor.worker.is_some() != worker_executable_sha256.is_some() {
+        return Err(format!(
+            "runtime profile {} worker configuration does not match executable provenance",
+            identity.name
+        ));
+    }
+    let genesis_hash = identity.genesis_hash.parse::<Hash>().map_err(|err| {
+        format!(
+            "runtime descriptor {} has invalid genesis hash {}: {err}",
+            identity.name, identity.genesis_hash
+        )
+    })?;
+    let base = ArchiveProvenanceV1 {
+        generation_profile: archive_generation_profile(),
+        runtime_profile: identity.name.to_owned(),
+        runtime_admission: archive_runtime_admission(selection.admission),
+        runtime_revision: identity.revision.to_owned(),
+        runtime_toolchain: archive_runtime_toolchain(identity),
+        genesis_hash,
+        bootstrap_state_kind,
+        bootstrap_slot,
+        bootstrap_state_hash,
+        requested_slot_start,
+        requested_slot_count,
+        transaction_metadata: archive_transaction_metadata_policy(requested_slot_start),
+    };
+    Ok(match worker_executable_sha256 {
+        Some(worker_executable_sha256) => ArchiveProvenanceV2 {
+            base,
+            worker_executable_sha256,
+        }
+        .into(),
+        None => base.into(),
+    })
+}
+
+fn archive_worker_executable_matches(
+    provenance: &ArchiveProvenance,
+    expected_sha256: Option<[u8; 32]>,
+) -> bool {
+    provenance.single_runtime_worker_executable_sha256() == Some(expected_sha256)
+}
+
+struct ValidatedRuntimeSegment {
+    archive_path: PathBuf,
+    manifest: HistoricalSegmentManifest,
+    provenance: ArchiveProvenanceV2,
+}
+
+fn load_validated_runtime_segment(
+    archive_path: &Path,
+    epoch: u64,
+    span: &compatibility::RuntimeSpan,
+) -> Result<ValidatedRuntimeSegment, String> {
+    let manifest = read_and_validate_segment_manifest(archive_path).map_err(|err| {
+        format!(
+            "runtime segment {} failed durable validation: {err}",
+            archive_path.display()
+        )
+    })?;
+    let selection = runtime_span_selection(span)?;
+    let identity = selection.descriptor.identity;
+    let expected_count = span.slots.end - span.slots.start;
+    if manifest.epoch != epoch
+        || manifest.output_slot_start != span.slots.start
+        || manifest.output_slot_count != expected_count
+        || manifest.terminal.slot != span.slots.end - 1
+        || manifest.runtime.generation_profile != archive_generation_profile()
+        || manifest.runtime.runtime_profile != identity.name
+        || manifest.runtime.runtime_revision != identity.revision
+        || manifest.runtime.runtime_toolchain != archive_runtime_toolchain(identity)
+        || manifest.runtime.runtime_target != identity.target.unwrap_or_default()
+        || manifest.runtime.genesis_hash != identity.genesis_hash
+        || manifest.bootstrap_archive_sha256.is_some() != span.handoff.is_some()
+        || manifest.runtime.runtime_admission
+            != match selection.admission {
+                compatibility::AdmissionLevel::Verified => SegmentRuntimeAdmission::Verified,
+                compatibility::AdmissionLevel::Candidate => SegmentRuntimeAdmission::Candidate,
+            }
+    {
+        return Err(format!(
+            "runtime segment {} does not match registry span {}..{} ({})",
+            archive_path.display(),
+            span.slots.start,
+            span.slots.end,
+            identity.name
+        ));
+    }
+    let executable = configured_historical_worker_executable(selection.descriptor)?;
+    let expected_worker_sha256 =
+        historical::measure_executable_sha256(&executable).map_err(|err| {
+            format!(
+                "failed to measure configured historical worker {}: {err}",
+                executable.display()
+            )
+        })?;
+    if manifest.worker_executable_sha256 != expected_worker_sha256 {
+        return Err(format!(
+            "runtime segment {} was produced by a different worker executable",
+            archive_path.display()
+        ));
+    }
+    let file = fs::File::open(archive_path).map_err(|err| {
+        format!(
+            "failed to open runtime segment {}: {err}",
+            archive_path.display()
+        )
+    })?;
+    let reader = jetstreamer_horizon::archive::ArchiveReader::open(std::io::BufReader::new(file))
+        .map_err(|err| {
+        format!(
+            "failed to open runtime segment {}: {err}",
+            archive_path.display()
+        )
+    })?;
+    let provenance = reader
+        .provenance()
+        .map_err(|err| format!("invalid provenance in {}: {err}", archive_path.display()))?
+        .ok_or_else(|| {
+            format!(
+                "runtime segment {} has no provenance",
+                archive_path.display()
+            )
+        })?;
+    let ArchiveProvenance::V2(provenance) = provenance else {
+        return Err(format!(
+            "runtime segment {} does not carry single-runtime V2 provenance",
+            archive_path.display()
+        ));
+    };
+    Ok(ValidatedRuntimeSegment {
+        archive_path: archive_path.to_path_buf(),
+        manifest,
+        provenance,
+    })
+}
+
+fn runtime_checkpoint_from_manifest(
+    checkpoint: &SegmentCheckpointSummary,
+) -> Result<RuntimeStateCheckpoint, String> {
+    Ok(RuntimeStateCheckpoint {
+        slot: checkpoint.slot,
+        bank_hash: checkpoint
+            .bank_hash_value()
+            .map_err(|err| format!("invalid checkpoint bank hash: {err}"))?,
+        accounts_hash_kind: AccountsHashKind::LegacyAccountsHash,
+        accounts_hash: checkpoint
+            .accounts_hash_value()
+            .map_err(|err| format!("invalid checkpoint accounts hash: {err}"))?,
+        last_blockhash: checkpoint
+            .last_blockhash_value()
+            .map_err(|err| format!("invalid checkpoint last blockhash: {err}"))?,
+        capitalization: checkpoint.capitalization,
+        transaction_count: checkpoint.transaction_count,
+        tick_height: checkpoint.tick_height,
+        slot_complete: checkpoint.slot_complete,
+        next_write_version: checkpoint.next_write_version,
+    })
+}
+
+fn build_multi_runtime_provenance(
+    epoch: u64,
+    spans: &[compatibility::RuntimeSpan],
+    segments: &[ValidatedRuntimeSegment],
+    handoff_manifests: &[HistoricalHandoffSnapshotManifest],
+) -> Result<ArchiveProvenanceV3, String> {
+    if spans.len() < 2
+        || spans.len() != segments.len()
+        || handoff_manifests.len() != segments.len() - 1
+    {
+        return Err(format!(
+            "multi-runtime assembly received {} spans, {} validated sources, and {} handoff manifests",
+            spans.len(),
+            segments.len(),
+            handoff_manifests.len()
+        ));
+    }
+    let (epoch_start, epoch_end_inclusive) = epoch_to_slot_range(epoch);
+    if spans
+        .first()
+        .is_none_or(|span| span.slots.start != epoch_start)
+        || spans
+            .last()
+            .is_none_or(|span| span.slots.end != epoch_end_inclusive + 1)
+    {
+        return Err(format!(
+            "runtime spans do not exactly cover epoch {epoch} ({epoch_start}..={epoch_end_inclusive})"
+        ));
+    }
+
+    let first = &segments[0];
+    let mut archive_write_start = 0u64;
+    let mut runtime_segments = Vec::with_capacity(segments.len());
+    for (span, segment) in spans.iter().zip(segments) {
+        let base = &segment.provenance.base;
+        let raw = &segment.manifest.emitted_raw_write_versions;
+        runtime_segments.push(RuntimeSegmentProvenance {
+            slot_start: span.slots.start,
+            slot_count: span.slots.end - span.slots.start,
+            generation_profile: base.generation_profile.clone(),
+            runtime_profile: base.runtime_profile.clone(),
+            runtime_admission: base.runtime_admission,
+            runtime_revision: base.runtime_revision.clone(),
+            runtime_toolchain: base.runtime_toolchain.clone(),
+            worker_executable_sha256: Some(segment.provenance.worker_executable_sha256),
+            write_versions: WriteVersionNormalization {
+                worker_start: raw.start,
+                worker_end_exclusive: raw.end,
+                archive_start: archive_write_start,
+            },
+        });
+        archive_write_start = archive_write_start
+            .checked_add(raw.end.checked_sub(raw.start).ok_or_else(|| {
+                format!(
+                    "runtime segment {} has an inverted write range",
+                    segment.archive_path.display()
+                )
+            })?)
+            .ok_or_else(|| "normalized archive write-version range overflows u64".to_string())?;
+    }
+
+    let mut handoffs = Vec::with_capacity(segments.len() - 1);
+    for index in 0..segments.len() - 1 {
+        let predecessor = &segments[index];
+        let successor = &segments[index + 1];
+        let handoff_manifest = &handoff_manifests[index];
+        let registry_handoff = spans[index + 1].handoff.ok_or_else(|| {
+            format!(
+                "runtime transition at slot {} has no registered handoff",
+                spans[index + 1].slots.start
+            )
+        })?;
+        let predecessor_checkpoint =
+            runtime_checkpoint_from_manifest(&predecessor.manifest.terminal)?;
+        let successor_checkpoint = runtime_checkpoint_from_manifest(&successor.manifest.bootstrap)?;
+        let expected_accounts_hash = registry_handoff.snapshot.accounts_hash()?;
+        if handoff_manifest.boundary_slot != registry_handoff.boundary_slot
+            || handoff_manifest.snapshot_slot != registry_handoff.snapshot.slot
+            || handoff_manifest.accounts_hash != registry_handoff.snapshot.accounts_hash_base58
+            || handoff_manifest.source_runtime != predecessor.manifest.runtime
+            || handoff_manifest.source_worker_executable_sha256
+                != predecessor.manifest.worker_executable_sha256
+            || handoff_manifest.terminal != predecessor.manifest.terminal
+            || successor.manifest.bootstrap_archive_sha256 != Some(handoff_manifest.archive_sha256)
+        {
+            return Err(format!(
+                "runtime handoff evidence at slot {} does not match its predecessor and successor segment evidence",
+                registry_handoff.boundary_slot
+            ));
+        }
+        if predecessor_checkpoint.accounts_hash != expected_accounts_hash
+            || successor_checkpoint.accounts_hash != expected_accounts_hash
+        {
+            return Err(format!(
+                "runtime handoff at slot {} does not match canonical snapshot {}",
+                registry_handoff.boundary_slot,
+                registry_handoff.snapshot.archive_name()
+            ));
+        }
+        handoffs.push(RuntimeHandoffProvenance {
+            boundary_slot: registry_handoff.boundary_slot,
+            predecessor: predecessor_checkpoint,
+            successor: successor_checkpoint,
+            successor_bootstrap_kind: successor.provenance.base.bootstrap_state_kind,
+            successor_bootstrap_archive_sha256: successor
+                .manifest
+                .bootstrap_archive_sha256
+                .expect("validated against handoff evidence above"),
+            successor_bootstrap_write_count: successor.manifest.bootstrap.write_count,
+        });
+    }
+
+    let provenance = ArchiveProvenanceV3 {
+        assembly_profile: archive_assembly_profile(),
+        genesis_hash: first.provenance.base.genesis_hash,
+        bootstrap_state_kind: first.provenance.base.bootstrap_state_kind,
+        bootstrap_state: StateCommitment {
+            slot: first.provenance.base.bootstrap_slot,
+            kind: StateCommitmentKind::LegacyAccountsHash,
+            hash: first.provenance.base.bootstrap_state_hash,
+        },
+        requested_slot_start: epoch_start,
+        requested_slot_count: epoch_end_inclusive - epoch_start + 1,
+        transaction_metadata: first.provenance.base.transaction_metadata,
+        runtime_segments,
+        handoffs,
+    };
+    provenance
+        .validate()
+        .map_err(|err| format!("constructed multi-runtime provenance is invalid: {err}"))?;
+    Ok(provenance)
+}
+
+fn historical_worker_profile(
+    descriptor: &compatibility::RuntimeDescriptor,
+) -> Result<historical::WorkerProfile, String> {
+    let profile = match descriptor.backend {
+        compatibility::RuntimeBackend::SolanaV1_0_7 => historical::SOLANA_V1_0_7_CANDIDATE,
+        compatibility::RuntimeBackend::SolanaV1_0_8 => historical::SOLANA_V1_0_8_CANDIDATE,
+        compatibility::RuntimeBackend::SolanaV1_0_24 => historical::SOLANA_V1_0_24_CANDIDATE,
+        compatibility::RuntimeBackend::AgaveV3 => {
+            return Err(
+                "the in-process Agave runtime has no historical worker profile".to_string(),
+            );
+        }
+    };
+    let identity = descriptor.identity;
+    if profile.backend_id != identity.name
+        || profile.solana_commit != identity.revision
+        || profile.rust_toolchain != identity.rust_toolchain
+        || Some(profile.target) != identity.target
+        || profile.required_genesis_hash != identity.genesis_hash
+    {
+        return Err(format!(
+            "runtime descriptor {} does not match its compiled historical worker profile",
+            identity.name
+        ));
+    }
+    Ok(profile)
+}
+
+fn configured_historical_worker_executable(
+    descriptor: &compatibility::RuntimeDescriptor,
+) -> Result<PathBuf, String> {
+    let worker = descriptor.worker.ok_or_else(|| {
+        format!(
+            "runtime profile {} has no registered worker executable",
+            descriptor.identity.name
+        )
+    })?;
+    Ok(env::var_os(worker.environment_override)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(worker.default_manifest_relative_path)
+        }))
+}
+
 struct SnapshotArchiveCandidate {
     path: PathBuf,
     slot: Slot,
 }
 
+fn snapshot_archive_candidate(path: PathBuf) -> Result<SnapshotArchiveCandidate, String> {
+    let metadata = fs::metadata(&path)
+        .map_err(|err| format!("failed to read snapshot {}: {err}", path.display()))?;
+    if !metadata.is_file() || metadata.len() == 0 {
+        return Err(format!(
+            "snapshot override must name a non-empty regular file: {}",
+            path.display()
+        ));
+    }
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| format!("snapshot path has no UTF-8 filename: {}", path.display()))?;
+    let (slot, _) = parse_snapshot_archive_name(name)?;
+    Ok(SnapshotArchiveCandidate { path, slot })
+}
+
 fn find_existing_snapshot_archive(
     dest_dir: &Path,
     target_slot: Slot,
+    archive_extensions: &[&str],
 ) -> Result<Option<SnapshotArchiveCandidate>, String> {
     if !dest_dir.is_dir() {
         return Ok(None);
@@ -4387,6 +5238,12 @@ fn find_existing_snapshot_archive(
         let Some(name) = name.to_str() else {
             continue;
         };
+        if !archive_extensions
+            .iter()
+            .any(|extension| name.ends_with(extension))
+        {
+            continue;
+        }
         let (slot, _) = match parse_snapshot_archive_name(name) {
             Ok(parsed) => parsed,
             Err(_) => continue,
@@ -4464,12 +5321,20 @@ fn has_extracted_snapshot(dest_dir: &Path, slot: Slot) -> Result<bool, String> {
     Ok(false)
 }
 
-async fn snapshot_expectations_for_epoch(
-    epoch: u64,
-) -> Result<BTreeMap<Slot, SnapshotHash>, String> {
-    let snapshots = list_epoch_snapshots(epoch)
-        .await
-        .map_err(|err| format!("failed to list epoch {epoch} snapshots: {err}"))?;
+async fn snapshot_expectations_for_span(
+    start_slot: Slot,
+    end_slot_inclusive: Slot,
+    archive_extensions: &[&str],
+) -> Result<BTreeMap<Slot, BankHashExpectation>, String> {
+    let snapshots = list_snapshots_in_slot_range_matching(
+        start_slot,
+        end_slot_inclusive,
+        archive_extensions,
+    )
+    .await
+    .map_err(|err| {
+        format!("failed to list snapshots in slot range {start_slot}..={end_slot_inclusive}: {err}")
+    })?;
     let mut expected = BTreeMap::new();
     for snapshot in snapshots {
         let name = snapshot_filename(&snapshot.snapshot_uri)?;
@@ -4480,7 +5345,12 @@ async fn snapshot_expectations_for_epoch(
                 snapshot.slot_dir
             ));
         }
-        if expected.insert(slot, hash).is_some() {
+        let expectation = if name.ends_with(".tar.bz2") {
+            BankHashExpectation::LegacyAccountsHash(hash.0)
+        } else {
+            BankHashExpectation::AccountsLtHash(hash)
+        };
+        if expected.insert(slot, expectation).is_some() {
             return Err(format!("duplicate snapshot entry for slot {slot}"));
         }
     }
@@ -4827,6 +5697,29 @@ fn env_truthy(var: &str) -> bool {
             !matches!(value.as_str(), "" | "0" | "false" | "no")
         }
         Err(_) => false,
+    }
+}
+
+/// Parses a security-sensitive opt-in. Unknown spellings are errors so a typo
+/// cannot silently enable an unverified compatibility backend.
+fn strict_opt_in(var: &str) -> Result<bool, String> {
+    match env::var(var) {
+        Err(env::VarError::NotPresent) => parse_strict_opt_in(var, None),
+        Err(err) => Err(format!("invalid {var}: {err}")),
+        Ok(value) => parse_strict_opt_in(var, Some(&value)),
+    }
+}
+
+fn parse_strict_opt_in(var: &str, value: Option<&str>) -> Result<bool, String> {
+    match value {
+        None => Ok(false),
+        Some(value) => match value.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" => Ok(true),
+            "" | "0" | "false" | "no" => Ok(false),
+            _ => Err(format!(
+                "invalid {var}={value:?}; expected one of 1/true/yes or 0/false/no"
+            )),
+        },
     }
 }
 
@@ -5571,6 +6464,27 @@ async fn download_with_ripget(
         fs::create_dir_all(parent)
             .map_err(|err| format!("failed to create {}: {err}", parent.display()))?;
     }
+    let parent = dest.parent().ok_or_else(|| {
+        format!(
+            "compact index destination has no parent: {}",
+            dest.display()
+        )
+    })?;
+    // ripget preallocates the destination to its final length before filling
+    // ranges.  Publishing that file directly lets a killed download look
+    // complete on the next run.  Keep it under an uncacheable temporary name
+    // and atomically publish it only after every range succeeds and is synced.
+    let partial = tempfile::Builder::new()
+        .prefix(".compact-index-")
+        .suffix(".partial")
+        .tempfile_in(parent)
+        .map_err(|err| {
+            format!(
+                "failed to create temporary compact index in {}: {err}",
+                parent.display()
+            )
+        })?;
+    let partial_path = partial.path().to_path_buf();
     let ripget_threads = env::var("JETSTREAMER_RIPGET_THREADS")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
@@ -5603,7 +6517,7 @@ async fn download_with_ripget(
         }
         result = ripget::download_url_with_progress(
             url.as_str(),
-            dest,
+            &partial_path,
             Some(ripget_threads),
             None,
             Some(progress),
@@ -5612,10 +6526,21 @@ async fn download_with_ripget(
     };
 
     let report = result.map_err(|err| format!("ripget failed for {}: {err}", url.as_str()))?;
+    partial
+        .as_file()
+        .sync_all()
+        .map_err(|err| format!("failed to sync compact index {}: {err}", dest.display()))?;
+    partial.persist(dest).map_err(|err| {
+        format!(
+            "failed to publish compact index {}: {}",
+            dest.display(),
+            err.error
+        )
+    })?;
     info!(
         "ripget finished: {} -> {} ({})",
         url.as_str(),
-        report.path.display(),
+        dest.display(),
         format_bytes(report.bytes),
     );
 
@@ -5805,9 +6730,136 @@ async fn build_slot_presence_map(
     .map_err(|err| format!("slot presence task failed: {err}"))?
 }
 
+struct CarriedRuntimeState {
+    backend: compatibility::RuntimeBackend,
+    completed_epoch: u64,
+    bank_forks: Arc<RwLock<BankForks>>,
+}
+
+struct ReplayRunResult {
+    carried_state: Option<CarriedRuntimeState>,
+    historical_evidence: Option<historical_replay::HistoricalReplayEvidence>,
+    historical_worker_executable_sha256: Option<[u8; 32]>,
+    /// Exact registered handoff archive admitted and privately copied before
+    /// this segment's historical worker initialized.
+    bootstrap_handoff_archive_sha256: Option<[u8; 32]>,
+}
+
+fn segment_checkpoint_summary(
+    checkpoint: &historical_replay::HistoricalCheckpointSummary,
+) -> SegmentCheckpointSummary {
+    SegmentCheckpointSummary {
+        slot: checkpoint.slot,
+        bank_hash: Hash::new_from_array(checkpoint.bank_hash).to_string(),
+        accounts_hash: Hash::new_from_array(checkpoint.accounts_hash).to_string(),
+        last_blockhash: Hash::new_from_array(checkpoint.last_blockhash).to_string(),
+        capitalization: checkpoint.capitalization,
+        transaction_count: checkpoint.transaction_count,
+        tick_height: checkpoint.tick_height,
+        slot_complete: checkpoint.slot_complete,
+        write_count: checkpoint.write_count,
+        next_write_version: checkpoint.next_write_version,
+    }
+}
+
+fn segment_runtime_identity(
+    selection: compatibility::RuntimeSelection,
+) -> Result<SegmentRuntimeIdentity, String> {
+    let identity = selection.descriptor.identity;
+    let target = identity.target.ok_or_else(|| {
+        format!(
+            "historical runtime profile {} has no target triple",
+            identity.name
+        )
+    })?;
+    Ok(SegmentRuntimeIdentity {
+        generation_profile: archive_generation_profile(),
+        runtime_profile: identity.name.to_owned(),
+        runtime_admission: match selection.admission {
+            compatibility::AdmissionLevel::Verified => SegmentRuntimeAdmission::Verified,
+            compatibility::AdmissionLevel::Candidate => SegmentRuntimeAdmission::Candidate,
+        },
+        runtime_revision: identity.revision.to_owned(),
+        runtime_toolchain: archive_runtime_toolchain(identity),
+        runtime_target: target.to_owned(),
+        genesis_hash: identity.genesis_hash.to_owned(),
+    })
+}
+
+fn publish_historical_segment_manifest(
+    epoch: u64,
+    plan: QualificationPlan,
+    archive_path: &Path,
+    result: &ReplayRunResult,
+    allow_candidate_runtime: bool,
+) -> Result<(), String> {
+    let evidence = result.historical_evidence.as_ref().ok_or_else(|| {
+        "focused historical segment completed without checkpoint evidence".to_string()
+    })?;
+    if evidence.bootstrap.slot != plan.bootstrap_slot {
+        return Err(format!(
+            "historical segment bootstrap evidence is for slot {}, expected {}",
+            evidence.bootstrap.slot, plan.bootstrap_slot
+        ));
+    }
+    if evidence.terminal.slot != plan.end_inclusive {
+        return Err(format!(
+            "historical segment terminal evidence is for slot {}, expected {}",
+            evidence.terminal.slot, plan.end_inclusive
+        ));
+    }
+    let selection = compatibility::select_runtime(plan.runtime_range(), allow_candidate_runtime)?;
+    let identity = selection.descriptor.identity;
+    let worker_executable_sha256 = result.historical_worker_executable_sha256.ok_or_else(|| {
+        format!(
+            "historical runtime profile {} has no worker digest",
+            identity.name
+        )
+    })?;
+    fs::File::open(archive_path)
+        .and_then(|archive| archive.sync_all())
+        .map_err(|err| {
+            format!(
+                "failed to sync completed segment {}: {err}",
+                archive_path.display()
+            )
+        })?;
+    let manifest = HistoricalSegmentManifest {
+        schema_version: jetstreamer_node::segment_manifest::SEGMENT_MANIFEST_SCHEMA_VERSION,
+        epoch,
+        output_slot_start: plan.output_slot_start,
+        output_slot_count: plan.slot_count(),
+        runtime: segment_runtime_identity(selection)?,
+        worker_executable_sha256,
+        // Replaced with the authoritative digest only after a full source
+        // validation pass in `write_segment_manifest`.
+        archive_sha256: [0; 32],
+        bootstrap_archive_sha256: result.bootstrap_handoff_archive_sha256,
+        bootstrap: segment_checkpoint_summary(&evidence.bootstrap),
+        terminal: segment_checkpoint_summary(&evidence.terminal),
+        emitted_raw_write_versions: evidence.emitted_write_versions.clone(),
+    };
+    let (path, _) = write_segment_manifest(archive_path, manifest)
+        .map_err(|err| format!("failed to publish segment evidence: {err}"))?;
+    // Exercise the durable read path before telling a supervising parent that
+    // this child succeeded.
+    read_and_validate_segment_manifest(archive_path).map_err(|err| {
+        format!(
+            "failed to re-read segment evidence {}: {err}",
+            path.display()
+        )
+    })?;
+    info!(
+        "published verified historical segment evidence {}",
+        path.display()
+    );
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)] // top-level replay entry point: CLI params map 1:1
 async fn run_geyser_replay(
     epoch: u64,
+    allow_candidate_runtime: bool,
     ledger_dir: &Path,
     snapshot_archive: &Path,
     shutdown: Arc<AtomicBool>,
@@ -5815,9 +6867,12 @@ async fn run_geyser_replay(
     restart_tracker: Arc<RestartTracker>,
     snapshot_verifier: Option<Arc<SnapshotVerifier>>,
     horizon_output: PathBuf,
+    // Focused qualification records exactly bootstrap+1..=end instead of a
+    // complete epoch. Normal production callers pass None.
+    qualification: Option<QualificationPlan>,
     // When set, reuse this bank (carried from the previous epoch in a range
     // run) instead of loading a snapshot — no reload, no warmup.
-    existing_bank_forks: Option<Arc<RwLock<BankForks>>>,
+    carried_state: Option<CarriedRuntimeState>,
     // Cross-epoch progress for a multi-epoch range run (None for single epoch).
     range_progress: Option<Arc<RangeProgress>>,
     // Progress counters shared across every epoch of a range. The accounts-db
@@ -5828,19 +6883,147 @@ async fn run_geyser_replay(
     // instance would leave chained epochs stuck at accounts=0 and falsely abort.
     // Counters are reset per epoch below, so sharing does not accumulate.
     carried_progress: Option<Arc<ReplayProgress>>,
-) -> Result<Arc<RwLock<BankForks>>, String> {
+) -> Result<ReplayRunResult, String> {
+    if qualification.is_some() && carried_state.is_some() {
+        return Err("focused qualification cannot reuse carried runtime state".to_string());
+    }
+    // Resolve the exact state span before starting a worker or loading a bank.
+    // Snapshot filename/format supplies only the bootstrap slot and loader
+    // details; execution semantics come exclusively from the slot registry.
+    let bootstrap_slot = match carried_state.as_ref() {
+        Some(state) => state
+            .bank_forks
+            .read()
+            .map_err(|_| "bank forks lock poisoned".to_string())?
+            .working_bank()
+            .slot(),
+        None => {
+            let archive_name = snapshot_archive
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| {
+                    format!(
+                        "snapshot path has no UTF-8 filename: {}",
+                        snapshot_archive.display()
+                    )
+                })?;
+            parse_snapshot_archive_name(archive_name)?.0
+        }
+    };
+    let (epoch_start, epoch_end_inclusive) = epoch_to_slot_range(epoch);
+    let (output_slot_start, replay_start, end_inclusive) = match qualification {
+        Some(plan) => {
+            if plan.epoch != epoch {
+                return Err(format!(
+                    "qualification plan targets epoch {}, but replay requested epoch {epoch}",
+                    plan.epoch
+                ));
+            }
+            if plan.bootstrap_slot != bootstrap_slot {
+                return Err(format!(
+                    "qualification plan bootstraps at slot {}, but loaded archive names slot {bootstrap_slot}",
+                    plan.bootstrap_slot
+                ));
+            }
+            (
+                plan.output_slot_start,
+                plan.replay_start,
+                plan.end_inclusive,
+            )
+        }
+        None => (
+            epoch_start,
+            initial_replay_slot(bootstrap_slot, epoch_start)?,
+            epoch_end_inclusive,
+        ),
+    };
+    let execution = compatibility::select_runtime(
+        replay_start..end_inclusive.saturating_add(1),
+        allow_candidate_runtime,
+    )?;
+    if qualification.is_some() || execution.admission == compatibility::AdmissionLevel::Candidate {
+        let Some(verifier) = snapshot_verifier.as_ref() else {
+            return Err(format!(
+                "runtime profile {} requires snapshot verification for this {} run",
+                execution.backend,
+                if qualification.is_some() {
+                    "qualification"
+                } else {
+                    "candidate"
+                }
+            ));
+        };
+        let checkpoint_count = verifier.checkpoint_count_in_range(replay_start, end_inclusive);
+        if checkpoint_count == 0 {
+            return Err(format!(
+                "runtime profile {} requires at least one trusted post-bootstrap checkpoint in replay range {}..={}; the supplied checkpoint set is empty for that range",
+                execution.backend, replay_start, end_inclusive
+            ));
+        }
+        info!(
+            "runtime profile {} has {} post-bootstrap checkpoint(s) in replay range",
+            execution.backend, checkpoint_count
+        );
+    }
+    let runtime_backend = execution.backend;
+    let runtime_descriptor = execution.descriptor;
+    if let Some(state) = carried_state.as_ref() {
+        if state.completed_epoch.checked_add(1) != Some(epoch) {
+            return Err(format!(
+                "carried runtime state completed epoch {}, but replay requested epoch {}",
+                state.completed_epoch, epoch
+            ));
+        }
+        if state.backend != runtime_backend {
+            return Err(format!(
+                "carried runtime state uses {}, but slot range selected {}",
+                state.backend, runtime_backend
+            ));
+        }
+        let (completed_start, completed_end) = epoch_to_slot_range(state.completed_epoch);
+        if !(completed_start..=completed_end).contains(&bootstrap_slot) {
+            return Err(format!(
+                "carried runtime state at slot {bootstrap_slot} is outside completed epoch {} ({}..={})",
+                state.completed_epoch, completed_start, completed_end
+            ));
+        }
+        if !runtime_descriptor.bootstrap.permits_in_memory_handoff {
+            return Err(format!(
+                "runtime profile {} does not permit an in-memory bank handoff",
+                runtime_descriptor.identity.name
+            ));
+        }
+    } else {
+        validate_runtime_bootstrap_archive(runtime_descriptor, snapshot_archive)?;
+    }
+    // Registered generated handoffs require an adjacent evidence sidecar. The
+    // complete archive digest covers replay-relevant state that the historical
+    // accounts hash does not, including the transaction status cache.
+    let bootstrap_handoff_manifest = if carried_state.is_none() {
+        registered_handoff_bootstrap(runtime_descriptor, snapshot_archive)?
+    } else {
+        None
+    };
+    info!(
+        "slot registry selected execution profile {} ({:?}) for slots {}..{}",
+        runtime_backend,
+        execution.admission,
+        replay_start,
+        end_inclusive.saturating_add(1),
+    );
+
     let (confirmed_bank_sender, confirmed_bank_receiver) = unbounded();
     let confirmed_bank_handle =
         std::thread::spawn(move || while confirmed_bank_receiver.recv().is_ok() {});
-    let (epoch_start, end_inclusive) = epoch_to_slot_range(epoch);
-    let progress = carried_progress.unwrap_or_else(|| Arc::new(ReplayProgress::new(epoch_start)));
+    let progress =
+        carried_progress.unwrap_or_else(|| Arc::new(ReplayProgress::new(output_slot_start)));
     // Fresh per-epoch baseline: a chained epoch reuses the shared instance, so
     // clear last-run counts before this epoch's replay begins (no notifications
     // are in flight here — the previous epoch's replay has fully returned).
     progress.reset_counts();
     let failure = Arc::new(ReplayFailure::new(shutdown.clone()));
     plugin::reset();
-    info!("direct in-process plugin notifier enabled");
+    info!("direct plugin notifier enabled");
     let ledger_dir = ledger_dir.to_path_buf();
     let root_interval = bank_root_interval();
     if let Some(interval) = root_interval {
@@ -5849,75 +7032,175 @@ async fn run_geyser_replay(
         info!("bank root pruning disabled");
     }
 
-    // Either reuse the bank carried from the previous epoch (range chaining —
-    // no snapshot load and no warmup), or load a fresh bank from the snapshot
-    // archive. The geyser account-update notifier is wired in at load time and
-    // travels with the accounts-db, so the reused bank already has it.
+    // Runtime selection is driven by the requested slots. Archive type only
+    // selects the corresponding state loader after that decision has been made.
     enum BankSource {
         Reuse(Arc<RwLock<BankForks>>),
         Fresh(Box<Bank>),
     }
-    let (bank_source, snapshot_slot) = match existing_bank_forks {
-        Some(bank_forks) => {
-            let slot = bank_forks
-                .read()
-                .map_err(|_| "bank forks lock poisoned".to_string())?
-                .working_bank()
-                .slot();
-            info!(
-                "reusing in-memory bank from previous epoch at slot {slot}; skipping snapshot load"
-            );
-            (BankSource::Reuse(bank_forks), slot)
-        }
-        None => {
-            let accounts_update_notifier: Option<AccountsUpdateNotifier> =
-                Some(Arc::new(ProgressAccountsUpdateNotifier {
-                    progress: progress.clone(),
-                    live_start_slot: epoch_start,
-                }) as AccountsUpdateNotifier);
-            info!("accounts update notifier wired into snapshot load: true");
-            // Genesis archive is fetched up front in main() (before the replay
-            // loop), so replay never touches gcloud/GCS.
-            info!("loading bank from snapshot");
-            let ledger_dir_for_load = ledger_dir.clone();
-            let snapshot_archive = snapshot_archive.to_path_buf();
-            let use_dir_loader = env_truthy("JETSTREAMER_LOAD_FROM_DIR");
-            let bank = tokio::task::spawn_blocking(move || {
-                if use_dir_loader {
-                    load_bank_from_snapshot(&ledger_dir_for_load, accounts_update_notifier)
-                } else {
-                    load_bank_from_snapshot_archive(
-                        &ledger_dir_for_load,
-                        &snapshot_archive,
-                        accounts_update_notifier,
+    enum ReplaySource {
+        Agave(BankSource),
+        Historical(Box<historical::HistoricalRuntimeClient>),
+    }
+    let (replay_source, snapshot_slot, bootstrap_state_kind, bootstrap_state_hash) =
+        match runtime_backend {
+            compatibility::RuntimeBackend::AgaveV3 => match carried_state {
+                Some(state) => {
+                    let bank_forks = state.bank_forks;
+                    let (slot, state_hash) = {
+                        let bank_forks = bank_forks
+                            .read()
+                            .map_err(|_| "bank forks lock poisoned".to_string())?;
+                        let bank = bank_forks.working_bank();
+                        (bank.slot(), bank.get_snapshot_hash().0)
+                    };
+                    info!(
+                        "reusing in-memory bank from previous epoch at slot {slot}; skipping snapshot load"
+                    );
+                    (
+                        ReplaySource::Agave(BankSource::Reuse(bank_forks)),
+                        slot,
+                        BootstrapStateKind::CarriedBank,
+                        state_hash,
                     )
                 }
-            })
-            .await
-            .map_err(|err| format!("snapshot load task failed: {err}"))??;
-            info!(
-                "bank accounts update notifier active: {}",
-                bank.rc.accounts.accounts_db.has_accounts_update_notifier()
-            );
-            let slot = bank.slot();
-            (BankSource::Fresh(Box::new(bank)), slot)
-        }
-    };
-    let replay_start = if snapshot_slot.saturating_add(1) < epoch_start {
-        snapshot_slot.saturating_add(1)
-    } else {
-        epoch_start
-    };
-    if replay_start < epoch_start {
+                None => {
+                    let accounts_update_notifier: Option<AccountsUpdateNotifier> =
+                        Some(Arc::new(ProgressAccountsUpdateNotifier {
+                            progress: progress.clone(),
+                            live_start_slot: output_slot_start,
+                        }) as AccountsUpdateNotifier);
+                    info!("accounts update notifier wired into snapshot load: true");
+                    info!("loading Agave bank from snapshot");
+                    let ledger_dir_for_load = ledger_dir.clone();
+                    let snapshot_archive = snapshot_archive.to_path_buf();
+                    let use_dir_loader = env_truthy("JETSTREAMER_LOAD_FROM_DIR");
+                    let bank = tokio::task::spawn_blocking(move || {
+                        if use_dir_loader {
+                            load_bank_from_snapshot(&ledger_dir_for_load, accounts_update_notifier)
+                        } else {
+                            load_bank_from_snapshot_archive(
+                                &ledger_dir_for_load,
+                                &snapshot_archive,
+                                accounts_update_notifier,
+                            )
+                        }
+                    })
+                    .await
+                    .map_err(|err| format!("snapshot load task failed: {err}"))??;
+                    info!(
+                        "bank accounts update notifier active: {}",
+                        bank.rc.accounts.accounts_db.has_accounts_update_notifier()
+                    );
+                    // Qualification checkpoint sets retain the bootstrap entry
+                    // so the loaded state itself is proven before replaying its
+                    // successor. Historical workers perform the same check as
+                    // part of `HistoricalReplay::new`.
+                    if qualification.is_some()
+                        && let Some(verifier) = snapshot_verifier.as_ref()
+                    {
+                        verifier.verify_bank(&bank);
+                        if let Some(message) = verifier.error_summary() {
+                            return Err(message);
+                        }
+                    }
+                    let slot = bank.slot();
+                    let state_hash = bank.get_snapshot_hash().0;
+                    (
+                        ReplaySource::Agave(BankSource::Fresh(Box::new(bank))),
+                        slot,
+                        BootstrapStateKind::SnapshotArchive,
+                        state_hash,
+                    )
+                }
+            },
+            compatibility::RuntimeBackend::SolanaV1_0_7
+            | compatibility::RuntimeBackend::SolanaV1_0_8
+            | compatibility::RuntimeBackend::SolanaV1_0_24 => {
+                if carried_state.is_some() {
+                    return Err(
+                        "an Agave in-memory bank cannot be handed to a Solana v1 worker"
+                            .to_string(),
+                    );
+                }
+                let archive_name = snapshot_archive
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .ok_or_else(|| {
+                        format!(
+                            "historical snapshot path has no UTF-8 filename: {}",
+                            snapshot_archive.display()
+                        )
+                    })?;
+                let (expected_slot, expected_hash) = parse_snapshot_archive_name(archive_name)?;
+                let bootstrap_state_hash = expected_hash.0;
+                let worker_profile = historical_worker_profile(runtime_descriptor)?;
+                let executable = configured_historical_worker_executable(runtime_descriptor)?;
+                let scratch_parent = ledger_dir.join(".historical-runtime");
+                fs::create_dir_all(&scratch_parent).map_err(|err| {
+                    format!(
+                        "failed to create historical runtime scratch directory {}: {err}",
+                        scratch_parent.display()
+                    )
+                })?;
+                info!(
+                    "starting isolated {} worker {}",
+                    runtime_backend,
+                    executable.display()
+                );
+                let spawn = historical::WorkerSpawn {
+                    executable,
+                    initialization: historical::SnapshotInitialization {
+                        ledger_path: ledger_dir.clone(),
+                        archive_path: snapshot_archive.to_path_buf(),
+                        expected_slot,
+                        expected_accounts_hash: expected_hash.0.to_bytes(),
+                        expected_archive_sha256: bootstrap_handoff_manifest
+                            .as_ref()
+                            .map(|manifest| manifest.archive_sha256),
+                        expected_archive_size: bootstrap_handoff_manifest
+                            .as_ref()
+                            .map(|manifest| manifest.archive_size),
+                        scratch_parent: Some(scratch_parent),
+                    },
+                };
+                let client = tokio::task::spawn_blocking(move || {
+                    historical::HistoricalRuntimeClient::spawn(worker_profile, spawn)
+                })
+                .await
+                .map_err(|err| format!("historical worker startup task failed: {err}"))?
+                .map_err(|err| format!("historical worker startup failed: {err}"))?;
+                let slot = client.initialized().slot;
+                info!(
+                    "historical worker initialized at slot {} (last_blockhash={}, ticks_per_slot={}, next_write_version={})",
+                    slot,
+                    Hash::new_from_array(client.initialized().last_blockhash),
+                    client.initialized().ticks_per_slot,
+                    client.initialized().next_write_version,
+                );
+                (
+                    ReplaySource::Historical(Box::new(client)),
+                    slot,
+                    BootstrapStateKind::SnapshotArchive,
+                    bootstrap_state_hash,
+                )
+            }
+        };
+    if snapshot_slot != bootstrap_slot {
+        return Err(format!(
+            "loaded state slot {} does not match the preflighted bootstrap slot {}",
+            snapshot_slot, bootstrap_slot,
+        ));
+    }
+    if replay_start < output_slot_start {
         info!(
-            "warming up replay from slot {} to {} (epoch {} starts at {})",
+            "warming up replay from slot {} to {} (recording starts at {})",
             replay_start,
-            epoch_start.saturating_sub(1),
-            epoch,
-            epoch_start
+            output_slot_start.saturating_sub(1),
+            output_slot_start
         );
     } else {
-        info!("starting replay at epoch {} slot {}", epoch, replay_start);
+        info!("starting replay at epoch {epoch} slot {replay_start}");
     }
     progress.reset_last_slots(replay_start.saturating_sub(1));
 
@@ -5935,19 +7218,40 @@ async fn run_geyser_replay(
     } else {
         info!("empty-slot gap guard disabled");
     }
+    let output_slot_count = qualification
+        .map(QualificationPlan::slot_count)
+        .unwrap_or_else(|| end_inclusive - output_slot_start + 1);
+    let worker_executable_sha256 = match &replay_source {
+        ReplaySource::Historical(client) => Some(client.executable_sha256()),
+        ReplaySource::Agave(_) => None,
+    };
+    let archive_provenance = build_archive_provenance(
+        execution,
+        worker_executable_sha256,
+        bootstrap_state_kind,
+        snapshot_slot,
+        bootstrap_state_hash,
+        output_slot_start,
+        output_slot_count,
+    )?;
     horizon::init(
         &horizon_output,
         epoch,
-        epoch_start,
-        end_inclusive - epoch_start + 1,
+        output_slot_start,
+        output_slot_count,
         slot_presence.clone(),
+        &archive_provenance,
     )?;
     info!(
-        "horizon archive recording to {} (epoch {}, slots {}..={})",
+        "horizon archive recording to {} (epoch {}, slots {}..={}, runtime={}, admission={:?}, bootstrap={:?}@{})",
         horizon_output.display(),
         epoch,
-        epoch_start,
-        end_inclusive
+        output_slot_start,
+        end_inclusive,
+        execution.descriptor.identity.name,
+        execution.admission,
+        bootstrap_state_kind,
+        snapshot_slot,
     );
     let scheduler = Arc::new(TransactionScheduler::new(
         replay_start,
@@ -5992,39 +7296,54 @@ async fn run_geyser_replay(
     } else {
         info!("accounts maintenance disabled");
     }
-    let bank_replay = Arc::new(match bank_source {
-        BankSource::Fresh(bank) => BankReplay::new(
-            *bank,
+    let mut agave_bank_replay = None;
+    let replay_executor: Arc<dyn ReplayExecutor> = match replay_source {
+        ReplaySource::Agave(bank_source) => {
+            let replay = Arc::new(match bank_source {
+                BankSource::Fresh(bank) => BankReplay::new(
+                    *bank,
+                    snapshot_verifier.clone(),
+                    root_interval,
+                    failure.clone(),
+                    cursor.clone(),
+                    scheduler.clone(),
+                    firehose_gate.clone(),
+                    output_slot_start,
+                    enable_program_cache_prune,
+                    enable_accounts_maintenance,
+                    accounts_maintenance_root_stride,
+                ),
+                BankSource::Reuse(bank_forks) => BankReplay::from_bank_forks(
+                    bank_forks,
+                    snapshot_verifier.clone(),
+                    root_interval,
+                    failure.clone(),
+                    cursor.clone(),
+                    scheduler.clone(),
+                    firehose_gate.clone(),
+                    output_slot_start,
+                    enable_program_cache_prune,
+                    enable_accounts_maintenance,
+                    accounts_maintenance_root_stride,
+                ),
+            });
+            agave_bank_replay = Some(replay.clone());
+            replay
+        }
+        ReplaySource::Historical(client) => Arc::new(historical_replay::HistoricalReplay::new(
+            *client,
             snapshot_verifier.clone(),
-            root_interval,
             failure.clone(),
             cursor.clone(),
-            scheduler.clone(),
-            firehose_gate.clone(),
-            epoch_start,
-            enable_program_cache_prune,
-            enable_accounts_maintenance,
-            accounts_maintenance_root_stride,
-        ),
-        BankSource::Reuse(bank_forks) => BankReplay::from_bank_forks(
-            bank_forks,
-            snapshot_verifier.clone(),
-            root_interval,
-            failure.clone(),
-            cursor.clone(),
-            scheduler.clone(),
-            firehose_gate.clone(),
-            epoch_start,
-            enable_program_cache_prune,
-            enable_accounts_maintenance,
-            accounts_maintenance_root_stride,
-        ),
-    });
+            progress.clone(),
+            output_slot_start,
+        )?),
+    };
     let ready_queue_capacity = ready_entry_queue_capacity();
     info!("ready entry queue capacity: {}", ready_queue_capacity);
     let (ready_sender, ready_receiver) = bounded::<Vec<ReadyEntry>>(ready_queue_capacity);
     let ready_shutdown = shutdown.clone();
-    let ready_bank_replay = bank_replay.clone();
+    let ready_replay_executor = replay_executor.clone();
     let ready_handle = std::thread::Builder::new()
         .name("readyEntries".to_string())
         .stack_size(64 * 1024 * 1024)
@@ -6059,7 +7378,7 @@ async fn run_geyser_replay(
                         Err(_) => break,
                     }
                 }
-                ready_bank_replay.process_ready_entries(entries);
+                ready_replay_executor.process_ready_entries(entries);
             }
         })
         .expect("failed to spawn ready entry thread");
@@ -6096,7 +7415,7 @@ async fn run_geyser_replay(
         progress: progress.clone(),
         failure: failure.clone(),
         ready_sender: ready_sender.clone(),
-        live_start_slot: epoch_start,
+        live_start_slot: output_slot_start,
         shutdown: shutdown.clone(),
         active_firehose_stop: active_firehose_stop.clone(),
         backpressure_stop_requested: backpressure_stop_requested.clone(),
@@ -6104,7 +7423,8 @@ async fn run_geyser_replay(
         firehose_gate: firehose_gate.clone(),
     });
     let notifiers = GeyserNotifiers {
-        transaction_notifier: Some(transaction_notifier.clone()),
+        transaction_notifier: None,
+        sourced_transaction_notifier: Some(transaction_notifier.clone()),
         entry_notifier: Some(entry_notifier.clone()),
         block_metadata_notifier: Some(block_metadata_notifier.clone()),
     };
@@ -6138,14 +7458,16 @@ async fn run_geyser_replay(
         let shutdown = shutdown.clone();
         let range_progress = range_progress.clone();
         std::thread::spawn(move || {
-            let has_warmup = replay_start < epoch_start;
-            let warmup_end = epoch_start.saturating_sub(1);
+            let has_warmup = replay_start < output_slot_start;
+            let warmup_end = output_slot_start.saturating_sub(1);
             let warmup_total = if has_warmup {
                 warmup_end.saturating_sub(replay_start).saturating_add(1)
             } else {
                 0
             };
-            let main_total = end_inclusive.saturating_sub(epoch_start).saturating_add(1);
+            let main_total = end_inclusive
+                .saturating_sub(output_slot_start)
+                .saturating_add(1);
             let stall_interval = env::var("JETSTREAMER_STALL_LOG_SECS")
                 .ok()
                 .and_then(|value| value.parse::<u64>().ok())
@@ -6202,7 +7524,7 @@ async fn run_geyser_replay(
                 let account_updates = progress.account_update_count.load(Ordering::Relaxed);
                 let last_account_update_slot =
                     progress.last_account_update_slot.load(Ordering::Relaxed);
-                let phase = if in_warmup && latest < epoch_start {
+                let phase = if in_warmup && latest < output_slot_start {
                     "warmup"
                 } else {
                     "main"
@@ -6291,18 +7613,21 @@ async fn run_geyser_replay(
                             if remaining_slots == 0 {
                                 "00:00:00".to_string()
                             } else if let Some(start) = phase_start {
-                                let processed = if in_warmup && latest < epoch_start {
+                                let processed = if in_warmup && latest < output_slot_start {
                                     if latest < replay_start {
                                         0
                                     } else {
                                         latest.saturating_sub(replay_start).saturating_add(1)
                                     }
                                 } else {
-                                    let display_slot = latest.clamp(epoch_start, end_inclusive);
-                                    if display_slot < epoch_start {
+                                    let display_slot =
+                                        latest.clamp(output_slot_start, end_inclusive);
+                                    if display_slot < output_slot_start {
                                         0
                                     } else {
-                                        display_slot.saturating_sub(epoch_start).saturating_add(1)
+                                        display_slot
+                                            .saturating_sub(output_slot_start)
+                                            .saturating_add(1)
                                     }
                                 };
                                 let elapsed = start.elapsed().as_secs_f64();
@@ -6483,7 +7808,7 @@ async fn run_geyser_replay(
                     }
                 }
                 last_seen_tx_count = tx_count;
-                if in_warmup && latest < epoch_start {
+                if in_warmup && latest < output_slot_start {
                     let processed = if latest < replay_start {
                         0
                     } else {
@@ -6543,7 +7868,7 @@ async fn run_geyser_replay(
                         "unknown".to_string()
                     };
                     info!(
-                        "warmup slot {display_slot}/{warmup_end} ({percent:.2}%) txs={tx_count} accounts={account_updates} slots_per_sec={slots_per_sec} accounts_per_sec={accounts_per_sec} eta={eta} (epoch {epoch} starts at {epoch_start})"
+                        "warmup slot {display_slot}/{warmup_end} ({percent:.2}%) txs={tx_count} accounts={account_updates} slots_per_sec={slots_per_sec} accounts_per_sec={accounts_per_sec} eta={eta} (recording starts at {output_slot_start})"
                     );
                     maybe_log_phases(false);
                 } else {
@@ -6551,8 +7876,8 @@ async fn run_geyser_replay(
                         in_warmup = false;
                         phase_start = Some(Instant::now());
                         main_rate_baseline = latest
-                            .clamp(epoch_start, end_inclusive)
-                            .saturating_sub(epoch_start)
+                            .clamp(output_slot_start, end_inclusive)
+                            .saturating_sub(output_slot_start)
                             .saturating_add(1);
                         progress.reset_counts();
                         last_seen_tx_count = 0;
@@ -6561,11 +7886,13 @@ async fn run_geyser_replay(
                         last_account_change = Instant::now();
                         last_account_log = Instant::now();
                     }
-                    let display_slot = latest.clamp(epoch_start, end_inclusive);
-                    let processed = if display_slot < epoch_start {
+                    let display_slot = latest.clamp(output_slot_start, end_inclusive);
+                    let processed = if display_slot < output_slot_start {
                         0
                     } else {
-                        display_slot.saturating_sub(epoch_start).saturating_add(1)
+                        display_slot
+                            .saturating_sub(output_slot_start)
+                            .saturating_add(1)
                     };
                     let percent = if main_total == 0 {
                         100.0
@@ -6701,6 +8028,7 @@ async fn run_geyser_replay(
             let slot_range = firehose_start..slot_range.end;
             let notifiers = GeyserNotifiers {
                 transaction_notifier: notifiers.transaction_notifier.clone(),
+                sourced_transaction_notifier: notifiers.sourced_transaction_notifier.clone(),
                 entry_notifier: notifiers.entry_notifier.clone(),
                 block_metadata_notifier: notifiers.block_metadata_notifier.clone(),
             };
@@ -6863,12 +8191,23 @@ async fn run_geyser_replay(
     drop(confirmed_bank_sender);
     let _ = confirmed_bank_handle.join();
 
+    // A checkpoint mismatch deliberately stops the shared replay pipeline,
+    // which can make producers observe a secondary closed-channel error.
+    // Preserve the consensus-relevant verification failure as the primary
+    // diagnostic instead of letting shutdown plumbing obscure it.
+    if let Some(message) = snapshot_verifier
+        .as_ref()
+        .and_then(|verifier| verifier.error_summary())
+    {
+        return Err(message);
+    }
+
     if let Some(message) = failure.error_message() {
         return Err(message);
     }
 
     if let Some(verifier) = snapshot_verifier {
-        bank_replay.verify_latest_bank()?;
+        replay_executor.verify_latest_bank()?;
         verifier.finish()?;
         info!("snapshot verification complete");
     }
@@ -6876,16 +8215,128 @@ async fn run_geyser_replay(
     if horizon::recorder().is_some() {
         // Freeze the final bank so its end-of-slot account updates are
         // recorded before the archive closes.
-        bank_replay.freeze_latest_bank()?;
+        replay_executor.freeze_latest_bank()?;
         // Finalize and tear down this epoch's archive so the next epoch in a
         // range run can install its own.
         horizon::finish()?;
     }
 
-    // Hand the live bank forks back so a range run can chain straight into the
-    // next epoch without reloading a snapshot.
-    let bank_forks = bank_replay.bank_forks();
-    Ok(bank_forks)
+    let carried_state = agave_bank_replay.map(|replay| CarriedRuntimeState {
+        backend: runtime_backend,
+        completed_epoch: epoch,
+        bank_forks: replay.bank_forks(),
+    });
+    let historical_evidence = replay_executor.historical_evidence()?;
+    if let Some(output_directory) = env::var_os("JETSTREAMER_EXPORT_HANDOFF_SNAPSHOT_DIR") {
+        let output_directory = PathBuf::from(output_directory);
+        let plan = qualification.ok_or_else(|| {
+            "handoff snapshot export is allowed only for a focused qualification run".to_string()
+        })?;
+        let handoff = compatibility::RUNTIME_HANDOFFS
+            .iter()
+            .copied()
+            .find(|handoff| {
+                handoff.snapshot.slot == plan.end_inclusive
+                    && std::ptr::eq(handoff.source, runtime_descriptor)
+            })
+            .ok_or_else(|| {
+                format!(
+                    "no registered handoff snapshot follows runtime {} at slot {}",
+                    runtime_descriptor.identity.name, plan.end_inclusive
+                )
+            })?;
+        let evidence = historical_evidence.as_ref().ok_or_else(|| {
+            "handoff snapshot export requires historical checkpoint evidence".to_string()
+        })?;
+        let expected_accounts_hash = handoff.snapshot.accounts_hash()?;
+        if evidence.terminal.accounts_hash != expected_accounts_hash.to_bytes() {
+            return Err(format!(
+                "terminal checkpoint at slot {} does not match registered handoff accounts hash {}",
+                evidence.terminal.slot, expected_accounts_hash
+            ));
+        }
+        let exported = replay_executor
+            .export_historical_snapshot(
+                handoff.snapshot.slot,
+                &output_directory,
+                expected_accounts_hash.to_bytes(),
+            )?
+            .ok_or_else(|| {
+                format!(
+                    "runtime {} cannot export a historical handoff snapshot",
+                    runtime_descriptor.identity.name
+                )
+            })?;
+        let expected_path = fs::canonicalize(&output_directory)
+            .map_err(|err| {
+                format!(
+                    "failed to canonicalize handoff output directory {}: {err}",
+                    output_directory.display()
+                )
+            })?
+            .join(handoff.snapshot.archive_name());
+        if exported.archive_path != expected_path {
+            return Err(format!(
+                "historical worker exported handoff snapshot to {}, expected {}",
+                exported.archive_path.display(),
+                expected_path.display()
+            ));
+        }
+        if exported.archive_size == 0 || exported.archive_sha256 == [0; 32] {
+            return Err("historical worker returned empty snapshot evidence".to_string());
+        }
+        let source_worker_executable_sha256 = worker_executable_sha256.ok_or_else(|| {
+            format!(
+                "runtime {} exported a snapshot without a measured worker executable",
+                runtime_descriptor.identity.name
+            )
+        })?;
+        let manifest = HistoricalHandoffSnapshotManifest {
+            schema_version: HANDOFF_SNAPSHOT_MANIFEST_SCHEMA_VERSION,
+            boundary_slot: handoff.boundary_slot,
+            snapshot_slot: handoff.snapshot.slot,
+            accounts_hash: expected_accounts_hash.to_string(),
+            archive_path: String::new(),
+            archive_size: exported.archive_size,
+            archive_sha256: exported.archive_sha256,
+            source_runtime: segment_runtime_identity(execution)?,
+            source_worker_executable_sha256,
+            terminal: segment_checkpoint_summary(&evidence.terminal),
+        };
+        let (manifest_path, published) =
+            write_handoff_snapshot_manifest(&exported.archive_path, manifest)
+                .map_err(|error| format!("failed to publish handoff snapshot evidence: {error}"))?;
+        if published.archive_size != exported.archive_size
+            || published.archive_sha256 != exported.archive_sha256
+        {
+            return Err(format!(
+                "handoff snapshot {} changed between worker export validation and evidence publication",
+                exported.archive_path.display()
+            ));
+        }
+        let admitted = validate_canonical_handoff_snapshot(&exported.archive_path, handoff)?;
+        if admitted != published {
+            return Err(format!(
+                "handoff snapshot evidence {} changed during publication",
+                manifest_path.display()
+            ));
+        }
+        info!(
+            "exported canonical runtime handoff snapshot {} with evidence {} ({} bytes, sha256={})",
+            exported.archive_path.display(),
+            manifest_path.display(),
+            exported.archive_size,
+            jetstreamer_node::segment_manifest::sha256_hex_string(&exported.archive_sha256),
+        );
+    }
+    replay_executor.shutdown()?;
+    Ok(ReplayRunResult {
+        carried_state,
+        historical_evidence,
+        historical_worker_executable_sha256: worker_executable_sha256,
+        bootstrap_handoff_archive_sha256: bootstrap_handoff_manifest
+            .map(|manifest| manifest.archive_sha256),
+    })
 }
 
 async fn extract_tarball(archive: &Path, dest_dir: &Path) -> Result<(), String> {
@@ -7001,15 +8452,443 @@ fn clear_ledger_accounts_state(ledger_dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Returns true if `path` is a fully finalized horizon archive. The reader only
-/// opens once the footer + bucket index are present and the index checksum
-/// matches, so a crash-truncated `.jet` (header written, no footer) reports
-/// false and is re-run. Used for epoch-level resume of a range.
-fn epoch_archive_complete(path: &Path) -> bool {
-    let Ok(file) = fs::File::open(path) else {
-        return false;
+/// Determines whether a finalized archive can be reused by range resume.
+/// Structural completeness alone is insufficient: a valid file generated by
+/// another runtime profile, source policy, or slot range must not bypass the
+/// current compatibility selection.
+fn epoch_archive_reusable(
+    path: &Path,
+    epoch: u64,
+    selection: compatibility::RuntimeSelection,
+) -> Result<bool, String> {
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(format!("failed to open {}: {err}", path.display())),
     };
-    jetstreamer_horizon::archive::ArchiveReader::open(std::io::BufReader::new(file)).is_ok()
+    let reader =
+        match jetstreamer_horizon::archive::ArchiveReader::open(std::io::BufReader::new(file)) {
+            Ok(reader) => reader,
+            Err(_) => return Ok(false),
+        };
+    let (slot_start, slot_end_inclusive) = epoch_to_slot_range(epoch);
+    let expected_slot_count = slot_end_inclusive - slot_start + 1;
+    let header = reader.header();
+    if header.epoch != epoch
+        || header.slot_start != slot_start
+        || header.slot_count != expected_slot_count
+    {
+        return Err(format!(
+            "completed archive {} has header epoch={} slots={}+{}, expected epoch={} slots={}+{}",
+            path.display(),
+            header.epoch,
+            header.slot_start,
+            header.slot_count,
+            epoch,
+            slot_start,
+            expected_slot_count
+        ));
+    }
+    let expected_bucket_count = expected_slot_count.div_ceil(u64::from(header.bucket_slots));
+    if reader.bucket_count() as u64 != expected_bucket_count {
+        return Err(format!(
+            "completed archive {} has {} buckets, expected {} for {} slots at {} slots per bucket",
+            path.display(),
+            reader.bucket_count(),
+            expected_bucket_count,
+            expected_slot_count,
+            header.bucket_slots
+        ));
+    }
+    let provenance = reader
+        .provenance()
+        .map_err(|err| {
+            format!(
+                "completed archive {} has invalid provenance: {err}",
+                path.display()
+            )
+        })?
+        .ok_or_else(|| {
+            format!(
+                "completed archive {} predates required runtime provenance; refusing to skip it",
+                path.display()
+            )
+        })?;
+    let provenance_v1 = provenance.single_runtime_v1().ok_or_else(|| {
+        format!(
+            "completed archive {} has multi-runtime provenance V{}; resuming from assembled archives is not implemented yet",
+            path.display(),
+            provenance.version(),
+        )
+    })?;
+    let recorded_worker_executable_sha256 = provenance
+        .single_runtime_worker_executable_sha256()
+        .expect("single-runtime provenance has a single worker-digest field");
+    let identity = selection.descriptor.identity;
+    let expected_genesis = identity.genesis_hash.parse::<Hash>().map_err(|err| {
+        format!(
+            "runtime descriptor {} has invalid genesis hash {}: {err}",
+            identity.name, identity.genesis_hash
+        )
+    })?;
+    let expected_toolchain = archive_runtime_toolchain(identity);
+    let expected_metadata = archive_transaction_metadata_policy(slot_start);
+    let expected_generation_profile = archive_generation_profile();
+    if provenance_v1.generation_profile != expected_generation_profile
+        || provenance_v1.runtime_profile != identity.name
+        || provenance_v1.runtime_admission != archive_runtime_admission(selection.admission)
+        || provenance_v1.runtime_revision != identity.revision
+        || provenance_v1.runtime_toolchain != expected_toolchain
+        || provenance_v1.genesis_hash != expected_genesis
+        || provenance_v1.transaction_metadata != expected_metadata
+    {
+        return Err(format!(
+            "completed archive {} was generated with incompatible provenance: {:?}",
+            path.display(),
+            provenance_v1
+        ));
+    }
+
+    let expected_worker_executable_sha256 = if selection.descriptor.worker.is_some() {
+        let executable = configured_historical_worker_executable(selection.descriptor)?;
+        Some(
+            historical::measure_executable_sha256(&executable).map_err(|err| {
+                format!(
+                    "failed to measure configured historical worker {}: {err}",
+                    executable.display()
+                )
+            })?,
+        )
+    } else {
+        None
+    };
+    if !archive_worker_executable_matches(&provenance, expected_worker_executable_sha256) {
+        return Err(format!(
+            "completed archive {} has historical worker executable SHA-256 {:?}, expected {:?}",
+            path.display(),
+            recorded_worker_executable_sha256,
+            expected_worker_executable_sha256,
+        ));
+    }
+
+    match provenance_v1.bootstrap_state_kind {
+        BootstrapStateKind::Genesis => {
+            if epoch != 0 || provenance_v1.bootstrap_slot != 0 {
+                return Err(format!(
+                    "completed archive {} claims an invalid genesis bootstrap at slot {} for epoch {}",
+                    path.display(),
+                    provenance_v1.bootstrap_slot,
+                    epoch
+                ));
+            }
+        }
+        BootstrapStateKind::SnapshotArchive | BootstrapStateKind::CarriedBank => {
+            if epoch == 0 {
+                return Err(format!(
+                    "completed epoch-0 archive {} did not bootstrap from genesis",
+                    path.display()
+                ));
+            }
+            let min_bootstrap_slot = epoch_to_slot(epoch - 1);
+            let max_bootstrap_slot = slot_start - 1;
+            if !(min_bootstrap_slot..=max_bootstrap_slot).contains(&provenance_v1.bootstrap_slot) {
+                return Err(format!(
+                    "completed archive {} has bootstrap slot {}, expected {}..={} for epoch {}",
+                    path.display(),
+                    provenance_v1.bootstrap_slot,
+                    min_bootstrap_slot,
+                    max_bootstrap_slot,
+                    epoch
+                ));
+            }
+            if provenance_v1.bootstrap_state_kind == BootstrapStateKind::CarriedBank
+                && !selection.descriptor.bootstrap.permits_in_memory_handoff
+            {
+                return Err(format!(
+                    "completed archive {} claims a carried-bank bootstrap for runtime {}",
+                    path.display(),
+                    identity.name
+                ));
+            }
+        }
+    }
+    Ok(true)
+}
+
+/// Determines whether an assembled multi-runtime epoch is safe to reuse.
+///
+/// V3 provenance is checked against the live slot registry and the executable
+/// bytes currently configured for every historical worker. A structurally
+/// valid archive made with an older routing decision therefore cannot silently
+/// bypass a newly tightened compatibility boundary.
+fn epoch_archive_reusable_multi_runtime(
+    path: &Path,
+    epoch: u64,
+    spans: &[compatibility::RuntimeSpan],
+) -> Result<bool, String> {
+    if spans.len() < 2 {
+        return Err("multi-runtime archive validation requires at least two spans".to_string());
+    }
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(format!("failed to open {}: {err}", path.display())),
+    };
+    let reader =
+        match jetstreamer_horizon::archive::ArchiveReader::open(std::io::BufReader::new(file)) {
+            Ok(reader) => reader,
+            Err(_) => return Ok(false),
+        };
+    let (slot_start, slot_end_inclusive) = epoch_to_slot_range(epoch);
+    let slot_count = slot_end_inclusive - slot_start + 1;
+    let header = reader.header();
+    if header.epoch != epoch || header.slot_start != slot_start || header.slot_count != slot_count {
+        return Err(format!(
+            "assembled archive {} has header epoch={} slots={}+{}, expected epoch={} slots={}+{}",
+            path.display(),
+            header.epoch,
+            header.slot_start,
+            header.slot_count,
+            epoch,
+            slot_start,
+            slot_count,
+        ));
+    }
+    let provenance = reader
+        .provenance()
+        .map_err(|err| {
+            format!(
+                "assembled archive {} has invalid provenance: {err}",
+                path.display()
+            )
+        })?
+        .ok_or_else(|| {
+            format!(
+                "assembled archive {} has no runtime provenance",
+                path.display()
+            )
+        })?;
+    let ArchiveProvenance::V3(provenance) = provenance else {
+        return Err(format!(
+            "assembled archive {} has provenance V{}, expected V3",
+            path.display(),
+            provenance.version(),
+        ));
+    };
+    if provenance.assembly_profile != archive_assembly_profile() {
+        return Err(format!(
+            "assembled archive {} uses assembly profile {:?}, expected {:?}",
+            path.display(),
+            provenance.assembly_profile,
+            archive_assembly_profile(),
+        ));
+    }
+    validate_multi_runtime_genesis(path, provenance.genesis_hash)?;
+    if provenance.transaction_metadata != archive_transaction_metadata_policy(slot_start) {
+        return Err(format!(
+            "assembled archive {} has incompatible transaction metadata policy",
+            path.display()
+        ));
+    }
+    let first_selection = runtime_span_selection(
+        spans
+            .first()
+            .expect("multi-runtime validation requires at least two spans"),
+    )?;
+    match provenance.bootstrap_state_kind {
+        BootstrapStateKind::Genesis => {
+            if epoch != 0 || provenance.bootstrap_state.slot != 0 {
+                return Err(format!(
+                    "assembled archive {} claims an invalid genesis bootstrap at slot {} for epoch {}",
+                    path.display(),
+                    provenance.bootstrap_state.slot,
+                    epoch
+                ));
+            }
+        }
+        BootstrapStateKind::SnapshotArchive | BootstrapStateKind::CarriedBank => {
+            if epoch == 0 {
+                return Err(format!(
+                    "assembled epoch-0 archive {} did not bootstrap from genesis",
+                    path.display()
+                ));
+            }
+            let min_bootstrap_slot = epoch_to_slot(epoch - 1);
+            let max_bootstrap_slot = slot_start - 1;
+            if !(min_bootstrap_slot..=max_bootstrap_slot).contains(&provenance.bootstrap_state.slot)
+            {
+                return Err(format!(
+                    "assembled archive {} has bootstrap slot {}, expected {}..={} for epoch {}",
+                    path.display(),
+                    provenance.bootstrap_state.slot,
+                    min_bootstrap_slot,
+                    max_bootstrap_slot,
+                    epoch
+                ));
+            }
+            if provenance.bootstrap_state_kind == BootstrapStateKind::CarriedBank
+                && !first_selection
+                    .descriptor
+                    .bootstrap
+                    .permits_in_memory_handoff
+            {
+                return Err(format!(
+                    "assembled archive {} claims a carried-bank bootstrap for runtime {}",
+                    path.display(),
+                    first_selection.descriptor.identity.name
+                ));
+            }
+        }
+    }
+    let expected_commitment_kind = match first_selection.backend {
+        compatibility::RuntimeBackend::SolanaV1_0_7
+        | compatibility::RuntimeBackend::SolanaV1_0_8
+        | compatibility::RuntimeBackend::SolanaV1_0_24 => StateCommitmentKind::LegacyAccountsHash,
+        compatibility::RuntimeBackend::AgaveV3 => StateCommitmentKind::AccountsLtHash,
+    };
+    if provenance.bootstrap_state.kind != expected_commitment_kind {
+        return Err(format!(
+            "assembled archive {} has {:?} bootstrap commitment, expected {:?} for runtime {}",
+            path.display(),
+            provenance.bootstrap_state.kind,
+            expected_commitment_kind,
+            first_selection.descriptor.identity.name
+        ));
+    }
+    if provenance.runtime_segments.len() != spans.len() {
+        return Err(format!(
+            "assembled archive {} records {} runtime spans, registry requires {}",
+            path.display(),
+            provenance.runtime_segments.len(),
+            spans.len(),
+        ));
+    }
+    if provenance.handoffs.len() != spans.len() - 1 {
+        return Err(format!(
+            "assembled archive {} records {} runtime handoffs, registry requires {}",
+            path.display(),
+            provenance.handoffs.len(),
+            spans.len() - 1,
+        ));
+    }
+
+    for (index, (recorded, expected_span)) in
+        provenance.runtime_segments.iter().zip(spans).enumerate()
+    {
+        let selection = runtime_span_selection(expected_span)?;
+        let identity = selection.descriptor.identity;
+        let expected_count = expected_span.slots.end - expected_span.slots.start;
+        let expected_worker_sha256 = if selection.descriptor.worker.is_some() {
+            let executable = configured_historical_worker_executable(selection.descriptor)?;
+            Some(
+                historical::measure_executable_sha256(&executable).map_err(|err| {
+                    format!(
+                        "failed to measure configured historical worker {}: {err}",
+                        executable.display()
+                    )
+                })?,
+            )
+        } else {
+            None
+        };
+        if recorded.slot_start != expected_span.slots.start
+            || recorded.slot_count != expected_count
+            || recorded.generation_profile != archive_generation_profile()
+            || recorded.runtime_profile != identity.name
+            || recorded.runtime_admission != archive_runtime_admission(selection.admission)
+            || recorded.runtime_revision != identity.revision
+            || recorded.runtime_toolchain != archive_runtime_toolchain(identity)
+            || recorded.worker_executable_sha256 != expected_worker_sha256
+        {
+            return Err(format!(
+                "assembled archive {} runtime segment {index} does not match the active slot registry",
+                path.display()
+            ));
+        }
+    }
+
+    for (index, (recorded, successor_span)) in
+        provenance.handoffs.iter().zip(&spans[1..]).enumerate()
+    {
+        let expected = successor_span.handoff.ok_or_else(|| {
+            format!(
+                "runtime span {}..{} has no registered handoff",
+                successor_span.slots.start, successor_span.slots.end
+            )
+        })?;
+        let expected_accounts_hash = expected.snapshot.accounts_hash()?;
+        if recorded.boundary_slot != expected.boundary_slot
+            || recorded.predecessor.slot != expected.snapshot.slot
+            || recorded.successor.slot != expected.snapshot.slot
+            || recorded.predecessor.accounts_hash_kind != AccountsHashKind::LegacyAccountsHash
+            || recorded.successor.accounts_hash_kind != AccountsHashKind::LegacyAccountsHash
+            || recorded.predecessor.accounts_hash != expected_accounts_hash
+            || recorded.successor.accounts_hash != expected_accounts_hash
+            || recorded.successor_bootstrap_kind != BootstrapStateKind::SnapshotArchive
+            || recorded.successor_bootstrap_write_count != 0
+        {
+            return Err(format!(
+                "assembled archive {} handoff {index} does not match the canonical snapshot committed by the registry",
+                path.display()
+            ));
+        }
+    }
+    // Opening the footer and validating provenance is not enough for resume:
+    // bucket payloads may have been truncated or corrupted after publication.
+    // Reuse is an admission decision, so pay the one full sequential decode.
+    verify_assembled_runtime_archive(path, epoch, &provenance)?;
+    Ok(true)
+}
+
+fn validate_multi_runtime_genesis(path: &Path, actual: Hash) -> Result<(), String> {
+    let expected = compatibility::MAINNET_GENESIS_HASH
+        .parse::<Hash>()
+        .map_err(|err| format!("runtime registry has an invalid mainnet genesis hash: {err}"))?;
+    if actual == expected {
+        return Ok(());
+    }
+    Err(format!(
+        "assembled archive {} has genesis {}, expected registered mainnet genesis {}",
+        path.display(),
+        actual,
+        expected,
+    ))
+}
+
+fn validate_epoch_bootstrap_snapshot(epoch: u64, path: &Path) -> Result<Slot, String> {
+    let target_slot = epoch_to_slot(epoch).saturating_sub(1);
+    let min_slot = epoch_to_slot(epoch.saturating_sub(1));
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| format!("snapshot path has no UTF-8 filename: {}", path.display()))?;
+    let (slot, _) = parse_snapshot_archive_name(name)?;
+    if slot < min_slot || slot > target_slot {
+        return Err(format!(
+            "epoch {epoch} requires a bootstrap snapshot in slots {min_slot}..={target_slot}, got slot {slot} ({})",
+            path.display()
+        ));
+    }
+    Ok(slot)
+}
+
+fn validate_runtime_bootstrap_archive(
+    descriptor: &compatibility::RuntimeDescriptor,
+    path: &Path,
+) -> Result<(), String> {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| format!("snapshot path has no UTF-8 filename: {}", path.display()))?;
+    if descriptor.accepts_bootstrap_archive_name(name) {
+        return Ok(());
+    }
+    Err(format!(
+        "runtime profile {} accepts snapshot formats {:?}, but selected {}",
+        descriptor.identity.name,
+        descriptor.bootstrap.archive_extensions,
+        path.display()
+    ))
 }
 
 /// Locates epoch `epoch`'s boundary snapshot archive in `dest_dir`, downloading
@@ -7017,10 +8896,15 @@ fn epoch_archive_complete(path: &Path) -> bool {
 /// epoch qualifies — an older archive would force a warmup replay across every
 /// slot between it and the epoch boundary (see the `min_snapshot_slot`
 /// rationale where `effective_start`'s snapshot is resolved).
-async fn ensure_epoch_boundary_snapshot(epoch: u64, dest_dir: &Path) -> Result<PathBuf, String> {
+async fn ensure_epoch_boundary_snapshot(
+    epoch: u64,
+    dest_dir: &Path,
+    archive_extensions: &[&str],
+) -> Result<PathBuf, String> {
     let target_slot = epoch_to_slot(epoch).saturating_sub(1);
     let min_snapshot_slot = epoch_to_slot(epoch.saturating_sub(1));
-    if let Some(candidate) = find_existing_snapshot_archive(dest_dir, target_slot)?
+    if let Some(candidate) =
+        find_existing_snapshot_archive(dest_dir, target_slot, archive_extensions)?
         && candidate.slot >= min_snapshot_slot
     {
         info!(
@@ -7030,9 +8914,15 @@ async fn ensure_epoch_boundary_snapshot(epoch: u64, dest_dir: &Path) -> Result<P
         return Ok(candidate.path);
     }
     info!("epoch {epoch}: downloading boundary snapshot (target slot {target_slot})");
-    let path = download_snapshot_at_or_before_slot(epoch, target_slot, dest_dir)
-        .await
-        .map_err(|err| format!("failed to download epoch {epoch} boundary snapshot: {err}"))?;
+    let path = download_snapshot_at_or_before_slot_matching(
+        epoch,
+        target_slot,
+        dest_dir,
+        archive_extensions,
+    )
+    .await
+    .map_err(|err| format!("failed to download epoch {epoch} boundary snapshot: {err}"))?;
+    validate_epoch_bootstrap_snapshot(epoch, &path)?;
     info!(
         "epoch {epoch}: downloaded boundary snapshot to {}",
         path.display()
@@ -7040,11 +8930,15 @@ async fn ensure_epoch_boundary_snapshot(epoch: u64, dest_dir: &Path) -> Result<P
     Ok(path)
 }
 
-/// Reads a supervisor-written per-epoch snapshot-hash file (one canonical
-/// snapshot archive filename per line) back into the expectations map. The
-/// filename format is the same one `parse_snapshot_archive_name` accepts, so
-/// writer and reader can't drift.
-fn read_epoch_hashes_file(path: &Path) -> Result<BTreeMap<Slot, SnapshotHash>, String> {
+/// Reads a supervisor-written per-epoch hash file (one canonical snapshot
+/// archive filename per line) back into the expectations map. The extension
+/// preserves the hash scheme: legacy `.tar.bz2` names contain the historical
+/// full accounts Merkle hash, while current snapshot names contain
+/// `AccountsLtHash`.
+fn read_epoch_hashes_file(
+    path: &Path,
+    archive_extensions: &[&str],
+) -> Result<BTreeMap<Slot, BankHashExpectation>, String> {
     let contents = fs::read_to_string(path).map_err(|err| {
         format!(
             "failed to read snapshot hashes file {}: {err}",
@@ -7057,8 +8951,22 @@ fn read_epoch_hashes_file(path: &Path) -> Result<BTreeMap<Slot, SnapshotHash>, S
         if line.is_empty() {
             continue;
         }
+        if !archive_extensions
+            .iter()
+            .any(|extension| line.ends_with(extension))
+        {
+            return Err(format!(
+                "snapshot entry {line:?} in {} is incompatible with the slot-selected runtime",
+                path.display()
+            ));
+        }
         let (slot, hash) = parse_snapshot_archive_name(line)?;
-        if expected.insert(slot, hash).is_some() {
+        let expectation = if line.ends_with(".tar.bz2") {
+            BankHashExpectation::LegacyAccountsHash(hash.0)
+        } else {
+            BankHashExpectation::AccountsLtHash(hash)
+        };
+        if expected.insert(slot, expectation).is_some() {
             return Err(format!(
                 "duplicate snapshot entry for slot {slot} in {}",
                 path.display()
@@ -7066,6 +8974,1148 @@ fn read_epoch_hashes_file(path: &Path) -> Result<BTreeMap<Slot, SnapshotHash>, S
         }
     }
     Ok(expected)
+}
+
+fn write_epoch_hashes_file(
+    path: &Path,
+    expected: &BTreeMap<Slot, BankHashExpectation>,
+) -> Result<(), String> {
+    let mut contents = String::new();
+    for (slot, hash) in expected {
+        match hash {
+            BankHashExpectation::AccountsLtHash(hash) => {
+                contents.push_str(&format!("snapshot-{slot}-{}.tar.zst\n", hash.0));
+            }
+            BankHashExpectation::LegacyAccountsHash(hash) => {
+                contents.push_str(&format!("snapshot-{slot}-{hash}.tar.bz2\n"));
+            }
+        }
+    }
+    fs::write(path, contents).map_err(|err| format!("failed to write {}: {err}", path.display()))
+}
+
+fn snapshot_path_expectation(path: &Path) -> Result<(Slot, BankHashExpectation), String> {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| format!("snapshot path has no UTF-8 filename: {}", path.display()))?;
+    let (slot, hash) = parse_snapshot_archive_name(name)?;
+    let expectation = if name.ends_with(".tar.bz2") {
+        BankHashExpectation::LegacyAccountsHash(hash.0)
+    } else {
+        BankHashExpectation::AccountsLtHash(hash)
+    };
+    Ok((slot, expectation))
+}
+
+/// Adds registry-committed handoff snapshots to a canonical checkpoint set.
+/// A storage listing may omit an archive that we can deterministically export
+/// from the predecessor runtime; the registry hash remains the trust anchor.
+fn add_runtime_handoff_expectations(
+    range: std::ops::Range<Slot>,
+    expected: &mut BTreeMap<Slot, BankHashExpectation>,
+) -> Result<(), String> {
+    for handoff in compatibility::RUNTIME_HANDOFFS {
+        if !range.contains(&handoff.snapshot.slot) {
+            continue;
+        }
+        let hash = handoff.snapshot.accounts_hash()?;
+        let value = match handoff.snapshot.archive_extension {
+            ".tar.bz2" => BankHashExpectation::LegacyAccountsHash(hash),
+            ".tar.zst" | ".tar.lz4" => BankHashExpectation::AccountsLtHash(SnapshotHash(hash)),
+            extension => {
+                return Err(format!(
+                    "runtime handoff at slot {} uses unsupported snapshot extension {extension:?}",
+                    handoff.boundary_slot
+                ));
+            }
+        };
+        match expected.get(&handoff.snapshot.slot) {
+            Some(existing) if *existing != value => {
+                return Err(format!(
+                    "canonical snapshot listing conflicts with the runtime registry at handoff slot {}: listing={existing:?}, registry={value:?}",
+                    handoff.snapshot.slot
+                ));
+            }
+            Some(_) => {}
+            None => {
+                info!(
+                    "adding registry-committed handoff checkpoint {}",
+                    handoff.snapshot.archive_name()
+                );
+                expected.insert(handoff.snapshot.slot, value);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Restricts a canonical epoch checkpoint list to one focused qualification
+/// span. The bootstrap filename must itself be present in the trusted list,
+/// and at least one independently generated checkpoint must follow it.
+fn qualification_expectations(
+    mut expected: BTreeMap<Slot, BankHashExpectation>,
+    plan: QualificationPlan,
+    snapshot_archive: &Path,
+) -> Result<BTreeMap<Slot, BankHashExpectation>, String> {
+    let (snapshot_slot, snapshot_expectation) = snapshot_path_expectation(snapshot_archive)?;
+    if snapshot_slot != plan.bootstrap_slot {
+        return Err(format!(
+            "qualification snapshot changed after CLI validation: expected slot {}, got {snapshot_slot}",
+            plan.bootstrap_slot
+        ));
+    }
+    match expected.get(&snapshot_slot) {
+        Some(expected_hash) if *expected_hash == snapshot_expectation => {}
+        Some(expected_hash) => {
+            return Err(format!(
+                "qualification snapshot {} does not match the canonical checkpoint entry at slot {snapshot_slot}: file={snapshot_expectation:?}, checkpoint={expected_hash:?}",
+                snapshot_archive.display()
+            ));
+        }
+        None => {
+            return Err(format!(
+                "qualification snapshot slot {snapshot_slot} is absent from the supplied checkpoint file"
+            ));
+        }
+    }
+
+    expected.retain(|slot, _| (plan.bootstrap_slot..=plan.end_inclusive).contains(slot));
+    let post_bootstrap = expected
+        .range(plan.replay_start..=plan.end_inclusive)
+        .count();
+    if post_bootstrap == 0 {
+        return Err(format!(
+            "qualification requires a canonical checkpoint in replay range {}..={}; none was supplied",
+            plan.replay_start, plan.end_inclusive
+        ));
+    }
+    Ok(expected)
+}
+
+fn runtime_segment_work_dir(final_output: &Path) -> Result<PathBuf, String> {
+    let name = final_output.file_name().ok_or_else(|| {
+        format!(
+            "multi-runtime output path has no filename: {}",
+            final_output.display()
+        )
+    })?;
+    let mut directory_name = OsString::from(".");
+    directory_name.push(name);
+    directory_name.push(".runtime-segments");
+    Ok(final_output.with_file_name(directory_name))
+}
+
+fn runtime_segment_archive_path(
+    work_dir: &Path,
+    epoch: u64,
+    index: usize,
+    span: &compatibility::RuntimeSpan,
+) -> PathBuf {
+    work_dir.join(format!(
+        "epoch-{epoch}.segment-{index:02}-{}-{}.jet",
+        span.slots.start, span.slots.end
+    ))
+}
+
+/// Removes private segment sources after complete pairs have been re-admitted
+/// against the active registry. The only accepted partial state is an archive
+/// whose sidecar was already removed by an interrupted invocation of this
+/// function. Unknown entries, links, and sidecar-only pairs fail closed, so a
+/// retry never broadens deletion beyond the exact files the supervisor named.
+fn cleanup_runtime_segment_work_dir(
+    work_dir: &Path,
+    epoch: u64,
+    spans: &[compatibility::RuntimeSpan],
+) -> Result<(), String> {
+    if env_truthy_default("JETSTREAMER_RETAIN_RUNTIME_SEGMENTS", false) {
+        info!(
+            "retaining verified runtime segment artifacts in {}",
+            work_dir.display()
+        );
+        return Ok(());
+    }
+
+    let work_metadata = match fs::symlink_metadata(work_dir) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(format!(
+                "failed to inspect runtime segment work directory {}: {error}",
+                work_dir.display()
+            ));
+        }
+    };
+    if !work_metadata.file_type().is_dir() {
+        return Err(format!(
+            "refusing to clean non-directory runtime segment work path {}",
+            work_dir.display()
+        ));
+    }
+
+    let mut expected = HashSet::with_capacity(spans.len() * 2);
+    let mut expected_pairs = Vec::with_capacity(spans.len());
+    for (index, span) in spans.iter().enumerate() {
+        let archive = runtime_segment_archive_path(work_dir, epoch, index, span);
+        let sidecar = jetstreamer_node::segment_manifest::segment_manifest_path(&archive).map_err(
+            |error| {
+                format!(
+                    "failed to resolve runtime segment sidecar for {}: {error}",
+                    archive.display()
+                )
+            },
+        )?;
+        expected.insert(archive.clone());
+        expected.insert(sidecar.clone());
+        expected_pairs.push((span, archive, sidecar));
+    }
+
+    let mut actual = HashSet::with_capacity(expected.len());
+    for entry in fs::read_dir(work_dir)
+        .map_err(|error| format!("failed to read {}: {error}", work_dir.display()))?
+    {
+        let entry = entry.map_err(|error| {
+            format!(
+                "failed to read entry in runtime segment directory {}: {error}",
+                work_dir.display()
+            )
+        })?;
+        let path = entry.path();
+        let file_type = entry.file_type().map_err(|error| {
+            format!(
+                "failed to inspect runtime segment artifact {}: {error}",
+                path.display()
+            )
+        })?;
+        if !file_type.is_file() || !expected.contains(&path) {
+            return Err(format!(
+                "refusing to clean runtime segment directory {} with unexpected entry {}",
+                work_dir.display(),
+                path.display()
+            ));
+        }
+        actual.insert(path);
+    }
+
+    for (span, archive, sidecar) in &expected_pairs {
+        let archive_present = actual.contains(archive);
+        let sidecar_present = actual.contains(sidecar);
+        match (archive_present, sidecar_present) {
+            (true, true) => {
+                load_validated_runtime_segment(archive, epoch, span).map_err(|error| {
+                    format!(
+                        "refusing to clean unvalidated runtime segment {}: {error}",
+                        archive.display()
+                    )
+                })?;
+            }
+            (true, false) | (false, false) => {
+                // `cleanup_runtime_segment_work_dir` always removes a sidecar
+                // before its archive. These are its two durable partial
+                // states, and both contain only exact regular paths admitted
+                // by the directory scan above.
+            }
+            (false, true) => {
+                return Err(format!(
+                    "refusing to clean runtime segment directory {} with sidecar {} but no archive; this is not a valid cleanup state",
+                    work_dir.display(),
+                    sidecar.display()
+                ));
+            }
+        }
+    }
+
+    // Removing the sidecar first makes an interrupted cleanup archive
+    // ineligible for reuse. On retry the archive-only state above is safe to
+    // finish because it is an exact expected regular file in the private dir.
+    for (_, archive, sidecar) in expected_pairs {
+        if actual.contains(&sidecar) {
+            fs::remove_file(&sidecar)
+                .map_err(|error| format!("failed to remove {}: {error}", sidecar.display()))?;
+        }
+        if actual.contains(&archive) {
+            fs::remove_file(&archive)
+                .map_err(|error| format!("failed to remove {}: {error}", archive.display()))?;
+        }
+    }
+    fs::File::open(work_dir)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| format!("failed to sync {}: {error}", work_dir.display()))?;
+    fs::remove_dir(work_dir)
+        .map_err(|error| format!("failed to remove {}: {error}", work_dir.display()))?;
+    let parent = work_dir.parent().unwrap_or_else(|| Path::new("."));
+    fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| format!("failed to sync {}: {error}", parent.display()))?;
+    info!(
+        "removed verified private runtime segment artifacts from {}",
+        work_dir.display()
+    );
+    Ok(())
+}
+
+struct HandoffSnapshotExpectation {
+    source_runtime: SegmentRuntimeIdentity,
+    source_worker_executable_sha256: [u8; 32],
+}
+
+fn handoff_snapshot_expectation(
+    handoff: &compatibility::RuntimeHandoff,
+) -> Result<HandoffSnapshotExpectation, String> {
+    let selection =
+        compatibility::select_runtime(handoff.snapshot.slot..handoff.boundary_slot, true)?;
+    if !std::ptr::eq(selection.descriptor, handoff.source) {
+        return Err(format!(
+            "runtime registry selects {} at handoff slot {}, expected source {}",
+            selection.descriptor.identity.name, handoff.snapshot.slot, handoff.source.identity.name
+        ));
+    }
+    let executable = configured_historical_worker_executable(selection.descriptor)?;
+    let source_worker_executable_sha256 = historical::measure_executable_sha256(&executable)
+        .map_err(|error| {
+            format!(
+                "failed to measure configured handoff source worker {}: {error}",
+                executable.display()
+            )
+        })?;
+    Ok(HandoffSnapshotExpectation {
+        source_runtime: segment_runtime_identity(selection)?,
+        source_worker_executable_sha256,
+    })
+}
+
+fn handoff_snapshot_matches_predecessor(
+    manifest: &HistoricalHandoffSnapshotManifest,
+    predecessor: &ValidatedRuntimeSegment,
+) -> bool {
+    manifest.source_runtime == predecessor.manifest.runtime
+        && manifest.source_worker_executable_sha256 == predecessor.manifest.worker_executable_sha256
+        && manifest.terminal == predecessor.manifest.terminal
+}
+
+fn validate_canonical_handoff_snapshot_with_expectation(
+    path: &Path,
+    handoff: &compatibility::RuntimeHandoff,
+    expectation: &HandoffSnapshotExpectation,
+) -> Result<HistoricalHandoffSnapshotManifest, String> {
+    let expected_name = handoff.snapshot.archive_name();
+    if path.file_name().and_then(|name| name.to_str()) != Some(expected_name.as_str()) {
+        return Err(format!(
+            "handoff snapshot path {} does not name registry object {expected_name}",
+            path.display()
+        ));
+    }
+    let (slot, hash) = parse_snapshot_archive_name(&expected_name)?;
+    if slot != handoff.snapshot.slot || hash.0 != handoff.snapshot.accounts_hash()? {
+        return Err(format!(
+            "handoff snapshot identity does not match the runtime registry: {expected_name}"
+        ));
+    }
+    let manifest = read_and_validate_handoff_snapshot_manifest(path).map_err(|error| {
+        format!(
+            "handoff snapshot pair {} failed durable validation: {error}",
+            path.display()
+        )
+    })?;
+    if manifest.boundary_slot != handoff.boundary_slot
+        || manifest.snapshot_slot != handoff.snapshot.slot
+        || manifest.accounts_hash != handoff.snapshot.accounts_hash_base58
+        || manifest.source_runtime != expectation.source_runtime
+        || manifest.source_worker_executable_sha256 != expectation.source_worker_executable_sha256
+        || manifest.terminal.slot != handoff.snapshot.slot
+        || manifest.terminal.accounts_hash != handoff.snapshot.accounts_hash_base58
+        || !manifest.terminal.slot_complete
+    {
+        return Err(format!(
+            "handoff snapshot evidence {} does not match the active runtime registry, source worker, or canonical checkpoint",
+            handoff_snapshot_manifest_path(path)
+                .map_err(|error| error.to_string())?
+                .display()
+        ));
+    }
+    Ok(manifest)
+}
+
+fn validate_canonical_handoff_snapshot(
+    path: &Path,
+    handoff: &compatibility::RuntimeHandoff,
+) -> Result<HistoricalHandoffSnapshotManifest, String> {
+    let expectation = handoff_snapshot_expectation(handoff)?;
+    validate_canonical_handoff_snapshot_with_expectation(path, handoff, &expectation)
+}
+
+fn registered_handoff_bootstrap(
+    descriptor: &compatibility::RuntimeDescriptor,
+    path: &Path,
+) -> Result<Option<HistoricalHandoffSnapshotManifest>, String> {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return Err(format!(
+            "snapshot path has no UTF-8 filename: {}",
+            path.display()
+        ));
+    };
+    let Some(handoff) = compatibility::RUNTIME_HANDOFFS
+        .iter()
+        .copied()
+        .find(|handoff| {
+            std::ptr::eq(handoff.destination, descriptor) && handoff.snapshot.archive_name() == name
+        })
+    else {
+        return Ok(None);
+    };
+    validate_canonical_handoff_snapshot(path, handoff).map(Some)
+}
+
+fn path_exists_without_following(path: &Path) -> Result<bool, String> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!("failed to inspect {}: {error}", path.display())),
+    }
+}
+
+/// Moves every present member of a handoff archive/evidence pair to unique,
+/// recoverable names without following either path.
+fn preserve_handoff_snapshot_pair(path: &Path) -> Result<Vec<(PathBuf, PathBuf)>, String> {
+    let sidecar = handoff_snapshot_manifest_path(path).map_err(|error| error.to_string())?;
+    let archive_present = path_exists_without_following(path)?;
+    let sidecar_present = path_exists_without_following(&sidecar)?;
+    if !archive_present && !sidecar_present {
+        return Ok(Vec::new());
+    }
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let archive_name = path
+        .file_name()
+        .ok_or_else(|| format!("handoff snapshot has no filename: {}", path.display()))?;
+    for sequence in 0..100u32 {
+        let mut quarantine_name = archive_name.to_os_string();
+        quarantine_name.push(format!(
+            ".replaced-{}-{timestamp}-{sequence}",
+            std::process::id()
+        ));
+        let quarantine = parent.join(quarantine_name);
+        match fs::create_dir(&quarantine) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(format!(
+                    "failed to create handoff quarantine {}: {error}",
+                    quarantine.display()
+                ));
+            }
+        }
+        let archive_backup = quarantine.join(archive_name);
+        let sidecar_name = sidecar
+            .file_name()
+            .ok_or_else(|| format!("handoff evidence has no filename: {}", sidecar.display()))?;
+        let sidecar_backup = quarantine.join(sidecar_name);
+        let mut moved = Vec::with_capacity(2);
+        // Move the evidence first. If moving the archive then fails, put the
+        // evidence back so the canonical namespace does not retain a split
+        // pair because of a normal filesystem error.
+        if sidecar_present {
+            fs::rename(&sidecar, &sidecar_backup).map_err(|error| {
+                let _ = fs::remove_dir(&quarantine);
+                format!(
+                    "failed to preserve handoff evidence {} as {}: {error}",
+                    sidecar.display(),
+                    sidecar_backup.display()
+                )
+            })?;
+            moved.push((sidecar.clone(), sidecar_backup.clone()));
+        }
+        if archive_present && let Err(error) = fs::rename(path, &archive_backup) {
+            let rollback = if sidecar_present {
+                fs::rename(&sidecar_backup, &sidecar).err()
+            } else {
+                None
+            };
+            let _ = fs::remove_dir(&quarantine);
+            return Err(match rollback {
+                Some(rollback) => format!(
+                    "failed to preserve handoff snapshot {} as {}: {error}; also failed to restore evidence {}: {rollback}",
+                    path.display(),
+                    archive_backup.display(),
+                    sidecar.display()
+                ),
+                None => format!(
+                    "failed to preserve handoff snapshot {} as {}: {error}",
+                    path.display(),
+                    archive_backup.display()
+                ),
+            });
+        }
+        if archive_present {
+            moved.push((path.to_path_buf(), archive_backup));
+        }
+        fs::File::open(&quarantine)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| {
+                format!(
+                    "failed to sync handoff quarantine {}: {error}",
+                    quarantine.display()
+                )
+            })?;
+        fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| format!("failed to sync {}: {error}", parent.display()))?;
+        return Ok(moved);
+    }
+    Err(format!(
+        "could not choose a unique backup name for handoff pair {}",
+        path.display()
+    ))
+}
+
+fn remove_quarantined_handoff_snapshot_pair(moved: Vec<(PathBuf, PathBuf)>) -> Result<(), String> {
+    if moved.len() != 2 {
+        return Err(format!(
+            "handoff pair quarantine moved {} artifacts, expected exactly two",
+            moved.len()
+        ));
+    }
+    let quarantine = moved[0]
+        .1
+        .parent()
+        .ok_or_else(|| "quarantined handoff artifact has no parent directory".to_string())?
+        .to_path_buf();
+    if moved
+        .iter()
+        .any(|(_, backup)| backup.parent() != Some(quarantine.as_path()))
+    {
+        return Err("quarantined handoff artifacts do not share one directory".to_string());
+    }
+    for (_, backup) in moved {
+        fs::remove_file(&backup)
+            .map_err(|error| format!("failed to prune {}: {error}", backup.display()))?;
+    }
+    fs::remove_dir(&quarantine)
+        .map_err(|error| format!("failed to remove {}: {error}", quarantine.display()))?;
+    Ok(())
+}
+
+/// Prunes one completed range child's bootstrap artifact without splitting a
+/// generated handoff archive from its durable evidence. A registered handoff
+/// pair is validated, quarantined as a unit, and only then removed; an unknown
+/// companion fails closed.
+fn prune_epoch_boundary_snapshot(
+    path: &Path,
+    descriptor: &compatibility::RuntimeDescriptor,
+) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
+        format!(
+            "failed to inspect boundary snapshot {}: {error}",
+            path.display()
+        )
+    })?;
+    if !metadata.file_type().is_file() {
+        return Err(format!(
+            "refusing to prune non-regular boundary snapshot {}",
+            path.display()
+        ));
+    }
+    let sidecar = handoff_snapshot_manifest_path(path).map_err(|error| error.to_string())?;
+    if path_exists_without_following(&sidecar)? {
+        if registered_handoff_bootstrap(descriptor, path)?.is_none() {
+            return Err(format!(
+                "refusing to prune boundary snapshot {} with an unregistered handoff companion {}",
+                path.display(),
+                sidecar.display()
+            ));
+        }
+        let moved = preserve_handoff_snapshot_pair(path)?;
+        remove_quarantined_handoff_snapshot_pair(moved)?;
+    } else {
+        fs::remove_file(path)
+            .map_err(|error| format!("failed to prune {}: {error}", path.display()))?;
+    }
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| format!("failed to sync {}: {error}", parent.display()))?;
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HandoffSnapshotReadiness {
+    Missing,
+    Invalid,
+    Ready,
+}
+
+fn handoff_snapshot_needs_export(readiness: HandoffSnapshotReadiness) -> bool {
+    readiness != HandoffSnapshotReadiness::Ready
+}
+
+/// Re-observes the handoff immediately before a segment attempt. A ready pair
+/// must be bound to the exact validated predecessor segment; registry-valid but
+/// stale evidence is quarantined so replay regenerates it.
+fn prepare_handoff_snapshot_export(
+    successor_snapshot: Option<&(&compatibility::RuntimeHandoff, PathBuf)>,
+    predecessor: Option<&ValidatedRuntimeSegment>,
+) -> Result<bool, String> {
+    let Some((handoff, path)) = successor_snapshot else {
+        return Ok(false);
+    };
+    // Resolve configuration before classifying existing bytes. A missing or
+    // changed worker executable is a fatal setup error, not a reason to
+    // quarantine otherwise valid artifacts.
+    let expectation = handoff_snapshot_expectation(handoff)?;
+    let sidecar = handoff_snapshot_manifest_path(path).map_err(|error| error.to_string())?;
+    let archive_present = path_exists_without_following(path)?;
+    let sidecar_present = path_exists_without_following(&sidecar)?;
+    let readiness = match (archive_present, sidecar_present) {
+        (false, false) => HandoffSnapshotReadiness::Missing,
+        (true, true) => {
+            match validate_canonical_handoff_snapshot_with_expectation(path, handoff, &expectation)
+            {
+                Ok(manifest)
+                    if predecessor.is_some_and(|segment| {
+                        handoff_snapshot_matches_predecessor(&manifest, segment)
+                    }) =>
+                {
+                    HandoffSnapshotReadiness::Ready
+                }
+                Ok(_) => {
+                    let moved = preserve_handoff_snapshot_pair(path)?;
+                    warn!(
+                        "preserved stale handoff snapshot pair {} as {:?}: it is not bound to the exact validated predecessor segment",
+                        path.display(),
+                        moved
+                    );
+                    HandoffSnapshotReadiness::Invalid
+                }
+                Err(validation_error) => {
+                    let moved = preserve_handoff_snapshot_pair(path)?;
+                    warn!(
+                        "preserved invalid handoff snapshot pair {} as {:?}: {validation_error}",
+                        path.display(),
+                        moved
+                    );
+                    HandoffSnapshotReadiness::Invalid
+                }
+            }
+        }
+        state => {
+            let moved = preserve_handoff_snapshot_pair(path)?;
+            warn!(
+                "preserved incomplete handoff snapshot pair {} as {:?} (archive/sidecar presence: {state:?})",
+                path.display(),
+                moved
+            );
+            HandoffSnapshotReadiness::Invalid
+        }
+    };
+    Ok(handoff_snapshot_needs_export(readiness))
+}
+
+fn require_regular_file_or_absent(path: &Path, description: &str) -> Result<(), String> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => Ok(()),
+        Ok(_) => Err(format!(
+            "{description} path is neither absent nor a regular file: {}",
+            path.display()
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "failed to inspect {description} path {}: {error}",
+            path.display()
+        )),
+    }
+}
+
+fn verify_assembled_runtime_archive(
+    path: &Path,
+    epoch: u64,
+    provenance: &ArchiveProvenanceV3,
+) -> Result<(), String> {
+    let (epoch_start, epoch_end) = epoch_to_slot_range(epoch);
+    verify_assembled_runtime_archive_range(
+        path,
+        epoch,
+        epoch_start,
+        epoch_end - epoch_start + 1,
+        provenance,
+    )
+}
+
+fn verify_assembled_runtime_archive_range(
+    path: &Path,
+    epoch: u64,
+    expected_start: Slot,
+    expected_count: u64,
+    provenance: &ArchiveProvenanceV3,
+) -> Result<(), String> {
+    let file = fs::File::open(path)
+        .map_err(|err| format!("failed to open assembled archive {}: {err}", path.display()))?;
+    let mut reader =
+        jetstreamer_horizon::archive::ArchiveReader::open(std::io::BufReader::new(file))
+            .map_err(|err| format!("failed to open assembled archive {}: {err}", path.display()))?;
+    let header = reader.header().clone();
+    if header.epoch != epoch
+        || header.slot_start != expected_start
+        || header.slot_count != expected_count
+    {
+        return Err(format!(
+            "assembled archive {} has unexpected header epoch={} slots={}+{}",
+            path.display(),
+            header.epoch,
+            header.slot_start,
+            header.slot_count
+        ));
+    }
+    let recorded = reader
+        .provenance()
+        .map_err(|err| {
+            format!(
+                "assembled archive {} has invalid provenance: {err}",
+                path.display()
+            )
+        })?
+        .ok_or_else(|| format!("assembled archive {} has no provenance", path.display()))?;
+    if recorded != ArchiveProvenance::V3(provenance.clone()) {
+        return Err(format!(
+            "assembled archive {} provenance changed during publication",
+            path.display()
+        ));
+    }
+    reader.verify_chain = true;
+    let mut digest = SemanticDigest::new();
+    let mut visited = 0u64;
+    for bucket in 0..reader.bucket_count() {
+        visited = visited
+            .checked_add(reader.read_bucket(bucket, &mut digest).map_err(|err| {
+                format!(
+                    "assembled archive {} failed full decode: {err}",
+                    path.display()
+                )
+            })?)
+            .ok_or_else(|| "assembled archive decoded slot count overflow".to_string())?;
+    }
+    digest
+        .finish()
+        .map_err(|err| format!("assembled archive semantic verification failed: {err}"))?;
+    if visited != expected_count {
+        return Err(format!(
+            "assembled archive {} decoded {visited} slots, expected {expected_count}",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn preserve_existing_output(path: &Path) -> Result<Option<PathBuf>, String> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(format!("failed to inspect {}: {err}", path.display())),
+    };
+    if !metadata.file_type().is_file() {
+        return Err(format!(
+            "refusing to replace non-regular output path {}",
+            path.display()
+        ));
+    }
+    let name = path
+        .file_name()
+        .ok_or_else(|| format!("output path has no filename: {}", path.display()))?;
+    for sequence in 0..100u32 {
+        let mut backup_name = name.to_os_string();
+        backup_name.push(format!(
+            ".replaced-{}-{}-{sequence}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+        ));
+        let backup = path.with_file_name(backup_name);
+        if backup.exists() {
+            continue;
+        }
+        fs::rename(path, &backup).map_err(|err| {
+            format!(
+                "failed to preserve existing output {} as {}: {err}",
+                path.display(),
+                backup.display()
+            )
+        })?;
+        if let Ok(sidecar) = jetstreamer_node::segment_manifest::segment_manifest_path(path)
+            && sidecar.exists()
+            && let Some(backup_name) = backup.file_name()
+        {
+            let mut backup_sidecar_name = backup_name.to_os_string();
+            backup_sidecar_name.push(jetstreamer_node::segment_manifest::SEGMENT_MANIFEST_SUFFIX);
+            let backup_sidecar = backup.with_file_name(backup_sidecar_name);
+            fs::rename(&sidecar, &backup_sidecar).map_err(|err| {
+                format!(
+                    "preserved {} but failed to preserve its sidecar {}: {err}",
+                    path.display(),
+                    sidecar.display()
+                )
+            })?;
+        }
+        return Ok(Some(backup));
+    }
+    Err(format!(
+        "could not choose a collision-free backup name for {}",
+        path.display()
+    ))
+}
+
+/// Runs and assembles every runtime span inside one epoch. Segment archives
+/// and manifests remain in a private adjacent directory until the complete V3
+/// output is verified and atomically published, so interruption is resumable.
+#[allow(clippy::too_many_arguments)]
+async fn run_multi_runtime_epoch_supervisor(
+    epoch: u64,
+    dest_dir: &Path,
+    initial_snapshot: &Path,
+    epoch_hashes: &Path,
+    final_output: &Path,
+    allow_candidate_runtime: bool,
+    shutdown: Arc<AtomicBool>,
+) -> Result<(), String> {
+    let (epoch_start, epoch_end) = epoch_to_slot_range(epoch);
+    let spans = compatibility::plan_runtime_spans(
+        epoch_start..epoch_end.saturating_add(1),
+        allow_candidate_runtime,
+    )?;
+    if spans.len() < 2 {
+        return Err(format!(
+            "epoch {epoch} does not cross a registered runtime boundary"
+        ));
+    }
+    let work_dir = runtime_segment_work_dir(final_output)?;
+    match epoch_archive_reusable_multi_runtime(final_output, epoch, &spans) {
+        Ok(true) => {
+            cleanup_runtime_segment_work_dir(&work_dir, epoch, &spans)?;
+            info!(
+                "multi-runtime epoch {epoch} archive {} is already complete",
+                final_output.display()
+            );
+            return Ok(());
+        }
+        Ok(false) => {}
+        Err(err) => warn!(
+            "existing output {} is not reusable and will be preserved after replacement: {err}",
+            final_output.display()
+        ),
+    }
+    if !epoch_hashes.is_file() {
+        return Err(format!(
+            "multi-runtime epoch {epoch} requires a local checkpoint file: {}",
+            epoch_hashes.display()
+        ));
+    }
+    fs::create_dir_all(&work_dir)
+        .map_err(|err| format!("failed to create {}: {err}", work_dir.display()))?;
+    let work_metadata = fs::symlink_metadata(&work_dir)
+        .map_err(|err| format!("failed to inspect {}: {err}", work_dir.display()))?;
+    if !work_metadata.file_type().is_dir() {
+        return Err(format!(
+            "runtime segment work path is not a real directory: {}",
+            work_dir.display()
+        ));
+    }
+    let exe =
+        env::current_exe().map_err(|err| format!("failed to resolve current executable: {err}"))?;
+    let attempts = env::var("JETSTREAMER_SEGMENT_ATTEMPTS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .filter(|attempts| *attempts > 0)
+        .unwrap_or(2);
+    let mut regenerated_handoffs = HashSet::new();
+    let source_paths = 'segment_pass: loop {
+        let mut source_paths = Vec::with_capacity(spans.len());
+        for (index, span) in spans.iter().enumerate() {
+            if shutdown.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+            let selection = runtime_span_selection(span)?;
+            let bootstrap = if index == 0 {
+                initial_snapshot.to_path_buf()
+            } else {
+                let handoff = span.handoff.ok_or_else(|| {
+                    format!(
+                        "runtime span {}..{} has no bootstrap handoff",
+                        span.slots.start, span.slots.end
+                    )
+                })?;
+                dest_dir.join(handoff.snapshot.archive_name())
+            };
+            let bootstrap_handoff_manifest = if index > 0 {
+                Some(validate_canonical_handoff_snapshot(
+                    &bootstrap,
+                    span.handoff.expect("checked above"),
+                )?)
+            } else {
+                None
+            };
+            validate_runtime_bootstrap_archive(selection.descriptor, &bootstrap)?;
+
+            let archive_path = runtime_segment_archive_path(&work_dir, epoch, index, span);
+            require_regular_file_or_absent(&archive_path, "runtime segment archive")?;
+            let successor_snapshot = spans.get(index + 1).and_then(|successor| {
+                successor
+                    .handoff
+                    .map(|handoff| (handoff, dest_dir.join(handoff.snapshot.archive_name())))
+            });
+            let validated_segment = load_validated_runtime_segment(&archive_path, epoch, span);
+            let mut reusable = validated_segment.is_ok();
+            if let (Ok(segment), Some(handoff_manifest)) =
+                (&validated_segment, &bootstrap_handoff_manifest)
+                && segment.manifest.bootstrap_archive_sha256
+                    != Some(handoff_manifest.archive_sha256)
+            {
+                warn!(
+                    "epoch {epoch}: runtime segment {index} was produced from a different handoff snapshot and will be replayed"
+                );
+                reusable = false;
+            }
+            let successor_snapshot_needs_export = prepare_handoff_snapshot_export(
+                successor_snapshot.as_ref(),
+                reusable.then(|| {
+                    validated_segment
+                        .as_ref()
+                        .expect("reusable segment was validated")
+                }),
+            )?;
+            if successor_snapshot_needs_export {
+                // A completed segment is insufficient to recreate runtime state;
+                // replay it once more when its successor snapshot is missing.
+                reusable = false;
+            }
+            if reusable {
+                info!(
+                    "epoch {epoch}: runtime segment {index} {}..{} already verified",
+                    span.slots.start, span.slots.end
+                );
+                source_paths.push(archive_path);
+                continue;
+            }
+
+            let mut completed = false;
+            for attempt in 1..=attempts {
+                if shutdown.load(Ordering::SeqCst) {
+                    return Ok(());
+                }
+                // This attempt will replace the predecessor segment. Never
+                // carry an outgoing handoff bound to the previous bytes across
+                // that replacement; regenerate both pieces in the same run.
+                let needs_export_now =
+                    prepare_handoff_snapshot_export(successor_snapshot.as_ref(), None)?;
+                info!(
+                    "epoch {epoch}: spawning runtime segment {index} {}..{} with {} (attempt {attempt}/{attempts})",
+                    span.slots.start, span.slots.end, selection.descriptor.identity.name,
+                );
+                let mut command = Command::new(&exe);
+                command
+                    .env_remove("JETSTREAMER_EXPORT_HANDOFF_SNAPSHOT_DIR")
+                    .arg(epoch.to_string())
+                    .arg(dest_dir)
+                    .arg("--verify")
+                    .arg(format!("--qualification-end-slot={}", span.slots.end - 1));
+                let mut hashes_arg = OsString::from("--epoch-hashes=");
+                hashes_arg.push(epoch_hashes);
+                command.arg(hashes_arg);
+                let mut snapshot_arg = OsString::from("--snapshot-archive=");
+                snapshot_arg.push(&bootstrap);
+                command.arg(snapshot_arg);
+                let mut output_arg = OsString::from("--horizon-output=");
+                output_arg.push(&archive_path);
+                command.arg(output_arg);
+                if needs_export_now {
+                    command.env("JETSTREAMER_EXPORT_HANDOFF_SNAPSHOT_DIR", dest_dir);
+                }
+                let status = command.status().await.map_err(|err| {
+                    format!(
+                        "failed to spawn runtime segment child {}..{}: {err}",
+                        span.slots.start, span.slots.end
+                    )
+                })?;
+                if shutdown.load(Ordering::SeqCst) {
+                    return Ok(());
+                }
+                if status.success() {
+                    match load_validated_runtime_segment(&archive_path, epoch, span) {
+                        Ok(segment) => {
+                            if let Some((handoff, path)) = successor_snapshot.as_ref() {
+                                let manifest = validate_canonical_handoff_snapshot(path, handoff)?;
+                                if !handoff_snapshot_matches_predecessor(&manifest, &segment) {
+                                    let moved = preserve_handoff_snapshot_pair(path)?;
+                                    warn!(
+                                        "epoch {epoch}: runtime segment {index} produced handoff evidence that does not match its exact terminal checkpoint; preserved {:?} and retrying",
+                                        moved
+                                    );
+                                    continue;
+                                }
+                            }
+                            completed = true;
+                            break;
+                        }
+                        Err(err) => warn!(
+                            "epoch {epoch}: segment child exited successfully but evidence validation failed: {err}"
+                        ),
+                    }
+                } else {
+                    warn!("epoch {epoch}: runtime segment {index} child failed with {status}");
+                }
+            }
+            if !completed {
+                if let Some(handoff) = span.handoff
+                    && regenerated_handoffs.insert(handoff.boundary_slot)
+                {
+                    let quarantined = preserve_handoff_snapshot_pair(&bootstrap)?;
+                    if quarantined.is_empty() {
+                        warn!(
+                            "epoch {epoch}: handoff snapshot {} disappeared after successor runtime failure; regenerating it once from {}",
+                            bootstrap.display(),
+                            handoff.source.identity.name,
+                        );
+                    } else {
+                        warn!(
+                            "epoch {epoch}: quarantined handoff snapshot pair {} as {:?} after successor runtime failed to load/replay; regenerating it once from {}",
+                            bootstrap.display(),
+                            quarantined,
+                            handoff.source.identity.name,
+                        );
+                    }
+                    continue 'segment_pass;
+                }
+                return Err(format!(
+                    "epoch {epoch} runtime segment {index} failed after {attempts} attempt(s)"
+                ));
+            }
+            source_paths.push(archive_path);
+        }
+        break source_paths;
+    };
+
+    let segments = source_paths
+        .iter()
+        .zip(&spans)
+        .map(|(path, span)| load_validated_runtime_segment(path, epoch, span))
+        .collect::<Result<Vec<_>, _>>()?;
+    let handoff_manifests = spans[1..]
+        .iter()
+        .map(|span| {
+            let handoff = span.handoff.ok_or_else(|| {
+                format!(
+                    "runtime span {}..{} has no registered handoff",
+                    span.slots.start, span.slots.end
+                )
+            })?;
+            validate_canonical_handoff_snapshot(
+                &dest_dir.join(handoff.snapshot.archive_name()),
+                handoff,
+            )
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let provenance = build_multi_runtime_provenance(epoch, &spans, &segments, &handoff_manifests)?;
+    let output_parent = final_output.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(output_parent)
+        .map_err(|err| format!("failed to create {}: {err}", output_parent.display()))?;
+    let temporary = tempfile::Builder::new()
+        .prefix(".jetstreamer-runtime-assembly-")
+        .suffix(".partial")
+        .tempfile_in(output_parent)
+        .map_err(|err| format!("failed to create assembly tempfile: {err}"))?;
+    let sink = temporary
+        .reopen()
+        .map_err(|err| format!("failed to open assembly tempfile: {err}"))?;
+    let sources = segments
+        .iter()
+        .map(|segment| {
+            let terminal_last_blockhash = segment
+                .manifest
+                .terminal
+                .last_blockhash_value()
+                .map_err(|error| {
+                    format!(
+                        "runtime segment {} has an invalid terminal last blockhash: {error}",
+                        segment.archive_path.display()
+                    )
+                })?;
+            fs::File::open(&segment.archive_path)
+                .map(std::io::BufReader::new)
+                .map(|reader| {
+                    RuntimeSegmentSource::new(
+                        reader,
+                        segment.manifest.archive_sha256,
+                        terminal_last_blockhash,
+                    )
+                })
+                .map_err(|err| {
+                    format!(
+                        "failed to open runtime segment {} for assembly: {err}",
+                        segment.archive_path.display()
+                    )
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let (sink, stats) =
+        merge_runtime_segments(sources, sink, ArchiveWriterConfig::default(), &provenance)
+            .map_err(|err| format!("verified runtime-segment assembly failed: {err}"))?;
+    sink.sync_all()
+        .map_err(|err| format!("failed to sync assembled archive: {err}"))?;
+    drop(sink);
+    verify_assembled_runtime_archive(temporary.path(), epoch, &provenance)?;
+    let preserved_output = preserve_existing_output(final_output)?;
+    if let Some(backup) = preserved_output.as_ref() {
+        warn!(
+            "preserved previous output {} as {}",
+            final_output.display(),
+            backup.display()
+        );
+    }
+    let published = match temporary.persist_noclobber(final_output) {
+        Ok(published) => published,
+        Err(error) => {
+            if let Some(backup) = preserved_output.as_ref()
+                && !final_output.exists()
+                && let Err(restore_error) = fs::rename(backup, final_output)
+            {
+                return Err(format!(
+                    "failed to publish assembled archive {}: {}; also failed to restore preserved output {}: {restore_error}",
+                    final_output.display(),
+                    error.error,
+                    backup.display()
+                ));
+            }
+            return Err(format!(
+                "failed to atomically publish assembled archive {}: {}",
+                final_output.display(),
+                error.error
+            ));
+        }
+    };
+    published
+        .sync_all()
+        .map_err(|err| format!("failed to sync {}: {err}", final_output.display()))?;
+    fs::File::open(output_parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|err| format!("failed to sync {}: {err}", output_parent.display()))?;
+    if !epoch_archive_reusable_multi_runtime(final_output, epoch, &spans)? {
+        return Err(format!(
+            "published archive {} did not pass final registry validation",
+            final_output.display()
+        ));
+    }
+    cleanup_runtime_segment_work_dir(&work_dir, epoch, &spans)?;
+    info!(
+        "epoch {epoch}: published verified multi-runtime archive {} (segments={}, slots={}, account_updates_rebased={}, bytes={})",
+        final_output.display(),
+        stats.source_archives,
+        stats.slots_merged,
+        stats.account_updates_rebased,
+        stats.output.bytes_written,
+    );
+    Ok(())
 }
 
 /// Runs each epoch of a range in its own child process (this same binary,
@@ -7081,6 +10131,7 @@ async fn run_epoch_range_supervisor(
     end_epoch: u64,
     dest_dir: &Path,
     verify_snapshots: bool,
+    allow_candidate_runtime: bool,
     shutdown: Arc<AtomicBool>,
     boundary_snapshots: BTreeMap<u64, PathBuf>,
 ) -> Result<(), String> {
@@ -7098,12 +10149,37 @@ async fn run_epoch_range_supervisor(
             info!("shutdown requested; stopping before epoch {epoch}");
             return Ok(());
         }
+        let (slot_start, slot_end_inclusive) = epoch_to_slot_range(epoch);
+        let slot_range = slot_start..slot_end_inclusive.saturating_add(1);
+        let spans = compatibility::plan_runtime_spans(slot_range.clone(), allow_candidate_runtime)?;
+        let selection = runtime_span_selection(
+            spans
+                .first()
+                .expect("runtime planner rejects empty epoch ranges"),
+        )?;
         let jet_path = dest_dir.join(format!("epoch-{epoch}.jet"));
-        if epoch_archive_complete(&jet_path) {
+        let reusable = if spans.len() == 1 {
+            epoch_archive_reusable(&jet_path, epoch, selection)?
+        } else {
+            match epoch_archive_reusable_multi_runtime(&jet_path, epoch, &spans) {
+                Ok(reusable) => reusable,
+                Err(err) => {
+                    warn!(
+                        "epoch {epoch}: pre-existing multi-runtime output {} is not reusable; regenerating it: {err}",
+                        jet_path.display()
+                    );
+                    false
+                }
+            }
+        };
+        if reusable {
             info!("epoch {epoch} already complete; skipping");
             continue;
         }
         let hashes_path = dest_dir.join(format!("epoch-hashes-{epoch}.txt"));
+        let snapshot_path = boundary_snapshots.get(&epoch).ok_or_else(|| {
+            format!("range supervisor has no staged boundary snapshot for epoch {epoch}")
+        })?;
         let mut attempt = 0u32;
         loop {
             attempt += 1;
@@ -7113,7 +10189,8 @@ async fn run_epoch_range_supervisor(
                 epoch - effective_start + 1
             );
             let mut cmd = Command::new(&exe);
-            cmd.arg(epoch.to_string())
+            cmd.env_remove("JETSTREAMER_EXPORT_HANDOFF_SNAPSHOT_DIR")
+                .arg(epoch.to_string())
                 .arg(dest_dir.as_os_str())
                 .arg(if verify_snapshots {
                     "--verify"
@@ -7124,6 +10201,9 @@ async fn run_epoch_range_supervisor(
             if verify_snapshots {
                 cmd.arg(format!("--epoch-hashes={}", hashes_path.display()));
             }
+            let mut snapshot_arg = OsString::from("--snapshot-archive=");
+            snapshot_arg.push(snapshot_path.as_os_str());
+            cmd.arg(snapshot_arg);
             let status = cmd
                 .status()
                 .await
@@ -7131,15 +10211,24 @@ async fn run_epoch_range_supervisor(
             // The epoch is done only if its `.jet` finalized — a child
             // interrupted by ctrl-c shuts down gracefully and exits 0 without
             // finishing, so the exit code alone can't be trusted.
-            if status.success() && epoch_archive_complete(&jet_path) {
+            let reusable = if !status.success() {
+                false
+            } else if spans.len() == 1 {
+                epoch_archive_reusable(&jet_path, epoch, selection)?
+            } else {
+                epoch_archive_reusable_multi_runtime(&jet_path, epoch, &spans)?
+            };
+            if status.success() && reusable {
                 info!("epoch {epoch} child completed");
                 let _ = fs::remove_file(&hashes_path);
                 if prune_snapshots && let Some(path) = boundary_snapshots.get(&epoch) {
-                    match fs::remove_file(path) {
-                        Ok(()) => info!("pruned boundary snapshot {}", path.display()),
+                    match prune_epoch_boundary_snapshot(path, selection.descriptor) {
+                        Ok(()) => {
+                            info!("pruned boundary snapshot artifacts for {}", path.display())
+                        }
                         Err(err) => {
                             warn!(
-                                "failed to prune boundary snapshot {}: {err}",
+                                "failed to prune boundary snapshot artifacts for {}: {err}",
                                 path.display()
                             )
                         }
@@ -7210,21 +10299,42 @@ async fn main() {
 
     let mut dest_dir_arg = None;
     let mut verify_snapshots = env_truthy_default("JETSTREAMER_VERIFY_SNAPSHOTS", true);
+    // Qualification requires a deliberate CLI opt-in, not merely the default
+    // value inherited from the environment.
+    let mut explicit_verify: Option<bool> = None;
     let mut horizon_output: Option<PathBuf> = None;
+    let mut qualification_end_slot: Option<Slot> = None;
     // Internal flags set by the range supervisor when spawning per-epoch
     // children: pre-fetched snapshot hashes (so the child never touches
     // gcloud) and the overall range for the child's overall-progress line.
     let mut epoch_hashes: Option<PathBuf> = None;
+    let mut snapshot_archive_override: Option<PathBuf> = None;
     let mut range_info: Option<(u64, u64)> = None;
     for arg in args {
         if arg == "--verify" {
             verify_snapshots = true;
+            explicit_verify = Some(true);
         } else if arg == "--no-verify" {
             verify_snapshots = false;
+            explicit_verify = Some(false);
         } else if let Some(path) = arg.strip_prefix("--horizon-output=") {
             horizon_output = Some(PathBuf::from(path));
+        } else if let Some(slot) = arg.strip_prefix("--qualification-end-slot=") {
+            if qualification_end_slot.is_some() {
+                eprintln!("duplicate --qualification-end-slot option");
+                exit(2);
+            }
+            match slot.parse::<Slot>() {
+                Ok(slot) => qualification_end_slot = Some(slot),
+                Err(err) => {
+                    eprintln!("invalid --qualification-end-slot '{slot}': {err}");
+                    exit(2);
+                }
+            }
         } else if let Some(path) = arg.strip_prefix("--epoch-hashes=") {
             epoch_hashes = Some(PathBuf::from(path));
+        } else if let Some(path) = arg.strip_prefix("--snapshot-archive=") {
+            snapshot_archive_override = Some(PathBuf::from(path));
         } else if let Some(spec) = arg.strip_prefix("--range-info=") {
             match parse_epoch_range(spec) {
                 Ok(range) => range_info = Some(range),
@@ -7268,7 +10378,77 @@ async fn main() {
         eprintln!("--epoch-hashes applies only to a single-epoch (child) invocation");
         exit(2);
     }
+    if snapshot_archive_override.is_some() && start_epoch != end_epoch {
+        eprintln!("--snapshot-archive applies only to a single-epoch (child) invocation");
+        exit(2);
+    }
+    if qualification_end_slot.is_some() && range_info.is_some() {
+        eprintln!("--qualification-end-slot cannot be combined with --range-info");
+        exit(2);
+    }
+    let qualification = match qualification_plan(
+        start_epoch,
+        end_epoch,
+        qualification_end_slot,
+        explicit_verify,
+        snapshot_archive_override.as_deref(),
+        epoch_hashes.as_deref(),
+        horizon_output.as_deref(),
+    ) {
+        Ok(plan) => plan,
+        Err(err) => {
+            eprintln!("error: {err}");
+            exit(2);
+        }
+    };
+    if let Some(plan) = qualification {
+        info!(
+            "focused qualification requested: epoch {}, bootstrap {}, replay {}..={}, output {}",
+            plan.epoch,
+            plan.bootstrap_slot,
+            plan.replay_start,
+            plan.end_inclusive,
+            horizon_output
+                .as_deref()
+                .expect("qualification output was validated")
+                .display()
+        );
+    }
     let horizon_output_override = horizon_output;
+
+    // Candidate admission is checked for the complete requested range before
+    // resume considers any existing output. This prevents a stale archive
+    // from bypassing the runtime policy simply because its footer is valid.
+    let allow_candidate_runtime = match strict_opt_in("JETSTREAMER_ALLOW_CANDIDATE_RUNTIME") {
+        Ok(value) => value,
+        Err(err) => {
+            eprintln!("error: {err}");
+            exit(2);
+        }
+    };
+    for epoch in start_epoch..=end_epoch {
+        let slot_range = runtime_slot_range(epoch, qualification);
+        let spans = match compatibility::plan_runtime_spans(slot_range, allow_candidate_runtime) {
+            Ok(spans) => spans,
+            Err(err) => {
+                eprintln!("error: epoch {epoch}: {err}");
+                exit(1);
+            }
+        };
+        for span in spans {
+            if span.execution.admission == compatibility::AdmissionLevel::Candidate
+                && !verify_snapshots
+            {
+                let selection = runtime_span_selection(&span)
+                    .expect("runtime planner cannot return an unsupported span");
+                eprintln!(
+                    "error: epoch {epoch}: candidate runtime profile {} requires snapshot verification; --no-verify is not allowed",
+                    selection.backend
+                );
+                exit(1);
+            }
+        }
+    }
 
     // Epoch-level resume for ranges: if an earlier run already finalized some
     // leading epochs (their `.jet` has a valid footer), skip them and restart at
@@ -7278,11 +10458,41 @@ async fn main() {
     // after a crash). Scoped to ranges so a single-epoch re-run still regenerates.
     let effective_start = if start_epoch != end_epoch {
         let mut first_incomplete = start_epoch;
-        while first_incomplete <= end_epoch
-            && epoch_archive_complete(&dest_dir.join(format!("epoch-{first_incomplete}.jet")))
-        {
-            println!("epoch {first_incomplete} already complete; skipping");
-            first_incomplete += 1;
+        while first_incomplete <= end_epoch {
+            let (slot_start, slot_end_inclusive) = epoch_to_slot_range(first_incomplete);
+            let spans = compatibility::plan_runtime_spans(
+                slot_start..slot_end_inclusive.saturating_add(1),
+                allow_candidate_runtime,
+            )
+            .expect("requested range was preflighted above");
+            let path = dest_dir.join(format!("epoch-{first_incomplete}.jet"));
+            let reusable = if spans.len() == 1 {
+                let selection = runtime_span_selection(&spans[0])
+                    .expect("runtime planner cannot return an unsupported span");
+                epoch_archive_reusable(&path, first_incomplete, selection)
+            } else {
+                match epoch_archive_reusable_multi_runtime(&path, first_incomplete, &spans) {
+                    Ok(reusable) => Ok(reusable),
+                    Err(err) => {
+                        warn!(
+                            "epoch {first_incomplete}: pre-existing multi-runtime output {} is not reusable; regenerating it: {err}",
+                            path.display()
+                        );
+                        Ok(false)
+                    }
+                }
+            };
+            match reusable {
+                Ok(true) => {
+                    println!("epoch {first_incomplete} already complete; skipping");
+                    first_incomplete += 1;
+                }
+                Ok(false) => break,
+                Err(err) => {
+                    eprintln!("error: {err}");
+                    exit(1);
+                }
+            }
         }
         if first_incomplete > end_epoch {
             println!(
@@ -7302,6 +10512,81 @@ async fn main() {
         start_epoch
     };
 
+    // Resolve execution semantics before touching snapshot state or the
+    // network.  The archive format has its own compatibility rules and must
+    // never be used as a proxy for the consensus runtime.  A range supervisor
+    // repeats this check in each child, so the selected era is always derived
+    // from the exact output slots that child owns.
+    if allow_candidate_runtime {
+        warn!(
+            "candidate historical runtimes enabled for differential replay; output remains \
+             non-canonical until every configured checkpoint passes"
+        );
+    }
+    for epoch in effective_start..=end_epoch {
+        let slot_range = runtime_slot_range(epoch, qualification);
+        match compatibility::plan_runtime_spans(slot_range.clone(), allow_candidate_runtime) {
+            Ok(runtime_spans) => {
+                for span in runtime_spans {
+                    let selection = runtime_span_selection(&span)
+                        .expect("runtime planner cannot return an unsupported span");
+                    if selection.admission == compatibility::AdmissionLevel::Candidate
+                        && !verify_snapshots
+                    {
+                        eprintln!(
+                            "error: epoch {epoch}: candidate runtime profile {} requires snapshot verification; --no-verify is not allowed",
+                            selection.backend
+                        );
+                        exit(1);
+                    }
+                    info!(
+                        "epoch {epoch}: selected execution profile {} ({:?}) from slots {}..{}",
+                        selection.backend, selection.admission, span.slots.start, span.slots.end
+                    );
+                    if let Some(artifact) = selection.backend.historical_artifact() {
+                        info!(
+                            "epoch {epoch}: historical artifact revision={} rust={} target={} genesis={}",
+                            artifact.upstream_revision,
+                            artifact.rust_toolchain,
+                            artifact.target,
+                            artifact.genesis_hash,
+                        );
+                    }
+                }
+                match compatibility::plan_replay(slot_range, allow_candidate_runtime) {
+                    Ok(segments) => {
+                        for segment in segments {
+                            info!(
+                                "epoch {epoch}: compatibility segment {}..{} input={:?} \
+                                 missing-status={:?} execution={} output={:?}",
+                                segment.slots.start,
+                                segment.slots.end,
+                                segment.input_metadata,
+                                segment.missing_transaction_status,
+                                segment.execution.name,
+                                segment.output,
+                            );
+                        }
+                    }
+                    Err(err) => {
+                        eprintln!("error: epoch {epoch}: {err}");
+                        exit(1);
+                    }
+                }
+            }
+            Err(err) => {
+                eprintln!("error: epoch {epoch}: {err}");
+                exit(1);
+            }
+        }
+    }
+    let effective_runtime = bootstrap_runtime_selection(
+        runtime_slot_range(effective_start, qualification),
+        allow_candidate_runtime,
+    )
+    .expect("requested range was preflighted above");
+    let effective_archive_extensions = effective_runtime.descriptor.bootstrap.archive_extensions;
+
     // Replay mutates the unpacked snapshot state in place (new appendvecs,
     // accounts index), so a crashed run leaves the staging dirs dirty.
     // Start every run from a clean unpack of the retained snapshot archive;
@@ -7317,7 +10602,9 @@ async fn main() {
 
     // The snapshot bootstraps only the first epoch actually run (effective_start);
     // later epochs in a range chain off the in-memory bank.
-    let target_slot = epoch_to_slot(effective_start).saturating_sub(1);
+    let target_slot = qualification
+        .map(|plan| plan.bootstrap_slot)
+        .unwrap_or_else(|| epoch_to_slot(effective_start).saturating_sub(1));
     // A local snapshot only bootstraps `effective_start` cheaply if it lands
     // within the previous epoch (at or after the start of `effective_start - 1`).
     // Anything older is still usable, but it forces a warmup replay across every
@@ -7327,9 +10614,43 @@ async fn main() {
     // only bounds the candidate from above (slot <= target_slot), so a leftover
     // snapshot from the prior epoch's run gets picked up here; reject it and
     // download the real boundary snapshot instead.
-    let min_snapshot_slot = epoch_to_slot(effective_start.saturating_sub(1));
-    let existing_snapshot = match find_existing_snapshot_archive(&dest_dir, target_slot) {
-        Ok(Some(candidate)) if candidate.slot < min_snapshot_slot => {
+    let min_snapshot_slot = qualification
+        .map(|plan| plan.bootstrap_slot)
+        .unwrap_or_else(|| epoch_to_slot(effective_start.saturating_sub(1)));
+    let discovered_snapshot = match snapshot_archive_override {
+        Some(path) => match snapshot_archive_candidate(path) {
+            Ok(candidate) => Some(candidate),
+            Err(err) => {
+                eprintln!("error: {err}");
+                exit(1);
+            }
+        },
+        None => match find_existing_snapshot_archive(
+            &dest_dir,
+            target_slot,
+            effective_archive_extensions,
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => {
+                eprintln!("error: {err}");
+                exit(1);
+            }
+        },
+    };
+    let existing_snapshot = match discovered_snapshot {
+        Some(candidate)
+            if qualification.is_some_and(|plan| candidate.slot != plan.bootstrap_slot) =>
+        {
+            eprintln!(
+                "error: qualification snapshot resolved to slot {}, expected {}",
+                candidate.slot,
+                qualification
+                    .expect("qualification guard established a plan")
+                    .bootstrap_slot
+            );
+            exit(1);
+        }
+        Some(candidate) if candidate.slot < min_snapshot_slot => {
             println!(
                 "Ignoring snapshot {} at slot {}: epoch {} needs a snapshot at or after slot {} \
                  (reusing it would warm up across {} slots); downloading the boundary snapshot",
@@ -7341,11 +10662,7 @@ async fn main() {
             );
             None
         }
-        Ok(other) => other,
-        Err(err) => {
-            eprintln!("error: {err}");
-            exit(1);
-        }
+        other => other,
     };
     let mut extracted_snapshot = false;
     let dest_path = match existing_snapshot {
@@ -7383,7 +10700,13 @@ async fn main() {
                 );
                 exit(1);
             }
-            match download_snapshot_at_or_before_slot(effective_start, target_slot, &dest_dir).await
+            match download_snapshot_at_or_before_slot_matching(
+                effective_start,
+                target_slot,
+                &dest_dir,
+                effective_archive_extensions,
+            )
+            .await
             {
                 Ok(path) => {
                     println!("Downloaded snapshot to {}", path.display());
@@ -7396,6 +10719,16 @@ async fn main() {
             }
         }
     };
+    if let Err(err) = validate_runtime_bootstrap_archive(effective_runtime.descriptor, &dest_path) {
+        eprintln!("error: {err}");
+        exit(1);
+    }
+    if qualification.is_none()
+        && let Err(err) = validate_epoch_bootstrap_snapshot(effective_start, &dest_path)
+    {
+        eprintln!("error: {err}");
+        exit(1);
+    }
 
     if !env_truthy("JETSTREAMER_LOAD_FROM_DIR") {
         // The default archive loader unpacks into its own staging
@@ -7434,8 +10767,24 @@ async fn main() {
     // gcloud/GCS session is fresh (a range runs for days; mid-run gcloud access
     // is forbidden). `dest_path` above already covers `effective_start`.
     let total_epochs = end_epoch - effective_start + 1;
-    let epoch_isolation =
-        total_epochs > 1 && env_truthy_default("JETSTREAMER_EPOCH_ISOLATION", true);
+    let configured_epoch_isolation = env_truthy_default("JETSTREAMER_EPOCH_ISOLATION", true);
+    let (epoch_isolation, forced_multi_runtime_epoch) = match epoch_isolation_plan(
+        effective_start,
+        end_epoch,
+        configured_epoch_isolation,
+        allow_candidate_runtime,
+    ) {
+        Ok(plan) => plan,
+        Err(err) => {
+            eprintln!("error: failed to plan epoch isolation: {err}");
+            exit(1);
+        }
+    };
+    if let Some(epoch) = forced_multi_runtime_epoch {
+        warn!(
+            "JETSTREAMER_EPOCH_ISOLATION=0 cannot chain range {effective_start}-{end_epoch} in one process because epoch {epoch} crosses an execution-runtime boundary; forcing per-epoch process isolation"
+        );
+    }
     let mut boundary_snapshots: BTreeMap<u64, PathBuf> = BTreeMap::new();
     if epoch_isolation {
         boundary_snapshots.insert(effective_start, dest_path.clone());
@@ -7445,7 +10794,19 @@ async fn main() {
             effective_start + 1
         );
         for epoch in effective_start + 1..=end_epoch {
-            match ensure_epoch_boundary_snapshot(epoch, &dest_dir).await {
+            let (slot_start, slot_end) = epoch_to_slot_range(epoch);
+            let selection = bootstrap_runtime_selection(
+                slot_start..slot_end.saturating_add(1),
+                allow_candidate_runtime,
+            )
+            .expect("requested range was preflighted above");
+            match ensure_epoch_boundary_snapshot(
+                epoch,
+                &dest_dir,
+                selection.descriptor.bootstrap.archive_extensions,
+            )
+            .await
+            {
                 Ok(path) => {
                     boundary_snapshots.insert(epoch, path);
                 }
@@ -7462,13 +10823,32 @@ async fn main() {
     // listing epoch N+1's snapshots mid-run risks a stale session aborting the
     // whole range long after the replay no longer needs the network. Empty when
     // verification is disabled.
-    let mut snapshot_expectations: BTreeMap<u64, BTreeMap<Slot, SnapshotHash>> = BTreeMap::new();
+    let mut snapshot_expectations: BTreeMap<u64, BTreeMap<Slot, BankHashExpectation>> =
+        BTreeMap::new();
     if verify_snapshots {
         if let Some(hashes_path) = &epoch_hashes {
             // Per-epoch child: the supervisor prefetched this epoch's hashes to
             // a file, so the child stays gcloud-free.
-            match read_epoch_hashes_file(hashes_path) {
-                Ok(expected) => {
+            match read_epoch_hashes_file(hashes_path, effective_archive_extensions) {
+                Ok(mut expected) => {
+                    if let Err(err) = add_runtime_handoff_expectations(
+                        runtime_slot_range(effective_start, qualification),
+                        &mut expected,
+                    ) {
+                        eprintln!("error: {err}");
+                        exit(1);
+                    }
+                    let expected = if let Some(plan) = qualification {
+                        match qualification_expectations(expected, plan, &dest_path) {
+                            Ok(expected) => expected,
+                            Err(err) => {
+                                eprintln!("error: {err}");
+                                exit(1);
+                            }
+                        }
+                    } else {
+                        expected
+                    };
                     info!(
                         "snapshot verification: {} snapshot hash(es) loaded from {}",
                         expected.len(),
@@ -7488,25 +10868,159 @@ async fn main() {
                  and local files ==="
             );
             for epoch in effective_start..=end_epoch {
-                info!("collecting canonical snapshot hashes for epoch {epoch}");
-                match snapshot_expectations_for_epoch(epoch).await {
-                    Ok(expected) => {
-                        info!(
-                            "snapshot verification: {} snapshot(s) prefetched for epoch {epoch}",
-                            expected.len()
-                        );
-                        snapshot_expectations.insert(epoch, expected);
+                let (epoch_start_slot, epoch_end_slot) = epoch_to_slot_range(epoch);
+                let selection = bootstrap_runtime_selection(
+                    epoch_start_slot..epoch_end_slot.saturating_add(1),
+                    allow_candidate_runtime,
+                )
+                .expect("requested range was preflighted above");
+                let archive_extensions = selection.descriptor.bootstrap.archive_extensions;
+                let boundary_path = boundary_snapshots
+                    .get(&epoch)
+                    .or_else(|| (epoch == effective_start).then_some(&dest_path));
+                let verification_start = match boundary_path {
+                    Some(path) => {
+                        let name = match path.file_name().and_then(|name| name.to_str()) {
+                            Some(name) => name,
+                            None => {
+                                eprintln!(
+                                    "error: snapshot path has no UTF-8 filename: {}",
+                                    path.display()
+                                );
+                                exit(1);
+                            }
+                        };
+                        match parse_snapshot_archive_name(name) {
+                            Ok((slot, _)) => slot,
+                            Err(err) => {
+                                eprintln!("error: {err}");
+                                exit(1);
+                            }
+                        }
                     }
+                    None => epoch_start_slot,
+                };
+                info!(
+                    "collecting canonical snapshot hashes for slots {}..={} (output epoch {epoch})",
+                    verification_start, epoch_end_slot
+                );
+                let mut expected = match snapshot_expectations_for_span(
+                    verification_start,
+                    epoch_end_slot,
+                    archive_extensions,
+                )
+                .await
+                {
+                    Ok(expected) => expected,
                     Err(err) => {
                         eprintln!("error: {err}");
                         exit(1);
                     }
+                };
+                if let Some(boundary_path) = boundary_path
+                    && is_legacy_snapshot_archive(boundary_path)
+                {
+                    match legacy_boundary_expectation(boundary_path) {
+                        Ok(boundary_expected) => {
+                            for (slot, hash) in boundary_expected {
+                                match expected.get(&slot) {
+                                    Some(existing) if *existing != hash => {
+                                        eprintln!(
+                                            "error: conflicting legacy snapshot hashes at slot \
+                                             {slot}: listing={existing:?} boundary={hash:?}"
+                                        );
+                                        exit(1);
+                                    }
+                                    Some(_) => {}
+                                    None => {
+                                        warn!(
+                                            "snapshot listing omitted boundary file {}; adding \
+                                             its legacy accounts hash at slot {slot}",
+                                            boundary_path.display()
+                                        );
+                                        expected.insert(slot, hash);
+                                    }
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            eprintln!("error: {err}");
+                            exit(1);
+                        }
+                    }
                 }
+                if let Err(err) = add_runtime_handoff_expectations(
+                    epoch_start_slot..epoch_end_slot.saturating_add(1),
+                    &mut expected,
+                ) {
+                    eprintln!("error: {err}");
+                    exit(1);
+                }
+                info!(
+                    "snapshot verification: {} snapshot(s) prefetched for epoch {epoch}",
+                    expected.len()
+                );
+                snapshot_expectations.insert(epoch, expected);
             }
             info!(
                 "=== gcloud/GCS prefetch complete; no further gcloud access for the rest of the run ==="
             );
         }
+    }
+
+    // A runtime transition inside one epoch cannot be represented by a bank
+    // carried across the process boundary: each historical Solana release is
+    // intentionally isolated in its own executable and dependency graph.
+    // Split the epoch into registry-owned qualification children, prove the
+    // canonical snapshot transition independently on both sides, and assemble
+    // their complete V2 archives into one V3 archive.
+    let effective_epoch_spans = compatibility::plan_runtime_spans(
+        runtime_slot_range(effective_start, qualification),
+        allow_candidate_runtime,
+    )
+    .expect("requested range was preflighted above");
+    if qualification.is_none() && effective_start == end_epoch && effective_epoch_spans.len() > 1 {
+        if !verify_snapshots {
+            eprintln!("error: multi-runtime epoch assembly requires --verify");
+            exit(1);
+        }
+        let hashes_path = match epoch_hashes.clone() {
+            Some(path) => path,
+            None => {
+                let path = dest_dir.join(format!(
+                    ".epoch-{effective_start}-runtime-segment-hashes.txt"
+                ));
+                let Some(expected) = snapshot_expectations.get(&effective_start) else {
+                    eprintln!(
+                        "error: no canonical checkpoint set was prepared for multi-runtime epoch {effective_start}"
+                    );
+                    exit(1);
+                };
+                if let Err(err) = write_epoch_hashes_file(&path, expected) {
+                    eprintln!("error: {err}");
+                    exit(1);
+                }
+                path
+            }
+        };
+        let final_output = horizon_output_override
+            .clone()
+            .unwrap_or_else(|| dest_dir.join(format!("epoch-{effective_start}.jet")));
+        if let Err(err) = run_multi_runtime_epoch_supervisor(
+            effective_start,
+            &dest_dir,
+            &dest_path,
+            &hashes_path,
+            &final_output,
+            allow_candidate_runtime,
+            shutdown.clone(),
+        )
+        .await
+        {
+            eprintln!("error: {err}");
+            exit(1);
+        }
+        return;
     }
 
     // Per-epoch process isolation: hand the prefetched hashes to disk (one file
@@ -7516,12 +11030,8 @@ async fn main() {
     if epoch_isolation {
         for (epoch, expected) in &snapshot_expectations {
             let path = dest_dir.join(format!("epoch-hashes-{epoch}.txt"));
-            let mut contents = String::new();
-            for (slot, hash) in expected {
-                contents.push_str(&format!("snapshot-{slot}-{}.tar.zst\n", hash.0));
-            }
-            if let Err(err) = fs::write(&path, contents) {
-                eprintln!("error: failed to write {}: {err}", path.display());
+            if let Err(err) = write_epoch_hashes_file(&path, expected) {
+                eprintln!("error: {err}");
                 exit(1);
             }
         }
@@ -7530,6 +11040,7 @@ async fn main() {
             end_epoch,
             &dest_dir,
             verify_snapshots,
+            allow_candidate_runtime,
             shutdown.clone(),
             boundary_snapshots,
         )
@@ -7544,7 +11055,7 @@ async fn main() {
     // Single-process fallback (JETSTREAMER_EPOCH_ISOLATION=0), or a per-epoch
     // child of the supervisor. A chained range replays each epoch in turn: the
     // first epoch loads the snapshot; each subsequent epoch reuses the
-    // in-memory bank handed back by the previous one (carried_bank_forks), so
+    // typed runtime state handed back by the previous one, so
     // there is no snapshot reload and no warmup between epochs. Verification
     // hashes were prefetched above; the `.jet` output path is resolved per
     // epoch.
@@ -7576,8 +11087,12 @@ async fn main() {
     // accounts-db notifier, created at the first epoch's load and carried with
     // the reused bank, captures this and keeps updating it for chained epochs —
     // otherwise their per-epoch counter stays at 0 and the stall watchdog aborts.
-    let shared_progress = Arc::new(ReplayProgress::new(epoch_to_slot_range(effective_start).0));
-    let mut carried_bank_forks: Option<Arc<RwLock<BankForks>>> = None;
+    let shared_progress = Arc::new(ReplayProgress::new(
+        qualification
+            .map(|plan| plan.replay_start)
+            .unwrap_or_else(|| epoch_to_slot_range(effective_start).0),
+    ));
+    let mut carried_state: Option<CarriedRuntimeState> = None;
     for epoch in effective_start..=end_epoch {
         if shutdown.load(Ordering::SeqCst) {
             info!("shutdown requested; stopping before epoch {epoch}");
@@ -7607,22 +11122,42 @@ async fn main() {
             None
         };
 
-        match run_geyser_replay(
+        let result = run_geyser_replay(
             epoch,
+            allow_candidate_runtime,
             &dest_dir,
             &dest_path,
             shutdown.clone(),
             cursor.clone(),
             restart_tracker.clone(),
             snapshot_verifier,
-            horizon_output,
-            carried_bank_forks.take(),
+            horizon_output.clone(),
+            qualification,
+            carried_state.take(),
             range_progress.clone(),
             Some(shared_progress.clone()),
         )
-        .await
-        {
-            Ok(bank_forks) => carried_bank_forks = Some(bank_forks),
+        .await;
+        match result {
+            Ok(result) => {
+                if let Some(plan) = qualification
+                    && result.historical_evidence.is_some()
+                {
+                    if let Err(err) = publish_historical_segment_manifest(
+                        epoch,
+                        plan,
+                        &horizon_output,
+                        &result,
+                        allow_candidate_runtime,
+                    ) {
+                        eprintln!("error: {err}");
+                        exit(1);
+                    }
+                } else if result.historical_evidence.is_some() {
+                    info!("historical replay evidence captured for epoch {epoch}");
+                }
+                carried_state = result.carried_state;
+            }
             Err(err) => {
                 eprintln!("error: {err}");
                 exit(1);
@@ -7632,9 +11167,885 @@ async fn main() {
 }
 
 #[cfg(test)]
+mod early_snapshot_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_bzip2_snapshot_format_is_classified_without_selecting_a_runtime() {
+        let hash = Hash::default();
+        let legacy = PathBuf::from(format!("snapshot-416012-{hash}.tar.bz2"));
+        let modern = PathBuf::from(format!("snapshot-416012-{hash}.tar.zst"));
+
+        assert!(is_legacy_snapshot_archive(&legacy));
+        assert!(!is_legacy_snapshot_archive(&modern));
+    }
+
+    #[test]
+    fn legacy_snapshot_filename_uses_accounts_hash_verification() {
+        let hash = Hash::new_unique();
+        let path = PathBuf::from(format!("snapshot-416012-{hash}.tar.bz2"));
+        let expected = legacy_boundary_expectation(&path).expect("valid legacy snapshot");
+
+        assert!(matches!(
+            expected.get(&416_012),
+            Some(BankHashExpectation::LegacyAccountsHash(actual)) if actual == &hash
+        ));
+    }
+
+    #[test]
+    fn snapshot_bootstrap_starts_after_the_snapshot() {
+        assert_eq!(initial_replay_slot(416_012, 432_000).unwrap(), 416_013);
+        assert!(initial_replay_slot(432_000, 432_000).is_err());
+        assert!(initial_replay_slot(432_001, 432_000).is_err());
+    }
+
+    #[test]
+    fn candidate_opt_in_rejects_unknown_spellings() {
+        assert!(!parse_strict_opt_in("CANDIDATE", None).unwrap());
+        assert!(parse_strict_opt_in("CANDIDATE", Some("yes")).unwrap());
+        assert!(!parse_strict_opt_in("CANDIDATE", Some("false")).unwrap());
+        assert!(parse_strict_opt_in("CANDIDATE", Some("off")).is_err());
+        assert!(parse_strict_opt_in("CANDIDATE", Some("tru")).is_err());
+    }
+
+    #[test]
+    fn epoch_range_rejects_slot_arithmetic_overflow() {
+        assert!(parse_epoch_range(&u64::MAX.to_string()).is_err());
+        assert_eq!(parse_epoch_range("1-10").unwrap(), (1, 10));
+    }
+
+    fn qualification_snapshot(slot: Slot, hash: Hash) -> PathBuf {
+        PathBuf::from(format!("snapshot-{slot}-{hash}.tar.bz2"))
+    }
+
+    #[test]
+    fn focused_qualification_uses_only_the_post_bootstrap_span() {
+        let snapshot = qualification_snapshot(515_912, Hash::new_unique());
+        let hashes = Path::new("epoch-hashes-1.txt");
+        let output = Path::new("qualification-515913-534248.jet");
+        let plan = qualification_plan(
+            1,
+            1,
+            Some(534_248),
+            Some(true),
+            Some(&snapshot),
+            Some(hashes),
+            Some(output),
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(plan.bootstrap_slot, 515_912);
+        assert_eq!(plan.replay_start, 515_913);
+        assert_eq!(plan.output_slot_start, 515_913);
+        assert_eq!(plan.end_inclusive, 534_248);
+        assert_eq!(plan.slot_count(), 18_336);
+        assert_eq!(runtime_slot_range(1, Some(plan)), 515_913..534_249);
+        assert_eq!(runtime_slot_range(1, None), 432_000..864_000);
+    }
+
+    #[test]
+    fn runtime_boundary_detection_forces_epoch_one_range_isolation() {
+        assert_eq!(
+            epoch_isolation_plan(1, 2, false, true).unwrap(),
+            (true, Some(1))
+        );
+        assert_eq!(
+            epoch_isolation_plan(2, 3, false, true).unwrap(),
+            (false, None)
+        );
+        assert_eq!(
+            epoch_isolation_plan(2, 3, true, true).unwrap(),
+            (true, None)
+        );
+        assert_eq!(
+            epoch_isolation_plan(1, 1, true, true).unwrap(),
+            (false, None)
+        );
+    }
+
+    #[test]
+    fn focused_qualification_requires_explicit_safe_inputs() {
+        let hash = Hash::new_unique();
+        let snapshot = qualification_snapshot(515_912, hash);
+        let hashes = Path::new("epoch-hashes-1.txt");
+        let output = Path::new("qualification.jet");
+
+        assert!(
+            qualification_plan(
+                1,
+                2,
+                Some(534_248),
+                Some(true),
+                Some(&snapshot),
+                Some(hashes),
+                Some(output),
+            )
+            .unwrap_err()
+            .contains("requires one epoch")
+        );
+        assert!(
+            qualification_plan(
+                1,
+                1,
+                Some(534_248),
+                None,
+                Some(&snapshot),
+                Some(hashes),
+                Some(output),
+            )
+            .unwrap_err()
+            .contains("explicit --verify")
+        );
+        assert!(
+            qualification_plan(
+                1,
+                1,
+                Some(534_248),
+                Some(true),
+                None,
+                Some(hashes),
+                Some(output),
+            )
+            .unwrap_err()
+            .contains("--snapshot-archive")
+        );
+        assert!(
+            qualification_plan(
+                1,
+                1,
+                Some(534_248),
+                Some(true),
+                Some(&snapshot),
+                None,
+                Some(output),
+            )
+            .unwrap_err()
+            .contains("--epoch-hashes")
+        );
+        assert!(
+            qualification_plan(
+                1,
+                1,
+                Some(534_248),
+                Some(true),
+                Some(&snapshot),
+                Some(hashes),
+                None,
+            )
+            .unwrap_err()
+            .contains("--horizon-output")
+        );
+        assert!(
+            qualification_plan(
+                1,
+                1,
+                Some(515_912),
+                Some(true),
+                Some(&snapshot),
+                Some(hashes),
+                Some(output),
+            )
+            .unwrap_err()
+            .contains("must be after bootstrap")
+        );
+
+        let previous_epoch_snapshot = qualification_snapshot(416_012, hash);
+        let previous_epoch_plan = qualification_plan(
+            1,
+            1,
+            Some(534_248),
+            Some(true),
+            Some(&previous_epoch_snapshot),
+            Some(hashes),
+            Some(output),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(previous_epoch_plan.bootstrap_slot, 416_012);
+        assert_eq!(previous_epoch_plan.replay_start, 416_013);
+        assert_eq!(previous_epoch_plan.output_slot_start, 432_000);
+        assert_eq!(previous_epoch_plan.slot_count(), 102_249);
+
+        assert!(
+            qualification_plan(
+                2,
+                2,
+                Some(900_000),
+                Some(true),
+                Some(&previous_epoch_snapshot),
+                Some(hashes),
+                Some(output),
+            )
+            .unwrap_err()
+            .contains("snapshot slot 416012 is outside the target or preceding epoch")
+        );
+    }
+
+    #[test]
+    fn focused_qualification_filters_and_requires_canonical_checkpoints() {
+        let bootstrap_hash = Hash::new_unique();
+        let post_hash = Hash::new_unique();
+        let snapshot = qualification_snapshot(515_912, bootstrap_hash);
+        let plan = QualificationPlan {
+            epoch: 1,
+            bootstrap_slot: 515_912,
+            replay_start: 515_913,
+            output_slot_start: 515_913,
+            end_inclusive: 534_248,
+        };
+        let expected = BTreeMap::from([
+            (
+                515_912,
+                BankHashExpectation::LegacyAccountsHash(bootstrap_hash),
+            ),
+            (534_248, BankHashExpectation::LegacyAccountsHash(post_hash)),
+            (
+                619_848,
+                BankHashExpectation::LegacyAccountsHash(Hash::new_unique()),
+            ),
+        ]);
+
+        let filtered = qualification_expectations(expected, plan, &snapshot).unwrap();
+        assert_eq!(filtered.len(), 2);
+        assert!(filtered.contains_key(&515_912));
+        assert!(filtered.contains_key(&534_248));
+        assert!(!filtered.contains_key(&619_848));
+
+        let bootstrap_only = BTreeMap::from([(
+            515_912,
+            BankHashExpectation::LegacyAccountsHash(bootstrap_hash),
+        )]);
+        assert!(
+            qualification_expectations(bootstrap_only, plan, &snapshot)
+                .unwrap_err()
+                .contains("requires a canonical checkpoint")
+        );
+
+        let wrong_bootstrap = BTreeMap::from([
+            (
+                515_912,
+                BankHashExpectation::LegacyAccountsHash(Hash::new_unique()),
+            ),
+            (534_248, BankHashExpectation::LegacyAccountsHash(post_hash)),
+        ]);
+        assert!(
+            qualification_expectations(wrong_bootstrap, plan, &snapshot)
+                .unwrap_err()
+                .contains("does not match the canonical checkpoint")
+        );
+    }
+
+    #[test]
+    fn candidate_checkpoint_gate_excludes_the_bootstrap_slot() {
+        let bootstrap_only = BTreeMap::from([(
+            416_012,
+            BankHashExpectation::LegacyAccountsHash(Hash::new_unique()),
+        )]);
+        let verifier = SnapshotVerifier::new(bootstrap_only, None);
+        assert_eq!(verifier.checkpoint_count_in_range(416_013, 863_999), 0);
+
+        verifier.expected.insert(
+            515_912,
+            BankHashExpectation::LegacyAccountsHash(Hash::new_unique()),
+        );
+        assert_eq!(verifier.checkpoint_count_in_range(416_013, 863_999), 1);
+    }
+
+    #[test]
+    fn snapshot_verifier_retains_the_checkpoint_mismatch_diagnostic() {
+        let expected = Hash::new_unique();
+        let actual = Hash::new_unique();
+        let verifier = SnapshotVerifier::new(
+            BTreeMap::from([(515_912, BankHashExpectation::LegacyAccountsHash(expected))]),
+            None,
+        );
+
+        verifier.verify_legacy_accounts_hash(515_912, actual);
+
+        let error = verifier.error_summary().unwrap();
+        assert!(error.contains("legacy accounts hash mismatch at slot 515912"));
+        assert!(error.contains(&expected.to_string()));
+        assert!(error.contains(&actual.to_string()));
+    }
+
+    #[test]
+    fn archive_provenance_records_the_slot_selected_runtime() {
+        let selection = compatibility::select_runtime(
+            432_000..compatibility::SOLANA_V1_0_8_ROUTING_START_SLOT,
+            true,
+        )
+        .unwrap();
+        let state_hash = Hash::new_unique();
+        let provenance = build_archive_provenance(
+            selection,
+            Some([0x5a; 32]),
+            BootstrapStateKind::SnapshotArchive,
+            416_012,
+            state_hash,
+            432_000,
+            compatibility::SOLANA_V1_0_8_ROUTING_START_SLOT - 432_000,
+        )
+        .unwrap();
+        assert_eq!(
+            provenance.single_runtime_worker_executable_sha256(),
+            Some(Some([0x5a; 32]))
+        );
+        assert_eq!(provenance.version(), 2);
+        let provenance = provenance.single_runtime_v1().unwrap();
+        assert_eq!(provenance.runtime_profile, "solana-v1.0.7");
+        assert_eq!(provenance.runtime_admission, RuntimeAdmission::Candidate);
+        assert_eq!(
+            provenance.runtime_revision,
+            compatibility::SOLANA_V1_0_7_REVISION
+        );
+        assert_eq!(provenance.bootstrap_slot, 416_012);
+        assert_eq!(provenance.bootstrap_state_hash, state_hash);
+        assert_eq!(
+            provenance.transaction_metadata,
+            TransactionMetadataPolicy::runtime_reconstructed_before(
+                compatibility::OLD_FAITHFUL_STATUS_REQUIRED_START_SLOT
+            )
+        );
+    }
+
+    #[test]
+    fn historical_archive_provenance_requires_the_measured_worker_digest() {
+        let selection = compatibility::select_runtime(
+            432_000..compatibility::SOLANA_V1_0_8_ROUTING_START_SLOT,
+            true,
+        )
+        .unwrap();
+        let error = build_archive_provenance(
+            selection,
+            None,
+            BootstrapStateKind::SnapshotArchive,
+            416_012,
+            Hash::new_unique(),
+            432_000,
+            compatibility::SOLANA_V1_0_8_ROUTING_START_SLOT - 432_000,
+        )
+        .unwrap_err();
+        assert!(error.contains("does not match executable provenance"));
+    }
+
+    #[test]
+    fn stale_worker_digest_is_not_compatible_with_archive_provenance() {
+        let selection = compatibility::select_runtime(
+            432_000..compatibility::SOLANA_V1_0_8_ROUTING_START_SLOT,
+            true,
+        )
+        .unwrap();
+        let provenance = build_archive_provenance(
+            selection,
+            Some([0x11; 32]),
+            BootstrapStateKind::SnapshotArchive,
+            416_012,
+            Hash::new_unique(),
+            432_000,
+            compatibility::SOLANA_V1_0_8_ROUTING_START_SLOT - 432_000,
+        )
+        .unwrap();
+        assert!(archive_worker_executable_matches(
+            &provenance,
+            Some([0x11; 32])
+        ));
+        assert!(!archive_worker_executable_matches(
+            &provenance,
+            Some([0x12; 32])
+        ));
+        assert!(!archive_worker_executable_matches(&provenance, None));
+    }
+
+    #[test]
+    fn epoch_bootstrap_snapshot_must_land_in_the_previous_epoch() {
+        let hash = Hash::default();
+        let valid = PathBuf::from(format!("snapshot-416012-{hash}.tar.bz2"));
+        assert_eq!(
+            validate_epoch_bootstrap_snapshot(1, &valid).unwrap(),
+            416_012
+        );
+
+        let too_old = PathBuf::from(format!("snapshot-104612-{hash}.tar.bz2"));
+        assert!(
+            validate_epoch_bootstrap_snapshot(2, &too_old)
+                .unwrap_err()
+                .contains("requires a bootstrap snapshot")
+        );
+
+        let too_new = PathBuf::from(format!("snapshot-432000-{hash}.tar.bz2"));
+        assert!(
+            validate_epoch_bootstrap_snapshot(1, &too_new)
+                .unwrap_err()
+                .contains("requires a bootstrap snapshot")
+        );
+    }
+
+    #[test]
+    fn missing_transaction_status_is_allowed_only_for_qualified_reconstruction() {
+        let signature = Signature::default();
+        assert!(
+            validate_transaction_status_presence(
+                compatibility::MissingTransactionStatus::Reconstruct,
+                false,
+                416_013,
+                0,
+                &signature,
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_transaction_status_presence(
+                compatibility::MissingTransactionStatus::Reject,
+                true,
+                406_080_000,
+                0,
+                &signature,
+            )
+            .is_ok()
+        );
+        let error = validate_transaction_status_presence(
+            compatibility::MissingTransactionStatus::Reject,
+            false,
+            406_080_000,
+            7,
+            &signature,
+        )
+        .unwrap_err();
+        assert!(error.contains("status metadata is required"));
+    }
+
+    #[test]
+    fn multi_runtime_provenance_rebases_writes_and_proves_the_handoff() {
+        let spans = compatibility::plan_runtime_spans(432_000..864_000, true).unwrap();
+        assert_eq!(spans.len(), 2);
+        let first_selection = runtime_span_selection(&spans[0]).unwrap();
+        let second_selection = runtime_span_selection(&spans[1]).unwrap();
+        let initial_accounts_hash = Hash::new_unique();
+        let handoff_accounts_hash = spans[1].handoff.unwrap().snapshot.accounts_hash().unwrap();
+        let handoff_bank_hash = Hash::new_unique();
+        let handoff_last_blockhash = Hash::new_unique();
+
+        let provenance = |selection: compatibility::RuntimeSelection,
+                          digest: [u8; 32],
+                          bootstrap_slot: Slot,
+                          bootstrap_hash: Hash,
+                          start: Slot,
+                          count: u64| {
+            let value = build_archive_provenance(
+                selection,
+                Some(digest),
+                BootstrapStateKind::SnapshotArchive,
+                bootstrap_slot,
+                bootstrap_hash,
+                start,
+                count,
+            )
+            .unwrap();
+            let ArchiveProvenance::V2(value) = value else {
+                panic!("historical provenance must be V2");
+            };
+            value
+        };
+        let checkpoint =
+            |slot: Slot,
+             bank_hash: Hash,
+             accounts_hash: Hash,
+             last_blockhash: Hash,
+             next_write_version: u64| SegmentCheckpointSummary {
+                slot,
+                bank_hash: bank_hash.to_string(),
+                accounts_hash: accounts_hash.to_string(),
+                last_blockhash: last_blockhash.to_string(),
+                capitalization: 42,
+                transaction_count: 84,
+                tick_height: 126,
+                slot_complete: true,
+                write_count: 0,
+                next_write_version,
+            };
+        let runtime_identity = |selection: compatibility::RuntimeSelection| {
+            let identity = selection.descriptor.identity;
+            SegmentRuntimeIdentity {
+                generation_profile: archive_generation_profile(),
+                runtime_profile: identity.name.to_owned(),
+                runtime_admission: SegmentRuntimeAdmission::Candidate,
+                runtime_revision: identity.revision.to_owned(),
+                runtime_toolchain: archive_runtime_toolchain(identity),
+                runtime_target: identity.target.unwrap().to_owned(),
+                genesis_hash: identity.genesis_hash.to_owned(),
+            }
+        };
+
+        let first_terminal = checkpoint(
+            619_848,
+            handoff_bank_hash,
+            handoff_accounts_hash,
+            handoff_last_blockhash,
+            900,
+        );
+        let second_bootstrap = checkpoint(
+            619_848,
+            handoff_bank_hash,
+            handoff_accounts_hash,
+            handoff_last_blockhash,
+            10,
+        );
+        let segments = vec![
+            ValidatedRuntimeSegment {
+                archive_path: PathBuf::from("first.jet"),
+                manifest: HistoricalSegmentManifest {
+                    schema_version:
+                        jetstreamer_node::segment_manifest::SEGMENT_MANIFEST_SCHEMA_VERSION,
+                    epoch: 1,
+                    output_slot_start: 432_000,
+                    output_slot_count: 187_849,
+                    runtime: runtime_identity(first_selection),
+                    worker_executable_sha256: [1; 32],
+                    archive_sha256: [11; 32],
+                    bootstrap_archive_sha256: None,
+                    bootstrap: checkpoint(
+                        416_012,
+                        Hash::new_unique(),
+                        initial_accounts_hash,
+                        Hash::new_unique(),
+                        50,
+                    ),
+                    terminal: first_terminal,
+                    emitted_raw_write_versions: 100..900,
+                },
+                provenance: provenance(
+                    first_selection,
+                    [1; 32],
+                    416_012,
+                    initial_accounts_hash,
+                    432_000,
+                    187_849,
+                ),
+            },
+            ValidatedRuntimeSegment {
+                archive_path: PathBuf::from("second.jet"),
+                manifest: HistoricalSegmentManifest {
+                    schema_version:
+                        jetstreamer_node::segment_manifest::SEGMENT_MANIFEST_SCHEMA_VERSION,
+                    epoch: 1,
+                    output_slot_start: 619_849,
+                    output_slot_count: 244_151,
+                    runtime: runtime_identity(second_selection),
+                    worker_executable_sha256: [2; 32],
+                    archive_sha256: [22; 32],
+                    bootstrap_archive_sha256: Some([0xcc; 32]),
+                    bootstrap: second_bootstrap,
+                    terminal: checkpoint(
+                        863_999,
+                        Hash::new_unique(),
+                        Hash::new_unique(),
+                        Hash::new_unique(),
+                        20,
+                    ),
+                    emitted_raw_write_versions: 10..20,
+                },
+                provenance: provenance(
+                    second_selection,
+                    [2; 32],
+                    619_848,
+                    handoff_accounts_hash,
+                    619_849,
+                    244_151,
+                ),
+            },
+        ];
+
+        let handoff_manifest = HistoricalHandoffSnapshotManifest {
+            schema_version: HANDOFF_SNAPSHOT_MANIFEST_SCHEMA_VERSION,
+            boundary_slot: 619_849,
+            snapshot_slot: 619_848,
+            accounts_hash: handoff_accounts_hash.to_string(),
+            archive_path: "/test/snapshot-619848-canonical.tar.bz2".into(),
+            archive_size: 123,
+            archive_sha256: [0xcc; 32],
+            source_runtime: segments[0].manifest.runtime.clone(),
+            source_worker_executable_sha256: segments[0].manifest.worker_executable_sha256,
+            terminal: segments[0].manifest.terminal.clone(),
+        };
+        assert!(handoff_snapshot_matches_predecessor(
+            &handoff_manifest,
+            &segments[0]
+        ));
+        let mut stale_runtime = handoff_manifest.clone();
+        stale_runtime
+            .source_runtime
+            .runtime_revision
+            .push_str("-stale");
+        assert!(!handoff_snapshot_matches_predecessor(
+            &stale_runtime,
+            &segments[0]
+        ));
+        let mut stale_worker = handoff_manifest.clone();
+        stale_worker.source_worker_executable_sha256 = [0xee; 32];
+        assert!(!handoff_snapshot_matches_predecessor(
+            &stale_worker,
+            &segments[0]
+        ));
+        let mut stale_terminal = handoff_manifest.clone();
+        stale_terminal.terminal.last_blockhash = Hash::new_unique().to_string();
+        assert!(!handoff_snapshot_matches_predecessor(
+            &stale_terminal,
+            &segments[0]
+        ));
+        let combined = build_multi_runtime_provenance(
+            1,
+            &spans,
+            &segments,
+            std::slice::from_ref(&handoff_manifest),
+        )
+        .unwrap();
+        assert_eq!(combined.runtime_segments[0].write_versions.archive_start, 0);
+        assert_eq!(
+            combined.runtime_segments[1].write_versions.archive_start,
+            800
+        );
+        assert_eq!(combined.handoffs[0].boundary_slot, 619_849);
+        assert_eq!(
+            combined.handoffs[0].predecessor.accounts_hash,
+            handoff_accounts_hash
+        );
+        assert_eq!(
+            combined.handoffs[0].successor.accounts_hash,
+            handoff_accounts_hash
+        );
+        assert_eq!(
+            combined.handoffs[0].successor_bootstrap_archive_sha256,
+            handoff_manifest.archive_sha256
+        );
+
+        let mut replaced_handoff = handoff_manifest.clone();
+        replaced_handoff.archive_sha256 = [0xdd; 32];
+        assert!(
+            build_multi_runtime_provenance(1, &spans, &segments, &[replaced_handoff])
+                .unwrap_err()
+                .contains("does not match its predecessor and successor segment evidence")
+        );
+
+        let mut invalid = segments;
+        invalid[1].manifest.bootstrap.write_count = 1;
+        assert!(
+            build_multi_runtime_provenance(1, &spans, &invalid, &[handoff_manifest])
+                .unwrap_err()
+                .contains("successor bootstrap emitted")
+        );
+    }
+
+    fn tiny_multi_runtime_provenance(slot_start: Slot) -> ArchiveProvenanceV3 {
+        let boundary = slot_start + 1;
+        let checkpoint = RuntimeStateCheckpoint {
+            slot: slot_start,
+            bank_hash: Hash::new_from_array([0x11; 32]),
+            accounts_hash_kind: AccountsHashKind::LegacyAccountsHash,
+            accounts_hash: Hash::new_from_array([0x22; 32]),
+            last_blockhash: Hash::new_from_array([0x33; 32]),
+            capitalization: 42,
+            transaction_count: 84,
+            tick_height: 126,
+            slot_complete: true,
+            next_write_version: 5,
+        };
+        ArchiveProvenanceV3 {
+            assembly_profile: "test/multi-runtime-assembly".into(),
+            genesis_hash: compatibility::MAINNET_GENESIS_HASH.parse().unwrap(),
+            bootstrap_state_kind: BootstrapStateKind::SnapshotArchive,
+            bootstrap_state: StateCommitment {
+                slot: slot_start - 1,
+                kind: StateCommitmentKind::LegacyAccountsHash,
+                hash: Hash::new_from_array([0x44; 32]),
+            },
+            requested_slot_start: slot_start,
+            requested_slot_count: 2,
+            transaction_metadata: TransactionMetadataPolicy::observed(),
+            runtime_segments: vec![
+                RuntimeSegmentProvenance {
+                    slot_start,
+                    slot_count: 1,
+                    generation_profile: "test/producer".into(),
+                    runtime_profile: "test/runtime-a".into(),
+                    runtime_admission: RuntimeAdmission::Candidate,
+                    runtime_revision: "revision-a".into(),
+                    runtime_toolchain: "toolchain-a".into(),
+                    worker_executable_sha256: Some([0xaa; 32]),
+                    write_versions: WriteVersionNormalization {
+                        worker_start: 5,
+                        worker_end_exclusive: 5,
+                        archive_start: 0,
+                    },
+                },
+                RuntimeSegmentProvenance {
+                    slot_start: boundary,
+                    slot_count: 1,
+                    generation_profile: "test/producer".into(),
+                    runtime_profile: "test/runtime-b".into(),
+                    runtime_admission: RuntimeAdmission::Candidate,
+                    runtime_revision: "revision-b".into(),
+                    runtime_toolchain: "toolchain-b".into(),
+                    worker_executable_sha256: Some([0xbb; 32]),
+                    write_versions: WriteVersionNormalization {
+                        worker_start: 9,
+                        worker_end_exclusive: 9,
+                        archive_start: 0,
+                    },
+                },
+            ],
+            handoffs: vec![RuntimeHandoffProvenance {
+                boundary_slot: boundary,
+                predecessor: checkpoint,
+                successor: RuntimeStateCheckpoint {
+                    next_write_version: 9,
+                    ..checkpoint
+                },
+                successor_bootstrap_kind: BootstrapStateKind::SnapshotArchive,
+                successor_bootstrap_archive_sha256: [0xcc; 32],
+                successor_bootstrap_write_count: 0,
+            }],
+        }
+    }
+
+    #[test]
+    fn assembled_archive_verifier_rejects_bucket_corruption() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let path = directory.path().join("tiny-v3.jet");
+        let slot_start = 432_000;
+        let provenance = tiny_multi_runtime_provenance(slot_start);
+        let mut writer = jetstreamer_horizon::archive::ArchiveWriter::new_with_provenance(
+            Vec::new(),
+            1,
+            slot_start,
+            2,
+            ArchiveWriterConfig::default(),
+            &ArchiveProvenance::V3(provenance.clone()),
+        )
+        .unwrap();
+        writer.write_skipped_slot(slot_start).unwrap();
+        writer.write_skipped_slot(slot_start + 1).unwrap();
+        let (mut bytes, _) = writer.finish().unwrap();
+        fs::write(&path, &bytes).unwrap();
+        verify_assembled_runtime_archive_range(&path, 1, slot_start, 2, &provenance).unwrap();
+
+        let reader = jetstreamer_horizon::archive::ArchiveReader::open(std::io::Cursor::new(
+            bytes.as_slice(),
+        ))
+        .unwrap();
+        let first_bucket = reader.bucket_index()[0];
+        let corrupt_at = usize::try_from(first_bucket.offset + first_bucket.len - 1).unwrap();
+        bytes[corrupt_at] ^= 0x80;
+        fs::write(&path, bytes).unwrap();
+        let error = verify_assembled_runtime_archive_range(&path, 1, slot_start, 2, &provenance)
+            .unwrap_err();
+        assert!(error.contains("failed full decode"), "{error}");
+    }
+
+    #[test]
+    fn multi_runtime_reuse_rejects_non_mainnet_genesis() {
+        let wrong = Hash::new_from_array([0xff; 32]);
+        let error = validate_multi_runtime_genesis(Path::new("epoch-1.jet"), wrong).unwrap_err();
+        assert!(error.contains("expected registered mainnet genesis"));
+        assert!(
+            validate_multi_runtime_genesis(
+                Path::new("epoch-1.jet"),
+                compatibility::MAINNET_GENESIS_HASH.parse().unwrap(),
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn handoff_export_retry_stops_exporting_once_snapshot_is_ready() {
+        let observations = [
+            HandoffSnapshotReadiness::Missing,
+            HandoffSnapshotReadiness::Ready,
+        ];
+        let export_by_attempt = observations.map(handoff_snapshot_needs_export);
+        assert_eq!(export_by_attempt, [true, false]);
+        assert!(handoff_snapshot_needs_export(
+            HandoffSnapshotReadiness::Invalid
+        ));
+    }
+
+    #[test]
+    fn handoff_pair_quarantine_handles_every_partial_state() {
+        for (archive_present, sidecar_present) in [(true, true), (true, false), (false, true)] {
+            let directory = tempfile::TempDir::new().unwrap();
+            let archive = directory.path().join("snapshot-1-hash.tar.bz2");
+            let sidecar = handoff_snapshot_manifest_path(&archive).unwrap();
+            if archive_present {
+                fs::write(&archive, b"archive").unwrap();
+            }
+            if sidecar_present {
+                fs::write(&sidecar, b"evidence").unwrap();
+            }
+
+            let moved = preserve_handoff_snapshot_pair(&archive).unwrap();
+            assert_eq!(
+                moved.len(),
+                usize::from(archive_present) + usize::from(sidecar_present)
+            );
+            assert!(!path_exists_without_following(&archive).unwrap());
+            assert!(!path_exists_without_following(&sidecar).unwrap());
+            for (_, backup) in moved {
+                assert!(path_exists_without_following(&backup).unwrap());
+            }
+        }
+    }
+
+    #[test]
+    fn boundary_snapshot_pruning_removes_pairs_and_rejects_unknown_companions() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let archive = directory.path().join("snapshot-1-hash.tar.bz2");
+        let sidecar = handoff_snapshot_manifest_path(&archive).unwrap();
+        fs::write(&archive, b"archive").unwrap();
+        fs::write(&sidecar, b"evidence").unwrap();
+        let moved = preserve_handoff_snapshot_pair(&archive).unwrap();
+        let quarantine = moved[0].1.parent().unwrap().to_path_buf();
+        remove_quarantined_handoff_snapshot_pair(moved).unwrap();
+        assert!(!quarantine.exists());
+
+        fs::write(&archive, b"archive").unwrap();
+        fs::write(&sidecar, b"unregistered evidence").unwrap();
+        let error = prune_epoch_boundary_snapshot(&archive, &compatibility::SOLANA_V1_0_8_RUNTIME)
+            .unwrap_err();
+        assert!(error.contains("unregistered handoff companion"));
+        assert!(archive.is_file());
+        assert!(sidecar.is_file());
+
+        fs::remove_file(&sidecar).unwrap();
+        prune_epoch_boundary_snapshot(&archive, &compatibility::SOLANA_V1_0_8_RUNTIME).unwrap();
+        assert!(!archive.exists());
+    }
+
+    #[test]
+    fn scheduler_accepts_slot_zero_as_its_first_slot() {
+        let presence = Arc::new(SlotPresenceMap {
+            start: 0,
+            end_inclusive: 0,
+            states: vec![SlotPresenceState::Present],
+            next_present_after: vec![None],
+        });
+        let scheduler = TransactionScheduler::new(0, presence, Arc::new(RestartTracker::new()), 0);
+
+        let ready = scheduler
+            .record_block_metadata(0, 0, 0)
+            .expect("slot zero must not be considered already finalized");
+        assert!(ready.is_empty());
+        let snapshot = scheduler.snapshot();
+        assert_eq!(snapshot.current_slot, 1);
+        assert_eq!(snapshot.last_finalized_slot, 0);
+    }
+}
+
+#[cfg(test)]
 mod scheduler_tests {
-    use super::{EntryAccounts, assign_rounds};
+    use super::{EntryAccounts, SlotExecutionBuffer, assign_rounds};
     use solana_address::Address;
+    use solana_transaction::versioned::VersionedTransaction;
+    use solana_transaction_status::TransactionStatusMeta;
     use std::collections::HashSet;
 
     fn addr(byte: u8) -> Address {
@@ -7646,6 +12057,28 @@ mod scheduler_tests {
             writes: writes.iter().map(|&b| addr(b)).collect(),
             reads: reads.iter().map(|&b| addr(b)).collect(),
         }
+    }
+
+    #[test]
+    fn scheduler_preserves_missing_status_provenance() {
+        let mut missing = SlotExecutionBuffer::default();
+        missing
+            .insert_transaction(0, VersionedTransaction::default(), None)
+            .unwrap();
+        assert!(missing.txs[0].as_ref().unwrap().expected_status.is_none());
+
+        let mut observed = SlotExecutionBuffer::default();
+        observed
+            .insert_transaction(
+                0,
+                VersionedTransaction::default(),
+                Some(TransactionStatusMeta::default()),
+            )
+            .unwrap();
+        assert_eq!(
+            observed.txs[0].as_ref().unwrap().expected_status,
+            Some(Ok(()))
+        );
     }
 
     /// Flattens rounds back to (entry_index -> round_index) for assertions.

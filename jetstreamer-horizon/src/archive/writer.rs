@@ -24,6 +24,7 @@ use super::bucket::{
     MAX_BUCKET_UNCOMPRESSED_BYTES, MAX_FRAME_SEQUENCE_ELEMENTS,
 };
 use super::format::*;
+use super::provenance::{ArchiveProvenance, encode_archive_provenance};
 
 #[derive(Debug, Clone, Copy)]
 enum BufferGrowthFailure {
@@ -334,11 +335,41 @@ pub struct ArchiveWriter<W: std::io::Write> {
 impl<W: std::io::Write> ArchiveWriter<W> {
     /// Creates a writer and emits the magic + file header to `sink`.
     pub fn new(
+        sink: W,
+        epoch: u64,
+        slot_start: u64,
+        slot_count: u64,
+        config: ArchiveWriterConfig,
+    ) -> Result<Self, ArchiveFormatError> {
+        Self::new_with_reserved(sink, epoch, slot_start, slot_count, config, Vec::new())
+    }
+
+    /// Creates a writer whose file header carries typed generation
+    /// provenance. Existing callers can continue to use [`Self::new`], which
+    /// emits the legacy empty `ArchiveMeta::reserved` field.
+    pub fn new_with_provenance(
+        sink: W,
+        epoch: u64,
+        slot_start: u64,
+        slot_count: u64,
+        config: ArchiveWriterConfig,
+        provenance: &ArchiveProvenance,
+    ) -> Result<Self, ArchiveFormatError> {
+        provenance.validate_for_archive(slot_start, slot_count)?;
+        let reserved = encode_archive_provenance(provenance)?;
+        Self::new_with_reserved(sink, epoch, slot_start, slot_count, config, reserved)
+    }
+
+    /// Internal constructor used when a semantic-preserving transformation
+    /// has already validated opaque header metadata and must retain its exact
+    /// bytes instead of decoding and re-encoding them.
+    pub(crate) fn new_with_reserved(
         mut sink: W,
         epoch: u64,
         slot_start: u64,
         slot_count: u64,
         config: ArchiveWriterConfig,
+        reserved: Vec<u8>,
     ) -> Result<Self, ArchiveFormatError> {
         if config.bucket_slots == 0 {
             return Err(ArchiveFormatError::InvalidContainerLayout(
@@ -376,7 +407,7 @@ impl<W: std::io::Write> ArchiveWriter<W> {
                     .map(|d| d.as_millis() as u64)
                     .unwrap_or(0),
                 writer_version: env!("CARGO_PKG_VERSION").as_bytes().to_vec(),
-                reserved: vec![],
+                reserved,
             },
         };
 
@@ -676,13 +707,14 @@ impl<W: std::io::Write> ArchiveWriter<W> {
         Ok(())
     }
 
-    /// Seeds a full archive re-encoding with the first source bucket's PoH
-    /// anchor before any destination bucket is staged.
+    /// Seeds an archive with the blockhash immediately preceding its declared
+    /// slot range, before any destination bucket is staged.
     ///
-    /// This is needed when the destination bucket geometry differs from the
-    /// source: a smaller destination may flush one or more leading buckets
-    /// before the complete source bucket has been decoded.
-    pub(super) fn preserve_initial_poh_anchor(
+    /// Producers use the parent blockhash of their first observed block (which
+    /// also anchors any leading skipped slots). Re-encoders use the first
+    /// source bucket's stored anchor. The state checks make late or repeated
+    /// changes impossible.
+    pub fn preserve_initial_poh_anchor(
         &mut self,
         source_first_slot: u64,
         poh_start_hash: Hash,
@@ -788,6 +820,39 @@ impl<W: std::io::Write> ArchiveWriter<W> {
     /// through the bucket's dedupe + diff encoders like any other account
     /// updates.
     pub fn write_epoch_meta(&mut self, meta: &EpochMeta) -> Result<(), ArchiveFormatError> {
+        self.write_epoch_meta_with_write_version_map(meta, |write_version| write_version)
+    }
+
+    /// Re-encodes epoch metadata while mapping its nested account-update
+    /// write versions. The multi-segment merger validates the complete raw
+    /// sequence before invoking this infallible mapping hook.
+    pub(super) fn write_epoch_meta_with_write_version_map(
+        &mut self,
+        meta: &EpochMeta,
+        mut map_write_version: impl FnMut(u64) -> u64,
+    ) -> Result<(), ArchiveFormatError> {
+        self.write_normalized_epoch_meta_with_write_version_map(
+            meta,
+            meta.epoch,
+            meta.start_slot,
+            meta.slot_count,
+            meta.first_block_slot,
+            &mut map_write_version,
+        )
+    }
+
+    /// Re-encodes epoch metadata with normalized scalar range fields while
+    /// mapping its nested account-update write versions. This avoids copying
+    /// the large epoch update arena when assembling segment-local archives.
+    pub(super) fn write_normalized_epoch_meta_with_write_version_map(
+        &mut self,
+        meta: &EpochMeta,
+        epoch: u64,
+        start_slot: u64,
+        slot_count: u64,
+        first_block_slot: u64,
+        mut map_write_version: impl FnMut(u64) -> u64,
+    ) -> Result<(), ArchiveFormatError> {
         self.ensure_writable()?;
         assert!(
             self.staging_slot.is_some(),
@@ -823,10 +888,10 @@ impl<W: std::io::Write> ArchiveWriter<W> {
         let ctx = &mut self.enc_ctx;
         let diff = &mut self.diff;
         let result = encode_bounded(buf, max_len, first_slot, "epoch staging", |buf| {
-            meta.epoch.encode_ext(buf, None)?;
-            meta.start_slot.encode_ext(buf, None)?;
-            meta.slot_count.encode_ext(buf, None)?;
-            meta.first_block_slot.encode_ext(buf, None)?;
+            epoch.encode_ext(buf, None)?;
+            start_slot.encode_ext(buf, None)?;
+            slot_count.encode_ext(buf, None)?;
+            first_block_slot.encode_ext(buf, None)?;
             meta.num_reward_partitions.encode_ext(buf, None)?;
             (meta.updates.len() as u64).encode_ext(buf, None)?;
             for (update, data) in meta.updates.iter() {
@@ -836,7 +901,7 @@ impl<W: std::io::Write> ArchiveWriter<W> {
                     owner: update.owner,
                     executable: update.executable,
                     rent_epoch: update.rent_epoch,
-                    write_version: update.write_version,
+                    write_version: map_write_version(update.write_version),
                     data,
                 };
                 encode_update_record(&view, buf, ctx, diff)?;
@@ -1012,6 +1077,17 @@ impl<W: std::io::Write> ArchiveWriter<W> {
     /// dedupe context; each account update's data blob goes through the
     /// bucket's diff encoder keyed by `xxh64(pubkey)`.
     pub fn write_transaction(&mut self, tx: &Transaction) -> Result<(), ArchiveFormatError> {
+        self.write_transaction_with_write_version_map(tx, |write_version| write_version)
+    }
+
+    /// Re-encodes a transaction while mapping every nested account-update
+    /// write version. The multi-segment merger validates the raw sequence
+    /// before invoking this infallible mapping hook.
+    pub(super) fn write_transaction_with_write_version_map(
+        &mut self,
+        tx: &Transaction,
+        mut map_write_version: impl FnMut(u64) -> u64,
+    ) -> Result<(), ArchiveFormatError> {
         self.ensure_writable()?;
         if self.staging_slot.is_none() {
             return Err(ArchiveFormatError::InvalidContainerLayout(
@@ -1070,7 +1146,7 @@ impl<W: std::io::Write> ArchiveWriter<W> {
                     owner: meta.owner,
                     executable: meta.executable,
                     rent_epoch: meta.rent_epoch,
-                    write_version: meta.write_version,
+                    write_version: map_write_version(meta.write_version),
                     data,
                 };
                 encode_update_record(&view, buf, ctx, diff)?;

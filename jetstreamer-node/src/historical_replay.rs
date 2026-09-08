@@ -1,0 +1,758 @@
+//! Replay adapter for an isolated historical runtime worker.
+
+use {
+    super::{
+        InFlightGuard, PHASE_ENTRY_COUNT, PHASE_EXECUTE_US, PHASE_POST_PROCESS_US, ReadyEntry,
+        ReplayCursor, ReplayFailure, ReplayProgress, SnapshotVerifier, horizon, plugin,
+    },
+    crate::historical::{
+        HistoricalAccountWrite, HistoricalCheckpoint, HistoricalRuntimeClient,
+        HistoricalSnapshotExport, denormalize_transaction_error, encode_legacy_transaction,
+        normalize_transaction_error,
+    },
+    jetstreamer_historical_protocol::TransactionError as HistoricalTransactionError,
+    log::info,
+    solana_address::Address,
+    solana_clock::Slot,
+    solana_hash::Hash,
+    solana_signature::Signature,
+    std::{
+        collections::BTreeSet,
+        ops::Range,
+        path::Path,
+        sync::{Arc, Mutex, atomic::Ordering},
+        time::Instant,
+    },
+};
+
+/// Checkpoint identity retained for replay provenance and runtime handoff.
+/// Account writes are deliberately excluded from this cloneable summary.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct HistoricalCheckpointSummary {
+    pub(crate) slot: Slot,
+    pub(crate) bank_hash: [u8; 32],
+    pub(crate) accounts_hash: [u8; 32],
+    pub(crate) last_blockhash: [u8; 32],
+    pub(crate) capitalization: u64,
+    pub(crate) transaction_count: u64,
+    pub(crate) tick_height: u64,
+    pub(crate) slot_complete: bool,
+    pub(crate) write_count: u64,
+    pub(crate) next_write_version: u64,
+}
+
+impl TryFrom<&HistoricalCheckpoint> for HistoricalCheckpointSummary {
+    type Error = String;
+
+    fn try_from(checkpoint: &HistoricalCheckpoint) -> Result<Self, Self::Error> {
+        let write_count = u64::try_from(checkpoint.writes.len()).map_err(|_| {
+            format!(
+                "historical checkpoint at slot {} has too many writes to summarize: {}",
+                checkpoint.slot,
+                checkpoint.writes.len()
+            )
+        })?;
+        Ok(Self {
+            slot: checkpoint.slot,
+            bank_hash: checkpoint.bank_hash,
+            accounts_hash: checkpoint.accounts_hash,
+            last_blockhash: checkpoint.last_blockhash,
+            capitalization: checkpoint.capitalization,
+            transaction_count: checkpoint.transaction_count,
+            tick_height: checkpoint.tick_height,
+            slot_complete: checkpoint.slot_complete,
+            write_count,
+            next_write_version: checkpoint.next_write_version,
+        })
+    }
+}
+
+/// Minimal evidence produced by one uninterrupted historical runtime segment.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct HistoricalReplayEvidence {
+    pub(crate) bootstrap: HistoricalCheckpointSummary,
+    pub(crate) terminal: HistoricalCheckpointSummary,
+    /// Raw worker write versions emitted for slots at or after the segment's
+    /// live start. The range is empty at the terminal cursor when no such
+    /// writes were emitted.
+    pub(crate) emitted_write_versions: Range<u64>,
+}
+
+/// Adapts the version-neutral worker protocol to Jetstreamer's ordered entry
+/// stream and Horizon recorder.
+///
+/// Calls are lockstep and are made by the single ready-entry thread. Keeping
+/// the mutex here still makes the ownership rule explicit and prevents final
+/// checkpointing from racing a future caller.
+pub(crate) struct HistoricalReplay {
+    state: Mutex<HistoricalReplayState>,
+    snapshot_verifier: Option<Arc<SnapshotVerifier>>,
+    checkpoint_slots: Mutex<BTreeSet<Slot>>,
+    failure: Arc<ReplayFailure>,
+    cursor: Arc<ReplayCursor>,
+    progress: Arc<ReplayProgress>,
+    live_start_slot: Slot,
+}
+
+struct HistoricalReplayState {
+    client: HistoricalRuntimeClient,
+    current_slot: Slot,
+    last_checkpoint_slot: Option<Slot>,
+    bootstrap_checkpoint: Option<HistoricalCheckpointSummary>,
+    terminal_checkpoint: Option<HistoricalCheckpointSummary>,
+    emitted_write_versions: Option<Range<u64>>,
+}
+
+impl HistoricalReplay {
+    pub(crate) fn new(
+        client: HistoricalRuntimeClient,
+        snapshot_verifier: Option<Arc<SnapshotVerifier>>,
+        failure: Arc<ReplayFailure>,
+        cursor: Arc<ReplayCursor>,
+        progress: Arc<ReplayProgress>,
+        live_start_slot: Slot,
+    ) -> Result<Self, String> {
+        let current_slot = client.initialized().slot;
+        let checkpoint_slots = snapshot_verifier
+            .as_ref()
+            .map(|verifier| verifier.legacy_checkpoint_slots().into_iter().collect())
+            .unwrap_or_default();
+        let replay = Self {
+            state: Mutex::new(HistoricalReplayState {
+                client,
+                current_slot,
+                last_checkpoint_slot: None,
+                bootstrap_checkpoint: None,
+                terminal_checkpoint: None,
+                emitted_write_versions: None,
+            }),
+            snapshot_verifier,
+            checkpoint_slots: Mutex::new(checkpoint_slots),
+            failure,
+            cursor,
+            progress,
+            live_start_slot,
+        };
+
+        // Always prove and retain the loaded state before accepting an entry.
+        // This also makes a wrong compiler-dependent AppendVec interpretation
+        // fail immediately. Remove the bootstrap slot from the scheduled set
+        // so a later cached request cannot attempt to record it twice.
+        replay.take_checkpoint_slot(current_slot);
+        replay.checkpoint_current(current_slot)?;
+        Ok(replay)
+    }
+
+    pub(crate) fn process_ready_entries(&self, entries: Vec<ReadyEntry>) {
+        for mut entry in entries {
+            if self.failure.shutdown_requested() {
+                return;
+            }
+            let entry_start = Instant::now();
+            let signature = entry
+                .txs
+                .first()
+                .and_then(|scheduled| scheduled.tx.signatures.first())
+                .map(ToString::to_string);
+            self.cursor.start_inflight(
+                entry.slot,
+                entry.entry_index,
+                entry.start_index,
+                entry.tx_count,
+                signature.clone(),
+            );
+            let inflight_guard = InFlightGuard {
+                cursor: self.cursor.clone(),
+            };
+            self.cursor.update_inflight_stage("historical_encode");
+
+            let encoded = match entry
+                .txs
+                .iter()
+                .map(|scheduled| encode_legacy_transaction(&scheduled.tx))
+                .collect::<Result<Vec<_>, _>>()
+            {
+                Ok(encoded) => encoded,
+                Err(error) => {
+                    self.failure.record(format!(
+                        "historical transaction encoding failed at slot {} entry {}: {error}",
+                        entry.slot, entry.entry_index
+                    ));
+                    return;
+                }
+            };
+
+            self.cursor.update_inflight_stage("historical_execute");
+            let execute_start = Instant::now();
+            let processed = {
+                let mut state = self.state.lock().expect("historical replay lock poisoned");
+                let result = state.client.process_entry(
+                    entry.slot,
+                    entry.entry_index as u64,
+                    entry.num_hashes,
+                    entry.hash.to_bytes(),
+                    encoded,
+                );
+                if result.is_ok() {
+                    state.current_slot = entry.slot;
+                    // Every accepted entry mutates the working bank, including
+                    // later entries in the same slot. A cached checkpoint is
+                    // reusable only while no entry has executed since it.
+                    state.last_checkpoint_slot = None;
+                    state.terminal_checkpoint = None;
+                }
+                result
+            };
+            PHASE_EXECUTE_US.fetch_add(
+                execute_start.elapsed().as_micros() as u64,
+                Ordering::Relaxed,
+            );
+            let processed = match processed {
+                Ok(processed) => processed,
+                Err(error) => {
+                    self.failure.record(format!(
+                        "historical worker failed at slot {} entry {}: {error}",
+                        entry.slot, entry.entry_index
+                    ));
+                    return;
+                }
+            };
+
+            self.cursor.update_inflight_stage("historical_verify");
+            if let Err(error) = self.verify_outcomes(&mut entry, &processed.outcomes) {
+                self.failure.record(error);
+                return;
+            }
+            if let Err(error) = self.record_writes(processed.writes) {
+                self.failure.record(error);
+                return;
+            }
+
+            let post_start = Instant::now();
+            if entry.slot >= self.live_start_slot {
+                plugin::notify_transaction_range(entry.slot, entry.start_index, entry.tx_count);
+                if let Some(recorder) = horizon::recorder() {
+                    let transactions = std::mem::take(&mut entry.txs)
+                        .into_iter()
+                        .map(|scheduled| (scheduled.tx, scheduled.status_meta))
+                        .collect();
+                    recorder.record_committed_entry(
+                        entry.slot,
+                        entry.entry_index,
+                        entry.num_hashes,
+                        transactions,
+                    );
+                }
+            }
+            self.cursor.update(
+                entry.slot,
+                entry.entry_index,
+                entry.start_index,
+                entry.tx_count,
+                signature,
+            );
+            PHASE_POST_PROCESS_US
+                .fetch_add(post_start.elapsed().as_micros() as u64, Ordering::Relaxed);
+            PHASE_ENTRY_COUNT.fetch_add(1, Ordering::Relaxed);
+
+            // The entry itself is complete. Checkpoint hashing is deliberately
+            // supervised by the worker's much larger checkpoint timeout, not
+            // the replay watchdog's per-entry budget.
+            drop(inflight_guard);
+
+            // Channel batches may end in the middle of a slot. The worker's
+            // tick-height proof, rather than a queue boundary, determines when
+            // the bank is safe to checkpoint and freeze.
+            if processed.slot_complete
+                && self.take_checkpoint_slot(entry.slot)
+                && let Err(error) = self.checkpoint_current(entry.slot)
+            {
+                self.failure.record(error);
+                return;
+            }
+
+            let elapsed = entry_start.elapsed();
+            if elapsed >= super::ENTRY_EXEC_WARN_AFTER {
+                info!(
+                    "historical entry slot={} index={} txs={} took {:.3}s",
+                    entry.slot,
+                    entry.entry_index,
+                    entry.tx_count,
+                    elapsed.as_secs_f64()
+                );
+            }
+        }
+    }
+
+    pub(crate) fn verify_latest_bank(&self) -> Result<(), String> {
+        let slot = self.current_slot()?;
+        self.checkpoint_current(slot)
+    }
+
+    pub(crate) fn freeze_latest_bank(&self) -> Result<(), String> {
+        let slot = self.current_slot()?;
+        self.checkpoint_current(slot)
+    }
+
+    /// Returns replay evidence only for a fully checkpointed segment.
+    pub(crate) fn evidence(&self) -> Result<HistoricalReplayEvidence, String> {
+        if let Some(error) = self.failure.error_message() {
+            return Err(format!(
+                "historical replay evidence is unavailable after replay failure: {error}"
+            ));
+        }
+        if let Some(verifier) = self.snapshot_verifier.as_ref()
+            && let Some(error) = verifier.error_summary()
+        {
+            return Err(format!(
+                "historical replay evidence is unavailable after checkpoint verification failure: {error}"
+            ));
+        }
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| "historical replay lock poisoned while reading evidence".to_string())?;
+        assemble_evidence(
+            state.bootstrap_checkpoint.as_ref(),
+            state.terminal_checkpoint.as_ref(),
+            state.current_slot,
+            state.emitted_write_versions.as_ref(),
+        )
+    }
+
+    pub(crate) fn export_snapshot(
+        &self,
+        slot: Slot,
+        output_directory: &Path,
+        expected_accounts_hash: [u8; 32],
+    ) -> Result<HistoricalSnapshotExport, String> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "historical replay lock poisoned while exporting snapshot".to_string())?;
+        if state.current_slot != slot {
+            return Err(format!(
+                "historical snapshot export requested for slot {slot}, current worker slot is {}",
+                state.current_slot
+            ));
+        }
+        let result = state
+            .client
+            .export_snapshot(slot, output_directory, expected_accounts_hash);
+        // Export is a one-use operation in both the parent client and worker.
+        // Once attempted, the cached checkpoint can still serve as evidence,
+        // but it no longer proves that an export seal is available. Force the
+        // next `freeze_latest_bank` call to issue a fresh FreezeCheckpoint so
+        // a failed export can be retried safely.
+        consume_checkpoint_export_seal(&mut state.last_checkpoint_slot);
+        result.map_err(|error| format!("historical snapshot export at slot {slot} failed: {error}"))
+    }
+
+    pub(crate) fn shutdown(&self) -> Result<(), String> {
+        let mut state = self.state.lock().map_err(|_| {
+            "historical replay lock poisoned while shutting down worker".to_string()
+        })?;
+        state
+            .client
+            .shutdown()
+            .map_err(|error| format!("historical worker shutdown failed: {error}"))
+    }
+
+    fn current_slot(&self) -> Result<Slot, String> {
+        self.state
+            .lock()
+            .map(|state| state.current_slot)
+            .map_err(|_| "historical replay lock poisoned".to_string())
+    }
+
+    fn verify_outcomes(
+        &self,
+        entry: &mut ReadyEntry,
+        outcomes: &[crate::historical::HistoricalTransactionOutcome],
+    ) -> Result<(), String> {
+        if outcomes.len() != entry.txs.len() {
+            return Err(format!(
+                "historical outcome count mismatch at slot {} entry {}: expected {}, got {}",
+                entry.slot,
+                entry.entry_index,
+                entry.txs.len(),
+                outcomes.len()
+            ));
+        }
+        for (offset, (scheduled, actual)) in entry.txs.iter_mut().zip(outcomes).enumerate() {
+            let expected_signature = scheduled
+                .tx
+                .signatures
+                .first()
+                .map(|signature| *signature.as_array());
+            if actual.signature != expected_signature {
+                return Err(format!(
+                    "historical signature mismatch at slot {} entry {} transaction {}",
+                    entry.slot,
+                    entry.entry_index,
+                    entry.start_index + offset
+                ));
+            }
+            if let Some(expected_status) = scheduled.expected_status.as_ref() {
+                let expected_error: Option<HistoricalTransactionError> = expected_status
+                    .as_ref()
+                    .err()
+                    .map(normalize_transaction_error)
+                    .transpose()
+                    .map_err(|error| {
+                        format!(
+                            "historical expected-status conversion failed at slot {} entry {} transaction {}: {error}",
+                            entry.slot,
+                            entry.entry_index,
+                            entry.start_index + offset
+                        )
+                    })?;
+                if actual.error != expected_error {
+                    return Err(format!(
+                        "historical execution mismatch at slot {} entry {} transaction {} signature {}: expected {:?}, got {:?}",
+                        entry.slot,
+                        entry.entry_index,
+                        entry.start_index + offset,
+                        scheduled
+                            .tx
+                            .signatures
+                            .first()
+                            .map(ToString::to_string)
+                            .unwrap_or_else(|| "<none>".to_string()),
+                        expected_error,
+                        actual.error
+                    ));
+                }
+            } else {
+                // Empty source metadata is unknown, not success. Preserve the
+                // historical executor's result in the generated archive.
+                scheduled.status_meta.status = match actual.error.as_ref() {
+                    Some(error) => Err(denormalize_transaction_error(error)),
+                    None => Ok(()),
+                };
+            }
+        }
+        Ok(())
+    }
+
+    fn take_checkpoint_slot(&self, slot: Slot) -> bool {
+        self.checkpoint_slots
+            .lock()
+            .expect("historical checkpoint set lock poisoned")
+            .remove(&slot)
+    }
+
+    fn checkpoint_current(&self, slot: Slot) -> Result<(), String> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "historical replay lock poisoned while checkpointing".to_string())?;
+        if state.current_slot != slot {
+            return Err(format!(
+                "historical checkpoint requested for slot {slot}, current worker slot is {}",
+                state.current_slot
+            ));
+        }
+        if !checkpoint_refresh_required(state.last_checkpoint_slot, slot) {
+            return Ok(());
+        }
+        let checkpoint = state
+            .client
+            .freeze_checkpoint(slot)
+            .map_err(|error| format!("historical checkpoint at slot {slot} failed: {error}"))?;
+        let emitted_write_versions = extend_emitted_write_versions(
+            state.emitted_write_versions.as_ref(),
+            self.live_start_slot,
+            &checkpoint.writes,
+        )?;
+        let summary = HistoricalCheckpointSummary::try_from(&checkpoint)?;
+        self.verify_checkpoint(&checkpoint);
+        self.emit_writes(checkpoint.writes);
+        state.emitted_write_versions = emitted_write_versions;
+        if state.bootstrap_checkpoint.is_none() {
+            state.bootstrap_checkpoint = Some(summary.clone());
+        }
+        state.terminal_checkpoint = Some(summary);
+        state.last_checkpoint_slot = Some(slot);
+        Ok(())
+    }
+
+    fn verify_checkpoint(&self, checkpoint: &HistoricalCheckpoint) {
+        if let Some(verifier) = self.snapshot_verifier.as_ref() {
+            verifier.verify_legacy_accounts_hash(
+                checkpoint.slot,
+                Hash::new_from_array(checkpoint.accounts_hash),
+            );
+        }
+        info!(
+            "historical checkpoint slot={} bank_hash={} accounts_hash={} capitalization={} transactions={} tick_height={} complete={}",
+            checkpoint.slot,
+            Hash::new_from_array(checkpoint.bank_hash),
+            Hash::new_from_array(checkpoint.accounts_hash),
+            checkpoint.capitalization,
+            checkpoint.transaction_count,
+            checkpoint.tick_height,
+            checkpoint.slot_complete,
+        );
+    }
+
+    fn record_writes(&self, writes: Vec<HistoricalAccountWrite>) -> Result<(), String> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "historical replay lock poisoned while recording writes".to_string())?;
+        let emitted_write_versions = extend_emitted_write_versions(
+            state.emitted_write_versions.as_ref(),
+            self.live_start_slot,
+            &writes,
+        )?;
+        self.emit_writes(writes);
+        state.emitted_write_versions = emitted_write_versions;
+        Ok(())
+    }
+
+    fn emit_writes(&self, writes: Vec<HistoricalAccountWrite>) {
+        for write in writes {
+            self.progress.note_account_update_slot(write.slot);
+            self.progress.inc_account_update();
+            if write.slot < self.live_start_slot {
+                continue;
+            }
+            plugin::notify_account_update_data_len(write.data.len());
+            horizon::note_historical_account_update(
+                write.slot,
+                Address::new_from_array(write.pubkey),
+                write.lamports,
+                Address::new_from_array(write.owner),
+                write.executable,
+                write.rent_epoch,
+                write.write_version,
+                write.data,
+                write.transaction_signature.map(Signature::from),
+            );
+        }
+    }
+}
+
+fn checkpoint_refresh_required(last_checkpoint_slot: Option<Slot>, slot: Slot) -> bool {
+    last_checkpoint_slot != Some(slot)
+}
+
+fn consume_checkpoint_export_seal(last_checkpoint_slot: &mut Option<Slot>) {
+    *last_checkpoint_slot = None;
+}
+
+fn extend_emitted_write_versions(
+    current: Option<&Range<u64>>,
+    live_start_slot: Slot,
+    writes: &[HistoricalAccountWrite],
+) -> Result<Option<Range<u64>>, String> {
+    let mut extended = current.cloned();
+    for write in writes {
+        if write.slot < live_start_slot {
+            continue;
+        }
+        let end = write.write_version.checked_add(1).ok_or_else(|| {
+            format!(
+                "historical live write version overflow at slot {} version {}",
+                write.slot, write.write_version
+            )
+        })?;
+        match extended.as_mut() {
+            Some(range) if range.end != write.write_version => {
+                return Err(format!(
+                    "historical live write stream is not contiguous: expected version {}, got {} at slot {}",
+                    range.end, write.write_version, write.slot
+                ));
+            }
+            Some(range) => range.end = end,
+            None => extended = Some(write.write_version..end),
+        }
+    }
+    Ok(extended)
+}
+
+fn assemble_evidence(
+    bootstrap: Option<&HistoricalCheckpointSummary>,
+    terminal: Option<&HistoricalCheckpointSummary>,
+    current_slot: Slot,
+    emitted_write_versions: Option<&Range<u64>>,
+) -> Result<HistoricalReplayEvidence, String> {
+    let bootstrap = bootstrap
+        .ok_or_else(|| "historical replay has no bootstrap checkpoint evidence".to_string())?;
+    let terminal = terminal
+        .ok_or_else(|| "historical replay has no terminal checkpoint evidence".to_string())?;
+    if !bootstrap.slot_complete {
+        return Err(format!(
+            "historical bootstrap checkpoint at slot {} is incomplete",
+            bootstrap.slot
+        ));
+    }
+    if !terminal.slot_complete {
+        return Err(format!(
+            "historical terminal checkpoint at slot {} is incomplete",
+            terminal.slot
+        ));
+    }
+    if terminal.slot < bootstrap.slot {
+        return Err(format!(
+            "historical terminal checkpoint slot {} precedes bootstrap slot {}",
+            terminal.slot, bootstrap.slot
+        ));
+    }
+    if terminal.slot != current_slot {
+        return Err(format!(
+            "historical terminal checkpoint is stale: checkpoint slot {}, current worker slot {}",
+            terminal.slot, current_slot
+        ));
+    }
+
+    let emitted_write_versions = match emitted_write_versions {
+        Some(range) => {
+            if range.start >= range.end {
+                return Err(format!(
+                    "historical emitted write-version range is invalid: {}..{}",
+                    range.start, range.end
+                ));
+            }
+            if range.end != terminal.next_write_version {
+                return Err(format!(
+                    "historical terminal write cursor {} does not match emitted range end {}",
+                    terminal.next_write_version, range.end
+                ));
+            }
+            range.clone()
+        }
+        None => terminal.next_write_version..terminal.next_write_version,
+    };
+
+    Ok(HistoricalReplayEvidence {
+        bootstrap: bootstrap.clone(),
+        terminal: terminal.clone(),
+        emitted_write_versions,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn account_write(slot: Slot, write_version: u64) -> HistoricalAccountWrite {
+        HistoricalAccountWrite {
+            slot,
+            write_version,
+            transaction_signature: None,
+            pubkey: [0; 32],
+            lamports: 0,
+            owner: [0; 32],
+            executable: false,
+            rent_epoch: 0,
+            data: Vec::new(),
+            stored_hash: [0; 32],
+        }
+    }
+
+    fn checkpoint_summary(slot: Slot, next_write_version: u64) -> HistoricalCheckpointSummary {
+        HistoricalCheckpointSummary {
+            slot,
+            bank_hash: [1; 32],
+            accounts_hash: [2; 32],
+            last_blockhash: [3; 32],
+            capitalization: 4,
+            transaction_count: 5,
+            tick_height: 6,
+            slot_complete: true,
+            write_count: 0,
+            next_write_version,
+        }
+    }
+
+    #[test]
+    fn checkpoint_summary_records_write_count_without_retaining_writes() {
+        let checkpoint = HistoricalCheckpoint {
+            slot: 10,
+            bank_hash: [1; 32],
+            accounts_hash: [2; 32],
+            last_blockhash: [3; 32],
+            capitalization: 4,
+            transaction_count: 5,
+            tick_height: 6,
+            slot_complete: true,
+            writes: vec![account_write(10, 100), account_write(10, 101)],
+            next_write_version: 102,
+        };
+        let summary = HistoricalCheckpointSummary::try_from(&checkpoint).unwrap();
+        assert_eq!(summary.write_count, 2);
+        assert_eq!(summary.next_write_version, 102);
+    }
+
+    #[test]
+    fn snapshot_export_attempt_requires_a_fresh_checkpoint_before_retry() {
+        let slot = 42;
+        let mut last_checkpoint_slot = Some(slot);
+        assert!(!checkpoint_refresh_required(last_checkpoint_slot, slot));
+
+        consume_checkpoint_export_seal(&mut last_checkpoint_slot);
+
+        assert!(checkpoint_refresh_required(last_checkpoint_slot, slot));
+    }
+
+    #[test]
+    fn live_write_range_filters_warmup_and_extends_contiguously() {
+        let first = extend_emitted_write_versions(
+            None,
+            10,
+            &[
+                account_write(9, 40),
+                account_write(10, 41),
+                account_write(10, 42),
+            ],
+        )
+        .unwrap();
+        assert_eq!(first, Some(41..43));
+
+        let second = extend_emitted_write_versions(
+            first.as_ref(),
+            10,
+            &[account_write(11, 43), account_write(11, 44)],
+        )
+        .unwrap();
+        assert_eq!(second, Some(41..45));
+    }
+
+    #[test]
+    fn live_write_range_rejects_a_gap() {
+        let current = 41..45;
+        let error = extend_emitted_write_versions(Some(&current), 10, &[account_write(11, 46)])
+            .unwrap_err();
+        assert!(error.contains("expected version 45, got 46"));
+        assert_eq!(current, 41..45);
+    }
+
+    #[test]
+    fn evidence_without_live_writes_uses_terminal_cursor_for_empty_range() {
+        let bootstrap = checkpoint_summary(10, 100);
+        let terminal = checkpoint_summary(20, 125);
+        let evidence = assemble_evidence(Some(&bootstrap), Some(&terminal), 20, None).unwrap();
+        assert_eq!(evidence.bootstrap, bootstrap);
+        assert_eq!(evidence.terminal, terminal);
+        assert_eq!(evidence.emitted_write_versions, 125..125);
+    }
+
+    #[test]
+    fn evidence_requires_current_terminal_checkpoint_and_matching_cursor() {
+        let bootstrap = checkpoint_summary(10, 100);
+        let terminal = checkpoint_summary(20, 125);
+        assert!(assemble_evidence(None, Some(&terminal), 20, None).is_err());
+        assert!(assemble_evidence(Some(&bootstrap), None, 20, None).is_err());
+
+        let stale = assemble_evidence(Some(&bootstrap), Some(&terminal), 21, Some(&(100..125)))
+            .unwrap_err();
+        assert!(stale.contains("terminal checkpoint is stale"));
+
+        let cursor_mismatch =
+            assemble_evidence(Some(&bootstrap), Some(&terminal), 20, Some(&(100..124)))
+                .unwrap_err();
+        assert!(cursor_mismatch.contains("does not match emitted range end"));
+    }
+}

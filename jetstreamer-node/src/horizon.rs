@@ -46,7 +46,8 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use jetstreamer_horizon::account_updates::AccountUpdateView;
 use jetstreamer_horizon::archive::{
-    ArchiveStats, ArchiveWriter, ArchiveWriterConfig, BlockMeta, EntryRecord, EpochMeta,
+    ArchiveProvenance, ArchiveStats, ArchiveWriter, ArchiveWriterConfig, BlockMeta, EntryRecord,
+    EpochMeta,
 };
 use jetstreamer_horizon::convert;
 use jetstreamer_horizon::transactions::Transaction;
@@ -109,8 +110,16 @@ pub fn init(
     slot_start: Slot,
     slot_count: u64,
     presence: Arc<SlotPresenceMap>,
+    provenance: &ArchiveProvenance,
 ) -> Result<(), String> {
-    let recorder = HorizonRecorder::create(path, epoch, slot_start, slot_count, presence)?;
+    let recorder = HorizonRecorder::create(
+        path,
+        epoch,
+        slot_start,
+        slot_count,
+        presence,
+        Some(provenance),
+    )?;
     let mut slot = RECORDER
         .write()
         .map_err(|_| "horizon recorder lock poisoned".to_string())?;
@@ -152,7 +161,17 @@ pub fn recorder() -> Option<Arc<HorizonRecorder>> {
 /// otherwise panic. No-op when recording is disabled.
 pub fn note_force_skipped(slot: Slot) {
     if let Some(recorder) = recorder() {
-        recorder.lock().force_skipped.insert(slot);
+        let mut state = recorder.lock();
+        if slot < state.slot_start {
+            return;
+        }
+        if slot > state.slot_end_inclusive {
+            panic!(
+                "horizon: force-skipped slot {slot} is outside recorder range {}..={}",
+                state.slot_start, state.slot_end_inclusive
+            );
+        }
+        state.force_skipped.insert(slot);
     }
 }
 
@@ -261,6 +280,43 @@ pub fn note_account_update(
     }
 }
 
+/// Records an account write emitted by an isolated historical runtime.
+///
+/// The worker protocol owns its buffers, so this adapter consumes `data`
+/// directly instead of constructing a current-Agave account or copying the
+/// payload through the borrowed Geyser interface. The remaining routing is
+/// identical to an in-process notification: `signature == None` is a runtime
+/// pre/post orphan; `Some` attributes the write to that transaction.
+#[allow(clippy::too_many_arguments)]
+pub fn note_historical_account_update(
+    slot: Slot,
+    pubkey: Address,
+    lamports: u64,
+    owner: Address,
+    executable: bool,
+    rent_epoch: u64,
+    write_version: u64,
+    data: Vec<u8>,
+    signature: Option<Signature>,
+) {
+    let Some(recorder) = recorder() else {
+        return;
+    };
+    recorder.record_owned_update(
+        slot,
+        signature,
+        OwnedAccountUpdate {
+            pubkey,
+            lamports,
+            owner,
+            executable,
+            rent_epoch,
+            write_version,
+            data,
+        },
+    );
+}
+
 /// A committed transaction paired with its original chain metadata.
 struct CommittedTx {
     tx: VersionedTransaction,
@@ -328,16 +384,18 @@ impl HorizonRecorder {
         slot_start: Slot,
         slot_count: u64,
         presence: std::sync::Arc<SlotPresenceMap>,
+        provenance: Option<&ArchiveProvenance>,
     ) -> Result<Self, String> {
         let file = File::create(path)
             .map_err(|err| format!("failed to create horizon archive {}: {err}", path.display()))?;
-        let writer = ArchiveWriter::new(
-            BufWriter::with_capacity(8 << 20, file),
-            epoch,
-            slot_start,
-            slot_count,
-            ArchiveWriterConfig::default(),
-        )
+        let sink = BufWriter::with_capacity(8 << 20, file);
+        let config = ArchiveWriterConfig::default();
+        let writer = match provenance {
+            Some(provenance) => ArchiveWriter::new_with_provenance(
+                sink, epoch, slot_start, slot_count, config, provenance,
+            ),
+            None => ArchiveWriter::new(sink, epoch, slot_start, slot_count, config),
+        }
         .map_err(|err| format!("failed to initialize horizon archive writer: {err}"))?;
         Ok(HorizonRecorder {
             state: Mutex::new(RecorderState {
@@ -412,6 +470,16 @@ impl HorizonRecorder {
         executed_transaction_count: u64,
         entry_count: u64,
     ) {
+        let mut state = self.lock();
+        if state.finished || slot < state.slot_start {
+            return;
+        }
+        if slot > state.slot_end_inclusive {
+            panic!(
+                "horizon: block metadata slot {slot} is outside recorder range {}..={}",
+                state.slot_start, state.slot_end_inclusive
+            );
+        }
         let parent_blockhash = Hash::from_str(parent_blockhash).unwrap_or_else(|err| {
             panic!("horizon: unparseable parent blockhash for slot {slot}: {err}")
         });
@@ -432,10 +500,6 @@ impl HorizonRecorder {
             executed_transaction_count,
             entry_count,
         };
-        let mut state = self.lock();
-        if state.finished {
-            return;
-        }
         // Re-delivery after a firehose restart replaces the buffered copy;
         // already-emitted slots are simply dropped.
         if state.last_emitted.is_some_and(|last| slot <= last) {
@@ -481,7 +545,13 @@ impl HorizonRecorder {
             held_start.duration_since(wait_start).as_micros() as u64,
             Ordering::Relaxed,
         );
-        if !state.finished {
+        if !state.finished && slot >= state.slot_start {
+            if slot > state.slot_end_inclusive {
+                panic!(
+                    "horizon: account update slot {slot} is outside recorder range {}..={}",
+                    state.slot_start, state.slot_end_inclusive
+                );
+            }
             state.route_update(slot, signature, update);
         }
         RECORDER_HELD_US.fetch_add(held_start.elapsed().as_micros() as u64, Ordering::Relaxed);
@@ -505,6 +575,15 @@ impl HorizonRecorder {
         );
         if !state.finished {
             for c in captured {
+                if c.slot < state.slot_start {
+                    continue;
+                }
+                if c.slot > state.slot_end_inclusive {
+                    panic!(
+                        "horizon: captured account update slot {} is outside recorder range {}..={}",
+                        c.slot, state.slot_start, state.slot_end_inclusive
+                    );
+                }
                 state.route_update(c.slot, c.signature, c.update);
             }
         }
@@ -521,8 +600,14 @@ impl HorizonRecorder {
         txs: Vec<(VersionedTransaction, TransactionStatusMeta)>,
     ) {
         let mut state = self.lock();
-        if state.finished {
+        if state.finished || slot < state.slot_start {
             return;
+        }
+        if slot > state.slot_end_inclusive {
+            panic!(
+                "horizon: committed entry slot {slot} is outside recorder range {}..={}",
+                state.slot_start, state.slot_end_inclusive
+            );
         }
         state.emit_complete_below(slot);
         let assembly = state.assemblies.entry(slot).or_default();
@@ -553,6 +638,12 @@ impl HorizonRecorder {
             return Err("horizon recorder already finished".to_string());
         }
         state.emit_complete_below(Slot::MAX);
+        if state.last_emitted.is_none() {
+            return Err(format!(
+                "horizon archive {}..={} contains no block from which to prove its initial PoH anchor",
+                state.slot_start, state.slot_end_inclusive
+            ));
+        }
         // Trailing leader-skipped slots through the end of the range.
         let next = state
             .last_emitted
@@ -669,6 +760,28 @@ impl RecorderState {
     }
 
     fn emit_slot(&mut self, slot: Slot, mut assembly: SlotAssembly) {
+        // A segment may begin with skipped slots. Their PoH value is unchanged,
+        // so the first real block's parent blockhash is also the anchor for the
+        // archive's declared start. Persist it before staging any leading gap;
+        // otherwise a standalone segment silently gets an all-zero anchor and
+        // cannot participate in a strict cross-runtime merge.
+        if self.last_emitted.is_none() {
+            let initial_poh_anchor = self
+                .block_metas
+                .get(&slot)
+                .unwrap_or_else(|| {
+                    panic!("horizon: no block metadata buffered for replayed slot {slot}")
+                })
+                .parent_blockhash;
+            self.writer
+                .preserve_initial_poh_anchor(self.slot_start, initial_poh_anchor)
+                .unwrap_or_else(|err| {
+                    panic!(
+                        "horizon: failed to preserve initial PoH anchor for {} at first block {slot}: {err}",
+                        self.slot_start
+                    )
+                });
+        }
         // Leader-skipped frames for the gap since the previous block.
         let next = self.last_emitted.map(|s| s + 1).unwrap_or(self.slot_start);
         for gap_slot in next..slot {
@@ -941,8 +1054,9 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("test.jet");
         let recorder =
-            HorizonRecorder::create(&path, 42, 100, 10, presence).expect("create recorder");
+            HorizonRecorder::create(&path, 42, 100, 10, presence, None).expect("create recorder");
 
+        let poh_anchor = solana_hash::Hash::new_unique();
         let bh_100 = solana_hash::Hash::new_unique();
         let bh_105 = solana_hash::Hash::new_unique();
         let (tx1, meta1) = legacy_tx(0xA1, 1);
@@ -956,7 +1070,7 @@ mod tests {
         recorder.record_block_meta(
             100,
             99,
-            &Hash::default().to_string(),
+            &poh_anchor.to_string(),
             &bh_100.to_string(),
             &KeyedRewardsAndNumPartitions {
                 keyed_rewards: vec![(
@@ -1022,6 +1136,7 @@ mod tests {
         // --- read back and verify ---
         let bytes = std::fs::read(&path).expect("read archive");
         let mut reader = ArchiveReader::open(std::io::Cursor::new(bytes)).expect("open archive");
+        reader.verify_chain = true;
         let mut collected = Collected::default();
         let visited = reader.read_slots(100, 64, &mut collected).expect("read");
         assert_eq!(visited, 10);
@@ -1063,6 +1178,82 @@ mod tests {
         assert_eq!(updates[0].2, b"gamma".to_vec());
     }
 
+    #[test]
+    fn ignores_warmup_events_before_the_declared_output_range() {
+        let presence = presence_map(100, &[SlotPresenceState::Present]);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("warmup.jet");
+        let recorder =
+            HorizonRecorder::create(&path, 1, 100, 1, presence, None).expect("create recorder");
+
+        // A qualification may replay earlier state to reach the output range.
+        // Even malformed metadata from that warm-up must not enter this file.
+        recorder.record_block_meta(
+            99,
+            98,
+            "not-a-hash",
+            "not-a-hash",
+            &KeyedRewardsAndNumPartitions {
+                keyed_rewards: vec![],
+                num_partitions: None,
+            },
+            None,
+            None,
+            0,
+            1,
+        );
+        recorder.record_account_update(99, &pk(1), &account(1, b"warmup", 2), None, 1);
+        recorder.record_committed_entry(99, 0, 1, Vec::new());
+
+        let anchor = Hash::new_unique();
+        let blockhash = Hash::new_unique();
+        recorder.record_block_meta(
+            100,
+            99,
+            &anchor.to_string(),
+            &blockhash.to_string(),
+            &KeyedRewardsAndNumPartitions {
+                keyed_rewards: vec![],
+                num_partitions: None,
+            },
+            None,
+            None,
+            0,
+            1,
+        );
+        recorder.record_committed_entry(100, 0, 1, Vec::new());
+        let stats = recorder.finish().expect("finish");
+        assert_eq!(stats.slots, 1);
+        assert_eq!(stats.blocks, 1);
+        assert_eq!(stats.account_updates, 0);
+
+        let bytes = std::fs::read(path).expect("read archive");
+        let mut reader = ArchiveReader::open(std::io::Cursor::new(bytes)).expect("open archive");
+        reader.verify_chain = true;
+        let mut collected = Collected::default();
+        assert_eq!(reader.read_slots(100, 1, &mut collected).expect("read"), 1);
+        assert_eq!(collected.blocks.len(), 1);
+        assert_eq!(collected.blocks[0].0, 100);
+    }
+
+    #[test]
+    fn refuses_all_skipped_archive_without_a_proven_poh_anchor() {
+        let states = vec![SlotPresenceState::Missing; 3];
+        let presence = presence_map(200, &states);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("all-skipped.jet");
+        let recorder =
+            HorizonRecorder::create(&path, 1, 200, 3, presence, None).expect("create recorder");
+
+        let error = recorder
+            .finish()
+            .expect_err("an all-skipped range has no independently proven PoH anchor");
+        assert!(
+            error.contains("contains no block"),
+            "unexpected error: {error}"
+        );
+    }
+
     /// A gap slot that old-faithful says has a block must abort the run
     /// rather than silently recording it as leader-skipped.
     #[test]
@@ -1073,7 +1264,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("bad.jet");
         let recorder =
-            HorizonRecorder::create(&path, 1, 200, 3, presence).expect("create recorder");
+            HorizonRecorder::create(&path, 1, 200, 3, presence, None).expect("create recorder");
         // Only slot 202 gets data; 200-201 are gaps the index says exist.
         recorder.record_block_meta(
             202,
@@ -1102,7 +1293,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("forced.jet");
         let recorder =
-            HorizonRecorder::create(&path, 1, 200, 3, presence).expect("create recorder");
+            HorizonRecorder::create(&path, 1, 200, 3, presence, None).expect("create recorder");
         // 200-201 have no fetchable block (their blocks don't exist despite the
         // index); the replay force-skipped them.
         {

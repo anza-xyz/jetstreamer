@@ -224,9 +224,21 @@ pub async fn slot_to_offset(slot: u64) -> Result<u64, SlotOffsetIndexError> {
     slot_to_range(slot).await.map(|(offset, _)| offset)
 }
 
-/// Returns the first *present* slot strictly after `after` and at most `up_to_inclusive`,
-/// or `None` when none exists or the answer is unknown (legacy-index epochs). See
-/// [`SlotOffsetIndex::next_present_slot`].
+/// Returns the first *present* slot at or after `from_inclusive` and at most
+/// `up_to_inclusive`, or `None` when none exists or the answer is unknown
+/// (legacy-index epochs). See [`SlotOffsetIndex::first_present_slot_at_or_after`].
+pub async fn first_present_slot_at_or_after(
+    from_inclusive: u64,
+    up_to_inclusive: u64,
+) -> Option<u64> {
+    SLOT_OFFSET_INDEX
+        .first_present_slot_at_or_after(from_inclusive, up_to_inclusive)
+        .await
+}
+
+/// Returns the first *present* slot strictly after `after` and at most
+/// `up_to_inclusive`, or `None` when none exists or the answer is unknown
+/// (legacy-index epochs). See [`SlotOffsetIndex::next_present_slot`].
 pub async fn next_present_slot(after: u64, up_to_inclusive: u64) -> Option<u64> {
     SLOT_OFFSET_INDEX
         .next_present_slot(after, up_to_inclusive)
@@ -460,13 +472,16 @@ impl SlotOffsetIndex {
         Ok(range)
     }
 
-    /// Returns the first *present* slot strictly after `after` and at most `up_to_inclusive`,
-    /// or `None` when no such slot exists **or the answer is unknown** (legacy compactindex
-    /// epochs cannot answer this without per-slot network lookups). Used to distinguish a
-    /// genuine end-of-epoch from a prematurely closed HTTP stream, and by the end-of-run
-    /// coverage audit; both treat `None` as "nothing provably missing".
-    pub async fn next_present_slot(&self, after: u64, up_to_inclusive: u64) -> Option<u64> {
-        let mut probe = after.saturating_add(1);
+    /// Returns the first *present* slot at or after `from_inclusive` and at most
+    /// `up_to_inclusive`, or `None` when no such slot exists **or the answer is unknown**
+    /// (legacy compactindex epochs cannot answer this without per-slot network lookups).
+    /// Used to distinguish a genuine end-of-epoch from a prematurely closed HTTP stream.
+    pub async fn first_present_slot_at_or_after(
+        &self,
+        from_inclusive: u64,
+        up_to_inclusive: u64,
+    ) -> Option<u64> {
+        let mut probe = from_inclusive;
         while probe <= up_to_inclusive {
             let epoch = slot_to_epoch(probe);
             let (_, epoch_end_inclusive) = epoch_to_slot_range(epoch);
@@ -486,10 +501,8 @@ impl SlotOffsetIndex {
             match indexes.as_ref() {
                 EpochIndexes::SlotRanges(index) => {
                     let scan_end = up_to_inclusive.min(epoch_end_inclusive);
-                    for slot in probe..=scan_end {
-                        if index.lookup_range(slot).is_ok() {
-                            return Some(slot);
-                        }
+                    if let Some(slot) = index.first_present_slot_at_or_after(probe, scan_end) {
+                        return Some(slot);
                     }
                 }
                 // Legacy epochs cannot be scanned cheaply; report "unknown".
@@ -498,6 +511,14 @@ impl SlotOffsetIndex {
             probe = epoch_end_inclusive.saturating_add(1);
         }
         None
+    }
+
+    /// Returns the first *present* slot strictly after `after` and at most
+    /// `up_to_inclusive`. See [`Self::first_present_slot_at_or_after`].
+    pub async fn next_present_slot(&self, after: u64, up_to_inclusive: u64) -> Option<u64> {
+        let from_inclusive = after.checked_add(1)?;
+        self.first_present_slot_at_or_after(from_inclusive, up_to_inclusive)
+            .await
     }
 
     fn remote_for_path(&self, path: &str) -> Result<RemoteObject, SlotOffsetIndexError> {
@@ -603,6 +624,19 @@ impl SlotRangesIndex {
             ));
         }
         Ok((offset, length as u64))
+    }
+
+    fn first_present_slot_at_or_after(
+        &self,
+        from_inclusive: u64,
+        up_to_inclusive: u64,
+    ) -> Option<u64> {
+        let scan_start = from_inclusive.max(*self.slot_range.start());
+        let scan_end = up_to_inclusive.min(*self.slot_range.end());
+        if scan_start > scan_end {
+            return None;
+        }
+        (scan_start..=scan_end).find(|slot| self.lookup_range(*slot).is_ok())
     }
 }
 
@@ -1929,6 +1963,20 @@ mod tests {
             index.lookup_range(1004),
             Err(SlotOffsetIndexError::IndexFormatError(..))
         ));
+    }
+
+    #[test]
+    fn test_first_present_slot_scan_is_inclusive_at_zero() {
+        let index = SlotRangesIndex::from_file(
+            synthetic_ranges_file(&[(59, 100), (0, 0), (159, 250)]),
+            0..=2,
+        )
+        .expect("valid index");
+
+        assert_eq!(index.first_present_slot_at_or_after(0, 2), Some(0));
+        assert_eq!(index.first_present_slot_at_or_after(1, 2), Some(2));
+        assert_eq!(index.first_present_slot_at_or_after(1, 1), None);
+        assert_eq!(index.first_present_slot_at_or_after(3, 4), None);
     }
 
     #[test]

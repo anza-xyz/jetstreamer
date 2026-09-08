@@ -11,8 +11,13 @@ jets/*
 # Runtime artifacts from replay/pipeline runs in the repo root
 .snapshot-extract-*
 snapshot-*.tar.zst
+snapshot-*.tar.bz2
 accounts-run/
 compact-indexes/
+.historical-runtime/
+mismatch-dumps/
+epoch-*-generation*.log
+epoch-hashes-*.txt
 genesis.bin
 genesis.tar.bz2
 *.jet

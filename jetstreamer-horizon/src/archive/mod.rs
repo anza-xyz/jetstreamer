@@ -69,6 +69,13 @@
 //! re-encoder can still emit V1 for compatibility controls (historical writer
 //! releases are not promised to reproduce byte-identical payloads).
 //!
+//! [`ArchiveMeta::reserved`] may carry an independently versioned
+//! [`ArchiveProvenance`] envelope. This does not change V1/V2 bucket or
+//! transaction bytes. Archive opening leaves the field opaque; callers can use
+//! [`ArchiveReader::provenance`] when provenance is part of their admission
+//! policy. Empty reserved bytes continue to mean that no provenance was
+//! recorded.
+//!
 //! # Re-encoding
 //!
 //! [`reencode_archive`] converts V1 or V2 input bucket by bucket, preserving
@@ -123,6 +130,8 @@
 //! readers as well as local files.
 mod bucket;
 mod format;
+mod merge;
+mod provenance;
 mod reader;
 mod reencode;
 mod writer;
@@ -132,6 +141,8 @@ mod tests;
 
 pub use bucket::*;
 pub use format::*;
+pub use merge::*;
+pub use provenance::*;
 pub use reader::*;
 pub use reencode::*;
 pub use writer::*;

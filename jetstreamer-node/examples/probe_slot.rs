@@ -145,6 +145,7 @@ fn main() {
     let blk: Arc<dyn BlockMetadataNotifier + Send + Sync> = probe.clone();
     let notifiers = GeyserNotifiers {
         transaction_notifier: Some(txn),
+        sourced_transaction_notifier: None,
         entry_notifier: Some(ent),
         block_metadata_notifier: Some(blk),
     };

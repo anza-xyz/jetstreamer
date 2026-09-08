@@ -305,6 +305,7 @@ mod tests {
             signature: Default::default(),
             message_hash: Hash::default(),
             is_vote: false,
+            status_meta_available: true,
             transaction_status_meta: TransactionStatusMeta {
                 status: Ok(()),
                 fee: 0,

@@ -19,6 +19,298 @@ fn writer_defaults_to_measured_archival_zstd_level() {
     assert_eq!(ArchiveWriterConfig::default().zstd_level, 9);
 }
 
+fn sample_archive_provenance_v1() -> ArchiveProvenanceV1 {
+    ArchiveProvenanceV1 {
+        generation_profile: "jetstreamer-node/historical-replay-v1".into(),
+        runtime_profile: "solana-v1.0.24".into(),
+        runtime_admission: RuntimeAdmission::Candidate,
+        runtime_revision: "a93915f1bddb73480f86fc09f487315ae191897d".into(),
+        runtime_toolchain: "rustc-1.43.0-x86_64-unknown-linux-gnu".into(),
+        genesis_hash: Hash::new_from_array([5; 32]),
+        bootstrap_state_kind: BootstrapStateKind::SnapshotArchive,
+        bootstrap_slot: 416_012,
+        bootstrap_state_hash: Hash::new_from_array([9; 32]),
+        requested_slot_start: 432_000,
+        requested_slot_count: 1,
+        transaction_metadata: TransactionMetadataPolicy::runtime_reconstructed_before(
+            157 * 432_000,
+        ),
+    }
+}
+
+fn sample_archive_provenance() -> ArchiveProvenance {
+    ArchiveProvenanceV2 {
+        base: sample_archive_provenance_v1(),
+        worker_executable_sha256: [0x42; 32],
+    }
+    .into()
+}
+
+fn sample_archive_provenance_v3() -> ArchiveProvenance {
+    let checkpoint = RuntimeStateCheckpoint {
+        slot: 432_000,
+        bank_hash: Hash::new_from_array([0x11; 32]),
+        accounts_hash_kind: AccountsHashKind::LegacyAccountsHash,
+        accounts_hash: Hash::new_from_array([0x22; 32]),
+        last_blockhash: Hash::new_from_array([0x33; 32]),
+        capitalization: 123,
+        transaction_count: 456,
+        tick_height: 789,
+        slot_complete: true,
+        next_write_version: 1,
+    };
+    ArchiveProvenanceV3 {
+        assembly_profile: "test/runtime-segment-assembly-v1".into(),
+        genesis_hash: Hash::new_from_array([5; 32]),
+        bootstrap_state_kind: BootstrapStateKind::SnapshotArchive,
+        bootstrap_state: StateCommitment {
+            slot: 431_999,
+            kind: StateCommitmentKind::LegacyAccountsHash,
+            hash: Hash::new_from_array([9; 32]),
+        },
+        requested_slot_start: 432_000,
+        requested_slot_count: 2,
+        transaction_metadata: TransactionMetadataPolicy::observed(),
+        runtime_segments: vec![
+            RuntimeSegmentProvenance {
+                slot_start: 432_000,
+                slot_count: 1,
+                generation_profile: "test/historical".into(),
+                runtime_profile: "solana-v1".into(),
+                runtime_admission: RuntimeAdmission::Candidate,
+                runtime_revision: "old-revision".into(),
+                runtime_toolchain: "old-toolchain".into(),
+                worker_executable_sha256: Some([0x44; 32]),
+                write_versions: WriteVersionNormalization {
+                    worker_start: 0,
+                    worker_end_exclusive: 1,
+                    archive_start: 10,
+                },
+            },
+            RuntimeSegmentProvenance {
+                slot_start: 432_001,
+                slot_count: 1,
+                generation_profile: "test/current".into(),
+                runtime_profile: "agave-v3".into(),
+                runtime_admission: RuntimeAdmission::Verified,
+                runtime_revision: "new-revision".into(),
+                runtime_toolchain: "new-toolchain".into(),
+                worker_executable_sha256: None,
+                write_versions: WriteVersionNormalization {
+                    worker_start: 99,
+                    worker_end_exclusive: 100,
+                    archive_start: 11,
+                },
+            },
+        ],
+        handoffs: vec![RuntimeHandoffProvenance {
+            boundary_slot: 432_001,
+            predecessor: checkpoint,
+            successor: RuntimeStateCheckpoint {
+                next_write_version: 99,
+                ..checkpoint
+            },
+            successor_bootstrap_kind: BootstrapStateKind::SnapshotArchive,
+            successor_bootstrap_archive_sha256: [0x55; 32],
+            successor_bootstrap_write_count: 0,
+        }],
+    }
+    .into()
+}
+
+#[test]
+fn writer_reader_provenance_is_opt_in_and_roundtrips() {
+    for expected in [sample_archive_provenance(), sample_archive_provenance_v3()] {
+        let range = expected.requested_range().unwrap();
+        let mut writer = ArchiveWriter::new_with_provenance(
+            Vec::new(),
+            1,
+            range.start,
+            range.end - range.start,
+            ArchiveWriterConfig::default(),
+            &expected,
+        )
+        .unwrap();
+        for slot in range {
+            writer.write_skipped_slot(slot).unwrap();
+        }
+        let (bytes, _) = writer.finish().unwrap();
+
+        let reader = ArchiveReader::open(std::io::Cursor::new(bytes)).unwrap();
+        assert_eq!(reader.header().format_version, FORMAT_VERSION_V2);
+        assert_eq!(reader.provenance().unwrap(), Some(expected));
+    }
+
+    let mut legacy_writer =
+        ArchiveWriter::new(Vec::new(), 1, 432_000, 1, ArchiveWriterConfig::default()).unwrap();
+    legacy_writer.write_skipped_slot(432_000).unwrap();
+    let (legacy_bytes, _) = legacy_writer.finish().unwrap();
+    let legacy_reader = ArchiveReader::open(std::io::Cursor::new(legacy_bytes)).unwrap();
+    assert!(legacy_reader.header().meta.reserved.is_empty());
+    assert_eq!(legacy_reader.provenance().unwrap(), None);
+}
+
+fn assert_full_reencode_preserves_provenance_bytes(provenance: ArchiveProvenance) {
+    let range = provenance.requested_range().unwrap();
+    let mut writer = ArchiveWriter::new_with_provenance(
+        Vec::new(),
+        1,
+        range.start,
+        range.end - range.start,
+        ArchiveWriterConfig::default(),
+        &provenance,
+    )
+    .unwrap();
+    for slot in range {
+        writer.write_skipped_slot(slot).unwrap();
+    }
+    let (source, _) = writer.finish().unwrap();
+    let source_reader = ArchiveReader::open(std::io::Cursor::new(&source)).unwrap();
+    let source_reserved = source_reader.header().meta.reserved.clone();
+
+    let (output, _) = reencode_archive(
+        std::io::Cursor::new(source),
+        Vec::new(),
+        ReencodeOptions {
+            writer: ArchiveWriterConfig {
+                compression: Compression::None,
+                ..ArchiveWriterConfig::default()
+            },
+            buckets: BucketSelection::All,
+        },
+    )
+    .unwrap();
+    let output_reader = ArchiveReader::open(std::io::Cursor::new(output)).unwrap();
+    assert_eq!(output_reader.header().meta.reserved, source_reserved);
+    assert_eq!(output_reader.provenance().unwrap(), Some(provenance));
+}
+
+#[test]
+fn full_reencode_preserves_v1_provenance_bytes() {
+    assert_full_reencode_preserves_provenance_bytes(sample_archive_provenance_v1().into());
+}
+
+#[test]
+fn full_reencode_preserves_v2_provenance_bytes() {
+    assert_full_reencode_preserves_provenance_bytes(sample_archive_provenance());
+}
+
+#[test]
+fn full_reencode_preserves_v3_provenance_bytes() {
+    assert_full_reencode_preserves_provenance_bytes(sample_archive_provenance_v3());
+}
+
+#[test]
+fn sparse_reencode_does_not_inherit_full_range_provenance() {
+    let mut base = sample_archive_provenance_v1();
+    base.requested_slot_count = 2;
+    let provenance = ArchiveProvenanceV2 {
+        base,
+        worker_executable_sha256: [0x42; 32],
+    }
+    .into();
+    let config = ArchiveWriterConfig {
+        bucket_slots: 1,
+        ..ArchiveWriterConfig::default()
+    };
+    let mut writer =
+        ArchiveWriter::new_with_provenance(Vec::new(), 1, 432_000, 2, config.clone(), &provenance)
+            .unwrap();
+    writer.write_skipped_slot(432_000).unwrap();
+    writer.write_skipped_slot(432_001).unwrap();
+    let (source, _) = writer.finish().unwrap();
+
+    let (output, _) = reencode_archive(
+        std::io::Cursor::new(source),
+        Vec::new(),
+        ReencodeOptions {
+            writer: config,
+            buckets: BucketSelection::Indices(vec![0]),
+        },
+    )
+    .unwrap();
+    let output_reader = ArchiveReader::open(std::io::Cursor::new(output)).unwrap();
+    assert!(output_reader.header().meta.reserved.is_empty());
+    assert_eq!(output_reader.provenance().unwrap(), None);
+}
+
+#[test]
+fn gapped_bucket_coverage_does_not_inherit_full_range_provenance() {
+    let mut base = sample_archive_provenance_v1();
+    base.requested_slot_count = 4;
+    let provenance = ArchiveProvenance::V1(base);
+    let config = ArchiveWriterConfig {
+        bucket_slots: 2,
+        ..ArchiveWriterConfig::default()
+    };
+    let mut writer =
+        ArchiveWriter::new_with_provenance(Vec::new(), 1, 432_000, 4, config.clone(), &provenance)
+            .unwrap();
+    // Both nominal bucket keys are present, but the first bucket is short.
+    writer.write_skipped_slot(432_000).unwrap();
+    writer.write_skipped_slot(432_002).unwrap();
+    writer.write_skipped_slot(432_003).unwrap();
+    let (source, _) = writer.finish().unwrap();
+
+    let (output, _) = reencode_archive(
+        std::io::Cursor::new(source),
+        Vec::new(),
+        ReencodeOptions {
+            writer: config,
+            buckets: BucketSelection::All,
+        },
+    )
+    .unwrap();
+    let output_reader = ArchiveReader::open(std::io::Cursor::new(output)).unwrap();
+    assert_eq!(output_reader.bucket_count(), 2);
+    assert!(output_reader.header().meta.reserved.is_empty());
+    assert_eq!(output_reader.provenance().unwrap(), None);
+}
+
+#[test]
+fn writer_rejects_provenance_for_a_different_slot_range() {
+    let error = ArchiveWriter::new_with_provenance(
+        Vec::new(),
+        1,
+        432_001,
+        1,
+        ArchiveWriterConfig::default(),
+        &sample_archive_provenance(),
+    )
+    .err()
+    .expect("mismatched provenance must fail");
+    assert!(matches!(
+        error,
+        ArchiveFormatError::Provenance(ArchiveProvenanceError::RequestedRangeMismatch { .. })
+    ));
+}
+
+#[test]
+fn reader_open_leaves_nonempty_reserved_bytes_opaque() {
+    let mut writer = ArchiveWriter::new_with_provenance(
+        Vec::new(),
+        1,
+        432_000,
+        1,
+        ArchiveWriterConfig::default(),
+        &sample_archive_provenance(),
+    )
+    .unwrap();
+    writer.write_skipped_slot(432_000).unwrap();
+    let (mut bytes, _) = writer.finish().unwrap();
+    let magic_offset = bytes
+        .windows(ARCHIVE_PROVENANCE_MAGIC.len())
+        .position(|window| window == ARCHIVE_PROVENANCE_MAGIC)
+        .expect("structured provenance magic in file header");
+    bytes[magic_offset] ^= 0xff;
+
+    let reader = ArchiveReader::open(std::io::Cursor::new(bytes)).unwrap();
+    assert!(matches!(
+        reader.provenance(),
+        Err(ArchiveProvenanceError::BadMagic)
+    ));
+}
+
 // --- deterministic PRNG (splitmix64) ---
 
 struct Rng(u64);

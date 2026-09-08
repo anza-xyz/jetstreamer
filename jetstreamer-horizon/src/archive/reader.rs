@@ -8,11 +8,12 @@
 use lencode::prelude::*;
 
 use super::bucket::{
-    BucketDecoder, ChainMismatchPolicy, MAX_HEADER_ALLOCATION_BYTES, PayloadByteStats, SlotVisitor,
-    bucket_containing, parse_bucket_index, read_io_varint, validate_bucket_index_layout,
+    BucketDecoder, ChainMismatchPolicy, PayloadByteStats, SlotVisitor, bucket_containing,
+    decode_file_header_bytes, parse_bucket_index, read_io_varint, validate_bucket_index_layout,
     validate_footer_layout,
 };
 use super::format::*;
+use super::provenance::{ArchiveProvenance, ArchiveProvenanceError};
 
 /// Streaming archive reader over any `Read + Seek` source.
 pub struct ArchiveReader<R: std::io::Read + std::io::Seek> {
@@ -76,15 +77,7 @@ impl<R: std::io::Read + std::io::Seek> ArchiveReader<R> {
         header_bytes.resize(header_len, 0);
         source.read_exact(&mut header_bytes)?;
         let header_end = source.stream_position()?;
-        let header: FileHeader = decode_exact_with_limits(
-            &header_bytes,
-            None,
-            DecodeLimits::new(
-                header_bytes.len(),
-                header_bytes.len(),
-                MAX_HEADER_ALLOCATION_BYTES,
-            ),
-        )?;
+        let header = decode_file_header_bytes(&header_bytes)?;
         validate_archive_version(header.format_version, header.flags)?;
         if header.bucket_slots == 0 {
             return Err(ArchiveFormatError::InvalidContainerLayout(
@@ -138,9 +131,55 @@ impl<R: std::io::Read + std::io::Seek> ArchiveReader<R> {
         &self.header
     }
 
+    /// Explicitly parses the optional, versioned generation provenance in the
+    /// file header. Opening an archive does not parse this field, preserving
+    /// compatibility with old empty-reserved archives and opaque future uses.
+    pub fn provenance(&self) -> Result<Option<ArchiveProvenance>, ArchiveProvenanceError> {
+        let provenance = self.header.meta.provenance()?;
+        if let Some(value) = &provenance {
+            value.validate_for_archive(self.header.slot_start, self.header.slot_count)?;
+        }
+        Ok(provenance)
+    }
+
     /// Number of buckets in the archive.
     pub fn bucket_count(&self) -> usize {
         self.index.len()
+    }
+
+    /// Returns whether indexed bucket headers cover every declared slot
+    /// exactly once, without decompressing their payloads.
+    ///
+    /// This is stricter than comparing the index count and first-slot keys:
+    /// an interrupted writer can leave the expected bucket keys while one of
+    /// those buckets contains fewer frames than its declared range requires.
+    pub(crate) fn has_complete_slot_coverage(&mut self) -> Result<bool, ArchiveFormatError> {
+        use std::io::SeekFrom;
+
+        let expected_buckets = self
+            .header
+            .slot_count
+            .div_ceil(u64::from(self.header.bucket_slots));
+        if u64::try_from(self.index.len()).ok() != Some(expected_buckets) {
+            return Ok(false);
+        }
+        let slot_end = self.header.slot_start + self.header.slot_count;
+        for (index, entry) in self.index.iter().enumerate() {
+            let expected_first = self.header.slot_start
+                + u64::try_from(index).map_err(|_| {
+                    ArchiveFormatError::InvalidContainerLayout("bucket index does not fit u64")
+                })? * u64::from(self.header.bucket_slots);
+            let expected_count =
+                (slot_end - expected_first).min(u64::from(self.header.bucket_slots));
+            self.source.seek(SeekFrom::Start(entry.offset))?;
+            let mut indexed_bytes = std::io::Read::take(&mut self.source, entry.len);
+            let bucket = BucketHeader::decode_ext(&mut indexed_bytes, None)?;
+            if bucket.first_slot != expected_first || u64::from(bucket.slot_count) != expected_count
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     /// The archive's bucket index (`first_slot`, byte `offset`, byte `len`

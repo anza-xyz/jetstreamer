@@ -314,22 +314,68 @@ transaction/block/reward/etc data on multiple threads in parallel.
 
 ## Epoch Feature Availability
 
-Old Faithful ledger snapshots vary in what metadata is available, because Solana as a
-blockchain has evolved significantly over time. Use the table below to decide which epochs fit
-your needs. In particular, note that early versions of the chain are no longer compatible with
-modern geyser but _do_ work with the current `firehose` interface and `JetstreamerRunner`.
-Furthermore, CU tracking was not always available historically so it is not available once you
-go back far enough.
+Old Faithful changed its transaction-status metadata encoding at epoch 157. The firehose
+selects the decoder from the slot and supports both encodings. Compute-unit metadata starts at
+slot 194,184,611, partway through epoch 449.
 
-| Epoch | Slot        | Comment |
-|-------|-------------|--------------------------------------------------|
-| 0-156 | 0-?         | Incompatible with modern Geyser plugins |
-| 157+  | ?           | Compatible with modern Geyser plugins |
-| 0-449 | 0-194184610 | CU tracking not available (reported as 0)        |
-| 450+  | 194184611+  | CU tracking available                            |
+| Epoch/range | Slot range        | Comment |
+|-------------|-------------------|-----------------------------------------------|
+| 0-156       | 0-67,823,999      | Bincode transaction metadata (auto-decoded)   |
+| 157+        | 67,824,000+       | Protobuf transaction metadata                 |
+| through 449 | 0-194,184,610     | CU tracking unavailable (reported as `0`)     |
+| from 449    | 194,184,611+      | CU tracking available                         |
 
-Epochs at or above 157 are compatible with the current Geyser plugin interface, while compute
-unit accounting first appears at epoch 450. Plan replay windows accordingly.
+The epoch-157 cutoff is an archive-input boundary, not a consensus-runtime boundary.
+Reconstructing historical account updates requires execution rules that match the requested
+slot range.
+
+### Historical replay compatibility
+
+`jetstreamer-node` selects execution semantics from the complete half-open slot range before it
+loads a snapshot or starts a worker. Snapshot extensions choose only the state loader; they do not
+select a runtime. The current registry is deliberately conservative:
+
+| Slots | Runtime | Admission |
+|---|---|---|
+| `0..619,849` | pinned Solana v1.0.7 worker | candidate through the first proven-safe handoff |
+| `619,849..4,752,000` | pinned Solana v1.0.8 worker | candidate search envelope for the rest of epochs 1-10 |
+| `4,752,000..406,080,000` | none | unsupported; replay fails closed |
+| `406,080,000..` | in-process Agave v3 | verified |
+
+Candidate mode requires the exact runtime identity, an explicit
+`JETSTREAMER_ALLOW_CANDIDATE_RUNTIME=1`, snapshot verification, and at least one canonical
+checkpoint after the bootstrap slot. Unknown opt-in values are rejected. Current behavioral
+evidence proves the old v1.0.7 vote-initialization semantics through slot 618,196 and first requires
+the v1.0.8 semantics at slot 630,648. The canonical snapshot at slot 619,848 is therefore the
+behaviorally safe handoff: v1.0.7 processes through that snapshot and v1.0.8 starts at slot 619,849.
+This routing point is not a claim about the exact deployment slot. The v1.0.8 tail remains an
+explicitly non-canonical search envelope until its checkpoint replay completes; the exact v1.0.24
+worker is registered but intentionally unassigned until later evidence requires it.
+
+Transaction metadata is an independent compatibility dimension. Old Faithful has no status frame
+before slot `4,258,776`; the pinned historical runtime reconstructs transaction status there, while
+the remaining metadata stays explicitly unavailable. At and after that slot, a missing status frame
+is an error. This policy changes during epoch 9 without changing the execution runtime.
+
+Generated Horizon archives record the selected runtime identity and admission level, genesis,
+bootstrap state, output slot range, and transaction-metadata policy in a versioned provenance
+envelope. Range resume skips a completed archive only when that provenance matches the current
+slot-derived plan.
+
+When an epoch crosses a registered runtime boundary, `jetstreamer-node` splits it automatically
+into bounded child replays. Each child writes a complete Horizon V2 segment plus a durable JSON
+evidence sidecar bound to both the archive and worker executable by SHA-256. At the v1.0.7 →
+v1.0.8 boundary, the predecessor exports the registry-committed slot-619,848 snapshot only after
+its frozen checkpoint matches the canonical accounts hash. A second durable sidecar binds every
+snapshot byte—including status-cache state not covered by the accounts hash—to that checkpoint
+and the measured predecessor worker. The successor copies exactly the sidecar-declared byte length
+into private storage while verifying that digest, restores only the bound copy, and must reproduce
+the full checkpoint state
+without bootstrap writes. The final Horizon V3 records the exact handoff archive digest, streams
+and re-encodes the segments, checks PoH continuity and every segment's terminal blockhash, rebases
+runtime-local write versions into one contiguous namespace, fully decodes the result, and then
+publishes it atomically. Interrupted segment files are retained for validated resume, and an older
+final output is moved to a recoverable backup only after the new archive has passed verification.
 
 ## Installation and Setup
 

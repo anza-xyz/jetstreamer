@@ -4666,6 +4666,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "jetstreamer-historical-protocol-current"
+version = "0.1.0"
+dependencies = [
+ "bincode",
+ "serde",
+]
+
+[[package]]
 name = "jetstreamer-horizon"
 version = "0.7.0"
 dependencies = [
@@ -4711,6 +4719,7 @@ name = "jetstreamer-node"
 version = "0.7.0"
 dependencies = [
  "agave-snapshots",
+ "bincode",
  "bs58",
  "cid",
  "crossbeam-channel",
@@ -4718,14 +4727,18 @@ dependencies = [
  "dashmap 6.1.0",
  "env_logger",
  "jetstreamer-firehose",
+ "jetstreamer-historical-protocol-current",
  "jetstreamer-horizon",
  "lencode",
+ "libc",
  "log",
  "rayon",
  "reqwest 0.13.3",
  "ripget 0.1.0",
+ "serde",
  "serde_cbor",
  "serde_json",
+ "sha2 0.10.9",
  "solana-account",
  "solana-accounts-db",
  "solana-address 1.1.0",

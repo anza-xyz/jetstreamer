@@ -10,6 +10,7 @@ keywords.workspace = true
 
 [dependencies]
 agave-snapshots.workspace = true
+bincode.workspace = true
 cid.workspace = true
 # Global allocator (same choice as agave-validator): glibc malloc never returns
 # the accounts-db churn to the OS (anon RSS grew ~520 GiB per replayed epoch →
@@ -24,6 +25,7 @@ dashmap.workspace = true
 env_logger.workspace = true
 jetstreamer-firehose.workspace = true
 jetstreamer-horizon.workspace = true
+jetstreamer-historical-protocol = { package = "jetstreamer-historical-protocol-current", path = "../historical-runtime/protocol-current" }
 solana-reward-info.workspace = true
 solana-message.workspace = true
 solana-runtime-transaction.workspace = true
@@ -31,10 +33,13 @@ rayon.workspace = true
 log.workspace = true
 bs58.workspace = true
 lencode.workspace = true
+libc.workspace = true
 reqwest.workspace = true
 serde_cbor.workspace = true
 ripget = "0.1"
+serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
+sha2.workspace = true
 solana-account.workspace = true
 solana-accounts-db.workspace = true
 solana-address.workspace = true
@@ -62,3 +67,6 @@ xxhash-rust.workspace = true
 
 [dev-dependencies]
 solana-runtime = { workspace = true, features = ["dev-context-only-utils"] }
+
+[build-dependencies]
+sha2.workspace = true

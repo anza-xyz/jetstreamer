@@ -40,6 +40,11 @@ pub const SIGNATURE_BYTES: usize = 64;
 /// preventing a replaced path from driving an unbounded private copy.
 const MAX_HISTORICAL_WORKER_EXECUTABLE_BYTES: u64 = 256 * 1024 * 1024;
 
+/// A mainnet `genesis.bin` is small (currently about 130 KiB). Keep this
+/// aligned with Agave's hardened 10 MiB genesis-archive unpack ceiling so a
+/// replaced source cannot drive an unbounded parent copy or old-worker decode.
+const MAX_HISTORICAL_GENESIS_BIN_BYTES: u64 = 10 * 1024 * 1024;
+
 const SOLANA_V1_0_24_BACKEND_ID: &str = "solana-v1.0.24";
 const SOLANA_V1_0_24_TAG: &str = "v1.0.24";
 const SOLANA_V1_0_24_COMMIT: &str = "a93915f1bddb73480f86fc09f487315ae191897d";
@@ -114,9 +119,9 @@ pub const SOLANA_V1_0_24_CANDIDATE: WorkerProfile = WorkerProfile {
 
 /// Exact snapshot identity supplied by the caller's archive-name parser.
 ///
-/// Requiring these values keeps initialization fail-closed: the parent checks
-/// that the worker actually loaded the snapshot it selected, rather than
-/// trusting metadata returned by the worker.
+/// Requiring these values keeps snapshot initialization fail-closed: the
+/// parent checks that the worker actually loaded the snapshot it selected,
+/// rather than trusting metadata returned by the worker.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SnapshotInitialization {
     pub ledger_path: PathBuf,
@@ -135,12 +140,39 @@ pub struct SnapshotInitialization {
     pub scratch_parent: Option<PathBuf>,
 }
 
+/// Canonical genesis state supplied locally by the caller.
+///
+/// The current runtime must first bind the canonical raw bytes into private
+/// storage and semantically validate only that private copy. The historical
+/// client binds it again into its own private work directory; the pinned worker
+/// decodes only that second copy with its historical types and must attest the
+/// registered mainnet genesis hash before initialization is accepted.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GenesisInitialization {
+    /// Exact private `genesis.bin` admitted and validated by the current runtime.
+    pub genesis_bin_path: PathBuf,
+    /// Raw-file identity established before semantic validation. The client
+    /// copies exactly these bytes again before the worker starts.
+    pub expected_size: u64,
+    pub expected_sha256: [u8; HASH_BYTES],
+    /// An existing directory in which the parent creates a private temporary
+    /// directory. The worker creates its own state directory below that.
+    pub scratch_parent: Option<PathBuf>,
+}
+
+/// State source for a newly spawned historical runtime.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum HistoricalInitialization {
+    SnapshotArchive(SnapshotInitialization),
+    Genesis(GenesisInitialization),
+}
+
 /// Spawn configuration separated from runtime identity so the same verified
 /// profile can be deployed at different filesystem locations.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WorkerSpawn {
     pub executable: PathBuf,
-    pub initialization: SnapshotInitialization,
+    pub initialization: HistoricalInitialization,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -177,6 +209,20 @@ pub enum HistoricalRuntimeError {
     SnapshotArchiveSizeMismatch { expected: u64, actual: u64 },
     #[error("historical snapshot archive binding must provide both size and SHA-256")]
     IncompleteSnapshotArchiveBinding,
+    #[error("historical genesis input is not a regular genesis.bin file: {0}")]
+    GenesisNotFile(PathBuf),
+    #[error("historical genesis.bin is empty: {0}")]
+    GenesisEmpty(PathBuf),
+    #[error("historical genesis.bin {path} is {bytes} bytes (limit {limit})")]
+    GenesisTooLarge {
+        path: PathBuf,
+        bytes: u64,
+        limit: u64,
+    },
+    #[error("historical genesis.bin size mismatch: expected {expected}, got {actual}")]
+    GenesisSizeMismatch { expected: u64, actual: u64 },
+    #[error("historical genesis.bin SHA-256 mismatch: expected {expected}, got {actual}")]
+    GenesisDigestMismatch { expected: String, actual: String },
     #[error("historical worker scratch parent is not a directory: {0}")]
     ScratchParentNotDirectory(PathBuf),
     #[error("historical snapshot output path is not a directory: {0}")]
@@ -263,7 +309,7 @@ pub enum HistoricalRuntimeError {
     },
     #[error("worker initialized with genesis {actual}, expected {expected}")]
     InitializedGenesisMismatch { expected: String, actual: String },
-    #[error("worker initialized at slot {actual}, expected snapshot slot {expected}")]
+    #[error("worker initialized at slot {actual}, expected bootstrap slot {expected}")]
     InitializedSlotMismatch { expected: u64, actual: u64 },
     #[error("worker initialized from the wrong source: {0}")]
     InitializedSourceMismatch(String),
@@ -363,10 +409,17 @@ pub enum HistoricalRuntimeError {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HistoricalInitialized {
     pub genesis_hash: String,
+    pub source: HistoricalInitializedSource,
     pub slot: u64,
     pub last_blockhash: [u8; HASH_BYTES],
     pub ticks_per_slot: u64,
     pub next_write_version: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HistoricalInitializedSource {
+    SnapshotArchive,
+    Genesis,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -575,7 +628,7 @@ pub struct HistoricalRuntimeClient {
 }
 
 impl HistoricalRuntimeClient {
-    /// Spawn, identify, and initialize a worker from an exact legacy snapshot.
+    /// Spawn, identify, and initialize a worker from a caller-selected state.
     pub fn spawn(
         profile: WorkerProfile,
         spawn: WorkerSpawn,
@@ -590,40 +643,76 @@ impl HistoricalRuntimeClient {
     ) -> Result<Self, HistoricalRuntimeError> {
         let executable = canonical_regular_file(&spawn.executable, true)?;
         let initialization = &spawn.initialization;
-        let ledger_path = canonical_directory(&initialization.ledger_path, "ledger")?;
-        let source_archive_path = canonical_regular_file(&initialization.archive_path, false)?;
-        if !source_archive_path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name.ends_with(".tar.bz2"))
-        {
-            return Err(HistoricalRuntimeError::NotLegacySnapshot(
-                source_archive_path,
-            ));
-        }
+        let scratch_parent = match initialization {
+            HistoricalInitialization::SnapshotArchive(initialization) => {
+                initialization.scratch_parent.as_deref()
+            }
+            HistoricalInitialization::Genesis(initialization) => {
+                initialization.scratch_parent.as_deref()
+            }
+        };
 
-        let private_work_dir = make_private_work_dir(initialization.scratch_parent.as_deref())?;
+        let private_work_dir = make_private_work_dir(scratch_parent)?;
         // A generated runtime-handoff archive contains replay-relevant bytes
         // (notably status-cache entries) that are not covered by its filename's
         // accounts hash. Copy from one open handle while hashing, then give the
         // worker only the private, digest-bound copy. This closes the path
         // replacement window between parent admission and worker loading.
         let bound_executable = bind_worker_executable(&executable, private_work_dir.path())?;
-        let archive_path = match (
-            initialization.expected_archive_size,
-            initialization.expected_archive_sha256,
-        ) {
-            (Some(expected_size), Some(expected_sha256)) => bind_snapshot_archive(
-                &source_archive_path,
-                private_work_dir.path(),
-                expected_size,
-                expected_sha256,
-            )?,
-            (None, None) => source_archive_path,
-            _ => return Err(HistoricalRuntimeError::IncompleteSnapshotArchiveBinding),
+        let (ledger_path, initial_state, expected_source) = match initialization {
+            HistoricalInitialization::SnapshotArchive(initialization) => {
+                let ledger_path = canonical_directory(&initialization.ledger_path, "ledger")?;
+                let source_archive_path =
+                    canonical_regular_file(&initialization.archive_path, false)?;
+                if !source_archive_path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.ends_with(".tar.bz2"))
+                {
+                    return Err(HistoricalRuntimeError::NotLegacySnapshot(
+                        source_archive_path,
+                    ));
+                }
+                let archive_path = match (
+                    initialization.expected_archive_size,
+                    initialization.expected_archive_sha256,
+                ) {
+                    (Some(expected_size), Some(expected_sha256)) => bind_snapshot_archive(
+                        &source_archive_path,
+                        private_work_dir.path(),
+                        expected_size,
+                        expected_sha256,
+                    )?,
+                    (None, None) => source_archive_path,
+                    _ => return Err(HistoricalRuntimeError::IncompleteSnapshotArchiveBinding),
+                };
+                let archive_path = path_string(&archive_path)?;
+                (
+                    path_string(&ledger_path)?,
+                    InitialState::SnapshotArchive {
+                        archive_path: archive_path.clone(),
+                    },
+                    ExpectedInitializedSource::SnapshotArchive {
+                        archive_path,
+                        slot: initialization.expected_slot,
+                        accounts_hash: initialization.expected_accounts_hash,
+                    },
+                )
+            }
+            HistoricalInitialization::Genesis(initialization) => {
+                let bound_genesis = bind_genesis_bin(
+                    &initialization.genesis_bin_path,
+                    private_work_dir.path(),
+                    initialization.expected_size,
+                    initialization.expected_sha256,
+                )?;
+                (
+                    path_string(&bound_genesis)?,
+                    InitialState::Genesis,
+                    ExpectedInitializedSource::Genesis,
+                )
+            }
         };
-        let ledger_path_string = path_string(&ledger_path)?;
-        let archive_path_string = path_string(&archive_path)?;
         let scratch_path_string = path_string(private_work_dir.path())?;
 
         // The private copy and its digest were produced from the same bounded
@@ -677,6 +766,7 @@ impl HistoricalRuntimeClient {
             snapshot_export_seal: None,
             initialized: HistoricalInitialized {
                 genesis_hash: String::new(),
+                source: HistoricalInitializedSource::Genesis,
                 slot: 0,
                 last_blockhash: [0; HASH_BYTES],
                 ticks_per_slot: 0,
@@ -702,10 +792,8 @@ impl HistoricalRuntimeClient {
         }
 
         let body = client.exchange(RequestBody::Initialize {
-            ledger_path: ledger_path_string,
-            initial_state: InitialState::SnapshotArchive {
-                archive_path: archive_path_string.clone(),
-            },
+            ledger_path,
+            initial_state,
             scratch_root: Some(scratch_path_string),
         })?;
         let initialized = match body {
@@ -717,13 +805,7 @@ impl HistoricalRuntimeClient {
                 });
             }
         };
-        let initialized = validate_initialized(
-            profile,
-            initialized,
-            &archive_path_string,
-            initialization.expected_slot,
-            initialization.expected_accounts_hash,
-        );
+        let initialized = validate_initialized(profile, initialized, &expected_source);
         client.initialized = match initialized {
             Ok(initialized) => initialized,
             Err(error) => return client.abort_after_response(error),
@@ -1483,6 +1565,22 @@ struct BoundWorkerExecutable {
     sha256: [u8; HASH_BYTES],
 }
 
+/// Raw identity of a bounded, materialized `genesis.bin`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GenesisFileIdentity {
+    pub size: u64,
+    pub sha256: [u8; HASH_BYTES],
+}
+
+/// Measures one nofollow-opened `genesis.bin` under the same hard size limit
+/// used when binding it for an old worker.
+#[cfg(test)]
+pub fn measure_genesis_bin(
+    source_path: &Path,
+) -> Result<GenesisFileIdentity, HistoricalRuntimeError> {
+    stream_genesis_bin(source_path, None, None)
+}
+
 /// Open one worker inode and stream exactly its admitted size into the hash and
 /// optional private copy. Hashing and copying the same chunks makes the result
 /// self-consistent even if the configured pathname is atomically replaced.
@@ -1595,6 +1693,160 @@ fn bind_worker_executable(
         path: bound_path,
         sha256,
     })
+}
+
+fn stream_genesis_bin(
+    source_path: &Path,
+    mut destination: Option<&mut fs::File>,
+    required_size: Option<u64>,
+) -> Result<GenesisFileIdentity, HistoricalRuntimeError> {
+    if source_path.file_name().and_then(|name| name.to_str()) != Some("genesis.bin") {
+        return Err(HistoricalRuntimeError::GenesisNotFile(
+            source_path.to_path_buf(),
+        ));
+    }
+    let source_file =
+        open_readonly_nofollow(source_path).map_err(|source| HistoricalRuntimeError::PathIo {
+            path: source_path.to_path_buf(),
+            source,
+        })?;
+    let source_metadata =
+        source_file
+            .metadata()
+            .map_err(|source| HistoricalRuntimeError::PathIo {
+                path: source_path.to_path_buf(),
+                source,
+            })?;
+    if !source_metadata.is_file() {
+        return Err(HistoricalRuntimeError::GenesisNotFile(
+            source_path.to_path_buf(),
+        ));
+    }
+    let expected_size = source_metadata.len();
+    if expected_size == 0 {
+        return Err(HistoricalRuntimeError::GenesisEmpty(
+            source_path.to_path_buf(),
+        ));
+    }
+    if expected_size > MAX_HISTORICAL_GENESIS_BIN_BYTES {
+        return Err(HistoricalRuntimeError::GenesisTooLarge {
+            path: source_path.to_path_buf(),
+            bytes: expected_size,
+            limit: MAX_HISTORICAL_GENESIS_BIN_BYTES,
+        });
+    }
+    if let Some(required_size) = required_size
+        && expected_size != required_size
+    {
+        return Err(HistoricalRuntimeError::GenesisSizeMismatch {
+            expected: required_size,
+            actual: expected_size,
+        });
+    }
+
+    let mut source = BufReader::new(source_file);
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    let mut remaining = expected_size;
+    while remaining != 0 {
+        let maximum = std::cmp::min(remaining, buffer.len() as u64) as usize;
+        let read = source.read(&mut buffer[..maximum]).map_err(|source| {
+            HistoricalRuntimeError::PathIo {
+                path: source_path.to_path_buf(),
+                source,
+            }
+        })?;
+        if read == 0 {
+            return Err(HistoricalRuntimeError::GenesisSizeMismatch {
+                expected: expected_size,
+                actual: expected_size - remaining,
+            });
+        }
+        hasher.update(&buffer[..read]);
+        if let Some(output) = destination.as_deref_mut() {
+            output
+                .write_all(&buffer[..read])
+                .map_err(|source| HistoricalRuntimeError::PathIo {
+                    path: source_path.to_path_buf(),
+                    source,
+                })?;
+        }
+        remaining -= read as u64;
+    }
+    let mut extra = [0u8; 1];
+    if source
+        .read(&mut extra)
+        .map_err(|source| HistoricalRuntimeError::PathIo {
+            path: source_path.to_path_buf(),
+            source,
+        })?
+        != 0
+    {
+        let actual = source
+            .get_ref()
+            .metadata()
+            .map(|metadata| metadata.len())
+            .unwrap_or(expected_size.saturating_add(1))
+            .max(expected_size.saturating_add(1));
+        return Err(HistoricalRuntimeError::GenesisSizeMismatch {
+            expected: expected_size,
+            actual,
+        });
+    }
+    ensure_path_names_open_file(source_path, &source_metadata)?;
+    Ok(GenesisFileIdentity {
+        size: expected_size,
+        sha256: hasher.finalize().into(),
+    })
+}
+
+pub(crate) fn bind_genesis_bin(
+    source_path: &Path,
+    private_work_dir: &Path,
+    expected_size: u64,
+    expected_sha256: [u8; HASH_BYTES],
+) -> Result<PathBuf, HistoricalRuntimeError> {
+    let bound_directory = private_work_dir.join("bound-genesis");
+    fs::create_dir(&bound_directory).map_err(|source| HistoricalRuntimeError::PathIo {
+        path: bound_directory.clone(),
+        source,
+    })?;
+    let bound_path = bound_directory.join("genesis.bin");
+    let mut bound_file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&bound_path)
+        .map_err(|source| HistoricalRuntimeError::PathIo {
+            path: bound_path.clone(),
+            source,
+        })?;
+    let actual = stream_genesis_bin(source_path, Some(&mut bound_file), Some(expected_size))?;
+    if actual.size != expected_size {
+        return Err(HistoricalRuntimeError::GenesisSizeMismatch {
+            expected: expected_size,
+            actual: actual.size,
+        });
+    }
+    if actual.sha256 != expected_sha256 {
+        return Err(HistoricalRuntimeError::GenesisDigestMismatch {
+            expected: digest_hex(&expected_sha256),
+            actual: digest_hex(&actual.sha256),
+        });
+    }
+    bound_file
+        .flush()
+        .and_then(|()| bound_file.sync_all())
+        .map_err(|source| HistoricalRuntimeError::PathIo {
+            path: bound_path.clone(),
+            source,
+        })?;
+    fs::File::open(&bound_directory)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|source| HistoricalRuntimeError::PathIo {
+            path: bound_directory,
+            source,
+        })?;
+    Ok(bound_path)
 }
 
 fn bind_snapshot_archive(
@@ -1886,12 +2138,19 @@ fn verify_identity_field(
     }
 }
 
+enum ExpectedInitializedSource {
+    SnapshotArchive {
+        archive_path: String,
+        slot: u64,
+        accounts_hash: [u8; HASH_BYTES],
+    },
+    Genesis,
+}
+
 fn validate_initialized(
     profile: WorkerProfile,
     initialized: protocol::Initialized,
-    expected_archive_path: &str,
-    expected_slot: u64,
-    expected_accounts_hash: [u8; HASH_BYTES],
+    expected_source: &ExpectedInitializedSource,
 ) -> Result<HistoricalInitialized, HistoricalRuntimeError> {
     if initialized.genesis_hash != profile.required_genesis_hash {
         return Err(HistoricalRuntimeError::InitializedGenesisMismatch {
@@ -1899,43 +2158,64 @@ fn validate_initialized(
             actual: initialized.genesis_hash,
         });
     }
+    let expected_slot = match expected_source {
+        ExpectedInitializedSource::SnapshotArchive { slot, .. } => *slot,
+        ExpectedInitializedSource::Genesis => 0,
+    };
     if initialized.slot != expected_slot {
         return Err(HistoricalRuntimeError::InitializedSlotMismatch {
             expected: expected_slot,
             actual: initialized.slot,
         });
     }
-    match initialized.source {
-        InitializedSource::SnapshotArchive {
-            archive_path,
-            expected_accounts_hash: actual_accounts_hash,
-        } => {
+    let source = match (&initialized.source, expected_source) {
+        (
+            InitializedSource::SnapshotArchive {
+                archive_path,
+                expected_accounts_hash: actual_accounts_hash,
+            },
+            ExpectedInitializedSource::SnapshotArchive {
+                archive_path: expected_archive_path,
+                accounts_hash: expected_accounts_hash,
+                ..
+            },
+        ) => {
             if archive_path != expected_archive_path {
                 return Err(HistoricalRuntimeError::InitializedArchiveMismatch {
-                    expected: expected_archive_path.to_owned(),
-                    actual: archive_path,
+                    expected: expected_archive_path.clone(),
+                    actual: archive_path.clone(),
                 });
             }
             let actual_accounts_hash = array_32(
                 "initialized.source.expected_accounts_hash",
-                actual_accounts_hash,
+                actual_accounts_hash.clone(),
             )?;
-            if actual_accounts_hash != expected_accounts_hash {
+            if actual_accounts_hash != *expected_accounts_hash {
                 return Err(HistoricalRuntimeError::InitializedSourceMismatch(format!(
                     "snapshot accounts hash mismatch: expected {}, got {}",
                     bs58::encode(expected_accounts_hash).into_string(),
                     bs58::encode(actual_accounts_hash).into_string()
                 )));
             }
+            HistoricalInitializedSource::SnapshotArchive
         }
-        InitializedSource::Genesis => {
+        (InitializedSource::Genesis, ExpectedInitializedSource::Genesis) => {
+            HistoricalInitializedSource::Genesis
+        }
+        (InitializedSource::Genesis, ExpectedInitializedSource::SnapshotArchive { .. }) => {
             return Err(HistoricalRuntimeError::InitializedSourceMismatch(
                 "worker reported Genesis after SnapshotArchive initialization".to_owned(),
             ));
         }
-    }
+        (InitializedSource::SnapshotArchive { .. }, ExpectedInitializedSource::Genesis) => {
+            return Err(HistoricalRuntimeError::InitializedSourceMismatch(
+                "worker reported SnapshotArchive after Genesis initialization".to_owned(),
+            ));
+        }
+    };
     Ok(HistoricalInitialized {
         genesis_hash: initialized.genesis_hash,
+        source,
         slot: initialized.slot,
         last_blockhash: array_32("initialized.last_blockhash", initialized.last_blockhash)?,
         ticks_per_slot: initialized.ticks_per_slot,
@@ -2163,6 +2443,142 @@ mod tests {
 
     type HandshakeMutation = (&'static str, fn(&mut protocol::Handshake));
 
+    fn initialized_from(source: InitializedSource, slot: u64) -> protocol::Initialized {
+        protocol::Initialized {
+            genesis_hash: protocol::MAINNET_GENESIS_HASH.to_owned(),
+            source,
+            slot,
+            last_blockhash: vec![1; HASH_BYTES],
+            ticks_per_slot: 64,
+            next_write_version: 7,
+        }
+    }
+
+    #[test]
+    fn genesis_initialization_requires_exact_source_slot_and_mainnet_identity() {
+        let initialized = validate_initialized(
+            SOLANA_V1_0_7_CANDIDATE,
+            initialized_from(InitializedSource::Genesis, 0),
+            &ExpectedInitializedSource::Genesis,
+        )
+        .unwrap();
+        assert_eq!(initialized.source, HistoricalInitializedSource::Genesis);
+        assert_eq!(initialized.slot, 0);
+        assert_eq!(initialized.genesis_hash, protocol::MAINNET_GENESIS_HASH);
+
+        let wrong_slot = validate_initialized(
+            SOLANA_V1_0_7_CANDIDATE,
+            initialized_from(InitializedSource::Genesis, 1),
+            &ExpectedInitializedSource::Genesis,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            wrong_slot,
+            HistoricalRuntimeError::InitializedSlotMismatch {
+                expected: 0,
+                actual: 1
+            }
+        ));
+
+        let mut wrong_genesis = initialized_from(InitializedSource::Genesis, 0);
+        wrong_genesis.genesis_hash = Hash::new_unique().to_string();
+        assert!(matches!(
+            validate_initialized(
+                SOLANA_V1_0_7_CANDIDATE,
+                wrong_genesis,
+                &ExpectedInitializedSource::Genesis,
+            ),
+            Err(HistoricalRuntimeError::InitializedGenesisMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn genesis_initialization_rejects_snapshot_attestation() {
+        let initialized = initialized_from(
+            InitializedSource::SnapshotArchive {
+                archive_path: "/private/snapshot-0-hash.tar.bz2".to_owned(),
+                expected_accounts_hash: vec![2; HASH_BYTES],
+            },
+            0,
+        );
+        assert!(matches!(
+            validate_initialized(
+                SOLANA_V1_0_7_CANDIDATE,
+                initialized,
+                &ExpectedInitializedSource::Genesis,
+            ),
+            Err(HistoricalRuntimeError::InitializedSourceMismatch(_))
+        ));
+    }
+
+    #[test]
+    fn bound_genesis_is_an_exact_private_copy() {
+        let source_directory = TempDir::new().unwrap();
+        let private_directory = TempDir::new().unwrap();
+        let source = source_directory.path().join("genesis.bin");
+        fs::write(&source, b"validated mainnet genesis bytes").unwrap();
+        let expected = measure_genesis_bin(&source).unwrap();
+
+        let bound = bind_genesis_bin(
+            &source,
+            private_directory.path(),
+            expected.size,
+            expected.sha256,
+        )
+        .unwrap();
+        assert_ne!(bound, source);
+        assert_eq!(
+            bound.file_name().and_then(|name| name.to_str()),
+            Some("genesis.bin")
+        );
+        assert_eq!(fs::read(&bound).unwrap(), fs::read(&source).unwrap());
+        assert_eq!(measure_genesis_bin(&bound).unwrap(), expected);
+    }
+
+    #[test]
+    fn bound_genesis_rejects_source_replacement_after_validation() {
+        let source_directory = TempDir::new().unwrap();
+        let private_directory = TempDir::new().unwrap();
+        let source = source_directory.path().join("genesis.bin");
+        fs::write(&source, b"validated genesis").unwrap();
+        let expected = measure_genesis_bin(&source).unwrap();
+
+        fs::rename(&source, source_directory.path().join("genesis.original")).unwrap();
+        fs::write(&source, b"replaced genesis!").unwrap();
+        assert_eq!(fs::metadata(&source).unwrap().len(), expected.size);
+        assert!(matches!(
+            bind_genesis_bin(
+                &source,
+                private_directory.path(),
+                expected.size,
+                expected.sha256,
+            ),
+            Err(HistoricalRuntimeError::GenesisDigestMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn genesis_binding_is_size_bounded_and_requires_exact_filename() {
+        let source_directory = TempDir::new().unwrap();
+        let private_directory = TempDir::new().unwrap();
+        let wrong_name = source_directory.path().join("genesis-copy.bin");
+        fs::write(&wrong_name, b"bytes").unwrap();
+        assert!(matches!(
+            measure_genesis_bin(&wrong_name),
+            Err(HistoricalRuntimeError::GenesisNotFile(path)) if path == wrong_name
+        ));
+
+        let source = source_directory.path().join("genesis.bin");
+        let file = fs::File::create(&source).unwrap();
+        file.set_len(MAX_HISTORICAL_GENESIS_BIN_BYTES + 1).unwrap();
+        assert!(matches!(
+            bind_genesis_bin(&source, private_directory.path(), 1, [0; HASH_BYTES]),
+            Err(HistoricalRuntimeError::GenesisTooLarge { bytes, limit, .. })
+                if bytes == MAX_HISTORICAL_GENESIS_BIN_BYTES + 1
+                    && limit == MAX_HISTORICAL_GENESIS_BIN_BYTES
+        ));
+    }
+
     #[test]
     fn bound_handoff_snapshot_is_an_exact_private_copy() {
         let source_directory = TempDir::new().unwrap();
@@ -2302,6 +2718,7 @@ mod tests {
             snapshot_export_seal: None,
             initialized: HistoricalInitialized {
                 genesis_hash: String::new(),
+                source: HistoricalInitializedSource::Genesis,
                 slot: 0,
                 last_blockhash: [0; HASH_BYTES],
                 ticks_per_slot: 0,
@@ -2467,6 +2884,7 @@ mod tests {
             snapshot_export_seal: None,
             initialized: HistoricalInitialized {
                 genesis_hash: String::new(),
+                source: HistoricalInitializedSource::Genesis,
                 slot: 0,
                 last_blockhash: [0; HASH_BYTES],
                 ticks_per_slot: 0,

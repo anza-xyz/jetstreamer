@@ -125,6 +125,14 @@ const CAR_HEADER_PREFETCH_BYTES: u64 = 4 * 1024;
 const BANK_SNAPSHOTS_DIR: &str = "snapshots";
 const ACCOUNTS_HARDLINKS_DIR: &str = "accounts_hardlinks";
 const GENESIS_ARCHIVE: &str = "genesis.tar.bz2";
+// This pins the canonical mainnet-beta raw serialization in addition to the
+// semantic genesis hash; accepting merely equivalent bincode would reopen the
+// gap between admission by the current runtime and decoding by an old worker.
+const MAINNET_GENESIS_BIN_SIZE: u64 = 132_347;
+const MAINNET_GENESIS_BIN_SHA256: [u8; 32] = [
+    0x45, 0x29, 0x69, 0x98, 0xa6, 0xf8, 0xe2, 0xa7, 0x84, 0xdb, 0x5d, 0x9f, 0x95, 0xe1, 0x8f, 0xc2,
+    0x3f, 0x70, 0x44, 0x1a, 0x10, 0x39, 0x44, 0x68, 0x01, 0x08, 0x98, 0x79, 0xb0, 0x8c, 0x7e, 0xf0,
+];
 const SNAPSHOT_VERSION_FILE: &str = "version";
 const SNAPSHOT_STATUS_CACHE_FILE: &str = "status_cache";
 const ACCOUNTS_SNAPSHOT_DIR: &str = "snapshot";
@@ -4549,9 +4557,10 @@ fn usage(program: &str) -> String {
          \n\
          <epoch|range> is a single epoch (950) or an inclusive range (950-955).\n\
          Replays each epoch and writes a horizon archive to <dest-dir>/epoch-<N>.jet.\n\
-         A range pre-downloads every epoch's boundary snapshot and snapshot hashes\n\
-         up front (the only gcloud/GCS access), then runs each epoch in its own\n\
-         child process so replay memory is fully released at every epoch boundary.\n\
+         Epoch 0 starts from the validated mainnet genesis; later epochs use a\n\
+         predecessor snapshot. A range pre-downloads those boundary snapshots\n\
+         and snapshot hashes up front (the only gcloud/GCS access), then runs each\n\
+         epoch in its own child process so memory is released at each boundary.\n\
          Set JETSTREAMER_EPOCH_ISOLATION=0 to restore single-process chaining (the\n\
          bank stays in memory across epochs; no per-epoch snapshot reload).\n\
          JETSTREAMER_EPOCH_ATTEMPTS (default 2) bounds retries of a crashed epoch;\n\
@@ -4605,6 +4614,45 @@ struct QualificationPlan {
     replay_start: Slot,
     output_slot_start: Slot,
     end_inclusive: Slot,
+}
+
+/// Durable state used to initialize the first runtime in a replay process.
+/// Execution-version selection remains exclusively slot-derived; this value
+/// chooses only the matching state loader after that selection is complete.
+#[derive(Clone, Debug)]
+enum ReplayBootstrap {
+    Genesis {
+        genesis_bin_path: PathBuf,
+        identity: historical::GenesisFileIdentity,
+        /// Keeps the admitted private genesis copy alive for every clone that
+        /// may initialize an in-process historical runtime.
+        _private_dir: Arc<tempfile::TempDir>,
+    },
+    SnapshotArchive(PathBuf),
+}
+
+impl ReplayBootstrap {
+    fn snapshot_archive(&self) -> Option<&Path> {
+        match self {
+            Self::Genesis { .. } => None,
+            Self::SnapshotArchive(path) => Some(path),
+        }
+    }
+
+    fn slot(&self) -> Result<Slot, String> {
+        match self {
+            Self::Genesis { .. } => Ok(0),
+            Self::SnapshotArchive(path) => {
+                let name = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .ok_or_else(|| {
+                        format!("snapshot path has no UTF-8 filename: {}", path.display())
+                    })?;
+                parse_snapshot_archive_name(name).map(|(slot, _)| slot)
+            }
+        }
+    }
 }
 
 impl QualificationPlan {
@@ -4804,6 +4852,20 @@ fn initial_replay_slot(bootstrap_slot: Slot, epoch_start: Slot) -> Result<Slot, 
     bootstrap_slot.checked_add(1).ok_or_else(|| {
         format!("bootstrap slot {bootstrap_slot} has no representable successor slot")
     })
+}
+
+fn replay_start_for_bootstrap(
+    bootstrap: &ReplayBootstrap,
+    epoch: u64,
+    epoch_start: Slot,
+) -> Result<Slot, String> {
+    match bootstrap {
+        ReplayBootstrap::Genesis { .. } if epoch == 0 && epoch_start == 0 => Ok(0),
+        ReplayBootstrap::Genesis { .. } => Err(format!(
+            "genesis bootstrap is valid only for epoch 0, not epoch {epoch}"
+        )),
+        ReplayBootstrap::SnapshotArchive(_) => initial_replay_slot(bootstrap.slot()?, epoch_start),
+    }
 }
 
 fn archive_generation_profile() -> String {
@@ -5385,6 +5447,93 @@ async fn ensure_genesis_archive(ledger_dir: &Path) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+fn validate_mainnet_genesis(ledger_dir: &Path) -> Result<ReplayBootstrap, String> {
+    let private_dir = Arc::new(
+        tempfile::Builder::new()
+            .prefix(".jetstreamer-genesis-")
+            .tempdir_in(ledger_dir)
+            .map_err(|err| {
+                format!(
+                    "failed to create private genesis admission directory in {}: {err}",
+                    ledger_dir.display()
+                )
+            })?,
+    );
+    let shared_genesis = ledger_dir.join("genesis.bin");
+    let source_path = match fs::symlink_metadata(&shared_genesis) {
+        Ok(_) => shared_genesis,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            let archive = ledger_dir.join(GENESIS_ARCHIVE);
+            agave_snapshots::unpack_genesis_archive(
+                &archive,
+                private_dir.path(),
+                MAX_GENESIS_ARCHIVE_UNPACKED_SIZE,
+            )
+            .map_err(|err| {
+                format!(
+                    "failed to unpack {} into private genesis admission storage: {err}",
+                    archive.display()
+                )
+            })?;
+            private_dir.path().join("genesis.bin")
+        }
+        Err(err) => {
+            return Err(format!(
+                "failed to inspect canonical genesis input {}: {err}",
+                shared_genesis.display()
+            ));
+        }
+    };
+
+    // Admission is based on one nofollow-opened inode: copy and hash the same
+    // bounded byte stream, and reject every serialization except the pinned
+    // mainnet genesis.bin before asking Agave to decode it.
+    let genesis_bin_path = historical::bind_genesis_bin(
+        &source_path,
+        private_dir.path(),
+        MAINNET_GENESIS_BIN_SIZE,
+        MAINNET_GENESIS_BIN_SHA256,
+    )
+    .map_err(|err| format!("failed to admit canonical genesis.bin: {err}"))?;
+    let admitted_ledger = genesis_bin_path
+        .parent()
+        .expect("bound genesis.bin always has a parent directory");
+    let genesis_config = open_genesis_config(admitted_ledger, MAX_GENESIS_ARCHIVE_UNPACKED_SIZE)
+        .map_err(|err| {
+            format!(
+                "failed to decode admitted canonical genesis from {}: {err}",
+                genesis_bin_path.display()
+            )
+        })?;
+    validate_mainnet_genesis_hash(genesis_config.hash())?;
+
+    Ok(ReplayBootstrap::Genesis {
+        genesis_bin_path,
+        identity: historical::GenesisFileIdentity {
+            size: MAINNET_GENESIS_BIN_SIZE,
+            sha256: MAINNET_GENESIS_BIN_SHA256,
+        },
+        _private_dir: private_dir,
+    })
+}
+
+fn validate_mainnet_genesis_hash(actual: Hash) -> Result<Hash, String> {
+    let expected = compatibility::MAINNET_GENESIS_HASH
+        .parse::<Hash>()
+        .map_err(|err| {
+            format!(
+                "runtime registry has invalid mainnet genesis hash {}: {err}",
+                compatibility::MAINNET_GENESIS_HASH
+            )
+        })?;
+    if actual != expected {
+        return Err(format!(
+            "local genesis hash {actual} does not match required mainnet hash {expected}"
+        ));
+    }
+    Ok(actual)
 }
 
 fn account_run_paths_from_snapshot(bank_snapshot_dir: &Path) -> Result<Vec<PathBuf>, String> {
@@ -6861,7 +7010,7 @@ async fn run_geyser_replay(
     epoch: u64,
     allow_candidate_runtime: bool,
     ledger_dir: &Path,
-    snapshot_archive: &Path,
+    bootstrap: &ReplayBootstrap,
     shutdown: Arc<AtomicBool>,
     cursor: Arc<ReplayCursor>,
     restart_tracker: Arc<RestartTracker>,
@@ -6897,18 +7046,7 @@ async fn run_geyser_replay(
             .map_err(|_| "bank forks lock poisoned".to_string())?
             .working_bank()
             .slot(),
-        None => {
-            let archive_name = snapshot_archive
-                .file_name()
-                .and_then(|name| name.to_str())
-                .ok_or_else(|| {
-                    format!(
-                        "snapshot path has no UTF-8 filename: {}",
-                        snapshot_archive.display()
-                    )
-                })?;
-            parse_snapshot_archive_name(archive_name)?.0
-        }
+        None => bootstrap.slot()?,
     };
     let (epoch_start, epoch_end_inclusive) = epoch_to_slot_range(epoch);
     let (output_slot_start, replay_start, end_inclusive) = match qualification {
@@ -6931,11 +7069,14 @@ async fn run_geyser_replay(
                 plan.end_inclusive,
             )
         }
-        None => (
-            epoch_start,
-            initial_replay_slot(bootstrap_slot, epoch_start)?,
-            epoch_end_inclusive,
-        ),
+        None => {
+            let replay_start = if carried_state.is_some() {
+                initial_replay_slot(bootstrap_slot, epoch_start)?
+            } else {
+                replay_start_for_bootstrap(bootstrap, epoch, epoch_start)?
+            };
+            (epoch_start, replay_start, epoch_end_inclusive)
+        }
     };
     let execution = compatibility::select_runtime(
         replay_start..end_inclusive.saturating_add(1),
@@ -6993,16 +7134,21 @@ async fn run_geyser_replay(
                 runtime_descriptor.identity.name
             ));
         }
-    } else {
+    } else if let Some(snapshot_archive) = bootstrap.snapshot_archive() {
         validate_runtime_bootstrap_archive(runtime_descriptor, snapshot_archive)?;
+    } else if epoch != 0 || bootstrap_slot != 0 {
+        return Err(format!(
+            "genesis bootstrap is valid only for epoch 0 at slot 0, got epoch {epoch} slot {bootstrap_slot}"
+        ));
     }
     // Registered generated handoffs require an adjacent evidence sidecar. The
     // complete archive digest covers replay-relevant state that the historical
     // accounts hash does not, including the transaction status cache.
-    let bootstrap_handoff_manifest = if carried_state.is_none() {
-        registered_handoff_bootstrap(runtime_descriptor, snapshot_archive)?
-    } else {
-        None
+    let bootstrap_handoff_manifest = match (carried_state.is_none(), bootstrap.snapshot_archive()) {
+        (true, Some(snapshot_archive)) => {
+            registered_handoff_bootstrap(runtime_descriptor, snapshot_archive)?
+        }
+        _ => None,
     };
     info!(
         "slot registry selected execution profile {} ({:?}) for slots {}..{}",
@@ -7065,6 +7211,10 @@ async fn run_geyser_replay(
                     )
                 }
                 None => {
+                    let snapshot_archive = bootstrap.snapshot_archive().ok_or_else(|| {
+                        "the in-process Agave runtime cannot initialize from historical genesis"
+                            .to_string()
+                    })?;
                     let accounts_update_notifier: Option<AccountsUpdateNotifier> =
                         Some(Arc::new(ProgressAccountsUpdateNotifier {
                             progress: progress.clone(),
@@ -7123,17 +7273,6 @@ async fn run_geyser_replay(
                             .to_string(),
                     );
                 }
-                let archive_name = snapshot_archive
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .ok_or_else(|| {
-                        format!(
-                            "historical snapshot path has no UTF-8 filename: {}",
-                            snapshot_archive.display()
-                        )
-                    })?;
-                let (expected_slot, expected_hash) = parse_snapshot_archive_name(archive_name)?;
-                let bootstrap_state_hash = expected_hash.0;
                 let worker_profile = historical_worker_profile(runtime_descriptor)?;
                 let executable = configured_historical_worker_executable(runtime_descriptor)?;
                 let scratch_parent = ledger_dir.join(".historical-runtime");
@@ -7148,21 +7287,72 @@ async fn run_geyser_replay(
                     runtime_backend,
                     executable.display()
                 );
+                let (initialization, bootstrap_state_kind, bootstrap_state_hash) = match bootstrap {
+                    ReplayBootstrap::Genesis {
+                        genesis_bin_path,
+                        identity,
+                        ..
+                    } => {
+                        let genesis_hash = runtime_descriptor
+                            .identity
+                            .genesis_hash
+                            .parse::<Hash>()
+                            .map_err(|err| {
+                                format!(
+                                    "runtime descriptor {} has invalid genesis hash {}: {err}",
+                                    runtime_descriptor.identity.name,
+                                    runtime_descriptor.identity.genesis_hash
+                                )
+                            })?;
+                        (
+                            historical::HistoricalInitialization::Genesis(
+                                historical::GenesisInitialization {
+                                    genesis_bin_path: genesis_bin_path.clone(),
+                                    expected_size: identity.size,
+                                    expected_sha256: identity.sha256,
+                                    scratch_parent: Some(scratch_parent),
+                                },
+                            ),
+                            BootstrapStateKind::Genesis,
+                            genesis_hash,
+                        )
+                    }
+                    ReplayBootstrap::SnapshotArchive(snapshot_archive) => {
+                        let archive_name = snapshot_archive
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .ok_or_else(|| {
+                                format!(
+                                    "historical snapshot path has no UTF-8 filename: {}",
+                                    snapshot_archive.display()
+                                )
+                            })?;
+                        let (expected_slot, expected_hash) =
+                            parse_snapshot_archive_name(archive_name)?;
+                        (
+                            historical::HistoricalInitialization::SnapshotArchive(
+                                historical::SnapshotInitialization {
+                                    ledger_path: ledger_dir.clone(),
+                                    archive_path: snapshot_archive.clone(),
+                                    expected_slot,
+                                    expected_accounts_hash: expected_hash.0.to_bytes(),
+                                    expected_archive_sha256: bootstrap_handoff_manifest
+                                        .as_ref()
+                                        .map(|manifest| manifest.archive_sha256),
+                                    expected_archive_size: bootstrap_handoff_manifest
+                                        .as_ref()
+                                        .map(|manifest| manifest.archive_size),
+                                    scratch_parent: Some(scratch_parent),
+                                },
+                            ),
+                            BootstrapStateKind::SnapshotArchive,
+                            expected_hash.0,
+                        )
+                    }
+                };
                 let spawn = historical::WorkerSpawn {
                     executable,
-                    initialization: historical::SnapshotInitialization {
-                        ledger_path: ledger_dir.clone(),
-                        archive_path: snapshot_archive.to_path_buf(),
-                        expected_slot,
-                        expected_accounts_hash: expected_hash.0.to_bytes(),
-                        expected_archive_sha256: bootstrap_handoff_manifest
-                            .as_ref()
-                            .map(|manifest| manifest.archive_sha256),
-                        expected_archive_size: bootstrap_handoff_manifest
-                            .as_ref()
-                            .map(|manifest| manifest.archive_size),
-                        scratch_parent: Some(scratch_parent),
-                    },
+                    initialization,
                 };
                 let client = tokio::task::spawn_blocking(move || {
                     historical::HistoricalRuntimeClient::spawn(worker_profile, spawn)
@@ -7181,7 +7371,7 @@ async fn run_geyser_replay(
                 (
                     ReplaySource::Historical(Box::new(client)),
                     slot,
-                    BootstrapStateKind::SnapshotArchive,
+                    bootstrap_state_kind,
                     bootstrap_state_hash,
                 )
             }
@@ -8573,14 +8763,13 @@ fn epoch_archive_reusable(
 
     match provenance_v1.bootstrap_state_kind {
         BootstrapStateKind::Genesis => {
-            if epoch != 0 || provenance_v1.bootstrap_slot != 0 {
-                return Err(format!(
-                    "completed archive {} claims an invalid genesis bootstrap at slot {} for epoch {}",
-                    path.display(),
-                    provenance_v1.bootstrap_slot,
-                    epoch
-                ));
-            }
+            validate_genesis_bootstrap_commitment(
+                path,
+                epoch,
+                provenance_v1.bootstrap_slot,
+                provenance_v1.bootstrap_state_hash,
+                expected_genesis,
+            )?;
         }
         BootstrapStateKind::SnapshotArchive | BootstrapStateKind::CarriedBank => {
             if epoch == 0 {
@@ -8697,14 +8886,13 @@ fn epoch_archive_reusable_multi_runtime(
     )?;
     match provenance.bootstrap_state_kind {
         BootstrapStateKind::Genesis => {
-            if epoch != 0 || provenance.bootstrap_state.slot != 0 {
-                return Err(format!(
-                    "assembled archive {} claims an invalid genesis bootstrap at slot {} for epoch {}",
-                    path.display(),
-                    provenance.bootstrap_state.slot,
-                    epoch
-                ));
-            }
+            validate_genesis_bootstrap_commitment(
+                path,
+                epoch,
+                provenance.bootstrap_state.slot,
+                provenance.bootstrap_state.hash,
+                provenance.genesis_hash,
+            )?;
         }
         BootstrapStateKind::SnapshotArchive | BootstrapStateKind::CarriedBank => {
             if epoch == 0 {
@@ -8838,6 +9026,32 @@ fn epoch_archive_reusable_multi_runtime(
     // Reuse is an admission decision, so pay the one full sequential decode.
     verify_assembled_runtime_archive(path, epoch, &provenance)?;
     Ok(true)
+}
+
+fn validate_genesis_bootstrap_commitment(
+    path: &Path,
+    epoch: u64,
+    bootstrap_slot: Slot,
+    bootstrap_hash: Hash,
+    expected_genesis: Hash,
+) -> Result<(), String> {
+    if epoch != 0 || bootstrap_slot != 0 {
+        return Err(format!(
+            "completed archive {} claims an invalid genesis bootstrap at slot {} for epoch {}",
+            path.display(),
+            bootstrap_slot,
+            epoch
+        ));
+    }
+    if bootstrap_hash != expected_genesis {
+        return Err(format!(
+            "completed epoch-0 archive {} has genesis bootstrap commitment {}, expected registered mainnet genesis {}",
+            path.display(),
+            bootstrap_hash,
+            expected_genesis,
+        ));
+    }
+    Ok(())
 }
 
 fn validate_multi_runtime_genesis(path: &Path, actual: Hash) -> Result<(), String> {
@@ -10123,9 +10337,9 @@ async fn run_multi_runtime_epoch_supervisor(
 /// every byte of replay memory — accounts-db growth, caches, the bank itself —
 /// is returned to the OS at each epoch boundary. In-process chaining was
 /// observed OOM-killed at ~745 GiB RSS two epochs into a range; isolation
-/// trades one boundary-snapshot load per epoch for a hard per-epoch memory
-/// cap. Children never touch gcloud: snapshots and hash files were staged by
-/// the caller before this runs.
+/// trades one state load per epoch for a hard per-epoch memory cap. Children
+/// never touch gcloud: genesis, snapshots, and hash files were staged by the
+/// caller before this runs.
 async fn run_epoch_range_supervisor(
     effective_start: u64,
     end_epoch: u64,
@@ -10133,7 +10347,7 @@ async fn run_epoch_range_supervisor(
     verify_snapshots: bool,
     allow_candidate_runtime: bool,
     shutdown: Arc<AtomicBool>,
-    boundary_snapshots: BTreeMap<u64, PathBuf>,
+    boundary_bootstraps: BTreeMap<u64, ReplayBootstrap>,
 ) -> Result<(), String> {
     let exe =
         env::current_exe().map_err(|err| format!("failed to resolve current executable: {err}"))?;
@@ -10177,8 +10391,8 @@ async fn run_epoch_range_supervisor(
             continue;
         }
         let hashes_path = dest_dir.join(format!("epoch-hashes-{epoch}.txt"));
-        let snapshot_path = boundary_snapshots.get(&epoch).ok_or_else(|| {
-            format!("range supervisor has no staged boundary snapshot for epoch {epoch}")
+        let bootstrap = boundary_bootstraps.get(&epoch).ok_or_else(|| {
+            format!("range supervisor has no staged bootstrap state for epoch {epoch}")
         })?;
         let mut attempt = 0u32;
         loop {
@@ -10201,9 +10415,11 @@ async fn run_epoch_range_supervisor(
             if verify_snapshots {
                 cmd.arg(format!("--epoch-hashes={}", hashes_path.display()));
             }
-            let mut snapshot_arg = OsString::from("--snapshot-archive=");
-            snapshot_arg.push(snapshot_path.as_os_str());
-            cmd.arg(snapshot_arg);
+            if let ReplayBootstrap::SnapshotArchive(snapshot_path) = bootstrap {
+                let mut snapshot_arg = OsString::from("--snapshot-archive=");
+                snapshot_arg.push(snapshot_path.as_os_str());
+                cmd.arg(snapshot_arg);
+            }
             let status = cmd
                 .status()
                 .await
@@ -10221,7 +10437,10 @@ async fn run_epoch_range_supervisor(
             if status.success() && reusable {
                 info!("epoch {epoch} child completed");
                 let _ = fs::remove_file(&hashes_path);
-                if prune_snapshots && let Some(path) = boundary_snapshots.get(&epoch) {
+                if prune_snapshots
+                    && let Some(ReplayBootstrap::SnapshotArchive(path)) =
+                        boundary_bootstraps.get(&epoch)
+                {
                     match prune_epoch_boundary_snapshot(path, selection.descriptor) {
                         Ok(()) => {
                             info!("pruned boundary snapshot artifacts for {}", path.display())
@@ -10600,161 +10819,178 @@ async fn main() {
         info!("ledger accounts cleanup disabled via JETSTREAMER_CLEAR_ACCOUNTS_ON_START=false");
     }
 
-    // The snapshot bootstraps only the first epoch actually run (effective_start);
-    // later epochs in a range chain off the in-memory bank.
-    let target_slot = qualification
-        .map(|plan| plan.bootstrap_slot)
-        .unwrap_or_else(|| epoch_to_slot(effective_start).saturating_sub(1));
-    // A local snapshot only bootstraps `effective_start` cheaply if it lands
-    // within the previous epoch (at or after the start of `effective_start - 1`).
-    // Anything older is still usable, but it forces a warmup replay across every
-    // slot between the snapshot and the epoch boundary — e.g. reusing epoch N's
-    // boundary snapshot to run epoch N+1 re-executes all of epoch N first
-    // (~432k slots, roughly doubling the run). `find_existing_snapshot_archive`
-    // only bounds the candidate from above (slot <= target_slot), so a leftover
-    // snapshot from the prior epoch's run gets picked up here; reject it and
-    // download the real boundary snapshot instead.
-    let min_snapshot_slot = qualification
-        .map(|plan| plan.bootstrap_slot)
-        .unwrap_or_else(|| epoch_to_slot(effective_start.saturating_sub(1)));
-    let discovered_snapshot = match snapshot_archive_override {
-        Some(path) => match snapshot_archive_candidate(path) {
-            Ok(candidate) => Some(candidate),
-            Err(err) => {
-                eprintln!("error: {err}");
-                exit(1);
-            }
-        },
-        None => match find_existing_snapshot_archive(
-            &dest_dir,
-            target_slot,
-            effective_archive_extensions,
-        ) {
-            Ok(candidate) => candidate,
-            Err(err) => {
-                eprintln!("error: {err}");
-                exit(1);
-            }
-        },
-    };
-    let existing_snapshot = match discovered_snapshot {
-        Some(candidate)
-            if qualification.is_some_and(|plan| candidate.slot != plan.bootstrap_slot) =>
-        {
-            eprintln!(
-                "error: qualification snapshot resolved to slot {}, expected {}",
-                candidate.slot,
-                qualification
-                    .expect("qualification guard established a plan")
-                    .bootstrap_slot
-            );
-            exit(1);
-        }
-        Some(candidate) if candidate.slot < min_snapshot_slot => {
-            println!(
-                "Ignoring snapshot {} at slot {}: epoch {} needs a snapshot at or after slot {} \
-                 (reusing it would warm up across {} slots); downloading the boundary snapshot",
-                candidate.path.display(),
-                candidate.slot,
-                effective_start,
-                min_snapshot_slot,
-                epoch_to_slot(effective_start).saturating_sub(candidate.slot),
-            );
-            None
-        }
-        other => other,
-    };
-    let mut extracted_snapshot = false;
-    let dest_path = match existing_snapshot {
-        Some(candidate) => {
-            extracted_snapshot = match has_extracted_snapshot(&dest_dir, candidate.slot) {
-                Ok(has_snapshot) => has_snapshot,
-                Err(err) => {
-                    eprintln!("error: {err}");
-                    exit(1);
-                }
-            };
-            if extracted_snapshot {
-                println!(
-                    "Found existing snapshot archive at {} with extracted data; skipping download",
-                    candidate.path.display()
-                );
-            } else {
-                println!(
-                    "Found existing snapshot archive at {}; skipping download",
-                    candidate.path.display()
-                );
-            }
-            candidate.path
-        }
-        None => {
-            // A per-epoch child must never reach for gcloud (the supervisor
-            // pre-downloads every boundary snapshot while the session is
-            // fresh); a missing archive here is a supervisor bug, not a
-            // download opportunity.
-            if epoch_hashes.is_some() {
-                eprintln!(
-                    "error: no boundary snapshot archive for epoch {effective_start} in {} \
-                     (child mode: expected the range supervisor to have pre-downloaded it)",
-                    dest_dir.display()
-                );
-                exit(1);
-            }
-            match download_snapshot_at_or_before_slot_matching(
-                effective_start,
-                target_slot,
-                &dest_dir,
-                effective_archive_extensions,
-            )
-            .await
-            {
-                Ok(path) => {
-                    println!("Downloaded snapshot to {}", path.display());
-                    path
-                }
-                Err(err) => {
-                    eprintln!("error: {err}");
-                    exit(1);
-                }
-            }
-        }
-    };
-    if let Err(err) = validate_runtime_bootstrap_archive(effective_runtime.descriptor, &dest_path) {
-        eprintln!("error: {err}");
-        exit(1);
-    }
-    if qualification.is_none()
-        && let Err(err) = validate_epoch_bootstrap_snapshot(effective_start, &dest_path)
-    {
-        eprintln!("error: {err}");
-        exit(1);
-    }
-
-    if !env_truthy("JETSTREAMER_LOAD_FROM_DIR") {
-        // The default archive loader unpacks into its own staging
-        // (`.snapshot-extract-*` + accounts-run); the ledger-root
-        // extraction below only feeds the dir loader.
-        println!("Skipping ledger-root extraction (archive loader manages its own staging)");
-    } else if env_truthy("JETSTREAMER_SKIP_EXTRACT") {
-        println!("Skipping extraction because JETSTREAMER_SKIP_EXTRACT is set");
-    } else if extracted_snapshot {
-        println!(
-            "Skipping extraction because snapshot data already exists in {}",
-            dest_dir.display()
+    // Epoch 0 has no predecessor state. It starts from the canonical mainnet
+    // genesis and replays slot 0 itself; every later epoch still starts from a
+    // predecessor snapshot (or an in-memory bank within this process).
+    let genesis_bootstrap = effective_start == 0 && qualification.is_none();
+    if genesis_bootstrap && snapshot_archive_override.is_some() {
+        eprintln!(
+            "error: normal epoch-0 replay must bootstrap from genesis; --snapshot-archive is reserved for focused qualification"
         );
-    } else {
-        println!("Extracting snapshot into {}", dest_dir.display());
-        if let Err(err) = extract_tarball(&dest_path, &dest_dir).await {
+        exit(2);
+    }
+    let bootstrap = if genesis_bootstrap {
+        // Materialize genesis through Agave's hardened bounded unpacker before
+        // measuring the exact file handed to the historical client.
+        if let Err(err) = ensure_genesis_archive(&dest_dir).await {
             eprintln!("error: {err}");
             exit(1);
         }
-        println!("Extraction complete");
-    }
+        info!("epoch 0: selecting canonical local genesis bootstrap at slot 0");
+        match validate_mainnet_genesis(&dest_dir) {
+            Ok(bootstrap) => bootstrap,
+            Err(err) => {
+                eprintln!("error: {err}");
+                exit(1);
+            }
+        }
+    } else {
+        // The snapshot bootstraps only the first epoch actually run
+        // (`effective_start`); later epochs in an in-process range chain off
+        // the working bank.
+        let target_slot = qualification
+            .map(|plan| plan.bootstrap_slot)
+            .unwrap_or_else(|| epoch_to_slot(effective_start).saturating_sub(1));
+        let min_snapshot_slot = qualification
+            .map(|plan| plan.bootstrap_slot)
+            .unwrap_or_else(|| epoch_to_slot(effective_start.saturating_sub(1)));
+        let discovered_snapshot = match snapshot_archive_override {
+            Some(path) => match snapshot_archive_candidate(path) {
+                Ok(candidate) => Some(candidate),
+                Err(err) => {
+                    eprintln!("error: {err}");
+                    exit(1);
+                }
+            },
+            None => match find_existing_snapshot_archive(
+                &dest_dir,
+                target_slot,
+                effective_archive_extensions,
+            ) {
+                Ok(candidate) => candidate,
+                Err(err) => {
+                    eprintln!("error: {err}");
+                    exit(1);
+                }
+            },
+        };
+        let existing_snapshot = match discovered_snapshot {
+            Some(candidate)
+                if qualification.is_some_and(|plan| candidate.slot != plan.bootstrap_slot) =>
+            {
+                eprintln!(
+                    "error: qualification snapshot resolved to slot {}, expected {}",
+                    candidate.slot,
+                    qualification
+                        .expect("qualification guard established a plan")
+                        .bootstrap_slot
+                );
+                exit(1);
+            }
+            Some(candidate) if candidate.slot < min_snapshot_slot => {
+                println!(
+                    "Ignoring snapshot {} at slot {}: epoch {} needs a snapshot at or after slot {} \
+                     (reusing it would warm up across {} slots); downloading the boundary snapshot",
+                    candidate.path.display(),
+                    candidate.slot,
+                    effective_start,
+                    min_snapshot_slot,
+                    epoch_to_slot(effective_start).saturating_sub(candidate.slot),
+                );
+                None
+            }
+            other => other,
+        };
+        let mut extracted_snapshot = false;
+        let snapshot_path = match existing_snapshot {
+            Some(candidate) => {
+                extracted_snapshot = match has_extracted_snapshot(&dest_dir, candidate.slot) {
+                    Ok(has_snapshot) => has_snapshot,
+                    Err(err) => {
+                        eprintln!("error: {err}");
+                        exit(1);
+                    }
+                };
+                if extracted_snapshot {
+                    println!(
+                        "Found existing snapshot archive at {} with extracted data; skipping download",
+                        candidate.path.display()
+                    );
+                } else {
+                    println!(
+                        "Found existing snapshot archive at {}; skipping download",
+                        candidate.path.display()
+                    );
+                }
+                candidate.path
+            }
+            None => {
+                // A per-epoch child must never reach for gcloud (the
+                // supervisor stages every boundary snapshot while its session
+                // is fresh).
+                if epoch_hashes.is_some() {
+                    eprintln!(
+                        "error: no boundary snapshot archive for epoch {effective_start} in {} \
+                         (child mode: expected the range supervisor to have pre-downloaded it)",
+                        dest_dir.display()
+                    );
+                    exit(1);
+                }
+                match download_snapshot_at_or_before_slot_matching(
+                    effective_start,
+                    target_slot,
+                    &dest_dir,
+                    effective_archive_extensions,
+                )
+                .await
+                {
+                    Ok(path) => {
+                        println!("Downloaded snapshot to {}", path.display());
+                        path
+                    }
+                    Err(err) => {
+                        eprintln!("error: {err}");
+                        exit(1);
+                    }
+                }
+            }
+        };
+        if let Err(err) =
+            validate_runtime_bootstrap_archive(effective_runtime.descriptor, &snapshot_path)
+        {
+            eprintln!("error: {err}");
+            exit(1);
+        }
+        if qualification.is_none()
+            && let Err(err) = validate_epoch_bootstrap_snapshot(effective_start, &snapshot_path)
+        {
+            eprintln!("error: {err}");
+            exit(1);
+        }
 
-    // Fetch the genesis archive up front too (idempotent; gcloud/GCS), so the
-    // replay never shells out to gcloud once it starts. After this point, no
-    // code path touches gcloud — only old-faithful and local files.
-    if let Err(err) = ensure_genesis_archive(&dest_dir).await {
+        if !env_truthy("JETSTREAMER_LOAD_FROM_DIR") {
+            println!("Skipping ledger-root extraction (archive loader manages its own staging)");
+        } else if env_truthy("JETSTREAMER_SKIP_EXTRACT") {
+            println!("Skipping extraction because JETSTREAMER_SKIP_EXTRACT is set");
+        } else if extracted_snapshot {
+            println!(
+                "Skipping extraction because snapshot data already exists in {}",
+                dest_dir.display()
+            );
+        } else {
+            println!("Extracting snapshot into {}", dest_dir.display());
+            if let Err(err) = extract_tarball(&snapshot_path, &dest_dir).await {
+                eprintln!("error: {err}");
+                exit(1);
+            }
+            println!("Extraction complete");
+        }
+        ReplayBootstrap::SnapshotArchive(snapshot_path)
+    };
+
+    // Snapshot-based runtimes also require genesis. Preserve the existing
+    // ordering: resolve and validate their snapshot before fetching genesis.
+    if !genesis_bootstrap && let Err(err) = ensure_genesis_archive(&dest_dir).await {
         eprintln!("error: {err}");
         exit(1);
     }
@@ -10765,7 +11001,7 @@ async fn main() {
     // OOM-killed at ~745 GiB RSS two epochs into a range. Isolation needs every
     // epoch's boundary snapshot on disk, so download them all now while the
     // gcloud/GCS session is fresh (a range runs for days; mid-run gcloud access
-    // is forbidden). `dest_path` above already covers `effective_start`.
+    // is forbidden). `bootstrap` above already covers `effective_start`.
     let total_epochs = end_epoch - effective_start + 1;
     let configured_epoch_isolation = env_truthy_default("JETSTREAMER_EPOCH_ISOLATION", true);
     let (epoch_isolation, forced_multi_runtime_epoch) = match epoch_isolation_plan(
@@ -10785,9 +11021,9 @@ async fn main() {
             "JETSTREAMER_EPOCH_ISOLATION=0 cannot chain range {effective_start}-{end_epoch} in one process because epoch {epoch} crosses an execution-runtime boundary; forcing per-epoch process isolation"
         );
     }
-    let mut boundary_snapshots: BTreeMap<u64, PathBuf> = BTreeMap::new();
+    let mut boundary_bootstraps: BTreeMap<u64, ReplayBootstrap> = BTreeMap::new();
     if epoch_isolation {
-        boundary_snapshots.insert(effective_start, dest_path.clone());
+        boundary_bootstraps.insert(effective_start, bootstrap.clone());
         info!(
             "=== per-epoch process isolation enabled; pre-downloading boundary snapshots for \
              epochs {}-{end_epoch} (gcloud/GCS) ===",
@@ -10808,7 +11044,7 @@ async fn main() {
             .await
             {
                 Ok(path) => {
-                    boundary_snapshots.insert(epoch, path);
+                    boundary_bootstraps.insert(epoch, ReplayBootstrap::SnapshotArchive(path));
                 }
                 Err(err) => {
                     eprintln!("error: {err}");
@@ -10839,7 +11075,10 @@ async fn main() {
                         exit(1);
                     }
                     let expected = if let Some(plan) = qualification {
-                        match qualification_expectations(expected, plan, &dest_path) {
+                        let snapshot_path = bootstrap.snapshot_archive().expect(
+                            "qualification validation requires an explicit snapshot archive",
+                        );
+                        match qualification_expectations(expected, plan, snapshot_path) {
                             Ok(expected) => expected,
                             Err(err) => {
                                 eprintln!("error: {err}");
@@ -10875,9 +11114,10 @@ async fn main() {
                 )
                 .expect("requested range was preflighted above");
                 let archive_extensions = selection.descriptor.bootstrap.archive_extensions;
-                let boundary_path = boundary_snapshots
+                let boundary_path = boundary_bootstraps
                     .get(&epoch)
-                    .or_else(|| (epoch == effective_start).then_some(&dest_path));
+                    .or_else(|| (epoch == effective_start).then_some(&bootstrap))
+                    .and_then(ReplayBootstrap::snapshot_archive);
                 let verification_start = match boundary_path {
                     Some(path) => {
                         let name = match path.file_name().and_then(|name| name.to_str()) {
@@ -11006,10 +11246,14 @@ async fn main() {
         let final_output = horizon_output_override
             .clone()
             .unwrap_or_else(|| dest_dir.join(format!("epoch-{effective_start}.jet")));
+        let Some(snapshot_path) = bootstrap.snapshot_archive() else {
+            eprintln!("error: multi-runtime epoch assembly cannot bootstrap from genesis");
+            exit(1);
+        };
         if let Err(err) = run_multi_runtime_epoch_supervisor(
             effective_start,
             &dest_dir,
-            &dest_path,
+            snapshot_path,
             &hashes_path,
             &final_output,
             allow_candidate_runtime,
@@ -11042,7 +11286,7 @@ async fn main() {
             verify_snapshots,
             allow_candidate_runtime,
             shutdown.clone(),
-            boundary_snapshots,
+            boundary_bootstraps,
         )
         .await
         {
@@ -11126,7 +11370,7 @@ async fn main() {
             epoch,
             allow_candidate_runtime,
             &dest_dir,
-            &dest_path,
+            &bootstrap,
             shutdown.clone(),
             cursor.clone(),
             restart_tracker.clone(),
@@ -11197,6 +11441,97 @@ mod early_snapshot_tests {
         assert_eq!(initial_replay_slot(416_012, 432_000).unwrap(), 416_013);
         assert!(initial_replay_slot(432_000, 432_000).is_err());
         assert!(initial_replay_slot(432_001, 432_000).is_err());
+    }
+
+    #[test]
+    fn genesis_bootstrap_starts_epoch_zero_at_slot_zero_only() {
+        let private_dir = Arc::new(tempfile::TempDir::new().unwrap());
+        let genesis_bin_path = private_dir.path().join("genesis.bin");
+        fs::write(&genesis_bin_path, [1]).unwrap();
+        let bootstrap = ReplayBootstrap::Genesis {
+            genesis_bin_path,
+            identity: historical::GenesisFileIdentity {
+                size: 1,
+                sha256: [1; 32],
+            },
+            _private_dir: private_dir,
+        };
+        assert_eq!(bootstrap.slot().unwrap(), 0);
+        assert!(bootstrap.snapshot_archive().is_none());
+        assert_eq!(replay_start_for_bootstrap(&bootstrap, 0, 0).unwrap(), 0);
+        assert!(replay_start_for_bootstrap(&bootstrap, 1, 432_000).is_err());
+    }
+
+    #[test]
+    fn genesis_bootstrap_clone_retains_private_admission_directory() {
+        let private_dir = Arc::new(tempfile::TempDir::new().unwrap());
+        let retained_path = private_dir.path().to_path_buf();
+        let genesis_bin_path = retained_path.join("genesis.bin");
+        fs::write(&genesis_bin_path, [1]).unwrap();
+        let bootstrap = ReplayBootstrap::Genesis {
+            genesis_bin_path,
+            identity: historical::GenesisFileIdentity {
+                size: 1,
+                sha256: [1; 32],
+            },
+            _private_dir: private_dir,
+        };
+        let retained = bootstrap.clone();
+
+        drop(bootstrap);
+        assert!(retained_path.exists());
+        drop(retained);
+        assert!(!retained_path.exists());
+    }
+
+    #[test]
+    fn mainnet_genesis_rejects_unpinned_raw_serializations_before_decode() {
+        let ledger_dir = tempfile::TempDir::new().unwrap();
+        let genesis_bin = ledger_dir.path().join("genesis.bin");
+        fs::write(&genesis_bin, b"not a genesis config").unwrap();
+
+        let wrong_size = validate_mainnet_genesis(ledger_dir.path()).unwrap_err();
+        assert!(wrong_size.contains("genesis.bin size mismatch"));
+        assert!(!wrong_size.contains("failed to decode"));
+
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&genesis_bin)
+            .unwrap();
+        file.set_len(MAINNET_GENESIS_BIN_SIZE).unwrap();
+        drop(file);
+
+        let wrong_digest = validate_mainnet_genesis(ledger_dir.path()).unwrap_err();
+        assert!(wrong_digest.contains("genesis.bin SHA-256 mismatch"));
+        assert!(!wrong_digest.contains("failed to decode"));
+    }
+
+    #[test]
+    fn local_genesis_identity_must_match_mainnet() {
+        let expected: Hash = compatibility::MAINNET_GENESIS_HASH.parse().unwrap();
+        assert_eq!(validate_mainnet_genesis_hash(expected).unwrap(), expected);
+        assert!(
+            validate_mainnet_genesis_hash(Hash::new_unique())
+                .unwrap_err()
+                .contains("does not match required mainnet hash")
+        );
+    }
+
+    #[test]
+    fn reusable_genesis_bootstrap_requires_the_registered_commitment() {
+        let path = Path::new("epoch-0.jet");
+        let expected: Hash = compatibility::MAINNET_GENESIS_HASH.parse().unwrap();
+        assert!(validate_genesis_bootstrap_commitment(path, 0, 0, expected, expected).is_ok());
+
+        let wrong = Hash::new_unique();
+        let error = validate_genesis_bootstrap_commitment(path, 0, 0, wrong, expected).unwrap_err();
+        assert!(error.contains("genesis bootstrap commitment"));
+        assert!(error.contains(&wrong.to_string()));
+        assert!(error.contains(&expected.to_string()));
+
+        assert!(validate_genesis_bootstrap_commitment(path, 1, 0, expected, expected).is_err());
+        assert!(validate_genesis_bootstrap_commitment(path, 0, 1, expected, expected).is_err());
     }
 
     #[test]
@@ -11507,6 +11842,27 @@ mod early_snapshot_tests {
                 compatibility::OLD_FAITHFUL_STATUS_REQUIRED_START_SLOT
             )
         );
+    }
+
+    #[test]
+    fn epoch_zero_provenance_commits_genesis_at_slot_zero() {
+        let selection = compatibility::select_runtime(0..432_000, true).unwrap();
+        let genesis_hash: Hash = compatibility::MAINNET_GENESIS_HASH.parse().unwrap();
+        let provenance = build_archive_provenance(
+            selection,
+            Some([0x5a; 32]),
+            BootstrapStateKind::Genesis,
+            0,
+            genesis_hash,
+            0,
+            432_000,
+        )
+        .unwrap();
+        let provenance = provenance.single_runtime_v1().unwrap();
+        assert_eq!(provenance.bootstrap_state_kind, BootstrapStateKind::Genesis);
+        assert_eq!(provenance.bootstrap_slot, 0);
+        assert_eq!(provenance.bootstrap_state_hash, genesis_hash);
+        assert_eq!(provenance.requested_slot_start, 0);
     }
 
     #[test]

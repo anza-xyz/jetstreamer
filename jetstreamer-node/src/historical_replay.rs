@@ -6,9 +6,9 @@ use {
         ReplayCursor, ReplayFailure, ReplayProgress, SnapshotVerifier, horizon, plugin,
     },
     crate::historical::{
-        HistoricalAccountWrite, HistoricalCheckpoint, HistoricalRuntimeClient,
-        HistoricalSnapshotExport, denormalize_transaction_error, encode_legacy_transaction,
-        normalize_transaction_error,
+        HistoricalAccountWrite, HistoricalCheckpoint, HistoricalInitializedSource,
+        HistoricalRuntimeClient, HistoricalSnapshotExport, denormalize_transaction_error,
+        encode_legacy_transaction, normalize_transaction_error,
     },
     jetstreamer_historical_protocol::TransactionError as HistoricalTransactionError,
     log::info,
@@ -113,6 +113,7 @@ impl HistoricalReplay {
         live_start_slot: Slot,
     ) -> Result<Self, String> {
         let current_slot = client.initialized().slot;
+        let initialized_source = client.initialized().source;
         let checkpoint_slots = snapshot_verifier
             .as_ref()
             .map(|verifier| verifier.legacy_checkpoint_slots().into_iter().collect())
@@ -134,12 +135,17 @@ impl HistoricalReplay {
             live_start_slot,
         };
 
-        // Always prove and retain the loaded state before accepting an entry.
-        // This also makes a wrong compiler-dependent AppendVec interpretation
-        // fail immediately. Remove the bootstrap slot from the scheduled set
-        // so a later cached request cannot attempt to record it twice.
-        replay.take_checkpoint_slot(current_slot);
-        replay.checkpoint_current(current_slot)?;
+        // A loaded snapshot is already a complete bank, so prove and retain it
+        // before accepting an entry. This also makes a wrong compiler-dependent
+        // AppendVec interpretation fail immediately. A genesis bank at slot 0
+        // is intentionally incomplete, however: its entries and ticks still
+        // need to execute. It is checkpointed only after completion if slot 0
+        // is in the verifier set; candidate admission still requires a trusted
+        // post-execution checkpoint elsewhere in the requested range.
+        if checkpoint_initialized_state(initialized_source) {
+            replay.take_checkpoint_slot(current_slot);
+            replay.checkpoint_current(current_slot)?;
+        }
         Ok(replay)
     }
 
@@ -538,6 +544,10 @@ fn checkpoint_refresh_required(last_checkpoint_slot: Option<Slot>, slot: Slot) -
     last_checkpoint_slot != Some(slot)
 }
 
+fn checkpoint_initialized_state(source: HistoricalInitializedSource) -> bool {
+    source == HistoricalInitializedSource::SnapshotArchive
+}
+
 fn consume_checkpoint_export_seal(last_checkpoint_slot: &mut Option<Slot>) {
     *last_checkpoint_slot = None;
 }
@@ -695,6 +705,16 @@ mod tests {
         consume_checkpoint_export_seal(&mut last_checkpoint_slot);
 
         assert!(checkpoint_refresh_required(last_checkpoint_slot, slot));
+    }
+
+    #[test]
+    fn incomplete_genesis_is_not_checkpointed_before_slot_zero_executes() {
+        assert!(!checkpoint_initialized_state(
+            HistoricalInitializedSource::Genesis
+        ));
+        assert!(checkpoint_initialized_state(
+            HistoricalInitializedSource::SnapshotArchive
+        ));
     }
 
     #[test]

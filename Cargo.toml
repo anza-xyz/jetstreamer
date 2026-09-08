@@ -42,7 +42,7 @@ anyhow = { version = "1", default-features = false }
 base64 = "0.22"
 bincode = "1"
 serial_test = "3"
-wincode = { version = "0.2", features = ["derive", "solana-short-vec"] }
+wincode = "0.5"
 bs58 = { version = "0", default-features = false }
 cbor = "0"
 cid = "0"
@@ -55,31 +55,31 @@ fnv = { version = "1", default-features = false }
 url = { version = "2", default-features = false }
 multihash = { version = "0", default-features = false }
 prost = { package = "prost", version = "0", default-features = false }
-prost_011 = { package = "prost", version = "0.11" }
+prost_014 = { package = "prost", version = "0.14" }
 protobuf-src = "1"
 serde = { version = "1", default-features = false }
 serde_cbor = "0"
-agave-geyser-plugin-interface = "3"
-solana-address = "1"
+agave-geyser-plugin-interface = "4"
+solana-address = "2"
 solana-hash = "4"
 solana-blake3-hasher = "=3.1.0"
 solana-epoch-rewards-hasher = "=3.1.0"
 solana-keccak-hasher = "=3.1.0"
 solana-logger = "3"
 solana-signature = { version = "3", default-features = false }
-solana-accounts-db = "3"
-solana-entry = "3"
-solana-ledger = "3"
-solana-geyser-plugin-manager = { version = "3", features = ["agave-unstable-api"] }
-solana-rpc = "3"
-solana-runtime = "3"
-solana-storage-proto = "3"
-solana-message = "3"
-solana-transaction = "3"
-solana-transaction-status = "3"
+solana-accounts-db = "4"
+solana-entry = "4"
+solana-ledger = "4"
+solana-geyser-plugin-manager = { version = "4", features = ["agave-unstable-api"] }
+solana-rpc = "4"
+solana-runtime = "4"
+solana-storage-proto = "4"
+solana-message = { version = "4", features = ["wincode"] }
+solana-transaction = { version = "4", features = ["wincode"] }
+solana-transaction-status = "4"
 solana-sdk-ids = "3"
-solana-reward-info = "3"
-solana-sysvar = "=3.0.0"
+solana-reward-info = "6"
+solana-sysvar = "=4.1.0"
 sha2 = "0.10"
 tonic = { version = "0", default-features = false }
 tonic-build = "0"

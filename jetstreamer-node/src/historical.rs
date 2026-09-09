@@ -287,6 +287,10 @@ pub enum HistoricalRuntimeError {
     },
     #[error("historical worker closed stdout while request {request_id} was outstanding")]
     UnexpectedEof { request_id: u64 },
+    #[error(
+        "historical worker closed stdout while request {request_id} was outstanding after exiting with {status}"
+    )]
+    UnexpectedExit { request_id: u64, status: ExitStatus },
     #[error("historical worker request ID overflow")]
     RequestIdOverflow,
     #[error(
@@ -1205,8 +1209,7 @@ impl HistoricalRuntimeClient {
             let response = match recv_ipc_response(&response_rx, remaining) {
                 Ok(Some(response)) => response,
                 Ok(None) => {
-                    self.abort_worker();
-                    return Err(HistoricalRuntimeError::UnexpectedEof { request_id });
+                    return Err(self.abort_after_unexpected_eof(request_id));
                 }
                 Err(IpcExchangeError::Io(error)) => {
                     self.abort_worker();
@@ -1649,8 +1652,7 @@ impl HistoricalRuntimeClient {
         let response = match result {
             Ok(Some(response)) => response,
             Ok(None) => {
-                self.abort_worker();
-                return Err(HistoricalRuntimeError::UnexpectedEof { request_id });
+                return Err(self.abort_after_unexpected_eof(request_id));
             }
             Err(IpcExchangeError::Io(error)) => {
                 self.abort_worker();
@@ -1703,6 +1705,20 @@ impl HistoricalRuntimeClient {
             kill_and_reap(child, self.private_work_dir.take(), self.timeouts.reap);
         } else {
             self.private_work_dir.take();
+        }
+    }
+
+    /// Preserve a worker's real exit status before fail-closed cleanup can
+    /// replace it with the status from a termination signal.
+    fn abort_after_unexpected_eof(&mut self, request_id: u64) -> HistoricalRuntimeError {
+        let exit_status = self
+            .child
+            .as_mut()
+            .and_then(|child| child.try_wait().ok().flatten());
+        self.abort_worker();
+        match exit_status {
+            Some(status) => HistoricalRuntimeError::UnexpectedExit { request_id, status },
+            None => HistoricalRuntimeError::UnexpectedEof { request_id },
         }
     }
 
@@ -3754,6 +3770,37 @@ mod tests {
         assert!(client.transport.is_none());
         assert!(matches!(client.ping(), Err(HistoricalRuntimeError::Closed)));
         assert!(!process_is_running(child_id));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unexpected_eof_reports_an_already_exited_worker_status() {
+        let (mut client, child_id) = scripted_response_client(&[]);
+        client.child.as_mut().unwrap().kill().unwrap();
+        let expected_status = client.child.as_mut().unwrap().wait().unwrap();
+
+        let error = client.abort_after_unexpected_eof(17);
+        assert!(matches!(
+            error,
+            HistoricalRuntimeError::UnexpectedExit {
+                request_id: 17,
+                status,
+            } if status == expected_status
+        ));
+        assert_client_poisoned_and_worker_reaped(&mut client, child_id);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unexpected_eof_still_terminates_a_running_worker() {
+        let (mut client, child_id) = scripted_response_client(&[]);
+
+        let error = client.abort_after_unexpected_eof(23);
+        assert!(matches!(
+            error,
+            HistoricalRuntimeError::UnexpectedEof { request_id: 23 }
+        ));
+        assert_client_poisoned_and_worker_reaped(&mut client, child_id);
     }
 
     #[cfg(unix)]

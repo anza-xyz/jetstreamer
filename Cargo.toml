@@ -80,7 +80,7 @@ solana-transaction-status = "4"
 solana-sdk-ids = "3"
 solana-reward-info = "6"
 solana-sysvar = "=4.1.0"
-sha2 = "0.10"
+sha2 = "0.11"
 tonic = { version = "0", default-features = false }
 tonic-build = "0"
 zstd = { version = "0", default-features = false }

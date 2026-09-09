@@ -42,7 +42,7 @@ anyhow = { version = "1", default-features = false }
 base64 = "0.22"
 bincode = "1"
 serial_test = "3"
-wincode = "0.5"
+wincode = "0.6"
 bs58 = { version = "0", default-features = false }
 cbor = "0"
 cid = "0"

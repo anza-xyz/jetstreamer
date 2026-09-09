@@ -1,5 +1,6 @@
 //! Helpers for working with Solana ledger snapshots stored in GCS.
 
+pub mod archive_checksum;
 pub mod handoff_snapshot;
 pub mod segment_manifest;
 pub mod snapshots;

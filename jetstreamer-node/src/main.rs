@@ -101,9 +101,10 @@ use solana_transaction::{
 use solana_transaction_status::TransactionStatusMeta;
 use solana_unified_scheduler_pool::DefaultSchedulerPool;
 use tar::Archive as TarArchive;
-use tokio::process::Command;
+use tokio::process::{Child, Command};
 use xxhash_rust::xxh64::xxh64;
 
+mod adaptive_epoch;
 mod compatibility;
 mod historical;
 mod historical_replay;
@@ -4564,6 +4565,11 @@ fn usage(program: &str) -> String {
          Set JETSTREAMER_EPOCH_ISOLATION=0 to restore single-process chaining (the\n\
          bank stays in memory across epochs; no per-epoch snapshot reload).\n\
          JETSTREAMER_EPOCH_ATTEMPTS (default 2) bounds retries of a crashed epoch;\n\
+         JETSTREAMER_ADAPTIVE_EPOCH_CONCURRENCY=yes explicitly enables RAM/CPU-gated\n\
+         isolated epoch fanout (default off; finite inherited cgroup memory.max\n\
+         is required above one child; Agave directory loading remains serial).\n\
+         JETSTREAMER_PROTECTED_MEMORY_GIB defaults\n\
+         to 400; JETSTREAMER_ADAPTIVE_EPOCH_MAX is capped at 3.\n\
          JETSTREAMER_PRUNE_EPOCH_SNAPSHOTS=0 keeps each boundary snapshot archive\n\
          after its epoch finalizes (default: deleted to reclaim disk).\n\
          --horizon-output applies only to a single epoch.\n\
@@ -4572,7 +4578,8 @@ fn usage(program: &str) -> String {
          at the later of the target epoch boundary and the snapshot successor. It\n\
          requires a single epoch, --verify,\n\
          --snapshot-archive, --epoch-hashes, and --horizon-output.\n\
-         --epoch-hashes=PATH, --snapshot-archive=PATH, and --range-info=A-B are\n\
+         --epoch-hashes=PATH, --snapshot-archive=PATH, --range-info=A-B, and\n\
+         --replay-scratch=PATH are\n\
          otherwise internal flags passed by the range supervisor to its children."
     )
 }
@@ -4814,6 +4821,67 @@ fn epoch_isolation_plan(
         }
     }
     Ok((false, None))
+}
+
+fn runtime_supports_private_replay_scratch(
+    selection: compatibility::RuntimeSelection,
+    load_from_dir: bool,
+) -> bool {
+    selection.descriptor.worker.is_some()
+        || (selection.backend == compatibility::RuntimeBackend::AgaveV3 && !load_from_dir)
+}
+
+fn runtime_spans_support_private_replay_scratch(
+    spans: &[compatibility::RuntimeSpan],
+    load_from_dir: bool,
+) -> Result<bool, String> {
+    for span in spans {
+        if !runtime_supports_private_replay_scratch(runtime_span_selection(span)?, load_from_dir) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn range_supports_private_replay_scratch(
+    start_epoch: u64,
+    end_epoch: u64,
+    allow_candidate_runtime: bool,
+    load_from_dir: bool,
+) -> Result<bool, String> {
+    for epoch in start_epoch..=end_epoch {
+        let (slot_start, slot_end_inclusive) = epoch_to_slot_range(epoch);
+        let spans = compatibility::plan_runtime_spans(
+            slot_start..slot_end_inclusive.saturating_add(1),
+            allow_candidate_runtime,
+        )?;
+        if !runtime_spans_support_private_replay_scratch(&spans, load_from_dir)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn range_runtime_kinds(
+    start_epoch: u64,
+    end_epoch: u64,
+    allow_candidate_runtime: bool,
+) -> Result<(bool, bool), String> {
+    let mut has_historical_worker = false;
+    let mut has_agave = false;
+    for epoch in start_epoch..=end_epoch {
+        let (slot_start, slot_end_inclusive) = epoch_to_slot_range(epoch);
+        let spans = compatibility::plan_runtime_spans(
+            slot_start..slot_end_inclusive.saturating_add(1),
+            allow_candidate_runtime,
+        )?;
+        for span in &spans {
+            let selection = runtime_span_selection(span)?;
+            has_historical_worker |= selection.descriptor.worker.is_some();
+            has_agave |= selection.backend == compatibility::RuntimeBackend::AgaveV3;
+        }
+    }
+    Ok((has_historical_worker, has_agave))
 }
 
 /// Whether this is a historical Solana 1.0 snapshot archive.  This classifies
@@ -5485,14 +5553,27 @@ async fn ensure_genesis_archive(ledger_dir: &Path) -> Result<(), String> {
 }
 
 fn validate_mainnet_genesis(ledger_dir: &Path) -> Result<ReplayBootstrap, String> {
+    validate_mainnet_genesis_in(ledger_dir, ledger_dir)
+}
+
+fn validate_mainnet_genesis_in(
+    ledger_dir: &Path,
+    private_parent: &Path,
+) -> Result<ReplayBootstrap, String> {
+    fs::create_dir_all(private_parent).map_err(|err| {
+        format!(
+            "failed to create private genesis parent {}: {err}",
+            private_parent.display()
+        )
+    })?;
     let private_dir = Arc::new(
         tempfile::Builder::new()
             .prefix(".jetstreamer-genesis-")
-            .tempdir_in(ledger_dir)
+            .tempdir_in(private_parent)
             .map_err(|err| {
                 format!(
                     "failed to create private genesis admission directory in {}: {err}",
-                    ledger_dir.display()
+                    private_parent.display()
                 )
             })?,
     );
@@ -6131,6 +6212,7 @@ fn load_bank_from_snapshot(
 
 fn load_bank_from_snapshot_archive(
     ledger_dir: &Path,
+    replay_scratch_dir: &Path,
     snapshot_archive: &Path,
     accounts_update_notifier: Option<AccountsUpdateNotifier>,
 ) -> Result<Bank, String> {
@@ -6139,7 +6221,7 @@ fn load_bank_from_snapshot_archive(
     let genesis_config = open_genesis_config(ledger_dir, MAX_GENESIS_ARCHIVE_UNPACKED_SIZE)
         .map_err(|err| format!("failed to load genesis config: {err}"))?;
     let runtime_config = RuntimeConfig::default();
-    let accounts_db_config = accounts_db_config_for_ledger(ledger_dir)?;
+    let accounts_db_config = accounts_db_config_for_ledger(replay_scratch_dir)?;
     let exit = Arc::new(AtomicBool::new(false));
     let limit_load_slot_count_from_snapshot = if skip_snapshot_verify() {
         info!("snapshot verification disabled via JETSTREAMER_SKIP_SNAPSHOT_VERIFY");
@@ -6152,14 +6234,14 @@ fn load_bank_from_snapshot_archive(
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("snapshot");
-    let unpack_dir = ledger_dir.join(format!(".snapshot-extract-{archive_tag}"));
+    let unpack_dir = replay_scratch_dir.join(format!(".snapshot-extract-{archive_tag}"));
     fs::create_dir_all(&unpack_dir)
         .map_err(|err| format!("failed to create {}: {err}", unpack_dir.display()))?;
     let unpack_marker = stage_marker(&unpack_dir, "unpacked");
     let meta_marker = stage_marker(&unpack_dir, "meta_fixed");
     let hardlinks_marker = stage_marker(&unpack_dir, "hardlinks");
     let run_paths_marker = stage_marker(&unpack_dir, "account_paths");
-    let account_run_dir = ledger_dir.join(ARCHIVE_ACCOUNTS_DIR);
+    let account_run_dir = replay_scratch_dir.join(ARCHIVE_ACCOUNTS_DIR);
     let bank_snapshots_dir = unpack_dir.join(BANK_SNAPSHOTS_DIR);
     let mut unpack_done = unpack_marker.is_file();
     if unpack_done {
@@ -7045,6 +7127,7 @@ async fn run_geyser_replay(
     epoch: u64,
     allow_candidate_runtime: bool,
     ledger_dir: &Path,
+    replay_scratch_dir: &Path,
     bootstrap: &ReplayBootstrap,
     shutdown: Arc<AtomicBool>,
     cursor: Arc<ReplayCursor>,
@@ -7258,6 +7341,7 @@ async fn run_geyser_replay(
                     info!("accounts update notifier wired into snapshot load: true");
                     info!("loading Agave bank from snapshot");
                     let ledger_dir_for_load = ledger_dir.clone();
+                    let replay_scratch_for_load = replay_scratch_dir.to_path_buf();
                     let snapshot_archive = snapshot_archive.to_path_buf();
                     let use_dir_loader = env_truthy("JETSTREAMER_LOAD_FROM_DIR");
                     let bank = tokio::task::spawn_blocking(move || {
@@ -7266,6 +7350,7 @@ async fn run_geyser_replay(
                         } else {
                             load_bank_from_snapshot_archive(
                                 &ledger_dir_for_load,
+                                &replay_scratch_for_load,
                                 &snapshot_archive,
                                 accounts_update_notifier,
                             )
@@ -7310,7 +7395,7 @@ async fn run_geyser_replay(
                 }
                 let worker_profile = historical_worker_profile(runtime_descriptor)?;
                 let executable = configured_historical_worker_executable(runtime_descriptor)?;
-                let scratch_parent = ledger_dir.join(".historical-runtime");
+                let scratch_parent = replay_scratch_dir.join(".historical-runtime");
                 fs::create_dir_all(&scratch_parent).map_err(|err| {
                     format!(
                         "failed to create historical runtime scratch directory {}: {err}",
@@ -10015,6 +10100,26 @@ fn preserve_existing_output(path: &Path) -> Result<Option<PathBuf>, String> {
                 )
             })?;
         }
+        if let Ok(checksum) = jetstreamer_node::archive_checksum::archive_checksum_path(path)
+            && checksum.exists()
+        {
+            let backup_checksum = jetstreamer_node::archive_checksum::archive_checksum_path(
+                &backup,
+            )
+            .map_err(|err| {
+                format!(
+                    "failed to resolve checksum backup for {}: {err}",
+                    backup.display()
+                )
+            })?;
+            fs::rename(&checksum, &backup_checksum).map_err(|err| {
+                format!(
+                    "preserved {} but failed to preserve its checksum {}: {err}",
+                    path.display(),
+                    checksum.display()
+                )
+            })?;
+        }
         return Ok(Some(backup));
     }
     Err(format!(
@@ -10030,10 +10135,12 @@ fn preserve_existing_output(path: &Path) -> Result<Option<PathBuf>, String> {
 async fn run_multi_runtime_epoch_supervisor(
     epoch: u64,
     dest_dir: &Path,
+    replay_scratch: Option<&Path>,
     initial_snapshot: &Path,
     epoch_hashes: &Path,
     final_output: &Path,
     allow_candidate_runtime: bool,
+    publish_checksum: bool,
     shutdown: Arc<AtomicBool>,
 ) -> Result<(), String> {
     let (epoch_start, epoch_end) = epoch_to_slot_range(epoch);
@@ -10047,8 +10154,22 @@ async fn run_multi_runtime_epoch_supervisor(
         ));
     }
     let work_dir = runtime_segment_work_dir(final_output)?;
+    let handoff_dir = replay_scratch
+        .map(|scratch| scratch.join("runtime-handoffs"))
+        .unwrap_or_else(|| dest_dir.to_path_buf());
+    fs::create_dir_all(&handoff_dir)
+        .map_err(|err| format!("failed to create {}: {err}", handoff_dir.display()))?;
     match epoch_archive_reusable_multi_runtime(final_output, epoch, &spans) {
         Ok(true) => {
+            if publish_checksum {
+                jetstreamer_node::archive_checksum::ensure_archive_checksum(final_output)
+                    .map_err(|err| {
+                        format!(
+                            "failed to validate or repair checksum for reusable epoch {epoch} archive {}: {err}",
+                            final_output.display()
+                        )
+                    })?;
+            }
             cleanup_runtime_segment_work_dir(&work_dir, epoch, &spans)?;
             info!(
                 "multi-runtime epoch {epoch} archive {} is already complete",
@@ -10102,7 +10223,7 @@ async fn run_multi_runtime_epoch_supervisor(
                         span.slots.start, span.slots.end
                     )
                 })?;
-                dest_dir.join(handoff.snapshot.archive_name())
+                handoff_dir.join(handoff.snapshot.archive_name())
             };
             let bootstrap_handoff_manifest = if index > 0 {
                 Some(validate_canonical_handoff_snapshot(
@@ -10119,7 +10240,7 @@ async fn run_multi_runtime_epoch_supervisor(
             let successor_snapshot = spans.get(index + 1).and_then(|successor| {
                 successor
                     .handoff
-                    .map(|handoff| (handoff, dest_dir.join(handoff.snapshot.archive_name())))
+                    .map(|handoff| (handoff, handoff_dir.join(handoff.snapshot.archive_name())))
             });
             let validated_segment = load_validated_runtime_segment(&archive_path, epoch, span);
             let mut reusable = validated_segment.is_ok();
@@ -10185,12 +10306,31 @@ async fn run_multi_runtime_epoch_supervisor(
                 let mut output_arg = OsString::from("--horizon-output=");
                 output_arg.push(&archive_path);
                 command.arg(output_arg);
-                if needs_export_now {
-                    command.env("JETSTREAMER_EXPORT_HANDOFF_SNAPSHOT_DIR", dest_dir);
+                if let Some(replay_scratch) = replay_scratch {
+                    let segment_scratch = replay_scratch.join(format!("segment-{index}"));
+                    fs::create_dir_all(&segment_scratch).map_err(|err| {
+                        format!(
+                            "failed to create runtime segment scratch {}: {err}",
+                            segment_scratch.display()
+                        )
+                    })?;
+                    let mut scratch_arg = OsString::from("--replay-scratch=");
+                    scratch_arg.push(&segment_scratch);
+                    command.arg(scratch_arg);
                 }
-                let status = command.status().await.map_err(|err| {
+                if needs_export_now {
+                    command.env("JETSTREAMER_EXPORT_HANDOFF_SNAPSHOT_DIR", &handoff_dir);
+                }
+                command.kill_on_drop(true);
+                let mut child = command.spawn().map_err(|err| {
                     format!(
                         "failed to spawn runtime segment child {}..{}: {err}",
+                        span.slots.start, span.slots.end
+                    )
+                })?;
+                let status = child.wait().await.map_err(|err| {
+                    format!(
+                        "failed to wait for runtime segment child {}..{}: {err}",
                         span.slots.start, span.slots.end
                     )
                 })?;
@@ -10267,7 +10407,7 @@ async fn run_multi_runtime_epoch_supervisor(
                 )
             })?;
             validate_canonical_handoff_snapshot(
-                &dest_dir.join(handoff.snapshot.archive_name()),
+                &handoff_dir.join(handoff.snapshot.archive_name()),
                 handoff,
             )
         })
@@ -10362,6 +10502,16 @@ async fn run_multi_runtime_epoch_supervisor(
             final_output.display()
         ));
     }
+    if publish_checksum {
+        jetstreamer_node::archive_checksum::ensure_archive_checksum(final_output).map_err(
+            |err| {
+                format!(
+                    "failed to publish checksum for verified epoch {epoch} archive {}: {err}",
+                    final_output.display()
+                )
+            },
+        )?;
+    }
     cleanup_runtime_segment_work_dir(&work_dir, epoch, &spans)?;
     info!(
         "epoch {epoch}: published verified multi-runtime archive {} (segments={}, slots={}, account_updates_rebased={}, bytes={})",
@@ -10374,6 +10524,595 @@ async fn run_multi_runtime_epoch_supervisor(
     Ok(())
 }
 
+const ADAPTIVE_EPOCH_HARD_MAX_CONCURRENCY: usize = 3;
+const DEFAULT_ADAPTIVE_EPOCH_SETTLE_SECS: u64 = 60;
+const ADAPTIVE_EPOCH_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+struct AdaptiveEpochJob {
+    epoch: u64,
+    spans: Vec<compatibility::RuntimeSpan>,
+    selection: compatibility::RuntimeSelection,
+    bootstrap: ReplayBootstrap,
+    hashes_path: PathBuf,
+    final_output: PathBuf,
+    staged_output: PathBuf,
+    scratch_dir: PathBuf,
+    work_dir: PathBuf,
+    attempt: u32,
+}
+
+struct RunningAdaptiveEpoch {
+    job: AdaptiveEpochJob,
+    child: Child,
+}
+
+fn adaptive_env_u64(name: &str) -> Result<Option<u64>, String> {
+    let Some(value) = env::var_os(name) else {
+        return Ok(None);
+    };
+    let value = value
+        .into_string()
+        .map_err(|_| format!("{name} must contain a decimal integer"))?;
+    value
+        .trim()
+        .parse::<u64>()
+        .map(Some)
+        .map_err(|err| format!("invalid {name} value {value:?}: {err}"))
+}
+
+fn configured_adaptive_epoch_policy(
+    has_historical_worker: bool,
+    has_agave: bool,
+) -> Result<(adaptive_epoch::EpochAdmissionPolicy, Duration), String> {
+    let mut policy = adaptive_epoch::EpochAdmissionPolicy::default();
+    if let Some(protected_gib) = adaptive_env_u64("JETSTREAMER_PROTECTED_MEMORY_GIB")? {
+        policy.protected_memory_bytes = protected_gib
+            .checked_mul(adaptive_epoch::GIB)
+            .ok_or_else(|| "JETSTREAMER_PROTECTED_MEMORY_GIB is too large".to_string())?;
+    }
+    if let Some(min_system_gib) = adaptive_env_u64("JETSTREAMER_SYSTEM_MEMORY_RESERVE_GIB")? {
+        policy.min_system_reserve_bytes = min_system_gib
+            .checked_mul(adaptive_epoch::GIB)
+            .ok_or_else(|| "JETSTREAMER_SYSTEM_MEMORY_RESERVE_GIB is too large".to_string())?;
+    }
+    if let Some(epoch_gib) = adaptive_env_u64("JETSTREAMER_EPOCH_MEMORY_RESERVATION_GIB")? {
+        policy.epoch_memory_reservation_bytes =
+            Some(epoch_gib.checked_mul(adaptive_epoch::GIB).ok_or_else(|| {
+                "JETSTREAMER_EPOCH_MEMORY_RESERVATION_GIB is too large".to_string()
+            })?);
+    }
+    if let Some(max_concurrency) = adaptive_env_u64("JETSTREAMER_ADAPTIVE_EPOCH_MAX")? {
+        let max_concurrency = usize::try_from(max_concurrency)
+            .map_err(|_| "JETSTREAMER_ADAPTIVE_EPOCH_MAX is too large".to_string())?;
+        if !(1..=ADAPTIVE_EPOCH_HARD_MAX_CONCURRENCY).contains(&max_concurrency) {
+            return Err(format!(
+                "JETSTREAMER_ADAPTIVE_EPOCH_MAX must be in 1..={ADAPTIVE_EPOCH_HARD_MAX_CONCURRENCY}"
+            ));
+        }
+        policy.max_concurrency = max_concurrency;
+    }
+
+    // Explicit runtime thread settings are inherited unchanged by every child
+    // and are the only basis for multi-worker CPU admission. Charge two logical
+    // CPUs per configured execution thread so an unset/default 32-thread worker
+    // remains serial on a 64-thread host, while a qualified 16-thread setting
+    // may use two workers.
+    let historical_threads = if has_historical_worker {
+        adaptive_env_u64("JETSTREAMER_HISTORICAL_POH_THREADS")?
+    } else {
+        None
+    };
+    let agave_threads = if has_agave {
+        adaptive_env_u64("JETSTREAMER_REPLAY_THREADS")?
+    } else {
+        None
+    };
+    if historical_threads == Some(0) {
+        return Err("JETSTREAMER_HISTORICAL_POH_THREADS must be positive".to_string());
+    }
+    if agave_threads == Some(0) {
+        return Err("JETSTREAMER_REPLAY_THREADS must be positive".to_string());
+    }
+    let all_required_threads_are_explicit = (!has_historical_worker
+        || historical_threads.is_some())
+        && (!has_agave || agave_threads.is_some());
+    if all_required_threads_are_explicit {
+        let configured_threads = historical_threads
+            .into_iter()
+            .chain(agave_threads)
+            .max()
+            .expect("an adaptive range contains at least one runtime");
+        let configured_threads = usize::try_from(configured_threads)
+            .map_err(|_| "configured replay thread count is too large".to_string())?;
+        policy.threads_per_epoch = configured_threads.saturating_mul(2);
+    } else {
+        policy.max_concurrency = 1;
+    }
+
+    let settle_secs = adaptive_env_u64("JETSTREAMER_ADAPTIVE_EPOCH_SETTLE_SECS")?
+        .unwrap_or(DEFAULT_ADAPTIVE_EPOCH_SETTLE_SECS);
+    Ok((policy, Duration::from_secs(settle_secs)))
+}
+
+fn adaptive_epoch_archive_reusable(job: &AdaptiveEpochJob, path: &Path) -> Result<bool, String> {
+    if job.spans.len() == 1 {
+        epoch_archive_reusable(path, job.epoch, job.selection)
+    } else {
+        epoch_archive_reusable_multi_runtime(path, job.epoch, &job.spans)
+    }
+}
+
+fn spawn_adaptive_epoch_child(
+    exe: &Path,
+    effective_start: u64,
+    end_epoch: u64,
+    dest_dir: &Path,
+    verify_snapshots: bool,
+    job: &AdaptiveEpochJob,
+) -> Result<Child, String> {
+    let mut command = Command::new(exe);
+    command
+        .kill_on_drop(true)
+        .env_remove("JETSTREAMER_EXPORT_HANDOFF_SNAPSHOT_DIR")
+        .arg(job.epoch.to_string())
+        .arg(dest_dir)
+        .arg(if verify_snapshots {
+            "--verify"
+        } else {
+            "--no-verify"
+        })
+        .arg(format!("--range-info={effective_start}-{end_epoch}"));
+    if verify_snapshots {
+        let mut hashes_arg = OsString::from("--epoch-hashes=");
+        hashes_arg.push(&job.hashes_path);
+        command.arg(hashes_arg);
+    }
+    if let ReplayBootstrap::SnapshotArchive(snapshot_path) = &job.bootstrap {
+        let mut snapshot_arg = OsString::from("--snapshot-archive=");
+        snapshot_arg.push(snapshot_path);
+        command.arg(snapshot_arg);
+    }
+    let mut output_arg = OsString::from("--horizon-output=");
+    output_arg.push(&job.staged_output);
+    command.arg(output_arg);
+    let mut scratch_arg = OsString::from("--replay-scratch=");
+    scratch_arg.push(&job.scratch_dir);
+    command.arg(scratch_arg);
+    command
+        .spawn()
+        .map_err(|err| format!("failed to spawn child for epoch {}: {err}", job.epoch))
+}
+
+fn publish_staged_epoch_archive(job: &AdaptiveEpochJob) -> Result<(), String> {
+    if !adaptive_epoch_archive_reusable(job, &job.staged_output)? {
+        return Err(format!(
+            "staged epoch {} archive {} did not pass registry validation",
+            job.epoch,
+            job.staged_output.display()
+        ));
+    }
+    fs::File::open(&job.staged_output)
+        .and_then(|file| file.sync_all())
+        .map_err(|err| {
+            format!(
+                "failed to sync staged epoch {} archive {}: {err}",
+                job.epoch,
+                job.staged_output.display()
+            )
+        })?;
+    let preserved_output = preserve_existing_output(&job.final_output)?;
+    if let Err(err) = fs::rename(&job.staged_output, &job.final_output) {
+        if let Some(backup) = preserved_output.as_ref()
+            && !job.final_output.exists()
+            && let Err(restore_err) = fs::rename(backup, &job.final_output)
+        {
+            return Err(format!(
+                "failed to publish staged epoch {} archive: {err}; also failed to restore {}: {restore_err}",
+                job.epoch,
+                backup.display()
+            ));
+        }
+        return Err(format!(
+            "failed to atomically publish staged epoch {} archive {} as {}: {err}",
+            job.epoch,
+            job.staged_output.display(),
+            job.final_output.display()
+        ));
+    }
+    fs::File::open(&job.final_output)
+        .and_then(|file| file.sync_all())
+        .map_err(|err| format!("failed to sync {}: {err}", job.final_output.display()))?;
+    let output_parent = job.final_output.parent().unwrap_or_else(|| Path::new("."));
+    fs::File::open(output_parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|err| format!("failed to sync {}: {err}", output_parent.display()))?;
+    if !adaptive_epoch_archive_reusable(job, &job.final_output)? {
+        return Err(format!(
+            "published epoch {} archive {} did not pass final registry validation",
+            job.epoch,
+            job.final_output.display()
+        ));
+    }
+    jetstreamer_node::archive_checksum::ensure_archive_checksum(&job.final_output).map_err(
+        |err| {
+            format!(
+                "failed to publish checksum for verified epoch {} archive {}: {err}",
+                job.epoch,
+                job.final_output.display()
+            )
+        },
+    )?;
+    Ok(())
+}
+
+async fn stop_adaptive_epoch_children(running: &mut BTreeMap<u64, RunningAdaptiveEpoch>) {
+    for running_epoch in running.values_mut() {
+        match running_epoch.child.try_wait() {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                if let Err(err) = running_epoch.child.start_kill() {
+                    warn!(
+                        "failed to stop owned epoch {} child: {err}",
+                        running_epoch.job.epoch
+                    );
+                }
+            }
+            Err(err) => warn!(
+                "failed to inspect owned epoch {} child before shutdown: {err}",
+                running_epoch.job.epoch
+            ),
+        }
+    }
+    let children = std::mem::take(running);
+    for (_, mut running_epoch) in children {
+        if let Err(err) = running_epoch.child.wait().await {
+            warn!(
+                "failed to reap owned epoch {} child: {err}",
+                running_epoch.job.epoch
+            );
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_epoch_range_supervisor_adaptive(
+    effective_start: u64,
+    end_epoch: u64,
+    dest_dir: &Path,
+    verify_snapshots: bool,
+    allow_candidate_runtime: bool,
+    shutdown: Arc<AtomicBool>,
+    boundary_bootstraps: BTreeMap<u64, ReplayBootstrap>,
+) -> Result<(), String> {
+    let load_from_dir = env_truthy("JETSTREAMER_LOAD_FROM_DIR");
+    if !range_supports_private_replay_scratch(
+        effective_start,
+        end_epoch,
+        allow_candidate_runtime,
+        load_from_dir,
+    )? {
+        return Err(
+            "adaptive epoch concurrency requires every runtime to support private replay scratch"
+                .to_string(),
+        );
+    }
+    let exe =
+        env::current_exe().map_err(|err| format!("failed to resolve current executable: {err}"))?;
+    let attempts_per_epoch = env::var("JETSTREAMER_EPOCH_ATTEMPTS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .filter(|attempts| *attempts > 0)
+        .unwrap_or(2);
+    let (has_historical_worker, has_agave) =
+        range_runtime_kinds(effective_start, end_epoch, allow_candidate_runtime)?;
+    let (policy, settle_interval) =
+        configured_adaptive_epoch_policy(has_historical_worker, has_agave)?;
+    let cgroup_memory_max = adaptive_epoch::read_current_cgroup_memory_max();
+    let prune_snapshots = env_truthy_default("JETSTREAMER_PRUNE_EPOCH_SNAPSHOTS", false);
+    let range_work = tempfile::Builder::new()
+        .prefix(".jetstreamer-adaptive-epochs-")
+        .tempdir_in(dest_dir)
+        .map_err(|err| {
+            format!(
+                "failed to create adaptive epoch work directory in {}: {err}",
+                dest_dir.display()
+            )
+        })?;
+    let mut pending = VecDeque::new();
+    let mut published_epochs = HashSet::new();
+    for epoch in effective_start..=end_epoch {
+        let (slot_start, slot_end_inclusive) = epoch_to_slot_range(epoch);
+        let spans = compatibility::plan_runtime_spans(
+            slot_start..slot_end_inclusive.saturating_add(1),
+            allow_candidate_runtime,
+        )?;
+        let selection = runtime_span_selection(
+            spans
+                .first()
+                .expect("runtime planner rejects empty epoch ranges"),
+        )?;
+        let final_output = dest_dir.join(format!("epoch-{epoch}.jet"));
+        let reusable = if spans.len() == 1 {
+            epoch_archive_reusable(&final_output, epoch, selection)?
+        } else {
+            match epoch_archive_reusable_multi_runtime(&final_output, epoch, &spans) {
+                Ok(reusable) => reusable,
+                Err(err) => {
+                    warn!(
+                        "epoch {epoch}: pre-existing multi-runtime output {} is not reusable; regenerating it: {err}",
+                        final_output.display()
+                    );
+                    false
+                }
+            }
+        };
+        if reusable {
+            jetstreamer_node::archive_checksum::ensure_archive_checksum(&final_output).map_err(
+                |err| {
+                    format!(
+                        "failed to validate or repair checksum for reusable epoch {epoch} archive {}: {err}",
+                        final_output.display()
+                    )
+                },
+            )?;
+            published_epochs.insert(epoch);
+            continue;
+        }
+        let bootstrap = boundary_bootstraps.get(&epoch).cloned().ok_or_else(|| {
+            format!("range supervisor has no staged bootstrap state for epoch {epoch}")
+        })?;
+        let work_dir = range_work.path().join(format!("epoch-{epoch}"));
+        let scratch_dir = work_dir.join("scratch");
+        fs::create_dir_all(&scratch_dir)
+            .map_err(|err| format!("failed to create {}: {err}", scratch_dir.display()))?;
+        pending.push_back(AdaptiveEpochJob {
+            epoch,
+            spans,
+            selection,
+            bootstrap,
+            hashes_path: dest_dir.join(format!("epoch-hashes-{epoch}.txt")),
+            final_output,
+            staged_output: work_dir.join(format!("epoch-{epoch}.jet")),
+            scratch_dir,
+            work_dir,
+            attempt: 0,
+        });
+    }
+
+    let mut running: BTreeMap<u64, RunningAdaptiveEpoch> = BTreeMap::new();
+    let mut ready: BTreeMap<u64, AdaptiveEpochJob> = BTreeMap::new();
+    let mut next_publish_epoch = effective_start;
+    let mut cohort_started: Option<Instant> = None;
+    let mut last_admission: Option<(bool, usize)> = None;
+    info!(
+        "adaptive epoch supervisor enabled (historical={}, agave={}, max={}, settle={}s, protected={} GiB, system-min={} GiB, pruning={})",
+        has_historical_worker,
+        has_agave,
+        policy.max_concurrency,
+        settle_interval.as_secs(),
+        policy.protected_memory_bytes / adaptive_epoch::GIB,
+        policy.min_system_reserve_bytes / adaptive_epoch::GIB,
+        prune_snapshots,
+    );
+
+    loop {
+        if shutdown.load(Ordering::SeqCst) {
+            info!(
+                "shutdown requested; stopping {} owned epoch child(ren)",
+                running.len()
+            );
+            stop_adaptive_epoch_children(&mut running).await;
+            return Ok(());
+        }
+
+        let running_epochs = running.keys().copied().collect::<Vec<_>>();
+        for epoch in running_epochs {
+            let status = match running
+                .get_mut(&epoch)
+                .expect("running epoch key came from this map")
+                .child
+                .try_wait()
+            {
+                Ok(status) => status,
+                Err(err) => {
+                    stop_adaptive_epoch_children(&mut running).await;
+                    return Err(format!("failed to poll child for epoch {epoch}: {err}"));
+                }
+            };
+            let Some(status) = status else {
+                continue;
+            };
+            let completed = running
+                .remove(&epoch)
+                .expect("completed epoch remained in the running map");
+            let validation = if status.success() {
+                adaptive_epoch_archive_reusable(&completed.job, &completed.job.staged_output)
+            } else {
+                Ok(false)
+            };
+            match validation {
+                Ok(true) => {
+                    info!(
+                        "epoch {epoch} child completed into private staging (attempt {}/{attempts_per_epoch})",
+                        completed.job.attempt
+                    );
+                    ready.insert(epoch, completed.job);
+                }
+                outcome => {
+                    let detail = match outcome {
+                        Ok(false) => format!("exit: {status}"),
+                        Err(err) => format!("exit: {status}; validation: {err}"),
+                        Ok(true) => unreachable!(),
+                    };
+                    if completed.job.attempt >= attempts_per_epoch {
+                        stop_adaptive_epoch_children(&mut running).await;
+                        return Err(format!(
+                            "epoch {epoch} failed after {attempts_per_epoch} attempt(s) ({detail})"
+                        ));
+                    }
+                    warn!("epoch {epoch} child failed ({detail}); retrying");
+                    if let Err(err) = remove_path_if_exists(&completed.job.staged_output) {
+                        stop_adaptive_epoch_children(&mut running).await;
+                        return Err(err);
+                    }
+                    pending.push_front(completed.job);
+                }
+            }
+        }
+        if running.is_empty() {
+            cohort_started = None;
+        }
+
+        while next_publish_epoch <= end_epoch {
+            if published_epochs.remove(&next_publish_epoch) {
+                next_publish_epoch += 1;
+                continue;
+            }
+            let Some(job) = ready.remove(&next_publish_epoch) else {
+                break;
+            };
+            if let Err(err) = publish_staged_epoch_archive(&job) {
+                stop_adaptive_epoch_children(&mut running).await;
+                return Err(err);
+            }
+            info!(
+                "epoch {}: atomically published ordered verified archive {}",
+                job.epoch,
+                job.final_output.display()
+            );
+            let _ = fs::remove_file(&job.hashes_path);
+            if prune_snapshots && let ReplayBootstrap::SnapshotArchive(path) = &job.bootstrap {
+                match prune_epoch_boundary_snapshot(path, job.selection.descriptor) {
+                    Ok(()) => info!("pruned boundary snapshot artifacts for {}", path.display()),
+                    Err(err) => warn!(
+                        "failed to prune boundary snapshot artifacts for {}: {err}",
+                        path.display()
+                    ),
+                }
+            }
+            fs::remove_dir_all(&job.work_dir)
+                .map_err(|err| format!("failed to remove {}: {err}", job.work_dir.display()))?;
+            next_publish_epoch += 1;
+        }
+
+        if next_publish_epoch > end_epoch && running.is_empty() && pending.is_empty() {
+            info!("=== all epochs {effective_start}-{end_epoch} complete ===");
+            return Ok(());
+        }
+
+        let telemetry = adaptive_epoch::read_host_telemetry();
+        let admission = policy.evaluate(telemetry, running.len());
+        let contained =
+            cgroup_memory_max.is_some_and(|limit| limit <= admission.owned_budget_bytes);
+        let effective_capacity = adaptive_epoch::contained_capacity(admission, cgroup_memory_max);
+        let admission_key = (admission.telemetry_reliable, effective_capacity);
+        if last_admission != Some(admission_key) {
+            if admission.telemetry_reliable {
+                info!(
+                    "adaptive epoch admission capacity={} running={} available={} GiB reservation={} GiB owned-limit={} GiB",
+                    effective_capacity,
+                    running.len(),
+                    telemetry
+                        .expect("reliable admission retained telemetry")
+                        .memory_available_bytes
+                        / adaptive_epoch::GIB,
+                    admission.epoch_reservation_bytes / adaptive_epoch::GIB,
+                    admission.normal_owned_limit_bytes / adaptive_epoch::GIB,
+                );
+            } else {
+                warn!("host memory/CPU telemetry unavailable; falling back to serial epochs");
+            }
+            if !contained {
+                warn!(
+                    "finite inherited cgroup memory.max is absent or exceeds the owned budget; adaptive epoch concurrency is held at one"
+                );
+            }
+            last_admission = Some(admission_key);
+        }
+        let elapsed = cohort_started
+            .map(|started| started.elapsed())
+            .unwrap_or(Duration::ZERO);
+        let target_capacity = adaptive_epoch::ramped_capacity(
+            effective_capacity,
+            running.len(),
+            elapsed,
+            settle_interval,
+        );
+        while running.len() < target_capacity {
+            let Some(mut job) = pending.pop_front() else {
+                break;
+            };
+            job.attempt += 1;
+            info!(
+                "=== epoch {}: spawning private staged child (attempt {}/{attempts_per_epoch}, running={}/{target_capacity}) ===",
+                job.epoch,
+                job.attempt,
+                running.len() + 1,
+            );
+            match spawn_adaptive_epoch_child(
+                &exe,
+                effective_start,
+                end_epoch,
+                dest_dir,
+                verify_snapshots,
+                &job,
+            ) {
+                Ok(child) => {
+                    cohort_started = Some(Instant::now());
+                    running.insert(job.epoch, RunningAdaptiveEpoch { job, child });
+                }
+                Err(err) if job.attempt < attempts_per_epoch => {
+                    warn!("{err}; retrying epoch {}", job.epoch);
+                    pending.push_front(job);
+                    break;
+                }
+                Err(err) => {
+                    stop_adaptive_epoch_children(&mut running).await;
+                    return Err(err);
+                }
+            }
+        }
+
+        tokio::time::sleep(ADAPTIVE_EPOCH_POLL_INTERVAL).await;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_epoch_range_supervisor(
+    effective_start: u64,
+    end_epoch: u64,
+    dest_dir: &Path,
+    verify_snapshots: bool,
+    allow_candidate_runtime: bool,
+    adaptive_epoch_concurrency: bool,
+    shutdown: Arc<AtomicBool>,
+    boundary_bootstraps: BTreeMap<u64, ReplayBootstrap>,
+) -> Result<(), String> {
+    if adaptive_epoch_concurrency {
+        run_epoch_range_supervisor_adaptive(
+            effective_start,
+            end_epoch,
+            dest_dir,
+            verify_snapshots,
+            allow_candidate_runtime,
+            shutdown,
+            boundary_bootstraps,
+        )
+        .await
+    } else {
+        run_epoch_range_supervisor_serial(
+            effective_start,
+            end_epoch,
+            dest_dir,
+            verify_snapshots,
+            allow_candidate_runtime,
+            shutdown,
+            boundary_bootstraps,
+        )
+        .await
+    }
+}
+
 /// Runs each epoch of a range in its own child process (this same binary,
 /// invoked as `<exe> <epoch> <dest-dir> --epoch-hashes=… --range-info=…`), so
 /// every byte of replay memory — accounts-db growth, caches, the bank itself —
@@ -10382,7 +11121,7 @@ async fn run_multi_runtime_epoch_supervisor(
 /// trades one state load per epoch for a hard per-epoch memory cap. Children
 /// never touch gcloud: genesis, snapshots, and hash files were staged by the
 /// caller before this runs.
-async fn run_epoch_range_supervisor(
+async fn run_epoch_range_supervisor_serial(
     effective_start: u64,
     end_epoch: u64,
     dest_dir: &Path,
@@ -10429,6 +11168,14 @@ async fn run_epoch_range_supervisor(
             }
         };
         if reusable {
+            jetstreamer_node::archive_checksum::ensure_archive_checksum(&jet_path).map_err(
+                |err| {
+                    format!(
+                        "failed to validate or repair checksum for reusable epoch {epoch} archive {}: {err}",
+                        jet_path.display()
+                    )
+                },
+            )?;
             info!("epoch {epoch} already complete; skipping");
             continue;
         }
@@ -10462,10 +11209,14 @@ async fn run_epoch_range_supervisor(
                 snapshot_arg.push(snapshot_path.as_os_str());
                 cmd.arg(snapshot_arg);
             }
-            let status = cmd
-                .status()
-                .await
+            cmd.kill_on_drop(true);
+            let mut child = cmd
+                .spawn()
                 .map_err(|err| format!("failed to spawn child for epoch {epoch}: {err}"))?;
+            let status = child
+                .wait()
+                .await
+                .map_err(|err| format!("failed to wait for child for epoch {epoch}: {err}"))?;
             // The epoch is done only if its `.jet` finalized — a child
             // interrupted by ctrl-c shuts down gracefully and exits 0 without
             // finishing, so the exit code alone can't be trusted.
@@ -10477,6 +11228,14 @@ async fn run_epoch_range_supervisor(
                 epoch_archive_reusable_multi_runtime(&jet_path, epoch, &spans)?
             };
             if status.success() && reusable {
+                jetstreamer_node::archive_checksum::ensure_archive_checksum(&jet_path).map_err(
+                    |err| {
+                        format!(
+                            "failed to publish checksum for verified epoch {epoch} archive {}: {err}",
+                            jet_path.display()
+                        )
+                    },
+                )?;
                 info!("epoch {epoch} child completed");
                 let _ = fs::remove_file(&hashes_path);
                 if prune_snapshots
@@ -10571,6 +11330,7 @@ async fn main() {
     let mut epoch_hashes: Option<PathBuf> = None;
     let mut snapshot_archive_override: Option<PathBuf> = None;
     let mut range_info: Option<(u64, u64)> = None;
+    let mut replay_scratch: Option<PathBuf> = None;
     for arg in args {
         if arg == "--verify" {
             verify_snapshots = true;
@@ -10604,6 +11364,8 @@ async fn main() {
                     exit(2);
                 }
             }
+        } else if let Some(path) = arg.strip_prefix("--replay-scratch=") {
+            replay_scratch = Some(PathBuf::from(path));
         } else if arg.starts_with('-') {
             eprintln!("unknown option '{arg}'");
             eprintln!("{}", usage(&program));
@@ -10643,6 +11405,10 @@ async fn main() {
         eprintln!("--snapshot-archive applies only to a single-epoch (child) invocation");
         exit(2);
     }
+    if replay_scratch.is_some() && start_epoch != end_epoch {
+        eprintln!("--replay-scratch applies only to a single-epoch (child) invocation");
+        exit(2);
+    }
     if qualification_end_slot.is_some() && range_info.is_some() {
         eprintln!("--qualification-end-slot cannot be combined with --range-info");
         exit(2);
@@ -10676,6 +11442,14 @@ async fn main() {
         );
     }
     let horizon_output_override = horizon_output;
+    let replay_scratch_dir = replay_scratch.as_deref().unwrap_or(&dest_dir);
+    if let Err(err) = fs::create_dir_all(replay_scratch_dir) {
+        eprintln!(
+            "error: failed to create replay scratch directory {}: {err}",
+            replay_scratch_dir.display()
+        );
+        exit(1);
+    }
 
     // Candidate admission is checked for the complete requested range before
     // resume considers any existing output. This prevents a stale archive
@@ -10708,6 +11482,24 @@ async fn main() {
                 );
                 exit(1);
             }
+        }
+    }
+    if replay_scratch.is_some() {
+        let spans = compatibility::plan_runtime_spans(
+            runtime_slot_range(start_epoch, qualification),
+            allow_candidate_runtime,
+        )
+        .expect("requested range was preflighted above");
+        if !runtime_spans_support_private_replay_scratch(
+            &spans,
+            env_truthy("JETSTREAMER_LOAD_FROM_DIR"),
+        )
+        .expect("requested range was preflighted above")
+        {
+            eprintln!(
+                "error: --replay-scratch is incompatible with a runtime that cannot isolate mutable replay state (the Agave directory loader is not isolated)"
+            );
+            exit(2);
         }
     }
 
@@ -10745,6 +11537,15 @@ async fn main() {
             };
             match reusable {
                 Ok(true) => {
+                    if let Err(err) =
+                        jetstreamer_node::archive_checksum::ensure_archive_checksum(&path)
+                    {
+                        eprintln!(
+                            "error: failed to validate or repair checksum for reusable epoch {first_incomplete} archive {}: {err}",
+                            path.display()
+                        );
+                        exit(1);
+                    }
                     println!("epoch {first_incomplete} already complete; skipping");
                     first_incomplete += 1;
                 }
@@ -10848,12 +11649,55 @@ async fn main() {
     .expect("requested range was preflighted above");
     let effective_archive_extensions = effective_runtime.descriptor.bootstrap.archive_extensions;
 
+    let total_epochs = end_epoch - effective_start + 1;
+    let configured_epoch_isolation = env_truthy_default("JETSTREAMER_EPOCH_ISOLATION", true);
+    let (epoch_isolation, forced_multi_runtime_epoch) = match epoch_isolation_plan(
+        effective_start,
+        end_epoch,
+        configured_epoch_isolation,
+        allow_candidate_runtime,
+    ) {
+        Ok(plan) => plan,
+        Err(err) => {
+            eprintln!("error: failed to plan epoch isolation: {err}");
+            exit(1);
+        }
+    };
+    if let Some(epoch) = forced_multi_runtime_epoch {
+        warn!(
+            "JETSTREAMER_EPOCH_ISOLATION=0 cannot chain range {effective_start}-{end_epoch} in one process because epoch {epoch} crosses an execution-runtime boundary; forcing per-epoch process isolation"
+        );
+    }
+    let adaptive_requested = match strict_opt_in("JETSTREAMER_ADAPTIVE_EPOCH_CONCURRENCY") {
+        Ok(requested) => requested,
+        Err(err) => {
+            eprintln!("error: {err}");
+            exit(2);
+        }
+    };
+    let private_scratch_capable = range_supports_private_replay_scratch(
+        effective_start,
+        end_epoch,
+        allow_candidate_runtime,
+        env_truthy("JETSTREAMER_LOAD_FROM_DIR"),
+    )
+    .expect("requested range was preflighted above");
+    if adaptive_requested && !private_scratch_capable {
+        warn!(
+            "adaptive epoch concurrency requires private mutable state; JETSTREAMER_LOAD_FROM_DIR keeps Agave state in the shared ledger, so the serial range supervisor will be used"
+        );
+    }
+    let adaptive_epoch_concurrency =
+        epoch_isolation && adaptive_requested && private_scratch_capable;
+
     // Replay mutates the unpacked snapshot state in place (new appendvecs,
     // accounts index), so a crashed run leaves the staging dirs dirty.
     // Start every run from a clean unpack of the retained snapshot archive;
     // set JETSTREAMER_CLEAR_ACCOUNTS_ON_START=false to skip.
-    if env_truthy_default("JETSTREAMER_CLEAR_ACCOUNTS_ON_START", true) {
-        if let Err(err) = clear_ledger_accounts_state(&dest_dir) {
+    if adaptive_epoch_concurrency {
+        info!("shared ledger cleanup deferred: range children use private replay scratch");
+    } else if env_truthy_default("JETSTREAMER_CLEAR_ACCOUNTS_ON_START", true) {
+        if let Err(err) = clear_ledger_accounts_state(replay_scratch_dir) {
             eprintln!("error: {err}");
             exit(1);
         }
@@ -10879,7 +11723,7 @@ async fn main() {
             exit(1);
         }
         info!("epoch 0: selecting canonical local genesis bootstrap at slot 0");
-        match validate_mainnet_genesis(&dest_dir) {
+        match validate_mainnet_genesis_in(&dest_dir, replay_scratch_dir) {
             Ok(bootstrap) => bootstrap,
             Err(err) => {
                 eprintln!("error: {err}");
@@ -11044,25 +11888,6 @@ async fn main() {
     // epoch's boundary snapshot on disk, so download them all now while the
     // gcloud/GCS session is fresh (a range runs for days; mid-run gcloud access
     // is forbidden). `bootstrap` above already covers `effective_start`.
-    let total_epochs = end_epoch - effective_start + 1;
-    let configured_epoch_isolation = env_truthy_default("JETSTREAMER_EPOCH_ISOLATION", true);
-    let (epoch_isolation, forced_multi_runtime_epoch) = match epoch_isolation_plan(
-        effective_start,
-        end_epoch,
-        configured_epoch_isolation,
-        allow_candidate_runtime,
-    ) {
-        Ok(plan) => plan,
-        Err(err) => {
-            eprintln!("error: failed to plan epoch isolation: {err}");
-            exit(1);
-        }
-    };
-    if let Some(epoch) = forced_multi_runtime_epoch {
-        warn!(
-            "JETSTREAMER_EPOCH_ISOLATION=0 cannot chain range {effective_start}-{end_epoch} in one process because epoch {epoch} crosses an execution-runtime boundary; forcing per-epoch process isolation"
-        );
-    }
     let mut boundary_bootstraps: BTreeMap<u64, ReplayBootstrap> = BTreeMap::new();
     if epoch_isolation {
         boundary_bootstraps.insert(effective_start, bootstrap.clone());
@@ -11295,10 +12120,12 @@ async fn main() {
         if let Err(err) = run_multi_runtime_epoch_supervisor(
             effective_start,
             &dest_dir,
+            replay_scratch.as_deref(),
             snapshot_path,
             &hashes_path,
             &final_output,
             allow_candidate_runtime,
+            range_info.is_none(),
             shutdown.clone(),
         )
         .await
@@ -11327,6 +12154,7 @@ async fn main() {
             &dest_dir,
             verify_snapshots,
             allow_candidate_runtime,
+            adaptive_epoch_concurrency,
             shutdown.clone(),
             boundary_bootstraps,
         )
@@ -11412,6 +12240,7 @@ async fn main() {
             epoch,
             allow_candidate_runtime,
             &dest_dir,
+            replay_scratch_dir,
             &bootstrap,
             shutdown.clone(),
             cursor.clone(),
@@ -11441,6 +12270,44 @@ async fn main() {
                     }
                 } else if result.historical_evidence.is_some() {
                     info!("historical replay evidence captured for epoch {epoch}");
+                }
+                if qualification.is_none() && range_info.is_none() {
+                    let (slot_start, slot_end_inclusive) = epoch_to_slot_range(epoch);
+                    let spans = compatibility::plan_runtime_spans(
+                        slot_start..slot_end_inclusive.saturating_add(1),
+                        allow_candidate_runtime,
+                    )
+                    .expect("requested range was preflighted above");
+                    let reusable = if spans.len() == 1 {
+                        let selection = runtime_span_selection(&spans[0])
+                            .expect("requested range was preflighted above");
+                        epoch_archive_reusable(&horizon_output, epoch, selection)
+                    } else {
+                        epoch_archive_reusable_multi_runtime(&horizon_output, epoch, &spans)
+                    };
+                    match reusable {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            eprintln!(
+                                "error: completed epoch {epoch} archive {} did not pass final registry validation",
+                                horizon_output.display()
+                            );
+                            exit(1);
+                        }
+                        Err(err) => {
+                            eprintln!("error: {err}");
+                            exit(1);
+                        }
+                    }
+                    if let Err(err) =
+                        jetstreamer_node::archive_checksum::ensure_archive_checksum(&horizon_output)
+                    {
+                        eprintln!(
+                            "error: failed to publish checksum for verified epoch {epoch} archive {}: {err}",
+                            horizon_output.display()
+                        );
+                        exit(1);
+                    }
                 }
                 carried_state = result.carried_state;
             }
@@ -11672,6 +12539,25 @@ mod early_snapshot_tests {
             epoch_isolation_plan(1, 1, true, true).unwrap(),
             (false, None)
         );
+    }
+
+    #[test]
+    fn private_replay_scratch_is_capability_based_not_epoch_based() {
+        let historical = compatibility::RuntimeSelection {
+            backend: compatibility::RuntimeBackend::SolanaV1_0_7,
+            descriptor: &compatibility::SOLANA_V1_0_7_RUNTIME,
+            admission: compatibility::AdmissionLevel::Verified,
+        };
+        let agave = compatibility::RuntimeSelection {
+            backend: compatibility::RuntimeBackend::AgaveV3,
+            descriptor: &compatibility::AGAVE_V3_RUNTIME,
+            admission: compatibility::AdmissionLevel::Verified,
+        };
+
+        assert!(runtime_supports_private_replay_scratch(historical, false));
+        assert!(runtime_supports_private_replay_scratch(historical, true));
+        assert!(runtime_supports_private_replay_scratch(agave, false));
+        assert!(!runtime_supports_private_replay_scratch(agave, true));
     }
 
     #[test]

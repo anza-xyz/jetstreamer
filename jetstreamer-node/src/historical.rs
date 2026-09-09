@@ -746,15 +746,13 @@ fn stream_frame_state(
             }
             Ok(*completed_entries == expected_entries)
         }
-        other => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "streamed entry response has body {}, expected EntryProcessedChunk",
-                    response_kind(other)
-                ),
-            ));
-        }
+        other => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "streamed entry response has body {}, expected EntryProcessedChunk",
+                response_kind(other)
+            ),
+        )),
     }
 }
 
@@ -884,10 +882,35 @@ impl HistoricalRuntimeClient {
         // byte stream. Spawn only that copy so an atomic deployment update to
         // the configured pathname cannot separate provenance from execution.
         let executable_sha256 = bound_executable.sha256;
-        let mut child = Command::new(&bound_executable.path)
+        let mut command = Command::new(&bound_executable.path);
+        command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
+            .stderr(Stdio::inherit());
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::process::CommandExt as _;
+
+            // Defense in depth for supervisors that are themselves killed:
+            // the worker also dies if its direct coordinator disappears.
+            // SAFETY: prctl/getppid are async-signal-safe and no allocation or
+            // lock acquisition occurs in the post-fork closure.
+            unsafe {
+                command.pre_exec(|| {
+                    let parent = libc::getppid();
+                    if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    if parent == 1 || libc::getppid() != parent {
+                        // Use a raw errno here: allocation and formatting are
+                        // not async-signal-safe between fork and exec.
+                        return Err(io::Error::from_raw_os_error(libc::ESRCH));
+                    }
+                    Ok(())
+                });
+            }
+        }
+        let mut child = command
             .spawn()
             .map_err(|source| HistoricalRuntimeError::Spawn {
                 path: bound_executable.path.clone(),
@@ -2990,7 +3013,7 @@ fn validate_request_frame_size(body: &RequestBody) -> Result<(), HistoricalRunti
     // protocol's fixed-integer bincode configuration.
     let body_bytes =
         bincode::serialized_size(body).map_err(HistoricalRuntimeError::RequestSerialization)?;
-    let bytes = body_bytes.checked_add(8).unwrap_or(u64::MAX);
+    let bytes = body_bytes.saturating_add(8);
     if bytes > protocol::MAX_FRAME_BYTES as u64 {
         return Err(HistoricalRuntimeError::RequestFrameTooLarge {
             bytes,

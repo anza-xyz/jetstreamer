@@ -1,6 +1,7 @@
 use std::{
+    collections::HashSet,
     fs,
-    path::{Component, Path, PathBuf},
+    path::{Component, Path},
     thread,
     time::Duration,
 };
@@ -22,6 +23,13 @@ pub(crate) struct HostTelemetry {
     pub(crate) memory_total_bytes: u64,
     pub(crate) memory_available_bytes: u64,
     pub(crate) logical_cpus: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CgroupMemorySnapshot {
+    pub(crate) max_bytes: u64,
+    pub(crate) current_bytes: u64,
+    pub(crate) dedicated: bool,
 }
 
 impl HostTelemetry {
@@ -153,16 +161,80 @@ pub(crate) fn ramped_capacity(
 
 pub(crate) fn contained_capacity(
     admission: AdmissionSnapshot,
-    cgroup_memory_max: Option<u64>,
+    cgroup: Option<CgroupMemorySnapshot>,
+    baseline_bytes: u64,
+    running_epochs: usize,
 ) -> usize {
-    let Some(limit) = cgroup_memory_max.filter(|limit| *limit <= admission.owned_budget_bytes)
-    else {
+    let Some(cgroup) = cgroup.filter(|snapshot| {
+        snapshot.dedicated
+            && snapshot.max_bytes <= admission.owned_budget_bytes
+            && baseline_bytes <= snapshot.max_bytes
+    }) else {
         return admission.capacity.min(1);
     };
-    let cgroup_capacity = limit / admission.epoch_reservation_bytes;
-    admission
+
+    // Reserve the supervisor's pre-job footprint before assigning the finite
+    // cgroup remainder to epoch workers. This prevents `memory.max / R` from
+    // silently charging the parent's own memory to no reservation at all.
+    let baseline_capacity =
+        cgroup.max_bytes.saturating_sub(baseline_bytes) / admission.epoch_reservation_bytes;
+
+    // `memory.current` is sampled again before every spawn. Existing workers
+    // may consume less than their bound, but their unused reservation is not
+    // lent to a new worker: the group must retain one complete additional
+    // reservation before additive admission.
+    let remaining_bytes = cgroup.max_bytes.saturating_sub(cgroup.current_bytes);
+    let live_additional_capacity = remaining_bytes / admission.epoch_reservation_bytes;
+    let live_capacity = running_epochs
+        .saturating_add(usize::try_from(live_additional_capacity).unwrap_or(usize::MAX));
+    let capacity = admission
         .capacity
-        .min(usize::try_from(cgroup_capacity).unwrap_or(usize::MAX))
+        .min(usize::try_from(baseline_capacity).unwrap_or(usize::MAX))
+        .min(live_capacity);
+
+    // A qualified reservation is an asserted upper bound. If the managed
+    // cohort has already crossed it, stop ramping immediately; never treat a
+    // young worker's current RSS as proof that another one will fit.
+    let observed_job_bytes = cgroup.current_bytes.saturating_sub(baseline_bytes);
+    let running_reservation = admission
+        .epoch_reservation_bytes
+        .saturating_mul(u64::try_from(running_epochs).unwrap_or(u64::MAX));
+    if running_epochs > 0 && observed_job_bytes > running_reservation {
+        capacity.min(running_epochs)
+    } else {
+        capacity
+    }
+}
+
+pub(crate) fn qualified_parallelism(
+    requested: usize,
+    explicit_memory_bound: bool,
+    memory_bound_qualified: bool,
+    explicit_disk_bound: bool,
+    disk_bound_qualified: bool,
+) -> usize {
+    if explicit_memory_bound
+        && memory_bound_qualified
+        && explicit_disk_bound
+        && disk_bound_qualified
+    {
+        requested.max(1)
+    } else {
+        1
+    }
+}
+
+pub(crate) fn disk_allows_additional_epoch(
+    available_bytes: Option<u64>,
+    reservation_bytes: u64,
+    running_epochs: usize,
+) -> bool {
+    let Some(available_bytes) = available_bytes else {
+        return running_epochs == 0;
+    };
+    let required = reservation_bytes
+        .saturating_mul(u64::try_from(running_epochs.saturating_add(1)).unwrap_or(u64::MAX));
+    available_bytes >= required
 }
 
 fn percent(value: u64, percentage: u64) -> u64 {
@@ -181,19 +253,99 @@ pub(crate) fn read_host_telemetry() -> Option<HostTelemetry> {
     telemetry.is_reliable().then_some(telemetry)
 }
 
-pub(crate) fn read_current_cgroup_memory_max() -> Option<u64> {
+pub(crate) fn read_current_cgroup_memory(
+    owned_process_groups: &[u32],
+) -> Option<CgroupMemorySnapshot> {
     let membership = fs::read_to_string("/proc/self/cgroup").ok()?;
     let relative = parse_unified_cgroup_path(&membership)?;
-    let mut memory_max = PathBuf::from("/sys/fs/cgroup");
+    read_cgroup_memory_at(
+        Path::new("/sys/fs/cgroup"),
+        relative,
+        std::process::id(),
+        owned_process_groups,
+    )
+}
+
+fn read_cgroup_memory_at(
+    root: &Path,
+    relative: &str,
+    supervisor_pid: u32,
+    owned_process_groups: &[u32],
+) -> Option<CgroupMemorySnapshot> {
+    let mut cgroup = root.to_path_buf();
     for component in Path::new(relative).components() {
         match component {
             Component::RootDir | Component::CurDir => {}
-            Component::Normal(component) => memory_max.push(component),
+            Component::Normal(component) => cgroup.push(component),
             Component::ParentDir | Component::Prefix(_) => return None,
         }
     }
-    memory_max.push("memory.max");
-    parse_finite_memory_max(&fs::read_to_string(memory_max).ok()?)
+    // Bracket the max read with current reads and retain the larger value. The
+    // files are not atomically snapshot-able, so this is the conservative
+    // coherent observation from one resolved cgroup.
+    let current_before =
+        parse_memory_current(&fs::read_to_string(cgroup.join("memory.current")).ok()?)?;
+    let max_bytes = parse_finite_memory_max(&fs::read_to_string(cgroup.join("memory.max")).ok()?)?;
+    let current_after =
+        parse_memory_current(&fs::read_to_string(cgroup.join("memory.current")).ok()?)?;
+    let members = read_cgroup_members_recursive(&cgroup)?;
+    let dedicated = cgroup_members_are_owned(
+        supervisor_pid,
+        owned_process_groups,
+        &members
+            .into_iter()
+            .map(|pid| (pid, read_process_group(pid)))
+            .collect::<Vec<_>>(),
+    );
+    Some(CgroupMemorySnapshot {
+        max_bytes,
+        current_bytes: current_before.max(current_after),
+        dedicated,
+    })
+}
+
+fn read_cgroup_members_recursive(root: &Path) -> Option<Vec<u32>> {
+    let mut pending = vec![root.to_path_buf()];
+    let mut members = Vec::new();
+    while let Some(directory) = pending.pop() {
+        let procs = fs::read_to_string(directory.join("cgroup.procs")).ok()?;
+        for line in procs.lines() {
+            members.push(line.trim().parse::<u32>().ok()?);
+        }
+        for entry in fs::read_dir(&directory).ok()? {
+            let entry = entry.ok()?;
+            if entry.file_type().ok()?.is_dir() {
+                pending.push(entry.path());
+            }
+        }
+    }
+    Some(members)
+}
+
+fn read_process_group(pid: u32) -> Option<u32> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    parse_process_group_from_stat(&stat)
+}
+
+fn parse_process_group_from_stat(stat: &str) -> Option<u32> {
+    let command_end = stat.rfind(") ")?;
+    // Fields after the command start at state (3), then ppid (4), pgrp (5).
+    stat[command_end + 2..]
+        .split_whitespace()
+        .nth(2)?
+        .parse()
+        .ok()
+}
+
+fn cgroup_members_are_owned(
+    supervisor_pid: u32,
+    owned_process_groups: &[u32],
+    members: &[(u32, Option<u32>)],
+) -> bool {
+    let owned = owned_process_groups.iter().copied().collect::<HashSet<_>>();
+    members.iter().all(|(pid, process_group)| {
+        *pid == supervisor_pid || process_group.is_some_and(|group| owned.contains(&group))
+    })
 }
 
 fn parse_unified_cgroup_path(contents: &str) -> Option<&str> {
@@ -212,6 +364,25 @@ fn parse_finite_memory_max(contents: &str) -> Option<u64> {
         return None;
     }
     value.parse::<u64>().ok().filter(|value| *value > 0)
+}
+
+fn parse_memory_current(contents: &str) -> Option<u64> {
+    contents.trim().parse::<u64>().ok()
+}
+
+#[cfg(unix)]
+pub(crate) fn read_filesystem_available_bytes(path: &Path) -> Option<u64> {
+    use std::{ffi::CString, os::unix::ffi::OsStrExt as _};
+
+    let path = CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    // SAFETY: `path` is NUL-terminated and `stats` points to writable storage.
+    if unsafe { libc::statvfs(path.as_ptr(), stats.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    // SAFETY: successful statvfs initialized the structure.
+    let stats = unsafe { stats.assume_init() };
+    stats.f_bavail.checked_mul(stats.f_frsize)
 }
 
 fn parse_meminfo(contents: &str) -> Option<(u64, u64)> {
@@ -278,13 +449,46 @@ mod tests {
         );
 
         assert_eq!(snapshot.capacity, 3);
-        assert_eq!(contained_capacity(snapshot, None), 1);
+        assert_eq!(contained_capacity(snapshot, None, 0, 0), 1);
         assert_eq!(
-            contained_capacity(snapshot, Some(snapshot.owned_budget_bytes + 1)),
+            contained_capacity(
+                snapshot,
+                Some(CgroupMemorySnapshot {
+                    max_bytes: snapshot.owned_budget_bytes + 1,
+                    current_bytes: 0,
+                    dedicated: true,
+                }),
+                0,
+                0,
+            ),
             1
         );
-        assert_eq!(contained_capacity(snapshot, Some(128 * GIB)), 2);
-        assert_eq!(contained_capacity(snapshot, Some(192 * GIB)), 3);
+        assert_eq!(
+            contained_capacity(
+                snapshot,
+                Some(CgroupMemorySnapshot {
+                    max_bytes: 138 * GIB,
+                    current_bytes: 10 * GIB,
+                    dedicated: true,
+                }),
+                10 * GIB,
+                0,
+            ),
+            2
+        );
+        assert_eq!(
+            contained_capacity(
+                snapshot,
+                Some(CgroupMemorySnapshot {
+                    max_bytes: 202 * GIB,
+                    current_bytes: 10 * GIB,
+                    dedicated: true,
+                }),
+                10 * GIB,
+                0,
+            ),
+            3
+        );
     }
 
     #[test]
@@ -387,7 +591,160 @@ mod tests {
         );
         assert_eq!(parse_finite_memory_max("max\n"), None);
         assert_eq!(parse_finite_memory_max("0\n"), None);
+        assert_eq!(parse_memory_current("0\n"), Some(0));
+        assert_eq!(parse_memory_current("invalid\n"), None);
         assert_eq!(parse_unified_cgroup_path("2:memory:/legacy\n"), None);
+    }
+
+    #[test]
+    fn cgroup_capacity_reserves_baseline_and_live_headroom() {
+        let admission = EpochAdmissionPolicy {
+            threads_per_epoch: 16,
+            epoch_memory_reservation_bytes: Some(64 * GIB),
+            ..EpochAdmissionPolicy::default()
+        }
+        .evaluate(
+            Some(HostTelemetry {
+                memory_total_bytes: 755 * GIB,
+                memory_available_bytes: 500 * GIB,
+                logical_cpus: 64,
+            }),
+            0,
+        );
+        let baseline = 10 * GIB;
+
+        assert_eq!(
+            contained_capacity(
+                admission,
+                Some(CgroupMemorySnapshot {
+                    max_bytes: 137 * GIB,
+                    current_bytes: baseline,
+                    dedicated: true,
+                }),
+                baseline,
+                0,
+            ),
+            1,
+            "baseline + two reservations does not fit"
+        );
+        assert_eq!(
+            contained_capacity(
+                admission,
+                Some(CgroupMemorySnapshot {
+                    max_bytes: 202 * GIB,
+                    current_bytes: 139 * GIB,
+                    dedicated: true,
+                }),
+                baseline,
+                1,
+            ),
+            1,
+            "less than one full live reservation refuses another child"
+        );
+    }
+
+    #[test]
+    fn cgroup_over_reservation_freezes_the_ramp() {
+        let admission = EpochAdmissionPolicy {
+            threads_per_epoch: 16,
+            epoch_memory_reservation_bytes: Some(64 * GIB),
+            ..EpochAdmissionPolicy::default()
+        }
+        .evaluate(
+            Some(HostTelemetry {
+                memory_total_bytes: 755 * GIB,
+                memory_available_bytes: 500 * GIB,
+                logical_cpus: 64,
+            }),
+            1,
+        );
+        let baseline = 10 * GIB;
+        assert_eq!(
+            contained_capacity(
+                admission,
+                Some(CgroupMemorySnapshot {
+                    max_bytes: 202 * GIB,
+                    current_bytes: 75 * GIB,
+                    dedicated: true,
+                }),
+                baseline,
+                1,
+            ),
+            1,
+            "65 GiB observed for a 64 GiB bound must stop additive admission"
+        );
+    }
+
+    #[test]
+    fn parallelism_requires_explicit_qualified_memory_and_disk_bounds() {
+        assert_eq!(qualified_parallelism(3, false, false, false, false), 1);
+        assert_eq!(qualified_parallelism(3, true, false, true, true), 1);
+        assert_eq!(qualified_parallelism(3, true, true, true, false), 1);
+        assert_eq!(qualified_parallelism(3, true, true, true, true), 3);
+    }
+
+    #[test]
+    fn disk_gate_reserves_running_jobs_and_the_next_child() {
+        assert!(disk_allows_additional_epoch(Some(3 * GIB), GIB, 2));
+        assert!(!disk_allows_additional_epoch(Some(3 * GIB - 1), GIB, 2));
+        assert!(disk_allows_additional_epoch(None, GIB, 0));
+        assert!(!disk_allows_additional_epoch(None, GIB, 1));
+    }
+
+    #[test]
+    fn reads_cgroup_current_and_max_from_one_resolved_directory() {
+        let root = tempfile::TempDir::new().unwrap();
+        let group = root.path().join("managed/epochs");
+        fs::create_dir_all(&group).unwrap();
+        fs::write(group.join("memory.max"), "2048\n").unwrap();
+        fs::write(group.join("memory.current"), "1024\n").unwrap();
+        fs::write(group.join("cgroup.procs"), "").unwrap();
+
+        assert_eq!(
+            read_cgroup_memory_at(root.path(), "/managed/epochs", 99, &[]),
+            Some(CgroupMemorySnapshot {
+                max_bytes: 2048,
+                current_bytes: 1024,
+                dedicated: true,
+            })
+        );
+        assert_eq!(
+            read_cgroup_memory_at(root.path(), "/../escape", 99, &[]),
+            None
+        );
+    }
+
+    #[test]
+    fn shared_cgroup_membership_is_rejected() {
+        let supervisor = 100;
+        let owned_group = 200;
+        assert!(cgroup_members_are_owned(
+            supervisor,
+            &[owned_group],
+            &[(supervisor, Some(100)), (201, Some(owned_group))],
+        ));
+        assert!(!cgroup_members_are_owned(
+            supervisor,
+            &[owned_group],
+            &[
+                (supervisor, Some(100)),
+                (201, Some(owned_group)),
+                (301, Some(300))
+            ],
+        ));
+        assert!(!cgroup_members_are_owned(
+            supervisor,
+            &[owned_group],
+            &[(supervisor, Some(100)), (201, None)],
+        ));
+    }
+
+    #[test]
+    fn parses_process_group_after_parenthesized_command() {
+        assert_eq!(
+            parse_process_group_from_stat("123 (worker with spaces) S 7 456 0 0"),
+            Some(456)
+        );
     }
 
     #[test]

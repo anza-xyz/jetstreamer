@@ -2427,6 +2427,8 @@ fn bind_worker_executable(
     source_path: &Path,
     private_work_dir: &Path,
 ) -> Result<BoundWorkerExecutable, HistoricalRuntimeError> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
     let bound_directory = private_work_dir.join("bound-worker");
     fs::create_dir(&bound_directory).map_err(|source| HistoricalRuntimeError::PathIo {
         path: bound_directory.clone(),
@@ -2436,6 +2438,7 @@ fn bind_worker_executable(
     let mut bound_file = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
+        .custom_flags(libc::O_CLOEXEC)
         .open(&bound_path)
         .map_err(|source| HistoricalRuntimeError::PathIo {
             path: bound_path.clone(),
@@ -2451,6 +2454,10 @@ fn bind_worker_executable(
             path: bound_path.clone(),
             source,
         })?;
+    // Close every writable descriptor before making this inode available for
+    // exec. This also prevents a concurrent fork from briefly inheriting a
+    // writer and making execve fail with ETXTBSY.
+    drop(bound_file);
     fs::File::open(&bound_directory)
         .and_then(|directory| directory.sync_all())
         .map_err(|source| HistoricalRuntimeError::PathIo {

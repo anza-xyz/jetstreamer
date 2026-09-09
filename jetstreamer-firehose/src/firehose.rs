@@ -1311,8 +1311,9 @@ pub struct FirehoseErrorContext {
 
 /// Streams blocks, transactions, entries, rewards, and stats to user-provided handlers.
 ///
-/// The requested `slot_range` is half-open `[start, end)`; on recoverable errors the
-/// runner restarts from the last processed slot to maintain coverage.
+/// The requested `slot_range` is half-open `[start, end)`. Recoverable data errors retry
+/// the incomplete slot. Stats handler failures retry the pending pulse before reading more
+/// data, preserving completed slot progress and avoiding duplicate data callbacks.
 ///
 /// When `sequential` is `true`, the firehose uses one worker thread and opens epoch streams
 /// with ripget's parallel windowed downloader. In this mode `threads` configures ripget range
@@ -1645,6 +1646,7 @@ where
                 None
             };
 
+            let mut pending_stats = false;
             let mut retry_backoff = RetryBackoff::new();
             // let mut triggered = false;
             while let Err((err, slot)) = async {
@@ -1653,9 +1655,6 @@ where
                 } else {
                     OP_TIMEOUT
                 };
-                // Each pass through this block opens a fresh stream; the stamp shields young
-                // connections from the recycle monitor while they warm up.
-                thread_activity::note_stream_start(thread_index);
                 // Restart boundary is quiescent: answer any steal proposals that arrived
                 // while the previous pass was ending.
                 if work_stealing {
@@ -1677,6 +1676,32 @@ where
                     );
                     return Ok(());
                 }
+                // A stats failure happens after the slot's data callbacks have succeeded.
+                // Retry that pulse before opening another stream, including when the failed
+                // pulse belonged to the final slot of the range or the final reverse epoch.
+                if pending_stats && let Some(ref stats) = thread_stats {
+                    maybe_emit_stats(
+                        stats_tracking.as_ref(),
+                        thread_index,
+                        stats,
+                        &overall_slots_processed,
+                        &overall_blocks_processed,
+                        &overall_transactions_processed,
+                        &overall_entries_processed,
+                        &transactions_since_stats,
+                        &blocks_since_stats,
+                        &slots_since_stats,
+                        &last_pulse,
+                        start_time,
+                    )
+                    .await?;
+                    pending_stats = false;
+                }
+                if !reverse_mode_local && slot_range.is_empty() {
+                    return Err((FirehoseError::RangeComplete, slot_range.end));
+                }
+                // Shield fresh connections from the recycle monitor while they warm up.
+                thread_activity::note_stream_start(thread_index);
                 let lowest_epoch = slot_to_epoch(slot_range.start);
                 let highest_epoch = slot_to_epoch(slot_range.end - 1);
                 let epoch_range = lowest_epoch..=highest_epoch;
@@ -2154,14 +2179,6 @@ where
                                 }
                                 Block(block) => {
                                     let prev_last_counted_slot = last_counted_slot;
-                                    let thread_stats_snapshot = thread_stats.as_ref().map(|stats| {
-                                        (
-                                            stats.slots_processed,
-                                            stats.blocks_processed,
-                                            stats.leader_skipped_slots,
-                                            stats.current_slot,
-                                        )
-                                    });
 
                                     let next_expected_slot = prev_last_counted_slot.saturating_add(1);
                                     let skip_start_from_previous = last_counted_slot.saturating_add(1);
@@ -2276,6 +2293,17 @@ where
                                     }
                                     previous_blockhash = latest_entry_blockhash;
 
+                                    // Data delivery is complete. A later stats error must resume
+                                    // after this slot so transactions cannot outlive their block callback.
+                                    if slot > last_counted_slot {
+                                        last_counted_slot = slot;
+                                    }
+                                    if work_stealing {
+                                        work_registry[thread_index]
+                                            .next
+                                            .store(last_counted_slot.saturating_add(1), Ordering::SeqCst);
+                                    }
+
                                     if tracking_enabled {
                                         overall_slots_processed.fetch_add(1, Ordering::Relaxed);
                                         overall_blocks_processed.fetch_add(1, Ordering::Relaxed);
@@ -2289,57 +2317,25 @@ where
 
                                         if let (Some(stats_tracking_cfg), Some(thread_stats_ref)) =
                                             (&stats_tracking, thread_stats.as_mut())
-                                            && slot % stats_tracking_cfg.tracking_interval_slots == 0
-                                                && let Err(err) = maybe_emit_stats(
-                                                    stats_tracking.as_ref(),
-                                                    thread_index,
-                                                    thread_stats_ref,
-                                                    &overall_slots_processed,
-                                                    &overall_blocks_processed,
-                                                    &overall_transactions_processed,
-                                                    &overall_entries_processed,
+                                            && slot % stats_tracking_cfg.tracking_interval_slots == 0 {
+                                            pending_stats = true;
+                                            maybe_emit_stats(
+                                                stats_tracking.as_ref(),
+                                                thread_index,
+                                                thread_stats_ref,
+                                                &overall_slots_processed,
+                                                &overall_blocks_processed,
+                                                &overall_transactions_processed,
+                                                &overall_entries_processed,
                                                 &transactions_since_stats,
                                                 &blocks_since_stats,
                                                 &slots_since_stats,
                                                 &last_pulse,
                                                 start_time,
                                             )
-                                            .await
-                                            {
-                                                blocks_since_stats.fetch_sub(1, Ordering::Relaxed);
-                                                    slots_since_stats.fetch_sub(1, Ordering::Relaxed);
-                                                    overall_blocks_processed
-                                                        .fetch_sub(1, Ordering::Relaxed);
-                                                    overall_slots_processed
-                                                        .fetch_sub(1, Ordering::Relaxed);
-                                                    if let Some((
-                                                        prev_slots_processed,
-                                                        prev_blocks_processed,
-                                                        prev_leader_skipped,
-                                                        prev_current_slot,
-                                                    )) = thread_stats_snapshot
-                                                    {
-                                                        thread_stats_ref.slots_processed =
-                                                            prev_slots_processed;
-                                                        thread_stats_ref.blocks_processed =
-                                                            prev_blocks_processed;
-                                                        thread_stats_ref.leader_skipped_slots =
-                                                            prev_leader_skipped;
-                                                        thread_stats_ref.current_slot =
-                                                            prev_current_slot;
-                                                    }
-                                                    last_counted_slot = prev_last_counted_slot;
-                                                    return Err(err);
-                                                }
-                                    }
-
-                                    if slot > last_counted_slot {
-                                        last_counted_slot = slot;
-                                    }
-                                    if work_stealing {
-                                        work_registry[thread_index]
-                                            .next
-                                            .store(last_counted_slot.saturating_add(1), Ordering::SeqCst);
+                                            .await?;
+                                            pending_stats = false;
+                                        }
                                     }
                                 }
                                 Subset(_subset) => (),
@@ -2471,6 +2467,7 @@ where
                     }
                     if let Some(ref mut stats) = thread_stats {
                         stats.finish_time = Some(std::time::Instant::now());
+                        pending_stats = true;
                         maybe_emit_stats(
                             stats_tracking.as_ref(),
                             thread_index,
@@ -2486,6 +2483,7 @@ where
                             start_time,
                         )
                         .await?;
+                        pending_stats = false;
                     }
                     if block_enabled {
                         pending_skipped_slots.remove(&thread_index);
@@ -2593,7 +2591,7 @@ where
                     }
                     log::error!(
                         target: &log_target,
-                        "🧯💦🔥 firehose encountered an error at slot {} in epoch {} and will roll back one slot and retry:",
+                        "🧯💦🔥 firehose encountered an error at slot {} in epoch {} and will retry:",
                         slot,
                         epoch
                     );
@@ -2631,9 +2629,8 @@ where
                         item_index,
                     );
                 }
-                // Update slot range to resume from the failed slot, not the original start.
-                // Reset local tracking so we don't treat the resumed slot range as already counted.
-                // If we've already counted this slot, resume from the next one to avoid duplicates.
+                // Data callback failures resume at the incomplete slot. Stats failures refer
+                // to an already delivered slot, so data resumes at the following slot.
                 if reverse_mode_local {
                     // In reverse mode, completed higher epochs are tracked via
                     // reverse_highest_remaining_epoch and the within-epoch resume slot lives in

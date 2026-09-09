@@ -325,58 +325,8 @@ pub async fn download_exact_snapshot(
             path: dest_dir.to_path_buf(),
             source,
         })?;
-    let destination = dest_dir.join(archive_name);
-    if destination.exists() {
-        let metadata = std::fs::metadata(&destination).map_err(SnapshotError::Spawn)?;
-        if metadata.is_file() && metadata.len() > 0 {
-            return Ok(destination);
-        }
-        return Err(SnapshotError::InvalidDestination { path: destination });
-    }
-
-    let temporary = tempfile::Builder::new()
-        .prefix(&format!(".{archive_name}."))
-        .suffix(".download")
-        .tempfile_in(dest_dir)
-        .map_err(SnapshotError::Spawn)?;
-    let temporary_arg = temporary.path().to_string_lossy().into_owned();
     let uri = format!("{DEFAULT_BUCKET}/{slot}/{archive_name}");
-    gcloud_status(&["storage", "cp", &uri, &temporary_arg]).await?;
-
-    let metadata = temporary
-        .as_file()
-        .metadata()
-        .map_err(SnapshotError::Spawn)?;
-    if !metadata.is_file() || metadata.len() == 0 {
-        return Err(SnapshotError::InvalidDestination {
-            path: temporary.path().to_path_buf(),
-        });
-    }
-    temporary
-        .as_file()
-        .sync_all()
-        .map_err(SnapshotError::Spawn)?;
-    let published = match temporary.persist_noclobber(&destination) {
-        Ok(_) => destination,
-        Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
-            let metadata = std::fs::metadata(&destination).map_err(SnapshotError::Spawn)?;
-            if metadata.is_file() && metadata.len() > 0 {
-                destination
-            } else {
-                return Err(SnapshotError::InvalidDestination { path: destination });
-            }
-        }
-        Err(error) => {
-            return Err(SnapshotError::Persist {
-                path: destination,
-                source: error.error,
-            });
-        }
-    };
-    std::fs::File::open(dest_dir)
-        .and_then(|directory| directory.sync_all())
-        .map_err(SnapshotError::Spawn)?;
-    Ok(published)
+    download_snapshot_uri_to_dir(&uri, archive_name, dest_dir).await
 }
 
 fn snapshot_filename(uri: &str) -> Result<&str, SnapshotError> {
@@ -429,11 +379,103 @@ async fn download_snapshot_to_dir(
     dest_dir: &Path,
 ) -> Result<PathBuf, SnapshotError> {
     let filename = snapshot_filename(&info.snapshot_uri)?;
-    let dest_path = dest_dir.join(filename);
-    let dest_arg = dest_path.to_string_lossy().to_string();
+    download_snapshot_uri_to_dir(&info.snapshot_uri, filename, dest_dir).await
+}
 
-    gcloud_status(&["storage", "cp", &info.snapshot_uri, &dest_arg]).await?;
-    Ok(dest_path)
+/// Downloads into a unique file in `dest_dir` and publishes it atomically.
+///
+/// The temporary suffix deliberately cannot match a supported snapshot
+/// archive extension. Snapshot discovery therefore cannot mistake an
+/// interrupted download for a complete archive. `persist_noclobber` also
+/// ensures a concurrently created destination is never overwritten.
+async fn download_snapshot_uri_to_dir(
+    uri: &str,
+    filename: &str,
+    dest_dir: &Path,
+) -> Result<PathBuf, SnapshotError> {
+    let destination = dest_dir.join(filename);
+    if valid_existing_snapshot_destination(&destination)? {
+        return Ok(destination);
+    }
+
+    let temporary = new_snapshot_download_tempfile(filename, dest_dir)?;
+    let temporary_arg = temporary.path().to_string_lossy().into_owned();
+
+    gcloud_status(&["storage", "cp", uri, &temporary_arg]).await?;
+    publish_downloaded_snapshot(temporary, &destination, dest_dir)
+}
+
+fn new_snapshot_download_tempfile(
+    filename: &str,
+    dest_dir: &Path,
+) -> Result<tempfile::NamedTempFile, SnapshotError> {
+    tempfile::Builder::new()
+        .prefix(&format!(".{filename}."))
+        .suffix(".download")
+        .tempfile_in(dest_dir)
+        .map_err(SnapshotError::Spawn)
+}
+
+/// Returns whether `destination` is an already complete snapshot file.
+///
+/// `symlink_metadata` is intentional: following a symlink here would let an
+/// attacker redirect either reuse or publication outside `dest_dir`.
+fn valid_existing_snapshot_destination(destination: &Path) -> Result<bool, SnapshotError> {
+    let metadata = match std::fs::symlink_metadata(destination) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(SnapshotError::Spawn(error)),
+    };
+    if metadata.file_type().is_file() && metadata.len() > 0 {
+        return Ok(true);
+    }
+    Err(SnapshotError::InvalidDestination {
+        path: destination.to_path_buf(),
+    })
+}
+
+fn publish_downloaded_snapshot(
+    temporary: tempfile::NamedTempFile,
+    destination: &Path,
+    dest_dir: &Path,
+) -> Result<PathBuf, SnapshotError> {
+    let metadata = temporary
+        .as_file()
+        .metadata()
+        .map_err(SnapshotError::Spawn)?;
+    if !metadata.file_type().is_file() || metadata.len() == 0 {
+        return Err(SnapshotError::InvalidDestination {
+            path: temporary.path().to_path_buf(),
+        });
+    }
+    temporary
+        .as_file()
+        .sync_all()
+        .map_err(SnapshotError::Spawn)?;
+
+    let published = match temporary.persist_noclobber(destination) {
+        Ok(_) => destination.to_path_buf(),
+        Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
+            if valid_existing_snapshot_destination(destination)? {
+                destination.to_path_buf()
+            } else {
+                return Err(SnapshotError::InvalidDestination {
+                    path: destination.to_path_buf(),
+                });
+            }
+        }
+        Err(error) => {
+            return Err(SnapshotError::Persist {
+                path: destination.to_path_buf(),
+                source: error.error,
+            });
+        }
+    };
+
+    std::fs::File::open(dest_dir)
+        .and_then(|directory| directory.sync_all())
+        .map_err(SnapshotError::Spawn)?;
+    Ok(published)
 }
 
 async fn list_bucket_slots(bucket: &str) -> Result<Vec<u64>, SnapshotError> {
@@ -601,6 +643,7 @@ fn format_command(args: &[&str]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     const BUCKET: &str = "gs://example-bucket";
 
@@ -671,5 +714,126 @@ mod tests {
                 .next()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn snapshot_download_tempfiles_cannot_be_discovered_as_archives() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive_name = "snapshot-830484-hash.tar.bz2";
+        let temporary = new_snapshot_download_tempfile(archive_name, directory.path()).unwrap();
+        let temporary_path = temporary.path().to_path_buf();
+        let temporary_name = temporary_path.file_name().unwrap().to_str().unwrap();
+
+        assert!(temporary_name.starts_with(&format!(".{archive_name}.")));
+        assert!(temporary_name.ends_with(".download"));
+        assert!(!snapshot_name_matches(
+            temporary_name,
+            ALL_SNAPSHOT_ARCHIVE_EXTENSIONS
+        ));
+
+        drop(temporary);
+        assert!(!temporary_path.exists());
+    }
+
+    #[test]
+    fn downloaded_snapshot_is_synced_and_published_without_clobbering() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive_name = "snapshot-830484-hash.tar.bz2";
+        let destination = directory.path().join(archive_name);
+        let mut temporary = new_snapshot_download_tempfile(archive_name, directory.path()).unwrap();
+        temporary.write_all(b"complete snapshot").unwrap();
+
+        let published =
+            publish_downloaded_snapshot(temporary, &destination, directory.path()).unwrap();
+
+        assert_eq!(published, destination);
+        assert_eq!(std::fs::read(&published).unwrap(), b"complete snapshot");
+        assert!(valid_existing_snapshot_destination(&published).unwrap());
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn empty_download_is_rejected_without_publishing() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive_name = "snapshot-830484-hash.tar.bz2";
+        let destination = directory.path().join(archive_name);
+        let temporary = new_snapshot_download_tempfile(archive_name, directory.path()).unwrap();
+
+        assert!(matches!(
+            publish_downloaded_snapshot(temporary, &destination, directory.path()),
+            Err(SnapshotError::InvalidDestination { .. })
+        ));
+        assert!(!destination.exists());
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn empty_existing_destination_is_rejected() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("snapshot-830484-hash.tar.bz2");
+        std::fs::File::create(&destination).unwrap();
+
+        assert!(matches!(
+            valid_existing_snapshot_destination(&destination),
+            Err(SnapshotError::InvalidDestination { .. })
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_destination_is_rejected_without_touching_its_target() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("outside-target");
+        std::fs::write(&target, b"sentinel").unwrap();
+        let destination = directory.path().join("snapshot-830484-hash.tar.bz2");
+        symlink(&target, &destination).unwrap();
+
+        assert!(matches!(
+            valid_existing_snapshot_destination(&destination),
+            Err(SnapshotError::InvalidDestination { .. })
+        ));
+        assert_eq!(std::fs::read(target).unwrap(), b"sentinel");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn race_created_symlink_cannot_redirect_publication() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let archive_name = "snapshot-830484-hash.tar.bz2";
+        let destination = directory.path().join(archive_name);
+        let mut temporary = new_snapshot_download_tempfile(archive_name, directory.path()).unwrap();
+        temporary.write_all(b"complete snapshot").unwrap();
+
+        let target = directory.path().join("outside-target");
+        std::fs::write(&target, b"sentinel").unwrap();
+        symlink(&target, &destination).unwrap();
+
+        assert!(matches!(
+            publish_downloaded_snapshot(temporary, &destination, directory.path()),
+            Err(SnapshotError::InvalidDestination { .. })
+        ));
+        assert_eq!(std::fs::read(target).unwrap(), b"sentinel");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fifo_destination_is_rejected_without_opening_it() {
+        use std::{ffi::CString, os::unix::ffi::OsStrExt};
+
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("snapshot-830484-hash.tar.bz2");
+        let destination_c = CString::new(destination.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `destination_c` is a valid NUL-terminated pathname and the
+        // mode contains only ordinary permission bits.
+        assert_eq!(unsafe { libc::mkfifo(destination_c.as_ptr(), 0o600) }, 0);
+
+        assert!(matches!(
+            valid_existing_snapshot_destination(&destination),
+            Err(SnapshotError::InvalidDestination { .. })
+        ));
     }
 }

@@ -1605,7 +1605,7 @@ where
             );
             let log_target = format!("{}::T{:03}", LOG_MODULE, thread_index);
             let mut skip_until_index = None;
-            let last_emitted_slot = slot_range.start.saturating_sub(1);
+            let mut last_emitted_slot = slot_range.start.saturating_sub(1);
             let block_enabled = on_block.is_some();
             let tx_enabled = on_tx.is_some();
             let entry_enabled = on_entry.is_some();
@@ -1617,7 +1617,6 @@ where
                     .or_insert_with(|| DashSet::with_hasher(ahash::RandomState::new()));
             }
             let mut last_counted_slot = slot_range.start.saturating_sub(1);
-            let mut last_emitted_slot_global = slot_range.start.saturating_sub(1);
             // Reverse-mode state preserved across retries. `None` for the highest remaining
             // epoch explicitly means "every epoch is complete" — required so completing
             // epoch 0 is distinguishable from epoch 0 still pending.
@@ -1649,7 +1648,6 @@ where
             let mut retry_backoff = RetryBackoff::new();
             // let mut triggered = false;
             while let Err((err, slot)) = async {
-                let mut last_emitted_slot = last_emitted_slot_global;
                 let op_timeout = if sequential_mode {
                     OP_TIMEOUT_SEQUENTIAL
                 } else {
@@ -2190,7 +2188,6 @@ where
                                         if block_enabled
                                             && let Some(on_block_cb) = on_block.as_ref()
                                             && skipped_slot > last_emitted_slot {
-                                                last_emitted_slot = skipped_slot;
                                                 on_block_cb(
                                                     thread_index,
                                                     BlockData::PossibleLeaderSkipped {
@@ -2201,9 +2198,10 @@ where
                                                 .map_err(|e| {
                                                     (
                                                         FirehoseError::BlockHandlerError(e),
-                                                        error_slot,
+                                                        skipped_slot,
                                                     )
                                                 })?;
+                                                last_emitted_slot = skipped_slot;
                                             }
                                         if tracking_enabled {
                                             overall_slots_processed.fetch_add(1, Ordering::Relaxed);
@@ -2245,7 +2243,6 @@ where
                                                 num_partitions,
                                             } = std::mem::take(&mut this_block_rewards);
                                             if slot > last_emitted_slot {
-                                                last_emitted_slot = slot;
                                                 on_block_cb(
                                                     thread_index,
                                                     BlockData::Block {
@@ -2271,6 +2268,7 @@ where
                                                         error_slot,
                                                     )
                                                 })?;
+                                                last_emitted_slot = slot;
                                             }
                                         }
                                     } else {
@@ -2560,7 +2558,7 @@ where
                         thread_activity::clear_finished(thread_index);
                         slot_range = stolen;
                         last_counted_slot = slot_range.start.saturating_sub(1);
-                        last_emitted_slot_global = slot_range.start.saturating_sub(1);
+                        last_emitted_slot = slot_range.start.saturating_sub(1);
                         reverse_partial_resume = None;
                         skip_until_index = None;
                         if let Some(ref mut stats) = thread_stats {
@@ -2667,7 +2665,6 @@ where
                 // is reset to 0 each epoch restart. Keeping it can skip large portions
                 // of the stream and silently drop slots.
                 skip_until_index = None;
-                last_emitted_slot_global = last_emitted_slot;
                 if !recycled {
                     let backoff = retry_backoff.next_delay(slot);
                     log::warn!(

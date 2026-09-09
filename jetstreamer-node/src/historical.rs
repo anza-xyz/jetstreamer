@@ -65,6 +65,10 @@ const SOLANA_V1_0_8_COMMIT: &str = "2a617f2d07f714918891f2b479d1cb1c324f0365";
 const SOLANA_V1_0_8_RUST_TOOLCHAIN: &str = "rustc 1.42.0 (b8cedc004 2020-03-09)";
 const SOLANA_V1_0_8_TARGET: &str = "x86_64-unknown-linux-gnu";
 
+fn backend_supports_entry_batches(backend_id: &str) -> bool {
+    backend_id == SOLANA_V1_0_7_BACKEND_ID || backend_id == SOLANA_V1_0_8_BACKEND_ID
+}
+
 const DEFAULT_CONTROL_TIMEOUT: Duration = Duration::from_secs(60);
 const DEFAULT_INITIALIZE_TIMEOUT: Duration = Duration::from_secs(6 * 60 * 60);
 const DEFAULT_ENTRY_TIMEOUT: Duration = Duration::from_secs(60 * 60);
@@ -926,7 +930,7 @@ impl HistoricalRuntimeClient {
             current_tick_height: 0,
             next_write_version: 0,
             snapshot_export_seal: None,
-            supports_entry_batches: profile.backend_id == SOLANA_V1_0_7_BACKEND_ID,
+            supports_entry_batches: backend_supports_entry_batches(profile.backend_id),
             initialized: HistoricalInitialized {
                 genesis_hash: String::new(),
                 source: HistoricalInitializedSource::Genesis,
@@ -3211,6 +3215,14 @@ mod tests {
     use solana_transaction::{Address, Signature, Transaction};
 
     type HandshakeMutation = (&'static str, fn(&mut protocol::Handshake));
+
+    #[test]
+    fn entry_batches_are_enabled_only_for_implemented_workers() {
+        assert!(backend_supports_entry_batches(SOLANA_V1_0_7_BACKEND_ID));
+        assert!(backend_supports_entry_batches(SOLANA_V1_0_8_BACKEND_ID));
+        assert!(!backend_supports_entry_batches(SOLANA_V1_0_24_BACKEND_ID));
+        assert!(!backend_supports_entry_batches("unknown"));
+    }
 
     fn batch_request(entry_count: usize) -> Request {
         Request {

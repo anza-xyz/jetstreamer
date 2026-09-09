@@ -4876,6 +4876,38 @@ fn archive_generation_profile() -> String {
     )
 }
 
+// This producer created the canonical v1.0.7 runtime segment and handoff
+// snapshot already in use. Compatibility is deliberately exact and scoped to
+// that runtime; the worker digest, runtime revision/toolchain/target, genesis,
+// archive digest, and checkpoint tuple are still validated independently.
+const COMPATIBLE_V1_0_7_GENERATION_PROFILES: &[&str] =
+    &["jetstreamer-node/0.7.0/old-faithful-to-horizon-v2@00f3f6e622128cbe9e57a68ce67981fa4b3f2d95"];
+
+fn runtime_generation_profile_is_compatible(
+    runtime_profile: &str,
+    recorded_generation_profile: &str,
+) -> bool {
+    recorded_generation_profile == archive_generation_profile()
+        || (runtime_profile == historical::SOLANA_V1_0_7_CANDIDATE.backend_id
+            && COMPATIBLE_V1_0_7_GENERATION_PROFILES.contains(&recorded_generation_profile))
+}
+
+fn segment_runtime_identity_is_compatible(
+    recorded: &SegmentRuntimeIdentity,
+    expected: &SegmentRuntimeIdentity,
+) -> bool {
+    recorded.runtime_profile == expected.runtime_profile
+        && runtime_generation_profile_is_compatible(
+            &recorded.runtime_profile,
+            &recorded.generation_profile,
+        )
+        && recorded.runtime_admission == expected.runtime_admission
+        && recorded.runtime_revision == expected.runtime_revision
+        && recorded.runtime_toolchain == expected.runtime_toolchain
+        && recorded.runtime_target == expected.runtime_target
+        && recorded.genesis_hash == expected.genesis_hash
+}
+
 fn archive_assembly_profile() -> String {
     format!(
         "jetstreamer-node/{}/verified-runtime-segment-assembly-v1@{}",
@@ -4985,7 +5017,10 @@ fn load_validated_runtime_segment(
         || manifest.output_slot_start != span.slots.start
         || manifest.output_slot_count != expected_count
         || manifest.terminal.slot != span.slots.end - 1
-        || manifest.runtime.generation_profile != archive_generation_profile()
+        || !runtime_generation_profile_is_compatible(
+            &manifest.runtime.runtime_profile,
+            &manifest.runtime.generation_profile,
+        )
         || manifest.runtime.runtime_profile != identity.name
         || manifest.runtime.runtime_revision != identity.revision
         || manifest.runtime.runtime_toolchain != archive_runtime_toolchain(identity)
@@ -8723,9 +8758,10 @@ fn epoch_archive_reusable(
     })?;
     let expected_toolchain = archive_runtime_toolchain(identity);
     let expected_metadata = archive_transaction_metadata_policy(slot_start);
-    let expected_generation_profile = archive_generation_profile();
-    if provenance_v1.generation_profile != expected_generation_profile
-        || provenance_v1.runtime_profile != identity.name
+    if !runtime_generation_profile_is_compatible(
+        &provenance_v1.runtime_profile,
+        &provenance_v1.generation_profile,
+    ) || provenance_v1.runtime_profile != identity.name
         || provenance_v1.runtime_admission != archive_runtime_admission(selection.admission)
         || provenance_v1.runtime_revision != identity.revision
         || provenance_v1.runtime_toolchain != expected_toolchain
@@ -8981,7 +9017,10 @@ fn epoch_archive_reusable_multi_runtime(
         };
         if recorded.slot_start != expected_span.slots.start
             || recorded.slot_count != expected_count
-            || recorded.generation_profile != archive_generation_profile()
+            || !runtime_generation_profile_is_compatible(
+                &recorded.runtime_profile,
+                &recorded.generation_profile,
+            )
             || recorded.runtime_profile != identity.name
             || recorded.runtime_admission != archive_runtime_admission(selection.admission)
             || recorded.runtime_revision != identity.revision
@@ -9534,7 +9573,10 @@ fn validate_canonical_handoff_snapshot_with_expectation(
     if manifest.boundary_slot != handoff.boundary_slot
         || manifest.snapshot_slot != handoff.snapshot.slot
         || manifest.accounts_hash != handoff.snapshot.accounts_hash_base58
-        || manifest.source_runtime != expectation.source_runtime
+        || !segment_runtime_identity_is_compatible(
+            &manifest.source_runtime,
+            &expectation.source_runtime,
+        )
         || manifest.source_worker_executable_sha256 != expectation.source_worker_executable_sha256
         || manifest.terminal.slot != handoff.snapshot.slot
         || manifest.terminal.accounts_hash != handoff.snapshot.accounts_hash_base58
@@ -11413,6 +11455,39 @@ async fn main() {
 #[cfg(test)]
 mod early_snapshot_tests {
     use super::*;
+
+    #[test]
+    fn prior_v1_0_7_generation_profile_allowlist_is_exact() {
+        let prior = COMPATIBLE_V1_0_7_GENERATION_PROFILES[0];
+        assert!(runtime_generation_profile_is_compatible(
+            historical::SOLANA_V1_0_7_CANDIDATE.backend_id,
+            prior,
+        ));
+        assert!(runtime_generation_profile_is_compatible(
+            historical::SOLANA_V1_0_8_CANDIDATE.backend_id,
+            &archive_generation_profile(),
+        ));
+
+        let mut one_character_mutation = prior.as_bytes().to_vec();
+        *one_character_mutation.last_mut().unwrap() = b'4';
+        let one_character_mutation = String::from_utf8(one_character_mutation).unwrap();
+        assert!(!runtime_generation_profile_is_compatible(
+            historical::SOLANA_V1_0_7_CANDIDATE.backend_id,
+            &one_character_mutation,
+        ));
+        assert!(!runtime_generation_profile_is_compatible(
+            historical::SOLANA_V1_0_7_CANDIDATE.backend_id,
+            &format!("{prior}-dirty-deadbeef"),
+        ));
+        assert!(!runtime_generation_profile_is_compatible(
+            historical::SOLANA_V1_0_7_CANDIDATE.backend_id,
+            "unknown",
+        ));
+        assert!(!runtime_generation_profile_is_compatible(
+            historical::SOLANA_V1_0_8_CANDIDATE.backend_id,
+            prior,
+        ));
+    }
 
     #[test]
     fn legacy_bzip2_snapshot_format_is_classified_without_selecting_a_runtime() {

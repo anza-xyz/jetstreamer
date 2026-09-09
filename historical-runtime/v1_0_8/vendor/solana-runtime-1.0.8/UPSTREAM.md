@@ -18,10 +18,13 @@ Jetstreamer changes are intentionally narrow:
 - three test-genesis macro calls in `src/genesis_utils.rs` are expanded to
   their identical name/id tuples so the split dependency graph compiles; and
 - `src/accounts_db.rs` provides read-only, owned, write-version-ordered access
-  to physical account writes for the IPC adapter.
+  to physical account writes for the IPC adapter; and
+- zero- and one-storage `scan_account_storage` calls run directly instead of
+  entering the old Rayon pool, whose workers cannot add parallelism there.
 
-The last change observes AppendVec contents and the existing atomic write
-counter. It does not participate in transaction execution, storage, account
-indexing, or hashing.
+The write adapter observes AppendVec contents and the existing atomic write
+counter. The scan fast path applies the same closure to the same storage in
+the same order as the parallel iterator's single-item path. Neither changes
+transaction execution, storage, account indexing, or hashing.
 
 `LICENSE-APACHE` is the upstream repository license copied with the subtree.

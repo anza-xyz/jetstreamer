@@ -69,6 +69,16 @@ cargo test --locked
 cargo build --release --locked
 ```
 
+The v1.0.7 and v1.0.8 workers accept bounded entry batches so transaction
+decoding and independently anchored PoH segments can be prepared in parallel.
+All batch validation finishes before bank mutation, while bank advancement,
+transaction execution, write collection, and response emission remain in
+canonical wire order. Their fixed-width PoH backend is shared because Solana
+v1.0.8 did not change `entry::next_hash`: runtime-dispatched SHA-NI is guarded
+by feature detection, every unsafe load/store operates on fixed-size owned
+arrays, and randomized differential tests cover optimized, paired, and forced
+portable paths against the version-pinned Solana SDK implementation.
+
 The executable handshake reports candidate status, protocol version, Solana
 tag and commit, Rust toolchain, target, and required mainnet genesis hash. The
 parent also hashes the executable itself and records that SHA-256 in historical
@@ -111,3 +121,6 @@ The source has only these integration changes:
    their persisted `write_version`, plus the next write version.  This is the
    worker's only runtime instrumentation and does not alter account storage,
    hashing, transaction execution, or serialization.
+4. The v1.0.7 and v1.0.8 `AccountsDB` scanners keep zero- and one-AppendVec
+   scans on the caller thread, avoiding an old Rayon-pool wakeup when no scan
+   parallelism exists. The multi-storage path is unchanged.

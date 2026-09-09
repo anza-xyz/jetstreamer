@@ -1,16 +1,18 @@
-use crate::{leader_schedule, snapshot};
+use crate::{leader_schedule, poh_backend, snapshot};
 use jetstreamer_historical_protocol::{
     AccountWrite, Checkpoint, EntryProcessed, EntryRequest, Initialized, InitializedSource,
     InstructionError as WireInstructionError, SnapshotExport,
-    TransactionError as WireTransactionError, TransactionOutcome,
+    TransactionError as WireTransactionError, TransactionOutcome, MAX_ENTRIES_PER_BATCH,
 };
+use rayon::{prelude::*, ThreadPool, ThreadPoolBuilder};
 use solana_config_program::config_processor;
 use solana_merkle_tree::MerkleTree;
+use solana_rayon_threadlimit::get_thread_count;
 use solana_runtime::{accounts_db::OwnedAccountWrite, bank::Bank};
 use solana_sdk::{
     clock::{MAX_PROCESSING_AGE, MAX_RECENT_BLOCKHASHES},
     genesis_config::{GenesisConfig, OperatingMode},
-    hash::{hash, hashv, Hash},
+    hash::Hash,
     instruction::InstructionError,
     pubkey::Pubkey,
     system_program,
@@ -19,12 +21,14 @@ use solana_sdk::{
 };
 use solana_stake_program::stake_instruction;
 use solana_vote_program::vote_instruction::VoteInstruction;
-use std::{collections::HashMap, env, path::Path, sync::Arc};
+use std::{cmp, collections::HashMap, env, path::Path, sync::Arc};
 use tempfile::TempDir;
 
 const MAX_AGE_CORRECTION_EPOCH: u64 = 14;
 const MAX_SUPPORTED_SLOT_EXCLUSIVE: u64 = 4_752_000;
 const MAX_SUPPORTED_EPOCH: u64 = 10;
+const POH_THREADS_ENV: &str = "JETSTREAMER_HISTORICAL_POH_THREADS";
+const ABSOLUTE_MAX_POH_THREADS: usize = 256;
 
 pub struct RuntimeState {
     bank: Arc<Bank>,
@@ -37,12 +41,18 @@ pub struct RuntimeState {
     tick_hash_count: u64,
     leader_schedules: HashMap<u64, Vec<Pubkey>>,
     snapshot_export_seal: Option<SnapshotExportSeal>,
+    poh_pool: ThreadPool,
 }
 
 #[derive(Clone, Copy)]
 struct SnapshotExportSeal {
     slot: u64,
     accounts_hash: Hash,
+}
+
+pub enum ProcessEntriesError<E> {
+    Runtime(String),
+    Emit(E),
 }
 
 impl RuntimeState {
@@ -62,6 +72,7 @@ impl RuntimeState {
             ));
         }
         let stable_cluster = genesis.operating_mode == OperatingMode::Stable;
+        let poh_pool = build_poh_pool()?;
 
         let (mut bank, source) = match initial_state {
             jetstreamer_historical_protocol::InitialState::SnapshotArchive { archive_path } => {
@@ -103,67 +114,96 @@ impl RuntimeState {
                 tick_hash_count: 0,
                 leader_schedules: HashMap::new(),
                 snapshot_export_seal: None,
+                poh_pool,
             },
             initialized,
         ))
     }
 
+    /// Preserve the original one-entry request surface while sharing exactly
+    /// the same fail-closed preparation and commit path as a batch.
     pub fn process_entry(&mut self, request: EntryRequest) -> Result<EntryProcessed, String> {
         self.snapshot_export_seal = None;
-        if request.slot >= MAX_SUPPORTED_SLOT_EXCLUSIVE {
-            return Err(format!(
-                "Solana v1.0.7 candidate runtime ends before slot {} (requested {})",
-                MAX_SUPPORTED_SLOT_EXCLUSIVE, request.slot
-            ));
-        }
-        if request.hash.len() != 32 {
-            return Err(format!(
-                "entry hash has {} bytes, expected 32",
-                request.hash.len()
-            ));
-        }
-        if request.slot < self.bank.slot() {
-            return Err(format!(
-                "entry slot {} precedes current bank slot {}",
-                request.slot,
-                self.bank.slot()
-            ));
-        }
-        let expected_index = if request.slot == self.bank.slot() {
-            self.next_entry_index
-        } else {
-            0
-        };
-        if request.entry_index != expected_index {
-            return Err(format!(
-                "entry index {} for slot {} does not match expected {}",
-                request.entry_index, request.slot, expected_index
-            ));
-        }
-        if request.slot == self.bank.slot() && self.bank.is_complete() {
-            return Err(format!(
-                "entry follows the completion tick for slot {}",
-                request.slot
-            ));
-        }
-        if request.slot == self.bank.slot() && self.bank.is_frozen() {
-            return Err(format!("bank at slot {} is already frozen", request.slot));
-        }
-        let transactions: Vec<Transaction> = request
-            .transactions
-            .iter()
-            .enumerate()
-            .map(|(index, wire)| {
-                bincode::deserialize(wire)
-                    .map_err(|error| format!("failed to decode transaction {}: {}", index, error))
-            })
-            .collect::<Result<_, _>>()?;
+        let mut processed = self.process_entries(vec![request])?;
+        Ok(processed.remove(0))
+    }
 
-        // Match the v1.0.7 BlockstoreProcessor checks before changing Bank
-        // state.  In particular, an invalid first entry in a new slot must not
-        // freeze/root its parent or create a child that later requests inherit.
-        let validation = self.validate_entry(&request, &transactions)?;
+    /// Validate the complete submitted batch before changing `Bank` state.
+    /// Transaction decoding and independent PoH segments run in parallel;
+    /// bank advances, transaction execution, results, and writes remain in
+    /// canonical entry order.
+    pub fn process_entries(
+        &mut self,
+        requests: Vec<EntryRequest>,
+    ) -> Result<Vec<EntryProcessed>, String> {
+        let mut processed = Vec::with_capacity(requests.len());
+        match self.process_entries_with(requests, |entry| {
+            processed.push(entry);
+            Ok::<(), ()>(())
+        }) {
+            Ok(()) => Ok(processed),
+            Err(ProcessEntriesError::Runtime(message)) => Err(message),
+            Err(ProcessEntriesError::Emit(())) => unreachable!(),
+        }
+    }
 
+    pub fn process_entries_with<E, F>(
+        &mut self,
+        requests: Vec<EntryRequest>,
+        mut emit: F,
+    ) -> Result<(), ProcessEntriesError<E>>
+    where
+        F: FnMut(EntryProcessed) -> Result<(), E>,
+    {
+        self.snapshot_export_seal = None;
+        if requests.is_empty() {
+            return Err(ProcessEntriesError::Runtime(
+                "entry batch must contain at least one entry".to_string(),
+            ));
+        }
+        if requests.len() > MAX_ENTRIES_PER_BATCH {
+            return Err(ProcessEntriesError::Runtime(format!(
+                "entry batch contains {} entries, limit is {}",
+                requests.len(),
+                MAX_ENTRIES_PER_BATCH
+            )));
+        }
+
+        let prepared_results: Vec<Result<PreparedEntry, String>> = self
+            .poh_pool
+            .install(|| requests.into_par_iter().map(prepare_entry).collect());
+        // Inspect in wire order so a malformed batch has deterministic error
+        // precedence even though all independent decoding ran concurrently.
+        let mut prepared = Vec::with_capacity(prepared_results.len());
+        for result in prepared_results {
+            prepared.push(result.map_err(ProcessEntriesError::Runtime)?);
+        }
+        let validations = self
+            .validate_entry_batch(&prepared)
+            .map_err(ProcessEntriesError::Runtime)?;
+
+        // Nothing above this line mutates the Bank. From here onward each
+        // accepted entry is applied and reported in canonical wire order.
+        for (entry, validation) in prepared.into_iter().zip(validations) {
+            let processed = self
+                .commit_prevalidated_entry(entry, validation)
+                .map_err(ProcessEntriesError::Runtime)?;
+            emit(processed).map_err(ProcessEntriesError::Emit)?;
+        }
+        Ok(())
+    }
+
+    fn commit_prevalidated_entry(
+        &mut self,
+        prepared: PreparedEntry,
+        validation: EntryValidation,
+    ) -> Result<EntryProcessed, String> {
+        let PreparedEntry {
+            request,
+            transactions,
+            signatures_by_writable_key,
+            ..
+        } = prepared;
         let mut writes = if request.slot > self.bank.slot() {
             self.advance_to(request.slot)?
         } else {
@@ -175,7 +215,6 @@ impl RuntimeState {
             self.bank.register_tick(&validation.hash);
             writes.extend(self.drain_writes(None)?);
         } else {
-            let signatures_by_writable_key = writable_key_attribution(&transactions)?;
             let max_age = processing_max_age(self.stable_cluster, self.bank.epoch());
             let batch = self.bank.prepare_batch(&transactions, None);
             if let Some(error) = batch.lock_results().iter().find(|result| result.is_err()) {
@@ -221,7 +260,7 @@ impl RuntimeState {
                 .fee_collection_results
                 .iter()
                 .enumerate()
-                .find(|(_index, result)| result.is_err())
+                .find(|&(_index, ref result)| result.is_err())
             {
                 return Err(format!(
                     "entry fee collection failed for transaction {}: {:?}",
@@ -251,7 +290,10 @@ impl RuntimeState {
             writes.extend(entry_writes);
         }
 
-        self.next_entry_index += 1;
+        self.next_entry_index = self
+            .next_entry_index
+            .checked_add(1)
+            .ok_or_else(|| "entry index overflowed u64".to_string())?;
         self.last_entry_hash = validation.hash;
         self.tick_hash_count = validation.next_tick_hash_count;
         Ok(EntryProcessed {
@@ -263,6 +305,168 @@ impl RuntimeState {
             slot_complete: self.bank.is_complete(),
             next_write_version: self.write_cursor,
         })
+    }
+
+    fn validate_entry_batch(
+        &self,
+        prepared: &[PreparedEntry],
+    ) -> Result<Vec<EntryValidation>, String> {
+        let mut current_slot = self.bank.slot();
+        let mut next_entry_index = self.next_entry_index;
+        let mut tick_height = self.bank.tick_height();
+        let mut max_tick_height = self.bank.max_tick_height();
+        let mut slot_complete = self.bank.is_complete();
+        let mut bank_frozen = self.bank.is_frozen();
+        let mut tick_hash_count = self.tick_hash_count;
+        let mut previous_hash = self.last_entry_hash;
+        let hashes_per_tick = self.bank.hashes_per_tick().unwrap_or(0);
+        let ticks_per_slot = self.bank.ticks_per_slot();
+        let mut starts = Vec::with_capacity(prepared.len());
+        let mut validations = Vec::with_capacity(prepared.len());
+
+        for (batch_index, entry) in prepared.iter().enumerate() {
+            let request = &entry.request;
+            if request.slot >= MAX_SUPPORTED_SLOT_EXCLUSIVE {
+                return Err(format!(
+                    "Solana v1.0.7 candidate runtime ends before slot {} (requested {})",
+                    MAX_SUPPORTED_SLOT_EXCLUSIVE, request.slot
+                ));
+            }
+            if request.slot < current_slot {
+                return Err(format!(
+                    "entry slot {} precedes current bank slot {}",
+                    request.slot, current_slot
+                ));
+            }
+
+            let starts_new_slot = request.slot > current_slot;
+            if starts_new_slot {
+                if !slot_complete {
+                    return Err(format!(
+                        "cannot advance incomplete bank at slot {} (tick height {}, max {})",
+                        current_slot, tick_height, max_tick_height
+                    ));
+                }
+                current_slot = request.slot;
+                next_entry_index = 0;
+                max_tick_height = (current_slot + 1) * ticks_per_slot;
+                slot_complete = tick_height == max_tick_height;
+                bank_frozen = false;
+                tick_hash_count = 0;
+            }
+
+            if request.entry_index != next_entry_index {
+                return Err(format!(
+                    "entry index {} for slot {} does not match expected {}",
+                    request.entry_index, request.slot, next_entry_index
+                ));
+            }
+            if slot_complete {
+                return Err(format!(
+                    "entry follows the completion tick for slot {}",
+                    request.slot
+                ));
+            }
+            if bank_frozen {
+                return Err(format!("bank at slot {} is already frozen", request.slot));
+            }
+            if tick_height >= max_tick_height {
+                return Err(format!(
+                    "entry follows the completion tick for slot {}",
+                    request.slot
+                ));
+            }
+
+            let is_tick = entry.transactions.is_empty();
+            if is_tick && tick_height + 1 > max_tick_height {
+                return Err(format!(
+                    "tick entry would exceed max tick height {} in slot {}",
+                    max_tick_height, request.slot
+                ));
+            }
+
+            let mut next_tick_hash_count = tick_hash_count;
+            if hashes_per_tick != 0 {
+                next_tick_hash_count = next_tick_hash_count
+                    .checked_add(request.num_hashes)
+                    .ok_or_else(|| "entry PoH hash count overflowed u64".to_string())?;
+                if is_tick {
+                    if next_tick_hash_count != hashes_per_tick {
+                        return Err(format!(
+                            "tick entry has {} accumulated PoH hashes, expected {}",
+                            next_tick_hash_count, hashes_per_tick
+                        ));
+                    }
+                    next_tick_hash_count = 0;
+                } else if next_tick_hash_count >= hashes_per_tick {
+                    return Err(format!(
+                        "transaction entry reaches {} accumulated PoH hashes without a tick (limit {})",
+                        next_tick_hash_count, hashes_per_tick
+                    ));
+                }
+            }
+
+            let start_hash = if batch_index == 0 && starts_new_slot {
+                self.bank.last_blockhash()
+            } else {
+                previous_hash
+            };
+            starts.push(start_hash);
+            validations.push(EntryValidation {
+                hash: entry.hash,
+                next_tick_hash_count,
+            });
+
+            previous_hash = entry.hash;
+            tick_hash_count = next_tick_hash_count;
+            next_entry_index = next_entry_index
+                .checked_add(1)
+                .ok_or_else(|| "entry index overflowed u64".to_string())?;
+            if is_tick {
+                tick_height += 1;
+                slot_complete = tick_height == max_tick_height;
+            }
+        }
+
+        let expected_hash_groups: Vec<(Hash, Option<Hash>)> = self.poh_pool.install(|| {
+            prepared
+                .par_chunks(2)
+                .zip(starts.par_chunks(2))
+                .map(|(entries, start_hashes)| match (entries, start_hashes) {
+                    ([first, second], [first_start, second_start]) => {
+                        let hashes = next_entry_hash_pair(
+                            [first_start, second_start],
+                            [first.request.num_hashes, second.request.num_hashes],
+                            [&first.transactions, &second.transactions],
+                        );
+                        (hashes[0], Some(hashes[1]))
+                    }
+                    ([entry], [start_hash]) => (
+                        next_entry_hash(start_hash, entry.request.num_hashes, &entry.transactions),
+                        None,
+                    ),
+                    _ => unreachable!("matching chunks of two have equal lengths"),
+                })
+                .collect()
+        });
+        let mut expected_hashes = Vec::with_capacity(prepared.len());
+        for (first, second) in expected_hash_groups {
+            expected_hashes.push(first);
+            if let Some(second) = second {
+                expected_hashes.push(second);
+            }
+        }
+        for ((entry, validation), expected_hash) in
+            prepared.iter().zip(validations.iter()).zip(expected_hashes)
+        {
+            if validation.hash != expected_hash {
+                return Err(format!(
+                    "entry PoH hash mismatch at slot {} index {}: expected {}, got {}",
+                    entry.request.slot, entry.request.entry_index, expected_hash, validation.hash
+                ));
+            }
+        }
+        Ok(validations)
     }
 
     pub fn freeze_checkpoint(&mut self, expected_slot: u64) -> Result<Checkpoint, String> {
@@ -390,88 +594,6 @@ impl RuntimeState {
         Ok(writes)
     }
 
-    fn validate_entry(
-        &self,
-        request: &EntryRequest,
-        transactions: &[Transaction],
-    ) -> Result<EntryValidation, String> {
-        let starts_new_slot = request.slot > self.bank.slot();
-        if starts_new_slot && !self.bank.is_complete() {
-            return Err(format!(
-                "cannot advance incomplete bank at slot {} (tick height {}, max {})",
-                self.bank.slot(),
-                self.bank.tick_height(),
-                self.bank.max_tick_height()
-            ));
-        }
-
-        let tick_height = self.bank.tick_height();
-        let max_tick_height = if starts_new_slot {
-            (request.slot + 1) * self.bank.ticks_per_slot()
-        } else {
-            self.bank.max_tick_height()
-        };
-        if tick_height >= max_tick_height {
-            return Err(format!(
-                "entry follows the completion tick for slot {}",
-                request.slot
-            ));
-        }
-
-        let is_tick = transactions.is_empty();
-        if is_tick && tick_height + 1 > max_tick_height {
-            return Err(format!(
-                "tick entry would exceed max tick height {} in slot {}",
-                max_tick_height, request.slot
-            ));
-        }
-
-        let hashes_per_tick = self.bank.hashes_per_tick().unwrap_or(0);
-        let mut next_tick_hash_count = if starts_new_slot {
-            0
-        } else {
-            self.tick_hash_count
-        };
-        if hashes_per_tick != 0 {
-            next_tick_hash_count = next_tick_hash_count
-                .checked_add(request.num_hashes)
-                .ok_or_else(|| "entry PoH hash count overflowed u64".to_string())?;
-            if is_tick {
-                if next_tick_hash_count != hashes_per_tick {
-                    return Err(format!(
-                        "tick entry has {} accumulated PoH hashes, expected {}",
-                        next_tick_hash_count, hashes_per_tick
-                    ));
-                }
-                next_tick_hash_count = 0;
-            } else if next_tick_hash_count >= hashes_per_tick {
-                return Err(format!(
-                    "transaction entry reaches {} accumulated PoH hashes without a tick (limit {})",
-                    next_tick_hash_count, hashes_per_tick
-                ));
-            }
-        }
-
-        let start_hash = if starts_new_slot {
-            self.bank.last_blockhash()
-        } else {
-            self.last_entry_hash
-        };
-        let expected_hash = next_entry_hash(&start_hash, request.num_hashes, transactions);
-        let actual_hash = Hash::new(&request.hash);
-        if actual_hash != expected_hash {
-            return Err(format!(
-                "entry PoH hash mismatch at slot {} index {}: expected {}, got {}",
-                request.slot, request.entry_index, expected_hash, actual_hash
-            ));
-        }
-
-        Ok(EntryValidation {
-            hash: actual_hash,
-            next_tick_hash_count,
-        })
-    }
-
     /// A completed bank is a canonical boundary in this linear replay. Drain
     /// every freeze-time account write before rooting it, then squash its
     /// ancestors so the next child retains only one parent Bank allocation.
@@ -544,8 +666,143 @@ impl RuntimeState {
             tick_hash_count: 0,
             leader_schedules: HashMap::new(),
             snapshot_export_seal: None,
+            poh_pool: build_poh_pool().unwrap(),
         }
     }
+}
+
+fn build_poh_pool() -> Result<ThreadPool, String> {
+    let thread_count = configured_poh_thread_count()?;
+    ThreadPoolBuilder::new()
+        .num_threads(thread_count)
+        .thread_name(|index| format!("historical-poh-{}", index))
+        .build()
+        .map_err(|error| format!("failed to create historical PoH thread pool: {}", error))
+}
+
+fn configured_poh_thread_count() -> Result<usize, String> {
+    let logical_cpus = cmp::max(1, num_cpus::get());
+    let maximum = cmp::min(logical_cpus, ABSOLUTE_MAX_POH_THREADS);
+    match env::var_os(POH_THREADS_ENV) {
+        Some(value) => {
+            let value = value.into_string().map_err(|_| {
+                format!(
+                    "{} must contain a positive decimal integer",
+                    POH_THREADS_ENV
+                )
+            })?;
+            parse_poh_thread_count(&value, maximum)
+        }
+        // This old workspace configures unusually large test-thread stacks.
+        // A single pool thread keeps unit tests bounded; production retains
+        // Solana's conservative half-of-logical-CPU default.
+        None if cfg!(test) => Ok(1),
+        None => Ok(cmp::max(1, cmp::min(get_thread_count(), maximum))),
+    }
+}
+
+fn parse_poh_thread_count(value: &str, maximum: usize) -> Result<usize, String> {
+    let configured = value.parse::<usize>().map_err(|_| {
+        format!(
+            "{} value {:?} is not a positive decimal integer",
+            POH_THREADS_ENV, value
+        )
+    })?;
+    if configured == 0 || configured > maximum {
+        return Err(format!(
+            "{} value {} is outside the supported range 1..={} (logical CPUs capped at {})",
+            POH_THREADS_ENV, configured, maximum, ABSOLUTE_MAX_POH_THREADS
+        ));
+    }
+    Ok(configured)
+}
+
+struct PreparedEntry {
+    request: EntryRequest,
+    hash: Hash,
+    transactions: Vec<Transaction>,
+    signatures_by_writable_key: HashMap<Vec<u8>, Option<Vec<u8>>>,
+}
+
+fn prepare_entry(request: EntryRequest) -> Result<PreparedEntry, String> {
+    if request.hash.len() != 32 {
+        return Err(format!(
+            "entry hash has {} bytes, expected 32",
+            request.hash.len()
+        ));
+    }
+    let hash = Hash::new(&request.hash);
+    let transactions: Vec<Transaction> = request
+        .transactions
+        .iter()
+        .enumerate()
+        .map(|(index, wire)| {
+            bincode::deserialize(wire)
+                .map_err(|error| format!("failed to decode transaction {}: {}", index, error))
+        })
+        .collect::<Result<_, _>>()?;
+    for (index, transaction) in transactions.iter().enumerate() {
+        validate_transaction_structure(transaction)
+            .map_err(|message| format!("failed to decode transaction {}: {}", index, message))?;
+    }
+    let signatures_by_writable_key = writable_key_attribution(&transactions)?;
+    Ok(PreparedEntry {
+        request,
+        hash,
+        transactions,
+        signatures_by_writable_key,
+    })
+}
+
+fn validate_transaction_structure(transaction: &Transaction) -> Result<(), String> {
+    let header = &transaction.message.header;
+    let required = header.num_required_signatures as usize;
+    let readonly_signed = header.num_readonly_signed_accounts as usize;
+    let key_count = transaction.message.account_keys.len();
+    if required > key_count {
+        return Err(format!(
+            "required signature count {} exceeds account-key count {}",
+            required, key_count
+        ));
+    }
+    if transaction.signatures.len() != required {
+        return Err(format!(
+            "signature count {} does not match required count {}",
+            transaction.signatures.len(),
+            required
+        ));
+    }
+    if readonly_signed > required {
+        return Err(format!(
+            "readonly signed count {} exceeds signed-key count {}",
+            readonly_signed, required
+        ));
+    }
+    let unsigned = key_count - required;
+    let readonly_unsigned = header.num_readonly_unsigned_accounts as usize;
+    if readonly_unsigned > unsigned {
+        return Err(format!(
+            "readonly unsigned count {} exceeds unsigned-key count {}",
+            readonly_unsigned, unsigned
+        ));
+    }
+    for (instruction_index, instruction) in transaction.message.instructions.iter().enumerate() {
+        if instruction.program_id_index as usize >= key_count {
+            return Err(format!(
+                "instruction {} program index {} exceeds account-key count {}",
+                instruction_index, instruction.program_id_index, key_count
+            ));
+        }
+        for account_index in &instruction.accounts {
+            if *account_index as usize >= key_count {
+                return Err(format!(
+                    "instruction {} account index {} exceeds account-key count {}",
+                    instruction_index, account_index, key_count
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 struct EntryValidation {
@@ -553,23 +810,48 @@ struct EntryValidation {
     next_tick_hash_count: u64,
 }
 
-/// Exact scalar equivalent of v1.0.7 ledger::entry::next_hash.  Pulling in
+/// Exact equivalent of v1.0.7 ledger::entry::next_hash. Pulling in
 /// the full ledger crate would also pull RocksDB into the isolated worker.
+/// The fixed-width backend bypasses generic digest buffering and dispatches
+/// to SHA-NI at runtime while retaining a portable software fallback.
 fn next_entry_hash(start_hash: &Hash, num_hashes: u64, transactions: &[Transaction]) -> Hash {
-    if num_hashes == 0 && transactions.is_empty() {
-        return *start_hash;
-    }
+    let mut start = [0u8; 32];
+    start.copy_from_slice(start_hash.as_ref());
+    let transaction_mixin = transaction_mixin(transactions);
+    Hash::new(&poh_backend::next_hash(
+        start,
+        num_hashes,
+        transaction_mixin,
+    ))
+}
 
-    let mut poh_hash = *start_hash;
-    for _ in 0..num_hashes.saturating_sub(1) {
-        poh_hash = hash(poh_hash.as_ref());
-    }
+fn next_entry_hash_pair(
+    start_hashes: [&Hash; 2],
+    num_hashes: [u64; 2],
+    transactions: [&[Transaction]; 2],
+) -> [Hash; 2] {
+    let mut starts = [[0u8; 32]; 2];
+    starts[0].copy_from_slice(start_hashes[0].as_ref());
+    starts[1].copy_from_slice(start_hashes[1].as_ref());
+    let hashes = poh_backend::next_hash_pair(
+        starts,
+        num_hashes,
+        [
+            transaction_mixin(transactions[0]),
+            transaction_mixin(transactions[1]),
+        ],
+    );
+    [Hash::new(&hashes[0]), Hash::new(&hashes[1])]
+}
+
+fn transaction_mixin(transactions: &[Transaction]) -> Option<poh_backend::PohHash> {
     if transactions.is_empty() {
-        hash(poh_hash.as_ref())
-    } else {
-        let transaction_hash = hash_transactions(transactions);
-        hashv(&[poh_hash.as_ref(), transaction_hash.as_ref()])
+        return None;
     }
+    let transaction_hash = hash_transactions(transactions);
+    let mut mixin = [0u8; 32];
+    mixin.copy_from_slice(transaction_hash.as_ref());
+    Some(mixin)
 }
 
 fn hash_transactions(transactions: &[Transaction]) -> Hash {
@@ -845,6 +1127,15 @@ mod tests {
             RuntimeState::from_test_bank(bank, false, state_dir),
             genesis.mint_keypair,
         )
+    }
+
+    #[test]
+    fn poh_thread_override_is_positive_and_bounded() {
+        assert_eq!(parse_poh_thread_count("1", 64).unwrap(), 1);
+        assert_eq!(parse_poh_thread_count("64", 64).unwrap(), 64);
+        assert!(parse_poh_thread_count("0", 64).is_err());
+        assert!(parse_poh_thread_count("65", 64).is_err());
+        assert!(parse_poh_thread_count("not-a-number", 64).is_err());
     }
 
     fn request_for(
@@ -1183,6 +1474,161 @@ mod tests {
 
         let valid_next_slot = request_for(&state, 1, 0, 4, &[]);
         assert_eq!(state.process_entry(valid_next_slot).unwrap().slot, 1);
+    }
+
+    #[test]
+    fn late_batch_validation_failure_leaves_bank_entirely_unmodified() {
+        let (mut state, _mint_keypair) = test_state(2, Some(4));
+        let initial_hash = state.last_entry_hash;
+        let initial_write_cursor = state.write_cursor;
+        let first_hash = next_entry_hash(&initial_hash, 4, &[]);
+        let second_hash = next_entry_hash(&first_hash, 4, &[]);
+        let first = EntryRequest {
+            slot: 0,
+            entry_index: 0,
+            num_hashes: 4,
+            hash: first_hash.as_ref().to_vec(),
+            transactions: Vec::new(),
+        };
+        let mut bad_poh = EntryRequest {
+            slot: 0,
+            entry_index: 1,
+            num_hashes: 4,
+            hash: second_hash.as_ref().to_vec(),
+            transactions: Vec::new(),
+        };
+        bad_poh.hash[0] ^= 1;
+
+        assert!(state
+            .process_entries(vec![first.clone(), bad_poh])
+            .unwrap_err()
+            .contains("entry PoH hash mismatch"));
+        assert_eq!(state.bank.tick_height(), 0);
+        assert_eq!(state.next_entry_index, 0);
+        assert_eq!(state.last_entry_hash, initial_hash);
+        assert_eq!(state.tick_hash_count, 0);
+        assert_eq!(state.write_cursor, initial_write_cursor);
+
+        let bad_order = EntryRequest {
+            entry_index: 2,
+            hash: second_hash.as_ref().to_vec(),
+            ..first.clone()
+        };
+        assert!(state
+            .process_entries(vec![first.clone(), bad_order])
+            .unwrap_err()
+            .contains("does not match expected 1"));
+        assert_eq!(state.bank.tick_height(), 0);
+        assert_eq!(state.next_entry_index, 0);
+        assert_eq!(state.last_entry_hash, initial_hash);
+
+        let undecodable = EntryRequest {
+            entry_index: 1,
+            num_hashes: 1,
+            hash: vec![0; 32],
+            transactions: vec![vec![0xff]],
+            ..first.clone()
+        };
+        assert!(state
+            .process_entries(vec![first, undecodable])
+            .unwrap_err()
+            .starts_with("failed to decode transaction"));
+        assert_eq!(state.bank.tick_height(), 0);
+        assert_eq!(state.next_entry_index, 0);
+        assert_eq!(state.last_entry_hash, initial_hash);
+    }
+
+    #[test]
+    fn malformed_legacy_transaction_structure_is_rejected_before_bank_mutation() {
+        let (mut state, mint_keypair) = test_state(2, Some(4));
+        let recipient = Pubkey::new_from_array([9; 32]);
+        let base =
+            system_transaction::transfer(&mint_keypair, &recipient, 1, state.bank.last_blockhash());
+        let initial_hash = state.last_entry_hash;
+
+        let mut bad_signatures = base.clone();
+        bad_signatures.signatures.clear();
+        let error = state
+            .process_entry(request_for(&state, 0, 0, 1, &[bad_signatures]))
+            .unwrap_err();
+        assert!(error.contains("signature count"));
+
+        let mut bad_readonly_signed = base.clone();
+        bad_readonly_signed
+            .message
+            .header
+            .num_readonly_signed_accounts = bad_readonly_signed
+            .message
+            .header
+            .num_required_signatures
+            .saturating_add(1);
+        let error = state
+            .process_entry(request_for(&state, 0, 0, 1, &[bad_readonly_signed]))
+            .unwrap_err();
+        assert!(error.contains("readonly signed count"));
+
+        let mut bad_program_index = base.clone();
+        bad_program_index.message.instructions[0].program_id_index = u8::max_value();
+        let error = state
+            .process_entry(request_for(&state, 0, 0, 1, &[bad_program_index]))
+            .unwrap_err();
+        assert!(error.contains("program index"));
+
+        let mut bad_account_index = base;
+        bad_account_index.message.instructions[0].accounts[0] = u8::max_value();
+        let error = state
+            .process_entry(request_for(&state, 0, 0, 1, &[bad_account_index]))
+            .unwrap_err();
+        assert!(error.contains("account index"));
+
+        assert_eq!(state.bank.tick_height(), 0);
+        assert_eq!(state.next_entry_index, 0);
+        assert_eq!(state.last_entry_hash, initial_hash);
+    }
+
+    #[test]
+    fn valid_batch_commits_and_reports_entries_in_wire_order() {
+        let (mut state, _mint_keypair) = test_state(2, Some(4));
+        let first_hash = next_entry_hash(&state.last_entry_hash, 4, &[]);
+        let second_hash = next_entry_hash(&first_hash, 4, &[]);
+        let processed = state
+            .process_entries(vec![
+                EntryRequest {
+                    slot: 0,
+                    entry_index: 0,
+                    num_hashes: 4,
+                    hash: first_hash.as_ref().to_vec(),
+                    transactions: Vec::new(),
+                },
+                EntryRequest {
+                    slot: 0,
+                    entry_index: 1,
+                    num_hashes: 4,
+                    hash: second_hash.as_ref().to_vec(),
+                    transactions: Vec::new(),
+                },
+            ])
+            .unwrap();
+        assert_eq!(processed.len(), 2);
+        assert_eq!(processed[0].entry_index, 0);
+        assert!(!processed[0].slot_complete);
+        assert_eq!(processed[1].entry_index, 1);
+        assert!(processed[1].slot_complete);
+        assert_eq!(state.bank.tick_height(), 2);
+        assert_eq!(state.next_entry_index, 2);
+        assert_eq!(state.last_entry_hash, second_hash);
+    }
+
+    #[test]
+    fn entry_batch_count_is_bounded_before_preparation() {
+        let (mut state, _mint_keypair) = test_state(2, Some(4));
+        let request = request_for(&state, 0, 0, 4, &[]);
+        let error = state
+            .process_entries(vec![request; MAX_ENTRIES_PER_BATCH + 1])
+            .unwrap_err();
+        assert!(error.contains("limit is"));
+        assert_eq!(state.bank.tick_height(), 0);
+        assert_eq!(state.next_entry_index, 0);
     }
 
     #[test]

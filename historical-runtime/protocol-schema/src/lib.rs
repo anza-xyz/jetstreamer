@@ -4,10 +4,13 @@
 // and an old compiler/runtime worker compile exactly these types.
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use std::io::{self, Cursor, ErrorKind, Read, Write};
+use std::io::{self, ErrorKind, Read, Write};
 
-pub const PROTOCOL_VERSION: u16 = 3;
+pub const PROTOCOL_VERSION: u16 = 4;
 pub const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
+/// Prevent a valid, small frame from expanding into an unbounded number of
+/// independently scheduled PoH jobs. The parent may submit smaller batches.
+pub const MAX_ENTRIES_PER_BATCH: usize = 512;
 
 pub const MAINNET_GENESIS_HASH: &str = "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d";
 
@@ -42,6 +45,11 @@ pub enum RequestBody {
         /// before publishing the archive.
         expected_accounts_hash: Vec<u8>,
     },
+    /// Entries in canonical replay order. A supporting worker validates the
+    /// complete batch, including every PoH link, before mutating its bank.
+    ///
+    /// Appended to preserve the discriminants of every v3 request variant.
+    ProcessEntries(Vec<EntryRequest>),
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -77,6 +85,29 @@ pub enum ResponseBody {
     ShuttingDown,
     Error(WorkerError),
     SnapshotExported(SnapshotExport),
+    /// A bounded fragment of one processed entry. Supporting workers stream
+    /// these fragments and terminate every entry with `End`.
+    /// Appended to preserve the discriminants of every v3 response variant.
+    EntryProcessedChunk(EntryProcessedChunk),
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct EntryProcessedChunk {
+    pub slot: u64,
+    pub entry_index: u64,
+    pub sequence: u32,
+    pub body: EntryProcessedChunkBody,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum EntryProcessedChunkBody {
+    Outcomes(Vec<TransactionOutcome>),
+    Writes(Vec<AccountWrite>),
+    End {
+        tick_height: u64,
+        slot_complete: bool,
+        next_write_version: u64,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -254,12 +285,20 @@ pub enum WorkerErrorCode {
 pub fn write_frame<T: Serialize, W: Write>(writer: &mut W, value: &T) -> io::Result<()> {
     // The free functions use bincode's legacy fixed-integer configuration in
     // both 1.2.1 and 1.3.3.
-    let payload =
-        bincode::serialize(value).map_err(|error| io::Error::new(ErrorKind::InvalidData, error))?;
-    if payload.len() > MAX_FRAME_BYTES {
+    let encoded_size = bincode::serialized_size(value)
+        .map_err(|error| io::Error::new(ErrorKind::InvalidData, error))?;
+    if encoded_size > MAX_FRAME_BYTES as u64 {
         return Err(io::Error::new(
             ErrorKind::InvalidData,
             "historical-runtime frame exceeds maximum size",
+        ));
+    }
+    let payload =
+        bincode::serialize(value).map_err(|error| io::Error::new(ErrorKind::InvalidData, error))?;
+    if payload.len() as u64 != encoded_size {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            "historical-runtime serialized size changed during framing",
         ));
     }
     let length = payload.len() as u32;
@@ -268,7 +307,9 @@ pub fn write_frame<T: Serialize, W: Write>(writer: &mut W, value: &T) -> io::Res
     writer.flush()
 }
 
-pub fn read_frame<T: DeserializeOwned, R: Read>(reader: &mut R) -> io::Result<Option<T>> {
+pub fn read_frame<T: DeserializeOwned + Serialize, R: Read>(
+    reader: &mut R,
+) -> io::Result<Option<T>> {
     let mut prefix = [0u8; 4];
     let mut read = 0;
     while read < prefix.len() {
@@ -295,10 +336,19 @@ pub fn read_frame<T: DeserializeOwned, R: Read>(reader: &mut R) -> io::Result<Op
     }
     let mut payload = vec![0u8; length];
     reader.read_exact(&mut payload)?;
-    let mut cursor = Cursor::new(payload.as_slice());
-    let value = bincode::deserialize_from(&mut cursor)
+
+    // Deserialize from the bounded slice, never from an `io::Read` wrapper.
+    // Old bincode's reader path reserves attacker-declared String/Vec lengths
+    // before discovering that the frame does not contain those bytes, while
+    // its slice path checks the physical remainder first.
+    let value: T = bincode::deserialize(payload.as_slice())
         .map_err(|error| io::Error::new(ErrorKind::InvalidData, error))?;
-    if cursor.position() != length as u64 {
+    // bincode 1.2 and the 1.3 legacy free functions accept trailing bytes.
+    // Fixed-width protocol encoding is canonical, so the serialized size must
+    // exactly consume the advertised payload.
+    let decoded_size = bincode::serialized_size(&value)
+        .map_err(|error| io::Error::new(ErrorKind::InvalidData, error))?;
+    if decoded_size != length as u64 {
         return Err(io::Error::new(
             ErrorKind::InvalidData,
             "historical-runtime frame has trailing bytes",
@@ -379,11 +429,60 @@ mod tests {
     }
 
     #[test]
+    fn entry_batch_round_trips_without_changing_legacy_discriminants() {
+        let entries = vec![
+            EntryRequest {
+                slot: 42,
+                entry_index: 0,
+                num_hashes: 7,
+                hash: vec![1; 32],
+                transactions: vec![vec![2, 3]],
+            },
+            EntryRequest {
+                slot: 42,
+                entry_index: 1,
+                num_hashes: 9,
+                hash: vec![4; 32],
+                transactions: Vec::new(),
+            },
+        ];
+        let request = Request {
+            id: 11,
+            body: RequestBody::ProcessEntries(entries),
+        };
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &request).unwrap();
+        let mut input = bytes.as_slice();
+        assert_eq!(read_frame(&mut input).unwrap(), Some(request));
+
+        // Ping was variant 4 in protocol v3 and remains byte-for-byte stable.
+        let ping = Request {
+            id: 7,
+            body: RequestBody::Ping,
+        };
+        let mut ping_bytes = Vec::new();
+        write_frame(&mut ping_bytes, &ping).unwrap();
+        assert_eq!(
+            ping_bytes,
+            vec![12, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0]
+        );
+    }
+
+    #[test]
     fn rejects_oversized_frame_before_allocating_payload() {
         let mut bytes = ((MAX_FRAME_BYTES as u32) + 1).to_le_bytes().to_vec();
         bytes.extend_from_slice(&[0; 8]);
         let error = read_frame::<Request, _>(&mut bytes.as_slice()).unwrap_err();
         assert_eq!(error.kind(), ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn write_rejects_oversized_value_before_serializing_it() {
+        let oversized = vec![0u8; MAX_FRAME_BYTES];
+        let mut output = Vec::new();
+        let error = write_frame(&mut output, &oversized).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::InvalidData);
+        assert!(output.is_empty());
     }
 
     #[test]
@@ -398,4 +497,31 @@ mod tests {
         framed.extend_from_slice(&bytes);
         assert!(read_frame::<Request, _>(&mut framed.as_slice()).is_err());
     }
+
+    #[test]
+    fn rejects_string_length_larger_than_the_bounded_payload() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&1u64.to_le_bytes()); // request ID
+        payload.extend_from_slice(&1u32.to_le_bytes()); // Initialize
+        payload.extend_from_slice(&std::u64::MAX.to_le_bytes()); // ledger_path length
+        let mut framed = (payload.len() as u32).to_le_bytes().to_vec();
+        framed.extend_from_slice(&payload);
+
+        let error = read_frame::<Request, _>(&mut framed.as_slice()).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn rejects_collection_length_larger_than_the_bounded_payload() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&1u64.to_le_bytes()); // request ID
+        payload.extend_from_slice(&7u32.to_le_bytes()); // ProcessEntries
+        payload.extend_from_slice(&std::u64::MAX.to_le_bytes()); // entries length
+        let mut framed = (payload.len() as u32).to_le_bytes().to_vec();
+        framed.extend_from_slice(&payload);
+
+        let error = read_frame::<Request, _>(&mut framed.as_slice()).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::InvalidData);
+    }
+
 }

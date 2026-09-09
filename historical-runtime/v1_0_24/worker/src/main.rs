@@ -87,6 +87,13 @@ impl Worker {
                 let processed = state.process_entry(entry).map_err(classify_runtime_error)?;
                 Ok((ResponseBody::EntryProcessed(processed), false))
             }
+            RequestBody::ProcessEntries(_) => {
+                self.require_hello()?;
+                Err(worker_error(
+                    WorkerErrorCode::UnsupportedOperation,
+                    "entry batches are supported only by the Solana v1.0.7 worker".to_string(),
+                ))
+            }
             RequestBody::FreezeCheckpoint { slot } => {
                 self.require_hello()?;
                 let state = self.state.as_mut().ok_or_else(|| {

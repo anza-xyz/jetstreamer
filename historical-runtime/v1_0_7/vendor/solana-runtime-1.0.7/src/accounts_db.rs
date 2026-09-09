@@ -852,6 +852,22 @@ impl AccountsDB {
             .values()
             .cloned()
             .collect();
+        // Entering the old Rayon pool for one AppendVec wakes every worker but
+        // cannot expose any parallelism. Historical replay hits this path for
+        // nearly every small per-slot delta, so keep the common case local.
+        if storage_maps.len() <= 1 {
+            return storage_maps
+                .into_iter()
+                .map(|storage| {
+                    let accounts = storage.accounts.accounts(0);
+                    let mut retval = B::default();
+                    accounts.iter().for_each(|stored_account| {
+                        scan_func(stored_account, storage.id, &mut retval)
+                    });
+                    retval
+                })
+                .collect();
+        }
         self.thread_pool.install(|| {
             storage_maps
                 .into_par_iter()
@@ -2745,6 +2761,38 @@ pub mod tests {
                 }
             });
         assert_eq!(accounts.len(), 2);
+    }
+
+    #[test]
+    fn test_scan_account_storage_single_store() {
+        let db = AccountsDB::new(Vec::new());
+        let empty: Vec<Vec<Pubkey>> = db.scan_account_storage(
+            6,
+            |stored_account, _store_id, accounts: &mut Vec<Pubkey>| {
+                accounts.push(stored_account.meta.pubkey);
+            },
+        );
+        assert!(empty.is_empty());
+
+        let owner = Pubkey::default();
+        let key0 = Pubkey::new_rand();
+        let key1 = Pubkey::new_rand();
+        let account0 = Account::new(1, 0, &owner);
+        let account1 = Account::new(2, 0, &owner);
+        db.store(7, &[(&key0, &account0), (&key1, &account1)]);
+
+        let mut scanned: Vec<(Pubkey, u64)> = db
+            .scan_account_storage(7, |stored_account, _store_id, accounts: &mut Vec<_>| {
+                accounts.push((
+                    stored_account.meta.pubkey,
+                    stored_account.account_meta.lamports,
+                ));
+            })
+            .into_iter()
+            .flatten()
+            .collect();
+        scanned.sort_by_key(|(_, lamports)| *lamports);
+        assert_eq!(scanned, vec![(key0, 1), (key1, 2)]);
     }
 
     #[test]

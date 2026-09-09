@@ -44,6 +44,10 @@ const MAX_HISTORICAL_WORKER_EXECUTABLE_BYTES: u64 = 256 * 1024 * 1024;
 /// aligned with Agave's hardened 10 MiB genesis-archive unpack ceiling so a
 /// replaced source cannot drive an unbounded parent copy or old-worker decode.
 const MAX_HISTORICAL_GENESIS_BIN_BYTES: u64 = 10 * 1024 * 1024;
+// v1.0.7's system program rejects larger account allocations.  Treat this as
+// an IPC invariant too so a compromised worker cannot force an oversized
+// response item into the parent.
+const MAX_HISTORICAL_ACCOUNT_DATA_BYTES: usize = 10 * 1024 * 1024;
 
 const SOLANA_V1_0_24_BACKEND_ID: &str = "solana-v1.0.24";
 const SOLANA_V1_0_24_TAG: &str = "v1.0.24";
@@ -332,6 +336,24 @@ pub enum HistoricalRuntimeError {
     },
     #[error("entry response contains {actual} transaction outcomes, expected {expected}")]
     OutcomeCountMismatch { expected: usize, actual: usize },
+    #[error("invalid streamed entry response: {0}")]
+    InvalidEntryStream(String),
+    #[error("entry response tick height is {actual}, expected {expected}")]
+    EntryTickHeightMismatch { expected: u64, actual: u64 },
+    #[error("entry response completion is {actual}, expected {expected}")]
+    EntryCompletionMismatch { expected: bool, actual: bool },
+    #[error("entry response consumer failed: {0}")]
+    EntryStreamConsumer(String),
+    #[error("historical entry batch must contain at least one entry")]
+    EmptyEntryBatch,
+    #[error("historical entry batch contains {actual} entries, limit is {limit}")]
+    EntryBatchTooLarge { actual: usize, limit: usize },
+    #[error("historical worker profile does not support entry batches")]
+    EntryBatchUnsupported,
+    #[error("failed to measure historical request frame: {0}")]
+    RequestSerialization(#[source] bincode::Error),
+    #[error("historical request frame is {bytes} bytes, limit is {limit}")]
+    RequestFrameTooLarge { bytes: u64, limit: usize },
     #[error("account write is for slot {actual}, expected {expected}")]
     AccountWriteSlotMismatch { expected: u64, actual: u64 },
     #[error(
@@ -442,6 +464,23 @@ pub struct HistoricalAccountWrite {
     pub stored_hash: [u8; HASH_BYTES],
 }
 
+/// Parent-side, fixed-hash representation of one neutral worker entry request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HistoricalEntryRequest {
+    pub slot: u64,
+    pub entry_index: u64,
+    pub num_hashes: u64,
+    pub hash: [u8; HASH_BYTES],
+    pub transactions: Vec<Vec<u8>>,
+}
+
+#[derive(Clone, Copy)]
+struct ExpectedEntryResponse {
+    slot: u64,
+    entry_index: u64,
+    transaction_count: usize,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HistoricalEntryProcessed {
     pub slot: u64,
@@ -451,6 +490,27 @@ pub struct HistoricalEntryProcessed {
     pub tick_height: u64,
     pub slot_complete: bool,
     pub next_write_version: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum HistoricalEntryStreamItem {
+    Outcomes {
+        slot: u64,
+        entry_index: u64,
+        outcomes: Vec<HistoricalTransactionOutcome>,
+    },
+    Writes {
+        slot: u64,
+        entry_index: u64,
+        writes: Vec<HistoricalAccountWrite>,
+    },
+    End {
+        slot: u64,
+        entry_index: u64,
+        tick_height: u64,
+        slot_complete: bool,
+        next_write_version: u64,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -515,6 +575,7 @@ impl HistoricalRuntimeTimeouts {
             RequestBody::Hello { .. } => ("hello", self.control),
             RequestBody::Initialize { .. } => ("initialize", self.initialize),
             RequestBody::ProcessEntry(_) => ("process-entry", self.entry),
+            RequestBody::ProcessEntries(_) => ("process-entries", self.entry),
             RequestBody::FreezeCheckpoint { .. } => ("freeze-checkpoint", self.checkpoint),
             RequestBody::ExportSnapshot { .. } => ("export-snapshot", self.checkpoint),
             RequestBody::Ping => ("ping", self.control),
@@ -559,12 +620,38 @@ impl IpcTransport {
             .spawn(move || {
                 let mut stdin = BufWriter::new(stdin);
                 let mut stdout = BufReader::new(stdout);
-                while let Ok(call) = call_rx.recv() {
-                    let response = protocol::write_frame(&mut stdin, &call.request)
-                        .and_then(|()| protocol::read_frame(&mut stdout));
-                    let terminal = response.as_ref().map_or(true, Option::is_none);
-                    if call.response_tx.send(response).is_err() || terminal {
+                'calls: while let Ok(call) = call_rx.recv() {
+                    if let Err(error) = protocol::write_frame(&mut stdin, &call.request) {
+                        let _ = call.response_tx.send(Err(error));
                         break;
+                    }
+                    let mut completed_entries = 0usize;
+                    loop {
+                        let response = protocol::read_frame::<Response, _>(&mut stdout);
+                        let terminal = response.as_ref().map_or(true, Option::is_none);
+                        let done = match response.as_ref() {
+                            Ok(Some(response)) => match stream_frame_state(
+                                &call.request,
+                                response,
+                                &mut completed_entries,
+                            ) {
+                                Ok(done) => done,
+                                Err(error) => {
+                                    let _ = call.response_tx.send(Err(error));
+                                    break 'calls;
+                                }
+                            },
+                            _ => true,
+                        };
+                        if call.response_tx.send(response).is_err() {
+                            break 'calls;
+                        }
+                        if terminal {
+                            break 'calls;
+                        }
+                        if done {
+                            break;
+                        }
                     }
                 }
             })?;
@@ -579,6 +666,14 @@ impl IpcTransport {
         request: Request,
         timeout: Duration,
     ) -> Result<Option<Response>, IpcExchangeError> {
+        let response_rx = self.start_exchange(request)?;
+        recv_ipc_response(&response_rx, timeout)
+    }
+
+    fn start_exchange(
+        &self,
+        request: Request,
+    ) -> Result<mpsc::Receiver<io::Result<Option<Response>>>, IpcExchangeError> {
         let (response_tx, response_rx) = mpsc::sync_channel(1);
         self.call_tx
             .send(IpcCall {
@@ -586,11 +681,75 @@ impl IpcTransport {
                 response_tx,
             })
             .map_err(|_| IpcExchangeError::Stopped)?;
-        match response_rx.recv_timeout(timeout) {
-            Ok(Ok(response)) => Ok(response),
-            Ok(Err(error)) => Err(IpcExchangeError::Io(error)),
-            Err(RecvTimeoutError::Timeout) => Err(IpcExchangeError::Timeout),
-            Err(RecvTimeoutError::Disconnected) => Err(IpcExchangeError::Stopped),
+        Ok(response_rx)
+    }
+}
+
+fn recv_ipc_response(
+    response_rx: &mpsc::Receiver<io::Result<Option<Response>>>,
+    timeout: Duration,
+) -> Result<Option<Response>, IpcExchangeError> {
+    match response_rx.recv_timeout(timeout) {
+        Ok(Ok(response)) => Ok(response),
+        Ok(Err(error)) => Err(IpcExchangeError::Io(error)),
+        Err(RecvTimeoutError::Timeout) => Err(IpcExchangeError::Timeout),
+        Err(RecvTimeoutError::Disconnected) => Err(IpcExchangeError::Stopped),
+    }
+}
+
+fn stream_frame_state(
+    request: &Request,
+    response: &Response,
+    completed_entries: &mut usize,
+) -> io::Result<bool> {
+    let expected_entries = match &request.body {
+        RequestBody::ProcessEntries(entries) => Some(entries.len()),
+        RequestBody::ProcessEntry(_) => Some(1),
+        _ => None,
+    };
+    let Some(expected_entries) = expected_entries else {
+        return Ok(true);
+    };
+    if response.request_id != request.id {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "streamed entry response has request ID {}, expected {}",
+                response.request_id, request.id
+            ),
+        ));
+    }
+    match &response.body {
+        ResponseBody::Error(_) => Ok(true),
+        // Older workers retain their one-frame ProcessEntry response.
+        ResponseBody::EntryProcessed(_)
+            if matches!(&request.body, RequestBody::ProcessEntry(_)) =>
+        {
+            *completed_entries = 1;
+            Ok(true)
+        }
+        ResponseBody::EntryProcessedChunk(chunk) => {
+            if matches!(&chunk.body, protocol::EntryProcessedChunkBody::End { .. }) {
+                *completed_entries = completed_entries.checked_add(1).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "entry response count overflow")
+                })?;
+                if *completed_entries > expected_entries {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "streamed entry response contains too many entry terminators",
+                    ));
+                }
+            }
+            Ok(*completed_entries == expected_entries)
+        }
+        other => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "streamed entry response has body {}, expected EntryProcessedChunk",
+                    response_kind(other)
+                ),
+            ));
         }
     }
 }
@@ -621,8 +780,10 @@ pub struct HistoricalRuntimeClient {
     next_request_id: u64,
     last_response_id: Option<u64>,
     current_slot: u64,
+    current_tick_height: u64,
     next_write_version: u64,
     snapshot_export_seal: Option<(u64, [u8; HASH_BYTES])>,
+    supports_entry_batches: bool,
     initialized: HistoricalInitialized,
     closed: bool,
 }
@@ -762,8 +923,10 @@ impl HistoricalRuntimeClient {
             next_request_id: 1,
             last_response_id: None,
             current_slot: 0,
+            current_tick_height: 0,
             next_write_version: 0,
             snapshot_export_seal: None,
+            supports_entry_batches: profile.backend_id == SOLANA_V1_0_7_BACKEND_ID,
             initialized: HistoricalInitialized {
                 genesis_hash: String::new(),
                 source: HistoricalInitializedSource::Genesis,
@@ -811,6 +974,19 @@ impl HistoricalRuntimeClient {
             Err(error) => return client.abort_after_response(error),
         };
         client.current_slot = client.initialized.slot;
+        client.current_tick_height = match client.initialized.source {
+            HistoricalInitializedSource::Genesis => 0,
+            HistoricalInitializedSource::SnapshotArchive => client
+                .initialized
+                .slot
+                .checked_add(1)
+                .and_then(|slots| slots.checked_mul(client.initialized.ticks_per_slot))
+                .ok_or_else(|| {
+                    HistoricalRuntimeError::InvalidEntryStream(
+                        "initialized tick height overflows u64".to_owned(),
+                    )
+                })?,
+        };
         client.next_write_version = client.initialized.next_write_version;
         Ok(client)
     }
@@ -823,6 +999,10 @@ impl HistoricalRuntimeClient {
 
     pub fn initialized(&self) -> &HistoricalInitialized {
         &self.initialized
+    }
+
+    pub fn supports_entry_batches(&self) -> bool {
+        self.supports_entry_batches
     }
 
     /// Process an entry whose transaction payloads are already canonical
@@ -839,44 +1019,429 @@ impl HistoricalRuntimeClient {
         hash: [u8; HASH_BYTES],
         transactions: Vec<Vec<u8>>,
     ) -> Result<HistoricalEntryProcessed, HistoricalRuntimeError> {
-        if slot < self.current_slot {
-            return Err(HistoricalRuntimeError::RequestedSlotRegression {
-                current: self.current_slot,
-                requested: slot,
-            });
-        }
-        let previous_slot = self.current_slot;
-        validate_encoded_transactions(&transactions)?;
         let transaction_count = transactions.len();
-        let body = self.exchange(RequestBody::ProcessEntry(protocol::EntryRequest {
+        let body = RequestBody::ProcessEntry(protocol::EntryRequest {
             slot,
             entry_index,
             num_hashes,
             hash: hash.to_vec(),
             transactions,
-        }))?;
-        let processed = match body {
-            ResponseBody::EntryProcessed(processed) => processed,
-            other => {
-                return self.abort_after_response(HistoricalRuntimeError::UnexpectedResponse {
-                    expected: "EntryProcessed",
-                    actual: response_kind(&other),
-                });
-            }
-        };
-        let processed = self.validate_processed_entry(
-            previous_slot,
+        });
+        validate_encoded_transactions(match &body {
+            RequestBody::ProcessEntry(entry) => &entry.transactions,
+            _ => unreachable!(),
+        })?;
+        validate_request_frame_size(&body)?;
+        let expected = vec![ExpectedEntryResponse {
             slot,
             entry_index,
             transaction_count,
-            processed,
-        );
-        let processed = match processed {
-            Ok(processed) => processed,
-            Err(error) => return self.abort_after_response(error),
+        }];
+        let mut collected = Vec::with_capacity(1);
+        let mut current = None;
+        let mut collected_bytes = 0usize;
+        self.process_entry_stream(body, expected, |item| {
+            collect_entry_stream_item(item, &mut current, &mut collected, &mut collected_bytes)
+        })?;
+        collected.pop().ok_or_else(|| {
+            HistoricalRuntimeError::InvalidEntryStream(
+                "single entry response ended without a result".to_owned(),
+            )
+        })
+    }
+
+    /// Process a bounded, canonically ordered entry batch in one lockstep RPC.
+    /// The v1.0.7 worker validates every entry and PoH segment before applying
+    /// the first bank mutation. Other historical profiles retain the original
+    /// one-entry protocol path and reject this API before sending a request.
+    #[allow(dead_code)]
+    pub fn process_entries(
+        &mut self,
+        entries: Vec<HistoricalEntryRequest>,
+    ) -> Result<Vec<HistoricalEntryProcessed>, HistoricalRuntimeError> {
+        let mut collected = Vec::with_capacity(entries.len());
+        let mut current = None;
+        let mut collected_bytes = 0usize;
+        self.process_entries_with(entries, |item| {
+            collect_entry_stream_item(item, &mut current, &mut collected, &mut collected_bytes)
+        })?;
+        Ok(collected)
+    }
+
+    pub fn process_entries_with<F>(
+        &mut self,
+        entries: Vec<HistoricalEntryRequest>,
+        emit: F,
+    ) -> Result<(), HistoricalRuntimeError>
+    where
+        F: FnMut(HistoricalEntryStreamItem) -> Result<(), String>,
+    {
+        if !self.supports_entry_batches {
+            return Err(HistoricalRuntimeError::EntryBatchUnsupported);
+        }
+        if entries.is_empty() {
+            return Err(HistoricalRuntimeError::EmptyEntryBatch);
+        }
+        if entries.len() > protocol::MAX_ENTRIES_PER_BATCH {
+            return Err(HistoricalRuntimeError::EntryBatchTooLarge {
+                actual: entries.len(),
+                limit: protocol::MAX_ENTRIES_PER_BATCH,
+            });
+        }
+
+        let mut requested_slot = self.current_slot;
+        let mut expected = Vec::with_capacity(entries.len());
+        let mut wire_entries = Vec::with_capacity(entries.len());
+        for entry in entries {
+            if entry.slot < requested_slot {
+                return Err(HistoricalRuntimeError::RequestedSlotRegression {
+                    current: requested_slot,
+                    requested: entry.slot,
+                });
+            }
+            validate_encoded_transactions(&entry.transactions)?;
+            expected.push(ExpectedEntryResponse {
+                slot: entry.slot,
+                entry_index: entry.entry_index,
+                transaction_count: entry.transactions.len(),
+            });
+            requested_slot = entry.slot;
+            wire_entries.push(protocol::EntryRequest {
+                slot: entry.slot,
+                entry_index: entry.entry_index,
+                num_hashes: entry.num_hashes,
+                hash: entry.hash.to_vec(),
+                transactions: entry.transactions,
+            });
+        }
+
+        let body = RequestBody::ProcessEntries(wire_entries);
+        validate_request_frame_size(&body)?;
+        self.process_entry_stream(body, expected, emit)
+    }
+
+    fn process_entry_stream<F>(
+        &mut self,
+        body: RequestBody,
+        expected: Vec<ExpectedEntryResponse>,
+        mut emit: F,
+    ) -> Result<(), HistoricalRuntimeError>
+    where
+        F: FnMut(HistoricalEntryStreamItem) -> Result<(), String>,
+    {
+        if self.closed {
+            return Err(HistoricalRuntimeError::Closed);
+        }
+        if let Some(first) = expected.first()
+            && first.slot < self.current_slot
+        {
+            return Err(HistoricalRuntimeError::RequestedSlotRegression {
+                current: self.current_slot,
+                requested: first.slot,
+            });
+        }
+        self.snapshot_export_seal = None;
+        let request_id = self.next_request_id;
+        self.next_request_id = request_id
+            .checked_add(1)
+            .ok_or(HistoricalRuntimeError::RequestIdOverflow)?;
+        let (operation, timeout) = self.timeouts.request(&body);
+        let response_rx = match self
+            .transport
+            .as_ref()
+            .ok_or(HistoricalRuntimeError::Closed)?
+            .start_exchange(Request {
+                id: request_id,
+                body,
+            }) {
+            Ok(receiver) => receiver,
+            Err(IpcExchangeError::Stopped) => {
+                self.abort_worker();
+                return Err(HistoricalRuntimeError::IpcStopped {
+                    operation,
+                    request_id,
+                });
+            }
+            Err(_) => unreachable!("start_exchange reports only Stopped"),
         };
-        self.current_slot = slot;
-        Ok(processed)
+
+        let started = Instant::now();
+        let mut completed = 0usize;
+        let mut next_sequence = 0u32;
+        let mut outcome_count = 0usize;
+        let mut writes_started = false;
+        let mut last_write_slot = None;
+        while completed < expected.len() {
+            let remaining = timeout
+                .checked_sub(started.elapsed())
+                .unwrap_or_else(|| Duration::from_secs(0));
+            let response = match recv_ipc_response(&response_rx, remaining) {
+                Ok(Some(response)) => response,
+                Ok(None) => {
+                    self.abort_worker();
+                    return Err(HistoricalRuntimeError::UnexpectedEof { request_id });
+                }
+                Err(IpcExchangeError::Io(error)) => {
+                    self.abort_worker();
+                    return Err(HistoricalRuntimeError::Io(error));
+                }
+                Err(IpcExchangeError::Timeout) => {
+                    self.abort_worker();
+                    return Err(HistoricalRuntimeError::RequestTimeout {
+                        operation,
+                        request_id,
+                        timeout,
+                    });
+                }
+                Err(IpcExchangeError::Stopped) => {
+                    self.abort_worker();
+                    return Err(HistoricalRuntimeError::IpcStopped {
+                        operation,
+                        request_id,
+                    });
+                }
+            };
+            match response.body {
+                ResponseBody::Error(error) => {
+                    return self.abort_after_response(HistoricalRuntimeError::Worker {
+                        code: error.code,
+                        message: error.message,
+                    });
+                }
+                ResponseBody::EntryProcessed(processed)
+                    if expected.len() == 1 && completed == 0 =>
+                {
+                    let expected_entry = expected[0];
+                    let processed = match self.validate_processed_entry(
+                        self.current_slot,
+                        expected_entry.slot,
+                        expected_entry.entry_index,
+                        expected_entry.transaction_count,
+                        processed,
+                    ) {
+                        Ok(processed) => processed,
+                        Err(error) => return self.abort_after_response(error),
+                    };
+                    let HistoricalEntryProcessed {
+                        slot,
+                        entry_index,
+                        outcomes,
+                        writes,
+                        tick_height,
+                        slot_complete,
+                        next_write_version,
+                    } = processed;
+                    if !outcomes.is_empty() {
+                        emit(HistoricalEntryStreamItem::Outcomes {
+                            slot,
+                            entry_index,
+                            outcomes,
+                        })
+                        .map_err(|message| {
+                            self.abort_worker();
+                            HistoricalRuntimeError::EntryStreamConsumer(message)
+                        })?;
+                    }
+                    if !writes.is_empty() {
+                        emit(HistoricalEntryStreamItem::Writes {
+                            slot,
+                            entry_index,
+                            writes,
+                        })
+                        .map_err(|message| {
+                            self.abort_worker();
+                            HistoricalRuntimeError::EntryStreamConsumer(message)
+                        })?;
+                    }
+                    emit(HistoricalEntryStreamItem::End {
+                        slot,
+                        entry_index,
+                        tick_height,
+                        slot_complete,
+                        next_write_version,
+                    })
+                    .map_err(|message| {
+                        self.abort_worker();
+                        HistoricalRuntimeError::EntryStreamConsumer(message)
+                    })?;
+                    completed = 1;
+                }
+                ResponseBody::EntryProcessedChunk(chunk) => {
+                    let expected_entry = expected[completed];
+                    if chunk.slot != expected_entry.slot
+                        || chunk.entry_index != expected_entry.entry_index
+                    {
+                        return self.abort_after_response(
+                            HistoricalRuntimeError::EntryIdentityMismatch {
+                                expected_slot: expected_entry.slot,
+                                expected_index: expected_entry.entry_index,
+                                actual_slot: chunk.slot,
+                                actual_index: chunk.entry_index,
+                            },
+                        );
+                    }
+                    if chunk.sequence != next_sequence {
+                        return self.abort_after_response(
+                            HistoricalRuntimeError::InvalidEntryStream(format!(
+                                "slot {} entry {} chunk sequence is {}, expected {}",
+                                chunk.slot, chunk.entry_index, chunk.sequence, next_sequence
+                            )),
+                        );
+                    }
+                    next_sequence = match next_sequence.checked_add(1) {
+                        Some(sequence) => sequence,
+                        None => {
+                            return self.abort_after_response(
+                                HistoricalRuntimeError::InvalidEntryStream(
+                                    "entry chunk sequence overflow".to_owned(),
+                                ),
+                            );
+                        }
+                    };
+                    match chunk.body {
+                        protocol::EntryProcessedChunkBody::Outcomes(outcomes) => {
+                            if writes_started || outcomes.is_empty() {
+                                return self.abort_after_response(
+                                    HistoricalRuntimeError::InvalidEntryStream(
+                                        "empty or out-of-order outcome chunk".to_owned(),
+                                    ),
+                                );
+                            }
+                            outcome_count = match outcome_count.checked_add(outcomes.len()) {
+                                Some(count) if count <= expected_entry.transaction_count => count,
+                                _ => {
+                                    return self.abort_after_response(
+                                        HistoricalRuntimeError::OutcomeCountMismatch {
+                                            expected: expected_entry.transaction_count,
+                                            actual: outcome_count.saturating_add(outcomes.len()),
+                                        },
+                                    );
+                                }
+                            };
+                            let outcomes = match normalize_outcomes(outcomes) {
+                                Ok(outcomes) => outcomes,
+                                Err(error) => return self.abort_after_response(error),
+                            };
+                            if let Err(message) = emit(HistoricalEntryStreamItem::Outcomes {
+                                slot: chunk.slot,
+                                entry_index: chunk.entry_index,
+                                outcomes,
+                            }) {
+                                self.abort_worker();
+                                return Err(HistoricalRuntimeError::EntryStreamConsumer(message));
+                            }
+                        }
+                        protocol::EntryProcessedChunkBody::Writes(writes) => {
+                            if writes.is_empty() {
+                                return self.abort_after_response(
+                                    HistoricalRuntimeError::InvalidEntryStream(
+                                        "empty account-write chunk".to_owned(),
+                                    ),
+                                );
+                            }
+                            if outcome_count != expected_entry.transaction_count {
+                                return self.abort_after_response(
+                                    HistoricalRuntimeError::OutcomeCountMismatch {
+                                        expected: expected_entry.transaction_count,
+                                        actual: outcome_count,
+                                    },
+                                );
+                            }
+                            writes_started = true;
+                            let writes = match validate_entry_writes(
+                                writes,
+                                self.current_slot,
+                                expected_entry.slot,
+                            ) {
+                                Ok(writes) => writes,
+                                Err(error) => return self.abort_after_response(error),
+                            };
+                            if let (Some(previous), Some(first)) =
+                                (last_write_slot, writes.first().map(|write| write.slot))
+                                && first < previous
+                            {
+                                return self.abort_after_response(
+                                    HistoricalRuntimeError::AccountWriteSlotOrder {
+                                        previous,
+                                        actual: first,
+                                    },
+                                );
+                            }
+                            last_write_slot = writes.last().map(|write| write.slot);
+                            let reported_next = writes
+                                .last()
+                                .and_then(|write| write.write_version.checked_add(1))
+                                .ok_or_else(|| {
+                                    HistoricalRuntimeError::InvalidEntryStream(
+                                        "account write version overflow".to_owned(),
+                                    )
+                                });
+                            let reported_next = match reported_next {
+                                Ok(next) => next,
+                                Err(error) => return self.abort_after_response(error),
+                            };
+                            if let Err(error) = self.validate_write_stream(&writes, reported_next) {
+                                return self.abort_after_response(error);
+                            }
+                            if let Err(message) = emit(HistoricalEntryStreamItem::Writes {
+                                slot: chunk.slot,
+                                entry_index: chunk.entry_index,
+                                writes,
+                            }) {
+                                self.abort_worker();
+                                return Err(HistoricalRuntimeError::EntryStreamConsumer(message));
+                            }
+                        }
+                        protocol::EntryProcessedChunkBody::End {
+                            tick_height,
+                            slot_complete,
+                            next_write_version,
+                        } => {
+                            if outcome_count != expected_entry.transaction_count {
+                                return self.abort_after_response(
+                                    HistoricalRuntimeError::OutcomeCountMismatch {
+                                        expected: expected_entry.transaction_count,
+                                        actual: outcome_count,
+                                    },
+                                );
+                            }
+                            if let Err(error) = self.validate_write_stream(&[], next_write_version)
+                            {
+                                return self.abort_after_response(error);
+                            }
+                            if let Err(error) =
+                                self.validate_entry_end(expected_entry, tick_height, slot_complete)
+                            {
+                                return self.abort_after_response(error);
+                            }
+                            if let Err(message) = emit(HistoricalEntryStreamItem::End {
+                                slot: chunk.slot,
+                                entry_index: chunk.entry_index,
+                                tick_height,
+                                slot_complete,
+                                next_write_version,
+                            }) {
+                                self.abort_worker();
+                                return Err(HistoricalRuntimeError::EntryStreamConsumer(message));
+                            }
+                            completed += 1;
+                            next_sequence = 0;
+                            outcome_count = 0;
+                            writes_started = false;
+                            last_write_slot = None;
+                        }
+                    }
+                }
+                other => {
+                    return self.abort_after_response(HistoricalRuntimeError::UnexpectedResponse {
+                        expected: "EntryProcessedChunk",
+                        actual: response_kind(&other),
+                    });
+                }
+            }
+        }
+        self.last_response_id = Some(request_id);
+        Ok(())
     }
 
     pub fn freeze_checkpoint(
@@ -1146,19 +1711,7 @@ impl HistoricalRuntimeClient {
                 actual: processed.outcomes.len(),
             });
         }
-        let outcomes = processed
-            .outcomes
-            .into_iter()
-            .map(|outcome| {
-                Ok(HistoricalTransactionOutcome {
-                    signature: outcome
-                        .signature
-                        .map(|bytes| array_64("transaction_outcome.signature", bytes))
-                        .transpose()?,
-                    error: outcome.error,
-                })
-            })
-            .collect::<Result<Vec<_>, HistoricalRuntimeError>>()?;
+        let outcomes = normalize_outcomes(processed.outcomes)?;
         let writes = validate_entry_writes(processed.writes, previous_slot, expected_slot)?;
         let validated = HistoricalEntryProcessed {
             slot: processed.slot,
@@ -1170,7 +1723,81 @@ impl HistoricalRuntimeClient {
             next_write_version: processed.next_write_version,
         };
         self.validate_write_stream(&validated.writes, validated.next_write_version)?;
+        self.validate_entry_end(
+            ExpectedEntryResponse {
+                slot: expected_slot,
+                entry_index: expected_index,
+                transaction_count,
+            },
+            validated.tick_height,
+            validated.slot_complete,
+        )?;
         Ok(validated)
+    }
+
+    fn validate_entry_end(
+        &mut self,
+        expected: ExpectedEntryResponse,
+        actual_tick_height: u64,
+        actual_complete: bool,
+    ) -> Result<(), HistoricalRuntimeError> {
+        let current_max_tick_height = self
+            .current_slot
+            .checked_add(1)
+            .and_then(|slots| slots.checked_mul(self.initialized.ticks_per_slot))
+            .ok_or_else(|| {
+                HistoricalRuntimeError::InvalidEntryStream(
+                    "current slot tick limit overflow".to_owned(),
+                )
+            })?;
+        if expected.slot > self.current_slot {
+            if self.current_tick_height != current_max_tick_height {
+                return Err(HistoricalRuntimeError::InvalidEntryStream(format!(
+                    "entry advances from incomplete slot {} at tick height {} (slot completes at {})",
+                    self.current_slot, self.current_tick_height, current_max_tick_height
+                )));
+            }
+        } else if self.current_tick_height == current_max_tick_height {
+            return Err(HistoricalRuntimeError::InvalidEntryStream(format!(
+                "entry follows completed slot {} at tick height {}",
+                self.current_slot, self.current_tick_height
+            )));
+        }
+        let expected_tick_height = self
+            .current_tick_height
+            .checked_add(u64::from(expected.transaction_count == 0))
+            .ok_or_else(|| {
+                HistoricalRuntimeError::InvalidEntryStream("tick height overflow".to_owned())
+            })?;
+        if actual_tick_height != expected_tick_height {
+            return Err(HistoricalRuntimeError::EntryTickHeightMismatch {
+                expected: expected_tick_height,
+                actual: actual_tick_height,
+            });
+        }
+        let max_tick_height = expected
+            .slot
+            .checked_add(1)
+            .and_then(|slots| slots.checked_mul(self.initialized.ticks_per_slot))
+            .ok_or_else(|| {
+                HistoricalRuntimeError::InvalidEntryStream("slot tick limit overflow".to_owned())
+            })?;
+        if expected_tick_height > max_tick_height {
+            return Err(HistoricalRuntimeError::EntryTickHeightMismatch {
+                expected: max_tick_height,
+                actual: expected_tick_height,
+            });
+        }
+        let expected_complete = expected_tick_height == max_tick_height;
+        if actual_complete != expected_complete {
+            return Err(HistoricalRuntimeError::EntryCompletionMismatch {
+                expected: expected_complete,
+                actual: actual_complete,
+            });
+        }
+        self.current_slot = expected.slot;
+        self.current_tick_height = expected_tick_height;
+        Ok(())
     }
 
     fn validate_write_stream(
@@ -1185,6 +1812,120 @@ impl HistoricalRuntimeClient {
         )?;
         Ok(())
     }
+}
+
+fn normalize_outcomes(
+    outcomes: Vec<protocol::TransactionOutcome>,
+) -> Result<Vec<HistoricalTransactionOutcome>, HistoricalRuntimeError> {
+    outcomes
+        .into_iter()
+        .map(|outcome| {
+            Ok(HistoricalTransactionOutcome {
+                signature: outcome
+                    .signature
+                    .map(|bytes| array_64("transaction_outcome.signature", bytes))
+                    .transpose()?,
+                error: outcome.error,
+            })
+        })
+        .collect()
+}
+
+fn collect_entry_stream_item(
+    item: HistoricalEntryStreamItem,
+    current: &mut Option<HistoricalEntryProcessed>,
+    collected: &mut Vec<HistoricalEntryProcessed>,
+    collected_bytes: &mut usize,
+) -> Result<(), String> {
+    match item {
+        HistoricalEntryStreamItem::Outcomes {
+            slot,
+            entry_index,
+            outcomes,
+        } => {
+            add_collected_bytes(collected_bytes, outcomes.len().saturating_mul(256))?;
+            collected_entry(current, slot, entry_index)?
+                .outcomes
+                .extend(outcomes);
+        }
+        HistoricalEntryStreamItem::Writes {
+            slot,
+            entry_index,
+            writes,
+        } => {
+            let bytes = writes.iter().try_fold(0usize, |total, write| {
+                total
+                    .checked_add(write.data.len())
+                    .and_then(|total| total.checked_add(256))
+                    .ok_or_else(|| "collected entry response size overflow".to_owned())
+            })?;
+            add_collected_bytes(collected_bytes, bytes)?;
+            collected_entry(current, slot, entry_index)?
+                .writes
+                .extend(writes);
+        }
+        HistoricalEntryStreamItem::End {
+            slot,
+            entry_index,
+            tick_height,
+            slot_complete,
+            next_write_version,
+        } => {
+            let mut entry = current.take().unwrap_or(HistoricalEntryProcessed {
+                slot,
+                entry_index,
+                outcomes: Vec::new(),
+                writes: Vec::new(),
+                tick_height,
+                slot_complete,
+                next_write_version,
+            });
+            if entry.slot != slot || entry.entry_index != entry_index {
+                return Err("entry stream identity changed before End".to_owned());
+            }
+            entry.tick_height = tick_height;
+            entry.slot_complete = slot_complete;
+            entry.next_write_version = next_write_version;
+            collected.push(entry);
+        }
+    }
+    Ok(())
+}
+
+fn collected_entry(
+    current: &mut Option<HistoricalEntryProcessed>,
+    slot: u64,
+    entry_index: u64,
+) -> Result<&mut HistoricalEntryProcessed, String> {
+    if current.is_none() {
+        *current = Some(HistoricalEntryProcessed {
+            slot,
+            entry_index,
+            outcomes: Vec::new(),
+            writes: Vec::new(),
+            tick_height: 0,
+            slot_complete: false,
+            next_write_version: 0,
+        });
+    }
+    let entry = current.as_mut().expect("initialized above");
+    if entry.slot != slot || entry.entry_index != entry_index {
+        return Err("entry stream identity changed between chunks".to_owned());
+    }
+    Ok(entry)
+}
+
+fn add_collected_bytes(total: &mut usize, additional: usize) -> Result<(), String> {
+    *total = total
+        .checked_add(additional)
+        .ok_or_else(|| "collected entry response size overflow".to_owned())?;
+    if *total > protocol::MAX_FRAME_BYTES {
+        return Err(format!(
+            "collected entry responses exceed the {}-byte compatibility limit",
+            protocol::MAX_FRAME_BYTES
+        ));
+    }
+    Ok(())
 }
 
 impl Drop for HistoricalRuntimeClient {
@@ -2168,6 +2909,11 @@ fn validate_initialized(
             actual: initialized.slot,
         });
     }
+    if initialized.ticks_per_slot == 0 {
+        return Err(HistoricalRuntimeError::InitializedSourceMismatch(
+            "worker reported zero ticks per slot".to_owned(),
+        ));
+    }
     let source = match (&initialized.source, expected_source) {
         (
             InitializedSource::SnapshotArchive {
@@ -2235,6 +2981,21 @@ fn validate_encoded_transactions(transactions: &[Vec<u8>]) -> Result<(), Histori
     Ok(())
 }
 
+fn validate_request_frame_size(body: &RequestBody) -> Result<(), HistoricalRuntimeError> {
+    // Request is encoded as its u64 ID followed by RequestBody under the
+    // protocol's fixed-integer bincode configuration.
+    let body_bytes =
+        bincode::serialized_size(body).map_err(HistoricalRuntimeError::RequestSerialization)?;
+    let bytes = body_bytes.checked_add(8).unwrap_or(u64::MAX);
+    if bytes > protocol::MAX_FRAME_BYTES as u64 {
+        return Err(HistoricalRuntimeError::RequestFrameTooLarge {
+            bytes,
+            limit: protocol::MAX_FRAME_BYTES,
+        });
+    }
+    Ok(())
+}
+
 fn validate_account_write(
     write: protocol::AccountWrite,
     expected_slot: u64,
@@ -2244,6 +3005,13 @@ fn validate_account_write(
             expected: expected_slot,
             actual: write.slot,
         });
+    }
+    if write.data.len() > MAX_HISTORICAL_ACCOUNT_DATA_BYTES {
+        return Err(HistoricalRuntimeError::InvalidEntryStream(format!(
+            "account write data is {} bytes, v1.0.7 limit is {}",
+            write.data.len(),
+            MAX_HISTORICAL_ACCOUNT_DATA_BYTES
+        )));
     }
     Ok(HistoricalAccountWrite {
         slot: write.slot,
@@ -2433,6 +3201,7 @@ fn response_kind(body: &ResponseBody) -> &'static str {
         ResponseBody::ShuttingDown => "ShuttingDown",
         ResponseBody::Error(_) => "Error",
         ResponseBody::SnapshotExported(_) => "SnapshotExported",
+        ResponseBody::EntryProcessedChunk(_) => "EntryProcessedChunk",
     }
 }
 
@@ -2442,6 +3211,172 @@ mod tests {
     use solana_transaction::{Address, Signature, Transaction};
 
     type HandshakeMutation = (&'static str, fn(&mut protocol::Handshake));
+
+    fn batch_request(entry_count: usize) -> Request {
+        Request {
+            id: 41,
+            body: RequestBody::ProcessEntries(
+                (0..entry_count)
+                    .map(|entry_index| protocol::EntryRequest {
+                        slot: 3,
+                        entry_index: entry_index as u64,
+                        num_hashes: 1,
+                        hash: vec![0; HASH_BYTES],
+                        transactions: Vec::new(),
+                    })
+                    .collect(),
+            ),
+        }
+    }
+
+    fn wire_entry_chunk(
+        request_id: u64,
+        slot: u64,
+        entry_index: u64,
+        sequence: u32,
+        body: protocol::EntryProcessedChunkBody,
+    ) -> Response {
+        Response {
+            request_id,
+            body: ResponseBody::EntryProcessedChunk(protocol::EntryProcessedChunk {
+                slot,
+                entry_index,
+                sequence,
+                body,
+            }),
+        }
+    }
+
+    fn wire_entry_end(
+        request_id: u64,
+        slot: u64,
+        entry_index: u64,
+        sequence: u32,
+        tick_height: u64,
+        slot_complete: bool,
+        next_write_version: u64,
+    ) -> Response {
+        wire_entry_chunk(
+            request_id,
+            slot,
+            entry_index,
+            sequence,
+            protocol::EntryProcessedChunkBody::End {
+                tick_height,
+                slot_complete,
+                next_write_version,
+            },
+        )
+    }
+
+    fn response_frames(responses: &[Response]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for response in responses {
+            protocol::write_frame(&mut bytes, response).unwrap();
+        }
+        bytes
+    }
+
+    fn wire_account_write(slot: u64, write_version: u64) -> protocol::AccountWrite {
+        protocol::AccountWrite {
+            slot,
+            write_version,
+            transaction_signature: None,
+            pubkey: vec![2; HASH_BYTES],
+            lamports: 1,
+            owner: vec![3; HASH_BYTES],
+            executable: false,
+            rent_epoch: 0,
+            data: vec![4],
+            stored_hash: vec![5; HASH_BYTES],
+        }
+    }
+
+    #[test]
+    fn ipc_batch_stream_tracks_ordered_multi_frame_completion() {
+        let request = batch_request(2);
+        let bytes = response_frames(&[
+            wire_entry_end(request.id, 3, 0, 0, 1, false, 0),
+            wire_entry_chunk(
+                request.id,
+                3,
+                1,
+                0,
+                protocol::EntryProcessedChunkBody::Outcomes(vec![protocol::TransactionOutcome {
+                    signature: None,
+                    error: None,
+                }]),
+            ),
+            wire_entry_end(request.id, 3, 1, 1, 2, false, 0),
+        ]);
+        let mut input = bytes.as_slice();
+        let mut completed = 0;
+
+        let first = protocol::read_frame::<Response, _>(&mut input)
+            .unwrap()
+            .unwrap();
+        assert!(!stream_frame_state(&request, &first, &mut completed).unwrap());
+        assert_eq!(completed, 1);
+
+        let second = protocol::read_frame::<Response, _>(&mut input)
+            .unwrap()
+            .unwrap();
+        assert!(!stream_frame_state(&request, &second, &mut completed).unwrap());
+        assert_eq!(completed, 1);
+
+        let third = protocol::read_frame::<Response, _>(&mut input)
+            .unwrap()
+            .unwrap();
+        assert!(stream_frame_state(&request, &third, &mut completed).unwrap());
+        assert_eq!(completed, 2);
+        assert!(input.is_empty());
+    }
+
+    #[test]
+    fn ipc_batch_stream_stops_immediately_on_early_error() {
+        let request = batch_request(3);
+        let bytes = response_frames(&[
+            wire_entry_end(request.id, 3, 0, 0, 1, false, 0),
+            Response {
+                request_id: request.id,
+                body: ResponseBody::Error(protocol::WorkerError {
+                    code: protocol::WorkerErrorCode::Runtime,
+                    message: "commit failed".to_owned(),
+                }),
+            },
+            wire_entry_end(request.id, 3, 2, 0, 2, false, 0),
+        ]);
+        let mut input = bytes.as_slice();
+        let mut completed = 0;
+
+        let first = protocol::read_frame::<Response, _>(&mut input)
+            .unwrap()
+            .unwrap();
+        assert!(!stream_frame_state(&request, &first, &mut completed).unwrap());
+
+        let error = protocol::read_frame::<Response, _>(&mut input)
+            .unwrap()
+            .unwrap();
+        assert!(stream_frame_state(&request, &error, &mut completed).unwrap());
+        assert!(matches!(error.body, ResponseBody::Error(_)));
+        assert!(
+            !input.is_empty(),
+            "caller consumed a frame after terminal Error"
+        );
+    }
+
+    #[test]
+    fn ipc_batch_stream_rejects_wrong_request_id() {
+        let request = batch_request(1);
+        let bytes = response_frames(&[wire_entry_end(request.id + 1, 3, 0, 0, 1, false, 0)]);
+        let response = protocol::read_frame::<Response, _>(&mut bytes.as_slice())
+            .unwrap()
+            .unwrap();
+        let mut completed = 0;
+        let error = stream_frame_state(&request, &response, &mut completed).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("request ID 42, expected 41"));
+    }
 
     fn initialized_from(source: InitializedSource, slot: u64) -> protocol::Initialized {
         protocol::Initialized {
@@ -2656,6 +3591,16 @@ mod tests {
             ("process-entry", DEFAULT_ENTRY_TIMEOUT)
         );
         assert_eq!(
+            timeouts.request(&RequestBody::ProcessEntries(vec![protocol::EntryRequest {
+                slot: 1,
+                entry_index: 0,
+                num_hashes: 0,
+                hash: vec![0; HASH_BYTES],
+                transactions: Vec::new(),
+            }])),
+            ("process-entries", DEFAULT_ENTRY_TIMEOUT)
+        );
+        assert_eq!(
             timeouts.request(&RequestBody::FreezeCheckpoint { slot: 1 }),
             ("freeze-checkpoint", DEFAULT_CHECKPOINT_TIMEOUT)
         );
@@ -2714,14 +3659,16 @@ mod tests {
             next_request_id: 1,
             last_response_id: None,
             current_slot: 0,
+            current_tick_height: 0,
             next_write_version: 0,
             snapshot_export_seal: None,
+            supports_entry_batches: true,
             initialized: HistoricalInitialized {
                 genesis_hash: String::new(),
                 source: HistoricalInitializedSource::Genesis,
                 slot: 0,
                 last_blockhash: [0; HASH_BYTES],
-                ticks_per_slot: 0,
+                ticks_per_slot: 2,
                 next_write_version: 0,
             },
             closed: false,
@@ -2731,8 +3678,15 @@ mod tests {
 
     #[cfg(unix)]
     fn client_with_response(response: &Response) -> (HistoricalRuntimeClient, u32) {
+        client_with_responses(std::slice::from_ref(response))
+    }
+
+    #[cfg(unix)]
+    fn client_with_responses(responses: &[Response]) -> (HistoricalRuntimeClient, u32) {
         let mut response_bytes = Vec::new();
-        protocol::write_frame(&mut response_bytes, response).unwrap();
+        for response in responses {
+            protocol::write_frame(&mut response_bytes, response).unwrap();
+        }
         scripted_response_client(&response_bytes)
     }
 
@@ -2862,6 +3816,204 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn entry_batch_response_is_validated_and_preserves_wire_order() {
+        let (mut client, _child_id) = client_with_responses(&[
+            wire_entry_end(1, 0, 0, 0, 1, false, 0),
+            wire_entry_end(1, 0, 1, 0, 2, true, 0),
+        ]);
+        let processed = client
+            .process_entries(vec![
+                HistoricalEntryRequest {
+                    slot: 0,
+                    entry_index: 0,
+                    num_hashes: 1,
+                    hash: [7; HASH_BYTES],
+                    transactions: Vec::new(),
+                },
+                HistoricalEntryRequest {
+                    slot: 0,
+                    entry_index: 1,
+                    num_hashes: 1,
+                    hash: [8; HASH_BYTES],
+                    transactions: Vec::new(),
+                },
+            ])
+            .unwrap();
+        assert_eq!(processed.len(), 2);
+        assert_eq!(processed[0].entry_index, 0);
+        assert_eq!(processed[0].tick_height, 1);
+        assert_eq!(processed[1].entry_index, 1);
+        assert_eq!(processed[1].tick_height, 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn entry_batch_rejects_incorrect_tick_height() {
+        let (mut client, child_id) = client_with_response(&wire_entry_end(1, 0, 0, 0, 2, true, 0));
+
+        assert!(matches!(
+            client.process_entries(vec![HistoricalEntryRequest {
+                slot: 0,
+                entry_index: 0,
+                num_hashes: 1,
+                hash: [7; HASH_BYTES],
+                transactions: Vec::new(),
+            }]),
+            Err(HistoricalRuntimeError::EntryTickHeightMismatch {
+                expected: 1,
+                actual: 2,
+            })
+        ));
+        assert_client_poisoned_and_worker_reaped(&mut client, child_id);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn entry_batch_rejects_incorrect_slot_completion() {
+        let (mut client, child_id) = client_with_response(&wire_entry_end(1, 0, 0, 0, 1, true, 0));
+
+        assert!(matches!(
+            client.process_entries(vec![HistoricalEntryRequest {
+                slot: 0,
+                entry_index: 0,
+                num_hashes: 1,
+                hash: [7; HASH_BYTES],
+                transactions: Vec::new(),
+            }]),
+            Err(HistoricalRuntimeError::EntryCompletionMismatch {
+                expected: false,
+                actual: true,
+            })
+        ));
+        assert_client_poisoned_and_worker_reaped(&mut client, child_id);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn entry_batch_rejects_advancing_from_an_incomplete_slot() {
+        let (mut client, child_id) = client_with_response(&wire_entry_end(1, 1, 0, 0, 1, false, 0));
+
+        assert!(matches!(
+            client.process_entries(vec![HistoricalEntryRequest {
+                slot: 1,
+                entry_index: 0,
+                num_hashes: 1,
+                hash: [7; HASH_BYTES],
+                transactions: Vec::new(),
+            }]),
+            Err(HistoricalRuntimeError::InvalidEntryStream(message))
+                if message.contains("advances from incomplete slot")
+        ));
+        assert_client_poisoned_and_worker_reaped(&mut client, child_id);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writes_before_all_outcomes_are_not_emitted() {
+        let (mut client, child_id) = client_with_response(&wire_entry_chunk(
+            1,
+            0,
+            0,
+            0,
+            protocol::EntryProcessedChunkBody::Writes(vec![wire_account_write(0, 0)]),
+        ));
+        let mut sink_calls = 0usize;
+
+        let error = client
+            .process_entries_with(
+                vec![HistoricalEntryRequest {
+                    slot: 0,
+                    entry_index: 0,
+                    num_hashes: 1,
+                    hash: [7; HASH_BYTES],
+                    transactions: vec![vec![1]],
+                }],
+                |_| {
+                    sink_calls += 1;
+                    Ok(())
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            HistoricalRuntimeError::OutcomeCountMismatch {
+                expected: 1,
+                actual: 0,
+            }
+        ));
+        assert_eq!(sink_calls, 0);
+        assert_client_poisoned_and_worker_reaped(&mut client, child_id);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn malformed_entry_batch_body_poisons_client() {
+        let (mut client, child_id) = client_with_response(&Response {
+            request_id: 1,
+            body: ResponseBody::Pong,
+        });
+        assert!(matches!(
+            client.process_entries(vec![HistoricalEntryRequest {
+                slot: 0,
+                entry_index: 0,
+                num_hashes: 1,
+                hash: [7; HASH_BYTES],
+                transactions: Vec::new(),
+            }]),
+            Err(HistoricalRuntimeError::Io(_))
+        ));
+        assert_client_poisoned_and_worker_reaped(&mut client, child_id);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_entry_batch_frame_times_out_and_poisons_client() {
+        let (mut client, child_id) = scripted_response_client(&[]);
+        client.timeouts.entry = Duration::from_millis(50);
+        assert!(matches!(
+            client.process_entries(vec![HistoricalEntryRequest {
+                slot: 0,
+                entry_index: 0,
+                num_hashes: 1,
+                hash: [7; HASH_BYTES],
+                transactions: Vec::new(),
+            }]),
+            Err(HistoricalRuntimeError::RequestTimeout {
+                operation: "process-entries",
+                ..
+            })
+        ));
+        assert_client_poisoned_and_worker_reaped(&mut client, child_id);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extra_entry_batch_frame_is_rejected_by_the_next_exchange() {
+        let (mut client, child_id) = client_with_responses(&[
+            wire_entry_end(1, 0, 0, 0, 1, false, 0),
+            wire_entry_end(1, 0, 0, 0, 1, false, 0),
+        ]);
+        client
+            .process_entries(vec![HistoricalEntryRequest {
+                slot: 0,
+                entry_index: 0,
+                num_hashes: 1,
+                hash: [7; HASH_BYTES],
+                transactions: Vec::new(),
+            }])
+            .unwrap();
+        assert!(matches!(
+            client.ping(),
+            Err(HistoricalRuntimeError::NonMonotonicResponseId {
+                previous: 1,
+                actual: 1,
+            })
+        ));
+        assert_client_poisoned_and_worker_reaped(&mut client, child_id);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn timed_out_ipc_terminates_and_reaps_worker() {
         let mut child = sleeping_child();
         let stdin = child.stdin.take().unwrap();
@@ -2880,14 +4032,16 @@ mod tests {
             next_request_id: 1,
             last_response_id: None,
             current_slot: 0,
+            current_tick_height: 0,
             next_write_version: 0,
             snapshot_export_seal: None,
+            supports_entry_batches: false,
             initialized: HistoricalInitialized {
                 genesis_hash: String::new(),
                 source: HistoricalInitializedSource::Genesis,
                 slot: 0,
                 last_blockhash: [0; HASH_BYTES],
-                ticks_per_slot: 0,
+                ticks_per_slot: 2,
                 next_write_version: 0,
             },
             closed: false,

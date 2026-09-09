@@ -607,6 +607,12 @@ struct MergeVisitor<'a, W: Write> {
     source_index: usize,
     normalization: WriteVersionNormalization,
     next_raw_write_version: u64,
+    /// Source wire order groups writes by semantic owner. AccountsDB's raw
+    /// write versions can therefore be a permutation within one slot (for
+    /// example, failed-transaction fee debits are physically stored after
+    /// later successful transactions). Keep only the current slot's versions
+    /// and validate their exact sorted run at the slot boundary.
+    slot_write_versions: Vec<u64>,
     account_updates: u64,
     current_slot: u64,
     current_is_block: bool,
@@ -640,6 +646,7 @@ impl<'a, W: Write> MergeVisitor<'a, W> {
             source_index,
             normalization,
             next_raw_write_version: normalization.worker_start,
+            slot_write_versions: Vec::new(),
             account_updates: 0,
             current_slot: 0,
             current_is_block: false,
@@ -715,15 +722,6 @@ impl<'a, W: Write> MergeVisitor<'a, W> {
             });
             return None;
         }
-        if raw != self.next_raw_write_version {
-            self.error = Some(MultiSegmentMergeError::NonContiguousWriteVersion {
-                index: self.source_index,
-                slot,
-                expected: self.next_raw_write_version,
-                actual: raw,
-            });
-            return None;
-        }
         let Some(mapped) = self.normalization.normalize(raw) else {
             self.error = Some(MultiSegmentMergeError::WriteVersionMappingOverflow {
                 index: self.source_index,
@@ -731,12 +729,36 @@ impl<'a, W: Write> MergeVisitor<'a, W> {
             });
             return None;
         };
-        self.next_raw_write_version = raw + 1;
+        self.slot_write_versions.push(raw);
         self.account_updates += 1;
         Some(mapped)
     }
 
-    fn finish(self, expected_terminal_hash: Hash) -> Result<u64, MultiSegmentMergeError> {
+    fn finish_slot_write_versions(&mut self) {
+        if self.error.is_some() || self.slot_write_versions.is_empty() {
+            return;
+        }
+        self.slot_write_versions.sort_unstable();
+        for index in 0..self.slot_write_versions.len() {
+            let raw = self.slot_write_versions[index];
+            if raw != self.next_raw_write_version {
+                self.error = Some(MultiSegmentMergeError::NonContiguousWriteVersion {
+                    index: self.source_index,
+                    slot: self.current_slot,
+                    expected: self.next_raw_write_version,
+                    actual: raw,
+                });
+                break;
+            }
+            // `raw < worker_end_exclusive` was checked on receipt, so this
+            // cannot overflow even when the declared end is `u64::MAX`.
+            self.next_raw_write_version = raw + 1;
+        }
+        self.slot_write_versions.clear();
+    }
+
+    fn finish(mut self, expected_terminal_hash: Hash) -> Result<u64, MultiSegmentMergeError> {
+        self.finish_slot_write_versions();
         if let Some(error) = self.error {
             return Err(error);
         }
@@ -761,6 +783,7 @@ impl<'a, W: Write> MergeVisitor<'a, W> {
 
 impl<W: Write> SlotVisitor for MergeVisitor<'_, W> {
     fn on_slot_start(&mut self, slot: u64, kind: SlotKind) {
+        self.finish_slot_write_versions();
         if self.error.is_some() {
             return;
         }
@@ -909,6 +932,7 @@ impl<W: Write> SlotVisitor for MergeVisitor<'_, W> {
     }
 
     fn on_block(&mut self, notification: &BlockNotification, entries: &[EntryRecord]) {
+        self.finish_slot_write_versions();
         if self.error.is_some() {
             return;
         }
@@ -1437,6 +1461,29 @@ mod tests {
                 slot: FIRST_SLOT
             })
         ));
+    }
+
+    #[test]
+    fn merge_accepts_per_slot_write_version_permutations_and_preserves_wire_order() {
+        let provenance = fixture_provenance();
+        let mut sources = fixture_sources(&provenance);
+        sources[0] = write_source(
+            &provenance,
+            0,
+            &[10, 13, 11, 12],
+            hash(0x10),
+            hash(0x20),
+            Some(source_provenance(&provenance, 0).into()),
+        );
+
+        let (output, stats) = merge(sources, &provenance).unwrap();
+        assert_eq!(stats.account_updates_rebased, 5);
+        let mut reader = ArchiveReader::open(Cursor::new(output)).unwrap();
+        let mut collector = WriteVersionCollector::default();
+        for bucket in 0..reader.bucket_count() {
+            reader.read_bucket(bucket, &mut collector).unwrap();
+        }
+        assert_eq!(collector.versions, vec![1_000, 1_003, 1_001, 1_002, 1_004]);
     }
 
     #[test]

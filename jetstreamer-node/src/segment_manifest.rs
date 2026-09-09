@@ -468,6 +468,13 @@ struct SegmentValidationVisitor {
     next_slot: u64,
     expected_writes: Range<u64>,
     next_write: u64,
+    current_slot: Option<u64>,
+    /// Wire order groups updates by owning transaction, while AccountsDB
+    /// assigns write versions in physical store order.  Those orders can
+    /// differ within a slot (notably when a failed transaction's fee debit is
+    /// stored after later successful transactions), so validate the exact
+    /// per-slot set instead of requiring callback order to be monotonic.
+    slot_writes: Vec<u64>,
     error: Option<String>,
 }
 
@@ -477,6 +484,8 @@ impl SegmentValidationVisitor {
             next_slot,
             next_write: expected_writes.start,
             expected_writes,
+            current_slot: None,
+            slot_writes: Vec::new(),
             error: None,
         }
     }
@@ -485,24 +494,50 @@ impl SegmentValidationVisitor {
         if self.error.is_some() {
             return;
         }
-        if write_version != self.next_write || write_version >= self.expected_writes.end {
+        if self.current_slot != Some(slot) {
             self.error = Some(format!(
-                "account update at slot {slot} has raw write version {write_version}, expected {} within {}..{}",
-                self.next_write, self.expected_writes.start, self.expected_writes.end
+                "account update callback for slot {slot} occurred while validating slot {:?}",
+                self.current_slot
             ));
             return;
         }
-        match self.next_write.checked_add(1) {
-            Some(next) => self.next_write = next,
-            None => {
-                self.error = Some(format!(
-                    "account update at slot {slot} overflows raw write-version cursor"
-                ))
-            }
+        if write_version < self.expected_writes.start || write_version >= self.expected_writes.end {
+            self.error = Some(format!(
+                "account update at slot {slot} has raw write version {write_version} outside {}..{}",
+                self.expected_writes.start, self.expected_writes.end
+            ));
+            return;
         }
+        self.slot_writes.push(write_version);
     }
 
-    fn finish(&self) -> Result<(), SegmentManifestError> {
+    fn finish_slot_writes(&mut self) {
+        if self.error.is_some() || self.slot_writes.is_empty() {
+            return;
+        }
+        let slot = self
+            .current_slot
+            .expect("account writes are accepted only inside a slot");
+        self.slot_writes.sort_unstable();
+        for index in 0..self.slot_writes.len() {
+            let write_version = self.slot_writes[index];
+            if write_version != self.next_write {
+                self.error = Some(format!(
+                    "account update at slot {slot} has raw write version {write_version}, expected {} within {}..{}",
+                    self.next_write, self.expected_writes.start, self.expected_writes.end
+                ));
+                break;
+            }
+            // `write_version < expected_writes.end` was checked on receipt,
+            // so incrementing cannot overflow even when the declared end is
+            // `u64::MAX`.
+            self.next_write = write_version + 1;
+        }
+        self.slot_writes.clear();
+    }
+
+    fn finish(&mut self) -> Result<(), SegmentManifestError> {
+        self.finish_slot_writes();
         if let Some(error) = &self.error {
             return Err(invalid(error.clone()));
         }
@@ -518,6 +553,7 @@ impl SegmentValidationVisitor {
 
 impl SlotVisitor for SegmentValidationVisitor {
     fn on_slot_start(&mut self, slot: u64, _kind: SlotKind) {
+        self.finish_slot_writes();
         if self.error.is_some() {
             return;
         }
@@ -528,6 +564,7 @@ impl SlotVisitor for SegmentValidationVisitor {
             ));
             return;
         }
+        self.current_slot = Some(slot);
         match self.next_slot.checked_add(1) {
             Some(next) => self.next_slot = next,
             None => self.error = Some("Horizon source slot coverage overflows u64".to_string()),
@@ -554,7 +591,9 @@ impl SlotVisitor for SegmentValidationVisitor {
         self.accept_write(slot, update.write_version);
     }
 
-    fn on_block(&mut self, _notification: &BlockNotification, _entries: &[EntryRecord]) {}
+    fn on_block(&mut self, _notification: &BlockNotification, _entries: &[EntryRecord]) {
+        self.finish_slot_writes();
+    }
 
     fn consumption(&self) -> Consumption {
         Consumption::all()
@@ -773,6 +812,18 @@ mod tests {
     const BOOTSTRAP_SLOT: u64 = 416_012;
     const WORKER_DIGEST: [u8; 32] = [0x42; 32];
 
+    fn validate_write_versions(
+        expected: Range<u64>,
+        versions: &[u64],
+    ) -> Result<(), SegmentManifestError> {
+        let mut visitor = SegmentValidationVisitor::new(SLOT_START, expected);
+        visitor.on_slot_start(SLOT_START, SlotKind::Block);
+        for &version in versions {
+            visitor.accept_write(SLOT_START, version);
+        }
+        visitor.finish()
+    }
+
     fn hash(byte: u8) -> Hash {
         Hash::new_from_array([byte; 32])
     }
@@ -926,6 +977,49 @@ mod tests {
             Err(SegmentManifestError::Invalid(message))
                 if message.contains("does not match emitted raw range end")
         ));
+    }
+
+    #[test]
+    fn segment_write_validation_accepts_a_complete_per_slot_permutation() {
+        validate_write_versions(100..104, &[100, 103, 101, 102]).unwrap();
+    }
+
+    #[test]
+    fn segment_write_validation_rejects_duplicates_omissions_and_out_of_range_values() {
+        for (versions, expected) in [
+            (&[100, 100, 102, 103][..], "expected 101"),
+            (&[100, 102, 103][..], "expected 101"),
+            (&[100, 101, 102][..], "ended at 103"),
+            (&[100, 101, 102, 104][..], "outside 100..104"),
+        ] {
+            let error = validate_write_versions(100..104, versions).unwrap_err();
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+    }
+
+    #[test]
+    fn segment_write_permutations_cannot_cross_slot_boundaries() {
+        let mut visitor = SegmentValidationVisitor::new(SLOT_START, 100..103);
+        visitor.on_slot_start(SLOT_START, SlotKind::Block);
+        visitor.accept_write(SLOT_START, 100);
+        visitor.accept_write(SLOT_START, 102);
+        visitor.on_slot_start(SLOT_START + 1, SlotKind::Block);
+        visitor.accept_write(SLOT_START + 1, 101);
+        assert!(visitor.finish().is_err());
+    }
+
+    #[test]
+    fn segment_write_validation_handles_u64_end_without_range_sized_allocation() {
+        let mut visitor = SegmentValidationVisitor::new(SLOT_START, 0..u64::MAX);
+        // Memory is proportional to writes observed in the current slot, not
+        // the attacker-controlled numeric span declared by the sidecar.
+        assert_eq!(visitor.slot_writes.capacity(), 0);
+
+        visitor = SegmentValidationVisitor::new(SLOT_START, (u64::MAX - 2)..u64::MAX);
+        visitor.on_slot_start(SLOT_START, SlotKind::Block);
+        visitor.accept_write(SLOT_START, u64::MAX - 1);
+        visitor.accept_write(SLOT_START, u64::MAX - 2);
+        visitor.finish().unwrap();
     }
 
     #[test]

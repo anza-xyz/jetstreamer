@@ -6,11 +6,14 @@ use {
         ReplayCursor, ReplayFailure, ReplayProgress, SnapshotVerifier, horizon, plugin,
     },
     crate::historical::{
-        HistoricalAccountWrite, HistoricalCheckpoint, HistoricalInitializedSource,
-        HistoricalRuntimeClient, HistoricalSnapshotExport, denormalize_transaction_error,
-        encode_legacy_transaction, normalize_transaction_error,
+        HistoricalAccountWrite, HistoricalCheckpoint, HistoricalEntryRequest,
+        HistoricalEntryStreamItem, HistoricalInitializedSource, HistoricalRuntimeClient,
+        HistoricalSnapshotExport, denormalize_transaction_error, encode_legacy_transaction,
+        normalize_transaction_error,
     },
-    jetstreamer_historical_protocol::TransactionError as HistoricalTransactionError,
+    jetstreamer_historical_protocol::{
+        MAX_ENTRIES_PER_BATCH, TransactionError as HistoricalTransactionError,
+    },
     log::info,
     solana_address::Address,
     solana_clock::Slot,
@@ -24,6 +27,11 @@ use {
         time::Instant,
     },
 };
+
+const HISTORICAL_BATCH_MAX_SLOTS: usize = 4;
+// Leave half of the 64 MiB frame for entry/vector framing and keep batches of
+// unusually large transactions from turning one response into a huge burst.
+const HISTORICAL_BATCH_TRANSACTION_BYTES: usize = 32 * 1024 * 1024;
 
 /// Checkpoint identity retained for replay provenance and runtime handoff.
 /// Account writes are deliberately excluded from this cloneable summary.
@@ -103,6 +111,12 @@ struct HistoricalReplayState {
     emitted_write_versions: Option<Range<u64>>,
 }
 
+struct EncodedReadyEntry {
+    entry: ReadyEntry,
+    transactions: Vec<Vec<u8>>,
+    transaction_bytes: usize,
+}
+
 impl HistoricalReplay {
     pub(crate) fn new(
         client: HistoricalRuntimeClient,
@@ -150,6 +164,20 @@ impl HistoricalReplay {
     }
 
     pub(crate) fn process_ready_entries(&self, entries: Vec<ReadyEntry>) {
+        let supports_entry_batches = self
+            .state
+            .lock()
+            .expect("historical replay lock poisoned")
+            .client
+            .supports_entry_batches();
+        if supports_entry_batches {
+            self.process_ready_entries_batched(entries);
+        } else {
+            self.process_ready_entries_sequential(entries);
+        }
+    }
+
+    fn process_ready_entries_sequential(&self, entries: Vec<ReadyEntry>) {
         for mut entry in entries {
             if self.failure.shutdown_requested() {
                 return;
@@ -288,6 +316,255 @@ impl HistoricalReplay {
                 );
             }
         }
+    }
+
+    fn process_ready_entries_batched(&self, entries: Vec<ReadyEntry>) {
+        let mut encoded = Vec::with_capacity(entries.len());
+        for entry in entries {
+            if self.failure.shutdown_requested() {
+                return;
+            }
+            let transactions = match entry
+                .txs
+                .iter()
+                .map(|scheduled| encode_legacy_transaction(&scheduled.tx))
+                .collect::<Result<Vec<_>, _>>()
+            {
+                Ok(transactions) => transactions,
+                Err(error) => {
+                    self.failure.record(format!(
+                        "historical transaction encoding failed at slot {} entry {}: {error}",
+                        entry.slot, entry.entry_index
+                    ));
+                    return;
+                }
+            };
+            let transaction_bytes = transactions.iter().fold(0usize, |total, transaction| {
+                total.saturating_add(transaction.len()).saturating_add(8)
+            });
+            encoded.push(EncodedReadyEntry {
+                entry,
+                transactions,
+                transaction_bytes,
+            });
+        }
+
+        let checkpoints = self
+            .checkpoint_slots
+            .lock()
+            .expect("historical checkpoint set lock poisoned")
+            .clone();
+        for batch in partition_entry_batches(encoded, &checkpoints) {
+            if self.failure.shutdown_requested() {
+                return;
+            }
+            if !self.process_ready_batch(batch) {
+                return;
+            }
+        }
+    }
+
+    fn process_ready_batch(&self, mut batch: Vec<EncodedReadyEntry>) -> bool {
+        let Some(first) = batch.first() else {
+            return true;
+        };
+        let batch_len = batch.len();
+        let first_slot = first.entry.slot;
+        let first_entry_index = first.entry.entry_index;
+        let first_signature = ready_entry_signature(&first.entry);
+        self.cursor.start_inflight(
+            first_slot,
+            first_entry_index,
+            first.entry.start_index,
+            first.entry.tx_count,
+            first_signature,
+        );
+        let execute_guard = InFlightGuard {
+            cursor: self.cursor.clone(),
+        };
+        self.cursor
+            .update_inflight_stage("historical_batch_execute");
+        let execute_start = Instant::now();
+        let last_slot = batch.last().expect("nonempty batch").entry.slot;
+        let requests = batch
+            .iter_mut()
+            .map(|encoded| HistoricalEntryRequest {
+                slot: encoded.entry.slot,
+                entry_index: encoded.entry.entry_index as u64,
+                num_hashes: encoded.entry.num_hashes,
+                hash: encoded.entry.hash.to_bytes(),
+                transactions: std::mem::take(&mut encoded.transactions),
+            })
+            .collect();
+        let last_entry_index = batch.last().expect("nonempty batch").entry.entry_index;
+        let mut entries = batch.into_iter();
+        let mut current = entries.next().expect("nonempty batch");
+        let mut current_outcomes = Vec::new();
+        let mut outcomes_verified = false;
+        let mut checkpoint_after = None;
+        let processed = {
+            let mut state = self.state.lock().expect("historical replay lock poisoned");
+            let HistoricalReplayState {
+                client,
+                current_slot,
+                last_checkpoint_slot,
+                terminal_checkpoint,
+                emitted_write_versions,
+                ..
+            } = &mut *state;
+            client.process_entries_with(requests, |item| {
+                match item {
+                    HistoricalEntryStreamItem::Outcomes {
+                        slot,
+                        entry_index,
+                        outcomes,
+                    } => {
+                        if current.entry.slot != slot
+                            || current.entry.entry_index as u64 != entry_index
+                        {
+                            return Err(format!(
+                                "historical outcome stream identifies slot {slot} entry {entry_index}, expected slot {} entry {}",
+                                current.entry.slot, current.entry.entry_index
+                            ));
+                        }
+                        current_outcomes.extend(outcomes);
+                    }
+                    HistoricalEntryStreamItem::Writes {
+                        slot,
+                        entry_index,
+                        writes,
+                    } => {
+                        if current.entry.slot != slot
+                            || current.entry.entry_index as u64 != entry_index
+                        {
+                            return Err(format!(
+                                "historical write stream identifies slot {slot} entry {entry_index}, expected slot {} entry {}",
+                                current.entry.slot, current.entry.entry_index
+                            ));
+                        }
+                        if !outcomes_verified {
+                            self.verify_outcomes(&mut current.entry, &current_outcomes)?;
+                            outcomes_verified = true;
+                        }
+                        let extended = extend_emitted_write_versions(
+                            emitted_write_versions.as_ref(),
+                            self.live_start_slot,
+                            &writes,
+                        )?;
+                        self.emit_writes(writes);
+                        *emitted_write_versions = extended;
+                    }
+                    HistoricalEntryStreamItem::End {
+                        slot,
+                        entry_index,
+                        slot_complete,
+                        ..
+                    } => {
+                        if current.entry.slot != slot
+                            || current.entry.entry_index as u64 != entry_index
+                        {
+                            return Err(format!(
+                                "historical entry end identifies slot {slot} entry {entry_index}, expected slot {} entry {}",
+                                current.entry.slot, current.entry.entry_index
+                            ));
+                        }
+                        let entry = &mut current.entry;
+                        let signature = ready_entry_signature(entry);
+                        self.cursor.update_inflight_stage("historical_verify");
+                        if !outcomes_verified {
+                            self.verify_outcomes(entry, &current_outcomes)?;
+                        }
+
+                        let post_start = Instant::now();
+                        if entry.slot >= self.live_start_slot {
+                            plugin::notify_transaction_range(
+                                entry.slot,
+                                entry.start_index,
+                                entry.tx_count,
+                            );
+                            if let Some(recorder) = horizon::recorder() {
+                                let transactions = std::mem::take(&mut entry.txs)
+                                    .into_iter()
+                                    .map(|scheduled| (scheduled.tx, scheduled.status_meta))
+                                    .collect();
+                                recorder.record_committed_entry(
+                                    entry.slot,
+                                    entry.entry_index,
+                                    entry.num_hashes,
+                                    transactions,
+                                );
+                            }
+                        }
+                        self.cursor.update(
+                            entry.slot,
+                            entry.entry_index,
+                            entry.start_index,
+                            entry.tx_count,
+                            signature,
+                        );
+                        PHASE_POST_PROCESS_US.fetch_add(
+                            post_start.elapsed().as_micros() as u64,
+                            Ordering::Relaxed,
+                        );
+                        PHASE_ENTRY_COUNT.fetch_add(1, Ordering::Relaxed);
+                        *current_slot = slot;
+                        *last_checkpoint_slot = None;
+                        *terminal_checkpoint = None;
+                        if slot_complete && self.take_checkpoint_slot(slot) {
+                            checkpoint_after = Some(slot);
+                        }
+
+                        current_outcomes.clear();
+                        outcomes_verified = false;
+                        if let Some(next) = entries.next() {
+                            current = next;
+                            self.cursor.start_inflight(
+                                current.entry.slot,
+                                current.entry.entry_index,
+                                current.entry.start_index,
+                                current.entry.tx_count,
+                                ready_entry_signature(&current.entry),
+                            );
+                            self.cursor
+                                .update_inflight_stage("historical_batch_execute");
+                        }
+                    }
+                }
+                Ok(())
+            })
+        };
+        let execute_elapsed = execute_start.elapsed();
+        PHASE_EXECUTE_US.fetch_add(execute_elapsed.as_micros() as u64, Ordering::Relaxed);
+        drop(execute_guard);
+        match processed {
+            Ok(()) => {}
+            Err(error) => {
+                self.failure.record(format!(
+                    "historical worker batch failed from slot {} entry {} through slot {} entry {}: {error}",
+                    first_slot,
+                    first_entry_index,
+                    last_slot,
+                    last_entry_index,
+                ));
+                return false;
+            }
+        }
+        if let Some(slot) = checkpoint_after
+            && let Err(error) = self.checkpoint_current(slot)
+        {
+            self.failure.record(error);
+            return false;
+        }
+
+        if execute_elapsed >= super::ENTRY_EXEC_WARN_AFTER {
+            info!(
+                "historical entry batch entries={} through_slot={} took {:.3}s",
+                batch_len,
+                last_slot,
+                execute_elapsed.as_secs_f64(),
+            );
+        }
+        true
     }
 
     pub(crate) fn verify_latest_bank(&self) -> Result<(), String> {
@@ -540,6 +817,65 @@ impl HistoricalReplay {
     }
 }
 
+fn ready_entry_signature(entry: &ReadyEntry) -> Option<String> {
+    entry
+        .txs
+        .first()
+        .and_then(|scheduled| scheduled.tx.signatures.first())
+        .map(ToString::to_string)
+}
+
+fn partition_entry_batches(
+    entries: Vec<EncodedReadyEntry>,
+    checkpoint_slots: &BTreeSet<Slot>,
+) -> Vec<Vec<EncodedReadyEntry>> {
+    let mut batches = Vec::new();
+    let mut current = Vec::new();
+    let mut current_transaction_bytes = 0usize;
+    let mut current_slots = 0usize;
+    let mut last_slot = None;
+    let mut checkpoint_boundary = None;
+
+    for entry in entries {
+        let slot = entry.entry.slot;
+        let starts_new_slot = last_slot != Some(slot);
+        let crosses_checkpoint = checkpoint_boundary
+            .map(|checkpoint| slot > checkpoint)
+            .unwrap_or(false);
+        let exceeds_slots = starts_new_slot && current_slots >= HISTORICAL_BATCH_MAX_SLOTS;
+        let exceeds_bytes = current_transaction_bytes.saturating_add(entry.transaction_bytes)
+            > HISTORICAL_BATCH_TRANSACTION_BYTES;
+        if !current.is_empty()
+            && (current.len() >= MAX_ENTRIES_PER_BATCH
+                || crosses_checkpoint
+                || exceeds_slots
+                || exceeds_bytes)
+        {
+            batches.push(current);
+            current = Vec::new();
+            current_transaction_bytes = 0;
+            current_slots = 0;
+            last_slot = None;
+            checkpoint_boundary = None;
+        }
+
+        if last_slot != Some(slot) {
+            current_slots += 1;
+            last_slot = Some(slot);
+        }
+        current_transaction_bytes =
+            current_transaction_bytes.saturating_add(entry.transaction_bytes);
+        if checkpoint_slots.contains(&slot) {
+            checkpoint_boundary = Some(slot);
+        }
+        current.push(entry);
+    }
+    if !current.is_empty() {
+        batches.push(current);
+    }
+    batches
+}
+
 fn checkpoint_refresh_required(last_checkpoint_slot: Option<Slot>, slot: Slot) -> bool {
     last_checkpoint_slot != Some(slot)
 }
@@ -647,6 +983,33 @@ fn assemble_evidence(
 mod tests {
     use super::*;
 
+    fn encoded_ready(
+        slot: Slot,
+        entry_index: usize,
+        transaction_bytes: usize,
+    ) -> EncodedReadyEntry {
+        EncodedReadyEntry {
+            entry: ReadyEntry {
+                slot,
+                entry_index,
+                start_index: 0,
+                txs: Vec::new(),
+                hash: Hash::default(),
+                num_hashes: 1,
+                tx_count: 0,
+            },
+            transactions: Vec::new(),
+            transaction_bytes,
+        }
+    }
+
+    fn batch_slots(batches: &[Vec<EncodedReadyEntry>]) -> Vec<Vec<Slot>> {
+        batches
+            .iter()
+            .map(|batch| batch.iter().map(|entry| entry.entry.slot).collect())
+            .collect()
+    }
+
     fn account_write(slot: Slot, write_version: u64) -> HistoricalAccountWrite {
         HistoricalAccountWrite {
             slot,
@@ -694,6 +1057,33 @@ mod tests {
         let summary = HistoricalCheckpointSummary::try_from(&checkpoint).unwrap();
         assert_eq!(summary.write_count, 2);
         assert_eq!(summary.next_write_version, 102);
+    }
+
+    #[test]
+    fn entry_batches_stop_at_checkpoint_before_advancing_worker() {
+        let entries = vec![
+            encoded_ready(8, 0, 0),
+            encoded_ready(9, 0, 0),
+            encoded_ready(9, 1, 0),
+            encoded_ready(10, 0, 0),
+        ];
+        let checkpoints = [9].into_iter().collect();
+        let batches = partition_entry_batches(entries, &checkpoints);
+        assert_eq!(batch_slots(&batches), vec![vec![8, 9, 9], vec![10]]);
+    }
+
+    #[test]
+    fn entry_batches_bound_slot_span_and_payload_bytes() {
+        let entries = (1..=6).map(|slot| encoded_ready(slot, 0, 0)).collect();
+        let batches = partition_entry_batches(entries, &BTreeSet::new());
+        assert_eq!(batch_slots(&batches), vec![vec![1, 2, 3, 4], vec![5, 6]]);
+
+        let entries = vec![
+            encoded_ready(1, 0, HISTORICAL_BATCH_TRANSACTION_BYTES),
+            encoded_ready(1, 1, 1),
+        ];
+        let batches = partition_entry_batches(entries, &BTreeSet::new());
+        assert_eq!(batch_slots(&batches), vec![vec![1], vec![1]]);
     }
 
     #[test]

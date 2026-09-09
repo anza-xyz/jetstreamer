@@ -6,16 +6,26 @@ license = "MIT OR Apache-2.0"
 publish = false
 build = "build.rs"
 
+[features]
+# Test-only escape hatch used to exercise sha2 0.9.9's portable backend on
+# SHA-NI hosts. Production builds leave this disabled and runtime-dispatch.
+poh-force-soft = ["sha2-fast/force-soft"]
+
 [dependencies]
 bincode = "=1.2.1"
 bzip2 = "=0.3.3"
 jetstreamer-historical-protocol = { path = "../protocol" }
+num_cpus = "=1.12.0"
 rand = "=0.6.5"
 rand_chacha = "=0.1.1"
+rayon = "=1.2.0"
+serde = "=1.0.105"
 sha2 = "=0.8.1"
+sha2-fast = { package = "sha2", version = "=0.9.9", features = ["compress"] }
 solana-runtime = { path = "../vendor/solana-runtime-1.0.7", version = "=1.0.7" }
 solana-config-program = { git = "https://github.com/solana-labs/solana.git", rev = "57abc370fa39e42e8fb84145a30395ddcf891692", version = "=1.0.7" }
 solana-merkle-tree = { git = "https://github.com/solana-labs/solana.git", rev = "57abc370fa39e42e8fb84145a30395ddcf891692", version = "=1.0.7" }
+solana-rayon-threadlimit = { git = "https://github.com/solana-labs/solana.git", rev = "57abc370fa39e42e8fb84145a30395ddcf891692", version = "=1.0.7" }
 solana-sdk = { git = "https://github.com/solana-labs/solana.git", rev = "57abc370fa39e42e8fb84145a30395ddcf891692", version = "=1.0.7" }
 solana-stake-program = { git = "https://github.com/solana-labs/solana.git", rev = "57abc370fa39e42e8fb84145a30395ddcf891692", version = "=1.0.7" }
 solana-vote-program = { git = "https://github.com/solana-labs/solana.git", rev = "57abc370fa39e42e8fb84145a30395ddcf891692", version = "=1.0.7" }

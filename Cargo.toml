@@ -78,7 +78,7 @@ solana-message = { version = "4", features = ["wincode"] }
 solana-transaction = { version = "4", features = ["wincode"] }
 solana-transaction-status = "4"
 solana-sdk-ids = "3"
-solana-reward-info = "6"
+solana-reward-info = "7"
 solana-sysvar = "=4.1.0"
 sha2 = "0.10"
 tonic = { version = "0", default-features = false }

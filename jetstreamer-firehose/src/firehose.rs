@@ -3678,6 +3678,106 @@ mod steal_protocol_tests {
 }
 
 #[cfg(test)]
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn test_stolen_lower_range_keeps_callbacks_after_recycle() {
+    use std::collections::BTreeSet;
+    use tokio::sync::Notify;
+
+    const END: u64 = 376_273_723;
+    const SPLIT: u64 = END - 100;
+    let release_victim = Arc::new(Notify::new());
+    let victim_paused = Arc::new(AtomicBool::new(false));
+    let transaction_slots = Arc::new(Mutex::new(BTreeSet::new()));
+    let block_slots = Arc::new(Mutex::new(BTreeSet::new()));
+    let first_stolen_slot = Arc::new(AtomicU64::new(0));
+
+    let run = firehose(
+        2,
+        false,
+        false,
+        None,
+        (END - 200)..END,
+        Some({
+            let release_victim = release_victim.clone();
+            let block_slots = block_slots.clone();
+            let first_stolen_slot = first_stolen_slot.clone();
+            move |thread_id: usize, block: BlockData| {
+                let release_victim = release_victim.clone();
+                let victim_paused = victim_paused.clone();
+                let block_slots = block_slots.clone();
+                let first_stolen_slot = first_stolen_slot.clone();
+                async move {
+                    if thread_id == 0 {
+                        // Leave enough lower slots to steal when worker 1 finishes.
+                        if !victim_paused.swap(true, Ordering::SeqCst) {
+                            release_victim.notified().await;
+                        }
+                        sleep(std::time::Duration::from_millis(20)).await;
+                    } else if block.slot() == END - 1 {
+                        release_victim.notify_one();
+                    } else if block.slot() < SPLIT && !block.was_skipped() {
+                        block_slots.lock().unwrap().insert(block.slot());
+                        if first_stolen_slot
+                            .compare_exchange(0, block.slot(), Ordering::SeqCst, Ordering::SeqCst)
+                            .is_ok()
+                        {
+                            thread_activity::request_recycle(thread_id);
+                        }
+                    }
+                    Ok(())
+                }
+                .boxed()
+            }
+        }),
+        Some({
+            let transaction_slots = transaction_slots.clone();
+            move |thread_id: usize, transaction: TransactionData| {
+                let transaction_slots = transaction_slots.clone();
+                async move {
+                    if thread_id == 1 && transaction.slot < SPLIT {
+                        transaction_slots.lock().unwrap().insert(transaction.slot);
+                    }
+                    Ok(())
+                }
+                .boxed()
+            }
+        }),
+        None::<OnEntryFn>,
+        None::<OnRewardFn>,
+        None::<OnErrorFn>,
+        None::<OnStatsTrackingFn>,
+        None,
+    );
+    timeout(std::time::Duration::from_secs(180), run)
+        .await
+        .expect("steal/recycle run timed out")
+        .expect("firehose failed");
+
+    assert!(thread_activity::steal_count() > 0);
+    assert!(thread_activity::recycle_count() > 0);
+    let first = first_stolen_slot.load(Ordering::SeqCst);
+    assert!(
+        first > 0,
+        "worker 1 must emit a stolen block before recycling"
+    );
+    let transactions = transaction_slots.lock().unwrap();
+    let blocks = block_slots.lock().unwrap();
+    assert!(
+        transactions.iter().any(|slot| *slot > first),
+        "transactions must continue after recycling"
+    );
+    assert!(
+        blocks.iter().any(|slot| *slot > first),
+        "blocks must continue after recycling"
+    );
+    assert!(
+        transactions.is_subset(&blocks),
+        "every stolen transaction slot needs a block callback"
+    );
+}
+
+#[cfg(test)]
 fn log_stats_handler(thread_id: usize, stats: Stats) -> HandlerFuture {
     Box::pin(async move {
         let elapsed = stats.start_time.elapsed();
@@ -4394,11 +4494,73 @@ async fn test_firehose_restart_loses_coverage_without_reset() {
     .await
     .unwrap();
 
+    assert!(FAIL_TRIGGERED.load(Ordering::SeqCst));
     let coverage = COVERAGE.get().unwrap().lock().unwrap();
     for slot in START_SLOT..(START_SLOT + NUM_SLOTS) {
-        assert!(
-            coverage.contains_key(&slot),
-            "missing coverage for slot {slot} after restart"
+        assert_eq!(
+            coverage.get(&slot).copied(),
+            Some(1),
+            "slot {slot} must be handled successfully once after restart"
+        );
+    }
+}
+
+#[cfg(test)]
+#[serial]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_firehose_retries_failed_skipped_slot_callback() {
+    use std::collections::HashMap;
+
+    // The existing gap-coverage test identifies 378864396..400 as skipped slots.
+    const START: u64 = 378_864_395;
+    const END: u64 = 378_864_402;
+    const FAILED_SLOT: u64 = 378_864_397;
+    let attempts = Arc::new(Mutex::new(HashMap::<u64, u32>::new()));
+
+    let run = firehose(
+        1,
+        false,
+        false,
+        None,
+        START..END,
+        Some({
+            let attempts = attempts.clone();
+            move |_thread_id: usize, block: BlockData| {
+                let attempts = attempts.clone();
+                async move {
+                    let mut attempts = attempts.lock().unwrap();
+                    let count = attempts.entry(block.slot()).or_default();
+                    *count += 1;
+                    if block.slot() == FAILED_SLOT {
+                        assert!(block.was_skipped());
+                        if *count == 1 {
+                            return Err("synthetic skipped-slot handler failure".into());
+                        }
+                    }
+                    Ok(())
+                }
+                .boxed()
+            }
+        }),
+        None::<OnTxFn>,
+        None::<OnEntryFn>,
+        None::<OnRewardFn>,
+        None::<OnErrorFn>,
+        None::<OnStatsTrackingFn>,
+        None,
+    );
+    timeout(std::time::Duration::from_secs(180), run)
+        .await
+        .expect("skipped-slot retry run timed out")
+        .expect("firehose failed");
+
+    let attempts = attempts.lock().unwrap();
+    for slot in START..END {
+        let expected = if slot == FAILED_SLOT { 2 } else { 1 };
+        assert_eq!(
+            attempts.get(&slot).copied(),
+            Some(expected),
+            "only the failed callback should be retried; slot {slot}"
         );
     }
 }

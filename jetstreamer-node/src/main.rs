@@ -14446,6 +14446,40 @@ mod early_snapshot_tests {
     }
 
     #[test]
+    fn epoch_12_bootstrap_warms_the_post_snapshot_epoch_11_tail() {
+        let snapshot = ReplayBootstrap::SnapshotArchive(PathBuf::from(
+            "snapshot-5183736-BUqwiSm2GgH9ByKrBDF6epXHYK9RRh3vyZDKtUqtMXfR.tar.bz2",
+        ));
+        let epoch_start = compatibility::SOLANA_V1_0_23_CANDIDATE_START_SLOT;
+        assert_eq!(snapshot.slot().unwrap(), 5_183_736);
+        assert_eq!(
+            validate_epoch_bootstrap_snapshot(12, snapshot.snapshot_archive().unwrap()).unwrap(),
+            compatibility::SOLANA_V1_0_23_INITIAL_SNAPSHOT_SLOT
+        );
+        let replay_start = replay_start_for_bootstrap(&snapshot, 12, epoch_start).unwrap();
+        assert_eq!(
+            replay_start,
+            compatibility::SOLANA_V1_0_23_INITIAL_REPLAY_SLOT
+        );
+        assert_eq!(epoch_start - replay_start, 263);
+
+        let selection = compatibility::select_runtime_with_snapshot_warmup(
+            replay_start,
+            epoch_start..epoch_to_slot_range(12).1 + 1,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            selection.backend,
+            compatibility::RuntimeBackend::SolanaV1_0_23
+        );
+        assert!(std::ptr::eq(
+            selection.descriptor,
+            &compatibility::SOLANA_V1_0_23_RUNTIME
+        ));
+    }
+
+    #[test]
     fn genesis_bootstrap_starts_epoch_zero_at_slot_zero_only() {
         let private_dir = Arc::new(tempfile::TempDir::new().unwrap());
         let genesis_bin_path = private_dir.path().join("genesis.bin");
@@ -14602,6 +14636,14 @@ mod early_snapshot_tests {
         assert_eq!(
             epoch_isolation_plan(1, 1, true, true).unwrap(),
             (false, None)
+        );
+        assert_eq!(
+            epoch_isolation_plan(9, 11, false, true).unwrap(),
+            (false, None)
+        );
+        assert_eq!(
+            epoch_isolation_plan(11, 12, false, true).unwrap(),
+            (true, Some(12))
         );
     }
 
@@ -14868,6 +14910,40 @@ mod early_snapshot_tests {
                 compatibility::OLD_FAITHFUL_STATUS_REQUIRED_START_SLOT
             )
         );
+    }
+
+    #[test]
+    fn epoch_11_provenance_records_the_v1_0_14_worker() {
+        let output_start = 4_752_000;
+        let output_end = compatibility::SOLANA_V1_0_14_CANDIDATE_END_SLOT_EXCLUSIVE;
+        let selection = compatibility::select_runtime(output_start..output_end, true).unwrap();
+        let provenance = build_archive_provenance(
+            selection,
+            Some([0x14; 32]),
+            BootstrapStateKind::SnapshotArchive,
+            4_751_796,
+            "6vJ22rwAfXfr4hFUJ7AtLupR6LHWBWX114AhKJqPYejb"
+                .parse()
+                .unwrap(),
+            output_start,
+            output_end - output_start,
+        )
+        .unwrap();
+
+        assert_eq!(provenance.version(), 2);
+        assert_eq!(
+            provenance.single_runtime_worker_executable_sha256(),
+            Some(Some([0x14; 32]))
+        );
+        let provenance = provenance.single_runtime_v1().unwrap();
+        assert_eq!(provenance.runtime_profile, "solana-v1.0.14");
+        assert_eq!(
+            provenance.runtime_revision,
+            compatibility::SOLANA_V1_0_14_REVISION
+        );
+        assert_eq!(provenance.bootstrap_slot, 4_751_796);
+        assert_eq!(provenance.requested_slot_start, output_start);
+        assert_eq!(provenance.requested_slot_count, 432_000);
     }
 
     #[test]

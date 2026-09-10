@@ -31,7 +31,7 @@ use tempfile::TempDir;
 const MAX_AGE_CORRECTION_EPOCH: u64 = 14;
 // The v1.0.23 terminal-patch candidate is a diagnostic envelope for the
 // remaining v1.0 history. Its first admitted snapshot is the canonical
-// v1.0.17 archive immediately before epoch 12; its last output is epoch 29.
+// v1.0.14 archive immediately before epoch 12; its last output is epoch 29.
 // Structural compatibility alone does not qualify this broad interval: every
 // generated epoch remains candidate-only and must match all trusted snapshot
 // checkpoints. A mismatch narrows the envelope and requires an earlier exact
@@ -1792,5 +1792,30 @@ mod tests {
             checkpoint.slot_complete
         );
         assert_eq!(checkpoint.accounts_hash, expected_accounts_hash);
+    }
+
+    #[test]
+    #[ignore]
+    fn initializes_and_checkpoints_epoch_12_bootstrap_snapshot() {
+        let archive = std::env::var("JETSTREAMER_SNAPSHOT_5183736")
+            .expect("set JETSTREAMER_SNAPSHOT_5183736");
+        let ledger =
+            std::env::var("JETSTREAMER_MAINNET_LEDGER").expect("set JETSTREAMER_MAINNET_LEDGER");
+        let (mut state, initialized) = RuntimeState::initialize(
+            &ledger,
+            &jetstreamer_historical_protocol::InitialState::SnapshotArchive {
+                archive_path: archive,
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(initialized.slot, MIN_SUPPORTED_SNAPSHOT_SLOT);
+        let checkpoint = state
+            .freeze_checkpoint(MIN_SUPPORTED_SNAPSHOT_SLOT)
+            .unwrap();
+        assert_eq!(
+            Hash::new(&checkpoint.accounts_hash).to_string(),
+            "BUqwiSm2GgH9ByKrBDF6epXHYK9RRh3vyZDKtUqtMXfR"
+        );
     }
 }

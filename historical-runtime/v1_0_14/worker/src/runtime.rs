@@ -30,13 +30,13 @@ use tempfile::TempDir;
 
 const MAX_AGE_CORRECTION_EPOCH: u64 = 14;
 // Epoch 9 starts at 3,888,000. The immediately preceding canonical v1.0.14
-// snapshot is at 3,887,911, so admit only its 88-slot bootstrap bridge and
-// epochs 9--10. Compatibility must be demonstrated by trusted checkpoints
-// before the parent may route or publish with this candidate.
+// snapshot is at 3,887,911, so admit only its bootstrap bridge and epochs
+// 9 through 11. Compatibility must be demonstrated by trusted checkpoints
+// before the parent may publish with this candidate.
 const MIN_SUPPORTED_SNAPSHOT_SLOT: u64 = 3_887_911;
 const MIN_SUPPORTED_ENTRY_SLOT: u64 = MIN_SUPPORTED_SNAPSHOT_SLOT + 1;
-const MAX_SUPPORTED_SLOT_EXCLUSIVE: u64 = 4_752_000;
-const MAX_SUPPORTED_EPOCH: u64 = 10;
+const MAX_SUPPORTED_SLOT_EXCLUSIVE: u64 = 5_184_000;
+const MAX_SUPPORTED_EPOCH: u64 = 11;
 const POH_THREADS_ENV: &str = "JETSTREAMER_HISTORICAL_POH_THREADS";
 const ABSOLUTE_MAX_POH_THREADS: usize = 256;
 
@@ -92,7 +92,7 @@ impl RuntimeState {
             }
             jetstreamer_historical_protocol::InitialState::Genesis => {
                 return Err(format!(
-                    "Solana v1.0.14 epochs 9-10 candidate requires a snapshot at or after slot {}",
+                    "Solana v1.0.14 epochs 9-11 candidate requires a snapshot at or after slot {}",
                     MIN_SUPPORTED_SNAPSHOT_SLOT
                 ));
             }
@@ -627,7 +627,7 @@ impl RuntimeState {
 fn validate_candidate_snapshot_slot(slot: u64) -> Result<(), String> {
     if slot < MIN_SUPPORTED_SNAPSHOT_SLOT || slot >= MAX_SUPPORTED_SLOT_EXCLUSIVE {
         return Err(format!(
-            "Solana v1.0.14 epochs 9-10 candidate snapshot slot {} is outside {}..{}",
+            "Solana v1.0.14 epochs 9-11 candidate snapshot slot {} is outside {}..{}",
             slot, MIN_SUPPORTED_SNAPSHOT_SLOT, MAX_SUPPORTED_SLOT_EXCLUSIVE
         ));
     }
@@ -637,7 +637,7 @@ fn validate_candidate_snapshot_slot(slot: u64) -> Result<(), String> {
 fn validate_candidate_entry_slot(slot: u64) -> Result<(), String> {
     if slot < MIN_SUPPORTED_ENTRY_SLOT || slot >= MAX_SUPPORTED_SLOT_EXCLUSIVE {
         return Err(format!(
-            "Solana v1.0.14 epochs 9-10 candidate entry slot {} is outside {}..{}",
+            "Solana v1.0.14 epochs 9-11 candidate entry slot {} is outside {}..{}",
             slot, MIN_SUPPORTED_ENTRY_SLOT, MAX_SUPPORTED_SLOT_EXCLUSIVE
         ));
     }
@@ -913,7 +913,7 @@ fn restore_mainnet_runtime_hooks(bank: &mut Bank, genesis: &GenesisConfig) -> Re
     validate_mainnet_genesis_programs(genesis)?;
     restore_mainnet_native_processors(bank);
 
-    // The upstream Stable callback has no state effects through epoch 10.
+    // The upstream Stable callback has no state effects through epoch 11.
     // Install the callback explicitly and guard the candidate's upper epoch;
     // entry validation rejects the first later slot before constructing it.
     bank.set_entered_epoch_callback(Box::new(|bank| {
@@ -1111,7 +1111,7 @@ mod tests {
     }
 
     #[test]
-    fn epochs_9_10_candidate_range_is_closed_at_both_ends() {
+    fn epochs_9_11_candidate_range_is_closed_at_both_ends() {
         assert!(validate_candidate_snapshot_slot(MIN_SUPPORTED_SNAPSHOT_SLOT).is_ok());
         assert!(validate_candidate_snapshot_slot(MIN_SUPPORTED_SNAPSHOT_SLOT - 1).is_err());
         assert!(validate_candidate_snapshot_slot(MAX_SUPPORTED_SLOT_EXCLUSIVE - 1).is_ok());
@@ -1808,6 +1808,29 @@ mod tests {
         assert_eq!(
             Hash::new(&checkpoint.accounts_hash).to_string(),
             "9wnXMY186BWwsUq7QjURqasDGKY4bG6mm5R4rCJD6ar"
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn initializes_and_checkpoints_epoch_11_boundary_snapshot() {
+        let archive = std::env::var("JETSTREAMER_SNAPSHOT_4751796")
+            .expect("set JETSTREAMER_SNAPSHOT_4751796");
+        let ledger =
+            std::env::var("JETSTREAMER_MAINNET_LEDGER").expect("set JETSTREAMER_MAINNET_LEDGER");
+        let (mut state, initialized) = RuntimeState::initialize(
+            &ledger,
+            &jetstreamer_historical_protocol::InitialState::SnapshotArchive {
+                archive_path: archive,
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(initialized.slot, 4_751_796);
+        let checkpoint = state.freeze_checkpoint(4_751_796).unwrap();
+        assert_eq!(
+            Hash::new(&checkpoint.accounts_hash).to_string(),
+            "6vJ22rwAfXfr4hFUJ7AtLupR6LHWBWX114AhKJqPYejb"
         );
     }
 }

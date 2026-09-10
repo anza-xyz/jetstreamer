@@ -340,8 +340,7 @@ select a runtime. The current registry is deliberately conservative:
 | `0..619,849` | pinned Solana v1.0.7 worker | candidate through the first proven-safe handoff |
 | `619,849..3,456,000` | pinned Solana v1.0.8 worker | candidate through epoch 7 |
 | `3,456,000..3,888,000` | pinned Solana v1.0.13 worker | candidate for epoch 8 |
-| `3,888,000..4,752,000` | pinned Solana v1.0.14 worker | candidate for epochs 9-10 |
-| `4,752,000..5,184,000` | pinned Solana v1.0.17 worker | candidate for epoch 11 |
+| `3,888,000..5,184,000` | pinned Solana v1.0.14 worker | candidate for epochs 9-11 |
 | `5,184,000..12,960,000` | pinned Solana v1.0.23 worker | diagnostic candidate for epochs 12-29 |
 | `12,960,000..26,352,000` | pinned Solana v1.1.23 worker | diagnostic candidate for epochs 30-60 |
 | `26,352,000..39,744,000` | pinned Solana v1.2.32 worker | diagnostic candidate for epochs 61-91 |
@@ -357,7 +356,12 @@ the v1.0.8 semantics at slot 630,648. The canonical snapshot at slot 619,848 is 
 behaviorally safe handoff: v1.0.7 processes through that snapshot and v1.0.8 starts at slot 619,849.
 This routing point is not a claim about the exact deployment slot. Every candidate envelope remains
 explicitly non-canonical until its checkpoint replay completes. Additional exact patch workers stay
-registered but unassigned until differential evidence requires a narrower runtime boundary.
+registered but unassigned until differential evidence requires a narrower runtime boundary. This
+includes the v1.0.17 worker, which remains available for comparison without claiming a slot range.
+
+Epoch 12 starts v1.0.23 from the canonical snapshot at slot 5,183,736. The worker warms slots
+5,183,737 through 5,183,999 and begins Horizon output at slot 5,184,000. This boundary uses an
+independently verified snapshot restart. The runtime handoff registry has no entry at 5,184,000.
 
 Transaction metadata is an independent compatibility dimension. Old Faithful has no status frame
 before slot `4,258,776`; the pinned historical runtime reconstructs transaction status there, while

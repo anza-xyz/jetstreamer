@@ -29,22 +29,24 @@ pub const SOLANA_V1_0_8_CANDIDATE_END_SLOT_EXCLUSIVE: Slot = 3_456_000;
 pub const SOLANA_V1_0_13_CANDIDATE_START_SLOT: Slot = SOLANA_V1_0_8_CANDIDATE_END_SLOT_EXCLUSIVE;
 pub const SOLANA_V1_0_13_CANDIDATE_END_SLOT_EXCLUSIVE: Slot = 3_888_000;
 
-/// Epochs 9 and 10 use the exact v1.0.14 runtime. Each epoch is restored from
-/// its own canonical predecessor-epoch snapshot and verified independently.
+/// Epochs 9 through 11 use the exact v1.0.14 runtime. Each epoch is restored
+/// from its own canonical predecessor-epoch snapshot and verified
+/// independently.
 pub const SOLANA_V1_0_14_CANDIDATE_START_SLOT: Slot = SOLANA_V1_0_13_CANDIDATE_END_SLOT_EXCLUSIVE;
-pub const SOLANA_V1_0_14_CANDIDATE_END_SLOT_EXCLUSIVE: Slot = 4_752_000;
+pub const SOLANA_V1_0_14_CANDIDATE_END_SLOT_EXCLUSIVE: Slot = 5_184_000;
 
-/// Epoch 11 uses the exact v1.0.17 runtime selected by its canonical
-/// predecessor-epoch snapshot and bounded checkpoint evidence.
-pub const SOLANA_V1_0_17_CANDIDATE_START_SLOT: Slot = SOLANA_V1_0_14_CANDIDATE_END_SLOT_EXCLUSIVE;
-pub const SOLANA_V1_0_17_CANDIDATE_END_SLOT_EXCLUSIVE: Slot = 5_184_000;
+/// Canonical predecessor snapshot used to start the v1.0.23 epoch-12 worker.
+/// Its successor through the end of epoch 11 is warmup input; Horizon output
+/// starts at the epoch-12 boundary.
+pub const SOLANA_V1_0_23_INITIAL_SNAPSHOT_SLOT: Slot = 5_183_736;
+pub const SOLANA_V1_0_23_INITIAL_REPLAY_SLOT: Slot = SOLANA_V1_0_23_INITIAL_SNAPSHOT_SLOT + 1;
 
 /// Epoch-aligned diagnostic envelopes for the terminal patch of each later
 /// Solana minor line. These are candidate-only: an epoch is publishable only
 /// after every canonical snapshot checkpoint in its span matches. A mismatch
 /// fails closed and is evidence to split that envelope around an earlier exact
 /// patch worker; release-marker timestamps are not treated as activation slots.
-pub const SOLANA_V1_0_23_CANDIDATE_START_SLOT: Slot = SOLANA_V1_0_17_CANDIDATE_END_SLOT_EXCLUSIVE;
+pub const SOLANA_V1_0_23_CANDIDATE_START_SLOT: Slot = SOLANA_V1_0_14_CANDIDATE_END_SLOT_EXCLUSIVE;
 pub const SOLANA_V1_0_23_CANDIDATE_END_SLOT_EXCLUSIVE: Slot = 12_960_000;
 pub const SOLANA_V1_1_23_CANDIDATE_START_SLOT: Slot = SOLANA_V1_0_23_CANDIDATE_END_SLOT_EXCLUSIVE;
 pub const SOLANA_V1_1_23_CANDIDATE_END_SLOT_EXCLUSIVE: Slot = 26_352_000;
@@ -127,9 +129,9 @@ pub enum RuntimeBackend {
     /// Exact v1.0.13 runtime and 1.1 snapshot loader, initially bounded to
     /// epoch 8 while canonical checkpoint replay is qualified.
     SolanaV1_0_13,
-    /// Exact v1.0.14 runtime bounded to epochs 9 and 10.
+    /// Exact v1.0.14 runtime bounded to epochs 9 through 11.
     SolanaV1_0_14,
-    /// Exact v1.0.17 runtime bounded to epoch 11.
+    /// Exact v1.0.17 runtime retained as an unassigned comparison candidate.
     SolanaV1_0_17,
     /// Exact v1.0.18 candidate retained without a routed slot era until
     /// differential replay identifies a justified whole-epoch envelope.
@@ -686,7 +688,6 @@ pub static RUNTIME_HANDOFFS: &[&RuntimeHandoff] = &[&SOLANA_V1_0_7_TO_V1_0_8_HAN
 pub static SNAPSHOT_ISOLATED_RUNTIME_BOUNDARIES: &[Slot] = &[
     SOLANA_V1_0_13_CANDIDATE_START_SLOT,
     SOLANA_V1_0_14_CANDIDATE_START_SLOT,
-    SOLANA_V1_0_17_CANDIDATE_START_SLOT,
     SOLANA_V1_0_23_CANDIDATE_START_SLOT,
     SOLANA_V1_1_23_CANDIDATE_START_SLOT,
     SOLANA_V1_2_32_CANDIDATE_START_SLOT,
@@ -876,17 +877,10 @@ pub static RUNTIME_ERAS: &[RuntimeEra] = &[
         admission: AdmissionLevel::Candidate,
     },
     RuntimeEra {
-        name: "solana-v1.0.14-epochs-9-10-candidate",
+        name: "solana-v1.0.14-epochs-9-11-candidate",
         start_slot: SOLANA_V1_0_14_CANDIDATE_START_SLOT,
         end_slot_exclusive: Some(SOLANA_V1_0_14_CANDIDATE_END_SLOT_EXCLUSIVE),
         backend: EraBackend::Available(&SOLANA_V1_0_14_RUNTIME),
-        admission: AdmissionLevel::Candidate,
-    },
-    RuntimeEra {
-        name: "solana-v1.0.17-epoch-11-candidate",
-        start_slot: SOLANA_V1_0_17_CANDIDATE_START_SLOT,
-        end_slot_exclusive: Some(SOLANA_V1_0_17_CANDIDATE_END_SLOT_EXCLUSIVE),
-        backend: EraBackend::Available(&SOLANA_V1_0_17_RUNTIME),
         admission: AdmissionLevel::Candidate,
     },
     RuntimeEra {
@@ -1690,7 +1684,11 @@ mod tests {
 
     #[test]
     fn unassigned_candidates_remain_registered_without_claiming_an_era() {
-        for backend in [RuntimeBackend::SolanaV1_0_18, RuntimeBackend::SolanaV1_0_24] {
+        for backend in [
+            RuntimeBackend::SolanaV1_0_17,
+            RuntimeBackend::SolanaV1_0_18,
+            RuntimeBackend::SolanaV1_0_24,
+        ] {
             assert!(backend.descriptor().is_ok());
             assert!(!RUNTIME_ERAS.iter().any(|era| {
                 matches!(
@@ -1762,26 +1760,82 @@ mod tests {
     }
 
     #[test]
-    fn epochs_9_through_11_use_snapshot_isolated_exact_candidates() {
-        for (range, backend, descriptor, boundary) in [
-            (
-                SOLANA_V1_0_14_CANDIDATE_START_SLOT..SOLANA_V1_0_14_CANDIDATE_END_SLOT_EXCLUSIVE,
-                RuntimeBackend::SolanaV1_0_14,
-                &SOLANA_V1_0_14_RUNTIME,
-                SOLANA_V1_0_14_CANDIDATE_START_SLOT,
-            ),
-            (
-                SOLANA_V1_0_17_CANDIDATE_START_SLOT..SOLANA_V1_0_17_CANDIDATE_END_SLOT_EXCLUSIVE,
-                RuntimeBackend::SolanaV1_0_17,
-                &SOLANA_V1_0_17_RUNTIME,
-                SOLANA_V1_0_17_CANDIDATE_START_SLOT,
-            ),
-        ] {
-            let selection = select_runtime(range, true).unwrap();
-            assert_eq!(selection.backend, backend);
-            assert!(std::ptr::eq(selection.descriptor, descriptor));
-            assert!(SNAPSHOT_ISOLATED_RUNTIME_BOUNDARIES.contains(&boundary));
-        }
+    fn epochs_9_through_11_are_one_v1_0_14_candidate_era() {
+        let range =
+            SOLANA_V1_0_14_CANDIDATE_START_SLOT..SOLANA_V1_0_14_CANDIDATE_END_SLOT_EXCLUSIVE;
+        let spans = plan_runtime_spans(range.clone(), true).unwrap();
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].slots, range.clone());
+        assert!(spans[0].handoff.is_none());
+
+        let selection = select_runtime(range, true).unwrap();
+        assert_eq!(selection.backend, RuntimeBackend::SolanaV1_0_14);
+        assert!(std::ptr::eq(selection.descriptor, &SOLANA_V1_0_14_RUNTIME));
+
+        assert!(
+            SNAPSHOT_ISOLATED_RUNTIME_BOUNDARIES.contains(&SOLANA_V1_0_14_CANDIDATE_START_SLOT)
+        );
+        assert!(!SNAPSHOT_ISOLATED_RUNTIME_BOUNDARIES.contains(&4_752_000));
+        assert!(!RUNTIME_ERAS.iter().any(|era| era.start_slot == 4_752_000));
+        assert!(
+            !RUNTIME_HANDOFFS
+                .iter()
+                .any(|handoff| handoff.boundary_slot == 4_752_000)
+        );
+    }
+
+    #[test]
+    fn epoch_12_uses_the_v1_0_23_snapshot_isolated_warmup() {
+        const EPOCH_12_END_SLOT_EXCLUSIVE: Slot = 5_616_000;
+        assert_eq!(SOLANA_V1_0_23_CANDIDATE_START_SLOT, 5_184_000);
+        assert_eq!(SOLANA_V1_0_23_INITIAL_REPLAY_SLOT, 5_183_737);
+        assert_eq!(
+            SOLANA_V1_0_23_CANDIDATE_START_SLOT - SOLANA_V1_0_23_INITIAL_REPLAY_SLOT,
+            263
+        );
+        assert!(
+            SNAPSHOT_ISOLATED_RUNTIME_BOUNDARIES.contains(&SOLANA_V1_0_23_CANDIDATE_START_SLOT)
+        );
+        assert!(
+            !RUNTIME_HANDOFFS
+                .iter()
+                .any(|handoff| handoff.boundary_slot == SOLANA_V1_0_23_CANDIDATE_START_SLOT)
+        );
+
+        let selection = select_runtime_with_snapshot_warmup(
+            SOLANA_V1_0_23_INITIAL_REPLAY_SLOT,
+            SOLANA_V1_0_23_CANDIDATE_START_SLOT..EPOCH_12_END_SLOT_EXCLUSIVE,
+            true,
+        )
+        .unwrap();
+        assert_eq!(selection.backend, RuntimeBackend::SolanaV1_0_23);
+        assert!(std::ptr::eq(selection.descriptor, &SOLANA_V1_0_23_RUNTIME));
+
+        let spans = plan_runtime_spans(
+            SOLANA_V1_0_23_INITIAL_REPLAY_SLOT..EPOCH_12_END_SLOT_EXCLUSIVE,
+            true,
+        )
+        .unwrap();
+        assert_eq!(spans.len(), 2);
+        assert_eq!(
+            spans[0].slots,
+            SOLANA_V1_0_23_INITIAL_REPLAY_SLOT..SOLANA_V1_0_23_CANDIDATE_START_SLOT
+        );
+        assert!(matches!(
+            spans[0].execution.backend,
+            EraBackend::Available(descriptor)
+                if std::ptr::eq(descriptor, &SOLANA_V1_0_14_RUNTIME)
+        ));
+        assert_eq!(
+            spans[1].slots,
+            SOLANA_V1_0_23_CANDIDATE_START_SLOT..EPOCH_12_END_SLOT_EXCLUSIVE
+        );
+        assert!(matches!(
+            spans[1].execution.backend,
+            EraBackend::Available(descriptor)
+                if std::ptr::eq(descriptor, &SOLANA_V1_0_23_RUNTIME)
+        ));
+        assert!(spans.iter().all(|span| span.handoff.is_none()));
     }
 
     #[test]

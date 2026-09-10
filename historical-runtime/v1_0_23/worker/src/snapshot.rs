@@ -1113,6 +1113,20 @@ mod tests {
 
     #[test]
     #[ignore]
+    fn loads_and_verifies_epoch_12_bootstrap_snapshot() {
+        let path = std::env::var("JETSTREAMER_SNAPSHOT_5183736")
+            .expect("set JETSTREAMER_SNAPSHOT_5183736 to run this integration test");
+        let state_dir = private_state_dir(None).unwrap();
+        let loaded = load_archive(Path::new(&path), &state_dir).unwrap();
+        assert_eq!(loaded.bank.slot(), 5_183_736);
+        assert_eq!(
+            loaded.expected_accounts_hash.to_string(),
+            "BUqwiSm2GgH9ByKrBDF6epXHYK9RRh3vyZDKtUqtMXfR"
+        );
+    }
+
+    #[test]
+    #[ignore]
     fn loads_and_verifies_mainnet_snapshot_416012() {
         let path = std::env::var("JETSTREAMER_SNAPSHOT_416012")
             .expect("set JETSTREAMER_SNAPSHOT_416012 to run this integration test");

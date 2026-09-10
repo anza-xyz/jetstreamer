@@ -20,6 +20,13 @@ snapshot checkpoints in that epoch match. The wider terminal-patch envelopes
 for epochs 12 through 100 are diagnostic: the first mismatch must split an
 envelope around an earlier exact worker rather than weakening validation.
 
+The current early-history route assigns one v1.0.14 era to slots 3888000
+through 5183999, covering epochs 9 through 11. The v1.0.17 worker remains
+registered without a slot assignment. Epoch 12 starts v1.0.23 from the
+canonical slot-5183736 snapshot, warms slots 5183737 through 5183999, and
+starts output at slot 5184000. This is a snapshot-isolated restart with no
+runtime-handoff record at the epoch boundary.
+
 Differential replay found an old-form vote
 initialization accepted by mainnet at slot 521850: v1.0.7 accepts that
 transaction, while v1.0.8 and v1.0.24 enforce the later node-signature rule.
@@ -106,8 +113,8 @@ Each vendored runtime directory contains the upstream `runtime/` crate and an
 | `v1_0_7` | `57abc370fa39e42e8fb84145a30395ddcf891692` | slot 0 through the verified slot-619848 handoff |
 | `v1_0_8` | `2a617f2d07f714918891f2b479d1cb1c324f0365` | slot 619849 through epoch 7 |
 | `v1_0_13` | `fdeda769d05fea4a3f861e787d47d995feee15d7` | epoch 8 |
-| `v1_0_14` | `8631be42ac29a062b5e26a85fc2f4c94af042afd` | epochs 9–10 |
-| `v1_0_17` | `cfc7b22c4c9094d09fc969247bfe60a154027d84` | epoch 11 |
+| `v1_0_14` | `8631be42ac29a062b5e26a85fc2f4c94af042afd` | epochs 9-11 |
+| `v1_0_17` | `cfc7b22c4c9094d09fc969247bfe60a154027d84` | registered but unassigned comparison candidate |
 | `v1_0_18` | `f26f18d29d650d06f5c5b7a4eb625622a999ea66` | unassigned exact fallback for late epoch 12 through epoch 15 |
 | `v1_0_23` | `825c0e2b6e39ae67431ed0a8282260ad3914c87a` | checkpoint-gated diagnostic envelope, epochs 12–29 |
 | `v1_0_24` | `a93915f1bddb73480f86fc09f487315ae191897d` | registered but unassigned differential candidate |

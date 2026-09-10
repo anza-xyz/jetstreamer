@@ -13473,7 +13473,7 @@ fn adaptive_epoch_archive_validated(
     })?;
     drop(file);
     let validated = if job.spans.len() == 1 {
-        validated_epoch_archive(path, job.epoch, job.selection, Some(shutdown), None)?
+        validated_epoch_archive(path, job.epoch, job.selection, Some(shutdown), None)
     } else {
         validated_epoch_archive_multi_runtime(path, job.epoch, &job.spans, Some(shutdown))
     };

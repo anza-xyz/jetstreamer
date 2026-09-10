@@ -955,16 +955,19 @@ impl BucketDecoder {
                         .push(EntryRecord::decode_ext(&mut cur, None)?);
                 }
 
-                if self.verify_chain
-                    && self.last_blockhash != Hash::default()
-                    && meta.parent_blockhash != self.last_blockhash
-                {
-                    if self.chain_mismatch_policy == ChainMismatchPolicy::AllowZeroParentResume
-                        && meta.parent_blockhash == Hash::default()
-                    {
-                        self.zero_parent_resume_artifacts += 1;
-                    } else {
-                        return Err(ArchiveFormatError::PohMismatch { slot });
+                if self.verify_chain {
+                    let zero_non_genesis_parent =
+                        slot != 0 && meta.parent_blockhash == Hash::default();
+                    let linked_parent_mismatch = self.last_blockhash != Hash::default()
+                        && meta.parent_blockhash != self.last_blockhash;
+                    if zero_non_genesis_parent || linked_parent_mismatch {
+                        if self.chain_mismatch_policy == ChainMismatchPolicy::AllowZeroParentResume
+                            && meta.parent_blockhash == Hash::default()
+                        {
+                            self.zero_parent_resume_artifacts += 1;
+                        } else {
+                            return Err(ArchiveFormatError::PohMismatch { slot });
+                        }
                     }
                 }
                 self.last_blockhash = meta.blockhash;

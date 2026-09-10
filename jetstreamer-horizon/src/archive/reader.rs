@@ -153,7 +153,7 @@ impl<R: std::io::Read + std::io::Seek> ArchiveReader<R> {
     /// This is stricter than comparing the index count and first-slot keys:
     /// an interrupted writer can leave the expected bucket keys while one of
     /// those buckets contains fewer frames than its declared range requires.
-    pub(crate) fn has_complete_slot_coverage(&mut self) -> Result<bool, ArchiveFormatError> {
+    pub fn has_complete_slot_coverage(&mut self) -> Result<bool, ArchiveFormatError> {
         use std::io::SeekFrom;
 
         let expected_buckets = self

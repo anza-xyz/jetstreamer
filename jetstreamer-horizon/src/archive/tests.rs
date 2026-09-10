@@ -559,7 +559,16 @@ fn write_archive(
     let sink = std::io::Cursor::new(Vec::new());
     let mut writer = ArchiveWriter::new(sink, 900, slot_start, n_slots, config).unwrap();
     let mut expected = Vec::new();
-    let mut last_blockhash = Hash::default();
+    let mut last_blockhash = if slot_start == 0 {
+        Hash::default()
+    } else {
+        Hash::new_from_array([0xa5; 32])
+    };
+    if slot_start != 0 {
+        writer
+            .preserve_initial_poh_anchor(slot_start, last_blockhash)
+            .unwrap();
+    }
 
     for i in 0..n_slots {
         let slot = slot_start + i;
@@ -929,6 +938,10 @@ fn v1_to_v2_reencode_preserves_semantic_sha256() {
 fn reencode_preserves_post_updates_on_zero_transaction_slots() {
     let mut writer =
         ArchiveWriter::new(Vec::new(), 900, 1_000, 1, ArchiveWriterConfig::default()).unwrap();
+    let initial_parent = Hash::new_from_array([0xa5; 32]);
+    writer
+        .preserve_initial_poh_anchor(1_000, initial_parent)
+        .unwrap();
     writer.begin_slot(1_000).unwrap();
     let data = b"zero-transaction post state";
     let update = AccountUpdateView {
@@ -951,7 +964,11 @@ fn reencode_preserves_post_updates_on_zero_transaction_slots() {
         ))
     ));
 
-    let meta = BlockMeta::new_boxed();
+    let mut meta = BlockMeta::new_boxed();
+    meta.slot = 1_000;
+    meta.parent_slot = 999;
+    meta.parent_blockhash = initial_parent;
+    meta.blockhash = Hash::new_from_array([1; 32]);
     writer.end_slot(&meta, &[]).unwrap();
     let (source, _) = writer.finish().unwrap();
     let source_slots = read_all(&source, 0, u64::MAX, true);
@@ -991,12 +1008,17 @@ fn reencode_accepts_counts_and_preserves_zero_parent_resume_artifact() {
     )
     .unwrap();
 
+    let initial_parent = Hash::new_from_array([0xa5; 32]);
+    writer
+        .preserve_initial_poh_anchor(1_000, initial_parent)
+        .unwrap();
     let first_hash = Hash::new_from_array([1; 32]);
     writer.begin_slot(1_000).unwrap();
     {
         let mut meta = BlockMeta::new_boxed();
         meta.slot = 1_000;
         meta.parent_slot = 999;
+        meta.parent_blockhash = initial_parent;
         meta.blockhash = first_hash;
         writer.end_slot(&meta, &[]).unwrap();
     }
@@ -1059,6 +1081,80 @@ fn reencode_accepts_counts_and_preserves_zero_parent_resume_artifact() {
 }
 
 #[test]
+fn strict_chain_rejects_zero_parent_on_first_non_genesis_block() {
+    let mut writer = ArchiveWriter::new(
+        std::io::Cursor::new(Vec::new()),
+        1,
+        1_000,
+        1,
+        ArchiveWriterConfig {
+            compression: Compression::None,
+            ..ArchiveWriterConfig::default()
+        },
+    )
+    .unwrap();
+    writer.begin_slot(1_000).unwrap();
+    let mut meta = BlockMeta::new_boxed();
+    meta.slot = 1_000;
+    meta.parent_slot = 999;
+    meta.parent_blockhash = Hash::default();
+    meta.blockhash = Hash::new_from_array([1; 32]);
+    writer.end_slot(&meta, &[]).unwrap();
+    let source = writer.finish().unwrap().0.into_inner();
+
+    let mut strict_reader = ArchiveReader::open(std::io::Cursor::new(&source)).unwrap();
+    strict_reader.verify_chain = true;
+    assert!(matches!(
+        strict_reader.read_slots(0, u64::MAX, &mut Collector::default()),
+        Err(ArchiveFormatError::PohMismatch { slot: 1_000 })
+    ));
+
+    let mut compatible_reader = ArchiveReader::open(std::io::Cursor::new(&source)).unwrap();
+    compatible_reader.verify_chain = true;
+    compatible_reader.chain_mismatch_policy = ChainMismatchPolicy::AllowZeroParentResume;
+    assert_eq!(
+        compatible_reader
+            .read_slots(0, u64::MAX, &mut Collector::default())
+            .unwrap(),
+        1
+    );
+    assert_eq!(compatible_reader.zero_parent_resume_artifacts(), 1);
+}
+
+#[test]
+fn strict_chain_accepts_zero_parent_only_for_slot_zero() {
+    let mut writer = ArchiveWriter::new(
+        std::io::Cursor::new(Vec::new()),
+        0,
+        0,
+        1,
+        ArchiveWriterConfig {
+            compression: Compression::None,
+            ..ArchiveWriterConfig::default()
+        },
+    )
+    .unwrap();
+    writer.begin_slot(0).unwrap();
+    let mut meta = BlockMeta::new_boxed();
+    meta.slot = 0;
+    meta.parent_slot = 0;
+    meta.parent_blockhash = Hash::default();
+    meta.blockhash = Hash::new_from_array([1; 32]);
+    writer.end_slot(&meta, &[]).unwrap();
+    let source = writer.finish().unwrap().0.into_inner();
+
+    let mut reader = ArchiveReader::open(std::io::Cursor::new(source)).unwrap();
+    reader.verify_chain = true;
+    assert_eq!(
+        reader
+            .read_slots(0, u64::MAX, &mut Collector::default())
+            .unwrap(),
+        1
+    );
+    assert_eq!(reader.zero_parent_resume_artifacts(), 0);
+}
+
+#[test]
 fn reencode_rejects_source_parent_hash_break() {
     let mut writer = ArchiveWriter::new(
         std::io::Cursor::new(Vec::new()),
@@ -1075,12 +1171,17 @@ fn reencode_rejects_source_parent_hash_break() {
     )
     .unwrap();
 
+    let initial_parent = Hash::new_from_array([0xa5; 32]);
+    writer
+        .preserve_initial_poh_anchor(1_000, initial_parent)
+        .unwrap();
     let first_hash = Hash::new_from_array([1; 32]);
     writer.begin_slot(1_000).unwrap();
     {
         let mut meta = BlockMeta::new_boxed();
         meta.slot = 1_000;
         meta.parent_slot = 999;
+        meta.parent_blockhash = initial_parent;
         meta.blockhash = first_hash;
         writer.end_slot(&meta, &[]).unwrap();
     }

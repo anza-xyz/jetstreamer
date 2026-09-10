@@ -630,6 +630,7 @@ pub enum HistoricalInitializedSource {
 pub struct HistoricalTransactionOutcome {
     pub signature: Option<[u8; SIGNATURE_BYTES]>,
     pub error: Option<protocol::TransactionError>,
+    pub fee: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2034,6 +2035,7 @@ fn normalize_outcomes(
                     .map(|bytes| array_64("transaction_outcome.signature", bytes))
                     .transpose()?,
                 error: outcome.error,
+                fee: outcome.fee,
             })
         })
         .collect()
@@ -3587,6 +3589,7 @@ mod tests {
                 protocol::EntryProcessedChunkBody::Outcomes(vec![protocol::TransactionOutcome {
                     signature: None,
                     error: None,
+                    fee: 5_000,
                 }]),
             ),
             wire_entry_end(request.id, 3, 1, 1, 2, false, 0),

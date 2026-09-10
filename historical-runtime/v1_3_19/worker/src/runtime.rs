@@ -9,7 +9,7 @@ use solana_merkle_tree::MerkleTree;
 use solana_rayon_threadlimit::get_thread_count;
 use solana_runtime::{
     accounts_db::OwnedAccountWrite,
-    bank::{Bank, Builtin, Builtins, Entrypoint},
+    bank::{Bank, Builtin, Builtins, Entrypoint, HashAgeKind},
     feature_set,
 };
 use solana_sdk::{
@@ -279,6 +279,15 @@ impl RuntimeState {
                 ));
             }
             for (index, transaction) in transactions.iter().enumerate() {
+                let fee_calculator = match results.processing_results[index].1.as_ref() {
+                    Some(HashAgeKind::DurableNonce(_, account)) => {
+                        solana_sdk::nonce::utils::fee_calculator_of(account)
+                    }
+                    _ => self
+                        .bank
+                        .get_fee_calculator(&transaction.message.recent_blockhash),
+                }
+                .ok_or_else(|| format!("missing fee calculator for transaction {}", index))?;
                 outcomes.push(TransactionOutcome {
                     signature: transaction
                         .signatures
@@ -289,6 +298,7 @@ impl RuntimeState {
                         .clone()
                         .err()
                         .map(normalize_transaction_error),
+                    fee: fee_calculator.calculate_fee(&transaction.message),
                 });
             }
             let mut entry_writes = self.drain_writes(None)?;

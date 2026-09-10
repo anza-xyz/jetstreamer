@@ -365,8 +365,10 @@ the remaining metadata stays explicitly unavailable. At and after that slot, a m
 is an error. The early source writer also stored an entry's randomized execution results beside its
 original-order transactions. For the epoch 0-100 compatibility scope, replay verifies that the
 source and runtime statuses have the same entry-wide multiset, then uses the runtime result to
-restore each transaction's status. This policy changes during epoch 9 without changing the
-execution runtime.
+restore each transaction's status. Because the same defect could select another transaction's
+durable-nonce fee calculator, protocol-v5 workers also return the runtime-associated fee. Replay
+uses that fee wherever complete source metadata is available. This policy changes during epoch 9
+without changing the execution runtime.
 
 Generated Horizon archives record the selected runtime identity and admission level, genesis,
 bootstrap state, output slot range, and transaction-metadata policy in a versioned provenance

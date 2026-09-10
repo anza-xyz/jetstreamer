@@ -6,7 +6,7 @@
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::io::{self, ErrorKind, Read, Write};
 
-pub const PROTOCOL_VERSION: u16 = 4;
+pub const PROTOCOL_VERSION: u16 = 5;
 pub const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 /// Prevent a valid, small frame from expanding into an unbounded number of
 /// independently scheduled PoH jobs. The parent may submit smaller batches.
@@ -162,6 +162,9 @@ pub struct EntryProcessed {
 pub struct TransactionOutcome {
     pub signature: Option<Vec<u8>>,
     pub error: Option<TransactionError>,
+    /// Fee selected from the transaction's recent blockhash or durable nonce
+    /// account by the historical runtime.
+    pub fee: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

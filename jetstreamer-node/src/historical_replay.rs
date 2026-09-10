@@ -726,6 +726,16 @@ impl HistoricalReplay {
                         actual.error
                     ));
                 }
+                if actual.fee != scheduled.status_meta.fee {
+                    return Err(format!(
+                        "historical fee mismatch at slot {} entry {} transaction {}: expected {}, got {}",
+                        entry.slot,
+                        entry.entry_index,
+                        entry.start_index + offset,
+                        scheduled.status_meta.fee,
+                        actual.fee,
+                    ));
+                }
             } else {
                 // Missing or v1.0-permuted source status is not associated
                 // ground truth. Preserve the historical executor's result in
@@ -734,6 +744,12 @@ impl HistoricalReplay {
                     Some(error) => Err(denormalize_transaction_error(error)),
                     None => Ok(()),
                 };
+                if scheduled.source_entry_status.is_some() {
+                    // The same source writer bug also paired the original
+                    // transaction with another transaction's durable-nonce
+                    // fee calculator. Use the runtime-associated fee.
+                    scheduled.status_meta.fee = actual.fee;
+                }
             }
         }
         Ok(())

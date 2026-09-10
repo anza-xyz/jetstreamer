@@ -2180,10 +2180,9 @@ impl BankReplay {
 
         for (offset, actual) in results.into_iter().enumerate() {
             let Some(expected) = entry.txs[offset].expected_status.clone() else {
-                // Old Faithful's earliest transactions may carry an empty
-                // metadata frame. Replay is the source of truth in that case;
-                // do not reinterpret TransactionStatusMeta::default() as an
-                // observed success.
+                // Missing and misassociated source statuses both defer to
+                // replay. Do not reinterpret TransactionStatusMeta::default()
+                // as observed success.
                 entry.txs[offset].status_meta.status = actual;
                 continue;
             };
@@ -5106,10 +5105,14 @@ fn archive_transaction_metadata_policy(
         TransactionMetadataPolicy::runtime_reconstructed_before(
             compatibility::OLD_FAITHFUL_STATUS_REQUIRED_START_SLOT,
         )
+    } else if slot_start < compatibility::OLD_FAITHFUL_STATUS_REQUIRED_START_SLOT {
+        TransactionMetadataPolicy::runtime_reconstructed_with_fee_from(
+            compatibility::OLD_FAITHFUL_STATUS_REQUIRED_START_SLOT,
+        )
     } else if slot_start
         < compatibility::OLD_FAITHFUL_UNTRUSTED_STATUS_ASSOCIATION_END_SLOT_EXCLUSIVE
     {
-        TransactionMetadataPolicy::runtime_reconstructed()
+        TransactionMetadataPolicy::runtime_reconstructed_status_and_fee()
     } else {
         TransactionMetadataPolicy::observed()
     }
@@ -14555,19 +14558,21 @@ mod early_snapshot_tests {
         );
         assert_eq!(
             archive_transaction_metadata_policy(9 * epoch_slots, epoch_slots),
-            TransactionMetadataPolicy::runtime_reconstructed()
+            TransactionMetadataPolicy::runtime_reconstructed_with_fee_from(
+                compatibility::OLD_FAITHFUL_STATUS_REQUIRED_START_SLOT
+            )
         );
         assert_eq!(
             archive_transaction_metadata_policy(29 * epoch_slots, epoch_slots),
-            TransactionMetadataPolicy::runtime_reconstructed()
+            TransactionMetadataPolicy::runtime_reconstructed_status_and_fee()
         );
         assert_eq!(
             archive_transaction_metadata_policy(30 * epoch_slots, epoch_slots),
-            TransactionMetadataPolicy::runtime_reconstructed()
+            TransactionMetadataPolicy::runtime_reconstructed_status_and_fee()
         );
         assert_eq!(
             archive_transaction_metadata_policy(100 * epoch_slots, epoch_slots),
-            TransactionMetadataPolicy::runtime_reconstructed()
+            TransactionMetadataPolicy::runtime_reconstructed_status_and_fee()
         );
         assert_eq!(
             archive_transaction_metadata_policy(101 * epoch_slots, epoch_slots),

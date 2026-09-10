@@ -51,6 +51,9 @@ pub enum TransactionMetadataSemantics {
     /// values, including absent/default values when the source frame was
     /// missing.
     RuntimeReconstructedStatusOnly = 1,
+    /// Replay supplied both status and fee. Remaining metadata fields retain
+    /// their source values.
+    RuntimeReconstructedStatusAndFee = 2,
 }
 
 /// Source of the runtime state from which this output range was replayed.
@@ -141,6 +144,25 @@ impl TransactionMetadataPolicy {
             boundary_slot: 0,
             before_boundary: TransactionMetadataSemantics::RuntimeReconstructedStatusOnly,
             at_or_after_boundary: TransactionMetadataSemantics::RuntimeReconstructedStatusOnly,
+        }
+    }
+
+    /// A policy that reconstructs status before `fee_from_slot`, then
+    /// reconstructs both status and fee at and after that slot.
+    pub const fn runtime_reconstructed_with_fee_from(fee_from_slot: u64) -> Self {
+        Self {
+            boundary_slot: fee_from_slot,
+            before_boundary: TransactionMetadataSemantics::RuntimeReconstructedStatusOnly,
+            at_or_after_boundary: TransactionMetadataSemantics::RuntimeReconstructedStatusAndFee,
+        }
+    }
+
+    /// A policy that uses runtime-reconstructed status and fee at every slot.
+    pub const fn runtime_reconstructed_status_and_fee() -> Self {
+        Self {
+            boundary_slot: 0,
+            before_boundary: TransactionMetadataSemantics::RuntimeReconstructedStatusAndFee,
+            at_or_after_boundary: TransactionMetadataSemantics::RuntimeReconstructedStatusAndFee,
         }
     }
 
@@ -1171,6 +1193,29 @@ mod tests {
         assert_eq!(
             policy.semantics_for_slot(u64::MAX),
             TransactionMetadataSemantics::RuntimeReconstructedStatusOnly
+        );
+    }
+
+    #[test]
+    fn reconstructed_fee_policy_changes_at_its_declared_slot() {
+        let policy = TransactionMetadataPolicy::runtime_reconstructed_with_fee_from(42);
+        assert_eq!(
+            policy.semantics_for_slot(41),
+            TransactionMetadataSemantics::RuntimeReconstructedStatusOnly
+        );
+        assert_eq!(
+            policy.semantics_for_slot(42),
+            TransactionMetadataSemantics::RuntimeReconstructedStatusAndFee
+        );
+
+        let all = TransactionMetadataPolicy::runtime_reconstructed_status_and_fee();
+        assert_eq!(
+            all.semantics_for_slot(0),
+            TransactionMetadataSemantics::RuntimeReconstructedStatusAndFee
+        );
+        assert_eq!(
+            all.semantics_for_slot(u64::MAX),
+            TransactionMetadataSemantics::RuntimeReconstructedStatusAndFee
         );
     }
 

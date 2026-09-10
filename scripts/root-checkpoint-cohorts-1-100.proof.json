@@ -1,0 +1,32 @@
+{
+  "schema": "jetstreamer-root-checkpoint-cohort-proof-v1",
+  "inventory": {
+    "root_objects": 1037,
+    "root_sha256": "9a837b538cef22d14be8c06d6f6831b56d7913b355d012581aee2ff4a87d98d9",
+    "hourly_objects": 34741,
+    "hourly_sha256": "f829f7e865ad4dacc20556a27e0196043210c6ef351693775452a40b772a1bc1"
+  },
+  "manifest_fingerprint": "sha256:888df3d89187e3fb8cd307e65eab1a4770153887965f3defd74f048504fc3f1a",
+  "epoch_count": 100,
+  "cohort_count": 81,
+  "multi_epoch_cohorts": [
+    {"epochs": [17, 19], "bootstrap_root_slot": 7343776, "final_root_slot": 8639740, "runtime": "solana-v1.0.23"},
+    {"epochs": [31, 32], "bootstrap_root_slot": 13391977, "final_root_slot": 14255926, "runtime": "solana-v1.1.23"},
+    {"epochs": [33, 34], "bootstrap_root_slot": 14255926, "final_root_slot": 15119936, "runtime": "solana-v1.1.23"},
+    {"epochs": [38, 39], "bootstrap_root_slot": 16415844, "final_root_slot": 17279883, "runtime": "solana-v1.1.23"},
+    {"epochs": [40, 41], "bootstrap_root_slot": 17279883, "final_root_slot": 18143963, "runtime": "solana-v1.1.23"},
+    {"epochs": [42, 43], "bootstrap_root_slot": 18143963, "final_root_slot": 18576059, "runtime": "solana-v1.1.23"},
+    {"epochs": [45, 46], "bootstrap_root_slot": 19439986, "final_root_slot": 20303899, "runtime": "solana-v1.1.23"},
+    {"epochs": [50, 51], "bootstrap_root_slot": 21599974, "final_root_slot": 22032005, "runtime": "solana-v1.1.23"},
+    {"epochs": [54, 55], "bootstrap_root_slot": 23327978, "final_root_slot": 24191928, "runtime": "solana-v1.1.23"},
+    {"epochs": [56, 57], "bootstrap_root_slot": 24191928, "final_root_slot": 25055977, "runtime": "solana-v1.1.23"},
+    {"epochs": [58, 59], "bootstrap_root_slot": 25055977, "final_root_slot": 25919917, "runtime": "solana-v1.1.23"},
+    {"epochs": [65, 66], "bootstrap_root_slot": 28079956, "final_root_slot": 28943975, "runtime": "solana-v1.2.32"},
+    {"epochs": [67, 68], "bootstrap_root_slot": 28943975, "final_root_slot": 29460107, "runtime": "solana-v1.2.32"},
+    {"epochs": [71, 72], "bootstrap_root_slot": 30671950, "final_root_slot": 31535921, "runtime": "solana-v1.2.32"},
+    {"epochs": [81, 82], "bootstrap_root_slot": 34991671, "final_root_slot": 35855942, "runtime": "solana-v1.2.32"},
+    {"epochs": [86, 87], "bootstrap_root_slot": 37151959, "final_root_slot": 38015941, "runtime": "solana-v1.2.32"},
+    {"epochs": [89, 90], "bootstrap_root_slot": 38447974, "final_root_slot": 39311837, "runtime": "solana-v1.2.32"},
+    {"epochs": [93, 94], "bootstrap_root_slot": 40175996, "final_root_slot": 41039887, "runtime": "solana-v1.3.19"}
+  ]
+}

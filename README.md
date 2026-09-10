@@ -381,6 +381,35 @@ bootstrap state, output slot range, and transaction-metadata policy in a version
 envelope. Range resume skips a completed archive only when that provenance matches the current
 slot-derived plan.
 
+Root snapshots are the only trust anchors for historical verification. The read-only inventory
+preflight groups an epoch without a root checkpoint with the first later epoch that has one, as
+long as the runtime descriptor does not change. Hourly snapshots may shorten bootstrap work for
+an independent single-epoch cohort, but they never satisfy a checkpoint or anchor a root-gap
+cohort. The preflight manifest records the root object's generation, CRC32C, size, slot, and
+accounts hash. It also records the full cohort range and terminal root checkpoints.
+
+Epochs 17 through 19 are one such cohort. They start from root slot 7,343,776 and reach root
+checkpoints in epoch 19. Run the cohort with:
+
+```bash
+JETSTREAMER_ALLOW_CANDIDATE_RUNTIME=1 \
+  cargo run --release -p jetstreamer-node --bin jetstreamer-node -- \
+  17-19 /path/to/output --verify --root-checkpoint-cohort
+```
+
+This mode keeps one historical worker and one root-only verifier alive across every epoch
+boundary. Each epoch archive is written below the owner-only private run directory. The process
+checks the exact checkpoint handoff, the next archive's initial PoH and parent anchors,
+cross-bucket continuity, provenance, full archive decode, and archive digest while publication is
+closed. Each terminal checkpoint must match the archive's final present block, so trailing skipped
+slots do not create a false epoch-boundary requirement. A mismatch, missing final-epoch root, or
+interruption leaves every generated archive private and creates no checksum. The final root must
+pass before any cohort archive is moved into the output directory and checksummed.
+
+Use `scripts/preflight_gcs_snapshots.py` before scheduling early epochs. Its schema-v2
+`verification_cohorts` array supplies the ranges accepted by this mode and fails if a root gap
+would cross a runtime boundary or extend beyond the requested range.
+
 When an epoch crosses a registered runtime boundary, `jetstreamer-node` splits it automatically
 into bounded child replays. Each child writes a complete Horizon V2 segment plus a durable JSON
 evidence sidecar bound to both the archive and worker executable by SHA-256. At the v1.0.7 →

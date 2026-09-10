@@ -104,7 +104,7 @@ pub(crate) struct HistoricalReplay {
 }
 
 struct HistoricalReplayState {
-    client: HistoricalRuntimeClient,
+    client: Option<HistoricalRuntimeClient>,
     current_slot: Slot,
     last_checkpoint_slot: Option<Slot>,
     bootstrap_checkpoint: Option<HistoricalCheckpointSummary>,
@@ -135,7 +135,7 @@ impl HistoricalReplay {
             .unwrap_or_default();
         let replay = Self {
             state: Mutex::new(HistoricalReplayState {
-                client,
+                client: Some(client),
                 current_slot,
                 last_checkpoint_slot: None,
                 bootstrap_checkpoint: None,
@@ -164,12 +164,51 @@ impl HistoricalReplay {
         Ok(replay)
     }
 
+    /// Resumes an already authenticated worker at an epoch boundary.
+    ///
+    /// The checkpoint is copied into the new segment as its bootstrap
+    /// evidence. No snapshot is loaded and no checkpoint supplied by a
+    /// transport object is promoted to a trust anchor.
+    pub(crate) fn from_carried(
+        client: HistoricalRuntimeClient,
+        bootstrap_checkpoint: HistoricalCheckpointSummary,
+        snapshot_verifier: Option<Arc<SnapshotVerifier>>,
+        failure: Arc<ReplayFailure>,
+        cursor: Arc<ReplayCursor>,
+        progress: Arc<ReplayProgress>,
+        live_start_slot: Slot,
+    ) -> Result<Self, String> {
+        validate_carried_bootstrap(client.initialized().slot, &bootstrap_checkpoint)?;
+        let checkpoint_slots = snapshot_verifier
+            .as_ref()
+            .map(|verifier| verifier.legacy_checkpoint_slots().into_iter().collect())
+            .unwrap_or_default();
+        Ok(Self {
+            state: Mutex::new(HistoricalReplayState {
+                client: Some(client),
+                current_slot: bootstrap_checkpoint.slot,
+                last_checkpoint_slot: Some(bootstrap_checkpoint.slot),
+                bootstrap_checkpoint: Some(bootstrap_checkpoint),
+                terminal_checkpoint: None,
+                emitted_write_versions: None,
+            }),
+            snapshot_verifier,
+            checkpoint_slots: Mutex::new(checkpoint_slots),
+            failure,
+            cursor,
+            progress,
+            live_start_slot,
+        })
+    }
+
     pub(crate) fn process_ready_entries(&self, entries: Vec<ReadyEntry>) {
         let supports_entry_batches = self
             .state
             .lock()
             .expect("historical replay lock poisoned")
             .client
+            .as_ref()
+            .expect("historical client is present while replay is active")
             .supports_entry_batches();
         if supports_entry_batches {
             self.process_ready_entries_batched(entries);
@@ -221,13 +260,17 @@ impl HistoricalReplay {
             let execute_start = Instant::now();
             let processed = {
                 let mut state = self.state.lock().expect("historical replay lock poisoned");
-                let result = state.client.process_entry(
-                    entry.slot,
-                    entry.entry_index as u64,
-                    entry.num_hashes,
-                    entry.hash.to_bytes(),
-                    encoded,
-                );
+                let result = state
+                    .client
+                    .as_mut()
+                    .expect("historical client is present while replay is active")
+                    .process_entry(
+                        entry.slot,
+                        entry.entry_index as u64,
+                        entry.num_hashes,
+                        entry.hash.to_bytes(),
+                        encoded,
+                    );
                 if result.is_ok() {
                     state.current_slot = entry.slot;
                     // Every accepted entry mutates the working bank, including
@@ -413,7 +456,10 @@ impl HistoricalReplay {
                 emitted_write_versions,
                 ..
             } = &mut *state;
-            client.process_entries_with(requests, |item| {
+            client
+                .as_mut()
+                .expect("historical client is present while replay is active")
+                .process_entries_with(requests, |item| {
                 match item {
                     HistoricalEntryStreamItem::Outcomes {
                         slot,
@@ -532,7 +578,7 @@ impl HistoricalReplay {
                     }
                 }
                 Ok(())
-            })
+                })
         };
         let execute_elapsed = execute_start.elapsed();
         PHASE_EXECUTE_US.fetch_add(execute_elapsed.as_micros() as u64, Ordering::Relaxed);
@@ -622,6 +668,8 @@ impl HistoricalReplay {
         }
         let result = state
             .client
+            .as_mut()
+            .ok_or_else(|| "historical client was already carried into another epoch".to_string())?
             .export_snapshot(slot, output_directory, expected_accounts_hash);
         // Export is a one-use operation in both the parent client and worker.
         // Once attempted, the cached checkpoint can still serve as evidence,
@@ -636,10 +684,30 @@ impl HistoricalReplay {
         let mut state = self.state.lock().map_err(|_| {
             "historical replay lock poisoned while shutting down worker".to_string()
         })?;
+        match state.client.as_mut() {
+            Some(client) => client
+                .shutdown()
+                .map_err(|error| format!("historical worker shutdown failed: {error}")),
+            None => Ok(()),
+        }
+    }
+
+    /// Transfers the live worker to the next epoch after terminal evidence is
+    /// sealed. Calling this before a complete terminal checkpoint fails.
+    pub(crate) fn take_client(&self) -> Result<HistoricalRuntimeClient, String> {
+        let mut state = self.state.lock().map_err(|_| {
+            "historical replay lock poisoned while carrying worker state".to_string()
+        })?;
+        assemble_evidence(
+            state.bootstrap_checkpoint.as_ref(),
+            state.terminal_checkpoint.as_ref(),
+            state.current_slot,
+            state.emitted_write_versions.as_ref(),
+        )?;
         state
             .client
-            .shutdown()
-            .map_err(|error| format!("historical worker shutdown failed: {error}"))
+            .take()
+            .ok_or_else(|| "historical client was already carried into another epoch".to_string())
     }
 
     fn current_slot(&self) -> Result<Slot, String> {
@@ -778,6 +846,8 @@ impl HistoricalReplay {
         }
         let checkpoint = state
             .client
+            .as_mut()
+            .ok_or_else(|| "historical client was already carried into another epoch".to_string())?
             .freeze_checkpoint(slot)
             .map_err(|error| format!("historical checkpoint at slot {slot} failed: {error}"))?;
         let emitted_write_versions = extend_emitted_write_versions(
@@ -919,6 +989,25 @@ fn checkpoint_refresh_required(last_checkpoint_slot: Option<Slot>, slot: Slot) -
 
 fn checkpoint_initialized_state(source: HistoricalInitializedSource) -> bool {
     source == HistoricalInitializedSource::SnapshotArchive
+}
+
+fn validate_carried_bootstrap(
+    initialized_slot: Slot,
+    checkpoint: &HistoricalCheckpointSummary,
+) -> Result<(), String> {
+    if !checkpoint.slot_complete {
+        return Err(format!(
+            "carried historical checkpoint at slot {} is incomplete",
+            checkpoint.slot
+        ));
+    }
+    if initialized_slot > checkpoint.slot {
+        return Err(format!(
+            "carried historical checkpoint slot {} precedes worker initialization slot {}",
+            checkpoint.slot, initialized_slot
+        ));
+    }
+    Ok(())
 }
 
 fn consume_checkpoint_export_seal(last_checkpoint_slot: &mut Option<Slot>) {
@@ -1142,6 +1231,25 @@ mod tests {
         assert!(checkpoint_initialized_state(
             HistoricalInitializedSource::SnapshotArchive
         ));
+    }
+
+    #[test]
+    fn carried_worker_requires_a_complete_nonregressing_checkpoint() {
+        let mut checkpoint = checkpoint_summary(20, 100);
+        validate_carried_bootstrap(10, &checkpoint).unwrap();
+
+        checkpoint.slot_complete = false;
+        assert!(
+            validate_carried_bootstrap(10, &checkpoint)
+                .unwrap_err()
+                .contains("is incomplete")
+        );
+        checkpoint.slot_complete = true;
+        assert!(
+            validate_carried_bootstrap(21, &checkpoint)
+                .unwrap_err()
+                .contains("precedes worker initialization")
+        );
     }
 
     #[test]

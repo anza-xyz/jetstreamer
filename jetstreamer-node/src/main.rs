@@ -42,10 +42,15 @@ use jetstreamer_firehose::{
 };
 use jetstreamer_horizon::archive::{
     AccountsHashKind, ArchiveProvenance, ArchiveProvenanceV1, ArchiveProvenanceV2,
-    ArchiveProvenanceV3, ArchiveWriterConfig, BootstrapStateKind, RuntimeAdmission,
-    RuntimeHandoffProvenance, RuntimeSegmentProvenance, RuntimeSegmentSource,
-    RuntimeStateCheckpoint, SemanticDigest, StateCommitment, StateCommitmentKind,
-    TransactionMetadataPolicy, WriteVersionNormalization, merge_runtime_segments,
+    ArchiveProvenanceV3, ArchiveWriterConfig, BootstrapStateKind,
+    BucketHeader as HorizonBucketHeader, Consumption, RuntimeAdmission, RuntimeHandoffProvenance,
+    RuntimeSegmentProvenance, RuntimeSegmentSource, RuntimeStateCheckpoint, SemanticDigest,
+    SlotKind, SlotVisitor, StateCommitment, StateCommitmentKind, TransactionMetadataPolicy,
+    WriteVersionNormalization, merge_runtime_segments,
+};
+use jetstreamer_horizon::{
+    account_updates::AccountUpdateView, block_metas::BlockNotification, entries::EntryRecord,
+    epochs::EpochMeta, transactions::Transaction as HorizonTransaction,
 };
 use jetstreamer_node::handoff_snapshot::{
     HANDOFF_SNAPSHOT_MANIFEST_SCHEMA_VERSION, HistoricalHandoffSnapshotManifest,
@@ -57,7 +62,7 @@ use jetstreamer_node::segment_manifest::{
     SegmentRuntimeIdentity, read_and_validate_segment_manifest, write_segment_manifest,
 };
 use jetstreamer_node::snapshots::{
-    DEFAULT_BUCKET, download_snapshot_at_or_before_slot_matching,
+    DEFAULT_BUCKET, download_exact_snapshot, download_snapshot_at_or_before_slot_matching,
     list_snapshots_in_slot_range_matching,
 };
 use log::{error, info, warn};
@@ -2357,6 +2362,11 @@ trait ReplayExecutor: Send + Sync {
     fn shutdown(&self) -> Result<(), String> {
         Ok(())
     }
+    fn take_historical_client(
+        &self,
+    ) -> Result<Option<historical::HistoricalRuntimeClient>, String> {
+        Ok(None)
+    }
 }
 
 impl ReplayExecutor for BankReplay {
@@ -2409,6 +2419,12 @@ impl ReplayExecutor for historical_replay::HistoricalReplay {
 
     fn shutdown(&self) -> Result<(), String> {
         historical_replay::HistoricalReplay::shutdown(self)
+    }
+
+    fn take_historical_client(
+        &self,
+    ) -> Result<Option<historical::HistoricalRuntimeClient>, String> {
+        historical_replay::HistoricalReplay::take_client(self).map(Some)
     }
 }
 
@@ -4893,7 +4909,7 @@ fn parse_epoch_range(arg: &str) -> Result<(u64, u64), String> {
 fn usage(program: &str) -> String {
     format!(
         "Usage: {program} <epoch|range> [dest-dir] [--verify|--no-verify] [--horizon-output=PATH]\n\
-         \x20      [--qualification-end-slot=SLOT]\n\
+         \x20      [--qualification-end-slot=SLOT] [--root-checkpoint-cohort]\n\
          \n\
          <epoch|range> is a single epoch (950) or an inclusive range (950-955).\n\
          Replays each epoch and writes a horizon archive to <dest-dir>/epoch-<N>.jet.\n\
@@ -4925,7 +4941,12 @@ fn usage(program: &str) -> String {
          --snapshot-archive, --epoch-hashes, and --horizon-output.\n\
          --epoch-hashes=PATH, --snapshot-archive=PATH, --range-info=A-B, and\n\
          --replay-scratch=PATH are\n\
-         otherwise internal flags passed by the range supervisor to its children."
+         otherwise internal flags passed by the range supervisor to its children.\n\
+         --root-checkpoint-cohort runs a multi-epoch range from one predecessor\n\
+         root snapshot through a root checkpoint in the final epoch. It requires\n\
+         explicit --verify, one unchanged runtime, and in-memory state handoff.\n\
+         Every archive remains in owner-only staging until the complete cohort\n\
+         and every staged archive pass validation."
     )
 }
 
@@ -5181,6 +5202,76 @@ fn epoch_isolation_plan(
         previous_descriptor = Some(selection.descriptor);
     }
     Ok((false, None))
+}
+
+/// Proves that an epoch range can be replayed as one uninterrupted
+/// root-checkpoint cohort. Every member must use the same runtime descriptor
+/// and that descriptor must explicitly permit a live state handoff.
+fn root_checkpoint_cohort_runtime(
+    start_epoch: u64,
+    end_epoch: u64,
+    allow_candidate_runtime: bool,
+) -> Result<compatibility::RuntimeSelection, String> {
+    if start_epoch == 0 || start_epoch >= end_epoch {
+        return Err("a root-checkpoint cohort requires at least two nonzero epochs".to_string());
+    }
+    let mut cohort_selection: Option<compatibility::RuntimeSelection> = None;
+    for epoch in start_epoch..=end_epoch {
+        let (start, end_inclusive) = epoch_to_slot_range(epoch);
+        let spans = compatibility::plan_runtime_spans(
+            start..end_inclusive.saturating_add(1),
+            allow_candidate_runtime,
+        )?;
+        if spans.len() != 1 {
+            return Err(format!(
+                "root-checkpoint cohort epoch {epoch} crosses a runtime boundary"
+            ));
+        }
+        let selection = runtime_span_selection(&spans[0])?;
+        if let Some(first) = cohort_selection
+            && !std::ptr::eq(first.descriptor, selection.descriptor)
+        {
+            return Err(format!(
+                "root-checkpoint cohort changes runtime at epoch {epoch}: {} to {}",
+                first.backend, selection.backend
+            ));
+        }
+        if !selection.descriptor.permits_live_epoch_handoff() {
+            return Err(format!(
+                "runtime profile {} does not permit the live state handoff required by a root-checkpoint cohort",
+                selection.descriptor.identity.name
+            ));
+        }
+        cohort_selection = Some(selection);
+    }
+    Ok(cohort_selection.expect("nonempty cohort has a runtime"))
+}
+
+fn validate_root_checkpoint_cohort_expectations(
+    start_epoch: u64,
+    end_epoch: u64,
+    bootstrap_slot: Slot,
+    bootstrap_expectation: BankHashExpectation,
+    expected: &BTreeMap<Slot, BankHashExpectation>,
+) -> Result<(), String> {
+    if expected.get(&bootstrap_slot) != Some(&bootstrap_expectation) {
+        return Err(format!(
+            "root-checkpoint cohort does not bind its bootstrap root at slot {bootstrap_slot}"
+        ));
+    }
+    let (first_start, _) = epoch_to_slot_range(start_epoch);
+    if bootstrap_slot >= first_start {
+        return Err(format!(
+            "root-checkpoint cohort bootstrap slot {bootstrap_slot} is not before epoch {start_epoch}"
+        ));
+    }
+    let (final_start, final_end) = epoch_to_slot_range(end_epoch);
+    if expected.range(final_start..=final_end).next().is_none() {
+        return Err(format!(
+            "root-checkpoint cohort {start_epoch}-{end_epoch} has no trusted root checkpoint in its final epoch"
+        ));
+    }
+    Ok(())
 }
 
 fn runtime_supports_private_replay_scratch(
@@ -7518,10 +7609,48 @@ async fn build_slot_presence_map(
     .map_err(|err| format!("slot presence task failed: {err}"))?
 }
 
-struct CarriedRuntimeState {
-    backend: compatibility::RuntimeBackend,
-    completed_epoch: u64,
-    bank_forks: Arc<RwLock<BankForks>>,
+enum CarriedRuntimeState {
+    Agave {
+        backend: compatibility::RuntimeBackend,
+        completed_epoch: u64,
+        bank_forks: Arc<RwLock<BankForks>>,
+    },
+    Historical {
+        backend: compatibility::RuntimeBackend,
+        completed_epoch: u64,
+        client: Box<historical::HistoricalRuntimeClient>,
+        terminal: historical_replay::HistoricalCheckpointSummary,
+        worker_executable_sha256: [u8; 32],
+    },
+}
+
+impl CarriedRuntimeState {
+    fn backend(&self) -> compatibility::RuntimeBackend {
+        match self {
+            Self::Agave { backend, .. } | Self::Historical { backend, .. } => *backend,
+        }
+    }
+
+    fn completed_epoch(&self) -> u64 {
+        match self {
+            Self::Agave {
+                completed_epoch, ..
+            }
+            | Self::Historical {
+                completed_epoch, ..
+            } => *completed_epoch,
+        }
+    }
+
+    fn slot(&self) -> Result<Slot, String> {
+        match self {
+            Self::Agave { bank_forks, .. } => bank_forks
+                .read()
+                .map_err(|_| "bank forks lock poisoned".to_string())
+                .map(|forks| forks.working_bank().slot()),
+            Self::Historical { terminal, .. } => Ok(terminal.slot),
+        }
+    }
 }
 
 struct ReplayRunResult {
@@ -7531,6 +7660,172 @@ struct ReplayRunResult {
     /// Exact registered handoff archive admitted and privately copied before
     /// this segment's historical worker initialized.
     bootstrap_handoff_archive_sha256: Option<[u8; 32]>,
+}
+
+struct CompletedCohortEpoch {
+    epoch: u64,
+    staged_output: PathBuf,
+    final_output: PathBuf,
+    historical_evidence: historical_replay::HistoricalReplayEvidence,
+    archive_chain: ArchiveChainEvidence,
+    validated: jetstreamer_node::archive_checksum::ValidatedArchiveFile,
+}
+
+fn validate_historical_cohort_evidence<'a>(
+    trusted_bootstrap_slot: Slot,
+    trusted_bootstrap_accounts_hash: Hash,
+    completed: impl IntoIterator<
+        Item = (
+            u64,
+            &'a historical_replay::HistoricalReplayEvidence,
+            ArchiveChainEvidence,
+        ),
+    >,
+) -> Result<(), String> {
+    let mut completed = completed.into_iter();
+    let Some((first_epoch, first_evidence, first_chain)) = completed.next() else {
+        return Err("root-checkpoint cohort produced no epoch evidence".to_string());
+    };
+    if first_evidence.bootstrap.slot != trusted_bootstrap_slot
+        || first_evidence.bootstrap.accounts_hash != trusted_bootstrap_accounts_hash.to_bytes()
+    {
+        return Err(format!(
+            "first cohort archive bootstrap evidence does not match trusted root {} at slot {}",
+            trusted_bootstrap_accounts_hash, trusted_bootstrap_slot
+        ));
+    }
+    let mut previous = (first_epoch, first_evidence, first_chain);
+    for (epoch, evidence, chain) in std::iter::once(previous).chain(completed) {
+        let (epoch_start, epoch_end) = epoch_to_slot_range(epoch);
+        if !evidence.terminal.slot_complete {
+            return Err(format!(
+                "cohort epoch {} terminal checkpoint at slot {} is incomplete",
+                epoch, evidence.terminal.slot
+            ));
+        }
+        match chain.terminal_block {
+            Some(block) => {
+                if !(epoch_start..=epoch_end).contains(&block.slot) {
+                    return Err(format!(
+                        "cohort epoch {epoch} archive terminal block {} is outside {epoch_start}..={epoch_end}",
+                        block.slot
+                    ));
+                }
+                if evidence.terminal.slot != block.slot
+                    || evidence.terminal.last_blockhash != block.blockhash.to_bytes()
+                {
+                    return Err(format!(
+                        "cohort epoch {epoch} terminal checkpoint does not match archive terminal block {} ({})",
+                        block.slot, block.blockhash
+                    ));
+                }
+            }
+            None => {
+                return Err(format!(
+                    "cohort epoch {epoch} archive contains no present block to bind its terminal checkpoint"
+                ));
+            }
+        }
+        if epoch != previous.0 {
+            if epoch != previous.0.saturating_add(1) {
+                return Err(format!(
+                    "cohort evidence skips from epoch {} to {}",
+                    previous.0, epoch
+                ));
+            }
+            if evidence.bootstrap != previous.1.terminal {
+                return Err(format!(
+                    "cohort state handoff from epoch {} to {} changed checkpoint evidence",
+                    previous.0, epoch
+                ));
+            }
+            if evidence.emitted_write_versions.start != evidence.bootstrap.next_write_version {
+                return Err(format!(
+                    "cohort epoch {} write versions start at {}, expected carried cursor {}",
+                    epoch,
+                    evidence.emitted_write_versions.start,
+                    evidence.bootstrap.next_write_version
+                ));
+            }
+        }
+        previous = (epoch, evidence, chain);
+    }
+    Ok(())
+}
+
+fn validate_cohort_archive_evidence_binding(
+    completed: &CompletedCohortEpoch,
+    first_epoch: bool,
+) -> Result<(), String> {
+    let file = jetstreamer_node::archive_checksum::open_regular_nofollow(&completed.staged_output)
+        .map_err(|error| {
+            format!(
+                "failed to bind staged cohort archive {}: {error}",
+                completed.staged_output.display()
+            )
+        })?;
+    let reader = jetstreamer_horizon::archive::ArchiveReader::open(std::io::BufReader::new(file))
+        .map_err(|error| {
+        format!(
+            "failed to open staged cohort archive {}: {error}",
+            completed.staged_output.display()
+        )
+    })?;
+    let provenance = reader
+        .provenance()
+        .map_err(|error| format!("invalid cohort archive provenance: {error}"))?
+        .ok_or_else(|| "cohort archive has no provenance".to_string())?;
+    let provenance = provenance
+        .single_runtime_v1()
+        .ok_or_else(|| "cohort archive does not have single-runtime provenance".to_string())?;
+    let expected_kind = if first_epoch {
+        BootstrapStateKind::SnapshotArchive
+    } else {
+        BootstrapStateKind::CarriedBank
+    };
+    let evidence = &completed.historical_evidence.bootstrap;
+    if provenance.bootstrap_state_kind != expected_kind
+        || provenance.bootstrap_slot != evidence.slot
+        || provenance.bootstrap_state_hash != Hash::new_from_array(evidence.accounts_hash)
+    {
+        return Err(format!(
+            "cohort epoch {} archive bootstrap provenance does not match runtime evidence",
+            completed.epoch
+        ));
+    }
+    if !first_epoch {
+        validate_carried_archive_anchor(completed.epoch, evidence, completed.archive_chain)?;
+    }
+    Ok(())
+}
+
+fn validate_carried_archive_anchor(
+    epoch: u64,
+    checkpoint: &historical_replay::HistoricalCheckpointSummary,
+    chain: ArchiveChainEvidence,
+) -> Result<(), String> {
+    let expected = Hash::new_from_array(checkpoint.last_blockhash);
+    let actual = chain
+        .initial_poh_anchor
+        .ok_or_else(|| format!("cohort epoch {epoch} archive has no initial PoH anchor"))?;
+    if actual != expected {
+        return Err(format!(
+            "cohort epoch {epoch} starts from PoH hash {actual}, expected carried checkpoint hash {expected}"
+        ));
+    }
+    if let Some(first_block) = chain.first_block
+        && (first_block.parent_slot != checkpoint.slot || first_block.parent_blockhash != expected)
+    {
+        return Err(format!(
+            "cohort epoch {epoch} first block {} names parent {} ({}), expected carried checkpoint {} ({})",
+            first_block.slot,
+            first_block.parent_slot,
+            first_block.parent_blockhash,
+            checkpoint.slot,
+            expected
+        ));
+    }
+    Ok(())
 }
 
 fn segment_checkpoint_summary(
@@ -7672,6 +7967,11 @@ async fn run_geyser_replay(
     // instance would leave chained epochs stuck at accounts=0 and falsely abort.
     // Counters are reset per epoch below, so sharing does not accumulate.
     carried_progress: Option<Arc<ReplayProgress>>,
+    // A root-checkpoint cohort keeps one verifier across several epochs. The
+    // terminal slot is used for candidate admission; only the final member
+    // consumes the verifier with `finish`.
+    verification_end_inclusive: Option<Slot>,
+    retain_runtime_state: bool,
 ) -> Result<ReplayRunResult, String> {
     if qualification.is_some() && carried_state.is_some() {
         return Err("focused qualification cannot reuse carried runtime state".to_string());
@@ -7680,12 +7980,7 @@ async fn run_geyser_replay(
     // Snapshot filename/format supplies only the bootstrap slot and loader
     // details; execution semantics come exclusively from the slot registry.
     let bootstrap_slot = match carried_state.as_ref() {
-        Some(state) => state
-            .bank_forks
-            .read()
-            .map_err(|_| "bank forks lock poisoned".to_string())?
-            .working_bank()
-            .slot(),
+        Some(state) => state.slot()?,
         None => bootstrap.slot()?,
     };
     let (epoch_start, epoch_end_inclusive) = epoch_to_slot_range(epoch);
@@ -7740,11 +8035,17 @@ async fn run_geyser_replay(
                 }
             ));
         };
-        let checkpoint_count = verifier.checkpoint_count_in_range(replay_start, end_inclusive);
+        let verification_end = verification_end_inclusive.unwrap_or(end_inclusive);
+        if verification_end < end_inclusive {
+            return Err(format!(
+                "snapshot verification end {verification_end} precedes replay end {end_inclusive}"
+            ));
+        }
+        let checkpoint_count = verifier.checkpoint_count_in_range(replay_start, verification_end);
         if checkpoint_count == 0 {
             return Err(format!(
-                "runtime profile {} requires at least one trusted post-bootstrap checkpoint in replay range {}..={}; the supplied checkpoint set is empty for that range",
-                execution.backend, replay_start, end_inclusive
+                "runtime profile {} requires at least one trusted post-bootstrap checkpoint in verification range {}..={}; the supplied checkpoint set is empty for that range",
+                execution.backend, replay_start, verification_end
             ));
         }
         info!(
@@ -7755,28 +8056,32 @@ async fn run_geyser_replay(
     let runtime_backend = execution.backend;
     let runtime_descriptor = execution.descriptor;
     if let Some(state) = carried_state.as_ref() {
-        if state.completed_epoch.checked_add(1) != Some(epoch) {
+        if state.completed_epoch().checked_add(1) != Some(epoch) {
             return Err(format!(
                 "carried runtime state completed epoch {}, but replay requested epoch {}",
-                state.completed_epoch, epoch
+                state.completed_epoch(),
+                epoch
             ));
         }
-        if state.backend != runtime_backend {
+        if state.backend() != runtime_backend {
             return Err(format!(
                 "carried runtime state uses {}, but slot range selected {}",
-                state.backend, runtime_backend
+                state.backend(),
+                runtime_backend
             ));
         }
-        let (completed_start, completed_end) = epoch_to_slot_range(state.completed_epoch);
+        let (completed_start, completed_end) = epoch_to_slot_range(state.completed_epoch());
         if !(completed_start..=completed_end).contains(&bootstrap_slot) {
             return Err(format!(
                 "carried runtime state at slot {bootstrap_slot} is outside completed epoch {} ({}..={})",
-                state.completed_epoch, completed_start, completed_end
+                state.completed_epoch(),
+                completed_start,
+                completed_end
             ));
         }
-        if !runtime_descriptor.bootstrap.permits_in_memory_handoff {
+        if !runtime_descriptor.permits_live_epoch_handoff() {
             return Err(format!(
-                "runtime profile {} does not permit an in-memory bank handoff",
+                "runtime profile {} does not permit a live epoch state handoff",
                 runtime_descriptor.identity.name
             ));
         }
@@ -7832,13 +8137,15 @@ async fn run_geyser_replay(
     }
     enum ReplaySource {
         Agave(BankSource),
-        Historical(Box<historical::HistoricalRuntimeClient>),
+        Historical {
+            client: Box<historical::HistoricalRuntimeClient>,
+            bootstrap_checkpoint: Option<historical_replay::HistoricalCheckpointSummary>,
+        },
     }
     let (replay_source, snapshot_slot, bootstrap_state_kind, bootstrap_state_hash) =
         match runtime_backend {
             compatibility::RuntimeBackend::AgaveV3 => match carried_state {
-                Some(state) => {
-                    let bank_forks = state.bank_forks;
+                Some(CarriedRuntimeState::Agave { bank_forks, .. }) => {
                     let (slot, state_hash) = {
                         let bank_forks = bank_forks
                             .read()
@@ -7855,6 +8162,11 @@ async fn run_geyser_replay(
                         BootstrapStateKind::CarriedBank,
                         state_hash,
                     )
+                }
+                Some(CarriedRuntimeState::Historical { .. }) => {
+                    return Err(
+                        "a historical worker cannot be handed to the Agave runtime".to_string()
+                    );
                 }
                 None => {
                     let snapshot_archive = bootstrap.snapshot_archive().ok_or_else(|| {
@@ -7923,33 +8235,61 @@ async fn run_geyser_replay(
             | compatibility::RuntimeBackend::SolanaV1_1_23
             | compatibility::RuntimeBackend::SolanaV1_2_32
             | compatibility::RuntimeBackend::SolanaV1_3_19 => {
-                if carried_state.is_some() {
-                    return Err(
-                        "an Agave in-memory bank cannot be handed to a Solana v1 worker"
-                            .to_string(),
-                    );
-                }
                 let worker_profile = historical_worker_profile(runtime_descriptor)?;
-                let executable = configured_historical_worker_executable(runtime_descriptor)?;
-                let scratch_parent = replay_scratch_dir.join(".historical-runtime");
-                fs::create_dir_all(&scratch_parent).map_err(|err| {
-                    format!(
-                        "failed to create historical runtime scratch directory {}: {err}",
-                        scratch_parent.display()
+                if let Some(CarriedRuntimeState::Historical {
+                    client,
+                    terminal,
+                    worker_executable_sha256,
+                    ..
+                }) = carried_state
+                {
+                    if client.executable_sha256() != worker_executable_sha256 {
+                        return Err(
+                            "carried historical worker executable digest changed".to_string()
+                        );
+                    }
+                    let state_hash = Hash::new_from_array(terminal.accounts_hash);
+                    info!(
+                        "reusing historical worker from previous epoch at slot {}; skipping snapshot load",
+                        terminal.slot
+                    );
+                    (
+                        ReplaySource::Historical {
+                            client,
+                            bootstrap_checkpoint: Some(terminal),
+                        },
+                        bootstrap_slot,
+                        BootstrapStateKind::CarriedBank,
+                        state_hash,
                     )
-                })?;
-                info!(
-                    "starting isolated {} worker {}",
-                    runtime_backend,
-                    executable.display()
-                );
-                let (initialization, bootstrap_state_kind, bootstrap_state_hash) = match bootstrap {
-                    ReplayBootstrap::Genesis {
-                        genesis_bin_path,
-                        identity,
-                        ..
-                    } => {
-                        let genesis_hash = runtime_descriptor
+                } else {
+                    if carried_state.is_some() {
+                        return Err(
+                            "an Agave in-memory bank cannot be handed to a Solana v1 worker"
+                                .to_string(),
+                        );
+                    }
+                    let executable = configured_historical_worker_executable(runtime_descriptor)?;
+                    let scratch_parent = replay_scratch_dir.join(".historical-runtime");
+                    fs::create_dir_all(&scratch_parent).map_err(|err| {
+                        format!(
+                            "failed to create historical runtime scratch directory {}: {err}",
+                            scratch_parent.display()
+                        )
+                    })?;
+                    info!(
+                        "starting isolated {} worker {}",
+                        runtime_backend,
+                        executable.display()
+                    );
+                    let (initialization, bootstrap_state_kind, bootstrap_state_hash) =
+                        match bootstrap {
+                            ReplayBootstrap::Genesis {
+                                genesis_bin_path,
+                                identity,
+                                ..
+                            } => {
+                                let genesis_hash = runtime_descriptor
                             .identity
                             .genesis_hash
                             .parse::<Hash>()
@@ -7960,76 +8300,80 @@ async fn run_geyser_replay(
                                     runtime_descriptor.identity.genesis_hash
                                 )
                             })?;
-                        (
-                            historical::HistoricalInitialization::Genesis(
-                                historical::GenesisInitialization {
-                                    genesis_bin_path: genesis_bin_path.clone(),
-                                    expected_size: identity.size,
-                                    expected_sha256: identity.sha256,
-                                    scratch_parent: Some(scratch_parent),
-                                },
-                            ),
-                            BootstrapStateKind::Genesis,
-                            genesis_hash,
-                        )
-                    }
-                    ReplayBootstrap::SnapshotArchive(snapshot_archive) => {
-                        let archive_name = snapshot_archive
-                            .file_name()
-                            .and_then(|name| name.to_str())
-                            .ok_or_else(|| {
-                                format!(
-                                    "historical snapshot path has no UTF-8 filename: {}",
-                                    snapshot_archive.display()
+                                (
+                                    historical::HistoricalInitialization::Genesis(
+                                        historical::GenesisInitialization {
+                                            genesis_bin_path: genesis_bin_path.clone(),
+                                            expected_size: identity.size,
+                                            expected_sha256: identity.sha256,
+                                            scratch_parent: Some(scratch_parent),
+                                        },
+                                    ),
+                                    BootstrapStateKind::Genesis,
+                                    genesis_hash,
                                 )
-                            })?;
-                        let (expected_slot, expected_hash) =
-                            parse_snapshot_archive_name(archive_name)?;
-                        (
-                            historical::HistoricalInitialization::SnapshotArchive(
-                                historical::SnapshotInitialization {
-                                    ledger_path: ledger_dir.clone(),
-                                    archive_path: snapshot_archive.clone(),
-                                    expected_slot,
-                                    expected_accounts_hash: expected_hash.0.to_bytes(),
-                                    expected_archive_sha256: bootstrap_handoff_manifest
-                                        .as_ref()
-                                        .map(|manifest| manifest.archive_sha256),
-                                    expected_archive_size: bootstrap_handoff_manifest
-                                        .as_ref()
-                                        .map(|manifest| manifest.archive_size),
-                                    scratch_parent: Some(scratch_parent),
-                                },
-                            ),
-                            BootstrapStateKind::SnapshotArchive,
-                            expected_hash.0,
-                        )
-                    }
-                };
-                let spawn = historical::WorkerSpawn {
-                    executable,
-                    initialization,
-                };
-                let client = tokio::task::spawn_blocking(move || {
-                    historical::HistoricalRuntimeClient::spawn(worker_profile, spawn)
-                })
-                .await
-                .map_err(|err| format!("historical worker startup task failed: {err}"))?
-                .map_err(|err| format!("historical worker startup failed: {err}"))?;
-                let slot = client.initialized().slot;
-                info!(
-                    "historical worker initialized at slot {} (last_blockhash={}, ticks_per_slot={}, next_write_version={})",
-                    slot,
-                    Hash::new_from_array(client.initialized().last_blockhash),
-                    client.initialized().ticks_per_slot,
-                    client.initialized().next_write_version,
-                );
-                (
-                    ReplaySource::Historical(Box::new(client)),
-                    slot,
-                    bootstrap_state_kind,
-                    bootstrap_state_hash,
-                )
+                            }
+                            ReplayBootstrap::SnapshotArchive(snapshot_archive) => {
+                                let archive_name = snapshot_archive
+                                    .file_name()
+                                    .and_then(|name| name.to_str())
+                                    .ok_or_else(|| {
+                                        format!(
+                                            "historical snapshot path has no UTF-8 filename: {}",
+                                            snapshot_archive.display()
+                                        )
+                                    })?;
+                                let (expected_slot, expected_hash) =
+                                    parse_snapshot_archive_name(archive_name)?;
+                                (
+                                    historical::HistoricalInitialization::SnapshotArchive(
+                                        historical::SnapshotInitialization {
+                                            ledger_path: ledger_dir.clone(),
+                                            archive_path: snapshot_archive.clone(),
+                                            expected_slot,
+                                            expected_accounts_hash: expected_hash.0.to_bytes(),
+                                            expected_archive_sha256: bootstrap_handoff_manifest
+                                                .as_ref()
+                                                .map(|manifest| manifest.archive_sha256),
+                                            expected_archive_size: bootstrap_handoff_manifest
+                                                .as_ref()
+                                                .map(|manifest| manifest.archive_size),
+                                            scratch_parent: Some(scratch_parent),
+                                        },
+                                    ),
+                                    BootstrapStateKind::SnapshotArchive,
+                                    expected_hash.0,
+                                )
+                            }
+                        };
+                    let spawn = historical::WorkerSpawn {
+                        executable,
+                        initialization,
+                    };
+                    let client = tokio::task::spawn_blocking(move || {
+                        historical::HistoricalRuntimeClient::spawn(worker_profile, spawn)
+                    })
+                    .await
+                    .map_err(|err| format!("historical worker startup task failed: {err}"))?
+                    .map_err(|err| format!("historical worker startup failed: {err}"))?;
+                    let slot = client.initialized().slot;
+                    info!(
+                        "historical worker initialized at slot {} (last_blockhash={}, ticks_per_slot={}, next_write_version={})",
+                        slot,
+                        Hash::new_from_array(client.initialized().last_blockhash),
+                        client.initialized().ticks_per_slot,
+                        client.initialized().next_write_version,
+                    );
+                    (
+                        ReplaySource::Historical {
+                            client: Box::new(client),
+                            bootstrap_checkpoint: None,
+                        },
+                        slot,
+                        bootstrap_state_kind,
+                        bootstrap_state_hash,
+                    )
+                }
             }
         };
     let bootstrap_last_blockhash = match &replay_source {
@@ -8039,9 +8383,13 @@ async fn run_geyser_replay(
             .working_bank()
             .last_blockhash(),
         ReplaySource::Agave(BankSource::Fresh(bank)) => bank.last_blockhash(),
-        ReplaySource::Historical(client) => {
-            Hash::new_from_array(client.initialized().last_blockhash)
-        }
+        ReplaySource::Historical {
+            client,
+            bootstrap_checkpoint,
+        } => bootstrap_checkpoint
+            .as_ref()
+            .map(|checkpoint| Hash::new_from_array(checkpoint.last_blockhash))
+            .unwrap_or_else(|| Hash::new_from_array(client.initialized().last_blockhash)),
     };
     if snapshot_slot != bootstrap_slot {
         return Err(format!(
@@ -8086,7 +8434,7 @@ async fn run_geyser_replay(
         .map(QualificationPlan::slot_count)
         .unwrap_or_else(|| end_inclusive - output_slot_start + 1);
     let worker_executable_sha256 = match &replay_source {
-        ReplaySource::Historical(client) => Some(client.executable_sha256()),
+        ReplaySource::Historical { client, .. } => Some(client.executable_sha256()),
         ReplaySource::Agave(_) => None,
     };
     let archive_provenance = build_archive_provenance(
@@ -8195,14 +8543,28 @@ async fn run_geyser_replay(
             agave_bank_replay = Some(replay.clone());
             replay
         }
-        ReplaySource::Historical(client) => Arc::new(historical_replay::HistoricalReplay::new(
-            *client,
-            snapshot_verifier.clone(),
-            failure.clone(),
-            cursor.clone(),
-            progress.clone(),
-            output_slot_start,
-        )?),
+        ReplaySource::Historical {
+            client,
+            bootstrap_checkpoint,
+        } => Arc::new(match bootstrap_checkpoint {
+            Some(checkpoint) => historical_replay::HistoricalReplay::from_carried(
+                *client,
+                checkpoint,
+                snapshot_verifier.clone(),
+                failure.clone(),
+                cursor.clone(),
+                progress.clone(),
+                output_slot_start,
+            )?,
+            None => historical_replay::HistoricalReplay::new(
+                *client,
+                snapshot_verifier.clone(),
+                failure.clone(),
+                cursor.clone(),
+                progress.clone(),
+                output_slot_start,
+            )?,
+        }),
     };
     let ready_queue_capacity = ready_entry_queue_capacity();
     info!("ready entry queue capacity: {}", ready_queue_capacity);
@@ -9091,10 +9453,19 @@ async fn run_geyser_replay(
         return Err(message);
     }
 
-    if let Some(verifier) = snapshot_verifier {
+    if let Some(verifier) = snapshot_verifier.as_ref() {
         replay_executor.verify_latest_bank()?;
-        verifier.finish()?;
-        info!("snapshot verification complete");
+        if verification_end_inclusive
+            .is_none_or(|verification_end| end_inclusive == verification_end)
+        {
+            verifier.finish()?;
+            info!("snapshot verification complete");
+        } else {
+            info!(
+                "snapshot verification remains open through slot {}",
+                verification_end_inclusive.expect("deferred verification has a terminal slot")
+            );
+        }
     }
 
     if horizon::recorder().is_some() {
@@ -9106,11 +9477,6 @@ async fn run_geyser_replay(
         horizon::finish()?;
     }
 
-    let carried_state = agave_bank_replay.map(|replay| CarriedRuntimeState {
-        backend: runtime_backend,
-        completed_epoch: epoch,
-        bank_forks: replay.bank_forks(),
-    });
     let historical_evidence = replay_executor.historical_evidence()?;
     if let Some(output_directory) = env::var_os("JETSTREAMER_EXPORT_HANDOFF_SNAPSHOT_DIR") {
         let output_directory = PathBuf::from(output_directory);
@@ -9214,7 +9580,34 @@ async fn run_geyser_replay(
             jetstreamer_node::segment_manifest::sha256_hex_string(&exported.archive_sha256),
         );
     }
-    replay_executor.shutdown()?;
+    let carried_state = if retain_runtime_state {
+        if let Some(replay) = agave_bank_replay {
+            Some(CarriedRuntimeState::Agave {
+                backend: runtime_backend,
+                completed_epoch: epoch,
+                bank_forks: replay.bank_forks(),
+            })
+        } else {
+            let evidence = historical_evidence.as_ref().ok_or_else(|| {
+                "historical runtime carry requires terminal checkpoint evidence".to_string()
+            })?;
+            let client = replay_executor.take_historical_client()?.ok_or_else(|| {
+                "historical runtime did not expose a carryable worker".to_string()
+            })?;
+            Some(CarriedRuntimeState::Historical {
+                backend: runtime_backend,
+                completed_epoch: epoch,
+                client: Box::new(client),
+                terminal: evidence.terminal.clone(),
+                worker_executable_sha256: worker_executable_sha256.ok_or_else(|| {
+                    "historical runtime carry has no worker executable digest".to_string()
+                })?,
+            })
+        }
+    } else {
+        replay_executor.shutdown()?;
+        None
+    };
     Ok(ReplayRunResult {
         carried_state,
         historical_evidence,
@@ -9346,6 +9739,7 @@ fn validated_epoch_archive(
     epoch: u64,
     selection: compatibility::RuntimeSelection,
     cancellation: Option<&AtomicBool>,
+    chain_evidence: Option<&mut ArchiveChainEvidence>,
 ) -> Result<Option<jetstreamer_node::archive_checksum::ValidatedArchiveFile>, String> {
     let file = match jetstreamer_node::archive_checksum::open_regular_nofollow(path) {
         Ok(file) => file,
@@ -9492,7 +9886,7 @@ fn validated_epoch_archive(
                 )
             })?;
             if provenance_v1.bootstrap_state_kind == BootstrapStateKind::CarriedBank
-                && !selection.descriptor.bootstrap.permits_in_memory_handoff
+                && !selection.descriptor.permits_live_epoch_handoff()
             {
                 return Err(format!(
                     "completed archive {} claims a carried-bank bootstrap for runtime {}",
@@ -9512,6 +9906,7 @@ fn validated_epoch_archive(
         &provenance,
         initial_identity,
         cancellation,
+        chain_evidence,
     )
     .map(Some)
 }
@@ -9521,7 +9916,7 @@ fn epoch_archive_reusable(
     epoch: u64,
     selection: compatibility::RuntimeSelection,
 ) -> Result<bool, String> {
-    validated_epoch_archive(path, epoch, selection, None).map(|validated| validated.is_some())
+    validated_epoch_archive(path, epoch, selection, None, None).map(|validated| validated.is_some())
 }
 
 /// Determines whether an assembled multi-runtime epoch is safe to reuse.
@@ -9768,6 +10163,7 @@ fn validated_epoch_archive_multi_runtime(
         &ArchiveProvenance::V3(provenance),
         initial_identity,
         cancellation,
+        None,
     )
     .map(Some)
 }
@@ -10705,7 +11101,100 @@ fn verify_assembled_runtime_archive_range(
         &ArchiveProvenance::V3(provenance.clone()),
         initial_identity,
         None,
+        None,
     )
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ArchiveBlockEvidence {
+    slot: Slot,
+    parent_slot: Slot,
+    parent_blockhash: Hash,
+    blockhash: Hash,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ArchiveChainEvidence {
+    initial_poh_anchor: Option<Hash>,
+    first_block: Option<ArchiveBlockEvidence>,
+    terminal_block: Option<ArchiveBlockEvidence>,
+}
+
+struct ArchiveVerificationVisitor {
+    digest: SemanticDigest,
+    chain: ArchiveChainEvidence,
+}
+
+impl ArchiveVerificationVisitor {
+    fn new() -> Self {
+        Self {
+            digest: SemanticDigest::new(),
+            chain: ArchiveChainEvidence::default(),
+        }
+    }
+
+    fn on_bucket_header(
+        &mut self,
+        header: &HorizonBucketHeader,
+    ) -> Result<(), jetstreamer_horizon::archive::ArchiveFormatError> {
+        let expected = self
+            .chain
+            .terminal_block
+            .map(|block| block.blockhash)
+            .or(self.chain.initial_poh_anchor);
+        match expected {
+            Some(expected) if header.poh_start_hash != expected => Err(
+                jetstreamer_horizon::archive::ArchiveFormatError::PohMismatch {
+                    slot: header.first_slot,
+                },
+            ),
+            Some(_) => Ok(()),
+            None => {
+                self.chain.initial_poh_anchor = Some(header.poh_start_hash);
+                Ok(())
+            }
+        }
+    }
+}
+
+impl SlotVisitor for ArchiveVerificationVisitor {
+    fn on_slot_start(&mut self, slot: u64, kind: SlotKind) {
+        self.digest.on_slot_start(slot, kind);
+    }
+
+    fn on_epoch(&mut self, meta: &EpochMeta) {
+        self.digest.on_epoch(meta);
+    }
+
+    fn on_pre_account_update(&mut self, slot: u64, update: &AccountUpdateView<'_>) {
+        self.digest.on_pre_account_update(slot, update);
+    }
+
+    fn on_transaction(&mut self, slot: u64, tx_index: u32, tx: &HorizonTransaction) {
+        self.digest.on_transaction(slot, tx_index, tx);
+    }
+
+    fn on_post_account_update(&mut self, slot: u64, update: &AccountUpdateView<'_>) {
+        self.digest.on_post_account_update(slot, update);
+    }
+
+    fn on_block(&mut self, notification: &BlockNotification, entries: &[EntryRecord]) {
+        self.digest.on_block(notification, entries);
+        if let BlockNotification::Block(meta) = notification {
+            let block = ArchiveBlockEvidence {
+                slot: meta.slot,
+                parent_slot: meta.parent_slot,
+                parent_blockhash: meta.parent_blockhash,
+                blockhash: meta.blockhash,
+            };
+            self.chain.first_block.get_or_insert(block);
+            self.chain.terminal_block = Some(block);
+        }
+    }
+
+    fn consumption(&self) -> Consumption {
+        self.digest.consumption()
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -10719,6 +11208,7 @@ fn verify_open_archive_payload(
     expected_provenance: &ArchiveProvenance,
     initial_identity: jetstreamer_node::archive_checksum::ArchiveFileIdentity,
     cancellation: Option<&AtomicBool>,
+    chain_evidence: Option<&mut ArchiveChainEvidence>,
 ) -> Result<jetstreamer_node::archive_checksum::ValidatedArchiveFile, String> {
     let header = reader.header().clone();
     if header.epoch != expected_epoch
@@ -10744,19 +11234,25 @@ fn verify_open_archive_payload(
         ));
     }
     reader.verify_chain = true;
-    let mut digest = SemanticDigest::new();
+    let mut visitor = ArchiveVerificationVisitor::new();
     let mut visited = 0u64;
     for bucket in 0..reader.bucket_count() {
         if cancellation.is_some_and(|cancelled| cancelled.load(Ordering::Relaxed)) {
             return Err(format!("archive validation cancelled: {}", path.display()));
         }
-        visited =
-            visited
-                .checked_add(reader.read_bucket(bucket, &mut digest).map_err(|err| {
-                    format!("archive {} failed full decode: {err}", path.display())
-                })?)
-                .ok_or_else(|| "assembled archive decoded slot count overflow".to_string())?;
+        visited = visited
+            .checked_add(
+                reader
+                    .read_bucket_with_header(bucket, &mut visitor, |header, visitor| {
+                        visitor.on_bucket_header(header)
+                    })
+                    .map_err(|err| {
+                        format!("archive {} failed full decode: {err}", path.display())
+                    })?,
+            )
+            .ok_or_else(|| "assembled archive decoded slot count overflow".to_string())?;
     }
+    let ArchiveVerificationVisitor { digest, chain } = visitor;
     digest
         .finish()
         .map_err(|err| format!("archive semantic verification failed: {err}"))?;
@@ -10792,6 +11288,9 @@ fn verify_open_archive_payload(
             "archive path {} changed during full validation",
             path.display()
         ));
+    }
+    if let Some(output) = chain_evidence {
+        *output = chain;
     }
     Ok(validated)
 }
@@ -12008,7 +12507,7 @@ fn adaptive_epoch_archive_validated(
         .map_err(|error| format!("failed to sync staged epoch {} archive: {error}", job.epoch))?;
     drop(file);
     let validated = if job.spans.len() == 1 {
-        validated_epoch_archive(path, job.epoch, job.selection, Some(shutdown))?
+        validated_epoch_archive(path, job.epoch, job.selection, Some(shutdown), None)?
     } else {
         validated_epoch_archive_multi_runtime(path, job.epoch, &job.spans, Some(shutdown))?
     };
@@ -12220,94 +12719,97 @@ fn spawn_adaptive_epoch_child(
 
 fn publish_staged_epoch_archive(validated: &ValidatedAdaptiveEpoch) -> Result<(), String> {
     let job = &validated.job;
-    if !jetstreamer_node::archive_checksum::path_matches_archive_identity(
+    publish_validated_staged_archive(
+        job.epoch,
         &job.staged_output,
-        validated.evidence.identity,
+        &job.final_output,
+        validated.evidence,
     )
-    .map_err(|error| {
-        format!(
-            "failed to recheck staged epoch {} archive: {error}",
-            job.epoch
-        )
-    })? {
+}
+
+fn publish_validated_staged_archive(
+    epoch: u64,
+    staged_output: &Path,
+    final_output: &Path,
+    evidence: jetstreamer_node::archive_checksum::ValidatedArchiveFile,
+) -> Result<(), String> {
+    if !jetstreamer_node::archive_checksum::path_matches_archive_identity(
+        staged_output,
+        evidence.identity,
+    )
+    .map_err(|error| format!("failed to recheck staged epoch {epoch} archive: {error}"))?
+    {
         return Err(format!(
             "staged epoch {} archive {} changed after validation",
-            job.epoch,
-            job.staged_output.display()
+            epoch,
+            staged_output.display()
         ));
     }
-    let bound_archive = jetstreamer_node::archive_checksum::open_regular_nofollow(
-        &job.staged_output,
-    )
-    .map_err(|error| {
-        format!(
-            "failed to bind staged epoch {} archive for rename: {error}",
-            job.epoch
-        )
-    })?;
+    let bound_archive = jetstreamer_node::archive_checksum::open_regular_nofollow(staged_output)
+        .map_err(|error| {
+            format!("failed to bind staged epoch {epoch} archive for rename: {error}")
+        })?;
     if jetstreamer_node::archive_checksum::archive_file_identity(&bound_archive)
-        .map_err(|error| format!("failed to identify staged epoch {}: {error}", job.epoch))?
-        != validated.evidence.identity
+        .map_err(|error| format!("failed to identify staged epoch {epoch}: {error}"))?
+        != evidence.identity
     {
         return Err(format!(
             "staged epoch {} descriptor no longer matches validation evidence",
-            job.epoch
+            epoch
         ));
     }
-    let preserved_output = preserve_existing_output(&job.final_output)?;
-    if let Err(err) = fs::rename(&job.staged_output, &job.final_output) {
+    let preserved_output = preserve_existing_output(final_output)?;
+    if let Err(err) = fs::rename(staged_output, final_output) {
         if let Some(backup) = preserved_output.as_ref()
-            && !job.final_output.exists()
-            && let Err(restore_err) = fs::rename(backup, &job.final_output)
+            && !final_output.exists()
+            && let Err(restore_err) = fs::rename(backup, final_output)
         {
             return Err(format!(
                 "failed to publish staged epoch {} archive: {err}; also failed to restore {}: {restore_err}",
-                job.epoch,
+                epoch,
                 backup.display()
             ));
         }
         return Err(format!(
             "failed to atomically publish staged epoch {} archive {} as {}: {err}",
-            job.epoch,
-            job.staged_output.display(),
-            job.final_output.display()
+            epoch,
+            staged_output.display(),
+            final_output.display()
         ));
     }
-    let output_parent = job.final_output.parent().unwrap_or_else(|| Path::new("."));
+    let output_parent = final_output.parent().unwrap_or_else(|| Path::new("."));
     fs::File::open(output_parent)
         .and_then(|directory| directory.sync_all())
         .map_err(|err| format!("failed to sync {}: {err}", output_parent.display()))?;
-    let rebound_evidence = jetstreamer_node::archive_checksum::rebind_validated_after_rename(
-        &bound_archive,
-        validated.evidence,
-    )
-    .map_err(|error| {
-        format!(
-            "published epoch {} archive changed across rename: {error}",
-            job.epoch
-        )
-    })?;
+    let rebound_evidence =
+        jetstreamer_node::archive_checksum::rebind_validated_after_rename(&bound_archive, evidence)
+            .map_err(|error| {
+                format!(
+                    "published epoch {} archive changed across rename: {error}",
+                    epoch
+                )
+            })?;
     if !jetstreamer_node::archive_checksum::path_matches_archive_identity(
-        &job.final_output,
+        final_output,
         rebound_evidence.identity,
     )
-    .map_err(|error| format!("failed to recheck {}: {error}", job.final_output.display()))?
+    .map_err(|error| format!("failed to recheck {}: {error}", final_output.display()))?
     {
         return Err(format!(
             "published epoch {} archive {} changed across atomic rename",
-            job.epoch,
-            job.final_output.display()
+            epoch,
+            final_output.display()
         ));
     }
     jetstreamer_node::archive_checksum::ensure_archive_checksum_for_validated(
-        &job.final_output,
+        final_output,
         rebound_evidence,
     )
     .map_err(|err| {
         format!(
             "failed to publish checksum for verified epoch {} archive {}: {err}",
-            job.epoch,
-            job.final_output.display()
+            epoch,
+            final_output.display()
         )
     })?;
     Ok(())
@@ -12533,7 +13035,7 @@ async fn run_epoch_range_supervisor_adaptive(
         )?;
         let final_output = dest_dir.join(format!("epoch-{epoch}.jet"));
         let reusable = if spans.len() == 1 {
-            validated_epoch_archive(&final_output, epoch, selection, None)
+            validated_epoch_archive(&final_output, epoch, selection, None, None)
         } else {
             validated_epoch_archive_multi_runtime(&final_output, epoch, &spans, None)
         };
@@ -13288,6 +13790,7 @@ async fn main() {
     let mut snapshot_archive_override: Option<PathBuf> = None;
     let mut range_info: Option<(u64, u64)> = None;
     let mut replay_scratch: Option<PathBuf> = None;
+    let mut root_checkpoint_cohort = false;
     for arg in args {
         if arg == "--verify" {
             verify_snapshots = true;
@@ -13323,6 +13826,12 @@ async fn main() {
             }
         } else if let Some(path) = arg.strip_prefix("--replay-scratch=") {
             replay_scratch = Some(PathBuf::from(path));
+        } else if arg == "--root-checkpoint-cohort" {
+            if root_checkpoint_cohort {
+                eprintln!("duplicate --root-checkpoint-cohort option");
+                exit(2);
+            }
+            root_checkpoint_cohort = true;
         } else if arg.starts_with('-') {
             eprintln!("unknown option '{arg}'");
             eprintln!("{}", usage(&program));
@@ -13370,6 +13879,28 @@ async fn main() {
         eprintln!("--qualification-end-slot cannot be combined with --range-info");
         exit(2);
     }
+    if root_checkpoint_cohort {
+        if start_epoch == end_epoch {
+            eprintln!("--root-checkpoint-cohort requires a multi-epoch range");
+            exit(2);
+        }
+        if explicit_verify != Some(true) {
+            eprintln!("--root-checkpoint-cohort requires explicit --verify");
+            exit(2);
+        }
+        if horizon_output.is_some()
+            || qualification_end_slot.is_some()
+            || epoch_hashes.is_some()
+            || snapshot_archive_override.is_some()
+            || range_info.is_some()
+            || replay_scratch.is_some()
+        {
+            eprintln!(
+                "--root-checkpoint-cohort cannot be combined with output, qualification, or internal child overrides"
+            );
+            exit(2);
+        }
+    }
     let qualification = match qualification_plan(
         start_epoch,
         end_epoch,
@@ -13399,7 +13930,51 @@ async fn main() {
         );
     }
     let horizon_output_override = horizon_output;
-    let replay_scratch_dir = replay_scratch.as_deref().unwrap_or(&dest_dir);
+    if let Err(err) = fs::create_dir_all(&dest_dir) {
+        eprintln!(
+            "error: failed to create destination directory {}: {err}",
+            dest_dir.display()
+        );
+        exit(1);
+    }
+    let cohort_run_dir = if root_checkpoint_cohort {
+        let scope = match private_epoch_scope(&dest_dir) {
+            Ok(scope) => scope,
+            Err(err) => {
+                eprintln!("error: {err}");
+                exit(1);
+            }
+        };
+        let cohort_root = scope
+            .join("work")
+            .join(format!("root-cohort-{start_epoch}-{end_epoch}"));
+        if let Err(err) = create_or_validate_private_directory(&cohort_root) {
+            eprintln!("error: {err}");
+            exit(1);
+        }
+        let run = cohort_root.join(format!(
+            "run-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        if let Err(err) = create_fresh_private_directory(&run) {
+            eprintln!("error: {err}");
+            exit(1);
+        }
+        Some(run)
+    } else {
+        None
+    };
+    let replay_scratch_path = replay_scratch.clone().unwrap_or_else(|| {
+        cohort_run_dir
+            .as_ref()
+            .map(|run| run.join("scratch"))
+            .unwrap_or_else(|| dest_dir.clone())
+    });
+    let replay_scratch_dir = replay_scratch_path.as_path();
     if let Err(err) = fs::create_dir_all(replay_scratch_dir) {
         eprintln!(
             "error: failed to create replay scratch directory {}: {err}",
@@ -13437,6 +14012,17 @@ async fn main() {
             eprintln!("error: {err}");
             exit(2);
         }
+    };
+    let cohort_runtime = if root_checkpoint_cohort {
+        match root_checkpoint_cohort_runtime(start_epoch, end_epoch, allow_candidate_runtime) {
+            Ok(selection) => Some(selection),
+            Err(err) => {
+                eprintln!("error: {err}");
+                exit(1);
+            }
+        }
+    } else {
+        None
     };
     for epoch in start_epoch..=end_epoch {
         let slot_range = runtime_slot_range(epoch, qualification);
@@ -13486,7 +14072,7 @@ async fn main() {
     // avoids redoing them; the resumed epoch bootstraps from a boundary snapshot
     // exactly like a fresh start (the in-memory bank from the prior epoch is gone
     // after a crash). Scoped to ranges so a single-epoch re-run still regenerates.
-    let effective_start = if start_epoch != end_epoch {
+    let effective_start = if start_epoch != end_epoch && !root_checkpoint_cohort {
         let mut first_incomplete = start_epoch;
         while first_incomplete <= end_epoch {
             let (slot_start, slot_end_inclusive) = epoch_to_slot_range(first_incomplete);
@@ -13628,7 +14214,8 @@ async fn main() {
     let effective_archive_extensions = effective_runtime.descriptor.bootstrap.archive_extensions;
 
     let total_epochs = end_epoch - effective_start + 1;
-    let configured_epoch_isolation = env_truthy_default("JETSTREAMER_EPOCH_ISOLATION", true);
+    let configured_epoch_isolation =
+        !root_checkpoint_cohort && env_truthy_default("JETSTREAMER_EPOCH_ISOLATION", true);
     let (epoch_isolation, forced_multi_runtime_epoch) = match epoch_isolation_plan(
         effective_start,
         end_epoch,
@@ -13642,6 +14229,12 @@ async fn main() {
         }
     };
     if let Some(epoch) = forced_multi_runtime_epoch {
+        if root_checkpoint_cohort {
+            eprintln!(
+                "error: root-checkpoint cohort cannot cross the runtime boundary in epoch {epoch}"
+            );
+            exit(1);
+        }
         warn!(
             "JETSTREAMER_EPOCH_ISOLATION=0 cannot chain range {effective_start}-{end_epoch} in one process because epoch {epoch} crosses an execution-runtime boundary; forcing per-epoch process isolation"
         );
@@ -13708,6 +14301,84 @@ async fn main() {
                 exit(1);
             }
         }
+    } else if root_checkpoint_cohort {
+        let bounds = match normal_epoch_bootstrap_bounds(effective_start) {
+            Ok(bounds) => bounds,
+            Err(err) => {
+                eprintln!("error: {err}");
+                exit(1);
+            }
+        };
+        let selection = cohort_runtime.expect("cohort runtime was validated");
+        let roots = match list_snapshots_in_slot_range_matching(
+            bounds.min_slot,
+            bounds.max_slot,
+            selection.descriptor.bootstrap.archive_extensions,
+        )
+        .await
+        {
+            Ok(roots) => roots,
+            Err(err) => {
+                eprintln!("error: failed to list predecessor root snapshots: {err}");
+                exit(1);
+            }
+        };
+        let Some(root) = roots.last() else {
+            eprintln!(
+                "error: root-checkpoint cohort has no predecessor root snapshot in slots {}..={}",
+                bounds.min_slot, bounds.max_slot
+            );
+            exit(1);
+        };
+        let name = match snapshot_filename(&root.snapshot_uri) {
+            Ok(name) => name.to_owned(),
+            Err(err) => {
+                eprintln!("error: {err}");
+                exit(1);
+            }
+        };
+        let (root_slot, root_hash) = match parse_snapshot_archive_name(&name) {
+            Ok(identity) => identity,
+            Err(err) => {
+                eprintln!("error: {err}");
+                exit(1);
+            }
+        };
+        if root_slot != root.slot_dir || !bounds.accepts(root_slot, root_hash.0) {
+            eprintln!(
+                "error: predecessor root object {} does not satisfy epoch {} bootstrap policy",
+                root.snapshot_uri, effective_start
+            );
+            exit(1);
+        }
+        let input_dir = cohort_run_dir
+            .as_ref()
+            .expect("cohort run directory was created")
+            .join("inputs");
+        if let Err(err) = create_or_validate_private_directory(&input_dir) {
+            eprintln!("error: {err}");
+            exit(1);
+        }
+        let snapshot_path = match download_exact_snapshot(root_slot, &name, &input_dir).await {
+            Ok(path) => path,
+            Err(err) => {
+                eprintln!("error: failed to download trusted predecessor root: {err}");
+                exit(1);
+            }
+        };
+        if let Err(err) = validate_runtime_bootstrap_archive(selection.descriptor, &snapshot_path) {
+            eprintln!("error: {err}");
+            exit(1);
+        }
+        if let Err(err) = validate_epoch_bootstrap_snapshot(effective_start, &snapshot_path) {
+            eprintln!("error: {err}");
+            exit(1);
+        }
+        info!(
+            "root-checkpoint cohort {}-{} selected predecessor root {} at slot {}",
+            effective_start, end_epoch, name, root_slot
+        );
+        ReplayBootstrap::SnapshotArchive(snapshot_path)
     } else {
         // The snapshot bootstraps only the first epoch actually run
         // (`effective_start`); later epochs in an in-process range chain off
@@ -13913,7 +14584,58 @@ async fn main() {
     let mut snapshot_expectations: BTreeMap<u64, BTreeMap<Slot, BankHashExpectation>> =
         BTreeMap::new();
     if verify_snapshots {
-        if let Some(hashes_path) = &epoch_hashes {
+        if root_checkpoint_cohort {
+            let selection = cohort_runtime.expect("cohort runtime was validated");
+            let snapshot_path = bootstrap
+                .snapshot_archive()
+                .expect("root-checkpoint cohort has a snapshot bootstrap");
+            let (bootstrap_slot, bootstrap_expectation) =
+                match snapshot_path_expectation(snapshot_path, selection.descriptor.bootstrap) {
+                    Ok(expectation) => expectation,
+                    Err(err) => {
+                        eprintln!("error: {err}");
+                        exit(1);
+                    }
+                };
+            let (_, cohort_end) = epoch_to_slot_range(end_epoch);
+            let mut expected = match snapshot_expectations_for_span(
+                bootstrap_slot,
+                cohort_end,
+                selection.descriptor.bootstrap,
+            )
+            .await
+            {
+                Ok(expected) => expected,
+                Err(err) => {
+                    eprintln!("error: {err}");
+                    exit(1);
+                }
+            };
+            if let Err(err) = add_boundary_snapshot_expectation(
+                &mut expected,
+                snapshot_path,
+                selection.descriptor.bootstrap,
+            ) {
+                eprintln!("error: {err}");
+                exit(1);
+            }
+            if let Err(err) = validate_root_checkpoint_cohort_expectations(
+                effective_start,
+                end_epoch,
+                bootstrap_slot,
+                bootstrap_expectation,
+                &expected,
+            ) {
+                eprintln!("error: {err}");
+                exit(1);
+            }
+            info!(
+                "root-checkpoint cohort verification bound {} root checkpoint(s) through epoch {}",
+                expected.len(),
+                end_epoch
+            );
+            snapshot_expectations.insert(effective_start, expected);
+        } else if let Some(hashes_path) = &epoch_hashes {
             // Per-epoch child: the supervisor prefetched this epoch's hashes to
             // a file, so the child stays gcloud-free.
             match read_epoch_hashes_file(hashes_path, effective_runtime.descriptor.bootstrap) {
@@ -14247,6 +14969,33 @@ async fn main() {
             .map(|plan| plan.replay_start)
             .unwrap_or_else(|| epoch_to_slot_range(effective_start).0),
     ));
+    let cohort_verifier = if root_checkpoint_cohort {
+        let expected = snapshot_expectations
+            .remove(&effective_start)
+            .unwrap_or_default();
+        Some(Arc::new(SnapshotVerifier::new(
+            expected,
+            Some(shutdown.clone()),
+        )))
+    } else {
+        None
+    };
+    let cohort_trusted_bootstrap = if root_checkpoint_cohort {
+        let snapshot_path = bootstrap
+            .snapshot_archive()
+            .expect("root-checkpoint cohort has a snapshot bootstrap");
+        let name = snapshot_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("validated snapshot path has a UTF-8 filename");
+        Some(
+            parse_snapshot_archive_name(name)
+                .expect("validated root-checkpoint bootstrap has a snapshot identity"),
+        )
+    } else {
+        None
+    };
+    let mut completed_cohort = Vec::new();
     let mut carried_state: Option<CarriedRuntimeState> = None;
     for epoch in effective_start..=end_epoch {
         if shutdown.load(Ordering::SeqCst) {
@@ -14259,11 +15008,26 @@ async fn main() {
                 epoch - effective_start + 1
             );
         }
-        let horizon_output = horizon_output_override
-            .clone()
-            .unwrap_or_else(|| dest_dir.join(format!("epoch-{epoch}.jet")));
+        let final_output = dest_dir.join(format!("epoch-{epoch}.jet"));
+        let horizon_output = if root_checkpoint_cohort {
+            let staging = cohort_run_dir
+                .as_ref()
+                .expect("cohort run directory was created")
+                .join("archives");
+            if let Err(err) = create_or_validate_private_directory(&staging) {
+                eprintln!("error: {err}");
+                exit(1);
+            }
+            staging.join(format!("epoch-{epoch}.jet"))
+        } else {
+            horizon_output_override
+                .clone()
+                .unwrap_or_else(|| final_output.clone())
+        };
 
-        let snapshot_verifier = if verify_snapshots {
+        let snapshot_verifier = if let Some(verifier) = cohort_verifier.as_ref() {
+            Some(verifier.clone())
+        } else if verify_snapshots {
             let expected = snapshot_expectations.remove(&epoch).unwrap_or_default();
             info!(
                 "snapshot verification enabled for {} snapshot(s)",
@@ -14292,11 +15056,107 @@ async fn main() {
             carried_state.take(),
             range_progress.clone(),
             Some(shared_progress.clone()),
+            root_checkpoint_cohort.then(|| epoch_to_slot_range(end_epoch).1),
+            epoch < end_epoch,
         )
         .await;
         match result {
             Ok(result) => {
-                if let Some(plan) = qualification
+                if root_checkpoint_cohort {
+                    let historical_evidence = match result.historical_evidence.clone() {
+                        Some(evidence) => evidence,
+                        None => {
+                            eprintln!(
+                                "error: root-checkpoint cohort epoch {epoch} produced no historical checkpoint evidence"
+                            );
+                            exit(1);
+                        }
+                    };
+                    let selection = cohort_runtime.expect("cohort runtime was validated");
+                    let staged_file =
+                        match jetstreamer_node::archive_checksum::open_regular_nofollow(
+                            &horizon_output,
+                        ) {
+                            Ok(file) => file,
+                            Err(err) => {
+                                eprintln!(
+                                    "error: failed to open staged cohort archive {}: {err}",
+                                    horizon_output.display()
+                                );
+                                exit(1);
+                            }
+                        };
+                    if let Err(err) =
+                        jetstreamer_node::archive_checksum::prepare_archive_permissions(
+                            &staged_file,
+                            &dest_dir,
+                        )
+                        .and_then(|()| staged_file.sync_all())
+                    {
+                        eprintln!(
+                            "error: failed to prepare staged cohort archive {}: {err}",
+                            horizon_output.display()
+                        );
+                        exit(1);
+                    }
+                    drop(staged_file);
+                    let mut archive_chain = ArchiveChainEvidence::default();
+                    let validated = match validated_epoch_archive(
+                        &horizon_output,
+                        epoch,
+                        selection,
+                        Some(&shutdown),
+                        Some(&mut archive_chain),
+                    ) {
+                        Ok(Some(validated)) => validated,
+                        Ok(None) => {
+                            eprintln!(
+                                "error: staged cohort archive {} is incomplete",
+                                horizon_output.display()
+                            );
+                            exit(1);
+                        }
+                        Err(err) => {
+                            eprintln!("error: {err}");
+                            exit(1);
+                        }
+                    };
+                    let completed = CompletedCohortEpoch {
+                        epoch,
+                        staged_output: horizon_output.clone(),
+                        final_output,
+                        historical_evidence,
+                        archive_chain,
+                        validated,
+                    };
+                    if let Err(err) = validate_cohort_archive_evidence_binding(
+                        &completed,
+                        epoch == effective_start,
+                    ) {
+                        eprintln!("error: {err}");
+                        exit(1);
+                    }
+                    completed_cohort.push(completed);
+                    let (trusted_slot, trusted_hash) =
+                        cohort_trusted_bootstrap.expect("cohort bootstrap was parsed");
+                    if let Err(err) = validate_historical_cohort_evidence(
+                        trusted_slot,
+                        trusted_hash.0,
+                        completed_cohort.iter().map(|completed| {
+                            (
+                                completed.epoch,
+                                &completed.historical_evidence,
+                                completed.archive_chain,
+                            )
+                        }),
+                    ) {
+                        eprintln!("error: {err}");
+                        exit(1);
+                    }
+                    info!(
+                        "root-checkpoint cohort retained validated epoch {epoch} privately; publication remains closed"
+                    );
+                } else if let Some(plan) = qualification
                     && result.historical_evidence.is_some()
                 {
                     if let Err(err) = publish_historical_segment_manifest(
@@ -14358,11 +15218,257 @@ async fn main() {
             }
         }
     }
+    if root_checkpoint_cohort {
+        if completed_cohort.len() as u64 != total_epochs {
+            if shutdown.load(Ordering::SeqCst) {
+                info!(
+                    "root-checkpoint cohort stopped with {} private archive(s); publication remains closed",
+                    completed_cohort.len()
+                );
+                return;
+            }
+            eprintln!(
+                "error: root-checkpoint cohort produced {} archives, expected {total_epochs}; publication remains closed",
+                completed_cohort.len()
+            );
+            exit(1);
+        }
+        let (trusted_slot, trusted_hash) =
+            cohort_trusted_bootstrap.expect("cohort bootstrap was parsed");
+        if let Err(err) = validate_historical_cohort_evidence(
+            trusted_slot,
+            trusted_hash.0,
+            completed_cohort.iter().map(|completed| {
+                (
+                    completed.epoch,
+                    &completed.historical_evidence,
+                    completed.archive_chain,
+                )
+            }),
+        ) {
+            eprintln!("error: {err}");
+            exit(1);
+        }
+        if let Err(err) = cohort_verifier
+            .as_ref()
+            .expect("cohort verifier was created")
+            .finish()
+        {
+            eprintln!(
+                "error: root-checkpoint cohort terminal verification is incomplete: {err}; publication remains closed"
+            );
+            exit(1);
+        }
+        info!(
+            "root-checkpoint cohort {}-{} passed its terminal root and all archive checks; opening publication gate",
+            effective_start, end_epoch
+        );
+        for completed in &completed_cohort {
+            if let Err(err) = publish_validated_staged_archive(
+                completed.epoch,
+                &completed.staged_output,
+                &completed.final_output,
+                completed.validated,
+            ) {
+                eprintln!("error: {err}");
+                exit(1);
+            }
+        }
+        info!(
+            "root-checkpoint cohort {}-{} published {} archive(s) with checksums",
+            effective_start,
+            end_epoch,
+            completed_cohort.len()
+        );
+    }
 }
 
 #[cfg(test)]
 mod early_snapshot_tests {
     use super::*;
+
+    fn historical_checkpoint(
+        slot: Slot,
+        accounts_hash: Hash,
+        last_blockhash: Hash,
+        next_write_version: u64,
+    ) -> historical_replay::HistoricalCheckpointSummary {
+        historical_replay::HistoricalCheckpointSummary {
+            slot,
+            bank_hash: Hash::new_unique().to_bytes(),
+            accounts_hash: accounts_hash.to_bytes(),
+            last_blockhash: last_blockhash.to_bytes(),
+            capitalization: 1,
+            transaction_count: 2,
+            tick_height: 3,
+            slot_complete: true,
+            write_count: 0,
+            next_write_version,
+        }
+    }
+
+    fn archive_chain_for(
+        evidence: &historical_replay::HistoricalReplayEvidence,
+    ) -> ArchiveChainEvidence {
+        let terminal = ArchiveBlockEvidence {
+            slot: evidence.terminal.slot,
+            parent_slot: evidence.bootstrap.slot,
+            parent_blockhash: Hash::new_from_array(evidence.bootstrap.last_blockhash),
+            blockhash: Hash::new_from_array(evidence.terminal.last_blockhash),
+        };
+        ArchiveChainEvidence {
+            initial_poh_anchor: Some(Hash::new_from_array(evidence.bootstrap.last_blockhash)),
+            first_block: Some(terminal),
+            terminal_block: Some(terminal),
+        }
+    }
+
+    #[test]
+    fn epochs_17_through_19_form_one_carryable_runtime_cohort() {
+        let selection = root_checkpoint_cohort_runtime(17, 19, true).unwrap();
+        assert_eq!(
+            selection.backend,
+            compatibility::RuntimeBackend::SolanaV1_0_23
+        );
+        assert!(selection.descriptor.permits_live_epoch_handoff());
+
+        let error = root_checkpoint_cohort_runtime(11, 12, true).unwrap_err();
+        assert!(error.contains("changes runtime at epoch 12"), "{error}");
+    }
+
+    #[test]
+    fn cohort_expectations_require_the_bootstrap_root_and_a_final_epoch_root() {
+        let bootstrap_hash = Hash::new_unique();
+        let bootstrap = BankHashExpectation::LegacyAccountsHash(bootstrap_hash);
+        let final_root_hash = Hash::new_unique();
+        let mut expected = BTreeMap::from([
+            (7_343_776, bootstrap),
+            (
+                8_213_950,
+                BankHashExpectation::LegacyAccountsHash(final_root_hash),
+            ),
+        ]);
+        validate_root_checkpoint_cohort_expectations(17, 19, 7_343_776, bootstrap, &expected)
+            .unwrap();
+
+        expected.remove(&8_213_950);
+        let error =
+            validate_root_checkpoint_cohort_expectations(17, 19, 7_343_776, bootstrap, &expected)
+                .unwrap_err();
+        assert!(error.contains("no trusted root checkpoint in its final epoch"));
+    }
+
+    #[test]
+    fn cohort_evidence_requires_exact_cross_epoch_state_handoffs() {
+        let trusted_hash = Hash::new_unique();
+        let root = historical_checkpoint(7_343_776, trusted_hash, Hash::new_unique(), 10);
+        let end_17 = historical_checkpoint(
+            epoch_to_slot_range(17).1,
+            Hash::new_unique(),
+            Hash::new_unique(),
+            20,
+        );
+        let end_18 = historical_checkpoint(
+            epoch_to_slot_range(18).1,
+            Hash::new_unique(),
+            Hash::new_unique(),
+            30,
+        );
+        let end_19 = historical_checkpoint(
+            epoch_to_slot_range(19).1,
+            Hash::new_unique(),
+            Hash::new_unique(),
+            40,
+        );
+        let evidence = vec![
+            (
+                17,
+                historical_replay::HistoricalReplayEvidence {
+                    bootstrap: root,
+                    terminal: end_17.clone(),
+                    emitted_write_versions: 10..20,
+                },
+            ),
+            (
+                18,
+                historical_replay::HistoricalReplayEvidence {
+                    bootstrap: end_17,
+                    terminal: end_18.clone(),
+                    emitted_write_versions: 20..30,
+                },
+            ),
+            (
+                19,
+                historical_replay::HistoricalReplayEvidence {
+                    bootstrap: end_18,
+                    terminal: end_19,
+                    emitted_write_versions: 30..40,
+                },
+            ),
+        ];
+        validate_historical_cohort_evidence(
+            7_343_776,
+            trusted_hash,
+            evidence
+                .iter()
+                .map(|(epoch, evidence)| (*epoch, evidence, archive_chain_for(evidence))),
+        )
+        .unwrap();
+
+        let mut broken = evidence.clone();
+        broken[1].1.bootstrap.bank_hash = Hash::new_unique().to_bytes();
+        let error = validate_historical_cohort_evidence(
+            7_343_776,
+            trusted_hash,
+            broken
+                .iter()
+                .map(|(epoch, evidence)| (*epoch, evidence, archive_chain_for(evidence))),
+        )
+        .unwrap_err();
+        assert!(error.contains("changed checkpoint evidence"), "{error}");
+    }
+
+    #[test]
+    fn cohort_terminal_evidence_tracks_the_last_present_block_before_trailing_skips() {
+        let trusted_hash = Hash::new_unique();
+        let root = historical_checkpoint(7_343_776, trusted_hash, Hash::new_unique(), 10);
+        let epoch = 18;
+        let epoch_end = epoch_to_slot_range(epoch).1;
+        let terminal =
+            historical_checkpoint(epoch_end - 1, Hash::new_unique(), Hash::new_unique(), 20);
+        let evidence = historical_replay::HistoricalReplayEvidence {
+            bootstrap: root,
+            terminal,
+            emitted_write_versions: 10..20,
+        };
+        validate_historical_cohort_evidence(
+            7_343_776,
+            trusted_hash,
+            [(epoch, &evidence, archive_chain_for(&evidence))],
+        )
+        .unwrap();
+        validate_carried_archive_anchor(epoch, &evidence.bootstrap, archive_chain_for(&evidence))
+            .unwrap();
+
+        let mut wrong_chain = archive_chain_for(&evidence);
+        wrong_chain.terminal_block.as_mut().unwrap().slot = epoch_end;
+        let error = validate_historical_cohort_evidence(
+            7_343_776,
+            trusted_hash,
+            [(epoch, &evidence, wrong_chain)],
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("does not match archive terminal block"),
+            "{error}"
+        );
+
+        let mut wrong_parent = archive_chain_for(&evidence);
+        wrong_parent.first_block.as_mut().unwrap().parent_slot += 1;
+        let error =
+            validate_carried_archive_anchor(epoch, &evidence.bootstrap, wrong_parent).unwrap_err();
+        assert!(error.contains("expected carried checkpoint"), "{error}");
+    }
 
     #[test]
     fn ready_entry_teardown_unblocks_and_joins_consumer() {
@@ -15033,6 +16139,31 @@ mod early_snapshot_tests {
             BankHashExpectation::LegacyAccountsHash(Hash::new_unique()),
         );
         assert_eq!(verifier.checkpoint_count_in_range(416_013, 863_999), 1);
+    }
+
+    #[test]
+    fn cohort_verifier_stays_open_until_the_terminal_root_is_consumed() {
+        let bootstrap_hash = Hash::new_unique();
+        let terminal_hash = Hash::new_unique();
+        let verifier = SnapshotVerifier::new(
+            BTreeMap::from([
+                (
+                    7_343_776,
+                    BankHashExpectation::LegacyAccountsHash(bootstrap_hash),
+                ),
+                (
+                    8_213_950,
+                    BankHashExpectation::LegacyAccountsHash(terminal_hash),
+                ),
+            ]),
+            None,
+        );
+        verifier.verify_legacy_accounts_hash(7_343_776, bootstrap_hash);
+        let deferred = verifier.finish().unwrap_err();
+        assert!(deferred.contains("8213950"), "{deferred}");
+
+        verifier.verify_legacy_accounts_hash(8_213_950, terminal_hash);
+        verifier.finish().unwrap();
     }
 
     #[test]

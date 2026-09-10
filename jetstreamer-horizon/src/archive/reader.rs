@@ -230,11 +230,11 @@ impl<R: std::io::Read + std::io::Seek> ArchiveReader<R> {
         self.read_bucket_with_header(index, visitor, |_, _| Ok(()))
     }
 
-    /// Decodes one bucket after giving an internal caller access to its
-    /// validated header, before any slot callbacks can advance destination
-    /// state. The re-encoder uses this to seed a changed bucket geometry with
-    /// the source archive's initial PoH anchor.
-    pub(crate) fn read_bucket_with_header<V, F>(
+    /// Decodes one bucket after giving the caller access to its validated
+    /// header, before any slot callbacks can advance destination state. This
+    /// allows cross-bucket chain validation and lets the re-encoder seed a
+    /// changed bucket geometry with the source archive's initial PoH anchor.
+    pub fn read_bucket_with_header<V, F>(
         &mut self,
         index: usize,
         visitor: &mut V,

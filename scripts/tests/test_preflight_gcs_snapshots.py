@@ -69,8 +69,22 @@ def complete_inventory() -> tuple[list[dict], list[dict]]:
     hourly: list[dict] = []
     for epoch in range(preflight.FIRST_EPOCH, preflight.LAST_EPOCH + 1):
         extension = ".tar.bz2" if epoch <= 60 else ".tar.zst"
-        boundary_slot = epoch * preflight.EPOCH_SLOTS - 1
-        boundary = inventory_record(boundary_slot, extension=extension, size=epoch * 10)
+        boundary_slot = (
+            preflight.EPOCH_12_BOOTSTRAP_SLOT
+            if epoch == 12
+            else epoch * preflight.EPOCH_SLOTS - 1
+        )
+        boundary_identity = (
+            preflight.EPOCH_12_BOOTSTRAP_ACCOUNTS_HASH
+            if epoch == 12
+            else ZERO_HASH
+        )
+        boundary = inventory_record(
+            boundary_slot,
+            extension=extension,
+            identity=boundary_identity,
+            size=epoch * 10,
+        )
         if epoch == preflight.FIRST_EPOCH:
             boundary = inventory_record(
                 boundary_slot,
@@ -276,7 +290,7 @@ class SelectionTests(unittest.TestCase):
             8: "solana-v1.0.13",
             9: "solana-v1.0.14",
             10: "solana-v1.0.14",
-            11: "solana-v1.0.17",
+            11: "solana-v1.0.14",
             12: "solana-v1.0.23",
         }
         for epoch, runtime in expected.items():
@@ -343,7 +357,11 @@ class SelectionTests(unittest.TestCase):
         root = preflight.parse_inventory_json(
             json.dumps(
                 [
-                    inventory_record(boundary_end - 1, extension=".tar.bz2"),
+                    inventory_record(
+                        preflight.EPOCH_12_BOOTSTRAP_SLOT,
+                        extension=".tar.bz2",
+                        identity=preflight.EPOCH_12_BOOTSTRAP_ACCOUNTS_HASH,
+                    ),
                     inventory_record(boundary_end, extension=".tar.gz"),
                     inventory_record(epoch * preflight.EPOCH_SLOTS + 1),
                 ]
@@ -353,7 +371,7 @@ class SelectionTests(unittest.TestCase):
 
         plan = preflight.build_epoch_plans(root, (), epoch, epoch)[0]
 
-        self.assertEqual(plan.bootstrap.slot, boundary_end - 1)
+        self.assertEqual(plan.bootstrap.slot, preflight.EPOCH_12_BOOTSTRAP_SLOT)
         self.assertEqual(plan.bootstrap.extension, ".tar.bz2")
 
     def test_ambiguous_newest_bootstrap_fails_without_fallback(self) -> None:
@@ -372,11 +390,21 @@ class SelectionTests(unittest.TestCase):
 
     def test_hourly_object_does_not_satisfy_checkpoint_requirement(self) -> None:
         epoch = 12
-        boundary_slot = epoch * preflight.EPOCH_SLOTS - 1
+        boundary_slot = preflight.EPOCH_12_BOOTSTRAP_SLOT
+        root = preflight.parse_inventory_json(
+            json.dumps(
+                [
+                    inventory_record(
+                        boundary_slot,
+                        identity=preflight.EPOCH_12_BOOTSTRAP_ACCOUNTS_HASH,
+                    )
+                ]
+            ),
+            "root",
+        )
         hourly = preflight.parse_inventory_json(
             json.dumps(
                 [
-                    inventory_record(boundary_slot, source="hourly", anchor=boundary_slot - 10),
                     inventory_record(
                         epoch * preflight.EPOCH_SLOTS + 100,
                         source="hourly",
@@ -389,7 +417,168 @@ class SelectionTests(unittest.TestCase):
         )
 
         with self.assertRaisesRegex(preflight.PreflightError, "root checkpoint"):
-            preflight.build_epoch_plans((), hourly, epoch, epoch)
+            preflight.build_epoch_plans(root, hourly, epoch, epoch)
+
+    def test_epoch_12_requires_the_registered_slot_and_accounts_hash(self) -> None:
+        epoch = 12
+        root = preflight.parse_inventory_json(
+            json.dumps(
+                [
+                    inventory_record(
+                        preflight.EPOCH_12_BOOTSTRAP_SLOT,
+                        identity=preflight.EPOCH_12_BOOTSTRAP_ACCOUNTS_HASH,
+                    ),
+                    inventory_record(
+                        preflight.EPOCH_12_BOOTSTRAP_SLOT + 1,
+                        identity=ONE_HASH,
+                    ),
+                    inventory_record(epoch * preflight.EPOCH_SLOTS + 10),
+                ]
+            ),
+            "root",
+        )
+
+        plan = preflight.build_epoch_plans(root, (), epoch, epoch)[0]
+        self.assertEqual(plan.bootstrap.slot, preflight.EPOCH_12_BOOTSTRAP_SLOT)
+        self.assertEqual(
+            plan.bootstrap.accounts_hash,
+            preflight.EPOCH_12_BOOTSTRAP_ACCOUNTS_HASH,
+        )
+
+        wrong = preflight.parse_inventory_json(
+            json.dumps(
+                [
+                    inventory_record(
+                        preflight.EPOCH_12_BOOTSTRAP_SLOT,
+                        identity=ONE_HASH,
+                    ),
+                    inventory_record(epoch * preflight.EPOCH_SLOTS + 10),
+                ]
+            ),
+            "root",
+        )
+        with self.assertRaisesRegex(preflight.PreflightError, "required canonical bootstrap"):
+            preflight.build_epoch_plans(wrong, (), epoch, epoch)
+
+    def test_checkpoint_gap_forms_one_root_anchored_cohort(self) -> None:
+        root_bootstrap_slot = 7_343_776
+        root_checkpoint_slot = 8_213_950
+        root = preflight.parse_inventory_json(
+            json.dumps(
+                [
+                    inventory_record(root_bootstrap_slot),
+                    inventory_record(root_checkpoint_slot, identity=ONE_HASH),
+                ]
+            ),
+            "root",
+            preflight.requested_slot_range(17, 19),
+        )
+        hourly = preflight.parse_inventory_json(
+            json.dumps(
+                [
+                    inventory_record(
+                        7_770_454,
+                        source="hourly",
+                        anchor=root_bootstrap_slot,
+                    )
+                ]
+            ),
+            "hourly",
+            preflight.requested_slot_range(17, 19),
+        )
+
+        cohorts = preflight.build_verification_cohorts(root, hourly, 17, 19)
+        self.assertEqual(len(cohorts), 1)
+        cohort = cohorts[0]
+        self.assertEqual((cohort.first_epoch, cohort.last_epoch), (17, 19))
+        self.assertEqual(cohort.bootstrap.source, "root")
+        self.assertEqual(cohort.bootstrap.slot, root_bootstrap_slot)
+        self.assertEqual(
+            [checkpoint.slot for checkpoint in cohort.checkpoints],
+            [root_checkpoint_slot],
+        )
+
+        plans = preflight.build_epoch_plans(root, hourly, 17, 19)
+        self.assertEqual([plan.bootstrap.slot for plan in plans], [root_bootstrap_slot] * 3)
+        self.assertEqual([len(plan.checkpoints) for plan in plans], [0, 0, 1])
+        manifest = preflight.build_manifest(plans)
+        self.assertEqual(len(manifest["verification_cohorts"]), 1)
+        self.assertEqual(
+            manifest["verification_cohorts"][0]["publication_gate"],
+            "all-archives-validated-and-final-root-verified",
+        )
+        self.assertEqual(manifest["epochs"][0]["runtime_state_source"], "root-bootstrap")
+        self.assertEqual(
+            manifest["epochs"][1]["runtime_state_source"],
+            "carried-from-previous-epoch",
+        )
+        self.assertEqual(
+            manifest["epochs"][1]["bootstrap_window"],
+            {
+                "start": preflight.epoch_slot_range(16)[0],
+                "end_inclusive": preflight.epoch_slot_range(16)[1],
+            },
+        )
+
+    def test_newer_hourly_bootstrap_cannot_hide_a_same_epoch_root(self) -> None:
+        epoch = 17
+        root_bootstrap_slot = 7_343_776
+        root_checkpoint_slot = 7_760_000
+        root = preflight.parse_inventory_json(
+            json.dumps(
+                [
+                    inventory_record(root_bootstrap_slot),
+                    inventory_record(root_checkpoint_slot, identity=ONE_HASH),
+                ]
+            ),
+            "root",
+            preflight.requested_slot_range(epoch, epoch),
+        )
+        hourly = preflight.parse_inventory_json(
+            json.dumps(
+                [
+                    inventory_record(
+                        7_770_454,
+                        source="hourly",
+                        anchor=root_bootstrap_slot,
+                    )
+                ]
+            ),
+            "hourly",
+            preflight.requested_slot_range(epoch, epoch),
+        )
+
+        cohort = preflight.build_verification_cohorts(root, hourly, epoch, epoch)[0]
+        self.assertEqual((cohort.first_epoch, cohort.last_epoch), (epoch, epoch))
+        self.assertEqual(cohort.bootstrap.slot, root_bootstrap_slot)
+        self.assertEqual(
+            [checkpoint.slot for checkpoint in cohort.checkpoints],
+            [root_checkpoint_slot],
+        )
+
+    def test_checkpoint_gap_must_reach_a_root_within_the_request(self) -> None:
+        root = preflight.parse_inventory_json(
+            json.dumps([inventory_record(7_343_776)]),
+            "root",
+            preflight.requested_slot_range(17, 18),
+        )
+        with self.assertRaisesRegex(preflight.PreflightError, "through requested epoch 18"):
+            preflight.build_verification_cohorts(root, (), 17, 18)
+
+    def test_checkpoint_gap_must_not_cross_a_runtime_boundary(self) -> None:
+        boundary = 29 * preflight.EPOCH_SLOTS - 1
+        root = preflight.parse_inventory_json(
+            json.dumps(
+                [
+                    inventory_record(boundary),
+                    inventory_record(30 * preflight.EPOCH_SLOTS + 10),
+                ]
+            ),
+            "root",
+            preflight.requested_slot_range(29, 30),
+        )
+        with self.assertRaisesRegex(preflight.PreflightError, "crosses runtime boundary"):
+            preflight.build_verification_cohorts(root, (), 29, 30)
 
 
 class ReportingAndAcquisitionTests(unittest.TestCase):

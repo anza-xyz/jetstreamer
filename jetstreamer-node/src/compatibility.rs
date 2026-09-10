@@ -234,6 +234,15 @@ pub struct RuntimeDescriptor {
 }
 
 impl RuntimeDescriptor {
+    /// Whether this exact runtime can preserve live state across an epoch
+    /// boundary. Agave carries its in-process bank. Historical runtimes keep
+    /// the same isolated worker and protocol session alive.
+    pub fn permits_live_epoch_handoff(&self) -> bool {
+        self.bootstrap.permits_in_memory_handoff
+            || (self.bootstrap.loader == BootstrapStateLoader::HistoricalWorkerSnapshotArchive
+                && self.worker.is_some())
+    }
+
     pub fn accepts_bootstrap_archive_name(self, name: &str) -> bool {
         self.bootstrap.accepts_archive_name(name)
     }
@@ -1597,6 +1606,7 @@ mod tests {
             "snapshot-416012-11111111111111111111111111111111.tar.zst"
         ));
         assert!(!historical.bootstrap.permits_in_memory_handoff);
+        assert!(historical.permits_live_epoch_handoff());
         let worker = historical.worker.unwrap();
         assert_eq!(worker.identity, "jetstreamer-historical-worker-v1-0-24");
         assert_eq!(worker.environment_override, "JETSTREAMER_HISTORICAL_WORKER");
@@ -1620,6 +1630,7 @@ mod tests {
             "snapshot-406080000-11111111111111111111111111111111.tar.bz2"
         ));
         assert!(agave.bootstrap.permits_in_memory_handoff);
+        assert!(agave.permits_live_epoch_handoff());
         assert!(agave.worker.is_none());
     }
 

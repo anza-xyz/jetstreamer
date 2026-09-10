@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """Read-only GCS snapshot inventory preflight for mainnet epochs 1 through 100.
 
-The manifest treats an epoch's bootstrap as the newest compatible snapshot in
-the preceding epoch.  Root and hourly objects may supply that bootstrap, but
-only root objects may supply the later checkpoints used to verify replay.
+Each epoch with a root checkpoint is an independent verification cohort. A run
+of epochs without a root checkpoint is joined to the first later epoch with a
+root checkpoint, provided every epoch uses the same runtime. Such a cohort
+starts from a root snapshot in the epoch immediately before the cohort. Hourly
+objects remain eligible only as transport bootstraps for single-epoch cohorts;
+they are never trust anchors or replay checkpoints.
 
 The two fixture options consume the unmodified output of ``gcloud storage ls
 --json``.  Supplying either fixture requires supplying both, and suppresses all
@@ -44,13 +47,17 @@ FIRST_EPOCH = 1
 LAST_EPOCH = 100
 EPOCH_SLOTS = 432_000
 UINT64_MAX = (1 << 64) - 1
-SCHEMA = "jetstreamer-gcs-snapshot-preflight-v1"
+SCHEMA = "jetstreamer-gcs-snapshot-preflight-v2"
+EPOCH_12_BOOTSTRAP_SLOT = 5_183_736
+EPOCH_12_BOOTSTRAP_ACCOUNTS_HASH = (
+    "BUqwiSm2GgH9ByKrBDF6epXHYK9RRh3vyZDKtUqtMXfR"
+)
 RUNTIME_ROUTES = (
     (1, 1, "solana-v1.0.7-to-v1.0.8", (".tar.bz2",)),
     (2, 7, "solana-v1.0.8", (".tar.bz2",)),
     (8, 8, "solana-v1.0.13", (".tar.bz2",)),
     (9, 10, "solana-v1.0.14", (".tar.bz2",)),
-    (11, 11, "solana-v1.0.17", (".tar.bz2",)),
+    (11, 11, "solana-v1.0.14", (".tar.bz2",)),
     (12, 29, "solana-v1.0.23", (".tar.bz2",)),
     (30, 60, "solana-v1.1.23", (".tar.bz2",)),
     (61, 91, "solana-v1.2.32", (".tar.bz2", ".tar.zst")),
@@ -90,6 +97,7 @@ class SnapshotObject:
     versioned_uri: str
     object_name: str
     filename: str
+    accounts_hash: str
     anchor_slot: int
     slot: int
     extension: str
@@ -102,6 +110,18 @@ class SnapshotObject:
 @dataclasses.dataclass(frozen=True)
 class EpochPlan:
     epoch: int
+    runtime: str
+    accepted_extensions: Tuple[str, ...]
+    bootstrap: SnapshotObject
+    checkpoints: Tuple[SnapshotObject, ...]
+    cohort_first_epoch: int
+    cohort_last_epoch: int
+
+
+@dataclasses.dataclass(frozen=True)
+class VerificationCohort:
+    first_epoch: int
+    last_epoch: int
     runtime: str
     accepted_extensions: Tuple[str, ...]
     bootstrap: SnapshotObject
@@ -258,6 +278,7 @@ def _parse_snapshot_object(
         versioned_uri=versioned_uri,
         object_name=object_name,
         filename=object_name.rsplit("/", 1)[-1],
+        accounts_hash=identity,
         anchor_slot=anchor_slot,
         slot=snapshot_slot,
         extension=match.group("extension"),
@@ -339,68 +360,204 @@ def epoch_slot_range(epoch: int) -> Tuple[int, int]:
     return start, start + EPOCH_SLOTS - 1
 
 
+def _unique_newest(
+    candidates: Sequence[SnapshotObject], description: str
+) -> SnapshotObject:
+    if not candidates:
+        raise PreflightError(f"no compatible {description}")
+    newest_slot = max(item.slot for item in candidates)
+    newest = sorted(
+        (item for item in candidates if item.slot == newest_slot),
+        key=lambda item: item.versioned_uri,
+    )
+    if len(newest) != 1:
+        choices = ", ".join(item.versioned_uri for item in newest)
+        raise PreflightError(
+            f"newest compatible {description} slot {newest_slot} is ambiguous: {choices}"
+        )
+    return newest[0]
+
+
+def _select_bootstrap(
+    epoch: int,
+    candidates: Sequence[SnapshotObject],
+    *,
+    root_only: bool,
+) -> SnapshotObject:
+    _, extensions = runtime_route(epoch)
+    prior_start, prior_end = epoch_slot_range(epoch - 1)
+    eligible = [
+        item
+        for item in candidates
+        if prior_start <= item.slot <= prior_end
+        and item.extension in extensions
+        and (not root_only or item.source == "root")
+    ]
+    if epoch == 12:
+        eligible = [
+            item
+            for item in eligible
+            if item.slot == EPOCH_12_BOOTSTRAP_SLOT
+            and item.accounts_hash == EPOCH_12_BOOTSTRAP_ACCOUNTS_HASH
+        ]
+    source = "root bootstrap" if root_only else "bootstrap"
+    try:
+        return _unique_newest(eligible, source)
+    except PreflightError as error:
+        if epoch == 12:
+            raise PreflightError(
+                "epoch 12: required canonical bootstrap "
+                f"snapshot-{EPOCH_12_BOOTSTRAP_SLOT}-"
+                f"{EPOCH_12_BOOTSTRAP_ACCOUNTS_HASH}.tar.bz2 is absent or ambiguous"
+            ) from error
+        raise PreflightError(
+            f"epoch {epoch}: {error} in prior-epoch slots {prior_start}..={prior_end}"
+        ) from error
+
+
+def _root_checkpoints_through(
+    root_objects: Sequence[SnapshotObject],
+    bootstrap_slot: int,
+    end_slot_inclusive: int,
+    extensions: Tuple[str, ...],
+    context: str,
+) -> Tuple[SnapshotObject, ...]:
+    groups: Dict[int, List[SnapshotObject]] = {}
+    for item in root_objects:
+        if bootstrap_slot < item.slot <= end_slot_inclusive and item.extension in extensions:
+            groups.setdefault(item.slot, []).append(item)
+    checkpoints: List[SnapshotObject] = []
+    for slot_number in sorted(groups):
+        choices = sorted(groups[slot_number], key=lambda item: item.versioned_uri)
+        if len(choices) != 1:
+            detail = ", ".join(item.versioned_uri for item in choices)
+            raise PreflightError(
+                f"{context}: root checkpoint slot {slot_number} is ambiguous: {detail}"
+            )
+        checkpoints.append(choices[0])
+    return tuple(checkpoints)
+
+
+def build_verification_cohorts(
+    root_objects: Sequence[SnapshotObject],
+    hourly_objects: Sequence[SnapshotObject],
+    first_epoch: int = FIRST_EPOCH,
+    last_epoch: int = LAST_EPOCH,
+) -> Tuple[VerificationCohort, ...]:
+    """Plan the shortest fail-closed cohorts that end at a root checkpoint."""
+    requested_slot_range(first_epoch, last_epoch)
+    all_bootstraps = tuple(root_objects) + tuple(hourly_objects)
+    cohorts: List[VerificationCohort] = []
+    epoch = first_epoch
+    while epoch <= last_epoch:
+        runtime, extensions = runtime_route(epoch)
+        bootstrap = _select_bootstrap(epoch, all_bootstraps, root_only=False)
+        _, epoch_end = epoch_slot_range(epoch)
+        checkpoints = _root_checkpoints_through(
+            root_objects,
+            bootstrap.slot,
+            epoch_end,
+            extensions,
+            f"epoch {epoch}",
+        )
+        if checkpoints:
+            cohorts.append(
+                VerificationCohort(
+                    epoch,
+                    epoch,
+                    runtime,
+                    extensions,
+                    bootstrap,
+                    checkpoints,
+                )
+            )
+            epoch += 1
+            continue
+
+        # A checkpoint-free epoch must be replayed continuously from a root
+        # in its predecessor epoch through the first later root. Replaying the
+        # later epoch from an hourly object would leave the earlier archives
+        # outside the verified state transition.
+        bootstrap = _select_bootstrap(epoch, root_objects, root_only=True)
+        cohort_end = epoch
+        cohort_checkpoints: Tuple[SnapshotObject, ...] = ()
+        while cohort_end <= last_epoch:
+            if cohort_end != epoch:
+                next_runtime, next_extensions = runtime_route(cohort_end)
+                if next_runtime != runtime or next_extensions != extensions:
+                    raise PreflightError(
+                        f"epoch {epoch}: root-checkpoint gap crosses runtime boundary at epoch "
+                        f"{cohort_end} ({runtime} to {next_runtime})"
+                    )
+            _, candidate_end = epoch_slot_range(cohort_end)
+            cohort_checkpoints = _root_checkpoints_through(
+                root_objects,
+                bootstrap.slot,
+                candidate_end,
+                extensions,
+                f"epochs {epoch}-{cohort_end}",
+            )
+            final_start, _ = epoch_slot_range(cohort_end)
+            if any(item.slot >= final_start for item in cohort_checkpoints):
+                break
+            if cohort_end == last_epoch:
+                cohort_checkpoints = ()
+                break
+            cohort_end += 1
+        if not cohort_checkpoints:
+            raise PreflightError(
+                f"epoch {epoch}: no compatible unique root checkpoint after trusted root "
+                f"bootstrap slot {bootstrap.slot} through requested epoch {last_epoch}"
+            )
+        cohorts.append(
+            VerificationCohort(
+                epoch,
+                cohort_end,
+                runtime,
+                extensions,
+                bootstrap,
+                cohort_checkpoints,
+            )
+        )
+        epoch = cohort_end + 1
+    return tuple(cohorts)
+
+
 def build_epoch_plans(
     root_objects: Sequence[SnapshotObject],
     hourly_objects: Sequence[SnapshotObject],
     first_epoch: int = FIRST_EPOCH,
     last_epoch: int = LAST_EPOCH,
 ) -> Tuple[EpochPlan, ...]:
-    """Select bootstraps and root-only verification checkpoints."""
-    requested_slot_range(first_epoch, last_epoch)
-    all_bootstraps = tuple(root_objects) + tuple(hourly_objects)
+    """Expand root-aware verification cohorts into per-epoch work records."""
     plans: List[EpochPlan] = []
-
-    for epoch in range(first_epoch, last_epoch + 1):
-        runtime, extensions = runtime_route(epoch)
-        prior_start, prior_end = epoch_slot_range(epoch - 1)
-        candidates = [
-            item
-            for item in all_bootstraps
-            if prior_start <= item.slot <= prior_end and item.extension in extensions
-        ]
-        if not candidates:
-            raise PreflightError(
-                f"epoch {epoch}: no compatible bootstrap in prior-epoch slots "
-                f"{prior_start}..={prior_end}"
+    for cohort in build_verification_cohorts(
+        root_objects, hourly_objects, first_epoch, last_epoch
+    ):
+        for epoch in range(cohort.first_epoch, cohort.last_epoch + 1):
+            epoch_start, epoch_end = epoch_slot_range(epoch)
+            checkpoints = tuple(
+                item
+                for item in cohort.checkpoints
+                if epoch_start <= item.slot <= epoch_end
             )
-        newest_slot = max(item.slot for item in candidates)
-        newest = sorted(
-            (item for item in candidates if item.slot == newest_slot),
-            key=lambda item: item.versioned_uri,
-        )
-        if len(newest) != 1:
-            choices = ", ".join(item.versioned_uri for item in newest)
-            raise PreflightError(
-                f"epoch {epoch}: newest compatible bootstrap slot {newest_slot} is ambiguous: "
-                f"{choices}"
-            )
-        bootstrap = newest[0]
-
-        _, epoch_end = epoch_slot_range(epoch)
-        checkpoint_groups: Dict[int, List[SnapshotObject]] = {}
-        for item in root_objects:
-            if bootstrap.slot < item.slot <= epoch_end and item.extension in extensions:
-                checkpoint_groups.setdefault(item.slot, []).append(item)
-        checkpoints: List[SnapshotObject] = []
-        for slot_number in sorted(checkpoint_groups):
-            choices = sorted(checkpoint_groups[slot_number], key=lambda item: item.versioned_uri)
-            if len(choices) != 1:
-                detail = ", ".join(item.versioned_uri for item in choices)
-                raise PreflightError(
-                    f"epoch {epoch}: root checkpoint slot {slot_number} is ambiguous: {detail}"
+            plans.append(
+                EpochPlan(
+                    epoch,
+                    cohort.runtime,
+                    cohort.accepted_extensions,
+                    cohort.bootstrap,
+                    checkpoints,
+                    cohort.first_epoch,
+                    cohort.last_epoch,
                 )
-            checkpoints.append(choices[0])
-        if not checkpoints:
-            raise PreflightError(
-                f"epoch {epoch}: no compatible unique root checkpoint after bootstrap slot "
-                f"{bootstrap.slot} and at or before {epoch_end}"
             )
-        plans.append(EpochPlan(epoch, runtime, extensions, bootstrap, tuple(checkpoints)))
     return tuple(plans)
 
 
 def _manifest_object(item: SnapshotObject) -> Dict[str, Any]:
     return {
+        "accounts_hash": item.accounts_hash,
         "anchor_slot": item.anchor_slot,
         "crc32c": item.crc32c,
         "extension": item.extension,
@@ -414,6 +571,29 @@ def _manifest_object(item: SnapshotObject) -> Dict[str, Any]:
 
 
 def build_manifest(plans: Sequence[EpochPlan]) -> Dict[str, Any]:
+    cohort_records: List[Dict[str, Any]] = []
+    for plan in plans:
+        key = (plan.cohort_first_epoch, plan.cohort_last_epoch)
+        if cohort_records and (
+            cohort_records[-1]["first_epoch"], cohort_records[-1]["last_epoch"]
+        ) == key:
+            cohort_records[-1]["root_checkpoints"].extend(
+                _manifest_object(item) for item in plan.checkpoints
+            )
+            continue
+        cohort_records.append(
+            {
+                "accepted_extensions": list(plan.accepted_extensions),
+                "bootstrap": _manifest_object(plan.bootstrap),
+                "first_epoch": plan.cohort_first_epoch,
+                "last_epoch": plan.cohort_last_epoch,
+                "publication_gate": "all-archives-validated-and-final-root-verified",
+                "root_checkpoints": [
+                    _manifest_object(item) for item in plan.checkpoints
+                ],
+                "runtime": plan.runtime,
+            }
+        )
     return {
         "account": GCLOUD_ACCOUNT,
         "billing_project": BILLING_PROJECT,
@@ -434,19 +614,32 @@ def build_manifest(plans: Sequence[EpochPlan]) -> Dict[str, Any]:
         "selection_policy": {
             "bootstrap_sources": ["root", "hourly"],
             "bootstrap_window": "prior-epoch",
+            "checkpoint_gap_bootstrap_source": "root",
+            "checkpoint_gap_runtime_boundary": "reject",
             "checkpoint_source": "root",
-            "checkpoint_window": "after-bootstrap-through-epoch-end",
+            "checkpoint_window": "after-bootstrap-through-cohort-end",
             "newest_slot_must_be_unique": True,
+            "publication": "withhold-complete-cohort-until-final-root",
         },
+        "verification_cohorts": cohort_records,
         "epochs": [
             {
                 "accepted_extensions": list(plan.accepted_extensions),
                 "bootstrap": _manifest_object(plan.bootstrap),
                 "bootstrap_window": {
-                    "end_inclusive": epoch_slot_range(plan.epoch - 1)[1],
-                    "start": epoch_slot_range(plan.epoch - 1)[0],
+                    "end_inclusive": epoch_slot_range(plan.cohort_first_epoch - 1)[1],
+                    "start": epoch_slot_range(plan.cohort_first_epoch - 1)[0],
                 },
                 "epoch": plan.epoch,
+                "runtime_state_source": (
+                    f"{plan.bootstrap.source}-bootstrap"
+                    if plan.epoch == plan.cohort_first_epoch
+                    else "carried-from-previous-epoch"
+                ),
+                "verification_cohort": {
+                    "first_epoch": plan.cohort_first_epoch,
+                    "last_epoch": plan.cohort_last_epoch,
+                },
                 "post_bootstrap_root_checkpoints": [
                     _manifest_object(item) for item in plan.checkpoints
                 ],

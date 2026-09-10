@@ -3,7 +3,8 @@
 use {
     super::{
         InFlightGuard, PHASE_ENTRY_COUNT, PHASE_EXECUTE_US, PHASE_POST_PROCESS_US, ReadyEntry,
-        ReplayCursor, ReplayFailure, ReplayProgress, SnapshotVerifier, horizon, plugin,
+        ReplayCursor, ReplayFailure, ReplayProgress, SnapshotVerifier,
+        entry_source_status_multiset, horizon, plugin, status_multisets_equal,
     },
     crate::historical::{
         HistoricalAccountWrite, HistoricalCheckpoint, HistoricalEntryRequest,
@@ -662,7 +663,7 @@ impl HistoricalReplay {
                 outcomes.len()
             ));
         }
-        for (offset, (scheduled, actual)) in entry.txs.iter_mut().zip(outcomes).enumerate() {
+        for (offset, (scheduled, actual)) in entry.txs.iter().zip(outcomes).enumerate() {
             let expected_signature = scheduled
                 .tx
                 .signatures
@@ -676,6 +677,25 @@ impl HistoricalReplay {
                     entry.start_index + offset
                 ));
             }
+        }
+
+        if let Some(source_statuses) = entry_source_status_multiset(&entry.txs)? {
+            let replay_statuses: Vec<_> = outcomes
+                .iter()
+                .map(|outcome| match outcome.error.as_ref() {
+                    Some(error) => Err(denormalize_transaction_error(error)),
+                    None => Ok(()),
+                })
+                .collect();
+            if !status_multisets_equal(&source_statuses, &replay_statuses) {
+                return Err(format!(
+                    "historical status multiset mismatch at slot {} entry {}: source {:?}, replay {:?}",
+                    entry.slot, entry.entry_index, source_statuses, replay_statuses
+                ));
+            }
+        }
+
+        for (offset, (scheduled, actual)) in entry.txs.iter_mut().zip(outcomes).enumerate() {
             if let Some(expected_status) = scheduled.expected_status.as_ref() {
                 let expected_error: Option<HistoricalTransactionError> = expected_status
                     .as_ref()
@@ -707,8 +727,9 @@ impl HistoricalReplay {
                     ));
                 }
             } else {
-                // Empty source metadata is unknown, not success. Preserve the
-                // historical executor's result in the generated archive.
+                // Missing or v1.0-permuted source status is not associated
+                // ground truth. Preserve the historical executor's result in
+                // the generated archive.
                 scheduled.status_meta.status = match actual.error.as_ref() {
                     Some(error) => Err(denormalize_transaction_error(error)),
                     None => Ok(()),

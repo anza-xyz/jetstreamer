@@ -2158,6 +2158,26 @@ impl BankReplay {
             panic!("{message}");
         }
 
+        match entry_source_status_multiset(&entry.txs) {
+            Ok(Some(source_statuses)) if !status_multisets_equal(&source_statuses, &results) => {
+                let message = format!(
+                    "transaction status multiset mismatch at slot {} entry {}: source {:?}, replay {:?}",
+                    entry.slot, entry.entry_index, source_statuses, results
+                );
+                self.failure.record(message.clone());
+                panic!("{message}");
+            }
+            Ok(_) => {}
+            Err(error) => {
+                let message = format!(
+                    "incomplete transaction status multiset at slot {} entry {}: {error}",
+                    entry.slot, entry.entry_index
+                );
+                self.failure.record(message.clone());
+                panic!("{message}");
+            }
+        }
+
         for (offset, actual) in results.into_iter().enumerate() {
             let Some(expected) = entry.txs[offset].expected_status.clone() else {
                 // Old Faithful's earliest transactions may carry an empty
@@ -3549,7 +3569,12 @@ impl TransactionScheduler {
             state.highest_seen_slot = slot;
         }
         let buffer = state.slots.entry(slot).or_default();
-        let inserted = buffer.insert_transaction(index, tx, status_meta)?;
+        let inserted = buffer.insert_transaction(
+            index,
+            tx,
+            status_meta,
+            compatibility::transaction_status_validation_at(slot),
+        )?;
         let ready = self.advance_ready_locked(&mut state)?;
         Ok((ready, inserted))
     }
@@ -3938,6 +3963,7 @@ impl SlotExecutionBuffer {
         index: usize,
         tx: VersionedTransaction,
         status_meta: Option<TransactionStatusMeta>,
+        status_validation: compatibility::TransactionStatusValidation,
     ) -> Result<bool, String> {
         if (index as u64) < self.processed_tx_count {
             // Duplicate transaction after a firehose restart; already processed.
@@ -3946,12 +3972,28 @@ impl SlotExecutionBuffer {
         if self.txs.len() <= index {
             self.txs.resize_with(index + 1, || None);
         }
+        let source_status = status_meta.as_ref().map(|metadata| metadata.status.clone());
+        let (expected_status, source_entry_status) = match status_validation {
+            compatibility::TransactionStatusValidation::RuntimeOnly => (None, None),
+            compatibility::TransactionStatusValidation::RuntimeWithSourceEntryMultiset => {
+                let status = source_status.clone().ok_or_else(|| {
+                    "entry-multiset status validation requires source metadata".to_string()
+                })?;
+                (None, Some(status))
+            }
+            compatibility::TransactionStatusValidation::SourceExact => {
+                let status = source_status.clone().ok_or_else(|| {
+                    "exact transaction status validation requires source metadata".to_string()
+                })?;
+                (Some(status), None)
+            }
+        };
         if let Some(existing) = &self.txs[index] {
             let existing_sig = existing.tx.signatures.first();
             let incoming_sig = tx.signatures.first();
             if existing_sig == incoming_sig
-                && existing.expected_status
-                    == status_meta.as_ref().map(|metadata| metadata.status.clone())
+                && existing.expected_status == expected_status
+                && existing.source_entry_status == source_entry_status
             {
                 // Duplicate delivery of the same transaction; ignore.
                 return Ok(false);
@@ -3961,10 +4003,10 @@ impl SlotExecutionBuffer {
                 existing_sig, incoming_sig
             ));
         }
-        let expected_status = status_meta.as_ref().map(|metadata| metadata.status.clone());
         self.txs[index] = Some(ScheduledTransaction {
             tx,
             expected_status,
+            source_entry_status,
             status_meta: status_meta.unwrap_or_default(),
         });
         Ok(true)
@@ -4128,13 +4170,63 @@ struct PendingEntry {
 #[derive(Debug)]
 struct ScheduledTransaction {
     tx: VersionedTransaction,
-    /// `None` means the source carried no transaction metadata. In that case
-    /// replay determines the status; a default `Ok(())` must not be mistaken
-    /// for observed ground truth.
+    /// Individually associated source status. `None` means replay supplies the
+    /// transaction's status.
     expected_status: Option<Result<(), TransactionError>>,
+    /// Source status retained only for an entry-wide multiset check. Solana
+    /// v1.0 persisted these results in randomized rather than transaction
+    /// order, so replay restores their per-transaction association.
+    source_entry_status: Option<Result<(), TransactionError>>,
     /// Full original chain metadata (from the CAR stream), carried through
     /// so the horizon recorder can archive it alongside replay output.
     status_meta: TransactionStatusMeta,
+}
+
+fn entry_source_status_multiset(
+    transactions: &[ScheduledTransaction],
+) -> Result<Option<Vec<Result<(), TransactionError>>>, String> {
+    let status_count = transactions
+        .iter()
+        .filter(|transaction| transaction.source_entry_status.is_some())
+        .count();
+    if status_count == 0 {
+        return Ok(None);
+    }
+    if status_count != transactions.len() {
+        return Err(format!(
+            "entry has source status for {status_count}/{} transactions",
+            transactions.len()
+        ));
+    }
+    Ok(Some(
+        transactions
+            .iter()
+            .map(|transaction| {
+                transaction
+                    .source_entry_status
+                    .clone()
+                    .expect("complete source-status multiset checked above")
+            })
+            .collect(),
+    ))
+}
+
+fn status_multisets_equal<T: PartialEq>(left: &[T], right: &[T]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut matched = vec![false; right.len()];
+    left.iter().all(|left_status| {
+        let Some(index) = right
+            .iter()
+            .enumerate()
+            .position(|(index, right_status)| !matched[index] && left_status == right_status)
+        else {
+            return false;
+        };
+        matched[index] = true;
+        true
+    })
 }
 
 #[derive(Debug)]
@@ -5002,11 +5094,22 @@ fn archive_assembly_profile() -> String {
     )
 }
 
-fn archive_transaction_metadata_policy(slot_start: Slot) -> TransactionMetadataPolicy {
-    if slot_start < compatibility::OLD_FAITHFUL_STATUS_REQUIRED_START_SLOT {
+fn archive_transaction_metadata_policy(
+    slot_start: Slot,
+    slot_count: u64,
+) -> TransactionMetadataPolicy {
+    let slot_end_exclusive = slot_start.saturating_add(slot_count);
+    if slot_end_exclusive <= compatibility::OLD_FAITHFUL_STATUS_REQUIRED_START_SLOT {
+        // Preserve the existing provenance encoding for archives wholly below
+        // the source-presence boundary. Its in-range semantics are identical
+        // to an all-reconstructed policy.
         TransactionMetadataPolicy::runtime_reconstructed_before(
             compatibility::OLD_FAITHFUL_STATUS_REQUIRED_START_SLOT,
         )
+    } else if slot_start
+        < compatibility::OLD_FAITHFUL_UNTRUSTED_STATUS_ASSOCIATION_END_SLOT_EXCLUSIVE
+    {
+        TransactionMetadataPolicy::runtime_reconstructed()
     } else {
         TransactionMetadataPolicy::observed()
     }
@@ -5060,7 +5163,10 @@ fn build_archive_provenance(
         bootstrap_state_hash,
         requested_slot_start,
         requested_slot_count,
-        transaction_metadata: archive_transaction_metadata_policy(requested_slot_start),
+        transaction_metadata: archive_transaction_metadata_policy(
+            requested_slot_start,
+            requested_slot_count,
+        ),
     };
     Ok(match worker_executable_sha256 {
         Some(worker_executable_sha256) => ArchiveProvenanceV2 {
@@ -8908,7 +9014,7 @@ fn validated_epoch_archive(
         )
     })?;
     let expected_toolchain = archive_runtime_toolchain(identity);
-    let expected_metadata = archive_transaction_metadata_policy(slot_start);
+    let expected_metadata = archive_transaction_metadata_policy(slot_start, expected_slot_count);
     if !runtime_generation_profile_is_compatible(
         &provenance_v1.runtime_profile,
         &provenance_v1.generation_profile,
@@ -9085,7 +9191,9 @@ fn validated_epoch_archive_multi_runtime(
         ));
     }
     validate_multi_runtime_genesis(path, provenance.genesis_hash)?;
-    if provenance.transaction_metadata != archive_transaction_metadata_policy(slot_start) {
+    if provenance.transaction_metadata
+        != archive_transaction_metadata_policy(slot_start, slot_count)
+    {
         return Err(format!(
             "assembled archive {} has incompatible transaction metadata policy",
             path.display()
@@ -13089,11 +13197,12 @@ async fn main() {
                         for segment in segments {
                             info!(
                                 "epoch {epoch}: compatibility segment {}..{} input={:?} \
-                                 missing-status={:?} execution={} output={:?}",
+                                 missing-status={:?} status-validation={:?} execution={} output={:?}",
                                 segment.slots.start,
                                 segment.slots.end,
                                 segment.input_metadata,
                                 segment.missing_transaction_status,
+                                segment.transaction_status_validation,
                                 segment.execution.name,
                                 segment.output,
                             );
@@ -14436,6 +14545,37 @@ mod early_snapshot_tests {
     }
 
     #[test]
+    fn archive_status_provenance_tracks_source_writer_eras() {
+        let epoch_slots = 432_000;
+        assert_eq!(
+            archive_transaction_metadata_policy(8 * epoch_slots, epoch_slots),
+            TransactionMetadataPolicy::runtime_reconstructed_before(
+                compatibility::OLD_FAITHFUL_STATUS_REQUIRED_START_SLOT
+            )
+        );
+        assert_eq!(
+            archive_transaction_metadata_policy(9 * epoch_slots, epoch_slots),
+            TransactionMetadataPolicy::runtime_reconstructed()
+        );
+        assert_eq!(
+            archive_transaction_metadata_policy(29 * epoch_slots, epoch_slots),
+            TransactionMetadataPolicy::runtime_reconstructed()
+        );
+        assert_eq!(
+            archive_transaction_metadata_policy(30 * epoch_slots, epoch_slots),
+            TransactionMetadataPolicy::runtime_reconstructed()
+        );
+        assert_eq!(
+            archive_transaction_metadata_policy(100 * epoch_slots, epoch_slots),
+            TransactionMetadataPolicy::runtime_reconstructed()
+        );
+        assert_eq!(
+            archive_transaction_metadata_policy(101 * epoch_slots, epoch_slots),
+            TransactionMetadataPolicy::observed()
+        );
+    }
+
+    #[test]
     fn historical_archive_provenance_requires_the_measured_worker_digest() {
         let selection = compatibility::select_runtime(
             432_000..compatibility::SOLANA_V1_0_8_ROUTING_START_SLOT,
@@ -15454,7 +15594,10 @@ mod early_snapshot_tests {
 
 #[cfg(test)]
 mod scheduler_tests {
-    use super::{EntryAccounts, SlotExecutionBuffer, assign_rounds};
+    use super::{
+        EntryAccounts, SlotExecutionBuffer, assign_rounds,
+        compatibility::TransactionStatusValidation, status_multisets_equal,
+    };
     use solana_address::Address;
     use solana_transaction::versioned::VersionedTransaction;
     use solana_transaction_status::TransactionStatusMeta;
@@ -15475,7 +15618,12 @@ mod scheduler_tests {
     fn scheduler_preserves_missing_status_provenance() {
         let mut missing = SlotExecutionBuffer::default();
         missing
-            .insert_transaction(0, VersionedTransaction::default(), None)
+            .insert_transaction(
+                0,
+                VersionedTransaction::default(),
+                None,
+                TransactionStatusValidation::RuntimeOnly,
+            )
             .unwrap();
         assert!(missing.txs[0].as_ref().unwrap().expected_status.is_none());
 
@@ -15485,12 +15633,33 @@ mod scheduler_tests {
                 0,
                 VersionedTransaction::default(),
                 Some(TransactionStatusMeta::default()),
+                TransactionStatusValidation::SourceExact,
             )
             .unwrap();
         assert_eq!(
             observed.txs[0].as_ref().unwrap().expected_status,
             Some(Ok(()))
         );
+
+        let mut permuted = SlotExecutionBuffer::default();
+        permuted
+            .insert_transaction(
+                0,
+                VersionedTransaction::default(),
+                Some(TransactionStatusMeta::default()),
+                TransactionStatusValidation::RuntimeWithSourceEntryMultiset,
+            )
+            .unwrap();
+        let scheduled = permuted.txs[0].as_ref().unwrap();
+        assert!(scheduled.expected_status.is_none());
+        assert_eq!(scheduled.source_entry_status, Some(Ok(())));
+    }
+
+    #[test]
+    fn status_multiset_comparison_preserves_duplicate_counts() {
+        assert!(status_multisets_equal(&[1, 2, 2, 3], &[2, 3, 2, 1]));
+        assert!(!status_multisets_equal(&[1, 2, 2, 3], &[1, 2, 3, 3]));
+        assert!(!status_multisets_equal(&[1, 2], &[1]));
     }
 
     /// Flattens rounds back to (entry_index -> round_index) for assertions.

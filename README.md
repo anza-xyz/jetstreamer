@@ -338,8 +338,15 @@ select a runtime. The current registry is deliberately conservative:
 | Slots | Runtime | Admission |
 |---|---|---|
 | `0..619,849` | pinned Solana v1.0.7 worker | candidate through the first proven-safe handoff |
-| `619,849..4,752,000` | pinned Solana v1.0.8 worker | candidate search envelope for the rest of epochs 1-10 |
-| `4,752,000..406,080,000` | none | unsupported; replay fails closed |
+| `619,849..3,456,000` | pinned Solana v1.0.8 worker | candidate through epoch 7 |
+| `3,456,000..3,888,000` | pinned Solana v1.0.13 worker | candidate for epoch 8 |
+| `3,888,000..4,752,000` | pinned Solana v1.0.14 worker | candidate for epochs 9-10 |
+| `4,752,000..5,184,000` | pinned Solana v1.0.17 worker | candidate for epoch 11 |
+| `5,184,000..12,960,000` | pinned Solana v1.0.23 worker | diagnostic candidate for epochs 12-29 |
+| `12,960,000..26,352,000` | pinned Solana v1.1.23 worker | diagnostic candidate for epochs 30-60 |
+| `26,352,000..39,744,000` | pinned Solana v1.2.32 worker | diagnostic candidate for epochs 61-91 |
+| `39,744,000..43,632,000` | pinned Solana v1.3.19 worker | diagnostic candidate for epochs 92-100 |
+| `43,632,000..406,080,000` | none | unsupported; replay fails closed |
 | `406,080,000..` | in-process Agave v3 | verified |
 
 Candidate mode requires the exact runtime identity, an explicit
@@ -348,14 +355,18 @@ checkpoint after the bootstrap slot. Unknown opt-in values are rejected. Current
 evidence proves the old v1.0.7 vote-initialization semantics through slot 618,196 and first requires
 the v1.0.8 semantics at slot 630,648. The canonical snapshot at slot 619,848 is therefore the
 behaviorally safe handoff: v1.0.7 processes through that snapshot and v1.0.8 starts at slot 619,849.
-This routing point is not a claim about the exact deployment slot. The v1.0.8 tail remains an
-explicitly non-canonical search envelope until its checkpoint replay completes; the exact v1.0.24
-worker is registered but intentionally unassigned until later evidence requires it.
+This routing point is not a claim about the exact deployment slot. Every candidate envelope remains
+explicitly non-canonical until its checkpoint replay completes. Additional exact patch workers stay
+registered but unassigned until differential evidence requires a narrower runtime boundary.
 
 Transaction metadata is an independent compatibility dimension. Old Faithful has no status frame
 before slot `4,258,776`; the pinned historical runtime reconstructs transaction status there, while
 the remaining metadata stays explicitly unavailable. At and after that slot, a missing status frame
-is an error. This policy changes during epoch 9 without changing the execution runtime.
+is an error. The early source writer also stored an entry's randomized execution results beside its
+original-order transactions. For the epoch 0-100 compatibility scope, replay verifies that the
+source and runtime statuses have the same entry-wide multiset, then uses the runtime result to
+restore each transaction's status. This policy changes during epoch 9 without changing the
+execution runtime.
 
 Generated Horizon archives record the selected runtime identity and admission level, genesis,
 bootstrap state, output slot range, and transaction-metadata policy in a versioned provenance

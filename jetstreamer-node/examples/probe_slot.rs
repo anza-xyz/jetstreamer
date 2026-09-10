@@ -11,8 +11,11 @@
 //! flagged present ⇒ genuine gap; sometimes COMPLETE ⇒ transient.
 //!
 //! Usage:
-//!   cargo run --release -p jetstreamer-node --example probe_slot -- [start_slot] [count]
+//!   cargo run --release -p jetstreamer-node --example probe_slot -- \
+//!       [start_slot] [count] [transaction_index]
 //! Defaults to slots 411195440..=411195445 (around the slot that failed).
+//! When `transaction_index` is present, the probe also prints that source
+//! transaction's signature and complete status metadata.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::AtomicBool;
@@ -20,7 +23,10 @@ use std::sync::{Arc, Mutex};
 
 use crossbeam_channel::unbounded;
 use jetstreamer_firehose::epochs::{BASE_URL, slot_to_epoch};
-use jetstreamer_firehose::firehose::{GeyserNotifiers, firehose_geyser_with_notifiers};
+use jetstreamer_firehose::firehose::{
+    GeyserNotifiers, SourcedTransaction, SourcedTransactionNotifier, SourcedTransactionStatus,
+    firehose_geyser_with_notifiers,
+};
 use reqwest::{Client, Url};
 use solana_clock::{Slot, UnixTimestamp};
 use solana_entry::entry::EntrySummary;
@@ -51,6 +57,7 @@ struct SlotTally {
 #[derive(Default)]
 struct Probe {
     slots: Mutex<BTreeMap<Slot, SlotTally>>,
+    transaction_index: Option<usize>,
 }
 
 impl TransactionNotifier for Probe {
@@ -70,6 +77,24 @@ impl TransactionNotifier for Probe {
             .entry(slot)
             .or_default()
             .delivered_txs += 1;
+    }
+}
+
+impl SourcedTransactionNotifier for Probe {
+    fn notify_transaction(&self, transaction: SourcedTransaction<'_>) {
+        if self.transaction_index != Some(transaction.transaction_slot_index) {
+            return;
+        }
+        match transaction.status {
+            SourcedTransactionStatus::Observed(meta) => println!(
+                "source transaction slot={} index={} signature={} status_meta={meta:#?}",
+                transaction.slot, transaction.transaction_slot_index, transaction.signature
+            ),
+            SourcedTransactionStatus::Missing => println!(
+                "source transaction slot={} index={} signature={} status_meta=<missing>",
+                transaction.slot, transaction.transaction_slot_index, transaction.signature
+            ),
+        }
     }
 }
 
@@ -126,6 +151,11 @@ fn main() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(411_195_440);
     let count: u64 = args.get(1).and_then(|v| v.parse().ok()).unwrap_or(6).max(1);
+    let transaction_index: Option<usize> = args.get(2).map(|value| {
+        value
+            .parse()
+            .expect("transaction_index must be a non-negative integer")
+    });
     let end = start + count; // exclusive
     let epoch = slot_to_epoch(start);
     eprintln!("probing slots {start}..{end} (epoch {epoch}) via firehose from {BASE_URL}\n");
@@ -134,18 +164,22 @@ fn main() {
     let client = Client::new();
     let index_base_url = Url::parse(BASE_URL).expect("base url");
     let shutdown = Arc::new(AtomicBool::new(false));
-    let probe = Arc::new(Probe::default());
+    let probe = Arc::new(Probe {
+        transaction_index,
+        ..Probe::default()
+    });
 
     // Drain the confirmed-bank notifications (unused for the probe).
     let (confirmed_tx, confirmed_rx) = unbounded();
     let drain = std::thread::spawn(move || while confirmed_rx.recv().is_ok() {});
 
     let txn: Arc<dyn TransactionNotifier + Send + Sync> = probe.clone();
+    let sourced_txn: Arc<dyn SourcedTransactionNotifier + Send + Sync> = probe.clone();
     let ent: Arc<dyn EntryNotifier + Send + Sync> = probe.clone();
     let blk: Arc<dyn BlockMetadataNotifier + Send + Sync> = probe.clone();
     let notifiers = GeyserNotifiers {
         transaction_notifier: Some(txn),
-        sourced_transaction_notifier: None,
+        sourced_transaction_notifier: Some(sourced_txn),
         entry_notifier: Some(ent),
         block_metadata_notifier: Some(blk),
     };
@@ -215,10 +249,7 @@ fn main() {
 
     println!("\n{complete}/{count} slots COMPLETE.");
     if problem.is_empty() {
-        println!(
-            "All probed slots fetched cleanly — slot {} was likely a transient failure; a re-run should clear it.",
-            start + 2
-        );
+        println!("All probed slots fetched cleanly.");
     } else {
         println!(
             "Problem slots: {problem:?}. If a slot the replay flagged present (e.g. 411195442) is \

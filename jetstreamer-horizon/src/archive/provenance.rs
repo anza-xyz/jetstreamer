@@ -47,8 +47,9 @@ pub enum TransactionMetadataSemantics {
     /// Status and the rest of the transaction metadata were observed in the
     /// source data.
     Observed = 0,
-    /// The source had no transaction metadata. Replay reconstructed only the
-    /// status; other metadata fields retain their absent/default values.
+    /// Replay supplied the status. Other metadata fields retain their source
+    /// values, including absent/default values when the source frame was
+    /// missing.
     RuntimeReconstructedStatusOnly = 1,
 }
 
@@ -131,6 +132,15 @@ impl TransactionMetadataPolicy {
             boundary_slot: observed_from_slot,
             before_boundary: TransactionMetadataSemantics::RuntimeReconstructedStatusOnly,
             at_or_after_boundary: TransactionMetadataSemantics::Observed,
+        }
+    }
+
+    /// A policy that uses runtime-reconstructed status at every slot.
+    pub const fn runtime_reconstructed() -> Self {
+        Self {
+            boundary_slot: 0,
+            before_boundary: TransactionMetadataSemantics::RuntimeReconstructedStatusOnly,
+            at_or_after_boundary: TransactionMetadataSemantics::RuntimeReconstructedStatusOnly,
         }
     }
 
@@ -1148,6 +1158,19 @@ mod tests {
         assert_eq!(
             decode_archive_provenance(&encoded).unwrap(),
             Some(worker_bound)
+        );
+    }
+
+    #[test]
+    fn all_runtime_reconstructed_policy_has_no_observed_side() {
+        let policy = TransactionMetadataPolicy::runtime_reconstructed();
+        assert_eq!(
+            policy.semantics_for_slot(0),
+            TransactionMetadataSemantics::RuntimeReconstructedStatusOnly
+        );
+        assert_eq!(
+            policy.semantics_for_slot(u64::MAX),
+            TransactionMetadataSemantics::RuntimeReconstructedStatusOnly
         );
     }
 

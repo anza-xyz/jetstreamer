@@ -62,6 +62,15 @@ pub const AGAVE_V3_VERIFIED_START_SLOT: Slot = 406_080_000;
 /// in slot 4,258,771; slots 4,258,772 through 4,258,775 are absent.
 pub const OLD_FAITHFUL_STATUS_REQUIRED_START_SLOT: Slot = 4_258_776;
 
+/// End of the historical range for which source transaction-to-status
+/// association is treated as untrusted. The old status writer paired
+/// original-order transactions with results produced in randomized execution
+/// order. The affected producer cutover is not encoded in the archive, and a
+/// mismatch is observed at the first slot of the v1.1 candidate envelope, so
+/// replay stays fail-safe through the currently qualified epoch 0-100 scope.
+pub const OLD_FAITHFUL_UNTRUSTED_STATUS_ASSOCIATION_END_SLOT_EXCLUSIVE: Slot =
+    SOLANA_V1_3_19_CANDIDATE_END_SLOT_EXCLUSIVE;
+
 /// Mainnet genesis identity every historical worker must verify before it
 /// accepts replay input.
 pub const MAINNET_GENESIS_HASH: &str = "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d";
@@ -792,6 +801,21 @@ pub enum MissingTransactionStatus {
     Reconstruct,
 }
 
+/// How replay validates and associates source transaction statuses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TransactionStatusValidation {
+    /// No complete source status set exists, so the selected runtime supplies
+    /// each transaction's status.
+    RuntimeOnly,
+    /// The source status writer permuted execution results within each entry.
+    /// Replay checks the entry-wide multiset, then uses runtime results for the
+    /// per-transaction association.
+    RuntimeWithSourceEntryMultiset,
+    /// Source statuses are associated with their transactions and must match
+    /// replay individually.
+    SourceExact,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EraBackend {
     Available(&'static RuntimeDescriptor),
@@ -1156,6 +1180,7 @@ pub struct ReplaySegment {
     pub slots: Range<Slot>,
     pub input_metadata: OldFaithfulMetaEncoding,
     pub missing_transaction_status: MissingTransactionStatus,
+    pub transaction_status_validation: TransactionStatusValidation,
     pub execution: &'static RuntimeEra,
     pub output: OutputSchema,
 }
@@ -1182,6 +1207,7 @@ fn runtime_at(slot: Slot) -> Result<&'static RuntimeEra, String> {
 fn input_end_exclusive(slot: Slot) -> Option<Slot> {
     [
         OLD_FAITHFUL_STATUS_REQUIRED_START_SLOT,
+        OLD_FAITHFUL_UNTRUSTED_STATUS_ASSOCIATION_END_SLOT_EXCLUSIVE,
         OLD_FAITHFUL_PROTOBUF_META_START_SLOT,
     ]
     .into_iter()
@@ -1196,6 +1222,19 @@ pub const fn missing_transaction_status_at(slot: Slot) -> MissingTransactionStat
         MissingTransactionStatus::Reconstruct
     } else {
         MissingTransactionStatus::Reject
+    }
+}
+
+/// Selects transaction-status validation independently from status presence
+/// and execution-runtime routing.
+#[inline]
+pub const fn transaction_status_validation_at(slot: Slot) -> TransactionStatusValidation {
+    if slot < OLD_FAITHFUL_STATUS_REQUIRED_START_SLOT {
+        TransactionStatusValidation::RuntimeOnly
+    } else if slot < OLD_FAITHFUL_UNTRUSTED_STATUS_ASSOCIATION_END_SLOT_EXCLUSIVE {
+        TransactionStatusValidation::RuntimeWithSourceEntryMultiset
+    } else {
+        TransactionStatusValidation::SourceExact
     }
 }
 
@@ -1320,6 +1359,7 @@ pub fn plan_replay(
             slots: cursor..segment_end,
             input_metadata: old_faithful_meta_encoding(cursor),
             missing_transaction_status: missing_transaction_status_at(cursor),
+            transaction_status_validation: transaction_status_validation_at(cursor),
             execution,
             output: OutputSchema::HorizonV2,
         });
@@ -1949,6 +1989,30 @@ mod tests {
         assert_eq!(
             missing_transaction_status_at(boundary),
             MissingTransactionStatus::Reject
+        );
+    }
+
+    #[test]
+    fn transaction_status_validation_tracks_source_writer_eras() {
+        assert_eq!(
+            transaction_status_validation_at(OLD_FAITHFUL_STATUS_REQUIRED_START_SLOT - 1),
+            TransactionStatusValidation::RuntimeOnly
+        );
+        assert_eq!(
+            transaction_status_validation_at(OLD_FAITHFUL_STATUS_REQUIRED_START_SLOT),
+            TransactionStatusValidation::RuntimeWithSourceEntryMultiset
+        );
+        assert_eq!(
+            transaction_status_validation_at(
+                OLD_FAITHFUL_UNTRUSTED_STATUS_ASSOCIATION_END_SLOT_EXCLUSIVE - 1
+            ),
+            TransactionStatusValidation::RuntimeWithSourceEntryMultiset
+        );
+        assert_eq!(
+            transaction_status_validation_at(
+                OLD_FAITHFUL_UNTRUSTED_STATUS_ASSOCIATION_END_SLOT_EXCLUSIVE
+            ),
+            TransactionStatusValidation::SourceExact
         );
     }
 }

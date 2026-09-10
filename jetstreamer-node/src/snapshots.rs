@@ -9,8 +9,7 @@ use tokio::process::Command;
 
 pub const DEFAULT_BUCKET: &str = "gs://mainnet-beta-ledger-us-ny5";
 const ALL_SNAPSHOT_ARCHIVE_EXTENSIONS: &[&str] = &[".tar.zst", ".tar.lz4", ".tar.bz2"];
-static DEFAULT_SNAPSHOT_INVENTORY: tokio::sync::OnceCell<SnapshotInventory> =
-    tokio::sync::OnceCell::const_new();
+static DEFAULT_SNAPSHOT_LISTING: tokio::sync::OnceCell<String> = tokio::sync::OnceCell::const_new();
 
 /// Metadata for a snapshot stored in the ledger bucket.
 #[derive(Debug, Clone)]
@@ -130,7 +129,7 @@ pub enum SnapshotError {
 /// Resolve the GCS URI for the snapshot tarball corresponding to an epoch.
 pub async fn resolve_epoch_snapshot(epoch: u64) -> Result<SnapshotInfo, SnapshotError> {
     let (start, end) = epoch_snapshot_search_window(epoch);
-    let mut candidates = snapshot_slots_for_bucket(DEFAULT_BUCKET)
+    let mut candidates = snapshot_slots_for_bucket(DEFAULT_BUCKET, start, end)
         .await?
         .into_iter()
         .filter(|slot| *slot >= start && *slot <= end)
@@ -160,7 +159,7 @@ pub async fn resolve_epoch_snapshot(epoch: u64) -> Result<SnapshotInfo, Snapshot
 /// List all snapshot tarballs that report the requested epoch.
 pub async fn list_epoch_snapshots(epoch: u64) -> Result<Vec<SnapshotInfo>, SnapshotError> {
     let (start, end) = epoch_snapshot_search_window(epoch);
-    let mut candidates = snapshot_slots_for_bucket(DEFAULT_BUCKET)
+    let mut candidates = snapshot_slots_for_bucket(DEFAULT_BUCKET, start, end)
         .await?
         .into_iter()
         .filter(|slot| *slot >= start && *slot <= end)
@@ -223,7 +222,7 @@ pub async fn list_snapshots_in_slot_range_matching(
         return Ok(Vec::new());
     }
 
-    let mut slots = snapshot_slots_for_bucket(DEFAULT_BUCKET)
+    let mut slots = snapshot_slots_for_bucket(DEFAULT_BUCKET, start_slot, end_slot_inclusive)
         .await?
         .into_iter()
         .filter(|slot| *slot >= start_slot && *slot <= end_slot_inclusive)
@@ -263,7 +262,14 @@ pub async fn resolve_snapshot_at_or_before_slot_matching(
     // A numeric bucket directory may contain only a RocksDB export. Walk the
     // candidates newest-first and select the first actual snapshot archive,
     // rather than treating the newest numeric directory as a snapshot.
-    let mut slots = bootstrap_snapshot_slots_for_bucket(DEFAULT_BUCKET)
+    let (search_start, _) = epoch_snapshot_search_window(epoch);
+    if target_slot < search_start {
+        return Err(SnapshotError::SnapshotDirNotFoundAtOrBeforeSlot {
+            epoch,
+            slot: target_slot,
+        });
+    }
+    let mut slots = bootstrap_snapshot_slots_for_bucket(DEFAULT_BUCKET, search_start, target_slot)
         .await?
         .into_iter()
         .filter(|slot| *slot <= target_slot)
@@ -561,19 +567,37 @@ fn bulk_snapshot_patterns(bucket: &str) -> [String; 2] {
     ]
 }
 
-async fn default_snapshot_inventory() -> Result<&'static SnapshotInventory, SnapshotError> {
-    DEFAULT_SNAPSHOT_INVENTORY
+async fn default_snapshot_listing() -> Result<&'static str, SnapshotError> {
+    DEFAULT_SNAPSHOT_LISTING
         .get_or_try_init(|| async {
             let [root_pattern, hourly_pattern] = bulk_snapshot_patterns(DEFAULT_BUCKET);
-            let listing = gcloud_stdout(&["storage", "ls", &root_pattern, &hourly_pattern]).await?;
-            parse_snapshot_inventory(DEFAULT_BUCKET, &listing)
+            gcloud_stdout(&["storage", "ls", &root_pattern, &hourly_pattern]).await
         })
         .await
+        .map(String::as_str)
 }
 
-async fn snapshot_slots_for_bucket(bucket: &str) -> Result<Vec<u64>, SnapshotError> {
+async fn default_snapshot_inventory(
+    start_slot: u64,
+    end_slot_inclusive: u64,
+) -> Result<SnapshotInventory, SnapshotError> {
+    parse_snapshot_inventory_in_range(
+        DEFAULT_BUCKET,
+        default_snapshot_listing().await?,
+        Some((start_slot, end_slot_inclusive)),
+    )
+}
+
+async fn snapshot_slots_for_bucket(
+    bucket: &str,
+    start_slot: u64,
+    end_slot_inclusive: u64,
+) -> Result<Vec<u64>, SnapshotError> {
     if is_default_bucket(bucket) {
-        return Ok(default_snapshot_inventory().await?.root_slots().collect());
+        return Ok(default_snapshot_inventory(start_slot, end_slot_inclusive)
+            .await?
+            .root_slots()
+            .collect());
     }
     list_bucket_slots(bucket).await
 }
@@ -584,16 +608,20 @@ async fn snapshot_objects_for_bucket(
     archive_extensions: &[&str],
 ) -> Result<Vec<String>, SnapshotError> {
     if is_default_bucket(bucket) {
-        return Ok(default_snapshot_inventory()
+        return Ok(default_snapshot_inventory(slot, slot)
             .await?
             .root_objects_for_slot(slot, archive_extensions));
     }
     list_snapshot_objects(bucket, slot, archive_extensions).await
 }
 
-async fn bootstrap_snapshot_slots_for_bucket(bucket: &str) -> Result<Vec<u64>, SnapshotError> {
+async fn bootstrap_snapshot_slots_for_bucket(
+    bucket: &str,
+    start_slot: u64,
+    end_slot_inclusive: u64,
+) -> Result<Vec<u64>, SnapshotError> {
     if is_default_bucket(bucket) {
-        return Ok(default_snapshot_inventory()
+        return Ok(default_snapshot_inventory(start_slot, end_slot_inclusive)
             .await?
             .bootstrap_slots()
             .collect());
@@ -607,31 +635,64 @@ async fn bootstrap_snapshot_objects_for_bucket(
     archive_extensions: &[&str],
 ) -> Result<Vec<String>, SnapshotError> {
     if is_default_bucket(bucket) {
-        return Ok(default_snapshot_inventory()
+        return Ok(default_snapshot_inventory(slot, slot)
             .await?
             .bootstrap_objects_for_slot(slot, archive_extensions));
     }
     list_snapshot_objects(bucket, slot, archive_extensions).await
 }
 
+#[cfg(test)]
 fn parse_snapshot_inventory(
     bucket: &str,
     listing: &str,
 ) -> Result<SnapshotInventory, SnapshotError> {
+    parse_snapshot_inventory_in_range(bucket, listing, None)
+}
+
+fn parse_snapshot_inventory_in_range(
+    bucket: &str,
+    listing: &str,
+    relevant_slots: Option<(u64, u64)>,
+) -> Result<SnapshotInventory, SnapshotError> {
+    if relevant_slots.is_some_and(|(start, end)| start > end) {
+        return Ok(SnapshotInventory::default());
+    }
     let mut inventory = SnapshotInventory::default();
     for line in listing.lines() {
         let uri = line.trim();
         if uri.is_empty() {
             continue;
         }
-        let object = parse_snapshot_object_uri(bucket, uri)?;
+        let name = uri.rsplit('/').next().unwrap_or_default();
         // The wildcard also sees future or unrelated snapshot archive
-        // formats. Keep the existing extension-filtering behavior.
-        if !snapshot_name_matches(object.name, ALL_SNAPSHOT_ARCHIVE_EXTENSIONS) {
+        // formats. Filter them before interpreting directory placement.
+        if !ALL_SNAPSHOT_ARCHIVE_EXTENSIONS
+            .iter()
+            .any(|extension| name.ends_with(extension))
+        {
             continue;
         }
-        let snapshot_slot = snapshot_slot_from_name(object.name, ALL_SNAPSHOT_ARCHIVE_EXTENSIONS)
+        let snapshot_slot = snapshot_slot_from_name(name, ALL_SNAPSHOT_ARCHIVE_EXTENSIONS)
             .ok_or_else(|| invalid_snapshot_object_uri(uri))?;
+        let object = match parse_snapshot_object_uri(bucket, uri) {
+            Ok(object) => object,
+            Err(error)
+                if relevant_slots.is_some_and(|bounds| {
+                    unusable_object_is_strictly_outside(bucket, uri, bounds)
+                }) =>
+            {
+                log::warn!("ignoring unusable snapshot object {uri}: {error}");
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        if object.name != name {
+            return Err(invalid_snapshot_object_uri(uri));
+        }
+        let outside_relevant_slots = relevant_slots.is_some_and(|bounds| {
+            slot_pair_is_strictly_outside(Some(object.anchor_slot), snapshot_slot, bounds)
+        });
         let objects_by_slot = match object.location {
             SnapshotObjectLocation::Root if object.anchor_slot == snapshot_slot => {
                 &mut inventory.root_objects_by_slot
@@ -640,9 +701,18 @@ fn parse_snapshot_inventory(
                 &mut inventory.hourly_objects_by_slot
             }
             SnapshotObjectLocation::Root | SnapshotObjectLocation::Hourly => {
+                if outside_relevant_slots {
+                    // A misplaced object can never be selected as a root or
+                    // bootstrap in this bounded request.
+                    log::warn!("ignoring misplaced snapshot object: {uri}");
+                    continue;
+                }
                 return Err(invalid_snapshot_object_uri(uri));
             }
         };
+        if outside_relevant_slots {
+            continue;
+        }
         objects_by_slot
             .entry(snapshot_slot)
             .or_default()
@@ -658,6 +728,32 @@ fn parse_snapshot_inventory(
         }
     }
     Ok(inventory)
+}
+
+fn unusable_object_is_strictly_outside(bucket: &str, uri: &str, bounds: (u64, u64)) -> bool {
+    let prefix = format!("{}/", bucket.trim_end_matches('/'));
+    let Some(rest) = uri.strip_prefix(&prefix) else {
+        return false;
+    };
+    let Some(name) = rest.rsplit('/').next() else {
+        return false;
+    };
+    let Some(snapshot_slot) = snapshot_slot_from_name(name, ALL_SNAPSHOT_ARCHIVE_EXTENSIONS) else {
+        return false;
+    };
+    let anchor_slot = rest.split('/').next().and_then(parse_canonical_slot);
+    slot_pair_is_strictly_outside(anchor_slot, snapshot_slot, bounds)
+}
+
+fn slot_pair_is_strictly_outside(
+    anchor_slot: Option<u64>,
+    snapshot_slot: u64,
+    (start_slot, end_slot_inclusive): (u64, u64),
+) -> bool {
+    let below = snapshot_slot < start_slot && anchor_slot.is_none_or(|anchor| anchor < start_slot);
+    let above = snapshot_slot > end_slot_inclusive
+        && anchor_slot.is_none_or(|anchor| anchor > end_slot_inclusive);
+    below || above
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -989,6 +1085,81 @@ mod tests {
                 }
             ));
         }
+    }
+
+    #[test]
+    fn bulk_snapshot_listing_ignores_misplaced_objects() {
+        let listing = "gs://mainnet-beta-ledger-us-ny5/416012/snapshot-416012-valid.tar.bz2\n\
+                       gs://mainnet-beta-ledger-us-ny5/619849/snapshot-619848-misplaced-root.tar.bz2\n\
+                       gs://mainnet-beta-ledger-us-ny5/619849/hourly/snapshot-619848-misplaced-hourly.tar.bz2\n\
+                       gs://mainnet-beta-ledger-us-ny5/ledger-old/snapshot-999999-unusable.tar.bz2\n\
+                       gs://mainnet-beta-ledger-us-ny5/416012/snapshot-416012-unsupported.tar.zst.1\n";
+
+        let inventory =
+            parse_snapshot_inventory_in_range(DEFAULT_BUCKET, listing, Some((400_000, 500_000)))
+                .unwrap();
+
+        assert_eq!(
+            inventory.root_objects_for_slot(416_012, &[".tar.bz2"]),
+            vec!["gs://mainnet-beta-ledger-us-ny5/416012/snapshot-416012-valid.tar.bz2"]
+        );
+        assert_eq!(
+            inventory.bootstrap_slots().collect::<Vec<_>>(),
+            vec![416_012]
+        );
+    }
+
+    #[test]
+    fn bounded_inventory_rejects_misplacement_crossing_requested_slots() {
+        for uri in [
+            "gs://mainnet-beta-ledger-us-ny5/416012/snapshot-619848-anchor-in-range.tar.bz2",
+            "gs://mainnet-beta-ledger-us-ny5/619848/snapshot-416012-name-in-range.tar.bz2",
+            "gs://mainnet-beta-ledger-us-ny5/300000/snapshot-600000-spanning.tar.bz2",
+            "gs://mainnet-beta-ledger-us-ny5/399999/snapshot-400000-at-boundary.tar.bz2",
+        ] {
+            let error =
+                parse_snapshot_inventory_in_range(DEFAULT_BUCKET, uri, Some((400_000, 500_000)))
+                    .unwrap_err();
+
+            assert!(matches!(
+                error,
+                SnapshotError::Parse {
+                    context: "snapshot object URI",
+                    ..
+                }
+            ));
+        }
+    }
+
+    #[test]
+    fn bounded_inventory_ignores_only_well_formed_same_side_objects() {
+        let listing = "gs://mainnet-beta-ledger-us-ny5/300001/snapshot-300000-below.tar.bz2\n\
+                       gs://mainnet-beta-ledger-us-ny5/600001/snapshot-600000-above.tar.bz2\n\
+                       gs://mainnet-beta-ledger-us-ny5/ledger-05-01-22/snapshot-600002-legacy.tar.zst\n\
+                       gs://mainnet-beta-ledger-us-ny5/450000/snapshot-450000-unsupported.tar.zst.1";
+
+        let inventory =
+            parse_snapshot_inventory_in_range(DEFAULT_BUCKET, listing, Some((400_000, 500_000)))
+                .unwrap();
+
+        assert!(inventory.root_slots().next().is_none());
+        assert!(inventory.bootstrap_slots().next().is_none());
+    }
+
+    #[test]
+    fn bounded_inventory_rejects_malformed_supported_basename_outside_range() {
+        let uri = "gs://mainnet-beta-ledger-us-ny5/600001/snapshot-0600000-malformed.tar.bz2";
+        let error =
+            parse_snapshot_inventory_in_range(DEFAULT_BUCKET, uri, Some((400_000, 500_000)))
+                .unwrap_err();
+
+        assert!(matches!(
+            error,
+            SnapshotError::Parse {
+                context: "snapshot object URI",
+                ..
+            }
+        ));
     }
 
     #[test]

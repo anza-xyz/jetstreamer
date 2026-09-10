@@ -51,14 +51,20 @@ RUNTIME_ROUTES = (
     (61, 91, "solana-v1.2.32", (".tar.bz2", ".tar.zst")),
     (92, 100, "solana-v1.3.19", (".tar.bz2", ".tar.zst")),
 )
+SNAPSHOT_ARCHIVE_EXTENSIONS = (".tar.zst", ".tar.lz4", ".tar.bz2")
 
 _DECIMAL_RE = re.compile(r"(?:0|[1-9][0-9]*)\Z")
+_SNAPSHOT_BASENAME_RE = re.compile(
+    r"snapshot-(?P<slot>0|[1-9][0-9]*)-"
+    r"(?P<identity>[1-9A-HJ-NP-Za-km-z]{32,44})"
+    r"(?P<extension>\.tar\.(?:zst|lz4|bz2))\Z"
+)
 _SNAPSHOT_PATH_RE = re.compile(
     r"(?P<anchor>0|[1-9][0-9]*)/"
     r"(?:(?P<hourly>hourly)/)?"
     r"snapshot-(?P<slot>0|[1-9][0-9]*)-"
     r"(?P<identity>[1-9A-HJ-NP-Za-km-z]{32,44})"
-    r"(?P<extension>\.tar(?:\.[a-z0-9]{1,16})?)\Z"
+    r"(?P<extension>\.tar\.(?:zst|lz4|bz2))\Z"
 )
 _BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 _BASE58_VALUES = {character: index for index, character in enumerate(_BASE58_ALPHABET)}
@@ -156,7 +162,12 @@ def _validate_crc32c(value: str, context: str) -> None:
         raise PreflightError(f"{context}: crc32c must encode exactly four bytes")
 
 
-def _parse_snapshot_object(raw: Any, source: str, index: int) -> SnapshotObject:
+def _parse_snapshot_object(
+    raw: Any,
+    source: str,
+    index: int,
+    relevant_slots: Tuple[int, int],
+) -> Optional[SnapshotObject]:
     context = f"{source} inventory entry {index}"
     if not isinstance(raw, dict):
         raise PreflightError(f"{context}: entry must be a JSON object")
@@ -173,6 +184,30 @@ def _parse_snapshot_object(raw: Any, source: str, index: int) -> SnapshotObject:
     object_name = _required_string(metadata, "name", context)
     if bucket != BUCKET_NAME:
         raise PreflightError(f"{context}: unexpected bucket {bucket!r}")
+    filename = object_name.rsplit("/", 1)[-1]
+    if not filename.endswith(SNAPSHOT_ARCHIVE_EXTENSIONS):
+        return None
+    filename_match = _SNAPSHOT_BASENAME_RE.fullmatch(filename)
+    if filename_match is None or not _base58_decodes_to_32_bytes(
+        filename_match.group("identity")
+    ):
+        raise PreflightError(f"{context}: invalid snapshot object path {object_name!r}")
+    filename_slot = _path_u64(filename_match.group("slot"), "snapshot slot", context)
+    anchor_text = object_name.split("/", 1)[0]
+    anchor_slot = (
+        _path_u64(anchor_text, "anchor slot", context)
+        if _DECIMAL_RE.fullmatch(anchor_text) is not None
+        else None
+    )
+    relevant_start, relevant_end = relevant_slots
+    below_range = filename_slot < relevant_start and (
+        anchor_slot is None or anchor_slot < relevant_start
+    )
+    above_range = filename_slot > relevant_end and (
+        anchor_slot is None or anchor_slot > relevant_end
+    )
+    if below_range or above_range:
+        return None
     generation_text = _required_string(metadata, "generation", context)
     generation = _canonical_u64(generation_text, "metadata.generation", context, nonzero=True)
     metageneration = _canonical_u64(
@@ -225,7 +260,22 @@ def _parse_snapshot_object(raw: Any, source: str, index: int) -> SnapshotObject:
     )
 
 
-def parse_inventory_json(text: str, source: str) -> Tuple[SnapshotObject, ...]:
+def requested_slot_range(
+    first_epoch: int = FIRST_EPOCH, last_epoch: int = LAST_EPOCH
+) -> Tuple[int, int]:
+    if first_epoch < FIRST_EPOCH or last_epoch > LAST_EPOCH or first_epoch > last_epoch:
+        raise PreflightError(
+            f"requested epoch range {first_epoch}-{last_epoch} is outside "
+            f"{FIRST_EPOCH}-{LAST_EPOCH}"
+        )
+    return (first_epoch - 1) * EPOCH_SLOTS, (last_epoch + 1) * EPOCH_SLOTS - 1
+
+
+def parse_inventory_json(
+    text: str,
+    source: str,
+    relevant_slots: Optional[Tuple[int, int]] = None,
+) -> Tuple[SnapshotObject, ...]:
     """Parse one raw gcloud JSON listing and validate every returned object."""
     if source not in ("root", "hourly"):
         raise ValueError("source must be 'root' or 'hourly'")
@@ -240,7 +290,16 @@ def parse_inventory_json(text: str, source: str) -> Tuple[SnapshotObject, ...]:
     if not isinstance(raw, list):
         raise PreflightError(f"{source} inventory must be a JSON list")
 
-    objects = [_parse_snapshot_object(item, source, index) for index, item in enumerate(raw)]
+    if relevant_slots is None:
+        relevant_slots = requested_slot_range()
+    if relevant_slots[0] > relevant_slots[1]:
+        raise ValueError("relevant slot range must not be empty")
+
+    objects = [
+        parsed
+        for index, item in enumerate(raw)
+        if (parsed := _parse_snapshot_object(item, source, index, relevant_slots)) is not None
+    ]
     seen: Dict[str, SnapshotObject] = {}
     for item in objects:
         previous = seen.get(item.object_name)
@@ -279,11 +338,7 @@ def build_epoch_plans(
     last_epoch: int = LAST_EPOCH,
 ) -> Tuple[EpochPlan, ...]:
     """Select bootstraps and root-only verification checkpoints."""
-    if first_epoch < FIRST_EPOCH or last_epoch > LAST_EPOCH or first_epoch > last_epoch:
-        raise PreflightError(
-            f"requested epoch range {first_epoch}-{last_epoch} is outside "
-            f"{FIRST_EPOCH}-{LAST_EPOCH}"
-        )
+    requested_slot_range(first_epoch, last_epoch)
     all_bootstraps = tuple(root_objects) + tuple(hourly_objects)
     plans: List[EpochPlan] = []
 
@@ -575,18 +630,26 @@ def build_argument_parser() -> argparse.ArgumentParser:
         default=LOCAL_ROOT,
         help=f"directory checked for selected archives (default: {LOCAL_ROOT})",
     )
+    parser.add_argument("--first-epoch", type=int, default=FIRST_EPOCH)
+    parser.add_argument("--last-epoch", type=int, default=LAST_EPOCH)
     return parser
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     arguments = build_argument_parser().parse_args(argv)
     try:
+        relevant_slots = requested_slot_range(arguments.first_epoch, arguments.last_epoch)
         root_text, hourly_text = load_inventory_texts(
             arguments.inventory_root_json, arguments.inventory_hourly_json
         )
-        root_objects = parse_inventory_json(root_text, "root")
-        hourly_objects = parse_inventory_json(hourly_text, "hourly")
-        plans = build_epoch_plans(root_objects, hourly_objects)
+        root_objects = parse_inventory_json(root_text, "root", relevant_slots)
+        hourly_objects = parse_inventory_json(hourly_text, "hourly", relevant_slots)
+        plans = build_epoch_plans(
+            root_objects,
+            hourly_objects,
+            arguments.first_epoch,
+            arguments.last_epoch,
+        )
         manifest = build_manifest(plans)
         fingerprint = manifest_fingerprint(manifest)
         storage = build_storage_report(plans, arguments.local_root)

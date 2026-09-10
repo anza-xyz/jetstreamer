@@ -143,8 +143,80 @@ class InventoryParsingTests(unittest.TestCase):
         items = preflight.parse_inventory_json(json.dumps([record, record]), "root")
         self.assertEqual(len(items), 1)
 
+    def test_ignores_misplaced_object_outside_requested_history(self) -> None:
+        _, relevant_end = preflight.requested_slot_range()
+        slot = relevant_end + 1
+        records = [
+            inventory_record(slot, anchor=slot + 10),
+            inventory_record(slot + 1, extension=".tar.zst.1"),
+        ]
+
+        items = preflight.parse_inventory_json(json.dumps(records), "root")
+
+        self.assertEqual(items, ())
+
+    def test_rejects_misplaced_object_crossing_requested_history(self) -> None:
+        relevant_start, relevant_end = preflight.requested_slot_range()
+        slot = relevant_end + 1
+        record = inventory_record(slot, anchor=relevant_start)
+
+        with self.assertRaises(preflight.PreflightError):
+            preflight.parse_inventory_json(json.dumps([record]), "root")
+
+    def test_requested_subrange_sets_inventory_trust_boundary(self) -> None:
+        relevant_slots = preflight.requested_slot_range(12, 16)
+        outside_slot = 17 * preflight.EPOCH_SLOTS
+        outside = inventory_record(outside_slot, anchor=outside_slot + 1)
+
+        self.assertEqual(
+            preflight.parse_inventory_json(
+                json.dumps([outside]), "root", relevant_slots
+            ),
+            (),
+        )
+
+    def test_unsupported_suffix_is_ignored_inside_requested_range(self) -> None:
+        relevant_slots = preflight.requested_slot_range(12, 16)
+        slot = 12 * preflight.EPOCH_SLOTS
+        unsupported = inventory_record(slot, extension=".tar.zst.1")
+
+        self.assertEqual(
+            preflight.parse_inventory_json(
+                json.dumps([unsupported]), "root", relevant_slots
+            ),
+            (),
+        )
+
+    def test_malformed_supported_basename_remains_fatal_outside_range(self) -> None:
+        _, relevant_end = preflight.requested_slot_range(12, 16)
+        malformed = inventory_record(relevant_end + 1)
+        malformed_name = malformed["metadata"]["name"].replace(
+            f"snapshot-{relevant_end + 1}-", "snapshot-00-"
+        )
+        malformed["metadata"]["name"] = malformed_name
+        malformed["metadata"]["id"] = (
+            f"{preflight.BUCKET_NAME}/{malformed_name}/"
+            f"{malformed['metadata']['generation']}"
+        )
+        malformed["url"] = (
+            f"{preflight.BUCKET_URI}/{malformed_name}#"
+            f"{malformed['metadata']['generation']}"
+        )
+
+        with self.assertRaises(preflight.PreflightError):
+            preflight.parse_inventory_json(
+                json.dumps([malformed]), "root", preflight.requested_slot_range(12, 16)
+            )
+
 
 class SelectionTests(unittest.TestCase):
+    def test_cli_accepts_a_supported_subrange(self) -> None:
+        arguments = preflight.build_argument_parser().parse_args(
+            ["--first-epoch", "12", "--last-epoch", "16"]
+        )
+
+        self.assertEqual((arguments.first_epoch, arguments.last_epoch), (12, 16))
+
     def test_builds_all_epoch_plans_and_keeps_hourly_bootstrap_only(self) -> None:
         root_raw, hourly_raw = complete_inventory()
         root = preflight.parse_inventory_json(json.dumps(list(reversed(root_raw))), "root")

@@ -5393,6 +5393,20 @@ fn validate_manifest_fingerprint(value: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn manifest_fingerprint_digest(value: &str) -> Result<[u8; 32], String> {
+    validate_manifest_fingerprint(value)?;
+    let hex = value
+        .strip_prefix("sha256:")
+        .expect("validated manifest fingerprint has its algorithm prefix");
+    let mut digest = [0u8; 32];
+    for (index, byte) in digest.iter_mut().enumerate() {
+        let offset = index * 2;
+        *byte = u8::from_str_radix(&hex[offset..offset + 2], 16)
+            .map_err(|error| format!("invalid cohort manifest fingerprint: {error}"))?;
+    }
+    Ok(digest)
+}
+
 fn validate_cohort_manifest_snapshot(
     item: &CohortManifestSnapshot,
     required_source: &str,
@@ -16501,9 +16515,13 @@ mod early_snapshot_tests {
             "z": [3, true, null],
             "a": {"x": "ASCII", "n": 17}
         });
+        let expected = "sha256:07d38896ccb84d2b0e52fffb78e70f293ded9e3988277f9332ab96469323c435";
+        assert_eq!(cohort_manifest_fingerprint(&manifest).unwrap(), expected);
         assert_eq!(
-            cohort_manifest_fingerprint(&manifest).unwrap(),
-            "sha256:07d38896ccb84d2b0e52fffb78e70f293ded9e3988277f9332ab96469323c435"
+            jetstreamer_node::segment_manifest::sha256_hex_string(
+                &manifest_fingerprint_digest(expected).unwrap()
+            ),
+            expected.strip_prefix("sha256:").unwrap()
         );
     }
 

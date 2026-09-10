@@ -209,7 +209,7 @@ pub fn prepare_archive_permissions(file: &File, destination_parent: &Path) -> io
     file.set_permissions(fs::Permissions::from_mode(0o440))
 }
 
-fn checksum_line(digest: &[u8; 32], file_name: &OsStr) -> io::Result<String> {
+pub fn archive_checksum_line(digest: &[u8; 32], file_name: &OsStr) -> io::Result<String> {
     let file_name = file_name.to_str().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -240,7 +240,7 @@ pub fn ensure_archive_checksum_for_validated(
             ),
         ));
     }
-    let line = checksum_line(
+    let line = archive_checksum_line(
         &validated.sha256,
         archive_path.file_name().ok_or_else(|| {
             io::Error::new(
@@ -347,7 +347,7 @@ mod tests {
 
     #[test]
     fn checksum_line_is_lowercase_coreutils_format() {
-        let line = checksum_line(&[0xab; 32], OsStr::new("epoch-7.jet")).unwrap();
+        let line = archive_checksum_line(&[0xab; 32], OsStr::new("epoch-7.jet")).unwrap();
         assert_eq!(line, format!("{}  epoch-7.jet\n", "ab".repeat(32)));
     }
 

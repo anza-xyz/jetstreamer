@@ -19,9 +19,10 @@ use {
     sha2::{Digest, Sha256},
     solana_hash::Hash,
     std::{
-        fs::{self, File},
+        fs::{self, File, OpenOptions},
         io::{self, BufReader, Read, Seek, SeekFrom, Write},
         ops::Range,
+        os::unix::fs::{MetadataExt as _, OpenOptionsExt as _},
         path::{Path, PathBuf},
         str::FromStr,
     },
@@ -607,7 +608,29 @@ fn open_regular_file(path: &Path, operation: &'static str) -> Result<File, Segme
     if !metadata.file_type().is_file() {
         return Err(invalid(format!("{} is not a regular file", path.display())));
     }
-    File::open(path).map_err(|source| io_err(operation, path, source))
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|source| io_err(operation, path, source))?;
+    let opened = file
+        .metadata()
+        .map_err(|source| io_err(operation, path, source))?;
+    if !opened.file_type().is_file()
+        || opened.dev() != metadata.dev()
+        || opened.ino() != metadata.ino()
+        || opened.len() != metadata.len()
+        || opened.mtime() != metadata.mtime()
+        || opened.mtime_nsec() != metadata.mtime_nsec()
+        || opened.ctime() != metadata.ctime()
+        || opened.ctime_nsec() != metadata.ctime_nsec()
+    {
+        return Err(invalid(format!(
+            "{} changed while it was opened",
+            path.display()
+        )));
+    }
+    Ok(file)
 }
 
 fn read_bounded_manifest(path: &Path) -> Result<Vec<u8>, SegmentManifestError> {

@@ -13550,99 +13550,25 @@ fn spawn_adaptive_epoch_child(
 
 fn publish_staged_epoch_archive(validated: &ValidatedAdaptiveEpoch) -> Result<(), String> {
     let job = &validated.job;
-    publish_validated_staged_archive(
-        job.epoch,
+    let publication = jetstreamer_node::archive_publish::publish_verified_archive(
         &job.staged_output,
         &job.final_output,
         validated.evidence,
     )
-}
-
-fn publish_validated_staged_archive(
-    epoch: u64,
-    staged_output: &Path,
-    final_output: &Path,
-    evidence: jetstreamer_node::archive_checksum::ValidatedArchiveFile,
-) -> Result<(), String> {
-    if !jetstreamer_node::archive_checksum::path_matches_archive_identity(
-        staged_output,
-        evidence.identity,
-    )
-    .map_err(|error| format!("failed to recheck staged epoch {epoch} archive: {error}"))?
-    {
-        return Err(format!(
-            "staged epoch {} archive {} changed after validation",
-            epoch,
-            staged_output.display()
-        ));
-    }
-    let bound_archive = jetstreamer_node::archive_checksum::open_regular_nofollow(staged_output)
-        .map_err(|error| {
-            format!("failed to bind staged epoch {epoch} archive for rename: {error}")
-        })?;
-    if jetstreamer_node::archive_checksum::archive_file_identity(&bound_archive)
-        .map_err(|error| format!("failed to identify staged epoch {epoch}: {error}"))?
-        != evidence.identity
-    {
-        return Err(format!(
-            "staged epoch {} descriptor no longer matches validation evidence",
-            epoch
-        ));
-    }
-    let preserved_output = preserve_existing_output(final_output)?;
-    if let Err(err) = fs::rename(staged_output, final_output) {
-        if let Some(backup) = preserved_output.as_ref()
-            && !final_output.exists()
-            && let Err(restore_err) = fs::rename(backup, final_output)
-        {
-            return Err(format!(
-                "failed to publish staged epoch {} archive: {err}; also failed to restore {}: {restore_err}",
-                epoch,
-                backup.display()
-            ));
-        }
-        return Err(format!(
-            "failed to atomically publish staged epoch {} archive {} as {}: {err}",
-            epoch,
-            staged_output.display(),
-            final_output.display()
-        ));
-    }
-    let output_parent = final_output.parent().unwrap_or_else(|| Path::new("."));
-    fs::File::open(output_parent)
-        .and_then(|directory| directory.sync_all())
-        .map_err(|err| format!("failed to sync {}: {err}", output_parent.display()))?;
-    let rebound_evidence =
-        jetstreamer_node::archive_checksum::rebind_validated_after_rename(&bound_archive, evidence)
-            .map_err(|error| {
-                format!(
-                    "published epoch {} archive changed across rename: {error}",
-                    epoch
-                )
-            })?;
-    if !jetstreamer_node::archive_checksum::path_matches_archive_identity(
-        final_output,
-        rebound_evidence.identity,
-    )
-    .map_err(|error| format!("failed to recheck {}: {error}", final_output.display()))?
-    {
-        return Err(format!(
-            "published epoch {} archive {} changed across atomic rename",
-            epoch,
-            final_output.display()
-        ));
-    }
-    jetstreamer_node::archive_checksum::ensure_archive_checksum_for_validated(
-        final_output,
-        rebound_evidence,
-    )
-    .map_err(|err| {
+    .map_err(|error| {
         format!(
-            "failed to publish checksum for verified epoch {} archive {}: {err}",
-            epoch,
-            final_output.display()
+            "failed to transactionally publish verified epoch {} archive (committed={}): {error}",
+            job.epoch,
+            error.committed(),
         )
     })?;
+    if let Some(recovery) = publication.recovery_directory {
+        warn!(
+            "epoch {}: retained replaced archive artifacts in {}",
+            job.epoch,
+            recovery.display()
+        );
+    }
     Ok(())
 }
 
@@ -14160,7 +14086,7 @@ async fn run_epoch_range_supervisor_adaptive(
             }
             let job = &validated.job;
             info!(
-                "epoch {}: atomically published verified archive {}",
+                "epoch {}: transactionally published verified archive {}",
                 job.epoch,
                 job.final_output.display()
             );

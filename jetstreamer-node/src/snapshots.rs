@@ -119,6 +119,8 @@ pub enum SnapshotError {
     InvalidExactSnapshotIdentity { slot: u64, name: String },
     #[error("invalid exact snapshot generation: {generation}")]
     InvalidExactSnapshotGeneration { generation: u64 },
+    #[error("generation-pinned snapshot destination already exists: {path}")]
+    PinnedDestinationExists { path: PathBuf },
     #[error("snapshot destination is not a non-empty regular file: {path}")]
     InvalidDestination { path: PathBuf },
     #[error("failed to persist downloaded snapshot to {path}: {source}")]
@@ -403,6 +405,7 @@ where
         exact_snapshot_uri(slot, archive_name, Some(generation)),
         archive_name,
         dest_dir,
+        false,
         copy,
     )
     .await
@@ -417,7 +420,22 @@ async fn download_exact_snapshot_inner(
     validate_exact_snapshot_identity(slot, archive_name)?;
     let dest_dir = prepare_snapshot_destination(dest_dir.as_ref()).await?;
     let uri = exact_snapshot_uri(slot, archive_name, generation);
-    download_snapshot_uri_to_dir(&uri, archive_name, dest_dir).await
+    match generation {
+        Some(_) => {
+            download_snapshot_uri_to_dir_with(
+                uri,
+                archive_name,
+                dest_dir,
+                false,
+                |uri, temporary| async move {
+                    let temporary_arg = temporary.to_string_lossy().into_owned();
+                    gcloud_status(&["storage", "cp", &uri, &temporary_arg]).await
+                },
+            )
+            .await
+        }
+        None => download_snapshot_uri_to_dir(&uri, archive_name, dest_dir).await,
+    }
 }
 
 fn validate_exact_snapshot_identity(slot: u64, archive_name: &str) -> Result<(), SnapshotError> {
@@ -532,6 +550,7 @@ async fn download_snapshot_uri_to_dir(
         uri.to_owned(),
         filename,
         dest_dir,
+        true,
         |uri, temporary| async move {
             let temporary_arg = temporary.to_string_lossy().into_owned();
             gcloud_status(&["storage", "cp", &uri, &temporary_arg]).await
@@ -544,6 +563,7 @@ async fn download_snapshot_uri_to_dir_with<F, Fut>(
     uri: String,
     filename: &str,
     dest_dir: &Path,
+    allow_existing: bool,
     copy: F,
 ) -> Result<PathBuf, SnapshotError>
 where
@@ -552,7 +572,10 @@ where
 {
     let destination = dest_dir.join(filename);
     if valid_existing_snapshot_destination(&destination)? {
-        return Ok(destination);
+        if allow_existing {
+            return Ok(destination);
+        }
+        return Err(SnapshotError::PinnedDestinationExists { path: destination });
     }
 
     let temporary = new_snapshot_download(filename, dest_dir)?;
@@ -1447,6 +1470,34 @@ mod tests {
                 .next()
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn generation_pinned_download_never_reuses_an_existing_name() {
+        let directory = tempfile::tempdir().unwrap();
+        let name = format!("snapshot-619848-{HASH_A}.tar.bz2");
+        let path = directory.path().join(&name);
+        std::fs::write(&path, b"unattributed local bytes").unwrap();
+        let called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = called.clone();
+        let error = download_exact_snapshot_generation_with(
+            619_848,
+            &name,
+            123,
+            directory.path(),
+            move |_, _| async move {
+                observed.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            SnapshotError::PinnedDestinationExists { path: existing } if existing == path
+        ));
+        assert!(!called.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(std::fs::read(path).unwrap(), b"unattributed local bytes");
     }
 
     #[test]

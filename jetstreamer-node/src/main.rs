@@ -4957,6 +4957,13 @@ fn archive_generation_profile() -> String {
 // archive digest, and checkpoint tuple are still validated independently.
 const COMPATIBLE_V1_0_7_GENERATION_PROFILES: &[&str] =
     &["jetstreamer-node/0.7.0/old-faithful-to-horizon-v2@00f3f6e622128cbe9e57a68ce67981fa4b3f2d95"];
+// 8154bc9 changed only worker-exit diagnostics. The following scheduler and
+// executable-binding changes likewise do not affect historical replay bytes.
+// Keep the last profile that produced verified v1.0.8 archives reusable while
+// every independent runtime, bootstrap, checkpoint, and archive digest check
+// remains mandatory.
+const COMPATIBLE_V1_0_8_GENERATION_PROFILES: &[&str] =
+    &["jetstreamer-node/0.7.0/old-faithful-to-horizon-v2@8154bc9b0057a138afa6e8833468f6ffba39a6a1"];
 
 fn runtime_generation_profile_is_compatible(
     runtime_profile: &str,
@@ -4965,6 +4972,8 @@ fn runtime_generation_profile_is_compatible(
     recorded_generation_profile == archive_generation_profile()
         || (runtime_profile == historical::SOLANA_V1_0_7_CANDIDATE.backend_id
             && COMPATIBLE_V1_0_7_GENERATION_PROFILES.contains(&recorded_generation_profile))
+        || (runtime_profile == historical::SOLANA_V1_0_8_CANDIDATE.backend_id
+            && COMPATIBLE_V1_0_8_GENERATION_PROFILES.contains(&recorded_generation_profile))
 }
 
 fn segment_runtime_identity_is_compatible(
@@ -10910,16 +10919,17 @@ fn adaptive_resource_occupancy(
     running_epochs.saturating_add(validating_epochs)
 }
 
-/// Put retries ahead of untouched work while preserving ascending epoch order
-/// within a batch of completions.
-fn prepend_adaptive_retries(
+/// Merge retries with untouched work in publication order. Prioritizing every
+/// recovered retry ahead of lower untouched epochs can waste hours rebuilding
+/// an archive that cannot yet be published.
+fn merge_adaptive_retries(
     pending: &mut VecDeque<AdaptiveEpochJob>,
-    mut retries: Vec<AdaptiveEpochJob>,
+    retries: Vec<AdaptiveEpochJob>,
 ) {
-    retries.sort_unstable_by_key(|job| job.epoch);
-    for job in retries.into_iter().rev() {
-        pending.push_front(job);
-    }
+    pending.extend(retries);
+    pending
+        .make_contiguous()
+        .sort_unstable_by_key(|job| job.epoch);
 }
 
 fn adaptive_env_u64(name: &str) -> Result<Option<u64>, String> {
@@ -11893,7 +11903,7 @@ async fn run_epoch_range_supervisor_adaptive(
                 }
             }
         }
-        prepend_adaptive_retries(&mut pending, retries);
+        merge_adaptive_retries(&mut pending, retries);
         if adaptive_resource_occupancy(running.len(), validating.len(), ready.len()) == 0 {
             cohort_started = None;
         }
@@ -13371,27 +13381,31 @@ mod early_snapshot_tests {
     use super::*;
 
     #[test]
-    fn prior_v1_0_7_generation_profile_allowlist_is_exact() {
-        let prior = COMPATIBLE_V1_0_7_GENERATION_PROFILES[0];
-        assert!(runtime_generation_profile_is_compatible(
-            historical::SOLANA_V1_0_7_CANDIDATE.backend_id,
-            prior,
-        ));
+    fn prior_runtime_generation_profile_allowlists_are_exact_and_scoped() {
+        let prior_v1_0_7 = COMPATIBLE_V1_0_7_GENERATION_PROFILES[0];
+        let prior_v1_0_8 = COMPATIBLE_V1_0_8_GENERATION_PROFILES[0];
+        for (runtime, prior) in [
+            (historical::SOLANA_V1_0_7_CANDIDATE.backend_id, prior_v1_0_7),
+            (historical::SOLANA_V1_0_8_CANDIDATE.backend_id, prior_v1_0_8),
+        ] {
+            assert!(runtime_generation_profile_is_compatible(runtime, prior));
+
+            let mut one_character_mutation = prior.as_bytes().to_vec();
+            *one_character_mutation.last_mut().unwrap() =
+                if prior.ends_with('0') { b'1' } else { b'0' };
+            let one_character_mutation = String::from_utf8(one_character_mutation).unwrap();
+            assert!(!runtime_generation_profile_is_compatible(
+                runtime,
+                &one_character_mutation,
+            ));
+            assert!(!runtime_generation_profile_is_compatible(
+                runtime,
+                &format!("{prior}-dirty-deadbeef"),
+            ));
+        }
         assert!(runtime_generation_profile_is_compatible(
             historical::SOLANA_V1_0_8_CANDIDATE.backend_id,
             &archive_generation_profile(),
-        ));
-
-        let mut one_character_mutation = prior.as_bytes().to_vec();
-        *one_character_mutation.last_mut().unwrap() = b'4';
-        let one_character_mutation = String::from_utf8(one_character_mutation).unwrap();
-        assert!(!runtime_generation_profile_is_compatible(
-            historical::SOLANA_V1_0_7_CANDIDATE.backend_id,
-            &one_character_mutation,
-        ));
-        assert!(!runtime_generation_profile_is_compatible(
-            historical::SOLANA_V1_0_7_CANDIDATE.backend_id,
-            &format!("{prior}-dirty-deadbeef"),
         ));
         assert!(!runtime_generation_profile_is_compatible(
             historical::SOLANA_V1_0_7_CANDIDATE.backend_id,
@@ -13399,7 +13413,11 @@ mod early_snapshot_tests {
         ));
         assert!(!runtime_generation_profile_is_compatible(
             historical::SOLANA_V1_0_8_CANDIDATE.backend_id,
-            prior,
+            prior_v1_0_7,
+        ));
+        assert!(!runtime_generation_profile_is_compatible(
+            historical::SOLANA_V1_0_7_CANDIDATE.backend_id,
+            prior_v1_0_8,
         ));
     }
 
@@ -14562,19 +14580,23 @@ mod early_snapshot_tests {
     }
 
     #[test]
-    fn adaptive_retry_batch_is_prioritized_in_epoch_order() {
-        let mut pending = VecDeque::from([adaptive_test_job(9, PathBuf::from("epoch-9"))]);
-        let retries = vec![
-            adaptive_test_job(4, PathBuf::from("epoch-4")),
+    fn adaptive_retries_merge_with_untouched_work_in_epoch_order() {
+        let mut pending = VecDeque::from([
             adaptive_test_job(2, PathBuf::from("epoch-2")),
             adaptive_test_job(3, PathBuf::from("epoch-3")),
+            adaptive_test_job(5, PathBuf::from("epoch-5")),
+            adaptive_test_job(9, PathBuf::from("epoch-9")),
+        ]);
+        let retries = vec![
+            adaptive_test_job(7, PathBuf::from("epoch-7")),
+            adaptive_test_job(4, PathBuf::from("epoch-4")),
         ];
 
-        prepend_adaptive_retries(&mut pending, retries);
+        merge_adaptive_retries(&mut pending, retries);
 
         assert_eq!(
             pending.iter().map(|job| job.epoch).collect::<Vec<_>>(),
-            vec![2, 3, 4, 9]
+            vec![2, 3, 4, 5, 7, 9]
         );
     }
 

@@ -69,6 +69,28 @@ pub struct ValidatedArchiveFile {
     pub sha256: [u8; 32],
 }
 
+impl ValidatedArchiveFile {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn matches_identity(
+        self,
+        dev: u64,
+        ino: u64,
+        len: u64,
+        modified_seconds: i64,
+        modified_nanoseconds: i64,
+        changed_seconds: i64,
+        changed_nanoseconds: i64,
+    ) -> bool {
+        self.identity.dev == dev
+            && self.identity.ino == ino
+            && self.identity.len == len
+            && self.identity.modified_seconds == modified_seconds
+            && self.identity.modified_nanoseconds == modified_nanoseconds
+            && self.identity.changed_seconds == changed_seconds
+            && self.identity.changed_nanoseconds == changed_nanoseconds
+    }
+}
+
 /// Journal-only representation. Keeping serde off `ValidatedArchiveFile`
 /// preserves its role as an in-process validation capability: downstream
 /// callers cannot deserialize forged evidence and pass it to publication.

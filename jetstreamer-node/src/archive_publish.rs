@@ -1715,7 +1715,19 @@ impl PublicationTransaction {
         if !committed_archive.same_across_rename(
             self.installed_archive_identity
                 .ok_or_else(|| "committed batch archive has no installed identity".to_string())?,
-        ) || !option_identities_correspond(committed_manifest, self.installed_manifest_identity)
+        ) || !self
+            .published_evidence
+            .ok_or_else(|| "committed batch archive has no validation evidence".to_string())?
+            .matches_identity(
+                committed_archive.dev,
+                committed_archive.ino,
+                committed_archive.len,
+                committed_archive.mtime,
+                committed_archive.mtime_nsec,
+                committed_archive.ctime,
+                committed_archive.ctime_nsec,
+            )
+            || !option_identities_correspond(committed_manifest, self.installed_manifest_identity)
             || !committed_checksum.same_across_rename(self.checksum_staged.identity)
         {
             return Err("committed batch identity evidence changed after verification".into());
@@ -1997,6 +2009,16 @@ impl PublicationTransaction {
             &self.destination_name,
             Some(archive_identity),
         )?;
+        if let Some(previous) = self.published_evidence {
+            let current = archive_file_identity(&self.archive_staged.file)
+                .map_err(|error| format!("failed to recheck published archive: {error}"))?;
+            if current != previous.identity {
+                return Err(
+                    "published archive metadata changed after its first binding".to_string()
+                );
+            }
+            return Ok(());
+        }
         let rebound = rebind_validated_after_rename(&self.archive_staged.file, self.evidence)
             .map_err(|error| {
                 format!("published archive changed across controlled rename: {error}")
@@ -4167,6 +4189,15 @@ fn recovered_batch_identity_evidence(
     let committed_checksum = target_identity(destination, &item.destination_checksum_name)?
         .ok_or_else(|| "recovered batch checksum disappeared".to_string())?;
     if !committed_archive.same_across_rename(item.record.archive_identity)
+        || !archive_validation.matches_identity(
+            committed_archive.dev,
+            committed_archive.ino,
+            committed_archive.len,
+            committed_archive.mtime,
+            committed_archive.mtime_nsec,
+            committed_archive.ctime,
+            committed_archive.ctime_nsec,
+        )
         || !option_identities_correspond(committed_manifest, item.record.manifest_staged_identity)
         || !committed_checksum.same_across_rename(item.record.checksum_staged_identity)
     {
@@ -4211,6 +4242,15 @@ fn recovered_batch_rollback_evidence(
     let restored_manifest = target_identity(destination, &item.destination_manifest_name)?;
     let restored_checksum = target_identity(destination, &item.destination_checksum_name)?;
     if !staged_archive.same_across_rename(item.record.archive_identity)
+        || !staged_archive_validation.matches_identity(
+            staged_archive.dev,
+            staged_archive.ino,
+            staged_archive.len,
+            staged_archive.mtime,
+            staged_archive.mtime_nsec,
+            staged_archive.ctime,
+            staged_archive.ctime_nsec,
+        )
         || !option_identities_correspond(restored_archive, item.record.initial.archive)
         || !option_identities_correspond(restored_manifest, item.record.initial.manifest)
         || !option_identities_correspond(restored_checksum, item.record.initial.checksum)

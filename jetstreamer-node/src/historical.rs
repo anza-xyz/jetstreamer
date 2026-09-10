@@ -75,6 +75,15 @@ const DEFAULT_ENTRY_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 const DEFAULT_CHECKPOINT_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 const DEFAULT_REAP_TIMEOUT: Duration = Duration::from_secs(10);
 const CHILD_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(10);
+// A concurrent fork can momentarily inherit the writable descriptor used to
+// bind the worker executable. Linux rejects execve while that descriptor is
+// alive, even though it is O_CLOEXEC. Retry only that transient errno and keep
+// both elapsed time and fork pressure bounded so a persistent writer fails
+// closed.
+const BOUND_WORKER_SPAWN_RETRY_TIMEOUT: Duration = Duration::from_secs(2);
+const BOUND_WORKER_SPAWN_INITIAL_BACKOFF: Duration = Duration::from_millis(10);
+const BOUND_WORKER_SPAWN_MAX_BACKOFF: Duration = Duration::from_millis(100);
+const BOUND_WORKER_SPAWN_MAX_ATTEMPTS: u32 = 32;
 
 const CONTROL_TIMEOUT_ENV: &str = "JETSTREAMER_HISTORICAL_CONTROL_TIMEOUT_SECS";
 const INITIALIZE_TIMEOUT_ENV: &str = "JETSTREAMER_HISTORICAL_INITIALIZE_TIMEOUT_SECS";
@@ -914,9 +923,8 @@ impl HistoricalRuntimeClient {
                 });
             }
         }
-        let mut child = command
-            .spawn()
-            .map_err(|source| HistoricalRuntimeError::Spawn {
+        let mut child =
+            spawn_bound_worker(&mut command).map_err(|source| HistoricalRuntimeError::Spawn {
                 path: bound_executable.path.clone(),
                 source,
             })?;
@@ -2443,7 +2451,7 @@ fn bind_worker_executable(
     source_path: &Path,
     private_work_dir: &Path,
 ) -> Result<BoundWorkerExecutable, HistoricalRuntimeError> {
-    use std::os::unix::fs::OpenOptionsExt as _;
+    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 
     let bound_directory = private_work_dir.join("bound-worker");
     fs::create_dir(&bound_directory).map_err(|source| HistoricalRuntimeError::PathIo {
@@ -2462,17 +2470,20 @@ fn bind_worker_executable(
         })?;
     let (sha256, source_permissions) =
         stream_worker_executable(source_path, Some(&mut bound_file))?;
+    let mut bound_permissions = source_permissions;
+    bound_permissions.set_mode(bound_permissions.mode() & !0o222);
     bound_file
         .flush()
-        .and_then(|()| bound_file.set_permissions(source_permissions))
+        .and_then(|()| bound_file.set_permissions(bound_permissions))
         .and_then(|()| bound_file.sync_all())
         .map_err(|source| HistoricalRuntimeError::PathIo {
             path: bound_path.clone(),
             source,
         })?;
-    // Close every writable descriptor before making this inode available for
-    // exec. This also prevents a concurrent fork from briefly inheriting a
-    // writer and making execve fail with ETXTBSY.
+    // Close the parent's writable descriptor before making this inode
+    // available for exec. Later forks cannot inherit it; an already in-flight
+    // concurrent fork can retain it briefly and is handled by the bounded
+    // ETXTBSY retry at spawn.
     drop(bound_file);
     fs::File::open(&bound_directory)
         .and_then(|directory| directory.sync_all())
@@ -2484,6 +2495,41 @@ fn bind_worker_executable(
         path: bound_path,
         sha256,
     })
+}
+
+fn spawn_bound_worker(command: &mut Command) -> io::Result<Child> {
+    spawn_bound_worker_with_retry(command, BOUND_WORKER_SPAWN_RETRY_TIMEOUT, || {})
+}
+
+fn spawn_bound_worker_with_retry<F>(
+    command: &mut Command,
+    retry_timeout: Duration,
+    mut on_etxtbsy: F,
+) -> io::Result<Child>
+where
+    F: FnMut(),
+{
+    let started = Instant::now();
+    let mut attempts = 0u32;
+    let mut backoff = BOUND_WORKER_SPAWN_INITIAL_BACKOFF;
+    loop {
+        attempts = attempts.saturating_add(1);
+        match command.spawn() {
+            Ok(child) => return Ok(child),
+            Err(error) if error.raw_os_error() == Some(libc::ETXTBSY) => {
+                let remaining = retry_timeout.saturating_sub(started.elapsed());
+                if remaining.is_zero() || attempts >= BOUND_WORKER_SPAWN_MAX_ATTEMPTS {
+                    return Err(error);
+                }
+                on_etxtbsy();
+                thread::sleep(backoff.min(remaining));
+                backoff = backoff
+                    .saturating_mul(2)
+                    .min(BOUND_WORKER_SPAWN_MAX_BACKOFF);
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 fn stream_genesis_bin(
@@ -4194,7 +4240,7 @@ mod tests {
         assert_eq!(bound.sha256, sha256_file(&bound.path).unwrap());
         assert_eq!(
             fs::metadata(&bound.path).unwrap().permissions().mode() & 0o777,
-            0o700
+            0o500
         );
 
         let replaced = source_directory.path().join("worker.replaced");
@@ -4202,10 +4248,88 @@ mod tests {
         fs::write(&source, b"#!/bin/sh\nprintf new").unwrap();
         fs::set_permissions(&source, fs::Permissions::from_mode(0o700)).unwrap();
 
-        let output = Command::new(&bound.path).output().unwrap();
+        let mut command = Command::new(&bound.path);
+        command.stdout(Stdio::piped());
+        let output = spawn_bound_worker(&mut command)
+            .unwrap()
+            .wait_with_output()
+            .unwrap();
         assert!(output.status.success());
         assert_eq!(output.stdout, b"old");
         assert_ne!(measure_executable_sha256(&source).unwrap(), bound.sha256);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bound_worker_spawn_retries_a_transient_writable_descriptor() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let source_directory = TempDir::new().unwrap();
+        let private_directory = TempDir::new().unwrap();
+        let source = source_directory.path().join("worker");
+        fs::write(&source, b"#!/bin/sh\nprintf retried").unwrap();
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let bound = bind_worker_executable(&source, private_directory.path()).unwrap();
+        fs::set_permissions(&bound.path, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut writer = Some(
+            fs::OpenOptions::new()
+                .write(true)
+                .open(&bound.path)
+                .unwrap(),
+        );
+        fs::set_permissions(&bound.path, fs::Permissions::from_mode(0o500)).unwrap();
+
+        let mut command = Command::new(&bound.path);
+        command.stdout(Stdio::piped());
+        let mut retries = 0;
+        let output =
+            spawn_bound_worker_with_retry(&mut command, BOUND_WORKER_SPAWN_RETRY_TIMEOUT, || {
+                retries += 1;
+                drop(writer.take());
+            })
+            .unwrap()
+            .wait_with_output()
+            .unwrap();
+
+        assert!(retries >= 1);
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"retried");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bound_worker_spawn_fails_closed_for_a_persistent_writer() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("worker");
+        fs::write(&path, b"#!/bin/sh\nprintf unreachable").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        let _writer = fs::OpenOptions::new().write(true).open(&path).unwrap();
+
+        let mut command = Command::new(&path);
+        let mut retries = 0;
+        let error = spawn_bound_worker_with_retry(&mut command, Duration::ZERO, || retries += 1)
+            .unwrap_err();
+
+        assert_eq!(error.raw_os_error(), Some(libc::ETXTBSY));
+        assert_eq!(retries, 0);
+    }
+
+    #[test]
+    fn bound_worker_spawn_does_not_retry_other_errors() {
+        let directory = TempDir::new().unwrap();
+        let mut command = Command::new(directory.path().join("missing-worker"));
+        let mut retries = 0;
+        let error =
+            spawn_bound_worker_with_retry(&mut command, BOUND_WORKER_SPAWN_RETRY_TIMEOUT, || {
+                retries += 1
+            })
+            .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert_eq!(retries, 0);
     }
 
     #[test]

@@ -10897,6 +10897,31 @@ struct AdaptiveValidationResult {
     result: Result<jetstreamer_node::archive_checksum::ValidatedArchiveFile, String>,
 }
 
+/// Resource-bearing epoch work. A validated archive waiting for ordered
+/// publication retains validation evidence and staged disk bytes, but no
+/// worker or validation reservation. Its actual disk use is already reflected
+/// by `statvfs`, so counting it here can deadlock a serial supervisor when a
+/// later epoch finishes before `next_publish_epoch`.
+fn adaptive_resource_occupancy(
+    running_epochs: usize,
+    validating_epochs: usize,
+    _ready_epochs: usize,
+) -> usize {
+    running_epochs.saturating_add(validating_epochs)
+}
+
+/// Put retries ahead of untouched work while preserving ascending epoch order
+/// within a batch of completions.
+fn prepend_adaptive_retries(
+    pending: &mut VecDeque<AdaptiveEpochJob>,
+    mut retries: Vec<AdaptiveEpochJob>,
+) {
+    retries.sort_unstable_by_key(|job| job.epoch);
+    for job in retries.into_iter().rev() {
+        pending.push_front(job);
+    }
+}
+
 fn adaptive_env_u64(name: &str) -> Result<Option<u64>, String> {
     let Some(value) = env::var_os(name) else {
         return Ok(None);
@@ -11748,6 +11773,7 @@ async fn run_epoch_range_supervisor_adaptive(
             return Ok(());
         }
 
+        let mut retries = Vec::new();
         let running_epochs = running.keys().copied().collect::<Vec<_>>();
         for epoch in running_epochs {
             let status = match running
@@ -11806,7 +11832,7 @@ async fn run_epoch_range_supervisor_adaptive(
                         cancel_adaptive_epoch_work(&shutdown, &mut running, &mut validating).await;
                     return Err(append_cleanup_error(error, cleanup));
                 }
-                pending.push_front(job);
+                retries.push(job);
             }
         }
 
@@ -11863,11 +11889,12 @@ async fn run_epoch_range_supervisor_adaptive(
                                 .await;
                         return Err(append_cleanup_error(cleanup_error, cleanup));
                     }
-                    pending.push_front(job);
+                    retries.push(job);
                 }
             }
         }
-        if running.is_empty() && validating.is_empty() && ready.is_empty() {
+        prepend_adaptive_retries(&mut pending, retries);
+        if adaptive_resource_occupancy(running.len(), validating.len(), ready.len()) == 0 {
             cohort_started = None;
         }
 
@@ -11920,24 +11947,29 @@ async fn run_epoch_range_supervisor_adaptive(
             return Ok(());
         }
 
-        let occupied = running.len() + validating.len() + ready.len();
+        let resource_occupied =
+            adaptive_resource_occupancy(running.len(), validating.len(), ready.len());
         let owned_process_groups = running
             .values()
             .map(|child| child.process_group as u32)
             .collect::<Vec<_>>();
         let telemetry = adaptive_epoch::read_host_telemetry();
-        let admission = policy.evaluate(telemetry, occupied);
+        let admission = policy.evaluate(telemetry, resource_occupied);
         let cgroup = adaptive_epoch::read_current_cgroup_memory(&owned_process_groups);
         let contained = cgroup.is_some_and(|snapshot| {
             snapshot.dedicated && snapshot.max_bytes <= admission.owned_budget_bytes
         });
-        let effective_capacity =
-            adaptive_epoch::contained_capacity(admission, cgroup, cgroup_baseline_bytes, occupied);
+        let effective_capacity = adaptive_epoch::contained_capacity(
+            admission,
+            cgroup,
+            cgroup_baseline_bytes,
+            resource_occupied,
+        );
         let disk_available = adaptive_epoch::read_filesystem_available_bytes(&range_work);
         let disk_admitted = adaptive_epoch::disk_allows_additional_epoch(
             disk_available,
             disk_reservation_bytes,
-            occupied,
+            resource_occupied,
         );
         let admission_key = (
             admission.telemetry_reliable,
@@ -11947,9 +11979,9 @@ async fn run_epoch_range_supervisor_adaptive(
         if last_admission != Some(admission_key) {
             if admission.telemetry_reliable {
                 info!(
-                    "adaptive epoch admission capacity={} occupied={} (running={}, validating={}, ready={}) host-available={} GiB cgroup-current={} GiB memory-reservation={} GiB disk-available={} GiB disk-reservation={} GiB",
+                    "adaptive epoch admission capacity={} resource-occupied={} (running={}, validating={}, ready={}) host-available={} GiB cgroup-current={} GiB memory-reservation={} GiB disk-available={} GiB disk-reservation={} GiB",
                     effective_capacity,
-                    occupied,
+                    resource_occupied,
                     running.len(),
                     validating.len(),
                     ready.len(),
@@ -11980,10 +12012,17 @@ async fn run_epoch_range_supervisor_adaptive(
         let elapsed = cohort_started
             .map(|started| started.elapsed())
             .unwrap_or(Duration::ZERO);
-        let target_capacity =
-            adaptive_epoch::ramped_capacity(effective_capacity, occupied, elapsed, settle_interval);
-        while running.len() + validating.len() + ready.len() < target_capacity {
-            let occupied_now = running.len() + validating.len() + ready.len();
+        let target_capacity = adaptive_epoch::ramped_capacity(
+            effective_capacity,
+            resource_occupied,
+            elapsed,
+            settle_interval,
+        );
+        while adaptive_resource_occupancy(running.len(), validating.len(), ready.len())
+            < target_capacity
+        {
+            let occupied_now =
+                adaptive_resource_occupancy(running.len(), validating.len(), ready.len());
             if !adaptive_epoch::disk_allows_additional_epoch(
                 adaptive_epoch::read_filesystem_available_bytes(&range_work),
                 disk_reservation_bytes,
@@ -14499,6 +14538,44 @@ mod early_snapshot_tests {
             work_dir,
             attempt: 0,
         }
+    }
+
+    #[test]
+    fn adaptive_ready_archive_does_not_consume_resource_capacity() {
+        // Regress the serial-admission deadlock: epoch 4 may validate before
+        // epoch 2 and wait in `ready`, but epoch 2 must still be able to start.
+        let resource_occupied = adaptive_resource_occupancy(0, 0, 1);
+        let target_capacity = adaptive_epoch::ramped_capacity(
+            1,
+            resource_occupied,
+            Duration::from_secs(600),
+            Duration::from_secs(60),
+        );
+
+        assert_eq!(resource_occupied, 0);
+        assert_eq!(target_capacity, 1);
+        assert!(resource_occupied < target_capacity);
+
+        // Validation remains resource-bearing until its blocking task drains.
+        assert_eq!(adaptive_resource_occupancy(0, 1, 1), 1);
+        assert_eq!(adaptive_resource_occupancy(1, 0, 1), 1);
+    }
+
+    #[test]
+    fn adaptive_retry_batch_is_prioritized_in_epoch_order() {
+        let mut pending = VecDeque::from([adaptive_test_job(9, PathBuf::from("epoch-9"))]);
+        let retries = vec![
+            adaptive_test_job(4, PathBuf::from("epoch-4")),
+            adaptive_test_job(2, PathBuf::from("epoch-2")),
+            adaptive_test_job(3, PathBuf::from("epoch-3")),
+        ];
+
+        prepend_adaptive_retries(&mut pending, retries);
+
+        assert_eq!(
+            pending.iter().map(|job| job.epoch).collect::<Vec<_>>(),
+            vec![2, 3, 4, 9]
+        );
     }
 
     #[test]

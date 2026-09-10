@@ -5749,6 +5749,70 @@ struct SnapshotArchiveCandidate {
     slot: Slot,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SnapshotBootstrapBounds {
+    min_slot: Slot,
+    max_slot: Slot,
+    required_accounts_hash: Option<Hash>,
+}
+
+impl SnapshotBootstrapBounds {
+    fn exact(slot: Slot, required_accounts_hash: Option<Hash>) -> Self {
+        Self {
+            min_slot: slot,
+            max_slot: slot,
+            required_accounts_hash,
+        }
+    }
+
+    fn accepts(self, slot: Slot, accounts_hash: Hash) -> bool {
+        (self.min_slot..=self.max_slot).contains(&slot)
+            && self
+                .required_accounts_hash
+                .is_none_or(|required_hash| accounts_hash == required_hash)
+    }
+}
+
+/// Returns the complete bootstrap policy for a normal (non-qualification)
+/// epoch run. Most epochs accept any snapshot from the predecessor epoch.
+/// Epoch 12 is intentionally narrower: its v1.0.23 route starts from one exact
+/// canonical anchor, so a later epoch-11 snapshot must not silently shorten
+/// the registered warmup span.
+fn normal_epoch_bootstrap_bounds(epoch: u64) -> Result<SnapshotBootstrapBounds, String> {
+    if epoch == 0 {
+        return Err("epoch 0 bootstraps from genesis, not a snapshot".to_string());
+    }
+    let min_slot = epoch_to_slot(epoch - 1);
+    let max_slot = epoch_to_slot(epoch)
+        .checked_sub(1)
+        .ok_or_else(|| format!("epoch {epoch} has no predecessor snapshot slot"))?;
+    if epoch_to_slot(epoch) == compatibility::SOLANA_V1_0_23_CANDIDATE_START_SLOT {
+        let slot = compatibility::SOLANA_V1_0_23_INITIAL_SNAPSHOT_SLOT;
+        if !(min_slot..=max_slot).contains(&slot) {
+            return Err(format!(
+                "runtime registry epoch-12 bootstrap slot {slot} is outside predecessor bounds {min_slot}..={max_slot}"
+            ));
+        }
+        if slot.checked_add(1) != Some(compatibility::SOLANA_V1_0_23_INITIAL_REPLAY_SLOT) {
+            return Err(
+                "runtime registry epoch-12 bootstrap and initial replay slots are inconsistent"
+                    .to_string(),
+            );
+        }
+        let accounts_hash = compatibility::SOLANA_V1_0_23_INITIAL_SNAPSHOT_ACCOUNTS_HASH
+            .parse::<Hash>()
+            .map_err(|err| {
+                format!("runtime registry has an invalid epoch-12 bootstrap accounts hash: {err}")
+            })?;
+        return Ok(SnapshotBootstrapBounds::exact(slot, Some(accounts_hash)));
+    }
+    Ok(SnapshotBootstrapBounds {
+        min_slot,
+        max_slot,
+        required_accounts_hash: None,
+    })
+}
+
 fn snapshot_archive_candidate(path: PathBuf) -> Result<SnapshotArchiveCandidate, String> {
     let metadata = fs::metadata(&path)
         .map_err(|err| format!("failed to read snapshot {}: {err}", path.display()))?;
@@ -5768,7 +5832,7 @@ fn snapshot_archive_candidate(path: PathBuf) -> Result<SnapshotArchiveCandidate,
 
 fn find_existing_snapshot_archive(
     dest_dir: &Path,
-    target_slot: Slot,
+    bounds: SnapshotBootstrapBounds,
     archive_extensions: &[&str],
 ) -> Result<Option<SnapshotArchiveCandidate>, String> {
     if !dest_dir.is_dir() {
@@ -5795,11 +5859,11 @@ fn find_existing_snapshot_archive(
         {
             continue;
         }
-        let (slot, _) = match parse_snapshot_archive_name(name) {
+        let (slot, SnapshotHash(accounts_hash)) = match parse_snapshot_archive_name(name) {
             Ok(parsed) => parsed,
             Err(_) => continue,
         };
-        if slot > target_slot {
+        if !bounds.accepts(slot, accounts_hash) {
             continue;
         }
         let metadata = entry
@@ -9740,16 +9804,25 @@ fn validate_multi_runtime_genesis(path: &Path, actual: Hash) -> Result<(), Strin
 }
 
 fn validate_epoch_bootstrap_snapshot(epoch: u64, path: &Path) -> Result<Slot, String> {
-    let target_slot = epoch_to_slot(epoch).saturating_sub(1);
-    let min_slot = epoch_to_slot(epoch.saturating_sub(1));
+    let bounds = normal_epoch_bootstrap_bounds(epoch)?;
     let name = path
         .file_name()
         .and_then(|name| name.to_str())
         .ok_or_else(|| format!("snapshot path has no UTF-8 filename: {}", path.display()))?;
-    let (slot, _) = parse_snapshot_archive_name(name)?;
-    if slot < min_slot || slot > target_slot {
+    let (slot, SnapshotHash(accounts_hash)) = parse_snapshot_archive_name(name)?;
+    if !(bounds.min_slot..=bounds.max_slot).contains(&slot) {
         return Err(format!(
-            "epoch {epoch} requires a bootstrap snapshot in slots {min_slot}..={target_slot}, got slot {slot} ({})",
+            "epoch {epoch} requires a bootstrap snapshot in slots {}..={}, got slot {slot} ({})",
+            bounds.min_slot,
+            bounds.max_slot,
+            path.display()
+        ));
+    }
+    if let Some(required_hash) = bounds.required_accounts_hash
+        && accounts_hash != required_hash
+    {
+        return Err(format!(
+            "epoch {epoch} requires bootstrap snapshot accounts hash {required_hash} at slot {slot}, got {accounts_hash} ({})",
             path.display()
         ));
     }
@@ -9785,22 +9858,22 @@ async fn ensure_epoch_boundary_snapshot(
     dest_dir: &Path,
     archive_extensions: &[&str],
 ) -> Result<PathBuf, String> {
-    let target_slot = epoch_to_slot(epoch).saturating_sub(1);
-    let min_snapshot_slot = epoch_to_slot(epoch.saturating_sub(1));
-    if let Some(candidate) =
-        find_existing_snapshot_archive(dest_dir, target_slot, archive_extensions)?
-        && candidate.slot >= min_snapshot_slot
-    {
+    let bounds = normal_epoch_bootstrap_bounds(epoch)?;
+    if let Some(candidate) = find_existing_snapshot_archive(dest_dir, bounds, archive_extensions)? {
+        validate_epoch_bootstrap_snapshot(epoch, &candidate.path)?;
         info!(
             "epoch {epoch}: boundary snapshot already present at {}",
             candidate.path.display()
         );
         return Ok(candidate.path);
     }
-    info!("epoch {epoch}: downloading boundary snapshot (target slot {target_slot})");
+    info!(
+        "epoch {epoch}: downloading boundary snapshot (target slot {})",
+        bounds.max_slot
+    );
     let path = download_snapshot_at_or_before_slot_matching(
         epoch,
-        target_slot,
+        bounds.max_slot,
         dest_dir,
         archive_extensions,
     )
@@ -13635,12 +13708,18 @@ async fn main() {
         // The snapshot bootstraps only the first epoch actually run
         // (`effective_start`); later epochs in an in-process range chain off
         // the working bank.
-        let target_slot = qualification
-            .map(|plan| plan.bootstrap_slot)
-            .unwrap_or_else(|| epoch_to_slot(effective_start).saturating_sub(1));
-        let min_snapshot_slot = qualification
-            .map(|plan| plan.bootstrap_slot)
-            .unwrap_or_else(|| epoch_to_slot(effective_start.saturating_sub(1)));
+        let bootstrap_bounds = match qualification {
+            Some(plan) => SnapshotBootstrapBounds::exact(plan.bootstrap_slot, None),
+            None => match normal_epoch_bootstrap_bounds(effective_start) {
+                Ok(bounds) => bounds,
+                Err(err) => {
+                    eprintln!("error: {err}");
+                    exit(1);
+                }
+            },
+        };
+        let target_slot = bootstrap_bounds.max_slot;
+        let min_snapshot_slot = bootstrap_bounds.min_slot;
         let discovered_snapshot = match snapshot_archive_override {
             Some(path) => match snapshot_archive_candidate(path) {
                 Ok(candidate) => Some(candidate),
@@ -13651,7 +13730,7 @@ async fn main() {
             },
             None => match find_existing_snapshot_archive(
                 &dest_dir,
-                target_slot,
+                bootstrap_bounds,
                 effective_archive_extensions,
             ) {
                 Ok(candidate) => candidate,
@@ -14408,7 +14487,7 @@ mod early_snapshot_tests {
 
         let error = find_existing_snapshot_archive(
             directory.path(),
-            slot,
+            normal_epoch_bootstrap_bounds(92).unwrap(),
             compatibility::SOLANA_V1_2_32_RUNTIME
                 .bootstrap
                 .archive_extensions,
@@ -14421,6 +14500,44 @@ mod early_snapshot_tests {
         );
         assert!(error.contains(&bzip2.display().to_string()), "{error}");
         assert!(error.contains(&zstd.display().to_string()), "{error}");
+    }
+
+    #[test]
+    fn epoch_12_local_discovery_uses_the_exact_registered_anchor() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let anchor_hash = compatibility::SOLANA_V1_0_23_INITIAL_SNAPSHOT_ACCOUNTS_HASH;
+        let anchor = directory.path().join(format!(
+            "snapshot-{}-{}.tar.bz2",
+            compatibility::SOLANA_V1_0_23_INITIAL_SNAPSHOT_SLOT,
+            anchor_hash,
+        ));
+        let wrong_anchor = directory.path().join(format!(
+            "snapshot-{}-{}.tar.bz2",
+            compatibility::SOLANA_V1_0_23_INITIAL_SNAPSHOT_SLOT,
+            Hash::new_unique(),
+        ));
+        let later = directory
+            .path()
+            .join(format!("snapshot-5183999-{anchor_hash}.tar.bz2"));
+        fs::write(&anchor, b"canonical anchor placeholder").unwrap();
+        fs::write(&wrong_anchor, b"wrong hash placeholder").unwrap();
+        fs::write(&later, b"later snapshot placeholder").unwrap();
+
+        let selected = find_existing_snapshot_archive(
+            directory.path(),
+            normal_epoch_bootstrap_bounds(12).unwrap(),
+            compatibility::SOLANA_V1_0_23_RUNTIME
+                .bootstrap
+                .archive_extensions,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(selected.path, anchor);
+        assert_eq!(
+            selected.slot,
+            compatibility::SOLANA_V1_0_23_INITIAL_SNAPSHOT_SLOT
+        );
     }
 
     #[test]
@@ -14477,6 +14594,28 @@ mod early_snapshot_tests {
             selection.descriptor,
             &compatibility::SOLANA_V1_0_23_RUNTIME
         ));
+    }
+
+    #[test]
+    fn epoch_12_normal_bootstrap_rejects_other_slots_and_hashes() {
+        let expected_hash: Hash = compatibility::SOLANA_V1_0_23_INITIAL_SNAPSHOT_ACCOUNTS_HASH
+            .parse()
+            .unwrap();
+        for slot in [5_183_737, 5_183_999] {
+            let path = PathBuf::from(format!("snapshot-{slot}-{expected_hash}.tar.bz2"));
+            let error = validate_epoch_bootstrap_snapshot(12, &path).unwrap_err();
+            assert!(error.contains("5183736..=5183736"), "{error}");
+        }
+
+        let wrong_hash = Hash::new_unique();
+        assert_ne!(wrong_hash, expected_hash);
+        let path = PathBuf::from(format!(
+            "snapshot-{}-{wrong_hash}.tar.bz2",
+            compatibility::SOLANA_V1_0_23_INITIAL_SNAPSHOT_SLOT,
+        ));
+        let error = validate_epoch_bootstrap_snapshot(12, &path).unwrap_err();
+        assert!(error.contains(&expected_hash.to_string()), "{error}");
+        assert!(error.contains(&wrong_hash.to_string()), "{error}");
     }
 
     #[test]
@@ -14613,6 +14752,26 @@ mod early_snapshot_tests {
         assert_eq!(plan.slot_count(), 18_336);
         assert_eq!(runtime_slot_range(1, Some(plan)), 515_913..534_249);
         assert_eq!(runtime_slot_range(1, None), 432_000..864_000);
+    }
+
+    #[test]
+    fn focused_epoch_12_qualification_can_use_a_later_bootstrap() {
+        let snapshot = qualification_snapshot(5_183_999, Hash::new_unique());
+        let plan = qualification_plan(
+            12,
+            12,
+            Some(5_184_010),
+            Some(true),
+            Some(&snapshot),
+            Some(Path::new("epoch-hashes-12.txt")),
+            Some(Path::new("qualification-5184000-5184010.jet")),
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(plan.bootstrap_slot, 5_183_999);
+        assert_eq!(plan.replay_start, 5_184_000);
+        assert_eq!(plan.output_slot_start, 5_184_000);
     }
 
     #[test]
@@ -15069,6 +15228,13 @@ mod early_snapshot_tests {
             validate_epoch_bootstrap_snapshot(1, &too_new)
                 .unwrap_err()
                 .contains("requires a bootstrap snapshot")
+        );
+
+        let epoch_13_predecessor =
+            PathBuf::from(format!("snapshot-5600000-{}.tar.bz2", Hash::new_unique()));
+        assert_eq!(
+            validate_epoch_bootstrap_snapshot(13, &epoch_13_predecessor).unwrap(),
+            5_600_000
         );
     }
 

@@ -359,9 +359,11 @@ explicitly non-canonical until its checkpoint replay completes. Additional exact
 registered but unassigned until differential evidence requires a narrower runtime boundary. This
 includes the v1.0.17 worker, which remains available for comparison without claiming a slot range.
 
-Epoch 12 starts v1.0.23 from the canonical snapshot at slot 5,183,736. The worker warms slots
-5,183,737 through 5,183,999 and begins Horizon output at slot 5,184,000. This boundary uses an
-independently verified snapshot restart. The runtime handoff registry has no entry at 5,184,000.
+Epoch 12 starts v1.0.23 from the canonical snapshot at slot 5,183,736 with legacy accounts hash
+`BUqwiSm2GgH9ByKrBDF6epXHYK9RRh3vyZDKtUqtMXfR`. Production discovery binds both values, so a
+later local epoch-11 snapshot cannot shorten the registered warmup. The worker warms slots 5,183,737
+through 5,183,999 and begins Horizon output at slot 5,184,000. This boundary uses an independently
+verified snapshot restart. The runtime handoff registry has no entry at 5,184,000.
 
 Transaction metadata is an independent compatibility dimension. Old Faithful has no status frame
 before slot `4,258,776`; the pinned historical runtime reconstructs transaction status there, while

@@ -23,9 +23,11 @@ envelope around an earlier exact worker rather than weakening validation.
 The current early-history route assigns one v1.0.14 era to slots 3888000
 through 5183999, covering epochs 9 through 11. The v1.0.17 worker remains
 registered without a slot assignment. Epoch 12 starts v1.0.23 from the
-canonical slot-5183736 snapshot, warms slots 5183737 through 5183999, and
-starts output at slot 5184000. This is a snapshot-isolated restart with no
-runtime-handoff record at the epoch boundary.
+canonical slot-5183736 snapshot with legacy accounts hash
+`BUqwiSm2GgH9ByKrBDF6epXHYK9RRh3vyZDKtUqtMXfR`. Normal production discovery
+requires that exact anchor, warms slots 5183737 through 5183999, and starts
+output at slot 5184000. This snapshot-isolated restart has no runtime handoff
+record at the epoch boundary.
 
 Differential replay found an old-form vote
 initialization accepted by mainnet at slot 521850: v1.0.7 accepts that

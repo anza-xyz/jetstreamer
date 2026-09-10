@@ -37,8 +37,11 @@ pub const SOLANA_V1_0_14_CANDIDATE_END_SLOT_EXCLUSIVE: Slot = 5_184_000;
 
 /// Canonical predecessor snapshot used to start the v1.0.23 epoch-12 worker.
 /// Its successor through the end of epoch 11 is warmup input; Horizon output
-/// starts at the epoch-12 boundary.
+/// starts at the epoch-12 boundary. Production epoch-12 bootstrap selection
+/// must bind both this slot and its canonical legacy accounts hash.
 pub const SOLANA_V1_0_23_INITIAL_SNAPSHOT_SLOT: Slot = 5_183_736;
+pub const SOLANA_V1_0_23_INITIAL_SNAPSHOT_ACCOUNTS_HASH: &str =
+    "BUqwiSm2GgH9ByKrBDF6epXHYK9RRh3vyZDKtUqtMXfR";
 pub const SOLANA_V1_0_23_INITIAL_REPLAY_SLOT: Slot = SOLANA_V1_0_23_INITIAL_SNAPSHOT_SLOT + 1;
 
 /// Epoch-aligned diagnostic envelopes for the terminal patch of each later

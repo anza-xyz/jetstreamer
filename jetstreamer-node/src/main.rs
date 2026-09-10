@@ -4817,6 +4817,7 @@ fn epoch_isolation_plan(
     if configured_isolation {
         return Ok((true, None));
     }
+    let mut previous_descriptor: Option<&'static compatibility::RuntimeDescriptor> = None;
     for epoch in start_epoch..=end_epoch {
         let (slot_start, slot_end_inclusive) = epoch_to_slot_range(epoch);
         let spans = compatibility::plan_runtime_spans(
@@ -4826,6 +4827,20 @@ fn epoch_isolation_plan(
         if spans.len() > 1 {
             return Ok((true, Some(epoch)));
         }
+        let selection = runtime_span_selection(
+            spans
+                .first()
+                .expect("runtime planner rejects an empty epoch range"),
+        )?;
+        if previous_descriptor.is_some_and(|previous| !std::ptr::eq(previous, selection.descriptor))
+        {
+            // Historical executors cannot carry a typed Bank across process
+            // or release boundaries. A fresh verified predecessor-epoch
+            // snapshot is therefore mandatory even when the switch happens
+            // exactly between two output epochs.
+            return Ok((true, Some(epoch)));
+        }
+        previous_descriptor = Some(selection.descriptor);
     }
     Ok((false, None))
 }
@@ -5336,7 +5351,15 @@ fn historical_worker_profile(
     let profile = match descriptor.backend {
         compatibility::RuntimeBackend::SolanaV1_0_7 => historical::SOLANA_V1_0_7_CANDIDATE,
         compatibility::RuntimeBackend::SolanaV1_0_8 => historical::SOLANA_V1_0_8_CANDIDATE,
+        compatibility::RuntimeBackend::SolanaV1_0_13 => historical::SOLANA_V1_0_13_CANDIDATE,
+        compatibility::RuntimeBackend::SolanaV1_0_14 => historical::SOLANA_V1_0_14_CANDIDATE,
+        compatibility::RuntimeBackend::SolanaV1_0_17 => historical::SOLANA_V1_0_17_CANDIDATE,
+        compatibility::RuntimeBackend::SolanaV1_0_18 => historical::SOLANA_V1_0_18_CANDIDATE,
+        compatibility::RuntimeBackend::SolanaV1_0_23 => historical::SOLANA_V1_0_23_CANDIDATE,
         compatibility::RuntimeBackend::SolanaV1_0_24 => historical::SOLANA_V1_0_24_CANDIDATE,
+        compatibility::RuntimeBackend::SolanaV1_1_23 => historical::SOLANA_V1_1_23_CANDIDATE,
+        compatibility::RuntimeBackend::SolanaV1_2_32 => historical::SOLANA_V1_2_32_CANDIDATE,
+        compatibility::RuntimeBackend::SolanaV1_3_19 => historical::SOLANA_V1_3_19_CANDIDATE,
         compatibility::RuntimeBackend::AgaveV3 => {
             return Err(
                 "the in-process Agave runtime has no historical worker profile".to_string(),
@@ -7213,10 +7236,16 @@ async fn run_geyser_replay(
             (epoch_start, replay_start, epoch_end_inclusive)
         }
     };
-    let execution = compatibility::select_runtime(
-        replay_start..end_inclusive.saturating_add(1),
-        allow_candidate_runtime,
-    )?;
+    let replay_end = end_inclusive.saturating_add(1);
+    let execution = if carried_state.is_none() && bootstrap.snapshot_archive().is_some() {
+        compatibility::select_runtime_with_snapshot_warmup(
+            replay_start,
+            output_slot_start..replay_end,
+            allow_candidate_runtime,
+        )?
+    } else {
+        compatibility::select_runtime(replay_start..replay_end, allow_candidate_runtime)?
+    };
     if qualification.is_some() || execution.admission == compatibility::AdmissionLevel::Candidate {
         let Some(verifier) = snapshot_verifier.as_ref() else {
             return Err(format!(
@@ -7403,7 +7432,15 @@ async fn run_geyser_replay(
             },
             compatibility::RuntimeBackend::SolanaV1_0_7
             | compatibility::RuntimeBackend::SolanaV1_0_8
-            | compatibility::RuntimeBackend::SolanaV1_0_24 => {
+            | compatibility::RuntimeBackend::SolanaV1_0_13
+            | compatibility::RuntimeBackend::SolanaV1_0_14
+            | compatibility::RuntimeBackend::SolanaV1_0_17
+            | compatibility::RuntimeBackend::SolanaV1_0_18
+            | compatibility::RuntimeBackend::SolanaV1_0_23
+            | compatibility::RuntimeBackend::SolanaV1_0_24
+            | compatibility::RuntimeBackend::SolanaV1_1_23
+            | compatibility::RuntimeBackend::SolanaV1_2_32
+            | compatibility::RuntimeBackend::SolanaV1_3_19 => {
                 if carried_state.is_some() {
                     return Err(
                         "an Agave in-memory bank cannot be handed to a Solana v1 worker"
@@ -9100,7 +9137,15 @@ fn validated_epoch_archive_multi_runtime(
     let expected_commitment_kind = match first_selection.backend {
         compatibility::RuntimeBackend::SolanaV1_0_7
         | compatibility::RuntimeBackend::SolanaV1_0_8
-        | compatibility::RuntimeBackend::SolanaV1_0_24 => StateCommitmentKind::LegacyAccountsHash,
+        | compatibility::RuntimeBackend::SolanaV1_0_13
+        | compatibility::RuntimeBackend::SolanaV1_0_14
+        | compatibility::RuntimeBackend::SolanaV1_0_17
+        | compatibility::RuntimeBackend::SolanaV1_0_18
+        | compatibility::RuntimeBackend::SolanaV1_0_23
+        | compatibility::RuntimeBackend::SolanaV1_0_24
+        | compatibility::RuntimeBackend::SolanaV1_1_23
+        | compatibility::RuntimeBackend::SolanaV1_2_32
+        | compatibility::RuntimeBackend::SolanaV1_3_19 => StateCommitmentKind::LegacyAccountsHash,
         compatibility::RuntimeBackend::AgaveV3 => StateCommitmentKind::AccountsLtHash,
     };
     if provenance.bootstrap_state.kind != expected_commitment_kind {
@@ -9341,12 +9386,58 @@ fn read_epoch_hashes_file(
     path: &Path,
     archive_extensions: &[&str],
 ) -> Result<BTreeMap<Slot, BankHashExpectation>, String> {
-    let contents = fs::read_to_string(path).map_err(|err| {
+    use std::io::Read as _;
+
+    const MAX_EPOCH_HASHES_FILE_BYTES: u64 = 1024 * 1024;
+    let mut file =
+        jetstreamer_node::archive_checksum::open_regular_nofollow(path).map_err(|err| {
+            format!(
+                "failed to open snapshot hashes file {}: {err}",
+                path.display()
+            )
+        })?;
+    let identity =
+        jetstreamer_node::archive_checksum::archive_file_identity(&file).map_err(|err| {
+            format!(
+                "failed to identify snapshot hashes file {}: {err}",
+                path.display()
+            )
+        })?;
+    let length = file
+        .metadata()
+        .map_err(|err| {
+            format!(
+                "failed to inspect snapshot hashes file {}: {err}",
+                path.display()
+            )
+        })?
+        .len();
+    if length > MAX_EPOCH_HASHES_FILE_BYTES {
+        return Err(format!(
+            "snapshot hashes file {} is {length} bytes (limit {MAX_EPOCH_HASHES_FILE_BYTES})",
+            path.display()
+        ));
+    }
+    let mut contents = String::with_capacity(usize::try_from(length).unwrap_or(0));
+    file.read_to_string(&mut contents).map_err(|err| {
         format!(
             "failed to read snapshot hashes file {}: {err}",
             path.display()
         )
     })?;
+    if contents.len() as u64 != length
+        || jetstreamer_node::archive_checksum::archive_file_identity(&file).map_err(|err| {
+            format!(
+                "failed to recheck snapshot hashes file {}: {err}",
+                path.display()
+            )
+        })? != identity
+    {
+        return Err(format!(
+            "snapshot hashes file changed while it was read: {}",
+            path.display()
+        ));
+    }
     let mut expected = BTreeMap::new();
     for line in contents.lines() {
         let line = line.trim();
@@ -10816,6 +10907,55 @@ fn private_epoch_scope(dest_dir: &Path) -> Result<PathBuf, String> {
     Ok(scope)
 }
 
+/// Reuses only the immutable, owner-only checkpoint file produced by a prior
+/// adaptive prefetch. This lets a detached replay restart after credentials
+/// expire without silently weakening verification or contacting GCS again.
+fn cached_private_epoch_hashes(
+    dest_dir: &Path,
+    epoch: u64,
+    archive_extensions: &[&str],
+) -> Result<Option<BTreeMap<Slot, BankHashExpectation>>, String> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    let work_dir = private_epoch_scope(dest_dir)?
+        .join("work")
+        .join(format!("epoch-{epoch}"));
+    let input_dir = work_dir.join("inputs");
+    for directory in [&work_dir, &input_dir] {
+        match fs::symlink_metadata(directory) {
+            Ok(_) => create_or_validate_private_directory(directory)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(format!(
+                    "failed to inspect cached epoch {epoch} input directory {}: {error}",
+                    directory.display()
+                ));
+            }
+        }
+    }
+    let path = input_dir.join("epoch-hashes.txt");
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "failed to inspect cached epoch {epoch} hashes {}: {error}",
+                path.display()
+            ));
+        }
+    };
+    if !metadata.file_type().is_file()
+        || metadata.uid() != effective_user_id()
+        || metadata.permissions().mode() & 0o077 != 0
+    {
+        return Err(format!(
+            "cached epoch {epoch} hashes must be an owner-only regular file: {}",
+            path.display()
+        ));
+    }
+    read_epoch_hashes_file(&path, archive_extensions).map(Some)
+}
+
 fn acquire_epoch_leases(
     dest_dir: &Path,
     start_epoch: u64,
@@ -10880,7 +11020,8 @@ struct AdaptiveEpochJob {
     epoch: u64,
     spans: Vec<compatibility::RuntimeSpan>,
     selection: compatibility::RuntimeSelection,
-    bootstrap: ReplayBootstrap,
+    source_bootstrap: ReplayBootstrap,
+    bound_bootstrap: Option<ReplayBootstrap>,
     source_snapshot: Option<PathBuf>,
     hashes_path: PathBuf,
     final_output: PathBuf,
@@ -10904,6 +11045,78 @@ struct ValidatedAdaptiveEpoch {
 struct AdaptiveValidationResult {
     job: AdaptiveEpochJob,
     result: Result<jetstreamer_node::archive_checksum::ValidatedArchiveFile, String>,
+}
+
+/// A terminal epoch failure closes admission without turning it into a global
+/// shutdown. Existing children and validation tasks retain the live shutdown
+/// token so they can finish, prove their archives, and publish them before the
+/// supervisor reports the range failure.
+#[derive(Default)]
+struct AdaptiveFailureDrain {
+    failures: Vec<String>,
+}
+
+impl AdaptiveFailureDrain {
+    fn is_active(&self) -> bool {
+        !self.failures.is_empty()
+    }
+
+    fn may_retry(&self, attempt: u32, attempts_per_epoch: u32) -> bool {
+        !self.is_active() && attempt < attempts_per_epoch
+    }
+
+    fn is_drained(
+        &self,
+        running_epochs: usize,
+        validating_epochs: usize,
+        ready_epochs: usize,
+    ) -> bool {
+        self.is_active() && running_epochs == 0 && validating_epochs == 0 && ready_epochs == 0
+    }
+
+    /// Returns true when this is the failure that closed admission.
+    fn record(&mut self, failure: String) -> bool {
+        let first = self.failures.is_empty();
+        self.failures.push(failure);
+        first
+    }
+
+    fn into_error(self) -> String {
+        self.failures.join("; ")
+    }
+}
+
+fn record_adaptive_terminal_failure(
+    drain: &mut AdaptiveFailureDrain,
+    failure: String,
+    running_epochs: usize,
+    validating_epochs: usize,
+) {
+    if drain.record(failure.clone()) {
+        warn!(
+            "{failure}; closing adaptive admission and draining {running_epochs} already-running child(ren) plus {validating_epochs} validation task(s)"
+        );
+    } else {
+        warn!("additional adaptive epoch failure while draining: {failure}");
+    }
+}
+
+/// In normal operation publication remains contiguous. Once a terminal
+/// failure creates an unavoidable gap, independently validated siblings are
+/// still safe to publish and must not be discarded merely because their epoch
+/// number follows the failed child.
+fn next_adaptive_publication_epoch<T>(
+    next_publish_epoch: u64,
+    ready: &BTreeMap<u64, T>,
+    draining_failure: bool,
+) -> Option<u64> {
+    if ready.contains_key(&next_publish_epoch) {
+        Some(next_publish_epoch)
+    } else if draining_failure {
+        ready.first_key_value().map(|(epoch, _)| *epoch)
+    } else {
+        None
+    }
 }
 
 /// Resource-bearing epoch work. A validated archive waiting for ordered
@@ -10950,7 +11163,10 @@ fn write_private_epoch_hashes(
     input_dir: &Path,
     expected: &BTreeMap<Slot, BankHashExpectation>,
 ) -> Result<PathBuf, String> {
-    use std::{io::Write as _, os::unix::fs::PermissionsExt as _};
+    use std::{
+        io::Write as _,
+        os::unix::fs::{MetadataExt as _, PermissionsExt as _},
+    };
 
     let mut contents = String::new();
     for (slot, hash) in expected {
@@ -10964,6 +11180,34 @@ fn write_private_epoch_hashes(
         }
     }
     let path = input_dir.join("epoch-hashes.txt");
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) => {
+            if !metadata.file_type().is_file()
+                || metadata.uid() != effective_user_id()
+                || metadata.permissions().mode() & 0o077 != 0
+            {
+                return Err(format!(
+                    "existing private epoch hashes must be an owner-only regular file: {}",
+                    path.display()
+                ));
+            }
+            let cached = read_epoch_hashes_file(&path, &[".tar.bz2", ".tar.zst", ".tar.lz4"])?;
+            if cached != *expected {
+                return Err(format!(
+                    "existing private epoch hashes differ from the prefetched checkpoint set: {}",
+                    path.display()
+                ));
+            }
+            return Ok(path);
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(format!(
+                "failed to inspect private epoch hashes {}: {error}",
+                path.display()
+            ));
+        }
+    }
     let mut temporary = tempfile::Builder::new()
         .prefix(".epoch-hashes-")
         .suffix(".partial")
@@ -10997,7 +11241,10 @@ fn bind_snapshot_for_adaptive_job(
     bootstrap: &ReplayBootstrap,
     input_dir: &Path,
 ) -> Result<ReplayBootstrap, String> {
-    use std::{io::Write as _, os::unix::fs::PermissionsExt as _};
+    use std::{
+        io::Write as _,
+        os::unix::fs::{MetadataExt as _, PermissionsExt as _},
+    };
 
     let ReplayBootstrap::SnapshotArchive(source_path) = bootstrap else {
         return Ok(bootstrap.clone());
@@ -11018,6 +11265,58 @@ fn bind_snapshot_for_adaptive_job(
         })?;
     let source_identity = jetstreamer_node::archive_checksum::archive_file_identity(&source)
         .map_err(|error| format!("failed to identify {}: {error}", source_path.display()))?;
+    match fs::symlink_metadata(&destination) {
+        Ok(metadata) => {
+            if !metadata.file_type().is_file()
+                || metadata.uid() != effective_user_id()
+                || metadata.permissions().mode() & 0o077 != 0
+            {
+                return Err(format!(
+                    "existing private boundary snapshot must be an owner-only regular file: {}",
+                    destination.display()
+                ));
+            }
+            let bound = jetstreamer_node::archive_checksum::open_regular_nofollow(&destination)
+                .map_err(|error| {
+                    format!(
+                        "failed to open existing private boundary snapshot {}: {error}",
+                        destination.display()
+                    )
+                })?;
+            let source_measurement = jetstreamer_node::archive_checksum::measure_open_archive(
+                &source,
+            )
+            .map_err(|error| {
+                format!(
+                    "failed to measure boundary snapshot {}: {error}",
+                    source_path.display()
+                )
+            })?;
+            let bound_measurement = jetstreamer_node::archive_checksum::measure_open_archive(
+                &bound,
+            )
+            .map_err(|error| {
+                format!(
+                    "failed to measure existing private boundary snapshot {}: {error}",
+                    destination.display()
+                )
+            })?;
+            if source_measurement.sha256 != bound_measurement.sha256 {
+                return Err(format!(
+                    "existing private boundary snapshot does not match its source: {}",
+                    destination.display()
+                ));
+            }
+            return Ok(ReplayBootstrap::SnapshotArchive(destination));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(format!(
+                "failed to inspect private boundary snapshot {}: {error}",
+                destination.display()
+            ));
+        }
+    }
     let mut temporary = tempfile::Builder::new()
         .prefix(".boundary-snapshot-")
         .suffix(".partial")
@@ -11066,6 +11365,16 @@ fn bind_snapshot_for_adaptive_job(
 }
 
 fn prepare_adaptive_attempt(job: &mut AdaptiveEpochJob) -> Result<(), String> {
+    // Boundary snapshots can be large. Bind only work that has passed memory,
+    // CPU, and disk admission instead of eagerly duplicating every prefetched
+    // range input. The Option keeps child spawning fail-closed if this step is
+    // ever accidentally skipped.
+    let input_dir = job.work_dir.join("inputs");
+    create_or_validate_private_directory(&input_dir)?;
+    job.bound_bootstrap = Some(bind_snapshot_for_adaptive_job(
+        &job.source_bootstrap,
+        &input_dir,
+    )?);
     job.attempt = job
         .attempt
         .checked_add(1)
@@ -11316,7 +11625,13 @@ fn spawn_adaptive_epoch_child(
         hashes_arg.push(&job.hashes_path);
         command.arg(hashes_arg);
     }
-    if let ReplayBootstrap::SnapshotArchive(snapshot_path) = &job.bootstrap {
+    let bound_bootstrap = job.bound_bootstrap.as_ref().ok_or_else(|| {
+        format!(
+            "refusing to spawn epoch {} without an admitted private bootstrap",
+            job.epoch
+        )
+    })?;
+    if let ReplayBootstrap::SnapshotArchive(snapshot_path) = bound_bootstrap {
         let mut snapshot_arg = OsString::from("--snapshot-archive=");
         snapshot_arg.push(snapshot_path);
         command.arg(snapshot_arg);
@@ -11718,14 +12033,14 @@ async fn run_epoch_range_supervisor_adaptive(
         } else {
             input_dir.join("epoch-hashes.disabled")
         };
-        let bootstrap = bind_snapshot_for_adaptive_job(&source_bootstrap, &input_dir)?;
         let source_snapshot = source_bootstrap.snapshot_archive().map(Path::to_path_buf);
         let staged_candidate = staged_archive_candidate(&work_dir, epoch)?;
         let mut job = AdaptiveEpochJob {
             epoch,
             spans,
             selection,
-            bootstrap,
+            source_bootstrap,
+            bound_bootstrap: None,
             source_snapshot,
             hashes_path,
             final_output,
@@ -11755,6 +12070,7 @@ async fn run_epoch_range_supervisor_adaptive(
     let mut next_publish_epoch = effective_start;
     let mut cohort_started = (!validating.is_empty()).then(Instant::now);
     let mut last_admission: Option<(bool, bool, usize)> = None;
+    let mut failure_drain = AdaptiveFailureDrain::default();
     info!(
         "adaptive epoch supervisor enabled (historical={}, agave={}, max={}, settle={}s, protected={} GiB, system-min={} GiB, memory-reservation={} GiB, disk-reservation={} GiB, private-work={}, pruning={})",
         has_historical_worker,
@@ -11828,21 +12144,33 @@ async fn run_epoch_range_supervisor_adaptive(
                 );
             } else {
                 let job = completed.job;
-                if job.attempt >= attempts_per_epoch {
-                    let primary = format!(
+                let may_retry = failure_drain.may_retry(job.attempt, attempts_per_epoch);
+                let cleanup = cleanup_adaptive_attempt(&job);
+                if may_retry && cleanup.is_ok() {
+                    warn!("epoch {epoch} child failed (exit: {status}); retrying cleanly");
+                    retries.push(job);
+                    continue;
+                }
+                let mut failure = if job.attempt >= attempts_per_epoch {
+                    format!(
                         "epoch {epoch} failed after {attempts_per_epoch} attempt(s) (exit: {status})"
-                    );
-                    let cleanup =
-                        cancel_adaptive_epoch_work(&shutdown, &mut running, &mut validating).await;
-                    return Err(append_cleanup_error(primary, cleanup));
+                    )
+                } else if failure_drain.is_active() {
+                    format!(
+                        "epoch {epoch} child failed while adaptive admission was draining (exit: {status}); retry suppressed"
+                    )
+                } else {
+                    format!("epoch {epoch} child failed (exit: {status})")
+                };
+                if let Err(error) = cleanup {
+                    failure.push_str(&format!("; additionally failed cleanup: {error}"));
                 }
-                warn!("epoch {epoch} child failed (exit: {status}); retrying cleanly");
-                if let Err(error) = cleanup_adaptive_attempt(&job) {
-                    let cleanup =
-                        cancel_adaptive_epoch_work(&shutdown, &mut running, &mut validating).await;
-                    return Err(append_cleanup_error(error, cleanup));
-                }
-                retries.push(job);
+                record_adaptive_terminal_failure(
+                    &mut failure_drain,
+                    failure,
+                    running.len(),
+                    validating.len(),
+                );
             }
         }
 
@@ -11857,10 +12185,13 @@ async fn run_epoch_range_supervisor_adaptive(
             let outcome = match validation.await {
                 Ok(outcome) => outcome,
                 Err(error) => {
-                    let primary = format!("epoch {epoch} validation task failed: {error}");
-                    let cleanup =
-                        cancel_adaptive_epoch_work(&shutdown, &mut running, &mut validating).await;
-                    return Err(append_cleanup_error(primary, cleanup));
+                    record_adaptive_terminal_failure(
+                        &mut failure_drain,
+                        format!("epoch {epoch} validation task failed: {error}"),
+                        running.len(),
+                        validating.len(),
+                    );
+                    continue;
                 }
             };
             match outcome.result {
@@ -11881,49 +12212,82 @@ async fn run_epoch_range_supervisor_adaptive(
                     if shutdown.load(Ordering::SeqCst) {
                         continue;
                     }
-                    if job.attempt >= attempts_per_epoch {
-                        let primary = format!(
-                            "epoch {epoch} failed validation after {attempts_per_epoch} attempt(s): {error}"
+                    let may_retry = failure_drain.may_retry(job.attempt, attempts_per_epoch);
+                    let cleanup = cleanup_adaptive_attempt(&job);
+                    if may_retry && cleanup.is_ok() {
+                        warn!(
+                            "epoch {epoch} staged output failed validation: {error}; retrying cleanly"
                         );
-                        let cleanup =
-                            cancel_adaptive_epoch_work(&shutdown, &mut running, &mut validating)
-                                .await;
-                        return Err(append_cleanup_error(primary, cleanup));
+                        retries.push(job);
+                        continue;
                     }
-                    warn!(
-                        "epoch {epoch} staged output failed validation: {error}; retrying cleanly"
+                    let mut failure = if job.attempt >= attempts_per_epoch {
+                        format!(
+                            "epoch {epoch} failed validation after {attempts_per_epoch} attempt(s): {error}"
+                        )
+                    } else if failure_drain.is_active() {
+                        format!(
+                            "epoch {epoch} failed validation while adaptive admission was draining: {error}; retry suppressed"
+                        )
+                    } else {
+                        format!("epoch {epoch} staged output failed validation: {error}")
+                    };
+                    if let Err(cleanup_error) = cleanup {
+                        failure
+                            .push_str(&format!("; additionally failed cleanup: {cleanup_error}"));
+                    }
+                    record_adaptive_terminal_failure(
+                        &mut failure_drain,
+                        failure,
+                        running.len(),
+                        validating.len(),
                     );
-                    if let Err(cleanup_error) = cleanup_adaptive_attempt(&job) {
-                        let cleanup =
-                            cancel_adaptive_epoch_work(&shutdown, &mut running, &mut validating)
-                                .await;
-                        return Err(append_cleanup_error(cleanup_error, cleanup));
-                    }
-                    retries.push(job);
                 }
             }
         }
-        merge_adaptive_retries(&mut pending, retries);
+        if failure_drain.is_active() {
+            // Every retry candidate has already had its failed attempt cleaned.
+            // Dropping it here prevents new work from entering a failed cohort.
+            retries.clear();
+        } else {
+            merge_adaptive_retries(&mut pending, retries);
+        }
         if adaptive_resource_occupancy(running.len(), validating.len(), ready.len()) == 0 {
             cohort_started = None;
         }
 
-        while next_publish_epoch <= end_epoch {
-            if published_epochs.remove(&next_publish_epoch) {
+        loop {
+            while next_publish_epoch <= end_epoch && published_epochs.remove(&next_publish_epoch) {
                 next_publish_epoch += 1;
-                continue;
             }
-            let Some(validated) = ready.remove(&next_publish_epoch) else {
+            let Some(epoch) = next_adaptive_publication_epoch(
+                next_publish_epoch,
+                &ready,
+                failure_drain.is_active(),
+            ) else {
                 break;
             };
+            let in_order = epoch == next_publish_epoch;
+            let validated = ready
+                .remove(&epoch)
+                .expect("publication epoch came from the ready map");
             if let Err(err) = publish_staged_epoch_archive(&validated) {
+                if failure_drain.is_active() {
+                    record_adaptive_terminal_failure(
+                        &mut failure_drain,
+                        err,
+                        running.len(),
+                        validating.len(),
+                    );
+                    continue;
+                }
                 let cleanup =
                     cancel_adaptive_epoch_work(&shutdown, &mut running, &mut validating).await;
                 return Err(append_cleanup_error(err, cleanup));
             }
             let job = &validated.job;
             info!(
-                "epoch {}: atomically published ordered verified archive {}",
+                "epoch {}: atomically published verified archive {}",
                 job.epoch,
                 job.final_output.display()
             );
@@ -11944,7 +12308,9 @@ async fn run_epoch_range_supervisor_adaptive(
                     job.work_dir.display()
                 );
             }
-            next_publish_epoch += 1;
+            if in_order {
+                next_publish_epoch += 1;
+            }
         }
 
         if next_publish_epoch > end_epoch
@@ -11955,6 +12321,17 @@ async fn run_epoch_range_supervisor_adaptive(
         {
             info!("=== all epochs {effective_start}-{end_epoch} complete ===");
             return Ok(());
+        }
+
+        if failure_drain.is_active() {
+            if failure_drain.is_drained(running.len(), validating.len(), ready.len()) {
+                return Err(std::mem::take(&mut failure_drain).into_error());
+            }
+            // Admission is permanently closed for this supervisor invocation.
+            // Do not let retries or untouched pending epochs replace the
+            // resources released by a draining sibling.
+            tokio::time::sleep(ADAPTIVE_EPOCH_POLL_INTERVAL).await;
+            continue;
         }
 
         let resource_occupied =
@@ -12044,9 +12421,13 @@ async fn run_epoch_range_supervisor_adaptive(
                 break;
             };
             if let Err(error) = prepare_adaptive_attempt(&mut job) {
-                let cleanup =
-                    cancel_adaptive_epoch_work(&shutdown, &mut running, &mut validating).await;
-                return Err(append_cleanup_error(error, cleanup));
+                record_adaptive_terminal_failure(
+                    &mut failure_drain,
+                    error,
+                    running.len(),
+                    validating.len(),
+                );
+                break;
             }
             info!(
                 "=== epoch {}: spawning fresh private staged child (attempt {}/{attempts_per_epoch}, occupied={}/{target_capacity}) ===",
@@ -12076,27 +12457,29 @@ async fn run_epoch_range_supervisor_adaptive(
                 Err(err) if job.attempt < attempts_per_epoch => {
                     warn!("{err}; retrying epoch {}", job.epoch);
                     if let Err(cleanup_error) = cleanup_adaptive_attempt(&job) {
-                        let primary =
-                            format!("{err}; additionally failed cleanup: {cleanup_error}");
-                        let cleanup =
-                            cancel_adaptive_epoch_work(&shutdown, &mut running, &mut validating)
-                                .await;
-                        return Err(append_cleanup_error(primary, cleanup));
+                        record_adaptive_terminal_failure(
+                            &mut failure_drain,
+                            format!("{err}; additionally failed cleanup: {cleanup_error}"),
+                            running.len(),
+                            validating.len(),
+                        );
+                        break;
                     }
                     pending.push_front(job);
                     break;
                 }
                 Err(err) => {
                     let cleanup_error = cleanup_adaptive_attempt(&job).err();
-                    let cleanup =
-                        cancel_adaptive_epoch_work(&shutdown, &mut running, &mut validating).await;
-                    if let Some(cleanup_error) = cleanup_error {
-                        return Err(append_cleanup_error(
-                            format!("{err}; additionally failed cleanup: {cleanup_error}"),
-                            cleanup,
-                        ));
-                    }
-                    return Err(append_cleanup_error(err, cleanup));
+                    let failure = cleanup_error.map_or(err.clone(), |cleanup_error| {
+                        format!("{err}; additionally failed cleanup: {cleanup_error}")
+                    });
+                    record_adaptive_terminal_failure(
+                        &mut failure_drain,
+                        failure,
+                        running.len(),
+                        validating.len(),
+                    );
+                    break;
                 }
             }
         }
@@ -13065,6 +13448,77 @@ async fn main() {
                     "collecting canonical snapshot hashes for slots {}..={} (output epoch {epoch})",
                     verification_start, epoch_end_slot
                 );
+                if adaptive_epoch_concurrency {
+                    let cached =
+                        match cached_private_epoch_hashes(&dest_dir, epoch, archive_extensions) {
+                            Ok(cached) => cached,
+                            Err(err) => {
+                                eprintln!("error: {err}");
+                                exit(1);
+                            }
+                        };
+                    if let Some(mut expected) = cached {
+                        if expected.is_empty()
+                            || expected
+                                .keys()
+                                .any(|slot| !(verification_start..=epoch_end_slot).contains(slot))
+                        {
+                            eprintln!(
+                                "error: cached epoch {epoch} checkpoint set is empty or outside {}..={epoch_end_slot}",
+                                verification_start
+                            );
+                            exit(1);
+                        }
+                        if let Some(boundary_path) = boundary_path {
+                            let (boundary_slot, boundary_expectation) =
+                                match snapshot_path_expectation(boundary_path) {
+                                    Ok(expectation) => expectation,
+                                    Err(err) => {
+                                        eprintln!("error: {err}");
+                                        exit(1);
+                                    }
+                                };
+                            if expected.get(&boundary_slot) != Some(&boundary_expectation) {
+                                eprintln!(
+                                    "error: cached epoch {epoch} checkpoint set does not bind boundary snapshot {}",
+                                    boundary_path.display()
+                                );
+                                exit(1);
+                            }
+                        }
+                        let before_handoffs = expected.clone();
+                        if let Err(err) = add_runtime_handoff_expectations(
+                            epoch_start_slot..epoch_end_slot.saturating_add(1),
+                            &mut expected,
+                        ) {
+                            eprintln!("error: {err}");
+                            exit(1);
+                        }
+                        if expected != before_handoffs {
+                            eprintln!(
+                                "error: cached epoch {epoch} checkpoint set omits a registry-committed runtime handoff"
+                            );
+                            exit(1);
+                        }
+                        let post_bootstrap_start = verification_start.saturating_add(1);
+                        if expected
+                            .range(post_bootstrap_start..=epoch_end_slot)
+                            .next()
+                            .is_none()
+                        {
+                            eprintln!(
+                                "error: cached epoch {epoch} checkpoint set has no post-bootstrap checkpoint in {post_bootstrap_start}..={epoch_end_slot}"
+                            );
+                            exit(1);
+                        }
+                        info!(
+                            "snapshot verification: reusing {} immutable private checkpoint(s) for epoch {epoch}; no GCS refresh required",
+                            expected.len()
+                        );
+                        snapshot_expectations.insert(epoch, expected);
+                        continue;
+                    }
+                }
                 let mut expected = match snapshot_expectations_for_span(
                     verification_start,
                     epoch_end_slot,
@@ -13595,6 +14049,10 @@ mod early_snapshot_tests {
         assert_eq!(
             epoch_isolation_plan(2, 3, false, true).unwrap(),
             (false, None)
+        );
+        assert_eq!(
+            epoch_isolation_plan(7, 8, false, true).unwrap(),
+            (true, Some(8))
         );
         assert_eq!(
             epoch_isolation_plan(2, 3, true, true).unwrap(),
@@ -14537,17 +14995,89 @@ mod early_snapshot_tests {
         );
     }
 
+    #[test]
+    fn adaptive_restart_reuses_only_identical_private_inputs() {
+        let (_fixture, destination) = private_destination_fixture();
+        let epoch = 8;
+        let input_dir = private_epoch_scope(&destination)
+            .unwrap()
+            .join("work")
+            .join(format!("epoch-{epoch}"))
+            .join("inputs");
+        create_or_validate_private_directory(input_dir.parent().unwrap()).unwrap();
+        create_or_validate_private_directory(&input_dir).unwrap();
+
+        let expected = BTreeMap::from([
+            (
+                3_455_940,
+                BankHashExpectation::LegacyAccountsHash(Hash::new_from_array([0x11; 32])),
+            ),
+            (
+                3_887_911,
+                BankHashExpectation::LegacyAccountsHash(Hash::new_from_array([0x22; 32])),
+            ),
+        ]);
+        let first_hashes = write_private_epoch_hashes(&input_dir, &expected).unwrap();
+        let second_hashes = write_private_epoch_hashes(&input_dir, &expected).unwrap();
+        assert_eq!(first_hashes, second_hashes);
+        assert_eq!(
+            cached_private_epoch_hashes(&destination, epoch, &[".tar.bz2"])
+                .unwrap()
+                .unwrap(),
+            expected
+        );
+
+        let different = BTreeMap::from([(
+            3_455_940,
+            BankHashExpectation::LegacyAccountsHash(Hash::new_from_array([0x33; 32])),
+        )]);
+        assert!(
+            write_private_epoch_hashes(&input_dir, &different)
+                .unwrap_err()
+                .contains("differ")
+        );
+
+        let source = destination.join("snapshot-3455940-11111111111111111111111111111111.tar.bz2");
+        fs::write(&source, b"canonical snapshot bytes").unwrap();
+        let bootstrap = ReplayBootstrap::SnapshotArchive(source.clone());
+        let first_bound = bind_snapshot_for_adaptive_job(&bootstrap, &input_dir).unwrap();
+        let second_bound = bind_snapshot_for_adaptive_job(&bootstrap, &input_dir).unwrap();
+        assert_eq!(
+            first_bound.snapshot_archive(),
+            second_bound.snapshot_archive()
+        );
+
+        fs::write(&source, b"changed source bytes").unwrap();
+        assert!(
+            bind_snapshot_for_adaptive_job(&bootstrap, &input_dir)
+                .unwrap_err()
+                .contains("does not match")
+        );
+    }
+
     fn adaptive_test_job(epoch: u64, work_dir: PathBuf) -> AdaptiveEpochJob {
         let selection = compatibility::RuntimeSelection {
             backend: compatibility::RuntimeBackend::SolanaV1_0_8,
             descriptor: &compatibility::SOLANA_V1_0_8_RUNTIME,
             admission: compatibility::AdmissionLevel::Verified,
         };
+        let private_dir = Arc::new(tempfile::TempDir::new().unwrap());
+        let genesis_bin_path = private_dir.path().join("genesis.bin");
+        fs::write(&genesis_bin_path, [0]).unwrap();
+        let source_bootstrap = ReplayBootstrap::Genesis {
+            genesis_bin_path,
+            identity: historical::GenesisFileIdentity {
+                size: 1,
+                sha256: [0; 32],
+            },
+            _private_dir: private_dir,
+        };
         AdaptiveEpochJob {
             epoch,
             spans: Vec::new(),
             selection,
-            bootstrap: ReplayBootstrap::SnapshotArchive(PathBuf::from("snapshot.tar.bz2")),
+            source_bootstrap,
+            bound_bootstrap: None,
             source_snapshot: None,
             hashes_path: PathBuf::from("epoch-hashes.txt"),
             final_output: PathBuf::from(format!("epoch-{epoch}.jet")),
@@ -14601,6 +15131,38 @@ mod early_snapshot_tests {
     }
 
     #[test]
+    fn adaptive_terminal_failure_closes_retries_until_existing_work_drains() {
+        let mut drain = AdaptiveFailureDrain::default();
+        assert!(drain.may_retry(1, 4));
+        assert!(!drain.is_drained(0, 0, 0));
+
+        assert!(drain.record("epoch 8 exhausted its retries".to_string()));
+        assert!(!drain.may_retry(1, 4));
+        assert!(!drain.is_drained(1, 0, 0));
+        assert!(!drain.is_drained(0, 1, 0));
+        assert!(!drain.is_drained(0, 0, 1));
+        assert!(drain.is_drained(0, 0, 0));
+
+        assert!(!drain.record("epoch 9 also failed while draining".to_string()));
+        assert_eq!(
+            drain.into_error(),
+            "epoch 8 exhausted its retries; epoch 9 also failed while draining"
+        );
+    }
+
+    #[test]
+    fn adaptive_failure_drain_publishes_validated_siblings_across_failed_gap() {
+        let mut ready = BTreeMap::from([(7, ()), (9, ())]);
+
+        assert_eq!(next_adaptive_publication_epoch(7, &ready, false), Some(7));
+        ready.remove(&7);
+        assert_eq!(next_adaptive_publication_epoch(8, &ready, false), None);
+        assert_eq!(next_adaptive_publication_epoch(8, &ready, true), Some(9));
+        ready.remove(&9);
+        assert_eq!(next_adaptive_publication_epoch(8, &ready, true), None);
+    }
+
+    #[test]
     fn adaptive_retries_use_fresh_private_attempt_directories() {
         use std::os::unix::fs::PermissionsExt as _;
 
@@ -14635,6 +15197,45 @@ mod early_snapshot_tests {
         assert!(!job.scratch_dir.join("crash-mutated-state").exists());
         cleanup_adaptive_attempt(&job).unwrap();
         assert!(!second_attempt.exists());
+    }
+
+    #[test]
+    fn adaptive_snapshot_binding_is_deferred_until_admission() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::TempDir::new().unwrap();
+        let source = directory
+            .path()
+            .join("snapshot-3455940-11111111111111111111111111111111.tar.bz2");
+        fs::write(&source, b"canonical boundary snapshot").unwrap();
+        let work_dir = directory.path().join("epoch-8");
+        fs::create_dir(&work_dir).unwrap();
+        fs::set_permissions(&work_dir, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut job = adaptive_test_job(8, work_dir.clone());
+        job.source_bootstrap = ReplayBootstrap::SnapshotArchive(source.clone());
+        job.source_snapshot = Some(source);
+
+        let bound_path = work_dir
+            .join("inputs")
+            .join("snapshot-3455940-11111111111111111111111111111111.tar.bz2");
+        assert!(!bound_path.exists());
+        assert!(job.bound_bootstrap.is_none());
+
+        prepare_adaptive_attempt(&mut job).unwrap();
+
+        assert_eq!(
+            job.bound_bootstrap.as_ref().unwrap().snapshot_archive(),
+            Some(bound_path.as_path())
+        );
+        assert_eq!(
+            fs::read(&bound_path).unwrap(),
+            b"canonical boundary snapshot"
+        );
+        assert_eq!(
+            fs::metadata(&bound_path).unwrap().permissions().mode() & 0o777,
+            0o400
+        );
+        cleanup_adaptive_attempt(&job).unwrap();
     }
 
     #[tokio::test(flavor = "current_thread")]

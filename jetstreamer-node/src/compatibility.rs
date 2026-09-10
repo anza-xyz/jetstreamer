@@ -16,9 +16,42 @@ use {
     std::{ops::Range, str::FromStr},
 };
 
-/// End of epoch 10. The first historical experiment executes the genesis
-/// warmup and epochs 1-10, so its complete state span is `0..4_752_000`.
-pub const INITIAL_SOLANA_V1_END_SLOT_EXCLUSIVE: Slot = 4_752_000;
+/// End of epoch 7, the last range both executable and bootstrap-compatible
+/// with the current v1.0.8 worker. Epoch 8's boundary snapshot uses the newer
+/// 1.1.0 bank schema and must remain fail-closed until a matching historical
+/// worker passes differential replay.
+pub const SOLANA_V1_0_8_CANDIDATE_END_SLOT_EXCLUSIVE: Slot = 3_456_000;
+
+/// Epoch 8 is the first output range whose best available predecessor
+/// snapshot uses the 1.1 bank schema. The exact v1.0.13 worker has restored
+/// that snapshot and is admitted here only as a checkpoint-verified
+/// differential candidate.
+pub const SOLANA_V1_0_13_CANDIDATE_START_SLOT: Slot = SOLANA_V1_0_8_CANDIDATE_END_SLOT_EXCLUSIVE;
+pub const SOLANA_V1_0_13_CANDIDATE_END_SLOT_EXCLUSIVE: Slot = 3_888_000;
+
+/// Epochs 9 and 10 use the exact v1.0.14 runtime. Each epoch is restored from
+/// its own canonical predecessor-epoch snapshot and verified independently.
+pub const SOLANA_V1_0_14_CANDIDATE_START_SLOT: Slot = SOLANA_V1_0_13_CANDIDATE_END_SLOT_EXCLUSIVE;
+pub const SOLANA_V1_0_14_CANDIDATE_END_SLOT_EXCLUSIVE: Slot = 4_752_000;
+
+/// Epoch 11 uses the exact v1.0.17 runtime selected by its canonical
+/// predecessor-epoch snapshot and bounded checkpoint evidence.
+pub const SOLANA_V1_0_17_CANDIDATE_START_SLOT: Slot = SOLANA_V1_0_14_CANDIDATE_END_SLOT_EXCLUSIVE;
+pub const SOLANA_V1_0_17_CANDIDATE_END_SLOT_EXCLUSIVE: Slot = 5_184_000;
+
+/// Epoch-aligned diagnostic envelopes for the terminal patch of each later
+/// Solana minor line. These are candidate-only: an epoch is publishable only
+/// after every canonical snapshot checkpoint in its span matches. A mismatch
+/// fails closed and is evidence to split that envelope around an earlier exact
+/// patch worker; release-marker timestamps are not treated as activation slots.
+pub const SOLANA_V1_0_23_CANDIDATE_START_SLOT: Slot = SOLANA_V1_0_17_CANDIDATE_END_SLOT_EXCLUSIVE;
+pub const SOLANA_V1_0_23_CANDIDATE_END_SLOT_EXCLUSIVE: Slot = 12_960_000;
+pub const SOLANA_V1_1_23_CANDIDATE_START_SLOT: Slot = SOLANA_V1_0_23_CANDIDATE_END_SLOT_EXCLUSIVE;
+pub const SOLANA_V1_1_23_CANDIDATE_END_SLOT_EXCLUSIVE: Slot = 26_352_000;
+pub const SOLANA_V1_2_32_CANDIDATE_START_SLOT: Slot = SOLANA_V1_1_23_CANDIDATE_END_SLOT_EXCLUSIVE;
+pub const SOLANA_V1_2_32_CANDIDATE_END_SLOT_EXCLUSIVE: Slot = 39_744_000;
+pub const SOLANA_V1_3_19_CANDIDATE_START_SLOT: Slot = SOLANA_V1_2_32_CANDIDATE_END_SLOT_EXCLUSIVE;
+pub const SOLANA_V1_3_19_CANDIDATE_END_SLOT_EXCLUSIVE: Slot = 43_632_000;
 
 /// Start of epoch 940, the earliest Agave 3 range currently backed by locally
 /// generated Horizon archives and canonical snapshot checks in this checkout.
@@ -36,7 +69,15 @@ pub const MAINNET_GENESIS_HASH: &str = "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw
 /// Exact upstream revisions behind the historical runtime candidates.
 pub const SOLANA_V1_0_7_REVISION: &str = "57abc370fa39e42e8fb84145a30395ddcf891692";
 pub const SOLANA_V1_0_8_REVISION: &str = "2a617f2d07f714918891f2b479d1cb1c324f0365";
+pub const SOLANA_V1_0_13_REVISION: &str = "fdeda769d05fea4a3f861e787d47d995feee15d7";
+pub const SOLANA_V1_0_14_REVISION: &str = "8631be42ac29a062b5e26a85fc2f4c94af042afd";
+pub const SOLANA_V1_0_17_REVISION: &str = "cfc7b22c4c9094d09fc969247bfe60a154027d84";
+pub const SOLANA_V1_0_18_REVISION: &str = "f26f18d29d650d06f5c5b7a4eb625622a999ea66";
+pub const SOLANA_V1_0_23_REVISION: &str = "825c0e2b6e39ae67431ed0a8282260ad3914c87a";
 pub const SOLANA_V1_0_24_REVISION: &str = "a93915f1bddb73480f86fc09f487315ae191897d";
+pub const SOLANA_V1_1_23_REVISION: &str = "263fc25992ebae85e7ba2f176e9a066449489c3e";
+pub const SOLANA_V1_2_32_REVISION: &str = "8c989da68342918f1717c60aa60fdfab7d1e676e";
+pub const SOLANA_V1_3_19_REVISION: &str = "15a49d75086f95573ad319b22e4843639bdf2169";
 
 /// Latest mainnet slot currently known to exercise the pre-v1.0.8
 /// three-account vote initialization successfully. This is behavioral
@@ -74,9 +115,31 @@ pub enum RuntimeBackend {
     /// for vote-account initialization. Its first routed slot follows a
     /// canonical snapshot checkpoint rather than a guessed deployment date.
     SolanaV1_0_8,
+    /// Exact v1.0.13 runtime and 1.1 snapshot loader, initially bounded to
+    /// epoch 8 while canonical checkpoint replay is qualified.
+    SolanaV1_0_13,
+    /// Exact v1.0.14 runtime bounded to epochs 9 and 10.
+    SolanaV1_0_14,
+    /// Exact v1.0.17 runtime bounded to epoch 11.
+    SolanaV1_0_17,
+    /// Exact v1.0.18 candidate retained without a routed slot era until
+    /// differential replay identifies a justified whole-epoch envelope.
+    SolanaV1_0_18,
+    /// Exact terminal v1.0 patch used only in the checkpoint-gated diagnostic
+    /// envelope for epochs 12 through 29.
+    SolanaV1_0_23,
     /// Later Solana 1.0 candidate retained separately until differential
     /// replay proves the exact slot at which its consensus behavior applies.
     SolanaV1_0_24,
+    /// Exact terminal v1.1 patch used only in the checkpoint-gated diagnostic
+    /// envelope for epochs 30 through 60.
+    SolanaV1_1_23,
+    /// Exact terminal v1.2 patch used only in the checkpoint-gated diagnostic
+    /// envelope for epochs 61 through 91.
+    SolanaV1_2_32,
+    /// Exact terminal v1.3 patch used only in the checkpoint-gated diagnostic
+    /// envelope for epochs 92 through 100.
+    SolanaV1_3_19,
     /// In-process Agave 3 runtime used by the existing replay path.
     AgaveV3,
 }
@@ -183,7 +246,15 @@ impl RuntimeDescriptor {
         let expected_loader = match self.backend {
             RuntimeBackend::SolanaV1_0_7
             | RuntimeBackend::SolanaV1_0_8
-            | RuntimeBackend::SolanaV1_0_24 => {
+            | RuntimeBackend::SolanaV1_0_13
+            | RuntimeBackend::SolanaV1_0_14
+            | RuntimeBackend::SolanaV1_0_17
+            | RuntimeBackend::SolanaV1_0_18
+            | RuntimeBackend::SolanaV1_0_23
+            | RuntimeBackend::SolanaV1_0_24
+            | RuntimeBackend::SolanaV1_1_23
+            | RuntimeBackend::SolanaV1_2_32
+            | RuntimeBackend::SolanaV1_3_19 => {
                 BootstrapStateLoader::HistoricalWorkerSnapshotArchive
             }
             RuntimeBackend::AgaveV3 => BootstrapStateLoader::AgaveSnapshotArchive,
@@ -337,6 +408,111 @@ pub static SOLANA_V1_0_8_RUNTIME: RuntimeDescriptor = RuntimeDescriptor {
     }),
 };
 
+pub static SOLANA_V1_0_13_RUNTIME: RuntimeDescriptor = RuntimeDescriptor {
+    backend: RuntimeBackend::SolanaV1_0_13,
+    identity: RuntimeIdentity {
+        name: "solana-v1.0.13",
+        revision: SOLANA_V1_0_13_REVISION,
+        rust_toolchain: "rustc 1.42.0 (b8cedc004 2020-03-09)",
+        target: Some("x86_64-unknown-linux-gnu"),
+        genesis_hash: MAINNET_GENESIS_HASH,
+    },
+    bootstrap: BootstrapState {
+        loader: BootstrapStateLoader::HistoricalWorkerSnapshotArchive,
+        archive_extensions: &[".tar.bz2"],
+        permits_in_memory_handoff: false,
+    },
+    worker: Some(WorkerExecutable {
+        identity: "jetstreamer-historical-worker-v1-0-13",
+        environment_override: "JETSTREAMER_HISTORICAL_WORKER_V1_0_13",
+        default_manifest_relative_path: "../historical-runtime/v1_0_13/target/release/jetstreamer-historical-worker-v1-0-13",
+    }),
+};
+
+pub static SOLANA_V1_0_14_RUNTIME: RuntimeDescriptor = RuntimeDescriptor {
+    backend: RuntimeBackend::SolanaV1_0_14,
+    identity: RuntimeIdentity {
+        name: "solana-v1.0.14",
+        revision: SOLANA_V1_0_14_REVISION,
+        rust_toolchain: "rustc 1.42.0 (b8cedc004 2020-03-09)",
+        target: Some("x86_64-unknown-linux-gnu"),
+        genesis_hash: MAINNET_GENESIS_HASH,
+    },
+    bootstrap: BootstrapState {
+        loader: BootstrapStateLoader::HistoricalWorkerSnapshotArchive,
+        archive_extensions: &[".tar.bz2"],
+        permits_in_memory_handoff: false,
+    },
+    worker: Some(WorkerExecutable {
+        identity: "jetstreamer-historical-worker-v1-0-14",
+        environment_override: "JETSTREAMER_HISTORICAL_WORKER_V1_0_14",
+        default_manifest_relative_path: "../historical-runtime/v1_0_14/target/release/jetstreamer-historical-worker-v1-0-14",
+    }),
+};
+
+pub static SOLANA_V1_0_17_RUNTIME: RuntimeDescriptor = RuntimeDescriptor {
+    backend: RuntimeBackend::SolanaV1_0_17,
+    identity: RuntimeIdentity {
+        name: "solana-v1.0.17",
+        revision: SOLANA_V1_0_17_REVISION,
+        rust_toolchain: "rustc 1.42.0 (b8cedc004 2020-03-09)",
+        target: Some("x86_64-unknown-linux-gnu"),
+        genesis_hash: MAINNET_GENESIS_HASH,
+    },
+    bootstrap: BootstrapState {
+        loader: BootstrapStateLoader::HistoricalWorkerSnapshotArchive,
+        archive_extensions: &[".tar.bz2"],
+        permits_in_memory_handoff: false,
+    },
+    worker: Some(WorkerExecutable {
+        identity: "jetstreamer-historical-worker-v1-0-17",
+        environment_override: "JETSTREAMER_HISTORICAL_WORKER_V1_0_17",
+        default_manifest_relative_path: "../historical-runtime/v1_0_17/target/release/jetstreamer-historical-worker-v1-0-17",
+    }),
+};
+
+pub static SOLANA_V1_0_18_RUNTIME: RuntimeDescriptor = RuntimeDescriptor {
+    backend: RuntimeBackend::SolanaV1_0_18,
+    identity: RuntimeIdentity {
+        name: "solana-v1.0.18",
+        revision: SOLANA_V1_0_18_REVISION,
+        rust_toolchain: "rustc 1.42.0 (b8cedc004 2020-03-09)",
+        target: Some("x86_64-unknown-linux-gnu"),
+        genesis_hash: MAINNET_GENESIS_HASH,
+    },
+    bootstrap: BootstrapState {
+        loader: BootstrapStateLoader::HistoricalWorkerSnapshotArchive,
+        archive_extensions: &[".tar.bz2"],
+        permits_in_memory_handoff: false,
+    },
+    worker: Some(WorkerExecutable {
+        identity: "jetstreamer-historical-worker-v1-0-18",
+        environment_override: "JETSTREAMER_HISTORICAL_WORKER_V1_0_18",
+        default_manifest_relative_path: "../historical-runtime/v1_0_18/target/release/jetstreamer-historical-worker-v1-0-18",
+    }),
+};
+
+pub static SOLANA_V1_0_23_RUNTIME: RuntimeDescriptor = RuntimeDescriptor {
+    backend: RuntimeBackend::SolanaV1_0_23,
+    identity: RuntimeIdentity {
+        name: "solana-v1.0.23",
+        revision: SOLANA_V1_0_23_REVISION,
+        rust_toolchain: "rustc 1.43.0 (4fb7144ed 2020-04-20)",
+        target: Some("x86_64-unknown-linux-gnu"),
+        genesis_hash: MAINNET_GENESIS_HASH,
+    },
+    bootstrap: BootstrapState {
+        loader: BootstrapStateLoader::HistoricalWorkerSnapshotArchive,
+        archive_extensions: &[".tar.bz2"],
+        permits_in_memory_handoff: false,
+    },
+    worker: Some(WorkerExecutable {
+        identity: "jetstreamer-historical-worker-v1-0-23",
+        environment_override: "JETSTREAMER_HISTORICAL_WORKER_V1_0_23",
+        default_manifest_relative_path: "../historical-runtime/v1_0_23/target/release/jetstreamer-historical-worker-v1-0-23",
+    }),
+};
+
 pub static SOLANA_V1_0_24_RUNTIME: RuntimeDescriptor = RuntimeDescriptor {
     backend: RuntimeBackend::SolanaV1_0_24,
     identity: RuntimeIdentity {
@@ -355,6 +531,69 @@ pub static SOLANA_V1_0_24_RUNTIME: RuntimeDescriptor = RuntimeDescriptor {
         identity: "jetstreamer-historical-worker-v1-0-24",
         environment_override: "JETSTREAMER_HISTORICAL_WORKER",
         default_manifest_relative_path: "../historical-runtime/v1_0_24/target/release/jetstreamer-historical-worker-v1-0-24",
+    }),
+};
+
+pub static SOLANA_V1_1_23_RUNTIME: RuntimeDescriptor = RuntimeDescriptor {
+    backend: RuntimeBackend::SolanaV1_1_23,
+    identity: RuntimeIdentity {
+        name: "solana-v1.1.23",
+        revision: SOLANA_V1_1_23_REVISION,
+        rust_toolchain: "rustc 1.43.0 (4fb7144ed 2020-04-20)",
+        target: Some("x86_64-unknown-linux-gnu"),
+        genesis_hash: MAINNET_GENESIS_HASH,
+    },
+    bootstrap: BootstrapState {
+        loader: BootstrapStateLoader::HistoricalWorkerSnapshotArchive,
+        archive_extensions: &[".tar.bz2"],
+        permits_in_memory_handoff: false,
+    },
+    worker: Some(WorkerExecutable {
+        identity: "jetstreamer-historical-worker-v1-1-23",
+        environment_override: "JETSTREAMER_HISTORICAL_WORKER_V1_1_23",
+        default_manifest_relative_path: "../historical-runtime/v1_1_23/target/release/jetstreamer-historical-worker-v1-1-23",
+    }),
+};
+
+pub static SOLANA_V1_2_32_RUNTIME: RuntimeDescriptor = RuntimeDescriptor {
+    backend: RuntimeBackend::SolanaV1_2_32,
+    identity: RuntimeIdentity {
+        name: "solana-v1.2.32",
+        revision: SOLANA_V1_2_32_REVISION,
+        rust_toolchain: "rustc 1.43.0 (4fb7144ed 2020-04-20)",
+        target: Some("x86_64-unknown-linux-gnu"),
+        genesis_hash: MAINNET_GENESIS_HASH,
+    },
+    bootstrap: BootstrapState {
+        loader: BootstrapStateLoader::HistoricalWorkerSnapshotArchive,
+        archive_extensions: &[".tar.bz2"],
+        permits_in_memory_handoff: false,
+    },
+    worker: Some(WorkerExecutable {
+        identity: "jetstreamer-historical-worker-v1-2-32",
+        environment_override: "JETSTREAMER_HISTORICAL_WORKER_V1_2_32",
+        default_manifest_relative_path: "../historical-runtime/v1_2_32/target/release/jetstreamer-historical-worker-v1-2-32",
+    }),
+};
+
+pub static SOLANA_V1_3_19_RUNTIME: RuntimeDescriptor = RuntimeDescriptor {
+    backend: RuntimeBackend::SolanaV1_3_19,
+    identity: RuntimeIdentity {
+        name: "solana-v1.3.19",
+        revision: SOLANA_V1_3_19_REVISION,
+        rust_toolchain: "rustc 1.45.1 (c367798cf 2020-07-26)",
+        target: Some("x86_64-unknown-linux-gnu"),
+        genesis_hash: MAINNET_GENESIS_HASH,
+    },
+    bootstrap: BootstrapState {
+        loader: BootstrapStateLoader::HistoricalWorkerSnapshotArchive,
+        archive_extensions: &[".tar.bz2"],
+        permits_in_memory_handoff: false,
+    },
+    worker: Some(WorkerExecutable {
+        identity: "jetstreamer-historical-worker-v1-3-19",
+        environment_override: "JETSTREAMER_HISTORICAL_WORKER_V1_3_19",
+        default_manifest_relative_path: "../historical-runtime/v1_3_19/target/release/jetstreamer-historical-worker-v1-3-19",
     }),
 };
 
@@ -390,6 +629,20 @@ pub static SOLANA_V1_0_7_TO_V1_0_8_HANDOFF: RuntimeHandoff = RuntimeHandoff {
 /// Canonical snapshot transitions keyed by their destination slot.
 pub static RUNTIME_HANDOFFS: &[&RuntimeHandoff] = &[&SOLANA_V1_0_7_TO_V1_0_8_HANDOFF];
 
+/// Runtime changes at these epoch boundaries are deliberately serviced by a
+/// fresh, independently verified predecessor-epoch snapshot in each isolated
+/// child. They are not canonical state handoffs and therefore cannot be used
+/// to assemble a replay that crosses the boundary inside one output archive.
+pub static SNAPSHOT_ISOLATED_RUNTIME_BOUNDARIES: &[Slot] = &[
+    SOLANA_V1_0_13_CANDIDATE_START_SLOT,
+    SOLANA_V1_0_14_CANDIDATE_START_SLOT,
+    SOLANA_V1_0_17_CANDIDATE_START_SLOT,
+    SOLANA_V1_0_23_CANDIDATE_START_SLOT,
+    SOLANA_V1_1_23_CANDIDATE_START_SLOT,
+    SOLANA_V1_2_32_CANDIDATE_START_SLOT,
+    SOLANA_V1_3_19_CANDIDATE_START_SLOT,
+];
+
 /// Single source of truth for executable and bootstrap-state identities.
 /// A candidate may be registered before it claims a slot era; this is how a
 /// differential worker remains available without inventing a release-date
@@ -397,7 +650,15 @@ pub static RUNTIME_HANDOFFS: &[&RuntimeHandoff] = &[&SOLANA_V1_0_7_TO_V1_0_8_HAN
 pub static RUNTIME_DESCRIPTORS: &[&RuntimeDescriptor] = &[
     &SOLANA_V1_0_7_RUNTIME,
     &SOLANA_V1_0_8_RUNTIME,
+    &SOLANA_V1_0_13_RUNTIME,
+    &SOLANA_V1_0_14_RUNTIME,
+    &SOLANA_V1_0_17_RUNTIME,
+    &SOLANA_V1_0_18_RUNTIME,
+    &SOLANA_V1_0_23_RUNTIME,
     &SOLANA_V1_0_24_RUNTIME,
+    &SOLANA_V1_1_23_RUNTIME,
+    &SOLANA_V1_2_32_RUNTIME,
+    &SOLANA_V1_3_19_RUNTIME,
     &AGAVE_V3_RUNTIME,
 ];
 
@@ -536,15 +797,64 @@ pub static RUNTIME_ERAS: &[RuntimeEra] = &[
         admission: AdmissionLevel::Candidate,
     },
     RuntimeEra {
-        name: "solana-v1.0.8-epochs-1-10-candidate-search-envelope",
+        name: "solana-v1.0.8-epochs-1-7-candidate-search-envelope",
         start_slot: SOLANA_V1_0_8_ROUTING_START_SLOT,
-        end_slot_exclusive: Some(INITIAL_SOLANA_V1_END_SLOT_EXCLUSIVE),
+        end_slot_exclusive: Some(SOLANA_V1_0_8_CANDIDATE_END_SLOT_EXCLUSIVE),
         backend: EraBackend::Available(&SOLANA_V1_0_8_RUNTIME),
         admission: AdmissionLevel::Candidate,
     },
     RuntimeEra {
+        name: "solana-v1.0.13-epoch-8-candidate",
+        start_slot: SOLANA_V1_0_13_CANDIDATE_START_SLOT,
+        end_slot_exclusive: Some(SOLANA_V1_0_13_CANDIDATE_END_SLOT_EXCLUSIVE),
+        backend: EraBackend::Available(&SOLANA_V1_0_13_RUNTIME),
+        admission: AdmissionLevel::Candidate,
+    },
+    RuntimeEra {
+        name: "solana-v1.0.14-epochs-9-10-candidate",
+        start_slot: SOLANA_V1_0_14_CANDIDATE_START_SLOT,
+        end_slot_exclusive: Some(SOLANA_V1_0_14_CANDIDATE_END_SLOT_EXCLUSIVE),
+        backend: EraBackend::Available(&SOLANA_V1_0_14_RUNTIME),
+        admission: AdmissionLevel::Candidate,
+    },
+    RuntimeEra {
+        name: "solana-v1.0.17-epoch-11-candidate",
+        start_slot: SOLANA_V1_0_17_CANDIDATE_START_SLOT,
+        end_slot_exclusive: Some(SOLANA_V1_0_17_CANDIDATE_END_SLOT_EXCLUSIVE),
+        backend: EraBackend::Available(&SOLANA_V1_0_17_RUNTIME),
+        admission: AdmissionLevel::Candidate,
+    },
+    RuntimeEra {
+        name: "solana-v1.0.23-epochs-12-29-differential-candidate",
+        start_slot: SOLANA_V1_0_23_CANDIDATE_START_SLOT,
+        end_slot_exclusive: Some(SOLANA_V1_0_23_CANDIDATE_END_SLOT_EXCLUSIVE),
+        backend: EraBackend::Available(&SOLANA_V1_0_23_RUNTIME),
+        admission: AdmissionLevel::Candidate,
+    },
+    RuntimeEra {
+        name: "solana-v1.1.23-epochs-30-60-differential-candidate",
+        start_slot: SOLANA_V1_1_23_CANDIDATE_START_SLOT,
+        end_slot_exclusive: Some(SOLANA_V1_1_23_CANDIDATE_END_SLOT_EXCLUSIVE),
+        backend: EraBackend::Available(&SOLANA_V1_1_23_RUNTIME),
+        admission: AdmissionLevel::Candidate,
+    },
+    RuntimeEra {
+        name: "solana-v1.2.32-epochs-61-91-differential-candidate",
+        start_slot: SOLANA_V1_2_32_CANDIDATE_START_SLOT,
+        end_slot_exclusive: Some(SOLANA_V1_2_32_CANDIDATE_END_SLOT_EXCLUSIVE),
+        backend: EraBackend::Available(&SOLANA_V1_2_32_RUNTIME),
+        admission: AdmissionLevel::Candidate,
+    },
+    RuntimeEra {
+        name: "solana-v1.3.19-epochs-92-100-differential-candidate",
+        start_slot: SOLANA_V1_3_19_CANDIDATE_START_SLOT,
+        end_slot_exclusive: Some(SOLANA_V1_3_19_CANDIDATE_END_SLOT_EXCLUSIVE),
+        backend: EraBackend::Available(&SOLANA_V1_3_19_RUNTIME),
+        admission: AdmissionLevel::Candidate,
+    },
+    RuntimeEra {
         name: "historical-runtime-gap",
-        start_slot: INITIAL_SOLANA_V1_END_SLOT_EXCLUSIVE,
+        start_slot: SOLANA_V1_3_19_CANDIDATE_END_SLOT_EXCLUSIVE,
         end_slot_exclusive: Some(AGAVE_V3_VERIFIED_START_SLOT),
         backend: EraBackend::Unsupported,
         admission: AdmissionLevel::Candidate,
@@ -570,13 +880,14 @@ pub fn validate_runtime_registry() -> Result<(), String> {
         ));
     }
     if SOLANA_V1_0_8_REQUIRED_SEMANTICS_OBSERVED_AT_SLOT < SOLANA_V1_0_8_ROUTING_START_SLOT
-        || SOLANA_V1_0_8_REQUIRED_SEMANTICS_OBSERVED_AT_SLOT >= INITIAL_SOLANA_V1_END_SLOT_EXCLUSIVE
+        || SOLANA_V1_0_8_REQUIRED_SEMANTICS_OBSERVED_AT_SLOT
+            >= SOLANA_V1_0_8_CANDIDATE_END_SLOT_EXCLUSIVE
     {
         return Err(format!(
             "v1.0.8 behavioral evidence slot {} falls outside its candidate range {}..{}",
             SOLANA_V1_0_8_REQUIRED_SEMANTICS_OBSERVED_AT_SLOT,
             SOLANA_V1_0_8_ROUTING_START_SLOT,
-            INITIAL_SOLANA_V1_END_SLOT_EXCLUSIVE,
+            SOLANA_V1_0_8_CANDIDATE_END_SLOT_EXCLUSIVE,
         ));
     }
     if RUNTIME_DESCRIPTORS.is_empty() {
@@ -657,6 +968,40 @@ fn validate_runtime_handoffs(
     eras: &[RuntimeEra],
     handoffs: &[&RuntimeHandoff],
 ) -> Result<(), String> {
+    for (index, boundary) in SNAPSHOT_ISOLATED_RUNTIME_BOUNDARIES
+        .iter()
+        .copied()
+        .enumerate()
+    {
+        if SNAPSHOT_ISOLATED_RUNTIME_BOUNDARIES[..index].contains(&boundary) {
+            return Err(format!(
+                "snapshot-isolated runtime boundary {boundary} is registered more than once"
+            ));
+        }
+        let matches_runtime_change = eras.windows(2).any(|pair| {
+            pair[0].end_slot_exclusive == Some(boundary)
+                && pair[1].start_slot == boundary
+                && matches!(
+                    (pair[0].backend, pair[1].backend),
+                    (EraBackend::Available(source), EraBackend::Available(destination))
+                        if !std::ptr::eq(source, destination)
+                )
+        });
+        if !matches_runtime_change {
+            return Err(format!(
+                "snapshot-isolated boundary {boundary} does not match an adjacent runtime change"
+            ));
+        }
+        if handoffs
+            .iter()
+            .any(|handoff| handoff.boundary_slot == boundary)
+        {
+            return Err(format!(
+                "runtime boundary {boundary} cannot be both a canonical handoff and snapshot-isolated restart"
+            ));
+        }
+    }
+
     for (index, handoff) in handoffs.iter().copied().enumerate() {
         handoff.snapshot.validate()?;
         if handoff.snapshot.slot.checked_add(1) != Some(handoff.boundary_slot) {
@@ -738,6 +1083,9 @@ fn validate_runtime_handoffs(
             .copied()
             .find(|handoff| handoff.boundary_slot == boundary)
         else {
+            if SNAPSHOT_ISOLATED_RUNTIME_BOUNDARIES.contains(&boundary) {
+                continue;
+            }
             return Err(format!(
                 "runtime boundary at slot {boundary} changes {} to {} without a canonical snapshot handoff",
                 source.identity.name, destination.identity.name
@@ -978,6 +1326,57 @@ pub fn select_runtime(
     })
 }
 
+/// Selects the runtime that owns an output range while validating an earlier
+/// snapshot warm-up range. A worker may consume pre-output slots from the
+/// preceding runtime era only at an explicitly registered snapshot-isolated
+/// epoch boundary. This is not a state handoff: the destination worker must
+/// independently restore and verify the canonical predecessor snapshot, and
+/// no output archive may cross the boundary.
+pub fn select_runtime_with_snapshot_warmup(
+    replay_start: Slot,
+    output_range: Range<Slot>,
+    allow_candidate_runtime: bool,
+) -> Result<RuntimeSelection, String> {
+    if replay_start > output_range.start {
+        return Err(format!(
+            "snapshot warm-up starts at {replay_start}, after output starts at {}",
+            output_range.start
+        ));
+    }
+    let output = select_runtime(output_range.clone(), allow_candidate_runtime)?;
+    if replay_start == output_range.start {
+        return Ok(output);
+    }
+
+    let complete_range = replay_start..output_range.end;
+    match select_runtime(complete_range.clone(), allow_candidate_runtime) {
+        Ok(selection) => return Ok(selection),
+        Err(crossing_error) => {
+            let boundary = output_range.start;
+            if !SNAPSHOT_ISOLATED_RUNTIME_BOUNDARIES.contains(&boundary) {
+                return Err(crossing_error);
+            }
+        }
+    }
+
+    let spans = plan_runtime_spans(complete_range, allow_candidate_runtime)?;
+    if spans.len() != 2
+        || spans[0].slots.end != output_range.start
+        || spans[1].slots.start != output_range.start
+        || spans[1].slots.end != output_range.end
+        || !matches!(
+            spans[1].execution.backend,
+            EraBackend::Available(descriptor) if std::ptr::eq(descriptor, output.descriptor)
+        )
+    {
+        return Err(format!(
+            "snapshot warm-up {}..{} does not form one registered predecessor span followed by output runtime {} at isolated boundary {}",
+            replay_start, output_range.start, output.backend, output_range.start,
+        ));
+    }
+    Ok(output)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -985,7 +1384,7 @@ mod tests {
     #[test]
     fn runtime_registry_is_complete_and_well_formed() {
         validate_runtime_registry().unwrap();
-        assert_eq!(RUNTIME_DESCRIPTORS.len(), 4);
+        assert_eq!(RUNTIME_DESCRIPTORS.len(), 12);
         for descriptor in RUNTIME_DESCRIPTORS.iter().copied() {
             assert!(std::ptr::eq(
                 descriptor,
@@ -1042,6 +1441,72 @@ mod tests {
             "../historical-runtime/v1_0_8/target/release/jetstreamer-historical-worker-v1-0-8"
         );
 
+        let schema_1_1_candidate = RuntimeBackend::SolanaV1_0_13.descriptor().unwrap();
+        assert_eq!(
+            schema_1_1_candidate.identity.revision,
+            SOLANA_V1_0_13_REVISION
+        );
+        let schema_1_1_worker = schema_1_1_candidate.worker.unwrap();
+        assert_eq!(
+            schema_1_1_worker.environment_override,
+            "JETSTREAMER_HISTORICAL_WORKER_V1_0_13"
+        );
+        assert_eq!(
+            schema_1_1_worker.default_manifest_relative_path,
+            "../historical-runtime/v1_0_13/target/release/jetstreamer-historical-worker-v1-0-13"
+        );
+
+        for (backend, revision, environment_override, relative_path) in [
+            (
+                RuntimeBackend::SolanaV1_0_14,
+                SOLANA_V1_0_14_REVISION,
+                "JETSTREAMER_HISTORICAL_WORKER_V1_0_14",
+                "../historical-runtime/v1_0_14/target/release/jetstreamer-historical-worker-v1-0-14",
+            ),
+            (
+                RuntimeBackend::SolanaV1_0_17,
+                SOLANA_V1_0_17_REVISION,
+                "JETSTREAMER_HISTORICAL_WORKER_V1_0_17",
+                "../historical-runtime/v1_0_17/target/release/jetstreamer-historical-worker-v1-0-17",
+            ),
+            (
+                RuntimeBackend::SolanaV1_0_18,
+                SOLANA_V1_0_18_REVISION,
+                "JETSTREAMER_HISTORICAL_WORKER_V1_0_18",
+                "../historical-runtime/v1_0_18/target/release/jetstreamer-historical-worker-v1-0-18",
+            ),
+            (
+                RuntimeBackend::SolanaV1_0_23,
+                SOLANA_V1_0_23_REVISION,
+                "JETSTREAMER_HISTORICAL_WORKER_V1_0_23",
+                "../historical-runtime/v1_0_23/target/release/jetstreamer-historical-worker-v1-0-23",
+            ),
+            (
+                RuntimeBackend::SolanaV1_1_23,
+                SOLANA_V1_1_23_REVISION,
+                "JETSTREAMER_HISTORICAL_WORKER_V1_1_23",
+                "../historical-runtime/v1_1_23/target/release/jetstreamer-historical-worker-v1-1-23",
+            ),
+            (
+                RuntimeBackend::SolanaV1_2_32,
+                SOLANA_V1_2_32_REVISION,
+                "JETSTREAMER_HISTORICAL_WORKER_V1_2_32",
+                "../historical-runtime/v1_2_32/target/release/jetstreamer-historical-worker-v1-2-32",
+            ),
+            (
+                RuntimeBackend::SolanaV1_3_19,
+                SOLANA_V1_3_19_REVISION,
+                "JETSTREAMER_HISTORICAL_WORKER_V1_3_19",
+                "../historical-runtime/v1_3_19/target/release/jetstreamer-historical-worker-v1-3-19",
+            ),
+        ] {
+            let descriptor = backend.descriptor().unwrap();
+            assert_eq!(descriptor.identity.revision, revision);
+            let worker = descriptor.worker.unwrap();
+            assert_eq!(worker.environment_override, environment_override);
+            assert_eq!(worker.default_manifest_relative_path, relative_path);
+        }
+
         let historical = RuntimeBackend::SolanaV1_0_24.descriptor().unwrap();
         assert_eq!(
             historical.bootstrap.loader,
@@ -1081,15 +1546,16 @@ mod tests {
     }
 
     #[test]
-    fn later_candidate_remains_registered_without_claiming_an_unproven_era() {
-        let backend = RuntimeBackend::SolanaV1_0_24;
-        assert!(backend.descriptor().is_ok());
-        assert!(!RUNTIME_ERAS.iter().any(|era| {
-            matches!(
-                era.backend,
-                EraBackend::Available(descriptor) if descriptor.backend == backend
-            )
-        }));
+    fn unassigned_candidates_remain_registered_without_claiming_an_era() {
+        for backend in [RuntimeBackend::SolanaV1_0_18, RuntimeBackend::SolanaV1_0_24] {
+            assert!(backend.descriptor().is_ok());
+            assert!(!RUNTIME_ERAS.iter().any(|era| {
+                matches!(
+                    era.backend,
+                    EraBackend::Available(descriptor) if descriptor.backend == backend
+                )
+            }));
+        }
     }
 
     #[test]
@@ -1100,7 +1566,8 @@ mod tests {
                     < SOLANA_V1_0_8_ROUTING_START_SLOT
             );
         }
-        let error = select_runtime(432_000..4_752_000, false).unwrap_err();
+        let error =
+            select_runtime(432_000..SOLANA_V1_0_8_CANDIDATE_END_SLOT_EXCLUSIVE, false).unwrap_err();
         assert!(error.contains("candidate-only"));
 
         let selection = select_runtime(432_000..SOLANA_V1_0_8_ROUTING_START_SLOT, true).unwrap();
@@ -1113,6 +1580,129 @@ mod tests {
 
         let error = select_runtime(432_000..864_000, true).unwrap_err();
         assert!(error.contains("crosses an execution-runtime boundary"));
+    }
+
+    #[test]
+    fn epoch_7_is_bounded_candidate_v1_0_8_work() {
+        let epoch_7 = 3_024_000..SOLANA_V1_0_8_CANDIDATE_END_SLOT_EXCLUSIVE;
+
+        let error = select_runtime(epoch_7.clone(), false).unwrap_err();
+        assert!(error.contains("candidate-only"));
+
+        let selection = select_runtime(epoch_7, true).unwrap();
+        assert_eq!(selection.backend, RuntimeBackend::SolanaV1_0_8);
+        assert!(std::ptr::eq(selection.descriptor, &SOLANA_V1_0_8_RUNTIME));
+
+        let last_slot = SOLANA_V1_0_8_CANDIDATE_END_SLOT_EXCLUSIVE - 1;
+        assert!(select_runtime(last_slot..last_slot + 1, true).is_ok());
+        let successor = select_runtime(last_slot + 1..last_slot + 2, true).unwrap();
+        assert_eq!(successor.backend, RuntimeBackend::SolanaV1_0_13);
+    }
+
+    #[test]
+    fn epoch_8_uses_the_exact_v1_0_13_candidate() {
+        let range =
+            SOLANA_V1_0_13_CANDIDATE_START_SLOT..SOLANA_V1_0_13_CANDIDATE_END_SLOT_EXCLUSIVE;
+        let selection = select_runtime(range, true).unwrap();
+        assert_eq!(selection.backend, RuntimeBackend::SolanaV1_0_13);
+        assert!(std::ptr::eq(selection.descriptor, &SOLANA_V1_0_13_RUNTIME));
+
+        let spans = plan_runtime_spans(
+            SOLANA_V1_0_13_CANDIDATE_START_SLOT..SOLANA_V1_0_13_CANDIDATE_START_SLOT + 1,
+            true,
+        )
+        .unwrap();
+        assert!(spans[0].handoff.is_none());
+        assert!(
+            SNAPSHOT_ISOLATED_RUNTIME_BOUNDARIES.contains(&SOLANA_V1_0_13_CANDIDATE_START_SLOT)
+        );
+    }
+
+    #[test]
+    fn epochs_9_through_11_use_snapshot_isolated_exact_candidates() {
+        for (range, backend, descriptor, boundary) in [
+            (
+                SOLANA_V1_0_14_CANDIDATE_START_SLOT..SOLANA_V1_0_14_CANDIDATE_END_SLOT_EXCLUSIVE,
+                RuntimeBackend::SolanaV1_0_14,
+                &SOLANA_V1_0_14_RUNTIME,
+                SOLANA_V1_0_14_CANDIDATE_START_SLOT,
+            ),
+            (
+                SOLANA_V1_0_17_CANDIDATE_START_SLOT..SOLANA_V1_0_17_CANDIDATE_END_SLOT_EXCLUSIVE,
+                RuntimeBackend::SolanaV1_0_17,
+                &SOLANA_V1_0_17_RUNTIME,
+                SOLANA_V1_0_17_CANDIDATE_START_SLOT,
+            ),
+        ] {
+            let selection = select_runtime(range, true).unwrap();
+            assert_eq!(selection.backend, backend);
+            assert!(std::ptr::eq(selection.descriptor, descriptor));
+            assert!(SNAPSHOT_ISOLATED_RUNTIME_BOUNDARIES.contains(&boundary));
+        }
+    }
+
+    #[test]
+    fn epochs_12_through_100_route_to_checkpoint_gated_terminal_patch_candidates() {
+        for (range, backend, descriptor, boundary) in [
+            (
+                SOLANA_V1_0_23_CANDIDATE_START_SLOT..SOLANA_V1_0_23_CANDIDATE_END_SLOT_EXCLUSIVE,
+                RuntimeBackend::SolanaV1_0_23,
+                &SOLANA_V1_0_23_RUNTIME,
+                SOLANA_V1_0_23_CANDIDATE_START_SLOT,
+            ),
+            (
+                SOLANA_V1_1_23_CANDIDATE_START_SLOT..SOLANA_V1_1_23_CANDIDATE_END_SLOT_EXCLUSIVE,
+                RuntimeBackend::SolanaV1_1_23,
+                &SOLANA_V1_1_23_RUNTIME,
+                SOLANA_V1_1_23_CANDIDATE_START_SLOT,
+            ),
+            (
+                SOLANA_V1_2_32_CANDIDATE_START_SLOT..SOLANA_V1_2_32_CANDIDATE_END_SLOT_EXCLUSIVE,
+                RuntimeBackend::SolanaV1_2_32,
+                &SOLANA_V1_2_32_RUNTIME,
+                SOLANA_V1_2_32_CANDIDATE_START_SLOT,
+            ),
+            (
+                SOLANA_V1_3_19_CANDIDATE_START_SLOT..SOLANA_V1_3_19_CANDIDATE_END_SLOT_EXCLUSIVE,
+                RuntimeBackend::SolanaV1_3_19,
+                &SOLANA_V1_3_19_RUNTIME,
+                SOLANA_V1_3_19_CANDIDATE_START_SLOT,
+            ),
+        ] {
+            let error = select_runtime(range.clone(), false).unwrap_err();
+            assert!(error.contains("candidate-only"));
+            let selection = select_runtime(range, true).unwrap();
+            assert_eq!(selection.backend, backend);
+            assert!(std::ptr::eq(selection.descriptor, descriptor));
+            assert!(SNAPSHOT_ISOLATED_RUNTIME_BOUNDARIES.contains(&boundary));
+        }
+    }
+
+    #[test]
+    fn snapshot_warmup_may_cross_only_at_the_registered_output_boundary() {
+        let epoch_8 = select_runtime_with_snapshot_warmup(
+            3_455_941,
+            SOLANA_V1_0_13_CANDIDATE_START_SLOT..SOLANA_V1_0_13_CANDIDATE_END_SLOT_EXCLUSIVE,
+            true,
+        )
+        .unwrap();
+        assert_eq!(epoch_8.backend, RuntimeBackend::SolanaV1_0_13);
+
+        let error = select_runtime_with_snapshot_warmup(
+            3_455_941,
+            SOLANA_V1_0_13_CANDIDATE_START_SLOT + 1..SOLANA_V1_0_13_CANDIDATE_END_SLOT_EXCLUSIVE,
+            true,
+        )
+        .unwrap_err();
+        assert!(error.contains("crosses an execution-runtime boundary"));
+
+        let error = select_runtime_with_snapshot_warmup(
+            SOLANA_V1_0_13_CANDIDATE_START_SLOT + 1,
+            SOLANA_V1_0_13_CANDIDATE_START_SLOT..SOLANA_V1_0_13_CANDIDATE_END_SLOT_EXCLUSIVE,
+            true,
+        )
+        .unwrap_err();
+        assert!(error.contains("after output starts"));
     }
 
     #[test]
@@ -1223,13 +1813,15 @@ mod tests {
 
     #[test]
     fn unknown_middle_history_fails_closed() {
-        let error = select_runtime(4_752_000..4_752_001, true).unwrap_err();
+        let start = SOLANA_V1_3_19_CANDIDATE_END_SLOT_EXCLUSIVE;
+        let error = select_runtime(start..start + 1, true).unwrap_err();
         assert!(error.contains("unsupported runtime era"));
     }
 
     #[test]
     fn crossing_into_an_unknown_era_fails_closed() {
-        let error = plan_replay(4_751_999..4_752_001, true).unwrap_err();
+        let boundary = SOLANA_V1_3_19_CANDIDATE_END_SLOT_EXCLUSIVE;
+        let error = plan_replay(boundary - 1..boundary + 1, true).unwrap_err();
         assert!(error.contains("unsupported runtime era"));
     }
 
@@ -1243,22 +1835,17 @@ mod tests {
     }
 
     #[test]
-    fn missing_status_boundary_splits_input_without_a_runtime_handoff() {
+    fn missing_status_policy_changes_at_its_input_boundary() {
         let start = OLD_FAITHFUL_STATUS_REQUIRED_START_SLOT - 1;
-        let end = OLD_FAITHFUL_STATUS_REQUIRED_START_SLOT + 1;
-        let segments = plan_replay(start..end, true).unwrap();
-        assert_eq!(segments.len(), 2);
+        let boundary = OLD_FAITHFUL_STATUS_REQUIRED_START_SLOT;
         assert_eq!(
-            segments[0].missing_transaction_status,
+            missing_transaction_status_at(start),
             MissingTransactionStatus::Reconstruct
         );
+        assert_eq!(input_end_exclusive(start), Some(boundary));
         assert_eq!(
-            segments[1].missing_transaction_status,
+            missing_transaction_status_at(boundary),
             MissingTransactionStatus::Reject
-        );
-        assert_eq!(
-            select_runtime(start..end, true).unwrap().backend,
-            RuntimeBackend::SolanaV1_0_8
         );
     }
 }

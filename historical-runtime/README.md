@@ -12,9 +12,15 @@ alias `jetstreamer-historical-protocol-current` to
 Rust imports.  Golden frame tests pin the facades' common fixed-integer wire
 encoding.
 
-`v1_0_7/worker`, `v1_0_8/worker`, and `v1_0_24/worker` are separate
-**candidate backends**, not a claim that any release is correct for a range
-merely because of its release date. Differential replay found an old-form vote
+Every sibling worker is a separate **candidate backend**, not a claim that a
+release is correct for a range merely because of its release date. Runtime
+selection is slot-driven, candidate use requires an explicit opt-in, and a
+generated epoch is publishable only after all canonical post-bootstrap
+snapshot checkpoints in that epoch match. The wider terminal-patch envelopes
+for epochs 12 through 100 are diagnostic: the first mismatch must split an
+envelope around an earlier exact worker rather than weakening validation.
+
+Differential replay found an old-form vote
 initialization accepted by mainnet at slot 521850: v1.0.7 accepts that
 transaction, while v1.0.8 and v1.0.24 enforce the later node-signature rule.
 The same old semantics are observed through slot 618196. A scan of every vote
@@ -36,16 +42,17 @@ relevant state-processing change to those vote checks. v1.0.24 remains
 unassigned until replay evidence supports another handoff. Candidate routing
 still requires explicit opt-in and trusted checkpoint validation.
 
-The sibling virtual workspaces have independent old-format lockfiles. v1.0.7
-and v1.0.8 are pinned to `1.42.0-x86_64-unknown-linux-gnu`; v1.0.24 is pinned
-to `1.43.0-x86_64-unknown-linux-gnu`. They cannot share dependency resolution
-because the exact upstream graphs require incompatible pre-release
-cryptography packages. The old `AppendVec` persisted native Rust layout, so
-compiling a runtime with another compiler can interpret historical storage
-incorrectly. Each workspace selects the historical compiler, and each
-worker's build script enforces the exact compiler commit and target.
+The sibling virtual workspaces have independent old-format lockfiles. Workers
+through v1.0.18 are pinned to `1.42.0-x86_64-unknown-linux-gnu`; v1.0.23,
+v1.0.24, v1.1.23, and v1.2.32 use `1.43.0-x86_64-unknown-linux-gnu`; v1.3.19
+uses `1.45.1-x86_64-unknown-linux-gnu`. They cannot share dependency
+resolution because the exact upstream graphs require incompatible
+pre-release cryptography packages. The old `AppendVec` persisted native Rust
+layout, so compiling a runtime with another compiler can interpret historical
+storage incorrectly. Each workspace selects the historical compiler, and
+each worker's build script enforces the exact compiler commit and target.
 
-Build and test v1.0.24 from its isolated workspace:
+Build and test any worker from its isolated workspace (v1.0.24 shown):
 
 ```sh
 cd v1_0_24
@@ -53,31 +60,21 @@ cargo test --locked
 cargo build --release --locked
 ```
 
-Build and test v1.0.7 from its isolated workspace:
-
-```sh
-cd v1_0_7
-cargo test --locked
-cargo build --release --locked
-```
-
-Build and test v1.0.8 from its isolated workspace:
-
-```sh
-cd v1_0_8
-cargo test --locked
-cargo build --release --locked
-```
-
-The v1.0.7 and v1.0.8 workers accept bounded entry batches so transaction
+All workers accept bounded entry batches so transaction
 decoding and independently anchored PoH segments can be prepared in parallel.
 All batch validation finishes before bank mutation, while bank advancement,
 transaction execution, write collection, and response emission remain in
-canonical wire order. Their fixed-width PoH backend is shared because Solana
-v1.0.8 did not change `entry::next_hash`: runtime-dispatched SHA-NI is guarded
-by feature detection, every unsafe load/store operates on fixed-size owned
-arrays, and randomized differential tests cover optimized, paired, and forced
-portable paths against the version-pinned Solana SDK implementation.
+canonical wire order. The fixed-width PoH backend is differentially tested
+against each version-pinned Solana SDK implementation: runtime-dispatched
+SHA-NI is guarded by feature detection, every unsafe load/store operates on
+fixed-size owned arrays, and randomized tests cover optimized, paired, and
+forced-portable paths.
+
+The broad v1.1.23 envelope retains mainnet's epoch-34 BPF-loader activation
+and the runtime's epoch-40 system-program transition. The v1.2.32 envelope
+retains the Stable-cluster CPI transition at epoch 63. Static loader bindings
+reproduce the exact linked processors without relying on mutable,
+deployment-adjacent shared libraries.
 
 The executable handshake reports candidate status, protocol version, Solana
 tag and commit, Rust toolchain, target, and required mainnet genesis hash. The
@@ -101,13 +98,22 @@ verified boundary, not as a general snapshot RPC.
 
 ## Vendored runtime provenance
 
-`v1_0_24/vendor/solana-runtime-1.0.24` is the `runtime/` crate from Solana tag
-`v1.0.24`, commit `a93915f1bddb73480f86fc09f487315ae191897d`.
-`v1_0_8/vendor/solana-runtime-1.0.8` is the same subtree from tag `v1.0.8`,
-commit `2a617f2d07f714918891f2b479d1cb1c324f0365`.
-`v1_0_7/vendor/solana-runtime-1.0.7` is the same subtree from tag `v1.0.7`, commit
-`57abc370fa39e42e8fb84145a30395ddcf891692`. Each directory has a complete
-`UPSTREAM.md` source and patch record.
+Each vendored runtime directory contains the upstream `runtime/` crate and an
+`UPSTREAM.md` source/patch record. The registry currently contains:
+
+| Workspace | Exact upstream commit | Intended evidence envelope |
+| --- | --- | --- |
+| `v1_0_7` | `57abc370fa39e42e8fb84145a30395ddcf891692` | slot 0 through the verified slot-619848 handoff |
+| `v1_0_8` | `2a617f2d07f714918891f2b479d1cb1c324f0365` | slot 619849 through epoch 7 |
+| `v1_0_13` | `fdeda769d05fea4a3f861e787d47d995feee15d7` | epoch 8 |
+| `v1_0_14` | `8631be42ac29a062b5e26a85fc2f4c94af042afd` | epochs 9–10 |
+| `v1_0_17` | `cfc7b22c4c9094d09fc969247bfe60a154027d84` | epoch 11 |
+| `v1_0_18` | `f26f18d29d650d06f5c5b7a4eb625622a999ea66` | unassigned exact fallback for late epoch 12 through epoch 15 |
+| `v1_0_23` | `825c0e2b6e39ae67431ed0a8282260ad3914c87a` | checkpoint-gated diagnostic envelope, epochs 12–29 |
+| `v1_0_24` | `a93915f1bddb73480f86fc09f487315ae191897d` | registered but unassigned differential candidate |
+| `v1_1_23` | `263fc25992ebae85e7ba2f176e9a066449489c3e` | checkpoint-gated diagnostic envelope, epochs 30–60 |
+| `v1_2_32` | `8c989da68342918f1717c60aa60fdfab7d1e676e` | checkpoint-gated diagnostic envelope, epochs 61–91 |
+| `v1_3_19` | `15a49d75086f95573ad319b22e4843639bdf2169` | checkpoint-gated diagnostic envelope, epochs 92–100 |
 
 The source has only these integration changes:
 

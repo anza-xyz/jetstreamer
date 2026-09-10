@@ -1,0 +1,11 @@
+[workspace]
+members = [
+    "protocol",
+    "worker",
+]
+exclude = ["vendor/solana-runtime-1.1.23"]
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3

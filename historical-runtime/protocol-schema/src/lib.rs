@@ -204,7 +204,7 @@ pub struct SnapshotExport {
     pub archive_sha256: Vec<u8>,
 }
 
-/// The normalized Solana v1 transaction-error superset through v1.0.24.
+/// The normalized Solana v1 transaction-error superset through v1.1.23.
 /// Older workers emit only the variants present in their exact release.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum TransactionError {
@@ -226,9 +226,11 @@ pub enum TransactionError {
     SignatureFailure,
     InvalidProgramForExecution,
     SanitizeFailure,
+    /// Appended for v1.1.23. Existing variant discriminants remain unchanged.
+    ClusterMaintenance,
 }
 
-/// The normalized Solana v1 instruction-error superset through v1.0.24.
+/// The normalized Solana v1 instruction-error superset through v1.3.19.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum InstructionError {
     GenericError,
@@ -258,6 +260,23 @@ pub enum InstructionError {
     DuplicateAccountOutOfSync,
     Custom(u32),
     InvalidError,
+    /// Appended in the same order as the v1.1.23 SDK enum. Existing variant
+    /// discriminants remain unchanged.
+    ExecutableDataModified,
+    ExecutableLamportChange,
+    ExecutableAccountNotRentExempt,
+    /// Appended in the same order as the v1.2.32 SDK enum. Existing variant
+    /// discriminants remain unchanged.
+    UnsupportedProgramId,
+    CallDepth,
+    MissingAccount,
+    ReentrancyNotAllowed,
+    MaxSeedLengthExceeded,
+    InvalidSeeds,
+    /// Appended in the same order as the v1.3.19 SDK enum. Existing variant
+    /// discriminants remain unchanged.
+    InvalidRealloc,
+    ComputationalBudgetExceeded,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -469,6 +488,78 @@ mod tests {
     }
 
     #[test]
+    fn v1_1_error_extensions_preserve_all_prior_discriminants() {
+        // These were the terminal variants in protocol v4 before the v1.1
+        // vocabulary was appended. Pin them byte-for-byte for old workers.
+        assert_eq!(
+            bincode::serialize(&TransactionError::SanitizeFailure).unwrap(),
+            14u32.to_le_bytes()
+        );
+        assert_eq!(
+            bincode::serialize(&InstructionError::InvalidError).unwrap(),
+            26u32.to_le_bytes()
+        );
+
+        assert_eq!(
+            bincode::serialize(&TransactionError::ClusterMaintenance).unwrap(),
+            15u32.to_le_bytes()
+        );
+        assert_eq!(
+            bincode::serialize(&InstructionError::ExecutableDataModified).unwrap(),
+            27u32.to_le_bytes()
+        );
+        assert_eq!(
+            bincode::serialize(&InstructionError::ExecutableLamportChange).unwrap(),
+            28u32.to_le_bytes()
+        );
+        assert_eq!(
+            bincode::serialize(&InstructionError::ExecutableAccountNotRentExempt).unwrap(),
+            29u32.to_le_bytes()
+        );
+    }
+
+    #[test]
+    fn v1_2_error_extensions_preserve_all_prior_discriminants() {
+        // v1.1's terminal instruction error remains byte-for-byte stable, and
+        // the v1.2 vocabulary is append-only in exact upstream enum order.
+        assert_eq!(
+            bincode::serialize(&InstructionError::ExecutableAccountNotRentExempt).unwrap(),
+            29u32.to_le_bytes()
+        );
+
+        let cases = [
+            (InstructionError::UnsupportedProgramId, 30u32),
+            (InstructionError::CallDepth, 31),
+            (InstructionError::MissingAccount, 32),
+            (InstructionError::ReentrancyNotAllowed, 33),
+            (InstructionError::MaxSeedLengthExceeded, 34),
+            (InstructionError::InvalidSeeds, 35),
+        ];
+        for (error, discriminant) in cases.iter() {
+            assert_eq!(
+                bincode::serialize(error).unwrap(),
+                discriminant.to_le_bytes()
+            );
+        }
+    }
+
+    #[test]
+    fn v1_3_error_extensions_preserve_all_prior_discriminants() {
+        assert_eq!(
+            bincode::serialize(&InstructionError::InvalidSeeds).unwrap(),
+            35u32.to_le_bytes()
+        );
+        assert_eq!(
+            bincode::serialize(&InstructionError::InvalidRealloc).unwrap(),
+            36u32.to_le_bytes()
+        );
+        assert_eq!(
+            bincode::serialize(&InstructionError::ComputationalBudgetExceeded).unwrap(),
+            37u32.to_le_bytes()
+        );
+    }
+
+    #[test]
     fn rejects_oversized_frame_before_allocating_payload() {
         let mut bytes = ((MAX_FRAME_BYTES as u32) + 1).to_le_bytes().to_vec();
         bytes.extend_from_slice(&[0; 8]);
@@ -523,5 +614,4 @@ mod tests {
         let error = read_frame::<Request, _>(&mut framed.as_slice()).unwrap_err();
         assert_eq!(error.kind(), ErrorKind::InvalidData);
     }
-
 }

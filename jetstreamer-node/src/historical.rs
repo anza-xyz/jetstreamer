@@ -64,9 +64,61 @@ const SOLANA_V1_0_8_TAG: &str = "v1.0.8";
 const SOLANA_V1_0_8_COMMIT: &str = "2a617f2d07f714918891f2b479d1cb1c324f0365";
 const SOLANA_V1_0_8_RUST_TOOLCHAIN: &str = "rustc 1.42.0 (b8cedc004 2020-03-09)";
 const SOLANA_V1_0_8_TARGET: &str = "x86_64-unknown-linux-gnu";
+const SOLANA_V1_0_13_BACKEND_ID: &str = "solana-v1.0.13";
+const SOLANA_V1_0_13_TAG: &str = "v1.0.13";
+const SOLANA_V1_0_13_COMMIT: &str = "fdeda769d05fea4a3f861e787d47d995feee15d7";
+const SOLANA_V1_0_13_RUST_TOOLCHAIN: &str = "rustc 1.42.0 (b8cedc004 2020-03-09)";
+const SOLANA_V1_0_13_TARGET: &str = "x86_64-unknown-linux-gnu";
+const SOLANA_V1_0_14_BACKEND_ID: &str = "solana-v1.0.14";
+const SOLANA_V1_0_14_TAG: &str = "v1.0.14";
+const SOLANA_V1_0_14_COMMIT: &str = "8631be42ac29a062b5e26a85fc2f4c94af042afd";
+const SOLANA_V1_0_14_RUST_TOOLCHAIN: &str = "rustc 1.42.0 (b8cedc004 2020-03-09)";
+const SOLANA_V1_0_14_TARGET: &str = "x86_64-unknown-linux-gnu";
+const SOLANA_V1_0_17_BACKEND_ID: &str = "solana-v1.0.17";
+const SOLANA_V1_0_17_TAG: &str = "v1.0.17";
+const SOLANA_V1_0_17_COMMIT: &str = "cfc7b22c4c9094d09fc969247bfe60a154027d84";
+const SOLANA_V1_0_17_RUST_TOOLCHAIN: &str = "rustc 1.42.0 (b8cedc004 2020-03-09)";
+const SOLANA_V1_0_17_TARGET: &str = "x86_64-unknown-linux-gnu";
+const SOLANA_V1_0_18_BACKEND_ID: &str = "solana-v1.0.18";
+const SOLANA_V1_0_18_TAG: &str = "v1.0.18";
+const SOLANA_V1_0_18_COMMIT: &str = "f26f18d29d650d06f5c5b7a4eb625622a999ea66";
+const SOLANA_V1_0_18_RUST_TOOLCHAIN: &str = "rustc 1.42.0 (b8cedc004 2020-03-09)";
+const SOLANA_V1_0_18_TARGET: &str = "x86_64-unknown-linux-gnu";
+const SOLANA_V1_0_23_BACKEND_ID: &str = "solana-v1.0.23";
+const SOLANA_V1_0_23_TAG: &str = "v1.0.23";
+const SOLANA_V1_0_23_COMMIT: &str = "825c0e2b6e39ae67431ed0a8282260ad3914c87a";
+const SOLANA_V1_0_23_RUST_TOOLCHAIN: &str = "rustc 1.43.0 (4fb7144ed 2020-04-20)";
+const SOLANA_V1_0_23_TARGET: &str = "x86_64-unknown-linux-gnu";
+const SOLANA_V1_1_23_BACKEND_ID: &str = "solana-v1.1.23";
+const SOLANA_V1_1_23_TAG: &str = "v1.1.23";
+const SOLANA_V1_1_23_COMMIT: &str = "263fc25992ebae85e7ba2f176e9a066449489c3e";
+const SOLANA_V1_1_23_RUST_TOOLCHAIN: &str = "rustc 1.43.0 (4fb7144ed 2020-04-20)";
+const SOLANA_V1_1_23_TARGET: &str = "x86_64-unknown-linux-gnu";
+const SOLANA_V1_2_32_BACKEND_ID: &str = "solana-v1.2.32";
+const SOLANA_V1_2_32_TAG: &str = "v1.2.32";
+const SOLANA_V1_2_32_COMMIT: &str = "8c989da68342918f1717c60aa60fdfab7d1e676e";
+const SOLANA_V1_2_32_RUST_TOOLCHAIN: &str = "rustc 1.43.0 (4fb7144ed 2020-04-20)";
+const SOLANA_V1_2_32_TARGET: &str = "x86_64-unknown-linux-gnu";
+const SOLANA_V1_3_19_BACKEND_ID: &str = "solana-v1.3.19";
+const SOLANA_V1_3_19_TAG: &str = "v1.3.19";
+const SOLANA_V1_3_19_COMMIT: &str = "15a49d75086f95573ad319b22e4843639bdf2169";
+const SOLANA_V1_3_19_RUST_TOOLCHAIN: &str = "rustc 1.45.1 (c367798cf 2020-07-26)";
+const SOLANA_V1_3_19_TARGET: &str = "x86_64-unknown-linux-gnu";
 
 fn backend_supports_entry_batches(backend_id: &str) -> bool {
-    backend_id == SOLANA_V1_0_7_BACKEND_ID || backend_id == SOLANA_V1_0_8_BACKEND_ID
+    matches!(
+        backend_id,
+        SOLANA_V1_0_7_BACKEND_ID
+            | SOLANA_V1_0_8_BACKEND_ID
+            | SOLANA_V1_0_13_BACKEND_ID
+            | SOLANA_V1_0_14_BACKEND_ID
+            | SOLANA_V1_0_17_BACKEND_ID
+            | SOLANA_V1_0_18_BACKEND_ID
+            | SOLANA_V1_0_23_BACKEND_ID
+            | SOLANA_V1_1_23_BACKEND_ID
+            | SOLANA_V1_2_32_BACKEND_ID
+            | SOLANA_V1_3_19_BACKEND_ID
+    )
 }
 
 const DEFAULT_CONTROL_TIMEOUT: Duration = Duration::from_secs(60);
@@ -122,6 +174,78 @@ pub const SOLANA_V1_0_8_CANDIDATE: WorkerProfile = WorkerProfile {
     solana_commit: SOLANA_V1_0_8_COMMIT,
     rust_toolchain: SOLANA_V1_0_8_RUST_TOOLCHAIN,
     target: SOLANA_V1_0_8_TARGET,
+    required_genesis_hash: protocol::MAINNET_GENESIS_HASH,
+};
+
+pub const SOLANA_V1_0_13_CANDIDATE: WorkerProfile = WorkerProfile {
+    backend_id: SOLANA_V1_0_13_BACKEND_ID,
+    solana_tag: SOLANA_V1_0_13_TAG,
+    solana_commit: SOLANA_V1_0_13_COMMIT,
+    rust_toolchain: SOLANA_V1_0_13_RUST_TOOLCHAIN,
+    target: SOLANA_V1_0_13_TARGET,
+    required_genesis_hash: protocol::MAINNET_GENESIS_HASH,
+};
+
+pub const SOLANA_V1_0_14_CANDIDATE: WorkerProfile = WorkerProfile {
+    backend_id: SOLANA_V1_0_14_BACKEND_ID,
+    solana_tag: SOLANA_V1_0_14_TAG,
+    solana_commit: SOLANA_V1_0_14_COMMIT,
+    rust_toolchain: SOLANA_V1_0_14_RUST_TOOLCHAIN,
+    target: SOLANA_V1_0_14_TARGET,
+    required_genesis_hash: protocol::MAINNET_GENESIS_HASH,
+};
+
+pub const SOLANA_V1_0_17_CANDIDATE: WorkerProfile = WorkerProfile {
+    backend_id: SOLANA_V1_0_17_BACKEND_ID,
+    solana_tag: SOLANA_V1_0_17_TAG,
+    solana_commit: SOLANA_V1_0_17_COMMIT,
+    rust_toolchain: SOLANA_V1_0_17_RUST_TOOLCHAIN,
+    target: SOLANA_V1_0_17_TARGET,
+    required_genesis_hash: protocol::MAINNET_GENESIS_HASH,
+};
+
+pub const SOLANA_V1_0_18_CANDIDATE: WorkerProfile = WorkerProfile {
+    backend_id: SOLANA_V1_0_18_BACKEND_ID,
+    solana_tag: SOLANA_V1_0_18_TAG,
+    solana_commit: SOLANA_V1_0_18_COMMIT,
+    rust_toolchain: SOLANA_V1_0_18_RUST_TOOLCHAIN,
+    target: SOLANA_V1_0_18_TARGET,
+    required_genesis_hash: protocol::MAINNET_GENESIS_HASH,
+};
+
+pub const SOLANA_V1_0_23_CANDIDATE: WorkerProfile = WorkerProfile {
+    backend_id: SOLANA_V1_0_23_BACKEND_ID,
+    solana_tag: SOLANA_V1_0_23_TAG,
+    solana_commit: SOLANA_V1_0_23_COMMIT,
+    rust_toolchain: SOLANA_V1_0_23_RUST_TOOLCHAIN,
+    target: SOLANA_V1_0_23_TARGET,
+    required_genesis_hash: protocol::MAINNET_GENESIS_HASH,
+};
+
+pub const SOLANA_V1_1_23_CANDIDATE: WorkerProfile = WorkerProfile {
+    backend_id: SOLANA_V1_1_23_BACKEND_ID,
+    solana_tag: SOLANA_V1_1_23_TAG,
+    solana_commit: SOLANA_V1_1_23_COMMIT,
+    rust_toolchain: SOLANA_V1_1_23_RUST_TOOLCHAIN,
+    target: SOLANA_V1_1_23_TARGET,
+    required_genesis_hash: protocol::MAINNET_GENESIS_HASH,
+};
+
+pub const SOLANA_V1_2_32_CANDIDATE: WorkerProfile = WorkerProfile {
+    backend_id: SOLANA_V1_2_32_BACKEND_ID,
+    solana_tag: SOLANA_V1_2_32_TAG,
+    solana_commit: SOLANA_V1_2_32_COMMIT,
+    rust_toolchain: SOLANA_V1_2_32_RUST_TOOLCHAIN,
+    target: SOLANA_V1_2_32_TARGET,
+    required_genesis_hash: protocol::MAINNET_GENESIS_HASH,
+};
+
+pub const SOLANA_V1_3_19_CANDIDATE: WorkerProfile = WorkerProfile {
+    backend_id: SOLANA_V1_3_19_BACKEND_ID,
+    solana_tag: SOLANA_V1_3_19_TAG,
+    solana_commit: SOLANA_V1_3_19_COMMIT,
+    rust_toolchain: SOLANA_V1_3_19_RUST_TOOLCHAIN,
+    target: SOLANA_V1_3_19_TARGET,
     required_genesis_hash: protocol::MAINNET_GENESIS_HASH,
 };
 
@@ -2014,8 +2138,9 @@ pub fn encode_legacy_transaction(
     Ok(encoded)
 }
 
-/// Normalize a current transaction status into exactly the v1.0.24 status
-/// vocabulary.  Newer-only statuses fail closed instead of being conflated.
+/// Normalize a current transaction status into the version-neutral historical
+/// vocabulary through v1.1.23. Newer-only statuses fail closed instead of
+/// being conflated.
 pub fn normalize_transaction_error(
     error: &CurrentTransactionError,
 ) -> Result<protocol::TransactionError, HistoricalRuntimeError> {
@@ -2041,8 +2166,8 @@ pub fn normalize_transaction_error(
         Current::SignatureFailure => Old::SignatureFailure,
         Current::InvalidProgramForExecution => Old::InvalidProgramForExecution,
         Current::SanitizeFailure => Old::SanitizeFailure,
-        Current::ClusterMaintenance
-        | Current::AccountBorrowOutstanding
+        Current::ClusterMaintenance => Old::ClusterMaintenance,
+        Current::AccountBorrowOutstanding
         | Current::WouldExceedMaxBlockCostLimit
         | Current::UnsupportedVersion
         | Current::InvalidWritableAccount
@@ -2072,8 +2197,8 @@ pub fn normalize_transaction_error(
     })
 }
 
-/// Normalize a current instruction status into exactly the v1.0.24 status
-/// vocabulary.  `Custom` is preserved as the old custom-error value.
+/// Normalize a current instruction status into the version-neutral historical
+/// vocabulary through v1.3.19. `Custom` preserves its numeric value.
 #[allow(deprecated)]
 pub fn normalize_instruction_error(
     error: &CurrentInstructionError,
@@ -2109,18 +2234,18 @@ pub fn normalize_instruction_error(
         Current::DuplicateAccountOutOfSync => Old::DuplicateAccountOutOfSync,
         Current::Custom(code) => Old::Custom(*code),
         Current::InvalidError => Old::InvalidError,
-        Current::ExecutableDataModified
-        | Current::ExecutableLamportChange
-        | Current::ExecutableAccountNotRentExempt
-        | Current::UnsupportedProgramId
-        | Current::CallDepth
-        | Current::MissingAccount
-        | Current::ReentrancyNotAllowed
-        | Current::MaxSeedLengthExceeded
-        | Current::InvalidSeeds
-        | Current::InvalidRealloc
-        | Current::ComputationalBudgetExceeded
-        | Current::PrivilegeEscalation
+        Current::ExecutableDataModified => Old::ExecutableDataModified,
+        Current::ExecutableLamportChange => Old::ExecutableLamportChange,
+        Current::ExecutableAccountNotRentExempt => Old::ExecutableAccountNotRentExempt,
+        Current::UnsupportedProgramId => Old::UnsupportedProgramId,
+        Current::CallDepth => Old::CallDepth,
+        Current::MissingAccount => Old::MissingAccount,
+        Current::ReentrancyNotAllowed => Old::ReentrancyNotAllowed,
+        Current::MaxSeedLengthExceeded => Old::MaxSeedLengthExceeded,
+        Current::InvalidSeeds => Old::InvalidSeeds,
+        Current::InvalidRealloc => Old::InvalidRealloc,
+        Current::ComputationalBudgetExceeded => Old::ComputationalBudgetExceeded,
+        Current::PrivilegeEscalation
         | Current::ProgramEnvironmentSetupFailure
         | Current::ProgramFailedToComplete
         | Current::ProgramFailedToCompile
@@ -2143,9 +2268,8 @@ pub fn normalize_instruction_error(
     })
 }
 
-/// Convert an exact v1.0.24 transaction status back into the current status
-/// type used by Horizon metadata. The historical vocabulary is a strict
-/// subset, so this direction is infallible.
+/// Convert a historical transaction status through v1.1.23 back into the
+/// current status type used by Horizon metadata.
 pub fn denormalize_transaction_error(
     error: &protocol::TransactionError,
 ) -> CurrentTransactionError {
@@ -2171,10 +2295,12 @@ pub fn denormalize_transaction_error(
         Old::SignatureFailure => Current::SignatureFailure,
         Old::InvalidProgramForExecution => Current::InvalidProgramForExecution,
         Old::SanitizeFailure => Current::SanitizeFailure,
+        Old::ClusterMaintenance => Current::ClusterMaintenance,
     }
 }
 
-/// Convert an exact v1.0.24 instruction status into the current superset.
+/// Convert a historical instruction status through v1.3.19 into the current
+/// superset.
 #[allow(deprecated)]
 pub fn denormalize_instruction_error(
     error: &protocol::InstructionError,
@@ -2210,6 +2336,17 @@ pub fn denormalize_instruction_error(
         Old::DuplicateAccountOutOfSync => Current::DuplicateAccountOutOfSync,
         Old::Custom(code) => Current::Custom(*code),
         Old::InvalidError => Current::InvalidError,
+        Old::ExecutableDataModified => Current::ExecutableDataModified,
+        Old::ExecutableLamportChange => Current::ExecutableLamportChange,
+        Old::ExecutableAccountNotRentExempt => Current::ExecutableAccountNotRentExempt,
+        Old::UnsupportedProgramId => Current::UnsupportedProgramId,
+        Old::CallDepth => Current::CallDepth,
+        Old::MissingAccount => Current::MissingAccount,
+        Old::ReentrancyNotAllowed => Current::ReentrancyNotAllowed,
+        Old::MaxSeedLengthExceeded => Current::MaxSeedLengthExceeded,
+        Old::InvalidSeeds => Current::InvalidSeeds,
+        Old::InvalidRealloc => Current::InvalidRealloc,
+        Old::ComputationalBudgetExceeded => Current::ComputationalBudgetExceeded,
     }
 }
 
@@ -3312,6 +3449,14 @@ mod tests {
     fn entry_batches_are_enabled_only_for_implemented_workers() {
         assert!(backend_supports_entry_batches(SOLANA_V1_0_7_BACKEND_ID));
         assert!(backend_supports_entry_batches(SOLANA_V1_0_8_BACKEND_ID));
+        assert!(backend_supports_entry_batches(SOLANA_V1_0_13_BACKEND_ID));
+        assert!(backend_supports_entry_batches(SOLANA_V1_0_14_BACKEND_ID));
+        assert!(backend_supports_entry_batches(SOLANA_V1_0_17_BACKEND_ID));
+        assert!(backend_supports_entry_batches(SOLANA_V1_0_18_BACKEND_ID));
+        assert!(backend_supports_entry_batches(SOLANA_V1_0_23_BACKEND_ID));
+        assert!(backend_supports_entry_batches(SOLANA_V1_1_23_BACKEND_ID));
+        assert!(backend_supports_entry_batches(SOLANA_V1_2_32_BACKEND_ID));
+        assert!(backend_supports_entry_batches(SOLANA_V1_3_19_BACKEND_ID));
         assert!(!backend_supports_entry_batches(SOLANA_V1_0_24_BACKEND_ID));
         assert!(!backend_supports_entry_batches("unknown"));
     }
@@ -4506,6 +4651,18 @@ mod tests {
             &valid_handshake_for(SOLANA_V1_0_8_CANDIDATE),
         )
         .unwrap();
+        for profile in [
+            SOLANA_V1_0_13_CANDIDATE,
+            SOLANA_V1_0_14_CANDIDATE,
+            SOLANA_V1_0_17_CANDIDATE,
+            SOLANA_V1_0_18_CANDIDATE,
+            SOLANA_V1_0_23_CANDIDATE,
+            SOLANA_V1_1_23_CANDIDATE,
+            SOLANA_V1_2_32_CANDIDATE,
+            SOLANA_V1_3_19_CANDIDATE,
+        ] {
+            verify_handshake(profile, &valid_handshake_for(profile)).unwrap();
+        }
         verify_handshake(SOLANA_V1_0_24_CANDIDATE, &valid_handshake()).unwrap();
     }
 
@@ -4696,7 +4853,7 @@ mod tests {
     }
 
     #[test]
-    fn maps_every_v1_transaction_status_and_rejects_newer_statuses() {
+    fn maps_every_v1_1_transaction_status_and_rejects_newer_statuses() {
         use CurrentTransactionError as Current;
         use protocol::TransactionError as Old;
 
@@ -4728,6 +4885,7 @@ mod tests {
                 Old::InvalidProgramForExecution,
             ),
             (Current::SanitizeFailure, Old::SanitizeFailure),
+            (Current::ClusterMaintenance, Old::ClusterMaintenance),
         ];
         for (current, expected) in cases {
             assert_eq!(normalize_transaction_error(&current).unwrap(), expected);
@@ -4743,7 +4901,7 @@ mod tests {
 
     #[test]
     #[allow(deprecated)]
-    fn maps_every_v1_instruction_status_and_rejects_newer_statuses() {
+    fn maps_every_v1_3_instruction_status_and_rejects_newer_statuses() {
         use CurrentInstructionError as Current;
         use protocol::InstructionError as Old;
 
@@ -4793,15 +4951,35 @@ mod tests {
             ),
             (Current::Custom(0xdecafbad), Old::Custom(0xdecafbad)),
             (Current::InvalidError, Old::InvalidError),
+            (Current::ExecutableDataModified, Old::ExecutableDataModified),
+            (
+                Current::ExecutableLamportChange,
+                Old::ExecutableLamportChange,
+            ),
+            (
+                Current::ExecutableAccountNotRentExempt,
+                Old::ExecutableAccountNotRentExempt,
+            ),
+            (Current::UnsupportedProgramId, Old::UnsupportedProgramId),
+            (Current::CallDepth, Old::CallDepth),
+            (Current::MissingAccount, Old::MissingAccount),
+            (Current::ReentrancyNotAllowed, Old::ReentrancyNotAllowed),
+            (Current::MaxSeedLengthExceeded, Old::MaxSeedLengthExceeded),
+            (Current::InvalidSeeds, Old::InvalidSeeds),
+            (Current::InvalidRealloc, Old::InvalidRealloc),
+            (
+                Current::ComputationalBudgetExceeded,
+                Old::ComputationalBudgetExceeded,
+            ),
         ];
         for (current, expected) in cases {
             assert_eq!(normalize_instruction_error(&current).unwrap(), expected);
             assert_eq!(denormalize_instruction_error(&expected), current);
         }
         assert!(matches!(
-            normalize_instruction_error(&Current::ComputationalBudgetExceeded),
+            normalize_instruction_error(&Current::PrivilegeEscalation),
             Err(HistoricalRuntimeError::UnsupportedInstructionError(
-                Current::ComputationalBudgetExceeded
+                Current::PrivilegeEscalation
             ))
         ));
     }

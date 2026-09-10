@@ -25,8 +25,11 @@ use std::{cmp, collections::HashMap, env, path::Path, sync::Arc};
 use tempfile::TempDir;
 
 const MAX_AGE_CORRECTION_EPOCH: u64 = 14;
-const MAX_SUPPORTED_SLOT_EXCLUSIVE: u64 = 4_752_000;
-const MAX_SUPPORTED_EPOCH: u64 = 10;
+// Epoch 7 is the last range whose bootstrap snapshot uses the bank schema this
+// exact runtime can decode. Later ranges stay fail-closed until a matching
+// historical worker passes differential replay.
+const MAX_SUPPORTED_SLOT_EXCLUSIVE: u64 = 3_456_000;
+const MAX_SUPPORTED_EPOCH: u64 = 7;
 const POH_THREADS_ENV: &str = "JETSTREAMER_HISTORICAL_POH_THREADS";
 const ABSOLUTE_MAX_POH_THREADS: usize = 256;
 
@@ -866,7 +869,7 @@ fn restore_mainnet_runtime_hooks(bank: &mut Bank, genesis: &GenesisConfig) -> Re
     restore_mainnet_native_processors(bank);
 
     // The upstream Stable callback has no state effects in epochs 0 through
-    // 10. Install the callback explicitly and guard that qualified interval;
+    // 7. Install the callback explicitly and guard that candidate interval;
     // process_entry rejects the first later slot before constructing its bank.
     bank.set_entered_epoch_callback(Box::new(|bank| {
         assert!(

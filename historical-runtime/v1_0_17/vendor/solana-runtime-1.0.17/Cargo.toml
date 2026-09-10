@@ -1,0 +1,48 @@
+[package]
+name = "solana-runtime"
+version = "1.0.17"
+description = "Solana runtime"
+authors = ["Solana Maintainers <maintainers@solana.com>"]
+repository = "https://github.com/solana-labs/solana"
+license = "Apache-2.0"
+homepage = "https://solana.com/"
+edition = "2018"
+
+[dependencies]
+bincode = "1.2.1"
+bv = { version = "0.11.1", features = ["serde"] }
+byteorder = "1.3.2"
+fnv = "1.0.6"
+fs_extra = "1.1.0"
+itertools = "0.8.2"
+lazy_static = "1.4.0"
+libc = "0.2.66"
+libloading = "0.5.2"
+log = "0.4.8"
+memmap = "0.7.0"
+num-derive = { version = "0.3" }
+num-traits = { version = "0.2" }
+rand = "0.6.5"
+rayon = "1.2.0"
+serde = { version = "1.0.104", features = ["rc"] }
+serde_derive = "1.0.103"
+solana-bpf-loader-program = { git = "https://github.com/solana-labs/solana.git", rev = "cfc7b22c4c9094d09fc969247bfe60a154027d84", version = "1.0.17" }
+solana-logger = { git = "https://github.com/solana-labs/solana.git", rev = "cfc7b22c4c9094d09fc969247bfe60a154027d84", version = "1.0.17" }
+solana-measure = { git = "https://github.com/solana-labs/solana.git", rev = "cfc7b22c4c9094d09fc969247bfe60a154027d84", version = "1.0.17" }
+solana-metrics = { git = "https://github.com/solana-labs/solana.git", rev = "cfc7b22c4c9094d09fc969247bfe60a154027d84", version = "1.0.17" }
+solana-rayon-threadlimit = { git = "https://github.com/solana-labs/solana.git", rev = "cfc7b22c4c9094d09fc969247bfe60a154027d84", version = "1.0.17" }
+solana-sdk = { git = "https://github.com/solana-labs/solana.git", rev = "cfc7b22c4c9094d09fc969247bfe60a154027d84", version = "1.0.17" }
+solana-stake-program = { git = "https://github.com/solana-labs/solana.git", rev = "cfc7b22c4c9094d09fc969247bfe60a154027d84", version = "1.0.17" }
+solana-storage-program = { git = "https://github.com/solana-labs/solana.git", rev = "cfc7b22c4c9094d09fc969247bfe60a154027d84", version = "1.0.17" }
+solana-vote-program = { git = "https://github.com/solana-labs/solana.git", rev = "cfc7b22c4c9094d09fc969247bfe60a154027d84", version = "1.0.17" }
+tempfile = "3.1.0"
+thiserror = "1.0"
+
+
+[lib]
+crate-type = ["lib"]
+name = "solana_runtime"
+
+[dev-dependencies]
+assert_matches = "1.3.0"
+solana-noop-program = { git = "https://github.com/solana-labs/solana.git", rev = "cfc7b22c4c9094d09fc969247bfe60a154027d84", version = "1.0.17" }

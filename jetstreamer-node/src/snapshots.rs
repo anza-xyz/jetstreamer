@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     path::{Path, PathBuf},
     process::Stdio,
 };
@@ -8,6 +9,8 @@ use tokio::process::Command;
 
 pub const DEFAULT_BUCKET: &str = "gs://mainnet-beta-ledger-us-ny5";
 const ALL_SNAPSHOT_ARCHIVE_EXTENSIONS: &[&str] = &[".tar.zst", ".tar.lz4", ".tar.bz2"];
+static DEFAULT_SNAPSHOT_INVENTORY: tokio::sync::OnceCell<SnapshotInventory> =
+    tokio::sync::OnceCell::const_new();
 
 /// Metadata for a snapshot stored in the ledger bucket.
 #[derive(Debug, Clone)]
@@ -18,6 +21,32 @@ pub struct SnapshotInfo {
     pub slot_dir: u64,
     /// Full GCS URI to the snapshot tarball.
     pub snapshot_uri: String,
+}
+
+/// Validated snapshot objects returned by one flat bucket listing.
+#[derive(Debug, Default)]
+struct SnapshotInventory {
+    objects_by_slot: BTreeMap<u64, Vec<String>>,
+}
+
+impl SnapshotInventory {
+    fn slots(&self) -> impl Iterator<Item = u64> + '_ {
+        self.objects_by_slot.keys().copied()
+    }
+
+    fn objects_for_slot(&self, slot: u64, archive_extensions: &[&str]) -> Vec<String> {
+        self.objects_by_slot
+            .get(&slot)
+            .into_iter()
+            .flatten()
+            .filter(|uri| {
+                uri.rsplit('/')
+                    .next()
+                    .is_some_and(|name| snapshot_name_matches(name, archive_extensions))
+            })
+            .cloned()
+            .collect()
+    }
 }
 
 /// Errors surfaced while resolving or downloading snapshots.
@@ -66,7 +95,7 @@ pub enum SnapshotError {
 /// Resolve the GCS URI for the snapshot tarball corresponding to an epoch.
 pub async fn resolve_epoch_snapshot(epoch: u64) -> Result<SnapshotInfo, SnapshotError> {
     let (start, end) = epoch_snapshot_search_window(epoch);
-    let mut candidates = list_bucket_slots(DEFAULT_BUCKET)
+    let mut candidates = snapshot_slots_for_bucket(DEFAULT_BUCKET)
         .await?
         .into_iter()
         .filter(|slot| *slot >= start && *slot <= end)
@@ -96,7 +125,7 @@ pub async fn resolve_epoch_snapshot(epoch: u64) -> Result<SnapshotInfo, Snapshot
 /// List all snapshot tarballs that report the requested epoch.
 pub async fn list_epoch_snapshots(epoch: u64) -> Result<Vec<SnapshotInfo>, SnapshotError> {
     let (start, end) = epoch_snapshot_search_window(epoch);
-    let mut candidates = list_bucket_slots(DEFAULT_BUCKET)
+    let mut candidates = snapshot_slots_for_bucket(DEFAULT_BUCKET)
         .await?
         .into_iter()
         .filter(|slot| *slot >= start && *slot <= end)
@@ -159,7 +188,7 @@ pub async fn list_snapshots_in_slot_range_matching(
         return Ok(Vec::new());
     }
 
-    let mut slots = list_bucket_slots(DEFAULT_BUCKET)
+    let mut slots = snapshot_slots_for_bucket(DEFAULT_BUCKET)
         .await?
         .into_iter()
         .filter(|slot| *slot >= start_slot && *slot <= end_slot_inclusive)
@@ -168,20 +197,13 @@ pub async fn list_snapshots_in_slot_range_matching(
 
     let mut snapshots = Vec::new();
     for slot in slots {
-        let objects = list_snapshot_objects(DEFAULT_BUCKET, slot, archive_extensions).await?;
-        match objects.as_slice() {
-            [] => {}
-            [snapshot_uri] => snapshots.push(SnapshotInfo {
+        let objects = snapshot_objects_for_bucket(DEFAULT_BUCKET, slot, archive_extensions).await?;
+        if let Some(snapshot_uri) = unique_snapshot_object(DEFAULT_BUCKET, slot, objects)? {
+            snapshots.push(SnapshotInfo {
                 epoch: slot_to_epoch(slot),
                 slot_dir: slot,
-                snapshot_uri: snapshot_uri.clone(),
-            }),
-            _ => {
-                return Err(SnapshotError::MultipleSnapshotObjects {
-                    slot_dir: format!("{DEFAULT_BUCKET}/{slot}"),
-                    objects,
-                });
-            }
+                snapshot_uri,
+            });
         }
     }
     Ok(snapshots)
@@ -206,7 +228,7 @@ pub async fn resolve_snapshot_at_or_before_slot_matching(
     // A numeric bucket directory may contain only a RocksDB export. Walk the
     // candidates newest-first and select the first actual snapshot archive,
     // rather than treating the newest numeric directory as a snapshot.
-    let mut slots = list_bucket_slots(DEFAULT_BUCKET)
+    let mut slots = snapshot_slots_for_bucket(DEFAULT_BUCKET)
         .await?
         .into_iter()
         .filter(|slot| *slot <= target_slot)
@@ -214,22 +236,14 @@ pub async fn resolve_snapshot_at_or_before_slot_matching(
     slots.sort_unstable_by(|left, right| right.cmp(left));
 
     for slot_dir in slots {
-        let objects = list_snapshot_objects(DEFAULT_BUCKET, slot_dir, archive_extensions).await?;
-        match objects.as_slice() {
-            [] => continue,
-            [snapshot_uri] => {
-                return Ok(SnapshotInfo {
-                    epoch,
-                    slot_dir,
-                    snapshot_uri: snapshot_uri.clone(),
-                });
-            }
-            _ => {
-                return Err(SnapshotError::MultipleSnapshotObjects {
-                    slot_dir: format!("{DEFAULT_BUCKET}/{slot_dir}"),
-                    objects,
-                });
-            }
+        let objects =
+            snapshot_objects_for_bucket(DEFAULT_BUCKET, slot_dir, archive_extensions).await?;
+        if let Some(snapshot_uri) = unique_snapshot_object(DEFAULT_BUCKET, slot_dir, objects)? {
+            return Ok(SnapshotInfo {
+                epoch,
+                slot_dir,
+                snapshot_uri,
+            });
         }
     }
 
@@ -294,8 +308,8 @@ pub async fn download_snapshot_at_or_before_slot_matching(
 /// Downloads one registry-committed snapshot object without performing a
 /// bucket listing or trusting a discovered filename.
 ///
-/// The object is first written to a unique temporary file in `dest_dir`,
-/// synced, and then published without replacing an existing path. A caller
+/// The object is first written beneath a unique private directory in
+/// `dest_dir`, synced, and then published without replacing an existing path. A caller
 /// must still restore and verify the snapshot's state commitment; this helper
 /// only makes local publication crash-safe and binds the requested object name
 /// to `slot`.
@@ -351,27 +365,34 @@ async fn resolve_snapshot_for_slot(
     slot_dir: u64,
 ) -> Result<SnapshotInfo, SnapshotError> {
     let snapshot_objects =
-        list_snapshot_objects(bucket, slot_dir, ALL_SNAPSHOT_ARCHIVE_EXTENSIONS).await?;
-    let snapshot_uri = match snapshot_objects.len() {
-        0 => {
-            return Err(SnapshotError::SnapshotObjectNotFound {
+        snapshot_objects_for_bucket(bucket, slot_dir, ALL_SNAPSHOT_ARCHIVE_EXTENSIONS).await?;
+    let snapshot_uri =
+        unique_snapshot_object(bucket, slot_dir, snapshot_objects)?.ok_or_else(|| {
+            SnapshotError::SnapshotObjectNotFound {
                 slot_dir: format!("{bucket}/{slot_dir}"),
-            });
-        }
-        1 => snapshot_objects[0].clone(),
-        _ => {
-            return Err(SnapshotError::MultipleSnapshotObjects {
-                slot_dir: format!("{bucket}/{slot_dir}"),
-                objects: snapshot_objects,
-            });
-        }
-    };
+            }
+        })?;
 
     Ok(SnapshotInfo {
         epoch,
         slot_dir,
         snapshot_uri,
     })
+}
+
+fn unique_snapshot_object(
+    bucket: &str,
+    slot: u64,
+    objects: Vec<String>,
+) -> Result<Option<String>, SnapshotError> {
+    match objects.len() {
+        0 => Ok(None),
+        1 => Ok(objects.into_iter().next()),
+        _ => Err(SnapshotError::MultipleSnapshotObjects {
+            slot_dir: format!("{}/{slot}", bucket.trim_end_matches('/')),
+            objects,
+        }),
+    }
 }
 
 async fn download_snapshot_to_dir(
@@ -382,12 +403,14 @@ async fn download_snapshot_to_dir(
     download_snapshot_uri_to_dir(&info.snapshot_uri, filename, dest_dir).await
 }
 
-/// Downloads into a unique file in `dest_dir` and publishes it atomically.
+/// Downloads beneath a unique private directory in `dest_dir` and publishes
+/// it atomically.
 ///
-/// The temporary suffix deliberately cannot match a supported snapshot
-/// archive extension. Snapshot discovery therefore cannot mistake an
-/// interrupted download for a complete archive. `persist_noclobber` also
-/// ensures a concurrently created destination is never overwritten.
+/// The temporary-directory suffix deliberately cannot match a supported
+/// snapshot archive extension. Snapshot discovery therefore cannot mistake
+/// an interrupted download for a complete archive. No-clobber hard-link
+/// publication also ensures a concurrently created destination is never
+/// overwritten.
 async fn download_snapshot_uri_to_dir(
     uri: &str,
     filename: &str,
@@ -398,22 +421,36 @@ async fn download_snapshot_uri_to_dir(
         return Ok(destination);
     }
 
-    let temporary = new_snapshot_download_tempfile(filename, dest_dir)?;
-    let temporary_arg = temporary.path().to_string_lossy().into_owned();
+    let temporary = new_snapshot_download(filename, dest_dir)?;
+    let temporary_arg = temporary.path.to_string_lossy().into_owned();
 
     gcloud_status(&["storage", "cp", uri, &temporary_arg]).await?;
-    publish_downloaded_snapshot(temporary, &destination, dest_dir)
+    publish_downloaded_snapshot(&temporary.path, &destination, dest_dir)
 }
 
-fn new_snapshot_download_tempfile(
+struct SnapshotDownload {
+    _directory: tempfile::TempDir,
+    path: PathBuf,
+}
+
+/// Reserves an owner-only directory but deliberately leaves the payload path
+/// absent. Current `gcloud storage cp` publishes downloads by renaming over
+/// its destination; passing an already-open `NamedTempFile` would leave our
+/// descriptor pointing at the empty, replaced inode.
+fn new_snapshot_download(
     filename: &str,
     dest_dir: &Path,
-) -> Result<tempfile::NamedTempFile, SnapshotError> {
-    tempfile::Builder::new()
+) -> Result<SnapshotDownload, SnapshotError> {
+    let directory = tempfile::Builder::new()
         .prefix(&format!(".{filename}."))
         .suffix(".download")
-        .tempfile_in(dest_dir)
-        .map_err(SnapshotError::Spawn)
+        .tempdir_in(dest_dir)
+        .map_err(SnapshotError::Spawn)?;
+    let path = directory.path().join("payload");
+    Ok(SnapshotDownload {
+        _directory: directory,
+        path,
+    })
 }
 
 /// Returns whether `destination` is an already complete snapshot file.
@@ -435,27 +472,25 @@ fn valid_existing_snapshot_destination(destination: &Path) -> Result<bool, Snaps
 }
 
 fn publish_downloaded_snapshot(
-    temporary: tempfile::NamedTempFile,
+    temporary: &Path,
     destination: &Path,
     dest_dir: &Path,
 ) -> Result<PathBuf, SnapshotError> {
-    let metadata = temporary
-        .as_file()
-        .metadata()
-        .map_err(SnapshotError::Spawn)?;
-    if !metadata.file_type().is_file() || metadata.len() == 0 {
+    if !valid_existing_snapshot_destination(temporary)? {
         return Err(SnapshotError::InvalidDestination {
-            path: temporary.path().to_path_buf(),
+            path: temporary.to_path_buf(),
         });
     }
-    temporary
-        .as_file()
-        .sync_all()
+    std::fs::File::open(temporary)
+        .and_then(|file| file.sync_all())
         .map_err(SnapshotError::Spawn)?;
 
-    let published = match temporary.persist_noclobber(destination) {
-        Ok(_) => destination.to_path_buf(),
-        Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
+    // The temporary directory lives inside `dest_dir`, so a hard link is an
+    // atomic, same-filesystem no-clobber publication. Dropping the temporary
+    // directory removes its name while the published link retains the bytes.
+    let published = match std::fs::hard_link(temporary, destination) {
+        Ok(()) => destination.to_path_buf(),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
             if valid_existing_snapshot_destination(destination)? {
                 destination.to_path_buf()
             } else {
@@ -467,7 +502,7 @@ fn publish_downloaded_snapshot(
         Err(error) => {
             return Err(SnapshotError::Persist {
                 path: destination.to_path_buf(),
-                source: error.error,
+                source: error,
             });
         }
     };
@@ -476,6 +511,128 @@ fn publish_downloaded_snapshot(
         .and_then(|directory| directory.sync_all())
         .map_err(SnapshotError::Spawn)?;
     Ok(published)
+}
+
+fn is_default_bucket(bucket: &str) -> bool {
+    bucket.trim_end_matches('/') == DEFAULT_BUCKET
+}
+
+fn bulk_snapshot_pattern(bucket: &str) -> String {
+    format!("{}/*/snapshot-*", bucket.trim_end_matches('/'))
+}
+
+async fn default_snapshot_inventory() -> Result<&'static SnapshotInventory, SnapshotError> {
+    DEFAULT_SNAPSHOT_INVENTORY
+        .get_or_try_init(|| async {
+            let pattern = bulk_snapshot_pattern(DEFAULT_BUCKET);
+            let listing = gcloud_stdout(&["storage", "ls", &pattern]).await?;
+            parse_snapshot_inventory(DEFAULT_BUCKET, &listing)
+        })
+        .await
+}
+
+async fn snapshot_slots_for_bucket(bucket: &str) -> Result<Vec<u64>, SnapshotError> {
+    if is_default_bucket(bucket) {
+        return Ok(default_snapshot_inventory().await?.slots().collect());
+    }
+    list_bucket_slots(bucket).await
+}
+
+async fn snapshot_objects_for_bucket(
+    bucket: &str,
+    slot: u64,
+    archive_extensions: &[&str],
+) -> Result<Vec<String>, SnapshotError> {
+    if is_default_bucket(bucket) {
+        return Ok(default_snapshot_inventory()
+            .await?
+            .objects_for_slot(slot, archive_extensions));
+    }
+    list_snapshot_objects(bucket, slot, archive_extensions).await
+}
+
+fn parse_snapshot_inventory(
+    bucket: &str,
+    listing: &str,
+) -> Result<SnapshotInventory, SnapshotError> {
+    let mut inventory = SnapshotInventory::default();
+    for line in listing.lines() {
+        let uri = line.trim();
+        if uri.is_empty() {
+            continue;
+        }
+        let (slot, name) = parse_snapshot_object_uri(bucket, uri)?;
+        // The wildcard also sees future or unrelated snapshot archive
+        // formats. Keep the existing extension-filtering behavior.
+        if !snapshot_name_matches(name, ALL_SNAPSHOT_ARCHIVE_EXTENSIONS) {
+            continue;
+        }
+        if !snapshot_name_is_bound_to_slot(name, slot, ALL_SNAPSHOT_ARCHIVE_EXTENSIONS) {
+            return Err(invalid_snapshot_object_uri(uri));
+        }
+        inventory
+            .objects_by_slot
+            .entry(slot)
+            .or_default()
+            .push(uri.to_owned());
+    }
+    for objects in inventory.objects_by_slot.values_mut() {
+        objects.sort_unstable();
+        objects.dedup();
+    }
+    Ok(inventory)
+}
+
+fn parse_snapshot_object_uri<'a>(
+    bucket: &str,
+    uri: &'a str,
+) -> Result<(u64, &'a str), SnapshotError> {
+    let prefix = format!("{}/", bucket.trim_end_matches('/'));
+    let rest = uri
+        .strip_prefix(&prefix)
+        .ok_or_else(|| invalid_snapshot_object_uri(uri))?;
+    let mut components = rest.split('/');
+    let slot_text = components
+        .next()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| invalid_snapshot_object_uri(uri))?;
+    let name = components
+        .next()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| invalid_snapshot_object_uri(uri))?;
+    if components.next().is_some()
+        || name.contains('\\')
+        || !slot_text.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err(invalid_snapshot_object_uri(uri));
+    }
+    let slot = slot_text
+        .parse::<u64>()
+        .map_err(|_| invalid_snapshot_object_uri(uri))?;
+    if slot.to_string() != slot_text {
+        return Err(invalid_snapshot_object_uri(uri));
+    }
+    Ok((slot, name))
+}
+
+fn snapshot_name_is_bound_to_slot(name: &str, slot: u64, archive_extensions: &[&str]) -> bool {
+    let prefix = format!("snapshot-{slot}-");
+    let Some(rest) = name.strip_prefix(&prefix) else {
+        return false;
+    };
+    archive_extensions.iter().any(|extension| {
+        !extension.is_empty()
+            && rest
+                .strip_suffix(extension)
+                .is_some_and(|identity| !identity.is_empty())
+    })
+}
+
+fn invalid_snapshot_object_uri(uri: &str) -> SnapshotError {
+    SnapshotError::Parse {
+        context: "snapshot object URI",
+        value: uri.to_owned(),
+    }
 }
 
 async fn list_bucket_slots(bucket: &str) -> Result<Vec<u64>, SnapshotError> {
@@ -558,17 +715,28 @@ async fn list_snapshot_objects(
     let mut objects = Vec::new();
 
     for line in stdout.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.ends_with('/') {
+        let uri = line.trim();
+        if uri.is_empty() || uri.ends_with('/') {
             continue;
         }
-        let Some(name) = line.rsplit('/').next() else {
+        let Some(name) = uri.rsplit('/').next() else {
             continue;
         };
-        if snapshot_name_matches(name, archive_extensions) {
-            objects.push(line.to_string());
+        if !snapshot_name_matches(name, archive_extensions) {
+            continue;
         }
+        let (listed_slot, parsed_name) = parse_snapshot_object_uri(bucket, uri)?;
+        if listed_slot != slot
+            || parsed_name != name
+            || !snapshot_name_is_bound_to_slot(name, slot, archive_extensions)
+        {
+            return Err(invalid_snapshot_object_uri(uri));
+        }
+        objects.push(uri.to_owned());
     }
+
+    objects.sort_unstable();
+    objects.dedup();
 
     Ok(objects)
 }
@@ -643,9 +811,88 @@ fn format_command(args: &[&str]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
 
     const BUCKET: &str = "gs://example-bucket";
+
+    #[test]
+    fn bulk_snapshot_listing_is_validated_sorted_and_deduplicated() {
+        let listing = "gs://example-bucket/619848/snapshot-619848-zeta.tar.bz2\n\
+                       gs://example-bucket/416012/snapshot-416012-alpha.tar.zst\n\
+                       gs://example-bucket/619848/snapshot-619848-zeta.tar.bz2\n\
+                       gs://example-bucket/830484/snapshot-830484-future.tar.gz\n";
+
+        let inventory = parse_snapshot_inventory(BUCKET, listing).unwrap();
+        assert_eq!(
+            inventory.slots().collect::<Vec<_>>(),
+            vec![416_012, 619_848]
+        );
+        assert_eq!(
+            inventory.objects_for_slot(416_012, ALL_SNAPSHOT_ARCHIVE_EXTENSIONS),
+            vec!["gs://example-bucket/416012/snapshot-416012-alpha.tar.zst"]
+        );
+        assert_eq!(
+            inventory.objects_for_slot(619_848, &[".tar.bz2"]),
+            vec!["gs://example-bucket/619848/snapshot-619848-zeta.tar.bz2"]
+        );
+        assert!(
+            inventory
+                .objects_for_slot(416_012, &[".tar.bz2"])
+                .is_empty()
+        );
+        assert!(inventory.slots().all(|slot| slot != 830_484));
+    }
+
+    #[test]
+    fn bulk_snapshot_listing_rejects_malformed_or_unbound_uris() {
+        for uri in [
+            "gs://other-bucket/416012/snapshot-416012-hash.tar.bz2",
+            "gs://example-bucket/not-a-slot/snapshot-416012-hash.tar.bz2",
+            "gs://example-bucket/0416012/snapshot-416012-hash.tar.bz2",
+            "gs://example-bucket/416012/nested/snapshot-416012-hash.tar.bz2",
+            "gs://example-bucket/416012/snapshot-619848-hash.tar.bz2",
+            "gs://example-bucket/416012/snapshot-416012-.tar.bz2",
+            "gs://example-bucket/416012/snapshot-416012-hash\\.tar.bz2",
+        ] {
+            let error = parse_snapshot_inventory(BUCKET, uri).unwrap_err();
+            assert!(matches!(
+                error,
+                SnapshotError::Parse {
+                    context: "snapshot object URI",
+                    ..
+                }
+            ));
+        }
+    }
+
+    #[test]
+    fn default_bucket_uses_one_flat_listing_pattern_only() {
+        assert!(is_default_bucket(DEFAULT_BUCKET));
+        assert!(is_default_bucket(&format!("{DEFAULT_BUCKET}/")));
+        assert!(!is_default_bucket(BUCKET));
+        assert_eq!(
+            bulk_snapshot_pattern(DEFAULT_BUCKET),
+            "gs://mainnet-beta-ledger-us-ny5/*/snapshot-*"
+        );
+    }
+
+    #[test]
+    fn inventory_filtering_precedes_ambiguity_checks() {
+        let listing = "gs://example-bucket/416012/snapshot-416012-alpha.tar.bz2\n\
+                       gs://example-bucket/416012/snapshot-416012-beta.tar.zst\n";
+        let inventory = parse_snapshot_inventory(BUCKET, listing).unwrap();
+
+        let legacy = inventory.objects_for_slot(416_012, &[".tar.bz2"]);
+        assert_eq!(
+            unique_snapshot_object(BUCKET, 416_012, legacy).unwrap(),
+            Some("gs://example-bucket/416012/snapshot-416012-alpha.tar.bz2".to_owned())
+        );
+
+        let all = inventory.objects_for_slot(416_012, ALL_SNAPSHOT_ARCHIVE_EXTENSIONS);
+        assert!(matches!(
+            unique_snapshot_object(BUCKET, 416_012, all),
+            Err(SnapshotError::MultipleSnapshotObjects { .. })
+        ));
+    }
 
     #[test]
     fn missing_epoch_marker_is_skipped() {
@@ -717,12 +964,12 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_download_tempfiles_cannot_be_discovered_as_archives() {
+    fn snapshot_download_directories_cannot_be_discovered_as_archives() {
         let directory = tempfile::tempdir().unwrap();
         let archive_name = "snapshot-830484-hash.tar.bz2";
-        let temporary = new_snapshot_download_tempfile(archive_name, directory.path()).unwrap();
-        let temporary_path = temporary.path().to_path_buf();
-        let temporary_name = temporary_path.file_name().unwrap().to_str().unwrap();
+        let temporary = new_snapshot_download(archive_name, directory.path()).unwrap();
+        let temporary_directory = temporary._directory.path().to_path_buf();
+        let temporary_name = temporary_directory.file_name().unwrap().to_str().unwrap();
 
         assert!(temporary_name.starts_with(&format!(".{archive_name}.")));
         assert!(temporary_name.ends_with(".download"));
@@ -730,9 +977,10 @@ mod tests {
             temporary_name,
             ALL_SNAPSHOT_ARCHIVE_EXTENSIONS
         ));
+        assert!(!temporary.path.exists());
 
         drop(temporary);
-        assert!(!temporary_path.exists());
+        assert!(!temporary_directory.exists());
     }
 
     #[test]
@@ -740,11 +988,12 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let archive_name = "snapshot-830484-hash.tar.bz2";
         let destination = directory.path().join(archive_name);
-        let mut temporary = new_snapshot_download_tempfile(archive_name, directory.path()).unwrap();
-        temporary.write_all(b"complete snapshot").unwrap();
+        let temporary = new_snapshot_download(archive_name, directory.path()).unwrap();
+        std::fs::write(&temporary.path, b"complete snapshot").unwrap();
 
         let published =
-            publish_downloaded_snapshot(temporary, &destination, directory.path()).unwrap();
+            publish_downloaded_snapshot(&temporary.path, &destination, directory.path()).unwrap();
+        drop(temporary);
 
         assert_eq!(published, destination);
         assert_eq!(std::fs::read(&published).unwrap(), b"complete snapshot");
@@ -757,12 +1006,14 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let archive_name = "snapshot-830484-hash.tar.bz2";
         let destination = directory.path().join(archive_name);
-        let temporary = new_snapshot_download_tempfile(archive_name, directory.path()).unwrap();
+        let temporary = new_snapshot_download(archive_name, directory.path()).unwrap();
+        std::fs::File::create(&temporary.path).unwrap();
 
         assert!(matches!(
-            publish_downloaded_snapshot(temporary, &destination, directory.path()),
+            publish_downloaded_snapshot(&temporary.path, &destination, directory.path()),
             Err(SnapshotError::InvalidDestination { .. })
         ));
+        drop(temporary);
         assert!(!destination.exists());
         assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
     }
@@ -805,15 +1056,15 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let archive_name = "snapshot-830484-hash.tar.bz2";
         let destination = directory.path().join(archive_name);
-        let mut temporary = new_snapshot_download_tempfile(archive_name, directory.path()).unwrap();
-        temporary.write_all(b"complete snapshot").unwrap();
+        let temporary = new_snapshot_download(archive_name, directory.path()).unwrap();
+        std::fs::write(&temporary.path, b"complete snapshot").unwrap();
 
         let target = directory.path().join("outside-target");
         std::fs::write(&target, b"sentinel").unwrap();
         symlink(&target, &destination).unwrap();
 
         assert!(matches!(
-            publish_downloaded_snapshot(temporary, &destination, directory.path()),
+            publish_downloaded_snapshot(&temporary.path, &destination, directory.path()),
             Err(SnapshotError::InvalidDestination { .. })
         ));
         assert_eq!(std::fs::read(target).unwrap(), b"sentinel");

@@ -5,6 +5,11 @@
 //! installs the optional segment manifest and archive, checks their exact
 //! inodes again, and exchanges the canonical checksum into place last.
 //! Existing files are retained in a private recovery directory.
+//!
+//! The mutation journal is process-local. A crash can therefore leave an
+//! invalid checksum sentinel and an identity-bound recovery directory. Those
+//! leftovers require manual reconciliation; startup never guesses at or
+//! recursively removes an interrupted transaction.
 
 use {
     crate::{
@@ -435,6 +440,7 @@ enum PublishPhase {
     AfterArchiveInstall,
     BeforeChecksumCommit,
     AfterChecksumCommitMutation,
+    BeforeRollbackMutationSync,
     BeforeRollbackDataSync,
     AfterRollbackDataSync,
     AfterChecksumRestoreMutation,
@@ -910,7 +916,7 @@ impl PublicationTransaction {
         };
         self.perform_journaled_mutation(mutation)
             .map_err(|error| format!("failed to reserve checksum commit-marker name: {error}"))?;
-        hook(PublishPhase::AfterChecksumInvalidationMutation)?;
+        self.finish_last_mutation(PublishPhase::AfterChecksumInvalidationMutation, hook)?;
         self.checksum_sentinel.identity = rebound_target_identity(
             &self.destination,
             &self.destination_checksum_name,
@@ -952,7 +958,8 @@ impl PublicationTransaction {
         };
 
         // Build the journal record before the final verification. The exchange
-        // and the non-allocating push are then the only operations that follow.
+        // and non-allocating push are the only namespace steps before the
+        // checksum durability barrier runs.
         if let Err(message) = self.verify_commit_ready() {
             return Err(self.rollback_error(message, hook));
         }
@@ -962,8 +969,13 @@ impl PublicationTransaction {
                 hook,
             ));
         }
-        if let Err(message) = hook(PublishPhase::AfterChecksumCommitMutation) {
-            return self.fail_after_checksum_commit(message, hook);
+        if let Err(message) =
+            self.finish_last_mutation(PublishPhase::AfterChecksumCommitMutation, hook)
+        {
+            return self.fail_after_checksum_commit(
+                format!("failed to durably install checksum commit marker: {message}"),
+                hook,
+            );
         }
 
         let post_commit = (|| {
@@ -1060,10 +1072,10 @@ impl PublicationTransaction {
         self.mutations.pop();
 
         let mut invalidation_failures = Vec::new();
-        if let Err(error) = self.verify_reversed_mutation(&commit_mutation) {
+        if let Err(error) = self.sync_namespace_mutation(&commit_mutation) {
             invalidation_failures.push(error);
         }
-        if let Err(error) = sync_all(&[&self.recovery, &self.destination]) {
+        if let Err(error) = self.verify_reversed_mutation(&commit_mutation) {
             invalidation_failures.push(error);
         }
         if !invalidation_failures.is_empty() {
@@ -1136,7 +1148,7 @@ impl PublicationTransaction {
                         kind.label()
                     )
                 })?;
-                hook(install_phase)?;
+                self.finish_last_mutation(install_phase, hook)?;
                 let new_identity =
                     rebound_target_identity(&self.destination, &destination_name, staged_identity)?;
                 require_expected_target(self.directory(source_directory), &source_name, None)?;
@@ -1158,7 +1170,7 @@ impl PublicationTransaction {
                 };
                 self.perform_journaled_mutation(exchange)
                     .map_err(|error| format!("failed to exchange {}: {error}", kind.label()))?;
-                hook(install_phase)?;
+                self.finish_last_mutation(install_phase, hook)?;
                 let new_identity =
                     rebound_target_identity(&self.destination, &destination_name, staged_identity)?;
                 let exchanged_old_identity = rebound_target_identity(
@@ -1182,7 +1194,7 @@ impl PublicationTransaction {
                 self.perform_journaled_mutation(backup).map_err(|error| {
                     format!("failed to retain replaced {}: {error}", kind.label())
                 })?;
-                hook(backup_phase)?;
+                self.finish_last_mutation(backup_phase, hook)?;
                 rebound_target_identity(
                     &self.recovery,
                     kind.backup_name(),
@@ -1221,7 +1233,7 @@ impl PublicationTransaction {
         };
         self.perform_journaled_mutation(mutation)
             .map_err(|error| format!("failed to retain previous {}: {error}", kind.label()))?;
-        hook(phase)?;
+        self.finish_last_mutation(phase, hook)?;
         rebound_target_identity(&self.recovery, kind.backup_name(), expected_identity)?;
         require_expected_target(&self.destination, &destination_name, None)
     }
@@ -1247,6 +1259,48 @@ impl PublicationTransaction {
         }
         self.mutations.push(mutation);
         Ok(())
+    }
+
+    fn finish_last_mutation(
+        &self,
+        phase: PublishPhase,
+        hook: &mut dyn FnMut(PublishPhase) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let mutation = self
+            .mutations
+            .last()
+            .ok_or_else(|| "namespace mutation was not journaled".to_string())?;
+        let mut failures = Vec::new();
+        // The test hook runs before the barrier so it can inject an fsync
+        // fault. Even a rejected hook cannot skip durability for a namespace
+        // mutation that has already completed.
+        if let Err(error) = hook(phase) {
+            failures.push(error);
+        }
+        if let Err(error) = self.sync_namespace_mutation(mutation) {
+            failures.push(error);
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(failures.join("; "))
+        }
+    }
+
+    fn sync_namespace_mutation(&self, mutation: &Mutation) -> Result<(), String> {
+        let (left, right) = match mutation {
+            Mutation::Rename {
+                source,
+                destination,
+                ..
+            } => (source.directory, destination.directory),
+            Mutation::Exchange { left, right, .. } => (left.directory, right.directory),
+        };
+        if left == right {
+            self.directory(left).sync()
+        } else {
+            sync_all(&[self.directory(left), self.directory(right)])
+        }
     }
 
     fn refresh_published_evidence(&mut self) -> Result<(), String> {
@@ -1364,11 +1418,26 @@ impl PublicationTransaction {
         for mutation in &data_mutations {
             match self.reverse_mutation_namespace(mutation) {
                 Ok(()) => {
+                    let failure_count = failures.len();
+                    if let Err(error) = hook(PublishPhase::BeforeRollbackMutationSync) {
+                        failures.push(format!(
+                            "rollback mutation durability barrier was rejected: {error}"
+                        ));
+                    }
                     if let Err(error) = self.verify_reversed_mutation(mutation) {
                         failures.push(error);
                     }
+                    if let Err(error) = self.sync_namespace_mutation(mutation) {
+                        failures.push(error);
+                    }
+                    if failures.len() != failure_count {
+                        break;
+                    }
                 }
-                Err(error) => failures.push(error),
+                Err(error) => {
+                    failures.push(error);
+                    break;
+                }
             }
         }
 
@@ -1405,7 +1474,9 @@ impl PublicationTransaction {
             if let Err(error) = self.verify_reversed_mutation(&reservation) {
                 failures.push(error);
             }
-            collect_sync_failures(&[&self.recovery, &self.destination], &mut failures);
+            if let Err(error) = self.sync_namespace_mutation(&reservation) {
+                failures.push(error);
+            }
             if let Err(error) = hook(PublishPhase::AfterChecksumRollbackSync) {
                 failures.push(error);
             }
@@ -3186,6 +3257,82 @@ mod tests {
             INVALID_CHECKSUM_CONTENTS
         );
         assert_eq!(fs::read(&displaced).unwrap(), b"new archive");
+    }
+
+    #[test]
+    fn dependent_forward_mutation_sync_failures_roll_back_exactly() {
+        for failed_barrier in [
+            PublishPhase::AfterArchiveInstallMutation,
+            PublishPhase::AfterArchiveBackupMutation,
+        ] {
+            let (_root, archive, destination, evidence) = fixture();
+            let old_inodes = write_existing_set(&destination);
+            let mut saw_backup_mutation = false;
+            let error =
+                publish_verified_archive_with_hook(&archive, &destination, evidence, |phase| {
+                    if phase == PublishPhase::AfterArchiveBackupMutation {
+                        saw_backup_mutation = true;
+                    }
+                    if phase == failed_barrier {
+                        SYNC_FAULT.with(|fault| fault.set(Some(libc::EIO)));
+                    }
+                    Ok(())
+                })
+                .unwrap_err();
+
+            assert_eq!(
+                saw_backup_mutation,
+                failed_barrier == PublishPhase::AfterArchiveBackupMutation,
+                "the backup rename must not follow a failed exchange barrier"
+            );
+            assert!(!error.committed(), "{failed_barrier:?}: {error}");
+            assert!(
+                error.recovery_directory().is_none(),
+                "{failed_barrier:?}: {error}"
+            );
+            assert_eq!(fs::read(&destination).unwrap(), b"old archive");
+            assert_eq!(fs::metadata(&destination).unwrap().ino(), old_inodes[0]);
+            assert_eq!(fs::read(&archive).unwrap(), b"new archive");
+            assert_eq!(
+                fs::metadata(archive_checksum_path(&destination).unwrap())
+                    .unwrap()
+                    .ino(),
+                old_inodes[2]
+            );
+        }
+    }
+
+    #[test]
+    fn failed_rollback_mutation_sync_stops_before_dependent_exchange() {
+        let (_root, archive, destination, evidence) = fixture();
+        write_existing_set(&destination);
+        let mut injected = false;
+        let error =
+            publish_verified_archive_with_hook(
+                &archive,
+                &destination,
+                evidence,
+                |phase| match phase {
+                    PublishPhase::AfterArchiveInstall => Err("start rollback".to_string()),
+                    PublishPhase::BeforeRollbackMutationSync if !injected => {
+                        injected = true;
+                        SYNC_FAULT.with(|fault| fault.set(Some(libc::EIO)));
+                        Ok(())
+                    }
+                    _ => Ok(()),
+                },
+            )
+            .unwrap_err();
+
+        assert!(injected);
+        assert!(!error.committed());
+        assert!(error.recovery_directory().is_some());
+        assert_eq!(fs::read(&destination).unwrap(), b"new archive");
+        assert_eq!(fs::read(&archive).unwrap(), b"old archive");
+        assert_eq!(
+            fs::read(archive_checksum_path(&destination).unwrap()).unwrap(),
+            INVALID_CHECKSUM_CONTENTS
+        );
     }
 
     #[test]

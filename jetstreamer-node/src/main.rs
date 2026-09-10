@@ -43,8 +43,8 @@ use jetstreamer_firehose::{
     node_reader::NodeReader,
 };
 use jetstreamer_horizon::archive::{
-    AccountsHashKind, ArchiveProvenance, ArchiveProvenanceV1, ArchiveProvenanceV2,
-    ArchiveProvenanceV3, ArchiveWriterConfig, BootstrapStateKind,
+    AccountsHashKind, ArchiveFormatError, ArchiveProvenance, ArchiveProvenanceV1,
+    ArchiveProvenanceV2, ArchiveProvenanceV3, ArchiveWriterConfig, BootstrapStateKind,
     BucketHeader as HorizonBucketHeader, Consumption, RuntimeAdmission, RuntimeHandoffProvenance,
     RuntimeSegmentProvenance, RuntimeSegmentSource, RuntimeStateCheckpoint, SemanticDigest,
     SlotKind, SlotVisitor, StateCommitment, StateCommitmentKind, TransactionMetadataPolicy,
@@ -10418,6 +10418,14 @@ fn validated_epoch_archive(
     let reader =
         match jetstreamer_horizon::archive::ArchiveReader::open(std::io::BufReader::new(file)) {
             Ok(reader) => reader,
+            Err(
+                error @ (ArchiveFormatError::Io(_) | ArchiveFormatError::AllocationFailed { .. }),
+            ) => {
+                return Err(format!(
+                    "failed to read archive framing {}: {error}",
+                    path.display()
+                ));
+            }
             Err(_) => return Ok(None),
         };
     let (slot_start, slot_end_inclusive) = epoch_to_slot_range(epoch);
@@ -10611,6 +10619,14 @@ fn validated_epoch_archive_multi_runtime(
     let reader =
         match jetstreamer_horizon::archive::ArchiveReader::open(std::io::BufReader::new(file)) {
             Ok(reader) => reader,
+            Err(
+                error @ (ArchiveFormatError::Io(_) | ArchiveFormatError::AllocationFailed { .. }),
+            ) => {
+                return Err(format!(
+                    "failed to read archive framing {}: {error}",
+                    path.display()
+                ));
+            }
             Err(_) => return Ok(None),
         };
     let (slot_start, slot_end_inclusive) = epoch_to_slot_range(epoch);
@@ -12920,13 +12936,13 @@ struct AdaptiveValidationResult {
 #[derive(Debug)]
 enum AdaptiveValidationError {
     InvalidArtifact(String),
-    Infrastructure(String),
+    RetainStaging(String),
 }
 
 impl std::fmt::Display for AdaptiveValidationError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::InvalidArtifact(message) | Self::Infrastructure(message) => {
+            Self::InvalidArtifact(message) | Self::RetainStaging(message) => {
                 formatter.write_str(message)
             }
         }
@@ -13349,20 +13365,20 @@ fn adaptive_epoch_archive_validated(
     let destination_parent = job.final_output.parent().unwrap_or_else(|| Path::new("."));
     let file =
         jetstreamer_node::archive_checksum::open_regular_nofollow(path).map_err(|error| {
-            AdaptiveValidationError::Infrastructure(format!(
+            AdaptiveValidationError::RetainStaging(format!(
                 "failed to open staged epoch {} archive: {error}",
                 job.epoch
             ))
         })?;
     jetstreamer_node::archive_checksum::prepare_archive_permissions(&file, destination_parent)
         .map_err(|error| {
-            AdaptiveValidationError::Infrastructure(format!(
+            AdaptiveValidationError::RetainStaging(format!(
                 "failed to prepare staged epoch {} permissions: {error}",
                 job.epoch
             ))
         })?;
     file.sync_all().map_err(|error| {
-        AdaptiveValidationError::Infrastructure(format!(
+        AdaptiveValidationError::RetainStaging(format!(
             "failed to sync staged epoch {} archive: {error}",
             job.epoch
         ))
@@ -13372,15 +13388,25 @@ fn adaptive_epoch_archive_validated(
         validated_epoch_archive(path, job.epoch, job.selection, Some(shutdown), None)?
     } else {
         validated_epoch_archive_multi_runtime(path, job.epoch, &job.spans, Some(shutdown))
-    }
-    .map_err(AdaptiveValidationError::InvalidArtifact)?;
-    validated.ok_or_else(|| {
-        AdaptiveValidationError::InvalidArtifact(format!(
-            "staged epoch {} archive {} is incomplete",
-            job.epoch,
+    };
+    classify_adaptive_deep_validation(validated, job.epoch, path)
+}
+
+fn classify_adaptive_deep_validation<T>(
+    result: Result<Option<T>, String>,
+    epoch: u64,
+    path: &Path,
+) -> Result<T, AdaptiveValidationError> {
+    match result {
+        Ok(Some(validated)) => Ok(validated),
+        Ok(None) => Err(AdaptiveValidationError::InvalidArtifact(format!(
+            "staged epoch {epoch} archive {} is incomplete or has invalid framing",
             path.display()
-        ))
-    })
+        ))),
+        Err(error) => Err(AdaptiveValidationError::RetainStaging(format!(
+            "deep validation failed without proving the staged epoch {epoch} archive invalid: {error}"
+        ))),
+    }
 }
 
 fn spawn_adaptive_validation(
@@ -13401,9 +13427,9 @@ fn handle_adaptive_validation_failure(
     draining_failure: bool,
 ) -> AdaptiveValidationFailureAction {
     match error {
-        AdaptiveValidationError::Infrastructure(error) => {
+        AdaptiveValidationError::RetainStaging(error) => {
             AdaptiveValidationFailureAction::Terminal(format!(
-                "epoch {} validation infrastructure failed: {error}; preserving staged attempt at {}",
+                "epoch {} validation could not safely classify the staged archive: {error}; preserving staged attempt at {}",
                 job.epoch,
                 job.staged_output
                     .parent()
@@ -18310,7 +18336,7 @@ mod early_snapshot_tests {
 
         let action = handle_adaptive_validation_failure(
             &job,
-            AdaptiveValidationError::Infrastructure(
+            AdaptiveValidationError::RetainStaging(
                 "failed to prepare staged epoch 20 permissions: Operation not permitted"
                     .to_string(),
             ),
@@ -18322,12 +18348,66 @@ mod early_snapshot_tests {
         let AdaptiveValidationFailureAction::Terminal(message) = action else {
             panic!("infrastructure failure was incorrectly classified as retryable");
         };
-        assert!(message.contains("validation infrastructure failed"));
+        assert!(message.contains("could not safely classify"));
         assert!(message.contains("preserving staged attempt"));
         assert_eq!(
             fs::read(staged_output).unwrap(),
             b"fully completed staged archive"
         );
+    }
+
+    #[test]
+    fn adaptive_deep_validation_error_preserves_completed_staged_attempt() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::TempDir::new().unwrap();
+        let work_dir = directory.path().join("epoch-21");
+        fs::create_dir(&work_dir).unwrap();
+        fs::set_permissions(&work_dir, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut job = adaptive_test_job(21, work_dir);
+        prepare_adaptive_attempt(&mut job).unwrap();
+        fs::write(&job.staged_output, b"fully completed staged archive").unwrap();
+        let staged_output = job.staged_output.clone();
+        let error = classify_adaptive_deep_validation::<()>(
+            Err("failed full decode: Input/output error (os error 5)".to_string()),
+            job.epoch,
+            &job.staged_output,
+        )
+        .unwrap_err();
+
+        let action = handle_adaptive_validation_failure(&job, error, true, 2, false);
+
+        let AdaptiveValidationFailureAction::Terminal(message) = action else {
+            panic!("deep validation error was incorrectly classified as retryable");
+        };
+        assert!(message.contains("without proving"), "{message}");
+        assert!(message.contains("preserving staged attempt"), "{message}");
+        assert_eq!(
+            fs::read(staged_output).unwrap(),
+            b"fully completed staged archive"
+        );
+    }
+
+    #[test]
+    fn adaptive_positively_invalid_framing_remains_retryable() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::TempDir::new().unwrap();
+        let work_dir = directory.path().join("epoch-22");
+        fs::create_dir(&work_dir).unwrap();
+        fs::set_permissions(&work_dir, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut job = adaptive_test_job(22, work_dir);
+        prepare_adaptive_attempt(&mut job).unwrap();
+        fs::write(&job.staged_output, b"not an archive").unwrap();
+        let attempt = job.staged_output.parent().unwrap().to_path_buf();
+        let error =
+            classify_adaptive_deep_validation::<()>(Ok(None), job.epoch, &job.staged_output)
+                .unwrap_err();
+
+        let action = handle_adaptive_validation_failure(&job, error, true, 2, false);
+
+        assert!(matches!(action, AdaptiveValidationFailureAction::Retry(_)));
+        assert!(!attempt.exists());
     }
 
     #[test]

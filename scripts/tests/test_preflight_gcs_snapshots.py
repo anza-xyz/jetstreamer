@@ -580,6 +580,25 @@ class SelectionTests(unittest.TestCase):
         with self.assertRaisesRegex(preflight.PreflightError, "crosses runtime boundary"):
             preflight.build_verification_cohorts(root, (), 29, 30)
 
+    def test_checkpoint_gap_rejects_an_agave_runtime(self) -> None:
+        root = preflight.parse_inventory_json(
+            json.dumps(
+                [
+                    inventory_record(17 * preflight.EPOCH_SLOTS - 1, extension=".tar.zst"),
+                    inventory_record(19 * preflight.EPOCH_SLOTS + 100, extension=".tar.zst"),
+                ]
+            ),
+            "root",
+            preflight.requested_slot_range(17, 19),
+        )
+        routes = ((1, 100, "agave-v3", (".tar.zst",)),)
+        with mock.patch.object(preflight, "RUNTIME_ROUTES", routes):
+            with self.assertRaisesRegex(
+                preflight.PreflightError,
+                "require an isolated historical Solana runtime",
+            ):
+                preflight.build_verification_cohorts(root, (), 17, 19)
+
 
 class ReportingAndAcquisitionTests(unittest.TestCase):
     def test_manifest_fingerprint_is_order_independent_and_binds_metadata(self) -> None:

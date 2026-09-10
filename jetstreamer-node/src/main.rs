@@ -28,7 +28,9 @@ use agave_snapshots::{
     snapshot_hash::SnapshotHash,
     streaming_unarchive_snapshot,
 };
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use cid::{Cid, multibase::Base};
+use crc::{CRC_32_ISCSI, Crc};
 use crossbeam_channel::{bounded, unbounded};
 use dashmap::DashMap;
 use jetstreamer_firehose::{
@@ -62,12 +64,13 @@ use jetstreamer_node::segment_manifest::{
     SegmentRuntimeIdentity, read_and_validate_segment_manifest, write_segment_manifest,
 };
 use jetstreamer_node::snapshots::{
-    DEFAULT_BUCKET, download_exact_snapshot, download_snapshot_at_or_before_slot_matching,
-    list_snapshots_in_slot_range_matching,
+    DEFAULT_BUCKET, download_exact_snapshot_generation,
+    download_snapshot_at_or_before_slot_matching, list_snapshots_in_slot_range_matching,
 };
 use log::{error, info, warn};
 use rayon::prelude::*;
 use reqwest::{Client, Url, header::RANGE};
+use serde::Deserialize;
 use serde_cbor::Value;
 use sha2::{Digest as _, Sha256};
 use solana_account::AccountSharedData;
@@ -4910,6 +4913,7 @@ fn usage(program: &str) -> String {
     format!(
         "Usage: {program} <epoch|range> [dest-dir] [--verify|--no-verify] [--horizon-output=PATH]\n\
          \x20      [--qualification-end-slot=SLOT] [--root-checkpoint-cohort]\n\
+         \x20      [--cohort-manifest=PATH --cohort-manifest-fingerprint=sha256:HEX]\n\
          \n\
          <epoch|range> is a single epoch (950) or an inclusive range (950-955).\n\
          Replays each epoch and writes a horizon archive to <dest-dir>/epoch-<N>.jet.\n\
@@ -4944,7 +4948,8 @@ fn usage(program: &str) -> String {
          otherwise internal flags passed by the range supervisor to its children.\n\
          --root-checkpoint-cohort runs a multi-epoch range from one predecessor\n\
          root snapshot through a root checkpoint in the final epoch. It requires\n\
-         explicit --verify, one unchanged runtime, and in-memory state handoff.\n\
+         explicit --verify, a sealed preflight manifest and its audited fingerprint,\n\
+         one unchanged historical runtime, and in-memory state handoff.\n\
          Every archive remains in owner-only staging until the complete cohort\n\
          and every staged archive pass validation."
     )
@@ -5228,6 +5233,16 @@ fn root_checkpoint_cohort_runtime(
             ));
         }
         let selection = runtime_span_selection(&spans[0])?;
+        if selection.backend == compatibility::RuntimeBackend::AgaveV3
+            || selection.descriptor.worker.is_none()
+            || selection.descriptor.bootstrap.loader
+                != compatibility::BootstrapStateLoader::HistoricalWorkerSnapshotArchive
+        {
+            return Err(format!(
+                "root-checkpoint cohorts require an isolated historical Solana worker; epoch {epoch} selected {}",
+                selection.descriptor.identity.name
+            ));
+        }
         if let Some(first) = cohort_selection
             && !std::ptr::eq(first.descriptor, selection.descriptor)
         {
@@ -5245,6 +5260,550 @@ fn root_checkpoint_cohort_runtime(
         cohort_selection = Some(selection);
     }
     Ok(cohort_selection.expect("nonempty cohort has a runtime"))
+}
+
+const COHORT_MANIFEST_SCHEMA: &str = "jetstreamer-gcs-snapshot-preflight-v2";
+const COHORT_PUBLICATION_GATE: &str = "all-archives-validated-and-final-root-verified";
+const COHORT_MANIFEST_MAX_BYTES: u64 = 16 * 1024 * 1024;
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CohortManifestSnapshot {
+    accounts_hash: String,
+    anchor_slot: Slot,
+    crc32c: String,
+    extension: String,
+    generation: u64,
+    size: u64,
+    slot: Slot,
+    source: String,
+    uri: String,
+    versioned_uri: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CohortManifestEntry {
+    accepted_extensions: Vec<String>,
+    bootstrap: CohortManifestSnapshot,
+    first_epoch: u64,
+    last_epoch: u64,
+    publication_gate: String,
+    root_checkpoints: Vec<CohortManifestSnapshot>,
+    runtime: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CohortManifestBody {
+    bucket: String,
+    epoch_slots: u64,
+    first_epoch: Option<u64>,
+    last_epoch: Option<u64>,
+    schema: String,
+    verification_cohorts: Vec<CohortManifestEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CohortManifestReport {
+    manifest: serde_json::Value,
+    manifest_fingerprint: String,
+}
+
+#[derive(Clone, Debug)]
+struct RootCheckpointCohortPlan {
+    fingerprint: String,
+    bootstrap: CohortManifestSnapshot,
+    root_checkpoints: Vec<CohortManifestSnapshot>,
+}
+
+fn canonical_json(value: &serde_json::Value, output: &mut Vec<u8>) -> Result<(), String> {
+    match value {
+        serde_json::Value::Null => output.extend_from_slice(b"null"),
+        serde_json::Value::Bool(value) => {
+            output.extend_from_slice(if *value { b"true" } else { b"false" })
+        }
+        serde_json::Value::Number(value) => {
+            if !value.is_i64() && !value.is_u64() {
+                return Err("cohort manifest contains a non-integer JSON number".to_string());
+            }
+            output.extend_from_slice(value.to_string().as_bytes());
+        }
+        serde_json::Value::String(value) => {
+            if !value.is_ascii() {
+                return Err("cohort manifest contains a non-ASCII string".to_string());
+            }
+            serde_json::to_writer(output, value)
+                .map_err(|error| format!("failed to canonicalize manifest string: {error}"))?;
+        }
+        serde_json::Value::Array(values) => {
+            output.push(b'[');
+            for (index, value) in values.iter().enumerate() {
+                if index != 0 {
+                    output.push(b',');
+                }
+                canonical_json(value, output)?;
+            }
+            output.push(b']');
+        }
+        serde_json::Value::Object(values) => {
+            output.push(b'{');
+            let mut entries: Vec<_> = values.iter().collect();
+            entries.sort_unstable_by(|left, right| left.0.cmp(right.0));
+            for (index, (key, value)) in entries.into_iter().enumerate() {
+                if !key.is_ascii() {
+                    return Err("cohort manifest contains a non-ASCII object key".to_string());
+                }
+                if index != 0 {
+                    output.push(b',');
+                }
+                serde_json::to_writer(&mut *output, key).map_err(|error| {
+                    format!("failed to canonicalize manifest object key: {error}")
+                })?;
+                output.push(b':');
+                canonical_json(value, output)?;
+            }
+            output.push(b'}');
+        }
+    }
+    Ok(())
+}
+
+fn cohort_manifest_fingerprint(manifest: &serde_json::Value) -> Result<String, String> {
+    let mut canonical = Vec::new();
+    canonical_json(manifest, &mut canonical)?;
+    Ok(format!(
+        "sha256:{}",
+        jetstreamer_node::segment_manifest::sha256_hex_string(&Sha256::digest(canonical).into())
+    ))
+}
+
+fn validate_manifest_fingerprint(value: &str) -> Result<(), String> {
+    let Some(hex) = value.strip_prefix("sha256:") else {
+        return Err("cohort manifest fingerprint must start with sha256:".to_string());
+    };
+    if hex.len() != 64
+        || !hex
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(
+            "cohort manifest fingerprint must contain 64 lowercase hexadecimal digits".to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_cohort_manifest_snapshot(
+    item: &CohortManifestSnapshot,
+    required_source: &str,
+    accepted_extensions: &[&str],
+) -> Result<(String, Hash), String> {
+    if item.source != required_source {
+        return Err(format!(
+            "cohort manifest object {} has source {}, expected {required_source}",
+            item.versioned_uri, item.source
+        ));
+    }
+    if item.size == 0 || item.generation == 0 {
+        return Err(format!(
+            "cohort manifest object {} has an empty size or generation",
+            item.versioned_uri
+        ));
+    }
+    if item.anchor_slot != item.slot {
+        return Err(format!(
+            "root checkpoint {} has anchor slot {}, expected {}",
+            item.versioned_uri, item.anchor_slot, item.slot
+        ));
+    }
+    if !accepted_extensions
+        .iter()
+        .any(|extension| *extension == item.extension)
+    {
+        return Err(format!(
+            "cohort manifest object {} has runtime-incompatible extension {}",
+            item.versioned_uri, item.extension
+        ));
+    }
+    let filename = snapshot_filename(&item.uri)?.to_owned();
+    let expected_uri = format!("{DEFAULT_BUCKET}/{}/{}", item.anchor_slot, filename);
+    if item.uri != expected_uri || item.versioned_uri != format!("{}#{}", item.uri, item.generation)
+    {
+        return Err(format!(
+            "cohort manifest object URI or generation is not canonical: {}",
+            item.versioned_uri
+        ));
+    }
+    let (filename_slot, filename_hash) = parse_snapshot_archive_name(&filename)?;
+    let accounts_hash = item.accounts_hash.parse::<Hash>().map_err(|error| {
+        format!(
+            "cohort manifest object {} has invalid accounts hash: {error}",
+            item.versioned_uri
+        )
+    })?;
+    if filename_slot != item.slot || filename_hash.0 != accounts_hash {
+        return Err(format!(
+            "cohort manifest object {} disagrees with its snapshot filename",
+            item.versioned_uri
+        ));
+    }
+    let decoded_crc = BASE64_STANDARD.decode(&item.crc32c).map_err(|error| {
+        format!(
+            "cohort manifest object {} has invalid CRC32C: {error}",
+            item.versioned_uri
+        )
+    })?;
+    if decoded_crc.len() != 4 {
+        return Err(format!(
+            "cohort manifest object {} CRC32C does not decode to four bytes",
+            item.versioned_uri
+        ));
+    }
+    Ok((filename, accounts_hash))
+}
+
+fn root_checkpoint_cohort_plan_from_report(
+    report_value: serde_json::Value,
+    expected_fingerprint: &str,
+    start_epoch: u64,
+    end_epoch: u64,
+    selection: compatibility::RuntimeSelection,
+) -> Result<RootCheckpointCohortPlan, String> {
+    if selection.backend == compatibility::RuntimeBackend::AgaveV3
+        || selection.descriptor.worker.is_none()
+        || selection.descriptor.bootstrap.loader
+            != compatibility::BootstrapStateLoader::HistoricalWorkerSnapshotArchive
+    {
+        return Err(
+            "root-checkpoint cohort manifest selected a non-historical runtime".to_string(),
+        );
+    }
+    validate_manifest_fingerprint(expected_fingerprint)?;
+    let report: CohortManifestReport = serde_json::from_value(report_value)
+        .map_err(|error| format!("invalid cohort preflight report: {error}"))?;
+    validate_manifest_fingerprint(&report.manifest_fingerprint)?;
+    let actual_fingerprint = cohort_manifest_fingerprint(&report.manifest)?;
+    if actual_fingerprint != report.manifest_fingerprint
+        || actual_fingerprint != expected_fingerprint
+    {
+        return Err(format!(
+            "cohort manifest fingerprint mismatch: expected {expected_fingerprint}, embedded {}, computed {actual_fingerprint}",
+            report.manifest_fingerprint
+        ));
+    }
+    let body: CohortManifestBody = serde_json::from_value(report.manifest)
+        .map_err(|error| format!("invalid cohort manifest: {error}"))?;
+    if body.schema != COHORT_MANIFEST_SCHEMA
+        || body.bucket != DEFAULT_BUCKET
+        || body.epoch_slots != 432_000
+    {
+        return Err(format!(
+            "cohort manifest registry identity is incompatible (schema={}, bucket={}, epoch_slots={})",
+            body.schema, body.bucket, body.epoch_slots
+        ));
+    }
+    if body.first_epoch.is_none_or(|first| first > start_epoch)
+        || body.last_epoch.is_none_or(|last| last < end_epoch)
+    {
+        return Err(format!(
+            "cohort manifest does not cover requested epochs {start_epoch}-{end_epoch}"
+        ));
+    }
+    let overlapping: Vec<_> = body
+        .verification_cohorts
+        .into_iter()
+        .filter(|entry| entry.first_epoch <= end_epoch && start_epoch <= entry.last_epoch)
+        .collect();
+    if overlapping.len() != 1
+        || overlapping[0].first_epoch != start_epoch
+        || overlapping[0].last_epoch != end_epoch
+    {
+        return Err(format!(
+            "cohort manifest must contain exactly one whole entry for epochs {start_epoch}-{end_epoch}"
+        ));
+    }
+    let entry = overlapping
+        .into_iter()
+        .next()
+        .expect("one overlap was required");
+    if entry.runtime != selection.descriptor.identity.name {
+        return Err(format!(
+            "cohort manifest runtime {} does not match selected runtime {}",
+            entry.runtime, selection.descriptor.identity.name
+        ));
+    }
+    if entry.publication_gate != COHORT_PUBLICATION_GATE {
+        return Err(format!(
+            "cohort manifest has unsupported publication gate {}",
+            entry.publication_gate
+        ));
+    }
+    let manifest_extensions: HashSet<_> = entry
+        .accepted_extensions
+        .iter()
+        .map(String::as_str)
+        .collect();
+    let runtime_extensions: HashSet<_> = selection
+        .descriptor
+        .bootstrap
+        .archive_extensions
+        .iter()
+        .copied()
+        .collect();
+    if manifest_extensions != runtime_extensions
+        || entry.accepted_extensions.len() != manifest_extensions.len()
+    {
+        return Err(
+            "cohort manifest archive extensions do not match the runtime registry".to_string(),
+        );
+    }
+    let (_, bootstrap_hash) = validate_cohort_manifest_snapshot(
+        &entry.bootstrap,
+        "root",
+        selection.descriptor.bootstrap.archive_extensions,
+    )?;
+    let bounds = normal_epoch_bootstrap_bounds(start_epoch)?;
+    if !bounds.accepts(entry.bootstrap.slot, bootstrap_hash) {
+        return Err(format!(
+            "cohort manifest bootstrap slot {} does not satisfy epoch {start_epoch} bootstrap policy",
+            entry.bootstrap.slot
+        ));
+    }
+    if entry.root_checkpoints.is_empty() {
+        return Err("cohort manifest has no root checkpoints".to_string());
+    }
+    let (_, cohort_end) = epoch_to_slot_range(end_epoch);
+    let (final_start, final_end) = epoch_to_slot_range(end_epoch);
+    let mut previous_slot = entry.bootstrap.slot;
+    let mut has_final_root = false;
+    for checkpoint in &entry.root_checkpoints {
+        validate_cohort_manifest_snapshot(
+            checkpoint,
+            "root",
+            selection.descriptor.bootstrap.archive_extensions,
+        )?;
+        if checkpoint.slot <= previous_slot || checkpoint.slot > cohort_end {
+            return Err(format!(
+                "cohort manifest root checkpoint slots are not strictly ordered through epoch {end_epoch}"
+            ));
+        }
+        has_final_root |= (final_start..=final_end).contains(&checkpoint.slot);
+        previous_slot = checkpoint.slot;
+    }
+    if !has_final_root {
+        return Err(format!(
+            "cohort manifest {start_epoch}-{end_epoch} has no root checkpoint in its final epoch"
+        ));
+    }
+    Ok(RootCheckpointCohortPlan {
+        fingerprint: actual_fingerprint,
+        bootstrap: entry.bootstrap,
+        root_checkpoints: entry.root_checkpoints,
+    })
+}
+
+fn load_root_checkpoint_cohort_plan(
+    path: &Path,
+    expected_fingerprint: &str,
+    start_epoch: u64,
+    end_epoch: u64,
+    selection: compatibility::RuntimeSelection,
+) -> Result<RootCheckpointCohortPlan, String> {
+    use std::{io::Read as _, os::unix::fs::MetadataExt as _};
+
+    let mut file = jetstreamer_node::archive_checksum::open_regular_nofollow(path)
+        .map_err(|error| format!("failed to open cohort manifest {}: {error}", path.display()))?;
+    let metadata = file.metadata().map_err(|error| {
+        format!(
+            "failed to inspect cohort manifest {}: {error}",
+            path.display()
+        )
+    })?;
+    if metadata.uid() != effective_user_id() || metadata.mode() & 0o022 != 0 {
+        return Err(format!(
+            "cohort manifest must be owned by this user and not group/world writable: {}",
+            path.display()
+        ));
+    }
+    if metadata.len() == 0 || metadata.len() > COHORT_MANIFEST_MAX_BYTES {
+        return Err(format!(
+            "cohort manifest size {} is outside 1..={COHORT_MANIFEST_MAX_BYTES}: {}",
+            metadata.len(),
+            path.display()
+        ));
+    }
+    let before = jetstreamer_node::archive_checksum::archive_file_identity(&file)
+        .map_err(|error| format!("failed to bind cohort manifest {}: {error}", path.display()))?;
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.read_to_end(&mut bytes)
+        .map_err(|error| format!("failed to read cohort manifest {}: {error}", path.display()))?;
+    let after =
+        jetstreamer_node::archive_checksum::archive_file_identity(&file).map_err(|error| {
+            format!(
+                "failed to recheck cohort manifest {}: {error}",
+                path.display()
+            )
+        })?;
+    if before != after
+        || !jetstreamer_node::archive_checksum::path_matches_archive_identity(path, before)
+            .map_err(|error| {
+                format!(
+                    "failed to recheck cohort manifest path {}: {error}",
+                    path.display()
+                )
+            })?
+    {
+        return Err(format!(
+            "cohort manifest changed while it was read: {}",
+            path.display()
+        ));
+    }
+    let report = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("invalid cohort manifest JSON {}: {error}", path.display()))?;
+    root_checkpoint_cohort_plan_from_report(
+        report,
+        expected_fingerprint,
+        start_epoch,
+        end_epoch,
+        selection,
+    )
+}
+
+#[derive(Debug)]
+struct BoundCohortSnapshot {
+    path: PathBuf,
+    file: fs::File,
+    evidence: jetstreamer_node::archive_checksum::ValidatedArchiveFile,
+    size: u64,
+}
+
+impl BoundCohortSnapshot {
+    fn revalidate(&self) -> Result<(), String> {
+        let current = jetstreamer_node::archive_checksum::archive_file_identity(&self.file)
+            .map_err(|error| {
+                format!(
+                    "failed to recheck bound cohort bootstrap {}: {error}",
+                    self.path.display()
+                )
+            })?;
+        if current != self.evidence.identity
+            || !jetstreamer_node::archive_checksum::path_matches_archive_identity(
+                &self.path,
+                self.evidence.identity,
+            )
+            .map_err(|error| {
+                format!(
+                    "failed to recheck cohort bootstrap path {}: {error}",
+                    self.path.display()
+                )
+            })?
+        {
+            return Err(format!(
+                "cohort bootstrap changed after it was bound: {}",
+                self.path.display()
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn bind_cohort_snapshot_download(
+    path: &Path,
+    manifest: &CohortManifestSnapshot,
+) -> Result<BoundCohortSnapshot, String> {
+    use std::os::unix::fs::FileExt as _;
+
+    let file =
+        jetstreamer_node::archive_checksum::open_regular_nofollow(path).map_err(|error| {
+            format!(
+                "failed to open downloaded cohort bootstrap {}: {error}",
+                path.display()
+            )
+        })?;
+    let identity =
+        jetstreamer_node::archive_checksum::archive_file_identity(&file).map_err(|error| {
+            format!(
+                "failed to identify downloaded cohort bootstrap {}: {error}",
+                path.display()
+            )
+        })?;
+    let metadata = file.metadata().map_err(|error| {
+        format!(
+            "failed to inspect downloaded cohort bootstrap {}: {error}",
+            path.display()
+        )
+    })?;
+    if metadata.len() != manifest.size {
+        return Err(format!(
+            "downloaded cohort bootstrap size mismatch for {}: manifest {}, local {}",
+            path.display(),
+            manifest.size,
+            metadata.len()
+        ));
+    }
+    let mut sha256 = Sha256::new();
+    let crc32c = Crc::<u32>::new(&CRC_32_ISCSI);
+    let mut crc_digest = crc32c.digest();
+    let mut buffer = [0u8; 128 * 1024];
+    let mut offset = 0u64;
+    while offset < manifest.size {
+        let remaining = usize::try_from((manifest.size - offset).min(buffer.len() as u64))
+            .expect("bounded by fixed checksum buffer");
+        let read = file
+            .read_at(&mut buffer[..remaining], offset)
+            .map_err(|error| {
+                format!(
+                    "failed to measure downloaded cohort bootstrap {}: {error}",
+                    path.display()
+                )
+            })?;
+        if read == 0 {
+            return Err(format!(
+                "downloaded cohort bootstrap ended early while measuring {}",
+                path.display()
+            ));
+        }
+        sha256.update(&buffer[..read]);
+        crc_digest.update(&buffer[..read]);
+        offset += read as u64;
+    }
+    let actual_crc32c = BASE64_STANDARD.encode(crc_digest.finalize().to_be_bytes());
+    if actual_crc32c != manifest.crc32c {
+        return Err(format!(
+            "downloaded cohort bootstrap CRC32C mismatch for {}: manifest {}, local {}",
+            path.display(),
+            manifest.crc32c,
+            actual_crc32c
+        ));
+    }
+    if jetstreamer_node::archive_checksum::archive_file_identity(&file).map_err(|error| {
+        format!(
+            "failed to recheck downloaded cohort bootstrap {}: {error}",
+            path.display()
+        )
+    })? != identity
+        || !jetstreamer_node::archive_checksum::path_matches_archive_identity(path, identity)
+            .map_err(|error| {
+                format!(
+                    "failed to recheck downloaded cohort bootstrap path {}: {error}",
+                    path.display()
+                )
+            })?
+    {
+        return Err(format!(
+            "downloaded cohort bootstrap changed while it was measured: {}",
+            path.display()
+        ));
+    }
+    Ok(BoundCohortSnapshot {
+        path: path.to_path_buf(),
+        file,
+        evidence: jetstreamer_node::archive_checksum::ValidatedArchiveFile {
+            identity,
+            sha256: sha256.finalize().into(),
+        },
+        size: manifest.size,
+    })
 }
 
 fn validate_root_checkpoint_cohort_expectations(
@@ -7671,6 +8230,78 @@ struct CompletedCohortEpoch {
     validated: jetstreamer_node::archive_checksum::ValidatedArchiveFile,
 }
 
+fn publish_completed_root_cohort_transactionally(
+    completed: &[CompletedCohortEpoch],
+) -> Result<(), String> {
+    for archive in completed {
+        if !jetstreamer_node::archive_checksum::path_matches_archive_identity(
+            &archive.staged_output,
+            archive.validated.identity,
+        )
+        .map_err(|error| {
+            format!(
+                "failed to rebind staged cohort archive {}: {error}",
+                archive.staged_output.display()
+            )
+        })? {
+            return Err(format!(
+                "staged cohort archive changed after validation: {}",
+                archive.staged_output.display()
+            ));
+        }
+    }
+    let destination = completed
+        .first()
+        .map(|archive| archive.final_output.display().to_string())
+        .unwrap_or_else(|| "<empty cohort>".to_string());
+    Err(format!(
+        "transactional cohort publication is unavailable for {} privately staged archive(s), beginning at {destination}; no archive or checksum was published",
+        completed.len(),
+    ))
+}
+
+fn after_root_cohort_publication_gate<T>(
+    completed_archives: usize,
+    expected_archives: usize,
+    shutdown_requested: bool,
+    terminal_verification: Result<(), String>,
+    publish: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    if completed_archives != expected_archives {
+        return Err(format!(
+            "root-checkpoint cohort produced {completed_archives} archives, expected {expected_archives}"
+        ));
+    }
+    if shutdown_requested {
+        return Err("root-checkpoint cohort was interrupted before publication".to_string());
+    }
+    terminal_verification.map_err(|error| {
+        format!("root-checkpoint cohort terminal verification is incomplete: {error}")
+    })?;
+    publish()
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ArchiveFinalizationRoute {
+    RootCheckpointCohort,
+    OrdinaryTopLevel,
+    InternalOrQualification,
+}
+
+fn archive_finalization_route(
+    root_checkpoint_cohort: bool,
+    qualification: Option<QualificationPlan>,
+    range_info: Option<(u64, u64)>,
+) -> ArchiveFinalizationRoute {
+    if root_checkpoint_cohort {
+        ArchiveFinalizationRoute::RootCheckpointCohort
+    } else if qualification.is_none() && range_info.is_none() {
+        ArchiveFinalizationRoute::OrdinaryTopLevel
+    } else {
+        ArchiveFinalizationRoute::InternalOrQualification
+    }
+}
+
 fn validate_historical_cohort_evidence<'a>(
     trusted_bootstrap_slot: Slot,
     trusted_bootstrap_accounts_hash: Hash,
@@ -7967,6 +8598,9 @@ async fn run_geyser_replay(
     // instance would leave chained epochs stuck at accounts=0 and falsely abort.
     // Counters are reset per epoch below, so sharing does not accumulate.
     carried_progress: Option<Arc<ReplayProgress>>,
+    // Generation-pinned bootstrap evidence from a sealed cohort manifest.
+    // This is valid only for a fresh historical-worker initialization.
+    audited_cohort_bootstrap: Option<&BoundCohortSnapshot>,
     // A root-checkpoint cohort keeps one verifier across several epochs. The
     // terminal slot is used for candidate admission; only the final member
     // consumes the verifier with `finish`.
@@ -7975,6 +8609,19 @@ async fn run_geyser_replay(
 ) -> Result<ReplayRunResult, String> {
     if qualification.is_some() && carried_state.is_some() {
         return Err("focused qualification cannot reuse carried runtime state".to_string());
+    }
+    if audited_cohort_bootstrap.is_some() && carried_state.is_some() {
+        return Err(
+            "an audited cohort bootstrap cannot accompany carried runtime state".to_string(),
+        );
+    }
+    if let Some(binding) = audited_cohort_bootstrap {
+        let Some(snapshot_path) = bootstrap.snapshot_archive() else {
+            return Err("an audited cohort bootstrap requires a snapshot archive".to_string());
+        };
+        if snapshot_path != binding.path {
+            return Err("audited cohort bootstrap evidence is bound to another path".to_string());
+        }
     }
     // Resolve the exact state span before starting a worker or loading a bank.
     // Snapshot filename/format supplies only the bootstrap slot and loader
@@ -8101,6 +8748,12 @@ async fn run_geyser_replay(
         }
         _ => None,
     };
+    if audited_cohort_bootstrap.is_some() && bootstrap_handoff_manifest.is_some() {
+        return Err(
+            "a cohort bootstrap cannot also be admitted as a generated handoff snapshot"
+                .to_string(),
+        );
+    }
     info!(
         "slot registry selected execution profile {} ({:?}) for slots {}..{}",
         runtime_backend,
@@ -8282,6 +8935,9 @@ async fn run_geyser_replay(
                         runtime_backend,
                         executable.display()
                     );
+                    if let Some(binding) = audited_cohort_bootstrap {
+                        binding.revalidate()?;
+                    }
                     let (initialization, bootstrap_state_kind, bootstrap_state_hash) =
                         match bootstrap {
                             ReplayBootstrap::Genesis {
@@ -8332,12 +8988,20 @@ async fn run_geyser_replay(
                                             archive_path: snapshot_archive.clone(),
                                             expected_slot,
                                             expected_accounts_hash: expected_hash.0.to_bytes(),
-                                            expected_archive_sha256: bootstrap_handoff_manifest
-                                                .as_ref()
-                                                .map(|manifest| manifest.archive_sha256),
-                                            expected_archive_size: bootstrap_handoff_manifest
-                                                .as_ref()
-                                                .map(|manifest| manifest.archive_size),
+                                            expected_archive_sha256: audited_cohort_bootstrap
+                                                .map(|binding| binding.evidence.sha256)
+                                                .or_else(|| {
+                                                    bootstrap_handoff_manifest
+                                                        .as_ref()
+                                                        .map(|manifest| manifest.archive_sha256)
+                                                }),
+                                            expected_archive_size: audited_cohort_bootstrap
+                                                .map(|binding| binding.size)
+                                                .or_else(|| {
+                                                    bootstrap_handoff_manifest
+                                                        .as_ref()
+                                                        .map(|manifest| manifest.archive_size)
+                                                }),
                                             scratch_parent: Some(scratch_parent),
                                         },
                                     ),
@@ -11791,6 +12455,173 @@ struct EpochLease {
     _file: fs::File,
 }
 
+struct BoundDestination {
+    path: PathBuf,
+    directory: fs::File,
+    dev: u64,
+    ino: u64,
+}
+
+impl BoundDestination {
+    fn bind(path: &Path) -> Result<Self, String> {
+        use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+
+        let path = path.canonicalize().map_err(|error| {
+            format!(
+                "failed to canonicalize epoch destination {}: {error}",
+                path.display()
+            )
+        })?;
+        let directory = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(&path)
+            .map_err(|error| {
+                format!(
+                    "failed to bind epoch destination {}: {error}",
+                    path.display()
+                )
+            })?;
+        let metadata = directory.metadata().map_err(|error| {
+            format!(
+                "failed to inspect epoch destination {}: {error}",
+                path.display()
+            )
+        })?;
+        if !metadata.file_type().is_dir() {
+            return Err(format!(
+                "epoch destination is not a directory: {}",
+                path.display()
+            ));
+        }
+        Ok(Self {
+            path,
+            directory,
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+        })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn revalidate(&self) -> Result<(), String> {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let descriptor = self.directory.metadata().map_err(|error| {
+            format!(
+                "failed to recheck bound epoch destination {}: {error}",
+                self.path.display()
+            )
+        })?;
+        let path = fs::symlink_metadata(&self.path).map_err(|error| {
+            format!(
+                "failed to recheck epoch destination path {}: {error}",
+                self.path.display()
+            )
+        })?;
+        if !path.file_type().is_dir()
+            || descriptor.dev() != self.dev
+            || descriptor.ino() != self.ino
+            || path.dev() != self.dev
+            || path.ino() != self.ino
+        {
+            return Err(format!(
+                "epoch destination changed after it was bound: {}",
+                self.path.display()
+            ));
+        }
+        Ok(())
+    }
+}
+
+const COHORT_RUN_STATE_FILE: &str = "cohort-state.json";
+
+struct CohortRunDirectory {
+    path: PathBuf,
+    parent: PathBuf,
+}
+
+impl CohortRunDirectory {
+    fn create(
+        parent: PathBuf,
+        start_epoch: u64,
+        end_epoch: u64,
+        manifest_fingerprint: &str,
+    ) -> Result<Self, String> {
+        use std::{io::Write as _, os::unix::fs::OpenOptionsExt as _};
+
+        create_or_validate_private_directory(&parent)?;
+        let path = parent.join(format!(
+            "run-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        create_fresh_private_directory(&path)?;
+        let state_path = path.join(COHORT_RUN_STATE_FILE);
+        let state = serde_json::json!({
+            "end_epoch": end_epoch,
+            "manifest_fingerprint": manifest_fingerprint,
+            "schema": "jetstreamer-root-cohort-run-v1",
+            "start_epoch": start_epoch,
+            "status": "running-private"
+        });
+        let bytes = serde_json::to_vec_pretty(&state)
+            .map_err(|error| format!("failed to encode cohort run state: {error}"))?;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(&state_path)
+            .map_err(|error| {
+                format!(
+                    "failed to create cohort run state {}: {error}",
+                    state_path.display()
+                )
+            })?;
+        file.write_all(&bytes)
+            .and_then(|()| file.sync_all())
+            .map_err(|error| {
+                format!(
+                    "failed to sync cohort run state {}: {error}",
+                    state_path.display()
+                )
+            })?;
+        fs::File::open(&path)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| format!("failed to sync cohort run directory: {error}"))?;
+        Ok(Self { path, parent })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn cleanup_after_commit(self) -> Result<(), String> {
+        create_or_validate_private_directory(&self.parent)?;
+        create_or_validate_private_directory(&self.path)?;
+        fs::remove_dir_all(&self.path).map_err(|error| {
+            format!(
+                "failed to remove committed cohort run {}: {error}",
+                self.path.display()
+            )
+        })?;
+        fs::File::open(&self.parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| {
+                format!(
+                    "failed to sync cohort run parent {}: {error}",
+                    self.parent.display()
+                )
+            })
+    }
+}
+
 fn effective_user_id() -> u32 {
     // SAFETY: geteuid has no preconditions and does not dereference memory.
     unsafe { libc::geteuid() }
@@ -13791,6 +14622,8 @@ async fn main() {
     let mut range_info: Option<(u64, u64)> = None;
     let mut replay_scratch: Option<PathBuf> = None;
     let mut root_checkpoint_cohort = false;
+    let mut cohort_manifest: Option<PathBuf> = None;
+    let mut cohort_manifest_fingerprint: Option<String> = None;
     for arg in args {
         if arg == "--verify" {
             verify_snapshots = true;
@@ -13832,6 +14665,19 @@ async fn main() {
                 exit(2);
             }
             root_checkpoint_cohort = true;
+        } else if let Some(path) = arg.strip_prefix("--cohort-manifest=") {
+            if cohort_manifest.replace(PathBuf::from(path)).is_some() {
+                eprintln!("duplicate --cohort-manifest option");
+                exit(2);
+            }
+        } else if let Some(fingerprint) = arg.strip_prefix("--cohort-manifest-fingerprint=") {
+            if cohort_manifest_fingerprint
+                .replace(fingerprint.to_owned())
+                .is_some()
+            {
+                eprintln!("duplicate --cohort-manifest-fingerprint option");
+                exit(2);
+            }
         } else if arg.starts_with('-') {
             eprintln!("unknown option '{arg}'");
             eprintln!("{}", usage(&program));
@@ -13888,6 +14734,12 @@ async fn main() {
             eprintln!("--root-checkpoint-cohort requires explicit --verify");
             exit(2);
         }
+        if cohort_manifest.is_none() || cohort_manifest_fingerprint.is_none() {
+            eprintln!(
+                "--root-checkpoint-cohort requires --cohort-manifest and --cohort-manifest-fingerprint"
+            );
+            exit(2);
+        }
         if horizon_output.is_some()
             || qualification_end_slot.is_some()
             || epoch_hashes.is_some()
@@ -13900,6 +14752,9 @@ async fn main() {
             );
             exit(2);
         }
+    } else if cohort_manifest.is_some() || cohort_manifest_fingerprint.is_some() {
+        eprintln!("cohort manifest options require --root-checkpoint-cohort");
+        exit(2);
     }
     let qualification = match qualification_plan(
         start_epoch,
@@ -13937,51 +14792,17 @@ async fn main() {
         );
         exit(1);
     }
-    let cohort_run_dir = if root_checkpoint_cohort {
-        let scope = match private_epoch_scope(&dest_dir) {
-            Ok(scope) => scope,
-            Err(err) => {
-                eprintln!("error: {err}");
-                exit(1);
-            }
-        };
-        let cohort_root = scope
-            .join("work")
-            .join(format!("root-cohort-{start_epoch}-{end_epoch}"));
-        if let Err(err) = create_or_validate_private_directory(&cohort_root) {
+    let destination_binding = match BoundDestination::bind(&dest_dir) {
+        Ok(binding) => binding,
+        Err(err) => {
             eprintln!("error: {err}");
             exit(1);
         }
-        let run = cohort_root.join(format!(
-            "run-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        ));
-        if let Err(err) = create_fresh_private_directory(&run) {
-            eprintln!("error: {err}");
-            exit(1);
-        }
-        Some(run)
-    } else {
-        None
     };
-    let replay_scratch_path = replay_scratch.clone().unwrap_or_else(|| {
-        cohort_run_dir
-            .as_ref()
-            .map(|run| run.join("scratch"))
-            .unwrap_or_else(|| dest_dir.clone())
-    });
-    let replay_scratch_dir = replay_scratch_path.as_path();
-    if let Err(err) = fs::create_dir_all(replay_scratch_dir) {
-        eprintln!(
-            "error: failed to create replay scratch directory {}: {err}",
-            replay_scratch_dir.display()
-        );
-        exit(1);
-    }
+    // Resolve the CLI path once. Leases, private scopes, scratch paths, and
+    // final publication all use this canonical path even if the original CLI
+    // path was a symlink that is retargeted later.
+    let dest_dir = destination_binding.path().to_path_buf();
     // Top-level producers hold one advisory lease per output epoch from before
     // bootstrap/hash binding through final checksum publication. Internal
     // children are covered by their parent's still-open lease.
@@ -14024,6 +14845,70 @@ async fn main() {
     } else {
         None
     };
+    let cohort_plan = if root_checkpoint_cohort {
+        let manifest_path = cohort_manifest
+            .as_deref()
+            .expect("cohort manifest option was required");
+        let fingerprint = cohort_manifest_fingerprint
+            .as_deref()
+            .expect("cohort manifest fingerprint was required");
+        match load_root_checkpoint_cohort_plan(
+            manifest_path,
+            fingerprint,
+            start_epoch,
+            end_epoch,
+            cohort_runtime.expect("cohort runtime was validated"),
+        ) {
+            Ok(plan) => {
+                info!(
+                    "root-checkpoint cohort {}-{} bound sealed preflight {}",
+                    start_epoch, end_epoch, plan.fingerprint
+                );
+                Some(plan)
+            }
+            Err(err) => {
+                eprintln!("error: {err}");
+                exit(1);
+            }
+        }
+    } else {
+        None
+    };
+    let mut cohort_run = if let Some(plan) = cohort_plan.as_ref() {
+        let scope = match private_epoch_scope(&dest_dir) {
+            Ok(scope) => scope,
+            Err(err) => {
+                eprintln!("error: {err}");
+                exit(1);
+            }
+        };
+        let cohort_root = scope
+            .join("work")
+            .join(format!("root-cohort-{start_epoch}-{end_epoch}"));
+        match CohortRunDirectory::create(cohort_root, start_epoch, end_epoch, &plan.fingerprint) {
+            Ok(run) => Some(run),
+            Err(err) => {
+                eprintln!("error: {err}");
+                exit(1);
+            }
+        }
+    } else {
+        None
+    };
+    let replay_scratch_path = replay_scratch.clone().unwrap_or_else(|| {
+        cohort_run
+            .as_ref()
+            .map(|run| run.path().join("scratch"))
+            .unwrap_or_else(|| dest_dir.clone())
+    });
+    let replay_scratch_dir = replay_scratch_path.as_path();
+    if let Err(err) = fs::create_dir_all(replay_scratch_dir) {
+        eprintln!(
+            "error: failed to create replay scratch directory {}: {err}",
+            replay_scratch_dir.display()
+        );
+        exit(1);
+    }
     for epoch in start_epoch..=end_epoch {
         let slot_range = runtime_slot_range(epoch, qualification);
         let spans = match compatibility::plan_runtime_spans(slot_range, allow_candidate_runtime) {
@@ -14286,6 +15171,7 @@ async fn main() {
         );
         exit(2);
     }
+    let mut cohort_bootstrap_binding = None;
     let bootstrap = if genesis_bootstrap {
         // Materialize genesis through Agave's hardened bounded unpacker before
         // measuring the exact file handed to the historical client.
@@ -14302,67 +15188,52 @@ async fn main() {
             }
         }
     } else if root_checkpoint_cohort {
-        let bounds = match normal_epoch_bootstrap_bounds(effective_start) {
-            Ok(bounds) => bounds,
-            Err(err) => {
-                eprintln!("error: {err}");
-                exit(1);
-            }
-        };
         let selection = cohort_runtime.expect("cohort runtime was validated");
-        let roots = match list_snapshots_in_slot_range_matching(
-            bounds.min_slot,
-            bounds.max_slot,
-            selection.descriptor.bootstrap.archive_extensions,
-        )
-        .await
-        {
-            Ok(roots) => roots,
-            Err(err) => {
-                eprintln!("error: failed to list predecessor root snapshots: {err}");
-                exit(1);
-            }
-        };
-        let Some(root) = roots.last() else {
-            eprintln!(
-                "error: root-checkpoint cohort has no predecessor root snapshot in slots {}..={}",
-                bounds.min_slot, bounds.max_slot
-            );
-            exit(1);
-        };
-        let name = match snapshot_filename(&root.snapshot_uri) {
+        let plan = cohort_plan.as_ref().expect("cohort plan was validated");
+        let name = match snapshot_filename(&plan.bootstrap.uri) {
             Ok(name) => name.to_owned(),
             Err(err) => {
                 eprintln!("error: {err}");
                 exit(1);
             }
         };
-        let (root_slot, root_hash) = match parse_snapshot_archive_name(&name) {
+        let (root_slot, _) = match parse_snapshot_archive_name(&name) {
             Ok(identity) => identity,
             Err(err) => {
                 eprintln!("error: {err}");
                 exit(1);
             }
         };
-        if root_slot != root.slot_dir || !bounds.accepts(root_slot, root_hash.0) {
-            eprintln!(
-                "error: predecessor root object {} does not satisfy epoch {} bootstrap policy",
-                root.snapshot_uri, effective_start
-            );
-            exit(1);
-        }
-        let input_dir = cohort_run_dir
+        let input_dir = cohort_run
             .as_ref()
             .expect("cohort run directory was created")
+            .path()
             .join("inputs");
         if let Err(err) = create_or_validate_private_directory(&input_dir) {
             eprintln!("error: {err}");
             exit(1);
         }
-        let snapshot_path = match download_exact_snapshot(root_slot, &name, &input_dir).await {
+        let snapshot_path = match download_exact_snapshot_generation(
+            root_slot,
+            &name,
+            plan.bootstrap.generation,
+            &input_dir,
+        )
+        .await
+        {
             Ok(path) => path,
             Err(err) => {
-                eprintln!("error: failed to download trusted predecessor root: {err}");
+                eprintln!(
+                    "error: failed to download audited predecessor root generation {}: {err}",
+                    plan.bootstrap.generation
+                );
+                exit(1);
+            }
+        };
+        let binding = match bind_cohort_snapshot_download(&snapshot_path, &plan.bootstrap) {
+            Ok(binding) => binding,
+            Err(err) => {
+                eprintln!("error: {err}");
                 exit(1);
             }
         };
@@ -14375,9 +15246,10 @@ async fn main() {
             exit(1);
         }
         info!(
-            "root-checkpoint cohort {}-{} selected predecessor root {} at slot {}",
-            effective_start, end_epoch, name, root_slot
+            "root-checkpoint cohort {}-{} bound predecessor root {} generation {} at slot {}",
+            effective_start, end_epoch, name, plan.bootstrap.generation, root_slot
         );
+        cohort_bootstrap_binding = Some(binding);
         ReplayBootstrap::SnapshotArchive(snapshot_path)
     } else {
         // The snapshot bootstraps only the first epoch actually run
@@ -14586,38 +15458,39 @@ async fn main() {
     if verify_snapshots {
         if root_checkpoint_cohort {
             let selection = cohort_runtime.expect("cohort runtime was validated");
-            let snapshot_path = bootstrap
-                .snapshot_archive()
-                .expect("root-checkpoint cohort has a snapshot bootstrap");
-            let (bootstrap_slot, bootstrap_expectation) =
-                match snapshot_path_expectation(snapshot_path, selection.descriptor.bootstrap) {
-                    Ok(expectation) => expectation,
-                    Err(err) => {
-                        eprintln!("error: {err}");
-                        exit(1);
-                    }
-                };
-            let (_, cohort_end) = epoch_to_slot_range(end_epoch);
-            let mut expected = match snapshot_expectations_for_span(
-                bootstrap_slot,
-                cohort_end,
-                selection.descriptor.bootstrap,
-            )
-            .await
-            {
-                Ok(expected) => expected,
-                Err(err) => {
-                    eprintln!("error: {err}");
+            let plan = cohort_plan.as_ref().expect("cohort plan was validated");
+            let bootstrap_hash = plan
+                .bootstrap
+                .accounts_hash
+                .parse::<Hash>()
+                .expect("cohort manifest bootstrap hash was validated");
+            let bootstrap_slot = plan.bootstrap.slot;
+            let bootstrap_expectation = snapshot_hash_expectation(
+                SnapshotHash(bootstrap_hash),
+                selection.descriptor.bootstrap.snapshot_hash_kind,
+            );
+            let mut expected = BTreeMap::from([(bootstrap_slot, bootstrap_expectation)]);
+            for checkpoint in &plan.root_checkpoints {
+                let hash = checkpoint
+                    .accounts_hash
+                    .parse::<Hash>()
+                    .expect("cohort manifest checkpoint hash was validated");
+                if expected
+                    .insert(
+                        checkpoint.slot,
+                        snapshot_hash_expectation(
+                            SnapshotHash(hash),
+                            selection.descriptor.bootstrap.snapshot_hash_kind,
+                        ),
+                    )
+                    .is_some()
+                {
+                    eprintln!(
+                        "error: cohort manifest repeats root checkpoint slot {}",
+                        checkpoint.slot
+                    );
                     exit(1);
                 }
-            };
-            if let Err(err) = add_boundary_snapshot_expectation(
-                &mut expected,
-                snapshot_path,
-                selection.descriptor.bootstrap,
-            ) {
-                eprintln!("error: {err}");
-                exit(1);
             }
             if let Err(err) = validate_root_checkpoint_cohort_expectations(
                 effective_start,
@@ -14630,8 +15503,8 @@ async fn main() {
                 exit(1);
             }
             info!(
-                "root-checkpoint cohort verification bound {} root checkpoint(s) through epoch {}",
-                expected.len(),
+                "root-checkpoint cohort verification bound its bootstrap and {} root checkpoint(s) through epoch {}",
+                plan.root_checkpoints.len(),
                 end_epoch
             );
             snapshot_expectations.insert(effective_start, expected);
@@ -15008,11 +15881,16 @@ async fn main() {
                 epoch - effective_start + 1
             );
         }
+        if let Err(err) = destination_binding.revalidate() {
+            eprintln!("error: {err}");
+            exit(1);
+        }
         let final_output = dest_dir.join(format!("epoch-{epoch}.jet"));
         let horizon_output = if root_checkpoint_cohort {
-            let staging = cohort_run_dir
+            let staging = cohort_run
                 .as_ref()
                 .expect("cohort run directory was created")
+                .path()
                 .join("archives");
             if let Err(err) = create_or_validate_private_directory(&staging) {
                 eprintln!("error: {err}");
@@ -15056,13 +15934,20 @@ async fn main() {
             carried_state.take(),
             range_progress.clone(),
             Some(shared_progress.clone()),
+            if epoch == effective_start {
+                cohort_bootstrap_binding.as_ref()
+            } else {
+                None
+            },
             root_checkpoint_cohort.then(|| epoch_to_slot_range(end_epoch).1),
             epoch < end_epoch,
         )
         .await;
         match result {
             Ok(result) => {
-                if root_checkpoint_cohort {
+                let finalization_route =
+                    archive_finalization_route(root_checkpoint_cohort, qualification, range_info);
+                if finalization_route == ArchiveFinalizationRoute::RootCheckpointCohort {
                     let historical_evidence = match result.historical_evidence.clone() {
                         Some(evidence) => evidence,
                         None => {
@@ -15172,7 +16057,7 @@ async fn main() {
                 } else if result.historical_evidence.is_some() {
                     info!("historical replay evidence captured for epoch {epoch}");
                 }
-                if qualification.is_none() && range_info.is_none() {
+                if finalization_route == ArchiveFinalizationRoute::OrdinaryTopLevel {
                     let (slot_start, slot_end_inclusive) = epoch_to_slot_range(epoch);
                     let spans = compatibility::plan_runtime_spans(
                         slot_start..slot_end_inclusive.saturating_add(1),
@@ -15219,18 +16104,8 @@ async fn main() {
         }
     }
     if root_checkpoint_cohort {
-        if completed_cohort.len() as u64 != total_epochs {
-            if shutdown.load(Ordering::SeqCst) {
-                info!(
-                    "root-checkpoint cohort stopped with {} private archive(s); publication remains closed",
-                    completed_cohort.len()
-                );
-                return;
-            }
-            eprintln!(
-                "error: root-checkpoint cohort produced {} archives, expected {total_epochs}; publication remains closed",
-                completed_cohort.len()
-            );
+        if let Err(err) = destination_binding.revalidate() {
+            eprintln!("error: {err}; publication remains closed");
             exit(1);
         }
         let (trusted_slot, trusted_hash) =
@@ -15249,30 +16124,41 @@ async fn main() {
             eprintln!("error: {err}");
             exit(1);
         }
-        if let Err(err) = cohort_verifier
+        let terminal_verification = cohort_verifier
             .as_ref()
             .expect("cohort verifier was created")
-            .finish()
-        {
+            .finish();
+        let publication = after_root_cohort_publication_gate(
+            completed_cohort.len(),
+            total_epochs as usize,
+            shutdown.load(Ordering::SeqCst),
+            terminal_verification,
+            || {
+                info!(
+                    "root-checkpoint cohort {}-{} passed its terminal root and all archive checks; opening publication gate",
+                    effective_start, end_epoch
+                );
+                publish_completed_root_cohort_transactionally(&completed_cohort)
+            },
+        );
+        if let Err(err) = publication {
             eprintln!(
-                "error: root-checkpoint cohort terminal verification is incomplete: {err}; publication remains closed"
+                "error: {err}; private run retained at {}",
+                cohort_run
+                    .as_ref()
+                    .expect("cohort run directory was created")
+                    .path()
+                    .display()
             );
             exit(1);
         }
-        info!(
-            "root-checkpoint cohort {}-{} passed its terminal root and all archive checks; opening publication gate",
-            effective_start, end_epoch
-        );
-        for completed in &completed_cohort {
-            if let Err(err) = publish_validated_staged_archive(
-                completed.epoch,
-                &completed.staged_output,
-                &completed.final_output,
-                completed.validated,
-            ) {
-                eprintln!("error: {err}");
-                exit(1);
-            }
+        if let Err(err) = cohort_run
+            .take()
+            .expect("cohort run directory was created")
+            .cleanup_after_commit()
+        {
+            eprintln!("error: {err}");
+            exit(1);
         }
         info!(
             "root-checkpoint cohort {}-{} published {} archive(s) with checksums",
@@ -15334,6 +16220,186 @@ mod early_snapshot_tests {
 
         let error = root_checkpoint_cohort_runtime(11, 12, true).unwrap_err();
         assert!(error.contains("changes runtime at epoch 12"), "{error}");
+
+        let error = root_checkpoint_cohort_runtime(954, 955, false).unwrap_err();
+        assert!(
+            error.contains("isolated historical Solana worker"),
+            "{error}"
+        );
+    }
+
+    fn cohort_manifest_object(
+        slot: Slot,
+        hash: Hash,
+        generation: u64,
+        bytes: &[u8],
+    ) -> serde_json::Value {
+        let name = format!("snapshot-{slot}-{hash}.tar.bz2");
+        let uri = format!("{DEFAULT_BUCKET}/{slot}/{name}");
+        let crc = Crc::<u32>::new(&CRC_32_ISCSI).checksum(bytes);
+        serde_json::json!({
+            "accounts_hash": hash.to_string(),
+            "anchor_slot": slot,
+            "crc32c": BASE64_STANDARD.encode(crc.to_be_bytes()),
+            "extension": ".tar.bz2",
+            "generation": generation,
+            "size": bytes.len(),
+            "slot": slot,
+            "source": "root",
+            "uri": uri,
+            "versioned_uri": format!("{uri}#{generation}")
+        })
+    }
+
+    fn cohort_manifest_report(bytes: &[u8]) -> (serde_json::Value, String) {
+        let bootstrap_hash = Hash::new_from_array([0x11; 32]);
+        let final_hash = Hash::new_from_array([0x22; 32]);
+        let manifest = serde_json::json!({
+            "bucket": DEFAULT_BUCKET,
+            "epoch_slots": 432_000,
+            "first_epoch": 1,
+            "last_epoch": 100,
+            "schema": COHORT_MANIFEST_SCHEMA,
+            "verification_cohorts": [{
+                "accepted_extensions": [".tar.bz2"],
+                "bootstrap": cohort_manifest_object(7_343_776, bootstrap_hash, 101, bytes),
+                "first_epoch": 17,
+                "last_epoch": 19,
+                "publication_gate": COHORT_PUBLICATION_GATE,
+                "root_checkpoints": [cohort_manifest_object(
+                    8_213_950,
+                    final_hash,
+                    102,
+                    b"checkpoint metadata is not downloaded"
+                )],
+                "runtime": "solana-v1.0.23"
+            }]
+        });
+        let fingerprint = cohort_manifest_fingerprint(&manifest).unwrap();
+        (
+            serde_json::json!({
+                "manifest": manifest,
+                "manifest_fingerprint": fingerprint
+            }),
+            fingerprint,
+        )
+    }
+
+    #[test]
+    fn sealed_cohort_manifest_binds_runtime_roots_and_fingerprint() {
+        let bytes = b"audited generation one";
+        let (report, fingerprint) = cohort_manifest_report(bytes);
+        let selection = root_checkpoint_cohort_runtime(17, 19, true).unwrap();
+        let plan = root_checkpoint_cohort_plan_from_report(
+            report.clone(),
+            &fingerprint,
+            17,
+            19,
+            selection,
+        )
+        .unwrap();
+        assert_eq!(plan.bootstrap.slot, 7_343_776);
+        assert_eq!(plan.bootstrap.generation, 101);
+        assert_eq!(plan.root_checkpoints.len(), 1);
+
+        let mut changed = report;
+        changed["manifest"]["verification_cohorts"][0]["bootstrap"]["generation"] =
+            serde_json::json!(202);
+        let error =
+            root_checkpoint_cohort_plan_from_report(changed, &fingerprint, 17, 19, selection)
+                .unwrap_err();
+        assert!(error.contains("fingerprint mismatch"), "{error}");
+    }
+
+    #[test]
+    fn cohort_manifest_fingerprint_matches_python_canonical_json() {
+        let manifest = serde_json::json!({
+            "z": [3, true, null],
+            "a": {"x": "ASCII", "n": 17}
+        });
+        assert_eq!(
+            cohort_manifest_fingerprint(&manifest).unwrap(),
+            "sha256:07d38896ccb84d2b0e52fffb78e70f293ded9e3988277f9332ab96469323c435"
+        );
+    }
+
+    #[test]
+    fn downloaded_cohort_bootstrap_rejects_g1_to_g2_path_replacement() {
+        let generation_one = b"audited generation one";
+        let generation_two = b"replacement version 2!";
+        assert_eq!(generation_one.len(), generation_two.len());
+        let (report, fingerprint) = cohort_manifest_report(generation_one);
+        let plan = root_checkpoint_cohort_plan_from_report(
+            report,
+            &fingerprint,
+            17,
+            19,
+            root_checkpoint_cohort_runtime(17, 19, true).unwrap(),
+        )
+        .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory
+            .path()
+            .join(snapshot_filename(&plan.bootstrap.uri).unwrap());
+        fs::write(&path, generation_one).unwrap();
+        let binding = bind_cohort_snapshot_download(&path, &plan.bootstrap).unwrap();
+        binding.revalidate().unwrap();
+
+        fs::remove_file(&path).unwrap();
+        fs::write(&path, generation_two).unwrap();
+        let error = binding.revalidate().unwrap_err();
+        assert!(error.contains("changed after it was bound"), "{error}");
+
+        let error = bind_cohort_snapshot_download(&path, &plan.bootstrap).unwrap_err();
+        assert!(error.contains("CRC32C mismatch"), "{error}");
+    }
+
+    #[test]
+    fn root_cohort_finalization_has_one_private_validation_path() {
+        let route = archive_finalization_route(true, None, None);
+        let mut validation_passes = 0;
+        let mut immediate_checksum_publications = 0;
+        match route {
+            ArchiveFinalizationRoute::RootCheckpointCohort => validation_passes += 1,
+            ArchiveFinalizationRoute::OrdinaryTopLevel => {
+                validation_passes += 1;
+                immediate_checksum_publications += 1;
+            }
+            ArchiveFinalizationRoute::InternalOrQualification => {}
+        }
+        assert_eq!(validation_passes, 1);
+        assert_eq!(immediate_checksum_publications, 0);
+    }
+
+    #[test]
+    fn interruption_and_root_mismatch_never_open_the_publication_gate() {
+        let calls = AtomicUsize::new(0);
+        let directory = tempfile::tempdir().unwrap();
+        let archive = directory.path().join("epoch-17.jet");
+        fs::write(&archive, b"privately staged archive").unwrap();
+        let checksum = jetstreamer_node::archive_checksum::archive_checksum_path(&archive).unwrap();
+        let interrupted = after_root_cohort_publication_gate(3, 3, true, Ok(()), || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            fs::write(&checksum, b"must remain unreachable").unwrap();
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(interrupted.contains("interrupted"));
+        let mismatch = after_root_cohort_publication_gate(
+            3,
+            3,
+            false,
+            Err("accounts hash mismatch".to_string()),
+            || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                fs::write(&checksum, b"must remain unreachable").unwrap();
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(mismatch.contains("accounts hash mismatch"));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(!checksum.exists());
     }
 
     #[test]
@@ -16845,6 +17911,65 @@ mod early_snapshot_tests {
         let mut builder = fs::DirBuilder::new();
         builder.mode(0o770).create(&destination).unwrap();
         (fixture, destination)
+    }
+
+    #[test]
+    fn destination_binding_ignores_cli_symlink_retargeting() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = tempfile::tempdir_in(".").unwrap();
+        let first = fixture.path().join("first");
+        let second = fixture.path().join("second");
+        fs::create_dir(&first).unwrap();
+        fs::create_dir(&second).unwrap();
+        let selected = fixture.path().join("selected");
+        symlink(&first, &selected).unwrap();
+
+        let binding = BoundDestination::bind(&selected).unwrap();
+        let bound_path = first.canonicalize().unwrap();
+        assert_eq!(binding.path(), bound_path);
+        fs::remove_file(&selected).unwrap();
+        symlink(&second, &selected).unwrap();
+
+        assert_eq!(
+            binding.path().join("epoch-17.jet"),
+            bound_path.join("epoch-17.jet")
+        );
+        binding.revalidate().unwrap();
+    }
+
+    #[test]
+    fn cohort_run_directory_survives_until_committed_cleanup() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let fixture = tempfile::tempdir_in(".").unwrap();
+        let parent = fixture.path().join("cohort");
+        let run = CohortRunDirectory::create(
+            parent,
+            17,
+            19,
+            "sha256:888df3d89187e3fb8cd307e65eab1a4770153887965f3defd74f048504fc3f1a",
+        )
+        .unwrap();
+        let run_path = run.path().to_path_buf();
+        let archive_dir = run_path.join("archives");
+        create_or_validate_private_directory(&archive_dir).unwrap();
+        fs::write(archive_dir.join("epoch-17.jet"), b"private archive").unwrap();
+
+        let state = fs::read_to_string(run_path.join(COHORT_RUN_STATE_FILE)).unwrap();
+        assert!(state.contains("running-private"));
+        assert_eq!(
+            fs::metadata(run_path.join(COHORT_RUN_STATE_FILE))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert!(archive_dir.join("epoch-17.jet").is_file());
+
+        run.cleanup_after_commit().unwrap();
+        assert!(!run_path.exists());
     }
 
     fn assert_private_scope_and_epoch_lease_guards() {

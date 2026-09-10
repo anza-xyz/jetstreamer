@@ -63,6 +63,17 @@ RUNTIME_ROUTES = (
     (61, 91, "solana-v1.2.32", (".tar.bz2", ".tar.zst")),
     (92, 100, "solana-v1.3.19", (".tar.bz2", ".tar.zst")),
 )
+ROOT_COHORT_HISTORICAL_RUNTIMES = frozenset(
+    {
+        "solana-v1.0.8",
+        "solana-v1.0.13",
+        "solana-v1.0.14",
+        "solana-v1.0.23",
+        "solana-v1.1.23",
+        "solana-v1.2.32",
+        "solana-v1.3.19",
+    }
+)
 SNAPSHOT_ARCHIVE_EXTENSIONS = (".tar.zst", ".tar.lz4", ".tar.bz2")
 
 _DECIMAL_RE = re.compile(r"(?:0|[1-9][0-9]*)\Z")
@@ -355,6 +366,11 @@ def accepted_extensions(epoch: int) -> Tuple[str, ...]:
     return runtime_route(epoch)[1]
 
 
+def root_cohort_runtime_is_historical(runtime: str) -> bool:
+    """Return whether a runtime is an isolated, pinned Solana worker."""
+    return runtime in ROOT_COHORT_HISTORICAL_RUNTIMES
+
+
 def epoch_slot_range(epoch: int) -> Tuple[int, int]:
     start = epoch * EPOCH_SLOTS
     return start, start + EPOCH_SLOTS - 1
@@ -478,6 +494,11 @@ def build_verification_cohorts(
         # in its predecessor epoch through the first later root. Replaying the
         # later epoch from an hourly object would leave the earlier archives
         # outside the verified state transition.
+        if not root_cohort_runtime_is_historical(runtime):
+            raise PreflightError(
+                f"epoch {epoch}: root-checkpoint gaps require an isolated historical "
+                f"Solana runtime, got {runtime}"
+            )
         bootstrap = _select_bootstrap(epoch, root_objects, root_only=True)
         cohort_end = epoch
         cohort_checkpoints: Tuple[SnapshotObject, ...] = ()

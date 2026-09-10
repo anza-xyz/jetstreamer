@@ -117,6 +117,8 @@ pub enum SnapshotError {
     SnapshotFilenameMissing { uri: String },
     #[error("invalid exact snapshot identity for slot {slot}: {name}")]
     InvalidExactSnapshotIdentity { slot: u64, name: String },
+    #[error("invalid exact snapshot generation: {generation}")]
+    InvalidExactSnapshotGeneration { generation: u64 },
     #[error("snapshot destination is not a non-empty regular file: {path}")]
     InvalidDestination { path: PathBuf },
     #[error("failed to persist downloaded snapshot to {path}: {source}")]
@@ -360,6 +362,65 @@ pub async fn download_exact_snapshot(
     archive_name: &str,
     dest_dir: impl AsRef<Path>,
 ) -> Result<PathBuf, SnapshotError> {
+    download_exact_snapshot_inner(slot, archive_name, None, dest_dir).await
+}
+
+/// Downloads one exact object generation selected by a sealed inventory.
+///
+/// GCS generations are immutable. Appending `#generation` makes replacement
+/// of the live object name fail closed instead of silently downloading newer
+/// bytes than the preflight audited.
+pub async fn download_exact_snapshot_generation(
+    slot: u64,
+    archive_name: &str,
+    generation: u64,
+    dest_dir: impl AsRef<Path>,
+) -> Result<PathBuf, SnapshotError> {
+    if generation == 0 {
+        return Err(SnapshotError::InvalidExactSnapshotGeneration { generation });
+    }
+    download_exact_snapshot_inner(slot, archive_name, Some(generation), dest_dir).await
+}
+
+#[cfg(test)]
+async fn download_exact_snapshot_generation_with<F, Fut>(
+    slot: u64,
+    archive_name: &str,
+    generation: u64,
+    dest_dir: impl AsRef<Path>,
+    copy: F,
+) -> Result<PathBuf, SnapshotError>
+where
+    F: FnOnce(String, PathBuf) -> Fut,
+    Fut: std::future::Future<Output = Result<(), SnapshotError>>,
+{
+    if generation == 0 {
+        return Err(SnapshotError::InvalidExactSnapshotGeneration { generation });
+    }
+    validate_exact_snapshot_identity(slot, archive_name)?;
+    let dest_dir = prepare_snapshot_destination(dest_dir.as_ref()).await?;
+    download_snapshot_uri_to_dir_with(
+        exact_snapshot_uri(slot, archive_name, Some(generation)),
+        archive_name,
+        dest_dir,
+        copy,
+    )
+    .await
+}
+
+async fn download_exact_snapshot_inner(
+    slot: u64,
+    archive_name: &str,
+    generation: Option<u64>,
+    dest_dir: impl AsRef<Path>,
+) -> Result<PathBuf, SnapshotError> {
+    validate_exact_snapshot_identity(slot, archive_name)?;
+    let dest_dir = prepare_snapshot_destination(dest_dir.as_ref()).await?;
+    let uri = exact_snapshot_uri(slot, archive_name, generation);
+    download_snapshot_uri_to_dir(&uri, archive_name, dest_dir).await
+}
+
+fn validate_exact_snapshot_identity(slot: u64, archive_name: &str) -> Result<(), SnapshotError> {
     let expected_prefix = format!("snapshot-{slot}-");
     if !archive_name.starts_with(&expected_prefix)
         || archive_name.contains('/')
@@ -373,16 +434,25 @@ pub async fn download_exact_snapshot(
             name: archive_name.to_owned(),
         });
     }
+    Ok(())
+}
 
-    let dest_dir = dest_dir.as_ref();
+async fn prepare_snapshot_destination(dest_dir: &Path) -> Result<&Path, SnapshotError> {
     tokio::fs::create_dir_all(dest_dir)
         .await
         .map_err(|source| SnapshotError::CreateDir {
             path: dest_dir.to_path_buf(),
             source,
         })?;
+    Ok(dest_dir)
+}
+
+fn exact_snapshot_uri(slot: u64, archive_name: &str, generation: Option<u64>) -> String {
     let uri = format!("{DEFAULT_BUCKET}/{slot}/{archive_name}");
-    download_snapshot_uri_to_dir(&uri, archive_name, dest_dir).await
+    match generation {
+        Some(generation) => format!("{uri}#{generation}"),
+        None => uri,
+    }
 }
 
 fn snapshot_filename(uri: &str) -> Result<&str, SnapshotError> {
@@ -458,15 +528,35 @@ async fn download_snapshot_uri_to_dir(
     filename: &str,
     dest_dir: &Path,
 ) -> Result<PathBuf, SnapshotError> {
+    download_snapshot_uri_to_dir_with(
+        uri.to_owned(),
+        filename,
+        dest_dir,
+        |uri, temporary| async move {
+            let temporary_arg = temporary.to_string_lossy().into_owned();
+            gcloud_status(&["storage", "cp", &uri, &temporary_arg]).await
+        },
+    )
+    .await
+}
+
+async fn download_snapshot_uri_to_dir_with<F, Fut>(
+    uri: String,
+    filename: &str,
+    dest_dir: &Path,
+    copy: F,
+) -> Result<PathBuf, SnapshotError>
+where
+    F: FnOnce(String, PathBuf) -> Fut,
+    Fut: std::future::Future<Output = Result<(), SnapshotError>>,
+{
     let destination = dest_dir.join(filename);
     if valid_existing_snapshot_destination(&destination)? {
         return Ok(destination);
     }
 
     let temporary = new_snapshot_download(filename, dest_dir)?;
-    let temporary_arg = temporary.path.to_string_lossy().into_owned();
-
-    gcloud_status(&["storage", "cp", uri, &temporary_arg]).await?;
+    copy(uri, temporary.path.clone()).await?;
     publish_downloaded_snapshot(&temporary.path, &destination, dest_dir)
 }
 
@@ -1306,6 +1396,51 @@ mod tests {
                 Err(SnapshotError::InvalidExactSnapshotIdentity { .. })
             ));
         }
+        assert!(
+            std::fs::read_dir(directory.path())
+                .unwrap()
+                .next()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn generation_pinned_download_issues_a_versioned_request() {
+        let name = format!("snapshot-619848-{HASH_A}.tar.bz2");
+        let directory = tempfile::tempdir().unwrap();
+        let issued = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let captured = issued.clone();
+        let downloaded = download_exact_snapshot_generation_with(
+            619_848,
+            &name,
+            1_634_787_417_768_812,
+            directory.path(),
+            move |uri, path| async move {
+                *captured.lock().unwrap() = Some(uri);
+                std::fs::write(path, b"generation-pinned bytes")?;
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            issued.lock().unwrap().as_deref(),
+            Some(format!("{DEFAULT_BUCKET}/619848/{name}#1634787417768812").as_str())
+        );
+        assert_eq!(
+            std::fs::read(downloaded).unwrap(),
+            b"generation-pinned bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn generation_pinned_download_rejects_generation_zero_before_io() {
+        let directory = tempfile::tempdir().unwrap();
+        let name = format!("snapshot-619848-{HASH_A}.tar.bz2");
+        assert!(matches!(
+            download_exact_snapshot_generation(619_848, &name, 0, directory.path()).await,
+            Err(SnapshotError::InvalidExactSnapshotGeneration { generation: 0 })
+        ));
         assert!(
             std::fs::read_dir(directory.path())
                 .unwrap()

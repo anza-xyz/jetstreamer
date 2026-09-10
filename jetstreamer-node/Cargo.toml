@@ -10,6 +10,7 @@ keywords.workspace = true
 
 [dependencies]
 agave-snapshots.workspace = true
+base64.workspace = true
 bincode.workspace = true
 cid.workspace = true
 # Global allocator (same choice as agave-validator): glibc malloc never returns
@@ -20,6 +21,7 @@ tikv-jemallocator = { version = "0.6", features = [
     "unprefixed_malloc_on_supported_platforms",
 ] }
 crossbeam-channel.workspace = true
+crc.workspace = true
 ctrlc.workspace = true
 dashmap.workspace = true
 env_logger.workspace = true

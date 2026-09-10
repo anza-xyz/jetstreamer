@@ -4719,9 +4719,11 @@ name = "jetstreamer-node"
 version = "0.7.0"
 dependencies = [
  "agave-snapshots",
+ "base64 0.22.1",
  "bincode",
  "bs58",
  "cid",
+ "crc",
  "crossbeam-channel",
  "ctrlc",
  "dashmap 6.1.0",

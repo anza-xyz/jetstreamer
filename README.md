@@ -389,26 +389,37 @@ cohort. The preflight manifest records the root object's generation, CRC32C, siz
 accounts hash. It also records the full cohort range and terminal root checkpoints.
 
 Epochs 17 through 19 are one such cohort. They start from root slot 7,343,776 and reach root
-checkpoints in epoch 19. Run the cohort with:
+checkpoints in epoch 19. First save the complete preflight report in an owner-controlled file and
+record its printed `manifest_fingerprint` through the review channel. The fingerprint supplied to
+the replay must be the independently reviewed value, not a value copied from a newly downloaded
+report. Run the cohort with:
 
 ```bash
 JETSTREAMER_ALLOW_CANDIDATE_RUNTIME=1 \
   cargo run --release -p jetstreamer-node --bin jetstreamer-node -- \
-  17-19 /path/to/output --verify --root-checkpoint-cohort
+  17-19 /path/to/output --verify --root-checkpoint-cohort \
+  --cohort-manifest=/secure/path/preflight-1-100.json \
+  --cohort-manifest-fingerprint=sha256:888df3d89187e3fb8cd307e65eab1a4770153887965f3defd74f048504fc3f1a
 ```
 
 This mode keeps one historical worker and one root-only verifier alive across every epoch
-boundary. Each epoch archive is written below the owner-only private run directory. The process
+boundary. It downloads the manifest's immutable GCS generation, verifies the recorded size and
+CRC32C, and holds the measured inode and SHA-256 digest through historical worker startup. The
+worker makes its own digest-checked private copy before decoding. Checkpoint expectations come
+only from the same fingerprinted manifest; replay does not replace them with a later bucket
+listing. Each epoch archive is written below the owner-only private run directory. The process
 checks the exact checkpoint handoff, the next archive's initial PoH and parent anchors,
 cross-bucket continuity, provenance, full archive decode, and archive digest while publication is
 closed. Each terminal checkpoint must match the archive's final present block, so trailing skipped
-slots do not create a false epoch-boundary requirement. A mismatch, missing final-epoch root, or
-interruption leaves every generated archive private and creates no checksum. The final root must
-pass before any cohort archive is moved into the output directory and checksummed.
+slots do not create a false epoch-boundary requirement. A mismatch, missing final-epoch root,
+infrastructure failure, or interruption leaves every generated archive and its recognizable run
+state private and creates no checksum. The final root and every archive must pass before the
+transactional publisher can expose any cohort member.
 
 Use `scripts/preflight_gcs_snapshots.py` before scheduling early epochs. Its schema-v2
 `verification_cohorts` array supplies the ranges accepted by this mode and fails if a root gap
-would cross a runtime boundary or extend beyond the requested range.
+would cross a runtime boundary, select a non-historical runtime, or extend beyond the requested
+range.
 
 When an epoch crosses a registered runtime boundary, `jetstreamer-node` splits it automatically
 into bounded child replays. Each child writes a complete Horizon V2 segment plus a durable JSON

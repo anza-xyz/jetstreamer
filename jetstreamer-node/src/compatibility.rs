@@ -164,12 +164,25 @@ pub enum BootstrapStateLoader {
     HistoricalWorkerSnapshotArchive,
 }
 
+/// Meaning of the hash embedded in a snapshot archive filename.
+///
+/// This is an execution-runtime property, not a compression-format property:
+/// historical runtimes can store their legacy accounts hash in either a bzip2
+/// or zstd archive name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SnapshotHashKind {
+    LegacyAccountsHash,
+    AccountsLtHash,
+}
+
 /// Persisted state formats accepted by one execution runtime.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BootstrapState {
     pub loader: BootstrapStateLoader,
     /// Complete archive suffixes, including the leading dot.
     pub archive_extensions: &'static [&'static str],
+    /// Hash scheme committed by the archive filename.
+    pub snapshot_hash_kind: SnapshotHashKind,
     /// Whether a bank produced by this same runtime may be carried directly
     /// across an epoch boundary without reloading an archive.
     pub permits_in_memory_handoff: bool,
@@ -263,6 +276,22 @@ impl RuntimeDescriptor {
             return Err(format!(
                 "runtime descriptor {} selects loader {:?}, expected {:?} for backend {:?}",
                 self.identity.name, self.bootstrap.loader, expected_loader, self.backend
+            ));
+        }
+
+        let expected_snapshot_hash_kind = match self.bootstrap.loader {
+            BootstrapStateLoader::HistoricalWorkerSnapshotArchive => {
+                SnapshotHashKind::LegacyAccountsHash
+            }
+            BootstrapStateLoader::AgaveSnapshotArchive => SnapshotHashKind::AccountsLtHash,
+        };
+        if self.bootstrap.snapshot_hash_kind != expected_snapshot_hash_kind {
+            return Err(format!(
+                "runtime descriptor {} uses snapshot hash kind {:?}, expected {:?} for loader {:?}",
+                self.identity.name,
+                self.bootstrap.snapshot_hash_kind,
+                expected_snapshot_hash_kind,
+                self.bootstrap.loader,
             ));
         }
 
@@ -378,6 +407,7 @@ pub static SOLANA_V1_0_7_RUNTIME: RuntimeDescriptor = RuntimeDescriptor {
     bootstrap: BootstrapState {
         loader: BootstrapStateLoader::HistoricalWorkerSnapshotArchive,
         archive_extensions: &[".tar.bz2"],
+        snapshot_hash_kind: SnapshotHashKind::LegacyAccountsHash,
         permits_in_memory_handoff: false,
     },
     worker: Some(WorkerExecutable {
@@ -399,6 +429,7 @@ pub static SOLANA_V1_0_8_RUNTIME: RuntimeDescriptor = RuntimeDescriptor {
     bootstrap: BootstrapState {
         loader: BootstrapStateLoader::HistoricalWorkerSnapshotArchive,
         archive_extensions: &[".tar.bz2"],
+        snapshot_hash_kind: SnapshotHashKind::LegacyAccountsHash,
         permits_in_memory_handoff: false,
     },
     worker: Some(WorkerExecutable {
@@ -420,6 +451,7 @@ pub static SOLANA_V1_0_13_RUNTIME: RuntimeDescriptor = RuntimeDescriptor {
     bootstrap: BootstrapState {
         loader: BootstrapStateLoader::HistoricalWorkerSnapshotArchive,
         archive_extensions: &[".tar.bz2"],
+        snapshot_hash_kind: SnapshotHashKind::LegacyAccountsHash,
         permits_in_memory_handoff: false,
     },
     worker: Some(WorkerExecutable {
@@ -441,6 +473,7 @@ pub static SOLANA_V1_0_14_RUNTIME: RuntimeDescriptor = RuntimeDescriptor {
     bootstrap: BootstrapState {
         loader: BootstrapStateLoader::HistoricalWorkerSnapshotArchive,
         archive_extensions: &[".tar.bz2"],
+        snapshot_hash_kind: SnapshotHashKind::LegacyAccountsHash,
         permits_in_memory_handoff: false,
     },
     worker: Some(WorkerExecutable {
@@ -462,6 +495,7 @@ pub static SOLANA_V1_0_17_RUNTIME: RuntimeDescriptor = RuntimeDescriptor {
     bootstrap: BootstrapState {
         loader: BootstrapStateLoader::HistoricalWorkerSnapshotArchive,
         archive_extensions: &[".tar.bz2"],
+        snapshot_hash_kind: SnapshotHashKind::LegacyAccountsHash,
         permits_in_memory_handoff: false,
     },
     worker: Some(WorkerExecutable {
@@ -483,6 +517,7 @@ pub static SOLANA_V1_0_18_RUNTIME: RuntimeDescriptor = RuntimeDescriptor {
     bootstrap: BootstrapState {
         loader: BootstrapStateLoader::HistoricalWorkerSnapshotArchive,
         archive_extensions: &[".tar.bz2"],
+        snapshot_hash_kind: SnapshotHashKind::LegacyAccountsHash,
         permits_in_memory_handoff: false,
     },
     worker: Some(WorkerExecutable {
@@ -504,6 +539,7 @@ pub static SOLANA_V1_0_23_RUNTIME: RuntimeDescriptor = RuntimeDescriptor {
     bootstrap: BootstrapState {
         loader: BootstrapStateLoader::HistoricalWorkerSnapshotArchive,
         archive_extensions: &[".tar.bz2"],
+        snapshot_hash_kind: SnapshotHashKind::LegacyAccountsHash,
         permits_in_memory_handoff: false,
     },
     worker: Some(WorkerExecutable {
@@ -525,6 +561,7 @@ pub static SOLANA_V1_0_24_RUNTIME: RuntimeDescriptor = RuntimeDescriptor {
     bootstrap: BootstrapState {
         loader: BootstrapStateLoader::HistoricalWorkerSnapshotArchive,
         archive_extensions: &[".tar.bz2"],
+        snapshot_hash_kind: SnapshotHashKind::LegacyAccountsHash,
         permits_in_memory_handoff: false,
     },
     worker: Some(WorkerExecutable {
@@ -546,6 +583,7 @@ pub static SOLANA_V1_1_23_RUNTIME: RuntimeDescriptor = RuntimeDescriptor {
     bootstrap: BootstrapState {
         loader: BootstrapStateLoader::HistoricalWorkerSnapshotArchive,
         archive_extensions: &[".tar.bz2"],
+        snapshot_hash_kind: SnapshotHashKind::LegacyAccountsHash,
         permits_in_memory_handoff: false,
     },
     worker: Some(WorkerExecutable {
@@ -566,7 +604,8 @@ pub static SOLANA_V1_2_32_RUNTIME: RuntimeDescriptor = RuntimeDescriptor {
     },
     bootstrap: BootstrapState {
         loader: BootstrapStateLoader::HistoricalWorkerSnapshotArchive,
-        archive_extensions: &[".tar.bz2"],
+        archive_extensions: &[".tar.bz2", ".tar.zst"],
+        snapshot_hash_kind: SnapshotHashKind::LegacyAccountsHash,
         permits_in_memory_handoff: false,
     },
     worker: Some(WorkerExecutable {
@@ -587,7 +626,8 @@ pub static SOLANA_V1_3_19_RUNTIME: RuntimeDescriptor = RuntimeDescriptor {
     },
     bootstrap: BootstrapState {
         loader: BootstrapStateLoader::HistoricalWorkerSnapshotArchive,
-        archive_extensions: &[".tar.bz2"],
+        archive_extensions: &[".tar.bz2", ".tar.zst"],
+        snapshot_hash_kind: SnapshotHashKind::LegacyAccountsHash,
         permits_in_memory_handoff: false,
     },
     worker: Some(WorkerExecutable {
@@ -609,6 +649,7 @@ pub static AGAVE_V3_RUNTIME: RuntimeDescriptor = RuntimeDescriptor {
     bootstrap: BootstrapState {
         loader: BootstrapStateLoader::AgaveSnapshotArchive,
         archive_extensions: &[".tar.zst", ".tar.lz4"],
+        snapshot_hash_kind: SnapshotHashKind::AccountsLtHash,
         permits_in_memory_handoff: true,
     },
     worker: None,
@@ -1543,6 +1584,68 @@ mod tests {
         ));
         assert!(agave.bootstrap.permits_in_memory_handoff);
         assert!(agave.worker.is_none());
+    }
+
+    #[test]
+    fn snapshot_filename_hash_and_container_support_are_runtime_scoped() {
+        let legacy_bzip2_only = [
+            RuntimeBackend::SolanaV1_0_7,
+            RuntimeBackend::SolanaV1_0_8,
+            RuntimeBackend::SolanaV1_0_13,
+            RuntimeBackend::SolanaV1_0_14,
+            RuntimeBackend::SolanaV1_0_17,
+            RuntimeBackend::SolanaV1_0_18,
+            RuntimeBackend::SolanaV1_0_23,
+            RuntimeBackend::SolanaV1_0_24,
+            RuntimeBackend::SolanaV1_1_23,
+        ];
+        for backend in legacy_bzip2_only {
+            let bootstrap = backend.descriptor().unwrap().bootstrap;
+            assert_eq!(
+                bootstrap.snapshot_hash_kind,
+                SnapshotHashKind::LegacyAccountsHash
+            );
+            assert_eq!(bootstrap.archive_extensions, &[".tar.bz2"]);
+        }
+
+        for backend in [RuntimeBackend::SolanaV1_2_32, RuntimeBackend::SolanaV1_3_19] {
+            let descriptor = backend.descriptor().unwrap();
+            assert_eq!(
+                descriptor.bootstrap.snapshot_hash_kind,
+                SnapshotHashKind::LegacyAccountsHash
+            );
+            assert_eq!(
+                descriptor.bootstrap.archive_extensions,
+                &[".tar.bz2", ".tar.zst"]
+            );
+            assert!(descriptor.accepts_bootstrap_archive_name("snapshot-1-hash.tar.bz2"));
+            assert!(descriptor.accepts_bootstrap_archive_name("snapshot-1-hash.tar.zst"));
+            assert!(!descriptor.accepts_bootstrap_archive_name("snapshot-1-hash.tar.lz4"));
+        }
+
+        assert_eq!(
+            AGAVE_V3_RUNTIME.bootstrap.snapshot_hash_kind,
+            SnapshotHashKind::AccountsLtHash
+        );
+
+        let mut historical_with_current_hash = SOLANA_V1_2_32_RUNTIME;
+        historical_with_current_hash.bootstrap.snapshot_hash_kind =
+            SnapshotHashKind::AccountsLtHash;
+        assert!(
+            historical_with_current_hash
+                .validate()
+                .unwrap_err()
+                .contains("expected LegacyAccountsHash")
+        );
+
+        let mut agave_with_legacy_hash = AGAVE_V3_RUNTIME;
+        agave_with_legacy_hash.bootstrap.snapshot_hash_kind = SnapshotHashKind::LegacyAccountsHash;
+        assert!(
+            agave_with_legacy_hash
+                .validate()
+                .unwrap_err()
+                .contains("expected AccountsLtHash")
+        );
     }
 
     #[test]

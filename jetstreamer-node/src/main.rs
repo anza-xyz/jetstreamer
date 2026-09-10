@@ -4906,31 +4906,18 @@ fn range_runtime_kinds(
     Ok((has_historical_worker, has_agave))
 }
 
-/// Whether this is a historical Solana 1.0 snapshot archive.  This classifies
-/// the persisted format only; runtime selection is independently driven by
-/// the requested slot range in `compatibility`.
-fn is_legacy_snapshot_archive(path: &Path) -> bool {
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| name.ends_with(".tar.bz2"))
-}
-
-fn legacy_boundary_expectation(path: &Path) -> Result<BTreeMap<Slot, BankHashExpectation>, String> {
-    let name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| format!("snapshot path has no UTF-8 filename: {}", path.display()))?;
-    if !name.ends_with(".tar.bz2") {
-        return Err(format!(
-            "legacy accounts-hash expectation requires a .tar.bz2 snapshot: {}",
-            path.display()
-        ));
+fn snapshot_hash_expectation(
+    hash: SnapshotHash,
+    kind: compatibility::SnapshotHashKind,
+) -> BankHashExpectation {
+    match kind {
+        compatibility::SnapshotHashKind::LegacyAccountsHash => {
+            BankHashExpectation::LegacyAccountsHash(hash.0)
+        }
+        compatibility::SnapshotHashKind::AccountsLtHash => {
+            BankHashExpectation::AccountsLtHash(hash)
+        }
     }
-    let (slot, hash) = parse_snapshot_archive_name(name)?;
-    Ok(BTreeMap::from([(
-        slot,
-        BankHashExpectation::LegacyAccountsHash(hash.0),
-    )]))
 }
 
 fn initial_replay_slot(bootstrap_slot: Slot, epoch_start: Slot) -> Result<Slot, String> {
@@ -5372,6 +5359,9 @@ fn historical_worker_profile(
         || profile.rust_toolchain != identity.rust_toolchain
         || Some(profile.target) != identity.target
         || profile.required_genesis_hash != identity.genesis_hash
+        || profile.snapshot_archive_extensions != descriptor.bootstrap.archive_extensions
+        || descriptor.bootstrap.snapshot_hash_kind
+            != compatibility::SnapshotHashKind::LegacyAccountsHash
     {
         return Err(format!(
             "runtime descriptor {} does not match its compiled historical worker profile",
@@ -5397,6 +5387,7 @@ fn configured_historical_worker_executable(
         }))
 }
 
+#[derive(Debug)]
 struct SnapshotArchiveCandidate {
     path: PathBuf,
     slot: Slot,
@@ -5429,7 +5420,7 @@ fn find_existing_snapshot_archive(
     }
     let read_dir = fs::read_dir(dest_dir)
         .map_err(|err| format!("failed to read {}: {err}", dest_dir.display()))?;
-    let mut best: Option<SnapshotArchiveCandidate> = None;
+    let mut best: Vec<SnapshotArchiveCandidate> = Vec::new();
     for entry in read_dir {
         let entry = entry.map_err(|err| format!("failed to read dir entry: {err}"))?;
         let file_type = entry
@@ -5465,12 +5456,31 @@ fn find_existing_snapshot_archive(
             path: entry.path(),
             slot,
         };
-        match best.as_ref() {
-            Some(current) if current.slot >= candidate.slot => {}
-            _ => best = Some(candidate),
+        match best.first() {
+            Some(current) if current.slot > candidate.slot => {}
+            Some(current) if current.slot == candidate.slot => best.push(candidate),
+            _ => {
+                best.clear();
+                best.push(candidate);
+            }
         }
     }
-    Ok(best)
+    match best.len() {
+        0 => Ok(None),
+        1 => Ok(best.pop()),
+        _ => {
+            let slot = best[0].slot;
+            let mut paths = best
+                .into_iter()
+                .map(|candidate| candidate.path.display().to_string())
+                .collect::<Vec<_>>();
+            paths.sort_unstable();
+            Err(format!(
+                "multiple local snapshot archives match newest slot {slot}: {}",
+                paths.join(", ")
+            ))
+        }
+    }
 }
 
 fn has_extracted_snapshot(dest_dir: &Path, slot: Slot) -> Result<bool, String> {
@@ -5528,12 +5538,12 @@ fn has_extracted_snapshot(dest_dir: &Path, slot: Slot) -> Result<bool, String> {
 async fn snapshot_expectations_for_span(
     start_slot: Slot,
     end_slot_inclusive: Slot,
-    archive_extensions: &[&str],
+    bootstrap: compatibility::BootstrapState,
 ) -> Result<BTreeMap<Slot, BankHashExpectation>, String> {
     let snapshots = list_snapshots_in_slot_range_matching(
         start_slot,
         end_slot_inclusive,
-        archive_extensions,
+        bootstrap.archive_extensions,
     )
     .await
     .map_err(|err| {
@@ -5549,11 +5559,7 @@ async fn snapshot_expectations_for_span(
                 snapshot.slot_dir
             ));
         }
-        let expectation = if name.ends_with(".tar.bz2") {
-            BankHashExpectation::LegacyAccountsHash(hash.0)
-        } else {
-            BankHashExpectation::AccountsLtHash(hash)
-        };
+        let expectation = snapshot_hash_expectation(hash, bootstrap.snapshot_hash_kind);
         if expected.insert(slot, expectation).is_some() {
             return Err(format!("duplicate snapshot entry for slot {slot}"));
         }
@@ -9378,13 +9384,12 @@ async fn ensure_epoch_boundary_snapshot(
 }
 
 /// Reads a supervisor-written per-epoch hash file (one canonical snapshot
-/// archive filename per line) back into the expectations map. The extension
-/// preserves the hash scheme: legacy `.tar.bz2` names contain the historical
-/// full accounts Merkle hash, while current snapshot names contain
-/// `AccountsLtHash`.
+/// archive filename per line) back into the expectations map. The selected
+/// runtime defines both the accepted containers and the filename hash scheme;
+/// compression alone carries no hash semantics.
 fn read_epoch_hashes_file(
     path: &Path,
-    archive_extensions: &[&str],
+    bootstrap: compatibility::BootstrapState,
 ) -> Result<BTreeMap<Slot, BankHashExpectation>, String> {
     use std::io::Read as _;
 
@@ -9444,21 +9449,14 @@ fn read_epoch_hashes_file(
         if line.is_empty() {
             continue;
         }
-        if !archive_extensions
-            .iter()
-            .any(|extension| line.ends_with(extension))
-        {
+        if !bootstrap.accepts_archive_name(line) {
             return Err(format!(
                 "snapshot entry {line:?} in {} is incompatible with the slot-selected runtime",
                 path.display()
             ));
         }
         let (slot, hash) = parse_snapshot_archive_name(line)?;
-        let expectation = if line.ends_with(".tar.bz2") {
-            BankHashExpectation::LegacyAccountsHash(hash.0)
-        } else {
-            BankHashExpectation::AccountsLtHash(hash)
-        };
+        let expectation = snapshot_hash_expectation(hash, bootstrap.snapshot_hash_kind);
         if expected.insert(slot, expectation).is_some() {
             return Err(format!(
                 "duplicate snapshot entry for slot {slot} in {}",
@@ -9487,18 +9485,46 @@ fn write_epoch_hashes_file(
     fs::write(path, contents).map_err(|err| format!("failed to write {}: {err}", path.display()))
 }
 
-fn snapshot_path_expectation(path: &Path) -> Result<(Slot, BankHashExpectation), String> {
+fn snapshot_path_expectation(
+    path: &Path,
+    bootstrap: compatibility::BootstrapState,
+) -> Result<(Slot, BankHashExpectation), String> {
     let name = path
         .file_name()
         .and_then(|name| name.to_str())
         .ok_or_else(|| format!("snapshot path has no UTF-8 filename: {}", path.display()))?;
+    if !bootstrap.accepts_archive_name(name) {
+        return Err(format!(
+            "snapshot {} is incompatible with the slot-selected runtime",
+            path.display()
+        ));
+    }
     let (slot, hash) = parse_snapshot_archive_name(name)?;
-    let expectation = if name.ends_with(".tar.bz2") {
-        BankHashExpectation::LegacyAccountsHash(hash.0)
-    } else {
-        BankHashExpectation::AccountsLtHash(hash)
-    };
+    let expectation = snapshot_hash_expectation(hash, bootstrap.snapshot_hash_kind);
     Ok((slot, expectation))
+}
+
+fn add_boundary_snapshot_expectation(
+    expected: &mut BTreeMap<Slot, BankHashExpectation>,
+    boundary_path: &Path,
+    bootstrap: compatibility::BootstrapState,
+) -> Result<(), String> {
+    let (slot, expectation) = snapshot_path_expectation(boundary_path, bootstrap)?;
+    match expected.get(&slot) {
+        Some(existing) if *existing != expectation => Err(format!(
+            "canonical snapshot listing conflicts with boundary snapshot at slot {slot}: listing={existing:?}, boundary={expectation:?}"
+        )),
+        Some(_) => Ok(()),
+        None => {
+            warn!(
+                "canonical snapshot listing omitted boundary file {}; adding its {:?} commitment at slot {slot}",
+                boundary_path.display(),
+                bootstrap.snapshot_hash_kind
+            );
+            expected.insert(slot, expectation);
+            Ok(())
+        }
+    }
 }
 
 /// Adds registry-committed handoff snapshots to a canonical checkpoint set.
@@ -9512,17 +9538,20 @@ fn add_runtime_handoff_expectations(
         if !range.contains(&handoff.snapshot.slot) {
             continue;
         }
+        let bootstrap = handoff.destination.bootstrap;
+        if !bootstrap.accepts_archive_name(handoff.snapshot.archive_name().as_str()) {
+            return Err(format!(
+                "runtime handoff at slot {} uses snapshot format {:?}, which destination runtime {} does not accept",
+                handoff.boundary_slot,
+                handoff.snapshot.archive_extension,
+                handoff.destination.identity.name
+            ));
+        }
         let hash = handoff.snapshot.accounts_hash()?;
-        let value = match handoff.snapshot.archive_extension {
-            ".tar.bz2" => BankHashExpectation::LegacyAccountsHash(hash),
-            ".tar.zst" | ".tar.lz4" => BankHashExpectation::AccountsLtHash(SnapshotHash(hash)),
-            extension => {
-                return Err(format!(
-                    "runtime handoff at slot {} uses unsupported snapshot extension {extension:?}",
-                    handoff.boundary_slot
-                ));
-            }
-        };
+        let value = snapshot_hash_expectation(
+            SnapshotHash(hash),
+            handoff.destination.bootstrap.snapshot_hash_kind,
+        );
         match expected.get(&handoff.snapshot.slot) {
             Some(existing) if *existing != value => {
                 return Err(format!(
@@ -9550,8 +9579,10 @@ fn qualification_expectations(
     mut expected: BTreeMap<Slot, BankHashExpectation>,
     plan: QualificationPlan,
     snapshot_archive: &Path,
+    bootstrap: compatibility::BootstrapState,
 ) -> Result<BTreeMap<Slot, BankHashExpectation>, String> {
-    let (snapshot_slot, snapshot_expectation) = snapshot_path_expectation(snapshot_archive)?;
+    let (snapshot_slot, snapshot_expectation) =
+        snapshot_path_expectation(snapshot_archive, bootstrap)?;
     if snapshot_slot != plan.bootstrap_slot {
         return Err(format!(
             "qualification snapshot changed after CLI validation: expected slot {}, got {snapshot_slot}",
@@ -10913,7 +10944,7 @@ fn private_epoch_scope(dest_dir: &Path) -> Result<PathBuf, String> {
 fn cached_private_epoch_hashes(
     dest_dir: &Path,
     epoch: u64,
-    archive_extensions: &[&str],
+    bootstrap: compatibility::BootstrapState,
 ) -> Result<Option<BTreeMap<Slot, BankHashExpectation>>, String> {
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 
@@ -10953,7 +10984,7 @@ fn cached_private_epoch_hashes(
             path.display()
         ));
     }
-    read_epoch_hashes_file(&path, archive_extensions).map(Some)
+    read_epoch_hashes_file(&path, bootstrap).map(Some)
 }
 
 fn acquire_epoch_leases(
@@ -11162,6 +11193,7 @@ fn adaptive_env_u64(name: &str) -> Result<Option<u64>, String> {
 fn write_private_epoch_hashes(
     input_dir: &Path,
     expected: &BTreeMap<Slot, BankHashExpectation>,
+    bootstrap: compatibility::BootstrapState,
 ) -> Result<PathBuf, String> {
     use std::{
         io::Write as _,
@@ -11191,7 +11223,7 @@ fn write_private_epoch_hashes(
                     path.display()
                 ));
             }
-            let cached = read_epoch_hashes_file(&path, &[".tar.bz2", ".tar.zst", ".tar.lz4"])?;
+            let cached = read_epoch_hashes_file(&path, bootstrap)?;
             if cached != *expected {
                 return Err(format!(
                     "existing private epoch hashes differ from the prefetched checkpoint set: {}",
@@ -12029,7 +12061,7 @@ async fn run_epoch_range_supervisor_adaptive(
             let expected = snapshot_expectations.get(&epoch).ok_or_else(|| {
                 format!("range supervisor has no in-memory checkpoint set for epoch {epoch}")
             })?;
-            write_private_epoch_hashes(&input_dir, expected)?
+            write_private_epoch_hashes(&input_dir, expected, selection.descriptor.bootstrap)?
         } else {
             input_dir.join("epoch-hashes.disabled")
         };
@@ -13369,7 +13401,7 @@ async fn main() {
         if let Some(hashes_path) = &epoch_hashes {
             // Per-epoch child: the supervisor prefetched this epoch's hashes to
             // a file, so the child stays gcloud-free.
-            match read_epoch_hashes_file(hashes_path, effective_archive_extensions) {
+            match read_epoch_hashes_file(hashes_path, effective_runtime.descriptor.bootstrap) {
                 Ok(mut expected) => {
                     if let Err(err) = add_runtime_handoff_expectations(
                         runtime_slot_range(effective_start, qualification),
@@ -13382,7 +13414,12 @@ async fn main() {
                         let snapshot_path = bootstrap.snapshot_archive().expect(
                             "qualification validation requires an explicit snapshot archive",
                         );
-                        match qualification_expectations(expected, plan, snapshot_path) {
+                        match qualification_expectations(
+                            expected,
+                            plan,
+                            snapshot_path,
+                            effective_runtime.descriptor.bootstrap,
+                        ) {
                             Ok(expected) => expected,
                             Err(err) => {
                                 eprintln!("error: {err}");
@@ -13417,7 +13454,7 @@ async fn main() {
                     allow_candidate_runtime,
                 )
                 .expect("requested range was preflighted above");
-                let archive_extensions = selection.descriptor.bootstrap.archive_extensions;
+                let bootstrap_state = selection.descriptor.bootstrap;
                 let boundary_path = boundary_bootstraps
                     .get(&epoch)
                     .or_else(|| (epoch == effective_start).then_some(&bootstrap))
@@ -13450,7 +13487,7 @@ async fn main() {
                 );
                 if adaptive_epoch_concurrency {
                     let cached =
-                        match cached_private_epoch_hashes(&dest_dir, epoch, archive_extensions) {
+                        match cached_private_epoch_hashes(&dest_dir, epoch, bootstrap_state) {
                             Ok(cached) => cached,
                             Err(err) => {
                                 eprintln!("error: {err}");
@@ -13471,7 +13508,7 @@ async fn main() {
                         }
                         if let Some(boundary_path) = boundary_path {
                             let (boundary_slot, boundary_expectation) =
-                                match snapshot_path_expectation(boundary_path) {
+                                match snapshot_path_expectation(boundary_path, bootstrap_state) {
                                     Ok(expectation) => expectation,
                                     Err(err) => {
                                         eprintln!("error: {err}");
@@ -13522,7 +13559,7 @@ async fn main() {
                 let mut expected = match snapshot_expectations_for_span(
                     verification_start,
                     epoch_end_slot,
-                    archive_extensions,
+                    bootstrap_state,
                 )
                 .await
                 {
@@ -13533,36 +13570,14 @@ async fn main() {
                     }
                 };
                 if let Some(boundary_path) = boundary_path
-                    && is_legacy_snapshot_archive(boundary_path)
+                    && let Err(err) = add_boundary_snapshot_expectation(
+                        &mut expected,
+                        boundary_path,
+                        bootstrap_state,
+                    )
                 {
-                    match legacy_boundary_expectation(boundary_path) {
-                        Ok(boundary_expected) => {
-                            for (slot, hash) in boundary_expected {
-                                match expected.get(&slot) {
-                                    Some(existing) if *existing != hash => {
-                                        eprintln!(
-                                            "error: conflicting legacy snapshot hashes at slot \
-                                             {slot}: listing={existing:?} boundary={hash:?}"
-                                        );
-                                        exit(1);
-                                    }
-                                    Some(_) => {}
-                                    None => {
-                                        warn!(
-                                            "snapshot listing omitted boundary file {}; adding \
-                                             its legacy accounts hash at slot {slot}",
-                                            boundary_path.display()
-                                        );
-                                        expected.insert(slot, hash);
-                                    }
-                                }
-                            }
-                        }
-                        Err(err) => {
-                            eprintln!("error: {err}");
-                            exit(1);
-                        }
-                    }
+                    eprintln!("error: {err}");
+                    exit(1);
                 }
                 if let Err(err) = add_runtime_handoff_expectations(
                     epoch_start_slot..epoch_end_slot.saturating_add(1),
@@ -13876,23 +13891,93 @@ mod early_snapshot_tests {
     }
 
     #[test]
-    fn legacy_bzip2_snapshot_format_is_classified_without_selecting_a_runtime() {
-        let hash = Hash::default();
-        let legacy = PathBuf::from(format!("snapshot-416012-{hash}.tar.bz2"));
-        let modern = PathBuf::from(format!("snapshot-416012-{hash}.tar.zst"));
+    fn snapshot_hash_semantics_are_runtime_driven_not_compression_driven() {
+        let hash = Hash::new_unique();
+        let path = PathBuf::from(format!("snapshot-416012-{hash}.tar.zst"));
+        let legacy =
+            snapshot_path_expectation(&path, compatibility::SOLANA_V1_2_32_RUNTIME.bootstrap)
+                .expect("v1.2 zstd snapshot");
+        let agave = snapshot_path_expectation(&path, compatibility::AGAVE_V3_RUNTIME.bootstrap)
+            .expect("Agave zstd snapshot");
 
-        assert!(is_legacy_snapshot_archive(&legacy));
-        assert!(!is_legacy_snapshot_archive(&modern));
+        assert!(matches!(
+            legacy,
+            (416_012, BankHashExpectation::LegacyAccountsHash(actual)) if actual == hash
+        ));
+        assert!(matches!(
+            agave,
+            (416_012, BankHashExpectation::AccountsLtHash(actual)) if actual.0 == hash
+        ));
     }
 
     #[test]
-    fn legacy_snapshot_filename_uses_accounts_hash_verification() {
+    fn epoch_hash_files_apply_the_selected_runtime_semantics() {
+        let directory = tempfile::TempDir::new().unwrap();
         let hash = Hash::new_unique();
-        let path = PathBuf::from(format!("snapshot-416012-{hash}.tar.bz2"));
-        let expected = legacy_boundary_expectation(&path).expect("valid legacy snapshot");
+        let path = directory.path().join("epoch-hashes.txt");
+        fs::write(&path, format!("snapshot-39743950-{hash}.tar.zst\n")).unwrap();
+
+        let legacy =
+            read_epoch_hashes_file(&path, compatibility::SOLANA_V1_2_32_RUNTIME.bootstrap).unwrap();
+        let agave =
+            read_epoch_hashes_file(&path, compatibility::AGAVE_V3_RUNTIME.bootstrap).unwrap();
 
         assert!(matches!(
-            expected.get(&416_012),
+            legacy.get(&39_743_950),
+            Some(BankHashExpectation::LegacyAccountsHash(actual)) if actual == &hash
+        ));
+        assert!(matches!(
+            agave.get(&39_743_950),
+            Some(BankHashExpectation::AccountsLtHash(actual)) if actual.0 == hash
+        ));
+        assert!(
+            read_epoch_hashes_file(&path, compatibility::SOLANA_V1_1_23_RUNTIME.bootstrap,)
+                .unwrap_err()
+                .contains("incompatible with the slot-selected runtime")
+        );
+    }
+
+    #[test]
+    fn local_snapshot_selection_rejects_same_slot_ambiguity() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let slot = 39_743_950;
+        let bzip2 = directory
+            .path()
+            .join(format!("snapshot-{slot}-{}.tar.bz2", Hash::new_unique()));
+        let zstd = directory
+            .path()
+            .join(format!("snapshot-{slot}-{}.tar.zst", Hash::new_unique()));
+        fs::write(&bzip2, b"bzip2 placeholder").unwrap();
+        fs::write(&zstd, b"zstd placeholder").unwrap();
+
+        let error = find_existing_snapshot_archive(
+            directory.path(),
+            slot,
+            compatibility::SOLANA_V1_2_32_RUNTIME
+                .bootstrap
+                .archive_extensions,
+        )
+        .unwrap_err();
+
+        assert!(
+            error.contains("multiple local snapshot archives"),
+            "{error}"
+        );
+        assert!(error.contains(&bzip2.display().to_string()), "{error}");
+        assert!(error.contains(&zstd.display().to_string()), "{error}");
+    }
+
+    #[test]
+    fn hourly_boundary_is_added_to_the_root_checkpoint_set() {
+        let hash = Hash::new_unique();
+        let path = PathBuf::from(format!("snapshot-3464856-{hash}.tar.bz2"));
+        let bootstrap = compatibility::SOLANA_V1_0_13_RUNTIME.bootstrap;
+        let mut expected = BTreeMap::new();
+
+        add_boundary_snapshot_expectation(&mut expected, &path, bootstrap).unwrap();
+
+        assert!(matches!(
+            expected.get(&3_464_856),
             Some(BankHashExpectation::LegacyAccountsHash(actual)) if actual == &hash
         ));
     }
@@ -14225,7 +14310,8 @@ mod early_snapshot_tests {
             ),
         ]);
 
-        let filtered = qualification_expectations(expected, plan, &snapshot).unwrap();
+        let bootstrap = compatibility::SOLANA_V1_0_13_RUNTIME.bootstrap;
+        let filtered = qualification_expectations(expected, plan, &snapshot, bootstrap).unwrap();
         assert_eq!(filtered.len(), 2);
         assert!(filtered.contains_key(&515_912));
         assert!(filtered.contains_key(&534_248));
@@ -14236,7 +14322,7 @@ mod early_snapshot_tests {
             BankHashExpectation::LegacyAccountsHash(bootstrap_hash),
         )]);
         assert!(
-            qualification_expectations(bootstrap_only, plan, &snapshot)
+            qualification_expectations(bootstrap_only, plan, &snapshot, bootstrap)
                 .unwrap_err()
                 .contains("requires a canonical checkpoint")
         );
@@ -14249,7 +14335,7 @@ mod early_snapshot_tests {
             (534_248, BankHashExpectation::LegacyAccountsHash(post_hash)),
         ]);
         assert!(
-            qualification_expectations(wrong_bootstrap, plan, &snapshot)
+            qualification_expectations(wrong_bootstrap, plan, &snapshot, bootstrap)
                 .unwrap_err()
                 .contains("does not match the canonical checkpoint")
         );
@@ -15017,11 +15103,12 @@ mod early_snapshot_tests {
                 BankHashExpectation::LegacyAccountsHash(Hash::new_from_array([0x22; 32])),
             ),
         ]);
-        let first_hashes = write_private_epoch_hashes(&input_dir, &expected).unwrap();
-        let second_hashes = write_private_epoch_hashes(&input_dir, &expected).unwrap();
+        let bootstrap = compatibility::SOLANA_V1_0_13_RUNTIME.bootstrap;
+        let first_hashes = write_private_epoch_hashes(&input_dir, &expected, bootstrap).unwrap();
+        let second_hashes = write_private_epoch_hashes(&input_dir, &expected, bootstrap).unwrap();
         assert_eq!(first_hashes, second_hashes);
         assert_eq!(
-            cached_private_epoch_hashes(&destination, epoch, &[".tar.bz2"])
+            cached_private_epoch_hashes(&destination, epoch, bootstrap)
                 .unwrap()
                 .unwrap(),
             expected
@@ -15032,7 +15119,7 @@ mod early_snapshot_tests {
             BankHashExpectation::LegacyAccountsHash(Hash::new_from_array([0x33; 32])),
         )]);
         assert!(
-            write_private_epoch_hashes(&input_dir, &different)
+            write_private_epoch_hashes(&input_dir, &different, bootstrap)
                 .unwrap_err()
                 .contains("differ")
         );

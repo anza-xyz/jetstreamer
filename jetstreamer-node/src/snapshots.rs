@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
     process::Stdio,
 };
@@ -17,36 +17,71 @@ static DEFAULT_SNAPSHOT_INVENTORY: tokio::sync::OnceCell<SnapshotInventory> =
 pub struct SnapshotInfo {
     /// Epoch number requested by the caller.
     pub epoch: u64,
-    /// Slot directory selected inside the bucket.
+    /// Snapshot slot committed by the archive filename.
     pub slot_dir: u64,
     /// Full GCS URI to the snapshot tarball.
     pub snapshot_uri: String,
 }
 
-/// Validated snapshot objects returned by one flat bucket listing.
+/// Validated snapshot objects returned by one bounded bucket listing.
+///
+/// Root snapshots remain separate because they are consensus checkpoints.
+/// Hourly snapshots are additional bootstrap choices, not checkpoint
+/// expectations in their own right.
 #[derive(Debug, Default)]
 struct SnapshotInventory {
-    objects_by_slot: BTreeMap<u64, Vec<String>>,
+    root_objects_by_slot: BTreeMap<u64, Vec<String>>,
+    hourly_objects_by_slot: BTreeMap<u64, Vec<String>>,
 }
 
 impl SnapshotInventory {
-    fn slots(&self) -> impl Iterator<Item = u64> + '_ {
-        self.objects_by_slot.keys().copied()
+    fn root_slots(&self) -> impl Iterator<Item = u64> + '_ {
+        self.root_objects_by_slot.keys().copied()
     }
 
-    fn objects_for_slot(&self, slot: u64, archive_extensions: &[&str]) -> Vec<String> {
-        self.objects_by_slot
-            .get(&slot)
-            .into_iter()
-            .flatten()
-            .filter(|uri| {
-                uri.rsplit('/')
-                    .next()
-                    .is_some_and(|name| snapshot_name_matches(name, archive_extensions))
-            })
-            .cloned()
-            .collect()
+    fn root_objects_for_slot(&self, slot: u64, archive_extensions: &[&str]) -> Vec<String> {
+        matching_snapshot_objects(&self.root_objects_by_slot, slot, archive_extensions)
     }
+
+    fn bootstrap_slots(&self) -> impl Iterator<Item = u64> {
+        self.root_objects_by_slot
+            .keys()
+            .chain(self.hourly_objects_by_slot.keys())
+            .copied()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+    }
+
+    fn bootstrap_objects_for_slot(&self, slot: u64, archive_extensions: &[&str]) -> Vec<String> {
+        let mut objects =
+            matching_snapshot_objects(&self.root_objects_by_slot, slot, archive_extensions);
+        objects.extend(matching_snapshot_objects(
+            &self.hourly_objects_by_slot,
+            slot,
+            archive_extensions,
+        ));
+        objects.sort_unstable();
+        objects.dedup();
+        objects
+    }
+}
+
+fn matching_snapshot_objects(
+    objects_by_slot: &BTreeMap<u64, Vec<String>>,
+    slot: u64,
+    archive_extensions: &[&str],
+) -> Vec<String> {
+    objects_by_slot
+        .get(&slot)
+        .into_iter()
+        .flatten()
+        .filter(|uri| {
+            uri.rsplit('/')
+                .next()
+                .is_some_and(|name| snapshot_name_matches(name, archive_extensions))
+        })
+        .cloned()
+        .collect()
 }
 
 /// Errors surfaced while resolving or downloading snapshots.
@@ -228,7 +263,7 @@ pub async fn resolve_snapshot_at_or_before_slot_matching(
     // A numeric bucket directory may contain only a RocksDB export. Walk the
     // candidates newest-first and select the first actual snapshot archive,
     // rather than treating the newest numeric directory as a snapshot.
-    let mut slots = snapshot_slots_for_bucket(DEFAULT_BUCKET)
+    let mut slots = bootstrap_snapshot_slots_for_bucket(DEFAULT_BUCKET)
         .await?
         .into_iter()
         .filter(|slot| *slot <= target_slot)
@@ -237,7 +272,8 @@ pub async fn resolve_snapshot_at_or_before_slot_matching(
 
     for slot_dir in slots {
         let objects =
-            snapshot_objects_for_bucket(DEFAULT_BUCKET, slot_dir, archive_extensions).await?;
+            bootstrap_snapshot_objects_for_bucket(DEFAULT_BUCKET, slot_dir, archive_extensions)
+                .await?;
         if let Some(snapshot_uri) = unique_snapshot_object(DEFAULT_BUCKET, slot_dir, objects)? {
             return Ok(SnapshotInfo {
                 epoch,
@@ -517,15 +553,19 @@ fn is_default_bucket(bucket: &str) -> bool {
     bucket.trim_end_matches('/') == DEFAULT_BUCKET
 }
 
-fn bulk_snapshot_pattern(bucket: &str) -> String {
-    format!("{}/*/snapshot-*", bucket.trim_end_matches('/'))
+fn bulk_snapshot_patterns(bucket: &str) -> [String; 2] {
+    let bucket = bucket.trim_end_matches('/');
+    [
+        format!("{bucket}/*/snapshot-*"),
+        format!("{bucket}/*/hourly/snapshot-*"),
+    ]
 }
 
 async fn default_snapshot_inventory() -> Result<&'static SnapshotInventory, SnapshotError> {
     DEFAULT_SNAPSHOT_INVENTORY
         .get_or_try_init(|| async {
-            let pattern = bulk_snapshot_pattern(DEFAULT_BUCKET);
-            let listing = gcloud_stdout(&["storage", "ls", &pattern]).await?;
+            let [root_pattern, hourly_pattern] = bulk_snapshot_patterns(DEFAULT_BUCKET);
+            let listing = gcloud_stdout(&["storage", "ls", &root_pattern, &hourly_pattern]).await?;
             parse_snapshot_inventory(DEFAULT_BUCKET, &listing)
         })
         .await
@@ -533,7 +573,7 @@ async fn default_snapshot_inventory() -> Result<&'static SnapshotInventory, Snap
 
 async fn snapshot_slots_for_bucket(bucket: &str) -> Result<Vec<u64>, SnapshotError> {
     if is_default_bucket(bucket) {
-        return Ok(default_snapshot_inventory().await?.slots().collect());
+        return Ok(default_snapshot_inventory().await?.root_slots().collect());
     }
     list_bucket_slots(bucket).await
 }
@@ -546,7 +586,30 @@ async fn snapshot_objects_for_bucket(
     if is_default_bucket(bucket) {
         return Ok(default_snapshot_inventory()
             .await?
-            .objects_for_slot(slot, archive_extensions));
+            .root_objects_for_slot(slot, archive_extensions));
+    }
+    list_snapshot_objects(bucket, slot, archive_extensions).await
+}
+
+async fn bootstrap_snapshot_slots_for_bucket(bucket: &str) -> Result<Vec<u64>, SnapshotError> {
+    if is_default_bucket(bucket) {
+        return Ok(default_snapshot_inventory()
+            .await?
+            .bootstrap_slots()
+            .collect());
+    }
+    list_bucket_slots(bucket).await
+}
+
+async fn bootstrap_snapshot_objects_for_bucket(
+    bucket: &str,
+    slot: u64,
+    archive_extensions: &[&str],
+) -> Result<Vec<String>, SnapshotError> {
+    if is_default_bucket(bucket) {
+        return Ok(default_snapshot_inventory()
+            .await?
+            .bootstrap_objects_for_slot(slot, archive_extensions));
     }
     list_snapshot_objects(bucket, slot, archive_extensions).await
 }
@@ -561,71 +624,114 @@ fn parse_snapshot_inventory(
         if uri.is_empty() {
             continue;
         }
-        let (slot, name) = parse_snapshot_object_uri(bucket, uri)?;
+        let object = parse_snapshot_object_uri(bucket, uri)?;
         // The wildcard also sees future or unrelated snapshot archive
         // formats. Keep the existing extension-filtering behavior.
-        if !snapshot_name_matches(name, ALL_SNAPSHOT_ARCHIVE_EXTENSIONS) {
+        if !snapshot_name_matches(object.name, ALL_SNAPSHOT_ARCHIVE_EXTENSIONS) {
             continue;
         }
-        if !snapshot_name_is_bound_to_slot(name, slot, ALL_SNAPSHOT_ARCHIVE_EXTENSIONS) {
-            return Err(invalid_snapshot_object_uri(uri));
-        }
-        inventory
-            .objects_by_slot
-            .entry(slot)
+        let snapshot_slot = snapshot_slot_from_name(object.name, ALL_SNAPSHOT_ARCHIVE_EXTENSIONS)
+            .ok_or_else(|| invalid_snapshot_object_uri(uri))?;
+        let objects_by_slot = match object.location {
+            SnapshotObjectLocation::Root if object.anchor_slot == snapshot_slot => {
+                &mut inventory.root_objects_by_slot
+            }
+            SnapshotObjectLocation::Hourly if object.anchor_slot <= snapshot_slot => {
+                &mut inventory.hourly_objects_by_slot
+            }
+            SnapshotObjectLocation::Root | SnapshotObjectLocation::Hourly => {
+                return Err(invalid_snapshot_object_uri(uri));
+            }
+        };
+        objects_by_slot
+            .entry(snapshot_slot)
             .or_default()
             .push(uri.to_owned());
     }
-    for objects in inventory.objects_by_slot.values_mut() {
-        objects.sort_unstable();
-        objects.dedup();
+    for objects_by_slot in [
+        &mut inventory.root_objects_by_slot,
+        &mut inventory.hourly_objects_by_slot,
+    ] {
+        for objects in objects_by_slot.values_mut() {
+            objects.sort_unstable();
+            objects.dedup();
+        }
     }
     Ok(inventory)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SnapshotObjectLocation {
+    Root,
+    Hourly,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ParsedSnapshotObject<'a> {
+    anchor_slot: u64,
+    location: SnapshotObjectLocation,
+    name: &'a str,
 }
 
 fn parse_snapshot_object_uri<'a>(
     bucket: &str,
     uri: &'a str,
-) -> Result<(u64, &'a str), SnapshotError> {
+) -> Result<ParsedSnapshotObject<'a>, SnapshotError> {
     let prefix = format!("{}/", bucket.trim_end_matches('/'));
     let rest = uri
         .strip_prefix(&prefix)
         .ok_or_else(|| invalid_snapshot_object_uri(uri))?;
     let mut components = rest.split('/');
-    let slot_text = components
+    let anchor_text = components
         .next()
         .filter(|value| !value.is_empty())
         .ok_or_else(|| invalid_snapshot_object_uri(uri))?;
-    let name = components
+    let second = components
         .next()
         .filter(|value| !value.is_empty())
         .ok_or_else(|| invalid_snapshot_object_uri(uri))?;
-    if components.next().is_some()
-        || name.contains('\\')
-        || !slot_text.bytes().all(|byte| byte.is_ascii_digit())
-    {
+    let third = components.next();
+    let fourth = components.next();
+    let (location, name) = match (second, third, fourth) {
+        (name, None, None) => (SnapshotObjectLocation::Root, name),
+        ("hourly", Some(name), None) if !name.is_empty() => (SnapshotObjectLocation::Hourly, name),
+        _ => return Err(invalid_snapshot_object_uri(uri)),
+    };
+    if name.contains('\\') {
         return Err(invalid_snapshot_object_uri(uri));
     }
-    let slot = slot_text
-        .parse::<u64>()
-        .map_err(|_| invalid_snapshot_object_uri(uri))?;
-    if slot.to_string() != slot_text {
-        return Err(invalid_snapshot_object_uri(uri));
-    }
-    Ok((slot, name))
+    let anchor_slot =
+        parse_canonical_slot(anchor_text).ok_or_else(|| invalid_snapshot_object_uri(uri))?;
+    Ok(ParsedSnapshotObject {
+        anchor_slot,
+        location,
+        name,
+    })
 }
 
 fn snapshot_name_is_bound_to_slot(name: &str, slot: u64, archive_extensions: &[&str]) -> bool {
-    let prefix = format!("snapshot-{slot}-");
-    let Some(rest) = name.strip_prefix(&prefix) else {
-        return false;
-    };
-    archive_extensions.iter().any(|extension| {
-        !extension.is_empty()
-            && rest
+    snapshot_slot_from_name(name, archive_extensions) == Some(slot)
+}
+
+fn snapshot_slot_from_name(name: &str, archive_extensions: &[&str]) -> Option<u64> {
+    let rest = name.strip_prefix("snapshot-")?;
+    let (slot_text, identity_and_extension) = rest.split_once('-')?;
+    let slot = parse_canonical_slot(slot_text)?;
+    archive_extensions.iter().find_map(|extension| {
+        (!extension.is_empty()
+            && identity_and_extension
                 .strip_suffix(extension)
-                .is_some_and(|identity| !identity.is_empty())
+                .is_some_and(|identity| !identity.is_empty()))
+        .then_some(slot)
     })
+}
+
+fn parse_canonical_slot(value: &str) -> Option<u64> {
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let slot = value.parse::<u64>().ok()?;
+    (slot.to_string() == value).then_some(slot)
 }
 
 fn invalid_snapshot_object_uri(uri: &str) -> SnapshotError {
@@ -725,9 +831,10 @@ async fn list_snapshot_objects(
         if !snapshot_name_matches(name, archive_extensions) {
             continue;
         }
-        let (listed_slot, parsed_name) = parse_snapshot_object_uri(bucket, uri)?;
-        if listed_slot != slot
-            || parsed_name != name
+        let object = parse_snapshot_object_uri(bucket, uri)?;
+        if object.location != SnapshotObjectLocation::Root
+            || object.anchor_slot != slot
+            || object.name != name
             || !snapshot_name_is_bound_to_slot(name, slot, archive_extensions)
         {
             return Err(invalid_snapshot_object_uri(uri));
@@ -815,31 +922,42 @@ mod tests {
     const BUCKET: &str = "gs://example-bucket";
 
     #[test]
-    fn bulk_snapshot_listing_is_validated_sorted_and_deduplicated() {
+    fn bulk_snapshot_listing_separates_root_checkpoints_from_hourly_bootstraps() {
         let listing = "gs://example-bucket/619848/snapshot-619848-zeta.tar.bz2\n\
                        gs://example-bucket/416012/snapshot-416012-alpha.tar.zst\n\
+                       gs://example-bucket/3455940/hourly/snapshot-3464856-hour-a.tar.bz2\n\
+                       gs://example-bucket/0/hourly/snapshot-3464857-hour-b.tar.bz2\n\
+                       gs://example-bucket/3464858/hourly/snapshot-3464858-hour-c.tar.zst\n\
                        gs://example-bucket/619848/snapshot-619848-zeta.tar.bz2\n\
                        gs://example-bucket/830484/snapshot-830484-future.tar.gz\n";
 
         let inventory = parse_snapshot_inventory(BUCKET, listing).unwrap();
         assert_eq!(
-            inventory.slots().collect::<Vec<_>>(),
+            inventory.root_slots().collect::<Vec<_>>(),
             vec![416_012, 619_848]
         );
         assert_eq!(
-            inventory.objects_for_slot(416_012, ALL_SNAPSHOT_ARCHIVE_EXTENSIONS),
+            inventory.root_objects_for_slot(416_012, ALL_SNAPSHOT_ARCHIVE_EXTENSIONS),
             vec!["gs://example-bucket/416012/snapshot-416012-alpha.tar.zst"]
         );
         assert_eq!(
-            inventory.objects_for_slot(619_848, &[".tar.bz2"]),
+            inventory.root_objects_for_slot(619_848, &[".tar.bz2"]),
             vec!["gs://example-bucket/619848/snapshot-619848-zeta.tar.bz2"]
         );
         assert!(
             inventory
-                .objects_for_slot(416_012, &[".tar.bz2"])
+                .root_objects_for_slot(416_012, &[".tar.bz2"])
                 .is_empty()
         );
-        assert!(inventory.slots().all(|slot| slot != 830_484));
+        assert_eq!(
+            inventory.bootstrap_slots().collect::<Vec<_>>(),
+            vec![416_012, 619_848, 3_464_856, 3_464_857, 3_464_858]
+        );
+        assert_eq!(
+            inventory.bootstrap_objects_for_slot(3_464_856, &[".tar.bz2"]),
+            vec!["gs://example-bucket/3455940/hourly/snapshot-3464856-hour-a.tar.bz2"]
+        );
+        assert!(inventory.root_slots().all(|slot| slot != 830_484));
     }
 
     #[test]
@@ -850,8 +968,17 @@ mod tests {
             "gs://example-bucket/0416012/snapshot-416012-hash.tar.bz2",
             "gs://example-bucket/416012/nested/snapshot-416012-hash.tar.bz2",
             "gs://example-bucket/416012/snapshot-619848-hash.tar.bz2",
+            "gs://example-bucket/416012/snapshot-0416012-hash.tar.bz2",
             "gs://example-bucket/416012/snapshot-416012-.tar.bz2",
             "gs://example-bucket/416012/snapshot-416012-hash\\.tar.bz2",
+            "gs://example-bucket/416013/hourly/snapshot-416012-hash.tar.bz2",
+            "gs://example-bucket/0416012/hourly/snapshot-416012-hash.tar.bz2",
+            "gs://example-bucket/416012/hourly/snapshot-0416012-hash.tar.bz2",
+            "gs://example-bucket/416012/hourly/extra/snapshot-416013-hash.tar.bz2",
+            "gs://example-bucket/416012/hourly//snapshot-416013-hash.tar.bz2",
+            "gs://example-bucket/416012/../snapshot-416013-hash.tar.bz2",
+            "gs://example-bucket/416012/hourly/../snapshot-416013-hash.tar.bz2",
+            "gs://example-bucket/18446744073709551616/hourly/snapshot-18446744073709551616-hash.tar.bz2",
         ] {
             let error = parse_snapshot_inventory(BUCKET, uri).unwrap_err();
             assert!(matches!(
@@ -865,31 +992,41 @@ mod tests {
     }
 
     #[test]
-    fn default_bucket_uses_one_flat_listing_pattern_only() {
+    fn default_bucket_uses_one_bounded_root_and_hourly_listing() {
         assert!(is_default_bucket(DEFAULT_BUCKET));
         assert!(is_default_bucket(&format!("{DEFAULT_BUCKET}/")));
         assert!(!is_default_bucket(BUCKET));
         assert_eq!(
-            bulk_snapshot_pattern(DEFAULT_BUCKET),
-            "gs://mainnet-beta-ledger-us-ny5/*/snapshot-*"
+            bulk_snapshot_patterns(DEFAULT_BUCKET),
+            [
+                "gs://mainnet-beta-ledger-us-ny5/*/snapshot-*",
+                "gs://mainnet-beta-ledger-us-ny5/*/hourly/snapshot-*",
+            ]
         );
     }
 
     #[test]
     fn inventory_filtering_precedes_ambiguity_checks() {
         let listing = "gs://example-bucket/416012/snapshot-416012-alpha.tar.bz2\n\
-                       gs://example-bucket/416012/snapshot-416012-beta.tar.zst\n";
+                       gs://example-bucket/416012/snapshot-416012-beta.tar.zst\n\
+                       gs://example-bucket/400000/hourly/snapshot-416012-gamma.tar.bz2\n";
         let inventory = parse_snapshot_inventory(BUCKET, listing).unwrap();
 
-        let legacy = inventory.objects_for_slot(416_012, &[".tar.bz2"]);
+        let legacy = inventory.root_objects_for_slot(416_012, &[".tar.bz2"]);
         assert_eq!(
             unique_snapshot_object(BUCKET, 416_012, legacy).unwrap(),
             Some("gs://example-bucket/416012/snapshot-416012-alpha.tar.bz2".to_owned())
         );
 
-        let all = inventory.objects_for_slot(416_012, ALL_SNAPSHOT_ARCHIVE_EXTENSIONS);
+        let all = inventory.root_objects_for_slot(416_012, ALL_SNAPSHOT_ARCHIVE_EXTENSIONS);
         assert!(matches!(
             unique_snapshot_object(BUCKET, 416_012, all),
+            Err(SnapshotError::MultipleSnapshotObjects { .. })
+        ));
+
+        let bootstrap = inventory.bootstrap_objects_for_slot(416_012, &[".tar.bz2"]);
+        assert!(matches!(
+            unique_snapshot_object(BUCKET, 416_012, bootstrap),
             Err(SnapshotError::MultipleSnapshotObjects { .. })
         ));
     }

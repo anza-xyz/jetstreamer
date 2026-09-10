@@ -157,6 +157,16 @@ pub struct WorkerProfile {
     pub rust_toolchain: &'static str,
     pub target: &'static str,
     pub required_genesis_hash: &'static str,
+    /// Snapshot containers this exact worker loader can safely restore.
+    pub snapshot_archive_extensions: &'static [&'static str],
+}
+
+impl WorkerProfile {
+    fn accepts_snapshot_archive_name(self, name: &str) -> bool {
+        self.snapshot_archive_extensions
+            .iter()
+            .any(|extension| name.ends_with(extension))
+    }
 }
 
 pub const SOLANA_V1_0_7_CANDIDATE: WorkerProfile = WorkerProfile {
@@ -166,6 +176,7 @@ pub const SOLANA_V1_0_7_CANDIDATE: WorkerProfile = WorkerProfile {
     rust_toolchain: SOLANA_V1_0_7_RUST_TOOLCHAIN,
     target: SOLANA_V1_0_7_TARGET,
     required_genesis_hash: protocol::MAINNET_GENESIS_HASH,
+    snapshot_archive_extensions: &[".tar.bz2"],
 };
 
 pub const SOLANA_V1_0_8_CANDIDATE: WorkerProfile = WorkerProfile {
@@ -175,6 +186,7 @@ pub const SOLANA_V1_0_8_CANDIDATE: WorkerProfile = WorkerProfile {
     rust_toolchain: SOLANA_V1_0_8_RUST_TOOLCHAIN,
     target: SOLANA_V1_0_8_TARGET,
     required_genesis_hash: protocol::MAINNET_GENESIS_HASH,
+    snapshot_archive_extensions: &[".tar.bz2"],
 };
 
 pub const SOLANA_V1_0_13_CANDIDATE: WorkerProfile = WorkerProfile {
@@ -184,6 +196,7 @@ pub const SOLANA_V1_0_13_CANDIDATE: WorkerProfile = WorkerProfile {
     rust_toolchain: SOLANA_V1_0_13_RUST_TOOLCHAIN,
     target: SOLANA_V1_0_13_TARGET,
     required_genesis_hash: protocol::MAINNET_GENESIS_HASH,
+    snapshot_archive_extensions: &[".tar.bz2"],
 };
 
 pub const SOLANA_V1_0_14_CANDIDATE: WorkerProfile = WorkerProfile {
@@ -193,6 +206,7 @@ pub const SOLANA_V1_0_14_CANDIDATE: WorkerProfile = WorkerProfile {
     rust_toolchain: SOLANA_V1_0_14_RUST_TOOLCHAIN,
     target: SOLANA_V1_0_14_TARGET,
     required_genesis_hash: protocol::MAINNET_GENESIS_HASH,
+    snapshot_archive_extensions: &[".tar.bz2"],
 };
 
 pub const SOLANA_V1_0_17_CANDIDATE: WorkerProfile = WorkerProfile {
@@ -202,6 +216,7 @@ pub const SOLANA_V1_0_17_CANDIDATE: WorkerProfile = WorkerProfile {
     rust_toolchain: SOLANA_V1_0_17_RUST_TOOLCHAIN,
     target: SOLANA_V1_0_17_TARGET,
     required_genesis_hash: protocol::MAINNET_GENESIS_HASH,
+    snapshot_archive_extensions: &[".tar.bz2"],
 };
 
 pub const SOLANA_V1_0_18_CANDIDATE: WorkerProfile = WorkerProfile {
@@ -211,6 +226,7 @@ pub const SOLANA_V1_0_18_CANDIDATE: WorkerProfile = WorkerProfile {
     rust_toolchain: SOLANA_V1_0_18_RUST_TOOLCHAIN,
     target: SOLANA_V1_0_18_TARGET,
     required_genesis_hash: protocol::MAINNET_GENESIS_HASH,
+    snapshot_archive_extensions: &[".tar.bz2"],
 };
 
 pub const SOLANA_V1_0_23_CANDIDATE: WorkerProfile = WorkerProfile {
@@ -220,6 +236,7 @@ pub const SOLANA_V1_0_23_CANDIDATE: WorkerProfile = WorkerProfile {
     rust_toolchain: SOLANA_V1_0_23_RUST_TOOLCHAIN,
     target: SOLANA_V1_0_23_TARGET,
     required_genesis_hash: protocol::MAINNET_GENESIS_HASH,
+    snapshot_archive_extensions: &[".tar.bz2"],
 };
 
 pub const SOLANA_V1_1_23_CANDIDATE: WorkerProfile = WorkerProfile {
@@ -229,6 +246,7 @@ pub const SOLANA_V1_1_23_CANDIDATE: WorkerProfile = WorkerProfile {
     rust_toolchain: SOLANA_V1_1_23_RUST_TOOLCHAIN,
     target: SOLANA_V1_1_23_TARGET,
     required_genesis_hash: protocol::MAINNET_GENESIS_HASH,
+    snapshot_archive_extensions: &[".tar.bz2"],
 };
 
 pub const SOLANA_V1_2_32_CANDIDATE: WorkerProfile = WorkerProfile {
@@ -238,6 +256,7 @@ pub const SOLANA_V1_2_32_CANDIDATE: WorkerProfile = WorkerProfile {
     rust_toolchain: SOLANA_V1_2_32_RUST_TOOLCHAIN,
     target: SOLANA_V1_2_32_TARGET,
     required_genesis_hash: protocol::MAINNET_GENESIS_HASH,
+    snapshot_archive_extensions: &[".tar.bz2", ".tar.zst"],
 };
 
 pub const SOLANA_V1_3_19_CANDIDATE: WorkerProfile = WorkerProfile {
@@ -247,6 +266,7 @@ pub const SOLANA_V1_3_19_CANDIDATE: WorkerProfile = WorkerProfile {
     rust_toolchain: SOLANA_V1_3_19_RUST_TOOLCHAIN,
     target: SOLANA_V1_3_19_TARGET,
     required_genesis_hash: protocol::MAINNET_GENESIS_HASH,
+    snapshot_archive_extensions: &[".tar.bz2", ".tar.zst"],
 };
 
 pub const SOLANA_V1_0_24_CANDIDATE: WorkerProfile = WorkerProfile {
@@ -256,7 +276,25 @@ pub const SOLANA_V1_0_24_CANDIDATE: WorkerProfile = WorkerProfile {
     rust_toolchain: SOLANA_V1_0_24_RUST_TOOLCHAIN,
     target: SOLANA_V1_0_24_TARGET,
     required_genesis_hash: protocol::MAINNET_GENESIS_HASH,
+    snapshot_archive_extensions: &[".tar.bz2"],
 };
+
+fn validate_snapshot_archive_format(
+    profile: WorkerProfile,
+    path: &Path,
+) -> Result<(), HistoricalRuntimeError> {
+    let accepted = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| profile.accepts_snapshot_archive_name(name));
+    if accepted {
+        return Ok(());
+    }
+    Err(HistoricalRuntimeError::UnsupportedSnapshotArchive {
+        backend_id: profile.backend_id,
+        path: path.to_path_buf(),
+    })
+}
 
 /// Exact snapshot identity supplied by the caller's archive-name parser.
 ///
@@ -342,8 +380,11 @@ pub enum HistoricalRuntimeError {
     LedgerNotDirectory(PathBuf),
     #[error("historical snapshot archive is not a regular file: {0}")]
     SnapshotNotFile(PathBuf),
-    #[error("historical snapshot archive is not a legacy .tar.bz2 archive: {0}")]
-    NotLegacySnapshot(PathBuf),
+    #[error("historical runtime {backend_id} does not accept snapshot archive format: {path}")]
+    UnsupportedSnapshotArchive {
+        backend_id: &'static str,
+        path: PathBuf,
+    },
     #[error("historical snapshot archive SHA-256 mismatch: expected {expected}, got {actual}")]
     SnapshotArchiveDigestMismatch { expected: String, actual: String },
     #[error("historical snapshot archive size mismatch: expected {expected}, got {actual}")]
@@ -964,15 +1005,7 @@ impl HistoricalRuntimeClient {
                 let ledger_path = canonical_directory(&initialization.ledger_path, "ledger")?;
                 let source_archive_path =
                     canonical_regular_file(&initialization.archive_path, false)?;
-                if !source_archive_path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.ends_with(".tar.bz2"))
-                {
-                    return Err(HistoricalRuntimeError::NotLegacySnapshot(
-                        source_archive_path,
-                    ));
-                }
+                validate_snapshot_archive_format(profile, &source_archive_path)?;
                 let archive_path = match (
                     initialization.expected_archive_size,
                     initialization.expected_archive_sha256,
@@ -4637,6 +4670,50 @@ mod tests {
 
     fn valid_handshake() -> protocol::Handshake {
         valid_handshake_for(SOLANA_V1_0_24_CANDIDATE)
+    }
+
+    #[test]
+    fn snapshot_archive_admission_is_profile_scoped() {
+        let bzip2_only = [
+            SOLANA_V1_0_7_CANDIDATE,
+            SOLANA_V1_0_8_CANDIDATE,
+            SOLANA_V1_0_13_CANDIDATE,
+            SOLANA_V1_0_14_CANDIDATE,
+            SOLANA_V1_0_17_CANDIDATE,
+            SOLANA_V1_0_18_CANDIDATE,
+            SOLANA_V1_0_23_CANDIDATE,
+            SOLANA_V1_0_24_CANDIDATE,
+            SOLANA_V1_1_23_CANDIDATE,
+        ];
+        for profile in bzip2_only {
+            assert_eq!(profile.snapshot_archive_extensions, &[".tar.bz2"]);
+            validate_snapshot_archive_format(profile, Path::new("snapshot-1-hash.tar.bz2"))
+                .unwrap();
+            let rejected =
+                validate_snapshot_archive_format(profile, Path::new("snapshot-1-hash.tar.zst"))
+                    .unwrap_err();
+            assert!(matches!(
+                rejected,
+                HistoricalRuntimeError::UnsupportedSnapshotArchive {
+                    backend_id,
+                    path,
+                } if backend_id == profile.backend_id && path == Path::new("snapshot-1-hash.tar.zst")
+            ));
+        }
+
+        for profile in [SOLANA_V1_2_32_CANDIDATE, SOLANA_V1_3_19_CANDIDATE] {
+            assert_eq!(
+                profile.snapshot_archive_extensions,
+                &[".tar.bz2", ".tar.zst"]
+            );
+            for name in ["snapshot-1-hash.tar.bz2", "snapshot-1-hash.tar.zst"] {
+                validate_snapshot_archive_format(profile, Path::new(name)).unwrap();
+            }
+            assert!(matches!(
+                validate_snapshot_archive_format(profile, Path::new("snapshot-1-hash.tar.lz4")),
+                Err(HistoricalRuntimeError::UnsupportedSnapshotArchive { .. })
+            ));
+        }
     }
 
     #[test]

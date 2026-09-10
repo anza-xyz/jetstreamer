@@ -10,15 +10,47 @@ use std::{
     sync::atomic::{AtomicBool, Ordering},
 };
 
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tempfile::Builder;
 
 pub const ARCHIVE_CHECKSUM_SUFFIX: &str = ".sha256";
+pub const ARCHIVE_BATCH_TRANSACTION_DIRECTORY: &str = ".jetstreamer-archive-batch";
+pub const ARCHIVE_BATCH_OUTCOME_DIRECTORY: &str = ".jetstreamer-archive-batch-outcome";
 /// Exact contents installed at the canonical checksum path while an archive
 /// publication transaction is incomplete. Checksum repair must never replace
 /// this marker because the adjacent archive and manifest may be from different
 /// sides of an interrupted transaction.
 pub const ARCHIVE_PUBLICATION_SENTINEL: &[u8] = b"jetstreamer publication in progress\n";
+
+/// Reports whether an active batch transaction or an unacknowledged completed
+/// batch outcome exists in a destination. Any non-directory entry at either
+/// reserved name is rejected rather than treated as absence.
+pub fn archive_batch_publication_in_progress(
+    destination_directory: impl AsRef<Path>,
+) -> io::Result<bool> {
+    for name in [
+        ARCHIVE_BATCH_TRANSACTION_DIRECTORY,
+        ARCHIVE_BATCH_OUTCOME_DIRECTORY,
+    ] {
+        let marker = destination_directory.as_ref().join(name);
+        match fs::symlink_metadata(&marker) {
+            Ok(metadata) if metadata.file_type().is_dir() => return Ok(true),
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "archive batch transaction marker is not a real directory: {}",
+                        marker.display()
+                    ),
+                ));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(false)
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ArchiveFileIdentity {
@@ -35,6 +67,76 @@ pub struct ArchiveFileIdentity {
 pub struct ValidatedArchiveFile {
     pub identity: ArchiveFileIdentity,
     pub sha256: [u8; 32],
+}
+
+/// Journal-only representation. Keeping serde off `ValidatedArchiveFile`
+/// preserves its role as an in-process validation capability: downstream
+/// callers cannot deserialize forged evidence and pass it to publication.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PersistedValidatedArchiveFile {
+    dev: u64,
+    ino: u64,
+    len: u64,
+    modified_seconds: i64,
+    modified_nanoseconds: i64,
+    changed_seconds: i64,
+    changed_nanoseconds: i64,
+    sha256: [u8; 32],
+}
+
+impl PersistedValidatedArchiveFile {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn matches_identity(
+        self,
+        dev: u64,
+        ino: u64,
+        len: u64,
+        modified_seconds: i64,
+        modified_nanoseconds: i64,
+        changed_seconds: i64,
+        changed_nanoseconds: i64,
+    ) -> bool {
+        self.dev == dev
+            && self.ino == ino
+            && self.len == len
+            && self.modified_seconds == modified_seconds
+            && self.modified_nanoseconds == modified_nanoseconds
+            && self.changed_seconds == changed_seconds
+            && self.changed_nanoseconds == changed_nanoseconds
+    }
+}
+
+impl From<ValidatedArchiveFile> for PersistedValidatedArchiveFile {
+    fn from(validated: ValidatedArchiveFile) -> Self {
+        Self {
+            dev: validated.identity.dev,
+            ino: validated.identity.ino,
+            len: validated.identity.len,
+            modified_seconds: validated.identity.modified_seconds,
+            modified_nanoseconds: validated.identity.modified_nanoseconds,
+            changed_seconds: validated.identity.changed_seconds,
+            changed_nanoseconds: validated.identity.changed_nanoseconds,
+            sha256: validated.sha256,
+        }
+    }
+}
+
+impl From<PersistedValidatedArchiveFile> for ValidatedArchiveFile {
+    fn from(persisted: PersistedValidatedArchiveFile) -> Self {
+        Self {
+            identity: ArchiveFileIdentity {
+                dev: persisted.dev,
+                ino: persisted.ino,
+                len: persisted.len,
+                modified_seconds: persisted.modified_seconds,
+                modified_nanoseconds: persisted.modified_nanoseconds,
+                changed_seconds: persisted.changed_seconds,
+                changed_nanoseconds: persisted.changed_nanoseconds,
+            },
+            sha256: persisted.sha256,
+        }
+    }
 }
 
 pub fn archive_checksum_path(archive_path: impl AsRef<Path>) -> io::Result<PathBuf> {
@@ -287,6 +389,16 @@ pub fn ensure_archive_checksum_for_validated(
     validated: ValidatedArchiveFile,
 ) -> io::Result<PathBuf> {
     let archive_path = archive_path.as_ref();
+    let parent = archive_path.parent().unwrap_or_else(|| Path::new("."));
+    if archive_batch_publication_in_progress(parent)? {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "destination {} has an in-progress archive batch transaction; refusing checksum publication until batch recovery completes",
+                parent.display()
+            ),
+        ));
+    }
     if !path_matches_archive_identity(archive_path, validated.identity)? {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -393,6 +505,15 @@ pub fn ensure_archive_checksum_for_validated(
             ),
         ));
     }
+    if archive_batch_publication_in_progress(parent)? {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "destination {} acquired an in-progress archive batch transaction before checksum publication",
+                parent.display()
+            ),
+        ));
+    }
     let published = temporary
         .persist(&checksum_path)
         .map_err(|error| error.error)?;
@@ -487,6 +608,22 @@ mod tests {
             sentinel_identity
         );
         assert_eq!(fs::read(checksum).unwrap(), ARCHIVE_PUBLICATION_SENTINEL);
+    }
+
+    #[test]
+    fn destination_batch_marker_blocks_checksum_repair() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let archive = directory.path().join("epoch-7.jet");
+        fs::write(&archive, b"verified archive bytes").unwrap();
+        fs::create_dir(directory.path().join(ARCHIVE_BATCH_TRANSACTION_DIRECTORY)).unwrap();
+        let archive_file = open_regular_nofollow(&archive).unwrap();
+        let evidence = measure_open_archive(&archive_file).unwrap();
+
+        let error = ensure_archive_checksum_for_validated(&archive, evidence).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("batch transaction"));
+        assert!(!archive_checksum_path(archive).unwrap().exists());
     }
 
     #[test]

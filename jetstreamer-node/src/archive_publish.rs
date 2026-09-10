@@ -6,32 +6,37 @@
 //! inodes again, and exchanges the canonical checksum into place last.
 //! Existing files are retained in a private recovery directory.
 //!
-//! The mutation journal is process-local. A crash can therefore leave an
-//! invalid checksum sentinel and an identity-bound recovery directory. Those
-//! leftovers require manual reconciliation; startup never guesses at or
-//! recursively removes an interrupted transaction.
+//! A single-archive mutation journal is process-local, so an interrupted
+//! single publication requires manual reconciliation. Ordered cohort
+//! publication adds a durable, identity-bound journal and a commit decision.
+//! Startup recovery rolls the whole cohort back before that decision, or
+//! finishes every checksum after it.
 
 use {
     crate::{
         archive_checksum::{
-            ARCHIVE_PUBLICATION_SENTINEL, ValidatedArchiveFile, archive_checksum_line,
-            archive_checksum_path, archive_file_identity, path_matches_archive_identity,
-            rebind_validated_after_rename,
+            ARCHIVE_BATCH_OUTCOME_DIRECTORY, ARCHIVE_BATCH_TRANSACTION_DIRECTORY,
+            ARCHIVE_PUBLICATION_SENTINEL, PersistedValidatedArchiveFile, ValidatedArchiveFile,
+            archive_batch_publication_in_progress, archive_checksum_line, archive_checksum_path,
+            archive_file_identity, path_matches_archive_identity, rebind_validated_after_rename,
         },
         segment_manifest::{
             HistoricalSegmentManifest, read_and_validate_segment_manifest, segment_manifest_path,
         },
     },
+    serde::{Deserialize, Serialize},
+    sha2::{Digest, Sha256},
     std::{
-        ffi::{CString, OsStr},
+        collections::HashSet,
+        ffi::{CStr, CString, OsStr},
         fmt,
         fs::{self, File, OpenOptions},
         io::{self, Read, Write},
         mem::MaybeUninit,
         os::{
-            fd::{AsRawFd as _, FromRawFd as _, RawFd},
+            fd::{AsRawFd as _, FromRawFd as _, IntoRawFd as _, RawFd},
             unix::{
-                ffi::OsStrExt as _,
+                ffi::{OsStrExt as _, OsStringExt as _},
                 fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _},
             },
         },
@@ -45,6 +50,13 @@ const FINAL_FILE_MODE: u32 = 0o440;
 const CAPABILITY_PROBE_A: &str = "rename-probe-a";
 const CAPABILITY_PROBE_B: &str = "rename-probe-b";
 const CAPABILITY_PROBE_MOVED: &str = "rename-probe-moved";
+const ARCHIVE_BATCH_JOURNAL: &str = "journal.json";
+const ARCHIVE_BATCH_JOURNAL_NEXT: &str = "journal.next.json";
+const ARCHIVE_BATCH_ARMED: &str = "armed";
+const ARCHIVE_BATCH_ARMED_PREFIX: &[u8] = b"jetstreamer archive batch armed v1\0";
+const ARCHIVE_BATCH_JOURNAL_VERSION: u32 = 1;
+const MAX_ARCHIVE_BATCH_ITEMS: usize = 4096;
+const MAX_ARCHIVE_BATCH_JOURNAL_BYTES: u64 = 8 << 20;
 
 #[derive(Debug)]
 pub struct ArchivePublication {
@@ -53,6 +65,89 @@ pub struct ArchivePublication {
     pub checksum_path: PathBuf,
     pub recovery_directory: Option<PathBuf>,
     pub evidence: ValidatedArchiveFile,
+}
+
+/// One fully validated member of an ordered archive publication cohort.
+///
+/// Every destination in a batch must share one directory, and the entries must
+/// be ordered by strictly increasing epoch. The staged and destination
+/// basenames must be the same.
+#[derive(Clone, Debug)]
+pub struct ArchiveBatchItem {
+    pub epoch: u64,
+    pub staged_archive: PathBuf,
+    pub destination_archive: PathBuf,
+    pub evidence: ValidatedArchiveFile,
+}
+
+#[derive(Debug)]
+pub struct ArchiveBatchPublication {
+    pub transaction_id: [u8; 32],
+    pub manifest_fingerprint: [u8; 32],
+    pub destination_identity: ArchiveBatchDestinationIdentity,
+    /// Publications in the same strictly increasing epoch order as the input.
+    pub publications: Vec<ArchivePublication>,
+    /// Exact initial and committed namespace identities for every member.
+    pub identity_evidence: Vec<ArchiveBatchIdentityEvidence>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ArchiveBatchDestinationIdentity {
+    pub device: u64,
+    pub inode: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ArchiveNamespaceIdentity {
+    pub device: u64,
+    pub inode: u64,
+    pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub link_count: u64,
+    pub length: u64,
+    pub modified_seconds: i64,
+    pub modified_nanoseconds: i64,
+    pub changed_seconds: i64,
+    pub changed_nanoseconds: i64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ArchiveBatchIdentityEvidence {
+    pub epoch: u64,
+    pub initial_archive: Option<ArchiveNamespaceIdentity>,
+    pub initial_manifest: Option<ArchiveNamespaceIdentity>,
+    pub initial_checksum: Option<ArchiveNamespaceIdentity>,
+    pub committed_archive: ArchiveNamespaceIdentity,
+    pub committed_manifest: Option<ArchiveNamespaceIdentity>,
+    pub committed_checksum: ArchiveNamespaceIdentity,
+    pub archive_validation: ValidatedArchiveFile,
+}
+
+#[derive(Debug)]
+pub struct ArchiveBatchRollback {
+    pub transaction_id: [u8; 32],
+    pub manifest_fingerprint: [u8; 32],
+    pub destination_identity: ArchiveBatchDestinationIdentity,
+    pub identity_evidence: Vec<ArchiveBatchRollbackIdentityEvidence>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArchiveBatchRollbackIdentityEvidence {
+    pub epoch: u64,
+    pub staged_archive_path: PathBuf,
+    pub restored_archive: Option<ArchiveNamespaceIdentity>,
+    pub restored_manifest: Option<ArchiveNamespaceIdentity>,
+    pub restored_checksum: Option<ArchiveNamespaceIdentity>,
+    pub staged_archive: ArchiveNamespaceIdentity,
+    pub staged_archive_validation: ValidatedArchiveFile,
+}
+
+#[derive(Debug)]
+pub enum ArchiveBatchRecovery {
+    None,
+    RolledBack(ArchiveBatchRollback),
+    Committed(ArchiveBatchPublication),
 }
 
 #[derive(Debug)]
@@ -80,7 +175,7 @@ impl fmt::Display for ArchivePublicationError {
 
 impl std::error::Error for ArchivePublicationError {}
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 struct FileIdentity {
     dev: u64,
     ino: u64,
@@ -151,6 +246,24 @@ impl FileIdentity {
     }
 }
 
+impl From<FileIdentity> for ArchiveNamespaceIdentity {
+    fn from(identity: FileIdentity) -> Self {
+        Self {
+            device: identity.dev,
+            inode: identity.ino,
+            mode: identity.mode,
+            uid: identity.uid,
+            gid: identity.gid,
+            link_count: identity.nlink,
+            length: identity.len,
+            modified_seconds: identity.mtime,
+            modified_nanoseconds: identity.mtime_nsec,
+            changed_seconds: identity.ctime,
+            changed_nanoseconds: identity.ctime_nsec,
+        }
+    }
+}
+
 struct BoundDirectory {
     path: PathBuf,
     file: File,
@@ -186,6 +299,54 @@ impl BoundDirectory {
         if path_identity != identity {
             return Err(format!(
                 "directory path changed while it was opened: {}",
+                path.display()
+            ));
+        }
+        validate_directory_policy(identity, policy, path)?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            file,
+            identity,
+            policy,
+        })
+    }
+
+    fn bind_absolute_nofollow(path: &Path, policy: DirectoryPolicy) -> Result<Self, String> {
+        require_canonical_absolute_path(path, "directory")?;
+        let mut file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open("/")
+            .map_err(|error| format!("failed to open filesystem root: {error}"))?;
+        for component in path.components().skip(1) {
+            let std::path::Component::Normal(name) = component else {
+                return Err(format!(
+                    "directory path has a non-canonical component: {}",
+                    path.display()
+                ));
+            };
+            file = openat_directory(file.as_raw_fd(), name).map_err(|error| {
+                format!(
+                    "failed to open directory component {:?} without following links in {}: {error}",
+                    name,
+                    path.display()
+                )
+            })?;
+        }
+        let descriptor_metadata = file.metadata().map_err(|error| {
+            format!(
+                "failed to inspect opened directory {}: {error}",
+                path.display()
+            )
+        })?;
+        let path_metadata = fs::symlink_metadata(path)
+            .map_err(|error| format!("failed to inspect directory {}: {error}", path.display()))?;
+        let identity = FileIdentity::from_metadata(&descriptor_metadata);
+        if !path_metadata.file_type().is_dir()
+            || FileIdentity::from_metadata(&path_metadata) != identity
+        {
+            return Err(format!(
+                "directory path changed while its components were bound: {}",
                 path.display()
             ));
         }
@@ -380,11 +541,50 @@ enum DirectoryIndex {
     Destination,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 struct InitialDestination {
     archive: Option<FileIdentity>,
     manifest: Option<FileIdentity>,
     checksum: Option<FileIdentity>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+enum ArchiveBatchDecision {
+    RollBack,
+    Commit,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ArchiveBatchJournalItem {
+    epoch: u64,
+    source_path: Vec<u8>,
+    source_identity: FileIdentity,
+    recovery_name: Vec<u8>,
+    recovery_identity: FileIdentity,
+    archive_name: Vec<u8>,
+    archive_identity: FileIdentity,
+    manifest_staged_identity: Option<FileIdentity>,
+    checksum_staged_identity: FileIdentity,
+    checksum_sentinel_identity: FileIdentity,
+    destination_name: Vec<u8>,
+    destination_manifest_name: Vec<u8>,
+    destination_checksum_name: Vec<u8>,
+    initial: InitialDestination,
+    evidence: PersistedValidatedArchiveFile,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ArchiveBatchJournal {
+    version: u32,
+    transaction_id: [u8; 32],
+    transaction_nonce: [u8; 32],
+    manifest_fingerprint: [u8; 32],
+    decision: ArchiveBatchDecision,
+    destination_path: Vec<u8>,
+    destination_identity: FileIdentity,
+    items: Vec<ArchiveBatchJournalItem>,
 }
 
 #[derive(Clone)]
@@ -447,6 +647,15 @@ enum PublishPhase {
     AfterChecksumRollbackSync,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ArchiveBatchPhase {
+    JournalPrepared,
+    Item { index: usize, phase: PublishPhase },
+    CommitDecisionDurable,
+    BeforeTransactionMarkerRemoval,
+    AfterTransactionMarkerRetirement,
+}
+
 /// Verifies the directory policies and filesystem operations required by
 /// [`publish_verified_archive`] before expensive archive generation begins.
 ///
@@ -462,6 +671,14 @@ pub fn preflight_archive_publication(
     let destination =
         BoundDirectory::bind(destination_directory, DirectoryPolicy::SharedDestination)
             .map_err(preflight_error)?;
+    if archive_batch_publication_in_progress(destination_directory).map_err(|error| {
+        preflight_error(format!("failed to inspect archive batch marker: {error}"))
+    })? {
+        return Err(preflight_error(format!(
+            "destination {} has an in-progress archive batch transaction",
+            destination_directory.display()
+        )));
+    }
     require_compatible_directories(&source, &destination).map_err(preflight_error)?;
     let (recovery_name, recovery) = create_recovery_directory(&destination)
         .map_err(|error| preflight_error_with_recovery(error.message, error.recovery_directory))?;
@@ -492,6 +709,336 @@ pub fn publish_verified_archive(
     publish_verified_archive_with_hook(staged_archive, destination_archive, evidence, |_| Ok(()))
 }
 
+/// Publishes an ordered cohort as one recoverable transaction.
+///
+/// Before any archive or manifest changes, every member is validated and every
+/// checksum name is durably replaced by the publication sentinel. The durable
+/// batch marker remains present until every new archive and canonical checksum
+/// is installed. It is then durably retired to a completed-outcome record.
+/// Persist a private receipt from the returned evidence, fsync it, and call
+/// [`acknowledge_archive_publication_batch`] with the transaction ID. Until
+/// acknowledgement, recovery returns the same outcome and no new batch may
+/// start. Call [`recover_archive_publication_batch`] during startup before
+/// constructing a new cohort for the same destination directory.
+///
+/// This is marked, recoverable visibility rather than literal multi-name POSIX
+/// atomicity. Batch-aware readers must refuse the destination while
+/// [`archive_batch_publication_in_progress`] reports true.
+pub fn publish_verified_archive_batch(
+    manifest_fingerprint: [u8; 32],
+    items: &[ArchiveBatchItem],
+) -> Result<ArchiveBatchPublication, ArchivePublicationError> {
+    publish_verified_archive_batch_with_hook(manifest_fingerprint, items, |_| Ok(()))
+}
+
+fn publish_verified_archive_batch_with_hook<F>(
+    manifest_fingerprint: [u8; 32],
+    items: &[ArchiveBatchItem],
+    mut hook: F,
+) -> Result<ArchiveBatchPublication, ArchivePublicationError>
+where
+    F: FnMut(ArchiveBatchPhase) -> Result<(), String>,
+{
+    if manifest_fingerprint == [0; 32] {
+        return Err(preflight_error(
+            "archive batch manifest fingerprint must not be zero".to_string(),
+        ));
+    }
+    let destination_path = validate_archive_batch_request(items)?;
+    if archive_batch_marker_exists(&destination_path).map_err(preflight_error)? {
+        return Err(preflight_error(format!(
+            "an interrupted archive batch transaction exists in {}; call recover_archive_publication_batch before starting another cohort",
+            destination_path.display()
+        )));
+    }
+
+    let mut transactions = Vec::with_capacity(items.len());
+    for item in items {
+        match prepare_publication_transaction(
+            &item.staged_archive,
+            &item.destination_archive,
+            item.evidence,
+        ) {
+            Ok(transaction) => transactions.push(transaction),
+            Err(error) => {
+                let cleanup = cleanup_prepared_batch_transactions(&mut transactions);
+                return Err(append_batch_cleanup_error(error, cleanup));
+            }
+        }
+    }
+    if let Err(message) = require_one_batch_destination(&transactions) {
+        let cleanup = cleanup_prepared_batch_transactions(&mut transactions);
+        return Err(append_batch_cleanup_error(
+            preflight_error(message),
+            cleanup,
+        ));
+    }
+
+    let transaction_nonce =
+        archive_batch_transaction_nonce(&transactions, items, manifest_fingerprint);
+    let mut journal = ArchiveBatchJournal {
+        version: ARCHIVE_BATCH_JOURNAL_VERSION,
+        transaction_id: [0; 32],
+        transaction_nonce,
+        manifest_fingerprint,
+        decision: ArchiveBatchDecision::RollBack,
+        destination_path: path_bytes(&destination_path),
+        destination_identity: transactions[0].destination.identity,
+        items: transactions
+            .iter()
+            .zip(items)
+            .map(|(transaction, item)| transaction.batch_journal_item(item.epoch))
+            .collect(),
+    };
+    journal.transaction_id = match archive_batch_journal_transaction_id(&journal) {
+        Ok(transaction_id) => transaction_id,
+        Err(message) => {
+            let cleanup = cleanup_prepared_batch_transactions(&mut transactions);
+            return Err(append_batch_cleanup_error(
+                preflight_error(message),
+                cleanup,
+            ));
+        }
+    };
+    let transaction_id = journal.transaction_id;
+    let marker = match create_archive_batch_marker(&transactions[0].destination, &journal) {
+        Ok(marker) => marker,
+        Err(error) => {
+            let cleanup = cleanup_prepared_batch_transactions(&mut transactions);
+            return Err(append_batch_cleanup_error(error, cleanup));
+        }
+    };
+
+    let operation = (|| -> Result<(), String> {
+        hook(ArchiveBatchPhase::JournalPrepared)?;
+        for (index, transaction) in transactions.iter_mut().enumerate() {
+            let mut item_hook = |phase| hook(ArchiveBatchPhase::Item { index, phase });
+            item_hook(PublishPhase::BeforeChecksumInvalidation)?;
+            transaction.reserve_checksum_name(&mut item_hook)?;
+            transaction.sync_mutation_directories()?;
+            item_hook(PublishPhase::AfterChecksumInvalidation)?;
+        }
+        for (index, transaction) in transactions.iter_mut().enumerate() {
+            let mut item_hook = |phase| hook(ArchiveBatchPhase::Item { index, phase });
+            transaction.run_data_precommit(&mut item_hook)?;
+        }
+        for transaction in &mut transactions {
+            transaction.verify_commit_ready()?;
+            transaction.sync_mutation_directories()?;
+        }
+
+        journal.decision = ArchiveBatchDecision::Commit;
+        replace_archive_batch_journal(&marker, &journal)?;
+        hook(ArchiveBatchPhase::CommitDecisionDurable)?;
+
+        for (index, transaction) in transactions.iter_mut().enumerate() {
+            let mut item_hook = |phase| hook(ArchiveBatchPhase::Item { index, phase });
+            transaction.commit_checksum_for_batch(&mut item_hook)?;
+        }
+        Ok(())
+    })();
+
+    if let Err(cause) = operation {
+        drop(transactions);
+        drop(marker);
+        return resolve_failed_archive_batch(&destination_path, cause);
+    }
+
+    if let Err(cause) = cleanup_committed_batch_sentinels(&transactions)
+        .and_then(|()| hook(ArchiveBatchPhase::BeforeTransactionMarkerRemoval))
+        .and_then(|()| {
+            for transaction in &mut transactions {
+                transaction.verify_finalized_batch_namespace()?;
+                transaction.sync_mutation_directories()?;
+            }
+            Ok(())
+        })
+    {
+        drop(transactions);
+        drop(marker);
+        return resolve_failed_archive_batch(&destination_path, cause);
+    }
+    let publications = match transactions
+        .iter_mut()
+        .map(PublicationTransaction::batch_publication)
+        .collect::<Result<Vec<_>, _>>()
+    {
+        Ok(publications) => publications,
+        Err(cause) => {
+            drop(transactions);
+            drop(marker);
+            return resolve_failed_archive_batch(&destination_path, cause);
+        }
+    };
+    let identity_evidence = match transactions
+        .iter()
+        .zip(items)
+        .map(|(transaction, item)| transaction.batch_identity_evidence(item.epoch))
+        .collect::<Result<Vec<_>, _>>()
+    {
+        Ok(evidence) => evidence,
+        Err(cause) => {
+            drop(transactions);
+            drop(marker);
+            return resolve_failed_archive_batch(&destination_path, cause);
+        }
+    };
+    if let Err(cause) = transactions
+        .iter_mut()
+        .try_for_each(PublicationTransaction::verify_finalized_batch_namespace)
+    {
+        drop(transactions);
+        drop(marker);
+        return resolve_failed_archive_batch(&destination_path, cause);
+    }
+    retire_archive_batch_marker(&transactions[0].destination, &marker)
+        .map_err(|message| batch_indeterminate_error(&destination_path, message, true))?;
+    if let Err(cause) = hook(ArchiveBatchPhase::AfterTransactionMarkerRetirement) {
+        drop(transactions);
+        drop(marker);
+        return resolve_failed_archive_batch(&destination_path, cause);
+    }
+    Ok(ArchiveBatchPublication {
+        transaction_id,
+        manifest_fingerprint,
+        destination_identity: ArchiveBatchDestinationIdentity {
+            device: journal.destination_identity.dev,
+            inode: journal.destination_identity.ino,
+        },
+        publications,
+        identity_evidence,
+    })
+}
+
+/// Recovers the one durable batch transaction marker in a destination.
+///
+/// A rollback decision restores every original archive, manifest, checksum,
+/// and staged archive. A commit decision finishes every canonical checksum.
+/// A completed outcome is returned repeatedly until it is acknowledged after
+/// the caller's private receipt is durable.
+/// The caller must ensure no live publisher is using this destination; an
+/// advisory lock rejects recovery while the publishing process is alive.
+pub fn recover_archive_publication_batch(
+    destination_directory: &Path,
+) -> Result<ArchiveBatchRecovery, ArchivePublicationError> {
+    let destination = BoundDirectory::bind_absolute_nofollow(
+        destination_directory,
+        DirectoryPolicy::SharedDestination,
+    )
+    .map_err(preflight_error)?;
+    let marker = bind_archive_batch_marker(&destination).map_err(preflight_error)?;
+    let outcome = bind_archive_batch_outcome(&destination).map_err(preflight_error)?;
+    if marker.is_some() && outcome.is_some() {
+        return Err(preflight_error(
+            "destination contains both an active archive batch and a completed outcome".to_string(),
+        ));
+    }
+    let Some(marker) = marker.or(outcome) else {
+        return Ok(ArchiveBatchRecovery::None);
+    };
+    let completed_outcome =
+        marker.path.file_name() == Some(OsStr::new(ARCHIVE_BATCH_OUTCOME_DIRECTORY));
+    lock_archive_batch_marker(&marker)
+        .map_err(|message| preflight_error_with_recovery(message, Some(marker.path.clone())))?;
+    let journal = read_archive_batch_journal(&destination, &marker)?;
+    if completed_outcome {
+        let journal = journal.ok_or_else(|| {
+            preflight_error_with_recovery(
+                "completed archive batch outcome is not armed".to_string(),
+                Some(marker.path.clone()),
+            )
+        })?;
+        return observe_finalized_archive_batch(&destination, &journal).map_err(|message| {
+            batch_indeterminate_error(
+                destination_directory,
+                message,
+                journal.decision == ArchiveBatchDecision::Commit,
+            )
+        });
+    }
+    let Some(journal) = journal else {
+        remove_archive_batch_marker_directory(
+            &destination,
+            &marker,
+            OsStr::new(ARCHIVE_BATCH_TRANSACTION_DIRECTORY),
+            Some(false),
+        )
+        .map_err(|message| preflight_error_with_recovery(message, Some(marker.path.clone())))?;
+        return Ok(ArchiveBatchRecovery::None);
+    };
+    recover_bound_archive_batch(&destination, &marker, &journal)
+}
+
+/// Removes the durable completed-outcome record after the caller has written
+/// its own durable receipt. The transaction ID prevents acknowledging a
+/// different batch. This operation must be ordered after receipt fsync.
+pub fn acknowledge_archive_publication_batch(
+    destination_directory: &Path,
+    transaction_id: [u8; 32],
+) -> Result<(), ArchivePublicationError> {
+    let destination = BoundDirectory::bind_absolute_nofollow(
+        destination_directory,
+        DirectoryPolicy::SharedDestination,
+    )
+    .map_err(preflight_error)?;
+    if bind_archive_batch_marker(&destination)
+        .map_err(preflight_error)?
+        .is_some()
+    {
+        return Err(preflight_error(
+            "cannot acknowledge a completed outcome while an active archive batch exists"
+                .to_string(),
+        ));
+    }
+    let outcome = bind_archive_batch_outcome(&destination)
+        .map_err(preflight_error)?
+        .ok_or_else(|| preflight_error("archive batch outcome does not exist".to_string()))?;
+    lock_archive_batch_marker(&outcome)
+        .map_err(|message| preflight_error_with_recovery(message, Some(outcome.path.clone())))?;
+    let journal = read_archive_batch_journal(&destination, &outcome)?.ok_or_else(|| {
+        preflight_error_with_recovery(
+            "completed archive batch outcome is not armed".to_string(),
+            Some(outcome.path.clone()),
+        )
+    })?;
+    if journal.transaction_id != transaction_id {
+        return Err(preflight_error_with_recovery(
+            "archive batch outcome transaction ID does not match acknowledgement".to_string(),
+            Some(outcome.path.clone()),
+        ));
+    }
+    let recovered =
+        bind_recovered_archive_batch_items(&destination, &journal).map_err(|message| {
+            batch_indeterminate_error(
+                destination_directory,
+                message,
+                journal.decision == ArchiveBatchDecision::Commit,
+            )
+        })?;
+    observe_finalized_archive_batch(&destination, &journal).map_err(|message| {
+        batch_indeterminate_error(
+            destination_directory,
+            message,
+            journal.decision == ArchiveBatchDecision::Commit,
+        )
+    })?;
+    remove_archive_batch_marker_directory(
+        &destination,
+        &outcome,
+        OsStr::new(ARCHIVE_BATCH_OUTCOME_DIRECTORY),
+        Some(true),
+    )
+    .map_err(|message| {
+        batch_indeterminate_error(
+            destination_directory,
+            message,
+            journal.decision == ArchiveBatchDecision::Commit,
+        )
+    })?;
+    cleanup_acknowledged_archive_batch(&destination, journal.decision, &recovered);
+    Ok(())
+}
+
 fn publish_verified_archive_with_hook<F>(
     staged_archive: &Path,
     destination_archive: &Path,
@@ -510,6 +1057,19 @@ fn publish_impl(
     evidence: ValidatedArchiveFile,
     hook: &mut dyn FnMut(PublishPhase) -> Result<(), String>,
 ) -> Result<ArchivePublication, ArchivePublicationError> {
+    let mut transaction =
+        prepare_publication_transaction(staged_archive, destination_archive, evidence)?;
+    if let Err(message) = transaction.run_precommit(hook) {
+        return Err(transaction.rollback_error(message, hook));
+    }
+    transaction.commit(hook)
+}
+
+fn prepare_publication_transaction(
+    staged_archive: &Path,
+    destination_archive: &Path,
+    evidence: ValidatedArchiveFile,
+) -> Result<PublicationTransaction, ArchivePublicationError> {
     let source_parent_path = staged_archive.parent().unwrap_or_else(|| Path::new("."));
     let destination_parent_path = destination_archive
         .parent()
@@ -519,6 +1079,14 @@ fn publish_impl(
     let destination =
         BoundDirectory::bind(destination_parent_path, DirectoryPolicy::SharedDestination)
             .map_err(preflight_error)?;
+    if archive_batch_publication_in_progress(destination_parent_path).map_err(|error| {
+        preflight_error(format!("failed to inspect archive batch marker: {error}"))
+    })? {
+        return Err(preflight_error(format!(
+            "destination {} has an in-progress archive batch transaction",
+            destination_parent_path.display()
+        )));
+    }
     require_compatible_directories(&source, &destination).map_err(preflight_error)?;
 
     let archive_name = safe_file_name(staged_archive).map_err(preflight_error)?;
@@ -763,7 +1331,7 @@ fn publish_impl(
         identity: archive.identity,
     };
     let manifest_staging_identity = manifest_staged.as_ref().map(|staged| staged.identity);
-    let mut transaction = PublicationTransaction {
+    Ok(PublicationTransaction {
         source,
         destination,
         recovery,
@@ -786,12 +1354,7 @@ fn publish_impl(
         installed_archive_identity: None,
         installed_manifest_identity: None,
         manifest_staging_identity,
-    };
-
-    if let Err(message) = transaction.run_precommit(hook) {
-        return Err(transaction.rollback_error(message, hook));
-    }
-    transaction.commit(hook)
+    })
 }
 
 struct PublicationTransaction {
@@ -836,6 +1399,13 @@ impl PublicationTransaction {
         self.sync_mutation_directories()?;
         hook(PublishPhase::AfterChecksumInvalidation)?;
 
+        self.run_data_precommit(hook)
+    }
+
+    fn run_data_precommit(
+        &mut self,
+        hook: &mut dyn FnMut(PublishPhase) -> Result<(), String>,
+    ) -> Result<(), String> {
         hook(PublishPhase::BeforeManifestMutation)?;
         if let Some((kind, directory, name, identity)) =
             self.manifest_staged.as_ref().map(|staged| {
@@ -1057,6 +1627,110 @@ impl PublicationTransaction {
             checksum_path: self.destination.path.join(&self.destination_checksum_name),
             recovery_directory,
             evidence,
+        })
+    }
+
+    fn commit_checksum_for_batch(
+        &mut self,
+        hook: &mut dyn FnMut(PublishPhase) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let commit_mutation = Mutation::Exchange {
+            role: MutationRole::ChecksumCommit,
+            left: NamespaceEntry {
+                directory: DirectoryIndex::Recovery,
+                name: self.checksum_staged.name.clone(),
+            },
+            right: NamespaceEntry {
+                directory: DirectoryIndex::Destination,
+                name: self.destination_checksum_name.clone(),
+            },
+            left_identity: self.checksum_staged.identity,
+            right_identity: self.checksum_sentinel.identity,
+        };
+        self.verify_commit_ready()?;
+        self.perform_journaled_mutation(commit_mutation)
+            .map_err(|error| format!("failed to exchange checksum commit marker: {error}"))?;
+        self.finish_last_mutation(PublishPhase::AfterChecksumCommitMutation, hook)?;
+        self.checksum_staged.identity = rebound_target_identity(
+            &self.destination,
+            &self.destination_checksum_name,
+            self.checksum_staged.identity,
+        )?;
+        self.checksum_sentinel.identity = rebound_target_identity(
+            &self.recovery,
+            ComponentKind::Checksum.staging_name(),
+            self.checksum_sentinel.identity,
+        )?;
+        sync_all(&[&self.recovery, &self.destination])?;
+        self.verify_committed_namespace()
+    }
+
+    fn batch_journal_item(&self, epoch: u64) -> ArchiveBatchJournalItem {
+        ArchiveBatchJournalItem {
+            epoch,
+            source_path: path_bytes(&self.source.path),
+            source_identity: self.source.identity,
+            recovery_name: self.recovery_name.as_bytes().to_vec(),
+            recovery_identity: self.recovery.identity,
+            archive_name: self.archive_staged.name.as_bytes().to_vec(),
+            archive_identity: self.archive_staged.identity,
+            manifest_staged_identity: self.manifest_staging_identity,
+            checksum_staged_identity: self.checksum_staged.identity,
+            checksum_sentinel_identity: self.checksum_sentinel.identity,
+            destination_name: self.destination_name.as_bytes().to_vec(),
+            destination_manifest_name: self.destination_manifest_name.as_bytes().to_vec(),
+            destination_checksum_name: self.destination_checksum_name.as_bytes().to_vec(),
+            initial: self.initial,
+            evidence: self.evidence.into(),
+        }
+    }
+
+    fn batch_publication(&mut self) -> Result<ArchivePublication, String> {
+        self.verify_finalized_batch_namespace()?;
+        let evidence = self
+            .published_evidence
+            .ok_or_else(|| "committed batch archive has no bound evidence".to_string())?;
+        let retains_backups = self.initial.archive.is_some()
+            || self.initial.manifest.is_some()
+            || self.initial.checksum.is_some();
+        Ok(ArchivePublication {
+            archive_path: self.destination.path.join(&self.destination_name),
+            manifest_path: self
+                .installed_manifest_identity
+                .map(|_| self.destination.path.join(&self.destination_manifest_name)),
+            checksum_path: self.destination.path.join(&self.destination_checksum_name),
+            recovery_directory: retains_backups.then(|| self.recovery.path.clone()),
+            evidence,
+        })
+    }
+
+    fn batch_identity_evidence(&self, epoch: u64) -> Result<ArchiveBatchIdentityEvidence, String> {
+        let committed_archive = target_identity(&self.destination, &self.destination_name)?
+            .ok_or_else(|| "committed batch archive disappeared".to_string())?;
+        let committed_manifest =
+            target_identity(&self.destination, &self.destination_manifest_name)?;
+        let committed_checksum =
+            target_identity(&self.destination, &self.destination_checksum_name)?
+                .ok_or_else(|| "committed batch checksum disappeared".to_string())?;
+        if !committed_archive.same_across_rename(
+            self.installed_archive_identity
+                .ok_or_else(|| "committed batch archive has no installed identity".to_string())?,
+        ) || !option_identities_correspond(committed_manifest, self.installed_manifest_identity)
+            || !committed_checksum.same_across_rename(self.checksum_staged.identity)
+        {
+            return Err("committed batch identity evidence changed after verification".into());
+        }
+        Ok(ArchiveBatchIdentityEvidence {
+            epoch,
+            initial_archive: self.initial.archive.map(Into::into),
+            initial_manifest: self.initial.manifest.map(Into::into),
+            initial_checksum: self.initial.checksum.map(Into::into),
+            committed_archive: committed_archive.into(),
+            committed_manifest: committed_manifest.map(Into::into),
+            committed_checksum: committed_checksum.into(),
+            archive_validation: self
+                .published_evidence
+                .ok_or_else(|| "committed batch archive has no validation evidence".to_string())?,
         })
     }
 
@@ -1375,6 +2049,40 @@ impl PublicationTransaction {
         )
     }
 
+    fn verify_finalized_batch_namespace(&mut self) -> Result<(), String> {
+        self.source.recheck_path()?;
+        self.destination.recheck_path()?;
+        require_recovery_binding(&self.destination, &self.recovery_name, &self.recovery)?;
+        self.refresh_published_evidence()?;
+        require_expected_target(
+            &self.destination,
+            &self.destination_manifest_name,
+            self.installed_manifest_identity,
+        )?;
+        require_expected_target(
+            &self.destination,
+            &self.destination_checksum_name,
+            Some(self.checksum_staged.identity),
+        )?;
+        require_expected_target(&self.recovery, ComponentKind::Checksum.staging_name(), None)?;
+        let evidence = self
+            .published_evidence
+            .ok_or_else(|| "finalized batch archive has no bound evidence".to_string())?;
+        let expected_checksum = archive_checksum_line(&evidence.sha256, &self.destination_name)
+            .map_err(|error| error.to_string())?;
+        let checksum = bind_required_regular(
+            &self.destination,
+            &self.destination_checksum_name,
+            ComponentKind::Checksum,
+        )?;
+        if read_bound_file(&checksum.file, expected_checksum.len() as u64)?
+            != expected_checksum.as_bytes()
+        {
+            return Err("finalized batch checksum is not canonical".to_string());
+        }
+        Ok(())
+    }
+
     fn sync_mutation_directories(&self) -> Result<(), String> {
         sync_all(&[&self.source, &self.recovery, &self.destination])
     }
@@ -1681,6 +2389,1846 @@ impl PublicationTransaction {
             }
         }
     }
+}
+
+fn path_bytes(path: &Path) -> Vec<u8> {
+    path.as_os_str().as_bytes().to_vec()
+}
+
+fn require_canonical_absolute_path(path: &Path, label: &str) -> Result<(), String> {
+    if !path.is_absolute() {
+        return Err(format!("{label} path must be absolute: {}", path.display()));
+    }
+    let mut rebuilt = PathBuf::from("/");
+    for component in path.components().skip(1) {
+        let std::path::Component::Normal(name) = component else {
+            return Err(format!(
+                "{label} path has a non-canonical component: {}",
+                path.display()
+            ));
+        };
+        rebuilt.push(name);
+    }
+    if rebuilt.as_os_str().as_bytes() != path.as_os_str().as_bytes() {
+        return Err(format!(
+            "{label} path is not in canonical lexical form: {}",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn archive_batch_transaction_nonce(
+    transactions: &[PublicationTransaction],
+    items: &[ArchiveBatchItem],
+    manifest_fingerprint: [u8; 32],
+) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"jetstreamer archive batch transaction v1\0");
+    digest.update(manifest_fingerprint);
+    digest.update(std::process::id().to_le_bytes());
+    digest.update(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+            .to_le_bytes(),
+    );
+    for (transaction, item) in transactions.iter().zip(items) {
+        digest.update(item.epoch.to_le_bytes());
+        digest.update(item.evidence.sha256);
+        digest.update(transaction.source.identity.dev.to_le_bytes());
+        digest.update(transaction.source.identity.ino.to_le_bytes());
+        digest.update(transaction.recovery.identity.dev.to_le_bytes());
+        digest.update(transaction.recovery.identity.ino.to_le_bytes());
+        digest.update(transaction.archive_staged.identity.ino.to_le_bytes());
+        digest.update(path_bytes(&item.staged_archive));
+        digest.update([0]);
+        digest.update(path_bytes(&item.destination_archive));
+        digest.update([0]);
+    }
+    digest.finalize().into()
+}
+
+fn path_from_bytes(bytes: &[u8], label: &str) -> Result<PathBuf, String> {
+    if bytes.is_empty() || bytes.contains(&0) {
+        return Err(format!("batch journal contains an invalid {label} path"));
+    }
+    let path = PathBuf::from(std::ffi::OsString::from_vec(bytes.to_vec()));
+    require_canonical_absolute_path(&path, &format!("batch journal {label}"))?;
+    Ok(path)
+}
+
+fn name_from_bytes(bytes: &[u8], label: &str) -> Result<std::ffi::OsString, String> {
+    let name = std::ffi::OsString::from_vec(bytes.to_vec());
+    let path = Path::new(&name);
+    if bytes.is_empty()
+        || bytes == b"."
+        || bytes == b".."
+        || bytes.contains(&b'/')
+        || bytes.contains(&0)
+        || path.file_name() != Some(name.as_os_str())
+    {
+        return Err(format!("batch journal contains an unsafe {label} filename"));
+    }
+    Ok(name)
+}
+
+fn validate_archive_batch_request(
+    items: &[ArchiveBatchItem],
+) -> Result<PathBuf, ArchivePublicationError> {
+    if items.is_empty() {
+        return Err(preflight_error(
+            "archive publication batch must not be empty".to_string(),
+        ));
+    }
+    if items.len() > MAX_ARCHIVE_BATCH_ITEMS {
+        return Err(preflight_error(format!(
+            "archive publication batch contains {} entries; maximum is {MAX_ARCHIVE_BATCH_ITEMS}",
+            items.len()
+        )));
+    }
+    let destination_path = items[0]
+        .destination_archive
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf();
+    require_canonical_absolute_path(&destination_path, "archive batch destination directory")
+        .map_err(preflight_error)?;
+
+    let mut epochs = HashSet::with_capacity(items.len());
+    let mut destination_names = HashSet::with_capacity(items.len().saturating_mul(3));
+    let mut staged_paths = HashSet::with_capacity(items.len());
+    let mut previous_epoch = None;
+    for item in items {
+        require_canonical_absolute_path(&item.staged_archive, "staged archive")
+            .map_err(preflight_error)?;
+        require_canonical_absolute_path(&item.destination_archive, "destination archive")
+            .map_err(preflight_error)?;
+        if !epochs.insert(item.epoch) {
+            return Err(preflight_error(format!(
+                "archive batch contains duplicate epoch {}",
+                item.epoch
+            )));
+        }
+        if previous_epoch.is_some_and(|previous| item.epoch <= previous) {
+            return Err(preflight_error(format!(
+                "archive batch epochs must be strictly increasing; epoch {} is out of order",
+                item.epoch
+            )));
+        }
+        previous_epoch = Some(item.epoch);
+        if item.destination_archive.parent() != Some(destination_path.as_path()) {
+            return Err(preflight_error(format!(
+                "archive batch destinations must share exactly one directory: {}",
+                item.destination_archive.display()
+            )));
+        }
+        let staged_name = safe_file_name(&item.staged_archive).map_err(preflight_error)?;
+        let destination_name =
+            safe_file_name(&item.destination_archive).map_err(preflight_error)?;
+        if staged_name != destination_name {
+            return Err(preflight_error(format!(
+                "staging and destination archive filenames differ for epoch {}",
+                item.epoch
+            )));
+        }
+        if !staged_paths.insert(item.staged_archive.clone()) {
+            return Err(preflight_error(format!(
+                "archive batch contains duplicate staged path {}",
+                item.staged_archive.display()
+            )));
+        }
+        let manifest_name = safe_file_name(
+            &segment_manifest_path(&item.destination_archive)
+                .map_err(|error| preflight_error(error.to_string()))?,
+        )
+        .map_err(preflight_error)?;
+        let checksum_name = safe_file_name(
+            &archive_checksum_path(&item.destination_archive)
+                .map_err(|error| preflight_error(error.to_string()))?,
+        )
+        .map_err(preflight_error)?;
+        for name in [destination_name, manifest_name, checksum_name] {
+            if !destination_names.insert(name.clone()) {
+                return Err(preflight_error(format!(
+                    "archive batch destination namespaces overlap at {:?}",
+                    name
+                )));
+            }
+        }
+        let expected_name = std::ffi::OsString::from(format!("epoch-{}.jet", item.epoch));
+        if staged_name != expected_name {
+            return Err(preflight_error(format!(
+                "archive batch destination for epoch {} must be named {:?}",
+                item.epoch, expected_name
+            )));
+        }
+    }
+    Ok(destination_path)
+}
+
+fn require_one_batch_destination(transactions: &[PublicationTransaction]) -> Result<(), String> {
+    let first = transactions
+        .first()
+        .ok_or_else(|| "archive batch unexpectedly contains no transactions".to_string())?;
+    let expected = first.destination.identity;
+    let rebound_destination = BoundDirectory::bind_absolute_nofollow(
+        &first.destination.path,
+        DirectoryPolicy::SharedDestination,
+    )?;
+    if !rebound_destination
+        .identity
+        .same_directory_binding(expected)
+    {
+        return Err("archive batch destination path changed during preflight".to_string());
+    }
+    for transaction in &transactions[1..] {
+        if !transaction
+            .destination
+            .identity
+            .same_directory_binding(expected)
+        {
+            return Err("archive batch destination directory changed during preflight".to_string());
+        }
+    }
+    let mut source_namespaces = HashSet::with_capacity(transactions.len());
+    let mut archive_inodes = HashSet::with_capacity(transactions.len());
+    for transaction in transactions {
+        let rebound_source = BoundDirectory::bind_absolute_nofollow(
+            &transaction.source.path,
+            DirectoryPolicy::PrivateSource,
+        )?;
+        if !rebound_source
+            .identity
+            .same_directory_binding(transaction.source.identity)
+        {
+            return Err(format!(
+                "archive batch source path changed during preflight: {}",
+                transaction.source.path.display()
+            ));
+        }
+        if !source_namespaces.insert((
+            transaction.source.identity.dev,
+            transaction.source.identity.ino,
+            transaction.archive_staged.name.as_bytes().to_vec(),
+        )) || !archive_inodes.insert((
+            transaction.archive_staged.identity.dev,
+            transaction.archive_staged.identity.ino,
+        )) {
+            return Err("archive batch contains an aliased staged archive".to_string());
+        }
+    }
+    Ok(())
+}
+
+fn cleanup_prepared_batch_transactions(transactions: &mut [PublicationTransaction]) -> Vec<String> {
+    let mut failures = Vec::new();
+    for transaction in transactions.iter_mut().rev() {
+        let mut hook = |_| Ok(());
+        if let Err(error) = transaction.rollback(&mut hook) {
+            failures.push(format!(
+                "failed to clean prepared recovery directory {}: {error}",
+                transaction.recovery.path.display()
+            ));
+        }
+    }
+    failures
+}
+
+fn append_batch_cleanup_error(
+    mut error: ArchivePublicationError,
+    cleanup: Vec<String>,
+) -> ArchivePublicationError {
+    if !cleanup.is_empty() {
+        error.message.push_str(&format!(
+            "; prepared batch cleanup failed: {}",
+            cleanup.join("; ")
+        ));
+        error.recovery_directory = None;
+    }
+    error
+}
+
+fn batch_indeterminate_error(
+    destination: &Path,
+    message: String,
+    committed: bool,
+) -> ArchivePublicationError {
+    ArchivePublicationError {
+        message: format!(
+            "archive batch transaction requires restart recovery in {}: {message}",
+            destination.display()
+        ),
+        committed,
+        recovery_directory: Some(destination.join(ARCHIVE_BATCH_TRANSACTION_DIRECTORY)),
+    }
+}
+
+fn archive_batch_marker_exists(destination_path: &Path) -> Result<bool, String> {
+    let destination = BoundDirectory::bind_absolute_nofollow(
+        destination_path,
+        DirectoryPolicy::SharedDestination,
+    )?;
+    Ok(bind_archive_batch_marker(&destination)?.is_some()
+        || bind_archive_batch_outcome(&destination)?.is_some())
+}
+
+fn bind_archive_batch_marker(
+    destination: &BoundDirectory,
+) -> Result<Option<BoundDirectory>, String> {
+    bind_named_archive_batch_marker(destination, OsStr::new(ARCHIVE_BATCH_TRANSACTION_DIRECTORY))
+}
+
+fn bind_archive_batch_outcome(
+    destination: &BoundDirectory,
+) -> Result<Option<BoundDirectory>, String> {
+    bind_named_archive_batch_marker(destination, OsStr::new(ARCHIVE_BATCH_OUTCOME_DIRECTORY))
+}
+
+fn bind_named_archive_batch_marker(
+    destination: &BoundDirectory,
+    name: &OsStr,
+) -> Result<Option<BoundDirectory>, String> {
+    let Some(identity) = fstatat_identity(destination.file.as_raw_fd(), name)
+        .map_err(|error| format!("failed to inspect archive batch marker: {error}"))?
+    else {
+        return Ok(None);
+    };
+    if identity.mode & libc::S_IFMT != libc::S_IFDIR {
+        return Err(format!(
+            "archive batch marker is not a real directory: {}",
+            destination.path.join(name).display()
+        ));
+    }
+    BoundDirectory::bind_child(
+        destination,
+        name,
+        destination.path.join(name),
+        DirectoryPolicy::PrivateRecovery,
+    )
+    .map(Some)
+}
+
+fn lock_archive_batch_marker(marker: &BoundDirectory) -> Result<(), String> {
+    // SAFETY: marker.file owns a live directory descriptor. flock does not
+    // dereference memory and the nonblocking lock is released with the fd.
+    if unsafe { libc::flock(marker.file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        Ok(())
+    } else {
+        Err(format!(
+            "archive batch transaction {} is owned by a live process: {}",
+            marker.path.display(),
+            io::Error::last_os_error()
+        ))
+    }
+}
+
+fn create_archive_batch_marker(
+    destination: &BoundDirectory,
+    journal: &ArchiveBatchJournal,
+) -> Result<BoundDirectory, ArchivePublicationError> {
+    let name = OsStr::new(ARCHIVE_BATCH_TRANSACTION_DIRECTORY);
+    let name_c = os_str_cstring(name).map_err(|error| preflight_error(error.to_string()))?;
+    // SAFETY: destination is a live directory and name_c is a NUL-terminated
+    // basename. O_EXCL semantics come from mkdirat returning EEXIST.
+    if unsafe {
+        libc::mkdirat(
+            destination.file.as_raw_fd(),
+            name_c.as_ptr(),
+            0o700 as libc::mode_t,
+        )
+    } != 0
+    {
+        let error = io::Error::last_os_error();
+        return Err(preflight_error(
+            if error.kind() == io::ErrorKind::AlreadyExists {
+                format!(
+                    "archive batch marker already exists at {}; recover it before starting another batch",
+                    destination.path.join(name).display()
+                )
+            } else {
+                format!("failed to create archive batch marker: {error}")
+            },
+        ));
+    }
+    let marker = BoundDirectory::bind_child(
+        destination,
+        name,
+        destination.path.join(name),
+        DirectoryPolicy::PrivateRecovery,
+    )
+    .map_err(|message| preflight_error_with_recovery(message, Some(destination.path.join(name))))?;
+    lock_archive_batch_marker(&marker)
+        .map_err(|message| preflight_error_with_recovery(message, Some(marker.path.clone())))?;
+    let outcome = match bind_archive_batch_outcome(destination) {
+        Ok(outcome) => outcome,
+        Err(message) => {
+            let cleanup = remove_archive_batch_marker_directory(
+                destination,
+                &marker,
+                OsStr::new(ARCHIVE_BATCH_TRANSACTION_DIRECTORY),
+                Some(false),
+            );
+            return Err(match cleanup {
+                Ok(()) => preflight_error(message),
+                Err(cleanup) => preflight_error_with_recovery(
+                    format!(
+                        "{message}; failed to remove unused active marker after outcome inspection failure: {cleanup}"
+                    ),
+                    Some(marker.path.clone()),
+                ),
+            });
+        }
+    };
+    if outcome.is_some() {
+        let cleanup = remove_archive_batch_marker_directory(
+            destination,
+            &marker,
+            OsStr::new(ARCHIVE_BATCH_TRANSACTION_DIRECTORY),
+            Some(false),
+        );
+        let message =
+            "an unacknowledged archive batch outcome appeared during publication preflight";
+        return Err(match cleanup {
+            Ok(()) => preflight_error(message.to_string()),
+            Err(cleanup) => preflight_error_with_recovery(
+                format!("{message}; failed to remove unused active marker: {cleanup}"),
+                Some(marker.path.clone()),
+            ),
+        });
+    }
+
+    let create = (|| -> Result<(), String> {
+        write_initial_archive_batch_journal(&marker, destination.identity.gid, journal)?;
+        create_bound_file(
+            &marker,
+            ComponentKind::Checksum,
+            OsStr::new(ARCHIVE_BATCH_ARMED),
+            &archive_batch_armed_contents(journal.transaction_id),
+            Some(destination.identity.gid),
+            0o400,
+        )?;
+        sync_all(&[&marker, destination])
+    })();
+    if let Err(message) = create {
+        let cleanup = remove_archive_batch_marker_directory(
+            destination,
+            &marker,
+            OsStr::new(ARCHIVE_BATCH_TRANSACTION_DIRECTORY),
+            None,
+        );
+        let recovery_directory = cleanup.as_ref().err().map(|_| marker.path.clone());
+        let message = match cleanup {
+            Ok(()) => message,
+            Err(cleanup) => {
+                format!("{message}; failed to remove incomplete archive batch marker: {cleanup}")
+            }
+        };
+        return Err(preflight_error_with_recovery(message, recovery_directory));
+    }
+    Ok(marker)
+}
+
+fn serialize_archive_batch_journal(journal: &ArchiveBatchJournal) -> Result<Vec<u8>, String> {
+    let bytes = serde_json::to_vec_pretty(journal)
+        .map_err(|error| format!("failed to serialize archive batch journal: {error}"))?;
+    if bytes.len() as u64 > MAX_ARCHIVE_BATCH_JOURNAL_BYTES {
+        return Err(format!(
+            "archive batch journal is {} bytes; maximum is {MAX_ARCHIVE_BATCH_JOURNAL_BYTES}",
+            bytes.len()
+        ));
+    }
+    Ok(bytes)
+}
+
+fn archive_batch_journal_transaction_id(journal: &ArchiveBatchJournal) -> Result<[u8; 32], String> {
+    let mut committed = journal.clone();
+    committed.transaction_id = [0; 32];
+    committed.decision = ArchiveBatchDecision::RollBack;
+    let bytes = serde_json::to_vec(&committed)
+        .map_err(|error| format!("failed to commit archive batch journal identity: {error}"))?;
+    let mut digest = Sha256::new();
+    digest.update(b"jetstreamer archive batch journal identity v1\0");
+    digest.update(bytes);
+    Ok(digest.finalize().into())
+}
+
+fn archive_batch_armed_contents(transaction_id: [u8; 32]) -> Vec<u8> {
+    let mut contents = Vec::with_capacity(ARCHIVE_BATCH_ARMED_PREFIX.len() + transaction_id.len());
+    contents.extend_from_slice(ARCHIVE_BATCH_ARMED_PREFIX);
+    contents.extend_from_slice(&transaction_id);
+    contents
+}
+
+fn write_initial_archive_batch_journal(
+    marker: &BoundDirectory,
+    destination_gid: u32,
+    journal: &ArchiveBatchJournal,
+) -> Result<(), String> {
+    let bytes = serialize_archive_batch_journal(journal)?;
+    create_bound_file(
+        marker,
+        ComponentKind::Checksum,
+        OsStr::new(ARCHIVE_BATCH_JOURNAL),
+        &bytes,
+        Some(destination_gid),
+        0o400,
+    )?;
+    marker.sync()
+}
+
+fn replace_archive_batch_journal(
+    marker: &BoundDirectory,
+    journal: &ArchiveBatchJournal,
+) -> Result<(), String> {
+    let bytes = serialize_archive_batch_journal(journal)?;
+    let next = create_bound_file(
+        marker,
+        ComponentKind::Checksum,
+        OsStr::new(ARCHIVE_BATCH_JOURNAL_NEXT),
+        &bytes,
+        Some(marker.identity.gid),
+        0o400,
+    )?;
+    marker.sync()?;
+    rename_exchange(
+        marker,
+        OsStr::new(ARCHIVE_BATCH_JOURNAL_NEXT),
+        marker,
+        OsStr::new(ARCHIVE_BATCH_JOURNAL),
+    )
+    .map_err(|error| format!("failed to install archive batch commit decision: {error}"))?;
+    marker.sync()?;
+    let rebound =
+        rebound_target_identity(marker, OsStr::new(ARCHIVE_BATCH_JOURNAL), next.identity)?;
+    require_corresponding_target(
+        marker,
+        OsStr::new(ARCHIVE_BATCH_JOURNAL),
+        Some(rebound),
+        "archive batch commit journal",
+    )?;
+    let previous = target_identity(marker, OsStr::new(ARCHIVE_BATCH_JOURNAL_NEXT))?
+        .ok_or_else(|| "previous archive batch journal disappeared after exchange".to_string())?;
+    unlink_corresponding_entry(marker, OsStr::new(ARCHIVE_BATCH_JOURNAL_NEXT), previous)?;
+    marker.sync()
+}
+
+fn read_archive_batch_journal(
+    destination: &BoundDirectory,
+    marker: &BoundDirectory,
+) -> Result<Option<ArchiveBatchJournal>, ArchivePublicationError> {
+    let armed = bind_optional_regular(
+        marker,
+        OsStr::new(ARCHIVE_BATCH_ARMED),
+        ComponentKind::Checksum,
+    )
+    .map_err(|message| preflight_error_with_recovery(message, Some(marker.path.clone())))?;
+    let Some(armed) = armed else {
+        return Ok(None);
+    };
+    validate_archive_batch_marker_entries(marker, Some(true))
+        .map_err(|message| preflight_error_with_recovery(message, Some(marker.path.clone())))?;
+    let armed_bytes = read_bound_file(&armed.file, (ARCHIVE_BATCH_ARMED_PREFIX.len() + 32) as u64)
+        .map_err(|message| preflight_error_with_recovery(message, Some(marker.path.clone())))?;
+    let journal_file = bind_required_regular(
+        marker,
+        OsStr::new(ARCHIVE_BATCH_JOURNAL),
+        ComponentKind::Checksum,
+    )
+    .map_err(|message| preflight_error_with_recovery(message, Some(marker.path.clone())))?;
+    let bytes = read_bound_file(&journal_file.file, MAX_ARCHIVE_BATCH_JOURNAL_BYTES)
+        .map_err(|message| preflight_error_with_recovery(message, Some(marker.path.clone())))?;
+    let journal: ArchiveBatchJournal = serde_json::from_slice(&bytes).map_err(|error| {
+        preflight_error_with_recovery(
+            format!("failed to parse armed archive batch journal: {error}"),
+            Some(marker.path.clone()),
+        )
+    })?;
+    validate_archive_batch_journal(destination, &journal)
+        .map_err(|message| preflight_error_with_recovery(message, Some(marker.path.clone())))?;
+    if armed_bytes != archive_batch_armed_contents(journal.transaction_id) {
+        return Err(preflight_error_with_recovery(
+            "archive batch armed marker does not bind the journal transaction ID".to_string(),
+            Some(marker.path.clone()),
+        ));
+    }
+    Ok(Some(journal))
+}
+
+fn validate_archive_batch_journal(
+    destination: &BoundDirectory,
+    journal: &ArchiveBatchJournal,
+) -> Result<(), String> {
+    if journal.version != ARCHIVE_BATCH_JOURNAL_VERSION {
+        return Err(format!(
+            "unsupported archive batch journal version {}",
+            journal.version
+        ));
+    }
+    if journal.transaction_id == [0; 32] {
+        return Err("archive batch journal has an invalid zero transaction ID".into());
+    }
+    if journal.transaction_nonce == [0; 32] {
+        return Err("archive batch journal has an invalid zero transaction nonce".into());
+    }
+    if journal.manifest_fingerprint == [0; 32] {
+        return Err("archive batch journal has an invalid zero manifest fingerprint".into());
+    }
+    if journal.items.is_empty() || journal.items.len() > MAX_ARCHIVE_BATCH_ITEMS {
+        return Err(format!(
+            "archive batch journal item count {} is outside 1..={MAX_ARCHIVE_BATCH_ITEMS}",
+            journal.items.len()
+        ));
+    }
+    let recorded_destination = path_from_bytes(&journal.destination_path, "destination")?;
+    if recorded_destination != destination.path
+        || !journal
+            .destination_identity
+            .same_directory_binding(destination.identity)
+    {
+        return Err("archive batch journal is bound to a different destination directory".into());
+    }
+
+    let mut epochs = HashSet::with_capacity(journal.items.len());
+    let mut destination_names = HashSet::with_capacity(journal.items.len().saturating_mul(3));
+    let mut recovery_names = HashSet::with_capacity(journal.items.len());
+    let mut source_archives = HashSet::with_capacity(journal.items.len());
+    let mut source_namespaces = HashSet::with_capacity(journal.items.len());
+    let mut archive_inodes = HashSet::with_capacity(journal.items.len());
+    let mut previous_epoch = None;
+    for item in &journal.items {
+        if !epochs.insert(item.epoch) {
+            return Err(format!(
+                "archive batch journal contains duplicate epoch {}",
+                item.epoch
+            ));
+        }
+        if previous_epoch.is_some_and(|previous| item.epoch <= previous) {
+            return Err(format!(
+                "archive batch journal epochs are not strictly increasing at {}",
+                item.epoch
+            ));
+        }
+        previous_epoch = Some(item.epoch);
+        let source_path = path_from_bytes(&item.source_path, "source")?;
+        let recovery_name = name_from_bytes(&item.recovery_name, "recovery")?;
+        if !recovery_name
+            .as_bytes()
+            .starts_with(b".jetstreamer-recovery-")
+            || !recovery_names.insert(recovery_name.clone())
+        {
+            return Err("archive batch journal has an invalid or duplicate recovery name".into());
+        }
+        let archive_name = name_from_bytes(&item.archive_name, "archive")?;
+        let destination_name = name_from_bytes(&item.destination_name, "destination archive")?;
+        let destination_manifest_name =
+            name_from_bytes(&item.destination_manifest_name, "destination manifest")?;
+        let destination_checksum_name =
+            name_from_bytes(&item.destination_checksum_name, "destination checksum")?;
+        let expected_name = std::ffi::OsString::from(format!("epoch-{}.jet", item.epoch));
+        if archive_name != destination_name || destination_name != expected_name {
+            return Err(format!(
+                "archive batch journal filename does not bind epoch {}",
+                item.epoch
+            ));
+        }
+        let destination_archive = destination.path.join(&destination_name);
+        if safe_file_name(
+            &segment_manifest_path(&destination_archive).map_err(|error| error.to_string())?,
+        )? != destination_manifest_name
+            || safe_file_name(
+                &archive_checksum_path(&destination_archive).map_err(|error| error.to_string())?,
+            )? != destination_checksum_name
+        {
+            return Err(format!(
+                "archive batch journal sidecar names do not match epoch {}",
+                item.epoch
+            ));
+        }
+        for name in [
+            destination_name,
+            destination_manifest_name,
+            destination_checksum_name,
+        ] {
+            if !destination_names.insert(name) {
+                return Err("archive batch journal destination namespaces overlap".into());
+            }
+        }
+        if !source_archives.insert((source_path, archive_name.clone()))
+            || !source_namespaces.insert((
+                item.source_identity.dev,
+                item.source_identity.ino,
+                archive_name.as_bytes().to_vec(),
+            ))
+            || !archive_inodes.insert((item.archive_identity.dev, item.archive_identity.ino))
+        {
+            return Err("archive batch journal contains a duplicate staged archive".into());
+        }
+        validate_journal_regular_identity(
+            item.archive_identity,
+            destination.identity.gid,
+            "staged archive",
+        )?;
+        if !item.evidence.matches_identity(
+            item.archive_identity.dev,
+            item.archive_identity.ino,
+            item.archive_identity.len,
+            item.archive_identity.mtime,
+            item.archive_identity.mtime_nsec,
+            item.archive_identity.ctime,
+            item.archive_identity.ctime_nsec,
+        ) {
+            return Err(format!(
+                "archive batch journal validation evidence does not bind epoch {} staged archive",
+                item.epoch
+            ));
+        }
+        if item.archive_identity.mode & 0o777 != FINAL_FILE_MODE {
+            return Err(format!(
+                "archive batch journal staged archive for epoch {} is not mode {FINAL_FILE_MODE:04o}",
+                item.epoch
+            ));
+        }
+        for (identity, label) in [
+            (item.manifest_staged_identity, "staged manifest"),
+            (Some(item.checksum_staged_identity), "staged checksum"),
+            (Some(item.checksum_sentinel_identity), "checksum sentinel"),
+            (item.initial.archive, "initial archive"),
+            (item.initial.manifest, "initial manifest"),
+            (item.initial.checksum, "initial checksum"),
+        ] {
+            if let Some(identity) = identity {
+                validate_journal_regular_identity(identity, destination.identity.gid, label)?;
+            }
+        }
+    }
+    if archive_batch_journal_transaction_id(journal)? != journal.transaction_id {
+        return Err("archive batch journal does not match its transaction ID commitment".into());
+    }
+    Ok(())
+}
+
+fn validate_journal_regular_identity(
+    identity: FileIdentity,
+    destination_gid: u32,
+    label: &str,
+) -> Result<(), String> {
+    if identity.mode & libc::S_IFMT != libc::S_IFREG
+        || identity.uid != effective_user_id()
+        || identity.gid != destination_gid
+        || identity.nlink != 1
+        || identity.mode & 0o022 != 0
+        || identity.mode & 0o6000 != 0
+    {
+        return Err(format!(
+            "archive batch journal contains an unsafe {label} identity"
+        ));
+    }
+    Ok(())
+}
+
+struct DirectoryStream(*mut libc::DIR);
+
+impl Drop for DirectoryStream {
+    fn drop(&mut self) {
+        // SAFETY: the pointer was returned by fdopendir and is owned here.
+        unsafe {
+            libc::closedir(self.0);
+        }
+    }
+}
+
+fn bound_directory_entry_names(directory: &BoundDirectory) -> Result<HashSet<Vec<u8>>, String> {
+    let cloned =
+        openat_directory(directory.file.as_raw_fd(), OsStr::new(".")).map_err(|error| {
+            format!(
+                "failed to open an enumeration descriptor for {}: {error}",
+                directory.path.display()
+            )
+        })?;
+    let cloned_fd = cloned.into_raw_fd();
+    // SAFETY: fdopendir takes ownership of the valid cloned directory fd on
+    // success. On failure it leaves ownership with the caller.
+    let stream = unsafe { libc::fdopendir(cloned_fd) };
+    if stream.is_null() {
+        // SAFETY: fdopendir failed and did not take ownership of cloned_fd.
+        unsafe {
+            libc::close(cloned_fd);
+        }
+        return Err(format!(
+            "failed to enumerate directory {}: {}",
+            directory.path.display(),
+            io::Error::last_os_error()
+        ));
+    }
+    let stream = DirectoryStream(stream);
+    let mut names = HashSet::new();
+    loop {
+        // SAFETY: the stream is live, exclusively owned here, and readdir's
+        // returned entry remains valid until the next call.
+        unsafe {
+            *libc::__errno_location() = 0;
+        }
+        // SAFETY: stream.0 is a valid DIR pointer owned by stream.
+        let entry = unsafe { libc::readdir(stream.0) };
+        if entry.is_null() {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(0) {
+                break;
+            }
+            return Err(format!(
+                "failed while enumerating directory {}: {error}",
+                directory.path.display()
+            ));
+        }
+        // SAFETY: d_name is NUL-terminated for a successful readdir result.
+        let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+        if name != b"." && name != b".." {
+            names.insert(name.to_vec());
+        }
+    }
+    Ok(names)
+}
+
+fn validate_archive_batch_marker_entries(
+    marker: &BoundDirectory,
+    armed_required: Option<bool>,
+) -> Result<(), String> {
+    let names = bound_directory_entry_names(marker)?;
+    let known = [
+        ARCHIVE_BATCH_ARMED.as_bytes(),
+        ARCHIVE_BATCH_JOURNAL.as_bytes(),
+        ARCHIVE_BATCH_JOURNAL_NEXT.as_bytes(),
+    ];
+    if let Some(unknown) = names.iter().find(|name| !known.contains(&name.as_slice())) {
+        return Err(format!(
+            "archive batch marker contains unexpected entry {:?}; refusing namespace mutation",
+            OsStr::from_bytes(unknown)
+        ));
+    }
+    match armed_required {
+        Some(true)
+            if !names.contains(ARCHIVE_BATCH_ARMED.as_bytes())
+                || !names.contains(ARCHIVE_BATCH_JOURNAL.as_bytes()) =>
+        {
+            return Err("armed archive batch marker lacks its required files".to_string());
+        }
+        Some(false)
+            if names.contains(ARCHIVE_BATCH_ARMED.as_bytes())
+                || names.contains(ARCHIVE_BATCH_JOURNAL_NEXT.as_bytes()) =>
+        {
+            return Err("unarmed archive batch marker contains an armed-only file".to_string());
+        }
+        _ => {}
+    }
+    let mut identities = Vec::with_capacity(names.len());
+    for name in &names {
+        let bound =
+            bind_required_regular(marker, OsStr::from_bytes(name), ComponentKind::Checksum)?;
+        identities.push((name, bound.identity));
+    }
+    // Close the check/use gap for accidental or concurrent namespace changes.
+    let rechecked = bound_directory_entry_names(marker)?;
+    if rechecked != names {
+        return Err(
+            "archive batch marker entries changed while they were being validated".to_string(),
+        );
+    }
+    for (name, identity) in identities {
+        require_corresponding_target(
+            marker,
+            OsStr::from_bytes(name),
+            Some(identity),
+            "archive batch marker entry",
+        )?;
+    }
+    Ok(())
+}
+
+fn retire_archive_batch_marker(
+    destination: &BoundDirectory,
+    marker: &BoundDirectory,
+) -> Result<(), String> {
+    validate_archive_batch_marker_entries(marker, Some(true))?;
+    require_recovery_binding(
+        destination,
+        OsStr::new(ARCHIVE_BATCH_TRANSACTION_DIRECTORY),
+        marker,
+    )?;
+    if target_identity(destination, OsStr::new(ARCHIVE_BATCH_OUTCOME_DIRECTORY))?.is_some() {
+        return Err(format!(
+            "archive batch outcome already exists at {}",
+            destination
+                .path
+                .join(ARCHIVE_BATCH_OUTCOME_DIRECTORY)
+                .display()
+        ));
+    }
+    rename_noreplace(
+        destination,
+        OsStr::new(ARCHIVE_BATCH_TRANSACTION_DIRECTORY),
+        destination,
+        OsStr::new(ARCHIVE_BATCH_OUTCOME_DIRECTORY),
+    )
+    .map_err(|error| format!("failed to retire archive batch marker: {error}"))?;
+    destination.sync()
+}
+
+fn remove_archive_batch_marker_directory(
+    destination: &BoundDirectory,
+    marker: &BoundDirectory,
+    marker_name: &OsStr,
+    armed_required: Option<bool>,
+) -> Result<(), String> {
+    validate_archive_batch_marker_entries(marker, armed_required)?;
+    require_recovery_binding(destination, marker_name, marker)?;
+    let cleanup_name = (0..100u32)
+        .map(|sequence| {
+            std::ffi::OsString::from(format!(
+                ".jetstreamer-archive-batch-finished-{}-{}-{sequence}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
+            ))
+        })
+        .find(|name| target_identity(destination, name).is_ok_and(|entry| entry.is_none()))
+        .ok_or_else(|| "could not allocate archive batch cleanup name".to_string())?;
+    rename_noreplace(destination, marker_name, destination, &cleanup_name)
+        .map_err(|error| format!("failed to retire archive batch marker: {error}"))?;
+    destination.sync()?;
+
+    let mut failures = Vec::new();
+    for name in [
+        ARCHIVE_BATCH_ARMED,
+        ARCHIVE_BATCH_JOURNAL_NEXT,
+        ARCHIVE_BATCH_JOURNAL,
+    ] {
+        match bind_optional_regular(marker, OsStr::new(name), ComponentKind::Checksum) {
+            Ok(Some(bound)) => {
+                if let Err(error) =
+                    unlink_corresponding_entry(marker, OsStr::new(name), bound.identity)
+                {
+                    failures.push(error);
+                }
+            }
+            Ok(None) => {}
+            Err(error) => failures.push(error),
+        }
+    }
+    collect_sync_failures(&[marker], &mut failures);
+    if !failures.is_empty() {
+        return Err(failures.join("; "));
+    }
+    remove_empty_recovery_directory(destination, &cleanup_name, marker)
+}
+
+fn cleanup_committed_batch_sentinels(
+    transactions: &[PublicationTransaction],
+) -> Result<(), String> {
+    let mut failures = Vec::new();
+    for transaction in transactions {
+        match target_identity(
+            &transaction.recovery,
+            ComponentKind::Checksum.staging_name(),
+        ) {
+            Ok(Some(identity))
+                if identity.same_across_rename(transaction.checksum_sentinel.identity) =>
+            {
+                if let Err(error) = remove_corresponding_file(
+                    &transaction.recovery,
+                    ComponentKind::Checksum.staging_name(),
+                    identity,
+                ) {
+                    failures.push(error);
+                }
+            }
+            Ok(Some(_)) => failures.push(format!(
+                "refusing to remove changed batch checksum sentinel in {}",
+                transaction.recovery.path.display()
+            )),
+            Ok(None) => {}
+            Err(error) => failures.push(error),
+        }
+        collect_sync_failures(&[&transaction.recovery], &mut failures);
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("; "))
+    }
+}
+
+fn resolve_failed_archive_batch(
+    destination_path: &Path,
+    cause: String,
+) -> Result<ArchiveBatchPublication, ArchivePublicationError> {
+    match recover_archive_publication_batch(destination_path) {
+        Ok(ArchiveBatchRecovery::RolledBack(_)) => Err(ArchivePublicationError {
+            message: format!(
+                "archive batch publication failed before its durable commit decision and was rolled back: {cause}"
+            ),
+            committed: false,
+            recovery_directory: None,
+        }),
+        Ok(ArchiveBatchRecovery::Committed(publication)) => Ok(publication),
+        Ok(ArchiveBatchRecovery::None) => Err(batch_indeterminate_error(
+            destination_path,
+            format!("{cause}; transaction marker disappeared before recovery"),
+            false,
+        )),
+        Err(recovery) => Err(batch_indeterminate_error(
+            destination_path,
+            format!("{cause}; automatic recovery failed: {recovery}"),
+            recovery.committed(),
+        )),
+    }
+}
+
+struct RecoveredArchiveBatchItem<'a> {
+    record: &'a ArchiveBatchJournalItem,
+    source: BoundDirectory,
+    recovery: BoundDirectory,
+    recovery_name: std::ffi::OsString,
+    archive_name: std::ffi::OsString,
+    destination_name: std::ffi::OsString,
+    destination_manifest_name: std::ffi::OsString,
+    destination_checksum_name: std::ffi::OsString,
+}
+
+fn bind_recovered_archive_batch_items<'a>(
+    destination: &BoundDirectory,
+    journal: &'a ArchiveBatchJournal,
+) -> Result<Vec<RecoveredArchiveBatchItem<'a>>, String> {
+    let mut recovered = Vec::with_capacity(journal.items.len());
+    for record in &journal.items {
+        let source_path = path_from_bytes(&record.source_path, "source")?;
+        let source =
+            BoundDirectory::bind_absolute_nofollow(&source_path, DirectoryPolicy::PrivateSource)?;
+        if !source
+            .identity
+            .same_directory_binding(record.source_identity)
+        {
+            return Err(format!(
+                "archive batch source directory changed for epoch {}: {}",
+                record.epoch,
+                source_path.display()
+            ));
+        }
+        require_compatible_directories(&source, destination)?;
+        let recovery_name = name_from_bytes(&record.recovery_name, "recovery")?;
+        let recovery = BoundDirectory::bind_child(
+            destination,
+            &recovery_name,
+            destination.path.join(&recovery_name),
+            DirectoryPolicy::PrivateRecovery,
+        )?;
+        if !recovery
+            .identity
+            .same_directory_binding(record.recovery_identity)
+        {
+            return Err(format!(
+                "archive batch recovery directory changed for epoch {}",
+                record.epoch
+            ));
+        }
+        recovered.push(RecoveredArchiveBatchItem {
+            record,
+            source,
+            recovery,
+            recovery_name,
+            archive_name: name_from_bytes(&record.archive_name, "archive")?,
+            destination_name: name_from_bytes(&record.destination_name, "destination archive")?,
+            destination_manifest_name: name_from_bytes(
+                &record.destination_manifest_name,
+                "destination manifest",
+            )?,
+            destination_checksum_name: name_from_bytes(
+                &record.destination_checksum_name,
+                "destination checksum",
+            )?,
+        });
+    }
+    Ok(recovered)
+}
+
+fn observe_finalized_archive_batch(
+    destination: &BoundDirectory,
+    journal: &ArchiveBatchJournal,
+) -> Result<ArchiveBatchRecovery, String> {
+    let recovered = bind_recovered_archive_batch_items(destination, journal)?;
+    match journal.decision {
+        ArchiveBatchDecision::RollBack => {
+            for item in &recovered {
+                validate_batch_rollback_item(destination, item)?;
+                verify_rolled_back_batch_item(destination, item)?;
+            }
+            let identity_evidence = recovered
+                .iter()
+                .map(|item| recovered_batch_rollback_evidence(destination, item))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(ArchiveBatchRecovery::RolledBack(ArchiveBatchRollback {
+                transaction_id: journal.transaction_id,
+                manifest_fingerprint: journal.manifest_fingerprint,
+                destination_identity: ArchiveBatchDestinationIdentity {
+                    device: journal.destination_identity.dev,
+                    inode: journal.destination_identity.ino,
+                },
+                identity_evidence,
+            }))
+        }
+        ArchiveBatchDecision::Commit => {
+            for item in &recovered {
+                validate_batch_commit_item(destination, item)?;
+            }
+            let publications = recovered
+                .iter()
+                .map(|item| recovered_batch_publication(destination, item))
+                .collect::<Result<Vec<_>, _>>()?;
+            let identity_evidence = recovered
+                .iter()
+                .zip(&publications)
+                .map(|(item, publication)| {
+                    recovered_batch_identity_evidence(destination, item, publication.evidence)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(ArchiveBatchRecovery::Committed(ArchiveBatchPublication {
+                transaction_id: journal.transaction_id,
+                manifest_fingerprint: journal.manifest_fingerprint,
+                destination_identity: ArchiveBatchDestinationIdentity {
+                    device: journal.destination_identity.dev,
+                    inode: journal.destination_identity.ino,
+                },
+                publications,
+                identity_evidence,
+            }))
+        }
+    }
+}
+
+fn recover_bound_archive_batch(
+    destination: &BoundDirectory,
+    marker: &BoundDirectory,
+    journal: &ArchiveBatchJournal,
+) -> Result<ArchiveBatchRecovery, ArchivePublicationError> {
+    let committed = journal.decision == ArchiveBatchDecision::Commit;
+    let operation = (|| -> Result<ArchiveBatchRecovery, String> {
+        let recovered = bind_recovered_archive_batch_items(destination, journal)?;
+        match journal.decision {
+            ArchiveBatchDecision::RollBack => {
+                for item in &recovered {
+                    validate_batch_rollback_item(destination, item)?;
+                }
+                for item in recovered.iter().rev() {
+                    rollback_batch_data_item(destination, item)?;
+                }
+                for item in recovered.iter().rev() {
+                    rollback_batch_checksum_item(destination, item)?;
+                }
+                for item in &recovered {
+                    verify_rolled_back_batch_item(destination, item)?;
+                }
+                let outcome = observe_finalized_archive_batch(destination, journal)?;
+                retire_archive_batch_marker(destination, marker)?;
+                Ok(outcome)
+            }
+            ArchiveBatchDecision::Commit => {
+                for item in &recovered {
+                    validate_batch_commit_item(destination, item)?;
+                }
+                for item in &recovered {
+                    commit_batch_checksum_item(destination, item)?;
+                }
+                for item in &recovered {
+                    cleanup_recovered_batch_sentinel(item)?;
+                }
+                let outcome = observe_finalized_archive_batch(destination, journal)?;
+                retire_archive_batch_marker(destination, marker)?;
+                Ok(outcome)
+            }
+        }
+    })();
+    operation.map_err(|message| batch_indeterminate_error(&destination.path, message, committed))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BatchComponentState {
+    Initial,
+    Exchanged,
+    Installed,
+}
+
+fn corresponding(observed: Option<FileIdentity>, expected: FileIdentity) -> bool {
+    observed.is_some_and(|observed| observed.same_across_rename(expected))
+}
+
+fn option_identities_correspond(
+    observed: Option<FileIdentity>,
+    expected: Option<FileIdentity>,
+) -> bool {
+    match (observed, expected) {
+        (None, None) => true,
+        (Some(observed), Some(expected)) => observed.same_across_rename(expected),
+        _ => false,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn batch_component_state(
+    source: &BoundDirectory,
+    source_name: &OsStr,
+    new_identity: Option<FileIdentity>,
+    destination: &BoundDirectory,
+    destination_name: &OsStr,
+    old_identity: Option<FileIdentity>,
+    recovery: &BoundDirectory,
+    backup_name: &OsStr,
+    label: &str,
+) -> Result<BatchComponentState, String> {
+    let source_observed = target_identity(source, source_name)?;
+    let destination_observed = target_identity(destination, destination_name)?;
+    let backup_observed = target_identity(recovery, backup_name)?;
+    let state = match (new_identity, old_identity) {
+        (Some(new), Some(old))
+            if corresponding(source_observed, new)
+                && corresponding(destination_observed, old)
+                && backup_observed.is_none() =>
+        {
+            BatchComponentState::Initial
+        }
+        (Some(new), Some(old))
+            if corresponding(source_observed, old)
+                && corresponding(destination_observed, new)
+                && backup_observed.is_none() =>
+        {
+            BatchComponentState::Exchanged
+        }
+        (Some(new), Some(old))
+            if source_observed.is_none()
+                && corresponding(destination_observed, new)
+                && corresponding(backup_observed, old) =>
+        {
+            BatchComponentState::Installed
+        }
+        (Some(new), None)
+            if corresponding(source_observed, new)
+                && destination_observed.is_none()
+                && backup_observed.is_none() =>
+        {
+            BatchComponentState::Initial
+        }
+        (Some(new), None)
+            if source_observed.is_none()
+                && corresponding(destination_observed, new)
+                && backup_observed.is_none() =>
+        {
+            BatchComponentState::Installed
+        }
+        (None, Some(old))
+            if source_observed.is_none()
+                && corresponding(destination_observed, old)
+                && backup_observed.is_none() =>
+        {
+            BatchComponentState::Initial
+        }
+        (None, Some(old))
+            if source_observed.is_none()
+                && destination_observed.is_none()
+                && corresponding(backup_observed, old) =>
+        {
+            BatchComponentState::Installed
+        }
+        (None, None)
+            if source_observed.is_none()
+                && destination_observed.is_none()
+                && backup_observed.is_none() =>
+        {
+            BatchComponentState::Initial
+        }
+        _ => {
+            return Err(format!(
+                "archive batch {label} namespace is not a recoverable transaction state"
+            ));
+        }
+    };
+    Ok(state)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BatchChecksumState {
+    Initial,
+    Reserved,
+    Committed,
+    CommittedAndCleaned,
+}
+
+fn batch_checksum_state(
+    destination: &BoundDirectory,
+    item: &RecoveredArchiveBatchItem<'_>,
+) -> Result<BatchChecksumState, String> {
+    let destination_observed = target_identity(destination, &item.destination_checksum_name)?;
+    let backup_observed = target_identity(&item.recovery, ComponentKind::Checksum.backup_name())?;
+    let staging_observed = target_identity(&item.recovery, ComponentKind::Checksum.staging_name())?;
+    let old = item.record.initial.checksum;
+    let canonical = item.record.checksum_staged_identity;
+    let sentinel = item.record.checksum_sentinel_identity;
+    match old {
+        Some(old)
+            if corresponding(destination_observed, old)
+                && corresponding(backup_observed, sentinel)
+                && corresponding(staging_observed, canonical) =>
+        {
+            Ok(BatchChecksumState::Initial)
+        }
+        None if destination_observed.is_none()
+            && corresponding(backup_observed, sentinel)
+            && corresponding(staging_observed, canonical) =>
+        {
+            Ok(BatchChecksumState::Initial)
+        }
+        Some(old)
+            if corresponding(destination_observed, sentinel)
+                && corresponding(backup_observed, old)
+                && corresponding(staging_observed, canonical) =>
+        {
+            Ok(BatchChecksumState::Reserved)
+        }
+        None if corresponding(destination_observed, sentinel)
+            && backup_observed.is_none()
+            && corresponding(staging_observed, canonical) =>
+        {
+            Ok(BatchChecksumState::Reserved)
+        }
+        Some(old)
+            if corresponding(destination_observed, canonical)
+                && corresponding(backup_observed, old)
+                && corresponding(staging_observed, sentinel) =>
+        {
+            Ok(BatchChecksumState::Committed)
+        }
+        None if corresponding(destination_observed, canonical)
+            && backup_observed.is_none()
+            && corresponding(staging_observed, sentinel) =>
+        {
+            Ok(BatchChecksumState::Committed)
+        }
+        Some(old)
+            if corresponding(destination_observed, canonical)
+                && corresponding(backup_observed, old)
+                && staging_observed.is_none() =>
+        {
+            Ok(BatchChecksumState::CommittedAndCleaned)
+        }
+        None if corresponding(destination_observed, canonical)
+            && backup_observed.is_none()
+            && staging_observed.is_none() =>
+        {
+            Ok(BatchChecksumState::CommittedAndCleaned)
+        }
+        _ => Err(format!(
+            "archive batch checksum namespace for epoch {} is not recoverable",
+            item.record.epoch
+        )),
+    }
+}
+
+fn validate_batch_rollback_item(
+    destination: &BoundDirectory,
+    item: &RecoveredArchiveBatchItem<'_>,
+) -> Result<(), String> {
+    batch_component_state(
+        &item.source,
+        &item.archive_name,
+        Some(item.record.archive_identity),
+        destination,
+        &item.destination_name,
+        item.record.initial.archive,
+        &item.recovery,
+        ComponentKind::Archive.backup_name(),
+        "archive",
+    )?;
+    batch_component_state(
+        &item.recovery,
+        ComponentKind::Manifest.staging_name(),
+        item.record.manifest_staged_identity,
+        destination,
+        &item.destination_manifest_name,
+        item.record.initial.manifest,
+        &item.recovery,
+        ComponentKind::Manifest.backup_name(),
+        "manifest",
+    )?;
+    match batch_checksum_state(destination, item)? {
+        BatchChecksumState::Initial | BatchChecksumState::Reserved => Ok(()),
+        BatchChecksumState::Committed | BatchChecksumState::CommittedAndCleaned => Err(format!(
+            "archive batch rollback journal found a committed checksum for epoch {}",
+            item.record.epoch
+        )),
+    }
+}
+
+fn validate_batch_commit_item(
+    destination: &BoundDirectory,
+    item: &RecoveredArchiveBatchItem<'_>,
+) -> Result<(), String> {
+    if batch_component_state(
+        &item.source,
+        &item.archive_name,
+        Some(item.record.archive_identity),
+        destination,
+        &item.destination_name,
+        item.record.initial.archive,
+        &item.recovery,
+        ComponentKind::Archive.backup_name(),
+        "archive",
+    )? != BatchComponentState::Installed
+    {
+        return Err(format!(
+            "archive batch commit journal found epoch {} archive uninstalled",
+            item.record.epoch
+        ));
+    }
+    let manifest_state = batch_component_state(
+        &item.recovery,
+        ComponentKind::Manifest.staging_name(),
+        item.record.manifest_staged_identity,
+        destination,
+        &item.destination_manifest_name,
+        item.record.initial.manifest,
+        &item.recovery,
+        ComponentKind::Manifest.backup_name(),
+        "manifest",
+    )?;
+    let expected_manifest_state = if item.record.manifest_staged_identity.is_some()
+        || item.record.initial.manifest.is_some()
+    {
+        BatchComponentState::Installed
+    } else {
+        BatchComponentState::Initial
+    };
+    if manifest_state != expected_manifest_state {
+        return Err(format!(
+            "archive batch commit journal found epoch {} manifest uninstalled",
+            item.record.epoch
+        ));
+    }
+    match batch_checksum_state(destination, item)? {
+        BatchChecksumState::Reserved
+        | BatchChecksumState::Committed
+        | BatchChecksumState::CommittedAndCleaned => Ok(()),
+        BatchChecksumState::Initial => Err(format!(
+            "archive batch commit journal found epoch {} checksum unreserved",
+            item.record.epoch
+        )),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn rollback_batch_component(
+    source: &BoundDirectory,
+    source_name: &OsStr,
+    new_identity: Option<FileIdentity>,
+    destination: &BoundDirectory,
+    destination_name: &OsStr,
+    old_identity: Option<FileIdentity>,
+    recovery: &BoundDirectory,
+    backup_name: &OsStr,
+    label: &str,
+) -> Result<(), String> {
+    for _ in 0..3 {
+        match batch_component_state(
+            source,
+            source_name,
+            new_identity,
+            destination,
+            destination_name,
+            old_identity,
+            recovery,
+            backup_name,
+            label,
+        )? {
+            BatchComponentState::Initial => {
+                return sync_all(&[source, recovery, destination]);
+            }
+            BatchComponentState::Exchanged => {
+                sync_all(&[source, recovery, destination])?;
+                rename_exchange(source, source_name, destination, destination_name).map_err(
+                    |error| format!("failed to roll back exchanged batch {label}: {error}"),
+                )?;
+                sync_all(&[source, destination])?;
+            }
+            BatchComponentState::Installed => {
+                sync_all(&[source, recovery, destination])?;
+                match (new_identity, old_identity) {
+                    (Some(_), Some(_)) => {
+                        rename_noreplace(recovery, backup_name, source, source_name).map_err(
+                            |error| format!("failed to restore staged old batch {label}: {error}"),
+                        )?;
+                        sync_all(&[recovery, source])?;
+                    }
+                    (Some(_), None) => {
+                        rename_noreplace(destination, destination_name, source, source_name)
+                            .map_err(|error| {
+                                format!("failed to return new batch {label} to staging: {error}")
+                            })?;
+                        sync_all(&[destination, source])?;
+                    }
+                    (None, Some(_)) => {
+                        rename_noreplace(recovery, backup_name, destination, destination_name)
+                            .map_err(|error| {
+                                format!("failed to restore removed batch {label}: {error}")
+                            })?;
+                        sync_all(&[recovery, destination])?;
+                    }
+                    (None, None) => {
+                        return Err(format!(
+                            "empty batch {label} unexpectedly reached installed state"
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    Err(format!("batch {label} rollback did not converge"))
+}
+
+fn rollback_batch_data_item(
+    destination: &BoundDirectory,
+    item: &RecoveredArchiveBatchItem<'_>,
+) -> Result<(), String> {
+    rollback_batch_component(
+        &item.source,
+        &item.archive_name,
+        Some(item.record.archive_identity),
+        destination,
+        &item.destination_name,
+        item.record.initial.archive,
+        &item.recovery,
+        ComponentKind::Archive.backup_name(),
+        "archive",
+    )?;
+    rollback_batch_component(
+        &item.recovery,
+        ComponentKind::Manifest.staging_name(),
+        item.record.manifest_staged_identity,
+        destination,
+        &item.destination_manifest_name,
+        item.record.initial.manifest,
+        &item.recovery,
+        ComponentKind::Manifest.backup_name(),
+        "manifest",
+    )
+}
+
+fn rollback_batch_checksum_item(
+    destination: &BoundDirectory,
+    item: &RecoveredArchiveBatchItem<'_>,
+) -> Result<(), String> {
+    match batch_checksum_state(destination, item)? {
+        BatchChecksumState::Initial => sync_all(&[&item.recovery, destination]),
+        BatchChecksumState::Reserved => {
+            sync_all(&[&item.recovery, destination])?;
+            if item.record.initial.checksum.is_some() {
+                rename_exchange(
+                    &item.recovery,
+                    ComponentKind::Checksum.backup_name(),
+                    destination,
+                    &item.destination_checksum_name,
+                )
+                .map_err(|error| format!("failed to restore batch checksum: {error}"))?;
+            } else {
+                rename_noreplace(
+                    destination,
+                    &item.destination_checksum_name,
+                    &item.recovery,
+                    ComponentKind::Checksum.backup_name(),
+                )
+                .map_err(|error| format!("failed to remove batch checksum sentinel: {error}"))?;
+            }
+            sync_all(&[&item.recovery, destination])?;
+            if batch_checksum_state(destination, item)? == BatchChecksumState::Initial {
+                Ok(())
+            } else {
+                Err("batch checksum rollback did not restore its initial state".into())
+            }
+        }
+        BatchChecksumState::Committed | BatchChecksumState::CommittedAndCleaned => {
+            Err("refusing to roll back batch data while a canonical checksum is installed".into())
+        }
+    }
+}
+
+fn verify_rolled_back_batch_item(
+    destination: &BoundDirectory,
+    item: &RecoveredArchiveBatchItem<'_>,
+) -> Result<(), String> {
+    if batch_component_state(
+        &item.source,
+        &item.archive_name,
+        Some(item.record.archive_identity),
+        destination,
+        &item.destination_name,
+        item.record.initial.archive,
+        &item.recovery,
+        ComponentKind::Archive.backup_name(),
+        "archive",
+    )? != BatchComponentState::Initial
+        || batch_component_state(
+            &item.recovery,
+            ComponentKind::Manifest.staging_name(),
+            item.record.manifest_staged_identity,
+            destination,
+            &item.destination_manifest_name,
+            item.record.initial.manifest,
+            &item.recovery,
+            ComponentKind::Manifest.backup_name(),
+            "manifest",
+        )? != BatchComponentState::Initial
+        || batch_checksum_state(destination, item)? != BatchChecksumState::Initial
+    {
+        return Err(format!(
+            "archive batch rollback did not restore the exact epoch {} namespace",
+            item.record.epoch
+        ));
+    }
+    let archive = bind_required_regular(&item.source, &item.archive_name, ComponentKind::Archive)?;
+    rebind_validated_after_rename(&archive.file, item.record.evidence.into()).map_err(|error| {
+        format!(
+            "rolled-back staged archive evidence changed for epoch {}: {error}",
+            item.record.epoch
+        )
+    })?;
+    sync_all(&[&item.source, &item.recovery, destination])
+}
+
+fn remove_optional_corresponding_file(
+    directory: &BoundDirectory,
+    name: &OsStr,
+    identity: FileIdentity,
+    label: &str,
+) -> Result<(), String> {
+    match target_identity(directory, name)? {
+        Some(observed) if observed.same_across_rename(identity) => {
+            remove_corresponding_file(directory, name, observed)
+        }
+        Some(_) => Err(format!(
+            "refusing to remove changed {label}: {}",
+            directory.path.join(name).display()
+        )),
+        None => Ok(()),
+    }
+}
+
+fn cleanup_rolled_back_batch_item(item: &RecoveredArchiveBatchItem<'_>) -> Result<(), String> {
+    if let Some(identity) = item.record.manifest_staged_identity {
+        remove_optional_corresponding_file(
+            &item.recovery,
+            ComponentKind::Manifest.staging_name(),
+            identity,
+            "rolled-back staged manifest",
+        )?;
+    }
+    remove_optional_corresponding_file(
+        &item.recovery,
+        ComponentKind::Checksum.staging_name(),
+        item.record.checksum_staged_identity,
+        "rolled-back staged checksum",
+    )?;
+    remove_optional_corresponding_file(
+        &item.recovery,
+        ComponentKind::Checksum.backup_name(),
+        item.record.checksum_sentinel_identity,
+        "rolled-back checksum sentinel",
+    )?;
+    item.recovery.sync()
+}
+
+fn commit_batch_checksum_item(
+    destination: &BoundDirectory,
+    item: &RecoveredArchiveBatchItem<'_>,
+) -> Result<(), String> {
+    match batch_checksum_state(destination, item)? {
+        BatchChecksumState::Reserved => {
+            sync_all(&[&item.recovery, destination])?;
+            rename_exchange(
+                &item.recovery,
+                ComponentKind::Checksum.staging_name(),
+                destination,
+                &item.destination_checksum_name,
+            )
+            .map_err(|error| format!("failed to commit batch checksum: {error}"))?;
+            sync_all(&[&item.recovery, destination])?;
+        }
+        BatchChecksumState::Committed | BatchChecksumState::CommittedAndCleaned => {
+            sync_all(&[&item.recovery, destination])?;
+        }
+        BatchChecksumState::Initial => {
+            return Err(format!(
+                "cannot commit unreserved batch checksum for epoch {}",
+                item.record.epoch
+            ));
+        }
+    }
+    match batch_checksum_state(destination, item)? {
+        BatchChecksumState::Committed | BatchChecksumState::CommittedAndCleaned => Ok(()),
+        BatchChecksumState::Initial | BatchChecksumState::Reserved => Err(format!(
+            "batch checksum commit did not converge for epoch {}",
+            item.record.epoch
+        )),
+    }
+}
+
+fn cleanup_recovered_batch_sentinel(item: &RecoveredArchiveBatchItem<'_>) -> Result<(), String> {
+    remove_optional_corresponding_file(
+        &item.recovery,
+        ComponentKind::Checksum.staging_name(),
+        item.record.checksum_sentinel_identity,
+        "committed batch checksum sentinel",
+    )?;
+    item.recovery.sync()
+}
+
+fn cleanup_acknowledged_archive_batch(
+    destination: &BoundDirectory,
+    decision: ArchiveBatchDecision,
+    recovered: &[RecoveredArchiveBatchItem<'_>],
+) {
+    for item in recovered {
+        let removable = match decision {
+            ArchiveBatchDecision::RollBack => cleanup_rolled_back_batch_item(item).is_ok(),
+            ArchiveBatchDecision::Commit => {
+                let retains_backups = item.record.initial.archive.is_some()
+                    || item.record.initial.manifest.is_some()
+                    || item.record.initial.checksum.is_some();
+                !retains_backups && cleanup_recovered_batch_sentinel(item).is_ok()
+            }
+        };
+        if removable {
+            let _ =
+                remove_empty_recovery_directory(destination, &item.recovery_name, &item.recovery);
+        }
+    }
+}
+
+fn recovered_batch_publication(
+    destination: &BoundDirectory,
+    item: &RecoveredArchiveBatchItem<'_>,
+) -> Result<ArchivePublication, String> {
+    validate_batch_commit_item(destination, item)?;
+    let archive =
+        bind_required_regular(destination, &item.destination_name, ComponentKind::Archive)?;
+    let evidence = rebind_validated_after_rename(&archive.file, item.record.evidence.into())
+        .map_err(|error| {
+            format!(
+                "committed batch archive evidence changed for epoch {}: {error}",
+                item.record.epoch
+            )
+        })?;
+    let expected_checksum = archive_checksum_line(&evidence.sha256, &item.destination_name)
+        .map_err(|error| error.to_string())?;
+    let checksum = bind_required_regular(
+        destination,
+        &item.destination_checksum_name,
+        ComponentKind::Checksum,
+    )?;
+    if read_bound_file(&checksum.file, expected_checksum.len() as u64)?
+        != expected_checksum.as_bytes()
+    {
+        return Err(format!(
+            "committed batch checksum contents are not canonical for epoch {}",
+            item.record.epoch
+        ));
+    }
+    Ok(ArchivePublication {
+        archive_path: destination.path.join(&item.destination_name),
+        manifest_path: item
+            .record
+            .manifest_staged_identity
+            .map(|_| destination.path.join(&item.destination_manifest_name)),
+        checksum_path: destination.path.join(&item.destination_checksum_name),
+        recovery_directory: (item.record.initial.archive.is_some()
+            || item.record.initial.manifest.is_some()
+            || item.record.initial.checksum.is_some())
+        .then(|| item.recovery.path.clone()),
+        evidence,
+    })
+}
+
+fn recovered_batch_identity_evidence(
+    destination: &BoundDirectory,
+    item: &RecoveredArchiveBatchItem<'_>,
+    archive_validation: ValidatedArchiveFile,
+) -> Result<ArchiveBatchIdentityEvidence, String> {
+    let committed_archive = target_identity(destination, &item.destination_name)?
+        .ok_or_else(|| "recovered batch archive disappeared".to_string())?;
+    let committed_manifest = target_identity(destination, &item.destination_manifest_name)?;
+    let committed_checksum = target_identity(destination, &item.destination_checksum_name)?
+        .ok_or_else(|| "recovered batch checksum disappeared".to_string())?;
+    if !committed_archive.same_across_rename(item.record.archive_identity)
+        || !option_identities_correspond(committed_manifest, item.record.manifest_staged_identity)
+        || !committed_checksum.same_across_rename(item.record.checksum_staged_identity)
+    {
+        return Err(format!(
+            "recovered batch identities changed after verification for epoch {}",
+            item.record.epoch
+        ));
+    }
+    Ok(ArchiveBatchIdentityEvidence {
+        epoch: item.record.epoch,
+        initial_archive: item.record.initial.archive.map(Into::into),
+        initial_manifest: item.record.initial.manifest.map(Into::into),
+        initial_checksum: item.record.initial.checksum.map(Into::into),
+        committed_archive: committed_archive.into(),
+        committed_manifest: committed_manifest.map(Into::into),
+        committed_checksum: committed_checksum.into(),
+        archive_validation,
+    })
+}
+
+fn recovered_batch_rollback_evidence(
+    destination: &BoundDirectory,
+    item: &RecoveredArchiveBatchItem<'_>,
+) -> Result<ArchiveBatchRollbackIdentityEvidence, String> {
+    let staged = bind_required_regular(&item.source, &item.archive_name, ComponentKind::Archive)?;
+    let staged_archive_validation =
+        rebind_validated_after_rename(&staged.file, item.record.evidence.into()).map_err(
+            |error| {
+                format!(
+                    "rolled-back batch archive evidence changed for epoch {}: {error}",
+                    item.record.epoch
+                )
+            },
+        )?;
+    let staged_archive = FileIdentity::from_metadata(
+        &staged
+            .file
+            .metadata()
+            .map_err(|error| format!("failed to identify rolled-back archive: {error}"))?,
+    );
+    let restored_archive = target_identity(destination, &item.destination_name)?;
+    let restored_manifest = target_identity(destination, &item.destination_manifest_name)?;
+    let restored_checksum = target_identity(destination, &item.destination_checksum_name)?;
+    if !staged_archive.same_across_rename(item.record.archive_identity)
+        || !option_identities_correspond(restored_archive, item.record.initial.archive)
+        || !option_identities_correspond(restored_manifest, item.record.initial.manifest)
+        || !option_identities_correspond(restored_checksum, item.record.initial.checksum)
+    {
+        return Err(format!(
+            "rolled-back batch identities changed after verification for epoch {}",
+            item.record.epoch
+        ));
+    }
+    Ok(ArchiveBatchRollbackIdentityEvidence {
+        epoch: item.record.epoch,
+        staged_archive_path: item.source.path.join(&item.archive_name),
+        restored_archive: restored_archive.map(Into::into),
+        restored_manifest: restored_manifest.map(Into::into),
+        restored_checksum: restored_checksum.map(Into::into),
+        staged_archive: staged_archive.into(),
+        staged_archive_validation,
+    })
 }
 
 fn preflight_error(message: String) -> ArchivePublicationError {
@@ -2692,6 +5240,8 @@ fn cleanup_unused_recovery_directory(
 mod tests {
     use super::*;
 
+    const BATCH_MANIFEST_FINGERPRINT: [u8; 32] = [0x5a; 32];
+
     use {
         crate::segment_manifest::{
             HistoricalSegmentManifest, SEGMENT_MANIFEST_SCHEMA_VERSION, SegmentCheckpointSummary,
@@ -2907,6 +5457,755 @@ mod tests {
         archive_file.sync_all().unwrap();
         let evidence = crate::archive_checksum::measure_open_archive(&archive_file).unwrap();
         (root, archive, destination.join("epoch-7.jet"), evidence)
+    }
+
+    fn corrected_batch_fixture(
+        end_epoch: u64,
+        with_manifests: bool,
+    ) -> (tempfile::TempDir, Vec<ArchiveBatchItem>) {
+        assert!((7..=10).contains(&end_epoch));
+        let (root, first_archive, first_destination, first_evidence) = fixture_with_manifest();
+        let source = first_archive.parent().unwrap().to_path_buf();
+        let destination = first_destination.parent().unwrap().to_path_buf();
+        let first_manifest = segment_manifest_path(&first_archive).unwrap();
+        if !with_manifests {
+            fs::remove_file(&first_manifest).unwrap();
+        }
+        let mut items = Vec::new();
+        for epoch in 7..=end_epoch {
+            let staged_archive = source.join(format!("epoch-{epoch}.jet"));
+            let destination_archive = destination.join(format!("epoch-{epoch}.jet"));
+            let evidence = if epoch == 7 {
+                first_evidence
+            } else {
+                fs::copy(&first_archive, &staged_archive).unwrap();
+                if with_manifests {
+                    fs::copy(
+                        segment_manifest_path(&first_archive).unwrap(),
+                        segment_manifest_path(&staged_archive).unwrap(),
+                    )
+                    .unwrap();
+                }
+                fs::set_permissions(&staged_archive, fs::Permissions::from_mode(FINAL_FILE_MODE))
+                    .unwrap();
+                let file = OpenOptions::new().read(true).open(&staged_archive).unwrap();
+                file.sync_all().unwrap();
+                crate::archive_checksum::measure_open_archive(&file).unwrap()
+            };
+            write_existing_set(&destination_archive);
+            items.push(ArchiveBatchItem {
+                epoch,
+                staged_archive,
+                destination_archive,
+                evidence,
+            });
+        }
+        (root, items)
+    }
+
+    fn assert_batch_rolled_back(items: &[ArchiveBatchItem]) {
+        for item in items {
+            let staged =
+                crate::archive_checksum::open_regular_nofollow(&item.staged_archive).unwrap();
+            assert_eq!(
+                crate::archive_checksum::measure_open_archive(&staged)
+                    .unwrap()
+                    .sha256,
+                item.evidence.sha256
+            );
+            assert_eq!(fs::read(&item.destination_archive).unwrap(), b"old archive");
+            assert_eq!(
+                fs::read(segment_manifest_path(&item.destination_archive).unwrap()).unwrap(),
+                b"old manifest"
+            );
+            assert_eq!(
+                fs::read(archive_checksum_path(&item.destination_archive).unwrap()).unwrap(),
+                b"old checksum"
+            );
+        }
+    }
+
+    fn assert_batch_committed(items: &[ArchiveBatchItem]) {
+        for item in items {
+            assert!(!item.staged_archive.exists());
+            let published =
+                crate::archive_checksum::open_regular_nofollow(&item.destination_archive).unwrap();
+            assert_eq!(
+                crate::archive_checksum::measure_open_archive(&published)
+                    .unwrap()
+                    .sha256,
+                item.evidence.sha256
+            );
+            let expected = archive_checksum_line(
+                &item.evidence.sha256,
+                item.destination_archive.file_name().unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                fs::read(archive_checksum_path(&item.destination_archive).unwrap()).unwrap(),
+                expected.as_bytes()
+            );
+        }
+    }
+
+    #[test]
+    fn corrected_epochs_7_through_10_publish_as_one_batch() {
+        let (_root, items) = corrected_batch_fixture(10, false);
+        let destination = items[0].destination_archive.parent().unwrap();
+
+        let publication =
+            publish_verified_archive_batch(BATCH_MANIFEST_FINGERPRINT, &items).unwrap();
+
+        assert_eq!(publication.publications.len(), 4);
+        assert_ne!(publication.transaction_id, [0; 32]);
+        assert_eq!(publication.manifest_fingerprint, BATCH_MANIFEST_FINGERPRINT);
+        assert_eq!(publication.identity_evidence.len(), 4);
+        for (epoch, evidence) in (7..=10).zip(&publication.identity_evidence) {
+            assert_eq!(evidence.epoch, epoch);
+            assert!(evidence.initial_archive.is_some());
+            assert!(evidence.initial_manifest.is_some());
+            assert!(evidence.initial_checksum.is_some());
+            assert_eq!(
+                evidence.archive_validation.sha256,
+                items[(epoch - 7) as usize].evidence.sha256
+            );
+            assert_ne!(
+                evidence.initial_archive.unwrap().inode,
+                evidence.committed_archive.inode
+            );
+            assert_ne!(
+                evidence.initial_checksum.unwrap().inode,
+                evidence.committed_checksum.inode
+            );
+        }
+        assert_batch_committed(&items);
+        for item in &items {
+            assert!(
+                !segment_manifest_path(&item.destination_archive)
+                    .unwrap()
+                    .exists()
+            );
+        }
+        assert!(
+            !destination
+                .join(ARCHIVE_BATCH_TRANSACTION_DIRECTORY)
+                .exists()
+        );
+        assert!(destination.join(ARCHIVE_BATCH_OUTCOME_DIRECTORY).is_dir());
+        assert!(archive_batch_publication_in_progress(destination).unwrap());
+        let ArchiveBatchRecovery::Committed(recovered) =
+            recover_archive_publication_batch(destination).unwrap()
+        else {
+            panic!("completed batch outcome was not recoverable");
+        };
+        assert_eq!(recovered.transaction_id, publication.transaction_id);
+        assert_eq!(recovered.manifest_fingerprint, BATCH_MANIFEST_FINGERPRINT);
+        acknowledge_archive_publication_batch(destination, publication.transaction_id).unwrap();
+        assert!(!destination.join(ARCHIVE_BATCH_OUTCOME_DIRECTORY).exists());
+        assert!(!archive_batch_publication_in_progress(destination).unwrap());
+    }
+
+    #[test]
+    fn batch_rejects_duplicate_epochs_and_destination_targets() {
+        let (_root, items) = corrected_batch_fixture(8, false);
+        let duplicate_epoch = vec![items[0].clone(), items[0].clone()];
+        let error = publish_verified_archive_batch(BATCH_MANIFEST_FINGERPRINT, &duplicate_epoch)
+            .unwrap_err();
+        assert!(error.to_string().contains("duplicate epoch"), "{error}");
+
+        let second_source = items[1]
+            .staged_archive
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("second-source");
+        fs::create_dir(&second_source).unwrap();
+        fs::set_permissions(&second_source, fs::Permissions::from_mode(0o700)).unwrap();
+        let duplicate_staged = second_source.join("epoch-7.jet");
+        fs::copy(&items[1].staged_archive, &duplicate_staged).unwrap();
+        fs::set_permissions(
+            &duplicate_staged,
+            fs::Permissions::from_mode(FINAL_FILE_MODE),
+        )
+        .unwrap();
+        let duplicate_file = OpenOptions::new()
+            .read(true)
+            .open(&duplicate_staged)
+            .unwrap();
+        duplicate_file.sync_all().unwrap();
+        let duplicate_target = vec![
+            items[0].clone(),
+            ArchiveBatchItem {
+                epoch: 8,
+                staged_archive: duplicate_staged,
+                destination_archive: items[0].destination_archive.clone(),
+                evidence: crate::archive_checksum::measure_open_archive(&duplicate_file).unwrap(),
+            },
+        ];
+        let error = publish_verified_archive_batch(BATCH_MANIFEST_FINGERPRINT, &duplicate_target)
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("destination namespaces overlap"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn batch_rejects_noncanonical_input_paths_before_preflight() {
+        let (_root, mut items) = corrected_batch_fixture(8, false);
+        let source = items[0].staged_archive.parent().unwrap();
+        items[0].staged_archive = source.join("subdirectory").join("..").join("epoch-7.jet");
+
+        let error = publish_verified_archive_batch(BATCH_MANIFEST_FINGERPRINT, &items).unwrap_err();
+
+        assert!(error.to_string().contains("non-canonical"), "{error}");
+        assert_batch_rolled_back(&items[1..]);
+    }
+
+    #[test]
+    fn batch_recovery_rejects_an_intermediate_source_symlink() {
+        let (root, mut items) = corrected_batch_fixture(8, false);
+        let original_source = items[0].staged_archive.parent().unwrap().to_path_buf();
+        let container = root.path().join("container");
+        fs::create_dir(&container).unwrap();
+        fs::set_permissions(&container, fs::Permissions::from_mode(0o700)).unwrap();
+        let moved_source = container.join("source");
+        fs::rename(&original_source, &moved_source).unwrap();
+        for item in &mut items {
+            item.staged_archive = moved_source.join(item.staged_archive.file_name().unwrap());
+        }
+        let destination = items[0].destination_archive.parent().unwrap().to_path_buf();
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = publish_verified_archive_batch_with_hook(
+                BATCH_MANIFEST_FINGERPRINT,
+                &items,
+                |phase| {
+                    if phase == ArchiveBatchPhase::JournalPrepared {
+                        panic!("simulated crash before source ancestor replacement");
+                    }
+                    Ok(())
+                },
+            );
+        }));
+        assert!(crashed.is_err());
+        let real_container = root.path().join("container-real");
+        fs::rename(&container, &real_container).unwrap();
+        std::os::unix::fs::symlink(&real_container, &container).unwrap();
+
+        let error = recover_archive_publication_batch(&destination).unwrap_err();
+
+        assert!(
+            error.to_string().contains("without following links"),
+            "{error}"
+        );
+        for item in &items {
+            assert_eq!(fs::read(&item.destination_archive).unwrap(), b"old archive");
+        }
+        assert!(
+            destination
+                .join(ARCHIVE_BATCH_TRANSACTION_DIRECTORY)
+                .is_dir()
+        );
+    }
+
+    #[test]
+    fn batch_recovery_rejects_noncanonical_journal_paths() {
+        let (_root, items) = corrected_batch_fixture(8, false);
+        let destination = items[0].destination_archive.parent().unwrap().to_path_buf();
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = publish_verified_archive_batch_with_hook(
+                BATCH_MANIFEST_FINGERPRINT,
+                &items,
+                |phase| {
+                    if phase == ArchiveBatchPhase::JournalPrepared {
+                        panic!("simulated crash before journal tampering");
+                    }
+                    Ok(())
+                },
+            );
+        }));
+        assert!(crashed.is_err());
+        let journal_path = destination
+            .join(ARCHIVE_BATCH_TRANSACTION_DIRECTORY)
+            .join(ARCHIVE_BATCH_JOURNAL);
+        let mut journal: ArchiveBatchJournal =
+            serde_json::from_slice(&fs::read(&journal_path).unwrap()).unwrap();
+        let source = path_from_bytes(&journal.items[0].source_path, "source").unwrap();
+        journal.items[0].source_path = path_bytes(
+            &source
+                .parent()
+                .unwrap()
+                .join("not-used")
+                .join("..")
+                .join(source.file_name().unwrap()),
+        );
+        fs::set_permissions(&journal_path, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::write(&journal_path, serde_json::to_vec_pretty(&journal).unwrap()).unwrap();
+        fs::set_permissions(&journal_path, fs::Permissions::from_mode(0o400)).unwrap();
+
+        let error = recover_archive_publication_batch(&destination).unwrap_err();
+
+        assert!(error.to_string().contains("non-canonical"), "{error}");
+        assert!(
+            destination
+                .join(ARCHIVE_BATCH_TRANSACTION_DIRECTORY)
+                .is_dir()
+        );
+    }
+
+    #[test]
+    fn batch_recovery_rejects_journal_changes_before_namespace_mutation() {
+        let (_root, items) = corrected_batch_fixture(8, false);
+        let destination = items[0].destination_archive.parent().unwrap().to_path_buf();
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = publish_verified_archive_batch_with_hook(
+                BATCH_MANIFEST_FINGERPRINT,
+                &items,
+                |phase| {
+                    if phase == ArchiveBatchPhase::JournalPrepared {
+                        panic!("simulated crash before journal tampering");
+                    }
+                    Ok(())
+                },
+            );
+        }));
+        assert!(crashed.is_err());
+        let journal_path = destination
+            .join(ARCHIVE_BATCH_TRANSACTION_DIRECTORY)
+            .join(ARCHIVE_BATCH_JOURNAL);
+        let mut journal: ArchiveBatchJournal =
+            serde_json::from_slice(&fs::read(&journal_path).unwrap()).unwrap();
+        journal.manifest_fingerprint = [0x77; 32];
+        fs::set_permissions(&journal_path, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::write(&journal_path, serde_json::to_vec_pretty(&journal).unwrap()).unwrap();
+        fs::set_permissions(&journal_path, fs::Permissions::from_mode(0o400)).unwrap();
+
+        let error = recover_archive_publication_batch(&destination).unwrap_err();
+
+        assert!(
+            error.to_string().contains("transaction ID commitment"),
+            "{error}"
+        );
+        assert_batch_rolled_back(&items);
+        assert!(
+            destination
+                .join(ARCHIVE_BATCH_TRANSACTION_DIRECTORY)
+                .is_dir()
+        );
+    }
+
+    #[test]
+    fn unarmed_batch_marker_with_unknown_entry_is_not_renamed() {
+        let (_root, items) = corrected_batch_fixture(8, false);
+        let destination = items[0].destination_archive.parent().unwrap().to_path_buf();
+        let marker = destination.join(ARCHIVE_BATCH_TRANSACTION_DIRECTORY);
+        fs::create_dir(&marker).unwrap();
+        fs::set_permissions(&marker, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(marker.join("unexpected"), b"do not discard").unwrap();
+
+        let error = recover_archive_publication_batch(&destination).unwrap_err();
+
+        assert!(error.to_string().contains("unexpected entry"), "{error}");
+        assert!(marker.is_dir());
+        assert_eq!(
+            fs::read(marker.join("unexpected")).unwrap(),
+            b"do not discard"
+        );
+        assert!(!destination.join(ARCHIVE_BATCH_OUTCOME_DIRECTORY).exists());
+    }
+
+    #[test]
+    fn armed_batch_marker_with_unknown_entry_is_not_retired() {
+        let (_root, items) = corrected_batch_fixture(8, false);
+        let destination = items[0].destination_archive.parent().unwrap().to_path_buf();
+
+        let error =
+            publish_verified_archive_batch_with_hook(BATCH_MANIFEST_FINGERPRINT, &items, |phase| {
+                if phase == ArchiveBatchPhase::BeforeTransactionMarkerRemoval {
+                    fs::write(
+                        destination
+                            .join(ARCHIVE_BATCH_TRANSACTION_DIRECTORY)
+                            .join("unexpected"),
+                        b"do not discard",
+                    )
+                    .unwrap();
+                }
+                Ok(())
+            })
+            .unwrap_err();
+
+        assert!(error.committed());
+        assert!(error.to_string().contains("unexpected entry"), "{error}");
+        assert!(
+            destination
+                .join(ARCHIVE_BATCH_TRANSACTION_DIRECTORY)
+                .is_dir()
+        );
+        assert!(!destination.join(ARCHIVE_BATCH_OUTCOME_DIRECTORY).exists());
+        let recovery = recover_archive_publication_batch(&destination).unwrap_err();
+        assert!(
+            recovery.to_string().contains("unexpected entry"),
+            "{recovery}"
+        );
+    }
+
+    #[test]
+    fn final_batch_recheck_prevents_stale_outcome_evidence() {
+        let (_root, items) = corrected_batch_fixture(8, false);
+        let destination = items[0].destination_archive.parent().unwrap().to_path_buf();
+        let displaced = destination.join("displaced-epoch-7.jet");
+
+        let error =
+            publish_verified_archive_batch_with_hook(BATCH_MANIFEST_FINGERPRINT, &items, |phase| {
+                if phase == ArchiveBatchPhase::BeforeTransactionMarkerRemoval {
+                    fs::rename(&items[0].destination_archive, &displaced).unwrap();
+                    fs::write(&items[0].destination_archive, b"concurrent replacement").unwrap();
+                    fs::set_permissions(
+                        &items[0].destination_archive,
+                        fs::Permissions::from_mode(FINAL_FILE_MODE),
+                    )
+                    .unwrap();
+                }
+                Ok(())
+            })
+            .unwrap_err();
+
+        assert!(error.committed());
+        assert!(
+            error.to_string().contains("automatic recovery failed"),
+            "{error}"
+        );
+        assert!(
+            destination
+                .join(ARCHIVE_BATCH_TRANSACTION_DIRECTORY)
+                .is_dir()
+        );
+        assert!(!destination.join(ARCHIVE_BATCH_OUTCOME_DIRECTORY).exists());
+        assert!(displaced.is_file());
+    }
+
+    #[test]
+    fn batch_outcome_requires_matching_acknowledgement() {
+        let (_root, items) = corrected_batch_fixture(8, false);
+        let destination = items[0].destination_archive.parent().unwrap().to_path_buf();
+        let publication =
+            publish_verified_archive_batch(BATCH_MANIFEST_FINGERPRINT, &items).unwrap();
+
+        let error = acknowledge_archive_publication_batch(&destination, [0x55; 32]).unwrap_err();
+
+        assert!(error.to_string().contains("transaction ID"), "{error}");
+        assert!(destination.join(ARCHIVE_BATCH_OUTCOME_DIRECTORY).is_dir());
+        let ArchiveBatchRecovery::Committed(recovered) =
+            recover_archive_publication_batch(&destination).unwrap()
+        else {
+            panic!("pending outcome was lost after a mismatched acknowledgement");
+        };
+        assert_eq!(recovered.transaction_id, publication.transaction_id);
+        acknowledge_archive_publication_batch(&destination, publication.transaction_id).unwrap();
+    }
+
+    #[test]
+    fn every_batch_mutation_boundary_recovers_the_whole_cohort() {
+        let mut phases = vec![ArchiveBatchPhase::JournalPrepared];
+        for index in 0..2 {
+            for phase in [
+                PublishPhase::AfterChecksumInvalidationMutation,
+                PublishPhase::AfterManifestInstallMutation,
+                PublishPhase::AfterManifestBackupMutation,
+                PublishPhase::AfterArchiveInstallMutation,
+                PublishPhase::AfterArchiveBackupMutation,
+            ] {
+                phases.push(ArchiveBatchPhase::Item { index, phase });
+            }
+        }
+        phases.push(ArchiveBatchPhase::CommitDecisionDurable);
+        for index in 0..2 {
+            phases.push(ArchiveBatchPhase::Item {
+                index,
+                phase: PublishPhase::AfterChecksumCommitMutation,
+            });
+        }
+        phases.push(ArchiveBatchPhase::BeforeTransactionMarkerRemoval);
+        phases.push(ArchiveBatchPhase::AfterTransactionMarkerRetirement);
+
+        for crash_phase in phases {
+            let (_root, items) = corrected_batch_fixture(8, true);
+            let destination = items[0].destination_archive.parent().unwrap().to_path_buf();
+            let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = publish_verified_archive_batch_with_hook(
+                    BATCH_MANIFEST_FINGERPRINT,
+                    &items,
+                    |phase| {
+                        if phase == crash_phase {
+                            panic!("simulated batch publisher crash at {crash_phase:?}");
+                        }
+                        Ok(())
+                    },
+                );
+            }));
+            assert!(crashed.is_err(), "phase was not reached: {crash_phase:?}");
+            if crash_phase == ArchiveBatchPhase::AfterTransactionMarkerRetirement {
+                assert!(destination.join(ARCHIVE_BATCH_OUTCOME_DIRECTORY).is_dir());
+            } else {
+                assert!(
+                    destination
+                        .join(ARCHIVE_BATCH_TRANSACTION_DIRECTORY)
+                        .is_dir()
+                );
+            }
+
+            let recovery = recover_archive_publication_batch(&destination).unwrap();
+
+            let committed = matches!(
+                crash_phase,
+                ArchiveBatchPhase::CommitDecisionDurable
+                    | ArchiveBatchPhase::Item {
+                        phase: PublishPhase::AfterChecksumCommitMutation,
+                        ..
+                    }
+                    | ArchiveBatchPhase::BeforeTransactionMarkerRemoval
+                    | ArchiveBatchPhase::AfterTransactionMarkerRetirement
+            );
+            let transaction_id = if committed {
+                let ArchiveBatchRecovery::Committed(publication) = recovery else {
+                    panic!("commit decision did not finish the cohort at {crash_phase:?}");
+                };
+                assert_eq!(publication.publications.len(), items.len());
+                assert_batch_committed(&items);
+                for item in &items {
+                    assert_ne!(
+                        fs::read(segment_manifest_path(&item.destination_archive).unwrap())
+                            .unwrap(),
+                        b"old manifest"
+                    );
+                }
+                publication.transaction_id
+            } else {
+                let ArchiveBatchRecovery::RolledBack(rollback) = recovery else {
+                    panic!("rollback decision did not restore the cohort at {crash_phase:?}");
+                };
+                assert_eq!(
+                    rollback
+                        .identity_evidence
+                        .iter()
+                        .map(|evidence| evidence.epoch)
+                        .collect::<Vec<_>>(),
+                    vec![7, 8]
+                );
+                assert_eq!(rollback.manifest_fingerprint, BATCH_MANIFEST_FINGERPRINT);
+                assert_ne!(rollback.transaction_id, [0; 32]);
+                for (evidence, item) in rollback.identity_evidence.iter().zip(&items) {
+                    assert_eq!(evidence.staged_archive_path, item.staged_archive);
+                    assert_eq!(
+                        evidence.staged_archive_validation.sha256,
+                        item.evidence.sha256
+                    );
+                }
+                assert_batch_rolled_back(&items);
+                rollback.transaction_id
+            };
+            assert!(
+                !destination
+                    .join(ARCHIVE_BATCH_TRANSACTION_DIRECTORY)
+                    .exists()
+            );
+            assert!(destination.join(ARCHIVE_BATCH_OUTCOME_DIRECTORY).is_dir());
+            let repeated = recover_archive_publication_batch(&destination).unwrap();
+            match repeated {
+                ArchiveBatchRecovery::Committed(publication) if committed => {
+                    assert_eq!(publication.transaction_id, transaction_id);
+                }
+                ArchiveBatchRecovery::RolledBack(rollback) if !committed => {
+                    assert_eq!(rollback.transaction_id, transaction_id);
+                }
+                _ => panic!("completed outcome changed on repeated recovery"),
+            }
+            acknowledge_archive_publication_batch(&destination, transaction_id).unwrap();
+            assert!(!destination.join(ARCHIVE_BATCH_OUTCOME_DIRECTORY).exists());
+        }
+    }
+
+    #[test]
+    fn batch_marks_every_member_before_data_and_removes_marker_only_after_checksums() {
+        let (_root, items) = corrected_batch_fixture(8, true);
+        let destination = items[0].destination_archive.parent().unwrap().to_path_buf();
+        let mut saw_data_gate = false;
+        let mut saw_partial_checksum_commit = false;
+
+        let publication =
+            publish_verified_archive_batch_with_hook(BATCH_MANIFEST_FINGERPRINT, &items, |phase| {
+                if phase
+                    == (ArchiveBatchPhase::Item {
+                        index: 0,
+                        phase: PublishPhase::BeforeManifestMutation,
+                    })
+                {
+                    saw_data_gate = true;
+                    assert!(
+                        destination
+                            .join(ARCHIVE_BATCH_TRANSACTION_DIRECTORY)
+                            .is_dir()
+                    );
+                    for item in &items {
+                        assert_eq!(
+                            fs::read(archive_checksum_path(&item.destination_archive).unwrap())
+                                .unwrap(),
+                            ARCHIVE_PUBLICATION_SENTINEL
+                        );
+                        assert_eq!(fs::read(&item.destination_archive).unwrap(), b"old archive");
+                    }
+                }
+                if phase
+                    == (ArchiveBatchPhase::Item {
+                        index: 0,
+                        phase: PublishPhase::AfterChecksumCommitMutation,
+                    })
+                {
+                    saw_partial_checksum_commit = true;
+                    assert!(
+                        destination
+                            .join(ARCHIVE_BATCH_TRANSACTION_DIRECTORY)
+                            .is_dir()
+                    );
+                    assert_ne!(
+                        fs::read(archive_checksum_path(&items[0].destination_archive).unwrap())
+                            .unwrap(),
+                        ARCHIVE_PUBLICATION_SENTINEL
+                    );
+                    assert_eq!(
+                        fs::read(archive_checksum_path(&items[1].destination_archive).unwrap())
+                            .unwrap(),
+                        ARCHIVE_PUBLICATION_SENTINEL
+                    );
+                    for item in &items {
+                        let published = crate::archive_checksum::open_regular_nofollow(
+                            &item.destination_archive,
+                        )
+                        .unwrap();
+                        assert_eq!(
+                            crate::archive_checksum::measure_open_archive(&published)
+                                .unwrap()
+                                .sha256,
+                            item.evidence.sha256
+                        );
+                    }
+                }
+                Ok(())
+            })
+            .unwrap();
+
+        assert!(saw_data_gate);
+        assert!(saw_partial_checksum_commit);
+        assert_eq!(
+            publication
+                .identity_evidence
+                .iter()
+                .map(|evidence| evidence.epoch)
+                .collect::<Vec<_>>(),
+            vec![7, 8]
+        );
+        assert!(
+            !destination
+                .join(ARCHIVE_BATCH_TRANSACTION_DIRECTORY)
+                .exists()
+        );
+        assert!(destination.join(ARCHIVE_BATCH_OUTCOME_DIRECTORY).is_dir());
+        acknowledge_archive_publication_batch(&destination, publication.transaction_id).unwrap();
+        assert!(!destination.join(ARCHIVE_BATCH_OUTCOME_DIRECTORY).exists());
+    }
+
+    #[test]
+    fn batch_recovery_handles_initially_absent_destinations() {
+        for (crash_phase, expect_commit) in [
+            (
+                ArchiveBatchPhase::Item {
+                    index: 1,
+                    phase: PublishPhase::AfterArchiveInstallMutation,
+                },
+                false,
+            ),
+            (ArchiveBatchPhase::CommitDecisionDurable, true),
+        ] {
+            let (_root, items) = corrected_batch_fixture(8, false);
+            let destination = items[0].destination_archive.parent().unwrap().to_path_buf();
+            for item in &items {
+                fs::remove_file(&item.destination_archive).unwrap();
+                fs::remove_file(segment_manifest_path(&item.destination_archive).unwrap()).unwrap();
+                fs::remove_file(archive_checksum_path(&item.destination_archive).unwrap()).unwrap();
+            }
+            let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = publish_verified_archive_batch_with_hook(
+                    BATCH_MANIFEST_FINGERPRINT,
+                    &items,
+                    |phase| {
+                        if phase == crash_phase {
+                            panic!("simulated absent-destination batch crash");
+                        }
+                        Ok(())
+                    },
+                );
+            }));
+            assert!(crashed.is_err());
+
+            let recovery = recover_archive_publication_batch(&destination).unwrap();
+
+            let transaction_id = if expect_commit {
+                let ArchiveBatchRecovery::Committed(publication) = recovery else {
+                    panic!("commit recovery did not commit");
+                };
+                assert_batch_committed(&items);
+                publication.transaction_id
+            } else {
+                let ArchiveBatchRecovery::RolledBack(rollback) = recovery else {
+                    panic!("rollback recovery did not roll back");
+                };
+                for item in &items {
+                    assert!(item.staged_archive.is_file());
+                    assert!(!item.destination_archive.exists());
+                    assert!(
+                        !archive_checksum_path(&item.destination_archive)
+                            .unwrap()
+                            .exists()
+                    );
+                }
+                rollback.transaction_id
+            };
+            assert!(
+                !destination
+                    .join(ARCHIVE_BATCH_TRANSACTION_DIRECTORY)
+                    .exists()
+            );
+            assert!(destination.join(ARCHIVE_BATCH_OUTCOME_DIRECTORY).is_dir());
+            acknowledge_archive_publication_batch(&destination, transaction_id).unwrap();
+            assert!(recovery_directories(&destination).is_empty());
+            assert!(!destination.join(ARCHIVE_BATCH_OUTCOME_DIRECTORY).exists());
+        }
+    }
+
+    #[test]
+    fn batch_mutation_error_still_runs_its_fsync_barrier_before_rollback() {
+        let (_root, items) = corrected_batch_fixture(8, true);
+
+        let error =
+            publish_verified_archive_batch_with_hook(BATCH_MANIFEST_FINGERPRINT, &items, |phase| {
+                if phase
+                    == (ArchiveBatchPhase::Item {
+                        index: 1,
+                        phase: PublishPhase::AfterArchiveInstallMutation,
+                    })
+                {
+                    SYNC_ATTEMPTS.with(|attempts| attempts.set(0));
+                    SYNC_FAULT.with(|fault| fault.set(Some(libc::EIO)));
+                    return Err("injected batch post-mutation failure".to_string());
+                }
+                Ok(())
+            })
+            .unwrap_err();
+
+        assert!(!error.committed());
+        assert!(SYNC_ATTEMPTS.with(std::cell::Cell::get) > 0);
+        assert_batch_rolled_back(&items);
     }
 
     #[test]

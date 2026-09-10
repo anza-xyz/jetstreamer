@@ -1,9 +1,10 @@
 //! Transactional publication of a fully validated Horizon archive.
 //!
-//! A checksum sidecar is the commit marker. Publication removes any previous
-//! checksum first, installs the optional segment manifest and archive, checks
-//! their exact inodes again, and installs the new checksum last. Existing
-//! files are retained in a private recovery directory.
+//! A canonical checksum sidecar is the commit marker. Publication atomically
+//! replaces any previous checksum with an invalid, publisher-owned sentinel,
+//! installs the optional segment manifest and archive, checks their exact
+//! inodes again, and exchanges the canonical checksum into place last.
+//! Existing files are retained in a private recovery directory.
 
 use {
     crate::{
@@ -20,6 +21,7 @@ use {
         fmt,
         fs::{self, File, OpenOptions},
         io::{self, Read, Write},
+        mem::MaybeUninit,
         os::{
             fd::{AsRawFd as _, FromRawFd as _, RawFd},
             unix::{
@@ -34,6 +36,10 @@ use {
 
 const MAX_SEGMENT_MANIFEST_BYTES: u64 = 1 << 20;
 const FINAL_FILE_MODE: u32 = 0o440;
+const INVALID_CHECKSUM_CONTENTS: &[u8] = b"jetstreamer publication in progress\n";
+const CAPABILITY_PROBE_A: &str = "rename-probe-a";
+const CAPABILITY_PROBE_B: &str = "rename-probe-b";
+const CAPABILITY_PROBE_MOVED: &str = "rename-probe-moved";
 
 #[derive(Debug)]
 pub struct ArchivePublication {
@@ -101,6 +107,22 @@ impl FileIdentity {
         }
     }
 
+    fn from_stat(stat: &libc::stat) -> Self {
+        Self {
+            dev: stat.st_dev,
+            ino: stat.st_ino,
+            mode: stat.st_mode,
+            uid: stat.st_uid,
+            gid: stat.st_gid,
+            nlink: stat.st_nlink,
+            len: stat.st_size as u64,
+            mtime: stat.st_mtime,
+            mtime_nsec: stat.st_mtime_nsec,
+            ctime: stat.st_ctime,
+            ctime_nsec: stat.st_ctime_nsec,
+        }
+    }
+
     /// A rename updates ctime while preserving the inode, contents, ownership,
     /// link count, permissions, and mtime.
     fn same_across_rename(self, other: Self) -> bool {
@@ -113,6 +135,14 @@ impl FileIdentity {
             && self.len == other.len
             && self.mtime == other.mtime
             && self.mtime_nsec == other.mtime_nsec
+    }
+
+    fn same_directory_binding(self, other: Self) -> bool {
+        self.dev == other.dev
+            && self.ino == other.ino
+            && self.mode == other.mode
+            && self.uid == other.uid
+            && self.gid == other.gid
     }
 }
 
@@ -154,42 +184,48 @@ impl BoundDirectory {
                 path.display()
             ));
         }
-        let euid = effective_user_id();
-        match policy {
-            DirectoryPolicy::PrivateSource => {
-                if identity.uid != euid || identity.mode & 0o077 != 0 {
-                    return Err(format!(
-                        "staging directory must be owned by this user and owner-only: {}",
-                        path.display()
-                    ));
-                }
-            }
-            DirectoryPolicy::SharedDestination => {
-                let private_destination = identity.uid == euid
-                    && identity.mode & 0o700 == 0o700
-                    && identity.mode & 0o022 == 0;
-                let shared_horizon_destination = identity.uid == euid
-                    && identity.mode & 0o777 == 0o770
-                    && identity.mode & libc::S_ISGID != 0
-                    && identity.mode & libc::S_ISVTX != 0;
-                if !private_destination && !shared_horizon_destination {
-                    return Err(format!(
-                        "destination directory must be user-owned and non-writable by group/other, or use shared Horizon mode 3770: {}",
-                        path.display()
-                    ));
-                }
-            }
-            DirectoryPolicy::PrivateRecovery => {
-                if identity.uid != euid || identity.mode & 0o077 != 0 {
-                    return Err(format!(
-                        "recovery directory must be owned by this user and owner-only: {}",
-                        path.display()
-                    ));
-                }
-            }
-        }
+        validate_directory_policy(identity, policy, path)?;
         Ok(Self {
             path: path.to_path_buf(),
+            file,
+            identity,
+            policy,
+        })
+    }
+
+    fn bind_child(
+        parent: &BoundDirectory,
+        name: &OsStr,
+        path: PathBuf,
+        policy: DirectoryPolicy,
+    ) -> Result<Self, String> {
+        let file = openat_directory(parent.file.as_raw_fd(), name).map_err(|error| {
+            format!(
+                "failed to bind child directory without following links {}: {error}",
+                path.display()
+            )
+        })?;
+        let descriptor_metadata = file.metadata().map_err(|error| {
+            format!(
+                "failed to inspect child directory {}: {error}",
+                path.display()
+            )
+        })?;
+        let identity = FileIdentity::from_metadata(&descriptor_metadata);
+        let entry_identity = fstatat_identity(parent.file.as_raw_fd(), name)
+            .map_err(|error| format!("failed to inspect child directory entry: {error}"))?
+            .ok_or_else(|| format!("child directory disappeared: {}", path.display()))?;
+        if !descriptor_metadata.file_type().is_dir()
+            || !entry_identity.same_directory_binding(identity)
+        {
+            return Err(format!(
+                "child directory changed while it was bound: {}",
+                path.display()
+            ));
+        }
+        validate_directory_policy(identity, policy, &path)?;
+        Ok(Self {
+            path,
             file,
             identity,
             policy,
@@ -220,10 +256,63 @@ impl BoundDirectory {
     }
 
     fn sync(&self) -> Result<(), String> {
+        #[cfg(test)]
+        {
+            SYNC_ATTEMPTS.with(|attempts| attempts.set(attempts.get().saturating_add(1)));
+            if let Some(errno) = SYNC_FAULT.with(|fault| fault.take()) {
+                return Err(format!(
+                    "failed to sync directory {}: {}",
+                    self.path.display(),
+                    io::Error::from_raw_os_error(errno)
+                ));
+            }
+        }
         self.file
             .sync_all()
             .map_err(|error| format!("failed to sync directory {}: {error}", self.path.display()))
     }
+}
+
+fn validate_directory_policy(
+    identity: FileIdentity,
+    policy: DirectoryPolicy,
+    path: &Path,
+) -> Result<(), String> {
+    let euid = effective_user_id();
+    match policy {
+        DirectoryPolicy::PrivateSource => {
+            if identity.uid != euid || identity.mode & 0o077 != 0 {
+                return Err(format!(
+                    "staging directory must be owned by this user and owner-only: {}",
+                    path.display()
+                ));
+            }
+        }
+        DirectoryPolicy::SharedDestination => {
+            let private_destination = identity.uid == euid
+                && identity.mode & 0o700 == 0o700
+                && identity.mode & 0o022 == 0;
+            let shared_horizon_destination = identity.uid == euid
+                && identity.mode & 0o777 == 0o770
+                && identity.mode & libc::S_ISGID != 0
+                && identity.mode & libc::S_ISVTX != 0;
+            if !private_destination && !shared_horizon_destination {
+                return Err(format!(
+                    "destination directory must be user-owned and non-writable by group/other, or use shared Horizon mode 3770: {}",
+                    path.display()
+                ));
+            }
+        }
+        DirectoryPolicy::PrivateRecovery => {
+            if identity.uid != euid || identity.mode & 0o077 != 0 {
+                return Err(format!(
+                    "recovery directory must be owned by this user and owner-only: {}",
+                    path.display()
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -283,6 +372,7 @@ struct StagedComponent {
 enum DirectoryIndex {
     Source,
     Recovery,
+    Destination,
 }
 
 #[derive(Clone, Copy)]
@@ -292,38 +382,94 @@ struct InitialDestination {
     checksum: Option<FileIdentity>,
 }
 
+#[derive(Clone)]
+struct NamespaceEntry {
+    directory: DirectoryIndex,
+    name: std::ffi::OsString,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MutationRole {
+    Data,
+    ChecksumReservation,
+    ChecksumCommit,
+}
+
+#[derive(Clone)]
 enum Mutation {
-    Removed {
-        kind: ComponentKind,
-        destination_name: std::ffi::OsString,
-        old_identity: FileIdentity,
+    Rename {
+        role: MutationRole,
+        source: NamespaceEntry,
+        destination: NamespaceEntry,
+        identity: FileIdentity,
     },
-    InstalledNew {
-        kind: ComponentKind,
-        source_directory: DirectoryIndex,
-        source_name: std::ffi::OsString,
-        destination_name: std::ffi::OsString,
-        new_identity: FileIdentity,
+    Exchange {
+        role: MutationRole,
+        left: NamespaceEntry,
+        right: NamespaceEntry,
+        left_identity: FileIdentity,
+        right_identity: FileIdentity,
     },
-    InstalledReplacing {
-        kind: ComponentKind,
-        source_directory: DirectoryIndex,
-        source_name: std::ffi::OsString,
-        destination_name: std::ffi::OsString,
-        new_identity: FileIdentity,
-        old_identity: FileIdentity,
-    },
+}
+
+impl Mutation {
+    fn role(&self) -> MutationRole {
+        match self {
+            Self::Rename { role, .. } | Self::Exchange { role, .. } => *role,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PublishPhase {
     BeforeChecksumInvalidation,
+    AfterChecksumInvalidationMutation,
     AfterChecksumInvalidation,
     BeforeManifestMutation,
+    AfterManifestInstallMutation,
+    AfterManifestBackupMutation,
     AfterManifestMutation,
     BeforeArchiveInstall,
+    AfterArchiveInstallMutation,
+    AfterArchiveBackupMutation,
     AfterArchiveInstall,
     BeforeChecksumCommit,
+    AfterChecksumCommitMutation,
+    BeforeRollbackDataSync,
+    AfterRollbackDataSync,
+    AfterChecksumRestoreMutation,
+    AfterChecksumRollbackSync,
+}
+
+/// Verifies the directory policies and filesystem operations required by
+/// [`publish_verified_archive`] before expensive archive generation begins.
+///
+/// The staging directory must be owner-only. The destination must satisfy the
+/// same ownership and mode policy as publication. The probe creates only
+/// private, identity-bound temporary entries and removes them before success.
+pub fn preflight_archive_publication(
+    staging_directory: &Path,
+    destination_directory: &Path,
+) -> Result<(), ArchivePublicationError> {
+    let source = BoundDirectory::bind(staging_directory, DirectoryPolicy::PrivateSource)
+        .map_err(preflight_error)?;
+    let destination =
+        BoundDirectory::bind(destination_directory, DirectoryPolicy::SharedDestination)
+            .map_err(preflight_error)?;
+    require_compatible_directories(&source, &destination).map_err(preflight_error)?;
+    let (recovery_name, recovery) = create_recovery_directory(&destination)
+        .map_err(|error| preflight_error_with_recovery(error.message, error.recovery_directory))?;
+    if let Err(message) = probe_rename_capabilities(&source, &recovery, destination.identity.gid) {
+        return Err(cleanup_preflight_error(
+            message,
+            &destination,
+            &recovery_name,
+            &recovery,
+            &[],
+        ));
+    }
+    remove_empty_recovery_directory(&destination, &recovery_name, &recovery)
+        .map_err(|message| preflight_error_with_recovery(message, Some(recovery.path.clone())))
 }
 
 /// Publishes a validated staging archive to a shared Horizon directory.
@@ -367,20 +513,7 @@ fn publish_impl(
     let destination =
         BoundDirectory::bind(destination_parent_path, DirectoryPolicy::SharedDestination)
             .map_err(preflight_error)?;
-    if source.identity.dev != destination.identity.dev {
-        return Err(preflight_error(format!(
-            "staging {} and destination {} are on different filesystems",
-            source.path.display(),
-            destination.path.display()
-        )));
-    }
-    if source.identity.dev == destination.identity.dev
-        && source.identity.ino == destination.identity.ino
-    {
-        return Err(preflight_error(
-            "staging and destination directories must differ".to_string(),
-        ));
-    }
+    require_compatible_directories(&source, &destination).map_err(preflight_error)?;
 
     let archive_name = safe_file_name(staged_archive).map_err(preflight_error)?;
     let destination_name = safe_file_name(destination_archive).map_err(preflight_error)?;
@@ -441,7 +574,9 @@ fn publish_impl(
                 staged_archive,
                 &archive,
                 evidence,
+                &source,
                 &source_manifest_path,
+                &source_manifest_name,
                 bound,
             )
             .map_err(preflight_error)?,
@@ -527,32 +662,79 @@ fn publish_impl(
 
     source.recheck_path().map_err(preflight_error)?;
     destination.recheck_path().map_err(preflight_error)?;
-    let (recovery_name, recovery) =
-        create_recovery_directory(&destination, &destination_name).map_err(preflight_error)?;
-    let manifest_staged = match manifest_bytes {
-        Some(bytes) => Some(
-            create_recovery_staging_file(
-                &recovery,
-                ComponentKind::Manifest,
-                &bytes,
-                destination.identity.gid,
-            )
-            .map_err(|message| cleanup_preflight_error(message, &destination, &recovery_name))?,
-        ),
-        None => None,
-    };
-    let checksum_staged = create_recovery_staging_file(
-        &recovery,
-        ComponentKind::Checksum,
-        expected_checksum.as_bytes(),
-        destination.identity.gid,
-    )
-    .map_err(|message| cleanup_preflight_error(message, &destination, &recovery_name))?;
-    if let Err(message) = recovery.sync().and_then(|()| destination.sync()) {
+    let (recovery_name, recovery) = create_recovery_directory(&destination)
+        .map_err(|error| preflight_error_with_recovery(error.message, error.recovery_directory))?;
+    if let Err(message) = probe_rename_capabilities(&source, &recovery, destination.identity.gid) {
         return Err(cleanup_preflight_error(
             message,
             &destination,
             &recovery_name,
+            &recovery,
+            &[],
+        ));
+    }
+    let manifest_staged = match manifest_bytes {
+        Some(bytes) => Some(
+            create_recovery_file(
+                &recovery,
+                ComponentKind::Manifest,
+                ComponentKind::Manifest.staging_name(),
+                &bytes,
+                destination.identity.gid,
+            )
+            .map_err(|message| {
+                cleanup_preflight_error(message, &destination, &recovery_name, &recovery, &[])
+            })?,
+        ),
+        None => None,
+    };
+    let manifest_cleanup = manifest_staged
+        .as_ref()
+        .map(|staged| (staged.name.clone(), staged.identity))
+        .into_iter()
+        .collect::<Vec<_>>();
+    let checksum_staged = create_recovery_file(
+        &recovery,
+        ComponentKind::Checksum,
+        ComponentKind::Checksum.staging_name(),
+        expected_checksum.as_bytes(),
+        destination.identity.gid,
+    )
+    .map_err(|message| {
+        cleanup_preflight_error(
+            message,
+            &destination,
+            &recovery_name,
+            &recovery,
+            &manifest_cleanup,
+        )
+    })?;
+    let mut staged_cleanup = manifest_cleanup;
+    staged_cleanup.push((checksum_staged.name.clone(), checksum_staged.identity));
+    let checksum_sentinel = create_recovery_file(
+        &recovery,
+        ComponentKind::Checksum,
+        ComponentKind::Checksum.backup_name(),
+        INVALID_CHECKSUM_CONTENTS,
+        destination.identity.gid,
+    )
+    .map_err(|message| {
+        cleanup_preflight_error(
+            message,
+            &destination,
+            &recovery_name,
+            &recovery,
+            &staged_cleanup,
+        )
+    })?;
+    if let Err(message) = recovery.sync().and_then(|()| destination.sync()) {
+        staged_cleanup.push((checksum_sentinel.name.clone(), checksum_sentinel.identity));
+        return Err(cleanup_preflight_error(
+            message,
+            &destination,
+            &recovery_name,
+            &recovery,
+            &staged_cleanup,
         ));
     }
 
@@ -564,31 +746,35 @@ fn publish_impl(
         identity: archive.identity,
     };
     let manifest_staging_identity = manifest_staged.as_ref().map(|staged| staged.identity);
-    let checksum_staging_identity = checksum_staged.identity;
     let mut transaction = PublicationTransaction {
         source,
         destination,
         recovery,
         recovery_name,
         initial,
-        mutations: Vec::new(),
+        // The fixed transaction performs at most reservation + two manifest
+        // operations + two archive operations + checksum commit. Preallocation
+        // leaves no allocation window after a successful namespace syscall.
+        mutations: Vec::with_capacity(6),
         _initial_handles: initial_handles,
         archive_staged,
         manifest_staged,
         checksum_staged,
+        checksum_sentinel,
         destination_name,
         destination_manifest_name,
         destination_checksum_name,
         evidence,
         published_evidence: None,
+        installed_archive_identity: None,
+        installed_manifest_identity: None,
         manifest_staging_identity,
-        checksum_staging_identity,
     };
 
     if let Err(message) = transaction.run_precommit(hook) {
-        return Err(transaction.rollback_error(message));
+        return Err(transaction.rollback_error(message, hook));
     }
-    transaction.commit()
+    transaction.commit(hook)
 }
 
 struct PublicationTransaction {
@@ -604,13 +790,15 @@ struct PublicationTransaction {
     archive_staged: StagedComponent,
     manifest_staged: Option<StagedComponent>,
     checksum_staged: StagedComponent,
+    checksum_sentinel: StagedComponent,
     destination_name: std::ffi::OsString,
     destination_manifest_name: std::ffi::OsString,
     destination_checksum_name: std::ffi::OsString,
     evidence: ValidatedArchiveFile,
     published_evidence: Option<ValidatedArchiveFile>,
+    installed_archive_identity: Option<FileIdentity>,
+    installed_manifest_identity: Option<FileIdentity>,
     manifest_staging_identity: Option<FileIdentity>,
-    checksum_staging_identity: FileIdentity,
 }
 
 impl PublicationTransaction {
@@ -618,6 +806,7 @@ impl PublicationTransaction {
         match index {
             DirectoryIndex::Source => &self.source,
             DirectoryIndex::Recovery => &self.recovery,
+            DirectoryIndex::Destination => &self.destination,
         }
     }
 
@@ -626,28 +815,39 @@ impl PublicationTransaction {
         hook: &mut dyn FnMut(PublishPhase) -> Result<(), String>,
     ) -> Result<(), String> {
         hook(PublishPhase::BeforeChecksumInvalidation)?;
-        if let Some(identity) = self.initial.checksum {
-            self.remove_destination_to_backup(
-                ComponentKind::Checksum,
-                self.destination_checksum_name.clone(),
-                identity,
-            )?;
-        } else {
-            require_expected_target(&self.destination, &self.destination_checksum_name, None)?;
-        }
+        self.reserve_checksum_name(hook)?;
         self.sync_mutation_directories()?;
         hook(PublishPhase::AfterChecksumInvalidation)?;
 
         hook(PublishPhase::BeforeManifestMutation)?;
-        if let Some(staged) = self.manifest_staged.take() {
-            let destination_name = self.destination_manifest_name.clone();
-            let expected = self.initial.manifest;
-            self.install_component(staged, destination_name, expected)?;
+        if let Some((kind, directory, name, identity)) =
+            self.manifest_staged.as_ref().map(|staged| {
+                (
+                    staged.kind,
+                    staged.directory_index,
+                    staged.name.clone(),
+                    staged.identity,
+                )
+            })
+        {
+            self.installed_manifest_identity = Some(self.install_component(
+                kind,
+                directory,
+                name,
+                identity,
+                self.destination_manifest_name.clone(),
+                self.initial.manifest,
+                PublishPhase::AfterManifestInstallMutation,
+                PublishPhase::AfterManifestBackupMutation,
+                hook,
+            )?);
         } else if let Some(identity) = self.initial.manifest {
             self.remove_destination_to_backup(
                 ComponentKind::Manifest,
                 self.destination_manifest_name.clone(),
                 identity,
+                PublishPhase::AfterManifestBackupMutation,
+                hook,
             )?;
         } else {
             require_expected_target(&self.destination, &self.destination_manifest_name, None)?;
@@ -656,141 +856,160 @@ impl PublicationTransaction {
         hook(PublishPhase::AfterManifestMutation)?;
 
         hook(PublishPhase::BeforeArchiveInstall)?;
-        let archive = take_staged_component(&mut self.archive_staged)?;
-        self.install_component(archive, self.destination_name.clone(), self.initial.archive)?;
+        self.installed_archive_identity = Some(self.install_component(
+            self.archive_staged.kind,
+            self.archive_staged.directory_index,
+            self.archive_staged.name.clone(),
+            self.archive_staged.identity,
+            self.destination_name.clone(),
+            self.initial.archive,
+            PublishPhase::AfterArchiveInstallMutation,
+            PublishPhase::AfterArchiveBackupMutation,
+            hook,
+        )?);
         self.sync_mutation_directories()?;
         hook(PublishPhase::AfterArchiveInstall)?;
 
-        let archive_identity = self.installed_identity(ComponentKind::Archive)?;
-        require_expected_target(
-            &self.destination,
-            &self.destination_name,
-            Some(archive_identity),
-        )?;
-        let rebound = rebind_validated_after_rename(&self.archive_staged.file, self.evidence)
-            .map_err(|error| {
-                format!("published archive changed across controlled rename: {error}")
-            })?;
-        if !path_matches_archive_identity(
-            &self.destination.path.join(&self.destination_name),
-            rebound.identity,
-        )
-        .map_err(|error| format!("failed to bind published archive path: {error}"))?
-        {
-            return Err("published archive path does not name the validated inode".to_string());
-        }
-        self.published_evidence = Some(rebound);
-        match self.installed_identity_optional(ComponentKind::Manifest) {
-            Some(identity) => require_expected_target(
-                &self.destination,
-                &self.destination_manifest_name,
-                Some(identity),
-            )?,
-            None => {
-                require_expected_target(&self.destination, &self.destination_manifest_name, None)?
-            }
-        }
-        require_expected_target(&self.destination, &self.destination_checksum_name, None)?;
-        self.source.recheck_path()?;
-        self.destination.recheck_path()?;
-        self.recovery.recheck_path()?;
+        self.refresh_published_evidence()?;
         hook(PublishPhase::BeforeChecksumCommit)?;
         Ok(())
     }
 
-    fn commit(mut self) -> Result<ArchivePublication, ArchivePublicationError> {
-        let checksum = match take_staged_component(&mut self.checksum_staged) {
-            Ok(checksum) => checksum,
-            Err(message) => return Err(self.rollback_error(message)),
-        };
-        if let Err(message) = self.verify_staged(&checksum) {
-            return Err(self.rollback_error(message));
-        }
-        if let Err(message) =
-            require_expected_target(&self.destination, &self.destination_checksum_name, None)
-        {
-            return Err(self.rollback_error(message));
-        }
-        let checksum_directory = self.directory(checksum.directory_index);
-        if let Err(error) = rename_noreplace(
-            checksum_directory,
-            &checksum.name,
+    fn reserve_checksum_name(
+        &mut self,
+        hook: &mut dyn FnMut(PublishPhase) -> Result<(), String>,
+    ) -> Result<(), String> {
+        self.verify_staged(&self.checksum_sentinel)?;
+        require_expected_target(
             &self.destination,
             &self.destination_checksum_name,
-        ) {
-            return Err(
-                self.rollback_error(format!("failed to install checksum commit marker: {error}"))
-            );
+            self.initial.checksum,
+        )?;
+        let recovery_entry = NamespaceEntry {
+            directory: DirectoryIndex::Recovery,
+            name: self.checksum_sentinel.name.clone(),
+        };
+        let destination_entry = NamespaceEntry {
+            directory: DirectoryIndex::Destination,
+            name: self.destination_checksum_name.clone(),
+        };
+        let mutation = match self.initial.checksum {
+            Some(old_identity) => Mutation::Exchange {
+                role: MutationRole::ChecksumReservation,
+                left: recovery_entry,
+                right: destination_entry,
+                left_identity: self.checksum_sentinel.identity,
+                right_identity: old_identity,
+            },
+            None => Mutation::Rename {
+                role: MutationRole::ChecksumReservation,
+                source: recovery_entry,
+                destination: destination_entry,
+                identity: self.checksum_sentinel.identity,
+            },
+        };
+        self.perform_journaled_mutation(mutation)
+            .map_err(|error| format!("failed to reserve checksum commit-marker name: {error}"))?;
+        hook(PublishPhase::AfterChecksumInvalidationMutation)?;
+        self.checksum_sentinel.identity = rebound_target_identity(
+            &self.destination,
+            &self.destination_checksum_name,
+            self.checksum_sentinel.identity,
+        )?;
+        match self.initial.checksum {
+            Some(identity) => {
+                rebound_target_identity(
+                    &self.recovery,
+                    ComponentKind::Checksum.backup_name(),
+                    identity,
+                )?;
+            }
+            None => require_expected_target(
+                &self.recovery,
+                ComponentKind::Checksum.backup_name(),
+                None,
+            )?,
+        }
+        Ok(())
+    }
+
+    fn commit(
+        mut self,
+        hook: &mut dyn FnMut(PublishPhase) -> Result<(), String>,
+    ) -> Result<ArchivePublication, ArchivePublicationError> {
+        let commit_mutation = Mutation::Exchange {
+            role: MutationRole::ChecksumCommit,
+            left: NamespaceEntry {
+                directory: DirectoryIndex::Recovery,
+                name: self.checksum_staged.name.clone(),
+            },
+            right: NamespaceEntry {
+                directory: DirectoryIndex::Destination,
+                name: self.destination_checksum_name.clone(),
+            },
+            left_identity: self.checksum_staged.identity,
+            right_identity: self.checksum_sentinel.identity,
+        };
+
+        // Build the journal record before the final verification. The exchange
+        // and the non-allocating push are then the only operations that follow.
+        if let Err(message) = self.verify_commit_ready() {
+            return Err(self.rollback_error(message, hook));
+        }
+        if let Err(error) = self.perform_journaled_mutation(commit_mutation) {
+            return Err(self.rollback_error(
+                format!("failed to exchange checksum commit marker: {error}"),
+                hook,
+            ));
+        }
+        if let Err(message) = hook(PublishPhase::AfterChecksumCommitMutation) {
+            return self.fail_after_checksum_commit(message, hook);
         }
 
-        // A successful rename is the commit point. Any failure below reports
-        // a committed transaction and leaves the checksum in place.
-        let committed_checksum_identity = match rebound_target_identity(
-            &self.destination,
-            &self.destination_checksum_name,
-            checksum.identity,
-        ) {
-            Ok(identity) => identity,
-            Err(message) => {
-                return Err(ArchivePublicationError {
-                    message: format!(
-                        "archive checksum rename committed, but its inode changed immediately afterward: {message}; recovery data remains in {}",
-                        self.recovery.path.display()
-                    ),
-                    committed: true,
-                    recovery_directory: Some(self.recovery.path.clone()),
-                });
-            }
-        };
         let post_commit = (|| {
-            require_expected_target(
+            self.checksum_staged.identity = rebound_target_identity(
                 &self.destination,
                 &self.destination_checksum_name,
-                Some(committed_checksum_identity),
+                self.checksum_staged.identity,
             )?;
-            self.recovery.sync()?;
-            self.destination.sync()?;
-            let archive_identity = self.installed_identity(ComponentKind::Archive)?;
-            require_expected_target(
-                &self.destination,
-                &self.destination_name,
-                Some(archive_identity),
+            self.checksum_sentinel.identity = rebound_target_identity(
+                &self.recovery,
+                ComponentKind::Checksum.staging_name(),
+                self.checksum_sentinel.identity,
             )?;
-            match self.installed_identity_optional(ComponentKind::Manifest) {
-                Some(identity) => require_expected_target(
-                    &self.destination,
-                    &self.destination_manifest_name,
-                    Some(identity),
-                )?,
-                None => require_expected_target(
-                    &self.destination,
-                    &self.destination_manifest_name,
-                    None,
-                )?,
-            }
-            Ok::<(), String>(())
+            sync_all(&[&self.recovery, &self.destination])?;
+            self.verify_committed_namespace()
         })();
         if let Err(message) = post_commit {
-            return Err(ArchivePublicationError {
-                message: format!(
-                    "archive checksum was committed, but post-commit verification or sync failed: {message}; recovery data remains in {}",
-                    self.recovery.path.display()
-                ),
-                committed: true,
-                recovery_directory: Some(self.recovery.path.clone()),
-            });
+            return self.fail_after_checksum_commit(message, hook);
+        }
+
+        if let Err(message) = remove_corresponding_file(
+            &self.recovery,
+            ComponentKind::Checksum.staging_name(),
+            self.checksum_sentinel.identity,
+        )
+        .and_then(|()| self.recovery.sync())
+        {
+            return Err(self.committed_failure(format!(
+                "committed archive, but failed to clean the invalid checksum sentinel: {message}"
+            )));
         }
 
         let evidence = self
             .published_evidence
-            .expect("precommit bound archive evidence");
-
-        let recovery_directory = if self.mutations.iter().any(|mutation| {
-            matches!(
-                mutation,
-                Mutation::Removed { .. } | Mutation::InstalledReplacing { .. }
-            )
-        }) {
+            .expect("commit readiness bound archive evidence");
+        let retains_backups = self.initial.archive.is_some()
+            || self.initial.manifest.is_some()
+            || self.initial.checksum.is_some();
+        let recovery_directory = if retains_backups {
+            if let Err(message) =
+                require_recovery_binding(&self.destination, &self.recovery_name, &self.recovery)
+            {
+                return Err(self.committed_failure(format!(
+                    "committed archive, but the retained recovery directory changed: {message}"
+                )));
+            }
             Some(self.recovery.path.clone())
         } else {
             match remove_empty_recovery_directory(
@@ -800,13 +1019,9 @@ impl PublicationTransaction {
             ) {
                 Ok(()) => None,
                 Err(message) => {
-                    return Err(ArchivePublicationError {
-                        message: format!(
-                            "archive checksum was committed, but empty transaction cleanup failed: {message}"
-                        ),
-                        committed: true,
-                        recovery_directory: Some(self.recovery.path.clone()),
-                    });
+                    return Err(self.committed_failure(format!(
+                        "committed archive, but failed to remove empty recovery directory: {message}"
+                    )));
                 }
             }
         };
@@ -814,7 +1029,7 @@ impl PublicationTransaction {
         Ok(ArchivePublication {
             archive_path: self.destination.path.join(&self.destination_name),
             manifest_path: self
-                .installed_identity_optional(ComponentKind::Manifest)
+                .installed_manifest_identity
                 .map(|_| self.destination.path.join(&self.destination_manifest_name)),
             checksum_path: self.destination.path.join(&self.destination_checksum_name),
             recovery_directory,
@@ -822,113 +1037,161 @@ impl PublicationTransaction {
         })
     }
 
-    fn verify_staged(&self, staged: &StagedComponent) -> Result<(), String> {
-        let directory = self.directory(staged.directory_index);
-        require_expected_target(directory, &staged.name, Some(staged.identity))
+    fn fail_after_checksum_commit(
+        mut self,
+        cause: String,
+        hook: &mut dyn FnMut(PublishPhase) -> Result<(), String>,
+    ) -> Result<ArchivePublication, ArchivePublicationError> {
+        let Some(commit_mutation) = self
+            .mutations
+            .last()
+            .filter(|mutation| mutation.role() == MutationRole::ChecksumCommit)
+            .cloned()
+        else {
+            return Err(self.committed_failure(format!(
+                "post-commit failure has no checksum exchange journal: {cause}"
+            )));
+        };
+        if let Err(error) = self.reverse_mutation_namespace(&commit_mutation) {
+            return Err(self.committed_failure(format!(
+                "post-commit verification failed: {cause}; failed to replace the canonical checksum with the invalid sentinel: {error}"
+            )));
+        }
+        self.mutations.pop();
+
+        let mut invalidation_failures = Vec::new();
+        if let Err(error) = self.verify_reversed_mutation(&commit_mutation) {
+            invalidation_failures.push(error);
+        }
+        if let Err(error) = sync_all(&[&self.recovery, &self.destination]) {
+            invalidation_failures.push(error);
+        }
+        if !invalidation_failures.is_empty() {
+            return Err(self.committed_failure(format!(
+                "post-commit verification failed: {cause}; checksum invalidation could not be proven durable: {}",
+                invalidation_failures.join("; ")
+            )));
+        }
+        Err(self.rollback_error(
+            format!("post-commit verification failed after the checksum was durably invalidated: {cause}"),
+            hook,
+        ))
     }
 
+    fn committed_failure(&self, message: String) -> ArchivePublicationError {
+        ArchivePublicationError {
+            message: format!(
+                "{message}; publication state is indeterminate and recovery data remains in {}",
+                self.recovery.path.display()
+            ),
+            committed: true,
+            recovery_directory: Some(self.recovery.path.clone()),
+        }
+    }
+
+    fn verify_staged(&self, staged: &StagedComponent) -> Result<(), String> {
+        require_expected_target(
+            self.directory(staged.directory_index),
+            &staged.name,
+            Some(staged.identity),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn install_component(
         &mut self,
-        staged: StagedComponent,
+        kind: ComponentKind,
+        source_directory: DirectoryIndex,
+        source_name: std::ffi::OsString,
+        staged_identity: FileIdentity,
         destination_name: std::ffi::OsString,
         expected_target: Option<FileIdentity>,
-    ) -> Result<(), String> {
-        self.verify_staged(&staged)?;
+        install_phase: PublishPhase,
+        backup_phase: PublishPhase,
+        hook: &mut dyn FnMut(PublishPhase) -> Result<(), String>,
+    ) -> Result<FileIdentity, String> {
+        require_expected_target(
+            self.directory(source_directory),
+            &source_name,
+            Some(staged_identity),
+        )?;
         require_expected_target(&self.destination, &destination_name, expected_target)?;
-        let source_directory = self.directory(staged.directory_index);
         match expected_target {
             None => {
-                rename_noreplace(
-                    source_directory,
-                    &staged.name,
-                    &self.destination,
-                    &destination_name,
-                )
-                .map_err(|error| {
+                let mutation = Mutation::Rename {
+                    role: MutationRole::Data,
+                    source: NamespaceEntry {
+                        directory: source_directory,
+                        name: source_name.clone(),
+                    },
+                    destination: NamespaceEntry {
+                        directory: DirectoryIndex::Destination,
+                        name: destination_name.clone(),
+                    },
+                    identity: staged_identity,
+                };
+                self.perform_journaled_mutation(mutation).map_err(|error| {
                     format!(
                         "failed to install {} without replacing a concurrent target: {error}",
-                        staged.kind.label()
+                        kind.label()
                     )
                 })?;
+                hook(install_phase)?;
                 let new_identity =
-                    rebound_target_identity(&self.destination, &destination_name, staged.identity)?;
-                require_expected_target(source_directory, &staged.name, None)?;
-                self.mutations.push(Mutation::InstalledNew {
-                    kind: staged.kind,
-                    source_directory: staged.directory_index,
-                    source_name: staged.name,
-                    destination_name,
-                    new_identity,
-                });
+                    rebound_target_identity(&self.destination, &destination_name, staged_identity)?;
+                require_expected_target(self.directory(source_directory), &source_name, None)?;
+                Ok(new_identity)
             }
             Some(old_identity) => {
-                rename_exchange(
-                    source_directory,
-                    &staged.name,
-                    &self.destination,
-                    &destination_name,
-                )
-                .map_err(|error| format!("failed to exchange {}: {error}", staged.kind.label()))?;
+                let exchange = Mutation::Exchange {
+                    role: MutationRole::Data,
+                    left: NamespaceEntry {
+                        directory: source_directory,
+                        name: source_name.clone(),
+                    },
+                    right: NamespaceEntry {
+                        directory: DirectoryIndex::Destination,
+                        name: destination_name.clone(),
+                    },
+                    left_identity: staged_identity,
+                    right_identity: old_identity,
+                };
+                self.perform_journaled_mutation(exchange)
+                    .map_err(|error| format!("failed to exchange {}: {error}", kind.label()))?;
+                hook(install_phase)?;
                 let new_identity =
-                    rebound_target_identity(&self.destination, &destination_name, staged.identity);
-                let exchanged_old_identity =
-                    rebound_target_identity(source_directory, &staged.name, old_identity);
-                if new_identity.is_err() || exchanged_old_identity.is_err() {
-                    if new_identity.is_ok() {
-                        rename_exchange(
-                            &self.destination,
-                            &destination_name,
-                            source_directory,
-                            &staged.name,
-                        )
-                        .map_err(|error| {
-                            format!(
-                                "{} target changed during exchange and atomic restoration failed: {error}",
-                                staged.kind.label()
-                            )
-                        })?;
-                    }
-                    return Err(format!(
-                        "{} target changed concurrently during atomic exchange",
-                        staged.kind.label()
-                    ));
-                }
-                let new_identity = new_identity.expect("checked above");
-                let exchanged_old_identity = exchanged_old_identity.expect("checked above");
-                let backup_name = staged.kind.backup_name();
-                if let Err(error) =
-                    rename_noreplace(source_directory, &staged.name, &self.recovery, backup_name)
-                {
-                    rename_exchange(
-                        &self.destination,
-                        &destination_name,
-                        source_directory,
-                        &staged.name,
-                    )
-                    .map_err(|restore_error| {
-                        format!(
-                            "failed to retain replaced {}: {error}; atomic restoration also failed: {restore_error}",
-                            staged.kind.label()
-                        )
-                    })?;
-                    return Err(format!(
-                        "failed to retain replaced {}: {error}",
-                        staged.kind.label()
-                    ));
-                }
-                let old_identity =
-                    rebound_target_identity(&self.recovery, backup_name, exchanged_old_identity)?;
-                self.mutations.push(Mutation::InstalledReplacing {
-                    kind: staged.kind,
-                    source_directory: staged.directory_index,
-                    source_name: staged.name,
-                    destination_name,
-                    new_identity,
+                    rebound_target_identity(&self.destination, &destination_name, staged_identity)?;
+                let exchanged_old_identity = rebound_target_identity(
+                    self.directory(source_directory),
+                    &source_name,
                     old_identity,
-                });
+                )?;
+
+                let backup = Mutation::Rename {
+                    role: MutationRole::Data,
+                    source: NamespaceEntry {
+                        directory: source_directory,
+                        name: source_name.clone(),
+                    },
+                    destination: NamespaceEntry {
+                        directory: DirectoryIndex::Recovery,
+                        name: kind.backup_name().to_os_string(),
+                    },
+                    identity: exchanged_old_identity,
+                };
+                self.perform_journaled_mutation(backup).map_err(|error| {
+                    format!("failed to retain replaced {}: {error}", kind.label())
+                })?;
+                hook(backup_phase)?;
+                rebound_target_identity(
+                    &self.recovery,
+                    kind.backup_name(),
+                    exchanged_old_identity,
+                )?;
+                require_expected_target(self.directory(source_directory), &source_name, None)?;
+                Ok(new_identity)
             }
         }
-        Ok(())
     }
 
     fn remove_destination_to_backup(
@@ -936,82 +1199,127 @@ impl PublicationTransaction {
         kind: ComponentKind,
         destination_name: std::ffi::OsString,
         expected_identity: FileIdentity,
+        phase: PublishPhase,
+        hook: &mut dyn FnMut(PublishPhase) -> Result<(), String>,
     ) -> Result<(), String> {
         require_expected_target(
             &self.destination,
             &destination_name,
             Some(expected_identity),
         )?;
-        let backup_name = kind.backup_name();
-        rename_noreplace(
-            &self.destination,
-            &destination_name,
-            &self.recovery,
-            backup_name,
-        )
-        .map_err(|error| format!("failed to retain previous {}: {error}", kind.label()))?;
-        let backup_identity =
-            rebound_target_identity(&self.recovery, backup_name, expected_identity);
-        if backup_identity.is_err() {
-            if target_matches(&self.destination, &destination_name, None)? {
-                rename_noreplace(
-                    &self.recovery,
-                    backup_name,
-                    &self.destination,
-                    &destination_name,
-                )
-                .map_err(|error| {
-                    format!(
-                        "{} changed during backup and restoration failed: {error}",
-                        kind.label()
-                    )
-                })?;
-            }
-            return Err(format!(
-                "{} changed concurrently while it was moved to recovery",
-                kind.label()
-            ));
+        let mutation = Mutation::Rename {
+            role: MutationRole::Data,
+            source: NamespaceEntry {
+                directory: DirectoryIndex::Destination,
+                name: destination_name.clone(),
+            },
+            destination: NamespaceEntry {
+                directory: DirectoryIndex::Recovery,
+                name: kind.backup_name().to_os_string(),
+            },
+            identity: expected_identity,
+        };
+        self.perform_journaled_mutation(mutation)
+            .map_err(|error| format!("failed to retain previous {}: {error}", kind.label()))?;
+        hook(phase)?;
+        rebound_target_identity(&self.recovery, kind.backup_name(), expected_identity)?;
+        require_expected_target(&self.destination, &destination_name, None)
+    }
+
+    fn perform_journaled_mutation(&mut self, mutation: Mutation) -> io::Result<()> {
+        match &mutation {
+            Mutation::Rename {
+                source,
+                destination,
+                ..
+            } => rename_noreplace(
+                self.directory(source.directory),
+                &source.name,
+                self.directory(destination.directory),
+                &destination.name,
+            )?,
+            Mutation::Exchange { left, right, .. } => rename_exchange(
+                self.directory(left.directory),
+                &left.name,
+                self.directory(right.directory),
+                &right.name,
+            )?,
         }
-        self.mutations.push(Mutation::Removed {
-            kind,
-            destination_name,
-            old_identity: backup_identity.expect("checked above"),
-        });
+        self.mutations.push(mutation);
         Ok(())
     }
 
+    fn refresh_published_evidence(&mut self) -> Result<(), String> {
+        let archive_identity = self
+            .installed_archive_identity
+            .ok_or_else(|| "archive was not installed".to_string())?;
+        require_expected_target(
+            &self.destination,
+            &self.destination_name,
+            Some(archive_identity),
+        )?;
+        let rebound = rebind_validated_after_rename(&self.archive_staged.file, self.evidence)
+            .map_err(|error| {
+                format!("published archive changed across controlled rename: {error}")
+            })?;
+        self.published_evidence = Some(rebound);
+        Ok(())
+    }
+
+    fn verify_commit_ready(&mut self) -> Result<(), String> {
+        self.source.recheck_path()?;
+        self.destination.recheck_path()?;
+        require_recovery_binding(&self.destination, &self.recovery_name, &self.recovery)?;
+        self.refresh_published_evidence()?;
+        require_expected_target(
+            &self.destination,
+            &self.destination_manifest_name,
+            self.installed_manifest_identity,
+        )?;
+        require_expected_target(
+            &self.destination,
+            &self.destination_checksum_name,
+            Some(self.checksum_sentinel.identity),
+        )?;
+        require_expected_target(
+            &self.recovery,
+            ComponentKind::Checksum.staging_name(),
+            Some(self.checksum_staged.identity),
+        )
+    }
+
+    fn verify_committed_namespace(&mut self) -> Result<(), String> {
+        self.source.recheck_path()?;
+        self.destination.recheck_path()?;
+        require_recovery_binding(&self.destination, &self.recovery_name, &self.recovery)?;
+        self.refresh_published_evidence()?;
+        require_expected_target(
+            &self.destination,
+            &self.destination_manifest_name,
+            self.installed_manifest_identity,
+        )?;
+        require_expected_target(
+            &self.destination,
+            &self.destination_checksum_name,
+            Some(self.checksum_staged.identity),
+        )?;
+        require_expected_target(
+            &self.recovery,
+            ComponentKind::Checksum.staging_name(),
+            Some(self.checksum_sentinel.identity),
+        )
+    }
+
     fn sync_mutation_directories(&self) -> Result<(), String> {
-        self.source.sync()?;
-        self.recovery.sync()?;
-        self.destination.sync()
+        sync_all(&[&self.source, &self.recovery, &self.destination])
     }
 
-    fn installed_identity(&self, kind: ComponentKind) -> Result<FileIdentity, String> {
-        self.installed_identity_optional(kind)
-            .ok_or_else(|| format!("{} was not installed", kind.label()))
-    }
-
-    fn installed_identity_optional(&self, kind: ComponentKind) -> Option<FileIdentity> {
-        self.mutations
-            .iter()
-            .rev()
-            .find_map(|mutation| match mutation {
-                Mutation::InstalledNew {
-                    kind: mutation_kind,
-                    new_identity,
-                    ..
-                }
-                | Mutation::InstalledReplacing {
-                    kind: mutation_kind,
-                    new_identity,
-                    ..
-                } if *mutation_kind == kind => Some(*new_identity),
-                _ => None,
-            })
-    }
-
-    fn rollback_error(mut self, cause: String) -> ArchivePublicationError {
-        let rollback = self.rollback();
+    fn rollback_error(
+        mut self,
+        cause: String,
+        hook: &mut dyn FnMut(PublishPhase) -> Result<(), String>,
+    ) -> ArchivePublicationError {
+        let rollback = self.rollback(hook);
         match rollback {
             Ok(()) => ArchivePublicationError {
                 message: format!(
@@ -1022,7 +1330,7 @@ impl PublicationTransaction {
             },
             Err(rollback_error) => ArchivePublicationError {
                 message: format!(
-                    "archive publication failed before checksum commit: {cause}; rollback could not restore the exact initial namespace: {rollback_error}; recovery data remains in {}",
+                    "archive publication failed with no durable canonical checksum: {cause}; rollback could not restore the exact initial namespace: {rollback_error}; recovery data remains in {}",
                     self.recovery.path.display()
                 ),
                 committed: false,
@@ -1031,157 +1339,263 @@ impl PublicationTransaction {
         }
     }
 
-    fn rollback(&mut self) -> Result<(), String> {
-        let mut failures = Vec::new();
-        let mut checksum_mutation = None;
-        while let Some(mutation) = self.mutations.pop() {
-            if matches!(
-                mutation,
-                Mutation::Removed {
-                    kind: ComponentKind::Checksum,
-                    ..
-                }
-            ) {
-                checksum_mutation = Some(mutation);
-                continue;
-            }
-            if let Err(error) = self.rollback_mutation(&mutation) {
-                failures.push(error);
-            }
+    fn rollback(
+        &mut self,
+        hook: &mut dyn FnMut(PublishPhase) -> Result<(), String>,
+    ) -> Result<(), String> {
+        if self
+            .mutations
+            .iter()
+            .any(|mutation| mutation.role() == MutationRole::ChecksumCommit)
+        {
+            return Err(
+                "canonical checksum is still installed; refusing data rollback".to_string(),
+            );
         }
 
-        let data_matches_initial = failures.is_empty()
-            && target_corresponds(
-                &self.destination,
-                &self.destination_name,
-                self.initial.archive,
-            )
-            .unwrap_or(false)
-            && target_corresponds(
-                &self.destination,
-                &self.destination_manifest_name,
-                self.initial.manifest,
-            )
-            .unwrap_or(false);
-        if let Some(mutation) = checksum_mutation {
-            if data_matches_initial {
-                if let Err(error) = self.rollback_mutation(&mutation) {
-                    failures.push(error);
+        let data_mutations = self
+            .mutations
+            .iter()
+            .rev()
+            .filter(|mutation| mutation.role() == MutationRole::Data)
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut failures = Vec::new();
+        for mutation in &data_mutations {
+            match self.reverse_mutation_namespace(mutation) {
+                Ok(()) => {
+                    if let Err(error) = self.verify_reversed_mutation(mutation) {
+                        failures.push(error);
+                    }
                 }
-            } else {
-                failures.push(
-                    "previous checksum remains in recovery because destination data changed concurrently"
-                        .to_string(),
-                );
-            }
-        } else {
-            match target_corresponds(
-                &self.destination,
-                &self.destination_checksum_name,
-                self.initial.checksum,
-            ) {
-                Ok(true) => {}
-                Ok(false) => failures
-                    .push("checksum target changed concurrently during rollback".to_string()),
                 Err(error) => failures.push(error),
             }
         }
 
-        if failures.is_empty() {
-            if let Some(identity) = self.manifest_staging_identity
-                && let Err(error) = remove_corresponding_file(
-                    &self.recovery,
-                    ComponentKind::Manifest.staging_name(),
-                    identity,
-                )
-            {
+        if let Err(error) = hook(PublishPhase::BeforeRollbackDataSync) {
+            failures.push(format!(
+                "rollback data durability barrier was rejected: {error}"
+            ));
+        }
+        if let Err(error) = self.sync_mutation_directories() {
+            failures.push(error);
+        }
+        if let Err(error) = self.verify_initial_data_namespace() {
+            failures.push(error);
+        }
+        if failures.is_empty()
+            && let Err(error) = hook(PublishPhase::AfterRollbackDataSync)
+        {
+            failures.push(error);
+        }
+        if !failures.is_empty() {
+            return Err(failures.join("; "));
+        }
+
+        if let Some(reservation) = self
+            .mutations
+            .iter()
+            .find(|mutation| mutation.role() == MutationRole::ChecksumReservation)
+            .cloned()
+        {
+            self.reverse_mutation_namespace(&reservation)?;
+            if let Err(error) = hook(PublishPhase::AfterChecksumRestoreMutation) {
                 failures.push(error);
             }
-            if let Err(error) = remove_corresponding_file(
-                &self.recovery,
-                ComponentKind::Checksum.staging_name(),
-                self.checksum_staging_identity,
-            ) {
+            if let Err(error) = self.verify_reversed_mutation(&reservation) {
                 failures.push(error);
+            }
+            collect_sync_failures(&[&self.recovery, &self.destination], &mut failures);
+            if let Err(error) = hook(PublishPhase::AfterChecksumRollbackSync) {
+                failures.push(error);
+            }
+        } else if let Err(error) = target_corresponds(
+            &self.destination,
+            &self.destination_checksum_name,
+            self.initial.checksum,
+        )
+        .and_then(|matches| {
+            matches
+                .then_some(())
+                .ok_or_else(|| "checksum changed before rollback".to_string())
+        }) {
+            failures.push(error);
+        }
+        if !failures.is_empty() {
+            return Err(failures.join("; "));
+        }
+
+        self.verify_initial_namespace()?;
+        let mut cleanup_failures = Vec::new();
+        if let Some(identity) = self.manifest_staging_identity
+            && let Err(error) = remove_corresponding_file(
+                &self.recovery,
+                ComponentKind::Manifest.staging_name(),
+                identity,
+            )
+        {
+            cleanup_failures.push(error);
+        }
+        for (name, identity) in [
+            (
+                ComponentKind::Checksum.staging_name(),
+                self.checksum_staged.identity,
+            ),
+            (
+                ComponentKind::Checksum.backup_name(),
+                self.checksum_sentinel.identity,
+            ),
+        ] {
+            if let Err(error) = remove_corresponding_file(&self.recovery, name, identity) {
+                cleanup_failures.push(error);
             }
         }
-        if failures.is_empty() {
-            if let Err(error) = self.sync_mutation_directories() {
-                failures.push(error);
-            } else if let Err(error) = remove_empty_recovery_directory(
+        collect_sync_failures(&[&self.recovery, &self.destination], &mut cleanup_failures);
+        if cleanup_failures.is_empty()
+            && let Err(error) = remove_empty_recovery_directory(
                 &self.destination,
                 &self.recovery_name,
                 &self.recovery,
-            ) {
-                failures.push(error);
-            }
+            )
+        {
+            cleanup_failures.push(error);
         }
-        if failures.is_empty() {
+        if cleanup_failures.is_empty() {
             Ok(())
         } else {
-            Err(failures.join("; "))
+            Err(cleanup_failures.join("; "))
         }
     }
 
-    fn rollback_mutation(&self, mutation: &Mutation) -> Result<(), String> {
+    fn verify_initial_data_namespace(&self) -> Result<(), String> {
+        require_corresponding_target(
+            &self.destination,
+            &self.destination_name,
+            self.initial.archive,
+            "archive",
+        )?;
+        require_corresponding_target(
+            &self.destination,
+            &self.destination_manifest_name,
+            self.initial.manifest,
+            "segment manifest",
+        )?;
+        require_corresponding_target(
+            &self.source,
+            &self.archive_staged.name,
+            Some(self.archive_staged.identity),
+            "staged archive",
+        )
+    }
+
+    fn verify_initial_namespace(&self) -> Result<(), String> {
+        self.verify_initial_data_namespace()?;
+        require_corresponding_target(
+            &self.destination,
+            &self.destination_checksum_name,
+            self.initial.checksum,
+            "checksum",
+        )
+    }
+
+    fn reverse_mutation_namespace(&self, mutation: &Mutation) -> Result<(), String> {
         match mutation {
-            Mutation::Removed {
-                kind,
-                destination_name,
-                old_identity,
+            Mutation::Rename {
+                source,
+                destination,
+                identity,
+                ..
             } => {
-                require_expected_target(&self.destination, destination_name, None)?;
-                require_expected_target(&self.recovery, kind.backup_name(), Some(*old_identity))?;
-                rename_noreplace(
-                    &self.recovery,
-                    kind.backup_name(),
-                    &self.destination,
-                    destination_name,
-                )
-                .map_err(|error| format!("failed to restore previous {}: {error}", kind.label()))?;
-                rebound_target_identity(&self.destination, destination_name, *old_identity)
-                    .map(|_| ())
-            }
-            Mutation::InstalledNew {
-                kind,
-                source_directory,
-                source_name,
-                destination_name,
-                new_identity,
-            } => {
-                let source = self.directory(*source_directory);
-                require_expected_target(source, source_name, None)?;
-                require_expected_target(&self.destination, destination_name, Some(*new_identity))?;
-                rename_noreplace(&self.destination, destination_name, source, source_name)
-                    .map_err(|error| {
-                        format!("failed to return staged {}: {error}", kind.label())
-                    })?;
-                rebound_target_identity(source, source_name, *new_identity).map(|_| ())
-            }
-            Mutation::InstalledReplacing {
-                kind,
-                source_directory,
-                source_name,
-                destination_name,
-                new_identity,
-                old_identity,
-            } => {
-                let source = self.directory(*source_directory);
-                require_expected_target(source, source_name, None)?;
-                require_expected_target(&self.destination, destination_name, Some(*new_identity))?;
-                require_expected_target(&self.recovery, kind.backup_name(), Some(*old_identity))?;
-                rename_exchange(
-                    &self.destination,
-                    destination_name,
-                    &self.recovery,
-                    kind.backup_name(),
-                )
-                .map_err(|error| format!("failed to restore previous {}: {error}", kind.label()))?;
-                rename_noreplace(&self.recovery, kind.backup_name(), source, source_name).map_err(
-                    |error| format!("failed to return staged {}: {error}", kind.label()),
+                require_corresponding_target(
+                    self.directory(source.directory),
+                    &source.name,
+                    None,
+                    "rollback rename source",
                 )?;
-                rebound_target_identity(&self.destination, destination_name, *old_identity)?;
-                rebound_target_identity(source, source_name, *new_identity).map(|_| ())
+                require_corresponding_target(
+                    self.directory(destination.directory),
+                    &destination.name,
+                    Some(*identity),
+                    "rollback rename destination",
+                )?;
+                rename_noreplace(
+                    self.directory(destination.directory),
+                    &destination.name,
+                    self.directory(source.directory),
+                    &source.name,
+                )
+                .map_err(|error| format!("failed to reverse namespace rename: {error}"))
+            }
+            Mutation::Exchange {
+                left,
+                right,
+                left_identity,
+                right_identity,
+                ..
+            } => {
+                require_corresponding_target(
+                    self.directory(left.directory),
+                    &left.name,
+                    Some(*right_identity),
+                    "rollback exchange left",
+                )?;
+                require_corresponding_target(
+                    self.directory(right.directory),
+                    &right.name,
+                    Some(*left_identity),
+                    "rollback exchange right",
+                )?;
+                rename_exchange(
+                    self.directory(left.directory),
+                    &left.name,
+                    self.directory(right.directory),
+                    &right.name,
+                )
+                .map_err(|error| format!("failed to reverse namespace exchange: {error}"))
+            }
+        }
+    }
+
+    fn verify_reversed_mutation(&self, mutation: &Mutation) -> Result<(), String> {
+        match mutation {
+            Mutation::Rename {
+                source,
+                destination,
+                identity,
+                ..
+            } => {
+                require_corresponding_target(
+                    self.directory(source.directory),
+                    &source.name,
+                    Some(*identity),
+                    "reversed rename source",
+                )?;
+                require_corresponding_target(
+                    self.directory(destination.directory),
+                    &destination.name,
+                    None,
+                    "reversed rename destination",
+                )
+            }
+            Mutation::Exchange {
+                left,
+                right,
+                left_identity,
+                right_identity,
+                ..
+            } => {
+                require_corresponding_target(
+                    self.directory(left.directory),
+                    &left.name,
+                    Some(*left_identity),
+                    "reversed exchange left",
+                )?;
+                require_corresponding_target(
+                    self.directory(right.directory),
+                    &right.name,
+                    Some(*right_identity),
+                    "reversed exchange right",
+                )
             }
         }
     }
@@ -1195,21 +1609,53 @@ fn preflight_error(message: String) -> ArchivePublicationError {
     }
 }
 
+fn preflight_error_with_recovery(
+    message: String,
+    recovery_directory: Option<PathBuf>,
+) -> ArchivePublicationError {
+    ArchivePublicationError {
+        message: format!("archive publication preflight failed: {message}"),
+        committed: false,
+        recovery_directory,
+    }
+}
+
 fn cleanup_preflight_error(
     message: String,
     destination: &BoundDirectory,
     recovery_name: &OsStr,
+    recovery: &BoundDirectory,
+    staged_files: &[(std::ffi::OsString, FileIdentity)],
 ) -> ArchivePublicationError {
-    let cleanup = remove_recovery_directory_tree(destination, recovery_name);
-    preflight_error(match cleanup {
-        Ok(()) => message,
-        Err(cleanup) => format!("{message}; failed to remove unused recovery directory: {cleanup}"),
-    })
+    match cleanup_unused_recovery_directory(destination, recovery_name, recovery, staged_files) {
+        Ok(()) => preflight_error(message),
+        Err(cleanup) => preflight_error_with_recovery(
+            format!("{message}; failed to remove unused recovery directory: {cleanup}"),
+            Some(recovery.path.clone()),
+        ),
+    }
 }
 
 fn effective_user_id() -> u32 {
     // SAFETY: geteuid has no preconditions.
     unsafe { libc::geteuid() }
+}
+
+fn require_compatible_directories(
+    source: &BoundDirectory,
+    destination: &BoundDirectory,
+) -> Result<(), String> {
+    if source.identity.dev != destination.identity.dev {
+        return Err(format!(
+            "staging {} and destination {} are on different filesystems",
+            source.path.display(),
+            destination.path.display()
+        ));
+    }
+    if source.identity.ino == destination.identity.ino {
+        return Err("staging and destination directories must differ".to_string());
+    }
+    Ok(())
 }
 
 fn safe_file_name(path: &Path) -> Result<std::ffi::OsString, String> {
@@ -1238,29 +1684,26 @@ fn bind_optional_regular(
     name: &OsStr,
     kind: ComponentKind,
 ) -> Result<Option<BoundFile>, String> {
-    directory.recheck_path()?;
     let full_path = directory.path.join(name);
-    let path_metadata = match fs::symlink_metadata(&full_path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            match openat_readonly(directory.file.as_raw_fd(), name) {
-                Err(open_error) if open_error.kind() == io::ErrorKind::NotFound => return Ok(None),
-                Ok(_) => {
-                    return Err(format!(
-                        "{} appeared while absence was checked: {}",
-                        kind.label(),
-                        full_path.display()
-                    ));
-                }
-                Err(open_error) => {
-                    return Err(format!(
-                        "failed to confirm absent {} {}: {open_error}",
-                        kind.label(),
-                        full_path.display()
-                    ));
-                }
+    let entry_identity = match fstatat_identity(directory.file.as_raw_fd(), name) {
+        Ok(Some(identity)) => identity,
+        Ok(None) => match openat_readonly(directory.file.as_raw_fd(), name) {
+            Err(open_error) if open_error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Ok(_) => {
+                return Err(format!(
+                    "{} appeared while absence was checked: {}",
+                    kind.label(),
+                    full_path.display()
+                ));
             }
-        }
+            Err(open_error) => {
+                return Err(format!(
+                    "failed to confirm absent {} {}: {open_error}",
+                    kind.label(),
+                    full_path.display()
+                ));
+            }
+        },
         Err(error) => {
             return Err(format!(
                 "failed to inspect {} {}: {error}",
@@ -1269,7 +1712,7 @@ fn bind_optional_regular(
             ));
         }
     };
-    if !path_metadata.file_type().is_file() {
+    if entry_identity.mode & libc::S_IFMT != libc::S_IFREG {
         return Err(format!(
             "{} path is not a regular file: {}",
             kind.label(),
@@ -1290,9 +1733,8 @@ fn bind_optional_regular(
             full_path.display()
         )
     })?;
-    let path_identity = FileIdentity::from_metadata(&path_metadata);
     let identity = FileIdentity::from_metadata(&descriptor_metadata);
-    if path_identity != identity {
+    if entry_identity != identity {
         return Err(format!(
             "{} changed while it was opened: {}",
             kind.label(),
@@ -1347,7 +1789,9 @@ fn validate_bound_manifest(
     archive_path: &Path,
     archive: &BoundFile,
     evidence: ValidatedArchiveFile,
+    source: &BoundDirectory,
     manifest_path: &Path,
+    manifest_name: &OsStr,
     manifest: &BoundFile,
 ) -> Result<Vec<u8>, String> {
     if manifest.identity.len > MAX_SEGMENT_MANIFEST_BYTES {
@@ -1393,10 +1837,10 @@ fn validate_bound_manifest(
         != evidence.identity
         || !path_matches_archive_identity(archive_path, evidence.identity)
             .map_err(|error| format!("failed to recheck archive path: {error}"))?
-        || !path_matches_generic_identity(manifest_path, manifest.identity)?
     {
         return Err("archive or segment manifest changed during sidecar validation".to_string());
     }
+    recheck_bound_file(source, manifest_name, manifest.identity)?;
     Ok(bytes)
 }
 
@@ -1422,21 +1866,14 @@ fn read_bound_file(file: &File, max_len: u64) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
-fn path_matches_generic_identity(path: &Path, expected: FileIdentity) -> Result<bool, String> {
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => {
-            return Err(format!("failed to inspect {}: {error}", path.display()));
-        }
-    };
-    Ok(metadata.file_type().is_file() && FileIdentity::from_metadata(&metadata) == expected)
+struct RecoveryDirectoryError {
+    message: String,
+    recovery_directory: Option<PathBuf>,
 }
 
 fn create_recovery_directory(
     destination: &BoundDirectory,
-    _archive_name: &OsStr,
-) -> Result<(std::ffi::OsString, BoundDirectory), String> {
+) -> Result<(std::ffi::OsString, BoundDirectory), RecoveryDirectoryError> {
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -1446,7 +1883,10 @@ fn create_recovery_directory(
             ".jetstreamer-recovery-{}-{timestamp}-{sequence}",
             std::process::id()
         ));
-        let name_c = os_str_cstring(&name).map_err(|error| error.to_string())?;
+        let name_c = os_str_cstring(&name).map_err(|error| RecoveryDirectoryError {
+            message: error.to_string(),
+            recovery_directory: None,
+        })?;
         // SAFETY: the directory descriptor and NUL-terminated basename are
         // valid. The destination directory is held open for the transaction.
         let result = unsafe {
@@ -1461,69 +1901,303 @@ fn create_recovery_directory(
             if error.kind() == io::ErrorKind::AlreadyExists {
                 continue;
             }
-            return Err(format!("failed to create recovery directory: {error}"));
+            return Err(RecoveryDirectoryError {
+                message: format!("failed to create recovery directory: {error}"),
+                recovery_directory: None,
+            });
         }
         let path = destination.path.join(&name);
-        let recovery = BoundDirectory::bind(&path, DirectoryPolicy::PrivateRecovery)?;
+        let recovery = BoundDirectory::bind_child(
+            destination,
+            &name,
+            path.clone(),
+            DirectoryPolicy::PrivateRecovery,
+        )
+        .map_err(|message| RecoveryDirectoryError {
+            message,
+            recovery_directory: Some(path.clone()),
+        })?;
         if recovery.identity.dev != destination.identity.dev {
-            return Err("recovery directory is on a different filesystem".to_string());
+            return Err(RecoveryDirectoryError {
+                message: "recovery directory is on a different filesystem".to_string(),
+                recovery_directory: Some(path),
+            });
         }
-        destination.sync()?;
+        if let Err(message) = destination.sync() {
+            let cleanup = remove_empty_recovery_directory(destination, &name, &recovery);
+            let recovery_directory = cleanup.as_ref().err().map(|_| recovery.path.clone());
+            return Err(RecoveryDirectoryError {
+                message: match &cleanup {
+                    Ok(()) => message,
+                    Err(cleanup) => format!(
+                        "{message}; failed to remove recovery directory after sync failure: {cleanup}"
+                    ),
+                },
+                recovery_directory,
+            });
+        }
         return Ok((name, recovery));
     }
-    Err("could not allocate a unique recovery directory".to_string())
+    Err(RecoveryDirectoryError {
+        message: "could not allocate a unique recovery directory".to_string(),
+        recovery_directory: None,
+    })
 }
 
-fn create_recovery_staging_file(
+fn create_recovery_file(
     recovery: &BoundDirectory,
     kind: ComponentKind,
+    name: &OsStr,
     contents: &[u8],
     destination_gid: u32,
 ) -> Result<StagedComponent, String> {
-    let name = kind.staging_name().to_os_string();
-    let path = recovery.path.join(&name);
-    let mut file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create_new(true)
-        .mode(0o400)
-        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
-        .open(&path)
-        .map_err(|error| format!("failed to create staged {}: {error}", kind.label()))?;
-    file.write_all(contents)
-        .and_then(|()| file.flush())
-        .map_err(|error| format!("failed to write staged {}: {error}", kind.label()))?;
-    // SAFETY: `file` is a live regular-file descriptor. -1 preserves uid.
-    if unsafe {
-        libc::fchown(
-            file.as_raw_fd(),
-            !0 as libc::uid_t,
-            destination_gid as libc::gid_t,
-        )
-    } != 0
-    {
-        return Err(format!(
-            "failed to assign destination group to staged {}: {}",
-            kind.label(),
-            io::Error::last_os_error()
-        ));
-    }
-    file.set_permissions(fs::Permissions::from_mode(FINAL_FILE_MODE))
-        .and_then(|()| file.sync_all())
-        .map_err(|error| format!("failed to sync staged {}: {error}", kind.label()))?;
-    let identity = FileIdentity::from_metadata(
-        &file
-            .metadata()
-            .map_err(|error| format!("failed to inspect staged {}: {error}", kind.label()))?,
-    );
-    require_safe_regular(identity, Some(destination_gid), kind, &path)?;
+    let name = name.to_os_string();
+    let bound = create_bound_file(
+        recovery,
+        kind,
+        &name,
+        contents,
+        Some(destination_gid),
+        FINAL_FILE_MODE,
+    )?;
     Ok(StagedComponent {
         kind,
         directory_index: DirectoryIndex::Recovery,
         name,
-        file,
-        identity,
+        file: bound.file,
+        identity: bound.identity,
     })
+}
+
+fn create_bound_file(
+    directory: &BoundDirectory,
+    kind: ComponentKind,
+    name: &OsStr,
+    contents: &[u8],
+    expected_gid: Option<u32>,
+    final_mode: u32,
+) -> Result<BoundFile, String> {
+    let path = directory.path.join(name);
+    let mut file = openat_create(directory.file.as_raw_fd(), name, 0o400)
+        .map_err(|error| format!("failed to create staged {}: {error}", kind.label()))?;
+    let operation = (|| {
+        file.write_all(contents)
+            .and_then(|()| file.flush())
+            .map_err(|error| format!("failed to write staged {}: {error}", kind.label()))?;
+        if let Some(gid) = expected_gid {
+            assign_destination_group(&file, gid).map_err(|error| {
+                format!(
+                    "failed to assign destination group to staged {}: {error}",
+                    kind.label()
+                )
+            })?;
+        }
+        file.set_permissions(fs::Permissions::from_mode(final_mode))
+            .and_then(|()| file.sync_all())
+            .map_err(|error| format!("failed to sync staged {}: {error}", kind.label()))?;
+        let identity = FileIdentity::from_metadata(
+            &file
+                .metadata()
+                .map_err(|error| format!("failed to inspect staged {}: {error}", kind.label()))?,
+        );
+        require_safe_regular(identity, expected_gid, kind, &path)?;
+        require_expected_target(directory, name, Some(identity))?;
+        Ok(identity)
+    })();
+    match operation {
+        Ok(identity) => Ok(BoundFile { file, identity }),
+        Err(message) => {
+            let mut cleanup_failures = Vec::new();
+            if let Err(error) = file
+                .metadata()
+                .map(|metadata| FileIdentity::from_metadata(&metadata))
+                .map_err(|error| format!("failed to identify partial staged file: {error}"))
+                .and_then(|identity| unlink_corresponding_entry(directory, name, identity))
+            {
+                cleanup_failures.push(error);
+            }
+            collect_sync_failures(&[directory], &mut cleanup_failures);
+            if cleanup_failures.is_empty() {
+                Err(message)
+            } else {
+                Err(format!(
+                    "{message}; failed to remove partial staged file {}: {}",
+                    path.display(),
+                    cleanup_failures.join("; ")
+                ))
+            }
+        }
+    }
+}
+
+fn assign_destination_group(file: &File, gid: u32) -> io::Result<()> {
+    #[cfg(test)]
+    if let Some(errno) = FCHOWN_FAULT.with(|fault| fault.take()) {
+        return Err(io::Error::from_raw_os_error(errno));
+    }
+    // SAFETY: file is live; -1 preserves uid and gid is supplied by a bound
+    // destination directory.
+    if unsafe { libc::fchown(file.as_raw_fd(), !0 as libc::uid_t, gid as libc::gid_t) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+fn probe_rename_capabilities(
+    source: &BoundDirectory,
+    recovery: &BoundDirectory,
+    destination_gid: u32,
+) -> Result<(), String> {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let source_name = std::ffi::OsString::from(format!(
+        ".jetstreamer-{}-{}-{timestamp}",
+        CAPABILITY_PROBE_A,
+        std::process::id()
+    ));
+    let recovery_name = std::ffi::OsString::from(format!(
+        ".jetstreamer-{}-{}-{timestamp}",
+        CAPABILITY_PROBE_B,
+        std::process::id()
+    ));
+    let moved_name = std::ffi::OsString::from(format!(
+        ".jetstreamer-{}-{}-{timestamp}",
+        CAPABILITY_PROBE_MOVED,
+        std::process::id()
+    ));
+    let source_file = create_bound_file(
+        source,
+        ComponentKind::Checksum,
+        &source_name,
+        b"source rename probe\n",
+        Some(destination_gid),
+        FINAL_FILE_MODE,
+    )?;
+    let recovery_file = match create_bound_file(
+        recovery,
+        ComponentKind::Checksum,
+        &recovery_name,
+        b"destination rename probe\n",
+        Some(destination_gid),
+        FINAL_FILE_MODE,
+    ) {
+        Ok(file) => file,
+        Err(error) => {
+            let mut cleanup_failures = Vec::new();
+            if let Err(cleanup) =
+                unlink_corresponding_entry(source, &source_name, source_file.identity)
+            {
+                cleanup_failures.push(cleanup);
+            }
+            collect_sync_failures(&[source], &mut cleanup_failures);
+            return if cleanup_failures.is_empty() {
+                Err(error)
+            } else {
+                Err(format!(
+                    "{error}; probe cleanup failed: {}",
+                    cleanup_failures.join("; ")
+                ))
+            };
+        }
+    };
+    let probe = (|| {
+        sync_all(&[source, recovery])?;
+        rename_noreplace(source, &source_name, recovery, &moved_name)
+            .map_err(|error| format!("RENAME_NOREPLACE is unavailable: {error}"))?;
+        require_corresponding_target(
+            recovery,
+            &moved_name,
+            Some(source_file.identity),
+            "moved rename probe",
+        )?;
+        rename_noreplace(recovery, &moved_name, source, &source_name)
+            .map_err(|error| format!("cross-directory RENAME_NOREPLACE failed: {error}"))?;
+        require_corresponding_target(
+            source,
+            &source_name,
+            Some(source_file.identity),
+            "returned rename probe",
+        )?;
+        rename_exchange(source, &source_name, recovery, &recovery_name)
+            .map_err(|error| format!("cross-directory RENAME_EXCHANGE is unavailable: {error}"))?;
+        require_corresponding_target(
+            source,
+            &source_name,
+            Some(recovery_file.identity),
+            "exchanged source probe",
+        )?;
+        require_corresponding_target(
+            recovery,
+            &recovery_name,
+            Some(source_file.identity),
+            "exchanged recovery probe",
+        )?;
+        rename_exchange(source, &source_name, recovery, &recovery_name)
+            .map_err(|error| format!("failed to restore RENAME_EXCHANGE probe: {error}"))?;
+        sync_all(&[source, recovery])
+    })();
+
+    let mut cleanup_failures = Vec::new();
+    cleanup_probe_identity(
+        source,
+        &[&source_name],
+        &[source_file.identity, recovery_file.identity],
+        &mut cleanup_failures,
+    );
+    cleanup_probe_identity(
+        recovery,
+        &[&recovery_name, &moved_name],
+        &[source_file.identity, recovery_file.identity],
+        &mut cleanup_failures,
+    );
+    collect_sync_failures(&[source, recovery], &mut cleanup_failures);
+    match (probe, cleanup_failures.is_empty()) {
+        (Ok(()), true) => Ok(()),
+        (Ok(()), false) => Err(format!(
+            "rename capability probe cleanup failed: {}",
+            cleanup_failures.join("; ")
+        )),
+        (Err(error), true) => Err(error),
+        (Err(error), false) => Err(format!(
+            "{error}; rename capability probe cleanup failed: {}",
+            cleanup_failures.join("; ")
+        )),
+    }
+}
+
+fn cleanup_probe_identity(
+    directory: &BoundDirectory,
+    names: &[&OsStr],
+    identities: &[FileIdentity],
+    failures: &mut Vec<String>,
+) {
+    for name in names {
+        match fstatat_identity(directory.file.as_raw_fd(), name) {
+            Ok(None) => {}
+            Ok(Some(observed)) => {
+                if identities
+                    .iter()
+                    .any(|identity| observed.same_across_rename(*identity))
+                {
+                    if let Err(error) = unlink_corresponding_entry(directory, name, observed) {
+                        failures.push(error);
+                    }
+                } else {
+                    failures.push(format!(
+                        "refusing to remove changed rename probe {}",
+                        directory.path.join(name).display()
+                    ));
+                }
+            }
+            Err(error) => failures.push(format!(
+                "failed to inspect rename probe {}: {error}",
+                directory.path.join(name).display()
+            )),
+        }
+    }
 }
 
 fn require_expected_target(
@@ -1541,14 +2215,6 @@ fn require_expected_target(
     }
 }
 
-fn target_matches(
-    directory: &BoundDirectory,
-    name: &OsStr,
-    expected: Option<FileIdentity>,
-) -> Result<bool, String> {
-    Ok(target_identity(directory, name)? == expected)
-}
-
 fn target_corresponds(
     directory: &BoundDirectory,
     name: &OsStr,
@@ -1558,6 +2224,73 @@ fn target_corresponds(
         (None, None) => Ok(true),
         (Some(observed), Some(expected)) => Ok(observed.same_across_rename(expected)),
         _ => Ok(false),
+    }
+}
+
+fn require_corresponding_target(
+    directory: &BoundDirectory,
+    name: &OsStr,
+    expected: Option<FileIdentity>,
+    label: &str,
+) -> Result<(), String> {
+    if target_corresponds(directory, name, expected)? {
+        Ok(())
+    } else {
+        Err(format!(
+            "{label} does not correspond to the expected inode: {}",
+            directory.path.join(name).display()
+        ))
+    }
+}
+
+fn sync_all(directories: &[&BoundDirectory]) -> Result<(), String> {
+    let mut failures = Vec::new();
+    collect_sync_failures(directories, &mut failures);
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("; "))
+    }
+}
+
+fn collect_sync_failures(directories: &[&BoundDirectory], failures: &mut Vec<String>) {
+    for directory in directories {
+        if let Err(error) = directory.sync() {
+            failures.push(error);
+        }
+    }
+}
+
+fn require_recovery_binding(
+    destination: &BoundDirectory,
+    recovery_name: &OsStr,
+    recovery: &BoundDirectory,
+) -> Result<(), String> {
+    let descriptor_identity =
+        FileIdentity::from_metadata(&recovery.file.metadata().map_err(|error| {
+            format!(
+                "failed to inspect bound recovery directory {}: {error}",
+                recovery.path.display()
+            )
+        })?);
+    let entry_identity = fstatat_identity(destination.file.as_raw_fd(), recovery_name)
+        .map_err(|error| format!("failed to inspect recovery directory entry: {error}"))?
+        .ok_or_else(|| {
+            format!(
+                "recovery directory entry disappeared: {}",
+                recovery.path.display()
+            )
+        })?;
+    if descriptor_identity.same_directory_binding(recovery.identity)
+        && entry_identity.same_directory_binding(recovery.identity)
+        && entry_identity.mode & libc::S_IFMT == libc::S_IFDIR
+    {
+        Ok(())
+    } else {
+        Err(format!(
+            "recovery directory entry no longer names the bound inode: {}",
+            recovery.path.display()
+        ))
     }
 }
 
@@ -1585,7 +2318,6 @@ fn target_identity(
     directory: &BoundDirectory,
     name: &OsStr,
 ) -> Result<Option<FileIdentity>, String> {
-    directory.recheck_path()?;
     let observed = bind_optional_regular(directory, name, ComponentKind::Archive)?;
     Ok(observed.map(|bound| bound.identity))
 }
@@ -1596,6 +2328,72 @@ fn recheck_bound_file(
     expected: FileIdentity,
 ) -> Result<(), String> {
     require_expected_target(directory, name, Some(expected))
+}
+
+fn fstatat_identity(directory_fd: RawFd, name: &OsStr) -> io::Result<Option<FileIdentity>> {
+    let name = os_str_cstring(name)?;
+    let mut stat = MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: directory_fd is live, name is NUL terminated, and stat points to
+    // writable storage. AT_SYMLINK_NOFOLLOW inspects the directory entry.
+    let result = unsafe {
+        libc::fstatat(
+            directory_fd,
+            name.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if result == 0 {
+        // SAFETY: successful fstatat initialized stat.
+        let stat = unsafe { stat.assume_init() };
+        Ok(Some(FileIdentity::from_stat(&stat)))
+    } else {
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::NotFound {
+            Ok(None)
+        } else {
+            Err(error)
+        }
+    }
+}
+
+fn openat_directory(directory_fd: RawFd, name: &OsStr) -> io::Result<File> {
+    let name = os_str_cstring(name)?;
+    // SAFETY: directory_fd is live and name is a NUL-terminated basename. The
+    // returned descriptor is uniquely owned.
+    let fd = unsafe {
+        libc::openat(
+            directory_fd,
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW,
+        )
+    };
+    if fd < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        // SAFETY: openat returned a fresh owned descriptor.
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+}
+
+fn openat_create(directory_fd: RawFd, name: &OsStr, mode: u32) -> io::Result<File> {
+    let name = os_str_cstring(name)?;
+    // SAFETY: directory_fd is live and name is a NUL-terminated basename. The
+    // returned descriptor is uniquely owned.
+    let fd = unsafe {
+        libc::openat(
+            directory_fd,
+            name.as_ptr(),
+            libc::O_RDWR | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_CREAT | libc::O_EXCL,
+            mode as libc::mode_t,
+        )
+    };
+    if fd < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        // SAFETY: openat returned a fresh owned descriptor.
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
 }
 
 fn openat_readonly(directory_fd: RawFd, name: &OsStr) -> io::Result<File> {
@@ -1665,6 +2463,10 @@ fn renameat2(
     destination_name: &OsStr,
     flags: u32,
 ) -> io::Result<()> {
+    #[cfg(test)]
+    if let Some(error) = injected_renameat2_error(flags) {
+        return Err(error);
+    }
     let source_name = os_str_cstring(source_name)?;
     let destination_name = os_str_cstring(destination_name)?;
     // SAFETY: both descriptors are live directories and both paths are
@@ -1686,12 +2488,60 @@ fn renameat2(
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static RENAMEAT2_FAULT: std::cell::Cell<Option<(u32, i32)>> = const {
+        std::cell::Cell::new(None)
+    };
+    static SYNC_FAULT: std::cell::Cell<Option<i32>> = const {
+        std::cell::Cell::new(None)
+    };
+    static SYNC_ATTEMPTS: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+    static FCHOWN_FAULT: std::cell::Cell<Option<i32>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
+#[cfg(test)]
+fn injected_renameat2_error(flags: u32) -> Option<io::Error> {
+    RENAMEAT2_FAULT.with(|fault| {
+        fault
+            .get()
+            .filter(|(fault_flags, _)| *fault_flags == flags)
+            .map(|(_, errno)| io::Error::from_raw_os_error(errno))
+    })
+}
+
 fn remove_corresponding_file(
     directory: &BoundDirectory,
     name: &OsStr,
     expected: FileIdentity,
 ) -> Result<(), String> {
-    if !target_corresponds(directory, name, Some(expected))? {
+    require_corresponding_target(
+        directory,
+        name,
+        Some(expected),
+        "transaction cleanup target",
+    )?;
+    unlink_corresponding_entry(directory, name, expected)
+}
+
+fn unlink_corresponding_entry(
+    directory: &BoundDirectory,
+    name: &OsStr,
+    expected: FileIdentity,
+) -> Result<(), String> {
+    let observed = fstatat_identity(directory.file.as_raw_fd(), name)
+        .map_err(|error| format!("failed to inspect transaction file: {error}"))?
+        .ok_or_else(|| {
+            format!(
+                "transaction file disappeared before cleanup: {}",
+                directory.path.join(name).display()
+            )
+        })?;
+    if observed.mode & libc::S_IFMT != libc::S_IFREG || !observed.same_across_rename(expected) {
         return Err(format!(
             "refusing to remove changed transaction file: {}",
             directory.path.join(name).display()
@@ -1714,8 +2564,8 @@ fn remove_empty_recovery_directory(
     recovery_name: &OsStr,
     recovery: &BoundDirectory,
 ) -> Result<(), String> {
-    recovery.recheck_path()?;
     recovery.sync()?;
+    require_recovery_binding(destination, recovery_name, recovery)?;
     let name = os_str_cstring(recovery_name).map_err(|error| error.to_string())?;
     // SAFETY: destination is a live directory descriptor and name is the
     // transaction directory's checked basename.
@@ -1736,39 +2586,24 @@ fn remove_empty_recovery_directory(
     destination.sync()
 }
 
-fn remove_recovery_directory_tree(
+fn cleanup_unused_recovery_directory(
     destination: &BoundDirectory,
     recovery_name: &OsStr,
+    recovery: &BoundDirectory,
+    staged_files: &[(std::ffi::OsString, FileIdentity)],
 ) -> Result<(), String> {
-    let path = destination.path.join(recovery_name);
-    let metadata = fs::symlink_metadata(&path)
-        .map_err(|error| format!("failed to inspect recovery directory: {error}"))?;
-    if !metadata.file_type().is_dir()
-        || metadata.uid() != effective_user_id()
-        || metadata.mode() & 0o077 != 0
-    {
-        return Err(format!(
-            "refusing to remove unsafe recovery path {}",
-            path.display()
-        ));
+    let mut failures = Vec::new();
+    for (name, identity) in staged_files {
+        if let Err(error) = remove_corresponding_file(recovery, name, *identity) {
+            failures.push(error);
+        }
     }
-    fs::remove_dir_all(&path)
-        .map_err(|error| format!("failed to remove recovery directory: {error}"))?;
-    destination.sync()
-}
-
-fn take_staged_component(component: &mut StagedComponent) -> Result<StagedComponent, String> {
-    let placeholder = StagedComponent {
-        kind: component.kind,
-        directory_index: component.directory_index,
-        name: std::ffi::OsString::new(),
-        file: component
-            .file
-            .try_clone()
-            .map_err(|error| format!("failed to retain staged descriptor: {error}"))?,
-        identity: component.identity,
-    };
-    Ok(std::mem::replace(component, placeholder))
+    collect_sync_failures(&[recovery, destination], &mut failures);
+    if failures.is_empty() {
+        remove_empty_recovery_directory(destination, recovery_name, recovery)
+    } else {
+        Err(failures.join("; "))
+    }
 }
 
 #[cfg(test)]
@@ -1786,6 +2621,54 @@ mod tests {
         },
         solana_hash::Hash,
     };
+
+    struct RenameFaultGuard;
+
+    impl RenameFaultGuard {
+        fn install(flags: u32, errno: i32) -> Self {
+            RENAMEAT2_FAULT.with(|fault| {
+                assert!(fault.replace(Some((flags, errno))).is_none());
+            });
+            Self
+        }
+    }
+
+    impl Drop for RenameFaultGuard {
+        fn drop(&mut self) {
+            RENAMEAT2_FAULT.with(|fault| fault.set(None));
+        }
+    }
+
+    struct ChownFaultGuard;
+
+    impl ChownFaultGuard {
+        fn install(errno: i32) -> Self {
+            FCHOWN_FAULT.with(|fault| {
+                assert!(fault.replace(Some(errno)).is_none());
+            });
+            Self
+        }
+    }
+
+    impl Drop for ChownFaultGuard {
+        fn drop(&mut self) {
+            FCHOWN_FAULT.with(|fault| fault.set(None));
+        }
+    }
+
+    fn recovery_directories(parent: &Path) -> Vec<PathBuf> {
+        fs::read_dir(parent)
+            .unwrap()
+            .map(|entry| entry.unwrap())
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".jetstreamer-recovery-")
+            })
+            .map(|entry| entry.path())
+            .collect()
+    }
 
     fn fixture() -> (tempfile::TempDir, PathBuf, PathBuf, ValidatedArchiveFile) {
         let root = tempfile::TempDir::new().unwrap();
@@ -1948,12 +2831,36 @@ mod tests {
     fn checksum_is_the_last_commit_marker() {
         let (_root, archive, destination, evidence) = fixture();
         let mut observed = false;
+        let mut sentinel_inode = None;
         let result =
             publish_verified_archive_with_hook(&archive, &destination, evidence, |phase| {
+                if matches!(
+                    phase,
+                    PublishPhase::AfterChecksumInvalidationMutation
+                        | PublishPhase::AfterChecksumInvalidation
+                        | PublishPhase::BeforeManifestMutation
+                        | PublishPhase::AfterManifestMutation
+                        | PublishPhase::BeforeArchiveInstall
+                        | PublishPhase::AfterArchiveInstall
+                        | PublishPhase::BeforeChecksumCommit
+                ) {
+                    let checksum = archive_checksum_path(&destination).unwrap();
+                    assert_eq!(fs::read(&checksum).unwrap(), INVALID_CHECKSUM_CONTENTS);
+                    let inode = fs::metadata(&checksum).unwrap().ino();
+                    assert_eq!(*sentinel_inode.get_or_insert(inode), inode);
+                    let create = OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(checksum);
+                    assert_eq!(
+                        create.unwrap_err().kind(),
+                        io::ErrorKind::AlreadyExists,
+                        "the invalid sentinel must reserve the checksum basename"
+                    );
+                }
                 if phase == PublishPhase::BeforeChecksumCommit {
                     observed = true;
                     assert_eq!(fs::read(&destination).unwrap(), b"new archive");
-                    assert!(!archive_checksum_path(&destination).unwrap().exists());
                 }
                 Ok(())
             })
@@ -1999,12 +2906,17 @@ mod tests {
     fn every_precommit_phase_rolls_back_exact_existing_inodes() {
         for failed_phase in [
             PublishPhase::BeforeChecksumInvalidation,
+            PublishPhase::AfterChecksumInvalidationMutation,
             PublishPhase::AfterChecksumInvalidation,
             PublishPhase::BeforeManifestMutation,
+            PublishPhase::AfterManifestBackupMutation,
             PublishPhase::AfterManifestMutation,
             PublishPhase::BeforeArchiveInstall,
+            PublishPhase::AfterArchiveInstallMutation,
+            PublishPhase::AfterArchiveBackupMutation,
             PublishPhase::AfterArchiveInstall,
             PublishPhase::BeforeChecksumCommit,
+            PublishPhase::AfterChecksumCommitMutation,
         ] {
             let (_root, archive, destination, evidence) = fixture();
             let old_inodes = write_existing_set(&destination);
@@ -2097,7 +3009,10 @@ mod tests {
         .unwrap_err();
         assert!(!error.committed());
         assert_eq!(fs::read(&destination).unwrap(), b"concurrent replacement");
-        assert!(!archive_checksum_path(&destination).unwrap().exists());
+        assert_eq!(
+            fs::read(archive_checksum_path(&destination).unwrap()).unwrap(),
+            INVALID_CHECKSUM_CONTENTS
+        );
         assert_eq!(fs::read(&displaced).unwrap(), b"old archive");
         assert!(archive.exists());
         assert!(error.recovery_directory().is_some());
@@ -2154,5 +3069,392 @@ mod tests {
         assert!(!error.committed());
         assert_eq!(fs::read(destination).unwrap(), b"group writable");
         assert!(archive.exists());
+    }
+
+    #[test]
+    fn provisional_manifest_journal_rolls_back_each_namespace_mutation() {
+        for failed_phase in [
+            PublishPhase::AfterManifestInstallMutation,
+            PublishPhase::AfterManifestBackupMutation,
+        ] {
+            let (_root, archive, destination, evidence) = fixture_with_manifest();
+            let source_manifest = segment_manifest_path(&archive).unwrap();
+            let old_inodes = write_existing_set(&destination);
+            let error =
+                publish_verified_archive_with_hook(&archive, &destination, evidence, |phase| {
+                    if phase == failed_phase {
+                        Err(format!("injected failure at {phase:?}"))
+                    } else {
+                        Ok(())
+                    }
+                })
+                .unwrap_err();
+
+            assert!(!error.committed(), "{failed_phase:?}: {error}");
+            assert!(error.recovery_directory().is_none(), "{failed_phase:?}");
+            assert_eq!(
+                [
+                    fs::metadata(&destination).unwrap().ino(),
+                    fs::metadata(segment_manifest_path(&destination).unwrap())
+                        .unwrap()
+                        .ino(),
+                    fs::metadata(archive_checksum_path(&destination).unwrap())
+                        .unwrap()
+                        .ino(),
+                ],
+                old_inodes,
+                "{failed_phase:?}"
+            );
+            assert!(archive.exists());
+            assert!(source_manifest.exists());
+        }
+    }
+
+    #[test]
+    fn provisional_new_install_journal_restores_absence() {
+        for failed_phase in [
+            PublishPhase::AfterChecksumInvalidationMutation,
+            PublishPhase::AfterArchiveInstallMutation,
+            PublishPhase::AfterChecksumCommitMutation,
+        ] {
+            let (_root, archive, destination, evidence) = fixture();
+            let error =
+                publish_verified_archive_with_hook(&archive, &destination, evidence, |phase| {
+                    if phase == failed_phase {
+                        Err(format!("injected failure at {phase:?}"))
+                    } else {
+                        Ok(())
+                    }
+                })
+                .unwrap_err();
+
+            assert!(!error.committed(), "{failed_phase:?}: {error}");
+            assert!(error.recovery_directory().is_none(), "{failed_phase:?}");
+            assert!(!destination.exists(), "{failed_phase:?}");
+            assert!(
+                !archive_checksum_path(&destination).unwrap().exists(),
+                "{failed_phase:?}"
+            );
+            assert!(archive.exists(), "{failed_phase:?}");
+        }
+    }
+
+    #[test]
+    fn final_precommit_race_cannot_publish_a_canonical_checksum() {
+        let (root, archive, destination, evidence) = fixture();
+        let displaced = root.path().join("displaced-validated-archive");
+        let error = publish_verified_archive_with_hook(&archive, &destination, evidence, |phase| {
+            if phase == PublishPhase::BeforeChecksumCommit {
+                fs::rename(&destination, &displaced).unwrap();
+                fs::write(&destination, b"same uid replacement").unwrap();
+                fs::set_permissions(&destination, fs::Permissions::from_mode(FINAL_FILE_MODE))
+                    .unwrap();
+            }
+            Ok(())
+        })
+        .unwrap_err();
+
+        assert!(!error.committed(), "{error}");
+        assert!(error.recovery_directory().is_some());
+        assert_eq!(fs::read(&destination).unwrap(), b"same uid replacement");
+        assert_eq!(fs::read(&displaced).unwrap(), b"new archive");
+        assert_eq!(
+            fs::read(archive_checksum_path(&destination).unwrap()).unwrap(),
+            INVALID_CHECKSUM_CONTENTS
+        );
+    }
+
+    #[test]
+    fn postcommit_race_is_atomically_invalidated_before_rollback() {
+        let (root, archive, destination, evidence) = fixture();
+        let displaced = root.path().join("displaced-after-checksum-exchange");
+        let error = publish_verified_archive_with_hook(&archive, &destination, evidence, |phase| {
+            if phase == PublishPhase::AfterChecksumCommitMutation {
+                fs::rename(&destination, &displaced).unwrap();
+                fs::write(&destination, b"postcommit same uid replacement").unwrap();
+                fs::set_permissions(&destination, fs::Permissions::from_mode(FINAL_FILE_MODE))
+                    .unwrap();
+            }
+            Ok(())
+        })
+        .unwrap_err();
+
+        assert!(!error.committed(), "{error}");
+        assert!(error.recovery_directory().is_some());
+        assert_eq!(
+            fs::read(archive_checksum_path(&destination).unwrap()).unwrap(),
+            INVALID_CHECKSUM_CONTENTS
+        );
+        assert_eq!(fs::read(&displaced).unwrap(), b"new archive");
+    }
+
+    #[test]
+    fn failed_data_durability_barrier_leaves_checksum_invalid() {
+        let (_root, archive, destination, evidence) = fixture();
+        let old_inodes = write_existing_set(&destination);
+        let error =
+            publish_verified_archive_with_hook(
+                &archive,
+                &destination,
+                evidence,
+                |phase| match phase {
+                    PublishPhase::AfterArchiveInstall => Err("start rollback".to_string()),
+                    PublishPhase::BeforeRollbackDataSync => {
+                        SYNC_ATTEMPTS.with(|attempts| attempts.set(0));
+                        SYNC_FAULT.with(|fault| fault.set(Some(libc::EIO)));
+                        Ok(())
+                    }
+                    _ => Ok(()),
+                },
+            )
+            .unwrap_err();
+
+        assert!(!error.committed());
+        let recovery = error.recovery_directory().unwrap();
+        assert_eq!(fs::read(&destination).unwrap(), b"old archive");
+        assert_eq!(fs::metadata(&destination).unwrap().ino(), old_inodes[0]);
+        assert_eq!(
+            fs::read(archive_checksum_path(&destination).unwrap()).unwrap(),
+            INVALID_CHECKSUM_CONTENTS
+        );
+        assert_eq!(
+            fs::metadata(recovery.join(ComponentKind::Checksum.backup_name()))
+                .unwrap()
+                .ino(),
+            old_inodes[2]
+        );
+        assert_eq!(
+            SYNC_ATTEMPTS.with(std::cell::Cell::get),
+            3,
+            "all data directories must be attempted even after one sync fails"
+        );
+    }
+
+    #[test]
+    fn checksum_restore_attempts_both_directory_syncs_after_an_error() {
+        let (_root, archive, destination, evidence) = fixture();
+        let old_inodes = write_existing_set(&destination);
+        let mut observed_attempts = None;
+        let error =
+            publish_verified_archive_with_hook(
+                &archive,
+                &destination,
+                evidence,
+                |phase| match phase {
+                    PublishPhase::AfterArchiveInstall => Err("start rollback".to_string()),
+                    PublishPhase::AfterChecksumRestoreMutation => {
+                        SYNC_ATTEMPTS.with(|attempts| attempts.set(0));
+                        SYNC_FAULT.with(|fault| fault.set(Some(libc::EIO)));
+                        Ok(())
+                    }
+                    PublishPhase::AfterChecksumRollbackSync => {
+                        observed_attempts = Some(SYNC_ATTEMPTS.with(std::cell::Cell::get));
+                        Ok(())
+                    }
+                    _ => Ok(()),
+                },
+            )
+            .unwrap_err();
+
+        assert_eq!(observed_attempts, Some(2));
+        assert!(!error.committed());
+        assert!(error.recovery_directory().is_some());
+        assert_eq!(
+            fs::metadata(archive_checksum_path(&destination).unwrap())
+                .unwrap()
+                .ino(),
+            old_inodes[2]
+        );
+    }
+
+    #[test]
+    fn checksum_restore_is_synced_before_cleanup_failure() {
+        let (_root, archive, destination, evidence) = fixture();
+        let old_inodes = write_existing_set(&destination);
+        let parent = destination.parent().unwrap().to_path_buf();
+        let mut saw_checksum_sync = false;
+        let error =
+            publish_verified_archive_with_hook(
+                &archive,
+                &destination,
+                evidence,
+                |phase| match phase {
+                    PublishPhase::AfterArchiveInstall => Err("start rollback".to_string()),
+                    PublishPhase::AfterChecksumRollbackSync => {
+                        saw_checksum_sync = true;
+                        let recovery = recovery_directories(&parent);
+                        assert_eq!(recovery.len(), 1);
+                        fs::write(recovery[0].join("unexpected-entry"), b"retain").unwrap();
+                        Ok(())
+                    }
+                    _ => Ok(()),
+                },
+            )
+            .unwrap_err();
+
+        assert!(saw_checksum_sync);
+        assert!(!error.committed());
+        assert!(error.recovery_directory().is_some());
+        assert_eq!(
+            [
+                fs::metadata(&destination).unwrap().ino(),
+                fs::metadata(segment_manifest_path(&destination).unwrap())
+                    .unwrap()
+                    .ino(),
+                fs::metadata(archive_checksum_path(&destination).unwrap())
+                    .unwrap()
+                    .ino(),
+            ],
+            old_inodes
+        );
+    }
+
+    #[test]
+    fn cleanup_refuses_a_swapped_recovery_entry() {
+        let (root, archive, destination, evidence) = fixture();
+        write_existing_set(&destination);
+        let parent = destination.parent().unwrap().to_path_buf();
+        let moved_recovery = root.path().join("moved-bound-recovery");
+        let mut lookalike = None;
+        let error =
+            publish_verified_archive_with_hook(
+                &archive,
+                &destination,
+                evidence,
+                |phase| match phase {
+                    PublishPhase::AfterArchiveInstall => Err("start rollback".to_string()),
+                    PublishPhase::AfterChecksumRollbackSync => {
+                        let recovery = recovery_directories(&parent);
+                        assert_eq!(recovery.len(), 1);
+                        fs::rename(&recovery[0], &moved_recovery).unwrap();
+                        fs::create_dir(&recovery[0]).unwrap();
+                        fs::set_permissions(&recovery[0], fs::Permissions::from_mode(0o700))
+                            .unwrap();
+                        fs::write(recovery[0].join("victim"), b"must survive").unwrap();
+                        lookalike = Some(recovery[0].clone());
+                        Ok(())
+                    }
+                    _ => Ok(()),
+                },
+            )
+            .unwrap_err();
+
+        assert!(!error.committed());
+        assert!(error.to_string().contains("bound inode"), "{error}");
+        let lookalike = lookalike.unwrap();
+        assert_eq!(fs::read(lookalike.join("victim")).unwrap(), b"must survive");
+        assert!(moved_recovery.exists());
+    }
+
+    #[test]
+    fn rollback_barriers_run_in_checksum_safe_order() {
+        let (_root, archive, destination, evidence) = fixture();
+        write_existing_set(&destination);
+        let mut trace = Vec::new();
+        publish_verified_archive_with_hook(&archive, &destination, evidence, |phase| match phase {
+            PublishPhase::AfterArchiveInstall => Err("start rollback".to_string()),
+            PublishPhase::BeforeRollbackDataSync
+            | PublishPhase::AfterRollbackDataSync
+            | PublishPhase::AfterChecksumRestoreMutation
+            | PublishPhase::AfterChecksumRollbackSync => {
+                trace.push(phase);
+                Ok(())
+            }
+            _ => Ok(()),
+        })
+        .unwrap_err();
+        assert_eq!(
+            trace,
+            [
+                PublishPhase::BeforeRollbackDataSync,
+                PublishPhase::AfterRollbackDataSync,
+                PublishPhase::AfterChecksumRestoreMutation,
+                PublishPhase::AfterChecksumRollbackSync,
+            ]
+        );
+    }
+
+    #[test]
+    fn publication_preflight_enforces_destination_modes() {
+        for (mode, accepted) in [
+            (0o700, true),
+            (0o750, true),
+            (0o755, true),
+            (0o770, false),
+            (0o2770, false),
+            (0o3770, true),
+        ] {
+            let root = tempfile::TempDir::new().unwrap();
+            let source = root.path().join("source");
+            let destination = root.path().join("destination");
+            fs::create_dir(&source).unwrap();
+            fs::create_dir(&destination).unwrap();
+            fs::set_permissions(&source, fs::Permissions::from_mode(0o700)).unwrap();
+            fs::set_permissions(&destination, fs::Permissions::from_mode(mode)).unwrap();
+
+            let result = preflight_archive_publication(&source, &destination);
+            assert_eq!(result.is_ok(), accepted, "mode {mode:04o}: {result:?}");
+            assert!(
+                recovery_directories(&destination).is_empty(),
+                "mode {mode:04o}"
+            );
+        }
+    }
+
+    #[test]
+    fn publication_preflight_reports_renameat2_capability_failures() {
+        for (flags, errno) in [
+            (libc::RENAME_NOREPLACE, libc::ENOSYS),
+            (libc::RENAME_EXCHANGE, libc::EOPNOTSUPP),
+            (libc::RENAME_NOREPLACE, libc::EXDEV),
+        ] {
+            let root = tempfile::TempDir::new().unwrap();
+            let source = root.path().join("source");
+            let destination = root.path().join("destination");
+            fs::create_dir(&source).unwrap();
+            fs::create_dir(&destination).unwrap();
+            fs::set_permissions(&source, fs::Permissions::from_mode(0o700)).unwrap();
+            fs::set_permissions(&destination, fs::Permissions::from_mode(0o3770)).unwrap();
+
+            let fault = RenameFaultGuard::install(flags, errno);
+            let error = preflight_archive_publication(&source, &destination).unwrap_err();
+            drop(fault);
+
+            assert!(!error.committed());
+            assert!(error.recovery_directory().is_none(), "{error}");
+            assert!(
+                error.to_string().contains("RENAME_"),
+                "errno {errno}: {error}"
+            );
+            assert!(recovery_directories(&destination).is_empty());
+            assert!(
+                fs::read_dir(&source).unwrap().next().is_none(),
+                "source probe was not cleaned for errno {errno}"
+            );
+        }
+    }
+
+    #[test]
+    fn publication_preflight_rejects_missing_destination_group_capability() {
+        let root = tempfile::TempDir::new().unwrap();
+        let source = root.path().join("source");
+        let destination = root.path().join("destination");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(&destination).unwrap();
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&destination, fs::Permissions::from_mode(0o3770)).unwrap();
+
+        let fault = ChownFaultGuard::install(libc::EPERM);
+        let error = preflight_archive_publication(&source, &destination).unwrap_err();
+        drop(fault);
+
+        assert!(!error.committed());
+        assert!(error.recovery_directory().is_none(), "{error}");
+        assert!(
+            error.to_string().contains("assign destination group"),
+            "{error}"
+        );
+        assert!(recovery_directories(&destination).is_empty());
+        assert!(fs::read_dir(&source).unwrap().next().is_none());
     }
 }

@@ -12913,7 +12913,29 @@ struct ValidatedAdaptiveEpoch {
 
 struct AdaptiveValidationResult {
     job: AdaptiveEpochJob,
-    result: Result<jetstreamer_node::archive_checksum::ValidatedArchiveFile, String>,
+    result:
+        Result<jetstreamer_node::archive_checksum::ValidatedArchiveFile, AdaptiveValidationError>,
+}
+
+#[derive(Debug)]
+enum AdaptiveValidationError {
+    InvalidArtifact(String),
+    Infrastructure(String),
+}
+
+impl std::fmt::Display for AdaptiveValidationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidArtifact(message) | Self::Infrastructure(message) => {
+                formatter.write_str(message)
+            }
+        }
+    }
+}
+
+enum AdaptiveValidationFailureAction {
+    Retry(String),
+    Terminal(String),
 }
 
 /// A terminal epoch failure closes admission without turning it into a global
@@ -13323,31 +13345,41 @@ fn adaptive_epoch_archive_validated(
     job: &AdaptiveEpochJob,
     path: &Path,
     shutdown: &AtomicBool,
-) -> Result<jetstreamer_node::archive_checksum::ValidatedArchiveFile, String> {
+) -> Result<jetstreamer_node::archive_checksum::ValidatedArchiveFile, AdaptiveValidationError> {
     let destination_parent = job.final_output.parent().unwrap_or_else(|| Path::new("."));
-    let file = jetstreamer_node::archive_checksum::open_regular_nofollow(path)
-        .map_err(|error| format!("failed to open staged epoch {} archive: {error}", job.epoch))?;
+    let file =
+        jetstreamer_node::archive_checksum::open_regular_nofollow(path).map_err(|error| {
+            AdaptiveValidationError::Infrastructure(format!(
+                "failed to open staged epoch {} archive: {error}",
+                job.epoch
+            ))
+        })?;
     jetstreamer_node::archive_checksum::prepare_archive_permissions(&file, destination_parent)
         .map_err(|error| {
-            format!(
+            AdaptiveValidationError::Infrastructure(format!(
                 "failed to prepare staged epoch {} permissions: {error}",
                 job.epoch
-            )
+            ))
         })?;
-    file.sync_all()
-        .map_err(|error| format!("failed to sync staged epoch {} archive: {error}", job.epoch))?;
+    file.sync_all().map_err(|error| {
+        AdaptiveValidationError::Infrastructure(format!(
+            "failed to sync staged epoch {} archive: {error}",
+            job.epoch
+        ))
+    })?;
     drop(file);
     let validated = if job.spans.len() == 1 {
         validated_epoch_archive(path, job.epoch, job.selection, Some(shutdown), None)?
     } else {
-        validated_epoch_archive_multi_runtime(path, job.epoch, &job.spans, Some(shutdown))?
-    };
+        validated_epoch_archive_multi_runtime(path, job.epoch, &job.spans, Some(shutdown))
+    }
+    .map_err(AdaptiveValidationError::InvalidArtifact)?;
     validated.ok_or_else(|| {
-        format!(
+        AdaptiveValidationError::InvalidArtifact(format!(
             "staged epoch {} archive {} is incomplete",
             job.epoch,
             path.display()
-        )
+        ))
     })
 }
 
@@ -13359,6 +13391,53 @@ fn spawn_adaptive_validation(
         let result = adaptive_epoch_archive_validated(&job, &job.staged_output, &shutdown);
         AdaptiveValidationResult { job, result }
     })
+}
+
+fn handle_adaptive_validation_failure(
+    job: &AdaptiveEpochJob,
+    error: AdaptiveValidationError,
+    may_retry: bool,
+    attempts_per_epoch: u32,
+    draining_failure: bool,
+) -> AdaptiveValidationFailureAction {
+    match error {
+        AdaptiveValidationError::Infrastructure(error) => {
+            AdaptiveValidationFailureAction::Terminal(format!(
+                "epoch {} validation infrastructure failed: {error}; preserving staged attempt at {}",
+                job.epoch,
+                job.staged_output
+                    .parent()
+                    .unwrap_or(job.staged_output.as_path())
+                    .display()
+            ))
+        }
+        AdaptiveValidationError::InvalidArtifact(error) => {
+            let cleanup = cleanup_adaptive_attempt(job);
+            if may_retry && cleanup.is_ok() {
+                return AdaptiveValidationFailureAction::Retry(error);
+            }
+            let mut failure = if job.attempt >= attempts_per_epoch {
+                format!(
+                    "epoch {} failed validation after {attempts_per_epoch} attempt(s): {error}",
+                    job.epoch
+                )
+            } else if draining_failure {
+                format!(
+                    "epoch {} failed validation while adaptive admission was draining: {error}; retry suppressed",
+                    job.epoch
+                )
+            } else {
+                format!(
+                    "epoch {} staged output failed validation: {error}",
+                    job.epoch
+                )
+            };
+            if let Err(cleanup_error) = cleanup {
+                failure.push_str(&format!("; additionally failed cleanup: {cleanup_error}"));
+            }
+            AdaptiveValidationFailureAction::Terminal(failure)
+        }
+    }
 }
 
 fn configured_adaptive_epoch_policy(
@@ -13774,6 +13853,8 @@ async fn run_epoch_range_supervisor_adaptive(
         configured_adaptive_epoch_policy(has_historical_worker, has_agave)?;
     let prune_snapshots = env_truthy_default("JETSTREAMER_PRUNE_EPOCH_SNAPSHOTS", false);
     let range_work = private_epoch_scope(dest_dir)?.join("work");
+    jetstreamer_node::archive_publish::preflight_archive_publication(&range_work, dest_dir)
+        .map_err(|error| format!("archive publication capability preflight failed: {error}"))?;
     let initial_cgroup = adaptive_epoch::read_current_cgroup_memory(&[]);
     let cgroup_baseline_bytes = initial_cgroup.map_or(0, |snapshot| snapshot.current_bytes);
     let mut pending = VecDeque::new();
@@ -14012,35 +14093,28 @@ async fn run_epoch_range_supervisor_adaptive(
                         continue;
                     }
                     let may_retry = failure_drain.may_retry(job.attempt, attempts_per_epoch);
-                    let cleanup = cleanup_adaptive_attempt(&job);
-                    if may_retry && cleanup.is_ok() {
-                        warn!(
-                            "epoch {epoch} staged output failed validation: {error}; retrying cleanly"
-                        );
-                        retries.push(job);
-                        continue;
+                    match handle_adaptive_validation_failure(
+                        &job,
+                        error,
+                        may_retry,
+                        attempts_per_epoch,
+                        failure_drain.is_active(),
+                    ) {
+                        AdaptiveValidationFailureAction::Retry(error) => {
+                            warn!(
+                                "epoch {epoch} staged output failed validation: {error}; retrying cleanly"
+                            );
+                            retries.push(job);
+                        }
+                        AdaptiveValidationFailureAction::Terminal(failure) => {
+                            record_adaptive_terminal_failure(
+                                &mut failure_drain,
+                                failure,
+                                running.len(),
+                                validating.len(),
+                            );
+                        }
                     }
-                    let mut failure = if job.attempt >= attempts_per_epoch {
-                        format!(
-                            "epoch {epoch} failed validation after {attempts_per_epoch} attempt(s): {error}"
-                        )
-                    } else if failure_drain.is_active() {
-                        format!(
-                            "epoch {epoch} failed validation while adaptive admission was draining: {error}; retry suppressed"
-                        )
-                    } else {
-                        format!("epoch {epoch} staged output failed validation: {error}")
-                    };
-                    if let Err(cleanup_error) = cleanup {
-                        failure
-                            .push_str(&format!("; additionally failed cleanup: {cleanup_error}"));
-                    }
-                    record_adaptive_terminal_failure(
-                        &mut failure_drain,
-                        failure,
-                        running.len(),
-                        validating.len(),
-                    );
                 }
             }
         }
@@ -18219,6 +18293,41 @@ mod early_snapshot_tests {
         assert!(!job.scratch_dir.join("crash-mutated-state").exists());
         cleanup_adaptive_attempt(&job).unwrap();
         assert!(!second_attempt.exists());
+    }
+
+    #[test]
+    fn adaptive_infrastructure_failure_preserves_completed_staged_attempt() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::TempDir::new().unwrap();
+        let work_dir = directory.path().join("epoch-20");
+        fs::create_dir(&work_dir).unwrap();
+        fs::set_permissions(&work_dir, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut job = adaptive_test_job(20, work_dir);
+        prepare_adaptive_attempt(&mut job).unwrap();
+        fs::write(&job.staged_output, b"fully completed staged archive").unwrap();
+        let staged_output = job.staged_output.clone();
+
+        let action = handle_adaptive_validation_failure(
+            &job,
+            AdaptiveValidationError::Infrastructure(
+                "failed to prepare staged epoch 20 permissions: Operation not permitted"
+                    .to_string(),
+            ),
+            true,
+            2,
+            false,
+        );
+
+        let AdaptiveValidationFailureAction::Terminal(message) = action else {
+            panic!("infrastructure failure was incorrectly classified as retryable");
+        };
+        assert!(message.contains("validation infrastructure failed"));
+        assert!(message.contains("preserving staged attempt"));
+        assert_eq!(
+            fs::read(staged_output).unwrap(),
+            b"fully completed staged archive"
+        );
     }
 
     #[test]

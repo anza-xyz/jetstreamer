@@ -5813,6 +5813,28 @@ fn normal_epoch_bootstrap_bounds(epoch: u64) -> Result<SnapshotBootstrapBounds, 
     })
 }
 
+fn validate_epoch_bootstrap_identity(
+    epoch: u64,
+    slot: Slot,
+    accounts_hash: Hash,
+) -> Result<(), String> {
+    let bounds = normal_epoch_bootstrap_bounds(epoch)?;
+    if !(bounds.min_slot..=bounds.max_slot).contains(&slot) {
+        return Err(format!(
+            "epoch {epoch} requires a bootstrap snapshot in slots {}..={}, got slot {slot}",
+            bounds.min_slot, bounds.max_slot,
+        ));
+    }
+    if let Some(required_hash) = bounds.required_accounts_hash
+        && accounts_hash != required_hash
+    {
+        return Err(format!(
+            "epoch {epoch} requires bootstrap snapshot accounts hash {required_hash} at slot {slot}, got {accounts_hash}",
+        ));
+    }
+    Ok(())
+}
+
 fn snapshot_archive_candidate(path: PathBuf) -> Result<SnapshotArchiveCandidate, String> {
     let metadata = fs::metadata(&path)
         .map_err(|err| format!("failed to read snapshot {}: {err}", path.display()))?;
@@ -9458,18 +9480,17 @@ fn validated_epoch_archive(
                     path.display()
                 ));
             }
-            let min_bootstrap_slot = epoch_to_slot(epoch - 1);
-            let max_bootstrap_slot = slot_start - 1;
-            if !(min_bootstrap_slot..=max_bootstrap_slot).contains(&provenance_v1.bootstrap_slot) {
-                return Err(format!(
-                    "completed archive {} has bootstrap slot {}, expected {}..={} for epoch {}",
-                    path.display(),
-                    provenance_v1.bootstrap_slot,
-                    min_bootstrap_slot,
-                    max_bootstrap_slot,
-                    epoch
-                ));
-            }
+            validate_epoch_bootstrap_identity(
+                epoch,
+                provenance_v1.bootstrap_slot,
+                provenance_v1.bootstrap_state_hash,
+            )
+            .map_err(|err| {
+                format!(
+                    "completed archive {} has invalid bootstrap identity: {err}",
+                    path.display()
+                )
+            })?;
             if provenance_v1.bootstrap_state_kind == BootstrapStateKind::CarriedBank
                 && !selection.descriptor.bootstrap.permits_in_memory_handoff
             {
@@ -9608,19 +9629,17 @@ fn validated_epoch_archive_multi_runtime(
                     path.display()
                 ));
             }
-            let min_bootstrap_slot = epoch_to_slot(epoch - 1);
-            let max_bootstrap_slot = slot_start - 1;
-            if !(min_bootstrap_slot..=max_bootstrap_slot).contains(&provenance.bootstrap_state.slot)
-            {
-                return Err(format!(
-                    "assembled archive {} has bootstrap slot {}, expected {}..={} for epoch {}",
-                    path.display(),
-                    provenance.bootstrap_state.slot,
-                    min_bootstrap_slot,
-                    max_bootstrap_slot,
-                    epoch
-                ));
-            }
+            validate_epoch_bootstrap_identity(
+                epoch,
+                provenance.bootstrap_state.slot,
+                provenance.bootstrap_state.hash,
+            )
+            .map_err(|err| {
+                format!(
+                    "assembled archive {} has invalid bootstrap identity: {err}",
+                    path.display()
+                )
+            })?;
             if provenance.bootstrap_state_kind == BootstrapStateKind::CarriedBank
                 && !first_selection
                     .descriptor
@@ -9804,28 +9823,13 @@ fn validate_multi_runtime_genesis(path: &Path, actual: Hash) -> Result<(), Strin
 }
 
 fn validate_epoch_bootstrap_snapshot(epoch: u64, path: &Path) -> Result<Slot, String> {
-    let bounds = normal_epoch_bootstrap_bounds(epoch)?;
     let name = path
         .file_name()
         .and_then(|name| name.to_str())
         .ok_or_else(|| format!("snapshot path has no UTF-8 filename: {}", path.display()))?;
     let (slot, SnapshotHash(accounts_hash)) = parse_snapshot_archive_name(name)?;
-    if !(bounds.min_slot..=bounds.max_slot).contains(&slot) {
-        return Err(format!(
-            "epoch {epoch} requires a bootstrap snapshot in slots {}..={}, got slot {slot} ({})",
-            bounds.min_slot,
-            bounds.max_slot,
-            path.display()
-        ));
-    }
-    if let Some(required_hash) = bounds.required_accounts_hash
-        && accounts_hash != required_hash
-    {
-        return Err(format!(
-            "epoch {epoch} requires bootstrap snapshot accounts hash {required_hash} at slot {slot}, got {accounts_hash} ({})",
-            path.display()
-        ));
-    }
+    validate_epoch_bootstrap_identity(epoch, slot, accounts_hash)
+        .map_err(|err| format!("{err} ({})", path.display()))?;
     Ok(slot)
 }
 
@@ -14601,10 +14605,19 @@ mod early_snapshot_tests {
         let expected_hash: Hash = compatibility::SOLANA_V1_0_23_INITIAL_SNAPSHOT_ACCOUNTS_HASH
             .parse()
             .unwrap();
+        assert!(
+            validate_epoch_bootstrap_identity(
+                12,
+                compatibility::SOLANA_V1_0_23_INITIAL_SNAPSHOT_SLOT,
+                expected_hash,
+            )
+            .is_ok()
+        );
         for slot in [5_183_737, 5_183_999] {
             let path = PathBuf::from(format!("snapshot-{slot}-{expected_hash}.tar.bz2"));
             let error = validate_epoch_bootstrap_snapshot(12, &path).unwrap_err();
             assert!(error.contains("5183736..=5183736"), "{error}");
+            assert!(validate_epoch_bootstrap_identity(12, slot, expected_hash).is_err());
         }
 
         let wrong_hash = Hash::new_unique();
@@ -14616,6 +14629,14 @@ mod early_snapshot_tests {
         let error = validate_epoch_bootstrap_snapshot(12, &path).unwrap_err();
         assert!(error.contains(&expected_hash.to_string()), "{error}");
         assert!(error.contains(&wrong_hash.to_string()), "{error}");
+        assert!(
+            validate_epoch_bootstrap_identity(
+                12,
+                compatibility::SOLANA_V1_0_23_INITIAL_SNAPSHOT_SLOT,
+                wrong_hash,
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -15236,6 +15257,7 @@ mod early_snapshot_tests {
             validate_epoch_bootstrap_snapshot(13, &epoch_13_predecessor).unwrap(),
             5_600_000
         );
+        assert!(validate_epoch_bootstrap_identity(13, 5_600_000, Hash::new_unique()).is_ok());
     }
 
     #[test]

@@ -4643,6 +4643,48 @@ struct BankBlockMetadataNotifier {
     firehose_gate: Arc<Mutex<()>>,
 }
 
+/// Owns every notifier that can enqueue replay work.
+///
+/// Keeping these producers in one value makes channel shutdown structural:
+/// dropping the bundle releases the block-parent sender together with the
+/// ordinary Geyser senders before the consumer thread is joined.
+struct ReadyEntryProducers<T, E, P, M> {
+    transaction: T,
+    entry: E,
+    block_parent: P,
+    block_metadata: M,
+}
+
+type ReplayReadyEntryProducers = ReadyEntryProducers<
+    Arc<BankTransactionNotifier>,
+    Arc<BankEntryNotifier>,
+    Arc<BankBlockParentNotifier>,
+    Arc<BankBlockMetadataNotifier>,
+>;
+
+impl ReplayReadyEntryProducers {
+    fn geyser_notifiers(&self) -> GeyserNotifiers {
+        GeyserNotifiers {
+            transaction_notifier: None,
+            sourced_transaction_notifier: Some(self.transaction.clone()),
+            entry_notifier: Some(self.entry.clone()),
+            block_metadata_notifier: Some(self.block_metadata.clone()),
+        }
+    }
+}
+
+fn close_ready_entry_channel<N, P, T>(
+    notifiers: N,
+    producers: P,
+    sender: crossbeam_channel::Sender<T>,
+    consumer: std::thread::JoinHandle<()>,
+) -> std::thread::Result<()> {
+    drop(notifiers);
+    drop(producers);
+    drop(sender);
+    consumer.join()
+}
+
 impl BlockMetadataNotifier for BankBlockMetadataNotifier {
     fn notify_block_metadata(
         &self,
@@ -8125,52 +8167,49 @@ async fn run_geyser_replay(
     let index_base_url = resolve_remote_index_base_url()?;
     let active_firehose_stop = Arc::new(Mutex::new(None::<Arc<AtomicBool>>));
     let backpressure_stop_requested = Arc::new(AtomicBool::new(false));
-    let transaction_notifier = Arc::new(BankTransactionNotifier {
-        progress: progress.clone(),
-        scheduler: scheduler.clone(),
-        failure: failure.clone(),
-        ready_sender: ready_sender.clone(),
-        shutdown: shutdown.clone(),
-        active_firehose_stop: active_firehose_stop.clone(),
-        backpressure_stop_requested: backpressure_stop_requested.clone(),
-        firehose_backpressure_slot_gap_limit,
-        firehose_gate: firehose_gate.clone(),
-    });
-    let entry_notifier = Arc::new(BankEntryNotifier {
-        progress: progress.clone(),
-        scheduler: scheduler.clone(),
-        failure: failure.clone(),
-        ready_sender: ready_sender.clone(),
-        shutdown: shutdown.clone(),
-        active_firehose_stop: active_firehose_stop.clone(),
-        backpressure_stop_requested: backpressure_stop_requested.clone(),
-        firehose_backpressure_slot_gap_limit,
-        firehose_gate: firehose_gate.clone(),
-    });
-    let block_parent_notifier = Arc::new(BankBlockParentNotifier {
-        scheduler: scheduler.clone(),
-        failure: failure.clone(),
-        ready_sender: ready_sender.clone(),
-        firehose_gate: firehose_gate.clone(),
-    });
-    let block_metadata_notifier = Arc::new(BankBlockMetadataNotifier {
-        scheduler: scheduler.clone(),
-        progress: progress.clone(),
-        failure: failure.clone(),
-        ready_sender: ready_sender.clone(),
-        live_start_slot: output_slot_start,
-        shutdown: shutdown.clone(),
-        active_firehose_stop: active_firehose_stop.clone(),
-        backpressure_stop_requested: backpressure_stop_requested.clone(),
-        firehose_backpressure_slot_gap_limit,
-        firehose_gate: firehose_gate.clone(),
-    });
-    let notifiers = GeyserNotifiers {
-        transaction_notifier: None,
-        sourced_transaction_notifier: Some(transaction_notifier.clone()),
-        entry_notifier: Some(entry_notifier.clone()),
-        block_metadata_notifier: Some(block_metadata_notifier.clone()),
+    let ready_producers = ReplayReadyEntryProducers {
+        transaction: Arc::new(BankTransactionNotifier {
+            progress: progress.clone(),
+            scheduler: scheduler.clone(),
+            failure: failure.clone(),
+            ready_sender: ready_sender.clone(),
+            shutdown: shutdown.clone(),
+            active_firehose_stop: active_firehose_stop.clone(),
+            backpressure_stop_requested: backpressure_stop_requested.clone(),
+            firehose_backpressure_slot_gap_limit,
+            firehose_gate: firehose_gate.clone(),
+        }),
+        entry: Arc::new(BankEntryNotifier {
+            progress: progress.clone(),
+            scheduler: scheduler.clone(),
+            failure: failure.clone(),
+            ready_sender: ready_sender.clone(),
+            shutdown: shutdown.clone(),
+            active_firehose_stop: active_firehose_stop.clone(),
+            backpressure_stop_requested: backpressure_stop_requested.clone(),
+            firehose_backpressure_slot_gap_limit,
+            firehose_gate: firehose_gate.clone(),
+        }),
+        block_parent: Arc::new(BankBlockParentNotifier {
+            scheduler: scheduler.clone(),
+            failure: failure.clone(),
+            ready_sender: ready_sender.clone(),
+            firehose_gate: firehose_gate.clone(),
+        }),
+        block_metadata: Arc::new(BankBlockMetadataNotifier {
+            scheduler: scheduler.clone(),
+            progress: progress.clone(),
+            failure: failure.clone(),
+            ready_sender: ready_sender.clone(),
+            live_start_slot: output_slot_start,
+            shutdown: shutdown.clone(),
+            active_firehose_stop: active_firehose_stop.clone(),
+            backpressure_stop_requested: backpressure_stop_requested.clone(),
+            firehose_backpressure_slot_gap_limit,
+            firehose_gate: firehose_gate.clone(),
+        }),
     };
+    let notifiers = ready_producers.geyser_notifiers();
     let threads = firehose_threads();
     let buffer_window_bytes = firehose_buffer_window_bytes();
     info!(
@@ -8769,7 +8808,7 @@ async fn run_geyser_replay(
                 entry_notifier: notifiers.entry_notifier.clone(),
                 block_metadata_notifier: notifiers.block_metadata_notifier.clone(),
             };
-            let block_parent_notifier = block_parent_notifier.clone();
+            let block_parent_notifier = ready_producers.block_parent.clone();
             let initial_parent = if firehose_start == replay_start {
                 bootstrap_parent_anchor
             } else {
@@ -8939,13 +8978,10 @@ async fn run_geyser_replay(
     if let Some(err) = firehose_error {
         failure.record(err);
     }
-    drop(transaction_notifier);
-    drop(entry_notifier);
-    drop(block_metadata_notifier);
-    // Drop the notifier bundle too; it holds Arc clones that keep ready_sender alive.
-    drop(notifiers);
-    drop(ready_sender);
-    let _ = ready_handle.join();
+    // Drop every producer before joining the channel consumer. The explicit
+    // owner also covers the block-parent notifier, which is not part of
+    // `GeyserNotifiers`.
+    let _ = close_ready_entry_channel(notifiers, ready_producers, ready_sender, ready_handle);
     if let Err(err) = scheduler.verify_complete(end_inclusive) {
         failure.record(err);
     }
@@ -14244,6 +14280,30 @@ async fn main() {
 #[cfg(test)]
 mod early_snapshot_tests {
     use super::*;
+
+    #[test]
+    fn ready_entry_teardown_unblocks_and_joins_consumer() {
+        let (sender, receiver) = crossbeam_channel::bounded::<()>(1);
+        let producers = ReadyEntryProducers {
+            transaction: sender.clone(),
+            entry: sender.clone(),
+            block_parent: sender.clone(),
+            block_metadata: sender.clone(),
+        };
+        let notifier_sender = sender.clone();
+        let consumer = std::thread::spawn(move || {
+            assert_eq!(receiver.recv(), Err(crossbeam_channel::RecvError));
+        });
+        let (done_sender, done_receiver) = crossbeam_channel::bounded(1);
+        std::thread::spawn(move || {
+            close_ready_entry_channel(notifier_sender, producers, sender, consumer)
+                .expect("consumer exits cleanly");
+            done_sender.send(()).expect("test remains alive");
+        });
+        done_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("ready-entry teardown must not deadlock");
+    }
 
     #[test]
     fn prior_runtime_generation_profile_allowlists_are_exact_and_scoped() {

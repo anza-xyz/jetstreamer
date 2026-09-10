@@ -3,8 +3,11 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
     os::{
-        fd::AsRawFd as _,
-        unix::fs::{FileExt as _, MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _},
+        fd::{AsRawFd as _, FromRawFd as _},
+        unix::{
+            ffi::OsStrExt as _,
+            fs::{FileExt as _, MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _},
+        },
     },
     path::{Path, PathBuf},
     sync::atomic::{AtomicBool, Ordering},
@@ -23,9 +26,13 @@ pub const ARCHIVE_BATCH_OUTCOME_DIRECTORY: &str = ".jetstreamer-archive-batch-ou
 /// sides of an interrupted transaction.
 pub const ARCHIVE_PUBLICATION_SENTINEL: &[u8] = b"jetstreamer publication in progress\n";
 
-/// Reports whether an active batch transaction or an unacknowledged completed
-/// batch outcome exists in a destination. Any non-directory entry at either
-/// reserved name is rejected rather than treated as absence.
+/// Reports an instantaneous observation of whether an active batch transaction
+/// or unacknowledged completed outcome exists. This is a diagnostic probe, not
+/// a read lease or a coherent-snapshot guarantee. Writers use an internal
+/// destination lock across their complete check-and-mutate windows.
+///
+/// Any non-directory entry at either reserved name is rejected rather than
+/// treated as absence.
 pub fn archive_batch_publication_in_progress(
     destination_directory: impl AsRef<Path>,
 ) -> io::Result<bool> {
@@ -50,6 +57,129 @@ pub fn archive_batch_publication_in_progress(
         }
     }
     Ok(false)
+}
+
+#[derive(Debug)]
+pub(crate) struct ArchiveDestinationWriterLock {
+    _directory: File,
+    destination_device: u64,
+    destination_inode: u64,
+}
+
+impl ArchiveDestinationWriterLock {
+    pub(crate) fn binds_destination(&self, device: u64, inode: u64) -> bool {
+        self.destination_device == device && self.destination_inode == inode
+    }
+}
+
+pub(crate) fn acquire_archive_destination_writer_lock(
+    destination_directory: &Path,
+) -> io::Result<ArchiveDestinationWriterLock> {
+    let mut directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(if destination_directory.is_absolute() {
+            Path::new("/")
+        } else {
+            Path::new(".")
+        })?;
+    for component in destination_directory.components() {
+        let name = match component {
+            std::path::Component::RootDir | std::path::Component::CurDir => continue,
+            std::path::Component::Normal(name) => name,
+            std::path::Component::ParentDir | std::path::Component::Prefix(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "archive destination contains an unsafe path component: {}",
+                        destination_directory.display()
+                    ),
+                ));
+            }
+        };
+        let name = std::ffi::CString::new(name.as_bytes()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "archive destination component contains NUL",
+            )
+        })?;
+        // SAFETY: directory is a live directory descriptor, name is a
+        // NUL-terminated path component, and the returned descriptor is owned.
+        let fd = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: openat returned a new owned descriptor.
+        directory = unsafe { File::from_raw_fd(fd) };
+    }
+    let path_metadata = fs::symlink_metadata(destination_directory)?;
+    if !path_metadata.file_type().is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "archive destination is not a real directory: {}",
+                destination_directory.display()
+            ),
+        ));
+    }
+    let directory_metadata = directory.metadata()?;
+    if directory_metadata.dev() != path_metadata.dev()
+        || directory_metadata.ino() != path_metadata.ino()
+        || directory_metadata.mode() != path_metadata.mode()
+        || directory_metadata.uid() != path_metadata.uid()
+        || directory_metadata.gid() != path_metadata.gid()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "archive destination changed while acquiring writer lock: {}",
+                destination_directory.display()
+            ),
+        ));
+    }
+
+    // SAFETY: flock has no memory-safety preconditions and `directory` is a
+    // live descriptor. The inode-scoped lock works across bind-mount aliases
+    // and is released automatically when the descriptor closes or we crash.
+    if unsafe { libc::flock(directory.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        let error = io::Error::last_os_error();
+        return Err(io::Error::new(
+            if error.kind() == io::ErrorKind::WouldBlock {
+                io::ErrorKind::WouldBlock
+            } else {
+                error.kind()
+            },
+            format!(
+                "archive destination writer lock is held for {}: {error}",
+                destination_directory.display()
+            ),
+        ));
+    }
+
+    let rebound_directory = fs::symlink_metadata(destination_directory)?;
+    if !rebound_directory.file_type().is_dir()
+        || rebound_directory.dev() != directory_metadata.dev()
+        || rebound_directory.ino() != directory_metadata.ino()
+        || rebound_directory.mode() != directory_metadata.mode()
+        || rebound_directory.uid() != directory_metadata.uid()
+        || rebound_directory.gid() != directory_metadata.gid()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "archive destination changed after acquiring writer lock",
+        ));
+    }
+    Ok(ArchiveDestinationWriterLock {
+        _directory: directory,
+        destination_device: directory_metadata.dev(),
+        destination_inode: directory_metadata.ino(),
+    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -411,6 +541,28 @@ pub fn ensure_archive_checksum_for_validated(
     validated: ValidatedArchiveFile,
 ) -> io::Result<PathBuf> {
     let archive_path = archive_path.as_ref();
+    let writer_lock = acquire_checksum_writer_lock(archive_path)?;
+    ensure_archive_checksum_for_validated_locked(archive_path, validated, &writer_lock)
+}
+
+fn acquire_checksum_writer_lock(archive_path: &Path) -> io::Result<ArchiveDestinationWriterLock> {
+    let parent = archive_path.parent().unwrap_or_else(|| Path::new("."));
+    acquire_archive_destination_writer_lock(parent).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "failed to acquire archive destination writer lock for {}: {error}",
+                parent.display()
+            ),
+        )
+    })
+}
+
+fn ensure_archive_checksum_for_validated_locked(
+    archive_path: &Path,
+    validated: ValidatedArchiveFile,
+    _writer_lock: &ArchiveDestinationWriterLock,
+) -> io::Result<PathBuf> {
     let parent = archive_path.parent().unwrap_or_else(|| Path::new("."));
     if archive_batch_publication_in_progress(parent)? {
         return Err(io::Error::new(
@@ -559,9 +711,10 @@ pub fn ensure_archive_checksum_for_validated(
 /// [`ensure_archive_checksum_for_validated`] to close the validation/hash gap.
 pub fn ensure_archive_checksum(archive_path: impl AsRef<Path>) -> io::Result<PathBuf> {
     let archive_path = archive_path.as_ref();
+    let writer_lock = acquire_checksum_writer_lock(archive_path)?;
     let file = open_regular_nofollow(archive_path)?;
     let validated = measure_open_archive(&file)?;
-    ensure_archive_checksum_for_validated(archive_path, validated)
+    ensure_archive_checksum_for_validated_locked(archive_path, validated, &writer_lock)
 }
 
 #[cfg(test)]
@@ -605,6 +758,42 @@ mod tests {
         assert_eq!(
             fs::metadata(&checksum).unwrap().permissions().mode() & 0o777,
             0o640
+        );
+    }
+
+    #[test]
+    fn destination_writer_lock_excludes_checksum_repair_until_release() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let archive = directory.path().join("epoch-7.jet");
+        fs::write(&archive, b"archive").unwrap();
+        let file = open_regular_nofollow(&archive).unwrap();
+        let evidence = measure_open_archive(&file).unwrap();
+        let writer_lock = acquire_archive_destination_writer_lock(directory.path()).unwrap();
+
+        let error = ensure_archive_checksum_for_validated(&archive, evidence).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert!(!archive_checksum_path(&archive).unwrap().exists());
+        drop(writer_lock);
+        ensure_archive_checksum_for_validated(&archive, evidence).unwrap();
+    }
+
+    #[test]
+    fn destination_writer_lock_rejects_intermediate_symlinks() {
+        let root = tempfile::TempDir::new().unwrap();
+        let real = root.path().join("real");
+        let alias = root.path().join("alias");
+        fs::create_dir(&real).unwrap();
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+
+        let error = acquire_archive_destination_writer_lock(&alias).unwrap_err();
+
+        assert!(
+            matches!(
+                error.raw_os_error(),
+                Some(libc::ELOOP) | Some(libc::ENOTDIR)
+            ),
+            "{error}"
         );
     }
 

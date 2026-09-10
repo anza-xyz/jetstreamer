@@ -12081,8 +12081,8 @@ fn publish_verified_runtime_assembly(
     )
     .map_err(|error| {
         format!(
-            "failed to transactionally publish verified multi-runtime epoch {epoch} archive (committed={}): {error}",
-            error.committed()
+            "failed to transactionally publish verified multi-runtime epoch {epoch} archive (commit_state={:?}): {error}",
+            error.commit_state()
         )
     })
 }
@@ -13824,9 +13824,9 @@ fn publish_staged_epoch_archive(validated: &ValidatedAdaptiveEpoch) -> Result<()
     )
     .map_err(|error| {
         format!(
-            "failed to transactionally publish verified epoch {} archive (committed={}): {error}",
+            "failed to transactionally publish verified epoch {} archive (commit_state={:?}): {error}",
             job.epoch,
-            error.committed(),
+            error.commit_state(),
         )
     })?;
     if let Some(recovery) = publication.recovery_directory {

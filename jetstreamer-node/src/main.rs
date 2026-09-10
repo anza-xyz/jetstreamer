@@ -32,11 +32,13 @@ use cid::{Cid, multibase::Base};
 use crossbeam_channel::{bounded, unbounded};
 use dashmap::DashMap;
 use jetstreamer_firehose::{
-    epochs::{BASE_URL, epoch_to_slot_range, slot_to_epoch},
+    epochs::{BASE_URL, epoch_to_slot_range, fetch_epoch_stream, slot_to_epoch},
     firehose::{
-        FirehoseError, GeyserNotifiers, SourcedTransaction, SourcedTransactionNotifier,
-        SourcedTransactionStatus, firehose_geyser_with_notifiers,
+        BlockParentNotifier, FirehoseError, GeyserNotifiers, SourcedTransaction,
+        SourcedTransactionNotifier, SourcedTransactionStatus,
+        firehose_geyser_with_notifiers_and_block_parent,
     },
+    node_reader::NodeReader,
 };
 use jetstreamer_horizon::archive::{
     AccountsHashKind, ArchiveProvenance, ArchiveProvenanceV1, ArchiveProvenanceV2,
@@ -176,7 +178,6 @@ const MAX_WAVE_TXS: usize = 256;
 const DEFAULT_POST_FIREHOSE_INCOMPLETE_RETRY_ATTEMPTS: usize = 16;
 const DEFAULT_EMPTY_SLOT_BUFFER_GAP_LIMIT: u64 = 0;
 const DEFAULT_FIREHOSE_BACKPRESSURE_SLOT_GAP_LIMIT: u64 = 128;
-const DEFAULT_FORCE_MISSING_BLOCK_RETRY_LIMIT: usize = 16;
 static LOGGED_FIRST_ACCOUNT_UPDATE: AtomicBool = AtomicBool::new(false);
 static LOGGED_PROGRAM_CACHE_ASSIGN_FAIL: AtomicBool = AtomicBool::new(false);
 static PROGRAM_CACHE_ASSIGN_FAIL_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -3351,6 +3352,13 @@ struct TransactionScheduler {
     empty_slot_buffer_gap_limit: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CanonicalSlotState {
+    Unknown,
+    RequiredPresent,
+    ProvenSkipped,
+}
+
 #[derive(Debug)]
 struct SchedulerState {
     last_finalized_slot: Slot,
@@ -3358,7 +3366,12 @@ struct SchedulerState {
     current_slot: Slot,
     slots: HashMap<Slot, SlotExecutionBuffer>,
     inferred_blocks: HashMap<Slot, (u64, u64)>,
-    forced_missing: HashSet<Slot>,
+    /// Canonical state derived only from decoded blocks and parent edges. The
+    /// indexes remain useful for seeking, but never populate this table.
+    canonical_slots: Vec<CanonicalSlotState>,
+    /// Parent slots from decoded block nodes, retained to reject conflicting
+    /// metadata when a firehose retry re-delivers a block.
+    decoded_parents: Vec<Option<Slot>>,
     highest_seen_slot: Slot,
 }
 
@@ -3414,6 +3427,7 @@ impl TransactionScheduler {
         restart_tracker: Arc<RestartTracker>,
         empty_slot_buffer_gap_limit: u64,
     ) -> Self {
+        let canonical_slot_count = presence.states.len();
         Self {
             state: Mutex::new(SchedulerState {
                 last_finalized_slot: start_slot.saturating_sub(1),
@@ -3421,7 +3435,8 @@ impl TransactionScheduler {
                 current_slot: start_slot,
                 slots: HashMap::new(),
                 inferred_blocks: HashMap::new(),
-                forced_missing: HashSet::new(),
+                canonical_slots: vec![CanonicalSlotState::Unknown; canonical_slot_count],
+                decoded_parents: vec![None; canonical_slot_count],
                 highest_seen_slot: start_slot.saturating_sub(1),
             }),
             presence,
@@ -3458,15 +3473,191 @@ impl TransactionScheduler {
         state: &SchedulerState,
         slot: Slot,
     ) -> Option<SlotPresenceState> {
-        if state.forced_missing.contains(&slot) {
-            return Some(SlotPresenceState::Missing);
+        match self.canonical_slot_state_locked(state, slot)? {
+            CanonicalSlotState::RequiredPresent => Some(SlotPresenceState::Present),
+            CanonicalSlotState::ProvenSkipped => Some(SlotPresenceState::Missing),
+            CanonicalSlotState::Unknown => self.presence.state(slot),
         }
-        self.presence.state(slot)
     }
 
-    fn is_missing_locked(&self, state: &SchedulerState, slot: Slot) -> Option<bool> {
-        self.slot_presence_locked(state, slot)
-            .map(|presence| presence == SlotPresenceState::Missing)
+    fn canonical_slot_index(&self, slot: Slot) -> Option<usize> {
+        if slot < self.presence.start || slot > self.presence.end_inclusive {
+            return None;
+        }
+        usize::try_from(slot - self.presence.start).ok()
+    }
+
+    fn canonical_slot_state_locked(
+        &self,
+        state: &SchedulerState,
+        slot: Slot,
+    ) -> Option<CanonicalSlotState> {
+        let index = self.canonical_slot_index(slot)?;
+        state.canonical_slots.get(index).copied()
+    }
+
+    fn record_present_evidence_locked(
+        &self,
+        state: &mut SchedulerState,
+        slot: Slot,
+        source: &str,
+    ) -> Result<(), String> {
+        let index = self
+            .canonical_slot_index(slot)
+            .ok_or_else(|| format!("{source} is outside the replay range at slot {slot}"))?;
+        match state.canonical_slots[index] {
+            CanonicalSlotState::Unknown => {
+                state.canonical_slots[index] = CanonicalSlotState::RequiredPresent;
+                Ok(())
+            }
+            CanonicalSlotState::RequiredPresent => Ok(()),
+            CanonicalSlotState::ProvenSkipped => Err(format!(
+                "{source} proves slot {slot} contains a block, but a decoded parent edge proved it skipped"
+            )),
+        }
+    }
+
+    /// Applies the canonical gap implied by a decoded block edge. Indexes are
+    /// only seek hints: a block at `slot` with parent `parent_slot` proves every
+    /// intervening slot was skipped and proves its parent contained a block.
+    fn record_parent_edge_locked(
+        &self,
+        state: &mut SchedulerState,
+        parent_slot: Slot,
+        slot: Slot,
+    ) -> Result<(), String> {
+        if slot == 0 {
+            if parent_slot != 0 {
+                return Err(format!(
+                    "genesis block at slot 0 has invalid parent slot {parent_slot}"
+                ));
+            }
+            let index = self
+                .canonical_slot_index(slot)
+                .ok_or_else(|| "genesis block is outside the replay range".to_string())?;
+            if state.canonical_slots[index] == CanonicalSlotState::ProvenSkipped {
+                return Err("decoded genesis block was previously proven skipped".to_string());
+            }
+            if state.decoded_parents[index].is_some_and(|parent| parent != 0) {
+                return Err("decoded genesis block has conflicting parent metadata".to_string());
+            }
+            state.canonical_slots[index] = CanonicalSlotState::RequiredPresent;
+            state.decoded_parents[index] = Some(0);
+            return Ok(());
+        }
+        if parent_slot >= slot {
+            return Err(format!(
+                "block metadata for slot {slot} has non-preceding parent slot {parent_slot}"
+            ));
+        }
+
+        let child_index = self.canonical_slot_index(slot);
+        let parent_index = self.canonical_slot_index(parent_slot);
+
+        if let Some(index) = child_index {
+            if state.canonical_slots[index] == CanonicalSlotState::ProvenSkipped {
+                return Err(format!(
+                    "decoded block metadata proves slot {slot} present after a parent edge proved it skipped"
+                ));
+            }
+            if let Some(existing_parent) = state.decoded_parents[index]
+                && existing_parent != parent_slot
+            {
+                return Err(format!(
+                    "conflicting parent metadata for slot {slot}: first {existing_parent}, then {parent_slot}"
+                ));
+            }
+        } else if slot <= self.presence.end_inclusive {
+            return Err(format!(
+                "decoded block slot {slot} precedes replay range start {}",
+                self.presence.start
+            ));
+        }
+
+        if let Some(index) = parent_index {
+            if state.canonical_slots[index] == CanonicalSlotState::ProvenSkipped {
+                return Err(format!(
+                    "block metadata for slot {slot} names slot {parent_slot} as its parent after another parent edge proved it skipped"
+                ));
+            }
+            if parent_slot < state.current_slot
+                && state.canonical_slots[index] != CanonicalSlotState::RequiredPresent
+            {
+                return Err(format!(
+                    "block metadata for slot {slot} names slot {parent_slot} as its parent after that slot was finalized without block data"
+                ));
+            }
+        }
+
+        let gap_start = parent_slot.saturating_add(1).max(self.presence.start);
+        let gap_end = slot.min(self.presence.end_inclusive.saturating_add(1));
+
+        for skipped in gap_start..gap_end {
+            let index = self
+                .canonical_slot_index(skipped)
+                .expect("parent gap clipped to scheduler range");
+            let buffered = state
+                .slots
+                .get(&skipped)
+                .is_some_and(SlotExecutionBuffer::has_any_data);
+            if state.canonical_slots[index] == CanonicalSlotState::RequiredPresent || buffered {
+                return Err(format!(
+                    "block metadata edge {parent_slot}->{slot} marks slot {skipped} skipped, but decoded block data proves it present"
+                ));
+            }
+            if skipped < state.current_slot
+                && state.canonical_slots[index] != CanonicalSlotState::ProvenSkipped
+            {
+                return Err(format!(
+                    "block metadata edge {parent_slot}->{slot} marks already-finalized slot {skipped} skipped without prior parent proof"
+                ));
+            }
+        }
+
+        let mut index_overrides = 0usize;
+        let mut newly_proven = Vec::new();
+        if let Some(index) = child_index {
+            state.canonical_slots[index] = CanonicalSlotState::RequiredPresent;
+            state.decoded_parents[index] = Some(parent_slot);
+        }
+        if let Some(index) = parent_index {
+            state.canonical_slots[index] = CanonicalSlotState::RequiredPresent;
+        }
+        for skipped in gap_start..gap_end {
+            let index = self
+                .canonical_slot_index(skipped)
+                .expect("parent gap clipped to scheduler range");
+            if state.canonical_slots[index] != CanonicalSlotState::ProvenSkipped {
+                state.canonical_slots[index] = CanonicalSlotState::ProvenSkipped;
+                newly_proven.push(skipped);
+                if self.presence.state(skipped) == Some(SlotPresenceState::Present) {
+                    index_overrides = index_overrides.saturating_add(1);
+                }
+            }
+        }
+        if child_index.is_some() {
+            state.highest_seen_slot = state.highest_seen_slot.max(slot);
+        }
+        for skipped in newly_proven {
+            horizon::note_chain_confirmed_skipped(skipped);
+        }
+        if index_overrides > 0 {
+            warn!(
+                "block metadata edge {}->{} proved {} index-present slot(s) skipped",
+                parent_slot, slot, index_overrides
+            );
+        }
+        Ok(())
+    }
+
+    fn record_block_parent(
+        &self,
+        parent_slot: Slot,
+        slot: Slot,
+    ) -> Result<Vec<ReadyEntry>, String> {
+        let mut state = self.state.lock().expect("transaction scheduler lock");
+        self.record_parent_edge_locked(&mut state, parent_slot, slot)?;
+        self.advance_ready_locked(&mut state)
     }
 
     fn apply_restart_locked(&self, state: &mut SchedulerState, target: ResumeTarget) {
@@ -3558,6 +3749,7 @@ impl TransactionScheduler {
                 slot, target.entry_index, target.tx_start
             );
         }
+        self.record_present_evidence_locked(&mut state, slot, "transaction data")?;
         if state.has_finalized_slot && slot <= state.last_finalized_slot {
             return Err(format!(
                 "late transaction for slot {slot} (last finalized slot {})",
@@ -3600,6 +3792,7 @@ impl TransactionScheduler {
                 slot, target.entry_index, target.tx_start
             );
         }
+        self.record_present_evidence_locked(&mut state, slot, "entry data")?;
         if state.has_finalized_slot && slot <= state.last_finalized_slot {
             return Err(format!(
                 "late entry for slot {slot} (last finalized slot {})",
@@ -3617,11 +3810,14 @@ impl TransactionScheduler {
 
     fn record_block_metadata(
         &self,
+        parent_slot: Slot,
         slot: Slot,
         expected_tx_count: u64,
         expected_entry_count: u64,
     ) -> Result<Vec<ReadyEntry>, String> {
         let mut state = self.state.lock().expect("transaction scheduler lock");
+        self.record_parent_edge_locked(&mut state, parent_slot, slot)?;
+        self.record_present_evidence_locked(&mut state, slot, "block metadata")?;
         if state.has_finalized_slot && slot <= state.last_finalized_slot {
             if let Some((inferred_tx, inferred_entry)) = state.inferred_blocks.remove(&slot) {
                 if inferred_tx == expected_tx_count && inferred_entry == expected_entry_count {
@@ -3656,58 +3852,42 @@ impl TransactionScheduler {
         self.advance_ready_locked(&mut state)
     }
 
-    fn force_mark_missing(&self, slot: Slot) -> Result<Vec<ReadyEntry>, String> {
-        let mut state = self.state.lock().expect("transaction scheduler lock");
-        let presence = self.presence.state(slot);
-        if presence.is_none() {
-            return Err(format!(
-                "cannot force missing for slot {} outside scheduler range",
-                slot
-            ));
-        }
-        if let Some(buffer) = state.slots.get(&slot)
-            && buffer.has_any_data()
-        {
-            return Err(format!(
-                "cannot force missing for slot {} because buffered data exists",
-                slot
-            ));
-        }
-        state.forced_missing.insert(slot);
-        // Tell the recorder this slot is a deliberate force-skip (its block
-        // data is genuinely unavailable from old-faithful despite the index
-        // marking it present) so the gap-fill records it as leader-skipped
-        // rather than panicking on a seemingly-dropped present block.
-        horizon::note_force_skipped(slot);
-        self.advance_ready_locked(&mut state)
-    }
-
     fn verify_complete(&self, end_inclusive: Slot) -> Result<(), String> {
         let state = self.state.lock().expect("transaction scheduler lock");
-        for (slot, buffer) in state.slots.iter() {
-            if *slot <= end_inclusive && buffer.has_any_data() {
-                return Err(format!(
-                    "replay incomplete: slot {slot} still has buffered data"
-                ));
-            }
-            if *slot > end_inclusive && buffer.has_any_data() {
-                return Err(format!(
-                    "replay received data for slot {slot} beyond end slot {end_inclusive}"
-                ));
-            }
-        }
-
         let mut slot = state.current_slot;
         while slot <= end_inclusive {
-            match self.slot_presence_locked(&state, slot) {
-                Some(SlotPresenceState::Missing) => slot = slot.saturating_add(1),
-                Some(SlotPresenceState::Present) => {
+            match self.canonical_slot_state_locked(&state, slot) {
+                Some(CanonicalSlotState::ProvenSkipped) => slot = slot.saturating_add(1),
+                Some(CanonicalSlotState::RequiredPresent) => {
                     return Err(format!(
-                        "replay incomplete: missing block data for slot {slot}"
+                        "replay incomplete: decoded chain evidence requires block data for slot {slot}"
+                    ));
+                }
+                Some(CanonicalSlotState::Unknown) => {
+                    return Err(format!(
+                        "replay incomplete: slot {slot} has no decoded block or parent-edge evidence (index hint: {:?})",
+                        self.presence.state(slot)
                     ));
                 }
                 None => break,
             }
+        }
+
+        if let Some(slot) = state
+            .slots
+            .iter()
+            .filter(|(_, buffer)| buffer.has_any_data())
+            .map(|(slot, _)| *slot)
+            .min()
+        {
+            if slot <= end_inclusive {
+                return Err(format!(
+                    "replay incomplete: slot {slot} still has buffered data"
+                ));
+            }
+            return Err(format!(
+                "replay received data for slot {slot} beyond end slot {end_inclusive}"
+            ));
         }
 
         Ok(())
@@ -3742,16 +3922,16 @@ impl TransactionScheduler {
         let mut slot = state.current_slot;
         let mut missing: Option<IncompleteSlotInfo> = None;
         while slot <= end_inclusive {
-            match self.slot_presence_locked(&state, slot) {
-                Some(SlotPresenceState::Missing) => slot = slot.saturating_add(1),
-                Some(SlotPresenceState::Present) => {
+            match self.canonical_slot_state_locked(&state, slot) {
+                Some(CanonicalSlotState::ProvenSkipped) => slot = slot.saturating_add(1),
+                Some(CanonicalSlotState::RequiredPresent | CanonicalSlotState::Unknown) => {
                     missing = Some(IncompleteSlotInfo {
                         slot,
                         entry_index: 0,
                         tx_start: 0,
                         reason: IncompleteReason::MissingBlockData,
                         snapshot: None,
-                        presence: Some(SlotPresenceState::Present),
+                        presence: self.slot_presence_locked(&state, slot),
                     });
                     break;
                 }
@@ -3821,6 +4001,25 @@ impl TransactionScheduler {
         let mut ready = Vec::new();
         loop {
             let current_slot = state.current_slot;
+            match self.canonical_slot_state_locked(state, current_slot) {
+                Some(CanonicalSlotState::ProvenSkipped) => {
+                    if let Some(buffer) = state.slots.remove(&current_slot)
+                        && buffer.has_any_data()
+                    {
+                        return Err(format!(
+                            "slot {} is proven skipped but contains buffered data",
+                            current_slot
+                        ));
+                    }
+                    state.last_finalized_slot = current_slot;
+                    state.has_finalized_slot = true;
+                    state.current_slot = current_slot.saturating_add(1);
+                    continue;
+                }
+                Some(CanonicalSlotState::RequiredPresent) => {}
+                Some(CanonicalSlotState::Unknown) | None => break,
+            }
+
             if state.highest_seen_slot > current_slot {
                 let current_has_data = state
                     .slots
@@ -3841,24 +4040,6 @@ impl TransactionScheduler {
                         ));
                     }
                 }
-            }
-            match self.is_missing_locked(state, current_slot) {
-                Some(true) => {
-                    if let Some(buffer) = state.slots.remove(&current_slot)
-                        && buffer.has_any_data()
-                    {
-                        return Err(format!(
-                            "slot {} marked leader skipped but contains buffered data",
-                            current_slot
-                        ));
-                    }
-                    state.last_finalized_slot = current_slot;
-                    state.has_finalized_slot = true;
-                    state.current_slot = current_slot.saturating_add(1);
-                    continue;
-                }
-                Some(false) => {}
-                None => break,
             }
 
             let Some(buffer) = state.slots.get_mut(&current_slot) else {
@@ -4427,6 +4608,28 @@ impl EntryNotifier for BankEntryNotifier {
     }
 }
 
+struct BankBlockParentNotifier {
+    scheduler: Arc<TransactionScheduler>,
+    failure: Arc<ReplayFailure>,
+    ready_sender: crossbeam_channel::Sender<Vec<ReadyEntry>>,
+    firehose_gate: Arc<Mutex<()>>,
+}
+
+impl BlockParentNotifier for BankBlockParentNotifier {
+    fn notify_block_parent(&self, parent_slot: u64, slot: u64) {
+        let _firehose_guard = self
+            .firehose_gate
+            .lock()
+            .expect("firehose gate lock poisoned");
+        match self.scheduler.record_block_parent(parent_slot, slot) {
+            Ok(ready_entries) => {
+                send_ready_entries(&self.ready_sender, &self.failure, ready_entries);
+            }
+            Err(err) => self.failure.record(err),
+        }
+    }
+}
+
 struct BankBlockMetadataNotifier {
     scheduler: Arc<TransactionScheduler>,
     progress: Arc<ReplayProgress>,
@@ -4443,7 +4646,7 @@ struct BankBlockMetadataNotifier {
 impl BlockMetadataNotifier for BankBlockMetadataNotifier {
     fn notify_block_metadata(
         &self,
-        _parent_slot: u64,
+        parent_slot: u64,
         _parent_blockhash: &str,
         slot: u64,
         _blockhash: &str,
@@ -4471,10 +4674,12 @@ impl BlockMetadataNotifier for BankBlockMetadataNotifier {
             .lock()
             .expect("firehose gate lock poisoned");
         self.progress.note_block_meta_slot(slot);
-        match self
-            .scheduler
-            .record_block_metadata(slot, executed_transaction_count, entry_count)
-        {
+        match self.scheduler.record_block_metadata(
+            parent_slot,
+            slot,
+            executed_transaction_count,
+            entry_count,
+        ) {
             Ok(ready_entries) => {
                 send_ready_entries(&self.ready_sender, &self.failure, ready_entries);
             }
@@ -4486,7 +4691,7 @@ impl BlockMetadataNotifier for BankBlockMetadataNotifier {
             if let Some(recorder) = horizon::recorder() {
                 recorder.record_block_meta(
                     slot,
-                    _parent_slot,
+                    parent_slot,
                     _parent_blockhash,
                     _blockhash,
                     _rewards,
@@ -6699,6 +6904,63 @@ fn post_firehose_incomplete_retry_attempts() -> usize {
         .unwrap_or(DEFAULT_POST_FIREHOSE_INCOMPLETE_RETRY_ATTEMPTS)
 }
 
+async fn fetch_first_block_edge_at_or_after(
+    start_slot: Slot,
+    client: &Client,
+) -> Result<(Slot, Slot), String> {
+    const READ_TIMEOUT: Duration = Duration::from_secs(180);
+
+    let epoch = slot_to_epoch(start_slot);
+    let (epoch_start, epoch_end_inclusive) = epoch_to_slot_range(epoch);
+    let stream = fetch_epoch_stream(epoch, client).await;
+    let mut reader = NodeReader::new(stream);
+    tokio::time::timeout(READ_TIMEOUT, reader.read_raw_header())
+        .await
+        .map_err(|_| format!("timed out reading epoch {epoch} CAR header"))?
+        .map_err(|err| format!("failed to read epoch {epoch} CAR header: {err}"))?;
+    if start_slot > epoch_start {
+        tokio::time::timeout(READ_TIMEOUT, reader.seek_to_slot(start_slot))
+            .await
+            .map_err(|_| format!("timed out seeking epoch {epoch} to slot {start_slot}"))?
+            .map_err(|err| format!("failed to seek epoch {epoch} to slot {start_slot}: {err}"))?;
+    }
+
+    loop {
+        let nodes = tokio::time::timeout(READ_TIMEOUT, reader.read_until_block())
+            .await
+            .map_err(|_| {
+                format!("timed out reading the first block at or after slot {start_slot}")
+            })?
+            .map_err(|err| {
+                format!("failed to read the first block at or after slot {start_slot}: {err}")
+            })?;
+        if nodes.0.is_empty() {
+            return Err(format!(
+                "epoch {epoch} CAR ended before a block at or after slot {start_slot}"
+            ));
+        }
+        let block = nodes
+            .get_block()
+            .map_err(|err| format!("invalid block group in epoch {epoch} CAR: {err}"))?;
+        if !(epoch_start..=epoch_end_inclusive).contains(&block.slot) {
+            return Err(format!(
+                "epoch {epoch} CAR yielded out-of-range block {}",
+                block.slot
+            ));
+        }
+        if block.slot < start_slot {
+            continue;
+        }
+        if block.slot > 0 && block.meta.parent_slot >= block.slot {
+            return Err(format!(
+                "block {} has non-preceding parent {}",
+                block.slot, block.meta.parent_slot
+            ));
+        }
+        return Ok((block.meta.parent_slot, block.slot));
+    }
+}
+
 fn firehose_backpressure_slot_gap_limit() -> u64 {
     match env::var("JETSTREAMER_FIREHOSE_BACKPRESSURE_SLOT_GAP_LIMIT") {
         Ok(value) => {
@@ -6718,29 +6980,6 @@ fn firehose_backpressure_slot_gap_limit() -> u64 {
             }
         }
         Err(_) => DEFAULT_FIREHOSE_BACKPRESSURE_SLOT_GAP_LIMIT,
-    }
-}
-
-fn force_missing_block_retry_limit() -> usize {
-    match env::var("JETSTREAMER_FORCE_MISSING_BLOCK_RETRY_LIMIT") {
-        Ok(value) => {
-            let trimmed = value.trim();
-            if trimmed.is_empty() {
-                return DEFAULT_FORCE_MISSING_BLOCK_RETRY_LIMIT;
-            }
-            match trimmed.parse::<usize>() {
-                Ok(limit) if limit > 0 => limit,
-                Ok(_) => DEFAULT_FORCE_MISSING_BLOCK_RETRY_LIMIT,
-                Err(err) => {
-                    warn!(
-                        "invalid JETSTREAMER_FORCE_MISSING_BLOCK_RETRY_LIMIT '{value}': {err}; using default {}",
-                        DEFAULT_FORCE_MISSING_BLOCK_RETRY_LIMIT
-                    );
-                    DEFAULT_FORCE_MISSING_BLOCK_RETRY_LIMIT
-                }
-            }
-        }
-        Err(_) => DEFAULT_FORCE_MISSING_BLOCK_RETRY_LIMIT,
     }
 }
 
@@ -7665,12 +7904,30 @@ async fn run_geyser_replay(
                 )
             }
         };
+    let bootstrap_last_blockhash = match &replay_source {
+        ReplaySource::Agave(BankSource::Reuse(bank_forks)) => bank_forks
+            .read()
+            .map_err(|_| "bank forks lock poisoned".to_string())?
+            .working_bank()
+            .last_blockhash(),
+        ReplaySource::Agave(BankSource::Fresh(bank)) => bank.last_blockhash(),
+        ReplaySource::Historical(client) => {
+            Hash::new_from_array(client.initialized().last_blockhash)
+        }
+    };
     if snapshot_slot != bootstrap_slot {
         return Err(format!(
             "loaded state slot {} does not match the preflighted bootstrap slot {}",
             snapshot_slot, bootstrap_slot,
         ));
     }
+    let bootstrap_parent_anchor = replay_start
+        .checked_sub(1)
+        .filter(|parent_slot| *parent_slot == snapshot_slot)
+        .map(|parent_slot| (parent_slot, bootstrap_last_blockhash));
+    let expected_initial_parent = (replay_start == output_slot_start)
+        .then_some(bootstrap_parent_anchor)
+        .flatten();
     if replay_start < output_slot_start {
         info!(
             "warming up replay from slot {} to {} (recording starts at {})",
@@ -7720,6 +7977,7 @@ async fn run_geyser_replay(
         output_slot_count,
         slot_presence.clone(),
         &archive_provenance,
+        expected_initial_parent,
     )?;
     info!(
         "horizon archive recording to {} (epoch {}, slots {}..={}, runtime={}, admission={:?}, bootstrap={:?}@{})",
@@ -7889,6 +8147,12 @@ async fn run_geyser_replay(
         firehose_backpressure_slot_gap_limit,
         firehose_gate: firehose_gate.clone(),
     });
+    let block_parent_notifier = Arc::new(BankBlockParentNotifier {
+        scheduler: scheduler.clone(),
+        failure: failure.clone(),
+        ready_sender: ready_sender.clone(),
+        firehose_gate: firehose_gate.clone(),
+    });
     let block_metadata_notifier = Arc::new(BankBlockMetadataNotifier {
         scheduler: scheduler.clone(),
         progress: progress.clone(),
@@ -7917,14 +8181,9 @@ async fn run_geyser_replay(
             .unwrap_or_else(|| "default".to_string())
     );
     let post_firehose_retries = post_firehose_incomplete_retry_attempts();
-    let force_missing_retry_limit = force_missing_block_retry_limit();
     info!(
         "post-firehose incomplete retry attempts: {}",
         post_firehose_retries
-    );
-    info!(
-        "force-missing retry limit for persistent missing block data: {}",
-        force_missing_retry_limit
     );
 
     let progress_done = Arc::new(AtomicBool::new(false));
@@ -8471,8 +8730,7 @@ async fn run_geyser_replay(
     let mut firehose_start = slot_range.start;
     let mut incomplete_retries = 0usize;
     let mut firehose_error: Option<String> = None;
-    let mut persistent_missing_slot: Option<Slot> = None;
-    let mut persistent_missing_count = 0usize;
+    let mut boundary_parent_edge: Option<(Slot, Slot)> = None;
     loop {
         if shutdown.load(Ordering::Relaxed) {
             info!("shutdown requested; abandoning replay");
@@ -8511,6 +8769,12 @@ async fn run_geyser_replay(
                 entry_notifier: notifiers.entry_notifier.clone(),
                 block_metadata_notifier: notifiers.block_metadata_notifier.clone(),
             };
+            let block_parent_notifier = block_parent_notifier.clone();
+            let initial_parent = if firehose_start == replay_start {
+                bootstrap_parent_anchor
+            } else {
+                None
+            };
             let confirmed_bank_sender = confirmed_bank_sender.clone();
             let index_base_url = index_base_url.clone();
             let client = client.clone();
@@ -8522,10 +8786,12 @@ async fn run_geyser_replay(
                         return Err((FirehoseError::OnLoadError(Box::new(err)), slot_range.start));
                     }
                 };
-                firehose_geyser_with_notifiers(
+                firehose_geyser_with_notifiers_and_block_parent(
                     rt,
                     slot_range,
                     notifiers,
+                    Some(block_parent_notifier),
+                    initial_parent,
                     confirmed_bank_sender,
                     &index_base_url,
                     &client,
@@ -8564,45 +8830,63 @@ async fn run_geyser_replay(
             Err(err) => failure.record(err),
         }
 
-        if let Err(err) = scheduler.verify_complete(end_inclusive) {
-            if let Some(incomplete) = scheduler.first_incomplete_slot(end_inclusive) {
-                if matches!(incomplete.reason, IncompleteReason::MissingBlockData) {
-                    if persistent_missing_slot == Some(incomplete.slot) {
-                        persistent_missing_count = persistent_missing_count.saturating_add(1);
-                    } else {
-                        persistent_missing_slot = Some(incomplete.slot);
-                        persistent_missing_count = 1;
+        if !stopped_by_backpressure && scheduler.snapshot().current_slot <= end_inclusive {
+            if boundary_parent_edge.is_none() {
+                let boundary_start = end_inclusive.checked_add(1).ok_or_else(|| {
+                    format!("end slot {end_inclusive} has no representable successor")
+                })?;
+                let mut last_error = None;
+                for attempt in 1..=3 {
+                    if shutdown.load(Ordering::Relaxed) {
+                        break;
                     }
-                } else {
-                    persistent_missing_slot = None;
-                    persistent_missing_count = 0;
-                }
-
-                if matches!(incomplete.reason, IncompleteReason::MissingBlockData)
-                    && persistent_missing_count >= force_missing_retry_limit
-                {
-                    warn!(
-                        "forcing slot {} to missing after {} consecutive missing-block-data retries",
-                        incomplete.slot, persistent_missing_count
-                    );
-                    match scheduler.force_mark_missing(incomplete.slot) {
-                        Ok(ready_entries) => {
-                            send_ready_entries(&ready_sender, &failure, ready_entries);
-                            persistent_missing_slot = None;
-                            persistent_missing_count = 0;
-                            firehose_start = scheduler.snapshot().current_slot;
-                            continue;
-                        }
-                        Err(force_err) => {
-                            failure.record(format!(
-                                "failed to force slot {} missing after persistent missing block data: {}",
-                                incomplete.slot, force_err
-                            ));
+                    match fetch_first_block_edge_at_or_after(boundary_start, &client).await {
+                        Ok(edge) => {
+                            boundary_parent_edge = Some(edge);
                             break;
                         }
+                        Err(err) => {
+                            warn!(
+                                "failed to fetch boundary parent edge after slot {end_inclusive} (attempt {attempt}/3): {err}"
+                            );
+                            last_error = Some(err);
+                            if attempt < 3 {
+                                tokio::time::sleep(Duration::from_secs(attempt)).await;
+                            }
+                        }
                     }
                 }
+                if boundary_parent_edge.is_none() && !shutdown.load(Ordering::Relaxed) {
+                    failure.record(format!(
+                        "could not prove the replay tail after slot {end_inclusive}: {}",
+                        last_error.unwrap_or_else(|| "boundary scan stopped".to_string())
+                    ));
+                }
+            }
 
+            if let Some((parent_slot, child_slot)) = boundary_parent_edge {
+                if parent_slot > end_inclusive {
+                    failure.record(format!(
+                        "boundary scan reached block {child_slot} with parent {parent_slot}; it skipped the first canonical successor after replay end {end_inclusive}"
+                    ));
+                } else {
+                    info!(
+                        "boundary block {child_slot} parent {parent_slot} supplies decoded tail evidence through slot {end_inclusive}"
+                    );
+                    match scheduler.record_block_parent(parent_slot, child_slot) {
+                        Ok(ready_entries) => {
+                            send_ready_entries(&ready_sender, &failure, ready_entries);
+                        }
+                        Err(err) => failure.record(format!(
+                            "boundary parent edge {parent_slot}->{child_slot} was rejected: {err}"
+                        )),
+                    }
+                }
+            }
+        }
+
+        if let Err(err) = scheduler.verify_complete(end_inclusive) {
+            if let Some(incomplete) = scheduler.first_incomplete_slot(end_inclusive) {
                 let consume_retry_budget = !stopped_by_backpressure;
                 if consume_retry_budget && incomplete_retries >= post_firehose_retries {
                     failure.record(err);
@@ -15588,12 +15872,251 @@ mod early_snapshot_tests {
         let scheduler = TransactionScheduler::new(0, presence, Arc::new(RestartTracker::new()), 0);
 
         let ready = scheduler
-            .record_block_metadata(0, 0, 0)
+            .record_block_metadata(0, 0, 0, 0)
             .expect("slot zero must not be considered already finalized");
         assert!(ready.is_empty());
         let snapshot = scheduler.snapshot();
         assert_eq!(snapshot.current_slot, 1);
         assert_eq!(snapshot.last_finalized_slot, 0);
+    }
+
+    fn test_scheduler(start: Slot, states: Vec<SlotPresenceState>) -> TransactionScheduler {
+        let end_inclusive = start + states.len() as Slot - 1;
+        TransactionScheduler::new(
+            start,
+            Arc::new(SlotPresenceMap {
+                start,
+                end_inclusive,
+                next_present_after: vec![None; states.len()],
+                states,
+            }),
+            Arc::new(RestartTracker::new()),
+            0,
+        )
+    }
+
+    #[test]
+    fn parent_edge_overrides_false_present_index_hints() {
+        let scheduler = test_scheduler(183, vec![SlotPresenceState::Present; 6]);
+        scheduler
+            .record_block_metadata(182, 183, 0, 0)
+            .expect("first block");
+
+        let ready = scheduler
+            .record_block_metadata(183, 188, 0, 0)
+            .expect("parent edge proves slots 184 through 187 skipped");
+
+        assert!(ready.is_empty());
+        let snapshot = scheduler.snapshot();
+        assert_eq!(snapshot.current_slot, 189);
+        assert_eq!(snapshot.last_finalized_slot, 188);
+        let state = scheduler.state.lock().unwrap();
+        assert_eq!(
+            &state.canonical_slots[1..5],
+            &[
+                CanonicalSlotState::ProvenSkipped,
+                CanonicalSlotState::ProvenSkipped,
+                CanonicalSlotState::ProvenSkipped,
+                CanonicalSlotState::ProvenSkipped,
+            ]
+        );
+    }
+
+    #[test]
+    fn decoded_block_overrides_false_missing_index_hint() {
+        let scheduler = test_scheduler(
+            183,
+            vec![
+                SlotPresenceState::Present,
+                SlotPresenceState::Missing,
+                SlotPresenceState::Missing,
+                SlotPresenceState::Missing,
+                SlotPresenceState::Missing,
+                SlotPresenceState::Missing,
+            ],
+        );
+        scheduler
+            .record_block_metadata(182, 183, 0, 0)
+            .expect("first block");
+        let snapshot = scheduler.snapshot();
+        assert_eq!(snapshot.current_slot, 184);
+        assert_eq!(snapshot.last_finalized_slot, 183);
+
+        scheduler
+            .record_block_metadata(183, 188, 0, 0)
+            .expect("decoded metadata proves slot 188 present");
+
+        let snapshot = scheduler.snapshot();
+        assert_eq!(snapshot.current_slot, 189);
+        assert_eq!(snapshot.last_finalized_slot, 188);
+        assert_eq!(
+            scheduler.state.lock().unwrap().canonical_slots[5],
+            CanonicalSlotState::RequiredPresent
+        );
+    }
+
+    #[test]
+    fn parent_edge_rejects_block_data_in_its_skipped_interval() {
+        let scheduler = test_scheduler(183, vec![SlotPresenceState::Present; 6]);
+        scheduler
+            .record_block_metadata(182, 183, 0, 0)
+            .expect("first block");
+        scheduler
+            .push_entry(185, 0, 0, 0, Hash::new_unique(), 1)
+            .expect("buffer contradictory entry");
+
+        let error = scheduler
+            .record_block_metadata(183, 188, 0, 0)
+            .expect_err("parent edge must not override decoded data");
+        assert!(error.contains("slot 185"), "{error}");
+        assert!(error.contains("proves it present"), "{error}");
+        let state = scheduler.state.lock().unwrap();
+        assert_eq!(
+            state.canonical_slots,
+            vec![
+                CanonicalSlotState::RequiredPresent,
+                CanonicalSlotState::Unknown,
+                CanonicalSlotState::RequiredPresent,
+                CanonicalSlotState::Unknown,
+                CanonicalSlotState::Unknown,
+                CanonicalSlotState::Unknown,
+            ]
+        );
+    }
+
+    #[test]
+    fn payload_before_parent_edge_does_not_finalize_index_hints() {
+        let scheduler = test_scheduler(183, vec![SlotPresenceState::Missing; 6]);
+        scheduler
+            .record_block_metadata(182, 183, 0, 0)
+            .expect("first block");
+        scheduler
+            .push_entry(188, 0, 0, 0, Hash::new_unique(), 1)
+            .expect("child payload may arrive before parent evidence");
+        assert_eq!(scheduler.snapshot().current_slot, 184);
+
+        scheduler
+            .record_block_parent(183, 188)
+            .expect("parent edge classifies only the intervening slots");
+        scheduler
+            .record_block_metadata(183, 188, 0, 1)
+            .expect("child metadata completes the block");
+        assert_eq!(scheduler.snapshot().current_slot, 189);
+    }
+
+    #[test]
+    fn child_parent_link_does_not_classify_unrelated_unknown_slots() {
+        let scheduler = test_scheduler(183, vec![SlotPresenceState::Missing; 6]);
+
+        scheduler
+            .record_block_metadata(187, 188, 0, 0)
+            .expect("child metadata records required parent");
+
+        let snapshot = scheduler.snapshot();
+        assert_eq!(snapshot.current_slot, 183);
+        assert_eq!(snapshot.last_finalized_slot, 182);
+        let state = scheduler.state.lock().unwrap();
+        assert_eq!(
+            state.canonical_slots,
+            vec![
+                CanonicalSlotState::Unknown,
+                CanonicalSlotState::Unknown,
+                CanonicalSlotState::Unknown,
+                CanonicalSlotState::Unknown,
+                CanonicalSlotState::RequiredPresent,
+                CanonicalSlotState::RequiredPresent,
+            ]
+        );
+        drop(state);
+        let error = scheduler
+            .verify_complete(188)
+            .expect_err("index-missing slots cannot certify themselves");
+        assert!(error.contains("slot 183 has no decoded"), "{error}");
+    }
+
+    #[test]
+    fn parent_edge_rejects_non_preceding_parent() {
+        let scheduler = test_scheduler(183, vec![SlotPresenceState::Present; 6]);
+        let error = scheduler
+            .record_block_metadata(188, 188, 0, 0)
+            .expect_err("a block cannot parent itself");
+        assert!(error.contains("non-preceding parent"), "{error}");
+    }
+
+    #[test]
+    fn parent_edge_resolves_gap_larger_than_backpressure_limit() {
+        let start = 100;
+        let states = vec![SlotPresenceState::Present; 201];
+        let end_inclusive = start + states.len() as Slot - 1;
+        let scheduler = TransactionScheduler::new(
+            start,
+            Arc::new(SlotPresenceMap {
+                start,
+                end_inclusive,
+                next_present_after: vec![None; states.len()],
+                states,
+            }),
+            Arc::new(RestartTracker::new()),
+            128,
+        );
+
+        scheduler
+            .record_block_parent(99, 300)
+            .expect("parent evidence must be applied before the gap guard");
+        assert_eq!(scheduler.snapshot().current_slot, 300);
+        scheduler
+            .record_block_metadata(99, 300, 0, 0)
+            .expect("empty child block");
+        assert_eq!(scheduler.snapshot().current_slot, 301);
+    }
+
+    #[test]
+    fn conflicting_redelivered_parent_is_rejected() {
+        let scheduler = test_scheduler(183, vec![SlotPresenceState::Present; 6]);
+        scheduler
+            .record_block_parent(183, 188)
+            .expect("first parent edge");
+        let error = scheduler
+            .record_block_parent(182, 188)
+            .expect_err("redelivery cannot change a decoded parent");
+        assert!(error.contains("conflicting parent metadata"), "{error}");
+    }
+
+    #[test]
+    fn successor_edge_proves_epoch_tail() {
+        let scheduler = test_scheduler(100, vec![SlotPresenceState::Missing; 6]);
+        scheduler
+            .record_block_metadata(99, 100, 0, 0)
+            .expect("first block");
+        scheduler
+            .record_block_parent(100, 110)
+            .expect("first successor proves the trailing gap");
+
+        let snapshot = scheduler.snapshot();
+        assert_eq!(snapshot.current_slot, 106);
+        assert_eq!(snapshot.highest_seen_slot, 100);
+        scheduler
+            .verify_complete(105)
+            .expect("every trailing slot has parent-edge proof");
+    }
+
+    #[test]
+    fn successor_edge_exposes_missing_required_tail_parent() {
+        let scheduler = test_scheduler(100, vec![SlotPresenceState::Missing; 6]);
+        scheduler
+            .record_block_metadata(99, 100, 0, 0)
+            .expect("first block");
+        scheduler
+            .record_block_parent(104, 110)
+            .expect("successor names an in-range parent");
+
+        let snapshot = scheduler.snapshot();
+        assert_eq!(snapshot.current_slot, 101);
+        assert_eq!(snapshot.highest_seen_slot, 100);
+        let error = scheduler
+            .verify_complete(105)
+            .expect_err("the successor alone cannot prove the gap before its parent");
+        assert!(error.contains("slot 101 has no decoded"), "{error}");
     }
 }
 

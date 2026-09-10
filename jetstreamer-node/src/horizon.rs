@@ -51,7 +51,7 @@ use jetstreamer_horizon::archive::{
 };
 use jetstreamer_horizon::convert;
 use jetstreamer_horizon::transactions::Transaction;
-use log::{info, warn};
+use log::info;
 use solana_account::{AccountSharedData, ReadableAccount};
 use solana_address::Address;
 use solana_clock::Slot;
@@ -61,7 +61,10 @@ use solana_signature::Signature;
 use solana_transaction::versioned::VersionedTransaction;
 use solana_transaction_status::TransactionStatusMeta;
 
-use crate::{SlotPresenceMap, SlotPresenceState};
+use crate::SlotPresenceMap;
+
+#[cfg(test)]
+use crate::SlotPresenceState;
 
 /// The active archive recorder. Swappable so one process can record an entire
 /// range of epochs back to back, writing an independent `.jet` per epoch: each
@@ -111,6 +114,7 @@ pub fn init(
     slot_count: u64,
     presence: Arc<SlotPresenceMap>,
     provenance: &ArchiveProvenance,
+    expected_initial_parent: Option<(Slot, Hash)>,
 ) -> Result<(), String> {
     let recorder = HorizonRecorder::create(
         path,
@@ -119,6 +123,7 @@ pub fn init(
         slot_count,
         presence,
         Some(provenance),
+        expected_initial_parent,
     )?;
     let mut slot = RECORDER
         .write()
@@ -153,13 +158,10 @@ pub fn recorder() -> Option<Arc<HorizonRecorder>> {
     RECORDER.read().ok()?.clone()
 }
 
-/// Notifies the active recorder (if any) that the replay deliberately
-/// force-skipped `slot` after exhausting fetch retries — its block data is
-/// unavailable from old-faithful even though the index marks it present
-/// (the block genuinely does not exist). The recorder then records it as
-/// leader-skipped instead of treating the gap as a silent drop, which would
-/// otherwise panic. No-op when recording is disabled.
-pub fn note_force_skipped(slot: Slot) {
+/// Allows a slot to be recorded as skipped when a decoded block's parent link
+/// proves that the slot is outside the canonical chain.
+/// No-op when recording is disabled.
+pub fn note_chain_confirmed_skipped(slot: Slot) {
     if let Some(recorder) = recorder() {
         let mut state = recorder.lock();
         if slot < state.slot_start {
@@ -167,11 +169,11 @@ pub fn note_force_skipped(slot: Slot) {
         }
         if slot > state.slot_end_inclusive {
             panic!(
-                "horizon: force-skipped slot {slot} is outside recorder range {}..={}",
+                "horizon: chain-confirmed skipped slot {slot} is outside recorder range {}..={}",
                 state.slot_start, state.slot_end_inclusive
             );
         }
-        state.force_skipped.insert(slot);
+        state.chain_confirmed_skipped.insert(slot);
     }
 }
 
@@ -337,6 +339,7 @@ struct SlotAssembly {
 }
 
 /// Original chain block metadata buffered from the input side.
+#[derive(Debug, PartialEq)]
 struct BufferedBlockMeta {
     parent_slot: Slot,
     parent_blockhash: Hash,
@@ -357,17 +360,16 @@ struct RecorderState {
     assemblies: BTreeMap<Slot, SlotAssembly>,
     block_metas: BTreeMap<Slot, BufferedBlockMeta>,
     last_emitted: Option<Slot>,
+    last_emitted_blockhash: Option<Hash>,
+    expected_initial_parent: Option<(Slot, Hash)>,
     epoch_meta_written: bool,
     // Reusable encode scratches (large; allocated once on the heap).
     tx_scratch: Box<Transaction>,
     meta_scratch: Box<BlockMeta>,
     epoch_scratch: Box<EpochMeta>,
     presence: std::sync::Arc<SlotPresenceMap>,
-    /// Slots the replay deliberately force-skipped after exhausting fetch
-    /// retries. Their block data is genuinely unavailable (the old-faithful
-    /// index marks them present, but the block does not exist), so the gap-fill
-    /// records them as leader-skipped instead of treating them as silent drops.
-    force_skipped: HashSet<Slot>,
+    /// Slots proven skipped by decoded parent links.
+    chain_confirmed_skipped: HashSet<Slot>,
     finished: bool,
 }
 
@@ -385,6 +387,7 @@ impl HorizonRecorder {
         slot_count: u64,
         presence: std::sync::Arc<SlotPresenceMap>,
         provenance: Option<&ArchiveProvenance>,
+        expected_initial_parent: Option<(Slot, Hash)>,
     ) -> Result<Self, String> {
         let file = File::create(path)
             .map_err(|err| format!("failed to create horizon archive {}: {err}", path.display()))?;
@@ -406,12 +409,14 @@ impl HorizonRecorder {
                 assemblies: BTreeMap::new(),
                 block_metas: BTreeMap::new(),
                 last_emitted: None,
+                last_emitted_blockhash: None,
+                expected_initial_parent,
                 epoch_meta_written: false,
                 tx_scratch: Transaction::new_boxed(),
                 meta_scratch: BlockMeta::new_boxed(),
                 epoch_scratch: EpochMeta::new_boxed(),
                 presence,
-                force_skipped: HashSet::new(),
+                chain_confirmed_skipped: HashSet::new(),
                 finished: false,
             }),
         })
@@ -503,6 +508,12 @@ impl HorizonRecorder {
         // Re-delivery after a firehose restart replaces the buffered copy;
         // already-emitted slots are simply dropped.
         if state.last_emitted.is_some_and(|last| slot <= last) {
+            return;
+        }
+        if let Some(existing) = state.block_metas.get(&slot) {
+            if existing != &meta {
+                panic!("horizon: conflicting block metadata redelivery for slot {slot}");
+            }
             return;
         }
         state.block_metas.insert(slot, meta);
@@ -734,32 +745,74 @@ impl RecorderState {
         }
     }
 
-    /// Verifies a gap slot really was leader-skipped before recording it as
-    /// such. A slot the old-faithful index marks present must either have been
-    /// replayed (not a gap) or deliberately force-skipped by the replay after
-    /// exhausting fetch retries (its block data genuinely does not exist — the
-    /// index is wrong). A present gap slot that was *not* force-skipped is a
-    /// silent drop and would corrupt the archive, so it still panics.
+    /// Requires a decoded parent link before recording a leader-skipped slot.
+    /// Either historical index may be wrong, so neither can certify absence.
     fn check_gap_slot_skipped(&self, slot: Slot) {
-        if self.presence.state(slot) != Some(SlotPresenceState::Present) {
-            return; // genuinely leader-skipped per the index
-        }
-        if self.force_skipped.contains(&slot) {
-            warn!(
-                target: "jetstreamer_node_horizon",
-                "horizon: recording slot {slot} as leader-skipped — the old-faithful index marks \
-                 it present, but its block data was unavailable after exhausting fetch retries \
-                 (block does not exist)"
-            );
+        if self.chain_confirmed_skipped.contains(&slot) {
             return;
         }
         panic!(
-            "horizon: slot {slot} has block data in the old-faithful index but was never \
-             replayed; refusing to record it as leader-skipped"
+            "horizon: slot {slot} has no decoded parent-link proof of being skipped \
+             (index hint: {:?}); refusing to record it as leader-skipped",
+            self.presence.state(slot)
         );
     }
 
     fn emit_slot(&mut self, slot: Slot, mut assembly: SlotAssembly) {
+        let buffered_meta = self.block_metas.get(&slot).unwrap_or_else(|| {
+            panic!("horizon: no block metadata buffered for replayed slot {slot}")
+        });
+        if self.last_emitted.is_none()
+            && slot > 0
+            && buffered_meta.parent_blockhash == Hash::default()
+        {
+            panic!("horizon: first non-genesis block {slot} has a zero parent blockhash");
+        }
+        if let Some(previous_slot) = self.last_emitted {
+            if buffered_meta.parent_slot != previous_slot {
+                panic!(
+                    "horizon: block {slot} names parent {}, expected previously emitted block {previous_slot}",
+                    buffered_meta.parent_slot
+                );
+            }
+            let previous_blockhash = self
+                .last_emitted_blockhash
+                .expect("emitted slot must retain its blockhash");
+            if buffered_meta.parent_blockhash != previous_blockhash {
+                panic!(
+                    "horizon: block {slot} parent blockhash {} does not match block {previous_slot} hash {previous_blockhash}",
+                    buffered_meta.parent_blockhash
+                );
+            }
+        } else if let Some((expected_parent_slot, expected_parent_hash)) =
+            self.expected_initial_parent
+        {
+            if buffered_meta.parent_slot != expected_parent_slot {
+                panic!(
+                    "horizon: first block {slot} names parent {}, expected bootstrap parent {expected_parent_slot}",
+                    buffered_meta.parent_slot
+                );
+            }
+            if buffered_meta.parent_blockhash != expected_parent_hash {
+                panic!(
+                    "horizon: first block {slot} parent blockhash {} does not match bootstrap parent {expected_parent_slot} hash {expected_parent_hash}",
+                    buffered_meta.parent_blockhash
+                );
+            }
+        } else if slot == 0 {
+            if buffered_meta.parent_slot != 0 {
+                panic!(
+                    "horizon: genesis block names parent {}, expected 0",
+                    buffered_meta.parent_slot
+                );
+            }
+        } else if buffered_meta.parent_slot >= self.slot_start {
+            panic!(
+                "horizon: first emitted block {slot} requires unrecorded in-range parent {}",
+                buffered_meta.parent_slot
+            );
+        }
+
         // A segment may begin with skipped slots. Their PoH value is unchanged,
         // so the first real block's parent blockhash is also the anchor for the
         // archive's declared start. Persist it before staging any leading gap;
@@ -913,6 +966,7 @@ impl RecorderState {
             std::sync::atomic::Ordering::Relaxed,
         );
         self.last_emitted = Some(slot);
+        self.last_emitted_blockhash = Some(block_meta.blockhash);
     }
 }
 
@@ -1053,8 +1107,13 @@ mod tests {
 
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("test.jet");
-        let recorder =
-            HorizonRecorder::create(&path, 42, 100, 10, presence, None).expect("create recorder");
+        let recorder = HorizonRecorder::create(&path, 42, 100, 10, presence, None, None)
+            .expect("create recorder");
+        {
+            let mut state = recorder.lock();
+            state.chain_confirmed_skipped.extend(101..105);
+            state.chain_confirmed_skipped.extend(106..110);
+        }
 
         let poh_anchor = solana_hash::Hash::new_unique();
         let bh_100 = solana_hash::Hash::new_unique();
@@ -1183,8 +1242,8 @@ mod tests {
         let presence = presence_map(100, &[SlotPresenceState::Present]);
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("warmup.jet");
-        let recorder =
-            HorizonRecorder::create(&path, 1, 100, 1, presence, None).expect("create recorder");
+        let recorder = HorizonRecorder::create(&path, 1, 100, 1, presence, None, None)
+            .expect("create recorder");
 
         // A qualification may replay earlier state to reach the output range.
         // Even malformed metadata from that warm-up must not enter this file.
@@ -1242,8 +1301,8 @@ mod tests {
         let presence = presence_map(200, &states);
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("all-skipped.jet");
-        let recorder =
-            HorizonRecorder::create(&path, 1, 200, 3, presence, None).expect("create recorder");
+        let recorder = HorizonRecorder::create(&path, 1, 200, 3, presence, None, None)
+            .expect("create recorder");
 
         let error = recorder
             .finish()
@@ -1254,23 +1313,20 @@ mod tests {
         );
     }
 
-    /// A gap slot that old-faithful says has a block must abort the run
-    /// rather than silently recording it as leader-skipped.
     #[test]
     #[should_panic(expected = "refusing to record it as leader-skipped")]
-    fn refuses_to_skip_present_slot() {
+    fn refuses_to_skip_unproven_index_present_slot() {
         let states = vec![SlotPresenceState::Present; 3];
         let presence = presence_map(200, &states);
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("bad.jet");
-        let recorder =
-            HorizonRecorder::create(&path, 1, 200, 3, presence, None).expect("create recorder");
-        // Only slot 202 gets data; 200-201 are gaps the index says exist.
+        let recorder = HorizonRecorder::create(&path, 1, 200, 3, presence, None, None)
+            .expect("create recorder");
         recorder.record_block_meta(
             202,
             199,
-            &Hash::default().to_string(),
-            &Hash::default().to_string(),
+            &Hash::new_unique().to_string(),
+            &Hash::new_unique().to_string(),
             &KeyedRewardsAndNumPartitions {
                 keyed_rewards: vec![],
                 num_partitions: None,
@@ -1284,28 +1340,55 @@ mod tests {
         let _ = recorder.finish();
     }
 
-    /// A present gap slot the replay *deliberately* force-skipped (block data
-    /// genuinely unavailable) is recorded as leader-skipped, not panicked.
     #[test]
-    fn force_skipped_present_slot_records_as_skipped() {
-        let states = vec![SlotPresenceState::Present; 3];
+    #[should_panic(expected = "refusing to record it as leader-skipped")]
+    fn refuses_to_skip_unproven_index_missing_slot() {
+        let states = vec![SlotPresenceState::Missing; 3];
         let presence = presence_map(200, &states);
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("forced.jet");
-        let recorder =
-            HorizonRecorder::create(&path, 1, 200, 3, presence, None).expect("create recorder");
-        // 200-201 have no fetchable block (their blocks don't exist despite the
-        // index); the replay force-skipped them.
-        {
-            let mut state = recorder.lock();
-            state.force_skipped.insert(200);
-            state.force_skipped.insert(201);
-        }
+        let path = dir.path().join("unproven-missing.jet");
+        let recorder = HorizonRecorder::create(&path, 1, 200, 3, presence, None, None)
+            .expect("create recorder");
+        let anchor = Hash::new_unique();
+        let blockhash = Hash::new_unique();
         recorder.record_block_meta(
             202,
             199,
-            &Hash::default().to_string(),
-            &Hash::default().to_string(),
+            &anchor.to_string(),
+            &blockhash.to_string(),
+            &KeyedRewardsAndNumPartitions {
+                keyed_rewards: vec![],
+                num_partitions: None,
+            },
+            None,
+            None,
+            0,
+            1,
+        );
+        recorder.record_committed_entry(202, 0, 1, Vec::new());
+        let _ = recorder.finish();
+    }
+
+    #[test]
+    fn chain_confirmed_present_slots_record_as_skipped() {
+        let states = vec![SlotPresenceState::Present; 3];
+        let presence = presence_map(200, &states);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("chain-confirmed.jet");
+        let recorder = HorizonRecorder::create(&path, 1, 200, 3, presence, None, None)
+            .expect("create recorder");
+        {
+            let mut state = recorder.lock();
+            state.chain_confirmed_skipped.insert(200);
+            state.chain_confirmed_skipped.insert(201);
+        }
+        let anchor = Hash::new_unique();
+        let blockhash = Hash::new_unique();
+        recorder.record_block_meta(
+            202,
+            199,
+            &anchor.to_string(),
+            &blockhash.to_string(),
             &KeyedRewardsAndNumPartitions {
                 keyed_rewards: vec![],
                 num_partitions: None,
@@ -1317,8 +1400,160 @@ mod tests {
         );
         recorder.record_committed_entry(202, 0, 1, Vec::new());
         let stats = recorder.finish().expect("finish should not panic");
-        // 3 slots: 200 + 201 recorded skipped, 202 a block.
         assert_eq!(stats.slots, 3);
         assert_eq!(stats.blocks, 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "expected previously emitted block 200")]
+    fn rejects_noncanonical_parent_slot_between_emitted_blocks() {
+        let presence = presence_map(
+            200,
+            &[SlotPresenceState::Present, SlotPresenceState::Present],
+        );
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("wrong-parent-slot.jet");
+        let recorder = HorizonRecorder::create(&path, 1, 200, 2, presence, None, None)
+            .expect("create recorder");
+        let anchor = Hash::new_unique();
+        let first_hash = Hash::new_unique();
+        recorder.record_block_meta(
+            200,
+            199,
+            &anchor.to_string(),
+            &first_hash.to_string(),
+            &KeyedRewardsAndNumPartitions {
+                keyed_rewards: vec![],
+                num_partitions: None,
+            },
+            None,
+            None,
+            0,
+            1,
+        );
+        recorder.record_committed_entry(200, 0, 1, Vec::new());
+        recorder.record_block_meta(
+            201,
+            199,
+            &first_hash.to_string(),
+            &Hash::new_unique().to_string(),
+            &KeyedRewardsAndNumPartitions {
+                keyed_rewards: vec![],
+                num_partitions: None,
+            },
+            None,
+            None,
+            0,
+            1,
+        );
+        recorder.record_committed_entry(201, 0, 1, Vec::new());
+        let _ = recorder.finish();
+    }
+
+    #[test]
+    #[should_panic(expected = "does not match block 200 hash")]
+    fn rejects_noncanonical_parent_hash_between_emitted_blocks() {
+        let presence = presence_map(
+            200,
+            &[SlotPresenceState::Present, SlotPresenceState::Present],
+        );
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("wrong-parent-hash.jet");
+        let recorder = HorizonRecorder::create(&path, 1, 200, 2, presence, None, None)
+            .expect("create recorder");
+        let anchor = Hash::new_unique();
+        let first_hash = Hash::new_unique();
+        recorder.record_block_meta(
+            200,
+            199,
+            &anchor.to_string(),
+            &first_hash.to_string(),
+            &KeyedRewardsAndNumPartitions {
+                keyed_rewards: vec![],
+                num_partitions: None,
+            },
+            None,
+            None,
+            0,
+            1,
+        );
+        recorder.record_committed_entry(200, 0, 1, Vec::new());
+        recorder.record_block_meta(
+            201,
+            200,
+            &Hash::new_unique().to_string(),
+            &Hash::new_unique().to_string(),
+            &KeyedRewardsAndNumPartitions {
+                keyed_rewards: vec![],
+                num_partitions: None,
+            },
+            None,
+            None,
+            0,
+            1,
+        );
+        recorder.record_committed_entry(201, 0, 1, Vec::new());
+        let _ = recorder.finish();
+    }
+
+    #[test]
+    #[should_panic(expected = "does not match bootstrap parent 199 hash")]
+    fn rejects_wrong_bootstrap_parent_hash() {
+        let presence = presence_map(200, &[SlotPresenceState::Present]);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("wrong-bootstrap-parent.jet");
+        let expected_anchor = Hash::new_unique();
+        let recorder = HorizonRecorder::create(
+            &path,
+            1,
+            200,
+            1,
+            presence,
+            None,
+            Some((199, expected_anchor)),
+        )
+        .expect("create recorder");
+        recorder.record_block_meta(
+            200,
+            199,
+            &Hash::new_unique().to_string(),
+            &Hash::new_unique().to_string(),
+            &KeyedRewardsAndNumPartitions {
+                keyed_rewards: vec![],
+                num_partitions: None,
+            },
+            None,
+            None,
+            0,
+            1,
+        );
+        recorder.record_committed_entry(200, 0, 1, Vec::new());
+        let _ = recorder.finish();
+    }
+
+    #[test]
+    #[should_panic(expected = "has a zero parent blockhash")]
+    fn rejects_zero_initial_parent_hash() {
+        let presence = presence_map(200, &[SlotPresenceState::Present]);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("zero-parent.jet");
+        let recorder = HorizonRecorder::create(&path, 1, 200, 1, presence, None, None)
+            .expect("create recorder");
+        recorder.record_block_meta(
+            200,
+            199,
+            &Hash::default().to_string(),
+            &Hash::new_unique().to_string(),
+            &KeyedRewardsAndNumPartitions {
+                keyed_rewards: vec![],
+                num_partitions: None,
+            },
+            None,
+            None,
+            0,
+            1,
+        );
+        recorder.record_committed_entry(200, 0, 1, Vec::new());
+        let _ = recorder.finish();
     }
 }

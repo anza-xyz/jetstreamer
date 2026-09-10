@@ -818,6 +818,12 @@ pub trait SourcedTransactionNotifier: Send + Sync {
     fn notify_transaction(&self, transaction: SourcedTransaction<'_>);
 }
 
+/// Receives a decoded block's parent edge before its payload callbacks.
+pub trait BlockParentNotifier: Send + Sync {
+    /// Reports that decoded block `slot` names `parent_slot` as its parent.
+    fn notify_block_parent(&self, parent_slot: u64, slot: u64);
+}
+
 impl From<reqwest::Error> for FirehoseError {
     fn from(e: reqwest::Error) -> Self {
         FirehoseError::Reqwest(e)
@@ -1777,6 +1783,7 @@ where
             } else {
                 None
             };
+            let mut retry_parent: Option<(u64, Hash)> = None;
 
             let mut retry_backoff = RetryBackoff::new();
             // let mut triggered = false;
@@ -1838,6 +1845,14 @@ where
                 } else {
                     epoch_range.clone().collect()
                 };
+                let mut previous_blockhash = if sequential_mode {
+                    retry_parent
+                        .map(|(_, blockhash)| blockhash)
+                        .unwrap_or_default()
+                } else {
+                    Hash::default()
+                };
+                let mut latest_entry_blockhash = previous_blockhash;
                 for epoch_num in epoch_iter {
                     if poll_shutdown(&shutdown_flag, &mut shutdown_rx) {
                         log::info!(
@@ -1915,8 +1930,10 @@ where
                     };
                     log::debug!(target: &log_target, "read epoch {} header: {:?}", epoch_num, header);
 
-                    let mut previous_blockhash = Hash::default();
-                    let mut latest_entry_blockhash = Hash::default();
+                    if reverse_mode_local || local_start > epoch_start {
+                        previous_blockhash = Hash::default();
+                        latest_entry_blockhash = Hash::default();
+                    }
                     // Reset counters to align to the local epoch slice; prevents boundary slots
                     // from being treated as already-counted after a restart.
                     last_counted_slot = local_start.saturating_sub(1);
@@ -2525,6 +2542,7 @@ where
                                         last_counted_slot = slot;
                                         has_counted_slot = true;
                                     }
+                                    retry_parent = Some((slot, latest_entry_blockhash));
                                     if work_stealing {
                                         work_registry[thread_index]
                                             .next
@@ -3105,6 +3123,54 @@ pub fn firehose_geyser_with_notifiers(
     sequential: bool,
     buffer_window_bytes: Option<u64>,
 ) -> Result<(), (FirehoseError, u64)> {
+    firehose_geyser_with_notifiers_and_block_parent(
+        rt,
+        slot_range,
+        notifiers,
+        None,
+        None,
+        confirmed_bank_sender,
+        index_base_url,
+        client,
+        shutdown,
+        on_load,
+        threads,
+        sequential,
+        buffer_window_bytes,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+/// Builds a Geyser-backed firehose with an early block-parent callback.
+///
+/// The callback runs after a block is decoded and before any transaction or
+/// entry callbacks for that block. Callers that do not need this ordering can
+/// use [`firehose_geyser_with_notifiers`]. `initial_parent` binds the first
+/// replayed block to a trusted bootstrap slot and blockhash and requires
+/// sequential mode.
+pub fn firehose_geyser_with_notifiers_and_block_parent(
+    rt: Arc<tokio::runtime::Runtime>,
+    slot_range: Range<u64>,
+    notifiers: GeyserNotifiers,
+    block_parent_notifier: Option<Arc<dyn BlockParentNotifier + Send + Sync + 'static>>,
+    initial_parent: Option<(u64, Hash)>,
+    confirmed_bank_sender: Sender<SlotNotification>,
+    index_base_url: &Url,
+    client: &Client,
+    shutdown: Arc<AtomicBool>,
+    on_load: impl Future<Output = Result<(), SharedError>> + Send + 'static,
+    threads: u64,
+    sequential: bool,
+    buffer_window_bytes: Option<u64>,
+) -> Result<(), (FirehoseError, u64)> {
+    if initial_parent.is_some() && !sequential {
+        return Err((
+            FirehoseError::OnLoadError(
+                "an initial previous blockhash requires sequential replay".into(),
+            ),
+            slot_range.start,
+        ));
+    }
     if threads == 0 {
         return Err((
             FirehoseError::OnLoadError("Number of threads must be greater than 0".into()),
@@ -3130,7 +3196,9 @@ pub fn firehose_geyser_with_notifiers(
     let transaction_notifier_maybe = Arc::new(notifiers.transaction_notifier);
     let sourced_transaction_notifier_maybe = Arc::new(notifiers.sourced_transaction_notifier);
     let entry_notifier_maybe = Arc::new(notifiers.entry_notifier);
+    let block_parent_notifier_maybe = Arc::new(block_parent_notifier);
     let block_meta_notifier_maybe = Arc::new(notifiers.block_metadata_notifier);
+    let initial_parent = Arc::new(initial_parent);
 
     if entry_notifier_maybe.is_some() {
         log::debug!(target: LOG_MODULE, "entry notifications enabled")
@@ -3171,7 +3239,9 @@ pub fn firehose_geyser_with_notifiers(
         let transaction_notifier_maybe = (*transaction_notifier_maybe).clone();
         let sourced_transaction_notifier_maybe = (*sourced_transaction_notifier_maybe).clone();
         let entry_notifier_maybe = (*entry_notifier_maybe).clone();
+        let block_parent_notifier_maybe = (*block_parent_notifier_maybe).clone();
         let block_meta_notifier_maybe = (*block_meta_notifier_maybe).clone();
+        let initial_parent = *initial_parent;
         let confirmed_bank_sender = (*confirmed_bank_sender).clone();
         let client = client.clone();
         let error_counts = error_counts.clone();
@@ -3181,33 +3251,31 @@ pub fn firehose_geyser_with_notifiers(
         let rt_clone = rt.clone();
 
         let handle = std::thread::spawn(move || {
-            rt_clone.block_on(async {
-                firehose_geyser_thread(
-                    slot_range,
-                    transaction_notifier_maybe,
-                    sourced_transaction_notifier_maybe,
-                    entry_notifier_maybe,
-                    block_meta_notifier_maybe,
-                    confirmed_bank_sender,
-                    &client,
-                    if firehose_threads > 1 { Some(i) } else { None },
-                    error_counts,
-                    shutdown,
-                    sequential,
-                    sequential_download_threads,
-                    sequential_buffer_window_bytes,
-                    ripget_client,
-                )
-                .await
-                .unwrap();
-            });
+            rt_clone.block_on(firehose_geyser_thread(
+                slot_range,
+                transaction_notifier_maybe,
+                sourced_transaction_notifier_maybe,
+                entry_notifier_maybe,
+                block_parent_notifier_maybe,
+                block_meta_notifier_maybe,
+                initial_parent,
+                confirmed_bank_sender,
+                &client,
+                if firehose_threads > 1 { Some(i) } else { None },
+                error_counts,
+                shutdown,
+                sequential,
+                sequential_download_threads,
+                sequential_buffer_window_bytes,
+                ripget_client,
+            ))
         });
         handles.push(handle);
     }
 
     // Wait for all threads to complete
     for handle in handles {
-        handle.join().unwrap();
+        handle.join().unwrap()?;
     }
     log::info!(target: LOG_MODULE, "🚒 firehose finished successfully.");
     if let Some(block_meta_notifier) = block_meta_notifier_maybe.as_ref() {
@@ -3238,7 +3306,9 @@ async fn firehose_geyser_thread(
         Arc<dyn SourcedTransactionNotifier + Send + Sync + 'static>,
     >,
     entry_notifier_maybe: Option<Arc<dyn EntryNotifier + Send + Sync + 'static>>,
+    block_parent_notifier_maybe: Option<Arc<dyn BlockParentNotifier + Send + Sync + 'static>>,
     block_meta_notifier_maybe: Option<Arc<dyn BlockMetadataNotifier + Send + Sync + 'static>>,
+    initial_parent: Option<(u64, Hash)>,
     confirmed_bank_sender: Sender<SlotNotification>,
     client: &Client,
     thread_index: Option<usize>,
@@ -3263,6 +3333,7 @@ async fn firehose_geyser_thread(
     // discard slot 0 as a duplicate.
     let mut has_counted_slot = slot_range.start > 0;
     let mut retry_backoff = RetryBackoff::new();
+    let mut retry_parent: Option<(u64, Hash)> = None;
     // let mut triggered = false;
     while let Err((err, slot)) = async {
             if shutdown.load(Ordering::Relaxed) {
@@ -3287,6 +3358,15 @@ async fn firehose_geyser_thread(
 
             // for each epoch
             let mut current_slot: Option<u64> = None;
+            let mut initial_parent_pending = if slot_range.start == initial_slot_range.start {
+                initial_parent
+            } else {
+                retry_parent
+            };
+            let mut todo_previous_blockhash = initial_parent_pending
+                .map(|(_, blockhash)| blockhash)
+                .unwrap_or_default();
+            let mut todo_latest_entry_blockhash = todo_previous_blockhash;
             for epoch_num in epoch_range.clone() {
                 if shutdown.load(Ordering::Relaxed) {
                     return Ok(());
@@ -3344,8 +3424,10 @@ async fn firehose_geyser_thread(
                 };
                 log::debug!(target: &log_target, "read epoch {} header: {:?}", epoch_num, header);
 
-                let mut todo_previous_blockhash = Hash::default();
-                let mut todo_latest_entry_blockhash = Hash::default();
+                if local_start > epoch_start && initial_parent_pending.is_none() {
+                    todo_previous_blockhash = Hash::default();
+                    todo_latest_entry_blockhash = Hash::default();
+                }
                 // Reset counters to align to the local epoch slice; prevents boundary slots
                 // from being treated as already-counted after a restart.
                 last_counted_slot = local_start.saturating_sub(1);
@@ -3492,8 +3574,31 @@ async fn firehose_geyser_thread(
                         // last entry hash is its blockhash, i.e. the next block's
                         // true parent.
                         if let Some(hash) = last_entry_hash(&nodes) {
-                            todo_latest_entry_blockhash = hash;
-                            todo_previous_blockhash = hash;
+                            match initial_parent_pending {
+                                Some((parent_slot, expected_hash)) if block.slot == parent_slot => {
+                                    if hash != expected_hash {
+                                        return Err((
+                                            FirehoseError::OnLoadError(
+                                                std::io::Error::new(
+                                                    std::io::ErrorKind::InvalidData,
+                                                    format!(
+                                                        "bootstrap blockhash does not match decoded block {parent_slot}"
+                                                    ),
+                                                )
+                                                .into(),
+                                            ),
+                                            local_start,
+                                        ));
+                                    }
+                                    todo_latest_entry_blockhash = hash;
+                                    todo_previous_blockhash = hash;
+                                }
+                                Some(_) => {}
+                                None => {
+                                    todo_latest_entry_blockhash = hash;
+                                    todo_previous_blockhash = hash;
+                                }
+                            }
                         }
                         continue;
                     }
@@ -3515,6 +3620,32 @@ async fn firehose_geyser_thread(
 
                     if shutdown.load(Ordering::Relaxed) {
                         return Ok(());
+                    }
+
+                    match initial_parent_pending.take() {
+                        Some((expected_parent_slot, expected_parent_hash))
+                            if block.meta.parent_slot != expected_parent_slot
+                                || todo_previous_blockhash != expected_parent_hash =>
+                        {
+                            return Err((
+                                FirehoseError::OnLoadError(
+                                    std::io::Error::new(
+                                        std::io::ErrorKind::InvalidData,
+                                        format!(
+                                            "first replayed block {slot} does not link to bootstrap block {expected_parent_slot}"
+                                        ),
+                                    )
+                                    .into(),
+                                ),
+                                local_start,
+                            ));
+                        }
+                        _ => {}
+                    }
+
+                    if let Some(block_parent_notifier) = block_parent_notifier_maybe.as_ref() {
+                        block_parent_notifier
+                            .notify_block_parent(block.meta.parent_slot, block.slot);
                     }
 
                     nodes.each(|node_with_cid| -> Result<(), SharedError> {
@@ -3671,6 +3802,7 @@ async fn firehose_geyser_thread(
                                     this_block_entry_count,
                                 );
                                 todo_previous_blockhash = todo_latest_entry_blockhash;
+                                retry_parent = Some((block.slot, todo_latest_entry_blockhash));
                                 last_counted_slot = block.slot;
                                 has_counted_slot = true;
                                 std::thread::yield_now();
@@ -3738,6 +3870,9 @@ async fn firehose_geyser_thread(
                 thread_index
             );
             return Ok(());
+        }
+        if matches!(err, FirehoseError::OnLoadError(_)) {
+            return Err((err, slot));
         }
         log::error!(
             target: &log_target,
@@ -4895,6 +5030,143 @@ async fn test_firehose_gap_coverage_near_known_missing_range() {
         missing.len(),
         &missing[..missing.len().min(10)]
     );
+}
+
+#[cfg(test)]
+#[serial]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_firehose_sequential_carries_parent_hash_across_epoch_boundary() {
+    use std::sync::{Arc, Mutex};
+
+    solana_logger::setup_with_default("info");
+    const SLOT_COUNT: u64 = 100;
+
+    let (epoch_900_start, _) = epoch_to_slot_range(900);
+    let slot_range = (epoch_900_start - SLOT_COUNT)..(epoch_900_start + SLOT_COUNT);
+    let observed = Arc::new(Mutex::new(Vec::new()));
+
+    firehose(
+        1,
+        true,
+        false,
+        None,
+        slot_range,
+        Some({
+            let observed = observed.clone();
+            move |_thread_id: usize, block: BlockData| {
+                let observed = observed.clone();
+                async move {
+                    if let BlockData::Block {
+                        parent_slot,
+                        parent_blockhash,
+                        slot,
+                        blockhash,
+                        ..
+                    } = block
+                    {
+                        observed.lock().unwrap().push((
+                            slot,
+                            parent_slot,
+                            parent_blockhash,
+                            blockhash,
+                        ));
+                    }
+                    Ok(())
+                }
+                .boxed()
+            }
+        }),
+        None::<OnTxFn>,
+        None::<OnEntryFn>,
+        None::<OnRewardFn>,
+        None::<OnErrorFn>,
+        None::<OnStatsTrackingFn>,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let observed = observed.lock().unwrap();
+    let first_upper = observed
+        .iter()
+        .position(|(slot, ..)| *slot >= epoch_900_start)
+        .expect("expected a block in epoch 900");
+    assert!(first_upper > 0, "expected a preceding epoch 899 block");
+    let (previous_slot, _, _, previous_hash) = observed[first_upper - 1];
+    let (slot, parent_slot, parent_hash, _) = observed[first_upper];
+    assert_eq!(slot_to_epoch(previous_slot), 899);
+    assert_eq!(slot_to_epoch(slot), 900);
+    assert_eq!(parent_slot, previous_slot);
+    assert_eq!(parent_hash, previous_hash);
+}
+
+#[cfg(test)]
+#[test]
+fn test_seeded_geyser_requires_sequential_mode() {
+    let runtime = Arc::new(tokio::runtime::Runtime::new().expect("runtime"));
+    let notifiers = GeyserNotifiers {
+        transaction_notifier: None,
+        sourced_transaction_notifier: None,
+        entry_notifier: None,
+        block_metadata_notifier: None,
+    };
+    let (confirmed_bank_sender, _confirmed_bank_receiver) = unbounded();
+    let index_base_url = Url::parse(crate::epochs::BASE_URL).expect("base URL");
+    let client = Client::new();
+    let result = firehose_geyser_with_notifiers_and_block_parent(
+        runtime,
+        345_600_000..345_600_001,
+        notifiers,
+        None,
+        Some((345_599_999, Hash::new_unique())),
+        confirmed_bank_sender,
+        &index_base_url,
+        &client,
+        Arc::new(AtomicBool::new(false)),
+        async { Ok(()) },
+        2,
+        false,
+        None,
+    );
+    assert!(matches!(
+        result,
+        Err((FirehoseError::OnLoadError(_), 345_600_000))
+    ));
+}
+
+#[cfg(test)]
+#[serial]
+#[test]
+fn test_seeded_geyser_propagates_initial_parent_mismatch() {
+    let runtime = Arc::new(tokio::runtime::Runtime::new().expect("runtime"));
+    let notifiers = GeyserNotifiers {
+        transaction_notifier: None,
+        sourced_transaction_notifier: None,
+        entry_notifier: None,
+        block_metadata_notifier: None,
+    };
+    let (confirmed_bank_sender, _confirmed_bank_receiver) = unbounded();
+    let index_base_url = Url::parse(crate::epochs::BASE_URL).expect("base URL");
+    let client = Client::new();
+    let result = firehose_geyser_with_notifiers_and_block_parent(
+        runtime,
+        345_600_000..345_600_001,
+        notifiers,
+        None,
+        Some((1, Hash::new_unique())),
+        confirmed_bank_sender,
+        &index_base_url,
+        &client,
+        Arc::new(AtomicBool::new(false)),
+        async { Ok(()) },
+        4,
+        true,
+        None,
+    );
+    assert!(matches!(
+        result,
+        Err((FirehoseError::OnLoadError(_), 345_600_000))
+    ));
 }
 
 #[cfg(test)]

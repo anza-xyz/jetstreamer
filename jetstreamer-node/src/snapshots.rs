@@ -814,11 +814,14 @@ fn snapshot_slot_from_name(name: &str, archive_extensions: &[&str]) -> Option<u6
     let (slot_text, identity_and_extension) = rest.split_once('-')?;
     let slot = parse_canonical_slot(slot_text)?;
     archive_extensions.iter().find_map(|extension| {
-        (!extension.is_empty()
-            && identity_and_extension
-                .strip_suffix(extension)
-                .is_some_and(|identity| !identity.is_empty()))
-        .then_some(slot)
+        if extension.is_empty() {
+            return None;
+        }
+        let identity = identity_and_extension.strip_suffix(extension)?;
+        let mut decoded = [0_u8; 32];
+        let decoded_len = bs58::decode(identity).onto(&mut decoded).ok()?;
+        (decoded_len == decoded.len() && bs58::encode(decoded).into_string() == identity)
+            .then_some(slot)
     })
 }
 
@@ -1016,29 +1019,38 @@ mod tests {
     use super::*;
 
     const BUCKET: &str = "gs://example-bucket";
+    const HASH_A: &str = "11111111111111111111111111111111";
+    const HASH_B: &str = "11111111111111111111111111111112";
+    const HASH_C: &str = "11111111111111111111111111111113";
 
     #[test]
     fn bulk_snapshot_listing_separates_root_checkpoints_from_hourly_bootstraps() {
-        let listing = "gs://example-bucket/619848/snapshot-619848-zeta.tar.bz2\n\
-                       gs://example-bucket/416012/snapshot-416012-alpha.tar.zst\n\
-                       gs://example-bucket/3455940/hourly/snapshot-3464856-hour-a.tar.bz2\n\
-                       gs://example-bucket/0/hourly/snapshot-3464857-hour-b.tar.bz2\n\
-                       gs://example-bucket/3464858/hourly/snapshot-3464858-hour-c.tar.zst\n\
-                       gs://example-bucket/619848/snapshot-619848-zeta.tar.bz2\n\
-                       gs://example-bucket/830484/snapshot-830484-future.tar.gz\n";
+        let listing = format!(
+            "gs://example-bucket/619848/snapshot-619848-{HASH_A}.tar.bz2\n\
+             gs://example-bucket/416012/snapshot-416012-{HASH_B}.tar.zst\n\
+             gs://example-bucket/3455940/hourly/snapshot-3464856-{HASH_A}.tar.bz2\n\
+             gs://example-bucket/0/hourly/snapshot-3464857-{HASH_B}.tar.bz2\n\
+             gs://example-bucket/3464858/hourly/snapshot-3464858-{HASH_C}.tar.zst\n\
+             gs://example-bucket/619848/snapshot-619848-{HASH_A}.tar.bz2\n\
+             gs://example-bucket/830484/snapshot-830484-future.tar.gz\n"
+        );
 
-        let inventory = parse_snapshot_inventory(BUCKET, listing).unwrap();
+        let inventory = parse_snapshot_inventory(BUCKET, &listing).unwrap();
         assert_eq!(
             inventory.root_slots().collect::<Vec<_>>(),
             vec![416_012, 619_848]
         );
         assert_eq!(
             inventory.root_objects_for_slot(416_012, ALL_SNAPSHOT_ARCHIVE_EXTENSIONS),
-            vec!["gs://example-bucket/416012/snapshot-416012-alpha.tar.zst"]
+            vec![format!(
+                "gs://example-bucket/416012/snapshot-416012-{HASH_B}.tar.zst"
+            )]
         );
         assert_eq!(
             inventory.root_objects_for_slot(619_848, &[".tar.bz2"]),
-            vec!["gs://example-bucket/619848/snapshot-619848-zeta.tar.bz2"]
+            vec![format!(
+                "gs://example-bucket/619848/snapshot-619848-{HASH_A}.tar.bz2"
+            )]
         );
         assert!(
             inventory
@@ -1051,7 +1063,9 @@ mod tests {
         );
         assert_eq!(
             inventory.bootstrap_objects_for_slot(3_464_856, &[".tar.bz2"]),
-            vec!["gs://example-bucket/3455940/hourly/snapshot-3464856-hour-a.tar.bz2"]
+            vec![format!(
+                "gs://example-bucket/3455940/hourly/snapshot-3464856-{HASH_A}.tar.bz2"
+            )]
         );
         assert!(inventory.root_slots().all(|slot| slot != 830_484));
     }
@@ -1059,24 +1073,27 @@ mod tests {
     #[test]
     fn bulk_snapshot_listing_rejects_malformed_or_unbound_uris() {
         for uri in [
-            "gs://other-bucket/416012/snapshot-416012-hash.tar.bz2",
-            "gs://example-bucket/not-a-slot/snapshot-416012-hash.tar.bz2",
-            "gs://example-bucket/0416012/snapshot-416012-hash.tar.bz2",
-            "gs://example-bucket/416012/nested/snapshot-416012-hash.tar.bz2",
-            "gs://example-bucket/416012/snapshot-619848-hash.tar.bz2",
-            "gs://example-bucket/416012/snapshot-0416012-hash.tar.bz2",
-            "gs://example-bucket/416012/snapshot-416012-.tar.bz2",
-            "gs://example-bucket/416012/snapshot-416012-hash\\.tar.bz2",
-            "gs://example-bucket/416013/hourly/snapshot-416012-hash.tar.bz2",
-            "gs://example-bucket/0416012/hourly/snapshot-416012-hash.tar.bz2",
-            "gs://example-bucket/416012/hourly/snapshot-0416012-hash.tar.bz2",
-            "gs://example-bucket/416012/hourly/extra/snapshot-416013-hash.tar.bz2",
-            "gs://example-bucket/416012/hourly//snapshot-416013-hash.tar.bz2",
-            "gs://example-bucket/416012/../snapshot-416013-hash.tar.bz2",
-            "gs://example-bucket/416012/hourly/../snapshot-416013-hash.tar.bz2",
-            "gs://example-bucket/18446744073709551616/hourly/snapshot-18446744073709551616-hash.tar.bz2",
+            format!("gs://other-bucket/416012/snapshot-416012-{HASH_A}.tar.bz2"),
+            format!("gs://example-bucket/not-a-slot/snapshot-416012-{HASH_A}.tar.bz2"),
+            format!("gs://example-bucket/0416012/snapshot-416012-{HASH_A}.tar.bz2"),
+            format!("gs://example-bucket/416012/nested/snapshot-416012-{HASH_A}.tar.bz2"),
+            format!("gs://example-bucket/416012/snapshot-619848-{HASH_A}.tar.bz2"),
+            format!("gs://example-bucket/416012/snapshot-0416012-{HASH_A}.tar.bz2"),
+            "gs://example-bucket/416012/snapshot-416012-.tar.bz2".to_owned(),
+            "gs://example-bucket/416012/snapshot-416012-hash\\.tar.bz2".to_owned(),
+            format!("gs://example-bucket/416013/hourly/snapshot-416012-{HASH_A}.tar.bz2"),
+            format!("gs://example-bucket/0416012/hourly/snapshot-416012-{HASH_A}.tar.bz2"),
+            format!("gs://example-bucket/416012/hourly/snapshot-0416012-{HASH_A}.tar.bz2"),
+            format!("gs://example-bucket/416012/hourly/extra/snapshot-416013-{HASH_A}.tar.bz2"),
+            format!("gs://example-bucket/416012/hourly//snapshot-416013-{HASH_A}.tar.bz2"),
+            format!("gs://example-bucket/416012/../snapshot-416013-{HASH_A}.tar.bz2"),
+            format!("gs://example-bucket/416012/hourly/../snapshot-416013-{HASH_A}.tar.bz2"),
+            format!(
+                "gs://example-bucket/18446744073709551616/hourly/\
+                 snapshot-18446744073709551616-{HASH_A}.tar.bz2"
+            ),
         ] {
-            let error = parse_snapshot_inventory(BUCKET, uri).unwrap_err();
+            let error = parse_snapshot_inventory(BUCKET, &uri).unwrap_err();
             assert!(matches!(
                 error,
                 SnapshotError::Parse {
@@ -1089,19 +1106,23 @@ mod tests {
 
     #[test]
     fn bulk_snapshot_listing_ignores_misplaced_objects() {
-        let listing = "gs://mainnet-beta-ledger-us-ny5/416012/snapshot-416012-valid.tar.bz2\n\
-                       gs://mainnet-beta-ledger-us-ny5/619849/snapshot-619848-misplaced-root.tar.bz2\n\
-                       gs://mainnet-beta-ledger-us-ny5/619849/hourly/snapshot-619848-misplaced-hourly.tar.bz2\n\
-                       gs://mainnet-beta-ledger-us-ny5/ledger-old/snapshot-999999-unusable.tar.bz2\n\
-                       gs://mainnet-beta-ledger-us-ny5/416012/snapshot-416012-unsupported.tar.zst.1\n";
+        let listing = format!(
+            "gs://mainnet-beta-ledger-us-ny5/416012/snapshot-416012-{HASH_A}.tar.bz2\n\
+             gs://mainnet-beta-ledger-us-ny5/619849/snapshot-619848-{HASH_A}.tar.bz2\n\
+             gs://mainnet-beta-ledger-us-ny5/619849/hourly/snapshot-619848-{HASH_B}.tar.bz2\n\
+             gs://mainnet-beta-ledger-us-ny5/ledger-old/snapshot-999999-{HASH_C}.tar.bz2\n\
+             gs://mainnet-beta-ledger-us-ny5/416012/snapshot-416012-unsupported.tar.zst.1\n"
+        );
 
         let inventory =
-            parse_snapshot_inventory_in_range(DEFAULT_BUCKET, listing, Some((400_000, 500_000)))
+            parse_snapshot_inventory_in_range(DEFAULT_BUCKET, &listing, Some((400_000, 500_000)))
                 .unwrap();
 
         assert_eq!(
             inventory.root_objects_for_slot(416_012, &[".tar.bz2"]),
-            vec!["gs://mainnet-beta-ledger-us-ny5/416012/snapshot-416012-valid.tar.bz2"]
+            vec![format!(
+                "gs://mainnet-beta-ledger-us-ny5/416012/snapshot-416012-{HASH_A}.tar.bz2"
+            )]
         );
         assert_eq!(
             inventory.bootstrap_slots().collect::<Vec<_>>(),
@@ -1112,13 +1133,13 @@ mod tests {
     #[test]
     fn bounded_inventory_rejects_misplacement_crossing_requested_slots() {
         for uri in [
-            "gs://mainnet-beta-ledger-us-ny5/416012/snapshot-619848-anchor-in-range.tar.bz2",
-            "gs://mainnet-beta-ledger-us-ny5/619848/snapshot-416012-name-in-range.tar.bz2",
-            "gs://mainnet-beta-ledger-us-ny5/300000/snapshot-600000-spanning.tar.bz2",
-            "gs://mainnet-beta-ledger-us-ny5/399999/snapshot-400000-at-boundary.tar.bz2",
+            format!("gs://mainnet-beta-ledger-us-ny5/416012/snapshot-619848-{HASH_A}.tar.bz2"),
+            format!("gs://mainnet-beta-ledger-us-ny5/619848/snapshot-416012-{HASH_A}.tar.bz2"),
+            format!("gs://mainnet-beta-ledger-us-ny5/300000/snapshot-600000-{HASH_A}.tar.bz2"),
+            format!("gs://mainnet-beta-ledger-us-ny5/399999/snapshot-400000-{HASH_A}.tar.bz2"),
         ] {
             let error =
-                parse_snapshot_inventory_in_range(DEFAULT_BUCKET, uri, Some((400_000, 500_000)))
+                parse_snapshot_inventory_in_range(DEFAULT_BUCKET, &uri, Some((400_000, 500_000)))
                     .unwrap_err();
 
             assert!(matches!(
@@ -1133,13 +1154,15 @@ mod tests {
 
     #[test]
     fn bounded_inventory_ignores_only_well_formed_same_side_objects() {
-        let listing = "gs://mainnet-beta-ledger-us-ny5/300001/snapshot-300000-below.tar.bz2\n\
-                       gs://mainnet-beta-ledger-us-ny5/600001/snapshot-600000-above.tar.bz2\n\
-                       gs://mainnet-beta-ledger-us-ny5/ledger-05-01-22/snapshot-600002-legacy.tar.zst\n\
-                       gs://mainnet-beta-ledger-us-ny5/450000/snapshot-450000-unsupported.tar.zst.1";
+        let listing = format!(
+            "gs://mainnet-beta-ledger-us-ny5/300001/snapshot-300000-{HASH_A}.tar.bz2\n\
+             gs://mainnet-beta-ledger-us-ny5/600001/snapshot-600000-{HASH_B}.tar.bz2\n\
+             gs://mainnet-beta-ledger-us-ny5/ledger-05-01-22/snapshot-600002-{HASH_C}.tar.zst\n\
+             gs://mainnet-beta-ledger-us-ny5/450000/snapshot-450000-unsupported.tar.zst.1"
+        );
 
         let inventory =
-            parse_snapshot_inventory_in_range(DEFAULT_BUCKET, listing, Some((400_000, 500_000)))
+            parse_snapshot_inventory_in_range(DEFAULT_BUCKET, &listing, Some((400_000, 500_000)))
                 .unwrap();
 
         assert!(inventory.root_slots().next().is_none());
@@ -1148,18 +1171,22 @@ mod tests {
 
     #[test]
     fn bounded_inventory_rejects_malformed_supported_basename_outside_range() {
-        let uri = "gs://mainnet-beta-ledger-us-ny5/600001/snapshot-0600000-malformed.tar.bz2";
-        let error =
-            parse_snapshot_inventory_in_range(DEFAULT_BUCKET, uri, Some((400_000, 500_000)))
-                .unwrap_err();
+        for uri in [
+            format!("gs://mainnet-beta-ledger-us-ny5/600001/snapshot-0600000-{HASH_A}.tar.bz2"),
+            "gs://mainnet-beta-ledger-us-ny5/600001/snapshot-600000-!.tar.bz2".to_owned(),
+        ] {
+            let error =
+                parse_snapshot_inventory_in_range(DEFAULT_BUCKET, &uri, Some((400_000, 500_000)))
+                    .unwrap_err();
 
-        assert!(matches!(
-            error,
-            SnapshotError::Parse {
-                context: "snapshot object URI",
-                ..
-            }
-        ));
+            assert!(matches!(
+                error,
+                SnapshotError::Parse {
+                    context: "snapshot object URI",
+                    ..
+                }
+            ));
+        }
     }
 
     #[test]
@@ -1178,15 +1205,19 @@ mod tests {
 
     #[test]
     fn inventory_filtering_precedes_ambiguity_checks() {
-        let listing = "gs://example-bucket/416012/snapshot-416012-alpha.tar.bz2\n\
-                       gs://example-bucket/416012/snapshot-416012-beta.tar.zst\n\
-                       gs://example-bucket/400000/hourly/snapshot-416012-gamma.tar.bz2\n";
-        let inventory = parse_snapshot_inventory(BUCKET, listing).unwrap();
+        let listing = format!(
+            "gs://example-bucket/416012/snapshot-416012-{HASH_A}.tar.bz2\n\
+             gs://example-bucket/416012/snapshot-416012-{HASH_B}.tar.zst\n\
+             gs://example-bucket/400000/hourly/snapshot-416012-{HASH_C}.tar.bz2\n"
+        );
+        let inventory = parse_snapshot_inventory(BUCKET, &listing).unwrap();
 
         let legacy = inventory.root_objects_for_slot(416_012, &[".tar.bz2"]);
         assert_eq!(
             unique_snapshot_object(BUCKET, 416_012, legacy).unwrap(),
-            Some("gs://example-bucket/416012/snapshot-416012-alpha.tar.bz2".to_owned())
+            Some(format!(
+                "gs://example-bucket/416012/snapshot-416012-{HASH_A}.tar.bz2"
+            ))
         );
 
         let all = inventory.root_objects_for_slot(416_012, ALL_SNAPSHOT_ARCHIVE_EXTENSIONS);
@@ -1247,6 +1278,18 @@ mod tests {
             legacy
         ));
         assert!(!snapshot_name_matches("rocksdb.tar.bz2", legacy));
+        assert_eq!(
+            snapshot_slot_from_name(&format!("snapshot-416012-{HASH_A}.tar.bz2"), legacy),
+            Some(416_012)
+        );
+        assert_eq!(
+            snapshot_slot_from_name(&format!("snapshot-416012-{HASH_A}"), &[""]),
+            None
+        );
+        assert_eq!(
+            snapshot_slot_from_name("snapshot-416012-!.tar.bz2", legacy),
+            None
+        );
     }
 
     #[tokio::test]

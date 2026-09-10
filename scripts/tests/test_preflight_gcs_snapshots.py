@@ -53,6 +53,17 @@ def parsed(record: dict, source: str = "root") -> preflight.SnapshotObject:
     return preflight.parse_inventory_json(json.dumps([record]), source)[0]
 
 
+def replace_anchor(record: dict, anchor: str | int) -> dict:
+    record = copy.deepcopy(record)
+    suffix = record["metadata"]["name"].split("/", 1)[1]
+    name = f"{anchor}/{suffix}"
+    generation = record["metadata"]["generation"]
+    record["metadata"]["name"] = name
+    record["metadata"]["id"] = f"{preflight.BUCKET_NAME}/{name}/{generation}"
+    record["url"] = f"{preflight.BUCKET_URI}/{name}#{generation}"
+    return record
+
+
 def complete_inventory() -> tuple[list[dict], list[dict]]:
     root: list[dict] = []
     hourly: list[dict] = []
@@ -207,6 +218,42 @@ class InventoryParsingTests(unittest.TestCase):
             preflight.parse_inventory_json(
                 json.dumps([malformed]), "root", preflight.requested_slot_range(12, 16)
             )
+
+    def test_only_same_side_out_of_range_placements_are_ignored(self) -> None:
+        relevant_start, relevant_end = preflight.requested_slot_range(12, 16)
+        harmless = [
+            inventory_record(relevant_start - 2, anchor=relevant_start - 1),
+            replace_anchor(
+                inventory_record(relevant_end + 2), "ledger-05-01-22"
+            ),
+            replace_anchor(
+                inventory_record(relevant_end + 3), str(preflight.UINT64_MAX + 1)
+            ),
+        ]
+        self.assertEqual(
+            preflight.parse_inventory_json(
+                json.dumps(harmless), "root", (relevant_start, relevant_end)
+            ),
+            (),
+        )
+
+        unsafe = [
+            inventory_record(relevant_end + 1, anchor=relevant_start),
+            inventory_record(relevant_start, anchor=relevant_end + 1),
+            inventory_record(relevant_end + 1, anchor=relevant_start - 1),
+            inventory_record(relevant_start, anchor=relevant_start - 1),
+            replace_anchor(
+                inventory_record(relevant_start), str(preflight.UINT64_MAX + 1)
+            ),
+        ]
+        for record in unsafe:
+            with self.subTest(name=record["metadata"]["name"]):
+                with self.assertRaises(preflight.PreflightError):
+                    preflight.parse_inventory_json(
+                        json.dumps([record]),
+                        "root",
+                        (relevant_start, relevant_end),
+                    )
 
 
 class SelectionTests(unittest.TestCase):

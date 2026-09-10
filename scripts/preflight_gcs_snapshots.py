@@ -141,6 +141,13 @@ def _path_u64(value: str, field: str, context: str) -> int:
     return parsed
 
 
+def _optional_path_u64(value: str) -> Optional[int]:
+    if _DECIMAL_RE.fullmatch(value) is None:
+        return None
+    parsed = int(value)
+    return parsed if parsed <= UINT64_MAX else None
+
+
 def _base58_decodes_to_32_bytes(value: str) -> bool:
     number = 0
     try:
@@ -194,11 +201,7 @@ def _parse_snapshot_object(
         raise PreflightError(f"{context}: invalid snapshot object path {object_name!r}")
     filename_slot = _path_u64(filename_match.group("slot"), "snapshot slot", context)
     anchor_text = object_name.split("/", 1)[0]
-    anchor_slot = (
-        _path_u64(anchor_text, "anchor slot", context)
-        if _DECIMAL_RE.fullmatch(anchor_text) is not None
-        else None
-    )
+    anchor_slot = _optional_path_u64(anchor_text)
     relevant_start, relevant_end = relevant_slots
     below_range = filename_slot < relevant_start and (
         anchor_slot is None or anchor_slot < relevant_start

@@ -257,12 +257,36 @@ class InventoryParsingTests(unittest.TestCase):
 
 
 class SelectionTests(unittest.TestCase):
-    def test_cli_accepts_a_supported_subrange(self) -> None:
+    def test_cli_accepts_early_and_later_supported_subranges(self) -> None:
+        early = preflight.build_argument_parser().parse_args(
+            ["--first-epoch", "1", "--last-epoch", "6"]
+        )
         arguments = preflight.build_argument_parser().parse_args(
             ["--first-epoch", "12", "--last-epoch", "16"]
         )
 
+        self.assertEqual((early.first_epoch, early.last_epoch), (1, 6))
         self.assertEqual((arguments.first_epoch, arguments.last_epoch), (12, 16))
+
+    def test_runtime_routes_cover_early_history_without_guessing_epoch_zero(self) -> None:
+        expected = {
+            1: "solana-v1.0.7-to-v1.0.8",
+            2: "solana-v1.0.8",
+            7: "solana-v1.0.8",
+            8: "solana-v1.0.13",
+            9: "solana-v1.0.14",
+            10: "solana-v1.0.14",
+            11: "solana-v1.0.17",
+            12: "solana-v1.0.23",
+        }
+        for epoch, runtime in expected.items():
+            with self.subTest(epoch=epoch):
+                self.assertEqual(preflight.runtime_route(epoch)[0], runtime)
+
+        with self.assertRaises(preflight.PreflightError):
+            preflight.requested_slot_range(0, 1)
+        with self.assertRaises(preflight.PreflightError):
+            preflight.requested_slot_range(100, 101)
 
     def test_builds_all_epoch_plans_and_keeps_hourly_bootstrap_only(self) -> None:
         root_raw, hourly_raw = complete_inventory()
@@ -271,10 +295,10 @@ class SelectionTests(unittest.TestCase):
 
         plans = preflight.build_epoch_plans(root, hourly)
 
-        self.assertEqual(len(plans), 89)
-        self.assertEqual(plans[0].epoch, 12)
+        self.assertEqual(len(plans), 100)
+        self.assertEqual(plans[0].epoch, 1)
         self.assertEqual(plans[-1].epoch, 100)
-        self.assertEqual(plans[0].runtime, "solana-v1.0.23")
+        self.assertEqual(plans[0].runtime, "solana-v1.0.7-to-v1.0.8")
         self.assertEqual(plans[-1].runtime, "solana-v1.3.19")
         self.assertEqual(plans[0].bootstrap.source, "hourly")
         self.assertTrue(
@@ -419,7 +443,7 @@ class ReportingAndAcquisitionTests(unittest.TestCase):
 
             report = preflight.build_storage_report(plans, local_root, free_bytes=10**12)
 
-        self.assertEqual(report["selected_bootstrap_objects"], 89)
+        self.assertEqual(report["selected_bootstrap_objects"], 100)
         self.assertEqual(report["present_bootstrap_bytes"], selected[0].size)
         self.assertEqual(
             report["missing_local_bootstrap_bytes"],

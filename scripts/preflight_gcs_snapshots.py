@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Read-only GCS snapshot inventory preflight for mainnet epochs 12 through 100.
+"""Read-only GCS snapshot inventory preflight for mainnet epochs 1 through 100.
 
 The manifest treats an epoch's bootstrap as the newest compatible snapshot in
 the preceding epoch.  Root and hourly objects may supply that bootstrap, but
@@ -40,12 +40,17 @@ HOURLY_PATTERN = f"{BUCKET_URI}/*/hourly/snapshot-*"
 GCLOUD_ACCOUNT = "sam.johnson@anza.xyz"
 BILLING_PROJECT = "principal-lane-200702"
 LOCAL_ROOT = Path("/home/sol/horizon")
-FIRST_EPOCH = 12
+FIRST_EPOCH = 1
 LAST_EPOCH = 100
 EPOCH_SLOTS = 432_000
 UINT64_MAX = (1 << 64) - 1
 SCHEMA = "jetstreamer-gcs-snapshot-preflight-v1"
 RUNTIME_ROUTES = (
+    (1, 1, "solana-v1.0.7-to-v1.0.8", (".tar.bz2",)),
+    (2, 7, "solana-v1.0.8", (".tar.bz2",)),
+    (8, 8, "solana-v1.0.13", (".tar.bz2",)),
+    (9, 10, "solana-v1.0.14", (".tar.bz2",)),
+    (11, 11, "solana-v1.0.17", (".tar.bz2",)),
     (12, 29, "solana-v1.0.23", (".tar.bz2",)),
     (30, 60, "solana-v1.1.23", (".tar.bz2",)),
     (61, 91, "solana-v1.2.32", (".tar.bz2", ".tar.zst")),

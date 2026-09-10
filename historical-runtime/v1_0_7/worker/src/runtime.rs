@@ -29,8 +29,11 @@ use std::{cmp, collections::HashMap, env, path::Path, sync::Arc};
 use tempfile::TempDir;
 
 const MAX_AGE_CORRECTION_EPOCH: u64 = 14;
-const MAX_SUPPORTED_SLOT_EXCLUSIVE: u64 = 4_752_000;
-const MAX_SUPPORTED_EPOCH: u64 = 10;
+// The parent registry hands execution to v1.0.8 after exporting the frozen
+// v1.0.7 bank at this canonical mainnet checkpoint.
+const HANDOFF_SNAPSHOT_SLOT: u64 = 619_848;
+const MAX_SUPPORTED_SLOT_EXCLUSIVE: u64 = HANDOFF_SNAPSHOT_SLOT + 1;
+const MAX_SUPPORTED_EPOCH: u64 = 1;
 const POH_THREADS_ENV: &str = "JETSTREAMER_HISTORICAL_POH_THREADS";
 const ABSOLUTE_MAX_POH_THREADS: usize = 256;
 
@@ -340,12 +343,7 @@ impl RuntimeState {
 
         for (batch_index, entry) in prepared.iter().enumerate() {
             let request = &entry.request;
-            if request.slot >= MAX_SUPPORTED_SLOT_EXCLUSIVE {
-                return Err(format!(
-                    "Solana v1.0.7 candidate runtime ends before slot {} (requested {})",
-                    MAX_SUPPORTED_SLOT_EXCLUSIVE, request.slot
-                ));
-            }
+            validate_supported_slot(request.slot)?;
             if request.slot < current_slot {
                 return Err(format!(
                     "entry slot {} precedes current bank slot {}",
@@ -685,6 +683,20 @@ impl RuntimeState {
     }
 }
 
+fn validate_supported_slot(slot: u64) -> Result<(), String> {
+    if slot >= MAX_SUPPORTED_SLOT_EXCLUSIVE {
+        return Err(format!(
+            "Solana v1.0.7 candidate runtime ends before slot {} (requested {})",
+            MAX_SUPPORTED_SLOT_EXCLUSIVE, slot
+        ));
+    }
+    Ok(())
+}
+
+fn supported_epoch(epoch: u64) -> bool {
+    epoch <= MAX_SUPPORTED_EPOCH
+}
+
 fn build_poh_pool() -> Result<ThreadPool, String> {
     let thread_count = configured_poh_thread_count()?;
     ThreadPoolBuilder::new()
@@ -954,12 +966,12 @@ fn restore_mainnet_runtime_hooks(bank: &mut Bank, genesis: &GenesisConfig) -> Re
     validate_mainnet_genesis_programs(genesis)?;
     restore_mainnet_native_processors(bank);
 
-    // The upstream Stable callback has no state effects in epochs 0 through
-    // 10. Install the callback explicitly and guard that qualified interval;
+    // The upstream Stable callback has no state effects in epochs 0 and 1.
+    // Install the callback explicitly and guard that qualified interval;
     // process_entry rejects the first later slot before constructing its bank.
     bank.set_entered_epoch_callback(Box::new(|bank| {
         assert!(
-            bank.epoch() <= MAX_SUPPORTED_EPOCH,
+            supported_epoch(bank.epoch()),
             "Solana v1.0.7 candidate entered unsupported epoch {}",
             bank.epoch()
         );
@@ -1217,6 +1229,19 @@ mod tests {
             &[payer, vote_account],
             recent_blockhash,
         )
+    }
+
+    #[test]
+    fn candidate_bounds_end_at_registered_handoff() {
+        assert_eq!(HANDOFF_SNAPSHOT_SLOT, 619_848);
+        assert_eq!(MAX_SUPPORTED_SLOT_EXCLUSIVE, 619_849);
+        assert_eq!(MAX_SUPPORTED_EPOCH, 1);
+
+        validate_supported_slot(HANDOFF_SNAPSHOT_SLOT).unwrap();
+        let error = validate_supported_slot(MAX_SUPPORTED_SLOT_EXCLUSIVE).unwrap_err();
+        assert!(error.contains("ends before slot 619849 (requested 619849)"));
+        assert!(supported_epoch(1));
+        assert!(!supported_epoch(2));
     }
 
     #[test]
@@ -1880,6 +1905,20 @@ mod tests {
         )
         .unwrap();
         assert_eq!(initialized.slot, 416_012);
+        assert_eq!(state.bank.epoch(), 0);
+        assert_eq!(state.bank.epoch_schedule().slots_per_epoch, 432_000);
+        assert!(!state.bank.epoch_schedule().warmup);
+        assert_eq!(
+            state.bank.epoch_schedule().get_epoch(HANDOFF_SNAPSHOT_SLOT),
+            1
+        );
+        assert_eq!(
+            state
+                .bank
+                .epoch_schedule()
+                .get_epoch(MAX_SUPPORTED_SLOT_EXCLUSIVE),
+            1
+        );
         let checkpoint = state.freeze_checkpoint(416_012).unwrap();
         println!(
             "initialized slot={} last_blockhash={} next_write_version={}",

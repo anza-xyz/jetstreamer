@@ -12054,6 +12054,25 @@ fn preserve_existing_output(path: &Path) -> Result<Option<PathBuf>, String> {
     ))
 }
 
+fn publish_verified_runtime_assembly(
+    epoch: u64,
+    staged_archive: &Path,
+    final_output: &Path,
+    evidence: jetstreamer_node::archive_checksum::ValidatedArchiveFile,
+) -> Result<jetstreamer_node::archive_publish::ArchivePublication, String> {
+    jetstreamer_node::archive_publish::publish_verified_archive(
+        staged_archive,
+        final_output,
+        evidence,
+    )
+    .map_err(|error| {
+        format!(
+            "failed to transactionally publish verified multi-runtime epoch {epoch} archive (committed={}): {error}",
+            error.committed()
+        )
+    })
+}
+
 /// Runs and assembles every runtime span inside one epoch. Segment archives
 /// and manifests remain in a private adjacent directory until the complete V3
 /// output is verified and atomically published, so interruption is resumable.
@@ -12085,6 +12104,21 @@ async fn run_multi_runtime_epoch_supervisor(
         .unwrap_or_else(|| dest_dir.to_path_buf());
     fs::create_dir_all(&handoff_dir)
         .map_err(|err| format!("failed to create {}: {err}", handoff_dir.display()))?;
+    if publish_checksum
+        && jetstreamer_node::archive_checksum::archive_checksum_is_publication_sentinel(
+            final_output,
+        )
+        .map_err(|error| {
+            format!("failed to inspect multi-runtime epoch {epoch} publication marker: {error}")
+        })?
+    {
+        return Err(format!(
+            "multi-runtime epoch {epoch} has an interrupted publication sentinel at {}; manual transaction recovery is required",
+            jetstreamer_node::archive_checksum::archive_checksum_path(final_output)
+                .map_err(|error| format!("failed to resolve checksum path: {error}"))?
+                .display()
+        ));
+    }
     match epoch_archive_reusable_multi_runtime(final_output, epoch, &spans) {
         Ok(true) => {
             if publish_checksum {
@@ -12352,14 +12386,38 @@ async fn run_multi_runtime_epoch_supervisor(
     let output_parent = final_output.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(output_parent)
         .map_err(|err| format!("failed to create {}: {err}", output_parent.display()))?;
-    let temporary = tempfile::Builder::new()
+    let assembly_directory = tempfile::Builder::new()
         .prefix(".jetstreamer-runtime-assembly-")
-        .suffix(".partial")
-        .tempfile_in(output_parent)
-        .map_err(|err| format!("failed to create assembly tempfile: {err}"))?;
-    let sink = temporary
-        .reopen()
-        .map_err(|err| format!("failed to open assembly tempfile: {err}"))?;
+        .tempdir_in(output_parent)
+        .map_err(|err| format!("failed to create private assembly directory: {err}"))?;
+    create_or_validate_private_directory(assembly_directory.path())?;
+    if publish_checksum {
+        jetstreamer_node::archive_publish::preflight_archive_publication(
+            assembly_directory.path(),
+            output_parent,
+        )
+        .map_err(|error| {
+            format!("multi-runtime archive publication capability preflight failed: {error}")
+        })?;
+    }
+    let output_name = final_output.file_name().ok_or_else(|| {
+        format!(
+            "multi-runtime output path has no filename: {}",
+            final_output.display()
+        )
+    })?;
+    let staged_assembly = assembly_directory.path().join(output_name);
+    let sink = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&staged_assembly)
+        .map_err(|err| {
+            format!(
+                "failed to create staged assembly {}: {err}",
+                staged_assembly.display()
+            )
+        })?;
     let sources = segments
         .iter()
         .map(|segment| {
@@ -12393,60 +12451,84 @@ async fn run_multi_runtime_epoch_supervisor(
     let (sink, stats) =
         merge_runtime_segments(sources, sink, ArchiveWriterConfig::default(), &provenance)
             .map_err(|err| format!("verified runtime-segment assembly failed: {err}"))?;
+    if publish_checksum {
+        jetstreamer_node::archive_checksum::prepare_archive_permissions(&sink, output_parent)
+            .map_err(|err| {
+                format!("failed to prepare assembled epoch {epoch} archive permissions: {err}")
+            })?;
+    }
     sink.sync_all()
         .map_err(|err| format!("failed to sync assembled archive: {err}"))?;
     drop(sink);
-    verify_assembled_runtime_archive(temporary.path(), epoch, &provenance)?;
-    let preserved_output = preserve_existing_output(final_output)?;
-    if let Some(backup) = preserved_output.as_ref() {
-        warn!(
-            "preserved previous output {} as {}",
-            final_output.display(),
-            backup.display()
-        );
-    }
-    let published = match temporary.persist_noclobber(final_output) {
-        Ok(published) => published,
-        Err(error) => {
+    let retained_assembly_directory = assembly_directory.keep();
+    let evidence = verify_assembled_runtime_archive(&staged_assembly, epoch, &provenance).map_err(
+        |error| {
+            format!(
+                "{error}; retaining assembled archive for inspection in {}",
+                retained_assembly_directory.display()
+            )
+        },
+    )?;
+    if publish_checksum {
+        let publication =
+            publish_verified_runtime_assembly(epoch, &staged_assembly, final_output, evidence)?;
+        if let Some(recovery) = publication.recovery_directory {
+            warn!(
+                "epoch {epoch}: retained replaced multi-runtime archive artifacts in {}",
+                recovery.display()
+            );
+        }
+    } else {
+        let preserved_output = preserve_existing_output(final_output)?;
+        if let Some(backup) = preserved_output.as_ref() {
+            warn!(
+                "preserved previous private output {} as {}",
+                final_output.display(),
+                backup.display()
+            );
+        }
+        if let Err(error) = fs::rename(&staged_assembly, final_output) {
             if let Some(backup) = preserved_output.as_ref()
                 && !final_output.exists()
                 && let Err(restore_error) = fs::rename(backup, final_output)
             {
                 return Err(format!(
-                    "failed to publish assembled archive {}: {}; also failed to restore preserved output {}: {restore_error}",
+                    "failed to publish private assembled archive {}: {error}; also failed to restore preserved output {}: {restore_error}",
                     final_output.display(),
-                    error.error,
                     backup.display()
                 ));
             }
             return Err(format!(
-                "failed to atomically publish assembled archive {}: {}",
+                "failed to publish private assembled archive {}: {error}; retained assembly directory {}",
                 final_output.display(),
-                error.error
+                retained_assembly_directory.display()
             ));
         }
-    };
-    published
-        .sync_all()
-        .map_err(|err| format!("failed to sync {}: {err}", final_output.display()))?;
-    fs::File::open(output_parent)
-        .and_then(|directory| directory.sync_all())
-        .map_err(|err| format!("failed to sync {}: {err}", output_parent.display()))?;
+        fs::File::open(final_output)
+            .and_then(|file| file.sync_all())
+            .map_err(|err| format!("failed to sync {}: {err}", final_output.display()))?;
+        fs::File::open(output_parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|err| format!("failed to sync {}: {err}", output_parent.display()))?;
+    }
     if !epoch_archive_reusable_multi_runtime(final_output, epoch, &spans)? {
         return Err(format!(
             "published archive {} did not pass final registry validation",
             final_output.display()
         ));
     }
-    if publish_checksum {
-        jetstreamer_node::archive_checksum::ensure_archive_checksum(final_output).map_err(
-            |err| {
-                format!(
-                    "failed to publish checksum for verified epoch {epoch} archive {}: {err}",
-                    final_output.display()
-                )
-            },
-        )?;
+    if let Err(error) = fs::remove_dir(&retained_assembly_directory) {
+        warn!(
+            "epoch {epoch}: published assembled archive, but failed to remove empty staging directory {}: {error}",
+            retained_assembly_directory.display()
+        );
+    } else if let Err(error) =
+        fs::File::open(output_parent).and_then(|directory| directory.sync_all())
+    {
+        warn!(
+            "epoch {epoch}: removed assembly staging directory, but failed to sync {}: {error}",
+            output_parent.display()
+        );
     }
     cleanup_runtime_segment_work_dir(&work_dir, epoch, &spans)?;
     info!(
@@ -12950,6 +13032,12 @@ impl std::fmt::Display for AdaptiveValidationError {
 }
 
 enum AdaptiveValidationFailureAction {
+    Retry(String),
+    Terminal(String),
+}
+
+enum AdaptiveChildFailureAction {
+    Validate(String),
     Retry(String),
     Terminal(String),
 }
@@ -13466,6 +13554,66 @@ fn handle_adaptive_validation_failure(
     }
 }
 
+fn handle_adaptive_child_failure(
+    job: &AdaptiveEpochJob,
+    exit_status: &str,
+    may_retry: bool,
+    attempts_per_epoch: u32,
+    draining_failure: bool,
+) -> AdaptiveChildFailureAction {
+    match fs::symlink_metadata(&job.staged_output) {
+        Ok(metadata) if metadata.file_type().is_file() => {
+            AdaptiveChildFailureAction::Validate(format!(
+                "epoch {} child failed (exit: {exit_status}) after creating a regular staged archive {}; running full validation before deciding whether it can be published or cleaned",
+                job.epoch,
+                job.staged_output.display()
+            ))
+        }
+        Ok(_) => AdaptiveChildFailureAction::Terminal(format!(
+            "epoch {} child failed (exit: {exit_status}) and its staged output is not a regular file; preserving staged attempt at {}",
+            job.epoch,
+            job.staged_output
+                .parent()
+                .unwrap_or(job.staged_output.as_path())
+                .display()
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let cleanup = cleanup_adaptive_attempt(job);
+            if may_retry && cleanup.is_ok() {
+                return AdaptiveChildFailureAction::Retry(format!(
+                    "epoch {} child failed without producing a staged archive (exit: {exit_status})",
+                    job.epoch
+                ));
+            }
+            let mut failure = if job.attempt >= attempts_per_epoch {
+                format!(
+                    "epoch {} failed after {attempts_per_epoch} attempt(s) (exit: {exit_status})",
+                    job.epoch
+                )
+            } else if draining_failure {
+                format!(
+                    "epoch {} child failed while adaptive admission was draining (exit: {exit_status}); retry suppressed",
+                    job.epoch
+                )
+            } else {
+                format!("epoch {} child failed (exit: {exit_status})", job.epoch)
+            };
+            if let Err(error) = cleanup {
+                failure.push_str(&format!("; additionally failed cleanup: {error}"));
+            }
+            AdaptiveChildFailureAction::Terminal(failure)
+        }
+        Err(error) => AdaptiveChildFailureAction::Terminal(format!(
+            "epoch {} child failed (exit: {exit_status}) and its staged archive could not be inspected: {error}; preserving staged attempt at {}",
+            job.epoch,
+            job.staged_output
+                .parent()
+                .unwrap_or(job.staged_output.as_path())
+                .display()
+        )),
+    }
+}
+
 fn configured_adaptive_epoch_policy(
     has_historical_worker: bool,
     has_agave: bool,
@@ -13898,6 +14046,18 @@ async fn run_epoch_range_supervisor_adaptive(
                 .expect("runtime planner rejects empty epoch ranges"),
         )?;
         let final_output = dest_dir.join(format!("epoch-{epoch}.jet"));
+        if jetstreamer_node::archive_checksum::archive_checksum_is_publication_sentinel(
+            &final_output,
+        )
+        .map_err(|error| format!("failed to inspect epoch {epoch} publication marker: {error}"))?
+        {
+            return Err(format!(
+                "epoch {epoch} has an interrupted publication sentinel at {}; manual transaction recovery is required",
+                jetstreamer_node::archive_checksum::archive_checksum_path(&final_output)
+                    .map_err(|error| format!("failed to resolve checksum path: {error}"))?
+                    .display()
+            ));
+        }
         let reusable = if spans.len() == 1 {
             validated_epoch_archive(&final_output, epoch, selection, None, None)
         } else {
@@ -14051,32 +14211,30 @@ async fn run_epoch_range_supervisor_adaptive(
             } else {
                 let job = completed.job;
                 let may_retry = failure_drain.may_retry(job.attempt, attempts_per_epoch);
-                let cleanup = cleanup_adaptive_attempt(&job);
-                if may_retry && cleanup.is_ok() {
-                    warn!("epoch {epoch} child failed (exit: {status}); retrying cleanly");
-                    retries.push(job);
-                    continue;
+                match handle_adaptive_child_failure(
+                    &job,
+                    &status.to_string(),
+                    may_retry,
+                    attempts_per_epoch,
+                    failure_drain.is_active(),
+                ) {
+                    AdaptiveChildFailureAction::Validate(message) => {
+                        warn!("{message}");
+                        validating.insert(epoch, spawn_adaptive_validation(job, shutdown.clone()));
+                    }
+                    AdaptiveChildFailureAction::Retry(message) => {
+                        warn!("{message}; retrying cleanly");
+                        retries.push(job);
+                    }
+                    AdaptiveChildFailureAction::Terminal(failure) => {
+                        record_adaptive_terminal_failure(
+                            &mut failure_drain,
+                            failure,
+                            running.len(),
+                            validating.len(),
+                        );
+                    }
                 }
-                let mut failure = if job.attempt >= attempts_per_epoch {
-                    format!(
-                        "epoch {epoch} failed after {attempts_per_epoch} attempt(s) (exit: {status})"
-                    )
-                } else if failure_drain.is_active() {
-                    format!(
-                        "epoch {epoch} child failed while adaptive admission was draining (exit: {status}); retry suppressed"
-                    )
-                } else {
-                    format!("epoch {epoch} child failed (exit: {status})")
-                };
-                if let Err(error) = cleanup {
-                    failure.push_str(&format!("; additionally failed cleanup: {error}"));
-                }
-                record_adaptive_terminal_failure(
-                    &mut failure_drain,
-                    failure,
-                    running.len(),
-                    validating.len(),
-                );
             }
         }
 
@@ -17845,6 +18003,56 @@ mod early_snapshot_tests {
     }
 
     #[test]
+    fn direct_multi_runtime_publication_uses_transactional_checksum_commit() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = tempfile::TempDir::new().unwrap();
+        let source = root.path().join("source");
+        let destination = root.path().join("destination");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(&destination).unwrap();
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&destination, fs::Permissions::from_mode(0o3770)).unwrap();
+        let staged = source.join("epoch-17.jet");
+        let published = destination.join("epoch-17.jet");
+        fs::write(&staged, b"verified multi-runtime assembly").unwrap();
+        fs::write(&published, b"previous multi-runtime archive").unwrap();
+        fs::set_permissions(&published, fs::Permissions::from_mode(0o440)).unwrap();
+        let old_checksum =
+            jetstreamer_node::archive_checksum::archive_checksum_path(&published).unwrap();
+        fs::write(&old_checksum, b"previous checksum\n").unwrap();
+        fs::set_permissions(&old_checksum, fs::Permissions::from_mode(0o440)).unwrap();
+
+        let staged_file =
+            jetstreamer_node::archive_checksum::open_regular_nofollow(&staged).unwrap();
+        jetstreamer_node::archive_checksum::prepare_archive_permissions(&staged_file, &destination)
+            .unwrap();
+        staged_file.sync_all().unwrap();
+        let evidence =
+            jetstreamer_node::archive_checksum::measure_open_archive(&staged_file).unwrap();
+
+        let result = publish_verified_runtime_assembly(17, &staged, &published, evidence).unwrap();
+
+        assert_eq!(
+            fs::read(&published).unwrap(),
+            b"verified multi-runtime assembly"
+        );
+        assert_eq!(
+            fs::read_to_string(&result.checksum_path).unwrap(),
+            jetstreamer_node::archive_checksum::archive_checksum_line(
+                &evidence.sha256,
+                published.file_name().unwrap()
+            )
+            .unwrap()
+        );
+        let recovery = result.recovery_directory.unwrap();
+        assert_eq!(
+            fs::read(recovery.join("previous-archive.jet")).unwrap(),
+            b"previous multi-runtime archive"
+        );
+    }
+
+    #[test]
     fn multi_runtime_reuse_rejects_non_mainnet_genesis() {
         let wrong = Hash::new_from_array([0xff; 32]);
         let error = validate_multi_runtime_genesis(Path::new("epoch-1.jet"), wrong).unwrap_err();
@@ -18319,6 +18527,52 @@ mod early_snapshot_tests {
         assert!(!job.scratch_dir.join("crash-mutated-state").exists());
         cleanup_adaptive_attempt(&job).unwrap();
         assert!(!second_attempt.exists());
+    }
+
+    #[test]
+    fn adaptive_late_child_failure_sends_regular_staging_to_deep_validation() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::TempDir::new().unwrap();
+        let work_dir = directory.path().join("epoch-19");
+        fs::create_dir(&work_dir).unwrap();
+        fs::set_permissions(&work_dir, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut job = adaptive_test_job(19, work_dir);
+        prepare_adaptive_attempt(&mut job).unwrap();
+        fs::write(&job.staged_output, b"complete archive awaiting validation").unwrap();
+        let staged_output = job.staged_output.clone();
+
+        let action = handle_adaptive_child_failure(&job, "exit status: 1", true, 2, false);
+
+        let AdaptiveChildFailureAction::Validate(message) = action else {
+            panic!("regular staging was not retained for validation");
+        };
+        assert!(message.contains("running full validation"), "{message}");
+        assert_eq!(
+            fs::read(staged_output).unwrap(),
+            b"complete archive awaiting validation"
+        );
+        assert!(
+            classify_adaptive_deep_validation(Ok(Some(())), job.epoch, &job.staged_output).is_ok()
+        );
+    }
+
+    #[test]
+    fn adaptive_child_failure_cleans_only_an_absent_staged_archive() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::TempDir::new().unwrap();
+        let work_dir = directory.path().join("epoch-19");
+        fs::create_dir(&work_dir).unwrap();
+        fs::set_permissions(&work_dir, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut job = adaptive_test_job(19, work_dir);
+        prepare_adaptive_attempt(&mut job).unwrap();
+        let attempt = job.staged_output.parent().unwrap().to_path_buf();
+
+        let action = handle_adaptive_child_failure(&job, "exit status: 1", true, 2, false);
+
+        assert!(matches!(action, AdaptiveChildFailureAction::Retry(_)));
+        assert!(!attempt.exists());
     }
 
     #[test]

@@ -14,8 +14,9 @@
 use {
     crate::{
         archive_checksum::{
-            ValidatedArchiveFile, archive_checksum_line, archive_checksum_path,
-            archive_file_identity, path_matches_archive_identity, rebind_validated_after_rename,
+            ARCHIVE_PUBLICATION_SENTINEL, ValidatedArchiveFile, archive_checksum_line,
+            archive_checksum_path, archive_file_identity, path_matches_archive_identity,
+            rebind_validated_after_rename,
         },
         segment_manifest::{
             HistoricalSegmentManifest, read_and_validate_segment_manifest, segment_manifest_path,
@@ -41,7 +42,6 @@ use {
 
 const MAX_SEGMENT_MANIFEST_BYTES: u64 = 1 << 20;
 const FINAL_FILE_MODE: u32 = 0o440;
-const INVALID_CHECKSUM_CONTENTS: &[u8] = b"jetstreamer publication in progress\n";
 const CAPABILITY_PROBE_A: &str = "rename-probe-a";
 const CAPABILITY_PROBE_B: &str = "rename-probe-b";
 const CAPABILITY_PROBE_MOVED: &str = "rename-probe-moved";
@@ -641,6 +641,17 @@ fn publish_impl(
         ComponentKind::Checksum,
     )
     .map_err(preflight_error)?;
+    if let Some(bound) = initial_checksum.as_ref()
+        && bound.identity.len == ARCHIVE_PUBLICATION_SENTINEL.len() as u64
+        && read_bound_file(&bound.file, ARCHIVE_PUBLICATION_SENTINEL.len() as u64)
+            .map_err(preflight_error)?
+            == ARCHIVE_PUBLICATION_SENTINEL
+    {
+        return Err(preflight_error(format!(
+            "destination checksum {} is an interrupted Jetstreamer publication sentinel; manual transaction recovery is required before another publication",
+            destination_checksum_path.display()
+        )));
+    }
     let initial = InitialDestination {
         archive: initial_archive.as_ref().map(|bound| bound.identity),
         manifest: initial_manifest.as_ref().map(|bound| bound.identity),
@@ -721,7 +732,7 @@ fn publish_impl(
         &recovery,
         ComponentKind::Checksum,
         ComponentKind::Checksum.backup_name(),
-        INVALID_CHECKSUM_CONTENTS,
+        ARCHIVE_PUBLICATION_SENTINEL,
         destination.identity.gid,
     )
     .map_err(|message| {
@@ -2916,7 +2927,7 @@ mod tests {
                         | PublishPhase::BeforeChecksumCommit
                 ) {
                     let checksum = archive_checksum_path(&destination).unwrap();
-                    assert_eq!(fs::read(&checksum).unwrap(), INVALID_CHECKSUM_CONTENTS);
+                    assert_eq!(fs::read(&checksum).unwrap(), ARCHIVE_PUBLICATION_SENTINEL);
                     let inode = fs::metadata(&checksum).unwrap().ino();
                     assert_eq!(*sentinel_inode.get_or_insert(inode), inode);
                     let create = OpenOptions::new()
@@ -2971,6 +2982,88 @@ mod tests {
             FINAL_FILE_MODE
         );
         assert!(source_manifest.exists());
+    }
+
+    #[test]
+    fn restart_refuses_to_overwrite_sentinel_after_new_manifest_install() {
+        let (_root, archive, destination, evidence) = fixture_with_manifest();
+        let expected_new_manifest = fs::read(segment_manifest_path(&archive).unwrap()).unwrap();
+        write_existing_set(&destination);
+        let old_archive = crate::archive_checksum::open_regular_nofollow(&destination).unwrap();
+        let old_evidence = crate::archive_checksum::measure_open_archive(&old_archive).unwrap();
+
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = publish_verified_archive_with_hook(&archive, &destination, evidence, |phase| {
+                if phase == PublishPhase::AfterManifestMutation {
+                    panic!("simulated process crash after manifest commit");
+                }
+                Ok(())
+            });
+        }));
+        assert!(crashed.is_err());
+        assert_eq!(fs::read(&destination).unwrap(), b"old archive");
+        assert_eq!(
+            fs::read(segment_manifest_path(&destination).unwrap()).unwrap(),
+            expected_new_manifest
+        );
+        let checksum = archive_checksum_path(&destination).unwrap();
+        let sentinel_inode = fs::metadata(&checksum).unwrap().ino();
+        assert_eq!(fs::read(&checksum).unwrap(), ARCHIVE_PUBLICATION_SENTINEL);
+
+        let error = crate::archive_checksum::ensure_archive_checksum_for_validated(
+            &destination,
+            old_evidence,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("manual transaction recovery"));
+        assert_eq!(fs::metadata(&checksum).unwrap().ino(), sentinel_inode);
+        assert_eq!(fs::read(&checksum).unwrap(), ARCHIVE_PUBLICATION_SENTINEL);
+        let retry = publish_verified_archive(&archive, &destination, evidence).unwrap_err();
+        assert!(!retry.committed());
+        assert!(retry.to_string().contains("manual transaction recovery"));
+        assert_eq!(fs::metadata(&checksum).unwrap().ino(), sentinel_inode);
+        assert_eq!(fs::read(checksum).unwrap(), ARCHIVE_PUBLICATION_SENTINEL);
+    }
+
+    #[test]
+    fn restart_refuses_to_overwrite_sentinel_after_manifest_removal() {
+        let (_root, archive, destination, evidence) = fixture();
+        write_existing_set(&destination);
+        let old_archive = crate::archive_checksum::open_regular_nofollow(&destination).unwrap();
+        let old_evidence = crate::archive_checksum::measure_open_archive(&old_archive).unwrap();
+
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = publish_verified_archive_with_hook(&archive, &destination, evidence, |phase| {
+                if phase == PublishPhase::AfterManifestMutation {
+                    panic!("simulated process crash after manifest removal");
+                }
+                Ok(())
+            });
+        }));
+        assert!(crashed.is_err());
+        assert_eq!(fs::read(&destination).unwrap(), b"old archive");
+        assert!(!segment_manifest_path(&destination).unwrap().exists());
+        let checksum = archive_checksum_path(&destination).unwrap();
+        let sentinel_inode = fs::metadata(&checksum).unwrap().ino();
+        assert_eq!(fs::read(&checksum).unwrap(), ARCHIVE_PUBLICATION_SENTINEL);
+
+        let error = crate::archive_checksum::ensure_archive_checksum_for_validated(
+            &destination,
+            old_evidence,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("manual transaction recovery"));
+        assert_eq!(fs::metadata(&checksum).unwrap().ino(), sentinel_inode);
+        assert_eq!(fs::read(&checksum).unwrap(), ARCHIVE_PUBLICATION_SENTINEL);
+        let retry = publish_verified_archive(&archive, &destination, evidence).unwrap_err();
+        assert!(!retry.committed());
+        assert!(retry.to_string().contains("manual transaction recovery"));
+        assert_eq!(fs::metadata(&checksum).unwrap().ino(), sentinel_inode);
+        assert_eq!(fs::read(checksum).unwrap(), ARCHIVE_PUBLICATION_SENTINEL);
     }
 
     #[test]
@@ -3082,7 +3175,7 @@ mod tests {
         assert_eq!(fs::read(&destination).unwrap(), b"concurrent replacement");
         assert_eq!(
             fs::read(archive_checksum_path(&destination).unwrap()).unwrap(),
-            INVALID_CHECKSUM_CONTENTS
+            ARCHIVE_PUBLICATION_SENTINEL
         );
         assert_eq!(fs::read(&displaced).unwrap(), b"old archive");
         assert!(archive.exists());
@@ -3231,7 +3324,7 @@ mod tests {
         assert_eq!(fs::read(&displaced).unwrap(), b"new archive");
         assert_eq!(
             fs::read(archive_checksum_path(&destination).unwrap()).unwrap(),
-            INVALID_CHECKSUM_CONTENTS
+            ARCHIVE_PUBLICATION_SENTINEL
         );
     }
 
@@ -3254,7 +3347,7 @@ mod tests {
         assert!(error.recovery_directory().is_some());
         assert_eq!(
             fs::read(archive_checksum_path(&destination).unwrap()).unwrap(),
-            INVALID_CHECKSUM_CONTENTS
+            ARCHIVE_PUBLICATION_SENTINEL
         );
         assert_eq!(fs::read(&displaced).unwrap(), b"new archive");
     }
@@ -3331,7 +3424,7 @@ mod tests {
         assert_eq!(fs::read(&archive).unwrap(), b"old archive");
         assert_eq!(
             fs::read(archive_checksum_path(&destination).unwrap()).unwrap(),
-            INVALID_CHECKSUM_CONTENTS
+            ARCHIVE_PUBLICATION_SENTINEL
         );
     }
 
@@ -3362,7 +3455,7 @@ mod tests {
         assert_eq!(fs::metadata(&destination).unwrap().ino(), old_inodes[0]);
         assert_eq!(
             fs::read(archive_checksum_path(&destination).unwrap()).unwrap(),
-            INVALID_CHECKSUM_CONTENTS
+            ARCHIVE_PUBLICATION_SENTINEL
         );
         assert_eq!(
             fs::metadata(recovery.join(ComponentKind::Checksum.backup_name()))

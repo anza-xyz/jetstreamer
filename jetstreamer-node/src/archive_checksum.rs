@@ -14,6 +14,11 @@ use sha2::{Digest, Sha256};
 use tempfile::Builder;
 
 pub const ARCHIVE_CHECKSUM_SUFFIX: &str = ".sha256";
+/// Exact contents installed at the canonical checksum path while an archive
+/// publication transaction is incomplete. Checksum repair must never replace
+/// this marker because the adjacent archive and manifest may be from different
+/// sides of an interrupted transaction.
+pub const ARCHIVE_PUBLICATION_SENTINEL: &[u8] = b"jetstreamer publication in progress\n";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ArchiveFileIdentity {
@@ -43,6 +48,57 @@ pub fn archive_checksum_path(archive_path: impl AsRef<Path>) -> io::Result<PathB
     let mut checksum_name = file_name.to_os_string();
     checksum_name.push(ARCHIVE_CHECKSUM_SUFFIX);
     Ok(archive_path.with_file_name(checksum_name))
+}
+
+/// Returns whether the adjacent checksum is the exact marker left by an
+/// interrupted archive publication. A true result requires operator-directed
+/// recovery; callers must not repair the checksum or start another publication
+/// transaction over that namespace.
+pub fn archive_checksum_is_publication_sentinel(
+    archive_path: impl AsRef<Path>,
+) -> io::Result<bool> {
+    let checksum_path = archive_checksum_path(archive_path)?;
+    let metadata = match fs::symlink_metadata(&checksum_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    if !metadata.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "archive checksum path is not a regular file: {}",
+                checksum_path.display()
+            ),
+        ));
+    }
+    if metadata.len() != ARCHIVE_PUBLICATION_SENTINEL.len() as u64 {
+        return Ok(false);
+    }
+    let expected_identity = identity_from_metadata(&metadata);
+    let mut file = open_regular_nofollow(&checksum_path)?;
+    if archive_file_identity(&file)? != expected_identity {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "archive checksum changed while checking the publication sentinel: {}",
+                checksum_path.display()
+            ),
+        ));
+    }
+    let mut bytes = vec![0u8; ARCHIVE_PUBLICATION_SENTINEL.len()];
+    file.read_exact(&mut bytes)?;
+    let mut trailing = [0u8; 1];
+    if file.read(&mut trailing)? != 0 || archive_file_identity(&file)? != expected_identity {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "archive checksum changed while checking the publication sentinel: {}",
+                checksum_path.display()
+            ),
+        ));
+    }
+    Ok(bytes == ARCHIVE_PUBLICATION_SENTINEL)
 }
 
 fn identity_from_metadata(metadata: &fs::Metadata) -> ArchiveFileIdentity {
@@ -240,6 +296,15 @@ pub fn ensure_archive_checksum_for_validated(
             ),
         ));
     }
+    if archive_checksum_is_publication_sentinel(archive_path)? {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "archive checksum {} is an interrupted Jetstreamer publication sentinel; refusing automatic repair because manual transaction recovery is required",
+                archive_checksum_path(archive_path)?.display()
+            ),
+        ));
+    }
     let line = archive_checksum_line(
         &validated.sha256,
         archive_path.file_name().ok_or_else(|| {
@@ -263,7 +328,13 @@ pub fn ensure_archive_checksum_for_validated(
         Ok(metadata) => {
             if metadata.len() == line.len() as u64 {
                 let mut existing = open_regular_nofollow(&checksum_path)?;
-                let mut bytes = vec![0u8; line.len()];
+                let existing_len = usize::try_from(metadata.len()).map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "archive checksum length does not fit usize",
+                    )
+                })?;
+                let mut bytes = vec![0u8; existing_len];
                 existing.read_exact(&mut bytes)?;
                 let mut trailing = [0u8; 1];
                 if existing.read(&mut trailing)? != 0 {
@@ -310,6 +381,15 @@ pub fn ensure_archive_checksum_for_validated(
             format!(
                 "archive path changed before checksum publication: {}",
                 archive_path.display()
+            ),
+        ));
+    }
+    if archive_checksum_is_publication_sentinel(archive_path)? {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "archive checksum {} became an interrupted Jetstreamer publication sentinel before repair; manual transaction recovery is required",
+                checksum_path.display()
             ),
         ));
     }
@@ -383,6 +463,30 @@ mod tests {
             fs::metadata(&checksum).unwrap().permissions().mode() & 0o777,
             0o640
         );
+    }
+
+    #[test]
+    fn publication_sentinel_requires_manual_recovery() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let archive = directory.path().join("epoch-7.jet");
+        let checksum = archive_checksum_path(&archive).unwrap();
+        fs::write(&archive, b"verified archive bytes").unwrap();
+        fs::write(&checksum, ARCHIVE_PUBLICATION_SENTINEL).unwrap();
+        let sentinel_identity =
+            archive_file_identity(&open_regular_nofollow(&checksum).unwrap()).unwrap();
+        let archive_file = open_regular_nofollow(&archive).unwrap();
+        let evidence = measure_open_archive(&archive_file).unwrap();
+
+        assert!(archive_checksum_is_publication_sentinel(&archive).unwrap());
+        let error = ensure_archive_checksum_for_validated(&archive, evidence).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("manual transaction recovery"));
+        assert_eq!(
+            archive_file_identity(&open_regular_nofollow(&checksum).unwrap()).unwrap(),
+            sentinel_identity
+        );
+        assert_eq!(fs::read(checksum).unwrap(), ARCHIVE_PUBLICATION_SENTINEL);
     }
 
     #[test]

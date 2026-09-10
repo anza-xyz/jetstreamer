@@ -2,6 +2,8 @@
 /bin
 /.serena
 .DS_Store
+__pycache__/
+*.py[cod]
 
 /.claude
 old-faithful-sizes.tsv

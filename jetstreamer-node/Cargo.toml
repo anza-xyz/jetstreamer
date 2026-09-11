@@ -57,7 +57,7 @@ solana-runtime.workspace = true
 solana-unified-scheduler-pool.workspace = true
 solana-signature.workspace = true
 solana-entry.workspace = true
-solana-transaction.workspace = true
+solana-transaction = { workspace = true, features = ["verify"] }
 solana-transaction-status.workspace = true
 solana-svm.workspace = true
 solana-svm-timings.workspace = true

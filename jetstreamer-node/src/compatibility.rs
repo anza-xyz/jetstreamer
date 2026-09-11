@@ -13,8 +13,14 @@ use {
     },
     solana_clock::Slot,
     solana_hash::Hash,
-    solana_signature::Signature,
     std::{ops::Range, str::FromStr},
+};
+
+mod missing_status;
+
+pub(crate) use missing_status::{
+    AuditedMissingTransactionStatus, MissingTransactionStatusEvidence,
+    resolve_missing_transaction_status, validate_audited_missing_status_registry,
 };
 
 /// End of epoch 7, the last range both executable and bootstrap-compatible
@@ -67,63 +73,6 @@ pub const AGAVE_V3_VERIFIED_START_SLOT: Slot = 406_080_000;
 /// status metadata for every transaction. The last observed missing record is
 /// in slot 4,258,771; slots 4,258,772 through 4,258,775 are absent.
 pub const OLD_FAITHFUL_STATUS_REQUIRED_START_SLOT: Slot = 4_258_776;
-
-struct AuditedMissingTransactionStatusRun {
-    slot: Slot,
-    first_transaction_index: usize,
-    signatures: &'static [&'static str],
-}
-
-/// Exact source holes admitted after the general missing-status era.
-///
-/// The metadata-only firehose audit covered every present slot in epochs 18
-/// and 19 and all 49,315,046 transaction notifications. It found only this
-/// consecutive run. Binding every index to its transaction signature prevents
-/// a changed or differently ordered source block from inheriting the
-/// exception. The selected historical runtime still executes every
-/// transaction, and cohort publication remains gated on the canonical root
-/// checkpoint.
-const AUDITED_MISSING_TRANSACTION_STATUS_RUNS: &[AuditedMissingTransactionStatusRun] = &[
-    AuditedMissingTransactionStatusRun {
-        slot: 8_120_052,
-        first_transaction_index: 79,
-        signatures: &[
-            "5iDNYejCujaTwp2m64YJstEKJPQP5xBVmh73u3eXejLp8c2fmyJNmyZss8RKoBhMYYeiQkadosN3W644Ro8h1cD2",
-            "5ENkyfnNcGY73P2x2KvN9Dmer6qdJFmMvkt4qrqMdfMEkEdZNCT3w764UFhYdE1YB8wCARhoMhhLETPyvWRRyWTJ",
-            "558F6tsTwJndXU8dKZHtdENo7S1UxjXupQSfVY422FHdajDojy3hNzMvXpXrfjDzoeEyP1zaTnXCSGEr7BrMxans",
-            "3EHbzGGkAWMiz1t5dFm6YDHjav54cbizZ3n9jYRTyVUx2fNSyuXvhzE2Hb2upFR8ErqVMtRNuoSZNXXevNKJvigR",
-            "4yRAcZZ1jzPRk1hoDSS4UgBJBnxn4kfQoF4YUsEbMrZqVyJvGLyR4hUKH9eDUPqc2CEQmDLhwtuKqJHK5poAPkeW",
-            "2zasUj1HqiUXniaJhgh6b4TKmMoWofaoSr98W3LcRYZ51ytxY8qkZ2AgcSj8wmF7wCe7GGQFUW4Si6Nen1kgZMVG",
-            "34HujUZUukDXEfo8P8bQp1L9nTtN1FdqeTAjuJtiZDGXmgn25K87Fy6C7DYmhQaXBDx15g1A2PwkFgmTxUVhY8bz",
-            "24gP4FMpEvNt4jox1UTQgiKJj4AzsgpZ32FDDLtZgLnBCLLRRQbCKyzKceo5bv7cna8NSeSbGxFkLxKSwaU7NCpN",
-            "4Lh4oM2W44XWbEainPZmCmUi5XEn8sGBzCfggbRBxRZg6pCsqFLJBFoZZZMvUoycKYsqVfgNf7vwyRxu8d6XiWJt",
-            "MHVowtzHH1uCLWHXvbLh1SE8MhesMY2XDFrKwu2MQkhMnaoLRPbhP1SNyQoUfF47YDCboCc6aq4tyxjjd9Wx2eN",
-            "2iDRe2MTjzGW8dfivWcDWJL951CoTZWkHhyLfrozVMbb5nMdq2enn1oAHNSEyUx2bNPxBDzN6Ja458XhWrXYx9ym",
-            "2puhgyJYivoxfSEsBJpXERyG1qRRXd7SUb1y2Vcd3STYA4S1RHpbMKR8wNwWJM21yt7CGocfNe4ZHMizV7u2dxxn",
-            "5Z4vkChbFosmjQgSVh3nt4BpNZDJe5sVkuDmcAiJASAEV2QKjHwfZfCMUKDLLAa8hnB8RzKDfLWKMN4C8QjS9sjt",
-            "z7USTrW99dyh94YMThU1tKfLKfmRdYjWStuQhc9pat5rhqXhMP5TtqZBoLmPEKY2uxqhg7f2mTXyrFmqjsQ5MQu",
-            "5jjyQzHRxZEdSRfzvrWuJiYED4QTwSwhxVpnVGNFyCuyGQTLsp9hBGbEKDtT62TiWbTjJX66uHFHCJwvSgnG3Cg1",
-            "eQcrJGaFbpjbQRkoetS86CwLqwrFrkiaKmKHn6kGrbvPHmrUmp1H7qoVkZV5vH6SfcXiFKuRPnrQDiaGn9pLNVR",
-            "4ApR5YJEiouugSX2Dj2kBXT79f14BFMzuDgnJn6oRKQtis7z2yr8NYu8aC3a89JsYc7AZtnHjjXKHcksEsPpvJWa",
-            "JsfxaP35uLdmUFBcZyqvLGym9WVfenFEP5n5NQjGSbM4vpcNjeQcceh4t8phVwJBg6HGZstmzmE757Q9Eye2hWe",
-            "5JsLtPq2sesfagWKfjxf5pt2a56V46Mz143waFaJjuQ1XXBYL4fUvTWjfyCmU7xsgyLPJJYsa4YSzGqvvGeXwcsT",
-            "5zXVEGMw5S2GS6oPL9wjAf273MvVJp9SfoGRJXw9HdiPp4kHXoav6tC2YrLehiiDNK2NPEAzP6HWauCEaegwnT4e",
-            "2WdowqyV55aXUQjBzCjLQ7pFX8efCvrKTxEEtRzGjQSGfvLQT6yQjGV668axmFHzSneyqENwc6ZfHspEi4X9Aftz",
-            "58TMUEhumNHkdFuohDiHThDFeLg39UGcLL7i3G7voZUkYvsQ6EZAwJfy8Qoyae6jr5TUAK88ftbNovDtTz32oZNA",
-            "1wNd1bLyeJHBe4vfwGi8S81Jf7WkCJcL4DXkmerSoaDYjRUQwQapqkCNiD1NRBWhyxGnMKpGjBwQZkNp8wi1Kua",
-            "5xvnopZMgJBWqHVDw6YCN9oEfcpuHog3Jmr6vSaK7t4LXiNxzd52s1nfLkawnLzHUjUJ2ZsMsTRVWmbaSVYE3xUr",
-            "dxKjHV95wHrhMRCpyMiMK99auerovPYTv5DUtka4sLR3bi7pWStcFnNpwgYbqLap95WVDzowcagiT5SSjtNNnUa",
-            "2YSGk8VrBB37fLD5eQsd8MTMvkHCdT2ZBxaLchg3QxLXKYdx5TCb1N83exEnCmGBH62jTZkN3UPWjLhBdNFsJCS3",
-            "4J2DQkTveBHksRPCaHPxAH6fmoq8wsJ1EeFLAN4XvJSpF94reRL3uFcbKQkumbnqYQQeY6dbhd1DULfNSBBDiHFx",
-            "3p3akan7AMQYixamsaVm5kPzuaV6Yyj7cHQ66FdpW1PbtnSnFRY3T1qyPwmatmeeUHBpJ2azrPJupTa7EZNKeoJr",
-            "5GthBtUwFjWD59gmjSSgE3JHndm3vwaM1tdNDpLKmY3Nwmq3PDXFxK8DYUxk9Ba64pjWZG5PqfUGJA52215FvZLN",
-            "287F4t3sJ6jeAqCArxGFKdr5PKMmVacU27C5CrBokWwU3u7fLdxedzFmjZX3k8GNxNX7fNVjN4M8pJSVQ2gdGuqX",
-            "3M7CBkabPQFoAZBFJEHfSvmoJuZpCFc7EvZ412CRQq9k4y6vBSzE9xz1Em24p5KNFX9DPpepunJQckbXxm5D6QAs",
-            "47Y9FMZ6ScDo53R3DhPXJbiwcsKtMjUmvbVnq3E8NDfApvk67Nh4tyie4hAp6GBUVDL5khY9KmeJ2pWcjxUJarrn",
-            "fFLHy5H4Nk8CoY86wrbv4Wr8BgDRm73cYSF2MALiSyi945EBnSNBF9Nfv6wXiDv5smyCparKvcT36ZayBS6v6Cd",
-        ],
-    },
-];
 
 /// End of the historical range for which source transaction-to-status
 /// association is treated as untrusted. The old status writer paired
@@ -1088,6 +1037,7 @@ pub fn validate_runtime_registry() -> Result<(), String> {
     }
 
     validate_runtime_handoffs(RUNTIME_DESCRIPTORS, RUNTIME_ERAS, RUNTIME_HANDOFFS)?;
+    validate_audited_missing_status_registry()?;
 
     Ok(())
 }
@@ -1283,44 +1233,6 @@ fn input_end_exclusive(slot: Slot) -> Option<Slot> {
 #[inline]
 pub const fn missing_transaction_status_at(slot: Slot) -> MissingTransactionStatus {
     if slot < OLD_FAITHFUL_STATUS_REQUIRED_START_SLOT {
-        MissingTransactionStatus::Reconstruct
-    } else {
-        MissingTransactionStatus::Reject
-    }
-}
-
-pub(crate) fn is_audited_missing_transaction_status(
-    slot: Slot,
-    transaction_slot_index: usize,
-    signature: &Signature,
-) -> bool {
-    AUDITED_MISSING_TRANSACTION_STATUS_RUNS.iter().any(|run| {
-        if run.slot != slot {
-            return false;
-        }
-        let Some(offset) = transaction_slot_index.checked_sub(run.first_transaction_index) else {
-            return false;
-        };
-        run.signatures
-            .get(offset)
-            .is_some_and(|expected| signature.to_string() == *expected)
-    })
-}
-
-/// Selects the missing-status policy for one identified transaction.
-///
-/// The slot-wide rule remains fail-closed after the source cutover. Only an
-/// exact audited `(slot, index, signature)` source hole can opt back into
-/// runtime reconstruction.
-#[inline]
-pub fn missing_transaction_status_for(
-    slot: Slot,
-    transaction_slot_index: usize,
-    signature: &Signature,
-) -> MissingTransactionStatus {
-    if missing_transaction_status_at(slot) == MissingTransactionStatus::Reconstruct
-        || is_audited_missing_transaction_status(slot, transaction_slot_index, signature)
-    {
         MissingTransactionStatus::Reconstruct
     } else {
         MissingTransactionStatus::Reject
@@ -2158,46 +2070,319 @@ mod tests {
 
     #[test]
     fn post_cutover_missing_status_exceptions_bind_slot_index_and_signature() {
-        assert_eq!(AUDITED_MISSING_TRANSACTION_STATUS_RUNS.len(), 1);
-        let run = &AUDITED_MISSING_TRANSACTION_STATUS_RUNS[0];
-        assert_eq!(run.slot, 8_120_052);
-        assert_eq!(run.first_transaction_index, 79);
-        assert_eq!(run.signatures.len(), 33);
+        use sha2::{Digest as _, Sha256};
+        use solana_signature::Signature;
+
+        let provenance: serde_json::Value = serde_json::from_slice(include_bytes!(
+            "../tests/fixtures/old-faithful-missing-status-provenance.json"
+        ))
+        .unwrap();
+        let report_bytes = include_bytes!("../tests/missing-transaction-status-epochs18-19.json");
         assert_eq!(
-            missing_transaction_status_at(run.slot),
+            report_bytes.len() as u64,
+            provenance["audit"]["raw_report"]["length"]
+                .as_u64()
+                .unwrap()
+        );
+        assert_eq!(
+            format!("{:x}", Sha256::digest(report_bytes)),
+            provenance["audit"]["raw_report"]["sha256"]
+                .as_str()
+                .unwrap()
+        );
+        let auditor_source =
+            include_bytes!("../../jetstreamer-firehose/src/bin/audit-missing-status.rs");
+        assert_eq!(
+            format!("{:x}", Sha256::digest(auditor_source)),
+            provenance["audit"]["auditor"]["source_sha256"]
+                .as_str()
+                .unwrap()
+        );
+        let status_capture_bytes =
+            include_bytes!("../tests/fixtures/mainnet-signature-statuses-8120052.json");
+        let status_evidence = &provenance["audit"]["canonical_transaction_statuses"];
+        assert_eq!(
+            status_capture_bytes.len() as u64,
+            status_evidence["response_length"].as_u64().unwrap()
+        );
+        assert_eq!(
+            format!("{:x}", Sha256::digest(status_capture_bytes)),
+            status_evidence["response_sha256"].as_str().unwrap()
+        );
+        let status_capture: serde_json::Value =
+            serde_json::from_slice(status_capture_bytes).unwrap();
+        assert_eq!(status_capture["rpc_url"], status_evidence["rpc_url"]);
+        assert_eq!(
+            status_capture["request"]["method"],
+            status_evidence["method"]
+        );
+        assert_eq!(
+            status_capture["request"]["params"][1]["searchTransactionHistory"].as_bool(),
+            Some(true)
+        );
+        let queried_signatures = status_capture["request"]["params"][0].as_array().unwrap();
+        let canonical_statuses = status_capture["response"]["result"]["value"]
+            .as_array()
+            .unwrap();
+        assert_eq!(queried_signatures.len(), canonical_statuses.len());
+        assert_eq!(
+            canonical_statuses.len() as u64,
+            status_evidence["result_count"].as_u64().unwrap()
+        );
+        assert_eq!(status_evidence["all_finalized"].as_bool(), Some(true));
+        assert_eq!(status_evidence["all_successful"].as_bool(), Some(true));
+        assert_eq!(
+            status_evidence["complete_metadata_in_latest_block_row"].as_bool(),
+            Some(false)
+        );
+        let expected_row_key = format!("{:016x}", provenance["source"]["slot"].as_u64().unwrap());
+        assert_eq!(
+            provenance["audit"]["older_bigtable_versions"]["row_key_hex"].as_str(),
+            Some(expected_row_key.as_str())
+        );
+        assert!(canonical_statuses.iter().all(|status| {
+            status["slot"].as_u64() == Some(8_120_052)
+                && status["err"].is_null()
+                && status["status"] == serde_json::json!({"Ok": null})
+                && status["confirmationStatus"].as_str() == Some("finalized")
+        }));
+
+        let report: serde_json::Value = serde_json::from_slice(report_bytes).unwrap();
+        assert_eq!(report["slot_start"], provenance["audit"]["slot_start"]);
+        assert_eq!(
+            report["slot_end_exclusive"],
+            provenance["audit"]["slot_end_exclusive"]
+        );
+        assert_eq!(
+            report["transaction_notifications"],
+            provenance["audit"]["transaction_notifications"]
+        );
+        let reported_missing = report["missing_statuses"].as_array().unwrap();
+        let provenance_signatures = provenance["missing_status_run"]["signatures"]
+            .as_array()
+            .unwrap();
+        assert_eq!(
+            reported_missing.len() as u64,
+            provenance["audit"]["missing_status_count"]
+                .as_u64()
+                .unwrap()
+        );
+
+        let index_record_hex = provenance["source"]["index"]["record_hex"]
+            .as_str()
+            .unwrap();
+        assert_eq!(
+            index_record_hex.len() as u64,
+            provenance["source"]["index"]["record_length"]
+                .as_u64()
+                .unwrap()
+                * 2
+        );
+        let (index_record_pairs, index_record_remainder) =
+            index_record_hex.as_bytes().as_chunks::<2>();
+        assert!(index_record_remainder.is_empty());
+        let index_record = index_record_pairs
+            .iter()
+            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            index_record.len() as u64,
+            provenance["source"]["index"]["record_length"]
+                .as_u64()
+                .unwrap()
+        );
+        assert_eq!(
+            format!("{:x}", Sha256::digest(&index_record)),
+            provenance["source"]["index"]["record_sha256"]
+                .as_str()
+                .unwrap()
+        );
+        assert_eq!(
+            u64::from_le_bytes(index_record[..8].try_into().unwrap()),
+            provenance["source"]["car"]["range_start"].as_u64().unwrap()
+        );
+        assert_eq!(
+            u32::from_le_bytes(index_record[8..].try_into().unwrap()) as u64,
+            provenance["source"]["car"]["range_length"]
+                .as_u64()
+                .unwrap()
+        );
+        assert_eq!(
+            provenance["source"]["car"]["range_end_inclusive"]
+                .as_u64()
+                .unwrap()
+                - provenance["source"]["car"]["range_start"].as_u64().unwrap()
+                + 1,
+            provenance["source"]["car"]["range_length"]
+                .as_u64()
+                .unwrap()
+        );
+        assert_eq!(
+            (provenance["source"]["slot"].as_u64().unwrap()
+                - provenance["audit"]["slot_start"].as_u64().unwrap())
+                * provenance["source"]["index"]["record_length"]
+                    .as_u64()
+                    .unwrap(),
+            provenance["source"]["index"]["record_offset"]
+                .as_u64()
+                .unwrap()
+        );
+        assert!(
+            provenance["source"]["index"]["record_offset"]
+                .as_u64()
+                .unwrap()
+                + index_record.len() as u64
+                <= provenance["source"]["index"]["object_length"]
+                    .as_u64()
+                    .unwrap()
+        );
+        assert!(
+            provenance["source"]["car"]["range_end_inclusive"]
+                .as_u64()
+                .unwrap()
+                < provenance["source"]["car"]["object_length"]
+                    .as_u64()
+                    .unwrap()
+        );
+
+        let preceding_entry = &provenance["block"]["preceding_nonempty_entry"];
+        let missing_entry = &provenance["block"]["missing_status_entry"];
+        provenance["block"]["cid"]
+            .as_str()
+            .unwrap()
+            .parse::<cid::Cid>()
+            .unwrap();
+        let recorded_blockhash = provenance["block"]["blockhash"]
+            .as_str()
+            .unwrap()
+            .parse::<Hash>()
+            .unwrap();
+        assert_ne!(recorded_blockhash, Hash::default());
+        let graph = &provenance["block"]["car_graph"];
+        assert_eq!(
+            graph["node_count"].as_u64().unwrap(),
+            1 + provenance["block"]["entry_count"].as_u64().unwrap()
+                + provenance["block"]["transaction_count"].as_u64().unwrap()
+        );
+        assert_eq!(graph["reachable_node_count"], graph["node_count"]);
+        assert_eq!(graph["data_frame_count"].as_u64(), Some(0));
+        assert_eq!(
+            graph["observed_metadata_count"].as_u64().unwrap()
+                + graph["missing_metadata_count"].as_u64().unwrap(),
+            provenance["block"]["transaction_count"].as_u64().unwrap()
+        );
+        assert_eq!(
+            graph["missing_metadata_count"],
+            provenance["audit"]["missing_status_count"]
+        );
+        assert_eq!(preceding_entry["entry_index"].as_u64(), Some(35));
+        assert_eq!(missing_entry["entry_index"].as_u64(), Some(52));
+        assert_eq!(
+            preceding_entry["transaction_start_index"].as_u64().unwrap()
+                + preceding_entry["transaction_count"].as_u64().unwrap(),
+            missing_entry["transaction_start_index"].as_u64().unwrap()
+        );
+        assert_eq!(
+            missing_entry["transaction_start_index"].as_u64().unwrap()
+                + missing_entry["transaction_count"].as_u64().unwrap(),
+            provenance["block"]["transaction_count"].as_u64().unwrap()
+        );
+        let replay_validation = &provenance["replay_validation"];
+        assert_eq!(
+            replay_validation["runtime"].as_str(),
+            Some(SOLANA_V1_0_23_RUNTIME.identity.name)
+        );
+        assert!(
+            replay_validation["bootstrap_root"]["slot"]
+                .as_u64()
+                .unwrap()
+                < provenance["source"]["slot"].as_u64().unwrap()
+        );
+        let post_anomaly_checkpoints = replay_validation["post_anomaly_root_checkpoints"]
+            .as_array()
+            .unwrap();
+        assert_eq!(post_anomaly_checkpoints.len(), 2);
+        assert!(post_anomaly_checkpoints.iter().all(|checkpoint| {
+            checkpoint["slot"].as_u64().unwrap() > provenance["source"]["slot"].as_u64().unwrap()
+                && checkpoint["accounts_hash"]
+                    .as_str()
+                    .unwrap()
+                    .parse::<Hash>()
+                    .is_ok()
+        }));
+
+        let run_slot = provenance["source"]["slot"].as_u64().unwrap();
+        let first_transaction_index = provenance["missing_status_run"]["first_transaction_index"]
+            .as_u64()
+            .unwrap() as usize;
+        assert_eq!(reported_missing.len(), 33);
+        assert_eq!(provenance_signatures.len(), reported_missing.len());
+        assert_eq!(queried_signatures.len(), reported_missing.len());
+        assert_eq!(
+            missing_transaction_status_at(run_slot),
             MissingTransactionStatus::Reject
         );
 
         let mut signatures = std::collections::HashSet::new();
-        for (offset, encoded) in run.signatures.iter().enumerate() {
+        for (offset, ((reported, provenance_signature), queried_signature)) in reported_missing
+            .iter()
+            .zip(provenance_signatures.iter())
+            .zip(queried_signatures.iter())
+            .enumerate()
+        {
+            let encoded = reported["signature"].as_str().unwrap();
+            assert_eq!(reported["slot"].as_u64(), Some(run_slot));
+            assert_eq!(
+                reported["transaction_slot_index"].as_u64(),
+                Some((first_transaction_index + offset) as u64)
+            );
+            assert_eq!(provenance_signature.as_str(), Some(encoded));
+            assert_eq!(queried_signature.as_str(), Some(encoded));
             let signature: Signature = encoded.parse().expect("audited signature is valid");
             assert!(signatures.insert(signature));
+            let evidence = resolve_missing_transaction_status(
+                run_slot,
+                first_transaction_index + offset,
+                &signature,
+            )
+            .unwrap();
             assert_eq!(
-                missing_transaction_status_for(
-                    run.slot,
-                    run.first_transaction_index + offset,
-                    &signature,
-                ),
-                MissingTransactionStatus::Reconstruct
+                evidence,
+                Some(MissingTransactionStatusEvidence::Audited(Box::new(
+                    AuditedMissingTransactionStatus {
+                        slot: run_slot,
+                        transaction_slot_index: (first_transaction_index + offset) as u32,
+                        signature,
+                        expected_status: Ok(()),
+                        canonical_metadata: None,
+                    }
+                )))
             );
         }
 
-        let first: Signature = run.signatures[0].parse().unwrap();
-        assert_eq!(
-            missing_transaction_status_for(run.slot - 1, run.first_transaction_index, &first,),
-            MissingTransactionStatus::Reject
+        let first: Signature = reported_missing[0]["signature"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(
+            resolve_missing_transaction_status(run_slot - 1, first_transaction_index, &first)
+                .unwrap()
+                .is_none()
         );
-        assert_eq!(
-            missing_transaction_status_for(run.slot, run.first_transaction_index + 1, &first,),
-            MissingTransactionStatus::Reject
+        assert!(
+            resolve_missing_transaction_status(run_slot, first_transaction_index + 1, &first)
+                .unwrap()
+                .is_none()
         );
-        assert_eq!(
-            missing_transaction_status_for(
-                run.slot,
-                run.first_transaction_index,
+        assert!(
+            resolve_missing_transaction_status(
+                run_slot,
+                first_transaction_index,
                 &Signature::default(),
-            ),
-            MissingTransactionStatus::Reject
+            )
+            .unwrap()
+            .is_none()
         );
     }
 

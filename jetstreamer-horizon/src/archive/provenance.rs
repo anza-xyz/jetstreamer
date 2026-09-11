@@ -51,8 +51,9 @@ pub enum TransactionMetadataSemantics {
     /// values, including absent/default values when the source frame was
     /// missing.
     RuntimeReconstructedStatusOnly = 1,
-    /// Replay supplied both status and fee. Remaining metadata fields retain
-    /// their source values.
+    /// Replay supplied both status and fee, or verified identical values from
+    /// an exact canonical recovery. Remaining metadata fields retain available
+    /// observations; unavailable fields remain absent/default.
     RuntimeReconstructedStatusAndFee = 2,
 }
 

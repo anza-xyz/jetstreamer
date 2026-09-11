@@ -310,7 +310,7 @@ impl HistoricalReplay {
             };
 
             self.cursor.update_inflight_stage("historical_verify");
-            if let Err(error) = self.verify_outcomes(&mut entry, &processed.outcomes) {
+            if let Err(error) = Self::verify_outcomes(&mut entry, &processed.outcomes) {
                 self.failure.record(error);
                 return;
             }
@@ -503,7 +503,7 @@ impl HistoricalReplay {
                             ));
                         }
                         if !outcomes_verified {
-                            self.verify_outcomes(&mut current.entry, &current_outcomes)?;
+                            Self::verify_outcomes(&mut current.entry, &current_outcomes)?;
                             outcomes_verified = true;
                         }
                         let extended = extend_emitted_write_versions(
@@ -532,7 +532,7 @@ impl HistoricalReplay {
                         let signature = ready_entry_signature(entry);
                         self.cursor.update_inflight_stage("historical_verify");
                         if !outcomes_verified {
-                            self.verify_outcomes(entry, &current_outcomes)?;
+                            Self::verify_outcomes(entry, &current_outcomes)?;
                         }
 
                         let post_start = Instant::now();
@@ -731,7 +731,6 @@ impl HistoricalReplay {
     }
 
     fn verify_outcomes(
-        &self,
         entry: &mut ReadyEntry,
         outcomes: &[crate::historical::HistoricalTransactionOutcome],
     ) -> Result<(), String> {
@@ -807,7 +806,12 @@ impl HistoricalReplay {
                         actual.error
                     ));
                 }
-                if actual.fee != scheduled.status_meta.fee {
+                if scheduled.reconstruct_fee {
+                    // The exact missing-frame exception carries an audited
+                    // status but no canonical metadata. Keep the verified
+                    // status and the runtime-associated fee.
+                    apply_runtime_reconstructed_metadata(scheduled, actual);
+                } else if actual.fee != scheduled.status_meta.fee {
                     return Err(format!(
                         "historical fee mismatch at slot {} entry {} transaction {}: expected {}, got {}",
                         entry.slot,
@@ -1174,18 +1178,22 @@ mod tests {
     }
 
     #[test]
-    fn audited_missing_status_uses_the_historical_runtime_fee() {
-        let mut scheduled = super::super::ScheduledTransaction {
-            tx: solana_transaction::versioned::VersionedTransaction::default(),
-            expected_status: None,
-            source_entry_status: None,
-            audited_missing_source_status: true,
-            reconstruct_fee: true,
-            status_meta: solana_transaction_status::TransactionStatusMeta {
-                status: Err(solana_transaction::TransactionError::AccountNotFound),
-                fee: 0,
-                ..solana_transaction_status::TransactionStatusMeta::default()
-            },
+    fn audited_missing_status_verifies_success_and_uses_the_historical_runtime_fee() {
+        let audited_entry = || ReadyEntry {
+            slot: 8_120_052,
+            entry_index: 52,
+            start_index: 79,
+            txs: vec![super::super::ScheduledTransaction {
+                tx: solana_transaction::versioned::VersionedTransaction::default(),
+                expected_status: Some(Ok(())),
+                source_entry_status: None,
+                audited_missing_source_status: true,
+                reconstruct_fee: true,
+                status_meta: solana_transaction_status::TransactionStatusMeta::default(),
+            }],
+            hash: Hash::default(),
+            num_hashes: 1,
+            tx_count: 1,
         };
         let outcome = crate::historical::HistoricalTransactionOutcome {
             signature: None,
@@ -1193,10 +1201,80 @@ mod tests {
             fee: 5_000,
         };
 
-        apply_runtime_reconstructed_metadata(&mut scheduled, &outcome);
+        let mut entry = audited_entry();
+        HistoricalReplay::verify_outcomes(&mut entry, std::slice::from_ref(&outcome)).unwrap();
 
-        assert_eq!(scheduled.status_meta.status, Ok(()));
-        assert_eq!(scheduled.status_meta.fee, 5_000);
+        assert_eq!(
+            entry.txs[0].status_meta,
+            solana_transaction_status::TransactionStatusMeta {
+                status: Ok(()),
+                fee: 5_000,
+                ..solana_transaction_status::TransactionStatusMeta::default()
+            }
+        );
+
+        let mut entry = audited_entry();
+        let failed_outcome = crate::historical::HistoricalTransactionOutcome {
+            signature: None,
+            error: Some(
+                normalize_transaction_error(&solana_transaction::TransactionError::AccountNotFound)
+                    .unwrap(),
+            ),
+            fee: 5_000,
+        };
+        let error =
+            HistoricalReplay::verify_outcomes(&mut entry, std::slice::from_ref(&failed_outcome))
+                .unwrap_err();
+        assert!(error.contains("historical status multiset mismatch"));
+    }
+
+    #[test]
+    fn audited_canonical_metadata_is_preserved_after_exact_runtime_verification() {
+        let expected_error = solana_transaction::TransactionError::InstructionError(
+            0,
+            solana_transaction::InstructionError::Custom(0),
+        );
+        let canonical_metadata = solana_transaction_status::TransactionStatusMeta {
+            status: Err(expected_error.clone()),
+            fee: 5_000,
+            pre_balances: vec![10_000, 1],
+            post_balances: vec![5_000, 1],
+            ..solana_transaction_status::TransactionStatusMeta::default()
+        };
+        let audited_entry = || ReadyEntry {
+            slot: 13_334_463,
+            entry_index: 14,
+            start_index: 13,
+            txs: vec![super::super::ScheduledTransaction {
+                tx: solana_transaction::versioned::VersionedTransaction::default(),
+                expected_status: Some(Err(expected_error.clone())),
+                source_entry_status: None,
+                audited_missing_source_status: true,
+                reconstruct_fee: false,
+                status_meta: canonical_metadata.clone(),
+            }],
+            hash: Hash::default(),
+            num_hashes: 1,
+            tx_count: 1,
+        };
+        let outcome = crate::historical::HistoricalTransactionOutcome {
+            signature: None,
+            error: Some(normalize_transaction_error(&expected_error).unwrap()),
+            fee: 5_000,
+        };
+
+        let mut entry = audited_entry();
+        HistoricalReplay::verify_outcomes(&mut entry, std::slice::from_ref(&outcome)).unwrap();
+        assert_eq!(entry.txs[0].status_meta, canonical_metadata);
+
+        let mut entry = audited_entry();
+        let wrong_fee = crate::historical::HistoricalTransactionOutcome {
+            fee: 10_000,
+            ..outcome
+        };
+        let error = HistoricalReplay::verify_outcomes(&mut entry, std::slice::from_ref(&wrong_fee))
+            .unwrap_err();
+        assert!(error.contains("historical fee mismatch"), "{error}");
     }
 
     #[test]

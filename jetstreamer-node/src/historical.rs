@@ -438,6 +438,26 @@ pub enum HistoricalRuntimeError {
     #[error("historical worker I/O failed: {0}")]
     Io(#[from] io::Error),
     #[error(
+        "historical worker {operation} request {request_id} write failed after exiting with {status}: {source}; worker stderr was inherited by the parent"
+    )]
+    WriteAfterExit {
+        operation: &'static str,
+        request_id: u64,
+        status: ExitStatus,
+        #[source]
+        source: io::Error,
+    },
+    #[error(
+        "historical worker {operation} request {request_id} write failed: {source}; {exit_context}; worker stderr was inherited by the parent"
+    )]
+    WriteFailure {
+        operation: &'static str,
+        request_id: u64,
+        #[source]
+        source: io::Error,
+        exit_context: String,
+    },
+    #[error(
         "historical worker {operation} request {request_id} timed out after {timeout:?}; worker was terminated"
     )]
     RequestTimeout {
@@ -1378,8 +1398,7 @@ impl HistoricalRuntimeClient {
                     return Err(self.abort_after_unexpected_eof(request_id));
                 }
                 Err(IpcExchangeError::Io(error)) => {
-                    self.abort_worker();
-                    return Err(HistoricalRuntimeError::Io(error));
+                    return Err(self.abort_after_io_error(operation, request_id, error));
                 }
                 Err(IpcExchangeError::Timeout) => {
                     self.abort_worker();
@@ -1821,8 +1840,7 @@ impl HistoricalRuntimeClient {
                 return Err(self.abort_after_unexpected_eof(request_id));
             }
             Err(IpcExchangeError::Io(error)) => {
-                self.abort_worker();
-                return Err(HistoricalRuntimeError::Io(error));
+                return Err(self.abort_after_io_error(operation, request_id, error));
             }
             Err(IpcExchangeError::Timeout) => {
                 self.abort_worker();
@@ -1871,6 +1889,82 @@ impl HistoricalRuntimeClient {
             kill_and_reap(child, self.private_work_dir.take(), self.timeouts.reap);
         } else {
             self.private_work_dir.take();
+        }
+    }
+
+    /// A broken write means the worker has closed its request pipe. Give an
+    /// already-failing worker the normal reap window so its real exit status
+    /// and inherited stderr survive diagnostics instead of immediately
+    /// replacing the status with the parent's cleanup signal.
+    fn abort_after_io_error(
+        &mut self,
+        operation: &'static str,
+        request_id: u64,
+        source: io::Error,
+    ) -> HistoricalRuntimeError {
+        if source.kind() != io::ErrorKind::BrokenPipe {
+            self.abort_worker();
+            return HistoricalRuntimeError::Io(source);
+        }
+
+        self.closed = true;
+        self.transport.take();
+        let exit_status = self
+            .child
+            .as_mut()
+            .map(|child| wait_for_child(child, self.timeouts.reap));
+
+        match exit_status {
+            Some(Ok(Some(status))) => {
+                self.child.take();
+                self.private_work_dir.take();
+                HistoricalRuntimeError::WriteAfterExit {
+                    operation,
+                    request_id,
+                    status,
+                    source,
+                }
+            }
+            Some(Ok(None)) => {
+                if let Some(child) = self.child.take() {
+                    kill_and_reap(child, self.private_work_dir.take(), self.timeouts.reap);
+                } else {
+                    self.private_work_dir.take();
+                }
+                HistoricalRuntimeError::WriteFailure {
+                    operation,
+                    request_id,
+                    source,
+                    exit_context: format!(
+                        "worker did not exit within {:?} and was terminated",
+                        self.timeouts.reap
+                    ),
+                }
+            }
+            Some(Err(error)) => {
+                if let Some(child) = self.child.take() {
+                    kill_and_reap(child, self.private_work_dir.take(), self.timeouts.reap);
+                } else {
+                    self.private_work_dir.take();
+                }
+                HistoricalRuntimeError::WriteFailure {
+                    operation,
+                    request_id,
+                    source,
+                    exit_context: format!(
+                        "failed to read worker exit status before cleanup: {error}"
+                    ),
+                }
+            }
+            None => {
+                self.private_work_dir.take();
+                HistoricalRuntimeError::WriteFailure {
+                    operation,
+                    request_id,
+                    source,
+                    exit_context: "worker process handle was unavailable".to_owned(),
+                }
+            }
         }
     }
 
@@ -3976,6 +4070,52 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn exited_client(script: &str) -> (HistoricalRuntimeClient, u32, ExitStatus) {
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .arg("historical-runtime-exited-test-worker")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap();
+        let child_id = child.id();
+        let stdin = child.stdin.take().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let transport = IpcTransport::spawn(stdin, stdout).unwrap();
+        let mut client = HistoricalRuntimeClient {
+            executable_sha256: [0; HASH_BYTES],
+            child: Some(child),
+            transport: Some(transport),
+            private_work_dir: None,
+            timeouts: HistoricalRuntimeTimeouts {
+                control: Duration::from_secs(2),
+                reap: Duration::from_secs(2),
+                ..HistoricalRuntimeTimeouts::default()
+            },
+            next_request_id: 1,
+            last_response_id: None,
+            current_slot: 0,
+            current_tick_height: 0,
+            next_write_version: 0,
+            snapshot_export_seal: None,
+            supports_entry_batches: false,
+            initialized: HistoricalInitialized {
+                genesis_hash: String::new(),
+                source: HistoricalInitializedSource::Genesis,
+                slot: 0,
+                last_blockhash: [0; HASH_BYTES],
+                ticks_per_slot: 2,
+                next_write_version: 0,
+            },
+            closed: false,
+        };
+        let status = client.child.as_mut().unwrap().wait().unwrap();
+        (client, child_id, status)
+    }
+
+    #[cfg(unix)]
     fn process_is_running(process_id: u32) -> bool {
         Command::new("sh")
             .arg("-c")
@@ -4026,6 +4166,51 @@ mod tests {
         assert!(matches!(
             error,
             HistoricalRuntimeError::UnexpectedEof { request_id: 23 }
+        ));
+        assert_client_poisoned_and_worker_reaped(&mut client, child_id);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn broken_request_pipe_reports_worker_exit_code_and_request_context() {
+        let (mut client, child_id, expected_status) =
+            exited_client("printf 'worker exit detail\\n' >&2; exit 23");
+
+        let error = client.ping().unwrap_err();
+        let message = error.to_string();
+        assert!(matches!(
+            error,
+            HistoricalRuntimeError::WriteAfterExit {
+                operation: "ping",
+                request_id: 1,
+                status,
+                source,
+            } if status == expected_status && source.kind() == io::ErrorKind::BrokenPipe
+        ));
+        assert!(message.contains("exit status: 23"));
+        assert!(message.contains("worker stderr was inherited by the parent"));
+        assert_client_poisoned_and_worker_reaped(&mut client, child_id);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn broken_request_pipe_reports_worker_exit_signal() {
+        use std::os::unix::process::ExitStatusExt as _;
+
+        let (mut client, child_id, expected_status) = exited_client("kill -TERM $$");
+        assert_eq!(expected_status.signal(), Some(libc::SIGTERM));
+
+        let error = client.ping().unwrap_err();
+        assert!(matches!(
+            error,
+            HistoricalRuntimeError::WriteAfterExit {
+                operation: "ping",
+                request_id: 1,
+                status,
+                source,
+            } if status == expected_status
+                && status.signal() == Some(libc::SIGTERM)
+                && source.kind() == io::ErrorKind::BrokenPipe
         ));
         assert_client_poisoned_and_worker_reaped(&mut client, child_id);
     }

@@ -1155,12 +1155,31 @@ mod metadata_decode_tests {
     }
 
     #[test]
-    fn rejects_protobuf_metadata_before_the_archive_cutoff() {
+    fn decodes_protobuf_metadata_before_the_archive_cutoff() {
         let meta = sample_meta();
         let generated: solana_storage_proto::convert::generated::TransactionStatusMeta =
-            meta.into();
+            meta.clone().into();
         let bytes = prost_011::Message::encode_to_vec(&generated);
-        assert!(decode_transaction_status_meta(100 * 432000, &bytes).is_err());
+        assert_eq!(
+            decode_transaction_status_meta(100 * 432000, &bytes).unwrap(),
+            meta
+        );
+    }
+
+    #[test]
+    fn rejects_bincode_metadata_after_the_archive_cutoff() {
+        let wire = LegacyWireMeta {
+            status: Ok(()),
+            fee: 42,
+            pre_balances: vec![1, 2],
+            post_balances: vec![3, 4],
+            inner_instructions: None,
+            log_messages: None,
+            pre_token_balances: Some(Vec::new()),
+            post_token_balances: Some(Vec::new()),
+        };
+        let bytes = bincode::serialize(&wire).expect("bincode serialize");
+        assert!(decode_transaction_status_meta(157 * 432000, &bytes).is_err());
     }
 
     #[test]
@@ -1174,8 +1193,8 @@ mod metadata_decode_tests {
         let wire = LegacyWireMeta {
             status: Ok(()),
             fee: 1,
-            pre_balances: vec![],
-            post_balances: vec![],
+            pre_balances: vec![2],
+            post_balances: vec![1],
             inner_instructions: None,
             log_messages: None,
             pre_token_balances: Some(Vec::new()),
@@ -1188,6 +1207,8 @@ mod metadata_decode_tests {
             decoded,
             TransactionStatusMeta {
                 fee: 1,
+                pre_balances: vec![2],
+                post_balances: vec![1],
                 pre_token_balances: Some(Vec::new()),
                 post_token_balances: Some(Vec::new()),
                 ..TransactionStatusMeta::default()

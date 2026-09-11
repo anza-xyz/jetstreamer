@@ -222,8 +222,8 @@ pub const MAX_ALLOWED_DECOMPRESSED_FRAME_SIZE: usize = 128 << 20; // 128MiB
 
 /// Maximum compressed or decompressed transaction-metadata frame (1 MiB).
 /// Transaction metadata is handled once per transaction and is much smaller
-/// than a slot-wide rewards frame; sampled historical metadata peaks below
-/// one KiB.
+/// than a slot-wide rewards frame; sampled historical metadata remains below
+/// three KiB.
 pub const MAX_TRANSACTION_METADATA_FRAME_SIZE: usize = 1 << 20; // 1MiB
 
 const _: () = {

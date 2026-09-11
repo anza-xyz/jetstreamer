@@ -1,27 +1,31 @@
 //! Versioned decoding for transaction metadata stored in Old Faithful.
 //!
-//! The pre-protobuf archive bytes use the Solana storage schema from before
-//! token balances gained `owner` and `program_id`. Deserializing those bytes
-//! into today's `StoredTransactionStatusMeta` is not backward compatible when
-//! a token-balance vector is nonempty: the added fields consume bytes that
-//! belong to the next balance or the next metadata field. Keep that historical
-//! wire schema explicit here and convert it into current public Solana types
-//! only after decoding.
+//! The pre-protobuf archive spans three Solana bincode schemas. V1.5.9 briefly
+//! made `UiTokenAmount::ui_amount` a string in backport
+//! `1f1dd58c78c3f4d543fb96526a0f6ee6d8a7f969`; v1.5.10 reverted it. Backport
+//! `16ded2115c02b5fa514f35b03cdcb98845506fc8` then changed the nested value
+//! from three fields to four for v1.5.13. Records without token balances are
+//! byte-compatible across these changes, while populated token balances are
+//! not. Keep all three historical wire schemas explicit here and compare any
+//! overlapping successful decodes before converting them into current public
+//! Solana types.
 //!
 //! Solana commit `7e6528972948c3f35b3ce21ae202ffd3155c9ba6`
 //! switched Blockstore transaction-status writes to protobuf on 2021-03-05.
 //! Its immediate parent, `bd13262b420779fba2e6103600bb806fcb3e96e4`,
 //! defines the last bincode schema: the eight fields and enum ranges copied
-//! below. Later fields and variants were added after the archive's bincode
-//! cutoff and must not make malformed early records valid.
+//! below. Old Faithful contains bincode and protobuf records during the
+//! producer transition. The pre-cutoff route tries all three exact bincode schemas
+//! and guarded protobuf, accepting only one normalized result. Later fields
+//! and variants must not make malformed legacy records valid.
 
 use {
     crate::{SharedError, epochs::slot_to_epoch},
     bincode::Options as _,
     serde::Deserialize,
+    solana_account_decoder_client_types::token::{UiTokenAmount, real_number_string_trimmed},
     solana_instruction_error::InstructionError,
     solana_message::{compiled_instruction::CompiledInstruction, v0::LoadedAddresses},
-    solana_storage_proto::StoredTokenAmount,
     solana_transaction_error::TransactionError,
     solana_transaction_status::{
         InnerInstruction, InnerInstructions, TransactionStatusMeta, TransactionTokenBalance,
@@ -223,18 +227,18 @@ impl From<LegacyInnerInstructions> for InnerInstructions {
     }
 }
 
-/// First slot whose Old Faithful transaction-status metadata is stored as
-/// protobuf. Earlier metadata uses the legacy bincode storage schema. This is
+/// First slot after which Old Faithful transaction-status metadata is
+/// consistently stored as protobuf. Earlier archive data is predominantly
+/// legacy bincode, but contains protobuf records near the transition. This is
 /// an archive-input boundary, independent of the runtime that executed a slot.
 pub const OLD_FAITHFUL_PROTOBUF_META_START_SLOT: u64 = 157 * 432_000;
 
 /// Transaction-metadata encoding selected from the source slot.
-///
-/// Each side of the archive boundary accepts only its documented encoding.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OldFaithfulMetaEncoding {
-    /// Decode the pre-token-owner bincode schema.
-    Bincode,
+    /// Try the Solana f64, v1.5.9 string, and v1.5.13 bincode schemas plus
+    /// guarded protobuf, rejecting successful decodes that disagree.
+    BincodeWithProtobufFallback,
     /// Decode protobuf directly.
     Protobuf,
 }
@@ -243,21 +247,79 @@ pub enum OldFaithfulMetaEncoding {
 #[inline]
 pub const fn old_faithful_meta_encoding(slot: u64) -> OldFaithfulMetaEncoding {
     if slot < OLD_FAITHFUL_PROTOBUF_META_START_SLOT {
-        OldFaithfulMetaEncoding::Bincode
+        OldFaithfulMetaEncoding::BincodeWithProtobufFallback
     } else {
         OldFaithfulMetaEncoding::Protobuf
     }
 }
 
 #[derive(Deserialize)]
-struct LegacyStoredTransactionTokenBalance {
-    account_index: u8,
-    mint: String,
-    ui_token_amount: StoredTokenAmount,
+struct LegacyV1_5_12UiTokenAmount {
+    ui_amount: f64,
+    decimals: u8,
+    amount: String,
 }
 
-impl From<LegacyStoredTransactionTokenBalance> for TransactionTokenBalance {
-    fn from(value: LegacyStoredTransactionTokenBalance) -> Self {
+impl From<LegacyV1_5_12UiTokenAmount> for UiTokenAmount {
+    fn from(value: LegacyV1_5_12UiTokenAmount) -> Self {
+        Self {
+            ui_amount: Some(value.ui_amount),
+            decimals: value.decimals,
+            ui_amount_string: real_number_string_trimmed(
+                value.amount.parse::<u64>().unwrap_or_default(),
+                value.decimals,
+            ),
+            amount: value.amount,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct LegacyV1_5_9UiTokenAmount {
+    ui_amount: String,
+    decimals: u8,
+    amount: String,
+}
+
+impl From<LegacyV1_5_9UiTokenAmount> for UiTokenAmount {
+    fn from(value: LegacyV1_5_9UiTokenAmount) -> Self {
+        Self {
+            ui_amount: value.ui_amount.parse().ok(),
+            decimals: value.decimals,
+            amount: value.amount,
+            ui_amount_string: value.ui_amount,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct LegacyV1_5_13UiTokenAmount {
+    ui_amount: Option<f64>,
+    decimals: u8,
+    amount: String,
+    ui_amount_string: String,
+}
+
+impl From<LegacyV1_5_13UiTokenAmount> for UiTokenAmount {
+    fn from(value: LegacyV1_5_13UiTokenAmount) -> Self {
+        Self {
+            ui_amount: value.ui_amount,
+            decimals: value.decimals,
+            amount: value.amount,
+            ui_amount_string: value.ui_amount_string,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct LegacyTransactionTokenBalance<A> {
+    account_index: u8,
+    mint: String,
+    ui_token_amount: A,
+}
+
+impl<A: Into<UiTokenAmount>> From<LegacyTransactionTokenBalance<A>> for TransactionTokenBalance {
+    fn from(value: LegacyTransactionTokenBalance<A>) -> Self {
         Self {
             account_index: value.account_index,
             mint: value.mint,
@@ -269,7 +331,8 @@ impl From<LegacyStoredTransactionTokenBalance> for TransactionTokenBalance {
 }
 
 #[derive(Deserialize)]
-struct LegacyStoredTransactionStatusMeta {
+#[serde(bound(deserialize = "A: Deserialize<'de>"))]
+struct LegacyTransactionStatusMeta<A> {
     status: Result<(), LegacyTransactionError>,
     fee: u64,
     pre_balances: Vec<u64>,
@@ -279,13 +342,13 @@ struct LegacyStoredTransactionStatusMeta {
     #[serde(deserialize_with = "solana_serde::default_on_eof")]
     log_messages: Option<Vec<String>>,
     #[serde(deserialize_with = "solana_serde::default_on_eof")]
-    pre_token_balances: Option<Vec<LegacyStoredTransactionTokenBalance>>,
+    pre_token_balances: Option<Vec<LegacyTransactionTokenBalance<A>>>,
     #[serde(deserialize_with = "solana_serde::default_on_eof")]
-    post_token_balances: Option<Vec<LegacyStoredTransactionTokenBalance>>,
+    post_token_balances: Option<Vec<LegacyTransactionTokenBalance<A>>>,
 }
 
-impl From<LegacyStoredTransactionStatusMeta> for TransactionStatusMeta {
-    fn from(value: LegacyStoredTransactionStatusMeta) -> Self {
+impl<A: Into<UiTokenAmount>> From<LegacyTransactionStatusMeta<A>> for TransactionStatusMeta {
+    fn from(value: LegacyTransactionStatusMeta<A>) -> Self {
         Self {
             status: value.status.map_err(Into::into),
             fee: value.fee,
@@ -310,15 +373,149 @@ impl From<LegacyStoredTransactionStatusMeta> for TransactionStatusMeta {
     }
 }
 
-fn decode_legacy_bincode(metadata_bytes: &[u8]) -> Result<TransactionStatusMeta, bincode::Error> {
+fn decode_legacy_bincode<A>(metadata_bytes: &[u8]) -> Result<TransactionStatusMeta, bincode::Error>
+where
+    A: for<'de> Deserialize<'de> + Into<UiTokenAmount>,
+{
     // Match the historical fixed-integer encoding, require the complete
     // cutoff-era schema, and bind allocations to the CID-verified input frame.
     bincode::DefaultOptions::new()
         .with_fixint_encoding()
         .reject_trailing_bytes()
         .with_limit(metadata_bytes.len() as u64)
-        .deserialize::<LegacyStoredTransactionStatusMeta>(metadata_bytes)
+        .deserialize::<LegacyTransactionStatusMeta<A>>(metadata_bytes)
         .map(Into::into)
+}
+
+fn validate_decoded_metadata(
+    slot: u64,
+    epoch: u64,
+    encoding: &str,
+    metadata: TransactionStatusMeta,
+) -> Result<TransactionStatusMeta, String> {
+    // Every stored transaction has at least its fee payer, and both balance
+    // snapshots cover the same account-key list. Besides checking source
+    // integrity, this prevents a permissive decoder from accepting a frame
+    // that only happens to match part of its grammar.
+    if metadata.pre_balances.is_empty()
+        || metadata.pre_balances.len() != metadata.post_balances.len()
+    {
+        return Err(format!(
+            "{encoding} transaction metadata has invalid balance vectors (slot {slot}, epoch {epoch}, pre={}, post={})",
+            metadata.pre_balances.len(),
+            metadata.post_balances.len(),
+        ));
+    }
+
+    let account_count = metadata.pre_balances.len();
+    if metadata
+        .pre_token_balances
+        .iter()
+        .chain(&metadata.post_token_balances)
+        .flatten()
+        .any(|balance| usize::from(balance.account_index) >= account_count)
+    {
+        return Err(format!(
+            "{encoding} transaction metadata has an out-of-range token balance account index (slot {slot}, epoch {epoch}, accounts={account_count})"
+        ));
+    }
+
+    Ok(metadata)
+}
+
+fn decode_legacy_candidate<A>(
+    slot: u64,
+    epoch: u64,
+    encoding: &str,
+    metadata_bytes: &[u8],
+) -> Result<TransactionStatusMeta, String>
+where
+    A: for<'de> Deserialize<'de> + Into<UiTokenAmount>,
+{
+    decode_legacy_bincode::<A>(metadata_bytes)
+        .map_err(|error| error.to_string())
+        .and_then(|metadata| validate_decoded_metadata(slot, epoch, encoding, metadata))
+}
+
+fn decode_v1_5_9_candidate(
+    slot: u64,
+    epoch: u64,
+    metadata_bytes: &[u8],
+) -> Result<TransactionStatusMeta, String> {
+    let metadata = decode_legacy_candidate::<LegacyV1_5_9UiTokenAmount>(
+        slot,
+        epoch,
+        "Solana v1.5.9 bincode",
+        metadata_bytes,
+    )?;
+
+    // InvalidAccountOwner was added after v1.5.9 and has no valid pairing
+    // with that release's short-lived string token-amount schema.
+    if matches!(
+        metadata.status,
+        Err(TransactionError::InstructionError(
+            _,
+            InstructionError::InvalidAccountOwner
+        ))
+    ) {
+        return Err(format!(
+            "Solana v1.5.9 bincode contains post-v1.5.9 InvalidAccountOwner (slot {slot}, epoch {epoch})"
+        ));
+    }
+
+    Ok(metadata)
+}
+
+fn decode_protobuf(
+    slot: u64,
+    epoch: u64,
+    metadata_bytes: &[u8],
+) -> Result<TransactionStatusMeta, SharedError> {
+    let proto: solana_storage_proto::convert::generated::TransactionStatusMeta =
+        prost_011::Message::decode(metadata_bytes).map_err(|error| {
+            Box::new(io::Error::other(format!(
+                "protobuf decode transaction metadata (slot {slot}, epoch {epoch}): {error}"
+            ))) as SharedError
+        })?;
+    let metadata: TransactionStatusMeta = proto.try_into().map_err(|error| {
+        Box::new(io::Error::other(format!(
+            "convert transaction metadata proto (slot {slot}, epoch {epoch}): {error}"
+        ))) as SharedError
+    })?;
+
+    validate_decoded_metadata(slot, epoch, "protobuf", metadata)
+        .map_err(|error| Box::new(io::Error::other(error)) as SharedError)
+}
+
+fn select_unique_metadata<const N: usize>(
+    slot: u64,
+    epoch: u64,
+    candidates: [(&'static str, Result<TransactionStatusMeta, String>); N],
+) -> Result<TransactionStatusMeta, SharedError> {
+    let mut selected: Option<(&'static str, TransactionStatusMeta)> = None;
+    let mut failures = Vec::with_capacity(N);
+
+    for (encoding, candidate) in candidates {
+        match candidate {
+            Ok(metadata) => match &selected {
+                Some((selected_encoding, selected_metadata)) if selected_metadata != &metadata => {
+                    return Err(Box::new(io::Error::other(format!(
+                        "ambiguous transaction metadata (slot {slot}, epoch {epoch}): {selected_encoding} and {encoding} decoded to different values"
+                    ))));
+                }
+                Some(_) => {}
+                None => selected = Some((encoding, metadata)),
+            },
+            Err(error) => failures.push(format!("{encoding}: {error}")),
+        }
+    }
+
+    selected.map(|(_, metadata)| metadata).ok_or_else(|| {
+        Box::new(io::Error::other(format!(
+            "decode transaction metadata (slot {slot}, epoch {epoch}): {}",
+            failures.join("; ")
+        ))) as SharedError
+    })
 }
 
 pub(crate) fn decode_transaction_status_meta(
@@ -327,25 +524,39 @@ pub(crate) fn decode_transaction_status_meta(
 ) -> Result<TransactionStatusMeta, SharedError> {
     let epoch = slot_to_epoch(slot);
     match old_faithful_meta_encoding(slot) {
-        OldFaithfulMetaEncoding::Bincode => decode_legacy_bincode(metadata_bytes).map_err(|error| {
-            Box::new(io::Error::other(format!(
-                "decode legacy bincode transaction metadata (slot {slot}, epoch {epoch}): {error}"
-            ))) as SharedError
-        }),
-        OldFaithfulMetaEncoding::Protobuf => {
-            let proto: solana_storage_proto::convert::generated::TransactionStatusMeta =
-                prost_011::Message::decode(metadata_bytes).map_err(|error| {
-                    Box::new(io::Error::other(format!(
-                        "protobuf decode transaction metadata (slot {slot}, epoch {epoch}): {error}"
-                    ))) as SharedError
-                })?;
-
-            proto.try_into().map_err(|error| {
-                Box::new(io::Error::other(format!(
-                    "convert transaction metadata proto (slot {slot}, epoch {epoch}): {error}"
-                ))) as SharedError
-            })
-        }
+        OldFaithfulMetaEncoding::BincodeWithProtobufFallback => select_unique_metadata(
+            slot,
+            epoch,
+            [
+                (
+                    "Solana v1.5.12 bincode",
+                    decode_legacy_candidate::<LegacyV1_5_12UiTokenAmount>(
+                        slot,
+                        epoch,
+                        "Solana v1.5.12 bincode",
+                        metadata_bytes,
+                    ),
+                ),
+                (
+                    "Solana v1.5.9 bincode",
+                    decode_v1_5_9_candidate(slot, epoch, metadata_bytes),
+                ),
+                (
+                    "Solana v1.5.13 bincode",
+                    decode_legacy_candidate::<LegacyV1_5_13UiTokenAmount>(
+                        slot,
+                        epoch,
+                        "Solana v1.5.13 bincode",
+                        metadata_bytes,
+                    ),
+                ),
+                (
+                    "protobuf",
+                    decode_protobuf(slot, epoch, metadata_bytes).map_err(|error| error.to_string()),
+                ),
+            ],
+        ),
+        OldFaithfulMetaEncoding::Protobuf => decode_protobuf(slot, epoch, metadata_bytes),
     }
 }
 
@@ -353,26 +564,34 @@ pub(crate) fn decode_transaction_status_meta(
 mod tests {
     use {
         super::{
-            LegacyInnerInstructions, LegacyInstructionError, LegacyStoredTransactionStatusMeta,
-            LegacyStoredTransactionTokenBalance, LegacyTransactionError,
+            LegacyInnerInstructions, LegacyInstructionError, LegacyTransactionError,
+            LegacyTransactionStatusMeta, LegacyTransactionTokenBalance, LegacyV1_5_9UiTokenAmount,
+            LegacyV1_5_12UiTokenAmount, LegacyV1_5_13UiTokenAmount,
             OLD_FAITHFUL_PROTOBUF_META_START_SLOT, OldFaithfulMetaEncoding, decode_legacy_bincode,
-            decode_transaction_status_meta, old_faithful_meta_encoding,
+            decode_transaction_status_meta, decode_v1_5_9_candidate, old_faithful_meta_encoding,
+            select_unique_metadata,
         },
         serde::Serialize,
         sha2::{Digest as _, Sha256},
         solana_instruction_error::InstructionError,
         solana_message::compiled_instruction::CompiledInstruction,
-        solana_storage_proto::StoredTokenAmount,
         solana_transaction_error::TransactionError,
         solana_transaction_status::TransactionStatusMeta,
         std::fmt::Write as _,
     };
 
     #[derive(Serialize)]
+    struct LegacyV1_5_12WireUiTokenAmount {
+        ui_amount: f64,
+        decimals: u8,
+        amount: String,
+    }
+
+    #[derive(Serialize)]
     struct LegacyWireTokenBalance<'a> {
         account_index: u8,
         mint: &'a str,
-        ui_token_amount: StoredTokenAmount,
+        ui_token_amount: LegacyV1_5_12WireUiTokenAmount,
     }
 
     #[derive(Serialize)]
@@ -393,11 +612,37 @@ mod tests {
         post_token_balances: Option<Vec<LegacyWireTokenBalance<'a>>>,
     }
 
+    #[derive(Serialize)]
+    struct LegacyV1_5_9WireUiTokenAmount<'a> {
+        ui_amount: &'a str,
+        decimals: u8,
+        amount: &'a str,
+    }
+
+    #[derive(Serialize)]
+    struct LegacyV1_5_9WireTokenBalance<'a> {
+        account_index: u8,
+        mint: &'a str,
+        ui_token_amount: LegacyV1_5_9WireUiTokenAmount<'a>,
+    }
+
+    #[derive(Serialize)]
+    struct LegacyV1_5_9WireMeta<'a> {
+        status: Result<(), LegacyTransactionError>,
+        fee: u64,
+        pre_balances: Vec<u64>,
+        post_balances: Vec<u64>,
+        inner_instructions: Option<Vec<LegacyWireInnerInstructions>>,
+        log_messages: Option<Vec<String>>,
+        pre_token_balances: Option<Vec<LegacyV1_5_9WireTokenBalance<'a>>>,
+        post_token_balances: Option<Vec<LegacyV1_5_9WireTokenBalance<'a>>>,
+    }
+
     fn token_balance(account_index: u8, mint: &'static str) -> LegacyWireTokenBalance<'static> {
         LegacyWireTokenBalance {
             account_index,
             mint,
-            ui_token_amount: StoredTokenAmount {
+            ui_token_amount: LegacyV1_5_12WireUiTokenAmount {
                 ui_amount: 1.25,
                 decimals: 2,
                 amount: "125".to_owned(),
@@ -432,12 +677,48 @@ mod tests {
     fn metadata_encoding_switches_at_the_configured_slot() {
         assert_eq!(
             old_faithful_meta_encoding(OLD_FAITHFUL_PROTOBUF_META_START_SLOT - 1),
-            OldFaithfulMetaEncoding::Bincode
+            OldFaithfulMetaEncoding::BincodeWithProtobufFallback
         );
         assert_eq!(
             old_faithful_meta_encoding(OLD_FAITHFUL_PROTOBUF_META_START_SLOT),
             OldFaithfulMetaEncoding::Protobuf
         );
+    }
+
+    #[test]
+    fn protobuf_transition_record_uses_the_bounded_fallback() {
+        let expected = TransactionStatusMeta {
+            fee: 5_000,
+            pre_balances: vec![10_000, 20_000],
+            post_balances: vec![5_000, 25_000],
+            pre_token_balances: Some(Vec::new()),
+            post_token_balances: Some(Vec::new()),
+            rewards: Some(Vec::new()),
+            ..TransactionStatusMeta::default()
+        };
+        let proto: solana_storage_proto::convert::generated::TransactionStatusMeta =
+            expected.clone().into();
+        let bytes = prost_011::Message::encode_to_vec(&proto);
+
+        assert_eq!(
+            decode_transaction_status_meta(OLD_FAITHFUL_PROTOBUF_META_START_SLOT - 1, &bytes)
+                .unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn protobuf_fallback_rejects_an_unknown_only_message() {
+        // Unknown protobuf field 100 with a varint value of one. Prost accepts
+        // and discards it, but it is not transaction metadata.
+        let unknown_only = [0xa0, 0x06, 0x01];
+        let error = decode_transaction_status_meta(
+            OLD_FAITHFUL_PROTOBUF_META_START_SLOT - 1,
+            &unknown_only,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("invalid balance vectors"));
     }
 
     #[test]
@@ -489,12 +770,78 @@ mod tests {
     }
 
     #[test]
+    fn v1_5_9_string_token_amount_decodes_into_current_solana_type() {
+        let token_balance = || LegacyV1_5_9WireTokenBalance {
+            account_index: 0,
+            mint: "mint-v1.5.9",
+            ui_token_amount: LegacyV1_5_9WireUiTokenAmount {
+                ui_amount: "1.25",
+                decimals: 2,
+                amount: "125",
+            },
+        };
+        let wire = LegacyV1_5_9WireMeta {
+            status: Ok(()),
+            fee: 5_000,
+            pre_balances: vec![10_000],
+            post_balances: vec![5_000],
+            inner_instructions: None,
+            log_messages: Some(vec!["v1.5.9".to_owned()]),
+            pre_token_balances: Some(vec![token_balance()]),
+            post_token_balances: Some(vec![token_balance()]),
+        };
+        let bytes = bincode::serialize(&wire).expect("serialize v1.5.9 fixture");
+
+        assert!(decode_legacy_bincode::<LegacyV1_5_12UiTokenAmount>(&bytes).is_err());
+        assert!(decode_legacy_bincode::<LegacyV1_5_13UiTokenAmount>(&bytes).is_err());
+        let decoded = decode_transaction_status_meta(66_000_000, &bytes).expect("decode");
+
+        let balance = &decoded.pre_token_balances.expect("token balances")[0];
+        assert_eq!(balance.ui_token_amount.ui_amount, Some(1.25));
+        assert_eq!(balance.ui_token_amount.amount, "125");
+        assert_eq!(balance.ui_token_amount.ui_amount_string, "1.25");
+    }
+
+    #[test]
+    fn v1_5_9_schema_rejects_later_instruction_error_variant() {
+        let token_balance = || LegacyV1_5_9WireTokenBalance {
+            account_index: 0,
+            mint: "mint-v1.5.9",
+            ui_token_amount: LegacyV1_5_9WireUiTokenAmount {
+                ui_amount: "1.25",
+                decimals: 2,
+                amount: "125",
+            },
+        };
+        let wire = LegacyV1_5_9WireMeta {
+            status: Err(LegacyTransactionError::InstructionError(
+                0,
+                LegacyInstructionError::InvalidAccountOwner,
+            )),
+            fee: 5_000,
+            pre_balances: vec![10_000],
+            post_balances: vec![5_000],
+            inner_instructions: None,
+            log_messages: None,
+            pre_token_balances: Some(vec![token_balance()]),
+            post_token_balances: Some(vec![token_balance()]),
+        };
+        let bytes = bincode::serialize(&wire).expect("serialize impossible hybrid");
+
+        assert!(decode_legacy_bincode::<LegacyV1_5_9UiTokenAmount>(&bytes).is_ok());
+        let error = decode_v1_5_9_candidate(66_000_000, 152, &bytes)
+            .expect_err("the release-specific validator rejects the later variant");
+        assert!(error.contains("post-v1.5.9 InvalidAccountOwner"));
+        assert!(decode_transaction_status_meta(66_000_000, &bytes).is_err());
+    }
+
+    #[test]
     fn legacy_schema_defaults_fields_introduced_after_the_cutoff() {
         let wire = LegacyWireMeta {
             status: Ok(()),
             fee: 1,
-            pre_balances: Vec::new(),
-            post_balances: Vec::new(),
+            pre_balances: vec![2],
+            post_balances: vec![1],
             inner_instructions: None,
             log_messages: None,
             pre_token_balances: None,
@@ -508,6 +855,8 @@ mod tests {
             decoded,
             TransactionStatusMeta {
                 fee: 1,
+                pre_balances: vec![2],
+                post_balances: vec![1],
                 ..TransactionStatusMeta::default()
             }
         );
@@ -528,7 +877,7 @@ mod tests {
         let mut bytes = bincode::serialize(&wire).expect("serialize legacy fixture");
         bytes.push(0);
 
-        assert!(decode_legacy_bincode(&bytes).is_err());
+        assert!(decode_legacy_bincode::<LegacyV1_5_12UiTokenAmount>(&bytes).is_err());
     }
 
     #[test]
@@ -607,10 +956,18 @@ mod tests {
     #[test]
     fn legacy_error_grammar_rejects_post_cutoff_discriminants() {
         // Result::Err followed by the first post-cutoff TransactionError tag.
-        assert!(decode_legacy_bincode(&[1, 0, 0, 0, 16, 0, 0, 0]).is_err());
+        assert!(
+            decode_legacy_bincode::<LegacyV1_5_12UiTokenAmount>(&[1, 0, 0, 0, 16, 0, 0, 0,])
+                .is_err()
+        );
         // Result::Err, TransactionError::InstructionError, index 0, followed
         // by the first post-cutoff InstructionError tag.
-        assert!(decode_legacy_bincode(&[1, 0, 0, 0, 8, 0, 0, 0, 0, 47, 0, 0, 0]).is_err());
+        assert!(
+            decode_legacy_bincode::<LegacyV1_5_12UiTokenAmount>(&[
+                1, 0, 0, 0, 8, 0, 0, 0, 0, 47, 0, 0, 0,
+            ])
+            .is_err()
+        );
     }
 
     #[test]
@@ -662,13 +1019,97 @@ mod tests {
     }
 
     #[test]
+    fn decodes_cid_verified_pre_cutoff_protobuf_fixture() {
+        // Decompressed bytes SHA-256:
+        // 13546d3b3e2f2e924661a39c647211cb42664362cb49fe2d37907c8b85da4d20
+        let bytes = decode_hex_fixture(include_str!(
+            "../tests/fixtures/old-faithful-meta-slot-67823992-protobuf.hex"
+        ));
+
+        assert!(decode_legacy_bincode::<LegacyV1_5_12UiTokenAmount>(&bytes).is_err());
+        assert!(decode_legacy_bincode::<LegacyV1_5_13UiTokenAmount>(&bytes).is_err());
+        let decoded = decode_transaction_status_meta(67_823_992, &bytes).expect("decode fixture");
+
+        assert_eq!(decoded.fee, 5_000);
+        assert_eq!(
+            decoded.pre_balances,
+            [
+                139_347_285_000,
+                23_357_760,
+                3_591_360,
+                7_299_063_360,
+                1_141_440,
+                1
+            ]
+        );
+        assert_eq!(
+            decoded.post_balances,
+            [
+                139_347_280_000,
+                23_357_760,
+                3_591_360,
+                7_299_063_360,
+                1_141_440,
+                1
+            ]
+        );
+    }
+
+    #[test]
+    fn decodes_cid_verified_v1_5_13_bincode_fixture() {
+        // Decompressed bytes SHA-256:
+        // db8cc6332ca542423c86f7924727dc3200d0213427b4f72e32e43e48f0685aa8
+        let bytes = decode_hex_fixture(include_str!(
+            "../tests/fixtures/old-faithful-meta-slot-67700000-v1.5.13.hex"
+        ));
+
+        assert!(decode_legacy_bincode::<LegacyV1_5_12UiTokenAmount>(&bytes).is_err());
+        let direct = decode_legacy_bincode::<LegacyV1_5_13UiTokenAmount>(&bytes)
+            .expect("decode exact Solana v1.5.13 schema");
+        let decoded = decode_transaction_status_meta(67_700_000, &bytes).expect("decode fixture");
+
+        assert_eq!(decoded, direct);
+        assert_eq!(decoded.fee, 10_000);
+        assert_eq!(decoded.pre_balances.len(), 6);
+        assert_eq!(decoded.post_balances.len(), 6);
+        let pre = decoded.pre_token_balances.expect("pre token balances");
+        assert_eq!(pre.len(), 2);
+        assert_eq!(pre[0].ui_token_amount.ui_amount, Some(425.0));
+        assert_eq!(pre[0].ui_token_amount.amount, "42500000");
+        assert_eq!(pre[0].ui_token_amount.ui_amount_string, "425");
+        assert!(pre.iter().all(|balance| balance.owner.is_empty()));
+        assert!(pre.iter().all(|balance| balance.program_id.is_empty()));
+    }
+
+    #[test]
+    fn rejects_different_successful_schema_results() {
+        let first = TransactionStatusMeta {
+            fee: 1,
+            ..TransactionStatusMeta::default()
+        };
+        let second = TransactionStatusMeta {
+            fee: 2,
+            ..TransactionStatusMeta::default()
+        };
+
+        let error = select_unique_metadata(
+            67_700_000,
+            156,
+            [("first schema", Ok(first)), ("second schema", Ok(second))],
+        )
+        .expect_err("different successful decodes are ambiguous");
+
+        assert!(error.to_string().contains("ambiguous transaction metadata"));
+    }
+
+    #[test]
     fn fixture_provenance_manifest_matches_the_checked_in_bytes() {
         let manifest: serde_json::Value = serde_json::from_str(include_str!(
             "../tests/fixtures/old-faithful-meta-provenance.json"
         ))
         .expect("valid fixture provenance manifest");
         let fixtures = manifest["fixtures"].as_array().expect("fixture array");
-        assert_eq!(fixtures.len(), 2);
+        assert_eq!(fixtures.len(), 4);
 
         for (expected_slot, fixture_path) in [
             (
@@ -678,6 +1119,14 @@ mod tests {
             (
                 40_607_999,
                 include_str!("../tests/fixtures/old-faithful-meta-slot-40607999.hex"),
+            ),
+            (
+                67_700_000,
+                include_str!("../tests/fixtures/old-faithful-meta-slot-67700000-v1.5.13.hex"),
+            ),
+            (
+                67_823_992,
+                include_str!("../tests/fixtures/old-faithful-meta-slot-67823992-protobuf.hex"),
             ),
         ] {
             let provenance = fixtures
@@ -702,7 +1151,14 @@ mod tests {
     fn legacy_wire_types_match_decode_types() {
         fn assert_deserialize<T: for<'de> serde::Deserialize<'de>>() {}
         assert_deserialize::<LegacyInnerInstructions>();
-        assert_deserialize::<LegacyStoredTransactionTokenBalance>();
-        assert_deserialize::<LegacyStoredTransactionStatusMeta>();
+        assert_deserialize::<LegacyV1_5_12UiTokenAmount>();
+        assert_deserialize::<LegacyV1_5_9UiTokenAmount>();
+        assert_deserialize::<LegacyV1_5_13UiTokenAmount>();
+        assert_deserialize::<LegacyTransactionTokenBalance<LegacyV1_5_12UiTokenAmount>>();
+        assert_deserialize::<LegacyTransactionTokenBalance<LegacyV1_5_9UiTokenAmount>>();
+        assert_deserialize::<LegacyTransactionTokenBalance<LegacyV1_5_13UiTokenAmount>>();
+        assert_deserialize::<LegacyTransactionStatusMeta<LegacyV1_5_12UiTokenAmount>>();
+        assert_deserialize::<LegacyTransactionStatusMeta<LegacyV1_5_9UiTokenAmount>>();
+        assert_deserialize::<LegacyTransactionStatusMeta<LegacyV1_5_13UiTokenAmount>>();
     }
 }

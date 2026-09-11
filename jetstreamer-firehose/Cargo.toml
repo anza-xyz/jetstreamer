@@ -30,6 +30,7 @@ serial_test.workspace = true
 solana-rpc.workspace = true
 solana-runtime.workspace = true
 solana-hash.workspace = true
+solana-account-decoder-client-types.workspace = true
 solana-geyser-plugin-manager.workspace = true
 solana-storage-proto.workspace = true
 solana-address.workspace = true

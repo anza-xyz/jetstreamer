@@ -260,36 +260,11 @@ struct LegacyV1_5_12UiTokenAmount {
     amount: String,
 }
 
-impl From<LegacyV1_5_12UiTokenAmount> for UiTokenAmount {
-    fn from(value: LegacyV1_5_12UiTokenAmount) -> Self {
-        Self {
-            ui_amount: Some(value.ui_amount),
-            decimals: value.decimals,
-            ui_amount_string: real_number_string_trimmed(
-                value.amount.parse::<u64>().unwrap_or_default(),
-                value.decimals,
-            ),
-            amount: value.amount,
-        }
-    }
-}
-
 #[derive(Deserialize)]
 struct LegacyV1_5_9UiTokenAmount {
     ui_amount: String,
     decimals: u8,
     amount: String,
-}
-
-impl From<LegacyV1_5_9UiTokenAmount> for UiTokenAmount {
-    fn from(value: LegacyV1_5_9UiTokenAmount) -> Self {
-        Self {
-            ui_amount: value.ui_amount.parse().ok(),
-            decimals: value.decimals,
-            amount: value.amount,
-            ui_amount_string: value.ui_amount,
-        }
-    }
 }
 
 #[derive(Deserialize)]
@@ -300,14 +275,112 @@ struct LegacyV1_5_13UiTokenAmount {
     ui_amount_string: String,
 }
 
-impl From<LegacyV1_5_13UiTokenAmount> for UiTokenAmount {
-    fn from(value: LegacyV1_5_13UiTokenAmount) -> Self {
-        Self {
-            ui_amount: value.ui_amount,
-            decimals: value.decimals,
-            amount: value.amount,
-            ui_amount_string: value.ui_amount_string,
+trait NormalizeLegacyUiTokenAmount {
+    fn normalize(self) -> Result<UiTokenAmount, String>;
+}
+
+fn parse_canonical_token_amount(amount: &str) -> Result<u64, String> {
+    let parsed = amount
+        .parse::<u64>()
+        .map_err(|_| "token amount is not a u64".to_owned())?;
+    if parsed.to_string() != amount {
+        return Err("token amount is not in canonical decimal form".to_owned());
+    }
+    Ok(parsed)
+}
+
+fn normalized_ui_amount(amount: u64, decimals: u8) -> Option<f64> {
+    10_usize
+        .checked_pow(u32::from(decimals))
+        .map(|divisor| amount as f64 / divisor as f64)
+}
+
+fn legacy_v1_5_12_ui_amount(amount: u64, decimals: u8) -> f64 {
+    // These releases computed the divisor with unchecked `usize::pow` in an
+    // optimized x86_64 build. Preserve its 64-bit wrapping behavior when
+    // validating the redundant historical field, even on another host.
+    amount as f64 / 10_u64.wrapping_pow(u32::from(decimals)) as f64
+}
+
+fn normalized_ui_token_amount(amount: u64, decimals: u8, amount_string: String) -> UiTokenAmount {
+    UiTokenAmount {
+        ui_amount: normalized_ui_amount(amount, decimals),
+        decimals,
+        ui_amount_string: real_number_string_trimmed(amount, decimals),
+        amount: amount_string,
+    }
+}
+
+fn legacy_real_number_string_trimmed(amount: u64, decimals: u8) -> String {
+    let decimals = usize::from(decimals);
+    let mut value = if decimals == 0 {
+        amount.to_string()
+    } else {
+        let width = decimals + 1;
+        let mut value = format!("{amount:0width$}");
+        value.insert(value.len() - decimals, '.');
+        value
+    };
+    let trimmed_len = value.trim_end_matches('0').trim_end_matches('.').len();
+    value.truncate(trimmed_len);
+    value
+}
+
+fn optional_f64_bits_equal(left: Option<f64>, right: Option<f64>) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => left.to_bits() == right.to_bits(),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+impl NormalizeLegacyUiTokenAmount for LegacyV1_5_12UiTokenAmount {
+    fn normalize(self) -> Result<UiTokenAmount, String> {
+        let amount = parse_canonical_token_amount(&self.amount)?;
+        let expected_ui_amount = legacy_v1_5_12_ui_amount(amount, self.decimals);
+        if self.ui_amount.to_bits() != expected_ui_amount.to_bits() {
+            return Err("f64 token amount disagrees with amount and decimals".to_owned());
         }
+
+        Ok(normalized_ui_token_amount(
+            amount,
+            self.decimals,
+            self.amount,
+        ))
+    }
+}
+
+impl NormalizeLegacyUiTokenAmount for LegacyV1_5_9UiTokenAmount {
+    fn normalize(self) -> Result<UiTokenAmount, String> {
+        let amount = parse_canonical_token_amount(&self.amount)?;
+        if self.ui_amount != legacy_real_number_string_trimmed(amount, self.decimals) {
+            return Err("string token amount disagrees with amount and decimals".to_owned());
+        }
+
+        Ok(normalized_ui_token_amount(
+            amount,
+            self.decimals,
+            self.amount,
+        ))
+    }
+}
+
+impl NormalizeLegacyUiTokenAmount for LegacyV1_5_13UiTokenAmount {
+    fn normalize(self) -> Result<UiTokenAmount, String> {
+        let amount = parse_canonical_token_amount(&self.amount)?;
+        let expected_ui_amount = normalized_ui_amount(amount, self.decimals);
+        if !optional_f64_bits_equal(self.ui_amount, expected_ui_amount) {
+            return Err("optional f64 token amount disagrees with amount and decimals".to_owned());
+        }
+        if self.ui_amount_string != legacy_real_number_string_trimmed(amount, self.decimals) {
+            return Err("token amount string disagrees with amount and decimals".to_owned());
+        }
+
+        Ok(normalized_ui_token_amount(
+            amount,
+            self.decimals,
+            self.amount,
+        ))
     }
 }
 
@@ -318,15 +391,15 @@ struct LegacyTransactionTokenBalance<A> {
     ui_token_amount: A,
 }
 
-impl<A: Into<UiTokenAmount>> From<LegacyTransactionTokenBalance<A>> for TransactionTokenBalance {
-    fn from(value: LegacyTransactionTokenBalance<A>) -> Self {
-        Self {
-            account_index: value.account_index,
-            mint: value.mint,
-            ui_token_amount: value.ui_token_amount.into(),
+impl<A: NormalizeLegacyUiTokenAmount> LegacyTransactionTokenBalance<A> {
+    fn normalize(self) -> Result<TransactionTokenBalance, String> {
+        Ok(TransactionTokenBalance {
+            account_index: self.account_index,
+            mint: self.mint,
+            ui_token_amount: self.ui_token_amount.normalize()?,
             owner: String::new(),
             program_id: String::new(),
-        }
+        })
     }
 }
 
@@ -347,35 +420,47 @@ struct LegacyTransactionStatusMeta<A> {
     post_token_balances: Option<Vec<LegacyTransactionTokenBalance<A>>>,
 }
 
-impl<A: Into<UiTokenAmount>> From<LegacyTransactionStatusMeta<A>> for TransactionStatusMeta {
-    fn from(value: LegacyTransactionStatusMeta<A>) -> Self {
-        Self {
-            status: value.status.map_err(Into::into),
-            fee: value.fee,
-            pre_balances: value.pre_balances,
-            post_balances: value.post_balances,
-            inner_instructions: value
+impl<A: NormalizeLegacyUiTokenAmount> LegacyTransactionStatusMeta<A> {
+    fn normalize(self) -> Result<TransactionStatusMeta, String> {
+        Ok(TransactionStatusMeta {
+            status: self.status.map_err(Into::into),
+            fee: self.fee,
+            pre_balances: self.pre_balances,
+            post_balances: self.post_balances,
+            inner_instructions: self
                 .inner_instructions
                 .map(|groups| groups.into_iter().map(Into::into).collect()),
-            log_messages: value.log_messages,
-            pre_token_balances: value
+            log_messages: self.log_messages,
+            pre_token_balances: self
                 .pre_token_balances
-                .map(|balances| balances.into_iter().map(Into::into).collect()),
-            post_token_balances: value
+                .map(|balances| {
+                    balances
+                        .into_iter()
+                        .map(LegacyTransactionTokenBalance::normalize)
+                        .collect()
+                })
+                .transpose()?,
+            post_token_balances: self
                 .post_token_balances
-                .map(|balances| balances.into_iter().map(Into::into).collect()),
+                .map(|balances| {
+                    balances
+                        .into_iter()
+                        .map(LegacyTransactionTokenBalance::normalize)
+                        .collect()
+                })
+                .transpose()?,
             rewards: None,
             loaded_addresses: LoadedAddresses::default(),
             return_data: None,
             compute_units_consumed: None,
             cost_units: None,
-        }
+        })
     }
 }
 
-fn decode_legacy_bincode<A>(metadata_bytes: &[u8]) -> Result<TransactionStatusMeta, bincode::Error>
+fn decode_legacy_bincode<A>(metadata_bytes: &[u8]) -> Result<TransactionStatusMeta, String>
 where
-    A: for<'de> Deserialize<'de> + Into<UiTokenAmount>,
+    A: for<'de> Deserialize<'de> + NormalizeLegacyUiTokenAmount,
 {
     // Match the historical fixed-integer encoding, require the complete
     // cutoff-era schema, and bind allocations to the CID-verified input frame.
@@ -384,7 +469,8 @@ where
         .reject_trailing_bytes()
         .with_limit(metadata_bytes.len() as u64)
         .deserialize::<LegacyTransactionStatusMeta<A>>(metadata_bytes)
-        .map(Into::into)
+        .map_err(|error| error.to_string())?
+        .normalize()
 }
 
 fn validate_decoded_metadata(
@@ -430,10 +516,9 @@ fn decode_legacy_candidate<A>(
     metadata_bytes: &[u8],
 ) -> Result<TransactionStatusMeta, String>
 where
-    A: for<'de> Deserialize<'de> + Into<UiTokenAmount>,
+    A: for<'de> Deserialize<'de> + NormalizeLegacyUiTokenAmount,
 {
     decode_legacy_bincode::<A>(metadata_bytes)
-        .map_err(|error| error.to_string())
         .and_then(|metadata| validate_decoded_metadata(slot, epoch, encoding, metadata))
 }
 
@@ -568,8 +653,8 @@ mod tests {
             LegacyTransactionStatusMeta, LegacyTransactionTokenBalance, LegacyV1_5_9UiTokenAmount,
             LegacyV1_5_12UiTokenAmount, LegacyV1_5_13UiTokenAmount,
             OLD_FAITHFUL_PROTOBUF_META_START_SLOT, OldFaithfulMetaEncoding, decode_legacy_bincode,
-            decode_transaction_status_meta, decode_v1_5_9_candidate, old_faithful_meta_encoding,
-            select_unique_metadata,
+            decode_transaction_status_meta, decode_v1_5_9_candidate, legacy_v1_5_12_ui_amount,
+            old_faithful_meta_encoding, select_unique_metadata,
         },
         serde::Serialize,
         sha2::{Digest as _, Sha256},
@@ -767,6 +852,39 @@ mod tests {
                 .iter()
                 .all(|instruction| instruction.stack_height.is_none())
         );
+    }
+
+    #[test]
+    fn legacy_f64_token_amount_preserves_release_wrapping_semantics() {
+        let decimals = 20;
+        let wire = LegacyWireMeta {
+            status: Ok(()),
+            fee: 1,
+            pre_balances: vec![2],
+            post_balances: vec![1],
+            inner_instructions: None,
+            log_messages: None,
+            pre_token_balances: Some(vec![LegacyWireTokenBalance {
+                account_index: 0,
+                mint: "legacy-mint",
+                ui_token_amount: LegacyV1_5_12WireUiTokenAmount {
+                    ui_amount: legacy_v1_5_12_ui_amount(1, decimals),
+                    decimals,
+                    amount: "1".to_owned(),
+                },
+            }]),
+            post_token_balances: None,
+        };
+        let bytes = bincode::serialize(&wire).expect("serialize legacy fixture");
+
+        let decoded = decode_legacy_bincode::<LegacyV1_5_12UiTokenAmount>(&bytes)
+            .expect("decode release-generated overflowing divisor");
+        let amount = &decoded.pre_token_balances.expect("token balance")[0].ui_token_amount;
+
+        assert_eq!(amount.ui_amount, None);
+        assert_eq!(amount.decimals, decimals);
+        assert_eq!(amount.amount, "1");
+        assert_eq!(amount.ui_amount_string, "0.00000000000000000001");
     }
 
     #[test]
@@ -1019,6 +1137,36 @@ mod tests {
     }
 
     #[test]
+    fn canonicalizes_cid_verified_dual_shape_zero_token_amount() {
+        // Eight zero bytes are both f64 0.0 and a zero-length bincode String.
+        // Solana's amount and decimals fields disambiguate the valid producer
+        // representation and define the current normalized value.
+        let bytes = decode_hex_fixture(include_str!(
+            "../tests/fixtures/old-faithful-meta-slot-66550000-zero-token.hex"
+        ));
+
+        assert!(decode_legacy_bincode::<LegacyV1_5_12UiTokenAmount>(&bytes).is_ok());
+        assert!(decode_legacy_bincode::<LegacyV1_5_9UiTokenAmount>(&bytes).is_err());
+        let decoded = decode_transaction_status_meta(66_550_000, &bytes).expect("decode fixture");
+
+        assert_eq!(decoded.fee, 15_000);
+        assert_eq!(decoded.pre_balances.len(), 7);
+        assert_eq!(decoded.post_balances.len(), 7);
+        let token_balances: Vec<_> = decoded
+            .pre_token_balances
+            .iter()
+            .chain(&decoded.post_token_balances)
+            .flatten()
+            .collect();
+        assert_eq!(token_balances.len(), 1);
+        let balance = token_balances[0];
+        assert_eq!(balance.ui_token_amount.ui_amount, Some(0.0));
+        assert_eq!(balance.ui_token_amount.decimals, 5);
+        assert_eq!(balance.ui_token_amount.amount, "0");
+        assert_eq!(balance.ui_token_amount.ui_amount_string, "0");
+    }
+
+    #[test]
     fn decodes_cid_verified_pre_cutoff_protobuf_fixture() {
         // Decompressed bytes SHA-256:
         // 13546d3b3e2f2e924661a39c647211cb42664362cb49fe2d37907c8b85da4d20
@@ -1109,7 +1257,7 @@ mod tests {
         ))
         .expect("valid fixture provenance manifest");
         let fixtures = manifest["fixtures"].as_array().expect("fixture array");
-        assert_eq!(fixtures.len(), 4);
+        assert_eq!(fixtures.len(), 5);
 
         for (expected_slot, fixture_path) in [
             (
@@ -1119,6 +1267,10 @@ mod tests {
             (
                 40_607_999,
                 include_str!("../tests/fixtures/old-faithful-meta-slot-40607999.hex"),
+            ),
+            (
+                66_550_000,
+                include_str!("../tests/fixtures/old-faithful-meta-slot-66550000-zero-token.hex"),
             ),
             (
                 67_700_000,

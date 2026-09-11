@@ -4915,6 +4915,7 @@ fn usage(program: &str) -> String {
         "Usage: {program} <epoch|range> [dest-dir] [--verify|--no-verify] [--horizon-output=PATH]\n\
          \x20      [--qualification-end-slot=SLOT] [--root-checkpoint-cohort]\n\
          \x20      [--cohort-manifest=PATH --cohort-manifest-fingerprint=sha256:HEX]\n\
+         \x20      [--recover-staged-only]\n\
          \n\
          <epoch|range> is a single epoch (950) or an inclusive range (950-955).\n\
          Replays each epoch and writes a horizon archive to <dest-dir>/epoch-<N>.jet.\n\
@@ -4952,7 +4953,11 @@ fn usage(program: &str) -> String {
          explicit --verify, a sealed preflight manifest and its audited fingerprint,\n\
          one unchanged historical runtime; ranges use in-memory state handoff.\n\
          Every archive remains in owner-only staging until the complete cohort\n\
-         and every staged archive pass validation."
+         and every staged archive pass validation.\n\
+         --recover-staged-only accepts one nonzero epoch and explicit --verify.\n\
+         It fully validates and transactionally publishes an existing private\n\
+         adaptive staging candidate, but never starts replay or removes a failed\n\
+         candidate."
     )
 }
 
@@ -5208,6 +5213,43 @@ fn epoch_isolation_plan(
         previous_descriptor = Some(selection.descriptor);
     }
     Ok((false, None))
+}
+
+/// Keeps the operator-only staged recovery route deliberately narrower than a
+/// normal replay invocation. Environment defaults cannot supply the
+/// verification opt-in, and no child, cohort, or output override may redirect
+/// the artifact being admitted.
+fn validate_staged_recovery_mode(
+    enabled: bool,
+    start_epoch: u64,
+    end_epoch: u64,
+    explicit_verify: Option<bool>,
+    verify_option_count: usize,
+    inherited_epoch_lease: bool,
+    has_conflicting_override: bool,
+) -> Result<(), String> {
+    if !enabled {
+        return Ok(());
+    }
+    if start_epoch != end_epoch || start_epoch == 0 {
+        return Err("--recover-staged-only requires exactly one nonzero epoch".to_string());
+    }
+    if explicit_verify != Some(true) || verify_option_count != 1 {
+        return Err(
+            "--recover-staged-only requires exactly one explicit --verify (environment defaults, --no-verify, and duplicate verification options do not qualify)"
+                .to_string(),
+        );
+    }
+    if inherited_epoch_lease {
+        return Err("--recover-staged-only is valid only in a top-level invocation".to_string());
+    }
+    if has_conflicting_override {
+        return Err(
+            "--recover-staged-only cannot be combined with cohort, output, qualification, or internal child overrides"
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 /// Proves that an epoch range can be replayed as one uninterrupted
@@ -13872,39 +13914,423 @@ fn staged_archive_candidate(work_dir: &Path, epoch: u64) -> Result<Option<PathBu
     Ok(candidates.pop().map(|(_, path)| path))
 }
 
+fn require_existing_private_directory(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
+        format!(
+            "failed to inspect private directory {}: {error}",
+            path.display()
+        )
+    })?;
+    if !metadata.file_type().is_dir()
+        || metadata.uid() != effective_user_id()
+        || metadata.permissions().mode() & 0o077 != 0
+    {
+        return Err(format!(
+            "staged-only recovery requires an existing owner-only real directory: {}",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+/// Unlike normal adaptive crash recovery, the explicit operator recovery route
+/// never guesses between attempts. Its namespace must contain exactly one
+/// direct, immutable-enough candidate and nothing else.
+#[derive(Debug)]
+struct StrictStagedArchiveCandidate {
+    path: PathBuf,
+    file: fs::File,
+    identity: jetstreamer_node::archive_checksum::ArchiveFileIdentity,
+}
+
+fn strict_staged_archive_candidate(
+    work_dir: &Path,
+    epoch: u64,
+) -> Result<StrictStagedArchiveCandidate, String> {
+    use std::os::unix::{
+        ffi::OsStrExt as _,
+        fs::{MetadataExt as _, PermissionsExt as _},
+    };
+
+    require_existing_private_directory(work_dir)?;
+    let expected_name = OsString::from(format!("epoch-{epoch}.jet"));
+    let mut candidate = None;
+    for entry in fs::read_dir(work_dir)
+        .map_err(|error| format!("failed to scan {}: {error}", work_dir.display()))?
+    {
+        let entry =
+            entry.map_err(|error| format!("failed to scan {}: {error}", work_dir.display()))?;
+        let attempt_name = entry.file_name();
+        if attempt_name == "inputs" {
+            require_existing_private_directory(&entry.path())?;
+            continue;
+        }
+        if !attempt_name.as_bytes().starts_with(b"attempt-") {
+            return Err(format!(
+                "staged-only recovery found an unexpected entry in {}: {:?}",
+                work_dir.display(),
+                attempt_name
+            ));
+        }
+        let attempt_dir = entry.path();
+        require_existing_private_directory(&attempt_dir)?;
+        let mut attempt_candidate = None;
+        for member in fs::read_dir(&attempt_dir).map_err(|error| {
+            format!(
+                "failed to scan staged attempt {}: {error}",
+                attempt_dir.display()
+            )
+        })? {
+            let member = member.map_err(|error| {
+                format!(
+                    "failed to scan staged attempt {}: {error}",
+                    attempt_dir.display()
+                )
+            })?;
+            if member.file_name() == "scratch" {
+                require_existing_private_directory(&member.path())?;
+                continue;
+            }
+            if member.file_name() != expected_name {
+                return Err(format!(
+                    "staged-only recovery found an unexpected entry in {}: {:?}",
+                    attempt_dir.display(),
+                    member.file_name()
+                ));
+            }
+            let path = member.path();
+            let file = jetstreamer_node::archive_checksum::open_regular_nofollow(&path).map_err(
+                |error| format!("failed to bind staged archive {}: {error}", path.display()),
+            )?;
+            let metadata = file.metadata().map_err(|error| {
+                format!(
+                    "failed to inspect staged archive {}: {error}",
+                    path.display()
+                )
+            })?;
+            let mode = metadata.permissions().mode();
+            if !metadata.file_type().is_file()
+                || metadata.uid() != effective_user_id()
+                || metadata.nlink() != 1
+                || mode & 0o7111 != 0
+            {
+                return Err(format!(
+                    "staged archive must be a single-link regular file owned by the caller with no executable or special permission bits: {}",
+                    path.display()
+                ));
+            }
+            let identity = jetstreamer_node::archive_checksum::archive_file_identity(&file)
+                .map_err(|error| {
+                    format!(
+                        "failed to identify staged archive {}: {error}",
+                        path.display()
+                    )
+                })?;
+            if !jetstreamer_node::archive_checksum::path_matches_archive_identity(&path, identity)
+                .map_err(|error| {
+                format!(
+                    "failed to recheck staged archive {}: {error}",
+                    path.display()
+                )
+            })? {
+                return Err(format!(
+                    "staged archive changed while it was admitted: {}",
+                    path.display()
+                ));
+            }
+            if attempt_candidate
+                .replace(StrictStagedArchiveCandidate {
+                    path,
+                    file,
+                    identity,
+                })
+                .is_some()
+            {
+                return Err(format!(
+                    "staged attempt contains more than one epoch-{epoch} archive: {}",
+                    attempt_dir.display()
+                ));
+            }
+        }
+        let attempt_candidate = attempt_candidate.ok_or_else(|| {
+            format!(
+                "staged attempt contains no epoch-{epoch} archive: {}",
+                attempt_dir.display()
+            )
+        })?;
+        if candidate.replace(attempt_candidate).is_some() {
+            return Err(format!(
+                "staged-only recovery found multiple attempt directories in {}",
+                work_dir.display()
+            ));
+        }
+    }
+    candidate.ok_or_else(|| {
+        format!(
+            "epoch {epoch}: no private staged archive candidate exists in {}; staged-only recovery will not start replay",
+            work_dir.display()
+        )
+    })
+}
+
+fn require_recovery_destination_namespace_absent(archive: &Path) -> Result<(), String> {
+    let manifest = jetstreamer_node::segment_manifest::segment_manifest_path(archive)
+        .map_err(|error| format!("failed to resolve archive manifest path: {error}"))?;
+    let checksum = jetstreamer_node::archive_checksum::archive_checksum_path(archive)
+        .map_err(|error| format!("failed to resolve archive checksum path: {error}"))?;
+    for (kind, path) in [
+        ("archive", archive.to_path_buf()),
+        ("segment manifest", manifest),
+        ("checksum", checksum),
+    ] {
+        match fs::symlink_metadata(&path) {
+            Ok(_) => {
+                return Err(format!(
+                    "staged-only recovery refuses to replace an existing destination {kind}: {}",
+                    path.display()
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "failed to inspect destination {kind} {}: {error}",
+                    path.display()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn recover_staged_epoch_archive_only(
+    epoch: u64,
+    destination: &BoundDestination,
+    allow_candidate_runtime: bool,
+    shutdown: Arc<AtomicBool>,
+) -> Result<(), String> {
+    destination.revalidate()?;
+    let final_output = destination.path().join(format!("epoch-{epoch}.jet"));
+    require_recovery_destination_namespace_absent(&final_output)?;
+
+    let (slot_start, slot_end_inclusive) = epoch_to_slot_range(epoch);
+    let spans = compatibility::plan_runtime_spans(
+        slot_start..slot_end_inclusive.saturating_add(1),
+        allow_candidate_runtime,
+    )?;
+    let selection = runtime_span_selection(
+        spans
+            .first()
+            .expect("runtime planner rejects an empty epoch range"),
+    )?;
+    let work_dir = private_epoch_scope(destination.path())?
+        .join("work")
+        .join(format!("epoch-{epoch}"));
+    let candidate = strict_staged_archive_candidate(&work_dir, epoch)?;
+    let staged_output = candidate.path.clone();
+    let attempt_dir = staged_output
+        .parent()
+        .expect("strict candidate has an attempt parent")
+        .to_path_buf();
+    jetstreamer_node::archive_publish::preflight_archive_publication(
+        &attempt_dir,
+        destination.path(),
+    )
+    .map_err(|error| format!("archive publication capability preflight failed: {error}"))?;
+
+    info!(
+        "epoch {epoch}: staged-only recovery is fully validating {} without replay",
+        staged_output.display()
+    );
+    let validation_path = staged_output.clone();
+    let destination_parent = destination.path().to_path_buf();
+    let validation_shutdown = shutdown.clone();
+    let admitted_file = candidate.file;
+    let admitted_identity = candidate.identity;
+    let validated = tokio::task::spawn_blocking(move || {
+        staged_epoch_archive_validated(
+            epoch,
+            &spans,
+            selection,
+            &validation_path,
+            &destination_parent,
+            &validation_shutdown,
+            Some((admitted_file, admitted_identity)),
+        )
+    })
+    .await
+    .map_err(|error| {
+        format!(
+            "epoch {epoch}: staged archive validation task failed: {error}; preserving {}",
+            staged_output.display()
+        )
+    })?
+    .map_err(|error| {
+        format!(
+            "epoch {epoch}: staged archive did not pass full validation: {error}; preserving {} and refusing replay",
+            staged_output.display()
+        )
+    })?;
+    if shutdown.load(Ordering::SeqCst) {
+        return Err(format!(
+            "epoch {epoch}: shutdown requested after validation; preserving {} without publication",
+            staged_output.display()
+        ));
+    }
+    destination.revalidate()?;
+    let publication =
+        jetstreamer_node::archive_publish::publish_verified_archive_if_absent(
+            &staged_output,
+            &final_output,
+            validated,
+        )
+        .map_err(|error| {
+            format!(
+                "epoch {epoch}: failed to transactionally publish staged archive (commit_state={:?}, recovery={:?}): {error}; refusing replay",
+                error.commit_state(),
+                error.recovery_directory(),
+            )
+        })?;
+    if let Some(recovery) = publication.recovery_directory {
+        warn!(
+            "epoch {epoch}: retained publication recovery artifacts in {}",
+            recovery.display()
+        );
+    }
+    info!(
+        "epoch {epoch}: staged-only recovery transactionally published verified archive {}; private control directories remain at {}",
+        final_output.display(),
+        work_dir.display(),
+    );
+    Ok(())
+}
+
+fn staged_epoch_archive_validated(
+    epoch: u64,
+    spans: &[compatibility::RuntimeSpan],
+    selection: compatibility::RuntimeSelection,
+    path: &Path,
+    destination_parent: &Path,
+    shutdown: &AtomicBool,
+    admitted: Option<(
+        fs::File,
+        jetstreamer_node::archive_checksum::ArchiveFileIdentity,
+    )>,
+) -> Result<jetstreamer_node::archive_checksum::ValidatedArchiveFile, AdaptiveValidationError> {
+    let file = match admitted {
+        Some((file, admitted_identity)) => {
+            let current = jetstreamer_node::archive_checksum::archive_file_identity(&file)
+                .map_err(|error| {
+                    AdaptiveValidationError::RetainStaging(format!(
+                        "failed to reidentify admitted staged epoch {epoch} archive: {error}"
+                    ))
+                })?;
+            if current != admitted_identity {
+                return Err(AdaptiveValidationError::RetainStaging(format!(
+                    "admitted staged epoch {epoch} archive changed before permission preparation"
+                )));
+            }
+            file
+        }
+        None => {
+            jetstreamer_node::archive_checksum::open_regular_nofollow(path).map_err(|error| {
+                AdaptiveValidationError::RetainStaging(format!(
+                    "failed to open staged epoch {epoch} archive: {error}"
+                ))
+            })?
+        }
+    };
+    let opened_identity = jetstreamer_node::archive_checksum::archive_file_identity(&file)
+        .map_err(|error| {
+            AdaptiveValidationError::RetainStaging(format!(
+                "failed to identify staged epoch {epoch} archive: {error}"
+            ))
+        })?;
+    if !jetstreamer_node::archive_checksum::path_matches_archive_identity(path, opened_identity)
+        .map_err(|error| {
+            AdaptiveValidationError::RetainStaging(format!(
+                "failed to bind staged epoch {epoch} archive path before permission preparation: {error}"
+            ))
+        })?
+    {
+        return Err(AdaptiveValidationError::RetainStaging(format!(
+            "staged epoch {epoch} archive path changed before permission preparation"
+        )));
+    }
+    jetstreamer_node::archive_checksum::prepare_archive_permissions(&file, destination_parent)
+        .map_err(|error| {
+            AdaptiveValidationError::RetainStaging(format!(
+                "failed to prepare staged epoch {epoch} permissions: {error}"
+            ))
+        })?;
+    file.sync_all().map_err(|error| {
+        AdaptiveValidationError::RetainStaging(format!(
+            "failed to sync staged epoch {epoch} archive: {error}"
+        ))
+    })?;
+    let prepared_identity = jetstreamer_node::archive_checksum::archive_file_identity(&file)
+        .map_err(|error| {
+            AdaptiveValidationError::RetainStaging(format!(
+                "failed to reidentify staged epoch {epoch} archive after permission preparation: {error}"
+            ))
+        })?;
+    if !jetstreamer_node::archive_checksum::path_matches_archive_identity(path, prepared_identity)
+        .map_err(|error| {
+            AdaptiveValidationError::RetainStaging(format!(
+                "failed to rebind staged epoch {epoch} archive path after permission preparation: {error}"
+            ))
+        })?
+    {
+        return Err(AdaptiveValidationError::RetainStaging(format!(
+            "staged epoch {epoch} archive path changed during permission preparation"
+        )));
+    }
+    let validated = if spans.len() == 1 {
+        validated_epoch_archive(path, epoch, selection, Some(shutdown), None)
+    } else {
+        validated_epoch_archive_multi_runtime(path, epoch, spans, Some(shutdown))
+    };
+    let validated = classify_adaptive_deep_validation(validated, epoch, path)?;
+    let current_identity = jetstreamer_node::archive_checksum::archive_file_identity(&file)
+        .map_err(|error| {
+            AdaptiveValidationError::RetainStaging(format!(
+                "failed to reidentify staged epoch {epoch} archive after validation: {error}"
+            ))
+        })?;
+    if validated.identity != prepared_identity
+        || current_identity != prepared_identity
+        || !jetstreamer_node::archive_checksum::path_matches_archive_identity(
+            path,
+            prepared_identity,
+        )
+        .map_err(|error| {
+            AdaptiveValidationError::RetainStaging(format!(
+                "failed to rebind staged epoch {epoch} archive path after validation: {error}"
+            ))
+        })?
+    {
+        return Err(AdaptiveValidationError::RetainStaging(format!(
+            "staged epoch {epoch} archive changed during validation"
+        )));
+    }
+    Ok(validated)
+}
+
 fn adaptive_epoch_archive_validated(
     job: &AdaptiveEpochJob,
     path: &Path,
     shutdown: &AtomicBool,
 ) -> Result<jetstreamer_node::archive_checksum::ValidatedArchiveFile, AdaptiveValidationError> {
-    let destination_parent = job.final_output.parent().unwrap_or_else(|| Path::new("."));
-    let file =
-        jetstreamer_node::archive_checksum::open_regular_nofollow(path).map_err(|error| {
-            AdaptiveValidationError::RetainStaging(format!(
-                "failed to open staged epoch {} archive: {error}",
-                job.epoch
-            ))
-        })?;
-    jetstreamer_node::archive_checksum::prepare_archive_permissions(&file, destination_parent)
-        .map_err(|error| {
-            AdaptiveValidationError::RetainStaging(format!(
-                "failed to prepare staged epoch {} permissions: {error}",
-                job.epoch
-            ))
-        })?;
-    file.sync_all().map_err(|error| {
-        AdaptiveValidationError::RetainStaging(format!(
-            "failed to sync staged epoch {} archive: {error}",
-            job.epoch
-        ))
-    })?;
-    drop(file);
-    let validated = if job.spans.len() == 1 {
-        validated_epoch_archive(path, job.epoch, job.selection, Some(shutdown), None)
-    } else {
-        validated_epoch_archive_multi_runtime(path, job.epoch, &job.spans, Some(shutdown))
-    };
-    classify_adaptive_deep_validation(validated, job.epoch, path)
+    staged_epoch_archive_validated(
+        job.epoch,
+        &job.spans,
+        job.selection,
+        path,
+        job.final_output.parent().unwrap_or_else(|| Path::new(".")),
+        shutdown,
+        None,
+    )
 }
 
 fn classify_adaptive_deep_validation<T>(
@@ -15223,6 +15649,7 @@ async fn main() {
     // Qualification requires a deliberate CLI opt-in, not merely the default
     // value inherited from the environment.
     let mut explicit_verify: Option<bool> = None;
+    let mut verify_option_count = 0usize;
     let mut horizon_output: Option<PathBuf> = None;
     let mut qualification_end_slot: Option<Slot> = None;
     // Internal flags set by the range supervisor when spawning per-epoch
@@ -15233,15 +15660,18 @@ async fn main() {
     let mut range_info: Option<(u64, u64)> = None;
     let mut replay_scratch: Option<PathBuf> = None;
     let mut root_checkpoint_cohort = false;
+    let mut recover_staged_only = false;
     let mut cohort_manifest: Option<PathBuf> = None;
     let mut cohort_manifest_fingerprint: Option<String> = None;
     for arg in args {
         if arg == "--verify" {
             verify_snapshots = true;
             explicit_verify = Some(true);
+            verify_option_count = verify_option_count.saturating_add(1);
         } else if arg == "--no-verify" {
             verify_snapshots = false;
             explicit_verify = Some(false);
+            verify_option_count = verify_option_count.saturating_add(1);
         } else if let Some(path) = arg.strip_prefix("--horizon-output=") {
             horizon_output = Some(PathBuf::from(path));
         } else if let Some(slot) = arg.strip_prefix("--qualification-end-slot=") {
@@ -15276,6 +15706,12 @@ async fn main() {
                 exit(2);
             }
             root_checkpoint_cohort = true;
+        } else if arg == "--recover-staged-only" {
+            if recover_staged_only {
+                eprintln!("duplicate --recover-staged-only option");
+                exit(2);
+            }
+            recover_staged_only = true;
         } else if let Some(path) = arg.strip_prefix("--cohort-manifest=") {
             if cohort_manifest.replace(PathBuf::from(path)).is_some() {
                 eprintln!("duplicate --cohort-manifest option");
@@ -15312,6 +15748,7 @@ async fn main() {
             }
         },
     };
+    let inherited_epoch_lease = inherited_epoch_lease_authorized();
 
     if horizon_output.is_some() && start_epoch != end_epoch {
         eprintln!(
@@ -15330,6 +15767,26 @@ async fn main() {
     }
     if replay_scratch.is_some() && start_epoch != end_epoch {
         eprintln!("--replay-scratch applies only to a single-epoch (child) invocation");
+        exit(2);
+    }
+    if let Err(error) = validate_staged_recovery_mode(
+        recover_staged_only,
+        start_epoch,
+        end_epoch,
+        explicit_verify,
+        verify_option_count,
+        inherited_epoch_lease,
+        root_checkpoint_cohort
+            || horizon_output.is_some()
+            || qualification_end_slot.is_some()
+            || epoch_hashes.is_some()
+            || snapshot_archive_override.is_some()
+            || range_info.is_some()
+            || replay_scratch.is_some()
+            || cohort_manifest.is_some()
+            || cohort_manifest_fingerprint.is_some(),
+    ) {
+        eprintln!("{error}");
         exit(2);
     }
     if qualification_end_slot.is_some() && range_info.is_some() {
@@ -15413,7 +15870,6 @@ async fn main() {
     // Top-level producers hold one advisory lease per output epoch from before
     // bootstrap/hash binding through final checksum publication. Internal
     // children are covered by their parent's still-open lease.
-    let inherited_epoch_lease = inherited_epoch_lease_authorized();
     let _epoch_leases = if !inherited_epoch_lease {
         match acquire_epoch_leases(&dest_dir, start_epoch, end_epoch) {
             Ok(leases) => {
@@ -15485,6 +15941,20 @@ async fn main() {
             exit(2);
         }
     };
+    if recover_staged_only {
+        if let Err(error) = recover_staged_epoch_archive_only(
+            start_epoch,
+            &destination_binding,
+            allow_candidate_runtime,
+            shutdown.clone(),
+        )
+        .await
+        {
+            eprintln!("error: {error}");
+            exit(1);
+        }
+        return;
+    }
     let cohort_runtime = if root_checkpoint_cohort {
         match root_checkpoint_cohort_runtime(start_epoch, end_epoch, allow_candidate_runtime) {
             Ok(selection) => Some(selection),
@@ -17874,6 +18344,161 @@ mod early_snapshot_tests {
     fn epoch_range_rejects_slot_arithmetic_overflow() {
         assert!(parse_epoch_range(&u64::MAX.to_string()).is_err());
         assert_eq!(parse_epoch_range("1-10").unwrap(), (1, 10));
+    }
+
+    #[test]
+    fn staged_recovery_requires_one_nonzero_explicitly_verified_epoch() {
+        assert!(validate_staged_recovery_mode(true, 11, 11, Some(true), 1, false, false).is_ok());
+        assert!(validate_staged_recovery_mode(false, 0, 10, None, 0, true, true).is_ok());
+
+        for (start, end) in [(0, 0), (11, 12)] {
+            let error =
+                validate_staged_recovery_mode(true, start, end, Some(true), 1, false, false)
+                    .unwrap_err();
+            assert!(error.contains("exactly one nonzero epoch"));
+        }
+        for (explicit_verify, count) in [(None, 0), (Some(false), 1), (Some(true), 2)] {
+            let error =
+                validate_staged_recovery_mode(true, 11, 11, explicit_verify, count, false, false)
+                    .unwrap_err();
+            assert!(error.contains("explicit --verify"));
+        }
+        let error =
+            validate_staged_recovery_mode(true, 11, 11, Some(true), 1, true, false).unwrap_err();
+        assert!(error.contains("top-level invocation"));
+        let error =
+            validate_staged_recovery_mode(true, 11, 11, Some(true), 1, false, true).unwrap_err();
+        assert!(error.contains("cannot be combined"));
+    }
+
+    fn make_private_test_directory(path: &Path) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        fs::create_dir(path).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    fn add_staged_test_candidate(work: &Path, attempt: &str, epoch: u64) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let attempt = work.join(attempt);
+        make_private_test_directory(&attempt);
+        let candidate = attempt.join(format!("epoch-{epoch}.jet"));
+        fs::write(&candidate, b"candidate").unwrap();
+        fs::set_permissions(&candidate, fs::Permissions::from_mode(0o664)).unwrap();
+        candidate
+    }
+
+    #[test]
+    fn staged_recovery_candidate_namespace_is_exact_and_unambiguous() {
+        let root = tempfile::TempDir::new().unwrap();
+        let work = root.path().join("epoch-11");
+        make_private_test_directory(&work);
+        make_private_test_directory(&work.join("inputs"));
+        let candidate = add_staged_test_candidate(&work, "attempt-import-a", 11);
+        make_private_test_directory(&candidate.parent().unwrap().join("scratch"));
+        assert_eq!(
+            strict_staged_archive_candidate(&work, 11).unwrap().path,
+            candidate
+        );
+
+        add_staged_test_candidate(&work, "attempt-import-b", 11);
+        let error = strict_staged_archive_candidate(&work, 11).unwrap_err();
+        assert!(error.contains("multiple attempt directories"), "{error}");
+    }
+
+    #[test]
+    fn staged_recovery_candidate_rejects_missing_or_unsafe_entries() {
+        use std::os::unix::{fs::PermissionsExt as _, fs::symlink};
+
+        let root = tempfile::TempDir::new().unwrap();
+        let empty = root.path().join("empty");
+        make_private_test_directory(&empty);
+        let error = strict_staged_archive_candidate(&empty, 11).unwrap_err();
+        assert!(error.contains("no private staged archive"), "{error}");
+
+        let unexpected = root.path().join("unexpected");
+        make_private_test_directory(&unexpected);
+        fs::write(unexpected.join("junk"), b"not admitted").unwrap();
+        let error = strict_staged_archive_candidate(&unexpected, 11).unwrap_err();
+        assert!(error.contains("unexpected entry"), "{error}");
+
+        let linked = root.path().join("linked");
+        make_private_test_directory(&linked);
+        let attempt = linked.join("attempt-import");
+        make_private_test_directory(&attempt);
+        let target = root.path().join("target.jet");
+        fs::write(&target, b"candidate").unwrap();
+        symlink(&target, attempt.join("epoch-11.jet")).unwrap();
+        let error = strict_staged_archive_candidate(&linked, 11).unwrap_err();
+        assert!(error.contains("failed to bind staged archive"), "{error}");
+
+        let executable = root.path().join("executable");
+        make_private_test_directory(&executable);
+        let candidate = add_staged_test_candidate(&executable, "attempt-import", 11);
+        fs::set_permissions(&candidate, fs::Permissions::from_mode(0o750)).unwrap();
+        let error = strict_staged_archive_candidate(&executable, 11).unwrap_err();
+        assert!(error.contains("executable or special"), "{error}");
+    }
+
+    #[test]
+    fn staged_recovery_never_mutates_a_path_replacement() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let root = tempfile::TempDir::new().unwrap();
+        let work = root.path().join("epoch-11");
+        make_private_test_directory(&work);
+        let path = add_staged_test_candidate(&work, "attempt-import", 11);
+        let admitted = strict_staged_archive_candidate(&work, 11).unwrap();
+        let displaced = root.path().join("displaced.jet");
+        fs::rename(&path, &displaced).unwrap();
+        let replacement = root.path().join("replacement.jet");
+        fs::write(&replacement, b"unrelated").unwrap();
+        fs::set_permissions(&replacement, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::hard_link(&replacement, &path).unwrap();
+        let before = fs::metadata(&replacement).unwrap();
+
+        let (start, end) = epoch_to_slot_range(11);
+        let spans = compatibility::plan_runtime_spans(start..end + 1, true).unwrap();
+        let selection = runtime_span_selection(&spans[0]).unwrap();
+        let shutdown = AtomicBool::new(false);
+        let error = staged_epoch_archive_validated(
+            11,
+            &spans,
+            selection,
+            &path,
+            root.path(),
+            &shutdown,
+            Some((admitted.file, admitted.identity)),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("changed before permission preparation"),
+            "{error}"
+        );
+        let after = fs::metadata(&replacement).unwrap();
+        assert_eq!(after.ino(), before.ino());
+        assert_eq!(after.permissions().mode(), before.permissions().mode());
+        assert_eq!(after.nlink(), before.nlink());
+    }
+
+    #[test]
+    fn staged_recovery_refuses_any_existing_public_namespace_component() {
+        let root = tempfile::TempDir::new().unwrap();
+        let archive = root.path().join("epoch-11.jet");
+        assert!(require_recovery_destination_namespace_absent(&archive).is_ok());
+        for path in [
+            archive.clone(),
+            jetstreamer_node::segment_manifest::segment_manifest_path(&archive).unwrap(),
+            jetstreamer_node::archive_checksum::archive_checksum_path(&archive).unwrap(),
+        ] {
+            fs::write(&path, b"occupied").unwrap();
+            let error = require_recovery_destination_namespace_absent(&archive).unwrap_err();
+            assert!(error.contains("refuses to replace"), "{error}");
+            fs::remove_file(path).unwrap();
+        }
     }
 
     fn qualification_snapshot(slot: Slot, hash: Hash) -> PathBuf {

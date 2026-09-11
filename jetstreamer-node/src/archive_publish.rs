@@ -729,6 +729,27 @@ pub fn publish_verified_archive(
     publish_verified_archive_with_hook(staged_archive, destination_archive, evidence, |_| Ok(()))
 }
 
+/// Publishes a validated staging archive only if its complete destination
+/// namespace is absent while holding the destination writer lock.
+///
+/// This is intended for explicit recovery imports, where replacing even a
+/// malformed pre-existing archive or sidecar would exceed the operator's
+/// request. The absence check covers the archive, segment manifest, and
+/// checksum in the same critical section as publication.
+pub fn publish_verified_archive_if_absent(
+    staged_archive: &Path,
+    destination_archive: &Path,
+    evidence: ValidatedArchiveFile,
+) -> Result<ArchivePublication, ArchivePublicationError> {
+    publish_impl(
+        staged_archive,
+        destination_archive,
+        evidence,
+        true,
+        &mut |_| Ok(()),
+    )
+}
+
 /// Publishes an ordered cohort as one recoverable transaction.
 ///
 /// `expected_epochs` must be a nonempty, strictly increasing list that exactly
@@ -796,6 +817,7 @@ where
             &item.staged_archive,
             &item.destination_archive,
             item.evidence,
+            false,
             &writer_lock,
         ) {
             Ok(transaction) => transactions.push(transaction),
@@ -1156,13 +1178,20 @@ fn publish_verified_archive_with_hook<F>(
 where
     F: FnMut(PublishPhase) -> Result<(), String>,
 {
-    publish_impl(staged_archive, destination_archive, evidence, &mut hook)
+    publish_impl(
+        staged_archive,
+        destination_archive,
+        evidence,
+        false,
+        &mut hook,
+    )
 }
 
 fn publish_impl(
     staged_archive: &Path,
     destination_archive: &Path,
     evidence: ValidatedArchiveFile,
+    destination_must_be_absent: bool,
     hook: &mut dyn FnMut(PublishPhase) -> Result<(), String>,
 ) -> Result<ArchivePublication, ArchivePublicationError> {
     let destination_parent = destination_archive
@@ -1179,6 +1208,7 @@ fn publish_impl(
         staged_archive,
         destination_archive,
         evidence,
+        destination_must_be_absent,
         &writer_lock,
     )?;
     if let Err(message) = transaction.run_precommit(hook) {
@@ -1191,6 +1221,7 @@ fn prepare_publication_transaction(
     staged_archive: &Path,
     destination_archive: &Path,
     evidence: ValidatedArchiveFile,
+    destination_must_be_absent: bool,
     writer_lock: &ArchiveDestinationWriterLock,
 ) -> Result<PublicationTransaction, ArchivePublicationError> {
     let source_parent_path = staged_archive.parent().unwrap_or_else(|| Path::new("."));
@@ -1349,6 +1380,14 @@ fn prepare_publication_transaction(
         manifest: initial_manifest.as_ref().map(|bound| bound.identity),
         checksum: initial_checksum.as_ref().map(|bound| bound.identity),
     };
+    if destination_must_be_absent
+        && (initial.archive.is_some() || initial.manifest.is_some() || initial.checksum.is_some())
+    {
+        return Err(preflight_error(format!(
+            "destination namespace for {} is not empty; refusing recovery replacement",
+            destination_archive.display()
+        )));
+    }
     for (kind, bound) in [
         (ComponentKind::Archive, initial_archive.as_ref()),
         (ComponentKind::Manifest, initial_manifest.as_ref()),
@@ -5973,6 +6012,83 @@ mod tests {
             publish_verified_archive_batch(BATCH_MANIFEST_FINGERPRINT, &expected_epochs, &items)
                 .unwrap();
         acknowledge_archive_publication_batch(destination, publication.transaction_id).unwrap();
+    }
+
+    #[test]
+    fn recovery_publication_requires_an_empty_destination_namespace() {
+        let (_root, archive, destination, evidence) = fixture();
+        publish_verified_archive_if_absent(&archive, &destination, evidence).unwrap();
+        assert!(!archive.exists());
+        assert_eq!(fs::read(&destination).unwrap(), b"new archive");
+
+        for component in ["archive", "manifest", "checksum"] {
+            let (_root, archive, destination, evidence) = fixture();
+            let occupied = match component {
+                "archive" => destination.clone(),
+                "manifest" => segment_manifest_path(&destination).unwrap(),
+                "checksum" => archive_checksum_path(&destination).unwrap(),
+                _ => unreachable!(),
+            };
+            fs::write(&occupied, format!("occupied {component}")).unwrap();
+            fs::set_permissions(&occupied, fs::Permissions::from_mode(FINAL_FILE_MODE)).unwrap();
+
+            let error =
+                publish_verified_archive_if_absent(&archive, &destination, evidence).unwrap_err();
+            assert_eq!(
+                error.commit_state(),
+                ArchivePublicationCommitState::NotCommitted
+            );
+            assert!(
+                error.to_string().contains("destination namespace")
+                    && error.to_string().contains("refusing recovery replacement"),
+                "{error}"
+            );
+            assert!(archive.exists());
+            assert_eq!(
+                fs::read(&occupied).unwrap(),
+                format!("occupied {component}").as_bytes()
+            );
+            assert!(recovery_directories(destination.parent().unwrap()).is_empty());
+        }
+    }
+
+    #[test]
+    fn recovery_publication_rejects_a_late_destination_insertion() {
+        let (_root, archive, destination, evidence) = fixture();
+        let raced_destination = destination.clone();
+        let mut inserted = false;
+        let error = publish_impl(&archive, &destination, evidence, true, &mut |phase| {
+            if phase == PublishPhase::BeforeChecksumInvalidation {
+                fs::write(&raced_destination, b"racing archive")
+                    .map_err(|error| error.to_string())?;
+                fs::set_permissions(
+                    &raced_destination,
+                    fs::Permissions::from_mode(FINAL_FILE_MODE),
+                )
+                .map_err(|error| error.to_string())?;
+                inserted = true;
+            }
+            Ok(())
+        })
+        .unwrap_err();
+
+        assert!(inserted);
+        assert_eq!(
+            error.commit_state(),
+            ArchivePublicationCommitState::NotCommitted
+        );
+        assert!(archive.exists());
+        assert_eq!(fs::read(&destination).unwrap(), b"racing archive");
+        let checksum = archive_checksum_path(&destination).unwrap();
+        assert_eq!(fs::read(&checksum).unwrap(), ARCHIVE_PUBLICATION_SENTINEL);
+        let recovery = error
+            .recovery_directory()
+            .expect("an incomplete rollback retains recovery state");
+        assert!(recovery.is_dir());
+        assert_eq!(
+            recovery_directories(destination.parent().unwrap()),
+            vec![recovery.to_path_buf()]
+        );
     }
 
     #[test]

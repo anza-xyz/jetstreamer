@@ -4947,10 +4947,10 @@ fn usage(program: &str) -> String {
          --epoch-hashes=PATH, --snapshot-archive=PATH, --range-info=A-B, and\n\
          --replay-scratch=PATH are\n\
          otherwise internal flags passed by the range supervisor to its children.\n\
-         --root-checkpoint-cohort runs a multi-epoch range from one predecessor\n\
-         root snapshot through a root checkpoint in the final epoch. It requires\n\
+         --root-checkpoint-cohort runs a manifest-defined nonzero epoch cohort from one\n\
+         predecessor root snapshot through a root checkpoint in the final epoch. It requires\n\
          explicit --verify, a sealed preflight manifest and its audited fingerprint,\n\
-         one unchanged historical runtime, and in-memory state handoff.\n\
+         one unchanged historical runtime; ranges use in-memory state handoff.\n\
          Every archive remains in owner-only staging until the complete cohort\n\
          and every staged archive pass validation."
     )
@@ -5211,15 +5211,16 @@ fn epoch_isolation_plan(
 }
 
 /// Proves that an epoch range can be replayed as one uninterrupted
-/// root-checkpoint cohort. Every member must use the same runtime descriptor
-/// and that descriptor must explicitly permit a live state handoff.
+/// root-checkpoint cohort. Every member must use the same runtime descriptor.
+/// Multi-epoch cohorts additionally require that descriptor's live state
+/// handoff support.
 fn root_checkpoint_cohort_runtime(
     start_epoch: u64,
     end_epoch: u64,
     allow_candidate_runtime: bool,
 ) -> Result<compatibility::RuntimeSelection, String> {
-    if start_epoch == 0 || start_epoch >= end_epoch {
-        return Err("a root-checkpoint cohort requires at least two nonzero epochs".to_string());
+    if start_epoch == 0 || start_epoch > end_epoch {
+        return Err("a root-checkpoint cohort requires one or more nonzero epochs".to_string());
     }
     let mut cohort_selection: Option<compatibility::RuntimeSelection> = None;
     for epoch in start_epoch..=end_epoch {
@@ -5252,7 +5253,7 @@ fn root_checkpoint_cohort_runtime(
                 first.backend, selection.backend
             ));
         }
-        if !selection.descriptor.permits_live_epoch_handoff() {
+        if start_epoch < end_epoch && !selection.descriptor.permits_live_epoch_handoff() {
             return Err(format!(
                 "runtime profile {} does not permit the live state handoff required by a root-checkpoint cohort",
                 selection.descriptor.identity.name
@@ -15336,10 +15337,6 @@ async fn main() {
         exit(2);
     }
     if root_checkpoint_cohort {
-        if start_epoch == end_epoch {
-            eprintln!("--root-checkpoint-cohort requires a multi-epoch range");
-            exit(2);
-        }
         if explicit_verify != Some(true) {
             eprintln!("--root-checkpoint-cohort requires explicit --verify");
             exit(2);
@@ -16911,6 +16908,14 @@ mod early_snapshot_tests {
             error.contains("isolated historical Solana worker"),
             "{error}"
         );
+
+        let singleton = root_checkpoint_cohort_runtime(20, 20, true).unwrap();
+        assert_eq!(
+            singleton.backend,
+            compatibility::RuntimeBackend::SolanaV1_0_23
+        );
+        let error = root_checkpoint_cohort_runtime(0, 0, true).unwrap_err();
+        assert!(error.contains("one or more nonzero epochs"), "{error}");
     }
 
     fn cohort_manifest_object(
@@ -16997,6 +17002,55 @@ mod early_snapshot_tests {
     }
 
     #[test]
+    fn sealed_manifest_supports_a_single_epoch_root_cohort() {
+        let bytes = b"audited singleton generation";
+        let bootstrap_hash = Hash::new_from_array([0x33; 32]);
+        let final_hash = Hash::new_from_array([0x44; 32]);
+        let manifest = serde_json::json!({
+            "bucket": DEFAULT_BUCKET,
+            "epoch_slots": 432_000,
+            "first_epoch": 1,
+            "last_epoch": 100,
+            "schema": COHORT_MANIFEST_SCHEMA,
+            "verification_cohorts": [{
+                "accepted_extensions": [".tar.bz2"],
+                "bootstrap": cohort_manifest_object(
+                    8_639_740,
+                    bootstrap_hash,
+                    201,
+                    bytes,
+                ),
+                "first_epoch": 20,
+                "last_epoch": 20,
+                "publication_gate": COHORT_PUBLICATION_GATE,
+                "root_checkpoints": [cohort_manifest_object(
+                    8_900_000,
+                    final_hash,
+                    202,
+                    b"singleton checkpoint metadata is not downloaded",
+                )],
+                "runtime": "solana-v1.0.23",
+            }]
+        });
+        let fingerprint = cohort_manifest_fingerprint(&manifest).unwrap();
+        let report = serde_json::json!({
+            "manifest": manifest,
+            "manifest_fingerprint": fingerprint,
+        });
+        let plan = root_checkpoint_cohort_plan_from_report(
+            report,
+            &fingerprint,
+            20,
+            20,
+            root_checkpoint_cohort_runtime(20, 20, true).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(plan.bootstrap.slot, 8_639_740);
+        assert_eq!(plan.root_checkpoints.len(), 1);
+        assert_eq!(plan.root_checkpoints[0].slot, 8_900_000);
+    }
+
+    #[test]
     fn cohort_manifest_fingerprint_matches_python_canonical_json() {
         let manifest = serde_json::json!({
             "z": [3, true, null],
@@ -17062,6 +17116,7 @@ mod early_snapshot_tests {
 
     #[test]
     fn root_cohort_publication_requires_exact_ordered_epoch_membership() {
+        assert!(validate_root_cohort_epoch_membership(&[20], &[20]).is_ok());
         assert!(validate_root_cohort_epoch_membership(&[17, 18, 19], &[17, 18, 19]).is_ok());
         for actual in [&[17, 19][..], &[17, 19, 18], &[17, 18, 19, 19]] {
             let error = validate_root_cohort_epoch_membership(actual, &[17, 18, 19]).unwrap_err();

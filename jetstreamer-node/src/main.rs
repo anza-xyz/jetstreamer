@@ -64,7 +64,7 @@ use jetstreamer_node::segment_manifest::{
     SegmentRuntimeIdentity, read_and_validate_segment_manifest, write_segment_manifest,
 };
 use jetstreamer_node::snapshots::{
-    DEFAULT_BUCKET, download_exact_snapshot_generation,
+    DEFAULT_BUCKET, download_exact_snapshot_uri_generation,
     download_snapshot_at_or_before_slot_matching, list_snapshots_in_slot_range_matching,
 };
 use log::{error, info, warn};
@@ -5107,7 +5107,7 @@ fn usage(program: &str) -> String {
          --replay-scratch=PATH are\n\
          otherwise internal flags passed by the range supervisor to its children.\n\
          --root-checkpoint-cohort runs a manifest-defined nonzero epoch cohort from one\n\
-         predecessor root snapshot through a root checkpoint in the final epoch. It requires\n\
+         predecessor snapshot through a root checkpoint in the final epoch. It requires\n\
          explicit --verify, a sealed preflight manifest and its audited fingerprint,\n\
          one unchanged historical runtime; ranges use in-memory state handoff.\n\
          Every archive remains in owner-only staging until the complete cohort\n\
@@ -5673,25 +5673,13 @@ fn manifest_fingerprint_digest(value: &str) -> Result<[u8; 32], String> {
 
 fn validate_cohort_manifest_snapshot(
     item: &CohortManifestSnapshot,
-    required_source: &str,
+    role: CohortManifestSnapshotRole,
     accepted_extensions: &[&str],
 ) -> Result<(String, Hash), String> {
-    if item.source != required_source {
-        return Err(format!(
-            "cohort manifest object {} has source {}, expected {required_source}",
-            item.versioned_uri, item.source
-        ));
-    }
     if item.size == 0 || item.generation == 0 {
         return Err(format!(
             "cohort manifest object {} has an empty size or generation",
             item.versioned_uri
-        ));
-    }
-    if item.anchor_slot != item.slot {
-        return Err(format!(
-            "root checkpoint {} has anchor slot {}, expected {}",
-            item.versioned_uri, item.anchor_slot, item.slot
         ));
     }
     if !accepted_extensions
@@ -5704,7 +5692,43 @@ fn validate_cohort_manifest_snapshot(
         ));
     }
     let filename = snapshot_filename(&item.uri)?.to_owned();
-    let expected_uri = format!("{DEFAULT_BUCKET}/{}/{}", item.anchor_slot, filename);
+    let expected_uri = match item.source.as_str() {
+        "root" => {
+            if item.anchor_slot != item.slot {
+                return Err(format!(
+                    "root snapshot {} has anchor slot {}, expected {}",
+                    item.versioned_uri, item.anchor_slot, item.slot
+                ));
+            }
+            format!("{DEFAULT_BUCKET}/{}/{}", item.anchor_slot, filename)
+        }
+        "hourly"
+            if matches!(
+                role,
+                CohortManifestSnapshotRole::Bootstrap { allow_hourly: true }
+            ) =>
+        {
+            if item.anchor_slot > item.slot {
+                return Err(format!(
+                    "hourly snapshot {} has anchor slot {} after snapshot slot {}",
+                    item.versioned_uri, item.anchor_slot, item.slot
+                ));
+            }
+            format!("{DEFAULT_BUCKET}/{}/hourly/{}", item.anchor_slot, filename)
+        }
+        "hourly" => {
+            return Err(format!(
+                "cohort manifest object {} cannot use an hourly snapshot for this role",
+                item.versioned_uri
+            ));
+        }
+        source => {
+            return Err(format!(
+                "cohort manifest object {} has unsupported source {source}",
+                item.versioned_uri
+            ));
+        }
+    };
     if item.uri != expected_uri || item.versioned_uri != format!("{}#{}", item.uri, item.generation)
     {
         return Err(format!(
@@ -5719,7 +5743,11 @@ fn validate_cohort_manifest_snapshot(
             item.versioned_uri
         )
     })?;
-    if filename_slot != item.slot || filename_hash.0 != accounts_hash {
+    let expected_filename = format!("snapshot-{}-{}{}", item.slot, accounts_hash, item.extension);
+    if filename != expected_filename
+        || filename_slot != item.slot
+        || filename_hash.0 != accounts_hash
+    {
         return Err(format!(
             "cohort manifest object {} disagrees with its snapshot filename",
             item.versioned_uri
@@ -5738,6 +5766,12 @@ fn validate_cohort_manifest_snapshot(
         ));
     }
     Ok((filename, accounts_hash))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CohortManifestSnapshotRole {
+    Bootstrap { allow_hourly: bool },
+    RootCheckpoint,
 }
 
 fn root_checkpoint_cohort_plan_from_report(
@@ -5837,7 +5871,9 @@ fn root_checkpoint_cohort_plan_from_report(
     }
     let (_, bootstrap_hash) = validate_cohort_manifest_snapshot(
         &entry.bootstrap,
-        "root",
+        CohortManifestSnapshotRole::Bootstrap {
+            allow_hourly: start_epoch == end_epoch,
+        },
         selection.descriptor.bootstrap.archive_extensions,
     )?;
     let bounds = normal_epoch_bootstrap_bounds(start_epoch)?;
@@ -5857,7 +5893,7 @@ fn root_checkpoint_cohort_plan_from_report(
     for checkpoint in &entry.root_checkpoints {
         validate_cohort_manifest_snapshot(
             checkpoint,
-            "root",
+            CohortManifestSnapshotRole::RootCheckpoint,
             selection.descriptor.bootstrap.archive_extensions,
         )?;
         if checkpoint.slot <= previous_slot || checkpoint.slot > cohort_end {
@@ -17078,9 +17114,9 @@ async fn main() {
             eprintln!("error: {err}");
             exit(1);
         }
-        let snapshot_path = match download_exact_snapshot_generation(
+        let snapshot_path = match download_exact_snapshot_uri_generation(
             root_slot,
-            &name,
+            &plan.bootstrap.uri,
             plan.bootstrap.generation,
             &input_dir,
         )
@@ -17089,7 +17125,7 @@ async fn main() {
             Ok(path) => path,
             Err(err) => {
                 eprintln!(
-                    "error: failed to download audited predecessor root generation {}: {err}",
+                    "error: failed to download audited predecessor snapshot generation {}: {err}",
                     plan.bootstrap.generation
                 );
                 exit(1);
@@ -17111,7 +17147,7 @@ async fn main() {
             exit(1);
         }
         info!(
-            "root-checkpoint cohort {}-{} bound predecessor root {} generation {} at slot {}",
+            "root-checkpoint cohort {}-{} bound predecessor snapshot {} generation {} at slot {}",
             effective_start, end_epoch, name, plan.bootstrap.generation, root_slot
         );
         cohort_bootstrap_binding = Some(binding);
@@ -18151,6 +18187,30 @@ mod early_snapshot_tests {
         })
     }
 
+    fn cohort_manifest_hourly_object(
+        anchor_slot: Slot,
+        slot: Slot,
+        hash: Hash,
+        generation: u64,
+        bytes: &[u8],
+    ) -> serde_json::Value {
+        let name = format!("snapshot-{slot}-{hash}.tar.bz2");
+        let uri = format!("{DEFAULT_BUCKET}/{anchor_slot}/hourly/{name}");
+        let crc = Crc::<u32>::new(&CRC_32_ISCSI).checksum(bytes);
+        serde_json::json!({
+            "accounts_hash": hash.to_string(),
+            "anchor_slot": anchor_slot,
+            "crc32c": BASE64_STANDARD.encode(crc.to_be_bytes()),
+            "extension": ".tar.bz2",
+            "generation": generation,
+            "size": bytes.len(),
+            "slot": slot,
+            "source": "hourly",
+            "uri": uri,
+            "versioned_uri": format!("{uri}#{generation}")
+        })
+    }
+
     fn cohort_manifest_report(bytes: &[u8]) -> (serde_json::Value, String) {
         let bootstrap_hash = Hash::new_from_array([0x11; 32]);
         let final_hash = Hash::new_from_array([0x22; 32]);
@@ -18408,6 +18468,222 @@ mod early_snapshot_tests {
         assert_eq!(plan.bootstrap.slot, 8_639_740);
         assert_eq!(plan.root_checkpoints.len(), 1);
         assert_eq!(plan.root_checkpoints[0].slot, 8_900_000);
+    }
+
+    #[test]
+    fn sealed_manifest_supports_a_single_epoch_hourly_bootstrap() {
+        let bytes = b"audited hourly transport bootstrap";
+        let bootstrap_hash = Hash::new_from_array([0x35; 32]);
+        let final_hash = Hash::new_from_array([0x45; 32]);
+        let selection = root_checkpoint_cohort_runtime(44, 44, true).unwrap();
+        let bootstrap =
+            cohort_manifest_hourly_object(18_576_059, 19_006_848, bootstrap_hash, 301, bytes);
+        let expected_uri = bootstrap["uri"].as_str().unwrap().to_owned();
+        let manifest = serde_json::json!({
+            "bucket": DEFAULT_BUCKET,
+            "epoch_slots": 432_000,
+            "first_epoch": 1,
+            "last_epoch": 100,
+            "schema": COHORT_MANIFEST_SCHEMA,
+            "verification_cohorts": [{
+                "accepted_extensions": [".tar.bz2"],
+                "bootstrap": bootstrap,
+                "first_epoch": 44,
+                "last_epoch": 44,
+                "publication_gate": COHORT_PUBLICATION_GATE,
+                "root_checkpoints": [cohort_manifest_object(
+                    19_439_986,
+                    final_hash,
+                    302,
+                    b"root checkpoint metadata is not downloaded",
+                )],
+                "runtime": selection.descriptor.identity.name,
+            }]
+        });
+        let fingerprint = cohort_manifest_fingerprint(&manifest).unwrap();
+        let report = serde_json::json!({
+            "manifest": manifest,
+            "manifest_fingerprint": fingerprint,
+        });
+        let plan = root_checkpoint_cohort_plan_from_report(report, &fingerprint, 44, 44, selection)
+            .unwrap();
+        assert_eq!(plan.bootstrap.source, "hourly");
+        assert_eq!(plan.bootstrap.anchor_slot, 18_576_059);
+        assert_eq!(plan.bootstrap.slot, 19_006_848);
+        assert_eq!(plan.bootstrap.uri, expected_uri);
+    }
+
+    #[test]
+    fn sealed_manifest_accepts_every_audited_hourly_bootstrap_shape() {
+        let cases = [
+            (
+                7,
+                2_908_740,
+                3_022_222,
+                "Ey5U4bGoxu6m7KhtEbJ2GMcrHPGg9DGKa7Sqrth5wpiS",
+                3_455_940,
+            ),
+            (
+                44,
+                18_576_059,
+                19_006_848,
+                "9MTB6Up7Ehwbx6y9KmcMekLgYc8yXPscGKfmGdzXq6Bq",
+                19_439_986,
+            ),
+            (
+                52,
+                22_032_005,
+                22_463_321,
+                "3awg8rr3oXzPRBGQQcP8FXizXdBmLNtvYVbnBoJGqiiy",
+                22_895_924,
+            ),
+            (
+                69,
+                29_460_107,
+                29_803_619,
+                "GiyX7g2pZu2dDeqmJRLgtZpBHAFkqxE3T8JFZW5RecZA",
+                30_239_887,
+            ),
+        ];
+        for (epoch, anchor_slot, slot, hash, final_slot) in cases {
+            let selection = root_checkpoint_cohort_runtime(epoch, epoch, true).unwrap();
+            let bootstrap = cohort_manifest_hourly_object(
+                anchor_slot,
+                slot,
+                hash.parse().unwrap(),
+                401 + epoch,
+                b"audited hourly transport object",
+            );
+            let expected_uri = bootstrap["uri"].as_str().unwrap().to_owned();
+            let manifest = serde_json::json!({
+                "bucket": DEFAULT_BUCKET,
+                "epoch_slots": 432_000,
+                "first_epoch": 1,
+                "last_epoch": 100,
+                "schema": COHORT_MANIFEST_SCHEMA,
+                "verification_cohorts": [{
+                    "accepted_extensions": selection.descriptor.bootstrap.archive_extensions,
+                    "bootstrap": bootstrap,
+                    "first_epoch": epoch,
+                    "last_epoch": epoch,
+                    "publication_gate": COHORT_PUBLICATION_GATE,
+                    "root_checkpoints": [cohort_manifest_object(
+                        final_slot,
+                        Hash::new_from_array([epoch as u8; 32]),
+                        501 + epoch,
+                        b"root checkpoint metadata",
+                    )],
+                    "runtime": selection.descriptor.identity.name,
+                }]
+            });
+            let fingerprint = cohort_manifest_fingerprint(&manifest).unwrap();
+            let report = serde_json::json!({
+                "manifest": manifest,
+                "manifest_fingerprint": fingerprint,
+            });
+            let plan = root_checkpoint_cohort_plan_from_report(
+                report,
+                &fingerprint,
+                epoch,
+                epoch,
+                selection,
+            )
+            .unwrap();
+            assert_eq!(plan.bootstrap.uri, expected_uri);
+        }
+    }
+
+    #[test]
+    fn hourly_bootstraps_are_rejected_for_multi_epoch_cohorts() {
+        let bytes = b"audited hourly transport bootstrap";
+        let bootstrap_hash = Hash::new_from_array([0x36; 32]);
+        let (mut report, _) = cohort_manifest_report(bytes);
+        report["manifest"]["verification_cohorts"][0]["bootstrap"] =
+            cohort_manifest_hourly_object(7_000_000, 7_343_776, bootstrap_hash, 303, bytes);
+        let fingerprint = cohort_manifest_fingerprint(&report["manifest"]).unwrap();
+        report["manifest_fingerprint"] = serde_json::json!(fingerprint);
+        let error = root_checkpoint_cohort_plan_from_report(
+            report,
+            &fingerprint,
+            17,
+            19,
+            root_checkpoint_cohort_runtime(17, 19, true).unwrap(),
+        )
+        .unwrap_err();
+        assert!(error.contains("cannot use an hourly snapshot"), "{error}");
+    }
+
+    #[test]
+    fn cohort_manifest_hourly_locations_fail_closed() {
+        let hash = Hash::new_from_array([0x37; 32]);
+        let value = cohort_manifest_hourly_object(
+            18_576_059,
+            19_006_848,
+            hash,
+            304,
+            b"audited hourly transport bootstrap",
+        );
+        let item: CohortManifestSnapshot = serde_json::from_value(value.clone()).unwrap();
+        validate_cohort_manifest_snapshot(
+            &item,
+            CohortManifestSnapshotRole::Bootstrap { allow_hourly: true },
+            &[".tar.bz2"],
+        )
+        .unwrap();
+
+        for role in [
+            CohortManifestSnapshotRole::Bootstrap {
+                allow_hourly: false,
+            },
+            CohortManifestSnapshotRole::RootCheckpoint,
+        ] {
+            let error = validate_cohort_manifest_snapshot(&item, role, &[".tar.bz2"]).unwrap_err();
+            assert!(error.contains("cannot use an hourly snapshot"), "{error}");
+        }
+
+        let mut bad_anchor = value.clone();
+        bad_anchor["anchor_slot"] = serde_json::json!(19_006_849);
+        let item: CohortManifestSnapshot = serde_json::from_value(bad_anchor).unwrap();
+        let error = validate_cohort_manifest_snapshot(
+            &item,
+            CohortManifestSnapshotRole::Bootstrap { allow_hourly: true },
+            &[".tar.bz2"],
+        )
+        .unwrap_err();
+        assert!(error.contains("after snapshot slot"), "{error}");
+
+        let mut unknown_source = value.clone();
+        unknown_source["source"] = serde_json::json!("mirror");
+        let item: CohortManifestSnapshot = serde_json::from_value(unknown_source).unwrap();
+        let error = validate_cohort_manifest_snapshot(
+            &item,
+            CohortManifestSnapshotRole::Bootstrap { allow_hourly: true },
+            &[".tar.bz2"],
+        )
+        .unwrap_err();
+        assert!(error.contains("unsupported source mirror"), "{error}");
+
+        let mut mismatched_extension = value.clone();
+        mismatched_extension["extension"] = serde_json::json!(".tar.zst");
+        let item: CohortManifestSnapshot = serde_json::from_value(mismatched_extension).unwrap();
+        let error = validate_cohort_manifest_snapshot(
+            &item,
+            CohortManifestSnapshotRole::Bootstrap { allow_hourly: true },
+            &[".tar.bz2", ".tar.zst"],
+        )
+        .unwrap_err();
+        assert!(error.contains("snapshot filename"), "{error}");
+
+        let mut root_with_hourly_anchor = value;
+        root_with_hourly_anchor["source"] = serde_json::json!("root");
+        let item: CohortManifestSnapshot = serde_json::from_value(root_with_hourly_anchor).unwrap();
+        let error = validate_cohort_manifest_snapshot(
+            &item,
+            CohortManifestSnapshotRole::Bootstrap { allow_hourly: true },
+            &[".tar.bz2"],
+        )
+        .unwrap_err();
+        assert!(error.contains("root snapshot"), "{error}");
     }
 
     #[test]

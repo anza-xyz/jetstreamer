@@ -378,10 +378,35 @@ pub async fn download_exact_snapshot_generation(
     generation: u64,
     dest_dir: impl AsRef<Path>,
 ) -> Result<PathBuf, SnapshotError> {
-    if generation == 0 {
-        return Err(SnapshotError::InvalidExactSnapshotGeneration { generation });
-    }
-    download_exact_snapshot_inner(slot, archive_name, Some(generation), dest_dir).await
+    validate_exact_snapshot_identity(slot, archive_name)?;
+    let uri = exact_snapshot_uri(slot, archive_name, None);
+    download_exact_snapshot_uri_generation(slot, &uri, generation, dest_dir).await
+}
+
+/// Downloads one exact object generation from a fingerprint-bound snapshot URI.
+///
+/// The URI must name an object in [`DEFAULT_BUCKET`] using either the canonical
+/// root form (`<slot>/<name>`) or hourly form
+/// (`<anchor>/hourly/<name>`). Root anchors must equal the snapshot slot;
+/// hourly anchors may precede it. The URI is revalidated here rather than
+/// relying on the caller's manifest validation.
+pub async fn download_exact_snapshot_uri_generation(
+    snapshot_slot: u64,
+    snapshot_uri: &str,
+    generation: u64,
+    dest_dir: impl AsRef<Path>,
+) -> Result<PathBuf, SnapshotError> {
+    download_exact_snapshot_uri_generation_with(
+        snapshot_slot,
+        snapshot_uri,
+        generation,
+        dest_dir,
+        |uri, temporary| async move {
+            let temporary_arg = temporary.to_string_lossy().into_owned();
+            gcloud_status(&["storage", "cp", &uri, &temporary_arg]).await
+        },
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -396,13 +421,29 @@ where
     F: FnOnce(String, PathBuf) -> Fut,
     Fut: std::future::Future<Output = Result<(), SnapshotError>>,
 {
+    validate_exact_snapshot_identity(slot, archive_name)?;
+    let uri = exact_snapshot_uri(slot, archive_name, None);
+    download_exact_snapshot_uri_generation_with(slot, &uri, generation, dest_dir, copy).await
+}
+
+async fn download_exact_snapshot_uri_generation_with<F, Fut>(
+    snapshot_slot: u64,
+    snapshot_uri: &str,
+    generation: u64,
+    dest_dir: impl AsRef<Path>,
+    copy: F,
+) -> Result<PathBuf, SnapshotError>
+where
+    F: FnOnce(String, PathBuf) -> Fut,
+    Fut: std::future::Future<Output = Result<(), SnapshotError>>,
+{
     if generation == 0 {
         return Err(SnapshotError::InvalidExactSnapshotGeneration { generation });
     }
-    validate_exact_snapshot_identity(slot, archive_name)?;
+    let archive_name = validate_exact_snapshot_uri(snapshot_slot, snapshot_uri)?;
     let dest_dir = prepare_snapshot_destination(dest_dir.as_ref()).await?;
     download_snapshot_uri_to_dir_with(
-        exact_snapshot_uri(slot, archive_name, Some(generation)),
+        format!("{snapshot_uri}#{generation}"),
         archive_name,
         dest_dir,
         false,
@@ -453,6 +494,28 @@ fn validate_exact_snapshot_identity(slot: u64, archive_name: &str) -> Result<(),
         });
     }
     Ok(())
+}
+
+fn validate_exact_snapshot_uri(
+    snapshot_slot: u64,
+    snapshot_uri: &str,
+) -> Result<&str, SnapshotError> {
+    let object = parse_snapshot_object_uri(DEFAULT_BUCKET, snapshot_uri)?;
+    if !snapshot_name_is_bound_to_slot(object.name, snapshot_slot, ALL_SNAPSHOT_ARCHIVE_EXTENSIONS)
+    {
+        return Err(SnapshotError::InvalidExactSnapshotIdentity {
+            slot: snapshot_slot,
+            name: object.name.to_owned(),
+        });
+    }
+    let location_is_valid = match object.location {
+        SnapshotObjectLocation::Root => object.anchor_slot == snapshot_slot,
+        SnapshotObjectLocation::Hourly => object.anchor_slot <= snapshot_slot,
+    };
+    if !location_is_valid {
+        return Err(invalid_snapshot_object_uri(snapshot_uri));
+    }
+    Ok(object.name)
 }
 
 async fn prepare_snapshot_destination(dest_dir: &Path) -> Result<&Path, SnapshotError> {
@@ -1454,6 +1517,74 @@ mod tests {
             std::fs::read(downloaded).unwrap(),
             b"generation-pinned bytes"
         );
+    }
+
+    #[tokio::test]
+    async fn generation_pinned_hourly_download_preserves_the_exact_audited_path() {
+        let name = format!("snapshot-619848-{HASH_A}.tar.bz2");
+        let uri = format!("{DEFAULT_BUCKET}/600001/hourly/{name}");
+        let directory = tempfile::tempdir().unwrap();
+        let issued = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let captured = issued.clone();
+        let downloaded = download_exact_snapshot_uri_generation_with(
+            619_848,
+            &uri,
+            1_634_787_417_768_812,
+            directory.path(),
+            move |uri, path| async move {
+                *captured.lock().unwrap() = Some(uri);
+                std::fs::write(path, b"hourly generation-pinned bytes")?;
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            issued.lock().unwrap().as_deref(),
+            Some(format!("{uri}#1634787417768812").as_str())
+        );
+        assert_eq!(
+            std::fs::read(downloaded).unwrap(),
+            b"hourly generation-pinned bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn generation_pinned_uri_rejects_noncanonical_locations_before_io() {
+        let name = format!("snapshot-619848-{HASH_A}.tar.bz2");
+        let wrong_slot_name = format!("snapshot-619847-{HASH_A}.tar.bz2");
+        let uris = [
+            format!("gs://other-bucket/619848/{name}"),
+            format!("{DEFAULT_BUCKET}/619847/{name}"),
+            format!("{DEFAULT_BUCKET}/619849/hourly/{name}"),
+            format!("{DEFAULT_BUCKET}/600001/hourly/../{name}"),
+            format!("{DEFAULT_BUCKET}/600001/hourly/{wrong_slot_name}"),
+            format!("{DEFAULT_BUCKET}/600001/hourly/{name}?replacement=true"),
+        ];
+        for uri in uris {
+            let directory = tempfile::tempdir().unwrap();
+            let called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let observed = called.clone();
+            let result = download_exact_snapshot_uri_generation_with(
+                619_848,
+                &uri,
+                123,
+                directory.path(),
+                move |_, _| async move {
+                    observed.store(true, std::sync::atomic::Ordering::SeqCst);
+                    Ok(())
+                },
+            )
+            .await;
+            assert!(result.is_err(), "unexpectedly accepted {uri}");
+            assert!(!called.load(std::sync::atomic::Ordering::SeqCst));
+            assert!(
+                std::fs::read_dir(directory.path())
+                    .unwrap()
+                    .next()
+                    .is_none()
+            );
+        }
     }
 
     #[tokio::test]

@@ -423,7 +423,11 @@ JETSTREAMER_ALLOW_CANDIDATE_RUNTIME=1 \
 This mode keeps one historical worker and one root-only verifier alive across every epoch
 boundary. It downloads the manifest's immutable GCS generation, verifies the recorded size and
 CRC32C, and holds the measured inode and SHA-256 digest through historical worker startup. The
-worker makes its own digest-checked private copy before decoding. Checkpoint expectations come
+worker makes its own digest-checked private copy before decoding. The bootstrap normally comes
+from a root object. A singleton cohort may instead use the manifest's exact hourly transport
+object; its anchor, snapshot slot, path, and generation remain fingerprint-bound. Multi-epoch
+cohorts still require a root bootstrap, and hourly objects are never admitted as checkpoint
+expectations. Checkpoint expectations come
 only from the same fingerprinted manifest; replay does not replace them with a later bucket
 listing. Each epoch archive is written below the owner-only private run directory. The process
 checks the exact checkpoint handoff, the next archive's initial PoH and parent anchors,

@@ -45,7 +45,12 @@ use crate::{
     },
     index::{SLOT_OFFSET_INDEX, SlotOffsetIndexError},
     node_reader::NodeReader,
+    transaction_status_meta::decode_transaction_status_meta,
     utils,
+};
+
+pub use crate::transaction_status_meta::{
+    OLD_FAITHFUL_PROTOBUF_META_START_SLOT, OldFaithfulMetaEncoding, old_faithful_meta_encoding,
 };
 
 /// Timeout applied to each asynchronous firehose operation (fetching epoch stream, reading
@@ -58,34 +63,6 @@ const OP_TIMEOUT_SEQUENTIAL: std::time::Duration = std::time::Duration::from_sec
 // double the wait up to the cap, and any forward progress resets it.
 const RETRY_BACKOFF_BASE: std::time::Duration = std::time::Duration::from_secs(1);
 const RETRY_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(32);
-/// First slot whose Old Faithful transaction-status metadata is stored as
-/// protobuf. Earlier metadata is bincode-encoded. This is an archive-input
-/// boundary only; it says nothing about which Solana runtime executed a slot.
-pub const OLD_FAITHFUL_PROTOBUF_META_START_SLOT: u64 = 157 * 432_000;
-
-/// Encoding Old Faithful uses for transaction-status metadata at a slot.
-///
-/// Early archives occasionally contain protobuf-shaped records before the
-/// documented cutoff, so the bincode era retains a protobuf fallback. The
-/// protobuf era does not guess backwards: malformed protobuf is rejected.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum OldFaithfulMetaEncoding {
-    /// Try historical bincode first, then protobuf for anomalous records.
-    BincodeWithProtobufFallback,
-    /// Decode protobuf directly.
-    Protobuf,
-}
-
-/// Selects the Old Faithful transaction-metadata decoder solely from `slot`.
-#[inline]
-pub const fn old_faithful_meta_encoding(slot: u64) -> OldFaithfulMetaEncoding {
-    if slot < OLD_FAITHFUL_PROTOBUF_META_START_SLOT {
-        OldFaithfulMetaEncoding::BincodeWithProtobufFallback
-    } else {
-        OldFaithfulMetaEncoding::Protobuf
-    }
-}
-
 fn poll_shutdown(
     flag: &Arc<std::sync::atomic::AtomicBool>,
     receiver: &mut Option<broadcast::Receiver<()>>,
@@ -999,7 +976,10 @@ fn decode_transaction_status_meta_from_frame(
         return Ok(solana_transaction_status::TransactionStatusMeta::default());
     }
 
-    match utils::decompress_zstd(reassembled_metadata.as_slice()) {
+    match utils::decompress_zstd_with_limit(
+        reassembled_metadata.as_slice(),
+        utils::MAX_TRANSACTION_METADATA_FRAME_SIZE,
+    ) {
         Ok(decompressed) => {
             decode_transaction_status_meta(slot, decompressed.as_slice()).map_err(|err| {
                 Box::new(std::io::Error::other(format!(
@@ -1100,61 +1080,25 @@ fn decode_rewards_from_bytes(slot: u64, bytes: &[u8]) -> Result<DecodedRewards, 
     }
 }
 
-fn decode_transaction_status_meta(
-    slot: u64,
-    metadata_bytes: &[u8],
-) -> Result<solana_transaction_status::TransactionStatusMeta, SharedError> {
-    let epoch = slot_to_epoch(slot);
-    let mut bincode_err: Option<String> = None;
-    if old_faithful_meta_encoding(slot) == OldFaithfulMetaEncoding::BincodeWithProtobufFallback {
-        match bincode::deserialize::<solana_storage_proto::StoredTransactionStatusMeta>(
-            metadata_bytes,
-        ) {
-            Ok(stored) => return Ok(stored.into()),
-            Err(err) => {
-                bincode_err = Some(err.to_string());
-            }
-        }
-    }
-
-    let bin_err_for_proto = bincode_err.clone();
-    let proto: solana_storage_proto::convert::generated::TransactionStatusMeta =
-        prost_011::Message::decode(metadata_bytes).map_err(|err| {
-            // If we already tried bincode, surface both failures for easier debugging.
-            if let Some(ref bin_err) = bin_err_for_proto {
-                Box::new(std::io::Error::other(format!(
-                    "protobuf decode transaction metadata failed (epoch {epoch}); bincode failed earlier: {bin_err}; protobuf error: {err}"
-                ))) as SharedError
-            } else {
-                Box::new(std::io::Error::other(format!(
-                    "protobuf decode transaction metadata: {err}"
-                ))) as SharedError
-            }
-        })?;
-
-    proto.try_into().map_err(|err| {
-        if let Some(ref bin_err) = bincode_err {
-            Box::new(std::io::Error::other(format!(
-                "convert transaction metadata proto failed (epoch {epoch}); bincode failed earlier: {bin_err}; conversion error: {err}"
-            ))) as SharedError
-        } else {
-            Box::new(std::io::Error::other(format!(
-                "convert transaction metadata proto: {err}"
-            ))) as SharedError
-        }
-    })
-}
-
 #[cfg(test)]
 mod metadata_decode_tests {
-    use super::{
-        OLD_FAITHFUL_PROTOBUF_META_START_SLOT, OldFaithfulMetaEncoding,
-        decode_transaction_status_meta, decode_transaction_status_meta_from_frame,
-        old_faithful_meta_encoding,
-    };
+    use super::decode_transaction_status_meta_from_frame;
+    use crate::transaction_status_meta::decode_transaction_status_meta;
+    use serde::Serialize;
     use solana_message::v0::LoadedAddresses;
-    use solana_storage_proto::StoredTransactionStatusMeta;
     use solana_transaction_status::TransactionStatusMeta;
+
+    #[derive(Serialize)]
+    struct LegacyWireMeta {
+        status: Result<(), u8>,
+        fee: u64,
+        pre_balances: Vec<u64>,
+        post_balances: Vec<u64>,
+        inner_instructions: Option<Vec<u8>>,
+        log_messages: Option<Vec<String>>,
+        pre_token_balances: Option<Vec<u8>>,
+        post_token_balances: Option<Vec<u8>>,
+    }
 
     fn sample_meta() -> TransactionStatusMeta {
         TransactionStatusMeta {
@@ -1173,20 +1117,8 @@ mod metadata_decode_tests {
     }
 
     #[test]
-    fn metadata_encoding_switches_at_the_documented_slot() {
-        assert_eq!(
-            old_faithful_meta_encoding(OLD_FAITHFUL_PROTOBUF_META_START_SLOT - 1),
-            OldFaithfulMetaEncoding::BincodeWithProtobufFallback
-        );
-        assert_eq!(
-            old_faithful_meta_encoding(OLD_FAITHFUL_PROTOBUF_META_START_SLOT),
-            OldFaithfulMetaEncoding::Protobuf
-        );
-    }
-
-    #[test]
-    fn decodes_bincode_metadata_for_early_epochs() {
-        let stored = StoredTransactionStatusMeta {
+    fn decodes_cutoff_schema_bincode_metadata_for_early_epochs() {
+        let wire = LegacyWireMeta {
             status: Ok(()),
             fee: 42,
             pre_balances: vec![1, 2],
@@ -1195,14 +1127,21 @@ mod metadata_decode_tests {
             log_messages: Some(vec!["hello".into()]),
             pre_token_balances: Some(Vec::new()),
             post_token_balances: Some(Vec::new()),
-            rewards: Some(Vec::new()),
-            return_data: None,
-            compute_units_consumed: Some(7),
-            cost_units: Some(9),
         };
-        let bytes = bincode::serialize(&stored).expect("bincode serialize");
+        let bytes = bincode::serialize(&wire).expect("bincode serialize");
         let decoded = decode_transaction_status_meta(0, &bytes).expect("decode");
-        assert_eq!(decoded, TransactionStatusMeta::from(stored));
+        assert_eq!(
+            decoded,
+            TransactionStatusMeta {
+                fee: 42,
+                pre_balances: vec![1, 2],
+                post_balances: vec![3, 4],
+                log_messages: Some(vec!["hello".into()]),
+                pre_token_balances: Some(Vec::new()),
+                post_token_balances: Some(Vec::new()),
+                ..TransactionStatusMeta::default()
+            }
+        );
     }
 
     #[test]
@@ -1216,14 +1155,12 @@ mod metadata_decode_tests {
     }
 
     #[test]
-    fn falls_back_to_proto_when_early_epoch_bytes_are_proto() {
+    fn rejects_protobuf_metadata_before_the_archive_cutoff() {
         let meta = sample_meta();
         let generated: solana_storage_proto::convert::generated::TransactionStatusMeta =
-            meta.clone().into();
+            meta.into();
         let bytes = prost_011::Message::encode_to_vec(&generated);
-        // Epoch 100 should try bincode first; if those bytes are proto, we must fall back.
-        let decoded = decode_transaction_status_meta(100 * 432000, &bytes).expect("decode");
-        assert_eq!(decoded, meta);
+        assert!(decode_transaction_status_meta(100 * 432000, &bytes).is_err());
     }
 
     #[test]
@@ -1234,7 +1171,7 @@ mod metadata_decode_tests {
 
     #[test]
     fn raw_bincode_frame_without_zstd_still_decodes() {
-        let stored = StoredTransactionStatusMeta {
+        let wire = LegacyWireMeta {
             status: Ok(()),
             fee: 1,
             pre_balances: vec![],
@@ -1243,15 +1180,19 @@ mod metadata_decode_tests {
             log_messages: None,
             pre_token_balances: Some(Vec::new()),
             post_token_balances: Some(Vec::new()),
-            rewards: Some(Vec::new()),
-            return_data: None,
-            compute_units_consumed: None,
-            cost_units: None,
         };
-        let raw_bytes = bincode::serialize(&stored).expect("serialize");
+        let raw_bytes = bincode::serialize(&wire).expect("serialize");
         let decoded =
             decode_transaction_status_meta_from_frame(0, raw_bytes).expect("decode fallback");
-        assert_eq!(decoded, TransactionStatusMeta::from(stored));
+        assert_eq!(
+            decoded,
+            TransactionStatusMeta {
+                fee: 1,
+                pre_token_balances: Some(Vec::new()),
+                post_token_balances: Some(Vec::new()),
+                ..TransactionStatusMeta::default()
+            }
+        );
     }
 }
 
@@ -2198,7 +2139,10 @@ where
                                             )
                                         })?;
                                         let reassembled_metadata = nodes
-                                            .reassemble_dataframes(&tx.metadata)
+                                            .reassemble_dataframes_bounded(
+                                                &tx.metadata,
+                                                utils::MAX_TRANSACTION_METADATA_FRAME_SIZE,
+                                            )
                                             .map_err(|err| {
                                                 (
                                                     FirehoseError::NodeDecodingError(item_index, err),
@@ -3682,7 +3626,10 @@ async fn firehose_geyser_thread(
                         match node {
                             Transaction(tx) => {
                                 let versioned_tx = tx.as_parsed()?;
-                                let reassembled_metadata = nodes.reassemble_dataframes(&tx.metadata)?;
+                                let reassembled_metadata = nodes.reassemble_dataframes_bounded(
+                                    &tx.metadata,
+                                    utils::MAX_TRANSACTION_METADATA_FRAME_SIZE,
+                                )?;
                                 let status_meta_available = !reassembled_metadata.is_empty();
 
                                 let as_native_metadata = decode_transaction_status_meta_from_frame(

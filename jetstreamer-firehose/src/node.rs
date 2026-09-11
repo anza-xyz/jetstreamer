@@ -6,12 +6,17 @@ use {
     crc::{CRC_64_GO_ISO, Crc},
     fnv::FnvHasher,
     std::{
-        collections::HashMap,
+        collections::{HashMap, HashSet},
         fmt,
         io::{self, Read},
         vec::Vec,
     },
 };
+
+// The largest CID-verified reward frame found at epoch starts 0 through 954
+// uses 61 continuation dataframes. Keep generous headroom while preventing an
+// attacker from constructing an effectively unbounded chain of empty frames.
+const MAX_DATAFRAME_CONTINUATIONS: usize = 4_096;
 
 /// Pairing of a decoded [`Node`] with its [`Cid`].
 pub struct NodeWithCid {
@@ -78,32 +83,90 @@ impl NodesWithCids {
     }
 
     /// Reassembles a potentially multi-part dataframe using the nodes in the collection.
+    ///
+    /// Continuation CIDs may be visited only once, and the complete frame may
+    /// not exceed [`utils::MAX_ALLOWED_REASSEMBLED_FRAME_SIZE`].
     pub fn reassemble_dataframes(
         &self,
         first_dataframe: &dataframe::DataFrame,
     ) -> Result<Vec<u8>, SharedError> {
-        let mut data = Vec::with_capacity(first_dataframe.data.len());
-        data.extend_from_slice(first_dataframe.data.as_slice());
+        self.reassemble_dataframes_bounded(
+            first_dataframe,
+            utils::MAX_ALLOWED_REASSEMBLED_FRAME_SIZE,
+        )
+    }
+
+    pub(crate) fn reassemble_dataframes_bounded(
+        &self,
+        first_dataframe: &dataframe::DataFrame,
+        max_size: usize,
+    ) -> Result<Vec<u8>, SharedError> {
+        self.reassemble_dataframes_with_limits(
+            first_dataframe,
+            max_size,
+            MAX_DATAFRAME_CONTINUATIONS,
+        )
+    }
+
+    fn reassemble_dataframes_with_limits(
+        &self,
+        first_dataframe: &dataframe::DataFrame,
+        max_size: usize,
+        max_continuations: usize,
+    ) -> Result<Vec<u8>, SharedError> {
+        fn append_bounded(
+            destination: &mut Vec<u8>,
+            source: &[u8],
+            max_size: usize,
+        ) -> Result<(), SharedError> {
+            let new_size = destination.len().checked_add(source.len()).ok_or_else(|| {
+                Box::new(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "reassembled dataframe size overflow",
+                )) as SharedError
+            })?;
+            if new_size > max_size {
+                return Err(Box::new(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("reassembled dataframe exceeds {max_size} bytes"),
+                )));
+            }
+            destination.extend_from_slice(source);
+            Ok(())
+        }
+
+        let mut data = Vec::with_capacity(first_dataframe.data.len().min(max_size));
+        append_bounded(&mut data, first_dataframe.data.as_slice(), max_size)?;
+        let mut visited = HashSet::with_hasher(RandomState::new());
 
         let mut next_arr = first_dataframe.next.as_deref();
         while let Some(next_cids) = next_arr {
             let mut next_segment = None;
             for next_cid in next_cids {
+                if !visited.insert(*next_cid) {
+                    return Err(Box::new(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("dataframe continuation cycle or duplicate CID: {next_cid}"),
+                    )));
+                }
+                if visited.len() > max_continuations {
+                    return Err(Box::new(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("dataframe chain exceeds {max_continuations} continuation CIDs"),
+                    )));
+                }
                 let next_node = self.get_by_cid(next_cid).ok_or_else(|| {
-                    Box::new(std::io::Error::other(std::format!(
-                        "Missing CID: {:?}",
-                        next_cid
-                    ))) as SharedError
+                    Box::new(io::Error::other(format!("Missing CID: {next_cid:?}"))) as SharedError
                 })?;
 
                 let next_dataframe = next_node.get_node().get_dataframe().ok_or_else(|| {
-                    Box::new(std::io::Error::other(std::format!(
+                    Box::new(io::Error::other(format!(
                         "Expected DataFrame, got {:?}",
                         next_node.get_node()
                     ))) as SharedError
                 })?;
 
-                data.extend_from_slice(next_dataframe.data.as_slice());
+                append_bounded(&mut data, next_dataframe.data.as_slice(), max_size)?;
                 next_segment = next_dataframe.next.as_deref();
             }
             next_arr = next_segment;
@@ -151,6 +214,101 @@ impl NodesWithCids {
         }
         let block = last_node_un.get_node().get_block().unwrap();
         Ok(block)
+    }
+}
+
+#[cfg(test)]
+mod reassembly_tests {
+    use super::*;
+
+    fn cid(text: &str) -> Cid {
+        text.parse().expect("valid test CID")
+    }
+
+    fn frame(data: &[u8], next: Option<Vec<Cid>>) -> dataframe::DataFrame {
+        dataframe::DataFrame {
+            kind: Kind::DataFrame.to_u64(),
+            hash: None,
+            index: None,
+            total: None,
+            data: utils::Buffer::from_vec(data.to_vec()),
+            next,
+        }
+    }
+
+    #[test]
+    fn bounded_reassembly_accepts_an_acyclic_chain() {
+        let first_cid = cid("bafyreid2i4binymehw5kf75yduyadcsa5db3wfacnnqil7ld2sp5n2y7wa");
+        let second_cid = cid("bafyreia4rs42uo2srir5pvj2r3rveh4septkpept225yrya7zlqzf5pfyy");
+        let first = frame(&[1], Some(vec![first_cid]));
+        let mut nodes = NodesWithCids::new();
+        nodes.push(NodeWithCid::new(
+            first_cid,
+            Node::DataFrame(frame(&[2], Some(vec![second_cid]))),
+        ));
+        nodes.push(NodeWithCid::new(
+            second_cid,
+            Node::DataFrame(frame(&[3], None)),
+        ));
+
+        assert_eq!(
+            nodes.reassemble_dataframes_bounded(&first, 3).unwrap(),
+            [1, 2, 3]
+        );
+    }
+
+    #[test]
+    fn bounded_reassembly_rejects_a_continuation_cycle() {
+        let continuation = cid("bafyreid2i4binymehw5kf75yduyadcsa5db3wfacnnqil7ld2sp5n2y7wa");
+        let first = frame(&[1], Some(vec![continuation]));
+        let mut nodes = NodesWithCids::new();
+        nodes.push(NodeWithCid::new(
+            continuation,
+            Node::DataFrame(frame(&[2], Some(vec![continuation]))),
+        ));
+
+        let error = nodes.reassemble_dataframes_bounded(&first, 3).unwrap_err();
+        assert!(error.to_string().contains("cycle or duplicate CID"));
+    }
+
+    #[test]
+    fn bounded_reassembly_rejects_an_oversized_frame() {
+        let continuation = cid("bafyreid2i4binymehw5kf75yduyadcsa5db3wfacnnqil7ld2sp5n2y7wa");
+        let first = frame(&[1, 2], Some(vec![continuation]));
+        let mut nodes = NodesWithCids::new();
+        nodes.push(NodeWithCid::new(
+            continuation,
+            Node::DataFrame(frame(&[3, 4], None)),
+        ));
+
+        let error = nodes.reassemble_dataframes_bounded(&first, 3).unwrap_err();
+        assert!(error.to_string().contains("exceeds 3 bytes"));
+    }
+
+    #[test]
+    fn bounded_reassembly_rejects_too_many_empty_continuations() {
+        let first_cid = cid("bafyreid2i4binymehw5kf75yduyadcsa5db3wfacnnqil7ld2sp5n2y7wa");
+        let second_cid = cid("bafyreia4rs42uo2srir5pvj2r3rveh4septkpept225yrya7zlqzf5pfyy");
+        let third_cid = cid("bafyreidly4pxe4x3ie4n43htg23d7qvshxcukbeai47hjxrlnh5a5nvphq");
+        let first = frame(&[], Some(vec![first_cid]));
+        let mut nodes = NodesWithCids::new();
+        nodes.push(NodeWithCid::new(
+            first_cid,
+            Node::DataFrame(frame(&[], Some(vec![second_cid]))),
+        ));
+        nodes.push(NodeWithCid::new(
+            second_cid,
+            Node::DataFrame(frame(&[], Some(vec![third_cid]))),
+        ));
+        nodes.push(NodeWithCid::new(
+            third_cid,
+            Node::DataFrame(frame(&[], None)),
+        ));
+
+        let error = nodes
+            .reassemble_dataframes_with_limits(&first, 1, 2)
+            .unwrap_err();
+        assert!(error.to_string().contains("exceeds 2 continuation CIDs"));
     }
 }
 

@@ -209,10 +209,106 @@ impl<'de> serde::Deserialize<'de> for Buffer {
 /// Maximum Old Faithful CAR section size permitted while parsing (32 MiB).
 pub const MAX_ALLOWED_SECTION_SIZE: usize = 32 << 20; // 32MiB
 
-/// Decompresses a Zstandard byte stream.
+/// Maximum size of a reassembled Old Faithful frame (128 MiB).
+///
+/// The largest epoch-start reward frame found across epochs 0 through 954 is
+/// 63,448,722 compressed bytes, so this retains more than 2x headroom.
+pub const MAX_ALLOWED_REASSEMBLED_FRAME_SIZE: usize = 128 << 20; // 128MiB
+
+/// Maximum decompressed size of an Old Faithful frame (128 MiB).
+///
+/// That same CID-verified reward frame expands to 87,557,613 bytes.
+pub const MAX_ALLOWED_DECOMPRESSED_FRAME_SIZE: usize = 128 << 20; // 128MiB
+
+/// Maximum compressed or decompressed transaction-metadata frame (1 MiB).
+/// Transaction metadata is handled once per transaction and is much smaller
+/// than a slot-wide rewards frame; sampled historical metadata peaks below
+/// one KiB.
+pub const MAX_TRANSACTION_METADATA_FRAME_SIZE: usize = 1 << 20; // 1MiB
+
+const _: () = {
+    assert!(MAX_ALLOWED_REASSEMBLED_FRAME_SIZE >= 63_448_722);
+    assert!(MAX_ALLOWED_DECOMPRESSED_FRAME_SIZE >= 87_557_613);
+};
+
+/// Decompresses a Zstandard byte stream to at most
+/// [`MAX_ALLOWED_DECOMPRESSED_FRAME_SIZE`] bytes.
 pub fn decompress_zstd(data: &[u8]) -> Result<Vec<u8>, SharedError> {
+    decompress_zstd_with_limit(data, MAX_ALLOWED_DECOMPRESSED_FRAME_SIZE)
+}
+
+pub(crate) fn decompress_zstd_with_limit(
+    data: &[u8],
+    max_output_size: usize,
+) -> Result<Vec<u8>, SharedError> {
     let mut decoder = zstd::Decoder::new(data)?;
+    decoder.window_log_max(zstd_window_log_for_limit(max_output_size))?;
+    let read_limit = u64::try_from(max_output_size)
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
     let mut decompressed = Vec::new();
-    decoder.read_to_end(&mut decompressed)?;
+    decoder
+        .by_ref()
+        .take(read_limit)
+        .read_to_end(&mut decompressed)?;
+    if decompressed.len() > max_output_size {
+        return Err(Box::new(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("decompressed frame exceeds {max_output_size} bytes"),
+        )));
+    }
     Ok(decompressed)
+}
+
+fn zstd_window_log_for_limit(max_output_size: usize) -> u32 {
+    // The streaming encoder uses a window larger than tiny test payloads, so
+    // keep a 1 MiB floor while still matching the metadata allocation limit.
+    const ZSTD_WINDOW_LOG_MIN: u32 = 20;
+    const ZSTD_WINDOW_LOG_MAX: u32 = 27;
+
+    let required_log = usize::BITS - max_output_size.saturating_sub(1).leading_zeros();
+    required_log.clamp(ZSTD_WINDOW_LOG_MIN, ZSTD_WINDOW_LOG_MAX)
+}
+
+#[cfg(test)]
+mod decompression_tests {
+    use super::*;
+    use std::io::Write as _;
+
+    #[test]
+    fn bounded_zstd_decompression_accepts_the_exact_limit() {
+        let compressed = zstd::encode_all([1, 2, 3].as_slice(), 1).unwrap();
+        assert_eq!(
+            decompress_zstd_with_limit(&compressed, 3).unwrap(),
+            [1, 2, 3]
+        );
+    }
+
+    #[test]
+    fn bounded_zstd_decompression_rejects_output_past_the_limit() {
+        let compressed = zstd::encode_all([1, 2, 3].as_slice(), 1).unwrap();
+        let error = decompress_zstd_with_limit(&compressed, 2).unwrap_err();
+        assert!(error.to_string().contains("exceeds 2 bytes"));
+    }
+
+    #[test]
+    fn bounded_zstd_decompression_rejects_large_decoder_window() {
+        let mut encoder = zstd::stream::write::Encoder::new(Vec::new(), 1).unwrap();
+        encoder.window_log(27).unwrap();
+        encoder.include_contentsize(false).unwrap();
+        encoder.write_all(&[1]).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        assert_eq!(zstd::decode_all(compressed.as_slice()).unwrap(), [1]);
+        assert!(decompress_zstd_with_limit(&compressed, 1 << 20).is_err());
+    }
+
+    #[test]
+    fn zstd_decoder_window_tracks_output_limit() {
+        assert_eq!(zstd_window_log_for_limit(0), 20);
+        assert_eq!(zstd_window_log_for_limit(1 << 10), 20);
+        assert_eq!(zstd_window_log_for_limit(1 << 20), 20);
+        assert_eq!(zstd_window_log_for_limit((1 << 20) + 1), 21);
+        assert_eq!(zstd_window_log_for_limit(usize::MAX), 27);
+    }
 }

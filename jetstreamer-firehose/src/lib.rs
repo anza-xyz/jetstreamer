@@ -204,6 +204,7 @@ pub mod subset;
 pub mod system;
 /// Transaction decoding and helpers.
 pub mod transaction;
+mod transaction_status_meta;
 /// Shared helpers used throughout the firehose crate.
 pub mod utils;
 

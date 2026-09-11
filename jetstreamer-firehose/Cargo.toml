@@ -61,6 +61,9 @@ fnv.workspace = true
 serde_json.workspace = true
 zstd.workspace = true
 solana-reward-info.workspace = true
+solana-instruction-error.workspace = true
+solana-serde.workspace = true
+solana-transaction-error.workspace = true
 bincode.workspace = true
 xxhash-rust.workspace = true
 ahash.workspace = true
@@ -75,6 +78,7 @@ aws-smithy-types = { workspace = true, optional = true }
 aws-types = { workspace = true, optional = true }
 
 [dev-dependencies]
+sha2.workspace = true
 tempfile.workspace = true
 serial_test = "3"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

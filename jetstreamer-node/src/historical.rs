@@ -967,6 +967,28 @@ impl Drop for IpcTransport {
     }
 }
 
+/// Keeps the OS thread that forked a worker alive until that worker is reaped.
+///
+/// Linux delivers `PR_SET_PDEATHSIG` when the specific thread that called
+/// `fork` exits, not only when the parent process exits. Historical clients
+/// may be created from short-lived executor threads, so the worker must have a
+/// dedicated, stable creator thread.
+struct WorkerGuardian {
+    release_tx: Option<mpsc::Sender<()>>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl Drop for WorkerGuardian {
+    fn drop(&mut self) {
+        // Disconnecting the channel releases the guardian. All client cleanup
+        // paths retain this token until wait(2) has reaped the child.
+        self.release_tx.take();
+        if self.thread.as_ref().is_some_and(JoinHandle::is_finished) {
+            let _ = self.thread.take().expect("checked above").join();
+        }
+    }
+}
+
 /// Sequential client for one isolated historical runtime process.
 ///
 /// The protocol is deliberately lockstep.  At most one request is outstanding,
@@ -975,6 +997,7 @@ impl Drop for IpcTransport {
 pub struct HistoricalRuntimeClient {
     executable_sha256: [u8; HASH_BYTES],
     child: Option<Child>,
+    guardian: Option<WorkerGuardian>,
     transport: Option<IpcTransport>,
     private_work_dir: Option<TempDir>,
     timeouts: HistoricalRuntimeTimeouts,
@@ -1078,38 +1101,15 @@ impl HistoricalRuntimeClient {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
-        #[cfg(target_os = "linux")]
-        {
-            use std::os::unix::process::CommandExt as _;
-
-            // Defense in depth for supervisors that are themselves killed:
-            // the worker also dies if its direct coordinator disappears.
-            // SAFETY: prctl/getppid are async-signal-safe and no allocation or
-            // lock acquisition occurs in the post-fork closure.
-            unsafe {
-                command.pre_exec(|| {
-                    let parent = libc::getppid();
-                    if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
-                        return Err(io::Error::last_os_error());
-                    }
-                    if parent == 1 || libc::getppid() != parent {
-                        // Use a raw errno here: allocation and formatting are
-                        // not async-signal-safe between fork and exec.
-                        return Err(io::Error::from_raw_os_error(libc::ESRCH));
-                    }
-                    Ok(())
-                });
-            }
-        }
-        let mut child =
-            spawn_bound_worker(&mut command).map_err(|source| HistoricalRuntimeError::Spawn {
+        let (mut child, guardian) =
+            spawn_guarded_worker(command).map_err(|source| HistoricalRuntimeError::Spawn {
                 path: bound_executable.path.clone(),
                 source,
             })?;
         let stdin = match child.stdin.take() {
             Some(stdin) => stdin,
             None => {
-                kill_and_reap(child, Some(private_work_dir), timeouts.reap);
+                kill_and_reap(child, Some(private_work_dir), Some(guardian), timeouts.reap);
                 return Err(HistoricalRuntimeError::MissingPipe { stream: "stdin" });
             }
         };
@@ -1117,14 +1117,14 @@ impl HistoricalRuntimeClient {
             Some(stdout) => stdout,
             None => {
                 drop(stdin);
-                kill_and_reap(child, Some(private_work_dir), timeouts.reap);
+                kill_and_reap(child, Some(private_work_dir), Some(guardian), timeouts.reap);
                 return Err(HistoricalRuntimeError::MissingPipe { stream: "stdout" });
             }
         };
         let transport = match IpcTransport::spawn(stdin, stdout) {
             Ok(transport) => transport,
             Err(error) => {
-                kill_and_reap(child, Some(private_work_dir), timeouts.reap);
+                kill_and_reap(child, Some(private_work_dir), Some(guardian), timeouts.reap);
                 return Err(HistoricalRuntimeError::SpawnIpcThread(error));
             }
         };
@@ -1134,6 +1134,7 @@ impl HistoricalRuntimeClient {
         let mut client = Self {
             executable_sha256,
             child: Some(child),
+            guardian: Some(guardian),
             transport: Some(transport),
             private_work_dir: Some(private_work_dir),
             timeouts,
@@ -1790,20 +1791,31 @@ impl HistoricalRuntimeClient {
         let status = match wait_for_child(&mut child, self.timeouts.reap) {
             Ok(Some(status)) => status,
             Ok(None) => {
-                kill_and_reap(child, self.private_work_dir.take(), self.timeouts.reap);
+                kill_and_reap(
+                    child,
+                    self.private_work_dir.take(),
+                    self.guardian.take(),
+                    self.timeouts.reap,
+                );
                 self.closed = true;
                 return Err(HistoricalRuntimeError::ShutdownExitTimeout {
                     timeout: self.timeouts.reap,
                 });
             }
             Err(error) => {
-                kill_and_reap(child, self.private_work_dir.take(), self.timeouts.reap);
+                kill_and_reap(
+                    child,
+                    self.private_work_dir.take(),
+                    self.guardian.take(),
+                    self.timeouts.reap,
+                );
                 self.closed = true;
                 return Err(HistoricalRuntimeError::Io(error));
             }
         };
         self.closed = true;
         self.private_work_dir.take();
+        self.guardian.take();
         if status.success() {
             Ok(())
         } else {
@@ -1886,9 +1898,15 @@ impl HistoricalRuntimeClient {
         self.closed = true;
         self.transport.take();
         if let Some(child) = self.child.take() {
-            kill_and_reap(child, self.private_work_dir.take(), self.timeouts.reap);
+            kill_and_reap(
+                child,
+                self.private_work_dir.take(),
+                self.guardian.take(),
+                self.timeouts.reap,
+            );
         } else {
             self.private_work_dir.take();
+            self.guardian.take();
         }
     }
 
@@ -1918,6 +1936,7 @@ impl HistoricalRuntimeClient {
             Some(Ok(Some(status))) => {
                 self.child.take();
                 self.private_work_dir.take();
+                self.guardian.take();
                 HistoricalRuntimeError::WriteAfterExit {
                     operation,
                     request_id,
@@ -1927,9 +1946,15 @@ impl HistoricalRuntimeClient {
             }
             Some(Ok(None)) => {
                 if let Some(child) = self.child.take() {
-                    kill_and_reap(child, self.private_work_dir.take(), self.timeouts.reap);
+                    kill_and_reap(
+                        child,
+                        self.private_work_dir.take(),
+                        self.guardian.take(),
+                        self.timeouts.reap,
+                    );
                 } else {
                     self.private_work_dir.take();
+                    self.guardian.take();
                 }
                 HistoricalRuntimeError::WriteFailure {
                     operation,
@@ -1943,9 +1968,15 @@ impl HistoricalRuntimeClient {
             }
             Some(Err(error)) => {
                 if let Some(child) = self.child.take() {
-                    kill_and_reap(child, self.private_work_dir.take(), self.timeouts.reap);
+                    kill_and_reap(
+                        child,
+                        self.private_work_dir.take(),
+                        self.guardian.take(),
+                        self.timeouts.reap,
+                    );
                 } else {
                     self.private_work_dir.take();
+                    self.guardian.take();
                 }
                 HistoricalRuntimeError::WriteFailure {
                     operation,
@@ -1958,6 +1989,7 @@ impl HistoricalRuntimeClient {
             }
             None => {
                 self.private_work_dir.take();
+                self.guardian.take();
                 HistoricalRuntimeError::WriteFailure {
                     operation,
                     request_id,
@@ -2238,7 +2270,8 @@ impl Drop for HistoricalRuntimeClient {
         // Pipe I/O runs on a disposable helper thread, while abort_worker
         // kills the process and gives reaping a bounded synchronous window.
         // In the pathological case where the OS does not report the exit in
-        // that window, a detached reaper retains both Child and TempDir.
+        // that window, a detached reaper retains Child, TempDir, and the
+        // creator-thread guardian.
         self.abort_worker();
     }
 }
@@ -2761,6 +2794,79 @@ fn bind_worker_executable(
         path: bound_path,
         sha256,
     })
+}
+
+fn configure_worker_parent_death_signal(command: &mut Command) {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::process::CommandExt as _;
+
+        // Capture the namespace-visible supervisor PID before fork. Comparing
+        // against that exact value supports a legitimate PID-1 supervisor
+        // while still detecting reparenting during the fork-to-prctl window.
+        let expected_supervisor_pid = std::process::id() as libc::pid_t;
+
+        // Defense in depth for supervisors that are themselves killed: the
+        // worker also dies if its dedicated guardian thread disappears.
+        // SAFETY: prctl/getppid are async-signal-safe and no allocation or
+        // lock acquisition occurs in the post-fork closure. The captured PID
+        // is a plain integer obtained before fork.
+        unsafe {
+            command.pre_exec(move || {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                if libc::getppid() != expected_supervisor_pid {
+                    // Use a raw errno here: allocation and formatting are not
+                    // async-signal-safe between fork and exec.
+                    return Err(io::Error::from_raw_os_error(libc::ESRCH));
+                }
+                Ok(())
+            });
+        }
+    }
+}
+
+/// Spawn on a dedicated thread and keep that exact thread alive until the
+/// returned guardian is released after child reaping.
+fn spawn_guarded_worker(mut command: Command) -> io::Result<(Child, WorkerGuardian)> {
+    let (spawn_tx, spawn_rx) = mpsc::sync_channel::<io::Result<Child>>(0);
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let guardian_thread = thread::Builder::new()
+        .name("historical-runtime-guardian".to_owned())
+        .spawn(move || {
+            configure_worker_parent_death_signal(&mut command);
+            match spawn_bound_worker(&mut command) {
+                Ok(child) => match spawn_tx.send(Ok(child)) {
+                    Ok(()) => {
+                        let _ = release_rx.recv();
+                    }
+                    Err(mpsc::SendError(Ok(mut child))) => {
+                        // The caller disappeared during handoff. Fail closed and
+                        // reap here while the creator thread is still alive.
+                        let _ = child.kill();
+                        let _ = child.wait();
+                    }
+                    Err(mpsc::SendError(Err(_))) => unreachable!("sent an Ok child"),
+                },
+                Err(error) => {
+                    let _ = spawn_tx.send(Err(error));
+                }
+            }
+        })?;
+    let child = spawn_rx.recv().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "historical worker guardian stopped during spawn",
+        )
+    })??;
+    Ok((
+        child,
+        WorkerGuardian {
+            release_tx: Some(release_tx),
+            thread: Some(guardian_thread),
+        },
+    ))
 }
 
 fn spawn_bound_worker(command: &mut Command) -> io::Result<Child> {
@@ -3494,17 +3600,36 @@ fn wait_for_child(child: &mut Child, timeout: Duration) -> io::Result<Option<Exi
 ///
 /// A normally scheduled process is reaped synchronously. If the kernel does
 /// not make it waitable within the configured window, ownership of both the
-/// `Child` and its private directory moves to a detached reaper. Rust threads
-/// do not keep process exit alive, so even that pathological wait cannot wedge
-/// the parent process.
-fn kill_and_reap(mut child: Child, private_work_dir: Option<TempDir>, timeout: Duration) -> bool {
+/// `Child`, its private directory, and its creator-thread guardian move to a
+/// detached reaper. Rust threads do not keep process exit alive, so even that
+/// pathological wait cannot wedge the parent process.
+fn kill_and_reap(
+    mut child: Child,
+    private_work_dir: Option<TempDir>,
+    guardian: Option<WorkerGuardian>,
+    timeout: Duration,
+) -> bool {
     let _ = child.kill();
+    reap_or_spawn_reaper(child, private_work_dir, guardian, timeout)
+}
+
+/// Reap within `timeout` or move the child and all coupled resources to a
+/// detached reaper.
+fn reap_or_spawn_reaper(
+    mut child: Child,
+    private_work_dir: Option<TempDir>,
+    guardian: Option<WorkerGuardian>,
+    timeout: Duration,
+) -> bool {
     if matches!(wait_for_child(&mut child, timeout), Ok(Some(_))) {
+        drop(private_work_dir);
+        drop(guardian);
         return true;
     }
     thread::spawn(move || {
-        let _private_work_dir = private_work_dir;
         let _ = child.wait();
+        drop(private_work_dir);
+        drop(guardian);
     });
     false
 }
@@ -4027,6 +4152,7 @@ mod tests {
         let client = HistoricalRuntimeClient {
             executable_sha256: [0; HASH_BYTES],
             child: Some(child),
+            guardian: None,
             transport: Some(transport),
             private_work_dir: Some(private_work_dir),
             timeouts: HistoricalRuntimeTimeouts {
@@ -4087,6 +4213,7 @@ mod tests {
         let mut client = HistoricalRuntimeClient {
             executable_sha256: [0; HASH_BYTES],
             child: Some(child),
+            guardian: None,
             transport: Some(transport),
             private_work_dir: None,
             timeouts: HistoricalRuntimeTimeouts {
@@ -4125,6 +4252,137 @@ mod tests {
             .status()
             .unwrap()
             .success()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn process_is_live_non_zombie(process_id: u32) -> bool {
+        let Ok(status) = fs::read_to_string(format!("/proc/{process_id}/status")) else {
+            return false;
+        };
+        matches!(
+            status
+                .lines()
+                .find(|line| line.starts_with("State:"))
+                .and_then(|line| line.split_whitespace().nth(1))
+                .and_then(|state| state.chars().next()),
+            Some(state) if !matches!(state, 'Z' | 'X' | 'x')
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    fn guarded_sleeping_child() -> (Child, WorkerGuardian) {
+        let mut command = Command::new("sleep");
+        command
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        spawn_guarded_worker(command).unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn guarded_worker_survives_spawning_thread_exit_and_reaps_cleanly() {
+        let (worker_tx, worker_rx) = mpsc::sync_channel(0);
+        let spawning_thread = thread::spawn(move || {
+            let mut command = Command::new("sh");
+            command
+                .arg("-c")
+                .arg(
+                    "IFS= read -r request; [ \"$request\" = ping ] || exit 2; \
+                     printf 'pong\\n'; IFS= read -r request; [ \"$request\" = shutdown ]",
+                )
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null());
+            worker_tx
+                .send(spawn_guarded_worker(command).unwrap())
+                .unwrap();
+        });
+        let (mut child, guardian) = worker_rx.recv().unwrap();
+        spawning_thread.join().unwrap();
+
+        let child_id = child.id();
+        assert!(process_is_running(child_id));
+        let mut stdin = child.stdin.take().unwrap();
+        let mut stdout = child.stdout.take().unwrap();
+        stdin.write_all(b"ping\n").unwrap();
+        stdin.flush().unwrap();
+        let mut response = [0; 5];
+        stdout.read_exact(&mut response).unwrap();
+        assert_eq!(&response, b"pong\n");
+
+        stdin.write_all(b"shutdown\n").unwrap();
+        stdin.flush().unwrap();
+        drop(stdin);
+        let status = wait_for_child(&mut child, Duration::from_secs(2))
+            .unwrap()
+            .expect("worker exits after shutdown");
+        assert!(status.success());
+        assert!(!process_is_running(child_id));
+        drop(child);
+        drop(guardian);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn dropping_guardian_kills_worker_and_child_is_reaped() {
+        use std::os::unix::process::ExitStatusExt as _;
+
+        let (mut child, guardian) = guarded_sleeping_child();
+        let child_id = child.id();
+        if !process_is_running(child_id) {
+            let status = child.wait();
+            drop(guardian);
+            panic!("worker exited before guardian release: {status:?}");
+        }
+
+        drop(guardian);
+        let status = match wait_for_child(&mut child, Duration::from_secs(2)) {
+            Ok(Some(status)) => status,
+            result => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("worker did not die after guardian release: {result:?}");
+            }
+        };
+        assert_eq!(status.signal(), Some(libc::SIGKILL));
+        assert!(!process_is_running(child_id));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn detached_reaper_retains_guardian_and_tempdir_until_child_exit() {
+        let (child, guardian) = guarded_sleeping_child();
+        let child_id = child.id();
+        let temp_parent = TempDir::new().unwrap();
+        let private_work_dir = TempDir::new_in(temp_parent.path()).unwrap();
+        let private_work_path = private_work_dir.path().to_path_buf();
+
+        assert!(!reap_or_spawn_reaper(
+            child,
+            Some(private_work_dir),
+            Some(guardian),
+            Duration::ZERO,
+        ));
+        thread::sleep(Duration::from_millis(50));
+        assert!(process_is_live_non_zombie(child_id));
+        assert!(private_work_path.exists());
+
+        // SAFETY: kill accepts any pid_t and SIGKILL is valid. child_id came
+        // from the live Child moved into the detached reaper.
+        assert_eq!(
+            unsafe { libc::kill(child_id as libc::pid_t, libc::SIGKILL) },
+            0
+        );
+        let started = Instant::now();
+        while (process_is_running(child_id) || private_work_path.exists())
+            && started.elapsed() < Duration::from_secs(2)
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!process_is_running(child_id));
+        assert!(!private_work_path.exists());
     }
 
     #[cfg(unix)]
@@ -4523,6 +4781,7 @@ mod tests {
         let mut client = HistoricalRuntimeClient {
             executable_sha256: [0; HASH_BYTES],
             child: Some(child),
+            guardian: None,
             transport: Some(transport),
             private_work_dir: None,
             timeouts: HistoricalRuntimeTimeouts {
@@ -4567,6 +4826,7 @@ mod tests {
         // proves the normal SIGKILL path is reaped synchronously.
         assert!(kill_and_reap(
             sleeping_child(),
+            None,
             None,
             Duration::from_secs(2)
         ));

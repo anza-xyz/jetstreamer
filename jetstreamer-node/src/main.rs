@@ -116,6 +116,7 @@ use tokio::process::{Child, Command};
 use xxhash_rust::xxh64::xxh64;
 
 mod adaptive_epoch;
+mod cohort_publication;
 mod compatibility;
 mod historical;
 mod historical_replay;
@@ -5969,6 +5970,30 @@ const COMPATIBLE_V1_0_7_GENERATION_PROFILES: &[&str] =
 const COMPATIBLE_V1_0_8_GENERATION_PROFILES: &[&str] =
     &["jetstreamer-node/0.7.0/old-faithful-to-horizon-v2@8154bc9b0057a138afa6e8833468f6ffba39a6a1"];
 
+// This is not a generation-profile allowlist. It identifies one completed
+// private epoch-11 archive whose full bytes and production inputs were audited
+// after its producer exited. Private recovery and later reuse may consult this
+// identity, but no validation capability is returned until the archive has
+// passed a full decode, semantic/PoH-chain verification, and exact SHA-256
+// binding. No other output from this producer profile is admitted.
+const AUDITED_EPOCH_11_RECOVERY_EPOCH: u64 = 11;
+const AUDITED_EPOCH_11_RECOVERY_PROFILE: &str =
+    "jetstreamer-node/0.7.0/old-faithful-to-horizon-v2@0a8ec77094ddf2b21ff22e6f4a55fef836f8f2c6";
+const AUDITED_EPOCH_11_RECOVERY_ARCHIVE_BYTES: u64 = 2_765_674_556;
+const AUDITED_EPOCH_11_RECOVERY_ARCHIVE_SHA256: [u8; 32] = [
+    0x85, 0xad, 0x2e, 0x93, 0xd5, 0x03, 0xaa, 0x17, 0xa6, 0x33, 0x40, 0x6e, 0x7d, 0x63, 0x83, 0x69,
+    0xa3, 0xe7, 0x86, 0xd4, 0x08, 0x0c, 0x05, 0x6d, 0x68, 0x9f, 0xd3, 0xe5, 0x81, 0x46, 0xde, 0xda,
+];
+const AUDITED_EPOCH_11_RECOVERY_WORKER_PATH: &str = "/home/sol/.jetstreamer-private/\
+deploy-epoch11-full-v1014-20260910-v3/jetstreamer-historical-worker-v1-0-14";
+const AUDITED_EPOCH_11_RECOVERY_WORKER_SHA256: [u8; 32] = [
+    0x89, 0xdb, 0xd1, 0x4b, 0x7b, 0xef, 0x4b, 0xd9, 0xcc, 0x6a, 0x49, 0xbc, 0x92, 0x6e, 0x70, 0x29,
+    0x00, 0x58, 0x63, 0x94, 0x98, 0xf9, 0xba, 0x51, 0xe4, 0x47, 0xbb, 0x78, 0x92, 0xa4, 0xb9, 0x96,
+];
+const AUDITED_EPOCH_11_RECOVERY_BOOTSTRAP_SLOT: Slot = 4_751_796;
+const AUDITED_EPOCH_11_RECOVERY_BOOTSTRAP_HASH: &str =
+    "6vJ22rwAfXfr4hFUJ7AtLupR6LHWBWX114AhKJqPYejb";
+
 fn runtime_generation_profile_is_compatible(
     runtime_profile: &str,
     recorded_generation_profile: &str,
@@ -5978,6 +6003,97 @@ fn runtime_generation_profile_is_compatible(
             && COMPATIBLE_V1_0_7_GENERATION_PROFILES.contains(&recorded_generation_profile))
         || (runtime_profile == historical::SOLANA_V1_0_8_CANDIDATE.backend_id
             && COMPATIBLE_V1_0_8_GENERATION_PROFILES.contains(&recorded_generation_profile))
+}
+
+fn audited_epoch_11_recovery_provenance_matches(
+    epoch: u64,
+    provenance: &ArchiveProvenance,
+) -> bool {
+    if epoch != AUDITED_EPOCH_11_RECOVERY_EPOCH {
+        return false;
+    }
+    let ArchiveProvenance::V2(provenance) = provenance else {
+        return false;
+    };
+    let Ok(bootstrap_hash) = AUDITED_EPOCH_11_RECOVERY_BOOTSTRAP_HASH.parse::<Hash>() else {
+        return false;
+    };
+    provenance.base.generation_profile == AUDITED_EPOCH_11_RECOVERY_PROFILE
+        && provenance.base.runtime_profile == historical::SOLANA_V1_0_14_CANDIDATE.backend_id
+        && provenance.base.runtime_admission == RuntimeAdmission::Candidate
+        && provenance.base.runtime_revision == compatibility::SOLANA_V1_0_14_REVISION
+        && provenance.base.runtime_toolchain
+            == archive_runtime_toolchain(compatibility::SOLANA_V1_0_14_RUNTIME.identity)
+        && provenance.base.genesis_hash
+            == compatibility::MAINNET_GENESIS_HASH
+                .parse::<Hash>()
+                .expect("compiled mainnet genesis hash is valid")
+        && provenance.base.bootstrap_state_kind == BootstrapStateKind::SnapshotArchive
+        && provenance.base.bootstrap_slot == AUDITED_EPOCH_11_RECOVERY_BOOTSTRAP_SLOT
+        && provenance.base.bootstrap_state_hash == bootstrap_hash
+        && provenance.base.requested_slot_start
+            == epoch_to_slot_range(AUDITED_EPOCH_11_RECOVERY_EPOCH).0
+        && provenance.base.requested_slot_count
+            == epoch_to_slot_range(AUDITED_EPOCH_11_RECOVERY_EPOCH).1
+                - epoch_to_slot_range(AUDITED_EPOCH_11_RECOVERY_EPOCH).0
+                + 1
+        && provenance.base.transaction_metadata
+            == archive_transaction_metadata_policy(
+                epoch_to_slot_range(AUDITED_EPOCH_11_RECOVERY_EPOCH).0,
+                epoch_to_slot_range(AUDITED_EPOCH_11_RECOVERY_EPOCH).1
+                    - epoch_to_slot_range(AUDITED_EPOCH_11_RECOVERY_EPOCH).0
+                    + 1,
+            )
+        && provenance.worker_executable_sha256 == AUDITED_EPOCH_11_RECOVERY_WORKER_SHA256
+}
+
+fn audited_epoch_11_worker_binding_matches(canonical_path: &Path, sha256: [u8; 32]) -> bool {
+    canonical_path == Path::new(AUDITED_EPOCH_11_RECOVERY_WORKER_PATH)
+        && sha256 == AUDITED_EPOCH_11_RECOVERY_WORKER_SHA256
+}
+
+fn measure_audited_epoch_11_recovery_worker(
+    descriptor: &compatibility::RuntimeDescriptor,
+) -> Result<[u8; 32], String> {
+    if !std::ptr::eq(descriptor, &compatibility::SOLANA_V1_0_14_RUNTIME) {
+        return Err(format!(
+            "audited epoch-11 recovery requires runtime {}, got {}",
+            compatibility::SOLANA_V1_0_14_RUNTIME.identity.name,
+            descriptor.identity.name,
+        ));
+    }
+    let configured = configured_historical_worker_executable(descriptor)?;
+    let canonical = fs::canonicalize(&configured).map_err(|error| {
+        format!(
+            "failed to resolve configured audited epoch-11 worker {}: {error}",
+            configured.display()
+        )
+    })?;
+    if canonical != Path::new(AUDITED_EPOCH_11_RECOVERY_WORKER_PATH) {
+        return Err(format!(
+            "audited epoch-11 recovery requires frozen worker {}, got {}",
+            AUDITED_EPOCH_11_RECOVERY_WORKER_PATH,
+            canonical.display(),
+        ));
+    }
+    let sha256 = historical::measure_executable_sha256(&canonical).map_err(|error| {
+        format!(
+            "failed to measure frozen audited epoch-11 worker {}: {error}",
+            canonical.display()
+        )
+    })?;
+    if !audited_epoch_11_worker_binding_matches(&canonical, sha256) {
+        return Err(format!(
+            "frozen audited epoch-11 worker {} has an unexpected SHA-256",
+            canonical.display()
+        ));
+    }
+    Ok(sha256)
+}
+
+fn audited_epoch_11_archive_content_matches(bytes: u64, sha256: [u8; 32]) -> bool {
+    bytes == AUDITED_EPOCH_11_RECOVERY_ARCHIVE_BYTES
+        && sha256 == AUDITED_EPOCH_11_RECOVERY_ARCHIVE_SHA256
 }
 
 fn segment_runtime_identity_is_compatible(
@@ -8246,7 +8362,16 @@ struct CompletedCohortEpoch {
 
 fn publish_completed_root_cohort_transactionally(
     completed: &[CompletedCohortEpoch],
-) -> Result<(), String> {
+    expected_epochs: &[u64],
+    manifest_fingerprint: [u8; 32],
+    destination: &BoundDestination,
+    receipt_directory: &Path,
+) -> Result<cohort_publication::CompletedPublication, String> {
+    let completed_epochs = completed
+        .iter()
+        .map(|archive| archive.epoch)
+        .collect::<Vec<_>>();
+    validate_root_cohort_epoch_membership(&completed_epochs, expected_epochs)?;
     for archive in completed {
         if !jetstreamer_node::archive_checksum::path_matches_archive_identity(
             &archive.staged_output,
@@ -8264,14 +8389,61 @@ fn publish_completed_root_cohort_transactionally(
             ));
         }
     }
-    let destination = completed
-        .first()
-        .map(|archive| archive.final_output.display().to_string())
-        .unwrap_or_else(|| "<empty cohort>".to_string());
-    Err(format!(
-        "transactional cohort publication is unavailable for {} privately staged archive(s), beginning at {destination}; no archive or checksum was published",
-        completed.len(),
-    ))
+    destination.revalidate()?;
+    let items = completed
+        .iter()
+        .map(
+            |archive| jetstreamer_node::archive_publish::ArchiveBatchItem {
+                epoch: archive.epoch,
+                staged_archive: archive.staged_output.clone(),
+                destination_archive: archive.final_output.clone(),
+                evidence: archive.validated,
+            },
+        )
+        .collect::<Vec<_>>();
+    let expected = completed
+        .iter()
+        .map(|archive| cohort_publication::ExpectedCohortArchive {
+            epoch: archive.epoch,
+            destination_archive: &archive.final_output,
+            sha256: archive.validated.sha256,
+        })
+        .collect::<Vec<_>>();
+    let publication = jetstreamer_node::archive_publish::publish_verified_archive_batch(
+        manifest_fingerprint,
+        expected_epochs,
+        &items,
+    )
+    .map_err(|error| format!("transactional cohort publication failed: {error}"))?;
+    cohort_publication::finish_committed_publication(
+        destination.publication_binding(),
+        receipt_directory,
+        manifest_fingerprint,
+        &expected,
+        &publication,
+    )
+}
+
+fn validate_root_cohort_epoch_membership(
+    actual: &[u64],
+    expected_epochs: &[u64],
+) -> Result<(), String> {
+    if expected_epochs.is_empty()
+        || expected_epochs
+            .windows(2)
+            .any(|epochs| epochs[0].checked_add(1) != Some(epochs[1]))
+    {
+        return Err(
+            "root-checkpoint cohort expected epoch range is empty or noncontiguous".to_string(),
+        );
+    }
+    if actual != expected_epochs {
+        return Err(format!(
+            "root-checkpoint cohort archive membership {:?} does not match expected epochs {:?}",
+            actual, expected_epochs
+        ));
+    }
+    Ok(())
 }
 
 fn after_root_cohort_publication_gate<T>(
@@ -10412,6 +10584,24 @@ fn clear_ledger_accounts_state(ledger_dir: &Path) -> Result<(), String> {
 /// Structural completeness alone is insufficient: a valid file generated by
 /// another runtime profile, source policy, or slot range must not bypass the
 /// current compatibility selection.
+fn require_archive_batch_closed_for_reuse(path: &Path) -> Result<(), String> {
+    let destination = path.parent().unwrap_or_else(|| Path::new("."));
+    if jetstreamer_node::archive_checksum::archive_batch_publication_in_progress(destination)
+        .map_err(|error| {
+            format!(
+                "failed to inspect archive batch state in {}: {error}",
+                destination.display()
+            )
+        })?
+    {
+        return Err(format!(
+            "destination {} has an active or unacknowledged archive batch; recovery must finish before archive reuse",
+            destination.display()
+        ));
+    }
+    Ok(())
+}
+
 fn validated_epoch_archive(
     path: &Path,
     epoch: u64,
@@ -10419,11 +10609,16 @@ fn validated_epoch_archive(
     cancellation: Option<&AtomicBool>,
     chain_evidence: Option<&mut ArchiveChainEvidence>,
 ) -> Result<Option<jetstreamer_node::archive_checksum::ValidatedArchiveFile>, String> {
+    require_archive_batch_closed_for_reuse(path)?;
     let file = match jetstreamer_node::archive_checksum::open_regular_nofollow(path) {
         Ok(file) => file,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(err) => return Err(format!("failed to open {}: {err}", path.display())),
     };
+    let initial_bytes = file
+        .metadata()
+        .map_err(|err| format!("failed to inspect archive {}: {err}", path.display()))?
+        .len();
     let initial_identity = jetstreamer_node::archive_checksum::archive_file_identity(&file)
         .map_err(|err| format!("failed to identify archive {}: {err}", path.display()))?;
     let measurement_file = file
@@ -10495,6 +10690,8 @@ fn validated_epoch_archive(
     let recorded_worker_executable_sha256 = provenance
         .single_runtime_worker_executable_sha256()
         .expect("single-runtime provenance has a single worker-digest field");
+    let audited_epoch_11_recovery =
+        audited_epoch_11_recovery_provenance_matches(epoch, &provenance);
     let identity = selection.descriptor.identity;
     let expected_genesis = identity.genesis_hash.parse::<Hash>().map_err(|err| {
         format!(
@@ -10504,10 +10701,11 @@ fn validated_epoch_archive(
     })?;
     let expected_toolchain = archive_runtime_toolchain(identity);
     let expected_metadata = archive_transaction_metadata_policy(slot_start, expected_slot_count);
-    if !runtime_generation_profile_is_compatible(
+    if !(runtime_generation_profile_is_compatible(
         &provenance_v1.runtime_profile,
         &provenance_v1.generation_profile,
-    ) || provenance_v1.runtime_profile != identity.name
+    ) || audited_epoch_11_recovery)
+        || provenance_v1.runtime_profile != identity.name
         || provenance_v1.runtime_admission != archive_runtime_admission(selection.admission)
         || provenance_v1.runtime_revision != identity.revision
         || provenance_v1.runtime_toolchain != expected_toolchain
@@ -10521,7 +10719,11 @@ fn validated_epoch_archive(
         ));
     }
 
-    let expected_worker_executable_sha256 = if selection.descriptor.worker.is_some() {
+    let expected_worker_executable_sha256 = if audited_epoch_11_recovery {
+        Some(measure_audited_epoch_11_recovery_worker(
+            selection.descriptor,
+        )?)
+    } else if selection.descriptor.worker.is_some() {
         let executable = configured_historical_worker_executable(selection.descriptor)?;
         Some(
             historical::measure_executable_sha256(&executable).map_err(|err| {
@@ -10582,7 +10784,7 @@ fn validated_epoch_archive(
             }
         }
     }
-    verify_open_archive_payload(
+    let validated = verify_open_archive_payload(
         path,
         reader,
         &measurement_file,
@@ -10593,8 +10795,16 @@ fn validated_epoch_archive(
         initial_identity,
         cancellation,
         chain_evidence,
-    )
-    .map(Some)
+    )?;
+    if audited_epoch_11_recovery
+        && !audited_epoch_11_archive_content_matches(initial_bytes, validated.sha256)
+    {
+        return Err(format!(
+            "epoch-11 archive {} does not match the audited content identity",
+            path.display()
+        ));
+    }
+    Ok(Some(validated))
 }
 
 fn epoch_archive_reusable(
@@ -10617,6 +10827,7 @@ fn validated_epoch_archive_multi_runtime(
     spans: &[compatibility::RuntimeSpan],
     cancellation: Option<&AtomicBool>,
 ) -> Result<Option<jetstreamer_node::archive_checksum::ValidatedArchiveFile>, String> {
+    require_archive_batch_closed_for_reuse(path)?;
     if spans.len() < 2 {
         return Err("multi-runtime archive validation requires at least two spans".to_string());
     }
@@ -12618,6 +12829,14 @@ impl BoundDestination {
         &self.path
     }
 
+    fn publication_binding(&self) -> cohort_publication::DestinationBinding<'_> {
+        cohort_publication::DestinationBinding {
+            path: &self.path,
+            device: self.dev,
+            inode: self.ino,
+        }
+    }
+
     fn revalidate(&self) -> Result<(), String> {
         use std::os::unix::fs::MetadataExt as _;
 
@@ -12712,6 +12931,23 @@ impl CohortRunDirectory {
 
     fn path(&self) -> &Path {
         &self.path
+    }
+
+    fn archives_path(&self) -> PathBuf {
+        self.path.join("archives")
+    }
+
+    fn preflight_publication(&self, destination: &BoundDestination) -> Result<(), String> {
+        destination.revalidate()?;
+        let archives = self.archives_path();
+        create_or_validate_private_directory(&archives)?;
+        jetstreamer_node::archive_publish::preflight_archive_publication(
+            &archives,
+            destination.path(),
+        )
+        .map_err(|error| {
+            format!("root-checkpoint cohort publication capability preflight failed: {error}")
+        })
     }
 
     fn cleanup_after_commit(self) -> Result<(), String> {
@@ -12882,10 +13118,23 @@ fn private_epoch_scope(dest_dir: &Path) -> Result<PathBuf, String> {
     );
     let scope = root.join(scope_name);
     create_or_validate_private_directory(&scope)?;
-    for child in ["locks", "work"] {
+    for child in ["evidence", "locks", "work"] {
         create_or_validate_private_directory(&scope.join(child))?;
     }
     Ok(scope)
+}
+
+fn cohort_batch_receipt_directory(destination: &BoundDestination) -> Result<PathBuf, String> {
+    destination.revalidate()?;
+    let evidence = private_epoch_scope(destination.path())?.join("evidence");
+    let batches = evidence.join("archive-batches");
+    create_or_validate_private_directory(&batches)?;
+    let identity = batches.join(format!(
+        "destination-{:016x}-{:016x}",
+        destination.dev, destination.ino
+    ));
+    create_or_validate_private_directory(&identity)?;
+    Ok(identity)
 }
 
 /// Reuses only the immutable, owner-only checkpoint file produced by a prior
@@ -15004,7 +15253,8 @@ async fn main() {
     // Top-level producers hold one advisory lease per output epoch from before
     // bootstrap/hash binding through final checksum publication. Internal
     // children are covered by their parent's still-open lease.
-    let _epoch_leases = if !inherited_epoch_lease_authorized() {
+    let inherited_epoch_lease = inherited_epoch_lease_authorized();
+    let _epoch_leases = if !inherited_epoch_lease {
         match acquire_epoch_leases(&dest_dir, start_epoch, end_epoch) {
             Ok(leases) => {
                 info!(
@@ -15021,6 +15271,49 @@ async fn main() {
     } else {
         Vec::new()
     };
+
+    // A durable batch outcome is delivered before this invocation inspects or
+    // reuses any archive. Recovery is a complete invocation boundary: persist
+    // the exact private receipt, acknowledge its transaction ID, and stop.
+    let batch_receipt_directory = if inherited_epoch_lease {
+        None
+    } else {
+        Some(match cohort_batch_receipt_directory(&destination_binding) {
+            Ok(path) => path,
+            Err(error) => {
+                eprintln!("error: {error}");
+                exit(1);
+            }
+        })
+    };
+    if let Some(receipt_directory) = batch_receipt_directory.as_deref() {
+        match cohort_publication::recover_pending_batch(
+            destination_binding.publication_binding(),
+            receipt_directory,
+        ) {
+            Ok(cohort_publication::RecoveryDisposition::None) => {}
+            Ok(cohort_publication::RecoveryDisposition::Stop {
+                outcome,
+                receipt_path,
+            }) => {
+                match (outcome, receipt_path) {
+                    (Some(outcome), Some(receipt_path)) => println!(
+                        "archive batch recovery completed with {outcome:?}; receipt {} is durable; rerun the command to continue",
+                        receipt_path.display()
+                    ),
+                    (None, None) => println!(
+                        "cleared an unarmed archive batch marker; rerun the command to continue"
+                    ),
+                    _ => unreachable!("recovery outcome and receipt are paired"),
+                }
+                return;
+            }
+            Err(error) => {
+                eprintln!("error: {error}; archive batch state remains closed");
+                exit(1);
+            }
+        }
+    }
 
     // Candidate admission is checked for the complete requested range before
     // resume considers any existing output. This prevents a stale archive
@@ -15084,7 +15377,16 @@ async fn main() {
             .join("work")
             .join(format!("root-cohort-{start_epoch}-{end_epoch}"));
         match CohortRunDirectory::create(cohort_root, start_epoch, end_epoch, &plan.fingerprint) {
-            Ok(run) => Some(run),
+            Ok(run) => {
+                if let Err(err) = run.preflight_publication(&destination_binding) {
+                    eprintln!(
+                        "error: {err}; private run retained at {}",
+                        run.path().display()
+                    );
+                    exit(1);
+                }
+                Some(run)
+            }
             Err(err) => {
                 eprintln!("error: {err}");
                 exit(1);
@@ -16085,16 +16387,11 @@ async fn main() {
         }
         let final_output = dest_dir.join(format!("epoch-{epoch}.jet"));
         let horizon_output = if root_checkpoint_cohort {
-            let staging = cohort_run
+            cohort_run
                 .as_ref()
                 .expect("cohort run directory was created")
-                .path()
-                .join("archives");
-            if let Err(err) = create_or_validate_private_directory(&staging) {
-                eprintln!("error: {err}");
-                exit(1);
-            }
-            staging.join(format!("epoch-{epoch}.jet"))
+                .archives_path()
+                .join(format!("epoch-{epoch}.jet"))
         } else {
             horizon_output_override
                 .clone()
@@ -16326,6 +16623,22 @@ async fn main() {
             .as_ref()
             .expect("cohort verifier was created")
             .finish();
+        let manifest_fingerprint = match manifest_fingerprint_digest(
+            &cohort_plan
+                .as_ref()
+                .expect("cohort plan was validated")
+                .fingerprint,
+        ) {
+            Ok(fingerprint) => fingerprint,
+            Err(err) => {
+                eprintln!("error: {err}; publication remains closed");
+                exit(1);
+            }
+        };
+        let receipt_directory = batch_receipt_directory
+            .as_deref()
+            .expect("top-level cohort has a private receipt directory");
+        let expected_epochs = (effective_start..=end_epoch).collect::<Vec<_>>();
         let publication = after_root_cohort_publication_gate(
             completed_cohort.len(),
             total_epochs as usize,
@@ -16336,20 +16649,29 @@ async fn main() {
                     "root-checkpoint cohort {}-{} passed its terminal root and all archive checks; opening publication gate",
                     effective_start, end_epoch
                 );
-                publish_completed_root_cohort_transactionally(&completed_cohort)
+                publish_completed_root_cohort_transactionally(
+                    &completed_cohort,
+                    &expected_epochs,
+                    manifest_fingerprint,
+                    &destination_binding,
+                    receipt_directory,
+                )
             },
         );
-        if let Err(err) = publication {
-            eprintln!(
-                "error: {err}; private run retained at {}",
-                cohort_run
-                    .as_ref()
-                    .expect("cohort run directory was created")
-                    .path()
-                    .display()
-            );
-            exit(1);
-        }
+        let publication = match publication {
+            Ok(publication) => publication,
+            Err(err) => {
+                eprintln!(
+                    "error: {err}; private run retained at {}",
+                    cohort_run
+                        .as_ref()
+                        .expect("cohort run directory was created")
+                        .path()
+                        .display()
+                );
+                exit(1);
+            }
+        };
         if let Err(err) = cohort_run
             .take()
             .expect("cohort run directory was created")
@@ -16359,10 +16681,12 @@ async fn main() {
             exit(1);
         }
         info!(
-            "root-checkpoint cohort {}-{} published {} archive(s) with checksums",
+            "root-checkpoint cohort {}-{} published {} archive(s) with checksums in transaction {}; receipt {} is durable",
             effective_start,
             end_epoch,
-            completed_cohort.len()
+            publication.archive_count,
+            jetstreamer_node::segment_manifest::sha256_hex_string(&publication.transaction_id),
+            publication.receipt_path.display()
         );
     }
 }
@@ -16574,6 +16898,45 @@ mod early_snapshot_tests {
     }
 
     #[test]
+    fn root_cohort_publication_requires_exact_ordered_epoch_membership() {
+        assert!(validate_root_cohort_epoch_membership(&[17, 18, 19], &[17, 18, 19]).is_ok());
+        for actual in [&[17, 19][..], &[17, 19, 18], &[17, 18, 19, 19]] {
+            let error = validate_root_cohort_epoch_membership(actual, &[17, 18, 19]).unwrap_err();
+            assert!(error.contains("does not match"), "{error}");
+        }
+        let error = validate_root_cohort_epoch_membership(&[], &[]).unwrap_err();
+        assert!(error.contains("empty or noncontiguous"), "{error}");
+        let error = validate_root_cohort_epoch_membership(&[17, 19], &[17, 19]).unwrap_err();
+        assert!(error.contains("empty or noncontiguous"), "{error}");
+        let error =
+            validate_root_cohort_epoch_membership(&[u64::MAX, u64::MAX], &[u64::MAX, u64::MAX])
+                .unwrap_err();
+        assert!(error.contains("empty or noncontiguous"), "{error}");
+    }
+
+    #[test]
+    fn archive_reuse_refuses_destination_wide_batch_state() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::create_dir(
+            directory
+                .path()
+                .join(jetstreamer_node::archive_checksum::ARCHIVE_BATCH_OUTCOME_DIRECTORY),
+        )
+        .unwrap();
+        let archive = directory.path().join("epoch-17.jet");
+        let error = epoch_archive_reusable(
+            &archive,
+            17,
+            root_checkpoint_cohort_runtime(17, 19, true).unwrap(),
+        )
+        .unwrap_err();
+        assert!(error.contains("unacknowledged archive batch"), "{error}");
+
+        let error = epoch_archive_reusable_multi_runtime(&archive, 17, &[]).unwrap_err();
+        assert!(error.contains("unacknowledged archive batch"), "{error}");
+    }
+
+    #[test]
     fn interruption_and_root_mismatch_never_open_the_publication_gate() {
         let calls = AtomicUsize::new(0);
         let directory = tempfile::tempdir().unwrap();
@@ -16602,6 +16965,18 @@ mod early_snapshot_tests {
         assert!(mismatch.contains("accounts hash mismatch"));
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         assert!(!checksum.exists());
+        assert!(
+            !directory
+                .path()
+                .join(jetstreamer_node::archive_checksum::ARCHIVE_BATCH_TRANSACTION_DIRECTORY)
+                .exists()
+        );
+        assert!(
+            !directory
+                .path()
+                .join(jetstreamer_node::archive_checksum::ARCHIVE_BATCH_OUTCOME_DIRECTORY)
+                .exists()
+        );
     }
 
     #[test]
@@ -16800,6 +17175,145 @@ mod early_snapshot_tests {
         assert!(!runtime_generation_profile_is_compatible(
             historical::SOLANA_V1_0_7_CANDIDATE.backend_id,
             prior_v1_0_8,
+        ));
+        assert!(!runtime_generation_profile_is_compatible(
+            historical::SOLANA_V1_0_14_CANDIDATE.backend_id,
+            AUDITED_EPOCH_11_RECOVERY_PROFILE,
+        ));
+    }
+
+    fn audited_epoch_11_recovery_provenance() -> ArchiveProvenance {
+        let output_start = epoch_to_slot_range(AUDITED_EPOCH_11_RECOVERY_EPOCH).0;
+        let output_end = epoch_to_slot_range(AUDITED_EPOCH_11_RECOVERY_EPOCH).1 + 1;
+        let selection = compatibility::select_runtime(output_start..output_end, true).unwrap();
+        let mut provenance = build_archive_provenance(
+            selection,
+            Some(AUDITED_EPOCH_11_RECOVERY_WORKER_SHA256),
+            BootstrapStateKind::SnapshotArchive,
+            AUDITED_EPOCH_11_RECOVERY_BOOTSTRAP_SLOT,
+            AUDITED_EPOCH_11_RECOVERY_BOOTSTRAP_HASH.parse().unwrap(),
+            output_start,
+            output_end - output_start,
+        )
+        .unwrap();
+        let ArchiveProvenance::V2(provenance_v2) = &mut provenance else {
+            panic!("historical worker provenance must be V2");
+        };
+        provenance_v2.base.generation_profile = AUDITED_EPOCH_11_RECOVERY_PROFILE.to_owned();
+        provenance
+    }
+
+    fn assert_audited_epoch_11_provenance_mutation_rejected(
+        provenance: &ArchiveProvenance,
+        mutation: impl FnOnce(&mut ArchiveProvenanceV2),
+    ) {
+        let mut changed = provenance.clone();
+        let ArchiveProvenance::V2(changed_v2) = &mut changed else {
+            panic!("audited epoch-11 fixture must be V2");
+        };
+        mutation(changed_v2);
+        assert!(!audited_epoch_11_recovery_provenance_matches(
+            AUDITED_EPOCH_11_RECOVERY_EPOCH,
+            &changed,
+        ));
+    }
+
+    #[test]
+    fn audited_epoch_11_recovery_is_exact_and_not_general_compatibility() {
+        let provenance = audited_epoch_11_recovery_provenance();
+        assert!(audited_epoch_11_recovery_provenance_matches(
+            AUDITED_EPOCH_11_RECOVERY_EPOCH,
+            &provenance,
+        ));
+        assert!(!audited_epoch_11_recovery_provenance_matches(
+            AUDITED_EPOCH_11_RECOVERY_EPOCH - 1,
+            &provenance,
+        ));
+        let ArchiveProvenance::V2(v2) = &provenance else {
+            unreachable!();
+        };
+        assert!(!audited_epoch_11_recovery_provenance_matches(
+            AUDITED_EPOCH_11_RECOVERY_EPOCH,
+            &ArchiveProvenance::V1(v2.base.clone()),
+        ));
+
+        assert_audited_epoch_11_provenance_mutation_rejected(&provenance, |changed| {
+            changed.base.generation_profile.pop();
+            changed.base.generation_profile.push('0');
+        });
+        assert_audited_epoch_11_provenance_mutation_rejected(&provenance, |changed| {
+            changed.base.runtime_profile.push_str("-different");
+        });
+        assert_audited_epoch_11_provenance_mutation_rejected(&provenance, |changed| {
+            changed.base.runtime_admission = RuntimeAdmission::Verified;
+        });
+        assert_audited_epoch_11_provenance_mutation_rejected(&provenance, |changed| {
+            changed.base.runtime_revision.push('0');
+        });
+        assert_audited_epoch_11_provenance_mutation_rejected(&provenance, |changed| {
+            changed.base.runtime_toolchain.push('0');
+        });
+        assert_audited_epoch_11_provenance_mutation_rejected(&provenance, |changed| {
+            changed.base.genesis_hash = Hash::new_unique();
+        });
+        assert_audited_epoch_11_provenance_mutation_rejected(&provenance, |changed| {
+            changed.base.bootstrap_state_kind = BootstrapStateKind::CarriedBank;
+        });
+        assert_audited_epoch_11_provenance_mutation_rejected(&provenance, |changed| {
+            changed.base.bootstrap_slot += 1;
+        });
+        assert_audited_epoch_11_provenance_mutation_rejected(&provenance, |changed| {
+            changed.base.bootstrap_state_hash = Hash::new_unique();
+        });
+        assert_audited_epoch_11_provenance_mutation_rejected(&provenance, |changed| {
+            changed.base.requested_slot_start += 1;
+        });
+        assert_audited_epoch_11_provenance_mutation_rejected(&provenance, |changed| {
+            changed.base.requested_slot_count -= 1;
+        });
+        assert_audited_epoch_11_provenance_mutation_rejected(&provenance, |changed| {
+            changed.base.transaction_metadata = TransactionMetadataPolicy::observed();
+        });
+        assert_audited_epoch_11_provenance_mutation_rejected(&provenance, |changed| {
+            changed.worker_executable_sha256[0] ^= 1;
+        });
+        assert!(!runtime_generation_profile_is_compatible(
+            historical::SOLANA_V1_0_14_CANDIDATE.backend_id,
+            AUDITED_EPOCH_11_RECOVERY_PROFILE,
+        ));
+    }
+
+    #[test]
+    fn audited_epoch_11_recovery_binds_archive_and_frozen_worker_bytes() {
+        assert!(audited_epoch_11_archive_content_matches(
+            AUDITED_EPOCH_11_RECOVERY_ARCHIVE_BYTES,
+            AUDITED_EPOCH_11_RECOVERY_ARCHIVE_SHA256,
+        ));
+        assert!(!audited_epoch_11_archive_content_matches(
+            AUDITED_EPOCH_11_RECOVERY_ARCHIVE_BYTES - 1,
+            AUDITED_EPOCH_11_RECOVERY_ARCHIVE_SHA256,
+        ));
+        let mut changed_archive = AUDITED_EPOCH_11_RECOVERY_ARCHIVE_SHA256;
+        changed_archive[0] ^= 1;
+        assert!(!audited_epoch_11_archive_content_matches(
+            AUDITED_EPOCH_11_RECOVERY_ARCHIVE_BYTES,
+            changed_archive,
+        ));
+
+        let path = Path::new(AUDITED_EPOCH_11_RECOVERY_WORKER_PATH);
+        assert!(audited_epoch_11_worker_binding_matches(
+            path,
+            AUDITED_EPOCH_11_RECOVERY_WORKER_SHA256,
+        ));
+        assert!(!audited_epoch_11_worker_binding_matches(
+            &path.with_file_name("different-worker"),
+            AUDITED_EPOCH_11_RECOVERY_WORKER_SHA256,
+        ));
+        let mut changed_worker = AUDITED_EPOCH_11_RECOVERY_WORKER_SHA256;
+        changed_worker[0] ^= 1;
+        assert!(!audited_epoch_11_worker_binding_matches(
+            path,
+            changed_worker,
         ));
     }
 
@@ -18222,6 +18736,23 @@ mod early_snapshot_tests {
 
         run.cleanup_after_commit().unwrap();
         assert!(!run_path.exists());
+    }
+
+    #[test]
+    fn cohort_receipts_live_in_private_destination_identity_scope() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let (_fixture, destination) = private_destination_fixture();
+        let binding = BoundDestination::bind(&destination).unwrap();
+        let receipts = cohort_batch_receipt_directory(&binding).unwrap();
+        assert!(!receipts.starts_with(binding.path()));
+        assert!(receipts.starts_with(private_epoch_scope(binding.path()).unwrap()));
+        let expected_name = format!("destination-{:016x}-{:016x}", binding.dev, binding.ino);
+        assert_eq!(receipts.file_name().unwrap(), OsString::from(expected_name));
+        let metadata = fs::symlink_metadata(receipts).unwrap();
+        assert!(metadata.file_type().is_dir());
+        assert_eq!(metadata.uid(), effective_user_id());
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
     }
 
     fn assert_private_scope_and_epoch_lease_guards() {

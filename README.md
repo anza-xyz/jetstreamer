@@ -381,6 +381,16 @@ bootstrap state, output slot range, and transaction-metadata policy in a version
 envelope. Range resume skips a completed archive only when that provenance matches the current
 slot-derived plan.
 
+One content-addressed rule is narrower than normal range resume. The epoch-11 archive produced at
+revision `0a8ec77094ddf2b21ff22e6f4a55fef836f8f2c6` may proceed from private crash recovery to
+the secure publisher, or be reused after publication, only when its complete provenance matches
+the audited v1.0.14 run. `JETSTREAMER_HISTORICAL_WORKER_V1_0_14` must resolve to
+`/home/sol/.jetstreamer-private/deploy-epoch11-full-v1014-20260910-v3/jetstreamer-historical-worker-v1-0-14`,
+and that executable must hash to the recorded SHA-256. The archive must then pass its full decode,
+semantic and PoH-chain checks, exact 2,765,674,556-byte length, and exact audited SHA-256. The old
+producer profile is not part of the general compatibility allowlist, so no other artifact from that
+profile gains admission.
+
 Root snapshots are the only trust anchors for historical verification. The read-only inventory
 preflight groups an epoch without a root checkpoint with the first later epoch that has one, as
 long as the runtime descriptor does not change. Hourly snapshots may shorten bootstrap work for
@@ -414,7 +424,21 @@ closed. Each terminal checkpoint must match the archive's final present block, s
 slots do not create a false epoch-boundary requirement. A mismatch, missing final-epoch root,
 infrastructure failure, or interruption leaves every generated archive and its recognizable run
 state private and creates no checksum. The final root and every archive must pass before the
-transactional publisher can expose any cohort member.
+transactional publisher can expose any cohort member. Publication capability is tested once before
+replay begins, then the ordered archive set is committed through one durable batch journal. While
+that journal or its completed outcome exists, archive reuse, checksum repair, and another batch all
+fail closed. After commit, Jetstreamer verifies the exact final inode set and checksums, writes and
+fsyncs an owner-only receipt below the destination's private evidence scope, and acknowledges the
+exact transaction ID before removing the private run. The receipt records the reviewed manifest
+fingerprint, canonical destination identity, ordered epochs, prior namespace identities, new archive
+digests, and final identities.
+
+On startup, a top-level producer recovers or observes any pending batch before inspecting an
+archive. It writes the same durable private receipt for a committed result, or a rollback receipt
+containing restored identities and the still-private validated archive digest. It then acknowledges
+that outcome and exits unconditionally. A clean subsequent invocation is required to resume. If
+the journal, destination, staged archive, or receipt evidence has changed, recovery makes no further
+mutation and the destination remains closed for operator review.
 
 Use `scripts/preflight_gcs_snapshots.py` before scheduling early epochs. Its schema-v2
 `verification_cohorts` array supplies the ranges accepted by this mode and fails if a root gap

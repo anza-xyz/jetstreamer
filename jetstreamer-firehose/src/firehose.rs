@@ -1360,8 +1360,9 @@ pub struct FirehoseErrorContext {
 
 /// Streams blocks, transactions, entries, rewards, and stats to user-provided handlers.
 ///
-/// The requested `slot_range` is half-open `[start, end)`; on recoverable errors the
-/// runner restarts from the last processed slot to maintain coverage.
+/// The requested `slot_range` is half-open `[start, end)`. Recoverable data errors retry
+/// the incomplete slot. Stats handler failures retry the pending pulse before reading more
+/// data, preserving completed slot progress and avoiding duplicate data callbacks.
 ///
 /// When `sequential` is `true`, the firehose uses one worker thread and opens epoch streams
 /// with ripget's parallel windowed downloader. In this mode `threads` configures ripget range
@@ -1654,7 +1655,7 @@ where
             );
             let log_target = format!("{}::T{:03}", LOG_MODULE, thread_index);
             let mut skip_until_index = None;
-            let last_emitted_slot = slot_range.start.saturating_sub(1);
+            let mut last_emitted_slot = slot_range.start.saturating_sub(1);
             let block_enabled = on_block.is_some();
             let tx_enabled = on_tx.is_some();
             let entry_enabled = on_entry.is_some();
@@ -1666,7 +1667,6 @@ where
                     .or_insert_with(|| DashSet::with_hasher(ahash::RandomState::new()));
             }
             let mut last_counted_slot = slot_range.start.saturating_sub(1);
-            let mut last_emitted_slot_global = slot_range.start.saturating_sub(1);
             // Reverse-mode state preserved across retries. `None` for the highest remaining
             // epoch explicitly means "every epoch is complete" — required so completing
             // epoch 0 is distinguishable from epoch 0 still pending.
@@ -1695,18 +1695,15 @@ where
                 None
             };
 
+            let mut pending_stats = false;
             let mut retry_backoff = RetryBackoff::new();
             // let mut triggered = false;
             while let Err((err, slot)) = async {
-                let mut last_emitted_slot = last_emitted_slot_global;
                 let op_timeout = if sequential_mode {
                     OP_TIMEOUT_SEQUENTIAL
                 } else {
                     OP_TIMEOUT
                 };
-                // Each pass through this block opens a fresh stream; the stamp shields young
-                // connections from the recycle monitor while they warm up.
-                thread_activity::note_stream_start(thread_index);
                 // Restart boundary is quiescent: answer any steal proposals that arrived
                 // while the previous pass was ending.
                 if work_stealing {
@@ -1728,6 +1725,32 @@ where
                     );
                     return Ok(());
                 }
+                // A stats failure happens after the slot's data callbacks have succeeded.
+                // Retry that pulse before opening another stream, including when the failed
+                // pulse belonged to the final slot of the range or the final reverse epoch.
+                if pending_stats && let Some(ref stats) = thread_stats {
+                    maybe_emit_stats(
+                        stats_tracking.as_ref(),
+                        thread_index,
+                        stats,
+                        &overall_slots_processed,
+                        &overall_blocks_processed,
+                        &overall_transactions_processed,
+                        &overall_entries_processed,
+                        &transactions_since_stats,
+                        &blocks_since_stats,
+                        &slots_since_stats,
+                        &last_pulse,
+                        start_time,
+                    )
+                    .await?;
+                    pending_stats = false;
+                }
+                if !reverse_mode_local && slot_range.is_empty() {
+                    return Err((FirehoseError::RangeComplete, slot_range.end));
+                }
+                // Shield fresh connections from the recycle monitor while they warm up.
+                thread_activity::note_stream_start(thread_index);
                 let lowest_epoch = slot_to_epoch(slot_range.start);
                 let highest_epoch = slot_to_epoch(slot_range.end - 1);
                 let epoch_range = lowest_epoch..=highest_epoch;
@@ -2205,14 +2228,6 @@ where
                                 }
                                 Block(block) => {
                                     let prev_last_counted_slot = last_counted_slot;
-                                    let thread_stats_snapshot = thread_stats.as_ref().map(|stats| {
-                                        (
-                                            stats.slots_processed,
-                                            stats.blocks_processed,
-                                            stats.leader_skipped_slots,
-                                            stats.current_slot,
-                                        )
-                                    });
 
                                     let next_expected_slot = prev_last_counted_slot.saturating_add(1);
                                     let skip_start_from_previous = last_counted_slot.saturating_add(1);
@@ -2239,7 +2254,6 @@ where
                                         if block_enabled
                                             && let Some(on_block_cb) = on_block.as_ref()
                                             && skipped_slot > last_emitted_slot {
-                                                last_emitted_slot = skipped_slot;
                                                 on_block_cb(
                                                     thread_index,
                                                     BlockData::PossibleLeaderSkipped {
@@ -2250,9 +2264,10 @@ where
                                                 .map_err(|e| {
                                                     (
                                                         FirehoseError::BlockHandlerError(e),
-                                                        error_slot,
+                                                        skipped_slot,
                                                     )
                                                 })?;
+                                                last_emitted_slot = skipped_slot;
                                             }
                                         if tracking_enabled {
                                             overall_slots_processed.fetch_add(1, Ordering::Relaxed);
@@ -2292,7 +2307,6 @@ where
                                             let rewards =
                                                 std::mem::take(&mut this_block_rewards).rewards;
                                             if slot > last_emitted_slot {
-                                                last_emitted_slot = slot;
                                                 on_block_cb(
                                                     thread_index,
                                                     BlockData::Block {
@@ -2315,12 +2329,24 @@ where
                                                         error_slot,
                                                     )
                                                 })?;
+                                                last_emitted_slot = slot;
                                             }
                                         }
                                     } else {
                                         this_block_rewards = DecodedRewards::empty();
                                     }
                                     previous_blockhash = latest_entry_blockhash;
+
+                                    // Data delivery is complete. A later stats error must resume
+                                    // after this slot so transactions cannot outlive their block callback.
+                                    if slot > last_counted_slot {
+                                        last_counted_slot = slot;
+                                    }
+                                    if work_stealing {
+                                        work_registry[thread_index]
+                                            .next
+                                            .store(last_counted_slot.saturating_add(1), Ordering::SeqCst);
+                                    }
 
                                     if tracking_enabled {
                                         overall_slots_processed.fetch_add(1, Ordering::Relaxed);
@@ -2335,57 +2361,25 @@ where
 
                                         if let (Some(stats_tracking_cfg), Some(thread_stats_ref)) =
                                             (&stats_tracking, thread_stats.as_mut())
-                                            && slot % stats_tracking_cfg.tracking_interval_slots == 0
-                                                && let Err(err) = maybe_emit_stats(
-                                                    stats_tracking.as_ref(),
-                                                    thread_index,
-                                                    thread_stats_ref,
-                                                    &overall_slots_processed,
-                                                    &overall_blocks_processed,
-                                                    &overall_transactions_processed,
-                                                    &overall_entries_processed,
+                                            && slot % stats_tracking_cfg.tracking_interval_slots == 0 {
+                                            pending_stats = true;
+                                            maybe_emit_stats(
+                                                stats_tracking.as_ref(),
+                                                thread_index,
+                                                thread_stats_ref,
+                                                &overall_slots_processed,
+                                                &overall_blocks_processed,
+                                                &overall_transactions_processed,
+                                                &overall_entries_processed,
                                                 &transactions_since_stats,
                                                 &blocks_since_stats,
                                                 &slots_since_stats,
                                                 &last_pulse,
                                                 start_time,
                                             )
-                                            .await
-                                            {
-                                                blocks_since_stats.fetch_sub(1, Ordering::Relaxed);
-                                                    slots_since_stats.fetch_sub(1, Ordering::Relaxed);
-                                                    overall_blocks_processed
-                                                        .fetch_sub(1, Ordering::Relaxed);
-                                                    overall_slots_processed
-                                                        .fetch_sub(1, Ordering::Relaxed);
-                                                    if let Some((
-                                                        prev_slots_processed,
-                                                        prev_blocks_processed,
-                                                        prev_leader_skipped,
-                                                        prev_current_slot,
-                                                    )) = thread_stats_snapshot
-                                                    {
-                                                        thread_stats_ref.slots_processed =
-                                                            prev_slots_processed;
-                                                        thread_stats_ref.blocks_processed =
-                                                            prev_blocks_processed;
-                                                        thread_stats_ref.leader_skipped_slots =
-                                                            prev_leader_skipped;
-                                                        thread_stats_ref.current_slot =
-                                                            prev_current_slot;
-                                                    }
-                                                    last_counted_slot = prev_last_counted_slot;
-                                                    return Err(err);
-                                                }
-                                    }
-
-                                    if slot > last_counted_slot {
-                                        last_counted_slot = slot;
-                                    }
-                                    if work_stealing {
-                                        work_registry[thread_index]
-                                            .next
-                                            .store(last_counted_slot.saturating_add(1), Ordering::SeqCst);
+                                            .await?;
+                                            pending_stats = false;
+                                        }
                                     }
                                 }
                                 Subset(_subset) => (),
@@ -2517,6 +2511,7 @@ where
                     }
                     if let Some(ref mut stats) = thread_stats {
                         stats.finish_time = Some(std::time::Instant::now());
+                        pending_stats = true;
                         maybe_emit_stats(
                             stats_tracking.as_ref(),
                             thread_index,
@@ -2532,6 +2527,7 @@ where
                             start_time,
                         )
                         .await?;
+                        pending_stats = false;
                     }
                     if block_enabled {
                         pending_skipped_slots.remove(&thread_index);
@@ -2604,7 +2600,7 @@ where
                         thread_activity::clear_finished(thread_index);
                         slot_range = stolen;
                         last_counted_slot = slot_range.start.saturating_sub(1);
-                        last_emitted_slot_global = slot_range.start.saturating_sub(1);
+                        last_emitted_slot = slot_range.start.saturating_sub(1);
                         reverse_partial_resume = None;
                         skip_until_index = None;
                         if let Some(ref mut stats) = thread_stats {
@@ -2639,7 +2635,7 @@ where
                     }
                     log::error!(
                         target: &log_target,
-                        "🧯💦🔥 firehose encountered an error at slot {} in epoch {} and will roll back one slot and retry:",
+                        "🧯💦🔥 firehose encountered an error at slot {} in epoch {} and will retry:",
                         slot,
                         epoch
                     );
@@ -2677,9 +2673,8 @@ where
                         item_index,
                     );
                 }
-                // Update slot range to resume from the failed slot, not the original start.
-                // Reset local tracking so we don't treat the resumed slot range as already counted.
-                // If we've already counted this slot, resume from the next one to avoid duplicates.
+                // Data callback failures resume at the incomplete slot. Stats failures refer
+                // to an already delivered slot, so data resumes at the following slot.
                 if reverse_mode_local {
                     // In reverse mode, completed higher epochs are tracked via
                     // reverse_highest_remaining_epoch and the within-epoch resume slot lives in
@@ -2711,7 +2706,6 @@ where
                 // is reset to 0 each epoch restart. Keeping it can skip large portions
                 // of the stream and silently drop slots.
                 skip_until_index = None;
-                last_emitted_slot_global = last_emitted_slot;
                 if !recycled {
                     let backoff = retry_backoff.next_delay(slot);
                     log::warn!(
@@ -3738,6 +3732,106 @@ mod steal_protocol_tests {
 }
 
 #[cfg(test)]
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn test_stolen_lower_range_keeps_callbacks_after_recycle() {
+    use std::collections::BTreeSet;
+    use tokio::sync::Notify;
+
+    const END: u64 = 376_273_723;
+    const SPLIT: u64 = END - 100;
+    let release_victim = Arc::new(Notify::new());
+    let victim_paused = Arc::new(AtomicBool::new(false));
+    let transaction_slots = Arc::new(Mutex::new(BTreeSet::new()));
+    let block_slots = Arc::new(Mutex::new(BTreeSet::new()));
+    let first_stolen_slot = Arc::new(AtomicU64::new(0));
+
+    let run = firehose(
+        2,
+        false,
+        false,
+        None,
+        (END - 200)..END,
+        Some({
+            let release_victim = release_victim.clone();
+            let block_slots = block_slots.clone();
+            let first_stolen_slot = first_stolen_slot.clone();
+            move |thread_id: usize, block: BlockData| {
+                let release_victim = release_victim.clone();
+                let victim_paused = victim_paused.clone();
+                let block_slots = block_slots.clone();
+                let first_stolen_slot = first_stolen_slot.clone();
+                async move {
+                    if thread_id == 0 {
+                        // Leave enough lower slots to steal when worker 1 finishes.
+                        if !victim_paused.swap(true, Ordering::SeqCst) {
+                            release_victim.notified().await;
+                        }
+                        sleep(std::time::Duration::from_millis(20)).await;
+                    } else if block.slot() == END - 1 {
+                        release_victim.notify_one();
+                    } else if block.slot() < SPLIT && !block.was_skipped() {
+                        block_slots.lock().unwrap().insert(block.slot());
+                        if first_stolen_slot
+                            .compare_exchange(0, block.slot(), Ordering::SeqCst, Ordering::SeqCst)
+                            .is_ok()
+                        {
+                            thread_activity::request_recycle(thread_id);
+                        }
+                    }
+                    Ok(())
+                }
+                .boxed()
+            }
+        }),
+        Some({
+            let transaction_slots = transaction_slots.clone();
+            move |thread_id: usize, transaction: TransactionData| {
+                let transaction_slots = transaction_slots.clone();
+                async move {
+                    if thread_id == 1 && transaction.slot < SPLIT {
+                        transaction_slots.lock().unwrap().insert(transaction.slot);
+                    }
+                    Ok(())
+                }
+                .boxed()
+            }
+        }),
+        None::<OnEntryFn>,
+        None::<OnRewardFn>,
+        None::<OnErrorFn>,
+        None::<OnStatsTrackingFn>,
+        None,
+    );
+    timeout(std::time::Duration::from_secs(180), run)
+        .await
+        .expect("steal/recycle run timed out")
+        .expect("firehose failed");
+
+    assert!(thread_activity::steal_count() > 0);
+    assert!(thread_activity::recycle_count() > 0);
+    let first = first_stolen_slot.load(Ordering::SeqCst);
+    assert!(
+        first > 0,
+        "worker 1 must emit a stolen block before recycling"
+    );
+    let transactions = transaction_slots.lock().unwrap();
+    let blocks = block_slots.lock().unwrap();
+    assert!(
+        transactions.iter().any(|slot| *slot > first),
+        "transactions must continue after recycling"
+    );
+    assert!(
+        blocks.iter().any(|slot| *slot > first),
+        "blocks must continue after recycling"
+    );
+    assert!(
+        transactions.is_subset(&blocks),
+        "every stolen transaction slot needs a block callback"
+    );
+}
+
+#[cfg(test)]
 fn log_stats_handler(thread_id: usize, stats: Stats) -> HandlerFuture {
     Box::pin(async move {
         let elapsed = stats.start_time.elapsed();
@@ -4454,11 +4548,73 @@ async fn test_firehose_restart_loses_coverage_without_reset() {
     .await
     .unwrap();
 
+    assert!(FAIL_TRIGGERED.load(Ordering::SeqCst));
     let coverage = COVERAGE.get().unwrap().lock().unwrap();
     for slot in START_SLOT..(START_SLOT + NUM_SLOTS) {
-        assert!(
-            coverage.contains_key(&slot),
-            "missing coverage for slot {slot} after restart"
+        assert_eq!(
+            coverage.get(&slot).copied(),
+            Some(1),
+            "slot {slot} must be handled successfully once after restart"
+        );
+    }
+}
+
+#[cfg(test)]
+#[serial]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_firehose_retries_failed_skipped_slot_callback() {
+    use std::collections::HashMap;
+
+    // The existing gap-coverage test identifies 378864396..400 as skipped slots.
+    const START: u64 = 378_864_395;
+    const END: u64 = 378_864_402;
+    const FAILED_SLOT: u64 = 378_864_397;
+    let attempts = Arc::new(Mutex::new(HashMap::<u64, u32>::new()));
+
+    let run = firehose(
+        1,
+        false,
+        false,
+        None,
+        START..END,
+        Some({
+            let attempts = attempts.clone();
+            move |_thread_id: usize, block: BlockData| {
+                let attempts = attempts.clone();
+                async move {
+                    let mut attempts = attempts.lock().unwrap();
+                    let count = attempts.entry(block.slot()).or_default();
+                    *count += 1;
+                    if block.slot() == FAILED_SLOT {
+                        assert!(block.was_skipped());
+                        if *count == 1 {
+                            return Err("synthetic skipped-slot handler failure".into());
+                        }
+                    }
+                    Ok(())
+                }
+                .boxed()
+            }
+        }),
+        None::<OnTxFn>,
+        None::<OnEntryFn>,
+        None::<OnRewardFn>,
+        None::<OnErrorFn>,
+        None::<OnStatsTrackingFn>,
+        None,
+    );
+    timeout(std::time::Duration::from_secs(180), run)
+        .await
+        .expect("skipped-slot retry run timed out")
+        .expect("firehose failed");
+
+    let attempts = attempts.lock().unwrap();
+    for slot in START..END {
+        let expected = if slot == FAILED_SLOT { 2 } else { 1 };
+        assert_eq!(
+            attempts.get(&slot).copied(),
+            Some(expected),
+            "only the failed callback should be retried; slot {slot}"
         );
     }
 }

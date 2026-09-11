@@ -5677,9 +5677,10 @@ fn load_root_checkpoint_cohort_plan(
             path.display()
         )
     })?;
-    if metadata.uid() != effective_user_id() || metadata.mode() & 0o022 != 0 {
+    if !trusted_manifest_owner(metadata.uid(), effective_user_id()) || metadata.mode() & 0o022 != 0
+    {
         return Err(format!(
-            "cohort manifest must be owned by this user and not group/world writable: {}",
+            "cohort manifest must be owned by this user or root and not group/world writable: {}",
             path.display()
         ));
     }
@@ -5725,6 +5726,14 @@ fn load_root_checkpoint_cohort_plan(
         end_epoch,
         selection,
     )
+}
+
+/// A privileged operator may seal a production manifest against the
+/// unprivileged replay service by transferring it to root. Caller ownership
+/// remains supported for ordinary local runs; the content fingerprint and
+/// before/after inode checks still bind what was admitted in either case.
+fn trusted_manifest_owner(owner_uid: u32, caller_uid: u32) -> bool {
+    owner_uid == caller_uid || owner_uid == 0
 }
 
 #[derive(Debug)]
@@ -17469,6 +17478,15 @@ mod early_snapshot_tests {
             root_checkpoint_cohort_plan_from_report(changed, &fingerprint, 17, 19, selection)
                 .unwrap_err();
         assert!(error.contains("fingerprint mismatch"), "{error}");
+    }
+
+    #[test]
+    fn sealed_cohort_manifest_accepts_only_caller_or_root_ownership() {
+        assert!(trusted_manifest_owner(1001, 1001));
+        assert!(trusted_manifest_owner(0, 1001));
+        assert!(!trusted_manifest_owner(1002, 1001));
+        assert!(trusted_manifest_owner(0, 0));
+        assert!(!trusted_manifest_owner(1, 0));
     }
 
     #[test]

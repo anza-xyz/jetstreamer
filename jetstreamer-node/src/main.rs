@@ -5970,29 +5970,173 @@ const COMPATIBLE_V1_0_7_GENERATION_PROFILES: &[&str] =
 const COMPATIBLE_V1_0_8_GENERATION_PROFILES: &[&str] =
     &["jetstreamer-node/0.7.0/old-faithful-to-horizon-v2@8154bc9b0057a138afa6e8833468f6ffba39a6a1"];
 
-// This is not a generation-profile allowlist. It identifies one completed
-// private epoch-11 archive whose full bytes and production inputs were audited
-// after its producer exited. Private recovery and later reuse may consult this
-// identity, but no validation capability is returned until the archive has
-// passed a full decode, semantic/PoH-chain verification, and exact SHA-256
-// binding. No other output from this producer profile is admitted.
-const AUDITED_EPOCH_11_RECOVERY_EPOCH: u64 = 11;
+// This is not a generation-profile allowlist. Each record identifies one
+// completed private archive whose full bytes and production inputs were
+// audited after its producer exited. Private recovery and later reuse may
+// consult these identities, but no validation capability is returned until
+// the archive has passed a full decode, semantic/PoH-chain verification, and
+// an inode-bound exact size and SHA-256 check. No other output from either
+// producer profile is admitted.
+struct AuditedArchiveRecovery {
+    epoch: u64,
+    generation_profile: &'static str,
+    archive_bytes: u64,
+    archive_sha256: [u8; 32],
+    worker_path: &'static str,
+    worker_sha256: [u8; 32],
+    runtime_descriptor: &'static compatibility::RuntimeDescriptor,
+    bootstrap_slot: Slot,
+    bootstrap_hash: &'static str,
+    requested_slot_start: Slot,
+    requested_slot_count: u64,
+    transaction_metadata: TransactionMetadataPolicy,
+}
+
+const AUDITED_DIRTY_RECOVERY_PROFILE: &str = "jetstreamer-node/0.7.0/old-faithful-to-horizon-v2@ba260be5771123de874438d89822fc6b121842a8-dirty-d74af39026d3f16cfbb43d76";
 const AUDITED_EPOCH_11_RECOVERY_PROFILE: &str =
     "jetstreamer-node/0.7.0/old-faithful-to-horizon-v2@0a8ec77094ddf2b21ff22e6f4a55fef836f8f2c6";
-const AUDITED_EPOCH_11_RECOVERY_ARCHIVE_BYTES: u64 = 2_765_674_556;
-const AUDITED_EPOCH_11_RECOVERY_ARCHIVE_SHA256: [u8; 32] = [
-    0x85, 0xad, 0x2e, 0x93, 0xd5, 0x03, 0xaa, 0x17, 0xa6, 0x33, 0x40, 0x6e, 0x7d, 0x63, 0x83, 0x69,
-    0xa3, 0xe7, 0x86, 0xd4, 0x08, 0x0c, 0x05, 0x6d, 0x68, 0x9f, 0xd3, 0xe5, 0x81, 0x46, 0xde, 0xda,
+static AUDITED_ARCHIVE_RECOVERIES: &[AuditedArchiveRecovery] = &[
+    AuditedArchiveRecovery {
+        epoch: 7,
+        generation_profile: AUDITED_DIRTY_RECOVERY_PROFILE,
+        archive_bytes: 2_641_008_144,
+        archive_sha256: [
+            0x95, 0xfb, 0x73, 0xb6, 0x6e, 0xaf, 0x0b, 0x9d, 0x42, 0xd3, 0x2e, 0x0f, 0x62, 0x5c,
+            0xa8, 0xbc, 0x7b, 0xdf, 0x1d, 0x4f, 0xb8, 0x52, 0x59, 0x0d, 0x4e, 0xab, 0x98, 0x48,
+            0x53, 0x96, 0xb5, 0xea,
+        ],
+        worker_path: "/home/sol/.jetstreamer-private/deploy-epochs7-100-20260911-v1/\
+jetstreamer-historical-worker-v1-0-8",
+        worker_sha256: [
+            0x6f, 0xd3, 0xcb, 0xc6, 0x14, 0xb1, 0xd2, 0x0d, 0xce, 0x57, 0x59, 0xec, 0x32, 0xc1,
+            0x35, 0xb2, 0x44, 0xd5, 0x9d, 0x92, 0xac, 0xbb, 0xa2, 0x7f, 0xf0, 0x6e, 0x05, 0x0b,
+            0x8f, 0x47, 0x4b, 0xb4,
+        ],
+        runtime_descriptor: &compatibility::SOLANA_V1_0_8_RUNTIME,
+        bootstrap_slot: 2_908_740,
+        bootstrap_hash: "AYUia12SdC6EnauaynZJna2Pf3WNcmmFhpUJU6XritdT",
+        requested_slot_start: 3_024_000,
+        requested_slot_count: 432_000,
+        transaction_metadata: TransactionMetadataPolicy::runtime_reconstructed_before(4_258_776),
+    },
+    AuditedArchiveRecovery {
+        epoch: 8,
+        generation_profile: AUDITED_DIRTY_RECOVERY_PROFILE,
+        archive_bytes: 2_620_596_851,
+        archive_sha256: [
+            0x69, 0x07, 0xab, 0xc3, 0xcf, 0x34, 0x68, 0xe5, 0xb4, 0x85, 0xb0, 0xec, 0x40, 0x53,
+            0x8a, 0x95, 0x00, 0xef, 0xad, 0x51, 0xb6, 0x7d, 0x65, 0x65, 0xd6, 0xe3, 0x79, 0x5a,
+            0x80, 0x1f, 0x22, 0x46,
+        ],
+        worker_path: "/home/sol/.jetstreamer-private/deploy-epochs7-100-20260911-v1/\
+jetstreamer-historical-worker-v1-0-13",
+        worker_sha256: [
+            0xc1, 0x18, 0xc6, 0xd7, 0xc5, 0x25, 0x4f, 0xca, 0x54, 0x1b, 0x7b, 0x45, 0xdb, 0x52,
+            0x9b, 0x22, 0x33, 0x95, 0xc3, 0xb9, 0x35, 0x73, 0x93, 0x7f, 0x64, 0x1d, 0x33, 0x0f,
+            0x0a, 0x61, 0x07, 0x0a,
+        ],
+        runtime_descriptor: &compatibility::SOLANA_V1_0_13_RUNTIME,
+        bootstrap_slot: 3_455_940,
+        bootstrap_hash: "aCgGdj7tmTZQPF118GKxe7hn7yBv7MgVdn7dWL1Qcbw",
+        requested_slot_start: 3_456_000,
+        requested_slot_count: 432_000,
+        transaction_metadata: TransactionMetadataPolicy::runtime_reconstructed_before(4_258_776),
+    },
+    AuditedArchiveRecovery {
+        epoch: 9,
+        generation_profile: AUDITED_DIRTY_RECOVERY_PROFILE,
+        archive_bytes: 2_602_836_112,
+        archive_sha256: [
+            0x4d, 0x60, 0x46, 0xc9, 0xde, 0xa1, 0xb8, 0x97, 0xb6, 0x77, 0x04, 0xd3, 0x97, 0x72,
+            0xaa, 0x58, 0x08, 0xf8, 0xe5, 0xbd, 0x82, 0x05, 0xff, 0xe4, 0x99, 0xa7, 0x12, 0x6e,
+            0x06, 0xb0, 0xa9, 0xaf,
+        ],
+        worker_path: "/home/sol/.jetstreamer-private/deploy-epochs7-100-20260911-v1/\
+jetstreamer-historical-worker-v1-0-14",
+        worker_sha256: [
+            0x86, 0xa9, 0xf2, 0x0f, 0x27, 0x37, 0x7b, 0xf1, 0xd6, 0xd8, 0xe4, 0xed, 0x2c, 0x5e,
+            0x23, 0xc2, 0xe0, 0x58, 0xeb, 0x14, 0x73, 0x2e, 0xa5, 0x96, 0x68, 0x39, 0x08, 0xa0,
+            0x6b, 0xf4, 0xa9, 0x4c,
+        ],
+        runtime_descriptor: &compatibility::SOLANA_V1_0_14_RUNTIME,
+        bootstrap_slot: 3_887_911,
+        bootstrap_hash: "BsYGwLpE5NBbehe1utx657A1b9vsT4nJ9scKbff1awbN",
+        requested_slot_start: 3_888_000,
+        requested_slot_count: 432_000,
+        transaction_metadata: TransactionMetadataPolicy::runtime_reconstructed_with_fee_from(
+            4_258_776,
+        ),
+    },
+    AuditedArchiveRecovery {
+        epoch: 10,
+        generation_profile: AUDITED_DIRTY_RECOVERY_PROFILE,
+        archive_bytes: 2_788_065_078,
+        archive_sha256: [
+            0xa5, 0x3d, 0x51, 0xd3, 0xba, 0x5d, 0x05, 0xf8, 0x21, 0x5e, 0x1a, 0xc2, 0xd7, 0x9f,
+            0xee, 0x4b, 0x93, 0x83, 0xb9, 0xb9, 0x0e, 0x3d, 0x6b, 0xd7, 0x74, 0xea, 0xd2, 0xc8,
+            0x4b, 0x52, 0x2a, 0x4b,
+        ],
+        worker_path: "/home/sol/.jetstreamer-private/deploy-epochs7-100-20260911-v1/\
+jetstreamer-historical-worker-v1-0-14",
+        worker_sha256: [
+            0x86, 0xa9, 0xf2, 0x0f, 0x27, 0x37, 0x7b, 0xf1, 0xd6, 0xd8, 0xe4, 0xed, 0x2c, 0x5e,
+            0x23, 0xc2, 0xe0, 0x58, 0xeb, 0x14, 0x73, 0x2e, 0xa5, 0x96, 0x68, 0x39, 0x08, 0xa0,
+            0x6b, 0xf4, 0xa9, 0x4c,
+        ],
+        runtime_descriptor: &compatibility::SOLANA_V1_0_14_RUNTIME,
+        bootstrap_slot: 4_319_880,
+        bootstrap_hash: "9wnXMY186BWwsUq7QjURqasDGKY4bG6mm5R4rCJD6ar",
+        requested_slot_start: 4_320_000,
+        requested_slot_count: 432_000,
+        transaction_metadata: TransactionMetadataPolicy::runtime_reconstructed_status_and_fee(),
+    },
+    AuditedArchiveRecovery {
+        epoch: 11,
+        generation_profile: AUDITED_EPOCH_11_RECOVERY_PROFILE,
+        archive_bytes: 2_765_674_556,
+        archive_sha256: [
+            0x85, 0xad, 0x2e, 0x93, 0xd5, 0x03, 0xaa, 0x17, 0xa6, 0x33, 0x40, 0x6e, 0x7d, 0x63,
+            0x83, 0x69, 0xa3, 0xe7, 0x86, 0xd4, 0x08, 0x0c, 0x05, 0x6d, 0x68, 0x9f, 0xd3, 0xe5,
+            0x81, 0x46, 0xde, 0xda,
+        ],
+        worker_path: "/home/sol/.jetstreamer-private/deploy-epoch11-full-v1014-20260910-v3/\
+jetstreamer-historical-worker-v1-0-14",
+        worker_sha256: [
+            0x89, 0xdb, 0xd1, 0x4b, 0x7b, 0xef, 0x4b, 0xd9, 0xcc, 0x6a, 0x49, 0xbc, 0x92, 0x6e,
+            0x70, 0x29, 0x00, 0x58, 0x63, 0x94, 0x98, 0xf9, 0xba, 0x51, 0xe4, 0x47, 0xbb, 0x78,
+            0x92, 0xa4, 0xb9, 0x96,
+        ],
+        runtime_descriptor: &compatibility::SOLANA_V1_0_14_RUNTIME,
+        bootstrap_slot: 4_751_796,
+        bootstrap_hash: "6vJ22rwAfXfr4hFUJ7AtLupR6LHWBWX114AhKJqPYejb",
+        requested_slot_start: 4_752_000,
+        requested_slot_count: 432_000,
+        transaction_metadata: TransactionMetadataPolicy::runtime_reconstructed_status_and_fee(),
+    },
+    AuditedArchiveRecovery {
+        epoch: 20,
+        generation_profile: AUDITED_DIRTY_RECOVERY_PROFILE,
+        archive_bytes: 2_940_249_886,
+        archive_sha256: [
+            0xd1, 0x43, 0x43, 0xee, 0x1f, 0x7a, 0xd7, 0x0f, 0x4f, 0x04, 0x2a, 0xa4, 0x13, 0x4d,
+            0xff, 0xd9, 0x5c, 0x87, 0xe8, 0x33, 0x46, 0xd4, 0x46, 0x36, 0x96, 0x13, 0x31, 0x89,
+            0xa9, 0x7f, 0x91, 0x55,
+        ],
+        worker_path: "/home/sol/.jetstreamer-private/deploy-epochs7-100-20260911-v1/\
+jetstreamer-historical-worker-v1-0-23",
+        worker_sha256: [
+            0xd0, 0x5d, 0x99, 0xe0, 0xfb, 0xfb, 0xb4, 0x9a, 0xc2, 0x65, 0x4f, 0xe9, 0x97, 0x5e,
+            0x7b, 0x3d, 0xf5, 0xed, 0x27, 0xf5, 0x22, 0x6d, 0x2c, 0x9c, 0x6e, 0x34, 0xf9, 0x6c,
+            0x2b, 0x31, 0x8b, 0xed,
+        ],
+        runtime_descriptor: &compatibility::SOLANA_V1_0_23_RUNTIME,
+        bootstrap_slot: 8_639_740,
+        bootstrap_hash: "6Mqw6TTrvCHZDyfovexiLB5yiyeYnWsFXtnxn4yST8g6",
+        requested_slot_start: 8_640_000,
+        requested_slot_count: 432_000,
+        transaction_metadata: TransactionMetadataPolicy::runtime_reconstructed_status_and_fee(),
+    },
 ];
-const AUDITED_EPOCH_11_RECOVERY_WORKER_PATH: &str = "/home/sol/.jetstreamer-private/\
-deploy-epoch11-full-v1014-20260910-v3/jetstreamer-historical-worker-v1-0-14";
-const AUDITED_EPOCH_11_RECOVERY_WORKER_SHA256: [u8; 32] = [
-    0x89, 0xdb, 0xd1, 0x4b, 0x7b, 0xef, 0x4b, 0xd9, 0xcc, 0x6a, 0x49, 0xbc, 0x92, 0x6e, 0x70, 0x29,
-    0x00, 0x58, 0x63, 0x94, 0x98, 0xf9, 0xba, 0x51, 0xe4, 0x47, 0xbb, 0x78, 0x92, 0xa4, 0xb9, 0x96,
-];
-const AUDITED_EPOCH_11_RECOVERY_BOOTSTRAP_SLOT: Slot = 4_751_796;
-const AUDITED_EPOCH_11_RECOVERY_BOOTSTRAP_HASH: &str =
-    "6vJ22rwAfXfr4hFUJ7AtLupR6LHWBWX114AhKJqPYejb";
 
 fn runtime_generation_profile_is_compatible(
     runtime_profile: &str,
@@ -6005,95 +6149,102 @@ fn runtime_generation_profile_is_compatible(
             && COMPATIBLE_V1_0_8_GENERATION_PROFILES.contains(&recorded_generation_profile))
 }
 
-fn audited_epoch_11_recovery_provenance_matches(
+fn audited_archive_recovery_provenance_matches(
     epoch: u64,
     provenance: &ArchiveProvenance,
-) -> bool {
-    if epoch != AUDITED_EPOCH_11_RECOVERY_EPOCH {
-        return false;
-    }
+) -> Option<&'static AuditedArchiveRecovery> {
+    let recovery = AUDITED_ARCHIVE_RECOVERIES
+        .iter()
+        .find(|candidate| candidate.epoch == epoch)?;
     let ArchiveProvenance::V2(provenance) = provenance else {
-        return false;
+        return None;
     };
-    let Ok(bootstrap_hash) = AUDITED_EPOCH_11_RECOVERY_BOOTSTRAP_HASH.parse::<Hash>() else {
-        return false;
+    let Ok(bootstrap_hash) = recovery.bootstrap_hash.parse::<Hash>() else {
+        return None;
     };
-    provenance.base.generation_profile == AUDITED_EPOCH_11_RECOVERY_PROFILE
-        && provenance.base.runtime_profile == historical::SOLANA_V1_0_14_CANDIDATE.backend_id
+    let (epoch_start, epoch_end_inclusive) = epoch_to_slot_range(recovery.epoch);
+    if recovery.requested_slot_start != epoch_start
+        || recovery.requested_slot_count != epoch_end_inclusive - epoch_start + 1
+    {
+        return None;
+    }
+    let runtime = recovery.runtime_descriptor.identity;
+    (provenance.base.generation_profile == recovery.generation_profile
+        && provenance.base.runtime_profile == runtime.name
         && provenance.base.runtime_admission == RuntimeAdmission::Candidate
-        && provenance.base.runtime_revision == compatibility::SOLANA_V1_0_14_REVISION
-        && provenance.base.runtime_toolchain
-            == archive_runtime_toolchain(compatibility::SOLANA_V1_0_14_RUNTIME.identity)
+        && provenance.base.runtime_revision == runtime.revision
+        && provenance.base.runtime_toolchain == archive_runtime_toolchain(runtime)
         && provenance.base.genesis_hash
             == compatibility::MAINNET_GENESIS_HASH
                 .parse::<Hash>()
                 .expect("compiled mainnet genesis hash is valid")
         && provenance.base.bootstrap_state_kind == BootstrapStateKind::SnapshotArchive
-        && provenance.base.bootstrap_slot == AUDITED_EPOCH_11_RECOVERY_BOOTSTRAP_SLOT
+        && provenance.base.bootstrap_slot == recovery.bootstrap_slot
         && provenance.base.bootstrap_state_hash == bootstrap_hash
-        && provenance.base.requested_slot_start
-            == epoch_to_slot_range(AUDITED_EPOCH_11_RECOVERY_EPOCH).0
-        && provenance.base.requested_slot_count
-            == epoch_to_slot_range(AUDITED_EPOCH_11_RECOVERY_EPOCH).1
-                - epoch_to_slot_range(AUDITED_EPOCH_11_RECOVERY_EPOCH).0
-                + 1
-        && provenance.base.transaction_metadata
-            == archive_transaction_metadata_policy(
-                epoch_to_slot_range(AUDITED_EPOCH_11_RECOVERY_EPOCH).0,
-                epoch_to_slot_range(AUDITED_EPOCH_11_RECOVERY_EPOCH).1
-                    - epoch_to_slot_range(AUDITED_EPOCH_11_RECOVERY_EPOCH).0
-                    + 1,
-            )
-        && provenance.worker_executable_sha256 == AUDITED_EPOCH_11_RECOVERY_WORKER_SHA256
+        && provenance.base.requested_slot_start == recovery.requested_slot_start
+        && provenance.base.requested_slot_count == recovery.requested_slot_count
+        && provenance.base.transaction_metadata == recovery.transaction_metadata
+        && provenance.worker_executable_sha256 == recovery.worker_sha256)
+        .then_some(recovery)
 }
 
-fn audited_epoch_11_worker_binding_matches(canonical_path: &Path, sha256: [u8; 32]) -> bool {
-    canonical_path == Path::new(AUDITED_EPOCH_11_RECOVERY_WORKER_PATH)
-        && sha256 == AUDITED_EPOCH_11_RECOVERY_WORKER_SHA256
+fn audited_archive_worker_binding_matches(
+    recovery: &AuditedArchiveRecovery,
+    canonical_path: &Path,
+    sha256: [u8; 32],
+) -> bool {
+    canonical_path == Path::new(recovery.worker_path) && sha256 == recovery.worker_sha256
 }
 
-fn measure_audited_epoch_11_recovery_worker(
+fn measure_audited_archive_recovery_worker(
+    recovery: &AuditedArchiveRecovery,
     descriptor: &compatibility::RuntimeDescriptor,
 ) -> Result<[u8; 32], String> {
-    if !std::ptr::eq(descriptor, &compatibility::SOLANA_V1_0_14_RUNTIME) {
+    if !std::ptr::eq(descriptor, recovery.runtime_descriptor) {
         return Err(format!(
-            "audited epoch-11 recovery requires runtime {}, got {}",
-            compatibility::SOLANA_V1_0_14_RUNTIME.identity.name,
-            descriptor.identity.name,
+            "audited epoch-{} recovery requires runtime {}, got {}",
+            recovery.epoch, recovery.runtime_descriptor.identity.name, descriptor.identity.name,
         ));
     }
     let configured = configured_historical_worker_executable(descriptor)?;
     let canonical = fs::canonicalize(&configured).map_err(|error| {
         format!(
-            "failed to resolve configured audited epoch-11 worker {}: {error}",
+            "failed to resolve configured audited epoch-{} worker {}: {error}",
+            recovery.epoch,
             configured.display()
         )
     })?;
-    if canonical != Path::new(AUDITED_EPOCH_11_RECOVERY_WORKER_PATH) {
+    if canonical != Path::new(recovery.worker_path) {
         return Err(format!(
-            "audited epoch-11 recovery requires frozen worker {}, got {}",
-            AUDITED_EPOCH_11_RECOVERY_WORKER_PATH,
+            "audited epoch-{} recovery requires frozen worker {}, got {}",
+            recovery.epoch,
+            recovery.worker_path,
             canonical.display(),
         ));
     }
     let sha256 = historical::measure_executable_sha256(&canonical).map_err(|error| {
         format!(
-            "failed to measure frozen audited epoch-11 worker {}: {error}",
+            "failed to measure frozen audited epoch-{} worker {}: {error}",
+            recovery.epoch,
             canonical.display()
         )
     })?;
-    if !audited_epoch_11_worker_binding_matches(&canonical, sha256) {
+    if !audited_archive_worker_binding_matches(recovery, &canonical, sha256) {
         return Err(format!(
-            "frozen audited epoch-11 worker {} has an unexpected SHA-256",
+            "frozen audited epoch-{} worker {} has an unexpected SHA-256",
+            recovery.epoch,
             canonical.display()
         ));
     }
     Ok(sha256)
 }
 
-fn audited_epoch_11_archive_content_matches(bytes: u64, sha256: [u8; 32]) -> bool {
-    bytes == AUDITED_EPOCH_11_RECOVERY_ARCHIVE_BYTES
-        && sha256 == AUDITED_EPOCH_11_RECOVERY_ARCHIVE_SHA256
+fn audited_archive_content_matches(
+    recovery: &AuditedArchiveRecovery,
+    bytes: u64,
+    sha256: [u8; 32],
+) -> bool {
+    bytes == recovery.archive_bytes && sha256 == recovery.archive_sha256
 }
 
 fn segment_runtime_identity_is_compatible(
@@ -10690,8 +10841,18 @@ fn validated_epoch_archive(
     let recorded_worker_executable_sha256 = provenance
         .single_runtime_worker_executable_sha256()
         .expect("single-runtime provenance has a single worker-digest field");
-    let audited_epoch_11_recovery =
-        audited_epoch_11_recovery_provenance_matches(epoch, &provenance);
+    let audited_recovery = audited_archive_recovery_provenance_matches(epoch, &provenance);
+    if let Some(recovery) = audited_recovery
+        && initial_bytes != recovery.archive_bytes
+    {
+        return Err(format!(
+            "epoch-{} archive {} has {} bytes, expected {} for the audited content identity",
+            recovery.epoch,
+            path.display(),
+            initial_bytes,
+            recovery.archive_bytes,
+        ));
+    }
     let identity = selection.descriptor.identity;
     let expected_genesis = identity.genesis_hash.parse::<Hash>().map_err(|err| {
         format!(
@@ -10704,7 +10865,7 @@ fn validated_epoch_archive(
     if !(runtime_generation_profile_is_compatible(
         &provenance_v1.runtime_profile,
         &provenance_v1.generation_profile,
-    ) || audited_epoch_11_recovery)
+    ) || audited_recovery.is_some())
         || provenance_v1.runtime_profile != identity.name
         || provenance_v1.runtime_admission != archive_runtime_admission(selection.admission)
         || provenance_v1.runtime_revision != identity.revision
@@ -10719,8 +10880,9 @@ fn validated_epoch_archive(
         ));
     }
 
-    let expected_worker_executable_sha256 = if audited_epoch_11_recovery {
-        Some(measure_audited_epoch_11_recovery_worker(
+    let expected_worker_executable_sha256 = if let Some(recovery) = audited_recovery {
+        Some(measure_audited_archive_recovery_worker(
+            recovery,
             selection.descriptor,
         )?)
     } else if selection.descriptor.worker.is_some() {
@@ -10796,12 +10958,13 @@ fn validated_epoch_archive(
         cancellation,
         chain_evidence,
     )?;
-    if audited_epoch_11_recovery
-        && !audited_epoch_11_archive_content_matches(initial_bytes, validated.sha256)
+    if let Some(recovery) = audited_recovery
+        && !audited_archive_content_matches(recovery, initial_bytes, validated.sha256)
     {
         return Err(format!(
-            "epoch-11 archive {} does not match the audited content identity",
-            path.display()
+            "epoch-{} archive {} does not match the audited content identity",
+            recovery.epoch,
+            path.display(),
         ));
     }
     Ok(Some(validated))
@@ -17182,16 +17345,20 @@ mod early_snapshot_tests {
         ));
     }
 
-    fn audited_epoch_11_recovery_provenance() -> ArchiveProvenance {
-        let output_start = epoch_to_slot_range(AUDITED_EPOCH_11_RECOVERY_EPOCH).0;
-        let output_end = epoch_to_slot_range(AUDITED_EPOCH_11_RECOVERY_EPOCH).1 + 1;
+    fn audited_archive_recovery_provenance(recovery: &AuditedArchiveRecovery) -> ArchiveProvenance {
+        let output_start = epoch_to_slot_range(recovery.epoch).0;
+        let output_end = epoch_to_slot_range(recovery.epoch).1 + 1;
         let selection = compatibility::select_runtime(output_start..output_end, true).unwrap();
+        assert!(std::ptr::eq(
+            selection.descriptor,
+            recovery.runtime_descriptor
+        ));
         let mut provenance = build_archive_provenance(
             selection,
-            Some(AUDITED_EPOCH_11_RECOVERY_WORKER_SHA256),
+            Some(recovery.worker_sha256),
             BootstrapStateKind::SnapshotArchive,
-            AUDITED_EPOCH_11_RECOVERY_BOOTSTRAP_SLOT,
-            AUDITED_EPOCH_11_RECOVERY_BOOTSTRAP_HASH.parse().unwrap(),
+            recovery.bootstrap_slot,
+            recovery.bootstrap_hash.parse().unwrap(),
             output_start,
             output_end - output_start,
         )
@@ -17199,122 +17366,143 @@ mod early_snapshot_tests {
         let ArchiveProvenance::V2(provenance_v2) = &mut provenance else {
             panic!("historical worker provenance must be V2");
         };
-        provenance_v2.base.generation_profile = AUDITED_EPOCH_11_RECOVERY_PROFILE.to_owned();
+        provenance_v2.base.generation_profile = recovery.generation_profile.to_owned();
         provenance
     }
 
-    fn assert_audited_epoch_11_provenance_mutation_rejected(
+    fn assert_audited_archive_provenance_mutation_rejected(
+        recovery: &AuditedArchiveRecovery,
         provenance: &ArchiveProvenance,
         mutation: impl FnOnce(&mut ArchiveProvenanceV2),
     ) {
         let mut changed = provenance.clone();
         let ArchiveProvenance::V2(changed_v2) = &mut changed else {
-            panic!("audited epoch-11 fixture must be V2");
+            panic!("audited archive fixture must be V2");
         };
         mutation(changed_v2);
-        assert!(!audited_epoch_11_recovery_provenance_matches(
-            AUDITED_EPOCH_11_RECOVERY_EPOCH,
-            &changed,
-        ));
+        assert!(
+            audited_archive_recovery_provenance_matches(recovery.epoch, &changed).is_none(),
+            "mutated epoch-{} provenance was admitted",
+            recovery.epoch,
+        );
     }
 
     #[test]
-    fn audited_epoch_11_recovery_is_exact_and_not_general_compatibility() {
-        let provenance = audited_epoch_11_recovery_provenance();
-        assert!(audited_epoch_11_recovery_provenance_matches(
-            AUDITED_EPOCH_11_RECOVERY_EPOCH,
-            &provenance,
-        ));
-        assert!(!audited_epoch_11_recovery_provenance_matches(
-            AUDITED_EPOCH_11_RECOVERY_EPOCH - 1,
-            &provenance,
-        ));
-        let ArchiveProvenance::V2(v2) = &provenance else {
-            unreachable!();
-        };
-        assert!(!audited_epoch_11_recovery_provenance_matches(
-            AUDITED_EPOCH_11_RECOVERY_EPOCH,
-            &ArchiveProvenance::V1(v2.base.clone()),
-        ));
+    fn audited_archive_recovery_is_exact_and_not_general_compatibility() {
+        assert!(
+            AUDITED_ARCHIVE_RECOVERIES
+                .windows(2)
+                .all(|pair| pair[0].epoch < pair[1].epoch),
+            "audited recovery epochs must be unique and sorted",
+        );
+        for recovery in AUDITED_ARCHIVE_RECOVERIES {
+            let provenance = audited_archive_recovery_provenance(recovery);
+            assert_eq!(
+                audited_archive_recovery_provenance_matches(recovery.epoch, &provenance)
+                    .map(|matched| matched.epoch),
+                Some(recovery.epoch),
+            );
+            assert!(
+                audited_archive_recovery_provenance_matches(recovery.epoch + 1_000, &provenance)
+                    .is_none()
+            );
+            let ArchiveProvenance::V2(v2) = &provenance else {
+                unreachable!();
+            };
+            assert!(
+                audited_archive_recovery_provenance_matches(
+                    recovery.epoch,
+                    &ArchiveProvenance::V1(v2.base.clone()),
+                )
+                .is_none()
+            );
 
-        assert_audited_epoch_11_provenance_mutation_rejected(&provenance, |changed| {
-            changed.base.generation_profile.pop();
-            changed.base.generation_profile.push('0');
-        });
-        assert_audited_epoch_11_provenance_mutation_rejected(&provenance, |changed| {
-            changed.base.runtime_profile.push_str("-different");
-        });
-        assert_audited_epoch_11_provenance_mutation_rejected(&provenance, |changed| {
-            changed.base.runtime_admission = RuntimeAdmission::Verified;
-        });
-        assert_audited_epoch_11_provenance_mutation_rejected(&provenance, |changed| {
-            changed.base.runtime_revision.push('0');
-        });
-        assert_audited_epoch_11_provenance_mutation_rejected(&provenance, |changed| {
-            changed.base.runtime_toolchain.push('0');
-        });
-        assert_audited_epoch_11_provenance_mutation_rejected(&provenance, |changed| {
-            changed.base.genesis_hash = Hash::new_unique();
-        });
-        assert_audited_epoch_11_provenance_mutation_rejected(&provenance, |changed| {
-            changed.base.bootstrap_state_kind = BootstrapStateKind::CarriedBank;
-        });
-        assert_audited_epoch_11_provenance_mutation_rejected(&provenance, |changed| {
-            changed.base.bootstrap_slot += 1;
-        });
-        assert_audited_epoch_11_provenance_mutation_rejected(&provenance, |changed| {
-            changed.base.bootstrap_state_hash = Hash::new_unique();
-        });
-        assert_audited_epoch_11_provenance_mutation_rejected(&provenance, |changed| {
-            changed.base.requested_slot_start += 1;
-        });
-        assert_audited_epoch_11_provenance_mutation_rejected(&provenance, |changed| {
-            changed.base.requested_slot_count -= 1;
-        });
-        assert_audited_epoch_11_provenance_mutation_rejected(&provenance, |changed| {
-            changed.base.transaction_metadata = TransactionMetadataPolicy::observed();
-        });
-        assert_audited_epoch_11_provenance_mutation_rejected(&provenance, |changed| {
-            changed.worker_executable_sha256[0] ^= 1;
-        });
-        assert!(!runtime_generation_profile_is_compatible(
-            historical::SOLANA_V1_0_14_CANDIDATE.backend_id,
-            AUDITED_EPOCH_11_RECOVERY_PROFILE,
-        ));
+            assert_audited_archive_provenance_mutation_rejected(recovery, &provenance, |changed| {
+                changed.base.generation_profile.push('0')
+            });
+            assert_audited_archive_provenance_mutation_rejected(recovery, &provenance, |changed| {
+                changed.base.runtime_profile.push_str("-different")
+            });
+            assert_audited_archive_provenance_mutation_rejected(recovery, &provenance, |changed| {
+                changed.base.runtime_admission = RuntimeAdmission::Verified
+            });
+            assert_audited_archive_provenance_mutation_rejected(recovery, &provenance, |changed| {
+                changed.base.runtime_revision.push('0')
+            });
+            assert_audited_archive_provenance_mutation_rejected(recovery, &provenance, |changed| {
+                changed.base.runtime_toolchain.push('0')
+            });
+            assert_audited_archive_provenance_mutation_rejected(recovery, &provenance, |changed| {
+                changed.base.genesis_hash = Hash::new_unique()
+            });
+            assert_audited_archive_provenance_mutation_rejected(recovery, &provenance, |changed| {
+                changed.base.bootstrap_state_kind = BootstrapStateKind::CarriedBank
+            });
+            assert_audited_archive_provenance_mutation_rejected(recovery, &provenance, |changed| {
+                changed.base.bootstrap_slot += 1
+            });
+            assert_audited_archive_provenance_mutation_rejected(recovery, &provenance, |changed| {
+                changed.base.bootstrap_state_hash = Hash::new_unique()
+            });
+            assert_audited_archive_provenance_mutation_rejected(recovery, &provenance, |changed| {
+                changed.base.requested_slot_start += 1
+            });
+            assert_audited_archive_provenance_mutation_rejected(recovery, &provenance, |changed| {
+                changed.base.requested_slot_count -= 1
+            });
+            assert_audited_archive_provenance_mutation_rejected(recovery, &provenance, |changed| {
+                changed.base.transaction_metadata = TransactionMetadataPolicy::observed()
+            });
+            assert_audited_archive_provenance_mutation_rejected(recovery, &provenance, |changed| {
+                changed.worker_executable_sha256[0] ^= 1
+            });
+            assert!(!runtime_generation_profile_is_compatible(
+                recovery.runtime_descriptor.identity.name,
+                recovery.generation_profile,
+            ));
+        }
     }
 
     #[test]
-    fn audited_epoch_11_recovery_binds_archive_and_frozen_worker_bytes() {
-        assert!(audited_epoch_11_archive_content_matches(
-            AUDITED_EPOCH_11_RECOVERY_ARCHIVE_BYTES,
-            AUDITED_EPOCH_11_RECOVERY_ARCHIVE_SHA256,
-        ));
-        assert!(!audited_epoch_11_archive_content_matches(
-            AUDITED_EPOCH_11_RECOVERY_ARCHIVE_BYTES - 1,
-            AUDITED_EPOCH_11_RECOVERY_ARCHIVE_SHA256,
-        ));
-        let mut changed_archive = AUDITED_EPOCH_11_RECOVERY_ARCHIVE_SHA256;
-        changed_archive[0] ^= 1;
-        assert!(!audited_epoch_11_archive_content_matches(
-            AUDITED_EPOCH_11_RECOVERY_ARCHIVE_BYTES,
-            changed_archive,
-        ));
+    fn audited_archive_recovery_binds_archive_and_frozen_worker_bytes() {
+        for recovery in AUDITED_ARCHIVE_RECOVERIES {
+            assert!(audited_archive_content_matches(
+                recovery,
+                recovery.archive_bytes,
+                recovery.archive_sha256,
+            ));
+            assert!(!audited_archive_content_matches(
+                recovery,
+                recovery.archive_bytes - 1,
+                recovery.archive_sha256,
+            ));
+            let mut changed_archive = recovery.archive_sha256;
+            changed_archive[0] ^= 1;
+            assert!(!audited_archive_content_matches(
+                recovery,
+                recovery.archive_bytes,
+                changed_archive,
+            ));
 
-        let path = Path::new(AUDITED_EPOCH_11_RECOVERY_WORKER_PATH);
-        assert!(audited_epoch_11_worker_binding_matches(
-            path,
-            AUDITED_EPOCH_11_RECOVERY_WORKER_SHA256,
-        ));
-        assert!(!audited_epoch_11_worker_binding_matches(
-            &path.with_file_name("different-worker"),
-            AUDITED_EPOCH_11_RECOVERY_WORKER_SHA256,
-        ));
-        let mut changed_worker = AUDITED_EPOCH_11_RECOVERY_WORKER_SHA256;
-        changed_worker[0] ^= 1;
-        assert!(!audited_epoch_11_worker_binding_matches(
-            path,
-            changed_worker,
-        ));
+            let path = Path::new(recovery.worker_path);
+            assert!(audited_archive_worker_binding_matches(
+                recovery,
+                path,
+                recovery.worker_sha256,
+            ));
+            assert!(!audited_archive_worker_binding_matches(
+                recovery,
+                &path.with_file_name("different-worker"),
+                recovery.worker_sha256,
+            ));
+            let mut changed_worker = recovery.worker_sha256;
+            changed_worker[0] ^= 1;
+            assert!(!audited_archive_worker_binding_matches(
+                recovery,
+                path,
+                changed_worker,
+            ));
+        }
     }
 
     #[test]

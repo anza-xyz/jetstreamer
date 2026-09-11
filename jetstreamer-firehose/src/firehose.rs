@@ -2,6 +2,7 @@ use crossbeam_channel::{Receiver, Sender, unbounded};
 use dashmap::{DashMap, DashSet};
 use futures_util::future::BoxFuture;
 use reqwest::{Client, Url};
+use solana_accounts_db::stake_rewards::StakeRewardInfo;
 use solana_address::Address;
 use solana_geyser_plugin_manager::{
     block_metadata_notifier_interface::BlockMetadataNotifier,
@@ -9,12 +10,12 @@ use solana_geyser_plugin_manager::{
 };
 use solana_hash::Hash;
 use solana_ledger::entry_notifier_interface::EntryNotifier;
-use solana_reward_info::RewardInfo;
+use solana_reward_info::RewardType;
 use solana_rpc::{
     optimistically_confirmed_bank_tracker::SlotNotification,
     transaction_notifier_interface::TransactionNotifier,
 };
-use solana_runtime::bank::{KeyedRewardsAndNumPartitions, RewardType};
+use solana_runtime::bank::KeyedRewardsAndNumPartitions;
 use solana_sdk_ids::vote::id as vote_program_id;
 use solana_transaction::versioned::VersionedTransaction;
 use std::{
@@ -901,18 +902,51 @@ fn decode_transaction_status_meta_from_frame(
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct DecodedRewards {
-    keyed_rewards: Vec<(Address, RewardInfo)>,
-    num_partitions: Option<u64>,
+    /// Rewards in the runtime's representation, ready to hand to block handlers and the geyser
+    /// block metadata notifier without further conversion.
+    rewards: KeyedRewardsAndNumPartitions,
+    /// Whether the ledger recorded vote commission in basis points (SIMD-0291) rather than
+    /// whole percent for this block. Forwarded to the geyser block metadata notifier so it
+    /// renders `commission`/`commission_bps` the same way a live validator would have.
+    commission_rate_in_basis_points: bool,
+}
+
+impl Default for DecodedRewards {
+    fn default() -> Self {
+        Self::empty()
+    }
 }
 
 impl DecodedRewards {
     fn empty() -> Self {
         Self {
-            keyed_rewards: Vec::new(),
-            num_partitions: None,
+            rewards: KeyedRewardsAndNumPartitions {
+                keyed_rewards: Vec::new(),
+                num_partitions: None,
+            },
+            commission_rate_in_basis_points: false,
         }
+    }
+
+    /// Copies the rewards into the form conveyed to reward [`Handler`] callbacks.
+    fn to_handler_rewards(&self) -> Vec<(Address, StakeRewardInfo)> {
+        self.rewards
+            .keyed_rewards
+            .iter()
+            .map(|(address, reward)| {
+                (
+                    *address,
+                    StakeRewardInfo {
+                        reward_type: reward.reward_type,
+                        lamports: reward.lamports,
+                        post_balance: reward.post_balance,
+                        commission_bps: reward.commission_bps,
+                    },
+                )
+            })
+            .collect()
     }
 }
 
@@ -946,18 +980,17 @@ fn decode_rewards_from_frame(
 fn decode_rewards_from_bytes(slot: u64, bytes: &[u8]) -> Result<DecodedRewards, SharedError> {
     let epoch = slot_to_epoch(slot);
     let proto_attempt: Result<solana_storage_proto::convert::generated::Rewards, _> =
-        prost_011::Message::decode(bytes);
+        prost_014::Message::decode(bytes);
     match proto_attempt {
         Ok(proto) => {
-            let num_partitions = proto.num_partitions.as_ref().map(|p| p.num_partitions);
-            let keyed_rewards = convert_proto_rewards(&proto).map_err(|err| {
+            let rewards = convert_proto_rewards(&proto).map_err(|err| {
                 Box::new(std::io::Error::other(format!(
                     "convert rewards proto failed (epoch {epoch}): {err}"
                 ))) as SharedError
             })?;
             Ok(DecodedRewards {
-                keyed_rewards,
-                num_partitions,
+                rewards,
+                commission_rate_in_basis_points: proto_commission_in_basis_points(&proto),
             })
         }
         Err(proto_err) => {
@@ -968,18 +1001,28 @@ fn decode_rewards_from_bytes(slot: u64, bytes: &[u8]) -> Result<DecodedRewards, 
                     ))) as SharedError
                 })?;
             let proto: solana_storage_proto::convert::generated::Rewards = stored.into();
-            let num_partitions = proto.num_partitions.as_ref().map(|p| p.num_partitions);
-            let keyed_rewards = convert_proto_rewards(&proto).map_err(|err| {
+            let rewards = convert_proto_rewards(&proto).map_err(|err| {
                 Box::new(std::io::Error::other(format!(
                     "convert rewards bincode fallback failed (epoch {epoch}); protobuf error: {proto_err}; conversion error: {err}"
                 ))) as SharedError
             })?;
             Ok(DecodedRewards {
-                keyed_rewards,
-                num_partitions,
+                rewards,
+                commission_rate_in_basis_points: proto_commission_in_basis_points(&proto),
             })
         }
     }
+}
+
+/// Returns `true` when the stored rewards carry a basis-point commission (SIMD-0291), i.e. the
+/// block was produced after the `commission_rate_in_basis_points` feature activated.
+fn proto_commission_in_basis_points(
+    proto: &solana_storage_proto::convert::generated::Rewards,
+) -> bool {
+    proto
+        .rewards
+        .iter()
+        .any(|reward| !reward.commission_bps.is_empty())
 }
 
 fn decode_transaction_status_meta(
@@ -1001,7 +1044,7 @@ fn decode_transaction_status_meta(
 
     let bin_err_for_proto = bincode_err.clone();
     let proto: solana_storage_proto::convert::generated::TransactionStatusMeta =
-        prost_011::Message::decode(metadata_bytes).map_err(|err| {
+        prost_014::Message::decode(metadata_bytes).map_err(|err| {
             // If we already tried bincode, surface both failures for easier debugging.
             if let Some(ref bin_err) = bin_err_for_proto {
                 Box::new(std::io::Error::other(format!(
@@ -1076,7 +1119,7 @@ mod metadata_decode_tests {
         let meta = sample_meta();
         let generated: solana_storage_proto::convert::generated::TransactionStatusMeta =
             meta.clone().into();
-        let bytes = prost_011::Message::encode_to_vec(&generated);
+        let bytes = prost_014::Message::encode_to_vec(&generated);
         let decoded = decode_transaction_status_meta(157 * 432000, &bytes).expect("decode");
         assert_eq!(decoded, meta);
     }
@@ -1086,7 +1129,7 @@ mod metadata_decode_tests {
         let meta = sample_meta();
         let generated: solana_storage_proto::convert::generated::TransactionStatusMeta =
             meta.clone().into();
-        let bytes = prost_011::Message::encode_to_vec(&generated);
+        let bytes = prost_014::Message::encode_to_vec(&generated);
         // Epoch 100 should try bincode first; if those bytes are proto, we must fall back.
         let decoded = decode_transaction_status_meta(100 * 432000, &bytes).expect("decode");
         assert_eq!(decoded, meta);
@@ -1138,15 +1181,16 @@ mod rewards_decode_tests {
                 post_balance: 10,
                 reward_type: solana_storage_proto::convert::generated::RewardType::Fee as i32,
                 commission: "1".to_string(),
+                commission_bps: String::new(),
             }],
             num_partitions: Some(solana_storage_proto::convert::generated::NumPartitions {
                 num_partitions: 2,
             }),
         };
-        let bytes = prost_011::Message::encode_to_vec(&proto);
+        let bytes = prost_014::Message::encode_to_vec(&proto);
         let decoded = decode_rewards_from_bytes(0, &bytes).expect("decode proto rewards");
-        assert_eq!(decoded.keyed_rewards.len(), 1);
-        assert_eq!(decoded.num_partitions, Some(2));
+        assert_eq!(decoded.rewards.keyed_rewards.len(), 1);
+        assert_eq!(decoded.rewards.num_partitions, Some(2));
     }
 
     #[test]
@@ -1158,12 +1202,13 @@ mod rewards_decode_tests {
             post_balance: 9,
             reward_type: Some(RewardType::Rent),
             commission: Some(3),
+            commission_bps: None,
         };
         let stored_rewards: StoredExtendedRewards = vec![reward.into()];
         let bytes = bincode::serialize(&stored_rewards).expect("bincode serialize");
         let decoded = decode_rewards_from_bytes(0, &bytes).expect("decode bincode rewards");
-        assert_eq!(decoded.keyed_rewards.len(), 1);
-        assert_eq!(decoded.num_partitions, None);
+        assert_eq!(decoded.rewards.keyed_rewards.len(), 1);
+        assert_eq!(decoded.rewards.num_partitions, None);
     }
 }
 
@@ -1207,7 +1252,11 @@ pub struct RewardsData {
     /// Slot the rewards correspond to.
     pub slot: u64,
     /// Reward recipients and their associated reward information.
-    pub rewards: Vec<(Address, RewardInfo)>,
+    ///
+    /// Agave 4.x no longer exports `solana_runtime`'s `RewardInfo`, so rewards are conveyed as
+    /// [`solana_accounts_db::stake_rewards::StakeRewardInfo`], which has the same fields and
+    /// converts into the runtime type.
+    pub rewards: Vec<(Address, StakeRewardInfo)>,
 }
 
 /// Block-level data streamed to block handlers.
@@ -2255,10 +2304,8 @@ where
 
                                     if block_enabled {
                                         if let Some(on_block_cb) = on_block.as_ref() {
-                                            let DecodedRewards {
-                                                keyed_rewards,
-                                                num_partitions,
-                                            } = std::mem::take(&mut this_block_rewards);
+                                            let rewards =
+                                                std::mem::take(&mut this_block_rewards).rewards;
                                             if slot > last_emitted_slot {
                                                 on_block_cb(
                                                     thread_index,
@@ -2267,10 +2314,7 @@ where
                                                         parent_blockhash: previous_blockhash,
                                                         slot: block.slot,
                                                         blockhash: latest_entry_blockhash,
-                                                        rewards: KeyedRewardsAndNumPartitions {
-                                                            keyed_rewards,
-                                                            num_partitions,
-                                                        },
+                                                        rewards,
                                                         block_time: Some(block.meta.blocktime as i64),
                                                         block_height: block.meta.block_height,
                                                         executed_transaction_count:
@@ -2391,7 +2435,7 @@ where
                                                 thread_index,
                                                 RewardsData {
                                                     slot: block.slot,
-                                                    rewards: decoded_rewards.keyed_rewards.clone(),
+                                                    rewards: decoded_rewards.to_handler_rewards(),
                                                 },
                                             )
                                             .await
@@ -2405,7 +2449,7 @@ where
                                         this_block_rewards = decoded_rewards;
                                         if let Some(ref mut stats) = thread_stats {
                                             stats.rewards_processed +=
-                                                this_block_rewards.keyed_rewards.len() as u64;
+                                                this_block_rewards.rewards.keyed_rewards.len() as u64;
                                         }
                                     }
                                 }
@@ -2927,6 +2971,7 @@ pub fn firehose_geyser(
             None,
             0,
             0,
+            false,
         );
     }
     Ok(confirmed_bank_receiver)
@@ -3258,24 +3303,21 @@ async fn firehose_geyser_thread(
                                     last_counted_slot = block.slot;
                                     return Ok(());
                                 }
-                                let DecodedRewards {
-                                    keyed_rewards,
-                                    num_partitions,
-                                } = std::mem::take(&mut this_block_rewards);
+                                let decoded_rewards = std::mem::take(&mut this_block_rewards);
+                                let commission_rate_in_basis_points =
+                                    decoded_rewards.commission_rate_in_basis_points;
                                 let block_meta_notifier = block_meta_notifier_maybe.as_ref().unwrap();
                                 block_meta_notifier.notify_block_metadata(
                                     block.meta.parent_slot,
                                     todo_previous_blockhash.to_string().as_str(),
                                     block.slot,
                                     todo_latest_entry_blockhash.to_string().as_str(),
-                                    &KeyedRewardsAndNumPartitions {
-                                        keyed_rewards,
-                                        num_partitions,
-                                    },
+                                    &decoded_rewards.rewards,
                                     Some(block.meta.blocktime as i64),
                                     block.meta.block_height,
                                     this_block_executed_transaction_count,
                                     this_block_entry_count,
+                                    commission_rate_in_basis_points,
                                 );
                                 todo_previous_blockhash = todo_latest_entry_blockhash;
                                 last_counted_slot = block.slot;
@@ -3425,15 +3467,16 @@ fn is_simple_vote_transaction(versioned_tx: &VersionedTransaction) -> bool {
 #[inline(always)]
 fn convert_proto_rewards(
     proto_rewards: &solana_storage_proto::convert::generated::Rewards,
-) -> Result<Vec<(Address, RewardInfo)>, SharedError> {
+) -> Result<KeyedRewardsAndNumPartitions, SharedError> {
     let mut keyed_rewards = Vec::with_capacity(proto_rewards.rewards.len());
     for proto_reward in proto_rewards.rewards.iter() {
-        let reward = RewardInfo {
+        let reward = StakeRewardInfo {
             reward_type: match proto_reward.reward_type - 1 {
                 0 => RewardType::Fee,
                 1 => RewardType::Rent,
                 2 => RewardType::Staking,
                 3 => RewardType::Voting,
+                4 => RewardType::DeactivatedStake,
                 typ => {
                     return Err(Box::new(std::io::Error::other(format!(
                         "unsupported reward type {}",
@@ -3443,15 +3486,29 @@ fn convert_proto_rewards(
             },
             lamports: proto_reward.lamports,
             post_balance: proto_reward.post_balance,
-            commission: proto_reward.commission.parse::<u8>().ok(),
+            // Blocks recorded before SIMD-0291 only carry a whole-percent commission; scale it
+            // so the runtime's basis-point field is populated either way.
+            commission_bps: proto_reward.commission_bps.parse::<u16>().ok().or_else(|| {
+                proto_reward
+                    .commission
+                    .parse::<u8>()
+                    .ok()
+                    .map(|percent| u16::from(percent) * 100)
+            }),
         };
         let pubkey = proto_reward
             .pubkey
             .parse::<Address>()
             .map_err(|err| Box::new(err) as SharedError)?;
-        keyed_rewards.push((pubkey, reward));
+        keyed_rewards.push((pubkey, reward.into()));
     }
-    Ok(keyed_rewards)
+    Ok(KeyedRewardsAndNumPartitions {
+        keyed_rewards,
+        num_partitions: proto_rewards
+            .num_partitions
+            .as_ref()
+            .map(|p| p.num_partitions),
+    })
 }
 
 #[inline]

@@ -739,8 +739,41 @@ impl BuiltinPlugin {
 /// }
 /// ```
 pub fn parse_cli_args() -> Result<CliInvocation, Box<dyn std::error::Error>> {
-    let mut args = std::env::args();
-    args.next(); // binary name
+    parse_cli_args_from(std::env::args())
+}
+
+/// Parses a Jetstreamer invocation from an explicit argument list.
+///
+/// Identical to [`parse_cli_args`], except the arguments are supplied by the caller instead of
+/// being read from the process environment. `args` must start with the binary name, exactly as
+/// [`std::env::args`] yields it; the first element is skipped.
+///
+/// Environment variables are still consulted for the settings documented on [`parse_cli_args`] —
+/// only the argument list is redirected.
+///
+/// # Errors
+///
+/// Returns an error when the range argument is missing or malformed, when a flag is
+/// unrecognized, when a value-taking flag is missing its value, or when `--no-plugins` is
+/// combined with `--with-plugin`.
+///
+/// # Examples
+///
+/// ```
+/// # use jetstreamer::{parse_cli_args_from, CliInvocation};
+/// let invocation =
+///     parse_cli_args_from(["jetstreamer", "--list-plugins"].map(String::from)).expect("parsed");
+/// assert!(matches!(invocation, CliInvocation::ListPlugins));
+///
+/// // A missing range argument is a recoverable error, not a panic.
+/// assert!(parse_cli_args_from(["jetstreamer"].map(String::from)).is_err());
+/// ```
+pub fn parse_cli_args_from<I>(args: I) -> Result<CliInvocation, Box<dyn std::error::Error>>
+where
+    I: IntoIterator<Item = String>,
+{
+    let raw: Vec<String> = args.into_iter().collect();
+    let mut args = raw.iter().skip(1).cloned();
     let mut first_arg: Option<String> = None;
     let mut builtin_plugins = Vec::new();
     let mut no_plugins = false;
@@ -796,7 +829,10 @@ pub fn parse_cli_args() -> Result<CliInvocation, Box<dyn std::error::Error>> {
             other => return Err(format!("unrecognized argument '{other}'").into()),
         }
     }
-    let first_arg = first_arg.expect("no first argument given");
+    let first_arg = first_arg.ok_or(
+        "missing range argument; expected <epoch>, <start>-<end>, or <start>:<end> \
+         (for example: jetstreamer 950)",
+    )?;
     if no_plugins && !builtin_plugins.is_empty() {
         return Err("--no-plugins cannot be combined with --with-plugin".into());
     }
@@ -805,7 +841,6 @@ pub fn parse_cli_args() -> Result<CliInvocation, Box<dyn std::error::Error>> {
     // a flag value that happens to equal the positional cannot be mistaken for it.
     {
         const VALUE_FLAGS: [&str; 3] = ["--with-plugin", "--buffer-window", "--clickhouse-dsn"];
-        let raw: Vec<String> = std::env::args().collect();
         let mut parts: Vec<String> = Vec::with_capacity(raw.len());
         let mut index = 0;
         let mut replaced = false;
@@ -829,13 +864,16 @@ pub fn parse_cli_args() -> Result<CliInvocation, Box<dyn std::error::Error>> {
         }
         jetstreamer_plugin::metrics::set_resume_command_template(parts.join(" "));
     }
-    let slot_range = if first_arg.contains(':') {
-        let (slot_a, slot_b) = first_arg
-            .split_once(':')
-            .expect("failed to parse slot range, expected format: <start>:<end> or a single epoch");
-        let slot_a: u64 = slot_a.parse().expect("failed to parse first slot");
-        let slot_b: u64 = slot_b.parse().expect("failed to parse second slot");
-        slot_a..(slot_b + 1)
+    let slot_range = if let Some((slot_a, slot_b)) = first_arg.split_once(':') {
+        let slot_a: u64 = slot_a
+            .trim()
+            .parse()
+            .map_err(|_| format!("failed to parse first slot in range '{first_arg}'"))?;
+        let slot_b: u64 = slot_b
+            .trim()
+            .parse()
+            .map_err(|_| format!("failed to parse second slot in range '{first_arg}'"))?;
+        slot_a..slot_b.saturating_add(1)
     } else if let Some((epoch_a, epoch_b)) = first_arg.split_once('-') {
         let epoch_a: u64 = epoch_a
             .trim()
@@ -856,7 +894,10 @@ pub fn parse_cli_args() -> Result<CliInvocation, Box<dyn std::error::Error>> {
         let (_, end_slot_inclusive) = jetstreamer_firehose::epochs::epoch_to_slot_range(epoch_b);
         start_slot..(end_slot_inclusive + 1)
     } else {
-        let epoch: u64 = first_arg.parse().expect("failed to parse epoch");
+        let epoch: u64 = first_arg
+            .trim()
+            .parse()
+            .map_err(|_| format!("failed to parse epoch '{first_arg}'"))?;
         log::info!("epoch: {}", epoch);
         let (start_slot, end_slot_inclusive) =
             jetstreamer_firehose::epochs::epoch_to_slot_range(epoch);
@@ -971,5 +1012,136 @@ mod tests {
     fn builtin_plugin_from_flag_rejects_unknown() {
         assert!(BuiltinPlugin::from_flag("not-a-plugin").is_none());
         assert!(BuiltinPlugin::from_flag("").is_none());
+    }
+
+    /// Builds an argument list with the leading binary name [`parse_cli_args_from`] expects.
+    fn args(rest: &[&str]) -> Vec<String> {
+        std::iter::once("jetstreamer")
+            .chain(rest.iter().copied())
+            .map(String::from)
+            .collect()
+    }
+
+    fn slot_range(rest: &[&str]) -> std::ops::Range<u64> {
+        match parse_cli_args_from(args(rest)).expect("parsed") {
+            CliInvocation::Run(config) => config.slot_range,
+            CliInvocation::ListPlugins => panic!("expected a run invocation"),
+        }
+    }
+
+    // Each of the four cases below used to panic instead of returning `Err`, despite the
+    // function's `Result` return type.
+
+    #[test]
+    fn missing_range_argument_is_an_error() {
+        let err = parse_cli_args_from(args(&[])).expect_err("missing range must be an error");
+        assert!(
+            err.to_string().contains("missing range argument"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn non_numeric_epoch_is_an_error() {
+        let err = parse_cli_args_from(args(&["notanepoch"])).expect_err("must be an error");
+        assert!(
+            err.to_string().contains("failed to parse epoch"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn non_numeric_slot_range_bounds_are_errors() {
+        for range in ["abc:def", "abc:200", "100:def"] {
+            let err = parse_cli_args_from(args(&[range])).expect_err("must be an error");
+            assert!(
+                err.to_string().contains("failed to parse"),
+                "unexpected error for '{range}': {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn slot_range_upper_bound_saturates_instead_of_overflowing() {
+        assert_eq!(slot_range(&["0:18446744073709551615"]), 0..u64::MAX);
+    }
+
+    // Regression cover for reading arguments from the supplied list rather than `std::env::args`.
+
+    #[test]
+    fn single_epoch_expands_to_its_slot_range() {
+        let (start, end_inclusive) = jetstreamer_firehose::epochs::epoch_to_slot_range(950);
+        assert_eq!(slot_range(&["950"]), start..end_inclusive + 1);
+    }
+
+    #[test]
+    fn epoch_range_is_inclusive_on_both_ends() {
+        let (start, _) = jetstreamer_firehose::epochs::epoch_to_slot_range(900);
+        let (_, end_inclusive) = jetstreamer_firehose::epochs::epoch_to_slot_range(950);
+        assert_eq!(slot_range(&["900-950"]), start..end_inclusive + 1);
+    }
+
+    #[test]
+    fn slot_range_is_inclusive_on_both_ends() {
+        assert_eq!(slot_range(&["410400000:410832000"]), 410400000..410832001);
+    }
+
+    #[test]
+    fn reversed_epoch_range_is_an_error() {
+        let err = parse_cli_args_from(args(&["950-900"])).expect_err("must be an error");
+        assert!(
+            err.to_string().contains("reversed"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn list_plugins_short_circuits_before_the_range_argument() {
+        let invocation = parse_cli_args_from(args(&["--list-plugins"])).expect("parsed");
+        assert!(matches!(invocation, CliInvocation::ListPlugins));
+    }
+
+    #[test]
+    fn unrecognized_flag_is_an_error() {
+        let err = parse_cli_args_from(args(&["950", "--nope"])).expect_err("must be an error");
+        assert!(
+            err.to_string().contains("unrecognized argument"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn value_taking_flags_require_a_value() {
+        for flag in ["--with-plugin", "--buffer-window", "--clickhouse-dsn"] {
+            let err = parse_cli_args_from(args(&["950", flag])).expect_err("must be an error");
+            assert!(
+                err.to_string().contains(flag),
+                "unexpected error for '{flag}': {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_plugins_conflicts_with_with_plugin() {
+        let err = parse_cli_args_from(args(&[
+            "950",
+            "--no-plugins",
+            "--with-plugin",
+            "pubkey-stats",
+        ]))
+        .expect_err("must be an error");
+        assert!(
+            err.to_string().contains("cannot be combined"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn positional_range_is_accepted_after_flags() {
+        let (start, end_inclusive) = jetstreamer_firehose::epochs::epoch_to_slot_range(950);
+        assert_eq!(
+            slot_range(&["--sequential", "950"]),
+            start..end_inclusive + 1
+        );
     }
 }

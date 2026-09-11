@@ -100,6 +100,7 @@ impl Plugin for PubkeyStatsPlugin {
             let account_keys = match &transaction.transaction.message {
                 VersionedMessage::Legacy(msg) => &msg.account_keys,
                 VersionedMessage::V0(msg) => &msg.account_keys,
+                VersionedMessage::V1(msg) => &msg.account_keys,
             };
             if account_keys.is_empty() {
                 return Ok(());

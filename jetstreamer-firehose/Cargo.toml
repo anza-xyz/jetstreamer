@@ -39,7 +39,8 @@ solana-transaction-status.workspace = true
 solana-ledger.workspace = true
 solana-signature.workspace = true
 solana-sdk-ids.workspace = true
-prost_011.workspace = true
+solana-accounts-db.workspace = true
+prost_014.workspace = true
 solana-entry.workspace = true
 reqwest = { workspace = true, features = ["json", "stream"] }
 tokio.workspace = true

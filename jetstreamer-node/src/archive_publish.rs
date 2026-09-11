@@ -59,6 +59,7 @@ const ARCHIVE_BATCH_ARMED_PREFIX: &[u8] = b"jetstreamer archive batch armed v2\0
 const ARCHIVE_BATCH_JOURNAL_VERSION: u32 = 2;
 const MAX_ARCHIVE_BATCH_ITEMS: usize = 4096;
 const MAX_ARCHIVE_BATCH_JOURNAL_BYTES: u64 = 8 << 20;
+const MAX_ARCHIVE_BATCH_CONTEXT_BYTES: usize = 4 << 20;
 
 #[derive(Debug)]
 pub struct ArchivePublication {
@@ -88,6 +89,9 @@ pub struct ArchiveBatchPublication {
     pub manifest_fingerprint: [u8; 32],
     /// Epochs independently expected by the caller and bound into the journal.
     pub expected_epochs: Vec<u64>,
+    /// Opaque caller evidence durably bound into the transaction journal and
+    /// therefore into the transaction ID. Ordinary batches leave this empty.
+    pub publication_context: Option<Vec<u8>>,
     pub destination_identity: ArchiveBatchDestinationIdentity,
     /// Publications in the same strictly increasing epoch order as the input.
     pub publications: Vec<ArchivePublication>,
@@ -600,6 +604,8 @@ struct ArchiveBatchJournal {
     manifest_fingerprint: [u8; 32],
     #[serde(default)]
     expected_epochs: Vec<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    publication_context: Option<Vec<u8>>,
     decision: ArchiveBatchDecision,
     destination_path: Vec<u8>,
     destination_identity: FileIdentity,
@@ -774,23 +780,85 @@ pub fn publish_verified_archive_batch(
     expected_epochs: &[u64],
     items: &[ArchiveBatchItem],
 ) -> Result<ArchiveBatchPublication, ArchivePublicationError> {
-    publish_verified_archive_batch_with_expected_epochs_and_hook(
+    publish_verified_archive_batch_with_expected_epochs_absence_and_hook(
         manifest_fingerprint,
         expected_epochs,
         items,
+        None,
+        false,
         |_| Ok(()),
     )
 }
 
-fn publish_verified_archive_batch_with_expected_epochs_and_hook<F>(
+/// Publishes an ordered cohort only when every destination archive, manifest,
+/// and checksum name is absent while holding the destination writer lock.
+///
+/// This is the batch counterpart of [`publish_verified_archive_if_absent`]
+/// and is intended for explicit imports that must never replace an existing
+/// public namespace component.
+pub fn publish_verified_archive_batch_if_absent(
     manifest_fingerprint: [u8; 32],
     expected_epochs: &[u64],
     items: &[ArchiveBatchItem],
+) -> Result<ArchiveBatchPublication, ArchivePublicationError> {
+    publish_verified_archive_batch_with_expected_epochs_absence_and_hook(
+        manifest_fingerprint,
+        expected_epochs,
+        items,
+        None,
+        true,
+        |_| Ok(()),
+    )
+}
+
+pub fn publish_verified_archive_batch_with_context(
+    manifest_fingerprint: [u8; 32],
+    expected_epochs: &[u64],
+    items: &[ArchiveBatchItem],
+    publication_context: &[u8],
+) -> Result<ArchiveBatchPublication, ArchivePublicationError> {
+    publish_verified_archive_batch_with_expected_epochs_absence_and_hook(
+        manifest_fingerprint,
+        expected_epochs,
+        items,
+        Some(publication_context),
+        false,
+        |_| Ok(()),
+    )
+}
+
+pub fn publish_verified_archive_batch_if_absent_with_context(
+    manifest_fingerprint: [u8; 32],
+    expected_epochs: &[u64],
+    items: &[ArchiveBatchItem],
+    publication_context: &[u8],
+) -> Result<ArchiveBatchPublication, ArchivePublicationError> {
+    publish_verified_archive_batch_with_expected_epochs_absence_and_hook(
+        manifest_fingerprint,
+        expected_epochs,
+        items,
+        Some(publication_context),
+        true,
+        |_| Ok(()),
+    )
+}
+
+fn publish_verified_archive_batch_with_expected_epochs_absence_and_hook<F>(
+    manifest_fingerprint: [u8; 32],
+    expected_epochs: &[u64],
+    items: &[ArchiveBatchItem],
+    publication_context: Option<&[u8]>,
+    destination_must_be_absent: bool,
     mut hook: F,
 ) -> Result<ArchiveBatchPublication, ArchivePublicationError>
 where
     F: FnMut(ArchiveBatchPhase) -> Result<(), String>,
 {
+    if publication_context.is_some_and(|context| context.len() > MAX_ARCHIVE_BATCH_CONTEXT_BYTES) {
+        return Err(preflight_error(format!(
+            "archive batch publication context exceeds {MAX_ARCHIVE_BATCH_CONTEXT_BYTES} bytes"
+        )));
+    }
     if manifest_fingerprint == [0; 32] {
         return Err(preflight_error(
             "archive batch manifest fingerprint must not be zero".to_string(),
@@ -817,7 +885,7 @@ where
             &item.staged_archive,
             &item.destination_archive,
             item.evidence,
-            false,
+            destination_must_be_absent,
             &writer_lock,
         ) {
             Ok(transaction) => transactions.push(transaction),
@@ -843,6 +911,7 @@ where
         transaction_nonce,
         manifest_fingerprint,
         expected_epochs: expected_epochs.to_vec(),
+        publication_context: publication_context.map(<[u8]>::to_vec),
         decision: ArchiveBatchDecision::RollBack,
         destination_path: path_bytes(&destination_path),
         destination_identity: transactions[0].destination.identity,
@@ -964,6 +1033,7 @@ where
         transaction_id,
         manifest_fingerprint,
         expected_epochs: expected_epochs.to_vec(),
+        publication_context: journal.publication_context.clone(),
         destination_identity: ArchiveBatchDestinationIdentity {
             device: journal.destination_identity.dev,
             inode: journal.destination_identity.ino,
@@ -983,10 +1053,12 @@ where
     F: FnMut(ArchiveBatchPhase) -> Result<(), String>,
 {
     let expected_epochs = items.iter().map(|item| item.epoch).collect::<Vec<_>>();
-    publish_verified_archive_batch_with_expected_epochs_and_hook(
+    publish_verified_archive_batch_with_expected_epochs_absence_and_hook(
         manifest_fingerprint,
         &expected_epochs,
         items,
+        None,
+        false,
         hook,
     )
 }
@@ -3162,6 +3234,15 @@ fn validate_archive_batch_journal(
     if journal.manifest_fingerprint == [0; 32] {
         return Err("archive batch journal has an invalid zero manifest fingerprint".into());
     }
+    if journal
+        .publication_context
+        .as_ref()
+        .is_some_and(|context| context.len() > MAX_ARCHIVE_BATCH_CONTEXT_BYTES)
+    {
+        return Err(format!(
+            "archive batch journal publication context exceeds {MAX_ARCHIVE_BATCH_CONTEXT_BYTES} bytes"
+        ));
+    }
     if journal.items.is_empty() || journal.items.len() > MAX_ARCHIVE_BATCH_ITEMS {
         return Err(format!(
             "archive batch journal item count {} is outside 1..={MAX_ARCHIVE_BATCH_ITEMS}",
@@ -3709,6 +3790,7 @@ fn observe_finalized_archive_batch(
                 transaction_id: journal.transaction_id,
                 manifest_fingerprint: journal.manifest_fingerprint,
                 expected_epochs: journal.expected_epochs.clone(),
+                publication_context: journal.publication_context.clone(),
                 destination_identity: ArchiveBatchDestinationIdentity {
                     device: journal.destination_identity.dev,
                     inode: journal.destination_identity.ino,
@@ -5814,6 +5896,93 @@ mod tests {
 
     fn batch_expected_epochs(items: &[ArchiveBatchItem]) -> Vec<u64> {
         items.iter().map(|item| item.epoch).collect()
+    }
+
+    fn remove_batch_destination_namespaces(items: &[ArchiveBatchItem]) {
+        for item in items {
+            for path in [
+                item.destination_archive.clone(),
+                segment_manifest_path(&item.destination_archive).unwrap(),
+                archive_checksum_path(&item.destination_archive).unwrap(),
+            ] {
+                match fs::remove_file(path) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => panic!("failed to clear batch destination fixture: {error}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn absence_only_batch_commits_when_every_namespace_is_empty() {
+        let (_root, items) = corrected_batch_fixture(8, false);
+        remove_batch_destination_namespaces(&items);
+        let expected_epochs = batch_expected_epochs(&items);
+
+        let publication = publish_verified_archive_batch_if_absent(
+            BATCH_MANIFEST_FINGERPRINT,
+            &expected_epochs,
+            &items,
+        )
+        .unwrap();
+
+        assert_eq!(publication.expected_epochs, expected_epochs);
+        assert!(publication.identity_evidence.iter().all(|evidence| {
+            evidence.initial_archive.is_none()
+                && evidence.initial_manifest.is_none()
+                && evidence.initial_checksum.is_none()
+        }));
+        assert_batch_committed(&items);
+    }
+
+    #[test]
+    fn absence_only_batch_refuses_one_occupied_namespace_without_mutation() {
+        let (_root, items) = corrected_batch_fixture(8, false);
+        remove_batch_destination_namespaces(&items);
+        fs::write(&items[1].destination_archive, b"occupied").unwrap();
+        fs::set_permissions(
+            &items[1].destination_archive,
+            fs::Permissions::from_mode(FINAL_FILE_MODE),
+        )
+        .unwrap();
+        let expected_epochs = batch_expected_epochs(&items);
+
+        let error = publish_verified_archive_batch_if_absent(
+            BATCH_MANIFEST_FINGERPRINT,
+            &expected_epochs,
+            &items,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error.commit_state(),
+            ArchivePublicationCommitState::NotCommitted
+        );
+        assert!(error.to_string().contains("not empty"), "{error}");
+        assert_eq!(
+            fs::read(&items[1].destination_archive).unwrap(),
+            b"occupied"
+        );
+        assert!(items.iter().all(|item| item.staged_archive.is_file()));
+    }
+
+    #[test]
+    fn batch_publication_context_has_a_recovery_safe_size_bound() {
+        let (_root, items) = corrected_batch_fixture(8, false);
+        let expected_epochs = batch_expected_epochs(&items);
+        let context = vec![0u8; MAX_ARCHIVE_BATCH_CONTEXT_BYTES + 1];
+
+        let error = publish_verified_archive_batch_with_context(
+            BATCH_MANIFEST_FINGERPRINT,
+            &expected_epochs,
+            &items,
+            &context,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("context exceeds"), "{error}");
+        assert_batch_rolled_back(&items);
     }
 
     #[test]

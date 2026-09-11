@@ -4915,7 +4915,8 @@ fn usage(program: &str) -> String {
         "Usage: {program} <epoch|range> [dest-dir] [--verify|--no-verify] [--horizon-output=PATH]\n\
          \x20      [--qualification-end-slot=SLOT] [--root-checkpoint-cohort]\n\
          \x20      [--cohort-manifest=PATH --cohort-manifest-fingerprint=sha256:HEX]\n\
-         \x20      [--recover-staged-only]\n\
+         \x20      [--recover-staged-only | --recover-staged-cohort-only]\n\
+         \x20      [--source-cohort-receipt=PATH]\n\
          \n\
          <epoch|range> is a single epoch (950) or an inclusive range (950-955).\n\
          Replays each epoch and writes a horizon archive to <dest-dir>/epoch-<N>.jet.\n\
@@ -4957,7 +4958,12 @@ fn usage(program: &str) -> String {
          --recover-staged-only accepts one nonzero epoch and explicit --verify.\n\
          It fully validates and transactionally publishes an existing private\n\
          adaptive staging candidate, but never starts replay or removes a failed\n\
-         candidate."
+         candidate.\n\
+         --recover-staged-cohort-only imports the exact nonzero epoch range bound\n\
+         by a sealed cohort manifest and a committed private-lane publication\n\
+         receipt. It deeply validates every archive and publishes the whole range\n\
+         only if all public destination names are absent. It never replays or\n\
+         accesses snapshot storage or the network."
     )
 }
 
@@ -5252,6 +5258,61 @@ fn validate_staged_recovery_mode(
     Ok(())
 }
 
+fn validate_staged_cohort_recovery_mode(
+    enabled: bool,
+    start_epoch: u64,
+    end_epoch: u64,
+    explicit_verify: Option<bool>,
+    verify_option_count: usize,
+    inherited_epoch_lease: bool,
+    has_manifest: bool,
+    has_manifest_fingerprint: bool,
+    has_source_receipt: bool,
+    has_conflicting_override: bool,
+) -> Result<(), String> {
+    if !enabled {
+        return Ok(());
+    }
+    if start_epoch == 0 || start_epoch > end_epoch {
+        return Err(
+            "--recover-staged-cohort-only requires a nonempty range of nonzero epochs".to_string(),
+        );
+    }
+    let cohort_len = end_epoch
+        .checked_sub(start_epoch)
+        .and_then(|difference| difference.checked_add(1))
+        .ok_or_else(|| "--recover-staged-cohort-only epoch count overflow".to_string())?;
+    if cohort_len > MAX_ROOT_CHECKPOINT_COHORT_EPOCHS {
+        return Err(format!(
+            "--recover-staged-cohort-only range contains {cohort_len} epochs, exceeding the limit of {MAX_ROOT_CHECKPOINT_COHORT_EPOCHS}"
+        ));
+    }
+    if explicit_verify != Some(true) || verify_option_count != 1 {
+        return Err(
+            "--recover-staged-cohort-only requires exactly one explicit --verify (environment defaults, --no-verify, and duplicate verification options do not qualify)"
+                .to_string(),
+        );
+    }
+    if inherited_epoch_lease {
+        return Err(
+            "--recover-staged-cohort-only is valid only in a top-level invocation".to_string(),
+        );
+    }
+    if !has_manifest || !has_manifest_fingerprint || !has_source_receipt {
+        return Err(
+            "--recover-staged-cohort-only requires --cohort-manifest, --cohort-manifest-fingerprint, and --source-cohort-receipt"
+                .to_string(),
+        );
+    }
+    if has_conflicting_override {
+        return Err(
+            "--recover-staged-cohort-only cannot be combined with replay, output, qualification, or internal child overrides"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 /// Proves that an epoch range can be replayed as one uninterrupted
 /// root-checkpoint cohort. Every member must use the same runtime descriptor.
 /// Multi-epoch cohorts additionally require that descriptor's live state
@@ -5309,6 +5370,7 @@ fn root_checkpoint_cohort_runtime(
 const COHORT_MANIFEST_SCHEMA: &str = "jetstreamer-gcs-snapshot-preflight-v2";
 const COHORT_PUBLICATION_GATE: &str = "all-archives-validated-and-final-root-verified";
 const COHORT_MANIFEST_MAX_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_ROOT_CHECKPOINT_COHORT_EPOCHS: u64 = 4096;
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -5677,10 +5739,12 @@ fn load_root_checkpoint_cohort_plan(
             path.display()
         )
     })?;
-    if !trusted_manifest_owner(metadata.uid(), effective_user_id()) || metadata.mode() & 0o022 != 0
+    if !trusted_manifest_owner(metadata.uid(), effective_user_id())
+        || metadata.nlink() != 1
+        || metadata.mode() & 0o7022 != 0
     {
         return Err(format!(
-            "cohort manifest must be owned by this user or root and not group/world writable: {}",
+            "cohort manifest must be singly linked, free of special mode bits, owned by this user or root, and not group/world writable: {}",
             path.display()
         ));
     }
@@ -8563,12 +8627,420 @@ struct CompletedCohortEpoch {
     validated: jetstreamer_node::archive_checksum::ValidatedArchiveFile,
 }
 
+struct RecoveredCohortEpoch {
+    epoch: u64,
+    source_archive: PathBuf,
+    destination_archive: PathBuf,
+    provenance: ArchiveProvenanceV1,
+    archive_chain: ArchiveChainEvidence,
+    validated: jetstreamer_node::archive_checksum::ValidatedArchiveFile,
+}
+
+fn read_bound_single_runtime_provenance(
+    path: &Path,
+    validated: jetstreamer_node::archive_checksum::ValidatedArchiveFile,
+) -> Result<ArchiveProvenanceV1, String> {
+    let file =
+        jetstreamer_node::archive_checksum::open_regular_nofollow(path).map_err(|error| {
+            format!(
+                "failed to reopen cohort archive {}: {error}",
+                path.display()
+            )
+        })?;
+    let identity =
+        jetstreamer_node::archive_checksum::archive_file_identity(&file).map_err(|error| {
+            format!(
+                "failed to identify cohort archive {}: {error}",
+                path.display()
+            )
+        })?;
+    if identity != validated.identity {
+        return Err(format!(
+            "cohort archive changed before provenance binding: {}",
+            path.display()
+        ));
+    }
+    let reader = jetstreamer_horizon::archive::ArchiveReader::open(std::io::BufReader::new(file));
+    let reader = reader
+        .map_err(|error| format!("failed to open cohort archive {}: {error}", path.display()))?;
+    let recorded = reader
+        .provenance()
+        .map_err(|error| format!("invalid cohort archive provenance: {error}"))?
+        .ok_or_else(|| {
+            format!(
+                "cohort archive {} has no single-runtime provenance",
+                path.display()
+            )
+        })?;
+    let provenance = recorded.single_runtime_v1().cloned().ok_or_else(|| {
+        format!(
+            "cohort archive {} has no single-runtime provenance",
+            path.display()
+        )
+    })?;
+    if !jetstreamer_node::archive_checksum::path_matches_archive_identity(path, validated.identity)
+        .map_err(|error| {
+            format!(
+                "failed to rebind cohort archive {}: {error}",
+                path.display()
+            )
+        })?
+    {
+        return Err(format!(
+            "cohort archive changed while provenance was read: {}",
+            path.display()
+        ));
+    }
+    Ok(provenance)
+}
+
+fn checkpoint_receipt_summary(
+    checkpoint: &historical_replay::HistoricalCheckpointSummary,
+) -> cohort_publication::RootCheckpointSummary {
+    cohort_publication::RootCheckpointSummary {
+        slot: checkpoint.slot,
+        bank_hash: checkpoint.bank_hash,
+        accounts_hash: checkpoint.accounts_hash,
+        last_blockhash: checkpoint.last_blockhash,
+        capitalization: checkpoint.capitalization,
+        transaction_count: checkpoint.transaction_count,
+        tick_height: checkpoint.tick_height,
+        slot_complete: checkpoint.slot_complete,
+        write_count: checkpoint.write_count,
+        next_write_version: checkpoint.next_write_version,
+    }
+}
+
+fn root_checkpoint_gate_evidence(
+    plan: &RootCheckpointCohortPlan,
+    completed: &[CompletedCohortEpoch],
+) -> cohort_publication::RootCheckpointGateEvidence {
+    cohort_publication::RootCheckpointGateEvidence {
+        kind: cohort_publication::ROOT_CHECKPOINT_GATE_KIND.to_owned(),
+        version: cohort_publication::ROOT_CHECKPOINT_GATE_VERSION,
+        verified_manifest_checkpoints: plan
+            .root_checkpoints
+            .iter()
+            .map(
+                |checkpoint| cohort_publication::VerifiedManifestCheckpoint {
+                    slot: checkpoint.slot,
+                    accounts_hash: checkpoint
+                        .accounts_hash
+                        .parse::<Hash>()
+                        .expect("cohort plan checkpoint hash was validated")
+                        .to_bytes(),
+                },
+            )
+            .collect(),
+        members: completed
+            .iter()
+            .map(|member| cohort_publication::RootCheckpointGateMember {
+                epoch: member.epoch,
+                bootstrap: checkpoint_receipt_summary(&member.historical_evidence.bootstrap),
+                terminal: checkpoint_receipt_summary(&member.historical_evidence.terminal),
+            })
+            .collect(),
+    }
+}
+
+fn validate_recovered_cohort_gate(
+    plan: &RootCheckpointCohortPlan,
+    recovered: &[RecoveredCohortEpoch],
+    gate: &cohort_publication::RootCheckpointGateEvidence,
+) -> Result<(), String> {
+    let first = recovered
+        .first()
+        .ok_or_else(|| "recovered root cohort contains no archives".to_string())?;
+    let bootstrap_hash = plan
+        .bootstrap
+        .accounts_hash
+        .parse::<Hash>()
+        .map_err(|error| {
+            format!("cohort manifest bootstrap accounts hash became invalid: {error}")
+        })?;
+    let expected_manifest_checkpoints = plan
+        .root_checkpoints
+        .iter()
+        .map(
+            |checkpoint| cohort_publication::VerifiedManifestCheckpoint {
+                slot: checkpoint.slot,
+                accounts_hash: checkpoint
+                    .accounts_hash
+                    .parse::<Hash>()
+                    .expect("cohort plan checkpoint hash was validated")
+                    .to_bytes(),
+            },
+        )
+        .collect::<Vec<_>>();
+    if gate.kind != cohort_publication::ROOT_CHECKPOINT_GATE_KIND
+        || gate.version != cohort_publication::ROOT_CHECKPOINT_GATE_VERSION
+        || gate.verified_manifest_checkpoints != expected_manifest_checkpoints
+        || gate.members.len() != recovered.len()
+    {
+        return Err(
+            "source receipt root-checkpoint gate does not bind the sealed cohort plan".to_string(),
+        );
+    }
+    let (_, final_epoch_end) = epoch_to_slot_range(
+        recovered
+            .last()
+            .expect("recovered cohort was required to be nonempty")
+            .epoch,
+    );
+    let final_epoch_start = epoch_to_slot(
+        recovered
+            .last()
+            .expect("recovered cohort was required to be nonempty")
+            .epoch,
+    );
+    if !gate
+        .verified_manifest_checkpoints
+        .iter()
+        .any(|checkpoint| (final_epoch_start..=final_epoch_end).contains(&checkpoint.slot))
+    {
+        return Err(
+            "source receipt root-checkpoint gate has no verified manifest checkpoint in the final epoch"
+                .to_string(),
+        );
+    }
+    let first_gate = &gate.members[0];
+    if first_gate.epoch != first.epoch
+        || first_gate.bootstrap.slot != plan.bootstrap.slot
+        || first_gate.bootstrap.accounts_hash != bootstrap_hash.to_bytes()
+        || !first_gate.bootstrap.slot_complete
+        || first.provenance.bootstrap_state_kind != BootstrapStateKind::SnapshotArchive
+        || first.provenance.bootstrap_slot != first_gate.bootstrap.slot
+        || first.provenance.bootstrap_state_hash
+            != Hash::new_from_array(first_gate.bootstrap.accounts_hash)
+    {
+        return Err(format!(
+            "recovered cohort epoch {} does not bind the sealed bootstrap root at slot {}",
+            first.epoch, plan.bootstrap.slot
+        ));
+    }
+    for (item, gate_member) in recovered.iter().zip(&gate.members) {
+        if gate_member.epoch != item.epoch || !gate_member.terminal.slot_complete {
+            return Err(format!(
+                "source receipt gate member does not bind recovered epoch {}",
+                item.epoch
+            ));
+        }
+        let (epoch_start, epoch_end) = epoch_to_slot_range(item.epoch);
+        let terminal = item.archive_chain.terminal_block.ok_or_else(|| {
+            format!(
+                "recovered cohort epoch {} contains no present block",
+                item.epoch
+            )
+        })?;
+        if !(epoch_start..=epoch_end).contains(&terminal.slot) {
+            return Err(format!(
+                "recovered cohort epoch {} terminal block {} is outside {}..={}",
+                item.epoch, terminal.slot, epoch_start, epoch_end
+            ));
+        }
+        if gate_member.terminal.slot != terminal.slot
+            || gate_member.terminal.last_blockhash != terminal.blockhash.to_bytes()
+            || item.provenance.bootstrap_slot != gate_member.bootstrap.slot
+            || item.provenance.bootstrap_state_hash
+                != Hash::new_from_array(gate_member.bootstrap.accounts_hash)
+        {
+            return Err(format!(
+                "source receipt checkpoint evidence does not bind recovered epoch {} archive",
+                item.epoch
+            ));
+        }
+    }
+    for (pair, gate_pair) in recovered.windows(2).zip(gate.members.windows(2)) {
+        let previous = &pair[0];
+        let current = &pair[1];
+        let previous_gate = &gate_pair[0];
+        let current_gate = &gate_pair[1];
+        if current.epoch != previous.epoch.saturating_add(1) {
+            return Err(format!(
+                "recovered cohort skips from epoch {} to {}",
+                previous.epoch, current.epoch
+            ));
+        }
+        let previous_terminal = previous
+            .archive_chain
+            .terminal_block
+            .expect("every recovered member was required to have a terminal block");
+        if current_gate.bootstrap != previous_gate.terminal {
+            return Err(format!(
+                "source receipt gate changes carried checkpoint state from epoch {} to {}",
+                previous.epoch, current.epoch
+            ));
+        }
+        if current.provenance.bootstrap_state_kind != BootstrapStateKind::CarriedBank
+            || current.provenance.bootstrap_slot != previous_terminal.slot
+        {
+            return Err(format!(
+                "recovered cohort epoch {} does not carry the terminal slot of epoch {}",
+                current.epoch, previous.epoch
+            ));
+        }
+        let carried_last_blockhash = Hash::new_from_array(current_gate.bootstrap.last_blockhash);
+        if current.archive_chain.initial_poh_anchor != Some(carried_last_blockhash) {
+            return Err(format!(
+                "recovered cohort epoch {} PoH anchor does not continue epoch {}",
+                current.epoch, previous.epoch
+            ));
+        }
+        let first_block = current.archive_chain.first_block.ok_or_else(|| {
+            format!(
+                "recovered cohort epoch {} has no first block for sibling continuity",
+                current.epoch
+            )
+        })?;
+        if first_block.parent_slot != current_gate.bootstrap.slot
+            || first_block.parent_blockhash != carried_last_blockhash
+        {
+            return Err(format!(
+                "recovered cohort epoch {} first block does not name epoch {} terminal block as its parent",
+                current.epoch, previous.epoch
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn recover_staged_root_cohort_only(
+    start_epoch: u64,
+    end_epoch: u64,
+    destination: &BoundDestination,
+    receipt_directory: &Path,
+    source_receipt: &Path,
+    plan: &RootCheckpointCohortPlan,
+    selection: compatibility::RuntimeSelection,
+    shutdown: Arc<AtomicBool>,
+) -> Result<cohort_publication::CompletedPublication, String> {
+    // The committed source receipt is the retained attestation that the live
+    // root verifier opened the original publication gate. Archives do not
+    // encode terminal bank/account checkpoint evidence, so this path admits
+    // no unreceipted run directory and independently re-proves every retained
+    // archive and chain invariant before opening a new batch transaction.
+    destination.revalidate()?;
+    let expected_epochs = (start_epoch..=end_epoch).collect::<Vec<_>>();
+    let manifest_fingerprint = manifest_fingerprint_digest(&plan.fingerprint)?;
+    let admitted = cohort_publication::admit_committed_cohort_receipt(
+        source_receipt,
+        manifest_fingerprint,
+        &expected_epochs,
+        destination.publication_binding(),
+    )?;
+    info!(
+        "admitted committed source cohort transaction {} with manifest fingerprint sha256:{} from {}",
+        jetstreamer_node::segment_manifest::sha256_hex_string(&admitted.transaction_id),
+        jetstreamer_node::segment_manifest::sha256_hex_string(&admitted.manifest_fingerprint),
+        admitted.source_path.display()
+    );
+    jetstreamer_node::archive_publish::preflight_archive_publication(
+        &admitted.source_path,
+        destination.path(),
+    )
+    .map_err(|error| format!("cohort import publication preflight failed: {error}"))?;
+
+    let mut recovered = Vec::with_capacity(admitted.members.len());
+    for member in &admitted.members {
+        if shutdown.load(Ordering::SeqCst) {
+            return Err("cohort import was interrupted before validation completed".to_string());
+        }
+        let destination_archive = destination
+            .path()
+            .join(format!("epoch-{}.jet", member.epoch));
+        require_recovery_destination_namespace_absent(&destination_archive)?;
+        let mut archive_chain = ArchiveChainEvidence::default();
+        let validated = validated_epoch_archive(
+            &member.archive_path,
+            member.epoch,
+            selection,
+            Some(&shutdown),
+            Some(&mut archive_chain),
+        )?
+        .ok_or_else(|| {
+            format!(
+                "source receipt archive is incomplete: {}",
+                member.archive_path.display()
+            )
+        })?;
+        if validated.sha256 != member.sha256 {
+            return Err(format!(
+                "source receipt digest does not match deeply validated epoch {} archive",
+                member.epoch
+            ));
+        }
+        let provenance = read_bound_single_runtime_provenance(&member.archive_path, validated)?;
+        admitted.revalidate()?;
+        recovered.push(RecoveredCohortEpoch {
+            epoch: member.epoch,
+            source_archive: member.archive_path.clone(),
+            destination_archive,
+            provenance,
+            archive_chain,
+            validated,
+        });
+    }
+    validate_recovered_cohort_gate(plan, &recovered, &admitted.root_checkpoint_gate)?;
+    admitted.revalidate()?;
+    destination.revalidate()?;
+    if shutdown.load(Ordering::SeqCst) {
+        return Err("cohort import was interrupted before publication".to_string());
+    }
+    let items = recovered
+        .iter()
+        .map(
+            |archive| jetstreamer_node::archive_publish::ArchiveBatchItem {
+                epoch: archive.epoch,
+                staged_archive: archive.source_archive.clone(),
+                destination_archive: archive.destination_archive.clone(),
+                evidence: archive.validated,
+            },
+        )
+        .collect::<Vec<_>>();
+    let expected = recovered
+        .iter()
+        .map(|archive| cohort_publication::ExpectedCohortArchive {
+            epoch: archive.epoch,
+            destination_archive: &archive.destination_archive,
+            sha256: archive.validated.sha256,
+        })
+        .collect::<Vec<_>>();
+    let gate_context = cohort_publication::encode_root_checkpoint_gate_context(
+        manifest_fingerprint,
+        &expected_epochs,
+        &admitted.root_checkpoint_gate,
+    )?;
+    let publication =
+        jetstreamer_node::archive_publish::publish_verified_archive_batch_if_absent_with_context(
+            manifest_fingerprint,
+            &expected_epochs,
+            &items,
+            &gate_context,
+        )
+        .map_err(|error| {
+            format!(
+                "transactional cohort import failed (commit_state={:?}, recovery={:?}): {error}",
+                error.commit_state(),
+                error.recovery_directory()
+            )
+        })?;
+    cohort_publication::finish_root_checkpoint_publication(
+        destination.publication_binding(),
+        receipt_directory,
+        manifest_fingerprint,
+        &expected,
+        &publication,
+        &admitted.root_checkpoint_gate,
+    )
+}
+
 fn publish_completed_root_cohort_transactionally(
     completed: &[CompletedCohortEpoch],
     expected_epochs: &[u64],
     manifest_fingerprint: [u8; 32],
     destination: &BoundDestination,
     receipt_directory: &Path,
+    gate: &cohort_publication::RootCheckpointGateEvidence,
 ) -> Result<cohort_publication::CompletedPublication, String> {
     let completed_epochs = completed
         .iter()
@@ -8612,18 +9084,26 @@ fn publish_completed_root_cohort_transactionally(
             sha256: archive.validated.sha256,
         })
         .collect::<Vec<_>>();
-    let publication = jetstreamer_node::archive_publish::publish_verified_archive_batch(
+    let gate_context = cohort_publication::encode_root_checkpoint_gate_context(
         manifest_fingerprint,
         expected_epochs,
-        &items,
-    )
-    .map_err(|error| format!("transactional cohort publication failed: {error}"))?;
-    cohort_publication::finish_committed_publication(
+        gate,
+    )?;
+    let publication =
+        jetstreamer_node::archive_publish::publish_verified_archive_batch_with_context(
+            manifest_fingerprint,
+            expected_epochs,
+            &items,
+            &gate_context,
+        )
+        .map_err(|error| format!("transactional cohort publication failed: {error}"))?;
+    cohort_publication::finish_root_checkpoint_publication(
         destination.publication_binding(),
         receipt_directory,
         manifest_fingerprint,
         &expected,
         &publication,
+        gate,
     )
 }
 
@@ -15670,8 +16150,10 @@ async fn main() {
     let mut replay_scratch: Option<PathBuf> = None;
     let mut root_checkpoint_cohort = false;
     let mut recover_staged_only = false;
+    let mut recover_staged_cohort_only = false;
     let mut cohort_manifest: Option<PathBuf> = None;
     let mut cohort_manifest_fingerprint: Option<String> = None;
+    let mut source_cohort_receipt: Option<PathBuf> = None;
     for arg in args {
         if arg == "--verify" {
             verify_snapshots = true;
@@ -15721,6 +16203,12 @@ async fn main() {
                 exit(2);
             }
             recover_staged_only = true;
+        } else if arg == "--recover-staged-cohort-only" {
+            if recover_staged_cohort_only {
+                eprintln!("duplicate --recover-staged-cohort-only option");
+                exit(2);
+            }
+            recover_staged_cohort_only = true;
         } else if let Some(path) = arg.strip_prefix("--cohort-manifest=") {
             if cohort_manifest.replace(PathBuf::from(path)).is_some() {
                 eprintln!("duplicate --cohort-manifest option");
@@ -15732,6 +16220,11 @@ async fn main() {
                 .is_some()
             {
                 eprintln!("duplicate --cohort-manifest-fingerprint option");
+                exit(2);
+            }
+        } else if let Some(path) = arg.strip_prefix("--source-cohort-receipt=") {
+            if source_cohort_receipt.replace(PathBuf::from(path)).is_some() {
+                eprintln!("duplicate --source-cohort-receipt option");
                 exit(2);
             }
         } else if arg.starts_with('-') {
@@ -15786,6 +16279,7 @@ async fn main() {
         verify_option_count,
         inherited_epoch_lease,
         root_checkpoint_cohort
+            || recover_staged_cohort_only
             || horizon_output.is_some()
             || qualification_end_slot.is_some()
             || epoch_hashes.is_some()
@@ -15794,6 +16288,28 @@ async fn main() {
             || replay_scratch.is_some()
             || cohort_manifest.is_some()
             || cohort_manifest_fingerprint.is_some(),
+    ) {
+        eprintln!("{error}");
+        exit(2);
+    }
+    if let Err(error) = validate_staged_cohort_recovery_mode(
+        recover_staged_cohort_only,
+        start_epoch,
+        end_epoch,
+        explicit_verify,
+        verify_option_count,
+        inherited_epoch_lease,
+        cohort_manifest.is_some(),
+        cohort_manifest_fingerprint.is_some(),
+        source_cohort_receipt.is_some(),
+        recover_staged_only
+            || root_checkpoint_cohort
+            || horizon_output.is_some()
+            || qualification_end_slot.is_some()
+            || epoch_hashes.is_some()
+            || snapshot_archive_override.is_some()
+            || range_info.is_some()
+            || replay_scratch.is_some(),
     ) {
         eprintln!("{error}");
         exit(2);
@@ -15825,8 +16341,16 @@ async fn main() {
             );
             exit(2);
         }
-    } else if cohort_manifest.is_some() || cohort_manifest_fingerprint.is_some() {
-        eprintln!("cohort manifest options require --root-checkpoint-cohort");
+    } else if !recover_staged_cohort_only
+        && (cohort_manifest.is_some() || cohort_manifest_fingerprint.is_some())
+    {
+        eprintln!(
+            "cohort manifest options require --root-checkpoint-cohort or --recover-staged-cohort-only"
+        );
+        exit(2);
+    }
+    if !recover_staged_cohort_only && source_cohort_receipt.is_some() {
+        eprintln!("--source-cohort-receipt requires --recover-staged-cohort-only");
         exit(2);
     }
     let qualification = match qualification_plan(
@@ -15964,7 +16488,7 @@ async fn main() {
         }
         return;
     }
-    let cohort_runtime = if root_checkpoint_cohort {
+    let cohort_runtime = if root_checkpoint_cohort || recover_staged_cohort_only {
         match root_checkpoint_cohort_runtime(start_epoch, end_epoch, allow_candidate_runtime) {
             Ok(selection) => Some(selection),
             Err(err) => {
@@ -15975,7 +16499,7 @@ async fn main() {
     } else {
         None
     };
-    let cohort_plan = if root_checkpoint_cohort {
+    let cohort_plan = if root_checkpoint_cohort || recover_staged_cohort_only {
         let manifest_path = cohort_manifest
             .as_deref()
             .expect("cohort manifest option was required");
@@ -16004,6 +16528,41 @@ async fn main() {
     } else {
         None
     };
+    if recover_staged_cohort_only {
+        let receipt_directory = batch_receipt_directory
+            .as_deref()
+            .expect("top-level cohort import has a private receipt directory");
+        match recover_staged_root_cohort_only(
+            start_epoch,
+            end_epoch,
+            &destination_binding,
+            receipt_directory,
+            source_cohort_receipt
+                .as_deref()
+                .expect("source cohort receipt option was required"),
+            cohort_plan.as_ref().expect("cohort plan was validated"),
+            cohort_runtime.expect("cohort runtime was validated"),
+            shutdown.clone(),
+        ) {
+            Ok(publication) => {
+                info!(
+                    "recovered root-checkpoint cohort {}-{} published {} archive(s) in transaction {}; receipt {} is durable",
+                    start_epoch,
+                    end_epoch,
+                    publication.archive_count,
+                    jetstreamer_node::segment_manifest::sha256_hex_string(
+                        &publication.transaction_id
+                    ),
+                    publication.receipt_path.display()
+                );
+            }
+            Err(error) => {
+                eprintln!("error: {error}; cohort import remains fail-closed");
+                exit(1);
+            }
+        }
+        return;
+    }
     let mut cohort_run = if let Some(plan) = cohort_plan.as_ref() {
         let scope = match private_epoch_scope(&dest_dir) {
             Ok(scope) => scope,
@@ -17284,6 +17843,10 @@ async fn main() {
             shutdown.load(Ordering::SeqCst),
             terminal_verification,
             || {
+                let gate = root_checkpoint_gate_evidence(
+                    cohort_plan.as_ref().expect("cohort plan was validated"),
+                    &completed_cohort,
+                );
                 info!(
                     "root-checkpoint cohort {}-{} passed its terminal root and all archive checks; opening publication gate",
                     effective_start, end_epoch
@@ -17294,6 +17857,7 @@ async fn main() {
                     manifest_fingerprint,
                     &destination_binding,
                     receipt_directory,
+                    &gate,
                 )
             },
         );
@@ -17478,6 +18042,147 @@ mod early_snapshot_tests {
             root_checkpoint_cohort_plan_from_report(changed, &fingerprint, 17, 19, selection)
                 .unwrap_err();
         assert!(error.contains("fingerprint mismatch"), "{error}");
+    }
+
+    #[test]
+    fn recovered_cohort_continuity_binds_bootstrap_and_sibling_anchors() {
+        let (report, fingerprint) = cohort_manifest_report(b"audited generation one");
+        let selection = root_checkpoint_cohort_runtime(17, 19, true).unwrap();
+        let plan = root_checkpoint_cohort_plan_from_report(report, &fingerprint, 17, 19, selection)
+            .unwrap();
+        let fixture = tempfile::TempDir::new().unwrap();
+        let mut previous_terminal: Option<ArchiveBlockEvidence> = None;
+        let mut recovered = Vec::new();
+        for epoch in 17..=19 {
+            let archive = fixture.path().join(format!("epoch-{epoch}.jet"));
+            fs::write(&archive, format!("epoch {epoch}")).unwrap();
+            let file = fs::File::open(&archive).unwrap();
+            let validated =
+                jetstreamer_node::archive_checksum::measure_open_archive(&file).unwrap();
+            let (slot_start, slot_end) = epoch_to_slot_range(epoch);
+            let terminal_hash = Hash::new_from_array([epoch as u8; 32]);
+            let (bootstrap_kind, bootstrap_slot, bootstrap_hash, initial_poh_anchor, first_block) =
+                match previous_terminal {
+                    None => (
+                        BootstrapStateKind::SnapshotArchive,
+                        plan.bootstrap.slot,
+                        plan.bootstrap.accounts_hash.parse::<Hash>().unwrap(),
+                        None,
+                        None,
+                    ),
+                    Some(previous) => (
+                        BootstrapStateKind::CarriedBank,
+                        previous.slot,
+                        Hash::new_from_array([(epoch + 10) as u8; 32]),
+                        Some(previous.blockhash),
+                        Some(ArchiveBlockEvidence {
+                            slot: slot_start,
+                            parent_slot: previous.slot,
+                            parent_blockhash: previous.blockhash,
+                            blockhash: Hash::new_from_array([(epoch + 20) as u8; 32]),
+                        }),
+                    ),
+                };
+            let provenance = build_archive_provenance(
+                selection,
+                Some([0x55; 32]),
+                bootstrap_kind,
+                bootstrap_slot,
+                bootstrap_hash,
+                slot_start,
+                slot_end - slot_start + 1,
+            )
+            .unwrap()
+            .single_runtime_v1()
+            .unwrap()
+            .clone();
+            let terminal = ArchiveBlockEvidence {
+                slot: slot_end,
+                parent_slot: slot_end - 1,
+                parent_blockhash: Hash::new_from_array([(epoch + 30) as u8; 32]),
+                blockhash: terminal_hash,
+            };
+            recovered.push(RecoveredCohortEpoch {
+                epoch,
+                source_archive: archive.clone(),
+                destination_archive: archive,
+                provenance,
+                archive_chain: ArchiveChainEvidence {
+                    initial_poh_anchor,
+                    first_block,
+                    terminal_block: Some(terminal),
+                },
+                validated,
+            });
+            previous_terminal = Some(terminal);
+        }
+
+        let summary = |slot, accounts_hash: Hash, last_blockhash: Hash| {
+            cohort_publication::RootCheckpointSummary {
+                slot,
+                bank_hash: Hash::new_from_array([0x41; 32]).to_bytes(),
+                accounts_hash: accounts_hash.to_bytes(),
+                last_blockhash: last_blockhash.to_bytes(),
+                capitalization: 1,
+                transaction_count: 2,
+                tick_height: 3,
+                slot_complete: true,
+                write_count: 4,
+                next_write_version: 5,
+            }
+        };
+        let mut gate_members = Vec::new();
+        let mut bootstrap = summary(
+            plan.bootstrap.slot,
+            plan.bootstrap.accounts_hash.parse().unwrap(),
+            Hash::new_from_array([0x42; 32]),
+        );
+        for (index, item) in recovered.iter().enumerate() {
+            let terminal = item.archive_chain.terminal_block.unwrap();
+            let terminal_accounts_hash = recovered
+                .get(index + 1)
+                .map(|next| next.provenance.bootstrap_state_hash)
+                .unwrap_or_else(|| Hash::new_from_array([0x43; 32]));
+            let terminal_summary =
+                summary(terminal.slot, terminal_accounts_hash, terminal.blockhash);
+            gate_members.push(cohort_publication::RootCheckpointGateMember {
+                epoch: item.epoch,
+                bootstrap,
+                terminal: terminal_summary,
+            });
+            bootstrap = terminal_summary;
+        }
+        let gate = cohort_publication::RootCheckpointGateEvidence {
+            kind: cohort_publication::ROOT_CHECKPOINT_GATE_KIND.to_owned(),
+            version: cohort_publication::ROOT_CHECKPOINT_GATE_VERSION,
+            verified_manifest_checkpoints: plan
+                .root_checkpoints
+                .iter()
+                .map(
+                    |checkpoint| cohort_publication::VerifiedManifestCheckpoint {
+                        slot: checkpoint.slot,
+                        accounts_hash: checkpoint.accounts_hash.parse::<Hash>().unwrap().to_bytes(),
+                    },
+                )
+                .collect(),
+            members: gate_members,
+        };
+
+        validate_recovered_cohort_gate(&plan, &recovered, &gate).unwrap();
+        let mut wrong_manifest_checkpoint = gate.clone();
+        wrong_manifest_checkpoint.verified_manifest_checkpoints[0].accounts_hash[0] ^= 1;
+        let error = validate_recovered_cohort_gate(&plan, &recovered, &wrong_manifest_checkpoint)
+            .unwrap_err();
+        assert!(error.contains("sealed cohort plan"), "{error}");
+        recovered[1].archive_chain.initial_poh_anchor = Some(Hash::new_unique());
+        let error = validate_recovered_cohort_gate(&plan, &recovered, &gate).unwrap_err();
+        assert!(error.contains("PoH anchor"), "{error}");
+        recovered[1].archive_chain.initial_poh_anchor = Some(Hash::new_from_array(
+            gate.members[1].bootstrap.last_blockhash,
+        ));
+        recovered[1].provenance.bootstrap_state_hash = Hash::new_unique();
+        let error = validate_recovered_cohort_gate(&plan, &recovered, &gate).unwrap_err();
+        assert!(error.contains("checkpoint evidence"), "{error}");
     }
 
     #[test]
@@ -18387,6 +19092,95 @@ mod early_snapshot_tests {
         let error =
             validate_staged_recovery_mode(true, 11, 11, Some(true), 1, false, true).unwrap_err();
         assert!(error.contains("cannot be combined"));
+    }
+
+    #[test]
+    fn staged_cohort_recovery_requires_all_explicit_evidence_and_no_replay_overrides() {
+        assert!(
+            validate_staged_cohort_recovery_mode(
+                true,
+                17,
+                19,
+                Some(true),
+                1,
+                false,
+                true,
+                true,
+                true,
+                false,
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_staged_cohort_recovery_mode(
+                false, 0, 0, None, 0, true, false, false, false, true,
+            )
+            .is_ok()
+        );
+        for (start, end) in [(0, 0), (19, 17)] {
+            let error = validate_staged_cohort_recovery_mode(
+                true,
+                start,
+                end,
+                Some(true),
+                1,
+                false,
+                true,
+                true,
+                true,
+                false,
+            )
+            .unwrap_err();
+            assert!(error.contains("nonzero epochs"), "{error}");
+        }
+        let error = validate_staged_cohort_recovery_mode(
+            true,
+            1,
+            MAX_ROOT_CHECKPOINT_COHORT_EPOCHS + 1,
+            Some(true),
+            1,
+            false,
+            true,
+            true,
+            true,
+            false,
+        )
+        .unwrap_err();
+        assert!(error.contains("exceeding the limit"), "{error}");
+        for (manifest, fingerprint, receipt) in [
+            (false, true, true),
+            (true, false, true),
+            (true, true, false),
+        ] {
+            let error = validate_staged_cohort_recovery_mode(
+                true,
+                17,
+                19,
+                Some(true),
+                1,
+                false,
+                manifest,
+                fingerprint,
+                receipt,
+                false,
+            )
+            .unwrap_err();
+            assert!(error.contains("source-cohort-receipt"), "{error}");
+        }
+        let error = validate_staged_cohort_recovery_mode(
+            true,
+            17,
+            19,
+            Some(true),
+            1,
+            false,
+            true,
+            true,
+            true,
+            true,
+        )
+        .unwrap_err();
+        assert!(error.contains("cannot be combined"), "{error}");
     }
 
     fn make_private_test_directory(path: &Path) {

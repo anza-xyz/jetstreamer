@@ -15,9 +15,9 @@ use {
             archive_file_identity, open_regular_nofollow, path_matches_archive_identity,
         },
         archive_publish::{
-            ArchiveBatchIdentityEvidence, ArchiveBatchPublication, ArchiveBatchRecovery,
-            ArchiveBatchRollback, ArchiveNamespaceIdentity, acknowledge_archive_publication_batch,
-            recover_archive_publication_batch,
+            ArchiveBatchDestinationIdentity, ArchiveBatchIdentityEvidence, ArchiveBatchPublication,
+            ArchiveBatchRecovery, ArchiveBatchRollback, ArchiveNamespaceIdentity,
+            acknowledge_archive_publication_batch, recover_archive_publication_batch,
         },
         segment_manifest::segment_manifest_path,
     },
@@ -167,24 +167,25 @@ pub(crate) fn recover_pending_batch(
     destination: DestinationBinding<'_>,
     receipt_directory: &Path,
 ) -> Result<RecoveryDisposition, String> {
-    if !archive_batch_publication_in_progress(destination.path).map_err(|error| {
-        format!(
-            "failed to inspect archive batch state in {}: {error}",
-            destination.path.display()
-        )
-    })? {
-        return Ok(RecoveryDisposition::None);
-    }
+    validate_destination_binding(destination)?;
     validate_receipt_location(destination.path, receipt_directory)?;
 
-    let recovered = recover_archive_publication_batch(destination.path).map_err(|error| {
+    let recovered = recover_archive_publication_batch(
+        destination.path,
+        ArchiveBatchDestinationIdentity {
+            device: destination.device,
+            inode: destination.inode,
+        },
+    )
+    .map_err(|error| {
         format!(
             "archive batch recovery is indeterminate in {}: {error}",
             destination.path.display()
         )
     })?;
     let (outcome, receipt_path, transaction_id) = match recovered {
-        ArchiveBatchRecovery::None => (None, None, None),
+        ArchiveBatchRecovery::None => return Ok(RecoveryDisposition::None),
+        ArchiveBatchRecovery::UnarmedMarkerCleared => (None, None, None),
         ArchiveBatchRecovery::Committed(publication) => {
             let receipt = committed_receipt(destination, &publication, None)?;
             let receipt_path = persist_receipt(receipt_directory, &receipt)?;
@@ -687,6 +688,14 @@ fn read_regular_nofollow(path: &Path) -> Result<Vec<u8>, String> {
 }
 
 fn persist_receipt(directory: &Path, receipt: &PublicationReceipt) -> Result<PathBuf, String> {
+    persist_receipt_with_directory_sync(directory, receipt, File::sync_all)
+}
+
+fn persist_receipt_with_directory_sync(
+    directory: &Path,
+    receipt: &PublicationReceipt,
+    mut sync_directory: impl FnMut(&File) -> io::Result<()>,
+) -> Result<PathBuf, String> {
     let mut bytes = serde_json::to_vec_pretty(receipt)
         .map_err(|error| format!("failed to encode archive batch receipt: {error}"))?;
     bytes.push(b'\n');
@@ -701,6 +710,13 @@ fn persist_receipt(directory: &Path, receipt: &PublicationReceipt) -> Result<Pat
 
     if let Some(existing) = read_receipt_at(&directory_file, &final_name)? {
         if existing == bytes {
+            sync_and_revalidate_receipt(
+                directory,
+                &directory_file,
+                &final_name,
+                &bytes,
+                &mut sync_directory,
+            )?;
             return Ok(final_path);
         }
         return Err(format!(
@@ -766,44 +782,60 @@ fn persist_receipt(directory: &Path, receipt: &PublicationReceipt) -> Result<Pat
         let error = io::Error::last_os_error();
         unlinkat_if_present(&directory_file, &temporary_name);
         if error.kind() == io::ErrorKind::AlreadyExists {
-            let existing = read_receipt_at(&directory_file, &final_name)?.ok_or_else(|| {
-                format!(
-                    "archive batch receipt appeared and disappeared during delivery: {}",
-                    final_path.display()
-                )
-            })?;
-            if existing == bytes {
-                return Ok(final_path);
-            }
-            return Err(format!(
-                "existing archive batch receipt disagrees with recovered evidence: {}",
-                final_path.display()
-            ));
+            sync_and_revalidate_receipt(
+                directory,
+                &directory_file,
+                &final_name,
+                &bytes,
+                &mut sync_directory,
+            )?;
+            return Ok(final_path);
         }
         return Err(format!(
             "failed to install private archive batch receipt {}: {error}",
             final_path.display()
         ));
     }
-    directory_file.sync_all().map_err(|error| {
+    sync_and_revalidate_receipt(
+        directory,
+        &directory_file,
+        &final_name,
+        &bytes,
+        &mut sync_directory,
+    )?;
+    Ok(final_path)
+}
+
+fn sync_and_revalidate_receipt(
+    directory_path: &Path,
+    directory: &File,
+    name: &CString,
+    expected: &[u8],
+    sync_directory: &mut impl FnMut(&File) -> io::Result<()>,
+) -> Result<(), String> {
+    sync_directory(directory).map_err(|error| {
         format!(
             "failed to sync archive batch receipt directory {}: {error}",
-            directory.display()
+            directory_path.display()
         )
     })?;
-    let installed = read_receipt_at(&directory_file, &final_name)?.ok_or_else(|| {
+    let installed = read_receipt_at(directory, name)?.ok_or_else(|| {
         format!(
             "archive batch receipt disappeared after installation: {}",
-            final_path.display()
+            directory_path
+                .join(OsStr::from_bytes(name.as_bytes()))
+                .display()
         )
     })?;
-    if installed != bytes {
+    if installed != expected {
         return Err(format!(
-            "archive batch receipt changed after installation: {}",
-            final_path.display()
+            "existing archive batch receipt disagrees with recovered evidence: {}",
+            directory_path
+                .join(OsStr::from_bytes(name.as_bytes()))
+                .display()
         ));
     }
-    Ok(final_path)
+    Ok(())
 }
 
 fn bind_private_receipt_directory(path: &Path) -> Result<File, String> {
@@ -1012,6 +1044,32 @@ mod tests {
     }
 
     #[test]
+    fn identical_existing_receipt_is_synced_then_revalidated() {
+        let fixture = tempfile::tempdir_in(".").unwrap();
+        let destination = private_directory(fixture.path(), "destination");
+        let receipts = private_directory(fixture.path(), "receipts");
+        let metadata = fs::metadata(&destination).unwrap();
+        let receipt = sample_receipt(&destination, &metadata);
+        let path = persist_receipt(&receipts, &receipt).unwrap();
+
+        let error = persist_receipt_with_directory_sync(&receipts, &receipt, |_| {
+            Err(io::Error::other("injected directory sync failure"))
+        })
+        .unwrap_err();
+        assert!(error.contains("injected directory sync failure"), "{error}");
+
+        let expected = fs::read(&path).unwrap();
+        let changed_path = path.clone();
+        let error = persist_receipt_with_directory_sync(&receipts, &receipt, |directory| {
+            directory.sync_all()?;
+            fs::write(&changed_path, b"changed after directory sync")
+        })
+        .unwrap_err();
+        assert!(error.contains("disagrees"), "{error}");
+        assert_ne!(fs::read(path).unwrap(), expected);
+    }
+
+    #[test]
     fn receipt_install_rejects_symlink_targets_and_directories() {
         let fixture = tempfile::tempdir_in(".").unwrap();
         let destination = private_directory(fixture.path(), "destination");
@@ -1129,6 +1187,31 @@ mod tests {
         assert!(receipt.contains("\"kind\": \"committed\""));
         assert!(receipt.contains(&format!("sha256:{}", digest_hex(&fingerprint))));
         assert!(!archive_batch_publication_in_progress(&destination).unwrap());
+        assert_eq!(
+            recover_pending_batch(destination_binding(&destination), &receipts).unwrap(),
+            RecoveryDisposition::None
+        );
+    }
+
+    #[test]
+    fn clearing_an_unarmed_marker_requires_a_clean_run() {
+        let fixture = tempfile::tempdir_in(".").unwrap();
+        let root = fixture.path().canonicalize().unwrap();
+        let destination = private_directory(&root, "destination");
+        let receipts = private_directory(&root, "receipts");
+        let marker = destination
+            .join(jetstreamer_node::archive_checksum::ARCHIVE_BATCH_TRANSACTION_DIRECTORY);
+        let mut builder = fs::DirBuilder::new();
+        builder.mode(0o700).create(&marker).unwrap();
+
+        assert_eq!(
+            recover_pending_batch(destination_binding(&destination), &receipts).unwrap(),
+            RecoveryDisposition::Stop {
+                outcome: None,
+                receipt_path: None,
+            }
+        );
+        assert!(!marker.exists());
         assert_eq!(
             recover_pending_batch(destination_binding(&destination), &receipts).unwrap(),
             RecoveryDisposition::None

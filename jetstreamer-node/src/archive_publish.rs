@@ -150,7 +150,12 @@ pub struct ArchiveBatchRollbackIdentityEvidence {
 
 #[derive(Debug)]
 pub enum ArchiveBatchRecovery {
+    /// No active transaction or completed outcome was present.
     None,
+    /// An unarmed transaction marker was removed without touching any archive
+    /// namespace entry. The caller must still treat this as a recovery event
+    /// and require a clean subsequent invocation.
+    UnarmedMarkerCleared,
     RolledBack(ArchiveBatchRollback),
     Committed(ArchiveBatchPublication),
 }
@@ -970,10 +975,15 @@ where
 /// and staged archive. A commit decision finishes every canonical checksum.
 /// A completed outcome is returned repeatedly until it is acknowledged after
 /// the caller's private receipt is durable.
-/// An inode-bound advisory writer lock excludes live publishers, checksum
-/// repair, acknowledgement, and concurrent recovery for the destination.
+/// `expected_destination` must be the identity bound by the caller before it
+/// decided to recover. An inode-bound advisory writer lock is acquired by
+/// walking the destination path component by component. Its identity is
+/// compared with that expectation before any marker or journal mutation.
+/// The lock excludes live publishers, checksum repair, acknowledgement, and
+/// concurrent recovery for the destination.
 pub fn recover_archive_publication_batch(
     destination_directory: &Path,
+    expected_destination: ArchiveBatchDestinationIdentity,
 ) -> Result<ArchiveBatchRecovery, ArchivePublicationError> {
     let writer_lock =
         acquire_archive_destination_writer_lock(destination_directory).map_err(|error| {
@@ -982,6 +992,15 @@ pub fn recover_archive_publication_batch(
                 format!("failed to acquire archive destination writer lock: {error}"),
             )
         })?;
+    if !writer_lock.binds_destination(expected_destination.device, expected_destination.inode) {
+        return Err(batch_indeterminate_error(
+            destination_directory,
+            format!(
+                "archive destination identity changed before recovery: expected {}/{}",
+                expected_destination.device, expected_destination.inode,
+            ),
+        ));
+    }
     recover_archive_publication_batch_locked(destination_directory, &writer_lock)
 }
 
@@ -1043,7 +1062,7 @@ fn recover_archive_publication_batch_locked_impl(
             Some(false),
         )
         .map_err(|message| preflight_error_with_recovery(message, Some(marker.path.clone())))?;
-        return Ok(ArchiveBatchRecovery::None);
+        return Ok(ArchiveBatchRecovery::UnarmedMarkerCleared);
     };
     recover_bound_archive_batch(&destination, &marker, &journal)
 }
@@ -3526,10 +3545,12 @@ fn resolve_failed_archive_batch(
             recovery_directory: None,
         }),
         Ok(ArchiveBatchRecovery::Committed(publication)) => Ok(publication),
-        Ok(ArchiveBatchRecovery::None) => Err(batch_indeterminate_error(
-            destination_path,
-            format!("{cause}; transaction marker disappeared before recovery"),
-        )),
+        Ok(ArchiveBatchRecovery::None | ArchiveBatchRecovery::UnarmedMarkerCleared) => {
+            Err(batch_indeterminate_error(
+                destination_path,
+                format!("{cause}; transaction marker disappeared before recovery"),
+            ))
+        }
         Err(recovery) => Err(batch_indeterminate_error(
             destination_path,
             format!("{cause}; automatic recovery failed: {recovery}"),
@@ -5498,6 +5519,14 @@ mod tests {
             .collect()
     }
 
+    fn expected_destination_identity(path: &Path) -> ArchiveBatchDestinationIdentity {
+        let metadata = fs::metadata(path).unwrap();
+        ArchiveBatchDestinationIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        }
+    }
+
     fn fixture() -> (tempfile::TempDir, PathBuf, PathBuf, ValidatedArchiveFile) {
         let root = tempfile::TempDir::new().unwrap();
         let source = root.path().join("source");
@@ -5796,9 +5825,11 @@ mod tests {
         );
         assert!(destination.join(ARCHIVE_BATCH_OUTCOME_DIRECTORY).is_dir());
         assert!(archive_batch_publication_in_progress(destination).unwrap());
-        let ArchiveBatchRecovery::Committed(recovered) =
-            recover_archive_publication_batch(destination).unwrap()
-        else {
+        let ArchiveBatchRecovery::Committed(recovered) = recover_archive_publication_batch(
+            destination,
+            expected_destination_identity(destination),
+        )
+        .unwrap() else {
             panic!("completed batch outcome was not recoverable");
         };
         assert_eq!(recovered.transaction_id, publication.transaction_id);
@@ -5910,7 +5941,11 @@ mod tests {
         assert!(archive.exists());
         assert!(!destination_archive.exists());
 
-        let recovery = recover_archive_publication_batch(destination).unwrap_err();
+        let recovery = recover_archive_publication_batch(
+            destination,
+            expected_destination_identity(destination),
+        )
+        .unwrap_err();
         assert!(
             recovery.to_string().contains("writer lock is held"),
             "{recovery}"
@@ -5938,6 +5973,52 @@ mod tests {
             publish_verified_archive_batch(BATCH_MANIFEST_FINGERPRINT, &expected_epochs, &items)
                 .unwrap();
         acknowledge_archive_publication_batch(destination, publication.transaction_id).unwrap();
+    }
+
+    #[test]
+    fn batch_recovery_rejects_retargeted_destination_before_marker_access() {
+        let root = tempfile::TempDir::new().unwrap();
+        let destination = root.path().join("destination");
+        fs::create_dir(&destination).unwrap();
+        fs::set_permissions(&destination, fs::Permissions::from_mode(0o3770)).unwrap();
+        let expected = expected_destination_identity(&destination);
+
+        let displaced = root.path().join("displaced-destination");
+        fs::rename(&destination, &displaced).unwrap();
+        fs::create_dir(&destination).unwrap();
+        fs::set_permissions(&destination, fs::Permissions::from_mode(0o3770)).unwrap();
+        let marker = destination.join(ARCHIVE_BATCH_TRANSACTION_DIRECTORY);
+        fs::create_dir(&marker).unwrap();
+        let journal = marker.join(ARCHIVE_BATCH_JOURNAL);
+        let journal_bytes = b"replacement namespace journal must remain untouched";
+        fs::write(&journal, journal_bytes).unwrap();
+        let marker_before = FileIdentity::from_metadata(&fs::symlink_metadata(&marker).unwrap());
+        let journal_before = FileIdentity::from_metadata(&fs::symlink_metadata(&journal).unwrap());
+
+        let error = recover_archive_publication_batch(&destination, expected).unwrap_err();
+
+        assert_eq!(
+            error.commit_state(),
+            ArchivePublicationCommitState::Indeterminate
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("destination identity changed before recovery"),
+            "{error}"
+        );
+        assert_eq!(
+            FileIdentity::from_metadata(&fs::symlink_metadata(&marker).unwrap()),
+            marker_before
+        );
+        assert_eq!(
+            FileIdentity::from_metadata(&fs::symlink_metadata(&journal).unwrap()),
+            journal_before
+        );
+        assert_eq!(fs::read(&journal).unwrap(), journal_bytes);
+        let displaced_metadata = fs::metadata(displaced).unwrap();
+        assert_eq!(displaced_metadata.dev(), expected.device);
+        assert_eq!(displaced_metadata.ino(), expected.inode);
     }
 
     #[test]
@@ -6045,7 +6126,11 @@ mod tests {
         fs::rename(&container, &real_container).unwrap();
         std::os::unix::fs::symlink(&real_container, &container).unwrap();
 
-        let error = recover_archive_publication_batch(&destination).unwrap_err();
+        let error = recover_archive_publication_batch(
+            &destination,
+            expected_destination_identity(&destination),
+        )
+        .unwrap_err();
 
         assert!(
             error.to_string().contains("without following links"),
@@ -6096,7 +6181,11 @@ mod tests {
         fs::write(&journal_path, serde_json::to_vec_pretty(&journal).unwrap()).unwrap();
         fs::set_permissions(&journal_path, fs::Permissions::from_mode(0o400)).unwrap();
 
-        let error = recover_archive_publication_batch(&destination).unwrap_err();
+        let error = recover_archive_publication_batch(
+            &destination,
+            expected_destination_identity(&destination),
+        )
+        .unwrap_err();
 
         assert!(error.to_string().contains("non-canonical"), "{error}");
         assert!(
@@ -6133,7 +6222,11 @@ mod tests {
         fs::write(&journal_path, serde_json::to_vec_pretty(&journal).unwrap()).unwrap();
         fs::set_permissions(&journal_path, fs::Permissions::from_mode(0o400)).unwrap();
 
-        let error = recover_archive_publication_batch(&destination).unwrap_err();
+        let error = recover_archive_publication_batch(
+            &destination,
+            expected_destination_identity(&destination),
+        )
+        .unwrap_err();
 
         assert!(
             error.to_string().contains("transaction ID commitment"),
@@ -6178,7 +6271,11 @@ mod tests {
         fs::write(&journal_path, serde_json::to_vec_pretty(&journal).unwrap()).unwrap();
         fs::set_permissions(&journal_path, fs::Permissions::from_mode(0o400)).unwrap();
 
-        let error = recover_archive_publication_batch(&destination).unwrap_err();
+        let error = recover_archive_publication_batch(
+            &destination,
+            expected_destination_identity(&destination),
+        )
+        .unwrap_err();
 
         assert_eq!(
             error.commit_state(),
@@ -6205,7 +6302,11 @@ mod tests {
         fs::set_permissions(&marker, fs::Permissions::from_mode(0o700)).unwrap();
         fs::write(marker.join("unexpected"), b"do not discard").unwrap();
 
-        let error = recover_archive_publication_batch(&destination).unwrap_err();
+        let error = recover_archive_publication_batch(
+            &destination,
+            expected_destination_identity(&destination),
+        )
+        .unwrap_err();
 
         assert!(error.to_string().contains("unexpected entry"), "{error}");
         assert_eq!(
@@ -6251,7 +6352,11 @@ mod tests {
                 .is_dir()
         );
         assert!(!destination.join(ARCHIVE_BATCH_OUTCOME_DIRECTORY).exists());
-        let recovery = recover_archive_publication_batch(&destination).unwrap_err();
+        let recovery = recover_archive_publication_batch(
+            &destination,
+            expected_destination_identity(&destination),
+        )
+        .unwrap_err();
         assert!(
             recovery.to_string().contains("unexpected entry"),
             "{recovery}"
@@ -6309,9 +6414,11 @@ mod tests {
 
         assert!(error.to_string().contains("transaction ID"), "{error}");
         assert!(destination.join(ARCHIVE_BATCH_OUTCOME_DIRECTORY).is_dir());
-        let ArchiveBatchRecovery::Committed(recovered) =
-            recover_archive_publication_batch(&destination).unwrap()
-        else {
+        let ArchiveBatchRecovery::Committed(recovered) = recover_archive_publication_batch(
+            &destination,
+            expected_destination_identity(&destination),
+        )
+        .unwrap() else {
             panic!("pending outcome was lost after a mismatched acknowledgement");
         };
         assert_eq!(recovered.transaction_id, publication.transaction_id);
@@ -6368,7 +6475,11 @@ mod tests {
                 );
             }
 
-            let recovery = recover_archive_publication_batch(&destination).unwrap();
+            let recovery = recover_archive_publication_batch(
+                &destination,
+                expected_destination_identity(&destination),
+            )
+            .unwrap();
 
             let committed = matches!(
                 crash_phase,
@@ -6426,7 +6537,11 @@ mod tests {
                     .exists()
             );
             assert!(destination.join(ARCHIVE_BATCH_OUTCOME_DIRECTORY).is_dir());
-            let repeated = recover_archive_publication_batch(&destination).unwrap();
+            let repeated = recover_archive_publication_batch(
+                &destination,
+                expected_destination_identity(&destination),
+            )
+            .unwrap();
             match repeated {
                 ArchiveBatchRecovery::Committed(publication) if committed => {
                     assert_eq!(publication.transaction_id, transaction_id);
@@ -6565,7 +6680,11 @@ mod tests {
             }));
             assert!(crashed.is_err());
 
-            let recovery = recover_archive_publication_batch(&destination).unwrap();
+            let recovery = recover_archive_publication_batch(
+                &destination,
+                expected_destination_identity(&destination),
+            )
+            .unwrap();
 
             let transaction_id = if expect_commit {
                 let ArchiveBatchRecovery::Committed(publication) = recovery else {

@@ -13,6 +13,7 @@ use {
     },
     solana_clock::Slot,
     solana_hash::Hash,
+    solana_signature::Signature,
     std::{ops::Range, str::FromStr},
 };
 
@@ -66,6 +67,63 @@ pub const AGAVE_V3_VERIFIED_START_SLOT: Slot = 406_080_000;
 /// status metadata for every transaction. The last observed missing record is
 /// in slot 4,258,771; slots 4,258,772 through 4,258,775 are absent.
 pub const OLD_FAITHFUL_STATUS_REQUIRED_START_SLOT: Slot = 4_258_776;
+
+struct AuditedMissingTransactionStatusRun {
+    slot: Slot,
+    first_transaction_index: usize,
+    signatures: &'static [&'static str],
+}
+
+/// Exact source holes admitted after the general missing-status era.
+///
+/// The metadata-only firehose audit covered every present slot in epochs 18
+/// and 19 and all 49,315,046 transaction notifications. It found only this
+/// consecutive run. Binding every index to its transaction signature prevents
+/// a changed or differently ordered source block from inheriting the
+/// exception. The selected historical runtime still executes every
+/// transaction, and cohort publication remains gated on the canonical root
+/// checkpoint.
+const AUDITED_MISSING_TRANSACTION_STATUS_RUNS: &[AuditedMissingTransactionStatusRun] = &[
+    AuditedMissingTransactionStatusRun {
+        slot: 8_120_052,
+        first_transaction_index: 79,
+        signatures: &[
+            "5iDNYejCujaTwp2m64YJstEKJPQP5xBVmh73u3eXejLp8c2fmyJNmyZss8RKoBhMYYeiQkadosN3W644Ro8h1cD2",
+            "5ENkyfnNcGY73P2x2KvN9Dmer6qdJFmMvkt4qrqMdfMEkEdZNCT3w764UFhYdE1YB8wCARhoMhhLETPyvWRRyWTJ",
+            "558F6tsTwJndXU8dKZHtdENo7S1UxjXupQSfVY422FHdajDojy3hNzMvXpXrfjDzoeEyP1zaTnXCSGEr7BrMxans",
+            "3EHbzGGkAWMiz1t5dFm6YDHjav54cbizZ3n9jYRTyVUx2fNSyuXvhzE2Hb2upFR8ErqVMtRNuoSZNXXevNKJvigR",
+            "4yRAcZZ1jzPRk1hoDSS4UgBJBnxn4kfQoF4YUsEbMrZqVyJvGLyR4hUKH9eDUPqc2CEQmDLhwtuKqJHK5poAPkeW",
+            "2zasUj1HqiUXniaJhgh6b4TKmMoWofaoSr98W3LcRYZ51ytxY8qkZ2AgcSj8wmF7wCe7GGQFUW4Si6Nen1kgZMVG",
+            "34HujUZUukDXEfo8P8bQp1L9nTtN1FdqeTAjuJtiZDGXmgn25K87Fy6C7DYmhQaXBDx15g1A2PwkFgmTxUVhY8bz",
+            "24gP4FMpEvNt4jox1UTQgiKJj4AzsgpZ32FDDLtZgLnBCLLRRQbCKyzKceo5bv7cna8NSeSbGxFkLxKSwaU7NCpN",
+            "4Lh4oM2W44XWbEainPZmCmUi5XEn8sGBzCfggbRBxRZg6pCsqFLJBFoZZZMvUoycKYsqVfgNf7vwyRxu8d6XiWJt",
+            "MHVowtzHH1uCLWHXvbLh1SE8MhesMY2XDFrKwu2MQkhMnaoLRPbhP1SNyQoUfF47YDCboCc6aq4tyxjjd9Wx2eN",
+            "2iDRe2MTjzGW8dfivWcDWJL951CoTZWkHhyLfrozVMbb5nMdq2enn1oAHNSEyUx2bNPxBDzN6Ja458XhWrXYx9ym",
+            "2puhgyJYivoxfSEsBJpXERyG1qRRXd7SUb1y2Vcd3STYA4S1RHpbMKR8wNwWJM21yt7CGocfNe4ZHMizV7u2dxxn",
+            "5Z4vkChbFosmjQgSVh3nt4BpNZDJe5sVkuDmcAiJASAEV2QKjHwfZfCMUKDLLAa8hnB8RzKDfLWKMN4C8QjS9sjt",
+            "z7USTrW99dyh94YMThU1tKfLKfmRdYjWStuQhc9pat5rhqXhMP5TtqZBoLmPEKY2uxqhg7f2mTXyrFmqjsQ5MQu",
+            "5jjyQzHRxZEdSRfzvrWuJiYED4QTwSwhxVpnVGNFyCuyGQTLsp9hBGbEKDtT62TiWbTjJX66uHFHCJwvSgnG3Cg1",
+            "eQcrJGaFbpjbQRkoetS86CwLqwrFrkiaKmKHn6kGrbvPHmrUmp1H7qoVkZV5vH6SfcXiFKuRPnrQDiaGn9pLNVR",
+            "4ApR5YJEiouugSX2Dj2kBXT79f14BFMzuDgnJn6oRKQtis7z2yr8NYu8aC3a89JsYc7AZtnHjjXKHcksEsPpvJWa",
+            "JsfxaP35uLdmUFBcZyqvLGym9WVfenFEP5n5NQjGSbM4vpcNjeQcceh4t8phVwJBg6HGZstmzmE757Q9Eye2hWe",
+            "5JsLtPq2sesfagWKfjxf5pt2a56V46Mz143waFaJjuQ1XXBYL4fUvTWjfyCmU7xsgyLPJJYsa4YSzGqvvGeXwcsT",
+            "5zXVEGMw5S2GS6oPL9wjAf273MvVJp9SfoGRJXw9HdiPp4kHXoav6tC2YrLehiiDNK2NPEAzP6HWauCEaegwnT4e",
+            "2WdowqyV55aXUQjBzCjLQ7pFX8efCvrKTxEEtRzGjQSGfvLQT6yQjGV668axmFHzSneyqENwc6ZfHspEi4X9Aftz",
+            "58TMUEhumNHkdFuohDiHThDFeLg39UGcLL7i3G7voZUkYvsQ6EZAwJfy8Qoyae6jr5TUAK88ftbNovDtTz32oZNA",
+            "1wNd1bLyeJHBe4vfwGi8S81Jf7WkCJcL4DXkmerSoaDYjRUQwQapqkCNiD1NRBWhyxGnMKpGjBwQZkNp8wi1Kua",
+            "5xvnopZMgJBWqHVDw6YCN9oEfcpuHog3Jmr6vSaK7t4LXiNxzd52s1nfLkawnLzHUjUJ2ZsMsTRVWmbaSVYE3xUr",
+            "dxKjHV95wHrhMRCpyMiMK99auerovPYTv5DUtka4sLR3bi7pWStcFnNpwgYbqLap95WVDzowcagiT5SSjtNNnUa",
+            "2YSGk8VrBB37fLD5eQsd8MTMvkHCdT2ZBxaLchg3QxLXKYdx5TCb1N83exEnCmGBH62jTZkN3UPWjLhBdNFsJCS3",
+            "4J2DQkTveBHksRPCaHPxAH6fmoq8wsJ1EeFLAN4XvJSpF94reRL3uFcbKQkumbnqYQQeY6dbhd1DULfNSBBDiHFx",
+            "3p3akan7AMQYixamsaVm5kPzuaV6Yyj7cHQ66FdpW1PbtnSnFRY3T1qyPwmatmeeUHBpJ2azrPJupTa7EZNKeoJr",
+            "5GthBtUwFjWD59gmjSSgE3JHndm3vwaM1tdNDpLKmY3Nwmq3PDXFxK8DYUxk9Ba64pjWZG5PqfUGJA52215FvZLN",
+            "287F4t3sJ6jeAqCArxGFKdr5PKMmVacU27C5CrBokWwU3u7fLdxedzFmjZX3k8GNxNX7fNVjN4M8pJSVQ2gdGuqX",
+            "3M7CBkabPQFoAZBFJEHfSvmoJuZpCFc7EvZ412CRQq9k4y6vBSzE9xz1Em24p5KNFX9DPpepunJQckbXxm5D6QAs",
+            "47Y9FMZ6ScDo53R3DhPXJbiwcsKtMjUmvbVnq3E8NDfApvk67Nh4tyie4hAp6GBUVDL5khY9KmeJ2pWcjxUJarrn",
+            "fFLHy5H4Nk8CoY86wrbv4Wr8BgDRm73cYSF2MALiSyi945EBnSNBF9Nfv6wXiDv5smyCparKvcT36ZayBS6v6Cd",
+        ],
+    },
+];
 
 /// End of the historical range for which source transaction-to-status
 /// association is treated as untrusted. The old status writer paired
@@ -1231,6 +1289,44 @@ pub const fn missing_transaction_status_at(slot: Slot) -> MissingTransactionStat
     }
 }
 
+pub(crate) fn is_audited_missing_transaction_status(
+    slot: Slot,
+    transaction_slot_index: usize,
+    signature: &Signature,
+) -> bool {
+    AUDITED_MISSING_TRANSACTION_STATUS_RUNS.iter().any(|run| {
+        if run.slot != slot {
+            return false;
+        }
+        let Some(offset) = transaction_slot_index.checked_sub(run.first_transaction_index) else {
+            return false;
+        };
+        run.signatures
+            .get(offset)
+            .is_some_and(|expected| signature.to_string() == *expected)
+    })
+}
+
+/// Selects the missing-status policy for one identified transaction.
+///
+/// The slot-wide rule remains fail-closed after the source cutover. Only an
+/// exact audited `(slot, index, signature)` source hole can opt back into
+/// runtime reconstruction.
+#[inline]
+pub fn missing_transaction_status_for(
+    slot: Slot,
+    transaction_slot_index: usize,
+    signature: &Signature,
+) -> MissingTransactionStatus {
+    if missing_transaction_status_at(slot) == MissingTransactionStatus::Reconstruct
+        || is_audited_missing_transaction_status(slot, transaction_slot_index, signature)
+    {
+        MissingTransactionStatus::Reconstruct
+    } else {
+        MissingTransactionStatus::Reject
+    }
+}
+
 /// Selects transaction-status validation independently from status presence
 /// and execution-runtime routing.
 #[inline]
@@ -2056,6 +2152,51 @@ mod tests {
         assert_eq!(input_end_exclusive(start), Some(boundary));
         assert_eq!(
             missing_transaction_status_at(boundary),
+            MissingTransactionStatus::Reject
+        );
+    }
+
+    #[test]
+    fn post_cutover_missing_status_exceptions_bind_slot_index_and_signature() {
+        assert_eq!(AUDITED_MISSING_TRANSACTION_STATUS_RUNS.len(), 1);
+        let run = &AUDITED_MISSING_TRANSACTION_STATUS_RUNS[0];
+        assert_eq!(run.slot, 8_120_052);
+        assert_eq!(run.first_transaction_index, 79);
+        assert_eq!(run.signatures.len(), 33);
+        assert_eq!(
+            missing_transaction_status_at(run.slot),
+            MissingTransactionStatus::Reject
+        );
+
+        let mut signatures = std::collections::HashSet::new();
+        for (offset, encoded) in run.signatures.iter().enumerate() {
+            let signature: Signature = encoded.parse().expect("audited signature is valid");
+            assert!(signatures.insert(signature));
+            assert_eq!(
+                missing_transaction_status_for(
+                    run.slot,
+                    run.first_transaction_index + offset,
+                    &signature,
+                ),
+                MissingTransactionStatus::Reconstruct
+            );
+        }
+
+        let first: Signature = run.signatures[0].parse().unwrap();
+        assert_eq!(
+            missing_transaction_status_for(run.slot - 1, run.first_transaction_index, &first,),
+            MissingTransactionStatus::Reject
+        );
+        assert_eq!(
+            missing_transaction_status_for(run.slot, run.first_transaction_index + 1, &first,),
+            MissingTransactionStatus::Reject
+        );
+        assert_eq!(
+            missing_transaction_status_for(
+                run.slot,
+                run.first_transaction_index,
+                &Signature::default(),
+            ),
             MissingTransactionStatus::Reject
         );
     }

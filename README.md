@@ -460,6 +460,31 @@ runtime-local write versions into one contiguous namespace, fully decodes the re
 publishes it atomically. Interrupted segment files are retained for validated resume, and an older
 final output is moved to a recoverable backup only after the new archive has passed verification.
 
+### Adaptive historical sweeps
+
+`scripts/adaptive_root_cohort_sweep.py` runs reviewed verification cohorts in separate,
+pre-provisioned lanes. It starts in planning mode. Execution is intended for a detached,
+root-owned service using a root-owned, non-writable deployment tree and owner-only controller
+state under root-controlled ancestry. The controller derives every work boundary from the
+fingerprinted preflight manifest and will not split a verification cohort.
+
+Concurrency begins at the configured floor and increases gradually when CPU and memory headroom
+allow it. Every producer runs as the unprivileged `sol` user in a resource-bounded systemd unit.
+The controller will adopt existing work only when the process identity, arguments, cgroup, lane,
+runtime, manifest, and complete sandbox configuration match the sealed plan. Overlapping epoch or
+lane claims stop scheduling.
+
+Completed lanes are imported one at a time through the same Rust recovery and transactional
+publication path used by manual cohort runs. Before launch, the root controller binds the source
+receipt, its gate context, and independently checked archive digests into durable state. A retained
+systemd unit supplies durable importer exit status across controller restarts. After a successful
+exit, the controller requires the public receipt to reproduce that evidence, rehashes every public
+archive, and records a root-owned completion attestation before unloading the unit. Directory
+inodes are bound into the sealed configuration and rechecked while the controller runs. A committed
+import consumes the source checksum sidecars so the lane can be reused. Publication journals,
+partial namespaces, changed receipts, and failed attempts remain in place for recovery or operator
+review; the controller does not delete them.
+
 ## Installation and Setup
 
 ### Nix (Recommended)

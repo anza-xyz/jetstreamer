@@ -3781,6 +3781,7 @@ impl TransactionScheduler {
         }
         let buffer = state.slots.entry(slot).or_default();
         let inserted = buffer.insert_transaction(
+            slot,
             index,
             tx,
             status_meta,
@@ -4160,6 +4161,7 @@ impl SlotExecutionBuffer {
 
     fn insert_transaction(
         &mut self,
+        slot: Slot,
         index: usize,
         tx: VersionedTransaction,
         status_meta: Option<TransactionStatusMeta>,
@@ -4173,19 +4175,25 @@ impl SlotExecutionBuffer {
             self.txs.resize_with(index + 1, || None);
         }
         let source_status = status_meta.as_ref().map(|metadata| metadata.status.clone());
-        let (expected_status, source_entry_status) = match status_validation {
-            compatibility::TransactionStatusValidation::RuntimeOnly => (None, None),
+        let audited_missing_source_status = status_meta.is_none()
+            && tx.signatures.first().is_some_and(|signature| {
+                compatibility::is_audited_missing_transaction_status(slot, index, signature)
+            });
+        let (expected_status, source_entry_status, reconstruct_fee) = match status_validation {
+            compatibility::TransactionStatusValidation::RuntimeOnly => (None, None, false),
             compatibility::TransactionStatusValidation::RuntimeWithSourceEntryMultiset => {
-                let status = source_status.clone().ok_or_else(|| {
-                    "entry-multiset status validation requires source metadata".to_string()
-                })?;
-                (None, Some(status))
+                if source_status.is_none() && !audited_missing_source_status {
+                    return Err(
+                        "entry-multiset status validation requires source metadata".to_string()
+                    );
+                }
+                (None, source_status.clone(), true)
             }
             compatibility::TransactionStatusValidation::SourceExact => {
                 let status = source_status.clone().ok_or_else(|| {
                     "exact transaction status validation requires source metadata".to_string()
                 })?;
-                (Some(status), None)
+                (Some(status), None, false)
             }
         };
         if let Some(existing) = &self.txs[index] {
@@ -4194,6 +4202,8 @@ impl SlotExecutionBuffer {
             if existing_sig == incoming_sig
                 && existing.expected_status == expected_status
                 && existing.source_entry_status == source_entry_status
+                && existing.audited_missing_source_status == audited_missing_source_status
+                && existing.reconstruct_fee == reconstruct_fee
             {
                 // Duplicate delivery of the same transaction; ignore.
                 return Ok(false);
@@ -4207,6 +4217,8 @@ impl SlotExecutionBuffer {
             tx,
             expected_status,
             source_entry_status,
+            audited_missing_source_status,
+            reconstruct_fee,
             status_meta: status_meta.unwrap_or_default(),
         });
         Ok(true)
@@ -4377,6 +4389,11 @@ struct ScheduledTransaction {
     /// v1.0 persisted these results in randomized rather than transaction
     /// order, so replay restores their per-transaction association.
     source_entry_status: Option<Result<(), TransactionError>>,
+    /// The source omitted this exact status frame after the normal cutover,
+    /// and its slot, index, and signature match the compiled audit record.
+    audited_missing_source_status: bool,
+    /// The selected runtime supplies the fee as well as the status.
+    reconstruct_fee: bool,
     /// Full original chain metadata (from the CAR stream), carried through
     /// so the horizon recorder can archive it alongside replay output.
     status_meta: TransactionStatusMeta,
@@ -4389,14 +4406,24 @@ fn entry_source_status_multiset(
         .iter()
         .filter(|transaction| transaction.source_entry_status.is_some())
         .count();
-    if status_count == 0 {
+    let audited_missing_count = transactions
+        .iter()
+        .filter(|transaction| transaction.audited_missing_source_status)
+        .count();
+    if status_count == 0 && audited_missing_count == 0 {
         return Ok(None);
     }
-    if status_count != transactions.len() {
+    if status_count + audited_missing_count != transactions.len() {
         return Err(format!(
-            "entry has source status for {status_count}/{} transactions",
-            transactions.len()
+            "entry has source status for {status_count}/{} transactions and {audited_missing_count} audited missing frames",
+            transactions.len(),
         ));
+    }
+    if audited_missing_count > 0 {
+        // The v1.0 source writer permuted statuses within an entry. Once even
+        // one exact source frame is absent, no sound partial multiset exists;
+        // the exact runtime and cohort root checkpoint supply the proof.
+        return Ok(None);
     }
     Ok(Some(
         transactions
@@ -4534,7 +4561,7 @@ impl SourcedTransactionNotifier for BankTransactionNotifier {
             SourcedTransactionStatus::Missing => None,
         };
         if let Err(error) = validate_transaction_status_presence(
-            compatibility::missing_transaction_status_at(slot),
+            compatibility::missing_transaction_status_for(slot, transaction_slot_index, signature),
             transaction_status_meta.is_some(),
             slot,
             transaction_slot_index,
@@ -6085,6 +6112,13 @@ const COMPATIBLE_V1_0_7_GENERATION_PROFILES: &[&str] =
 // remains mandatory.
 const COMPATIBLE_V1_0_8_GENERATION_PROFILES: &[&str] =
     &["jetstreamer-node/0.7.0/old-faithful-to-horizon-v2@8154bc9b0057a138afa6e8833468f6ffba39a6a1"];
+// ba39b66 produced the currently staged early-epoch cohorts. Later changes
+// affect only orchestration and rollback admission: they do not change replay
+// or archive bytes. Keep that exact producer profile admissible while runtime,
+// worker, genesis, checkpoint, provenance, archive structure, and SHA-256
+// checks remain mandatory.
+const COMPATIBLE_SEALED_SWEEP_GENERATION_PROFILES: &[&str] =
+    &["jetstreamer-node/0.7.0/old-faithful-to-horizon-v2@ba39b6677d604d9258452a926b93ac667b2cf7eb"];
 
 // This is not a generation-profile allowlist. Each record identifies one
 // completed private archive whose full bytes and production inputs were
@@ -6259,6 +6293,7 @@ fn runtime_generation_profile_is_compatible(
     recorded_generation_profile: &str,
 ) -> bool {
     recorded_generation_profile == archive_generation_profile()
+        || COMPATIBLE_SEALED_SWEEP_GENERATION_PROFILES.contains(&recorded_generation_profile)
         || (runtime_profile == historical::SOLANA_V1_0_7_CANDIDATE.backend_id
             && COMPATIBLE_V1_0_7_GENERATION_PROFILES.contains(&recorded_generation_profile))
         || (runtime_profile == historical::SOLANA_V1_0_8_CANDIDATE.backend_id
@@ -18552,6 +18587,7 @@ mod early_snapshot_tests {
     fn prior_runtime_generation_profile_allowlists_are_exact_and_scoped() {
         let prior_v1_0_7 = COMPATIBLE_V1_0_7_GENERATION_PROFILES[0];
         let prior_v1_0_8 = COMPATIBLE_V1_0_8_GENERATION_PROFILES[0];
+        let sealed_sweep = COMPATIBLE_SEALED_SWEEP_GENERATION_PROFILES[0];
         for (runtime, prior) in [
             (historical::SOLANA_V1_0_7_CANDIDATE.backend_id, prior_v1_0_7),
             (historical::SOLANA_V1_0_8_CANDIDATE.backend_id, prior_v1_0_8),
@@ -18574,6 +18610,20 @@ mod early_snapshot_tests {
         assert!(runtime_generation_profile_is_compatible(
             historical::SOLANA_V1_0_8_CANDIDATE.backend_id,
             &archive_generation_profile(),
+        ));
+        for runtime in [
+            historical::SOLANA_V1_0_8_CANDIDATE.backend_id,
+            historical::SOLANA_V1_0_14_CANDIDATE.backend_id,
+            historical::SOLANA_V1_3_19_CANDIDATE.backend_id,
+        ] {
+            assert!(runtime_generation_profile_is_compatible(
+                runtime,
+                sealed_sweep,
+            ));
+        }
+        assert!(!runtime_generation_profile_is_compatible(
+            historical::SOLANA_V1_0_23_CANDIDATE.backend_id,
+            &format!("{sealed_sweep}-dirty"),
         ));
         assert!(!runtime_generation_profile_is_compatible(
             historical::SOLANA_V1_0_7_CANDIDATE.backend_id,
@@ -19882,6 +19932,30 @@ mod early_snapshot_tests {
             406_080_000,
             7,
             &signature,
+        )
+        .unwrap_err();
+        assert!(error.contains("status metadata is required"));
+
+        let audited_signature: Signature =
+            "5iDNYejCujaTwp2m64YJstEKJPQP5xBVmh73u3eXejLp8c2fmyJNmyZss8RKoBhMYYeiQkadosN3W644Ro8h1cD2"
+                .parse()
+                .unwrap();
+        assert!(
+            validate_transaction_status_presence(
+                compatibility::missing_transaction_status_for(8_120_052, 79, &audited_signature,),
+                false,
+                8_120_052,
+                79,
+                &audited_signature,
+            )
+            .is_ok()
+        );
+        let error = validate_transaction_status_presence(
+            compatibility::missing_transaction_status_for(8_120_052, 80, &audited_signature),
+            false,
+            8_120_052,
+            80,
+            &audited_signature,
         )
         .unwrap_err();
         assert!(error.contains("status metadata is required"));
@@ -21302,9 +21376,11 @@ mod early_snapshot_tests {
 mod scheduler_tests {
     use super::{
         EntryAccounts, SlotExecutionBuffer, assign_rounds,
-        compatibility::TransactionStatusValidation, status_multisets_equal,
+        compatibility::TransactionStatusValidation, entry_source_status_multiset,
+        status_multisets_equal,
     };
     use solana_address::Address;
+    use solana_signature::Signature;
     use solana_transaction::versioned::VersionedTransaction;
     use solana_transaction_status::TransactionStatusMeta;
     use std::collections::HashSet;
@@ -21326,6 +21402,7 @@ mod scheduler_tests {
         missing
             .insert_transaction(
                 0,
+                0,
                 VersionedTransaction::default(),
                 None,
                 TransactionStatusValidation::RuntimeOnly,
@@ -21336,6 +21413,7 @@ mod scheduler_tests {
         let mut observed = SlotExecutionBuffer::default();
         observed
             .insert_transaction(
+                0,
                 0,
                 VersionedTransaction::default(),
                 Some(TransactionStatusMeta::default()),
@@ -21351,6 +21429,7 @@ mod scheduler_tests {
         permuted
             .insert_transaction(
                 0,
+                0,
                 VersionedTransaction::default(),
                 Some(TransactionStatusMeta::default()),
                 TransactionStatusValidation::RuntimeWithSourceEntryMultiset,
@@ -21359,6 +21438,59 @@ mod scheduler_tests {
         let scheduled = permuted.txs[0].as_ref().unwrap();
         assert!(scheduled.expected_status.is_none());
         assert_eq!(scheduled.source_entry_status, Some(Ok(())));
+    }
+
+    #[test]
+    fn audited_post_cutover_status_hole_skips_only_its_entry_multiset() {
+        let mut buffer = SlotExecutionBuffer::default();
+        buffer
+            .insert_transaction(
+                8_120_052,
+                78,
+                VersionedTransaction::default(),
+                Some(TransactionStatusMeta::default()),
+                TransactionStatusValidation::RuntimeWithSourceEntryMultiset,
+            )
+            .unwrap();
+        let signature: Signature =
+            "5iDNYejCujaTwp2m64YJstEKJPQP5xBVmh73u3eXejLp8c2fmyJNmyZss8RKoBhMYYeiQkadosN3W644Ro8h1cD2"
+                .parse()
+                .unwrap();
+        let transaction = VersionedTransaction {
+            signatures: vec![signature],
+            ..VersionedTransaction::default()
+        };
+        buffer
+            .insert_transaction(
+                8_120_052,
+                79,
+                transaction,
+                None,
+                TransactionStatusValidation::RuntimeWithSourceEntryMultiset,
+            )
+            .unwrap();
+
+        let observed = buffer.txs[78].take().unwrap();
+        let missing = buffer.txs[79].take().unwrap();
+        assert!(!observed.audited_missing_source_status);
+        assert!(missing.audited_missing_source_status);
+        assert!(missing.reconstruct_fee);
+        assert!(
+            entry_source_status_multiset(&[observed, missing])
+                .unwrap()
+                .is_none()
+        );
+
+        let error = SlotExecutionBuffer::default()
+            .insert_transaction(
+                8_120_052,
+                78,
+                VersionedTransaction::default(),
+                None,
+                TransactionStatusValidation::RuntimeWithSourceEntryMultiset,
+            )
+            .unwrap_err();
+        assert!(error.contains("requires source metadata"));
     }
 
     #[test]

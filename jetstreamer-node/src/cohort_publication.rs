@@ -636,12 +636,19 @@ pub(crate) fn admit_committed_cohort_receipt(
                 "source cohort receipt contains a noncanonical checksum path for epoch {expected_epoch}"
             ));
         }
-        let archive_identity: ArchiveNamespaceIdentity = member.committed_archive.into();
-        let checksum_identity: ArchiveNamespaceIdentity = member.committed_checksum.into();
-        validate_import_identity(archive_identity, target_metadata.gid(), "archive")?;
-        validate_import_identity(checksum_identity, target_metadata.gid(), "checksum")?;
-        require_namespace_identity(&archive_path, Some(archive_identity))?;
-        require_namespace_identity(&checksum_path, Some(checksum_identity))?;
+        let receipt_archive_identity: ArchiveNamespaceIdentity = member.committed_archive.into();
+        let receipt_checksum_identity: ArchiveNamespaceIdentity = member.committed_checksum.into();
+        validate_import_identity(receipt_archive_identity, target_metadata.gid(), "archive")?;
+        validate_import_identity(receipt_checksum_identity, target_metadata.gid(), "checksum")?;
+        // A failed import can move these exact inodes to the public
+        // destination and back. Rename changes ctime, so bind the observed
+        // post-rollback identities after requiring every stable field from
+        // the sealed receipt. Full archive hashing and exact observed-identity
+        // revalidation still run before publication.
+        let archive_identity =
+            require_namespace_identity_across_rename(&archive_path, receipt_archive_identity)?;
+        require_namespace_identity(&checksum_path, Some(receipt_checksum_identity))?;
+        let checksum_identity = receipt_checksum_identity;
         let sha256 = decode_digest(&member.archive_sha256, false, "archive SHA-256")?;
         let checksum = read_regular_nofollow(&checksum_path)?;
         let expected_checksum_bytes = archive_checksum_line(
@@ -1415,6 +1422,36 @@ fn require_namespace_identity(
             Ok(())
         }
     }
+}
+
+fn require_namespace_identity_across_rename(
+    path: &Path,
+    expected: ArchiveNamespaceIdentity,
+) -> Result<ArchiveNamespaceIdentity, String> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
+        format!(
+            "failed to inspect source cohort path {}: {error}",
+            path.display()
+        )
+    })?;
+    let observed = namespace_identity(&metadata);
+    if !metadata.file_type().is_file()
+        || observed.device != expected.device
+        || observed.inode != expected.inode
+        || observed.mode != expected.mode
+        || observed.uid != expected.uid
+        || observed.gid != expected.gid
+        || observed.link_count != expected.link_count
+        || observed.length != expected.length
+        || observed.modified_seconds != expected.modified_seconds
+        || observed.modified_nanoseconds != expected.modified_nanoseconds
+    {
+        return Err(format!(
+            "source cohort identity changed beyond a rename: {}",
+            path.display()
+        ));
+    }
+    Ok(observed)
 }
 
 fn namespace_identity(metadata: &fs::Metadata) -> ArchiveNamespaceIdentity {
@@ -2240,6 +2277,110 @@ mod tests {
             error.contains("checksum changed after admission"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn committed_receipt_admission_rebinds_members_after_rollback_renames() {
+        let fixture = tempfile::tempdir_in(".").unwrap();
+        let root = fixture.path().canonicalize().unwrap();
+        let staging = private_directory(&root, "staging");
+        let source = private_directory(&root, "source");
+        let target = private_directory(&root, "target");
+        let receipts = identity_bound_receipt_directory(&root, &source);
+        let items = staged_batch_items(&staging, &source, &[31]);
+        let fingerprint = [0x24; 32];
+        let gate = sample_root_gate(&[31]);
+        let gate_context = encode_root_checkpoint_gate_context(fingerprint, &[31], &gate).unwrap();
+        let expected = [ExpectedCohortArchive {
+            epoch: 31,
+            destination_archive: &items[0].destination_archive,
+            sha256: items[0].evidence.sha256,
+        }];
+        let publication =
+            jetstreamer_node::archive_publish::publish_verified_archive_batch_with_context(
+                fingerprint,
+                &[31],
+                &items,
+                &gate_context,
+            )
+            .unwrap();
+        let receipt = retry_after_transient_fork_lock(|| {
+            finish_root_checkpoint_publication(
+                destination_binding(&source),
+                &receipts,
+                fingerprint,
+                &expected,
+                &publication,
+                &gate,
+            )
+        })
+        .unwrap();
+
+        let archive = &items[0].destination_archive;
+        let checksum = archive_checksum_path(archive).unwrap();
+        let receipt_json: PublicationReceipt =
+            serde_json::from_slice(&fs::read(&receipt.receipt_path).unwrap()).unwrap();
+        let ReceiptOutcome::Committed { members } = receipt_json.outcome else {
+            panic!("source receipt was not committed");
+        };
+        let recorded_archive: ArchiveNamespaceIdentity = members[0].committed_archive.into();
+        let recorded_checksum: ArchiveNamespaceIdentity = members[0].committed_checksum.into();
+
+        let parked_archive = staging.join("rollback-archive");
+        fs::rename(archive, &parked_archive).unwrap();
+        fs::rename(&parked_archive, archive).unwrap();
+
+        let observed_archive = namespace_identity(&fs::metadata(archive).unwrap());
+        let observed_checksum = namespace_identity(&fs::metadata(&checksum).unwrap());
+        assert_ne!(
+            (
+                recorded_archive.changed_seconds,
+                recorded_archive.changed_nanoseconds,
+            ),
+            (
+                observed_archive.changed_seconds,
+                observed_archive.changed_nanoseconds,
+            )
+        );
+        assert_eq!(recorded_checksum, observed_checksum);
+
+        let admitted = admit_committed_cohort_receipt(
+            &receipt.receipt_path,
+            fingerprint,
+            &[31],
+            destination_binding(&target),
+        )
+        .unwrap();
+        assert_eq!(admitted.members[0].archive_identity, observed_archive);
+        admitted.revalidate().unwrap();
+        drop(admitted);
+
+        fs::set_permissions(archive, fs::Permissions::from_mode(0o600)).unwrap();
+        let error = match admit_committed_cohort_receipt(
+            &receipt.receipt_path,
+            fingerprint,
+            &[31],
+            destination_binding(&target),
+        ) {
+            Ok(_) => panic!("source archive mode change was admitted as a rename"),
+            Err(error) => error,
+        };
+        assert!(error.contains("changed beyond a rename"), "{error}");
+        fs::set_permissions(archive, fs::Permissions::from_mode(0o440)).unwrap();
+
+        let parked_checksum = staging.join("rollback-checksum");
+        fs::rename(&checksum, &parked_checksum).unwrap();
+        fs::rename(&parked_checksum, &checksum).unwrap();
+        let error = match admit_committed_cohort_receipt(
+            &receipt.receipt_path,
+            fingerprint,
+            &[31],
+            destination_binding(&target),
+        ) {
+            Ok(_) => panic!("source checksum ctime drift was admitted as a rollback rename"),
+            Err(error) => error,
+        };
+        assert!(error.contains("identity changed"), "{error}");
     }
 
     #[test]

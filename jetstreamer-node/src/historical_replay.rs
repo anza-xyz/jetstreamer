@@ -34,6 +34,19 @@ const HISTORICAL_BATCH_MAX_SLOTS: usize = 4;
 // unusually large transactions from turning one response into a huge burst.
 const HISTORICAL_BATCH_TRANSACTION_BYTES: usize = 32 * 1024 * 1024;
 
+fn apply_runtime_reconstructed_metadata(
+    scheduled: &mut super::ScheduledTransaction,
+    actual: &crate::historical::HistoricalTransactionOutcome,
+) {
+    scheduled.status_meta.status = match actual.error.as_ref() {
+        Some(error) => Err(denormalize_transaction_error(error)),
+        None => Ok(()),
+    };
+    if scheduled.reconstruct_fee {
+        scheduled.status_meta.fee = actual.fee;
+    }
+}
+
 /// Checkpoint identity retained for replay provenance and runtime handoff.
 /// Account writes are deliberately excluded from this cloneable summary.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -808,16 +821,10 @@ impl HistoricalReplay {
                 // Missing or v1.0-permuted source status is not associated
                 // ground truth. Preserve the historical executor's result in
                 // the generated archive.
-                scheduled.status_meta.status = match actual.error.as_ref() {
-                    Some(error) => Err(denormalize_transaction_error(error)),
-                    None => Ok(()),
-                };
-                if scheduled.source_entry_status.is_some() {
-                    // The same source writer bug also paired the original
-                    // transaction with another transaction's durable-nonce
-                    // fee calculator. Use the runtime-associated fee.
-                    scheduled.status_meta.fee = actual.fee;
-                }
+                // The source writer bug also paired the original transaction
+                // with another transaction's durable-nonce fee calculator.
+                // Exact missing-frame exceptions have no source fee at all.
+                apply_runtime_reconstructed_metadata(scheduled, actual);
             }
         }
         Ok(())
@@ -1164,6 +1171,32 @@ mod tests {
             write_count: 0,
             next_write_version,
         }
+    }
+
+    #[test]
+    fn audited_missing_status_uses_the_historical_runtime_fee() {
+        let mut scheduled = super::super::ScheduledTransaction {
+            tx: solana_transaction::versioned::VersionedTransaction::default(),
+            expected_status: None,
+            source_entry_status: None,
+            audited_missing_source_status: true,
+            reconstruct_fee: true,
+            status_meta: solana_transaction_status::TransactionStatusMeta {
+                status: Err(solana_transaction::TransactionError::AccountNotFound),
+                fee: 0,
+                ..solana_transaction_status::TransactionStatusMeta::default()
+            },
+        };
+        let outcome = crate::historical::HistoricalTransactionOutcome {
+            signature: None,
+            error: None,
+            fee: 5_000,
+        };
+
+        apply_runtime_reconstructed_metadata(&mut scheduled, &outcome);
+
+        assert_eq!(scheduled.status_meta.status, Ok(()));
+        assert_eq!(scheduled.status_meta.fee, 5_000);
     }
 
     #[test]

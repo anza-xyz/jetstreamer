@@ -55,6 +55,7 @@ const CAPABILITY_PROBE_MOVED: &str = "rename-probe-moved";
 const ARCHIVE_BATCH_JOURNAL: &str = "journal.json";
 const ARCHIVE_BATCH_JOURNAL_NEXT: &str = "journal.next.json";
 const ARCHIVE_BATCH_ARMED: &str = "armed";
+const ARCHIVE_BATCH_RETIRED_SOURCE_CHECKSUM: &str = "retired-source.jet.sha256";
 const ARCHIVE_BATCH_ARMED_PREFIX: &[u8] = b"jetstreamer archive batch armed v2\0";
 const ARCHIVE_BATCH_JOURNAL_VERSION: u32 = 2;
 const MAX_ARCHIVE_BATCH_ITEMS: usize = 4096;
@@ -585,6 +586,8 @@ struct ArchiveBatchJournalItem {
     recovery_identity: FileIdentity,
     archive_name: Vec<u8>,
     archive_identity: FileIdentity,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_checksum_identity: Option<FileIdentity>,
     manifest_staged_identity: Option<FileIdentity>,
     checksum_staged_identity: FileIdentity,
     checksum_sentinel_identity: FileIdentity,
@@ -675,10 +678,25 @@ enum PublishPhase {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ArchiveBatchPhase {
     JournalPrepared,
-    Item { index: usize, phase: PublishPhase },
+    Item {
+        index: usize,
+        phase: PublishPhase,
+    },
     CommitDecisionDurable,
+    SourceChecksum {
+        index: usize,
+        phase: SourceChecksumRetirementPhase,
+    },
     BeforeTransactionMarkerRemoval,
     AfterTransactionMarkerRetirement,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SourceChecksumRetirementPhase {
+    BeforeRetention,
+    AfterRetentionMutation,
+    BeforeRemoval,
+    AfterRemovalMutation,
 }
 
 /// Verifies the directory policies and filesystem operations required by
@@ -765,7 +783,9 @@ pub fn publish_verified_archive_if_absent(
 /// Before any archive or manifest changes, every member is validated and every
 /// checksum name is durably replaced by the publication sentinel. The durable
 /// batch marker remains present until every new archive and canonical checksum
-/// is installed. It is then durably retired to a completed-outcome record.
+/// is installed. An admitted checksum alongside a staged archive is consumed
+/// only after the durable commit decision. The marker is then durably retired
+/// to a completed-outcome record.
 /// Persist a private receipt from the returned evidence, fsync it, and call
 /// [`acknowledge_archive_publication_batch`] with the transaction ID. Until
 /// acknowledgement, recovery returns the same outcome and no new batch may
@@ -965,6 +985,24 @@ where
         for (index, transaction) in transactions.iter_mut().enumerate() {
             let mut item_hook = |phase| hook(ArchiveBatchPhase::Item { index, phase });
             transaction.commit_checksum_for_batch(&mut item_hook)?;
+        }
+        for (index, transaction) in transactions.iter().enumerate() {
+            let mut retirement_hook =
+                |phase| hook(ArchiveBatchPhase::SourceChecksum { index, phase });
+            retire_source_checksum_with_hook(
+                &transaction.source,
+                transaction
+                    .source_checksum
+                    .as_ref()
+                    .map(|checksum| checksum.name.as_os_str())
+                    .unwrap_or_else(|| transaction.destination_checksum_name.as_os_str()),
+                &transaction.recovery,
+                transaction
+                    .source_checksum
+                    .as_ref()
+                    .map(|checksum| checksum.identity),
+                &mut retirement_hook,
+            )?;
         }
         Ok(())
     })();
@@ -1390,10 +1428,10 @@ fn prepare_publication_transaction(
     let source_checksum_name = safe_file_name(&source_checksum_path).map_err(preflight_error)?;
     let expected_checksum = archive_checksum_line(&evidence.sha256, &destination_name)
         .map_err(|error| preflight_error(error.to_string()))?;
-    if let Some(bound) =
+    let source_checksum =
         bind_optional_regular(&source, &source_checksum_name, ComponentKind::Checksum)
-            .map_err(preflight_error)?
-    {
+            .map_err(preflight_error)?;
+    if let Some(bound) = source_checksum.as_ref() {
         bound.file.sync_all().map_err(|error| {
             preflight_error(format!(
                 "failed to sync staged checksum {}: {error}",
@@ -1565,6 +1603,13 @@ fn prepare_publication_transaction(
         file: archive.file,
         identity: archive.identity,
     };
+    let source_checksum = source_checksum.map(|bound| StagedComponent {
+        kind: ComponentKind::Checksum,
+        directory_index: DirectoryIndex::Source,
+        name: source_checksum_name,
+        file: bound.file,
+        identity: bound.identity,
+    });
     let manifest_staging_identity = manifest_staged.as_ref().map(|staged| staged.identity);
     Ok(PublicationTransaction {
         source,
@@ -1578,6 +1623,7 @@ fn prepare_publication_transaction(
         mutations: Vec::with_capacity(6),
         _initial_handles: initial_handles,
         archive_staged,
+        source_checksum,
         manifest_staged,
         checksum_staged,
         checksum_sentinel,
@@ -1603,6 +1649,7 @@ struct PublicationTransaction {
     // rollback. Backups are then provably the same inodes admitted at preflight.
     _initial_handles: Vec<File>,
     archive_staged: StagedComponent,
+    source_checksum: Option<StagedComponent>,
     manifest_staged: Option<StagedComponent>,
     checksum_staged: StagedComponent,
     checksum_sentinel: StagedComponent,
@@ -1909,6 +1956,10 @@ impl PublicationTransaction {
             recovery_identity: self.recovery.identity,
             archive_name: self.archive_staged.name.as_bytes().to_vec(),
             archive_identity: self.archive_staged.identity,
+            source_checksum_identity: self
+                .source_checksum
+                .as_ref()
+                .map(|checksum| checksum.identity),
             manifest_staged_identity: self.manifest_staging_identity,
             checksum_staged_identity: self.checksum_staged.identity,
             checksum_sentinel_identity: self.checksum_sentinel.identity,
@@ -2336,6 +2387,20 @@ impl PublicationTransaction {
             != expected_checksum.as_bytes()
         {
             return Err("finalized batch checksum is not canonical".to_string());
+        }
+        if source_checksum_retirement_state(
+            &self.source,
+            self.source_checksum
+                .as_ref()
+                .map(|checksum| checksum.name.as_os_str())
+                .unwrap_or_else(|| self.destination_checksum_name.as_os_str()),
+            &self.recovery,
+            self.source_checksum
+                .as_ref()
+                .map(|checksum| checksum.identity),
+        )? != SourceChecksumRetirementState::Retired
+        {
+            return Err("source checksum was not retired after batch commit".to_string());
         }
         Ok(())
     }
@@ -3286,6 +3351,7 @@ fn validate_archive_batch_journal(
     let mut source_archives = HashSet::with_capacity(journal.items.len());
     let mut source_namespaces = HashSet::with_capacity(journal.items.len());
     let mut archive_inodes = HashSet::with_capacity(journal.items.len());
+    let mut source_checksum_inodes = HashSet::with_capacity(journal.items.len());
     let mut previous_epoch = None;
     for item in &journal.items {
         if !epochs.insert(item.epoch) {
@@ -3352,6 +3418,8 @@ fn validate_archive_batch_journal(
                 archive_name.as_bytes().to_vec(),
             ))
             || !archive_inodes.insert((item.archive_identity.dev, item.archive_identity.ino))
+            || source_checksum_inodes
+                .contains(&(item.archive_identity.dev, item.archive_identity.ino))
         {
             return Err("archive batch journal contains a duplicate staged archive".into());
         }
@@ -3380,6 +3448,14 @@ fn validate_archive_batch_journal(
                 item.epoch
             ));
         }
+        if let Some(identity) = item.source_checksum_identity {
+            validate_journal_source_identity(identity, "source checksum")?;
+            if !source_checksum_inodes.insert((identity.dev, identity.ino))
+                || archive_inodes.contains(&(identity.dev, identity.ino))
+            {
+                return Err("archive batch journal contains a duplicate source checksum".into());
+            }
+        }
         for (identity, label) in [
             (item.manifest_staged_identity, "staged manifest"),
             (Some(item.checksum_staged_identity), "staged checksum"),
@@ -3407,6 +3483,20 @@ fn validate_journal_regular_identity(
     if identity.mode & libc::S_IFMT != libc::S_IFREG
         || identity.uid != effective_user_id()
         || identity.gid != destination_gid
+        || identity.nlink != 1
+        || identity.mode & 0o022 != 0
+        || identity.mode & 0o6000 != 0
+    {
+        return Err(format!(
+            "archive batch journal contains an unsafe {label} identity"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_journal_source_identity(identity: FileIdentity, label: &str) -> Result<(), String> {
+    if identity.mode & libc::S_IFMT != libc::S_IFREG
+        || identity.uid != effective_user_id()
         || identity.nlink != 1
         || identity.mode & 0o022 != 0
         || identity.mode & 0o6000 != 0
@@ -3774,6 +3864,18 @@ fn observe_finalized_archive_batch(
         ArchiveBatchDecision::Commit => {
             for item in &recovered {
                 validate_batch_commit_item(destination, item)?;
+                if source_checksum_retirement_state(
+                    &item.source,
+                    &item.destination_checksum_name,
+                    &item.recovery,
+                    item.record.source_checksum_identity,
+                )? != SourceChecksumRetirementState::Retired
+                {
+                    return Err(format!(
+                        "committed batch source checksum was not retired for epoch {}",
+                        item.record.epoch
+                    ));
+                }
             }
             let publications = recovered
                 .iter()
@@ -3836,6 +3938,14 @@ fn recover_bound_archive_batch(
                 }
                 for item in &recovered {
                     cleanup_recovered_batch_sentinel(item)?;
+                }
+                for item in &recovered {
+                    retire_source_checksum(
+                        &item.source,
+                        &item.destination_checksum_name,
+                        &item.recovery,
+                        item.record.source_checksum_identity,
+                    )?;
                 }
                 let outcome = observe_finalized_archive_batch(destination, journal)?;
                 retire_archive_batch_marker(destination, marker)?;
@@ -3957,6 +4067,116 @@ enum BatchChecksumState {
     CommittedAndCleaned,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SourceChecksumRetirementState {
+    Source,
+    Retained,
+    Retired,
+}
+
+fn source_checksum_retirement_state(
+    source: &BoundDirectory,
+    source_name: &OsStr,
+    recovery: &BoundDirectory,
+    expected: Option<FileIdentity>,
+) -> Result<SourceChecksumRetirementState, String> {
+    let Some(expected) = expected else {
+        // Version-2 journals created before source-sidecar retirement do not
+        // carry this field. Their sidecar namespace is deliberately unmanaged:
+        // recovery must neither require its absence nor remove it.
+        return Ok(SourceChecksumRetirementState::Retired);
+    };
+    let source_observed = source_checksum_target_identity(source, source_name)?;
+    let retained_observed = source_checksum_target_identity(
+        recovery,
+        OsStr::new(ARCHIVE_BATCH_RETIRED_SOURCE_CHECKSUM),
+    )?;
+    match (source_observed, retained_observed) {
+        (Some(observed), None) if observed == expected => Ok(SourceChecksumRetirementState::Source),
+        (None, Some(observed)) if observed.same_across_rename(expected) => {
+            Ok(SourceChecksumRetirementState::Retained)
+        }
+        (None, None) => Ok(SourceChecksumRetirementState::Retired),
+        _ => Err(format!(
+            "batch source checksum namespace is not recoverable: {}",
+            source.path.join(source_name).display()
+        )),
+    }
+}
+
+fn source_checksum_target_identity(
+    directory: &BoundDirectory,
+    name: &OsStr,
+) -> Result<Option<FileIdentity>, String> {
+    let observed = fstatat_identity(directory.file.as_raw_fd(), name).map_err(|error| {
+        format!(
+            "failed to inspect source checksum {}: {error}",
+            directory.path.join(name).display()
+        )
+    })?;
+    if let Some(identity) = observed {
+        validate_journal_source_identity(identity, "source checksum")?;
+    }
+    Ok(observed)
+}
+
+fn retire_source_checksum(
+    source: &BoundDirectory,
+    source_name: &OsStr,
+    recovery: &BoundDirectory,
+    expected: Option<FileIdentity>,
+) -> Result<(), String> {
+    retire_source_checksum_with_hook(source, source_name, recovery, expected, &mut |_| Ok(()))
+}
+
+fn retire_source_checksum_with_hook(
+    source: &BoundDirectory,
+    source_name: &OsStr,
+    recovery: &BoundDirectory,
+    expected: Option<FileIdentity>,
+    hook: &mut dyn FnMut(SourceChecksumRetirementPhase) -> Result<(), String>,
+) -> Result<(), String> {
+    if expected.is_none() {
+        return Ok(());
+    }
+    for _ in 0..3 {
+        match source_checksum_retirement_state(source, source_name, recovery, expected)? {
+            SourceChecksumRetirementState::Source => {
+                sync_all(&[source, recovery])?;
+                hook(SourceChecksumRetirementPhase::BeforeRetention)?;
+                rename_noreplace(
+                    source,
+                    source_name,
+                    recovery,
+                    OsStr::new(ARCHIVE_BATCH_RETIRED_SOURCE_CHECKSUM),
+                )
+                .map_err(|error| format!("failed to retain source checksum: {error}"))?;
+                hook(SourceChecksumRetirementPhase::AfterRetentionMutation)?;
+                sync_all(&[source, recovery])?;
+            }
+            SourceChecksumRetirementState::Retained => {
+                let observed = source_checksum_target_identity(
+                    recovery,
+                    OsStr::new(ARCHIVE_BATCH_RETIRED_SOURCE_CHECKSUM),
+                )?
+                .ok_or_else(|| "retained source checksum disappeared".to_string())?;
+                hook(SourceChecksumRetirementPhase::BeforeRemoval)?;
+                unlink_corresponding_entry(
+                    recovery,
+                    OsStr::new(ARCHIVE_BATCH_RETIRED_SOURCE_CHECKSUM),
+                    observed,
+                )?;
+                hook(SourceChecksumRetirementPhase::AfterRemovalMutation)?;
+                recovery.sync()?;
+            }
+            SourceChecksumRetirementState::Retired => {
+                return sync_all(&[source, recovery]);
+            }
+        }
+    }
+    Err("source checksum retirement did not converge".to_string())
+}
+
 fn batch_checksum_state(
     destination: &BoundDirectory,
     item: &RecoveredArchiveBatchItem<'_>,
@@ -4031,6 +4251,23 @@ fn validate_batch_rollback_item(
     destination: &BoundDirectory,
     item: &RecoveredArchiveBatchItem<'_>,
 ) -> Result<(), String> {
+    let expected_source_checksum_state = if item.record.source_checksum_identity.is_some() {
+        SourceChecksumRetirementState::Source
+    } else {
+        SourceChecksumRetirementState::Retired
+    };
+    if source_checksum_retirement_state(
+        &item.source,
+        &item.destination_checksum_name,
+        &item.recovery,
+        item.record.source_checksum_identity,
+    )? != expected_source_checksum_state
+    {
+        return Err(format!(
+            "archive batch rollback found a moved source checksum for epoch {}",
+            item.record.epoch
+        ));
+    }
     batch_component_state(
         &item.source,
         &item.archive_name,
@@ -4066,6 +4303,12 @@ fn validate_batch_commit_item(
     destination: &BoundDirectory,
     item: &RecoveredArchiveBatchItem<'_>,
 ) -> Result<(), String> {
+    source_checksum_retirement_state(
+        &item.source,
+        &item.destination_checksum_name,
+        &item.recovery,
+        item.record.source_checksum_identity,
+    )?;
     if batch_component_state(
         &item.source,
         &item.archive_name,
@@ -4257,17 +4500,28 @@ fn verify_rolled_back_batch_item(
     destination: &BoundDirectory,
     item: &RecoveredArchiveBatchItem<'_>,
 ) -> Result<(), String> {
-    if batch_component_state(
+    let expected_source_checksum_state = if item.record.source_checksum_identity.is_some() {
+        SourceChecksumRetirementState::Source
+    } else {
+        SourceChecksumRetirementState::Retired
+    };
+    if source_checksum_retirement_state(
         &item.source,
-        &item.archive_name,
-        Some(item.record.archive_identity),
-        destination,
-        &item.destination_name,
-        item.record.initial.archive,
+        &item.destination_checksum_name,
         &item.recovery,
-        ComponentKind::Archive.backup_name(),
-        "archive",
-    )? != BatchComponentState::Initial
+        item.record.source_checksum_identity,
+    )? != expected_source_checksum_state
+        || batch_component_state(
+            &item.source,
+            &item.archive_name,
+            Some(item.record.archive_identity),
+            destination,
+            &item.destination_name,
+            item.record.initial.archive,
+            &item.recovery,
+            ComponentKind::Archive.backup_name(),
+            "archive",
+        )? != BatchComponentState::Initial
         || batch_component_state(
             &item.recovery,
             ComponentKind::Manifest.staging_name(),
@@ -5898,6 +6152,87 @@ mod tests {
         items.iter().map(|item| item.epoch).collect()
     }
 
+    fn write_batch_source_checksums(
+        items: &[ArchiveBatchItem],
+    ) -> Vec<(PathBuf, Vec<u8>, FileIdentity)> {
+        items
+            .iter()
+            .map(|item| {
+                let path = archive_checksum_path(&item.staged_archive).unwrap();
+                let contents = archive_checksum_line(
+                    &item.evidence.sha256,
+                    item.staged_archive.file_name().unwrap(),
+                )
+                .unwrap()
+                .into_bytes();
+                fs::write(&path, &contents).unwrap();
+                fs::set_permissions(&path, fs::Permissions::from_mode(FINAL_FILE_MODE)).unwrap();
+                let file = OpenOptions::new().read(true).open(&path).unwrap();
+                file.sync_all().unwrap();
+                let identity = FileIdentity::from_metadata(&file.metadata().unwrap());
+                (path, contents, identity)
+            })
+            .collect()
+    }
+
+    fn assert_source_checksums_unchanged(checksums: &[(PathBuf, Vec<u8>, FileIdentity)]) {
+        for (path, contents, identity) in checksums {
+            assert_eq!(&fs::read(path).unwrap(), contents);
+            assert_eq!(
+                FileIdentity::from_metadata(&fs::symlink_metadata(path).unwrap()),
+                *identity
+            );
+        }
+    }
+
+    fn rewrite_batch_journal_without_source_checksum(destination: &Path) -> [u8; 32] {
+        let marker = destination.join(ARCHIVE_BATCH_TRANSACTION_DIRECTORY);
+        let journal_path = marker.join(ARCHIVE_BATCH_JOURNAL);
+        let mut encoded: serde_json::Value =
+            serde_json::from_slice(&fs::read(&journal_path).unwrap()).unwrap();
+        for item in encoded["items"].as_array_mut().unwrap() {
+            assert!(
+                item.as_object_mut()
+                    .unwrap()
+                    .remove("source_checksum_identity")
+                    .is_some()
+            );
+        }
+        let mut journal: ArchiveBatchJournal = serde_json::from_value(encoded).unwrap();
+        assert!(
+            journal
+                .items
+                .iter()
+                .all(|item| item.source_checksum_identity.is_none())
+        );
+        journal.transaction_id = archive_batch_journal_transaction_id(&journal).unwrap();
+        let bytes = serialize_archive_batch_journal(&journal).unwrap();
+        assert!(
+            !bytes
+                .windows(b"source_checksum_identity".len())
+                .any(|window| window == b"source_checksum_identity")
+        );
+
+        fs::set_permissions(&journal_path, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::write(&journal_path, bytes).unwrap();
+        let journal_file = OpenOptions::new().read(true).open(&journal_path).unwrap();
+        journal_file.sync_all().unwrap();
+        fs::set_permissions(&journal_path, fs::Permissions::from_mode(0o400)).unwrap();
+
+        let armed_path = marker.join(ARCHIVE_BATCH_ARMED);
+        fs::set_permissions(&armed_path, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::write(
+            &armed_path,
+            archive_batch_armed_contents(journal.transaction_id),
+        )
+        .unwrap();
+        let armed_file = OpenOptions::new().read(true).open(&armed_path).unwrap();
+        armed_file.sync_all().unwrap();
+        fs::set_permissions(&armed_path, fs::Permissions::from_mode(0o400)).unwrap();
+
+        journal.transaction_id
+    }
+
     fn remove_batch_destination_namespaces(items: &[ArchiveBatchItem]) {
         for item in items {
             for path in [
@@ -5934,6 +6269,182 @@ mod tests {
                 && evidence.initial_checksum.is_none()
         }));
         assert_batch_committed(&items);
+    }
+
+    #[test]
+    fn committed_batch_consumes_bound_source_checksums() {
+        let (_root, items) = corrected_batch_fixture(8, false);
+        let source_checksums = write_batch_source_checksums(&items);
+        let destination = items[0].destination_archive.parent().unwrap().to_path_buf();
+        let expected_epochs = batch_expected_epochs(&items);
+
+        let publication =
+            publish_verified_archive_batch(BATCH_MANIFEST_FINGERPRINT, &expected_epochs, &items)
+                .unwrap();
+
+        assert_batch_committed(&items);
+        for (path, _, _) in &source_checksums {
+            assert!(!path.exists());
+        }
+        for recovery in recovery_directories(&destination) {
+            assert!(
+                !recovery
+                    .join(ARCHIVE_BATCH_RETIRED_SOURCE_CHECKSUM)
+                    .exists()
+            );
+        }
+        acknowledge_archive_publication_batch(&destination, publication.transaction_id).unwrap();
+    }
+
+    #[test]
+    fn source_checksum_retirement_is_recoverable_and_rollback_preserves_it() {
+        for (crash_phase, expect_commit) in [
+            (ArchiveBatchPhase::JournalPrepared, false),
+            (
+                ArchiveBatchPhase::SourceChecksum {
+                    index: 0,
+                    phase: SourceChecksumRetirementPhase::AfterRetentionMutation,
+                },
+                true,
+            ),
+            (
+                ArchiveBatchPhase::SourceChecksum {
+                    index: 0,
+                    phase: SourceChecksumRetirementPhase::AfterRemovalMutation,
+                },
+                true,
+            ),
+        ] {
+            let (_root, items) = corrected_batch_fixture(8, false);
+            let source_checksums = write_batch_source_checksums(&items);
+            let destination = items[0].destination_archive.parent().unwrap().to_path_buf();
+            let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = publish_verified_archive_batch_with_hook(
+                    BATCH_MANIFEST_FINGERPRINT,
+                    &items,
+                    |phase| {
+                        if phase == crash_phase {
+                            panic!("simulated source-checksum crash at {crash_phase:?}");
+                        }
+                        Ok(())
+                    },
+                );
+            }));
+            assert!(crashed.is_err(), "phase was not reached: {crash_phase:?}");
+
+            let recovery = recover_archive_publication_batch(
+                &destination,
+                expected_destination_identity(&destination),
+            )
+            .unwrap();
+            let transaction_id = if expect_commit {
+                let ArchiveBatchRecovery::Committed(publication) = recovery else {
+                    panic!("durable commit did not recover at {crash_phase:?}");
+                };
+                assert_batch_committed(&items);
+                for (path, _, _) in &source_checksums {
+                    assert!(!path.exists());
+                }
+                for recovery in recovery_directories(&destination) {
+                    assert!(
+                        !recovery
+                            .join(ARCHIVE_BATCH_RETIRED_SOURCE_CHECKSUM)
+                            .exists()
+                    );
+                }
+                publication.transaction_id
+            } else {
+                let ArchiveBatchRecovery::RolledBack(rollback) = recovery else {
+                    panic!("rollback decision did not recover at {crash_phase:?}");
+                };
+                assert_batch_rolled_back(&items);
+                assert_source_checksums_unchanged(&source_checksums);
+                rollback.transaction_id
+            };
+            acknowledge_archive_publication_batch(&destination, transaction_id).unwrap();
+        }
+    }
+
+    #[test]
+    fn batch_recovery_rejects_a_source_checksum_ctime_change() {
+        let (_root, items) = corrected_batch_fixture(8, false);
+        let source_checksums = write_batch_source_checksums(&items);
+        let destination = items[0].destination_archive.parent().unwrap().to_path_buf();
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = publish_verified_archive_batch_with_hook(
+                BATCH_MANIFEST_FINGERPRINT,
+                &items,
+                |phase| {
+                    if phase == ArchiveBatchPhase::JournalPrepared {
+                        panic!("simulated crash before source-checksum metadata change");
+                    }
+                    Ok(())
+                },
+            );
+        }));
+        assert!(crashed.is_err());
+
+        let (checksum_path, _, original_identity) = &source_checksums[0];
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        fs::set_permissions(checksum_path, fs::Permissions::from_mode(0o400)).unwrap();
+        fs::set_permissions(checksum_path, fs::Permissions::from_mode(FINAL_FILE_MODE)).unwrap();
+        let changed_identity =
+            FileIdentity::from_metadata(&fs::symlink_metadata(checksum_path).unwrap());
+        assert!(changed_identity.same_across_rename(*original_identity));
+        assert_ne!(changed_identity, *original_identity);
+
+        let error = recover_archive_publication_batch(
+            &destination,
+            expected_destination_identity(&destination),
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("source checksum namespace is not recoverable"),
+            "{error}"
+        );
+        assert!(
+            destination
+                .join(ARCHIVE_BATCH_TRANSACTION_DIRECTORY)
+                .is_dir()
+        );
+        assert!(checksum_path.is_file());
+    }
+
+    #[test]
+    fn legacy_batch_journal_leaves_unmanaged_source_checksums_untouched() {
+        let (_root, items) = corrected_batch_fixture(8, false);
+        let source_checksums = write_batch_source_checksums(&items);
+        let destination = items[0].destination_archive.parent().unwrap().to_path_buf();
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = publish_verified_archive_batch_with_hook(
+                BATCH_MANIFEST_FINGERPRINT,
+                &items,
+                |phase| {
+                    if phase == ArchiveBatchPhase::CommitDecisionDurable {
+                        panic!("simulated legacy publisher crash");
+                    }
+                    Ok(())
+                },
+            );
+        }));
+        assert!(crashed.is_err());
+        let legacy_transaction_id = rewrite_batch_journal_without_source_checksum(&destination);
+
+        let ArchiveBatchRecovery::Committed(publication) = recover_archive_publication_batch(
+            &destination,
+            expected_destination_identity(&destination),
+        )
+        .unwrap() else {
+            panic!("legacy committed journal did not recover");
+        };
+
+        assert_eq!(publication.transaction_id, legacy_transaction_id);
+        assert_batch_committed(&items);
+        assert_source_checksums_unchanged(&source_checksums);
+        acknowledge_archive_publication_batch(&destination, publication.transaction_id).unwrap();
     }
 
     #[test]

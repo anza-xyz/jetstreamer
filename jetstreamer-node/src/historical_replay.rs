@@ -1178,14 +1178,14 @@ mod tests {
     }
 
     #[test]
-    fn audited_missing_status_verifies_success_and_uses_the_historical_runtime_fee() {
+    fn audited_missing_status_uses_the_historical_runtime_status_and_fee() {
         let audited_entry = || ReadyEntry {
             slot: 8_120_052,
             entry_index: 52,
             start_index: 79,
             txs: vec![super::super::ScheduledTransaction {
                 tx: solana_transaction::versioned::VersionedTransaction::default(),
-                expected_status: Some(Ok(())),
+                expected_status: None,
                 source_entry_status: None,
                 audited_missing_source_status: true,
                 reconstruct_fee: true,
@@ -1222,14 +1222,17 @@ mod tests {
             ),
             fee: 5_000,
         };
-        let error =
-            HistoricalReplay::verify_outcomes(&mut entry, std::slice::from_ref(&failed_outcome))
-                .unwrap_err();
-        assert!(error.contains("historical status multiset mismatch"));
+        HistoricalReplay::verify_outcomes(&mut entry, std::slice::from_ref(&failed_outcome))
+            .unwrap();
+        assert_eq!(
+            entry.txs[0].status_meta.status,
+            Err(solana_transaction::TransactionError::AccountNotFound)
+        );
+        assert_eq!(entry.txs[0].status_meta.fee, 5_000);
     }
 
     #[test]
-    fn audited_canonical_metadata_is_preserved_after_exact_runtime_verification() {
+    fn audited_canonical_metadata_preserves_ancillary_fields_but_uses_runtime_status_and_fee() {
         let expected_error = solana_transaction::TransactionError::InstructionError(
             0,
             solana_transaction::InstructionError::Custom(0),
@@ -1247,10 +1250,10 @@ mod tests {
             start_index: 13,
             txs: vec![super::super::ScheduledTransaction {
                 tx: solana_transaction::versioned::VersionedTransaction::default(),
-                expected_status: Some(Err(expected_error.clone())),
+                expected_status: None,
                 source_entry_status: None,
                 audited_missing_source_status: true,
-                reconstruct_fee: false,
+                reconstruct_fee: true,
                 status_meta: canonical_metadata.clone(),
             }],
             hash: Hash::default(),
@@ -1260,21 +1263,79 @@ mod tests {
         let outcome = crate::historical::HistoricalTransactionOutcome {
             signature: None,
             error: Some(normalize_transaction_error(&expected_error).unwrap()),
-            fee: 5_000,
+            fee: 7_000,
         };
 
         let mut entry = audited_entry();
         HistoricalReplay::verify_outcomes(&mut entry, std::slice::from_ref(&outcome)).unwrap();
-        assert_eq!(entry.txs[0].status_meta, canonical_metadata);
+        let mut expected_metadata = canonical_metadata.clone();
+        expected_metadata.fee = 7_000;
+        assert_eq!(entry.txs[0].status_meta, expected_metadata);
 
         let mut entry = audited_entry();
-        let wrong_fee = crate::historical::HistoricalTransactionOutcome {
-            fee: 10_000,
+        let runtime_success = crate::historical::HistoricalTransactionOutcome {
+            error: None,
             ..outcome
         };
-        let error = HistoricalReplay::verify_outcomes(&mut entry, std::slice::from_ref(&wrong_fee))
-            .unwrap_err();
-        assert!(error.contains("historical fee mismatch"), "{error}");
+        HistoricalReplay::verify_outcomes(&mut entry, std::slice::from_ref(&runtime_success))
+            .unwrap();
+        assert_eq!(entry.txs[0].status_meta.status, Ok(()));
+        assert_eq!(entry.txs[0].status_meta.fee, 7_000);
+        assert_eq!(entry.txs[0].status_meta.pre_balances, vec![10_000, 1]);
+        assert_eq!(entry.txs[0].status_meta.post_balances, vec![5_000, 1]);
+    }
+
+    #[test]
+    fn epoch_30_audited_hole_uses_runtime_status_association() {
+        let vote_too_old = solana_transaction::TransactionError::InstructionError(
+            0,
+            solana_transaction::InstructionError::Custom(0),
+        );
+        let runtime_failure_signature: Signature =
+            "3e4kde1Vo1EpM5bz8sctGmGnSgoxwi2TQVnKTvacCPL3SEud2QBkh6JG1Qs64LrH6kzCFwXrhg14SQK4yNEnA96r"
+                .parse()
+                .unwrap();
+        let rpc_failure_signature: Signature =
+            "BEGWJ7cztpfGAieC9mQQuuKWNee615fHVatKfssvQGdUjpJJHFtXSscoc1Kotucu4BmkEBmd9bmBq9FjmxmpKTb"
+                .parse()
+                .unwrap();
+        let mut transactions = (0..15)
+            .map(|_| super::super::ScheduledTransaction {
+                tx: solana_transaction::versioned::VersionedTransaction::default(),
+                expected_status: None,
+                source_entry_status: None,
+                audited_missing_source_status: true,
+                reconstruct_fee: true,
+                status_meta: solana_transaction_status::TransactionStatusMeta::default(),
+            })
+            .collect::<Vec<_>>();
+        transactions[1].tx.signatures = vec![runtime_failure_signature];
+        transactions[13].tx.signatures = vec![rpc_failure_signature];
+
+        let outcomes = (0..15)
+            .map(|index| crate::historical::HistoricalTransactionOutcome {
+                signature: transactions[index]
+                    .tx
+                    .signatures
+                    .first()
+                    .map(|signature| *signature.as_array()),
+                error: (index == 1).then(|| normalize_transaction_error(&vote_too_old).unwrap()),
+                fee: 5_000,
+            })
+            .collect::<Vec<_>>();
+        let mut entry = ReadyEntry {
+            slot: 13_334_463,
+            entry_index: 14,
+            start_index: 0,
+            txs: transactions,
+            hash: Hash::default(),
+            num_hashes: 1,
+            tx_count: 15,
+        };
+
+        HistoricalReplay::verify_outcomes(&mut entry, &outcomes).unwrap();
+        assert_eq!(entry.txs[1].status_meta.status, Err(vote_too_old.clone()));
+        assert_eq!(entry.txs[13].status_meta.status, Ok(()));
     }
 
     #[test]

@@ -1791,13 +1791,27 @@ impl HistoricalRuntimeClient {
         let status = match wait_for_child(&mut child, self.timeouts.reap) {
             Ok(Some(status)) => status,
             Ok(None) => {
-                kill_and_reap(
+                let reaped = kill_and_reap(
                     child,
                     self.private_work_dir.take(),
                     self.guardian.take(),
                     self.timeouts.reap,
                 );
                 self.closed = true;
+                if reaped {
+                    // A valid, ordered ShuttingDown response is the worker's
+                    // protocol commit point: all replay/checkpoint work has
+                    // completed and no further traffic is legal. Large old
+                    // Banks can spend longer than the graceful window only
+                    // destroying private account storage. A synchronously
+                    // reaped forced exit is therefore a bounded cleanup
+                    // fallback, not a replay or validation failure.
+                    log::warn!(
+                        "historical worker acknowledged shutdown but required forced cleanup after {:?}",
+                        self.timeouts.reap,
+                    );
+                    return Ok(());
+                }
                 return Err(HistoricalRuntimeError::ShutdownExitTimeout {
                     timeout: self.timeouts.reap,
                 });
@@ -4508,6 +4522,21 @@ mod tests {
                 actual: "ShuttingDown",
             })
         ));
+        assert_client_poisoned_and_worker_reaped(&mut client, child_id);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn acknowledged_shutdown_uses_bounded_forced_cleanup() {
+        let (mut client, child_id) = client_with_response(&Response {
+            request_id: 1,
+            body: ResponseBody::ShuttingDown,
+        });
+        client.timeouts.reap = Duration::from_millis(50);
+        assert!(process_is_running(child_id));
+
+        client.shutdown().unwrap();
+
         assert_client_poisoned_and_worker_reaped(&mut client, child_id);
     }
 

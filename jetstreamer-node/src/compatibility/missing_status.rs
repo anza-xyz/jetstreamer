@@ -1,10 +1,13 @@
 //! Exact, independently audited exceptions for missing Old Faithful metadata.
 //!
 //! The ordinary post-cutover rule is fail-closed. This registry admits only a
-//! byte-for-byte `(slot, transaction index, signature)` match and carries the
-//! canonical execution result used to verify historical replay. Where the
-//! finalized block RPC still exposes the complete metadata frame, its fee and
-//! balance vectors are retained as well.
+//! byte-for-byte `(slot, transaction index, signature)` match. Captured RPC
+//! status is retained as audit evidence for the source hole, but is not treated
+//! as a canonical transaction-result association: the affected historical
+//! writer could permute those associations. Where finalized block RPC exposes
+//! ancillary metadata, its balance vectors are retained as well. The pinned
+//! runtime reconstructs status and fee and canonical state checkpoints remain
+//! the replay admission gate.
 
 use {
     super::{
@@ -83,7 +86,7 @@ pub(crate) enum MissingTransactionStatusEvidence {
     /// The archive predates status frames; the selected historical runtime is
     /// the only available source for the transaction result.
     PreCutoverRuntime,
-    /// An exact post-cutover source hole with independently captured status.
+    /// An exact post-cutover source hole with captured historical RPC evidence.
     Audited(Box<AuditedMissingTransactionStatus>),
 }
 

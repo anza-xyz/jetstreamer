@@ -4224,7 +4224,7 @@ impl SlotExecutionBuffer {
                     slot: audited_slot,
                     transaction_slot_index: audited_index,
                     signature: audited_signature,
-                    expected_status,
+                    expected_status: audited_status,
                     canonical_metadata,
                 } = *audited;
                 if audited_slot != slot
@@ -4237,18 +4237,26 @@ impl SlotExecutionBuffer {
                 }
                 if canonical_metadata
                     .as_ref()
-                    .is_some_and(|metadata| metadata.status != expected_status)
+                    .is_some_and(|metadata| metadata.status != audited_status)
                 {
                     return Err(format!(
                         "audited missing-status canonical metadata mismatch at slot {slot} index {index}"
                     ));
                 }
-                let has_canonical_metadata = canonical_metadata.is_some();
+                // The same historical writer that misassociated observed
+                // status frames also populated the public RPC rows used to
+                // recover these holes. The audit binds this exact missing
+                // slot/index/signature and any ancillary metadata, but its
+                // status cannot safely complete an entry multiset: singleton
+                // missing entries in epochs 49 and 50 prove that even the
+                // RPC-derived multiset can be wrong. Let the pinned runtime
+                // restore status and fee; later canonical checkpoints remain
+                // the admission gate for the resulting state.
                 (
-                    Some(expected_status),
+                    None,
                     None,
                     true,
-                    !has_canonical_metadata,
+                    true,
                     canonical_metadata.unwrap_or_default(),
                 )
             }
@@ -4492,33 +4500,34 @@ fn entry_source_status_multiset(
         .iter()
         .filter(|transaction| transaction.audited_missing_source_status)
         .count();
-    if status_count == 0 && audited_missing_count == 0 {
+    if audited_missing_count > 0 {
+        if status_count + audited_missing_count != transactions.len() {
+            return Err(format!(
+                "entry has source status for {status_count}/{} transactions and {audited_missing_count} audited missing frames",
+                transactions.len(),
+            ));
+        }
+        // A recovered RPC status is useful for auditing the exact hole but
+        // not for execution validation: it came through the same historical
+        // status-association path known to permute results. A complete set of
+        // actually observed frames is required for an entry multiset check.
         return Ok(None);
     }
-    if status_count + audited_missing_count != transactions.len() {
+    if status_count == 0 {
+        return Ok(None);
+    }
+    if status_count != transactions.len() {
         return Err(format!(
-            "entry has source status for {status_count}/{} transactions and {audited_missing_count} audited missing frames",
+            "entry has status-multiset evidence for {status_count}/{} transactions and {audited_missing_count} audited missing frames",
             transactions.len(),
         ));
     }
     transactions
         .iter()
         .map(|transaction| {
-            if transaction.audited_missing_source_status {
-                if transaction.source_entry_status.is_some() {
-                    return Err(
-                        "audited missing status unexpectedly carries source metadata".to_string(),
-                    );
-                }
-                transaction.expected_status.clone().ok_or_else(|| {
-                    "audited missing status has no independently verified expected status"
-                        .to_string()
-                })
-            } else {
-                transaction.source_entry_status.clone().ok_or_else(|| {
-                    "complete source-status multiset check lost source metadata".to_string()
-                })
-            }
+            transaction.source_entry_status.clone().ok_or_else(|| {
+                "complete source-status multiset check lost status evidence".to_string()
+            })
         })
         .collect::<Result<Vec<_>, _>>()
         .map(Some)
@@ -21962,7 +21971,7 @@ mod scheduler_tests {
     }
 
     #[test]
-    fn audited_post_cutover_status_hole_contributes_verified_status_to_entry_multiset() {
+    fn audited_post_cutover_status_hole_requires_runtime_reconstruction() {
         let mut buffer = SlotExecutionBuffer::default();
         // In the audited source block, entry 35 contains indexes 65..=78 and
         // has complete metadata. The final nonempty entry, entry 52, contains
@@ -22040,17 +22049,14 @@ mod scheduler_tests {
         assert!(missing_entry.iter().all(|transaction| {
             transaction.audited_missing_source_status
                 && transaction.reconstruct_fee
-                && transaction.expected_status == Some(Ok(()))
+                && transaction.expected_status.is_none()
+                && transaction.source_entry_status.is_none()
                 && transaction.status_meta == TransactionStatusMeta::default()
         }));
-        assert_eq!(
-            entry_source_status_multiset(&missing_entry).unwrap(),
-            Some(vec![Ok(()); 33])
-        );
+        assert_eq!(entry_source_status_multiset(&missing_entry).unwrap(), None);
 
-        // Even if untrusted entry framing regrouped an admitted hole beside
-        // an observed record, the hole contributes its independently proven
-        // result instead of suppressing validation for the whole entry.
+        // If untrusted entry framing regrouped an admitted hole beside an
+        // observed record, a complete observed-frame multiset is unavailable.
         let mixed_entry = [
             ScheduledTransaction {
                 tx: VersionedTransaction::default(),
@@ -22062,17 +22068,14 @@ mod scheduler_tests {
             },
             ScheduledTransaction {
                 tx: VersionedTransaction::default(),
-                expected_status: Some(Ok(())),
+                expected_status: None,
                 source_entry_status: None,
                 audited_missing_source_status: true,
                 reconstruct_fee: true,
                 status_meta: TransactionStatusMeta::default(),
             },
         ];
-        assert_eq!(
-            entry_source_status_multiset(&mixed_entry).unwrap(),
-            Some(vec![Err(TransactionError::AccountNotFound), Ok(())])
-        );
+        assert_eq!(entry_source_status_multiset(&mixed_entry).unwrap(), None);
 
         let error = SlotExecutionBuffer::default()
             .insert_transaction(
@@ -22155,12 +22158,11 @@ mod scheduler_tests {
             )
             .unwrap();
         let mixed_entry = [buffer.txs[7].take().unwrap(), buffer.txs[8].take().unwrap()];
-        assert_eq!(
-            entry_source_status_multiset(&mixed_entry).unwrap(),
-            Some(vec![Ok(()), Ok(())])
-        );
+        assert_eq!(entry_source_status_multiset(&mixed_entry).unwrap(), None);
         assert!(mixed_entry[1].audited_missing_source_status);
-        assert!(!mixed_entry[1].reconstruct_fee);
+        assert!(mixed_entry[1].reconstruct_fee);
+        assert!(mixed_entry[1].expected_status.is_none());
+        assert_eq!(mixed_entry[1].source_entry_status, None);
         assert_eq!(mixed_entry[1].status_meta.fee, 5_000);
         assert_eq!(mixed_entry[1].status_meta.pre_balances.len(), 7);
 
@@ -22190,9 +22192,10 @@ mod scheduler_tests {
             0,
             InstructionError::Custom(0),
         ));
-        assert_eq!(scheduled.expected_status, Some(expected_failure.clone()));
+        assert_eq!(scheduled.expected_status, None);
+        assert_eq!(scheduled.source_entry_status, None);
         assert_eq!(scheduled.status_meta.status, expected_failure);
-        assert!(!scheduled.reconstruct_fee);
+        assert!(scheduled.reconstruct_fee);
     }
 
     #[test]

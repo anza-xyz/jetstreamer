@@ -369,20 +369,22 @@ Transaction metadata is an independent compatibility dimension. Old Faithful has
 before slot `4,258,776`; the pinned historical runtime reconstructs transaction status there, while
 the remaining metadata stays explicitly unavailable. At and after that slot, a missing status frame
 is rejected unless it matches a checked-in audited `(slot, transaction index, signature)` anomaly.
-The audit table binds all 1,084 known holes across 15 slots to finalized canonical statuses. For 463
-of them, finalized block RPC data also preserves the original fee and balance vectors; replay checks
-the status and fee against the pinned runtime and preserves those balance vectors. For the other
-621, complete metadata was absent from the canonical RPC evidence captured so far; the runtime
-supplies status and fee and the other fields remain absent or at their defaults. The early source
+The audit table binds all 1,084 known holes across 15 slots to finalized RPC status evidence. For 463
+of them, finalized block RPC data also preserves the original balance vectors. For the other 621,
+complete metadata was absent from the captured RPC evidence and the other fields remain absent or
+at their defaults. The early source
 writer also stored an
 entry's randomized execution results beside its original-order transactions. For the epoch 0-100
 compatibility scope, replay verifies that the source and runtime statuses have the same entry-wide
-multiset, then uses the runtime result to restore each transaction's status. This check remains
-per-transaction even in the one audited entry containing both an observed frame and a missing one.
+multiset, then uses the runtime result to restore each transaction's status and fee. Audited holes
+only authorize the exact source omission and preserve any available ancillary metadata. If an entry
+contains an audited hole, a complete observed-frame multiset is unavailable, so replay uses the
+pinned runtime to restore every transaction's status and fee. Later canonical account-state
+checkpoints remain the admission gate for that reconstructed execution.
 Because the same writer defect could select another transaction's durable-nonce fee calculator,
 protocol-v5 workers also return the runtime-associated fee. Replay uses that fee for source-present
-records in the affected writer era and for exact missing-frame exceptions without canonical block
-metadata. This policy changes during epoch 9 without changing the execution runtime.
+records and audited missing-frame exceptions in the affected writer era. This policy changes during
+epoch 9 without changing the execution runtime.
 
 Generated Horizon archives record the selected runtime identity and admission level, genesis,
 bootstrap state, output slot range, and transaction-metadata policy in a versioned provenance

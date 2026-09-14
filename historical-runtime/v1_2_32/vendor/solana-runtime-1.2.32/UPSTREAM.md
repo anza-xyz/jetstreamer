@@ -33,8 +33,9 @@ Jetstreamer changes are intentionally narrow:
 - zero- and one-storage `scan_account_storage` calls run directly instead of
   entering the old Rayon pool, whose workers cannot add parallelism there; and
 - `Bank::add_builtin_loader` restores the serde-skipped, exact static BPF
-  loader entrypoint without consulting a deployment-adjacent shared object;
-  and
+  loader entrypoint, and `MessageProcessor` intercepts that native-loader root
+  with the same program ID and account slice that upstream's dynamic dispatch
+  would pass, without consulting a deployment-adjacent shared object; and
 - read-only `Bank::cross_program_support` exposes the serde-skipped CPI gate
   so the worker can regression-test exact epoch-63 restoration semantics.
 
@@ -42,7 +43,8 @@ The decoder accepts the same valid bincode representation while adding a
 per-field allocation bound. The write adapter observes AppendVec contents and
 the existing atomic write counter. The scan fast path applies the same closure
 to the same storage in the same order as the parallel iterator's single-item
-path. None of these changes alter transaction execution, storage, account
-indexing, hashing, or serialization.
+path. Static loader dispatch calls the exact linked v1.2.32 entrypoint with the
+same arguments as the upstream dynamic loader. These changes do not alter
+storage, account indexing, hashing, or serialization.
 
 `LICENSE-APACHE` is the upstream repository license copied with the subtree.

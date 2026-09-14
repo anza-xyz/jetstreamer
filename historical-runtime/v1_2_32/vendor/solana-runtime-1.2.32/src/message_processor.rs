@@ -353,6 +353,20 @@ impl MessageProcessor {
                     return process_instruction(&root_id, &keyed_accounts[1..], instruction_data);
                 }
             }
+            for (id, process_instruction) in &self.loaders {
+                if id == root_id {
+                    // A statically linked native loader replaces the dynamic
+                    // library represented by the root account. Match
+                    // NativeLoader::process_instruction by consuming that
+                    // account before invoking the loader entrypoint.
+                    return process_instruction(
+                        &root_id,
+                        &keyed_accounts[1..],
+                        instruction_data,
+                        invoke_context,
+                    );
+                }
+            }
             // Call the program via the native loader
             return self.native_loader.process_instruction(
                 &native_loader::id(),
@@ -1325,6 +1339,48 @@ mod tests {
         assert_eq!(accounts[0].borrow().lamports, 80);
         assert_eq!(accounts[1].borrow().lamports, 20);
         assert_eq!(accounts[0].borrow().data, vec![42]);
+    }
+
+    #[test]
+    fn test_static_native_loader_dispatch() {
+        fn mock_loader_process_instruction(
+            program_id: &Pubkey,
+            keyed_accounts: &[KeyedAccount],
+            _data: &[u8],
+            _invoke_context: &mut dyn InvokeContext,
+        ) -> Result<(), InstructionError> {
+            assert_eq!(*program_id, Pubkey::new_from_array([41; 32]));
+            assert_eq!(keyed_accounts.len(), 1);
+            assert_eq!(*keyed_accounts[0].unsigned_key(), Pubkey::new_from_array([42; 32]));
+            Ok(())
+        }
+
+        let loader_id = Pubkey::new_from_array([41; 32]);
+        let program_id = Pubkey::new_from_array([42; 32]);
+        let mut message_processor = MessageProcessor::default();
+        message_processor.add_loader(loader_id, mock_loader_process_instruction);
+
+        let mut loader_account = Account::new(1, 0, &native_loader::id());
+        loader_account.executable = true;
+        let mut program_account = Account::new(1, 0, &loader_id);
+        program_account.executable = true;
+        let executable_accounts = vec![
+            (loader_id, RefCell::new(loader_account)),
+            (program_id, RefCell::new(program_account)),
+        ];
+        let instruction = Instruction::new(program_id, &(), Vec::new());
+        let message = Message::new(&[instruction], None);
+
+        assert_eq!(
+            message_processor.process_message(
+                &message,
+                &[executable_accounts],
+                &[],
+                &RentCollector::default(),
+                None,
+            ),
+            Ok(())
+        );
     }
 
     #[test]

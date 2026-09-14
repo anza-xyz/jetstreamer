@@ -1405,6 +1405,49 @@ mod tests {
     }
 
     #[test]
+    fn restored_bpf_loader_dispatch_is_static() {
+        let leader = Pubkey::new_from_array([7; 32]);
+        let mut genesis = create_genesis_config_with_leader(1_000_000, &leader, 500_000);
+        set_exact_mainnet_native_programs(&mut genesis.genesis_config);
+        let state_dir = snapshot::private_state_dir(None).unwrap();
+        let account_paths = snapshot::private_account_paths(&state_dir).unwrap();
+        let mut bank = Bank::new_with_paths(&genesis.genesis_config, account_paths, &[]);
+        bank.add_native_program("solana_bpf_loader_program", &solana_sdk::bpf_loader::id());
+        restore_mainnet_runtime_hooks(&mut bank, &genesis.genesis_config).unwrap();
+
+        // An invalid BPF image must return an instruction error through the
+        // linked loader. Falling back to NativeLoader would instead panic
+        // while trying to open libsolana_bpf_loader_program.so next to the
+        // bound worker executable.
+        let program_id = Pubkey::new_from_array([43; 32]);
+        let mut program_account = Account::new(1, 1, &solana_sdk::bpf_loader::id());
+        program_account.executable = true;
+        bank.store_account(&program_id, &program_account);
+        let mut state = RuntimeState::from_test_bank(bank, true, state_dir);
+        let transaction = Transaction::new_signed_with_payer(
+            &[Instruction {
+                program_id,
+                accounts: Vec::new(),
+                data: Vec::new(),
+            }],
+            Some(&genesis.mint_keypair.pubkey()),
+            &[&genesis.mint_keypair],
+            state.bank.last_blockhash(),
+        );
+        let entry_hash = next_entry_hash(&state.last_entry_hash, 1, &[transaction.clone()]);
+        let processed = state
+            .process_entry(EntryRequest {
+                slot: 0,
+                entry_index: 0,
+                num_hashes: 1,
+                hash: entry_hash.as_ref().to_vec(),
+                transactions: vec![bincode::serialize(&transaction).unwrap()],
+            })
+            .unwrap();
+        assert!(processed.outcomes[0].error.is_some());
+    }
+
+    #[test]
     fn entry_batch_emits_attributed_ordered_writes_and_checkpoint() {
         let leader = Pubkey::new_from_array([7; 32]);
         let mut genesis = create_genesis_config_with_leader(1_000_000, &leader, 500_000);

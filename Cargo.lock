@@ -1355,6 +1355,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
+name = "base64"
+version = "0.23.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ac07cdecf99051d9a5238b80f35af32cdeba5b336e55d957b318b50137e18da5"
+
+[[package]]
 name = "base64-simd"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3703,7 +3709,7 @@ dependencies = [
  "libc",
  "percent-encoding 2.3.2",
  "pin-project-lite",
- "socket2 0.6.3",
+ "socket2 0.5.10",
  "system-configuration",
  "tokio",
  "tower-service",
@@ -4089,7 +4095,7 @@ dependencies = [
  "multihash",
  "once_cell",
  "prost",
- "reqwest 0.13.3",
+ "reqwest 0.13.5",
  "ripget",
  "rseek",
  "serde",
@@ -5660,7 +5666,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls 0.23.43",
- "socket2 0.6.3",
+ "socket2 0.5.10",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -5701,7 +5707,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.6.3",
+ "socket2 0.5.10",
  "tracing",
  "windows-sys 0.59.0",
 ]
@@ -6048,11 +6054,11 @@ dependencies = [
 
 [[package]]
 name = "reqwest"
-version = "0.13.3"
+version = "0.13.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "62e0021ea2c22aed41653bc7e1419abb2c97e038ff2c33d0e1309e49a97deec0"
+checksum = "16a1cfa75cc186dd73d5818e510e042e40927bccc9c236b061cea97e1eb08029"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.23.1",
  "bytes",
  "encoding_rs",
  "futures-channel",
@@ -6154,10 +6160,10 @@ dependencies = [
  "futures-util",
  "indicatif",
  "log",
- "reqwest 0.13.3",
+ "reqwest 0.13.5",
  "thiserror 1.0.69",
  "tokio",
- "tokio-util 0.7.18",
+ "tokio-util 0.6.10",
 ]
 
 [[package]]
@@ -6189,7 +6195,7 @@ checksum = "baa3b42de82358c9ff16906b26a3a2bae2fbc3f6aa1db6971ae1e62c6064b279"
 dependencies = [
  "bytes",
  "futures 0.3.32",
- "reqwest 0.13.3",
+ "reqwest 0.13.5",
  "tokio",
  "tokio-util 0.7.18",
 ]
@@ -7837,7 +7843,7 @@ dependencies = [
  "console 0.15.11",
  "indicatif",
  "log",
- "reqwest 0.13.3",
+ "reqwest 0.13.5",
 ]
 
 [[package]]

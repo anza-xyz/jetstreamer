@@ -351,6 +351,22 @@ class SelectionTests(unittest.TestCase):
         self.assertEqual(plans[1].bootstrap.extension, ".tar.zst")
         self.assertEqual(plans[1].runtime, "solana-v1.2.32")
 
+    def test_epoch_30_uses_exact_v1_1_15_runtime(self) -> None:
+        length = preflight.EPOCH_SLOTS
+        root = preflight.parse_inventory_json(
+            json.dumps(
+                [
+                    inventory_record(30 * length - 1, extension=".tar.bz2"),
+                    inventory_record(31 * length - 1, extension=".tar.bz2", identity=ONE_HASH),
+                ]
+            ),
+            "root",
+        )
+
+        plans = preflight.build_epoch_plans(root, (), 30, 30)
+
+        self.assertEqual(plans[0].runtime, "solana-v1.1.15")
+
     def test_structurally_valid_unrelated_archive_extension_is_ignored(self) -> None:
         epoch = 12
         boundary_end = epoch * preflight.EPOCH_SLOTS - 1

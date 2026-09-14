@@ -89,6 +89,11 @@ const SOLANA_V1_0_23_TAG: &str = "v1.0.23";
 const SOLANA_V1_0_23_COMMIT: &str = "825c0e2b6e39ae67431ed0a8282260ad3914c87a";
 const SOLANA_V1_0_23_RUST_TOOLCHAIN: &str = "rustc 1.43.0 (4fb7144ed 2020-04-20)";
 const SOLANA_V1_0_23_TARGET: &str = "x86_64-unknown-linux-gnu";
+const SOLANA_V1_1_15_BACKEND_ID: &str = "solana-v1.1.15";
+const SOLANA_V1_1_15_TAG: &str = "v1.1.15";
+const SOLANA_V1_1_15_COMMIT: &str = "2cdd3f835f00ca531af7141459d657f0ea60a946";
+const SOLANA_V1_1_15_RUST_TOOLCHAIN: &str = "rustc 1.43.0 (4fb7144ed 2020-04-20)";
+const SOLANA_V1_1_15_TARGET: &str = "x86_64-unknown-linux-gnu";
 const SOLANA_V1_1_23_BACKEND_ID: &str = "solana-v1.1.23";
 const SOLANA_V1_1_23_TAG: &str = "v1.1.23";
 const SOLANA_V1_1_23_COMMIT: &str = "263fc25992ebae85e7ba2f176e9a066449489c3e";
@@ -115,6 +120,7 @@ fn backend_supports_entry_batches(backend_id: &str) -> bool {
             | SOLANA_V1_0_17_BACKEND_ID
             | SOLANA_V1_0_18_BACKEND_ID
             | SOLANA_V1_0_23_BACKEND_ID
+            | SOLANA_V1_1_15_BACKEND_ID
             | SOLANA_V1_1_23_BACKEND_ID
             | SOLANA_V1_2_32_BACKEND_ID
             | SOLANA_V1_3_19_BACKEND_ID
@@ -235,6 +241,16 @@ pub const SOLANA_V1_0_23_CANDIDATE: WorkerProfile = WorkerProfile {
     solana_commit: SOLANA_V1_0_23_COMMIT,
     rust_toolchain: SOLANA_V1_0_23_RUST_TOOLCHAIN,
     target: SOLANA_V1_0_23_TARGET,
+    required_genesis_hash: protocol::MAINNET_GENESIS_HASH,
+    snapshot_archive_extensions: &[".tar.bz2"],
+};
+
+pub const SOLANA_V1_1_15_CANDIDATE: WorkerProfile = WorkerProfile {
+    backend_id: SOLANA_V1_1_15_BACKEND_ID,
+    solana_tag: SOLANA_V1_1_15_TAG,
+    solana_commit: SOLANA_V1_1_15_COMMIT,
+    rust_toolchain: SOLANA_V1_1_15_RUST_TOOLCHAIN,
+    target: SOLANA_V1_1_15_TARGET,
     required_genesis_hash: protocol::MAINNET_GENESIS_HASH,
     snapshot_archive_extensions: &[".tar.bz2"],
 };

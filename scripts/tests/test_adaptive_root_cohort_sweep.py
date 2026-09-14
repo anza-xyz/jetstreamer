@@ -235,7 +235,8 @@ class ManifestTests(unittest.TestCase):
         ).split()
         expected_runtime = {
             **{epoch: "solana-v1.0.23" for epoch in range(22, 30)},
-            **{epoch: "solana-v1.1.23" for epoch in range(30, 61)},
+            30: "solana-v1.1.23",  # the installed v12 manifest remains immutable
+            **{epoch: "solana-v1.1.23" for epoch in range(31, 61)},
             **{epoch: "solana-v1.2.32" for epoch in range(61, 92)},
             **{epoch: "solana-v1.3.19" for epoch in range(92, 101)},
         }

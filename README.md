@@ -342,7 +342,8 @@ select a runtime. The current registry is deliberately conservative:
 | `3,456,000..3,888,000` | pinned Solana v1.0.13 worker | candidate for epoch 8 |
 | `3,888,000..5,184,000` | pinned Solana v1.0.14 worker | candidate for epochs 9-11 |
 | `5,184,000..12,960,000` | pinned Solana v1.0.23 worker | diagnostic candidate for epochs 12-29 |
-| `12,960,000..26,352,000` | pinned Solana v1.1.23 worker | diagnostic candidate for epochs 30-60 |
+| `12,960,000..13,392,000` | pinned Solana v1.1.15 worker | diagnostic candidate for epoch 30 |
+| `13,392,000..26,352,000` | pinned Solana v1.1.23 worker | diagnostic candidate for epochs 31-60 |
 | `26,352,000..39,744,000` | pinned Solana v1.2.32 worker | diagnostic candidate for epochs 61-91 |
 | `39,744,000..43,632,000` | pinned Solana v1.3.19 worker | diagnostic candidate for epochs 92-100 |
 | `43,632,000..406,080,000` | none | unsupported; replay fails closed |
@@ -372,15 +373,12 @@ is rejected unless it matches a checked-in audited `(slot, transaction index, si
 The audit table binds all 1,084 known holes across 15 slots to finalized RPC status evidence. For 463
 of them, finalized block RPC data also preserves the original balance vectors. For the other 621,
 complete metadata was absent from the captured RPC evidence and the other fields remain absent or
-at their defaults. The early source
-writer also stored an
-entry's randomized execution results beside its original-order transactions. For the epoch 0-100
-compatibility scope, replay verifies that the source and runtime statuses have the same entry-wide
-multiset, then uses the runtime result to restore each transaction's status and fee. Audited holes
-only authorize the exact source omission and preserve any available ancillary metadata. If an entry
-contains an audited hole, a complete observed-frame multiset is unavailable, so replay uses the
-pinned runtime to restore every transaction's status and fee. Later canonical account-state
-checkpoints remain the admission gate for that reconstructed execution.
+at their defaults. The early source writer also stored execution results beside the wrong
+transactions. Observed singleton entries and complete slots prove that the corruption is not bounded
+to one entry or slot, so a source-status multiset is not valid execution evidence. For the epoch 0-100
+compatibility scope, the pinned runtime is authoritative for each transaction's status and fee.
+Audited holes only authorize the exact source omission and preserve any available ancillary metadata.
+Later canonical account-state checkpoints remain the admission gate for that reconstructed execution.
 Because the same writer defect could select another transaction's durable-nonce fee calculator,
 protocol-v5 workers also return the runtime-associated fee. Replay uses that fee for source-present
 records and audited missing-frame exceptions in the affected writer era. This policy changes during

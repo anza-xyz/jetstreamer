@@ -3,8 +3,7 @@
 use {
     super::{
         InFlightGuard, PHASE_ENTRY_COUNT, PHASE_EXECUTE_US, PHASE_POST_PROCESS_US, ReadyEntry,
-        ReplayCursor, ReplayFailure, ReplayProgress, SnapshotVerifier,
-        entry_source_status_multiset, horizon, plugin, status_multisets_equal,
+        ReplayCursor, ReplayFailure, ReplayProgress, SnapshotVerifier, horizon, plugin,
     },
     crate::historical::{
         HistoricalAccountWrite, HistoricalCheckpoint, HistoricalEntryRequest,
@@ -759,22 +758,6 @@ impl HistoricalReplay {
             }
         }
 
-        if let Some(source_statuses) = entry_source_status_multiset(&entry.txs)? {
-            let replay_statuses: Vec<_> = outcomes
-                .iter()
-                .map(|outcome| match outcome.error.as_ref() {
-                    Some(error) => Err(denormalize_transaction_error(error)),
-                    None => Ok(()),
-                })
-                .collect();
-            if !status_multisets_equal(&source_statuses, &replay_statuses) {
-                return Err(format!(
-                    "historical status multiset mismatch at slot {} entry {}: source {:?}, replay {:?}",
-                    entry.slot, entry.entry_index, source_statuses, replay_statuses
-                ));
-            }
-        }
-
         for (offset, (scheduled, actual)) in entry.txs.iter_mut().zip(outcomes).enumerate() {
             if let Some(expected_status) = scheduled.expected_status.as_ref() {
                 let expected_error: Option<HistoricalTransactionError> = expected_status
@@ -822,9 +805,9 @@ impl HistoricalReplay {
                     ));
                 }
             } else {
-                // Missing or v1.0-permuted source status is not associated
-                // ground truth. Preserve the historical executor's result in
-                // the generated archive.
+                // Missing or misassociated source status is not ground truth.
+                // Preserve the historical executor's result in the generated
+                // archive.
                 // The source writer bug also paired the original transaction
                 // with another transaction's durable-nonce fee calculator.
                 // Exact missing-frame exceptions have no source fee at all.
@@ -1186,8 +1169,6 @@ mod tests {
             txs: vec![super::super::ScheduledTransaction {
                 tx: solana_transaction::versioned::VersionedTransaction::default(),
                 expected_status: None,
-                source_entry_status: None,
-                audited_missing_source_status: true,
                 reconstruct_fee: true,
                 status_meta: solana_transaction_status::TransactionStatusMeta::default(),
             }],
@@ -1251,8 +1232,6 @@ mod tests {
             txs: vec![super::super::ScheduledTransaction {
                 tx: solana_transaction::versioned::VersionedTransaction::default(),
                 expected_status: None,
-                source_entry_status: None,
-                audited_missing_source_status: true,
                 reconstruct_fee: true,
                 status_meta: canonical_metadata.clone(),
             }],
@@ -1303,8 +1282,6 @@ mod tests {
             .map(|_| super::super::ScheduledTransaction {
                 tx: solana_transaction::versioned::VersionedTransaction::default(),
                 expected_status: None,
-                source_entry_status: None,
-                audited_missing_source_status: true,
                 reconstruct_fee: true,
                 status_meta: solana_transaction_status::TransactionStatusMeta::default(),
             })

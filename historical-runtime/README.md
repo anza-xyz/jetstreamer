@@ -53,7 +53,8 @@ still requires explicit opt-in and trusted checkpoint validation.
 
 The sibling virtual workspaces have independent old-format lockfiles. Workers
 through v1.0.18 are pinned to `1.42.0-x86_64-unknown-linux-gnu`; v1.0.23,
-v1.0.24, v1.1.23, and v1.2.32 use `1.43.0-x86_64-unknown-linux-gnu`; v1.3.19
+v1.0.24, v1.1.15, v1.1.23, and v1.2.32 use
+`1.43.0-x86_64-unknown-linux-gnu`; v1.3.19
 uses `1.45.1-x86_64-unknown-linux-gnu`. They cannot share dependency
 resolution because the exact upstream graphs require incompatible
 pre-release cryptography packages. The old `AppendVec` persisted native Rust
@@ -79,7 +80,10 @@ SHA-NI is guarded by feature detection, every unsafe load/store operates on
 fixed-size owned arrays, and randomized tests cover optimized, paired, and
 forced-portable paths.
 
-The broad v1.1.23 envelope retains mainnet's epoch-34 BPF-loader activation
+The narrow v1.1.15 envelope covers epoch 30; canonical metadata identifies
+v1.1.14 at its bootstrap and v1.1.15 at both trusted checkpoints, and those
+two tags have identical runtime source. The following v1.1.23 envelope retains
+mainnet's epoch-34 BPF-loader activation
 and the runtime's epoch-40 system-program transition. The v1.2.32 envelope
 retains the Stable-cluster CPI transition at epoch 63. Static loader bindings
 reproduce the exact linked processors without relying on mutable,
@@ -120,7 +124,8 @@ Each vendored runtime directory contains the upstream `runtime/` crate and an
 | `v1_0_18` | `f26f18d29d650d06f5c5b7a4eb625622a999ea66` | unassigned exact fallback for late epoch 12 through epoch 15 |
 | `v1_0_23` | `825c0e2b6e39ae67431ed0a8282260ad3914c87a` | checkpoint-gated diagnostic envelope, epochs 12–29 |
 | `v1_0_24` | `a93915f1bddb73480f86fc09f487315ae191897d` | registered but unassigned differential candidate |
-| `v1_1_23` | `263fc25992ebae85e7ba2f176e9a066449489c3e` | checkpoint-gated diagnostic envelope, epochs 30–60 |
+| `v1_1_15` | `2cdd3f835f00ca531af7141459d657f0ea60a946` | checkpoint-gated diagnostic envelope, epoch 30 |
+| `v1_1_23` | `263fc25992ebae85e7ba2f176e9a066449489c3e` | checkpoint-gated diagnostic envelope, epochs 31–60 |
 | `v1_2_32` | `8c989da68342918f1717c60aa60fdfab7d1e676e` | checkpoint-gated diagnostic envelope, epochs 61–91 |
 | `v1_3_19` | `15a49d75086f95573ad319b22e4843639bdf2169` | checkpoint-gated diagnostic envelope, epochs 92–100 |
 

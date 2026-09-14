@@ -2168,26 +2168,6 @@ impl BankReplay {
             panic!("{message}");
         }
 
-        match entry_source_status_multiset(&entry.txs) {
-            Ok(Some(source_statuses)) if !status_multisets_equal(&source_statuses, &results) => {
-                let message = format!(
-                    "transaction status multiset mismatch at slot {} entry {}: source {:?}, replay {:?}",
-                    entry.slot, entry.entry_index, source_statuses, results
-                );
-                self.failure.record(message.clone());
-                panic!("{message}");
-            }
-            Ok(_) => {}
-            Err(error) => {
-                let message = format!(
-                    "incomplete transaction status multiset at slot {} entry {}: {error}",
-                    entry.slot, entry.entry_index
-                );
-                self.failure.record(message.clone());
-                panic!("{message}");
-            }
-        }
-
         for (offset, actual) in results.into_iter().enumerate() {
             let Some(expected) = entry.txs[offset].expected_status.clone() else {
                 // Missing and misassociated source statuses both defer to
@@ -4183,23 +4163,17 @@ impl SlotExecutionBuffer {
         if self.txs.len() <= index {
             self.txs.resize_with(index + 1, || None);
         }
-        let (
-            expected_status,
-            source_entry_status,
-            audited_missing_source_status,
-            reconstruct_fee,
-            status_meta,
-        ) = match (status_validation, metadata) {
+        let (expected_status, reconstruct_fee, status_meta) = match (status_validation, metadata) {
             (
                 compatibility::TransactionStatusValidation::RuntimeOnly,
                 TransactionMetadataInput::Observed(metadata),
-            ) => (None, None, false, false, metadata),
+            ) => (None, false, metadata),
             (
                 compatibility::TransactionStatusValidation::RuntimeOnly,
                 TransactionMetadataInput::Missing(
                     compatibility::MissingTransactionStatusEvidence::PreCutoverRuntime,
                 ),
-            ) => (None, None, false, false, TransactionStatusMeta::default()),
+            ) => (None, false, TransactionStatusMeta::default()),
             (
                 compatibility::TransactionStatusValidation::RuntimeOnly,
                 TransactionMetadataInput::Missing(
@@ -4211,11 +4185,11 @@ impl SlotExecutionBuffer {
                 ));
             }
             (
-                compatibility::TransactionStatusValidation::RuntimeWithSourceEntryMultiset,
+                compatibility::TransactionStatusValidation::RuntimeAuthoritative,
                 TransactionMetadataInput::Observed(metadata),
-            ) => (None, Some(metadata.status.clone()), false, true, metadata),
+            ) => (None, true, metadata),
             (
-                compatibility::TransactionStatusValidation::RuntimeWithSourceEntryMultiset,
+                compatibility::TransactionStatusValidation::RuntimeAuthoritative,
                 TransactionMetadataInput::Missing(
                     compatibility::MissingTransactionStatusEvidence::Audited(audited),
                 ),
@@ -4246,34 +4220,25 @@ impl SlotExecutionBuffer {
                 // The same historical writer that misassociated observed
                 // status frames also populated the public RPC rows used to
                 // recover these holes. The audit binds this exact missing
-                // slot/index/signature and any ancillary metadata, but its
-                // status cannot safely complete an entry multiset: singleton
-                // missing entries in epochs 49 and 50 prove that even the
-                // RPC-derived multiset can be wrong. Let the pinned runtime
-                // restore status and fee; later canonical checkpoints remain
-                // the admission gate for the resulting state.
-                (
-                    None,
-                    None,
-                    true,
-                    true,
-                    canonical_metadata.unwrap_or_default(),
-                )
+                // slot/index/signature and any ancillary metadata, but the
+                // pinned runtime remains authoritative for status and fee;
+                // later canonical checkpoints gate the resulting state.
+                (None, true, canonical_metadata.unwrap_or_default())
             }
             (
-                compatibility::TransactionStatusValidation::RuntimeWithSourceEntryMultiset,
+                compatibility::TransactionStatusValidation::RuntimeAuthoritative,
                 TransactionMetadataInput::Missing(
                     compatibility::MissingTransactionStatusEvidence::PreCutoverRuntime,
                 ),
             ) => {
                 return Err(format!(
-                    "pre-cutover status evidence is invalid for entry-multiset slot {slot}"
+                    "pre-cutover status evidence is invalid for runtime-authoritative slot {slot}"
                 ));
             }
             (
                 compatibility::TransactionStatusValidation::SourceExact,
                 TransactionMetadataInput::Observed(metadata),
-            ) => (Some(metadata.status.clone()), None, false, false, metadata),
+            ) => (Some(metadata.status.clone()), false, metadata),
             (
                 compatibility::TransactionStatusValidation::SourceExact,
                 TransactionMetadataInput::Missing(_),
@@ -4289,8 +4254,6 @@ impl SlotExecutionBuffer {
             if existing_sig == incoming_sig
                 && existing.tx == tx
                 && existing.expected_status == expected_status
-                && existing.source_entry_status == source_entry_status
-                && existing.audited_missing_source_status == audited_missing_source_status
                 && existing.reconstruct_fee == reconstruct_fee
                 && existing.status_meta == status_meta
             {
@@ -4305,8 +4268,6 @@ impl SlotExecutionBuffer {
         self.txs[index] = Some(ScheduledTransaction {
             tx,
             expected_status,
-            source_entry_status,
-            audited_missing_source_status,
             reconstruct_fee,
             status_meta,
         });
@@ -4475,80 +4436,11 @@ struct ScheduledTransaction {
     /// separately audited canonical transaction index. `None` means replay
     /// supplies the transaction's status.
     expected_status: Option<Result<(), TransactionError>>,
-    /// Source status retained only for an entry-wide multiset check. Solana
-    /// v1.0 persisted these results in randomized rather than transaction
-    /// order, so replay restores their per-transaction association.
-    source_entry_status: Option<Result<(), TransactionError>>,
-    /// The source omitted this exact status frame after the normal cutover,
-    /// and its slot, index, and signature match the compiled audit record.
-    audited_missing_source_status: bool,
     /// The selected runtime supplies the fee as well as the status.
     reconstruct_fee: bool,
     /// Full original chain metadata from the CAR stream or an exact audited
     /// canonical recovery, carried through to the Horizon recorder.
     status_meta: TransactionStatusMeta,
-}
-
-fn entry_source_status_multiset(
-    transactions: &[ScheduledTransaction],
-) -> Result<Option<Vec<Result<(), TransactionError>>>, String> {
-    let status_count = transactions
-        .iter()
-        .filter(|transaction| transaction.source_entry_status.is_some())
-        .count();
-    let audited_missing_count = transactions
-        .iter()
-        .filter(|transaction| transaction.audited_missing_source_status)
-        .count();
-    if audited_missing_count > 0 {
-        if status_count + audited_missing_count != transactions.len() {
-            return Err(format!(
-                "entry has source status for {status_count}/{} transactions and {audited_missing_count} audited missing frames",
-                transactions.len(),
-            ));
-        }
-        // A recovered RPC status is useful for auditing the exact hole but
-        // not for execution validation: it came through the same historical
-        // status-association path known to permute results. A complete set of
-        // actually observed frames is required for an entry multiset check.
-        return Ok(None);
-    }
-    if status_count == 0 {
-        return Ok(None);
-    }
-    if status_count != transactions.len() {
-        return Err(format!(
-            "entry has status-multiset evidence for {status_count}/{} transactions and {audited_missing_count} audited missing frames",
-            transactions.len(),
-        ));
-    }
-    transactions
-        .iter()
-        .map(|transaction| {
-            transaction.source_entry_status.clone().ok_or_else(|| {
-                "complete source-status multiset check lost status evidence".to_string()
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()
-        .map(Some)
-}
-
-fn status_multisets_equal<T: PartialEq>(left: &[T], right: &[T]) -> bool {
-    if left.len() != right.len() {
-        return false;
-    }
-    let mut matched = vec![false; right.len()];
-    left.iter().all(|left_status| {
-        let Some(index) = right
-            .iter()
-            .enumerate()
-            .position(|(index, right_status)| !matched[index] && left_status == right_status)
-        else {
-            return false;
-        };
-        matched[index] = true;
-        true
-    })
 }
 
 #[derive(Debug)]
@@ -6958,6 +6850,7 @@ fn historical_worker_profile(
         compatibility::RuntimeBackend::SolanaV1_0_18 => historical::SOLANA_V1_0_18_CANDIDATE,
         compatibility::RuntimeBackend::SolanaV1_0_23 => historical::SOLANA_V1_0_23_CANDIDATE,
         compatibility::RuntimeBackend::SolanaV1_0_24 => historical::SOLANA_V1_0_24_CANDIDATE,
+        compatibility::RuntimeBackend::SolanaV1_1_15 => historical::SOLANA_V1_1_15_CANDIDATE,
         compatibility::RuntimeBackend::SolanaV1_1_23 => historical::SOLANA_V1_1_23_CANDIDATE,
         compatibility::RuntimeBackend::SolanaV1_2_32 => historical::SOLANA_V1_2_32_CANDIDATE,
         compatibility::RuntimeBackend::SolanaV1_3_19 => historical::SOLANA_V1_3_19_CANDIDATE,
@@ -9966,6 +9859,7 @@ async fn run_geyser_replay(
             | compatibility::RuntimeBackend::SolanaV1_0_18
             | compatibility::RuntimeBackend::SolanaV1_0_23
             | compatibility::RuntimeBackend::SolanaV1_0_24
+            | compatibility::RuntimeBackend::SolanaV1_1_15
             | compatibility::RuntimeBackend::SolanaV1_1_23
             | compatibility::RuntimeBackend::SolanaV1_2_32
             | compatibility::RuntimeBackend::SolanaV1_3_19 => {
@@ -11870,6 +11764,7 @@ fn validated_epoch_archive_multi_runtime(
         | compatibility::RuntimeBackend::SolanaV1_0_18
         | compatibility::RuntimeBackend::SolanaV1_0_23
         | compatibility::RuntimeBackend::SolanaV1_0_24
+        | compatibility::RuntimeBackend::SolanaV1_1_15
         | compatibility::RuntimeBackend::SolanaV1_1_23
         | compatibility::RuntimeBackend::SolanaV1_2_32
         | compatibility::RuntimeBackend::SolanaV1_3_19 => StateCommitmentKind::LegacyAccountsHash,
@@ -21840,10 +21735,9 @@ mod early_snapshot_tests {
 #[cfg(test)]
 mod scheduler_tests {
     use super::{
-        EntryAccounts, ScheduledTransaction, SlotExecutionBuffer, TransactionError,
-        TransactionMetadataInput, assign_rounds,
+        EntryAccounts, SlotExecutionBuffer, TransactionError, TransactionMetadataInput,
+        assign_rounds,
         compatibility::{self, TransactionStatusValidation},
-        entry_source_status_multiset, status_multisets_equal,
     };
     use solana_address::Address;
     use solana_hash::Hash;
@@ -21894,19 +21788,19 @@ mod scheduler_tests {
             Some(Ok(()))
         );
 
-        let mut permuted = SlotExecutionBuffer::default();
-        permuted
+        let mut authoritative = SlotExecutionBuffer::default();
+        authoritative
             .insert_transaction(
                 0,
                 0,
                 VersionedTransaction::default(),
                 TransactionMetadataInput::Observed(TransactionStatusMeta::default()),
-                TransactionStatusValidation::RuntimeWithSourceEntryMultiset,
+                TransactionStatusValidation::RuntimeAuthoritative,
             )
             .unwrap();
-        let scheduled = permuted.txs[0].as_ref().unwrap();
+        let scheduled = authoritative.txs[0].as_ref().unwrap();
         assert!(scheduled.expected_status.is_none());
-        assert_eq!(scheduled.source_entry_status, Some(Ok(())));
+        assert!(scheduled.reconstruct_fee);
     }
 
     #[test]
@@ -21993,7 +21887,7 @@ mod scheduler_tests {
                     index,
                     VersionedTransaction::default(),
                     TransactionMetadataInput::Observed(TransactionStatusMeta::default()),
-                    TransactionStatusValidation::RuntimeWithSourceEntryMultiset,
+                    TransactionStatusValidation::RuntimeAuthoritative,
                 )
                 .unwrap();
         }
@@ -22024,7 +21918,7 @@ mod scheduler_tests {
                     index,
                     transaction,
                     TransactionMetadataInput::Missing(evidence),
-                    TransactionStatusValidation::RuntimeWithSourceEntryMultiset,
+                    TransactionStatusValidation::RuntimeAuthoritative,
                 )
                 .unwrap();
         }
@@ -22032,50 +21926,19 @@ mod scheduler_tests {
         let observed_entry = (preceding_start..preceding_end)
             .map(|index| buffer.txs[index].take().unwrap())
             .collect::<Vec<_>>();
-        let observed_multiset = entry_source_status_multiset(&observed_entry)
-            .unwrap()
-            .unwrap();
-        assert_eq!(observed_multiset.len(), 14);
-        assert!(
-            observed_entry
-                .iter()
-                .all(|transaction| !transaction.audited_missing_source_status)
-        );
+        assert!(observed_entry.iter().all(
+            |transaction| transaction.expected_status.is_none() && transaction.reconstruct_fee
+        ));
 
         let missing_entry = (missing_start..missing_end)
             .map(|index| buffer.txs[index].take().unwrap())
             .collect::<Vec<_>>();
         assert_eq!(missing_entry.len(), 33);
         assert!(missing_entry.iter().all(|transaction| {
-            transaction.audited_missing_source_status
-                && transaction.reconstruct_fee
+            transaction.reconstruct_fee
                 && transaction.expected_status.is_none()
-                && transaction.source_entry_status.is_none()
                 && transaction.status_meta == TransactionStatusMeta::default()
         }));
-        assert_eq!(entry_source_status_multiset(&missing_entry).unwrap(), None);
-
-        // If untrusted entry framing regrouped an admitted hole beside an
-        // observed record, a complete observed-frame multiset is unavailable.
-        let mixed_entry = [
-            ScheduledTransaction {
-                tx: VersionedTransaction::default(),
-                expected_status: None,
-                source_entry_status: Some(Err(TransactionError::AccountNotFound)),
-                audited_missing_source_status: false,
-                reconstruct_fee: true,
-                status_meta: TransactionStatusMeta::default(),
-            },
-            ScheduledTransaction {
-                tx: VersionedTransaction::default(),
-                expected_status: None,
-                source_entry_status: None,
-                audited_missing_source_status: true,
-                reconstruct_fee: true,
-                status_meta: TransactionStatusMeta::default(),
-            },
-        ];
-        assert_eq!(entry_source_status_multiset(&mixed_entry).unwrap(), None);
 
         let error = SlotExecutionBuffer::default()
             .insert_transaction(
@@ -22085,7 +21948,7 @@ mod scheduler_tests {
                 TransactionMetadataInput::Missing(
                     compatibility::MissingTransactionStatusEvidence::PreCutoverRuntime,
                 ),
-                TransactionStatusValidation::RuntimeWithSourceEntryMultiset,
+                TransactionStatusValidation::RuntimeAuthoritative,
             )
             .unwrap_err();
         assert!(error.contains("pre-cutover status evidence"));
@@ -22118,7 +21981,7 @@ mod scheduler_tests {
                     ..VersionedTransaction::default()
                 },
                 TransactionMetadataInput::Missing(inconsistent_evidence),
-                TransactionStatusValidation::RuntimeWithSourceEntryMultiset,
+                TransactionStatusValidation::RuntimeAuthoritative,
             )
             .unwrap_err();
         assert!(error.contains("canonical metadata mismatch"), "{error}");
@@ -22128,7 +21991,7 @@ mod scheduler_tests {
                 8,
                 VersionedTransaction::default(),
                 TransactionMetadataInput::Missing(mixed_evidence.clone()),
-                TransactionStatusValidation::RuntimeWithSourceEntryMultiset,
+                TransactionStatusValidation::RuntimeAuthoritative,
             )
             .unwrap_err();
         assert!(error.contains("evidence identity mismatch"), "{error}");
@@ -22142,7 +22005,7 @@ mod scheduler_tests {
                     fee: 5_000,
                     ..TransactionStatusMeta::default()
                 }),
-                TransactionStatusValidation::RuntimeWithSourceEntryMultiset,
+                TransactionStatusValidation::RuntimeAuthoritative,
             )
             .unwrap();
         buffer
@@ -22154,15 +22017,12 @@ mod scheduler_tests {
                     ..VersionedTransaction::default()
                 },
                 TransactionMetadataInput::Missing(mixed_evidence),
-                TransactionStatusValidation::RuntimeWithSourceEntryMultiset,
+                TransactionStatusValidation::RuntimeAuthoritative,
             )
             .unwrap();
         let mixed_entry = [buffer.txs[7].take().unwrap(), buffer.txs[8].take().unwrap()];
-        assert_eq!(entry_source_status_multiset(&mixed_entry).unwrap(), None);
-        assert!(mixed_entry[1].audited_missing_source_status);
         assert!(mixed_entry[1].reconstruct_fee);
         assert!(mixed_entry[1].expected_status.is_none());
-        assert_eq!(mixed_entry[1].source_entry_status, None);
         assert_eq!(mixed_entry[1].status_meta.fee, 5_000);
         assert_eq!(mixed_entry[1].status_meta.pre_balances.len(), 7);
 
@@ -22184,7 +22044,7 @@ mod scheduler_tests {
                     ..VersionedTransaction::default()
                 },
                 TransactionMetadataInput::Missing(failed_evidence),
-                TransactionStatusValidation::RuntimeWithSourceEntryMultiset,
+                TransactionStatusValidation::RuntimeAuthoritative,
             )
             .unwrap();
         let scheduled = failed.txs[13].as_ref().unwrap();
@@ -22193,16 +22053,8 @@ mod scheduler_tests {
             InstructionError::Custom(0),
         ));
         assert_eq!(scheduled.expected_status, None);
-        assert_eq!(scheduled.source_entry_status, None);
         assert_eq!(scheduled.status_meta.status, expected_failure);
         assert!(scheduled.reconstruct_fee);
-    }
-
-    #[test]
-    fn status_multiset_comparison_preserves_duplicate_counts() {
-        assert!(status_multisets_equal(&[1, 2, 2, 3], &[2, 3, 2, 1]));
-        assert!(!status_multisets_equal(&[1, 2, 2, 3], &[1, 2, 3, 3]));
-        assert!(!status_multisets_equal(&[1, 2], &[1]));
     }
 
     /// Flattens rounds back to (entry_index -> round_index) for assertions.

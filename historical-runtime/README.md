@@ -82,7 +82,10 @@ forced-portable paths.
 
 The narrow v1.1.15 envelope covers epoch 30; canonical metadata identifies
 v1.1.14 at its bootstrap and v1.1.15 at both trusted checkpoints, and those
-two tags have identical runtime source. The following v1.1.23 envelope retains
+two tags have identical runtime source. It also restores mainnet's single
+hard-fork marker at slot 13,334,463 when bootstrapping from the preceding
+snapshot; snapshots after that slot must contain the persisted marker with its
+exact count. The following v1.1.23 envelope retains
 mainnet's epoch-34 BPF-loader activation
 and the runtime's epoch-40 system-program transition. The v1.2.32 envelope
 retains the Stable-cluster CPI transition at epoch 63. Static loader bindings

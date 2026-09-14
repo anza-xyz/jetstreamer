@@ -36,6 +36,12 @@ const MAX_SUPPORTED_SLOT_EXCLUSIVE: u64 = 13_392_000;
 const MAX_SUPPORTED_EPOCH: u64 = 30;
 const BPF_LOADER_ACTIVATION_EPOCH: u64 = 34;
 const BPF_LOADER_NAME: &str = "solana_bpf_loader_program";
+// Mainnet was restarted with one explicit hard-fork marker at this slot. The
+// last canonical snapshot before the restart does not contain the future
+// marker, while snapshots after it persist `(slot, 1)`. Without restoring the
+// marker, the first post-restart Bank hash is missing `extend_and_hash(..., 1)`
+// and every subsequent vote fails SlotHashMismatch.
+const MAINNET_HARD_FORK_SLOT: u64 = 13_334_463;
 const POH_THREADS_ENV: &str = "JETSTREAMER_HISTORICAL_POH_THREADS";
 const ABSOLUTE_MAX_POH_THREADS: usize = 256;
 
@@ -893,6 +899,7 @@ fn restore_mainnet_runtime_hooks(bank: &mut Bank, genesis: &GenesisConfig) -> Re
     {
         return Err("snapshot PoH configuration does not match mainnet genesis".to_string());
     }
+    restore_mainnet_hard_fork(bank)?;
     // `finish_init` creates missing native accounts. Validate every persisted
     // identity first so a malformed snapshot cannot pass hash verification and
     // then acquire new consensus state as a side effect of restoring dispatch.
@@ -926,6 +933,42 @@ fn restore_mainnet_runtime_hooks(bank: &mut Bank, genesis: &GenesisConfig) -> Re
         }
     }));
     Ok(())
+}
+
+fn restore_mainnet_hard_fork(bank: &Bank) -> Result<(), String> {
+    let hard_forks = bank.hard_forks();
+    let mut hard_forks = hard_forks.write().unwrap();
+    let mut marker_count = None;
+    for &(slot, count) in hard_forks.iter() {
+        if slot != MAINNET_HARD_FORK_SLOT {
+            return Err(format!(
+                "snapshot contains unsupported mainnet hard fork ({}, {})",
+                slot, count
+            ));
+        }
+        if marker_count.replace(count).is_some() {
+            return Err(format!(
+                "snapshot contains duplicate mainnet hard fork {}",
+                MAINNET_HARD_FORK_SLOT
+            ));
+        }
+    }
+    match marker_count {
+        Some(1) => Ok(()),
+        Some(count) => Err(format!(
+            "snapshot mainnet hard fork {} has count {}, expected 1",
+            MAINNET_HARD_FORK_SLOT, count
+        )),
+        None if bank.slot() < MAINNET_HARD_FORK_SLOT => {
+            hard_forks.register(MAINNET_HARD_FORK_SLOT);
+            Ok(())
+        }
+        None => Err(format!(
+            "snapshot at slot {} is missing applied mainnet hard fork {}",
+            bank.slot(),
+            MAINNET_HARD_FORK_SLOT
+        )),
+    }
 }
 
 /// The epoch-34 genesis-program callback persisted the BPF loader's native
@@ -1288,6 +1331,50 @@ mod tests {
         assert!(validate_mainnet_genesis_programs(&genesis)
             .unwrap_err()
             .contains("requires Stable operating mode"));
+    }
+
+    #[test]
+    fn mainnet_hard_fork_is_restored_once_and_strictly_validated() {
+        let leader = Pubkey::new_from_array([7; 32]);
+        let genesis = create_genesis_config_with_leader(1_000_000, &leader, 500_000);
+        let bank = Bank::new(&genesis.genesis_config);
+
+        restore_mainnet_hard_fork(&bank).unwrap();
+        restore_mainnet_hard_fork(&bank).unwrap();
+        assert_eq!(
+            bank.hard_forks()
+                .read()
+                .unwrap()
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec![(MAINNET_HARD_FORK_SLOT, 1)]
+        );
+
+        bank.hard_forks()
+            .write()
+            .unwrap()
+            .register(MAINNET_HARD_FORK_SLOT);
+        assert!(restore_mainnet_hard_fork(&bank)
+            .unwrap_err()
+            .contains("has count 2, expected 1"));
+
+        let unexpected = Bank::new(&genesis.genesis_config);
+        unexpected.hard_forks().write().unwrap().register(42);
+        assert!(restore_mainnet_hard_fork(&unexpected)
+            .unwrap_err()
+            .contains("unsupported mainnet hard fork"));
+    }
+
+    #[test]
+    fn epoch30_hard_fork_marker_matches_canonical_vote_witness() {
+        use std::str::FromStr;
+        let pre_marker = Hash::from_str("TNQnvSAiz5ob5rALRBHZuazmLsmxyVfPSdqNgMkuazd").unwrap();
+        let canonical = solana_sdk::hash::extend_and_hash(&pre_marker, &1u64.to_le_bytes());
+        assert_eq!(
+            canonical.to_string(),
+            "CwcsEtfa7wcdm3xa7FFoFZUcXpTy9fQEUHbjCVe8Wa7F"
+        );
     }
 
     #[test]
@@ -1837,6 +1924,17 @@ mod tests {
         )
         .unwrap();
         assert_eq!(initialized.slot, 13_334_356);
+        assert_eq!(
+            state
+                .bank
+                .hard_forks()
+                .read()
+                .unwrap()
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec![(MAINNET_HARD_FORK_SLOT, 1)]
+        );
         let checkpoint = state.freeze_checkpoint(13_334_356).unwrap();
         println!(
             "initialized slot={} last_blockhash={} next_write_version={}",

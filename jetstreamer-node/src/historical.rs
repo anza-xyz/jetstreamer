@@ -2031,16 +2031,38 @@ impl HistoricalRuntimeClient {
     }
 
     /// Preserve a worker's real exit status before fail-closed cleanup can
-    /// replace it with the status from a termination signal.
+    /// replace it with the status from a termination signal. EOF normally
+    /// arrives just before process exit, so give the child the same bounded
+    /// reap window used after a broken request pipe instead of racing a
+    /// single `try_wait` against its final teardown.
     fn abort_after_unexpected_eof(&mut self, request_id: u64) -> HistoricalRuntimeError {
+        self.closed = true;
+        self.transport.take();
         let exit_status = self
             .child
             .as_mut()
-            .and_then(|child| child.try_wait().ok().flatten());
-        self.abort_worker();
+            .map(|child| wait_for_child(child, self.timeouts.reap));
         match exit_status {
-            Some(status) => HistoricalRuntimeError::UnexpectedExit { request_id, status },
-            None => HistoricalRuntimeError::UnexpectedEof { request_id },
+            Some(Ok(Some(status))) => {
+                self.child.take();
+                self.private_work_dir.take();
+                self.guardian.take();
+                HistoricalRuntimeError::UnexpectedExit { request_id, status }
+            }
+            Some(Ok(None)) | Some(Err(_)) | None => {
+                if let Some(child) = self.child.take() {
+                    kill_and_reap(
+                        child,
+                        self.private_work_dir.take(),
+                        self.guardian.take(),
+                        self.timeouts.reap,
+                    );
+                } else {
+                    self.private_work_dir.take();
+                    self.guardian.take();
+                }
+                HistoricalRuntimeError::UnexpectedEof { request_id }
+            }
         }
     }
 
@@ -4449,6 +4471,7 @@ mod tests {
     #[test]
     fn unexpected_eof_still_terminates_a_running_worker() {
         let (mut client, child_id) = scripted_response_client(&[]);
+        client.timeouts.reap = Duration::from_millis(50);
 
         let error = client.abort_after_unexpected_eof(23);
         assert!(matches!(

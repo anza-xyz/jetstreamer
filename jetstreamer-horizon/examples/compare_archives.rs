@@ -14,8 +14,19 @@ use jetstreamer_horizon::archive::{
     ArchiveReader, BlockNotification, BucketDecoder, BucketHeader, Consumption, EntryRecord,
     MAX_FILE_HEADER_BYTES, SlotKind, SlotVisitor, parse_file_header,
 };
+use jetstreamer_horizon::transactions::{Transaction, TransactionStatus};
 use lencode::Decode;
 use solana_hash::Hash;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FailedTransaction {
+    index: u32,
+    signature: Option<String>,
+    status: TransactionStatus,
+    pre_balances: Vec<u64>,
+    post_balances: Vec<u64>,
+    account_updates: Vec<(String, u64, String, bool, u64)>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SlotSummary {
@@ -25,12 +36,14 @@ struct SlotSummary {
     blockhash: Option<Hash>,
     executed_transactions: u64,
     entries: Vec<EntryRecord>,
+    failed_transactions: Vec<FailedTransaction>,
 }
 
 #[derive(Default)]
 struct Collector {
     current_slot: Option<u64>,
     current_kind: Option<SlotKind>,
+    failed_transactions: Vec<FailedTransaction>,
     slots: BTreeMap<u64, SlotSummary>,
 }
 
@@ -38,6 +51,31 @@ impl SlotVisitor for Collector {
     fn on_slot_start(&mut self, slot: u64, kind: SlotKind) {
         self.current_slot = Some(slot);
         self.current_kind = Some(kind);
+        self.failed_transactions.clear();
+    }
+
+    fn on_transaction(&mut self, _slot: u64, tx_index: u32, tx: &Transaction) {
+        if !tx.status.is_ok() {
+            self.failed_transactions.push(FailedTransaction {
+                index: tx_index,
+                signature: tx.signatures.first().map(ToString::to_string),
+                status: tx.status.clone(),
+                pre_balances: tx.pre_balances.to_vec(),
+                post_balances: tx.post_balances.to_vec(),
+                account_updates: tx
+                    .iter_account_updates()
+                    .map(|(update, data)| {
+                        (
+                            update.pubkey.to_string(),
+                            update.lamports,
+                            update.owner.to_string(),
+                            update.executable,
+                            data.len() as u64,
+                        )
+                    })
+                    .collect(),
+            });
+        }
     }
 
     fn on_block(&mut self, notification: &BlockNotification, entries: &[EntryRecord]) {
@@ -52,6 +90,7 @@ impl SlotVisitor for Collector {
                 blockhash: None,
                 executed_transactions: 0,
                 entries: Vec::new(),
+                failed_transactions: Vec::new(),
             },
             BlockNotification::Block(meta) => SlotSummary {
                 kind,
@@ -60,6 +99,7 @@ impl SlotVisitor for Collector {
                 blockhash: Some(meta.blockhash),
                 executed_transactions: meta.executed_transaction_count,
                 entries: entries.to_vec(),
+                failed_transactions: self.failed_transactions.clone(),
             },
         };
         assert!(self.slots.insert(slot, summary).is_none());
@@ -169,13 +209,14 @@ fn describe(summary: Option<&SlotSummary>) -> String {
     match summary {
         None => "absent".to_string(),
         Some(summary) => format!(
-            "kind={:?} parent_slot={:?} parent_blockhash={:?} blockhash={:?} txs={} entries={}",
+            "kind={:?} parent_slot={:?} parent_blockhash={:?} blockhash={:?} txs={} entries={} failed_transactions={:?}",
             summary.kind,
             summary.parent_slot,
             summary.parent_blockhash,
             summary.blockhash,
             summary.executed_transactions,
             summary.entries.len(),
+            summary.failed_transactions,
         ),
     }
 }

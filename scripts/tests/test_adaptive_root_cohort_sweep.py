@@ -1186,6 +1186,32 @@ class CrashSafetyTests(unittest.TestCase):
         )
         return controller, cohort, assignment
 
+    def test_import_waits_while_public_destination_is_claimed(self) -> None:
+        controller, _cohort, assignment = self.staged_import_controller()
+        public_claim = sweep.EpochClaim(
+            pid=1234,
+            start_time=5678,
+            first_epoch=67,
+            last_epoch=68,
+            output=controller.args.public_dir,
+            executable_argument=Path("/sealed/jetstreamer-node"),
+            unit="direct-public-writer.service",
+        )
+        with (
+            mock.patch.object(
+                sweep, "public_recovery_marker_present", return_value=False
+            ),
+            mock.patch.object(
+                sweep, "discover_epoch_claims", return_value=(public_claim,)
+            ),
+        ):
+            self.assertFalse(controller.import_one())
+
+        self.assertEqual(assignment["phase"], "staged")
+        self.assertIsNone(controller.state["import_owner"])
+        controller.require_live_source_receipt.assert_not_called()
+        controller.save.assert_not_called()
+
     def test_successful_import_is_durable_before_unit_retirement(self) -> None:
         controller, cohort, assignment = self.staged_import_controller()
         assignment["phase"] = "importing"

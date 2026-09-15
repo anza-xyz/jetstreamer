@@ -3143,6 +3143,7 @@ class Controller:
         if any(
             claim.overlaps(cohort)
             or claim.output == self.lanes[lane_name].output
+            or claim.output == self.args.public_dir
             for claim in claims
         ):
             return False

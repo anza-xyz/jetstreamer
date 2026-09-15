@@ -41,6 +41,12 @@ const MAX_SUPPORTED_SLOT_EXCLUSIVE: u64 = 39_744_000;
 const MAX_SUPPORTED_EPOCH: u64 = 91;
 const POH_THREADS_ENV: &str = "JETSTREAMER_HISTORICAL_POH_THREADS";
 const ABSOLUTE_MAX_POH_THREADS: usize = 256;
+// The validator runs AccountsBackgroundService alongside replay. This worker
+// has no BankForks service, so perform the same storage-only maintenance at
+// deterministic rooted-bank boundaries instead. At most one stale store is
+// considered per root; the recovery budget bounds how often another can run.
+const ACCOUNTS_CLEAN_INTERVAL_ROOTS: u64 = 100;
+const ACCOUNTS_SHRINK_RECOVERY_PER_ROOT: usize = 250;
 
 pub struct RuntimeState {
     bank: Arc<Bank>,
@@ -54,6 +60,8 @@ pub struct RuntimeState {
     leader_schedules: HashMap<u64, Vec<Pubkey>>,
     poh_pool: ThreadPool,
     enforce_candidate_range: bool,
+    last_accounts_clean_block_height: u64,
+    accounts_shrink_consumed_budget: usize,
 }
 
 pub enum ProcessEntriesError<E> {
@@ -126,6 +134,8 @@ impl RuntimeState {
                 leader_schedules: HashMap::new(),
                 poh_pool,
                 enforce_candidate_range: true,
+                last_accounts_clean_block_height: 0,
+                accounts_shrink_consumed_budget: 0,
             },
             initialized,
         ))
@@ -560,7 +570,40 @@ impl RuntimeState {
         // Bank::squash does not currently store accounts, but draining again
         // makes that implementation detail unable to silently lose a write.
         writes.extend(self.drain_writes(None)?);
+        self.maintain_accounts_storage()?;
         Ok(writes)
+    }
+
+    /// Mirror the pinned validator's AccountsBackgroundService without a
+    /// concurrent BankForks owner. These operations only reclaim physical
+    /// AppendVec state; preserving the global write cursor proves they did not
+    /// manufacture an account update that the archive would fail to observe.
+    fn maintain_accounts_storage(&mut self) -> Result<(), String> {
+        let write_version = self.bank.accounts().accounts_db.next_write_version();
+        self.bank.process_dead_slots();
+        self.accounts_shrink_consumed_budget = self.bank.process_stale_slot_with_budget(
+            self.accounts_shrink_consumed_budget,
+            ACCOUNTS_SHRINK_RECOVERY_PER_ROOT,
+        );
+
+        let block_height = self.bank.block_height();
+        if block_height.saturating_sub(self.last_accounts_clean_block_height)
+            > ACCOUNTS_CLEAN_INTERVAL_ROOTS
+        {
+            self.bank.clean_accounts();
+            self.last_accounts_clean_block_height = block_height;
+        }
+
+        let next_write_version = self.bank.accounts().accounts_db.next_write_version();
+        if next_write_version != write_version {
+            return Err(format!(
+                "accounts storage maintenance changed write version from {} to {} at slot {}",
+                write_version,
+                next_write_version,
+                self.bank.slot()
+            ));
+        }
+        Ok(())
     }
 
     fn drain_writes(&mut self, signature: Option<Vec<u8>>) -> Result<Vec<AccountWrite>, String> {
@@ -615,6 +658,8 @@ impl RuntimeState {
             leader_schedules: HashMap::new(),
             poh_pool: build_poh_pool().unwrap(),
             enforce_candidate_range: false,
+            last_accounts_clean_block_height: 0,
+            accounts_shrink_consumed_budget: 0,
         }
     }
 }
@@ -1815,7 +1860,7 @@ mod tests {
         assert_eq!(tick_processed.next_write_version, expected_write_version);
         assert_eq!(state.bank.get_balance(&preserved_key), 777);
 
-        for slot in 1..=16 {
+        for slot in 1..=101 {
             let tick = request_for(&state, slot, 0, 2, &[]);
             let processed = state.process_entry(tick).unwrap();
             assert!(processed.slot_complete);
@@ -1829,7 +1874,17 @@ mod tests {
             assert!(state.bank.parent().unwrap().parents().is_empty());
         }
 
-        let checkpoint = state.freeze_checkpoint(16).unwrap();
+        assert_eq!(state.last_accounts_clean_block_height, 0);
+        let storage_slots_before_clean = state
+            .bank
+            .accounts()
+            .accounts_db
+            .storage
+            .read()
+            .unwrap()
+            .0
+            .len();
+        let checkpoint = state.freeze_checkpoint(101).unwrap();
         for write in checkpoint.writes {
             assert_eq!(write.write_version, expected_write_version);
             expected_write_version += 1;
@@ -1837,6 +1892,17 @@ mod tests {
         assert_eq!(checkpoint.next_write_version, expected_write_version);
         assert!(state.bank.parents().is_empty());
         assert_eq!(state.bank.get_balance(&preserved_key), 777);
+        assert_eq!(state.last_accounts_clean_block_height, 101);
+        let storage_slots_after_clean = state
+            .bank
+            .accounts()
+            .accounts_db
+            .storage
+            .read()
+            .unwrap()
+            .0
+            .len();
+        assert!(storage_slots_after_clean < storage_slots_before_clean);
     }
 
     #[test]

@@ -80,6 +80,15 @@ SHA-NI is guarded by feature detection, every unsafe load/store operates on
 fixed-size owned arrays, and randomized tests cover optimized, paired, and
 forced-portable paths.
 
+The v1.2.32 and v1.3.19 workers also perform the storage-only duties that their
+validators normally delegated to `AccountsBackgroundService`. After a rooted
+bank is squashed and all observable writes are drained, the worker reclaims
+dead and stale AppendVec storage and periodically runs account cleaning. This
+maintenance is synchronous because the standalone worker has no concurrent
+`BankForks` owner. It fails closed if the global account write cursor changes,
+and tests preserve logical account state while proving that obsolete physical
+storage is actually removed.
+
 The narrow v1.1.15 envelope covers epoch 30; canonical metadata identifies
 v1.1.14 at its bootstrap and v1.1.15 at both trusted checkpoints, and those
 two tags have identical runtime source. It also restores mainnet's single

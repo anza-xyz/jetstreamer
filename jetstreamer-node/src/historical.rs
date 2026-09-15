@@ -99,6 +99,11 @@ const SOLANA_V1_1_23_TAG: &str = "v1.1.23";
 const SOLANA_V1_1_23_COMMIT: &str = "263fc25992ebae85e7ba2f176e9a066449489c3e";
 const SOLANA_V1_1_23_RUST_TOOLCHAIN: &str = "rustc 1.43.0 (4fb7144ed 2020-04-20)";
 const SOLANA_V1_1_23_TARGET: &str = "x86_64-unknown-linux-gnu";
+const SOLANA_V1_2_24_EPOCH67_PRE_CPI_BACKEND_ID: &str = "solana-v1.2.24-mainnet-epoch67-pre-cpi";
+const SOLANA_V1_2_24_EPOCH67_PRE_CPI_TAG: &str = "v1.2.24";
+const SOLANA_V1_2_24_EPOCH67_PRE_CPI_COMMIT: &str = "14bc62398944d6270698506d468cbeddc8513ccd";
+const SOLANA_V1_2_24_EPOCH67_PRE_CPI_RUST_TOOLCHAIN: &str = "rustc 1.43.0 (4fb7144ed 2020-04-20)";
+const SOLANA_V1_2_24_EPOCH67_PRE_CPI_TARGET: &str = "x86_64-unknown-linux-gnu";
 const SOLANA_V1_2_32_EPOCH68_TRANSITION_BACKEND_ID: &str =
     "solana-v1.2.32-mainnet-epoch68-transition";
 const SOLANA_V1_2_32_EPOCH68_TRANSITION_TAG: &str = "v1.2.32";
@@ -129,6 +134,7 @@ fn backend_supports_entry_batches(backend_id: &str) -> bool {
             | SOLANA_V1_0_23_BACKEND_ID
             | SOLANA_V1_1_15_BACKEND_ID
             | SOLANA_V1_1_23_BACKEND_ID
+            | SOLANA_V1_2_24_EPOCH67_PRE_CPI_BACKEND_ID
             | SOLANA_V1_2_32_EPOCH68_TRANSITION_BACKEND_ID
             | SOLANA_V1_2_32_BACKEND_ID
             | SOLANA_V1_3_19_BACKEND_ID
@@ -279,6 +285,16 @@ pub const SOLANA_V1_2_32_EPOCH68_TRANSITION_CANDIDATE: WorkerProfile = WorkerPro
     solana_commit: SOLANA_V1_2_32_EPOCH68_TRANSITION_COMMIT,
     rust_toolchain: SOLANA_V1_2_32_EPOCH68_TRANSITION_RUST_TOOLCHAIN,
     target: SOLANA_V1_2_32_EPOCH68_TRANSITION_TARGET,
+    required_genesis_hash: protocol::MAINNET_GENESIS_HASH,
+    snapshot_archive_extensions: &[".tar.bz2", ".tar.zst"],
+};
+
+pub const SOLANA_V1_2_24_EPOCH67_PRE_CPI_CANDIDATE: WorkerProfile = WorkerProfile {
+    backend_id: SOLANA_V1_2_24_EPOCH67_PRE_CPI_BACKEND_ID,
+    solana_tag: SOLANA_V1_2_24_EPOCH67_PRE_CPI_TAG,
+    solana_commit: SOLANA_V1_2_24_EPOCH67_PRE_CPI_COMMIT,
+    rust_toolchain: SOLANA_V1_2_24_EPOCH67_PRE_CPI_RUST_TOOLCHAIN,
+    target: SOLANA_V1_2_24_EPOCH67_PRE_CPI_TARGET,
     required_genesis_hash: protocol::MAINNET_GENESIS_HASH,
     snapshot_archive_extensions: &[".tar.bz2", ".tar.zst"],
 };
@@ -1303,9 +1319,8 @@ impl HistoricalRuntimeClient {
     }
 
     /// Process a bounded, canonically ordered entry batch in one lockstep RPC.
-    /// The v1.0.7 worker validates every entry and PoH segment before applying
-    /// the first bank mutation. Other historical profiles retain the original
-    /// one-entry protocol path and reject this API before sending a request.
+    /// Every registered batch-capable worker validates each entry and PoH
+    /// segment before applying the first bank mutation.
     #[allow(dead_code)]
     pub fn process_entries(
         &mut self,
@@ -1747,7 +1762,7 @@ impl HistoricalRuntimeClient {
         Ok(validated)
     }
 
-    /// Publish a canonical v1.0.7 snapshot from the immediately preceding
+    /// Publish a canonical handoff snapshot from the immediately preceding
     /// successful checkpoint. The one-use gate is also enforced by the worker.
     pub fn export_snapshot(
         &mut self,
@@ -3780,6 +3795,9 @@ mod tests {
         assert!(backend_supports_entry_batches(SOLANA_V1_0_23_BACKEND_ID));
         assert!(backend_supports_entry_batches(SOLANA_V1_1_23_BACKEND_ID));
         assert!(backend_supports_entry_batches(
+            SOLANA_V1_2_24_EPOCH67_PRE_CPI_BACKEND_ID
+        ));
+        assert!(backend_supports_entry_batches(
             SOLANA_V1_2_32_EPOCH68_TRANSITION_BACKEND_ID
         ));
         assert!(backend_supports_entry_batches(SOLANA_V1_2_32_BACKEND_ID));
@@ -5239,6 +5257,7 @@ mod tests {
         }
 
         for profile in [
+            SOLANA_V1_2_24_EPOCH67_PRE_CPI_CANDIDATE,
             SOLANA_V1_2_32_EPOCH68_TRANSITION_CANDIDATE,
             SOLANA_V1_2_32_CANDIDATE,
             SOLANA_V1_3_19_CANDIDATE,
@@ -5276,6 +5295,7 @@ mod tests {
             SOLANA_V1_0_18_CANDIDATE,
             SOLANA_V1_0_23_CANDIDATE,
             SOLANA_V1_1_23_CANDIDATE,
+            SOLANA_V1_2_24_EPOCH67_PRE_CPI_CANDIDATE,
             SOLANA_V1_2_32_EPOCH68_TRANSITION_CANDIDATE,
             SOLANA_V1_2_32_CANDIDATE,
             SOLANA_V1_3_19_CANDIDATE,

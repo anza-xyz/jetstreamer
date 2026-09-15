@@ -1,8 +1,8 @@
 use crate::{leader_schedule, poh_backend, snapshot};
 use jetstreamer_historical_protocol::{
     AccountWrite, Checkpoint, EntryProcessed, EntryRequest, Initialized, InitializedSource,
-    InstructionError as WireInstructionError, TransactionError as WireTransactionError,
-    TransactionOutcome, MAX_ENTRIES_PER_BATCH,
+    InstructionError as WireInstructionError, SnapshotExport,
+    TransactionError as WireTransactionError, TransactionOutcome, MAX_ENTRIES_PER_BATCH,
 };
 use rayon::{prelude::*, ThreadPool, ThreadPoolBuilder};
 use solana_merkle_tree::MerkleTree;
@@ -28,23 +28,17 @@ use std::{cmp, collections::HashMap, env, path::Path, sync::Arc};
 use tempfile::TempDir;
 
 const MAX_AGE_CORRECTION_EPOCH: u64 = 14;
-// This worker begins only from the canonical snapshot exported by the exact
-// v1.2.24 pre-CPI runtime at the last completed old-semantics slot. It uses
-// the v1.2.32 execution tree from the first behaviorally proven transition
-// slot onward and remains bounded by the epoch-68 terminal checkpoint.
-const MAINNET_CPI_ACTIVATION_SLOT: u64 = 29_371_188;
-const MIN_SUPPORTED_SNAPSHOT_SLOT: u64 = MAINNET_CPI_ACTIVATION_SLOT - 1;
-const MIN_SUPPORTED_ENTRY_SLOT: u64 = MAINNET_CPI_ACTIVATION_SLOT;
-const MAX_SUPPORTED_SLOT_EXCLUSIVE: u64 = 29_808_000;
-const MAX_SUPPORTED_EPOCH: u64 = 68;
+// A root-start proof shows that v1.2.24 is not canonical at the epoch-67
+// boundary. The first canonical state from which this exact runtime is proven
+// is the checkpoint at slot 29,186,735; it then matches through 29,371,187.
+// Bound both ends so this worker cannot stand in for either adjacent v1.2.32
+// span merely because all three decode the same snapshot format.
+const MIN_SUPPORTED_SNAPSHOT_SLOT: u64 = 29_186_735;
+const MIN_SUPPORTED_ENTRY_SLOT: u64 = MIN_SUPPORTED_SNAPSHOT_SLOT + 1;
+const MAX_SUPPORTED_SLOT_EXCLUSIVE: u64 = 29_371_188;
+const MAX_SUPPORTED_EPOCH: u64 = 67;
 const POH_THREADS_ENV: &str = "JETSTREAMER_HISTORICAL_POH_THREADS";
 const ABSOLUTE_MAX_POH_THREADS: usize = 256;
-// The validator runs AccountsBackgroundService alongside replay. This worker
-// has no BankForks service, so perform the same storage-only maintenance at
-// deterministic rooted-bank boundaries instead. At most one stale store is
-// considered per root; the recovery budget bounds how often another can run.
-const ACCOUNTS_CLEAN_INTERVAL_ROOTS: u64 = 100;
-const ACCOUNTS_SHRINK_RECOVERY_PER_ROOT: usize = 250;
 
 pub struct RuntimeState {
     bank: Arc<Bank>,
@@ -56,10 +50,15 @@ pub struct RuntimeState {
     last_entry_hash: Hash,
     tick_hash_count: u64,
     leader_schedules: HashMap<u64, Vec<Pubkey>>,
+    snapshot_export_seal: Option<SnapshotExportSeal>,
     poh_pool: ThreadPool,
     enforce_candidate_range: bool,
-    last_accounts_clean_block_height: u64,
-    accounts_shrink_consumed_budget: usize,
+}
+
+#[derive(Clone, Copy)]
+struct SnapshotExportSeal {
+    slot: u64,
+    accounts_hash: Hash,
 }
 
 pub enum ProcessEntriesError<E> {
@@ -103,7 +102,7 @@ impl RuntimeState {
             }
             jetstreamer_historical_protocol::InitialState::Genesis => {
                 return Err(format!(
-                    "Solana v1.2.32 epoch-68 transition worker requires a snapshot in {}..{}",
+                    "Solana v1.2.24 epoch-67 pre-CPI worker requires a snapshot in {}..{}",
                     MIN_SUPPORTED_SNAPSHOT_SLOT, MAX_SUPPORTED_SLOT_EXCLUSIVE
                 ));
             }
@@ -130,10 +129,9 @@ impl RuntimeState {
                 last_entry_hash,
                 tick_hash_count: 0,
                 leader_schedules: HashMap::new(),
+                snapshot_export_seal: None,
                 poh_pool,
                 enforce_candidate_range: true,
-                last_accounts_clean_block_height: 0,
-                accounts_shrink_consumed_budget: 0,
             },
             initialized,
         ))
@@ -142,6 +140,7 @@ impl RuntimeState {
     /// Preserve the original one-entry request surface while sharing exactly
     /// the same fail-closed preparation and commit path as a batch.
     pub fn process_entry(&mut self, request: EntryRequest) -> Result<EntryProcessed, String> {
+        self.snapshot_export_seal = None;
         let mut processed = self.process_entries(vec![request])?;
         Ok(processed.remove(0))
     }
@@ -173,6 +172,7 @@ impl RuntimeState {
     where
         F: FnMut(EntryProcessed) -> Result<(), E>,
     {
+        self.snapshot_export_seal = None;
         if requests.is_empty() {
             return Err(ProcessEntriesError::Runtime(
                 "entry batch must contain at least one entry".to_string(),
@@ -276,9 +276,42 @@ impl RuntimeState {
                 .enumerate()
                 .find(|&(_index, ref result)| result.is_err())
             {
+                let transaction = &transactions[index];
+                let programs = transaction
+                    .message
+                    .instructions
+                    .iter()
+                    .map(|instruction| {
+                        let key_index = usize::from(instruction.program_id_index);
+                        let key = transaction.message.account_keys.get(key_index);
+                        let state = key
+                            .and_then(|key| self.bank.get_account(key))
+                            .map(|account| {
+                                format!(
+                                    "present(executable={},owner={},lamports={},data_len={})",
+                                    account.executable,
+                                    account.owner,
+                                    account.lamports,
+                                    account.data.len()
+                                )
+                            });
+                        format!(
+                            "instruction_program_index={} key={:?} state={}",
+                            key_index,
+                            key,
+                            state.unwrap_or_else(|| "missing".to_string())
+                        )
+                    })
+                    .collect::<Vec<_>>();
                 return Err(format!(
-                    "entry fee collection failed for transaction {}: {:?}",
-                    index, error
+                    "entry fee collection failed for transaction {}: {:?}; signature={:?}; payer={:?}; recent_blockhash={}; processing_result={:?}; programs=[{}]",
+                    index,
+                    error,
+                    transaction.signatures.get(0),
+                    transaction.message.account_keys.get(0),
+                    transaction.message.recent_blockhash,
+                    results.processing_results[index],
+                    programs.join(", ")
                 ));
             }
             for (index, transaction) in transactions.iter().enumerate() {
@@ -491,6 +524,7 @@ impl RuntimeState {
     }
 
     pub fn freeze_checkpoint(&mut self, expected_slot: u64) -> Result<Checkpoint, String> {
+        self.snapshot_export_seal = None;
         if expected_slot != self.bank.slot() {
             return Err(format!(
                 "checkpoint requested for slot {}, current bank is {}",
@@ -515,7 +549,7 @@ impl RuntimeState {
         }
         let writes = self.freeze_root_and_drain()?;
         let accounts_hash = self.bank.update_accounts_hash();
-        Ok(Checkpoint {
+        let checkpoint = Checkpoint {
             slot: self.bank.slot(),
             bank_hash: self.bank.hash().as_ref().to_vec(),
             accounts_hash: accounts_hash.as_ref().to_vec(),
@@ -526,6 +560,69 @@ impl RuntimeState {
             slot_complete: self.bank.is_complete(),
             writes,
             next_write_version: self.write_cursor,
+        };
+        self.snapshot_export_seal = Some(SnapshotExportSeal {
+            slot: checkpoint.slot,
+            accounts_hash,
+        });
+        Ok(checkpoint)
+    }
+
+    pub fn invalidate_snapshot_export(&mut self) {
+        self.snapshot_export_seal = None;
+    }
+
+    pub fn export_snapshot(
+        &mut self,
+        slot: u64,
+        output_directory: &str,
+        expected_accounts_hash: &[u8],
+    ) -> Result<SnapshotExport, String> {
+        let seal = self.snapshot_export_seal.take().ok_or_else(|| {
+            "snapshot export requires the immediately preceding successful checkpoint".to_string()
+        })?;
+        if seal.slot != slot || self.bank.slot() != slot {
+            return Err(format!(
+                "snapshot export slot {} does not match checkpoint slot {} and bank slot {}",
+                slot,
+                seal.slot,
+                self.bank.slot()
+            ));
+        }
+        if expected_accounts_hash.len() != 32 {
+            return Err(format!(
+                "expected accounts hash has {} bytes, expected 32",
+                expected_accounts_hash.len()
+            ));
+        }
+        let expected_accounts_hash = Hash::new(expected_accounts_hash);
+        if expected_accounts_hash != seal.accounts_hash {
+            return Err(format!(
+                "snapshot export hash {} does not match checkpoint hash {}",
+                expected_accounts_hash, seal.accounts_hash
+            ));
+        }
+        let exported = snapshot::export_archive(
+            &self.bank,
+            Path::new(output_directory),
+            expected_accounts_hash,
+        )?;
+        let archive_path = exported
+            .archive_path
+            .to_str()
+            .ok_or_else(|| {
+                format!(
+                    "snapshot archive path is not UTF-8: {}",
+                    exported.archive_path.display()
+                )
+            })?
+            .to_string();
+        Ok(SnapshotExport {
+            slot,
+            archive_path,
+            accounts_hash: exported.accounts_hash.as_ref().to_vec(),
+            archive_size: exported.archive_size,
+            archive_sha256: exported.archive_sha256.to_vec(),
         })
     }
 
@@ -568,40 +665,7 @@ impl RuntimeState {
         // Bank::squash does not currently store accounts, but draining again
         // makes that implementation detail unable to silently lose a write.
         writes.extend(self.drain_writes(None)?);
-        self.maintain_accounts_storage()?;
         Ok(writes)
-    }
-
-    /// Mirror the pinned validator's AccountsBackgroundService without a
-    /// concurrent BankForks owner. These operations only reclaim physical
-    /// AppendVec state; preserving the global write cursor proves they did not
-    /// manufacture an account update that the archive would fail to observe.
-    fn maintain_accounts_storage(&mut self) -> Result<(), String> {
-        let write_version = self.bank.accounts().accounts_db.next_write_version();
-        self.bank.process_dead_slots();
-        self.accounts_shrink_consumed_budget = self.bank.process_stale_slot_with_budget(
-            self.accounts_shrink_consumed_budget,
-            ACCOUNTS_SHRINK_RECOVERY_PER_ROOT,
-        );
-
-        let block_height = self.bank.block_height();
-        if block_height.saturating_sub(self.last_accounts_clean_block_height)
-            > ACCOUNTS_CLEAN_INTERVAL_ROOTS
-        {
-            self.bank.clean_accounts();
-            self.last_accounts_clean_block_height = block_height;
-        }
-
-        let next_write_version = self.bank.accounts().accounts_db.next_write_version();
-        if next_write_version != write_version {
-            return Err(format!(
-                "accounts storage maintenance changed write version from {} to {} at slot {}",
-                write_version,
-                next_write_version,
-                self.bank.slot()
-            ));
-        }
-        Ok(())
     }
 
     fn drain_writes(&mut self, signature: Option<Vec<u8>>) -> Result<Vec<AccountWrite>, String> {
@@ -654,10 +718,9 @@ impl RuntimeState {
             last_entry_hash,
             tick_hash_count: 0,
             leader_schedules: HashMap::new(),
+            snapshot_export_seal: None,
             poh_pool: build_poh_pool().unwrap(),
             enforce_candidate_range: false,
-            last_accounts_clean_block_height: 0,
-            accounts_shrink_consumed_budget: 0,
         }
     }
 }
@@ -665,7 +728,7 @@ impl RuntimeState {
 fn validate_candidate_snapshot_slot(slot: u64) -> Result<(), String> {
     if slot < MIN_SUPPORTED_SNAPSHOT_SLOT || slot >= MAX_SUPPORTED_SLOT_EXCLUSIVE {
         return Err(format!(
-            "Solana v1.2.32 epoch-68 transition snapshot slot {} is outside {}..{}",
+            "Solana v1.2.24 epoch-67 pre-CPI snapshot slot {} is outside {}..{}",
             slot, MIN_SUPPORTED_SNAPSHOT_SLOT, MAX_SUPPORTED_SLOT_EXCLUSIVE
         ));
     }
@@ -675,7 +738,7 @@ fn validate_candidate_snapshot_slot(slot: u64) -> Result<(), String> {
 fn validate_candidate_entry_slot(slot: u64) -> Result<(), String> {
     if slot < MIN_SUPPORTED_ENTRY_SLOT || slot >= MAX_SUPPORTED_SLOT_EXCLUSIVE {
         return Err(format!(
-            "Solana v1.2.32 epoch-68 transition entry slot {} is outside {}..{}",
+            "Solana v1.2.24 epoch-67 pre-CPI entry slot {} is outside {}..{}",
             slot, MIN_SUPPORTED_ENTRY_SLOT, MAX_SUPPORTED_SLOT_EXCLUSIVE
         ));
     }
@@ -821,7 +884,7 @@ struct EntryValidation {
     next_tick_hash_count: u64,
 }
 
-/// Exact equivalent of v1.2.32 ledger::entry::next_hash. Pulling in
+/// Exact equivalent of v1.2.24 ledger::entry::next_hash. Pulling in
 /// the full ledger crate would also pull RocksDB into the isolated worker.
 /// The fixed-width backend bypasses generic digest buffering and dispatches
 /// to SHA-NI at runtime while retaining a portable software fallback.
@@ -945,13 +1008,13 @@ fn validate_mainnet_genesis_programs(genesis: &GenesisConfig) -> Result<(), Stri
 }
 
 /// Snapshot serde intentionally drops the in-memory native dispatch table.
-/// Restore it with the exact v1.2.32 processors linked into this worker, so
+/// Restore it with the exact v1.2.24 processors linked into this worker, so
 /// replay never depends on deployment-adjacent, dynamically loaded `.so`s.
 fn restore_mainnet_runtime_hooks(bank: &mut Bank, genesis: &GenesisConfig) -> Result<(), String> {
     validate_mainnet_genesis_programs(genesis)?;
     // BPF activation at mainnet epoch 34 persists as an account, while the
     // loader function pointer is serde-skipped. Validate that persisted
-    // identity before binding the exact statically linked v1.2.32 loader.
+    // identity before binding the exact statically linked v1.2.24 loader.
     let bpf_loader_account = bank
         .get_account(&solana_sdk::bpf_loader::id())
         .ok_or_else(|| {
@@ -968,18 +1031,18 @@ fn restore_mainnet_runtime_hooks(bank: &mut Bank, genesis: &GenesisConfig) -> Re
         solana_bpf_loader_program::process_instruction,
     );
 
-    // `MessageProcessor::is_cross_program_supported` is serde-skipped. The
-    // canonical epoch-67 transaction stream proves the gate was still closed
-    // through slot 29,371,187. The vendored child-bank transition tests the
-    // first behaviorally admissible slot as the restart boundary.
-    bank.set_cross_program_support(bank.slot() >= MAINNET_CPI_ACTIVATION_SLOT);
+    // v1.2.24's serde-skipped flag restores as false. Keep it false across the
+    // epoch-67 entry boundary as observed by the independently checkpointed
+    // canonical chain. The worker rejects every slot at or after the runtime
+    // handoff, so this callback cannot silently carry old semantics forward.
+    bank.set_cross_program_support(false);
     bank.set_entered_epoch_callback(Box::new(|bank| {
         assert!(
             bank.epoch() <= MAX_SUPPORTED_EPOCH,
-            "Solana v1.2.32 epoch-68 transition candidate entered unsupported epoch {}",
+            "Solana v1.2.24 epoch-67 pre-CPI worker entered unsupported epoch {}",
             bank.epoch()
         );
-        bank.set_cross_program_support(bank.slot() >= MAINNET_CPI_ACTIVATION_SLOT);
+        bank.set_cross_program_support(false);
     }));
     Ok(())
 }
@@ -1120,7 +1183,6 @@ mod tests {
     use solana_runtime::genesis_utils::create_genesis_config_with_leader;
     use solana_sdk::{
         account::Account,
-        epoch_schedule::EpochSchedule,
         hash::hashv,
         instruction::{AccountMeta, Instruction},
         signature::{Keypair, Signer},
@@ -1170,13 +1232,11 @@ mod tests {
     #[test]
     fn candidate_range_is_closed_at_both_ends() {
         assert!(validate_candidate_snapshot_slot(MIN_SUPPORTED_SNAPSHOT_SLOT).is_ok());
-        assert!(validate_candidate_snapshot_slot(29_807_950).is_ok());
         assert!(validate_candidate_snapshot_slot(MAX_SUPPORTED_SLOT_EXCLUSIVE - 1).is_ok());
         assert!(validate_candidate_snapshot_slot(MIN_SUPPORTED_SNAPSHOT_SLOT - 1).is_err());
         assert!(validate_candidate_snapshot_slot(MAX_SUPPORTED_SLOT_EXCLUSIVE).is_err());
 
         assert!(validate_candidate_entry_slot(MIN_SUPPORTED_ENTRY_SLOT).is_ok());
-        assert!(validate_candidate_entry_slot(29_807_950).is_ok());
         assert!(validate_candidate_entry_slot(MAX_SUPPORTED_SLOT_EXCLUSIVE - 1).is_ok());
         assert!(validate_candidate_entry_slot(MIN_SUPPORTED_ENTRY_SLOT - 1).is_err());
         assert!(validate_candidate_entry_slot(MAX_SUPPORTED_SLOT_EXCLUSIVE).is_err());
@@ -1321,40 +1381,39 @@ mod tests {
     }
 
     #[test]
-    fn restored_epoch_67_activates_cpi_at_the_candidate_restart_slot() {
+    fn restored_epoch67_bank_keeps_cpi_disabled_at_the_epoch_boundary() {
         let leader = Pubkey::new_from_array([7; 32]);
         let mut genesis = create_genesis_config_with_leader(1_000_000, &leader, 500_000);
         set_exact_mainnet_native_programs(&mut genesis.genesis_config);
-        genesis.genesis_config.epoch_schedule = EpochSchedule::custom(432_000, 432_000, false);
         let state_dir = snapshot::private_state_dir(None).unwrap();
         let account_paths = snapshot::private_account_paths(&state_dir).unwrap();
         let bank0 = Bank::new_with_paths(&genesis.genesis_config, account_paths, &[]);
         bank0.add_native_program("solana_bpf_loader_program", &solana_sdk::bpf_loader::id());
 
         // A deserialized MessageProcessor defaults this serde-skipped flag to
-        // true. Prove restoration closes the gate before the inferred restart,
-        // that the final pre-restart child inherits it, and that the next child
-        // activates the v1.2.26 hotfix within epoch 67.
-        let mut restored = bank0;
-        assert!(restored.cross_program_support());
-        restore_mainnet_runtime_hooks(&mut restored, &genesis.genesis_config).unwrap();
-        assert!(!restored.cross_program_support());
+        // true. Construct the same pre-restoration state, then prove the worker
+        // corrects it immediately and keeps the observed pre-CPI state when
+        // epoch 67 is entered.
+        let epoch_66_slot = genesis
+            .genesis_config
+            .epoch_schedule
+            .get_first_slot_in_epoch(66);
+        let mut bank66 = Bank::new_from_parent(&Arc::new(bank0), &leader, epoch_66_slot);
+        bank66.set_cross_program_support(true);
+        assert!(bank66.cross_program_support());
+        restore_mainnet_runtime_hooks(&mut bank66, &genesis.genesis_config).unwrap();
+        assert!(!bank66.cross_program_support());
 
-        let before = Arc::new(Bank::new_from_parent(
-            &Arc::new(restored),
-            &leader,
-            MAINNET_CPI_ACTIVATION_SLOT - 1,
-        ));
-        assert_eq!(before.epoch(), 67);
-        assert!(!before.cross_program_support());
-
-        let activated = Bank::new_from_parent(&before, &leader, MAINNET_CPI_ACTIVATION_SLOT);
-        assert_eq!(activated.epoch(), 67);
-        assert!(activated.cross_program_support());
+        let epoch_67_slot = genesis
+            .genesis_config
+            .epoch_schedule
+            .get_first_slot_in_epoch(67);
+        let bank67 = Bank::new_from_parent(&Arc::new(bank66), &leader, epoch_67_slot);
+        assert!(!bank67.cross_program_support());
     }
 
     #[test]
-    fn v1_2_32_rejects_old_form_vote_initialization_without_node_instruction_account() {
+    fn v1_2_24_rejects_old_form_vote_initialization_without_node_instruction_account() {
         let leader = Pubkey::new_from_array([7; 32]);
         let mut genesis = create_genesis_config_with_leader(1_000_000, &leader, 500_000);
         set_exact_mainnet_native_programs(&mut genesis.genesis_config);
@@ -1830,6 +1889,96 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_export_is_one_use_no_clobber_and_restore_compatible() {
+        use sha2::Digest;
+
+        let leader = Pubkey::new_from_array([7; 32]);
+        let mut genesis = create_genesis_config_with_leader(1_000_000, &leader, 500_000);
+        genesis.genesis_config.ticks_per_slot = 1;
+        genesis.genesis_config.poh_config.hashes_per_tick = Some(2);
+        let genesis_config = genesis.genesis_config.clone();
+        let state_dir = snapshot::private_state_dir(None).unwrap();
+        let account_paths = snapshot::private_account_paths(&state_dir).unwrap();
+        let bank = Bank::new_with_paths(&genesis_config, account_paths, &[]);
+        let mut state = RuntimeState::from_test_bank(bank, false, state_dir);
+
+        let transaction = system_transaction::transfer(
+            &genesis.mint_keypair,
+            &Pubkey::new_from_array([55; 32]),
+            1,
+            state.bank.last_blockhash(),
+        );
+        let signature = transaction.signatures[0];
+        let transaction_entry = request_for(&state, 0, 0, 1, &[transaction]);
+        state.process_entry(transaction_entry).unwrap();
+        let tick = request_for(&state, 0, 1, 1, &[]);
+        state.process_entry(tick).unwrap();
+        let checkpoint = state.freeze_checkpoint(0).unwrap();
+        let output = tempfile::tempdir().unwrap();
+
+        let mut wrong_hash = checkpoint.accounts_hash.clone();
+        wrong_hash[0] ^= 1;
+        assert!(state
+            .export_snapshot(0, output.path().to_str().unwrap(), &wrong_hash)
+            .unwrap_err()
+            .contains("does not match checkpoint hash"));
+        assert!(state
+            .export_snapshot(
+                0,
+                output.path().to_str().unwrap(),
+                &checkpoint.accounts_hash,
+            )
+            .unwrap_err()
+            .contains("immediately preceding successful checkpoint"));
+
+        let checkpoint = state.freeze_checkpoint(0).unwrap();
+        let exported = state
+            .export_snapshot(
+                0,
+                output.path().to_str().unwrap(),
+                &checkpoint.accounts_hash,
+            )
+            .unwrap();
+        assert_eq!(exported.slot, 0);
+        assert_eq!(exported.accounts_hash, checkpoint.accounts_hash);
+        let archive_path = Path::new(&exported.archive_path);
+        assert_eq!(
+            std::fs::metadata(archive_path).unwrap().len(),
+            exported.archive_size
+        );
+        let archive_bytes = std::fs::read(archive_path).unwrap();
+        let mut archive_hasher = sha2::Sha256::new();
+        archive_hasher.input(&archive_bytes);
+        assert_eq!(
+            exported.archive_sha256.as_slice(),
+            archive_hasher.result().as_slice()
+        );
+
+        let restore_state = snapshot::private_state_dir(None).unwrap();
+        let restored =
+            snapshot::load_archive(archive_path, &restore_state, &genesis_config).unwrap();
+        assert_eq!(restored.bank.slot(), 0);
+        assert_eq!(
+            restored.expected_accounts_hash.as_ref(),
+            checkpoint.accounts_hash.as_slice()
+        );
+        assert!(restored.bank.verify_snapshot_bank());
+        assert_eq!(restored.bank.src.roots(), state.bank.src.roots());
+        assert_eq!(restored.bank.get_signature_status(&signature), Some(Ok(())));
+
+        let checkpoint = state.freeze_checkpoint(0).unwrap();
+        assert!(state
+            .export_snapshot(
+                0,
+                output.path().to_str().unwrap(),
+                &checkpoint.accounts_hash,
+            )
+            .unwrap_err()
+            .contains("refusing to replace existing snapshot archive"));
+        assert!(archive_path.is_file());
+    }
+
+    #[test]
     fn completed_slots_are_squashed_without_losing_state_or_writes() {
         let (mut state, mint_keypair) = test_state(1, Some(2));
         let preserved_key = Pubkey::new_from_array([42; 32]);
@@ -1861,7 +2010,7 @@ mod tests {
         assert_eq!(tick_processed.next_write_version, expected_write_version);
         assert_eq!(state.bank.get_balance(&preserved_key), 777);
 
-        for slot in 1..=101 {
+        for slot in 1..=16 {
             let tick = request_for(&state, slot, 0, 2, &[]);
             let processed = state.process_entry(tick).unwrap();
             assert!(processed.slot_complete);
@@ -1875,17 +2024,7 @@ mod tests {
             assert!(state.bank.parent().unwrap().parents().is_empty());
         }
 
-        assert_eq!(state.last_accounts_clean_block_height, 0);
-        let storage_slots_before_clean = state
-            .bank
-            .accounts()
-            .accounts_db
-            .storage
-            .read()
-            .unwrap()
-            .0
-            .len();
-        let checkpoint = state.freeze_checkpoint(101).unwrap();
+        let checkpoint = state.freeze_checkpoint(16).unwrap();
         for write in checkpoint.writes {
             assert_eq!(write.write_version, expected_write_version);
             expected_write_version += 1;
@@ -1893,17 +2032,6 @@ mod tests {
         assert_eq!(checkpoint.next_write_version, expected_write_version);
         assert!(state.bank.parents().is_empty());
         assert_eq!(state.bank.get_balance(&preserved_key), 777);
-        assert_eq!(state.last_accounts_clean_block_height, 101);
-        let storage_slots_after_clean = state
-            .bank
-            .accounts()
-            .accounts_db
-            .storage
-            .read()
-            .unwrap()
-            .0
-            .len();
-        assert!(storage_slots_after_clean < storage_slots_before_clean);
     }
 
     #[test]
@@ -1944,9 +2072,9 @@ mod tests {
 
     #[test]
     #[ignore]
-    fn initializes_and_checkpoints_v1_2_32_epoch68_transition_snapshot() {
-        let archive = std::env::var("JETSTREAMER_V1_2_32_EPOCH68_TRANSITION_SNAPSHOT")
-            .expect("set JETSTREAMER_V1_2_32_EPOCH68_TRANSITION_SNAPSHOT");
+    fn initializes_and_checkpoints_v1_2_24_boundary_snapshot() {
+        let archive = std::env::var("JETSTREAMER_SNAPSHOT_28943975")
+            .expect("set JETSTREAMER_SNAPSHOT_28943975");
         let ledger =
             std::env::var("JETSTREAMER_MAINNET_LEDGER").expect("set JETSTREAMER_MAINNET_LEDGER");
         let (mut state, initialized) = RuntimeState::initialize(
@@ -1964,13 +2092,10 @@ mod tests {
             } => expected_accounts_hash.clone(),
             InitializedSource::Genesis => unreachable!(),
         };
-        // Accept any snapshot inside this worker's deliberately bounded
-        // compatibility window.  This makes the ignored integration test
-        // useful for inspecting both the cohort bootstrap and its independent
-        // terminal checkpoint without weakening production admission.
-        let initialized_slot = initialized.slot;
-        validate_candidate_snapshot_slot(initialized_slot).unwrap();
-        let checkpoint = state.freeze_checkpoint(initialized_slot).unwrap();
+        assert_eq!(initialized.slot, MIN_SUPPORTED_SNAPSHOT_SLOT);
+        let checkpoint = state
+            .freeze_checkpoint(MIN_SUPPORTED_SNAPSHOT_SLOT)
+            .unwrap();
         println!(
             "initialized slot={} last_blockhash={} next_write_version={}",
             initialized.slot,

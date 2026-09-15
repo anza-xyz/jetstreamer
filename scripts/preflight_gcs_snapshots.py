@@ -862,6 +862,11 @@ def build_argument_parser() -> argparse.ArgumentParser:
         default=LOCAL_ROOT,
         help=f"directory checked for selected archives (default: {LOCAL_ROOT})",
     )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        help="create the JSON report at this path instead of writing it to stdout",
+    )
     parser.add_argument("--first-epoch", type=int, default=FIRST_EPOCH)
     parser.add_argument("--last-epoch", type=int, default=LAST_EPOCH)
     return parser
@@ -894,7 +899,31 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "selected_bootstrap_bytes": storage["selected_bootstrap_bytes"],
             "storage": storage,
         }
-        print(json.dumps(report, indent=2, sort_keys=True))
+        encoded_report = json.dumps(report, indent=2, sort_keys=True) + "\n"
+        if arguments.output is None:
+            sys.stdout.write(encoded_report)
+        else:
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+            try:
+                descriptor = os.open(arguments.output, flags, 0o600)
+            except OSError as error:
+                raise PreflightError(
+                    f"cannot create preflight report {arguments.output}: {error}"
+                ) from error
+            try:
+                with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+                    output.write(encoded_report)
+                    output.flush()
+                    os.fsync(output.fileno())
+            except (OSError, UnicodeError) as error:
+                try:
+                    arguments.output.unlink()
+                except OSError:
+                    pass
+                raise PreflightError(
+                    f"cannot write preflight report {arguments.output}: {error}"
+                ) from error
         return 0 if storage["preflight_ok"] else 2
     except PreflightError as error:
         print(f"error: {error}", file=sys.stderr)

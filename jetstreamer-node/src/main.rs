@@ -5373,9 +5373,10 @@ fn validate_staged_cohort_recovery_mode(
 }
 
 /// Proves that an epoch range can be replayed as one uninterrupted
-/// root-checkpoint cohort. Every member must use the same runtime descriptor.
-/// Multi-epoch cohorts additionally require that descriptor's live state
-/// handoff support.
+/// root-checkpoint cohort. Runtime changes are accepted only at a registry-
+/// committed snapshot handoff; ordinary snapshot-isolated era boundaries
+/// remain invalid. The returned selection is the terminal runtime and is the
+/// stable manifest identity for the cohort.
 fn root_checkpoint_cohort_runtime(
     start_epoch: u64,
     end_epoch: u64,
@@ -5384,46 +5385,52 @@ fn root_checkpoint_cohort_runtime(
     if start_epoch == 0 || start_epoch > end_epoch {
         return Err("a root-checkpoint cohort requires one or more nonzero epochs".to_string());
     }
-    let mut cohort_selection: Option<compatibility::RuntimeSelection> = None;
+    let mut previous_selection: Option<compatibility::RuntimeSelection> = None;
+    let mut terminal_selection: Option<compatibility::RuntimeSelection> = None;
     for epoch in start_epoch..=end_epoch {
         let (start, end_inclusive) = epoch_to_slot_range(epoch);
         let spans = compatibility::plan_runtime_spans(
             start..end_inclusive.saturating_add(1),
             allow_candidate_runtime,
         )?;
-        if spans.len() != 1 {
-            return Err(format!(
-                "root-checkpoint cohort epoch {epoch} crosses a runtime boundary"
-            ));
+        for span in &spans {
+            let selection = runtime_span_selection(span)?;
+            if selection.backend == compatibility::RuntimeBackend::AgaveV3
+                || selection.descriptor.worker.is_none()
+                || selection.descriptor.bootstrap.loader
+                    != compatibility::BootstrapStateLoader::HistoricalWorkerSnapshotArchive
+            {
+                return Err(format!(
+                    "root-checkpoint cohorts require an isolated historical Solana worker; epoch {epoch} selected {}",
+                    selection.descriptor.identity.name
+                ));
+            }
+            if let Some(previous) = previous_selection {
+                if std::ptr::eq(previous.descriptor, selection.descriptor) {
+                    if span.slots.start == start
+                        && epoch > start_epoch
+                        && !selection.descriptor.permits_live_epoch_handoff()
+                    {
+                        return Err(format!(
+                            "runtime profile {} does not permit the live state handoff required by a root-checkpoint cohort",
+                            selection.descriptor.identity.name
+                        ));
+                    }
+                } else if span.handoff.is_none_or(|handoff| {
+                    !std::ptr::eq(handoff.source, previous.descriptor)
+                        || !std::ptr::eq(handoff.destination, selection.descriptor)
+                }) {
+                    return Err(format!(
+                        "root-checkpoint cohort changes runtime at epoch {epoch} without a canonical handoff: {} to {}",
+                        previous.backend, selection.backend
+                    ));
+                }
+            }
+            previous_selection = Some(selection);
+            terminal_selection = Some(selection);
         }
-        let selection = runtime_span_selection(&spans[0])?;
-        if selection.backend == compatibility::RuntimeBackend::AgaveV3
-            || selection.descriptor.worker.is_none()
-            || selection.descriptor.bootstrap.loader
-                != compatibility::BootstrapStateLoader::HistoricalWorkerSnapshotArchive
-        {
-            return Err(format!(
-                "root-checkpoint cohorts require an isolated historical Solana worker; epoch {epoch} selected {}",
-                selection.descriptor.identity.name
-            ));
-        }
-        if let Some(first) = cohort_selection
-            && !std::ptr::eq(first.descriptor, selection.descriptor)
-        {
-            return Err(format!(
-                "root-checkpoint cohort changes runtime at epoch {epoch}: {} to {}",
-                first.backend, selection.backend
-            ));
-        }
-        if start_epoch < end_epoch && !selection.descriptor.permits_live_epoch_handoff() {
-            return Err(format!(
-                "runtime profile {} does not permit the live state handoff required by a root-checkpoint cohort",
-                selection.descriptor.identity.name
-            ));
-        }
-        cohort_selection = Some(selection);
     }
-    Ok(cohort_selection.expect("nonempty cohort has a runtime"))
+    Ok(terminal_selection.expect("nonempty cohort has a runtime"))
 }
 
 const COHORT_MANIFEST_SCHEMA: &str = "jetstreamer-gcs-snapshot-preflight-v2";
@@ -6855,6 +6862,9 @@ fn historical_worker_profile(
         compatibility::RuntimeBackend::SolanaV1_0_24 => historical::SOLANA_V1_0_24_CANDIDATE,
         compatibility::RuntimeBackend::SolanaV1_1_15 => historical::SOLANA_V1_1_15_CANDIDATE,
         compatibility::RuntimeBackend::SolanaV1_1_23 => historical::SOLANA_V1_1_23_CANDIDATE,
+        compatibility::RuntimeBackend::SolanaV1_2_24Epoch67PreCpi => {
+            historical::SOLANA_V1_2_24_EPOCH67_PRE_CPI_CANDIDATE
+        }
         compatibility::RuntimeBackend::SolanaV1_2_32Epoch68Transition => {
             historical::SOLANA_V1_2_32_EPOCH68_TRANSITION_CANDIDATE
         }
@@ -8732,24 +8742,71 @@ struct CompletedCohortEpoch {
     epoch: u64,
     staged_output: PathBuf,
     final_output: PathBuf,
-    historical_evidence: historical_replay::HistoricalReplayEvidence,
+    evidence: CohortEpochEvidence,
     archive_chain: ArchiveChainEvidence,
     validated: jetstreamer_node::archive_checksum::ValidatedArchiveFile,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CohortEpochEvidence {
+    bootstrap: historical_replay::HistoricalCheckpointSummary,
+    terminal: historical_replay::HistoricalCheckpointSummary,
+    /// Present for one uninterrupted worker segment. A mixed-runtime epoch
+    /// has independently versioned source ranges whose normalization is
+    /// committed by V3 archive provenance instead.
+    emitted_write_versions: Option<std::ops::Range<u64>>,
+}
+
+impl From<historical_replay::HistoricalReplayEvidence> for CohortEpochEvidence {
+    fn from(evidence: historical_replay::HistoricalReplayEvidence) -> Self {
+        Self {
+            bootstrap: evidence.bootstrap,
+            terminal: evidence.terminal,
+            emitted_write_versions: Some(evidence.emitted_write_versions),
+        }
+    }
 }
 
 struct RecoveredCohortEpoch {
     epoch: u64,
     source_archive: PathBuf,
     destination_archive: PathBuf,
-    provenance: ArchiveProvenanceV1,
+    provenance: CohortArchiveProvenance,
     archive_chain: ArchiveChainEvidence,
     validated: jetstreamer_node::archive_checksum::ValidatedArchiveFile,
 }
 
-fn read_bound_single_runtime_provenance(
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CohortArchiveProvenance {
+    bootstrap_state_kind: BootstrapStateKind,
+    bootstrap_slot: Slot,
+    bootstrap_state_hash: Hash,
+}
+
+fn cohort_archive_provenance(recorded: &ArchiveProvenance) -> CohortArchiveProvenance {
+    match recorded {
+        ArchiveProvenance::V1(single) => CohortArchiveProvenance {
+            bootstrap_state_kind: single.bootstrap_state_kind,
+            bootstrap_slot: single.bootstrap_slot,
+            bootstrap_state_hash: single.bootstrap_state_hash,
+        },
+        ArchiveProvenance::V2(single) => CohortArchiveProvenance {
+            bootstrap_state_kind: single.base.bootstrap_state_kind,
+            bootstrap_slot: single.base.bootstrap_slot,
+            bootstrap_state_hash: single.base.bootstrap_state_hash,
+        },
+        ArchiveProvenance::V3(multi) => CohortArchiveProvenance {
+            bootstrap_state_kind: multi.bootstrap_state_kind,
+            bootstrap_slot: multi.bootstrap_state.slot,
+            bootstrap_state_hash: multi.bootstrap_state.hash,
+        },
+    }
+}
+
+fn read_bound_cohort_provenance(
     path: &Path,
     validated: jetstreamer_node::archive_checksum::ValidatedArchiveFile,
-) -> Result<ArchiveProvenanceV1, String> {
+) -> Result<CohortArchiveProvenance, String> {
     let file =
         jetstreamer_node::archive_checksum::open_regular_nofollow(path).map_err(|error| {
             format!(
@@ -8778,16 +8835,11 @@ fn read_bound_single_runtime_provenance(
         .map_err(|error| format!("invalid cohort archive provenance: {error}"))?
         .ok_or_else(|| {
             format!(
-                "cohort archive {} has no single-runtime provenance",
+                "cohort archive {} has no runtime provenance",
                 path.display()
             )
         })?;
-    let provenance = recorded.single_runtime_v1().cloned().ok_or_else(|| {
-        format!(
-            "cohort archive {} has no single-runtime provenance",
-            path.display()
-        )
-    })?;
+    let provenance = cohort_archive_provenance(&recorded);
     if !jetstreamer_node::archive_checksum::path_matches_archive_identity(path, validated.identity)
         .map_err(|error| {
             format!(
@@ -8846,8 +8898,8 @@ fn root_checkpoint_gate_evidence(
             .iter()
             .map(|member| cohort_publication::RootCheckpointGateMember {
                 epoch: member.epoch,
-                bootstrap: checkpoint_receipt_summary(&member.historical_evidence.bootstrap),
-                terminal: checkpoint_receipt_summary(&member.historical_evidence.terminal),
+                bootstrap: checkpoint_receipt_summary(&member.evidence.bootstrap),
+                terminal: checkpoint_receipt_summary(&member.evidence.terminal),
             })
             .collect(),
     }
@@ -9061,10 +9113,10 @@ fn recover_staged_root_cohort_only(
             .join(format!("epoch-{}.jet", member.epoch));
         require_recovery_destination_namespace_absent(&destination_archive)?;
         let mut archive_chain = ArchiveChainEvidence::default();
-        let validated = validated_epoch_archive(
+        let validated = validated_cohort_epoch_archive(
             &member.archive_path,
             member.epoch,
-            selection,
+            selection.admission == compatibility::AdmissionLevel::Candidate,
             Some(&shutdown),
             Some(&mut archive_chain),
         )?
@@ -9080,7 +9132,7 @@ fn recover_staged_root_cohort_only(
                 member.epoch
             ));
         }
-        let provenance = read_bound_single_runtime_provenance(&member.archive_path, validated)?;
+        let provenance = read_bound_cohort_provenance(&member.archive_path, validated)?;
         admitted.revalidate()?;
         recovered.push(RecoveredCohortEpoch {
             epoch: member.epoch,
@@ -9285,13 +9337,7 @@ fn archive_finalization_route(
 fn validate_historical_cohort_evidence<'a>(
     trusted_bootstrap_slot: Slot,
     trusted_bootstrap_accounts_hash: Hash,
-    completed: impl IntoIterator<
-        Item = (
-            u64,
-            &'a historical_replay::HistoricalReplayEvidence,
-            ArchiveChainEvidence,
-        ),
-    >,
+    completed: impl IntoIterator<Item = (u64, &'a CohortEpochEvidence, ArchiveChainEvidence)>,
 ) -> Result<(), String> {
     let mut completed = completed.into_iter();
     let Some((first_epoch, first_evidence, first_chain)) = completed.next() else {
@@ -9350,12 +9396,14 @@ fn validate_historical_cohort_evidence<'a>(
                     previous.0, epoch
                 ));
             }
-            if evidence.emitted_write_versions.start != evidence.bootstrap.next_write_version {
+            if evidence
+                .emitted_write_versions
+                .as_ref()
+                .is_none_or(|versions| versions.start != evidence.bootstrap.next_write_version)
+            {
                 return Err(format!(
-                    "cohort epoch {} write versions start at {}, expected carried cursor {}",
-                    epoch,
-                    evidence.emitted_write_versions.start,
-                    evidence.bootstrap.next_write_version
+                    "cohort epoch {} write versions do not start at carried cursor {}",
+                    epoch, evidence.bootstrap.next_write_version
                 ));
             }
         }
@@ -9368,33 +9416,13 @@ fn validate_cohort_archive_evidence_binding(
     completed: &CompletedCohortEpoch,
     first_epoch: bool,
 ) -> Result<(), String> {
-    let file = jetstreamer_node::archive_checksum::open_regular_nofollow(&completed.staged_output)
-        .map_err(|error| {
-            format!(
-                "failed to bind staged cohort archive {}: {error}",
-                completed.staged_output.display()
-            )
-        })?;
-    let reader = jetstreamer_horizon::archive::ArchiveReader::open(std::io::BufReader::new(file))
-        .map_err(|error| {
-        format!(
-            "failed to open staged cohort archive {}: {error}",
-            completed.staged_output.display()
-        )
-    })?;
-    let provenance = reader
-        .provenance()
-        .map_err(|error| format!("invalid cohort archive provenance: {error}"))?
-        .ok_or_else(|| "cohort archive has no provenance".to_string())?;
-    let provenance = provenance
-        .single_runtime_v1()
-        .ok_or_else(|| "cohort archive does not have single-runtime provenance".to_string())?;
+    let provenance = read_bound_cohort_provenance(&completed.staged_output, completed.validated)?;
     let expected_kind = if first_epoch {
         BootstrapStateKind::SnapshotArchive
     } else {
         BootstrapStateKind::CarriedBank
     };
-    let evidence = &completed.historical_evidence.bootstrap;
+    let evidence = &completed.evidence.bootstrap;
     if provenance.bootstrap_state_kind != expected_kind
         || provenance.bootstrap_slot != evidence.slot
         || provenance.bootstrap_state_hash != Hash::new_from_array(evidence.accounts_hash)
@@ -9585,6 +9613,10 @@ async fn run_geyser_replay(
     // terminal slot is used for candidate admission; only the final member
     // consumes the verifier with `finish`.
     verification_end_inclusive: Option<Slot>,
+    // Registry-owned directory for a source runtime's one-use handoff
+    // snapshot export. Normal replay passes `None`; the self-supervised
+    // qualification child obtains this from its sealed environment.
+    handoff_export_directory: Option<&Path>,
     retain_runtime_state: bool,
 ) -> Result<ReplayRunResult, String> {
     if qualification.is_some() && carried_state.is_some() {
@@ -9867,6 +9899,7 @@ async fn run_geyser_replay(
             | compatibility::RuntimeBackend::SolanaV1_0_24
             | compatibility::RuntimeBackend::SolanaV1_1_15
             | compatibility::RuntimeBackend::SolanaV1_1_23
+            | compatibility::RuntimeBackend::SolanaV1_2_24Epoch67PreCpi
             | compatibility::RuntimeBackend::SolanaV1_2_32Epoch68Transition
             | compatibility::RuntimeBackend::SolanaV1_2_32
             | compatibility::RuntimeBackend::SolanaV1_3_19 => {
@@ -11124,8 +11157,7 @@ async fn run_geyser_replay(
     }
 
     let historical_evidence = replay_executor.historical_evidence()?;
-    if let Some(output_directory) = env::var_os("JETSTREAMER_EXPORT_HANDOFF_SNAPSHOT_DIR") {
-        let output_directory = PathBuf::from(output_directory);
+    if let Some(output_directory) = handoff_export_directory {
         let plan = qualification.ok_or_else(|| {
             "handoff snapshot export is allowed only for a focused qualification run".to_string()
         })?;
@@ -11155,7 +11187,7 @@ async fn run_geyser_replay(
         let exported = replay_executor
             .export_historical_snapshot(
                 handoff.snapshot.slot,
-                &output_directory,
+                output_directory,
                 expected_accounts_hash.to_bytes(),
             )?
             .ok_or_else(|| {
@@ -11164,7 +11196,7 @@ async fn run_geyser_replay(
                     runtime_descriptor.identity.name
                 )
             })?;
-        let expected_path = fs::canonicalize(&output_directory)
+        let expected_path = fs::canonicalize(output_directory)
             .map_err(|err| {
                 format!(
                     "failed to canonicalize handoff output directory {}: {err}",
@@ -11634,6 +11666,7 @@ fn validated_epoch_archive_multi_runtime(
     epoch: u64,
     spans: &[compatibility::RuntimeSpan],
     cancellation: Option<&AtomicBool>,
+    chain_evidence: Option<&mut ArchiveChainEvidence>,
 ) -> Result<Option<jetstreamer_node::archive_checksum::ValidatedArchiveFile>, String> {
     require_archive_batch_closed_for_reuse(path)?;
     if spans.len() < 2 {
@@ -11773,6 +11806,7 @@ fn validated_epoch_archive_multi_runtime(
         | compatibility::RuntimeBackend::SolanaV1_0_24
         | compatibility::RuntimeBackend::SolanaV1_1_15
         | compatibility::RuntimeBackend::SolanaV1_1_23
+        | compatibility::RuntimeBackend::SolanaV1_2_24Epoch67PreCpi
         | compatibility::RuntimeBackend::SolanaV1_2_32Epoch68Transition
         | compatibility::RuntimeBackend::SolanaV1_2_32
         | compatibility::RuntimeBackend::SolanaV1_3_19 => StateCommitmentKind::LegacyAccountsHash,
@@ -11878,9 +11912,29 @@ fn validated_epoch_archive_multi_runtime(
         &ArchiveProvenance::V3(provenance),
         initial_identity,
         cancellation,
-        None,
+        chain_evidence,
     )
     .map(Some)
+}
+
+fn validated_cohort_epoch_archive(
+    path: &Path,
+    epoch: u64,
+    allow_candidate_runtime: bool,
+    cancellation: Option<&AtomicBool>,
+    chain_evidence: Option<&mut ArchiveChainEvidence>,
+) -> Result<Option<jetstreamer_node::archive_checksum::ValidatedArchiveFile>, String> {
+    let (slot_start, slot_end_inclusive) = epoch_to_slot_range(epoch);
+    let spans = compatibility::plan_runtime_spans(
+        slot_start..slot_end_inclusive.saturating_add(1),
+        allow_candidate_runtime,
+    )?;
+    if spans.len() == 1 {
+        let selection = runtime_span_selection(&spans[0])?;
+        validated_epoch_archive(path, epoch, selection, cancellation, chain_evidence)
+    } else {
+        validated_epoch_archive_multi_runtime(path, epoch, &spans, cancellation, chain_evidence)
+    }
 }
 
 fn epoch_archive_reusable_multi_runtime(
@@ -11888,7 +11942,7 @@ fn epoch_archive_reusable_multi_runtime(
     epoch: u64,
     spans: &[compatibility::RuntimeSpan],
 ) -> Result<bool, String> {
-    validated_epoch_archive_multi_runtime(path, epoch, spans, None)
+    validated_epoch_archive_multi_runtime(path, epoch, spans, None, None)
         .map(|validated| validated.is_some())
 }
 
@@ -13577,6 +13631,210 @@ async fn run_multi_runtime_epoch_supervisor(
     Ok(())
 }
 
+/// Replays the first, mixed-runtime member of a root-checkpoint cohort while
+/// retaining the destination worker for the following epoch. The source and
+/// destination are independently checkpointed on each side of the canonical
+/// handoff, assembled with V3 provenance, and only then admitted as one cohort
+/// member. The shared destination verifier remains open until the cohort's
+/// later root checkpoint is reached.
+#[allow(clippy::too_many_arguments)]
+async fn run_mixed_runtime_root_cohort_first_epoch(
+    epoch: u64,
+    final_epoch: u64,
+    dest_dir: &Path,
+    replay_scratch: &Path,
+    bootstrap: &ReplayBootstrap,
+    audited_bootstrap: &BoundCohortSnapshot,
+    all_expectations: &BTreeMap<Slot, BankHashExpectation>,
+    destination_verifier: Arc<SnapshotVerifier>,
+    staged_output: &Path,
+    final_output: &Path,
+    allow_candidate_runtime: bool,
+    shutdown: Arc<AtomicBool>,
+    cursor: Arc<ReplayCursor>,
+    restart_tracker: Arc<RestartTracker>,
+    range_progress: Option<Arc<RangeProgress>>,
+    shared_progress: Arc<ReplayProgress>,
+) -> Result<(CompletedCohortEpoch, CarriedRuntimeState), String> {
+    let (epoch_start, epoch_end) = epoch_to_slot_range(epoch);
+    let spans = compatibility::plan_runtime_spans(
+        epoch_start..epoch_end.saturating_add(1),
+        allow_candidate_runtime,
+    )?;
+    if spans.len() != 2 {
+        return Err(format!(
+            "mixed-runtime root cohort requires exactly two spans in its first epoch, got {}",
+            spans.len()
+        ));
+    }
+    let handoff = spans[1]
+        .handoff
+        .ok_or_else(|| "mixed-runtime root cohort has no canonical handoff".to_string())?;
+    let bootstrap_slot = bootstrap.slot()?;
+    let source_plan = QualificationPlan {
+        epoch,
+        bootstrap_slot,
+        replay_start: bootstrap_slot
+            .checked_add(1)
+            .ok_or_else(|| "mixed-runtime bootstrap slot has no successor".to_string())?,
+        output_slot_start: epoch_start,
+        end_inclusive: spans[0].slots.end - 1,
+    };
+    let destination_plan = QualificationPlan {
+        epoch,
+        bootstrap_slot: handoff.snapshot.slot,
+        replay_start: handoff.boundary_slot,
+        output_slot_start: handoff.boundary_slot,
+        end_inclusive: epoch_end,
+    };
+    let work_dir = runtime_segment_work_dir(staged_output)?;
+    fs::create_dir_all(&work_dir)
+        .map_err(|error| format!("failed to create {}: {error}", work_dir.display()))?;
+    let handoff_dir = replay_scratch.join("runtime-handoffs");
+    fs::create_dir_all(&handoff_dir)
+        .map_err(|error| format!("failed to create {}: {error}", handoff_dir.display()))?;
+
+    let source_expected = all_expectations
+        .iter()
+        .filter(|(slot, _)| **slot <= handoff.snapshot.slot)
+        .map(|(slot, hash)| (*slot, *hash))
+        .collect::<BTreeMap<_, _>>();
+    if !source_expected.contains_key(&bootstrap_slot)
+        || !source_expected.contains_key(&handoff.snapshot.slot)
+    {
+        return Err(
+            "mixed-runtime source expectations do not bind bootstrap and handoff checkpoints"
+                .to_string(),
+        );
+    }
+    let source_verifier = Arc::new(SnapshotVerifier::new(
+        source_expected,
+        Some(shutdown.clone()),
+    ));
+    let source_output = runtime_segment_archive_path(&work_dir, epoch, 0, &spans[0]);
+    let source_result = run_geyser_replay(
+        epoch,
+        allow_candidate_runtime,
+        dest_dir,
+        replay_scratch,
+        bootstrap,
+        shutdown.clone(),
+        cursor.clone(),
+        restart_tracker.clone(),
+        Some(source_verifier),
+        source_output.clone(),
+        Some(source_plan),
+        None,
+        range_progress.clone(),
+        Some(shared_progress.clone()),
+        Some(audited_bootstrap),
+        Some(source_plan.end_inclusive),
+        Some(&handoff_dir),
+        false,
+    )
+    .await?;
+    publish_historical_segment_manifest(
+        epoch,
+        source_plan,
+        &source_output,
+        &source_result,
+        allow_candidate_runtime,
+    )?;
+    let source_evidence = source_result
+        .historical_evidence
+        .ok_or_else(|| "mixed-runtime source produced no checkpoint evidence".to_string())?;
+    let handoff_path = handoff_dir.join(handoff.snapshot.archive_name());
+    validate_canonical_handoff_snapshot(&handoff_path, handoff)?;
+
+    let destination_bootstrap = ReplayBootstrap::SnapshotArchive(handoff_path);
+    let destination_output = runtime_segment_archive_path(&work_dir, epoch, 1, &spans[1]);
+    let mut destination_result = run_geyser_replay(
+        epoch,
+        allow_candidate_runtime,
+        dest_dir,
+        replay_scratch,
+        &destination_bootstrap,
+        shutdown.clone(),
+        cursor,
+        restart_tracker,
+        Some(destination_verifier),
+        destination_output.clone(),
+        Some(destination_plan),
+        None,
+        range_progress,
+        Some(shared_progress),
+        None,
+        Some(epoch_to_slot_range(final_epoch).1),
+        None,
+        true,
+    )
+    .await?;
+    publish_historical_segment_manifest(
+        epoch,
+        destination_plan,
+        &destination_output,
+        &destination_result,
+        allow_candidate_runtime,
+    )?;
+    let destination_evidence = destination_result
+        .historical_evidence
+        .clone()
+        .ok_or_else(|| "mixed-runtime destination produced no checkpoint evidence".to_string())?;
+    let carried_state = destination_result
+        .carried_state
+        .take()
+        .ok_or_else(|| "mixed-runtime destination did not retain its worker".to_string())?;
+
+    let assembly_hashes = replay_scratch.join("mixed-runtime-root-cohort-hashes.txt");
+    write_epoch_hashes_file(&assembly_hashes, all_expectations)?;
+    run_multi_runtime_epoch_supervisor(
+        epoch,
+        dest_dir,
+        Some(replay_scratch),
+        bootstrap
+            .snapshot_archive()
+            .ok_or_else(|| "mixed-runtime root cohort requires a snapshot bootstrap".to_string())?,
+        // Both segment manifests and the handoff are already complete. The
+        // supervisor re-admits them before assembly; this sealed checkpoint
+        // set remains available only for its fail-closed retry path.
+        &assembly_hashes,
+        staged_output,
+        allow_candidate_runtime,
+        false,
+        shutdown.clone(),
+    )
+    .await?;
+
+    let mut archive_chain = ArchiveChainEvidence::default();
+    let validated = validated_epoch_archive_multi_runtime(
+        staged_output,
+        epoch,
+        &spans,
+        Some(&shutdown),
+        Some(&mut archive_chain),
+    )?
+    .ok_or_else(|| {
+        format!(
+            "assembled mixed-runtime cohort archive is incomplete: {}",
+            staged_output.display()
+        )
+    })?;
+    let completed = CompletedCohortEpoch {
+        epoch,
+        staged_output: staged_output.to_path_buf(),
+        final_output: final_output.to_path_buf(),
+        evidence: CohortEpochEvidence {
+            bootstrap: source_evidence.bootstrap,
+            terminal: destination_evidence.terminal,
+            emitted_write_versions: None,
+        },
+        archive_chain,
+        validated,
+    };
+    validate_cohort_archive_evidence_binding(&completed, true)?;
+    Ok((completed, carried_state))
+}
+
 const ADAPTIVE_EPOCH_HARD_MAX_CONCURRENCY: usize = 3;
 const DEFAULT_ADAPTIVE_EPOCH_SETTLE_SECS: u64 = 60;
 const ADAPTIVE_EPOCH_POLL_INTERVAL: Duration = Duration::from_secs(1);
@@ -14893,7 +15151,7 @@ fn staged_epoch_archive_validated(
     let validated = if spans.len() == 1 {
         validated_epoch_archive(path, epoch, selection, Some(shutdown), None)
     } else {
-        validated_epoch_archive_multi_runtime(path, epoch, spans, Some(shutdown))
+        validated_epoch_archive_multi_runtime(path, epoch, spans, Some(shutdown), None)
     };
     let validated = classify_adaptive_deep_validation(validated, epoch, path)?;
     let current_identity = jetstreamer_node::archive_checksum::archive_file_identity(&file)
@@ -15518,7 +15776,7 @@ async fn run_epoch_range_supervisor_adaptive(
         let reusable = if spans.len() == 1 {
             validated_epoch_archive(&final_output, epoch, selection, None, None)
         } else {
-            validated_epoch_archive_multi_runtime(&final_output, epoch, &spans, None)
+            validated_epoch_archive_multi_runtime(&final_output, epoch, &spans, None, None)
         };
         match reusable {
             Ok(Some(evidence)) => {
@@ -16914,7 +17172,7 @@ async fn main() {
     let total_epochs = end_epoch - effective_start + 1;
     let configured_epoch_isolation =
         !root_checkpoint_cohort && env_truthy_default("JETSTREAMER_EPOCH_ISOLATION", true);
-    let (epoch_isolation, forced_multi_runtime_epoch) = match epoch_isolation_plan(
+    let (mut epoch_isolation, forced_multi_runtime_epoch) = match epoch_isolation_plan(
         effective_start,
         end_epoch,
         configured_epoch_isolation,
@@ -16928,14 +17186,15 @@ async fn main() {
     };
     if let Some(epoch) = forced_multi_runtime_epoch {
         if root_checkpoint_cohort {
-            eprintln!(
-                "error: root-checkpoint cohort cannot cross the runtime boundary in epoch {epoch}"
+            epoch_isolation = false;
+            info!(
+                "root-checkpoint cohort will use the canonical runtime handoff inside epoch {epoch} and retain its destination worker"
             );
-            exit(1);
+        } else {
+            warn!(
+                "JETSTREAMER_EPOCH_ISOLATION=0 cannot chain range {effective_start}-{end_epoch} in one process because epoch {epoch} crosses an execution-runtime boundary; forcing per-epoch process isolation"
+            );
         }
-        warn!(
-            "JETSTREAMER_EPOCH_ISOLATION=0 cannot chain range {effective_start}-{end_epoch} in one process because epoch {epoch} crosses an execution-runtime boundary; forcing per-epoch process isolation"
-        );
     }
     let adaptive_requested = match strict_opt_in("JETSTREAMER_ADAPTIVE_EPOCH_CONCURRENCY") {
         Ok(requested) => requested,
@@ -17305,6 +17564,13 @@ async fn main() {
                     exit(1);
                 }
             }
+            if let Err(err) = add_runtime_handoff_expectations(
+                epoch_to_slot(effective_start)..epoch_to_slot(end_epoch.saturating_add(1)),
+                &mut expected,
+            ) {
+                eprintln!("error: {err}");
+                exit(1);
+            }
             if let Err(err) = validate_root_checkpoint_cohort_expectations(
                 effective_start,
                 end_epoch,
@@ -17655,10 +17921,29 @@ async fn main() {
             .map(|plan| plan.replay_start)
             .unwrap_or_else(|| epoch_to_slot_range(effective_start).0),
     ));
+    let first_epoch_spans = compatibility::plan_runtime_spans(
+        epoch_to_slot(effective_start)..epoch_to_slot(effective_start.saturating_add(1)),
+        allow_candidate_runtime,
+    )
+    .expect("requested range was preflighted above");
+    let mixed_root_first_epoch = root_checkpoint_cohort && first_epoch_spans.len() > 1;
+    let mut complete_cohort_expectations = None;
     let cohort_verifier = if root_checkpoint_cohort {
-        let expected = snapshot_expectations
+        let mut expected = snapshot_expectations
             .remove(&effective_start)
             .unwrap_or_default();
+        complete_cohort_expectations = Some(expected.clone());
+        if mixed_root_first_epoch {
+            let handoff_slot = first_epoch_spans[1]
+                .handoff
+                .expect("mixed-runtime cohort was validated with a handoff")
+                .snapshot
+                .slot;
+            // The source segment independently consumes bootstrap..handoff.
+            // The destination verifier begins from the same committed handoff
+            // and remains live through the final root checkpoint.
+            expected.retain(|slot, _| *slot >= handoff_slot);
+        }
         Some(Arc::new(SnapshotVerifier::new(
             expected,
             Some(shutdown.clone()),
@@ -17683,7 +17968,68 @@ async fn main() {
     };
     let mut completed_cohort = Vec::new();
     let mut carried_state: Option<CarriedRuntimeState> = None;
-    for epoch in effective_start..=end_epoch {
+    let mut first_epoch_to_run = effective_start;
+    if mixed_root_first_epoch {
+        let cohort_run = cohort_run
+            .as_ref()
+            .expect("root-checkpoint cohort run directory was created");
+        let staged_output = cohort_run
+            .archives_path()
+            .join(format!("epoch-{effective_start}.jet"));
+        let final_output = dest_dir.join(format!("epoch-{effective_start}.jet"));
+        let result = run_mixed_runtime_root_cohort_first_epoch(
+            effective_start,
+            end_epoch,
+            &dest_dir,
+            replay_scratch_dir,
+            &bootstrap,
+            cohort_bootstrap_binding
+                .as_ref()
+                .expect("root-checkpoint cohort bootstrap was bound"),
+            complete_cohort_expectations
+                .as_ref()
+                .expect("root-checkpoint cohort expectations were prepared"),
+            cohort_verifier
+                .as_ref()
+                .expect("root-checkpoint cohort verifier was created")
+                .clone(),
+            &staged_output,
+            &final_output,
+            allow_candidate_runtime,
+            shutdown.clone(),
+            cursor.clone(),
+            restart_tracker.clone(),
+            range_progress.clone(),
+            shared_progress.clone(),
+        )
+        .await;
+        let (completed, state) = match result {
+            Ok(result) => result,
+            Err(error) => {
+                eprintln!("error: {error}");
+                exit(1);
+            }
+        };
+        let (trusted_slot, trusted_hash) =
+            cohort_trusted_bootstrap.expect("cohort bootstrap was parsed");
+        completed_cohort.push(completed);
+        if let Err(error) = validate_historical_cohort_evidence(
+            trusted_slot,
+            trusted_hash.0,
+            completed_cohort
+                .iter()
+                .map(|member| (member.epoch, &member.evidence, member.archive_chain)),
+        ) {
+            eprintln!("error: {error}");
+            exit(1);
+        }
+        carried_state = Some(state);
+        first_epoch_to_run = effective_start.saturating_add(1);
+        info!(
+            "root-checkpoint cohort retained validated mixed-runtime epoch {effective_start} privately; publication remains closed"
+        );
+    }
+    for epoch in first_epoch_to_run..=end_epoch {
         if shutdown.load(Ordering::SeqCst) {
             info!("shutdown requested; stopping before epoch {epoch}");
             break;
@@ -17748,6 +18094,9 @@ async fn main() {
                 None
             },
             root_checkpoint_cohort.then(|| epoch_to_slot_range(end_epoch).1),
+            env::var_os("JETSTREAMER_EXPORT_HANDOFF_SNAPSHOT_DIR")
+                .as_deref()
+                .map(Path::new),
             epoch < end_epoch,
         )
         .await;
@@ -17818,7 +18167,7 @@ async fn main() {
                         epoch,
                         staged_output: horizon_output.clone(),
                         final_output,
-                        historical_evidence,
+                        evidence: historical_evidence.into(),
                         archive_chain,
                         validated,
                     };
@@ -17838,7 +18187,7 @@ async fn main() {
                         completed_cohort.iter().map(|completed| {
                             (
                                 completed.epoch,
-                                &completed.historical_evidence,
+                                &completed.evidence,
                                 completed.archive_chain,
                             )
                         }),
@@ -17924,7 +18273,7 @@ async fn main() {
             completed_cohort.iter().map(|completed| {
                 (
                     completed.epoch,
-                    &completed.historical_evidence,
+                    &completed.evidence,
                     completed.archive_chain,
                 )
             }),
@@ -18033,9 +18382,7 @@ mod early_snapshot_tests {
         }
     }
 
-    fn archive_chain_for(
-        evidence: &historical_replay::HistoricalReplayEvidence,
-    ) -> ArchiveChainEvidence {
+    fn archive_chain_for(evidence: &CohortEpochEvidence) -> ArchiveChainEvidence {
         let terminal = ArchiveBlockEvidence {
             slot: evidence.terminal.slot,
             parent_slot: evidence.bootstrap.slot,
@@ -18051,6 +18398,9 @@ mod early_snapshot_tests {
 
     #[test]
     fn epochs_17_through_19_form_one_carryable_runtime_cohort() {
+        let mixed = root_checkpoint_cohort_runtime(1, 1, true).unwrap();
+        assert_eq!(mixed.backend, compatibility::RuntimeBackend::SolanaV1_0_8);
+
         let selection = root_checkpoint_cohort_runtime(17, 19, true).unwrap();
         assert_eq!(
             selection.backend,
@@ -18235,6 +18585,11 @@ mod early_snapshot_tests {
             .single_runtime_v1()
             .unwrap()
             .clone();
+            let provenance = CohortArchiveProvenance {
+                bootstrap_state_kind: provenance.bootstrap_state_kind,
+                bootstrap_slot: provenance.bootstrap_slot,
+                bootstrap_state_hash: provenance.bootstrap_state_hash,
+            };
             let terminal = ArchiveBlockEvidence {
                 slot: slot_end,
                 parent_slot: slot_end - 1,
@@ -18792,27 +19147,27 @@ mod early_snapshot_tests {
         let evidence = vec![
             (
                 17,
-                historical_replay::HistoricalReplayEvidence {
+                CohortEpochEvidence::from(historical_replay::HistoricalReplayEvidence {
                     bootstrap: root,
                     terminal: end_17.clone(),
                     emitted_write_versions: 10..20,
-                },
+                }),
             ),
             (
                 18,
-                historical_replay::HistoricalReplayEvidence {
+                CohortEpochEvidence::from(historical_replay::HistoricalReplayEvidence {
                     bootstrap: end_17,
                     terminal: end_18.clone(),
                     emitted_write_versions: 20..30,
-                },
+                }),
             ),
             (
                 19,
-                historical_replay::HistoricalReplayEvidence {
+                CohortEpochEvidence::from(historical_replay::HistoricalReplayEvidence {
                     bootstrap: end_18,
                     terminal: end_19,
                     emitted_write_versions: 30..40,
-                },
+                }),
             ),
         ];
         validate_historical_cohort_evidence(
@@ -18845,11 +19200,11 @@ mod early_snapshot_tests {
         let epoch_end = epoch_to_slot_range(epoch).1;
         let terminal =
             historical_checkpoint(epoch_end - 1, Hash::new_unique(), Hash::new_unique(), 20);
-        let evidence = historical_replay::HistoricalReplayEvidence {
+        let evidence = CohortEpochEvidence::from(historical_replay::HistoricalReplayEvidence {
             bootstrap: root,
             terminal,
             emitted_write_versions: 10..20,
-        };
+        });
         validate_historical_cohort_evidence(
             7_343_776,
             trusted_hash,
@@ -20532,6 +20887,14 @@ mod early_snapshot_tests {
         assert_eq!(
             combined.handoffs[0].successor_bootstrap_archive_sha256,
             handoff_manifest.archive_sha256
+        );
+        assert_eq!(
+            cohort_archive_provenance(&ArchiveProvenance::V3(combined.clone())),
+            CohortArchiveProvenance {
+                bootstrap_state_kind: BootstrapStateKind::SnapshotArchive,
+                bootstrap_slot: 416_012,
+                bootstrap_state_hash: initial_accounts_hash,
+            }
         );
 
         let mut replaced_handoff = handoff_manifest.clone();

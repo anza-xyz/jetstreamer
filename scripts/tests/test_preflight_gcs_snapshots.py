@@ -282,6 +282,12 @@ class SelectionTests(unittest.TestCase):
         self.assertEqual((early.first_epoch, early.last_epoch), (1, 6))
         self.assertEqual((arguments.first_epoch, arguments.last_epoch), (12, 16))
 
+    def test_cli_accepts_an_explicit_report_output(self) -> None:
+        arguments = preflight.build_argument_parser().parse_args(
+            ["--output", "/secure/preflight.json"]
+        )
+        self.assertEqual(arguments.output, Path("/secure/preflight.json"))
+
     def test_runtime_routes_cover_early_history_without_guessing_epoch_zero(self) -> None:
         expected = {
             1: "solana-v1.0.7-to-v1.0.8",

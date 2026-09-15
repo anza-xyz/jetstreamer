@@ -1,8 +1,11 @@
 # Solana v1.2.32 mainnet epoch-68 transition worker
 
-This isolated worker is restricted to the mainnet root-checkpoint cohort
-covering epochs 67 and 68 (slots `28,944,000..29,807,999`). Its runtime,
-BPF-loader, stake, and SDK sources are pinned to upstream Solana v1.2.32 at
+This isolated worker executes mainnet slots
+`29,371,188..29,807,999`. It accepts only a completed snapshot in
+`29,371,187..29,807,999`, with production routing committed to the canonical
+slot-`29,371,187` snapshot exported by the exact v1.2.24 predecessor. Its
+runtime, BPF loader, stake program, vote program, and SDK are pinned to
+upstream Solana v1.2.32 at
 `8c989da68342918f1717c60aa60fdfab7d1e676e`.
 
 Two pieces of consensus state are not serialized in these historical
@@ -13,14 +16,16 @@ state:
   `sol_create_program_address` BPF syscall, is enabled; and
 - whether vote timestamps may repeat on a later slot.
 
-The canonical epoch-67 transaction stream proves the CPI gate was closed:
+The canonical epoch-67 transaction stream proves the CPI gate was closed
+under the predecessor runtime:
 transactions using `sol_create_program_address` fail with the BPF loader's
 missing-syscall error and charge only fees. Replaying the same transactions
 with v1.2.32's in-memory default drains their payer accounts and diverges from
-the next canonical snapshot. This worker reconstructs both activation states
-as closed through slot `29,371,187` and open from slot `29,371,188`, the first
-behaviorally admissible child slot after the last transaction proving the old
-behavior.
+the next canonical snapshot. The separate v1.2.24 worker processes and
+checkpoints all old-semantics slots. This worker starts from that checkpoint
+and reconstructs both activation states as open from slot `29,371,188`, the
+first behaviorally admissible child slot after the last transaction proving
+the old behavior.
 
 One reproducible witness is transaction
 `v1sn5twz95Xc4Qa7WRVvE6QvqxKSHhvzi4RbCs73saETU6KhVam9wtY66R87dg8gHGUfCWRhXY8fybXnSBCKL9H`
@@ -33,7 +38,8 @@ instruction 5 as a call to program
 `0x0b9f0002` as `VirtualMachineFailedToRunProgram` and registers
 `sol_create_program_address` only while cross-program support is enabled.
 
-The worker has a distinct handshake identity, is bounded to this two-epoch
-window, and remains a checkpoint-gated candidate. The entire cohort must be
-replayed from its immutable root bootstrap and match the independent terminal
-legacy accounts hash before either archive can be published.
+The worker has a distinct handshake identity, is bounded to the remainder of
+epochs 67 and 68, and remains a checkpoint-gated candidate. The complete
+multi-runtime cohort must replay from the immutable epoch-67 root, bind the
+handoff snapshot to both workers, and match the independent terminal legacy
+accounts hash before either archive can be published.

@@ -345,7 +345,7 @@ select a runtime. The current registry is deliberately conservative:
 | `12,960,000..13,392,000` | pinned Solana v1.1.15 worker | diagnostic candidate for epoch 30 |
 | `13,392,000..26,352,000` | pinned Solana v1.1.23 worker | diagnostic candidate for epochs 31-60 |
 | `26,352,000..28,944,000` | pinned Solana v1.2.32 worker | diagnostic candidate for epochs 61-66 |
-| `28,944,000..29,808,000` | pinned Solana v1.2.32 mainnet transition worker | checkpoint-gated CPI/vote-state reconstruction for epochs 67-68 |
+| `28,944,000..29,808,000` | pinned Solana v1.2.32 mainnet transition worker | fail-closed epoch-67/68 candidate while both handoffs are qualified |
 | `29,808,000..39,744,000` | pinned Solana v1.2.32 worker | diagnostic candidate for epochs 69-91 |
 | `39,744,000..43,632,000` | pinned Solana v1.3.19 worker | diagnostic candidate for epochs 92-100 |
 | `43,632,000..406,080,000` | none | unsupported; replay fails closed |
@@ -361,6 +361,14 @@ This routing point is not a claim about the exact deployment slot. Every candida
 explicitly non-canonical until its checkpoint replay completes. Additional exact patch workers stay
 registered but unassigned until differential evidence requires a narrower runtime boundary. This
 includes the v1.0.17 worker, which remains available for comparison without claiming a slot range.
+
+Epoch 67 requires more than one intra-epoch runtime handoff. Exact v1.2.24 with CPI disabled matches
+from the canonical checkpoint at slot 29,186,735 through slot 29,371,187, while v1.2.32 diverges at
+slot 29,188,719. A separate root-start proof rejects using v1.2.24 from the epoch boundary: it
+diverges at checkpoint 29,195,008. The expected shape is therefore v1.2.32 through slot 29,186,735,
+v1.2.24 through slot 29,371,187, and the v1.2.32 transition runtime afterward. Until the first
+state-bound export and its root-to-boundary proof are complete, that three-span route is not in the
+registry and epochs 67–68 remain fail-closed checkpoint candidates.
 
 Epoch 12 starts v1.0.23 from the canonical snapshot at slot 5,183,736 with legacy accounts hash
 `BUqwiSm2GgH9ByKrBDF6epXHYK9RRh3vyZDKtUqtMXfR`. Production discovery binds both values, so a

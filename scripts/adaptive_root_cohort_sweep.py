@@ -87,6 +87,20 @@ RUNTIME_WORKERS = {
     "solana-v1.2.32": ("V1_2_32", "jetstreamer-historical-worker-v1-2-32"),
     "solana-v1.3.19": ("V1_3_19", "jetstreamer-historical-worker-v1-3-19"),
 }
+# A manifest cohort normally names the only worker it needs. A cohort that
+# crosses a canonical runtime handoff must also expose the source worker: the
+# node launches it through the boundary, seals the handoff snapshot, and then
+# launches the manifest's destination worker. Keep this explicit so a new
+# handoff fails deployment preflight until its complete executable set is
+# registered here.
+RUNTIME_AUXILIARY_WORKERS = {
+    "solana-v1.2.32-mainnet-epoch68-transition": (
+        (
+            "V1_2_24_EPOCH67_PRE_CPI",
+            "jetstreamer-historical-worker-v1-2-24-epoch67-pre-cpi",
+        ),
+    ),
+}
 SENSITIVE_PATHS = (
     "/home/sol/.ssh",
     "/home/sol/workspace",
@@ -723,6 +737,17 @@ def _path_arg(path: Path) -> str:
     return str(path)
 
 
+def runtime_workers(runtime: str) -> tuple[tuple[str, str], ...]:
+    return (RUNTIME_WORKERS[runtime],) + RUNTIME_AUXILIARY_WORKERS.get(runtime, ())
+
+
+def runtime_worker_environment(runtime: str, deploy: Path) -> tuple[str, ...]:
+    return tuple(
+        f"JETSTREAMER_HISTORICAL_WORKER_{worker_env}={deploy / worker_name}"
+        for worker_env, worker_name in runtime_workers(runtime)
+    )
+
+
 def producer_environment(
     cohort: Cohort,
     deploy: Path,
@@ -730,8 +755,6 @@ def producer_environment(
     account: str,
     project: str,
 ) -> tuple[str, ...]:
-    worker_env, worker_name = RUNTIME_WORKERS[cohort.runtime]
-    worker = deploy / worker_name
     return (
         "HOME=/home/sol",
         "USER=sol",
@@ -745,7 +768,7 @@ def producer_environment(
         f"CLOUDSDK_CORE_PROJECT={project}",
         f"CLOUDSDK_CORE_ACCOUNT={account}",
         "JETSTREAMER_ALLOW_CANDIDATE_RUNTIME=1",
-        f"JETSTREAMER_HISTORICAL_WORKER_{worker_env}={worker}",
+        *runtime_worker_environment(cohort.runtime, deploy),
         "JETSTREAMER_HISTORICAL_POH_THREADS=10",
         "RAYON_NUM_THREADS=10",
         "JETSTREAMER_ARCHIVE_BACKEND=http",
@@ -780,9 +803,8 @@ def build_producer_command(
     memory_max_gib: int = DEFAULT_MEMORY_MAX_GIB,
     cpu_quota_percent: int = DEFAULT_CPU_QUOTA_PERCENT,
 ) -> list[str]:
-    _, worker_name = RUNTIME_WORKERS[cohort.runtime]
     node = deploy / "jetstreamer-node"
-    worker = deploy / worker_name
+    workers = tuple(deploy / name for _, name in runtime_workers(cohort.runtime))
     whole_lane_paths = f"{lane.root}"
     properties = (
         "Type=exec",
@@ -822,7 +844,7 @@ def build_producer_command(
         "AmbientCapabilities=",
         "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6",
         "NoExecPaths=/home/sol",
-        f"ExecPaths={node} {worker} {whole_lane_paths}",
+        f"ExecPaths={node} {' '.join(map(str, workers))} {whole_lane_paths}",
         f"ReadWritePaths={whole_lane_paths}",
         f"BindReadOnlyPaths={deploy}:{deploy}:rbind",
         "InaccessiblePaths=" + " ".join(f"-{item}" for item in SENSITIVE_PATHS),
@@ -869,9 +891,7 @@ def build_import_command(
     memory_max_gib: int = DEFAULT_MEMORY_MAX_GIB,
     cpu_quota_percent: int = DEFAULT_CPU_QUOTA_PERCENT,
 ) -> list[str]:
-    worker_env, worker_name = RUNTIME_WORKERS[cohort.runtime]
     node = deploy / "jetstreamer-node"
-    worker = deploy / worker_name
     environment = (
         "HOME=/home/sol",
         "USER=sol",
@@ -879,7 +899,7 @@ def build_import_command(
         "LANG=C.UTF-8",
         "PATH=/usr/bin:/bin",
         "JETSTREAMER_ALLOW_CANDIDATE_RUNTIME=1",
-        f"JETSTREAMER_HISTORICAL_WORKER_{worker_env}={worker}",
+        *runtime_worker_environment(cohort.runtime, deploy),
         "RAYON_NUM_THREADS=10",
         "JETSTREAMER_ENFORCE_ARCHIVE_HASH=1",
         f"JETSTREAMER_PRIVATE_RUN_ROOT={public_private_root}",
@@ -1183,7 +1203,7 @@ def unit_is_hardened_for_adoption(
     )
     if properties is None:
         return False
-    _, worker_name = RUNTIME_WORKERS[cohort.runtime]
+    workers = tuple(deploy / name for _, name in runtime_workers(cohort.runtime))
     exact = {
         "MainPID": str(process.pid),
         "ControlGroup": f"/system.slice/{unit}",
@@ -1206,7 +1226,10 @@ def unit_is_hardened_for_adoption(
         "Group": "horizon",
         "WorkingDirectory": str(deploy),
         "ReadWritePaths": str(lane.root),
-        "ExecPaths": f"{deploy / 'jetstreamer-node'} {deploy / worker_name} {lane.root}",
+        "ExecPaths": (
+            f"{deploy / 'jetstreamer-node'} "
+            f"{' '.join(map(str, workers))} {lane.root}"
+        ),
         "NoExecPaths": "/home/sol",
         "InaccessiblePaths": " ".join(f"-{item}" for item in SENSITIVE_PATHS),
         "PrivateTmp": "yes",
@@ -1987,7 +2010,11 @@ def verify_deployment(
             raise SweepError("deployment SHA256SUMS is noncanonical")
         sums[match.group(2)] = match.group(1)
     required = {"jetstreamer-node", manifest.name}
-    required.update(RUNTIME_WORKERS[cohort.runtime][1] for cohort in cohorts)
+    required.update(
+        worker_name
+        for cohort in cohorts
+        for _, worker_name in runtime_workers(cohort.runtime)
+    )
     for name in sorted(required):
         path = deploy / name
         info = path.lstat()

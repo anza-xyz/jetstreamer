@@ -566,6 +566,53 @@ class CommandTests(unittest.TestCase):
                 self.assertEqual(properties["CPUQuota"], "725%")
                 self.assertEqual(properties["MemorySwapMax"], "0")
 
+    def test_handoff_cohort_exposes_source_and_destination_workers(self) -> None:
+        cohort = sweep.Cohort(
+            67,
+            68,
+            "solana-v1.2.32-mainnet-epoch68-transition",
+        )
+        command = sweep.build_producer_command(
+            cohort=cohort,
+            lane=self.lane,
+            deploy=self.deploy,
+            manifest=self.manifest,
+            fingerprint=self.fingerprint,
+            unit="handoff-test.service",
+        )
+        properties = command_properties(command)
+        environments = {
+            item.removeprefix("--setenv=")
+            for item in command
+            if item.startswith("--setenv=")
+        }
+
+        self.assertEqual(
+            properties["ExecPaths"].split(),
+            [
+                str(self.deploy / "jetstreamer-node"),
+                str(
+                    self.deploy
+                    / "jetstreamer-historical-worker-v1-2-32-epoch68-transition"
+                ),
+                str(
+                    self.deploy
+                    / "jetstreamer-historical-worker-v1-2-24-epoch67-pre-cpi"
+                ),
+                str(self.lane.root),
+            ],
+        )
+        self.assertIn(
+            "JETSTREAMER_HISTORICAL_WORKER_V1_2_32_EPOCH68_TRANSITION="
+            f"{self.deploy}/jetstreamer-historical-worker-v1-2-32-epoch68-transition",
+            environments,
+        )
+        self.assertIn(
+            "JETSTREAMER_HISTORICAL_WORKER_V1_2_24_EPOCH67_PRE_CPI="
+            f"{self.deploy}/jetstreamer-historical-worker-v1-2-24-epoch67-pre-cpi",
+            environments,
+        )
+
     def test_importer_has_no_mount_namespace_or_systemd_path_bind(self) -> None:
         command = sweep.build_import_command(
             cohort=self.cohort,

@@ -6180,13 +6180,16 @@ const COMPATIBLE_V1_0_7_GENERATION_PROFILES: &[&str] =
 // remains mandatory.
 const COMPATIBLE_V1_0_8_GENERATION_PROFILES: &[&str] =
     &["jetstreamer-node/0.7.0/old-faithful-to-horizon-v2@8154bc9b0057a138afa6e8833468f6ffba39a6a1"];
-// ba39b66 produced the currently staged early-epoch cohorts. Later changes
-// affect only orchestration and rollback admission: they do not change replay
-// or archive bytes. Keep that exact producer profile admissible while runtime,
-// worker, genesis, checkpoint, provenance, archive structure, and SHA-256
-// checks remain mandatory.
-const COMPATIBLE_SEALED_SWEEP_GENERATION_PROFILES: &[&str] =
-    &["jetstreamer-node/0.7.0/old-faithful-to-horizon-v2@ba39b6677d604d9258452a926b93ac667b2cf7eb"];
+// These exact clean parents produced root-checkpointed historical cohorts.
+// ba39b66 added the sealed sweep path. 45fbea7 is the immutable deployment
+// currently producing epochs 1-6 and 73-100; its replay change is confined to
+// the separately routed v1.2 runtime. Reuse still checks the runtime and worker
+// identities, genesis, checkpoint evidence, provenance, full archive contents,
+// and SHA-256.
+const COMPATIBLE_SEALED_SWEEP_GENERATION_PROFILES: &[&str] = &[
+    "jetstreamer-node/0.7.0/old-faithful-to-horizon-v2@ba39b6677d604d9258452a926b93ac667b2cf7eb",
+    "jetstreamer-node/0.7.0/old-faithful-to-horizon-v2@45fbea7565901a8b596e45bf53ceab722700bb67",
+];
 
 // This is not a generation-profile allowlist. Each record identifies one
 // completed private archive whose full bytes and production inputs were
@@ -18899,7 +18902,6 @@ mod early_snapshot_tests {
     fn prior_runtime_generation_profile_allowlists_are_exact_and_scoped() {
         let prior_v1_0_7 = COMPATIBLE_V1_0_7_GENERATION_PROFILES[0];
         let prior_v1_0_8 = COMPATIBLE_V1_0_8_GENERATION_PROFILES[0];
-        let sealed_sweep = COMPATIBLE_SEALED_SWEEP_GENERATION_PROFILES[0];
         for (runtime, prior) in [
             (historical::SOLANA_V1_0_7_CANDIDATE.backend_id, prior_v1_0_7),
             (historical::SOLANA_V1_0_8_CANDIDATE.backend_id, prior_v1_0_8),
@@ -18923,20 +18925,22 @@ mod early_snapshot_tests {
             historical::SOLANA_V1_0_8_CANDIDATE.backend_id,
             &archive_generation_profile(),
         ));
-        for runtime in [
-            historical::SOLANA_V1_0_8_CANDIDATE.backend_id,
-            historical::SOLANA_V1_0_14_CANDIDATE.backend_id,
-            historical::SOLANA_V1_3_19_CANDIDATE.backend_id,
-        ] {
-            assert!(runtime_generation_profile_is_compatible(
-                runtime,
-                sealed_sweep,
+        for sealed_sweep in COMPATIBLE_SEALED_SWEEP_GENERATION_PROFILES {
+            for runtime in [
+                historical::SOLANA_V1_0_8_CANDIDATE.backend_id,
+                historical::SOLANA_V1_0_14_CANDIDATE.backend_id,
+                historical::SOLANA_V1_3_19_CANDIDATE.backend_id,
+            ] {
+                assert!(runtime_generation_profile_is_compatible(
+                    runtime,
+                    sealed_sweep,
+                ));
+            }
+            assert!(!runtime_generation_profile_is_compatible(
+                historical::SOLANA_V1_0_23_CANDIDATE.backend_id,
+                &format!("{sealed_sweep}-dirty"),
             ));
         }
-        assert!(!runtime_generation_profile_is_compatible(
-            historical::SOLANA_V1_0_23_CANDIDATE.backend_id,
-            &format!("{sealed_sweep}-dirty"),
-        ));
         assert!(!runtime_generation_profile_is_compatible(
             historical::SOLANA_V1_0_7_CANDIDATE.backend_id,
             "unknown",

@@ -335,22 +335,48 @@ slot range.
 loads a snapshot or starts a worker. Snapshot extensions choose only the state loader; they do not
 select a runtime. The current registry is deliberately conservative:
 
-| Slots | Runtime | Admission |
+| Slots | Runtime | Boundary and range-specific handling | Admission |
+|---|---|---|---|
+| `0..619,849` | pinned Solana v1.0.7 worker | starts from genesis; preserves the old vote-initialization checks observed through slot 618,196 | candidate through the first proven-safe handoff |
+| `619,849..3,456,000` | pinned Solana v1.0.8 worker | canonical state handoff from snapshot slot 619,848; the newer vote checks are first required by observed execution at slot 630,648 | candidate through epoch 7 |
+| `3,456,000..3,888,000` | pinned Solana v1.0.13 worker | independently verified snapshot restart; epoch 8's predecessor snapshot uses the newer bank schema | candidate for epoch 8 |
+| `3,888,000..5,184,000` | pinned Solana v1.0.14 worker | independently verified snapshot restart | candidate for epochs 9-11 |
+| `5,184,000..12,960,000` | pinned Solana v1.0.23 worker | anchored at canonical snapshot slot 5,183,736, warms slots 5,183,737-5,183,999, then starts output at 5,184,000 | diagnostic candidate for epochs 12-29 |
+| `12,960,000..13,392,000` | pinned Solana v1.1.15 worker | independently verified snapshot restart; restores and strictly validates the mainnet hard-fork marker at slot 13,334,463 | diagnostic candidate for epoch 30 |
+| `13,392,000..26,352,000` | pinned Solana v1.1.23 worker | independently verified snapshot restart; retains the upstream epoch-34 BPF-loader and epoch-40 system-program transitions | diagnostic candidate for epochs 31-60 |
+| `26,352,000..29,186,736` | pinned Solana v1.2.32 worker | independently verified snapshot restart, ending at the hash-bound epoch-67 handoff snapshot | diagnostic candidate through the first epoch-67 handoff |
+| `29,186,736..29,371,188` | pinned Solana v1.2.24 pre-CPI worker | canonical state handoff from snapshot slot 29,186,735; keeps CPI disabled and exports the next hash-bound handoff state | exact epoch-67 candidate between canonical handoffs |
+| `29,371,188..29,808,000` | pinned Solana v1.2.32 mainnet transition worker | canonical state handoff from snapshot slot 29,371,187; reconstructs the mainnet CPI and vote-timestamp activation state | fail-closed epoch-67/68 candidate after the second handoff |
+| `29,808,000..39,744,000` | pinned Solana v1.2.32 worker | independently verified snapshot restart | diagnostic candidate for epochs 69-91 |
+| `39,744,000..43,632,000` | pinned Solana v1.3.19 worker | independently verified snapshot restart | diagnostic candidate for epochs 92-100 |
+| `43,632,000..406,080,000` | none | unsupported; replay fails closed | unsupported |
+| `406,080,000..` | in-process Agave v3 | independently verified modern snapshot bootstrap | verified |
+
+For epochs 0-100 this is 12 execution envelopes backed by 11 historical worker variants. The
+11 runtime boundaries consist of three hash-bound canonical state handoffs and eight independently
+verified snapshot restarts. The v1.2.32 worker is used on both sides of the two specialized
+epoch-67 ranges.
+
+Five execution interventions go beyond choosing a pinned worker and restarting from an independently
+verified boundary snapshot:
+
+1. The behaviorally safe v1.0.7 to v1.0.8 state handoff at slot 619,849.
+2. The fixed epoch-12 bootstrap at slot 5,183,736 and warmup through slot 5,183,999.
+3. Reconstruction and validation of the epoch-30 hard-fork marker at slot 13,334,463.
+4. The v1.2.32 to pre-CPI v1.2.24 state handoff at slot 29,186,736.
+5. The return to v1.2.32 at slot 29,371,188 with CPI and vote-timestamp state reconstructed.
+
+Input repair is planned independently of execution and adds three more historical interventions:
+
+| Slots or records | Input handling | Evidence gate |
 |---|---|---|
-| `0..619,849` | pinned Solana v1.0.7 worker | candidate through the first proven-safe handoff |
-| `619,849..3,456,000` | pinned Solana v1.0.8 worker | candidate through epoch 7 |
-| `3,456,000..3,888,000` | pinned Solana v1.0.13 worker | candidate for epoch 8 |
-| `3,888,000..5,184,000` | pinned Solana v1.0.14 worker | candidate for epochs 9-11 |
-| `5,184,000..12,960,000` | pinned Solana v1.0.23 worker | diagnostic candidate for epochs 12-29 |
-| `12,960,000..13,392,000` | pinned Solana v1.1.15 worker | diagnostic candidate for epoch 30 |
-| `13,392,000..26,352,000` | pinned Solana v1.1.23 worker | diagnostic candidate for epochs 31-60 |
-| `26,352,000..29,186,736` | pinned Solana v1.2.32 worker | diagnostic candidate through the first epoch-67 handoff |
-| `29,186,736..29,371,188` | pinned Solana v1.2.24 pre-CPI worker | exact epoch-67 candidate between canonical handoffs |
-| `29,371,188..29,808,000` | pinned Solana v1.2.32 mainnet transition worker | fail-closed epoch-67/68 candidate after the second handoff |
-| `29,808,000..39,744,000` | pinned Solana v1.2.32 worker | diagnostic candidate for epochs 69-91 |
-| `39,744,000..43,632,000` | pinned Solana v1.3.19 worker | diagnostic candidate for epochs 92-100 |
-| `43,632,000..406,080,000` | none | unsupported; replay fails closed |
-| `406,080,000..` | in-process Agave v3 | verified |
+| `0..4,258,776` | reconstruct status and fee from the selected runtime because the archive has no status frames | canonical account-state checkpoints |
+| `4,258,776..43,632,000` | use runtime-associated status and fee because the early writer could pair source statuses with the wrong transactions | exact worker identity plus canonical account-state checkpoints |
+| 1,084 exact records across 15 post-cutover slots | admit a missing status only for a checked-in `(slot, transaction index, signature)` match | hashed audit registry plus captured finalized RPC evidence |
+
+Using this narrower definition, which excludes ordinary version pinning, snapshot-format support,
+PoH optimization, and AccountsDB maintenance, epochs 0-100 currently require eight distinct
+slot- or record-specific compatibility interventions.
 
 Candidate mode requires the exact runtime identity, an explicit
 `JETSTREAMER_ALLOW_CANDIDATE_RUNTIME=1`, snapshot verification, and at least one canonical

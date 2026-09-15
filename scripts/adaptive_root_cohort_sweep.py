@@ -55,6 +55,8 @@ DEFAULT_MEMORY_HIGH_GIB = 48
 DEFAULT_MEMORY_MAX_GIB = 64
 DEFAULT_MEMORY_RESERVE_GIB = 64
 DEFAULT_PROTECTED_MEMORY_GIB = 350
+DEFAULT_DISK_RESERVE_GIB = 512
+DEFAULT_DISK_BUDGET_PER_WORKER_GIB = 2048
 DEFAULT_CPUS_PER_LANE = 8
 DEFAULT_CPU_QUOTA_PERCENT = 1000
 DEFAULT_ACCOUNT = "sam.johnson@anza.xyz"
@@ -975,19 +977,34 @@ def admission_capacity(
     memory_current: Sequence[int | None],
     memory_peak: Sequence[int | None],
     memory_high: int,
+    disk_available: int,
+    disk_reserve: int,
+    disk_budget_per_worker: int,
 ) -> int:
-    if min(memory_total, memory_available, logical_cpus, lane_count, memory_max) <= 0:
+    if min(
+        memory_total,
+        memory_available,
+        logical_cpus,
+        lane_count,
+        memory_max,
+        disk_budget_per_worker,
+    ) <= 0:
         return min(active, 1)
     static_memory = max(0, memory_total - protected_memory - memory_reserve) // memory_max
     live_additional = max(0, memory_available - memory_reserve) // memory_max
     live_memory = active + live_additional
+    # Treat each live producer as if it may still consume its complete disk
+    # budget. This intentionally double-counts space it already allocated: an
+    # admission estimate may be conservative, but it must never strand every
+    # replay on a full filesystem. Existing jobs are never terminated here.
+    disk = max(active, max(0, disk_available - disk_reserve) // disk_budget_per_worker)
     cpu = max(1, logical_cpus // max(1, cpus_per_lane))
     # One observation window can qualify at most one additional lane. The
     # controller persists the new limit and starts a fresh window.
     ramp_steps = min(1, int(elapsed_seconds // max(1, settle_seconds)))
     ramp = min(target, initial + ramp_steps)
     configured = min(maximum, lane_count, ramp)
-    capacity = min(configured, static_memory, live_memory, cpu)
+    capacity = min(configured, static_memory, live_memory, disk, cpu)
     if active >= initial:
         if any(value is None for value in memory_current):
             return min(active, capacity)
@@ -1329,7 +1346,11 @@ def public_recovery_marker_present(public_dir: Path, expected_uid: int) -> bool:
             not stat.S_ISDIR(info.st_mode)
             or info.st_uid != expected_uid
             or stat.S_IMODE(info.st_mode) & 0o077
-            or stat.S_IMODE(info.st_mode) & 0o7000
+            # A marker created beneath the shared mode-3770 Horizon
+            # destination inherits S_ISGID from its parent even though
+            # mkdirat requests mode 0700. That is the publisher's normal,
+            # owner-only marker shape. S_ISUID and S_ISVTX remain invalid.
+            or stat.S_IMODE(info.st_mode) & (stat.S_ISUID | stat.S_ISVTX)
             or path.resolve(strict=True) != path
         ):
             raise SweepError(f"unsafe public archive batch marker: {path}")
@@ -2080,6 +2101,8 @@ def controller_configuration_sha256(
         "memory_max_gib": args.memory_max_gib,
         "memory_reserve_gib": args.memory_reserve_gib,
         "protected_memory_gib": args.protected_memory_gib,
+        "disk_reserve_gib": args.disk_reserve_gib,
+        "disk_budget_per_worker_gib": args.disk_budget_per_worker_gib,
         "cpus_per_lane": args.cpus_per_lane,
         "cpu_quota_percent": args.cpu_quota_percent,
         "gcloud_account": args.gcloud_account,
@@ -3306,6 +3329,8 @@ class Controller:
         )
         elapsed = max(0.0, now - float(self.state["last_ramp_unix"]))
         next_limit = min(self.args.target_concurrency, current_limit + 1)
+        filesystem = os.statvfs(self.args.public_dir)
+        disk_available = filesystem.f_bavail * filesystem.f_frsize
         capacity = admission_capacity(
             memory_total=total,
             memory_available=available,
@@ -3324,6 +3349,9 @@ class Controller:
             memory_current=[status.memory_current for status in statuses],
             memory_peak=[status.memory_peak for status in statuses],
             memory_high=self.args.memory_high_gib * GIB,
+            disk_available=disk_available,
+            disk_reserve=self.args.disk_reserve_gib * GIB,
+            disk_budget_per_worker=self.args.disk_budget_per_worker_gib * GIB,
         )
         if next_limit > current_limit and capacity >= next_limit:
             self.state["ramp_limit"] = next_limit
@@ -3460,6 +3488,12 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--memory-max-gib", type=int, default=DEFAULT_MEMORY_MAX_GIB)
     parser.add_argument("--memory-reserve-gib", type=int, default=DEFAULT_MEMORY_RESERVE_GIB)
     parser.add_argument("--protected-memory-gib", type=int, default=DEFAULT_PROTECTED_MEMORY_GIB)
+    parser.add_argument("--disk-reserve-gib", type=int, default=DEFAULT_DISK_RESERVE_GIB)
+    parser.add_argument(
+        "--disk-budget-per-worker-gib",
+        type=int,
+        default=DEFAULT_DISK_BUDGET_PER_WORKER_GIB,
+    )
     parser.add_argument("--cpus-per-lane", type=int, default=DEFAULT_CPUS_PER_LANE)
     parser.add_argument("--cpu-quota-percent", type=int, default=DEFAULT_CPU_QUOTA_PERCENT)
     parser.add_argument("--gcloud-account", default=DEFAULT_ACCOUNT)
@@ -3490,6 +3524,8 @@ def validate_options(args: argparse.Namespace) -> None:
         args.memory_max_gib,
         args.memory_reserve_gib,
         args.protected_memory_gib,
+        args.disk_reserve_gib,
+        args.disk_budget_per_worker_gib,
         args.cpus_per_lane,
         args.cpu_quota_percent,
     )
@@ -3644,6 +3680,8 @@ def print_plan(
         "initial_concurrency": args.initial_concurrency,
         "target_concurrency": args.target_concurrency,
         "max_concurrency": args.max_concurrency,
+        "disk_reserve_gib": args.disk_reserve_gib,
+        "disk_budget_per_worker_gib": args.disk_budget_per_worker_gib,
         "completed": completed,
         "live_epoch_claims": live,
         "public_write_path": "jetstreamer-node --recover-staged-cohort-only only",

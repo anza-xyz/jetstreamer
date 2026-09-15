@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import stat
 import sys
 import tempfile
 import time
@@ -810,6 +811,9 @@ class AdmissionTests(unittest.TestCase):
         target: int = 6,
         current: list[int | None] | None = None,
         peak: list[int | None] | None = None,
+        disk_available_gib: int = 20_000,
+        disk_reserve_gib: int = 512,
+        disk_budget_per_worker_gib: int = 2_048,
     ) -> int:
         current = [5 * sweep.GIB] * active if current is None else current
         peak = [6 * sweep.GIB] * active if peak is None else peak
@@ -831,6 +835,9 @@ class AdmissionTests(unittest.TestCase):
             memory_current=current,
             memory_peak=peak,
             memory_high=48 * sweep.GIB,
+            disk_available=disk_available_gib * sweep.GIB,
+            disk_reserve=disk_reserve_gib * sweep.GIB,
+            disk_budget_per_worker=disk_budget_per_worker_gib * sweep.GIB,
         )
 
     def test_starts_at_two_then_ramps_one_per_settle_interval_to_six(self) -> None:
@@ -867,6 +874,24 @@ class AdmissionTests(unittest.TestCase):
             2,
         )
 
+    def test_disk_budget_never_stops_live_work_but_blocks_unsafe_launches(self) -> None:
+        self.assertEqual(
+            self.capacity(active=2, elapsed=10_000, disk_available_gib=4_100),
+            2,
+        )
+        self.assertEqual(
+            self.capacity(active=1, elapsed=10_000, disk_available_gib=5_000),
+            2,
+        )
+        self.assertEqual(
+            self.capacity(active=3, elapsed=10_000, disk_available_gib=256),
+            3,
+        )
+        self.assertEqual(
+            self.capacity(active=3, elapsed=10_000, disk_available_gib=0),
+            3,
+        )
+
 
 class PublicStateTests(unittest.TestCase):
     def test_public_batch_marker_must_be_one_safe_real_directory(self) -> None:
@@ -886,6 +911,22 @@ class PublicStateTests(unittest.TestCase):
             second.rmdir()
             marker.rmdir()
             marker.symlink_to(public, target_is_directory=True)
+            with self.assertRaisesRegex(sweep.SweepError, "unsafe public archive batch"):
+                sweep.public_recovery_marker_present(public, os.getuid())
+
+    def test_public_batch_marker_accepts_inherited_setgid_without_group_access(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            public = Path(raw).resolve() / "horizon"
+            public.mkdir()
+            public.chmod(0o3770)
+            marker = public / sweep.ARCHIVE_BATCH_MARKERS[0]
+            marker.mkdir(mode=0o700)
+            self.assertEqual(stat.S_IMODE(marker.stat().st_mode), 0o2700)
+            self.assertTrue(
+                sweep.public_recovery_marker_present(public, os.getuid())
+            )
+
+            marker.chmod(0o1700)
             with self.assertRaisesRegex(sweep.SweepError, "unsafe public archive batch"):
                 sweep.public_recovery_marker_present(public, os.getuid())
 

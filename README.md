@@ -480,8 +480,11 @@ root-owned service using a root-owned, non-writable deployment tree and owner-on
 state under root-controlled ancestry. The controller derives every work boundary from the
 fingerprinted preflight manifest and will not split a verification cohort.
 
-Concurrency begins at the configured floor and increases gradually when CPU and memory headroom
-allow it. Every producer runs as the unprivileged `sol` user in a resource-bounded systemd unit.
+Concurrency begins at the configured floor and increases gradually when CPU, memory, and disk
+headroom allow it. Disk admission reserves a fixed safety margin and conservatively budgets the
+full configured private-storage allowance for every live producer before starting another one;
+it never terminates live work merely because available space falls below that estimate. Every
+producer runs as the unprivileged `sol` user in a resource-bounded systemd unit.
 The controller will adopt existing work only when the process identity, arguments, cgroup, lane,
 runtime, manifest, and complete sandbox configuration match the sealed plan. Overlapping epoch or
 lane claims stop scheduling.

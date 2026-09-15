@@ -30,6 +30,8 @@ Jetstreamer changes are intentionally narrow:
   field larger than 16 MiB before allocating it;
 - `src/accounts_db.rs` provides read-only, owned, write-version-ordered access
   to physical account writes for the IPC adapter;
+- `AccountStorageEntry::snapshot_file_layout` exposes the existing AppendVec
+  written length and mapped file length to the in-process snapshot packager;
 - zero- and one-storage `scan_account_storage` calls run directly instead of
   entering the old Rayon pool, whose workers cannot add parallelism there; and
 - `Bank::add_builtin_loader` restores the serde-skipped, exact static BPF

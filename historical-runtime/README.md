@@ -106,9 +106,12 @@ at checkpoint 29,195,008, proving that v1.2.24 cannot own the epoch boundary.
 The required shape is therefore v1.2.32 through slot 29,186,735, v1.2.24
 through slot 29,371,187, then the v1.2.32 transition worker. The second
 handoff's legacy accounts hash is
-`JBDL7UvkWrgMdcW9PuFyoXmSUjxpiB5gWJGWpG6RTwC8`. The three-span route remains
-unregistered until the first state-bound export and root proof are complete;
-epochs 67–68 continue to fail closed at their final canonical checkpoint.
+`JBDL7UvkWrgMdcW9PuFyoXmSUjxpiB5gWJGWpG6RTwC8`; the first handoff is bound to
+`9FLn7BisKQrjPkD3Dsz7btr7quMD4J1pGQR6HGvvprFp`. The registered three-span
+route requires a state-bound export at each handoff, and epochs 67–68 continue
+to fail closed unless the immutable root proof and final canonical checkpoint
+both pass. The independent root-to-first-handoff replay matches the first
+hash; complete-cohort publication remains gated on the later checks.
 The surrounding v1.2.32 ranges remain independently checkpoint-gated. Static
 loader bindings reproduce the exact linked processors without relying on
 mutable shared libraries next to the deployment.
@@ -119,8 +122,9 @@ parent also hashes the executable itself and records that SHA-256 in historical
 archive provenance; resume rejects a different worker binary.
 
 The version-neutral protocol also has a narrowly scoped snapshot-export
-transition. Only narrowly bounded handoff-source workers implement it, and only immediately after a
-successful complete frozen checkpoint. The request supplies a registry-owned
+transition. Only narrowly bounded handoff-source workers implement it, and
+only immediately after a successful complete frozen checkpoint. The request
+supplies a registry-owned
 slot and accounts hash; both the parent and worker compare them with the sealed
 checkpoint before the worker writes a no-clobber `.tar.bz2` archive through a
 same-directory temporary file. The source packager writes GNU sparse AppendVec

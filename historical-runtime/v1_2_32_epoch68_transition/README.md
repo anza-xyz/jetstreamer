@@ -40,6 +40,6 @@ instruction 5 as a call to program
 
 The worker has a distinct handshake identity, is bounded to the remainder of
 epochs 67 and 68, and remains a checkpoint-gated candidate. The complete
-multi-runtime cohort must replay from the immutable epoch-67 root, bind the
-handoff snapshot to both workers, and match the independent terminal legacy
-accounts hash before either archive can be published.
+three-span cohort must replay from the immutable epoch-67 root, bind both
+handoff snapshots across all three workers, and match the independent terminal
+legacy accounts hash before either archive can be published.

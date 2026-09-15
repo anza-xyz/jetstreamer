@@ -66,10 +66,20 @@ pub const SOLANA_V1_1_15_CANDIDATE_END_SLOT_EXCLUSIVE: Slot = 13_392_000;
 pub const SOLANA_V1_1_23_CANDIDATE_START_SLOT: Slot = SOLANA_V1_1_15_CANDIDATE_END_SLOT_EXCLUSIVE;
 pub const SOLANA_V1_1_23_CANDIDATE_END_SLOT_EXCLUSIVE: Slot = 26_352_000;
 pub const SOLANA_V1_2_32_CANDIDATE_START_SLOT: Slot = SOLANA_V1_1_23_CANDIDATE_END_SLOT_EXCLUSIVE;
-/// Epoch-67 candidate envelope. This remains one fail-closed transition
-/// runtime until both intra-epoch handoffs have complete implementations and
-/// root-to-boundary proofs.
-pub const SOLANA_V1_2_32_EPOCH68_TRANSITION_START_SLOT: Slot = 28_944_000;
+/// Canonical epoch-67 state boundary between the root-start v1.2.32 span and
+/// the exact pre-CPI v1.2.24 span.
+pub const SOLANA_V1_2_32_TO_V1_2_24_HANDOFF_SNAPSHOT_SLOT: Slot = 29_186_735;
+pub const SOLANA_V1_2_32_TO_V1_2_24_HANDOFF_ACCOUNTS_HASH: &str =
+    "9FLn7BisKQrjPkD3Dsz7btr7quMD4J1pGQR6HGvvprFp";
+pub const SOLANA_V1_2_24_EPOCH67_PRE_CPI_START_SLOT: Slot =
+    SOLANA_V1_2_32_TO_V1_2_24_HANDOFF_SNAPSHOT_SLOT + 1;
+/// Canonical state boundary immediately before CPI and vote-timestamp
+/// semantics change in epoch 67.
+pub const SOLANA_V1_2_24_TO_V1_2_32_HANDOFF_SNAPSHOT_SLOT: Slot = 29_371_187;
+pub const SOLANA_V1_2_24_TO_V1_2_32_HANDOFF_ACCOUNTS_HASH: &str =
+    "JBDL7UvkWrgMdcW9PuFyoXmSUjxpiB5gWJGWpG6RTwC8";
+pub const SOLANA_V1_2_32_EPOCH68_TRANSITION_START_SLOT: Slot =
+    SOLANA_V1_2_24_TO_V1_2_32_HANDOFF_SNAPSHOT_SLOT + 1;
 pub const SOLANA_V1_2_32_EPOCH68_TRANSITION_END_SLOT_EXCLUSIVE: Slot = 29_808_000;
 pub const SOLANA_V1_2_32_CANDIDATE_END_SLOT_EXCLUSIVE: Slot = 39_744_000;
 pub const SOLANA_V1_3_19_CANDIDATE_START_SLOT: Slot = SOLANA_V1_2_32_CANDIDATE_END_SLOT_EXCLUSIVE;
@@ -790,8 +800,34 @@ pub static SOLANA_V1_0_7_TO_V1_0_8_HANDOFF: RuntimeHandoff = RuntimeHandoff {
     },
 };
 
+pub static SOLANA_V1_2_32_TO_V1_2_24_EPOCH67_HANDOFF: RuntimeHandoff = RuntimeHandoff {
+    boundary_slot: SOLANA_V1_2_24_EPOCH67_PRE_CPI_START_SLOT,
+    source: &SOLANA_V1_2_32_RUNTIME,
+    destination: &SOLANA_V1_2_24_EPOCH67_PRE_CPI_RUNTIME,
+    snapshot: CanonicalSnapshotIdentity {
+        slot: SOLANA_V1_2_32_TO_V1_2_24_HANDOFF_SNAPSHOT_SLOT,
+        accounts_hash_base58: SOLANA_V1_2_32_TO_V1_2_24_HANDOFF_ACCOUNTS_HASH,
+        archive_extension: ".tar.bz2",
+    },
+};
+
+pub static SOLANA_V1_2_24_TO_V1_2_32_EPOCH67_HANDOFF: RuntimeHandoff = RuntimeHandoff {
+    boundary_slot: SOLANA_V1_2_32_EPOCH68_TRANSITION_START_SLOT,
+    source: &SOLANA_V1_2_24_EPOCH67_PRE_CPI_RUNTIME,
+    destination: &SOLANA_V1_2_32_EPOCH68_TRANSITION_RUNTIME,
+    snapshot: CanonicalSnapshotIdentity {
+        slot: SOLANA_V1_2_24_TO_V1_2_32_HANDOFF_SNAPSHOT_SLOT,
+        accounts_hash_base58: SOLANA_V1_2_24_TO_V1_2_32_HANDOFF_ACCOUNTS_HASH,
+        archive_extension: ".tar.bz2",
+    },
+};
+
 /// Canonical snapshot transitions keyed by their destination slot.
-pub static RUNTIME_HANDOFFS: &[&RuntimeHandoff] = &[&SOLANA_V1_0_7_TO_V1_0_8_HANDOFF];
+pub static RUNTIME_HANDOFFS: &[&RuntimeHandoff] = &[
+    &SOLANA_V1_0_7_TO_V1_0_8_HANDOFF,
+    &SOLANA_V1_2_32_TO_V1_2_24_EPOCH67_HANDOFF,
+    &SOLANA_V1_2_24_TO_V1_2_32_EPOCH67_HANDOFF,
+];
 
 /// Runtime changes at these epoch boundaries are deliberately serviced by a
 /// fresh, independently verified predecessor-epoch snapshot in each isolated
@@ -804,7 +840,6 @@ pub static SNAPSHOT_ISOLATED_RUNTIME_BOUNDARIES: &[Slot] = &[
     SOLANA_V1_1_15_CANDIDATE_START_SLOT,
     SOLANA_V1_1_23_CANDIDATE_START_SLOT,
     SOLANA_V1_2_32_CANDIDATE_START_SLOT,
-    SOLANA_V1_2_32_EPOCH68_TRANSITION_START_SLOT,
     SOLANA_V1_2_32_EPOCH68_TRANSITION_END_SLOT_EXCLUSIVE,
     SOLANA_V1_3_19_CANDIDATE_START_SLOT,
 ];
@@ -1023,10 +1058,17 @@ pub static RUNTIME_ERAS: &[RuntimeEra] = &[
         admission: AdmissionLevel::Candidate,
     },
     RuntimeEra {
-        name: "solana-v1.2.32-epochs-61-66-differential-candidate",
+        name: "solana-v1.2.32-epochs-61-through-epoch67-first-handoff-candidate",
         start_slot: SOLANA_V1_2_32_CANDIDATE_START_SLOT,
-        end_slot_exclusive: Some(SOLANA_V1_2_32_EPOCH68_TRANSITION_START_SLOT),
+        end_slot_exclusive: Some(SOLANA_V1_2_24_EPOCH67_PRE_CPI_START_SLOT),
         backend: EraBackend::Available(&SOLANA_V1_2_32_RUNTIME),
+        admission: AdmissionLevel::Candidate,
+    },
+    RuntimeEra {
+        name: "solana-v1.2.24-mainnet-epoch67-pre-cpi-candidate",
+        start_slot: SOLANA_V1_2_24_EPOCH67_PRE_CPI_START_SLOT,
+        end_slot_exclusive: Some(SOLANA_V1_2_32_EPOCH68_TRANSITION_START_SLOT),
+        backend: EraBackend::Available(&SOLANA_V1_2_24_EPOCH67_PRE_CPI_RUNTIME),
         admission: AdmissionLevel::Candidate,
     },
     RuntimeEra {
@@ -2026,17 +2068,10 @@ mod tests {
                 SOLANA_V1_1_23_CANDIDATE_START_SLOT,
             ),
             (
-                SOLANA_V1_2_32_CANDIDATE_START_SLOT..SOLANA_V1_2_32_EPOCH68_TRANSITION_START_SLOT,
+                SOLANA_V1_2_32_CANDIDATE_START_SLOT..SOLANA_V1_2_24_EPOCH67_PRE_CPI_START_SLOT,
                 RuntimeBackend::SolanaV1_2_32,
                 &SOLANA_V1_2_32_RUNTIME,
                 SOLANA_V1_2_32_CANDIDATE_START_SLOT,
-            ),
-            (
-                SOLANA_V1_2_32_EPOCH68_TRANSITION_START_SLOT
-                    ..SOLANA_V1_2_32_EPOCH68_TRANSITION_END_SLOT_EXCLUSIVE,
-                RuntimeBackend::SolanaV1_2_32Epoch68Transition,
-                &SOLANA_V1_2_32_EPOCH68_TRANSITION_RUNTIME,
-                SOLANA_V1_2_32_EPOCH68_TRANSITION_START_SLOT,
             ),
             (
                 SOLANA_V1_2_32_EPOCH68_TRANSITION_END_SLOT_EXCLUSIVE
@@ -2059,6 +2094,49 @@ mod tests {
             assert!(std::ptr::eq(selection.descriptor, descriptor));
             assert!(SNAPSHOT_ISOLATED_RUNTIME_BOUNDARIES.contains(&boundary));
         }
+    }
+
+    #[test]
+    fn epoch_67_has_two_canonical_handoffs_and_three_exact_spans() {
+        let spans = plan_runtime_spans(28_944_000..29_376_000, true).unwrap();
+        assert_eq!(spans.len(), 3);
+        assert_eq!(spans[0].slots, 28_944_000..29_186_736);
+        assert!(matches!(
+            spans[0].execution.backend,
+            EraBackend::Available(descriptor)
+                if std::ptr::eq(descriptor, &SOLANA_V1_2_32_RUNTIME)
+        ));
+        assert!(spans[0].handoff.is_none());
+
+        assert_eq!(spans[1].slots, 29_186_736..29_371_188);
+        assert!(matches!(
+            spans[1].execution.backend,
+            EraBackend::Available(descriptor)
+                if std::ptr::eq(descriptor, &SOLANA_V1_2_24_EPOCH67_PRE_CPI_RUNTIME)
+        ));
+        assert!(std::ptr::eq(
+            spans[1].handoff.unwrap(),
+            &SOLANA_V1_2_32_TO_V1_2_24_EPOCH67_HANDOFF
+        ));
+
+        assert_eq!(spans[2].slots, 29_371_188..29_376_000);
+        assert!(matches!(
+            spans[2].execution.backend,
+            EraBackend::Available(descriptor)
+                if std::ptr::eq(descriptor, &SOLANA_V1_2_32_EPOCH68_TRANSITION_RUNTIME)
+        ));
+        assert!(std::ptr::eq(
+            spans[2].handoff.unwrap(),
+            &SOLANA_V1_2_24_TO_V1_2_32_EPOCH67_HANDOFF
+        ));
+        assert!(
+            !SNAPSHOT_ISOLATED_RUNTIME_BOUNDARIES
+                .contains(&SOLANA_V1_2_24_EPOCH67_PRE_CPI_START_SLOT)
+        );
+        assert!(
+            !SNAPSHOT_ISOLATED_RUNTIME_BOUNDARIES
+                .contains(&SOLANA_V1_2_32_EPOCH68_TRANSITION_START_SLOT)
+        );
     }
 
     #[test]

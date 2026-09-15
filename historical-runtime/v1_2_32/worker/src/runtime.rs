@@ -1,8 +1,8 @@
 use crate::{leader_schedule, poh_backend, snapshot};
 use jetstreamer_historical_protocol::{
     AccountWrite, Checkpoint, EntryProcessed, EntryRequest, Initialized, InitializedSource,
-    InstructionError as WireInstructionError, TransactionError as WireTransactionError,
-    TransactionOutcome, MAX_ENTRIES_PER_BATCH,
+    InstructionError as WireInstructionError, SnapshotExport,
+    TransactionError as WireTransactionError, TransactionOutcome, MAX_ENTRIES_PER_BATCH,
 };
 use rayon::{prelude::*, ThreadPool, ThreadPoolBuilder};
 use solana_merkle_tree::MerkleTree;
@@ -41,6 +41,11 @@ const MAX_SUPPORTED_SLOT_EXCLUSIVE: u64 = 39_744_000;
 const MAX_SUPPORTED_EPOCH: u64 = 91;
 const POH_THREADS_ENV: &str = "JETSTREAMER_HISTORICAL_POH_THREADS";
 const ABSOLUTE_MAX_POH_THREADS: usize = 256;
+// This generic worker is used across a broad candidate range, but its export
+// authority is deliberately limited to the one canonically proven epoch-67
+// handoff. It must not become a general snapshot-packaging RPC.
+const EPOCH67_FIRST_HANDOFF_SLOT: u64 = 29_186_735;
+const EPOCH67_FIRST_HANDOFF_ACCOUNTS_HASH: &str = "9FLn7BisKQrjPkD3Dsz7btr7quMD4J1pGQR6HGvvprFp";
 // The validator runs AccountsBackgroundService alongside replay. This worker
 // has no BankForks service, so perform the same storage-only maintenance at
 // deterministic rooted-bank boundaries instead. At most one stale store is
@@ -58,10 +63,17 @@ pub struct RuntimeState {
     last_entry_hash: Hash,
     tick_hash_count: u64,
     leader_schedules: HashMap<u64, Vec<Pubkey>>,
+    snapshot_export_seal: Option<SnapshotExportSeal>,
     poh_pool: ThreadPool,
     enforce_candidate_range: bool,
     last_accounts_clean_block_height: u64,
     accounts_shrink_consumed_budget: usize,
+}
+
+#[derive(Clone, Copy)]
+struct SnapshotExportSeal {
+    slot: u64,
+    accounts_hash: Hash,
 }
 
 pub enum ProcessEntriesError<E> {
@@ -132,6 +144,7 @@ impl RuntimeState {
                 last_entry_hash,
                 tick_hash_count: 0,
                 leader_schedules: HashMap::new(),
+                snapshot_export_seal: None,
                 poh_pool,
                 enforce_candidate_range: true,
                 last_accounts_clean_block_height: 0,
@@ -144,6 +157,7 @@ impl RuntimeState {
     /// Preserve the original one-entry request surface while sharing exactly
     /// the same fail-closed preparation and commit path as a batch.
     pub fn process_entry(&mut self, request: EntryRequest) -> Result<EntryProcessed, String> {
+        self.snapshot_export_seal = None;
         let mut processed = self.process_entries(vec![request])?;
         Ok(processed.remove(0))
     }
@@ -175,6 +189,7 @@ impl RuntimeState {
     where
         F: FnMut(EntryProcessed) -> Result<(), E>,
     {
+        self.snapshot_export_seal = None;
         if requests.is_empty() {
             return Err(ProcessEntriesError::Runtime(
                 "entry batch must contain at least one entry".to_string(),
@@ -493,6 +508,7 @@ impl RuntimeState {
     }
 
     pub fn freeze_checkpoint(&mut self, expected_slot: u64) -> Result<Checkpoint, String> {
+        self.snapshot_export_seal = None;
         if expected_slot != self.bank.slot() {
             return Err(format!(
                 "checkpoint requested for slot {}, current bank is {}",
@@ -517,7 +533,7 @@ impl RuntimeState {
         }
         let writes = self.freeze_root_and_drain()?;
         let accounts_hash = self.bank.update_accounts_hash();
-        Ok(Checkpoint {
+        let checkpoint = Checkpoint {
             slot: self.bank.slot(),
             bank_hash: self.bank.hash().as_ref().to_vec(),
             accounts_hash: accounts_hash.as_ref().to_vec(),
@@ -528,6 +544,78 @@ impl RuntimeState {
             slot_complete: self.bank.is_complete(),
             writes,
             next_write_version: self.write_cursor,
+        };
+        self.snapshot_export_seal = Some(SnapshotExportSeal {
+            slot: checkpoint.slot,
+            accounts_hash,
+        });
+        Ok(checkpoint)
+    }
+
+    pub fn invalidate_snapshot_export(&mut self) {
+        self.snapshot_export_seal = None;
+    }
+
+    pub fn export_snapshot(
+        &mut self,
+        slot: u64,
+        output_directory: &str,
+        expected_accounts_hash: &[u8],
+    ) -> Result<SnapshotExport, String> {
+        let seal = self.snapshot_export_seal.take().ok_or_else(|| {
+            "snapshot export requires the immediately preceding successful checkpoint".to_string()
+        })?;
+        let authorized_hash = EPOCH67_FIRST_HANDOFF_ACCOUNTS_HASH
+            .parse::<Hash>()
+            .map_err(|error| format!("invalid compiled handoff hash: {}", error))?;
+        if slot != EPOCH67_FIRST_HANDOFF_SLOT || authorized_hash != seal.accounts_hash {
+            return Err(format!(
+                "snapshot export is authorized only for epoch-67 handoff slot {} hash {}",
+                EPOCH67_FIRST_HANDOFF_SLOT, authorized_hash
+            ));
+        }
+        if seal.slot != slot || self.bank.slot() != slot {
+            return Err(format!(
+                "snapshot export slot {} does not match checkpoint slot {} and bank slot {}",
+                slot,
+                seal.slot,
+                self.bank.slot()
+            ));
+        }
+        if expected_accounts_hash.len() != 32 {
+            return Err(format!(
+                "expected accounts hash has {} bytes, expected 32",
+                expected_accounts_hash.len()
+            ));
+        }
+        let expected_accounts_hash = Hash::new(expected_accounts_hash);
+        if expected_accounts_hash != seal.accounts_hash {
+            return Err(format!(
+                "snapshot export hash {} does not match checkpoint hash {}",
+                expected_accounts_hash, seal.accounts_hash
+            ));
+        }
+        let exported = snapshot::export_archive(
+            &self.bank,
+            Path::new(output_directory),
+            expected_accounts_hash,
+        )?;
+        let archive_path = exported
+            .archive_path
+            .to_str()
+            .ok_or_else(|| {
+                format!(
+                    "snapshot archive path is not UTF-8: {}",
+                    exported.archive_path.display()
+                )
+            })?
+            .to_string();
+        Ok(SnapshotExport {
+            slot,
+            archive_path,
+            accounts_hash: exported.accounts_hash.as_ref().to_vec(),
+            archive_size: exported.archive_size,
+            archive_sha256: exported.archive_sha256.to_vec(),
         })
     }
 
@@ -656,6 +744,7 @@ impl RuntimeState {
             last_entry_hash,
             tick_hash_count: 0,
             leader_schedules: HashMap::new(),
+            snapshot_export_seal: None,
             poh_pool: build_poh_pool().unwrap(),
             enforce_candidate_range: false,
             last_accounts_clean_block_height: 0,
@@ -1829,6 +1918,32 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_export_is_one_use_and_bound_to_the_epoch67_handoff() {
+        let (mut state, _mint_keypair) = test_state(1, Some(1));
+        let tick = request_for(&state, 0, 0, 1, &[]);
+        state.process_entry(tick).unwrap();
+        let checkpoint = state.freeze_checkpoint(0).unwrap();
+        let output = tempfile::tempdir().unwrap();
+
+        let error = state
+            .export_snapshot(
+                0,
+                output.path().to_str().unwrap(),
+                &checkpoint.accounts_hash,
+            )
+            .unwrap_err();
+        assert!(error.contains("authorized only for epoch-67 handoff slot 29186735"));
+        assert!(state
+            .export_snapshot(
+                0,
+                output.path().to_str().unwrap(),
+                &checkpoint.accounts_hash,
+            )
+            .unwrap_err()
+            .contains("immediately preceding successful checkpoint"));
+    }
+
+    #[test]
     fn completed_slots_are_squashed_without_losing_state_or_writes() {
         let (mut state, mint_keypair) = test_state(1, Some(2));
         let preserved_key = Pubkey::new_from_array([42; 32]);
@@ -1985,5 +2100,62 @@ mod tests {
             checkpoint.slot_complete
         );
         assert_eq!(checkpoint.accounts_hash, expected_accounts_hash);
+    }
+
+    #[test]
+    #[ignore]
+    fn exports_and_restores_exact_epoch67_handoff_snapshot() {
+        let archive = std::env::var("JETSTREAMER_SNAPSHOT_29186735")
+            .expect("set JETSTREAMER_SNAPSHOT_29186735");
+        let ledger =
+            std::env::var("JETSTREAMER_MAINNET_LEDGER").expect("set JETSTREAMER_MAINNET_LEDGER");
+        let (mut state, initialized) = RuntimeState::initialize(
+            &ledger,
+            &jetstreamer_historical_protocol::InitialState::SnapshotArchive {
+                archive_path: archive,
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(initialized.slot, EPOCH67_FIRST_HANDOFF_SLOT);
+        let checkpoint = state.freeze_checkpoint(EPOCH67_FIRST_HANDOFF_SLOT).unwrap();
+        assert_eq!(
+            Hash::new(&checkpoint.accounts_hash).to_string(),
+            EPOCH67_FIRST_HANDOFF_ACCOUNTS_HASH
+        );
+
+        let output = tempfile::tempdir().unwrap();
+        let exported = state
+            .export_snapshot(
+                EPOCH67_FIRST_HANDOFF_SLOT,
+                output.path().to_str().unwrap(),
+                &checkpoint.accounts_hash,
+            )
+            .unwrap();
+        assert_eq!(exported.slot, EPOCH67_FIRST_HANDOFF_SLOT);
+        assert_eq!(exported.accounts_hash, checkpoint.accounts_hash);
+        assert_eq!(exported.archive_sha256.len(), 32);
+        assert_eq!(
+            std::fs::metadata(&exported.archive_path).unwrap().len(),
+            exported.archive_size
+        );
+
+        let (_restored, restored) = RuntimeState::initialize(
+            &ledger,
+            &jetstreamer_historical_protocol::InitialState::SnapshotArchive {
+                archive_path: exported.archive_path,
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(restored.slot, EPOCH67_FIRST_HANDOFF_SLOT);
+        let restored_hash = match restored.source {
+            InitializedSource::SnapshotArchive {
+                expected_accounts_hash,
+                ..
+            } => expected_accounts_hash,
+            InitializedSource::Genesis => unreachable!(),
+        };
+        assert_eq!(restored_hash, checkpoint.accounts_hash);
     }
 }

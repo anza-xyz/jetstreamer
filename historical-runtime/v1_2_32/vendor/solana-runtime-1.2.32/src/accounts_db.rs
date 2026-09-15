@@ -268,6 +268,14 @@ impl AccountStorageEntry {
         self.accounts.flush()
     }
 
+    /// Return the on-disk AppendVec layout needed by snapshot packagers.
+    ///
+    /// The written prefix contains serialized accounts while `file_len` is
+    /// the logical mmap length. A sparse snapshot must preserve both values.
+    pub fn snapshot_file_layout(&self) -> (usize, u64) {
+        (self.accounts.len(), self.accounts.capacity())
+    }
+
     fn add_account(&self) {
         let mut count_and_status = self.count_and_status.write().unwrap();
         *count_and_status = (count_and_status.0 + 1, count_and_status.1);

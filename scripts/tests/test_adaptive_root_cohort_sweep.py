@@ -595,6 +595,7 @@ class CommandTests(unittest.TestCase):
                     self.deploy
                     / "jetstreamer-historical-worker-v1-2-32-epoch68-transition"
                 ),
+                str(self.deploy / "jetstreamer-historical-worker-v1-2-32"),
                 str(
                     self.deploy
                     / "jetstreamer-historical-worker-v1-2-24-epoch67-pre-cpi"
@@ -605,6 +606,11 @@ class CommandTests(unittest.TestCase):
         self.assertIn(
             "JETSTREAMER_HISTORICAL_WORKER_V1_2_32_EPOCH68_TRANSITION="
             f"{self.deploy}/jetstreamer-historical-worker-v1-2-32-epoch68-transition",
+            environments,
+        )
+        self.assertIn(
+            "JETSTREAMER_HISTORICAL_WORKER_V1_2_32="
+            f"{self.deploy}/jetstreamer-historical-worker-v1-2-32",
             environments,
         )
         self.assertIn(

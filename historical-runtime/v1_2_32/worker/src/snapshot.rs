@@ -1,19 +1,22 @@
-use bzip2::bufread::BzDecoder;
+use bzip2::{bufread::BzDecoder, write::BzEncoder, Compression};
+use sha2::{Digest, Sha256};
 use solana_runtime::{
     bank::{Bank, BankSlotDelta},
     serde_snapshot::{
-        bankrc_from_stream, deserialize_from_snapshot, SerdeStyle, MAX_SNAPSHOT_DATA_FILE_SIZE,
+        bankrc_from_stream, bankrc_to_stream, deserialize_from_snapshot, SerdeStyle,
+        MAX_SNAPSHOT_DATA_FILE_SIZE,
     },
 };
 use solana_sdk::{genesis_config::GenesisConfig, hash::Hash};
 use std::{
-    collections::HashSet,
+    collections::{BTreeSet, HashSet},
+    convert::TryFrom,
     fs::{self, File},
-    io::{self, BufReader, Read, Seek, SeekFrom},
+    io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     path::{Component, Path, PathBuf},
     str::FromStr,
 };
-use tar::{Archive, EntryType};
+use tar::{Archive, Builder as TarBuilder, EntryType, Header};
 use tempfile::{Builder, TempDir};
 
 const SNAPSHOT_VERSION_1_1: &str = "1.1.0";
@@ -251,6 +254,451 @@ enum SnapshotSchema {
 pub(crate) enum SnapshotCompression {
     Bzip2,
     Zstd,
+}
+
+pub struct ExportedSnapshot {
+    pub archive_path: PathBuf,
+    pub accounts_hash: Hash,
+    pub archive_size: u64,
+    pub archive_sha256: [u8; 32],
+}
+
+/// Write the v1.2.32 `1.2.0` snapshot format without invoking a host-side
+/// packager. The caller must have just checkpointed this exact frozen bank.
+pub fn export_archive(
+    bank: &Bank,
+    output_directory: &Path,
+    expected_accounts_hash: Hash,
+) -> Result<ExportedSnapshot, String> {
+    if !bank.is_complete() {
+        return Err(format!(
+            "cannot export incomplete bank at slot {}",
+            bank.slot()
+        ));
+    }
+    if !bank.is_frozen() {
+        return Err(format!(
+            "cannot export unfrozen bank at slot {}",
+            bank.slot()
+        ));
+    }
+    if bank.parent().is_some() {
+        return Err(format!(
+            "cannot export bank at slot {} before its ancestry is squashed",
+            bank.slot()
+        ));
+    }
+    if bank.get_accounts_hash() != expected_accounts_hash {
+        return Err(format!(
+            "bank accounts hash {} does not match expected checkpoint hash {}",
+            bank.get_accounts_hash(),
+            expected_accounts_hash
+        ));
+    }
+
+    let output_directory = fs::canonicalize(output_directory).map_err(|error| {
+        format!(
+            "failed to resolve snapshot output directory {}: {}",
+            output_directory.display(),
+            error
+        )
+    })?;
+    if !output_directory.is_dir() {
+        return Err(format!(
+            "snapshot output path is not a directory: {}",
+            output_directory.display()
+        ));
+    }
+
+    // Keep the selected storage Arcs alive while cleaning, matching the
+    // historical snapshot packager and preventing AppendVec reclamation.
+    let snapshot_storages = bank.get_snapshot_storages();
+    bank.clean_accounts();
+    let accounts_hash = bank.update_accounts_hash();
+    if accounts_hash != expected_accounts_hash {
+        return Err(format!(
+            "accounts hash changed after snapshot cleaning: expected {}, got {}",
+            expected_accounts_hash, accounts_hash
+        ));
+    }
+    let final_path = output_directory.join(format!(
+        "snapshot-{}-{}.tar.bz2",
+        bank.slot(),
+        accounts_hash
+    ));
+    if final_path.exists() {
+        return Err(format!(
+            "refusing to replace existing snapshot archive {}",
+            final_path.display()
+        ));
+    }
+
+    let roots = bank.src.roots();
+    if !roots.contains(&bank.slot()) || roots.iter().any(|slot| *slot > bank.slot()) {
+        return Err(format!(
+            "status cache roots do not end at frozen slot {}: {:?}",
+            bank.slot(),
+            roots
+        ));
+    }
+    let slot_deltas = bank.src.slot_deltas(&roots);
+
+    let staging = Builder::new()
+        .prefix("jetstreamer-v1.2.32-snapshot-staging-")
+        .tempdir_in(&output_directory)
+        .map_err(|error| {
+            format!(
+                "failed to create snapshot staging directory under {}: {}",
+                output_directory.display(),
+                error
+            )
+        })?;
+    let snapshots_directory = staging.path().join("snapshots");
+    let slot_directory = snapshots_directory.join(bank.slot().to_string());
+    fs::create_dir_all(&slot_directory)
+        .map_err(|error| format!("failed to create snapshot staging layout: {}", error))?;
+
+    let bank_path = slot_directory.join(bank.slot().to_string());
+    serialize_capped(&bank_path, |stream| {
+        bincode::serialize_into(&mut *stream, bank)
+            .map_err(|error| format!("failed to serialize snapshot Bank: {}", error))?;
+        bankrc_to_stream(SerdeStyle::NEWER, stream, &bank.rc, &snapshot_storages)
+            .map_err(|error| format!("failed to serialize snapshot AccountsDB: {}", error))
+    })?;
+
+    serialize_capped(&snapshots_directory.join("status_cache"), |stream| {
+        bincode::serialize_into(stream, &slot_deltas)
+            .map_err(|error| format!("failed to serialize snapshot status cache: {}", error))
+    })?;
+
+    let version_path = staging.path().join("version");
+    let mut version = File::create(&version_path)
+        .map_err(|error| format!("failed to create {}: {}", version_path.display(), error))?;
+    version
+        .write_all(SNAPSHOT_VERSION_1_2.as_bytes())
+        .and_then(|()| version.sync_all())
+        .map_err(|error| format!("failed to write {}: {}", version_path.display(), error))?;
+
+    let mut names = BTreeSet::new();
+    let mut append_vecs = Vec::new();
+    for storage in snapshot_storages.iter().flatten() {
+        storage
+            .flush()
+            .map_err(|error| format!("failed to flush snapshot AppendVec: {}", error))?;
+        let source = fs::canonicalize(storage.get_path()).map_err(|error| {
+            format!(
+                "failed to resolve snapshot AppendVec {}: {}",
+                storage.get_path().display(),
+                error
+            )
+        })?;
+        if !source.is_file() {
+            return Err(format!(
+                "snapshot AppendVec is not a regular file: {}",
+                source.display()
+            ));
+        }
+        let name = source
+            .file_name()
+            .ok_or_else(|| format!("snapshot AppendVec has no filename: {}", source.display()))?
+            .to_os_string();
+        if !names.insert(name.clone()) {
+            return Err(format!("duplicate snapshot AppendVec filename {:?}", name));
+        }
+        let (written_len, file_len) = storage.snapshot_file_layout();
+        let written_len = u64::try_from(written_len)
+            .map_err(|_| "snapshot AppendVec length does not fit u64".to_string())?;
+        let metadata = fs::metadata(&source).map_err(|error| {
+            format!(
+                "failed to stat snapshot AppendVec {}: {}",
+                source.display(),
+                error
+            )
+        })?;
+        if metadata.len() != file_len || written_len > file_len {
+            return Err(format!(
+                "snapshot AppendVec {} layout changed: written {}, runtime file {}, disk file {}",
+                source.display(),
+                written_len,
+                file_len,
+                metadata.len()
+            ));
+        }
+        append_vecs.push((name, source, written_len, file_len));
+    }
+
+    let archive = Builder::new()
+        .prefix("jetstreamer-v1.2.32-snapshot-archive-")
+        .suffix(".tar.bz2.partial")
+        .tempfile_in(&output_directory)
+        .map_err(|error| {
+            format!(
+                "failed to create temporary snapshot archive under {}: {}",
+                output_directory.display(),
+                error
+            )
+        })?;
+    let archive_path = archive.path().to_path_buf();
+    let output = archive
+        .reopen()
+        .map_err(|error| format!("failed to open {}: {}", archive_path.display(), error))?;
+    let writer = BufWriter::new(output);
+    let encoder = BzEncoder::new(writer, Compression::Best);
+    let mut tar = TarBuilder::new(encoder);
+    tar.append_dir("accounts", staging.path())
+        .and_then(|()| {
+            for (name, source, written_len, file_len) in append_vecs {
+                append_sparse_append_vec(
+                    &mut tar,
+                    &Path::new("accounts").join(name),
+                    &source,
+                    written_len,
+                    file_len,
+                )?;
+            }
+            Ok(())
+        })
+        .and_then(|()| tar.append_dir_all("snapshots", &snapshots_directory))
+        .and_then(|()| tar.append_path_with_name(&version_path, "version"))
+        .map_err(|error| format!("failed to build snapshot tar: {}", error))?;
+    let encoder = tar
+        .into_inner()
+        .map_err(|error| format!("failed to finish snapshot tar: {}", error))?;
+    let mut writer = encoder
+        .finish()
+        .map_err(|error| format!("failed to finish snapshot compression: {}", error))?;
+    writer
+        .flush()
+        .map_err(|error| format!("failed to flush snapshot archive: {}", error))?;
+    writer
+        .get_ref()
+        .sync_all()
+        .map_err(|error| format!("failed to sync {}: {}", archive_path.display(), error))?;
+    drop(writer);
+    archive
+        .as_file()
+        .sync_all()
+        .map_err(|error| format!("failed to sync {}: {}", archive_path.display(), error))?;
+    let archive_size = archive
+        .as_file()
+        .metadata()
+        .map_err(|error| format!("failed to stat {}: {}", archive_path.display(), error))?
+        .len();
+    if archive_size == 0 {
+        return Err("snapshot tar produced an empty archive".to_string());
+    }
+    let mut persisted = archive.persist_noclobber(&final_path).map_err(|error| {
+        format!(
+            "failed to publish snapshot archive {} without replacing a file: {}",
+            final_path.display(),
+            error
+        )
+    })?;
+    persisted
+        .sync_all()
+        .map_err(|error| format!("failed to sync {}: {}", final_path.display(), error))?;
+    persisted
+        .seek(SeekFrom::Start(0))
+        .map_err(|error| format!("failed to seek {}: {}", final_path.display(), error))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 128 * 1024];
+    loop {
+        let read = persisted
+            .read(&mut buffer)
+            .map_err(|error| format!("failed to hash {}: {}", final_path.display(), error))?;
+        if read == 0 {
+            break;
+        }
+        hasher.input(&buffer[..read]);
+    }
+    let digest = hasher.result();
+    let mut archive_sha256 = [0u8; 32];
+    archive_sha256.copy_from_slice(digest.as_slice());
+    let measured_size = persisted
+        .metadata()
+        .map_err(|error| format!("failed to stat {}: {}", final_path.display(), error))?
+        .len();
+    if measured_size != archive_size {
+        return Err(format!(
+            "snapshot archive {} changed while hashing: expected {} bytes, got {}",
+            final_path.display(),
+            archive_size,
+            measured_size
+        ));
+    }
+    File::open(&output_directory)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| {
+            format!(
+                "failed to sync snapshot output directory {}: {}",
+                output_directory.display(),
+                error
+            )
+        })?;
+
+    Ok(ExportedSnapshot {
+        archive_path: final_path,
+        accounts_hash,
+        archive_size,
+        archive_sha256,
+    })
+}
+
+fn append_sparse_append_vec<W: Write>(
+    tar: &mut TarBuilder<W>,
+    archive_path: &Path,
+    source_path: &Path,
+    written_len: u64,
+    file_len: u64,
+) -> io::Result<()> {
+    if file_len == 0 || written_len > file_len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "invalid AppendVec layout: written {}, file {}",
+                written_len, file_len
+            ),
+        ));
+    }
+    let file = File::open(source_path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() != file_len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "AppendVec file metadata does not match the captured layout",
+        ));
+    }
+
+    let prefix_len = written_len
+        .checked_add(511)
+        .map(|length| length / 512 * 512)
+        .unwrap_or(file_len)
+        .min(file_len);
+    if prefix_len == file_len {
+        let mut header = Header::new_gnu();
+        header.set_metadata(&metadata);
+        header.set_size(file_len);
+        header.set_cksum();
+        return tar.append_data(&mut header, archive_path, file.take(file_len));
+    }
+
+    let mut extents = Vec::with_capacity(2);
+    if prefix_len != 0 {
+        extents.push((0, prefix_len));
+    }
+    extents.push((file_len - 1, 1));
+    let archived_size = prefix_len + 1;
+
+    let mut header = Header::new_gnu();
+    header.set_metadata(&metadata);
+    header.set_entry_type(EntryType::GNUSparse);
+    header.set_size(archived_size);
+    let gnu = header
+        .as_gnu_mut()
+        .expect("Header::new_gnu must produce a GNU header");
+    write_octal(&mut gnu.realsize, file_len)?;
+    gnu.isextended[0] = 0;
+    for (sparse, &(offset, length)) in gnu.sparse.iter_mut().zip(&extents) {
+        write_octal(&mut sparse.offset, offset)?;
+        write_octal(&mut sparse.numbytes, length)?;
+    }
+    header.set_cksum();
+    tar.append_data(
+        &mut header,
+        archive_path,
+        FileExtentsReader::new(file, extents),
+    )
+}
+
+fn write_octal(field: &mut [u8], value: u64) -> io::Result<()> {
+    let encoded = format!("{:o}", value);
+    if encoded.len() + 1 > field.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "value does not fit GNU tar numeric field",
+        ));
+    }
+    for byte in field.iter_mut() {
+        *byte = b'0';
+    }
+    let start = field.len() - encoded.len() - 1;
+    field[start..start + encoded.len()].copy_from_slice(encoded.as_bytes());
+    field[field.len() - 1] = 0;
+    Ok(())
+}
+
+struct FileExtentsReader {
+    file: File,
+    extents: Vec<(u64, u64)>,
+    next_extent: usize,
+    remaining: u64,
+}
+
+impl FileExtentsReader {
+    fn new(file: File, extents: Vec<(u64, u64)>) -> Self {
+        Self {
+            file,
+            extents,
+            next_extent: 0,
+            remaining: 0,
+        }
+    }
+}
+
+impl Read for FileExtentsReader {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+        if self.remaining == 0 {
+            let &(offset, length) = match self.extents.get(self.next_extent) {
+                Some(extent) => extent,
+                None => return Ok(0),
+            };
+            self.next_extent += 1;
+            self.file.seek(SeekFrom::Start(offset))?;
+            self.remaining = length;
+        }
+        let maximum = std::cmp::min(self.remaining, buffer.len() as u64) as usize;
+        let read = self.file.read(&mut buffer[..maximum])?;
+        if read == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "AppendVec changed while its snapshot was being archived",
+            ));
+        }
+        self.remaining -= read as u64;
+        Ok(read)
+    }
+}
+
+fn serialize_capped<F>(path: &Path, mut serialize: F) -> Result<u64, String>
+where
+    F: FnMut(&mut BufWriter<File>) -> Result<(), String>,
+{
+    let file = File::create(path)
+        .map_err(|error| format!("failed to create {}: {}", path.display(), error))?;
+    let mut stream = BufWriter::new(file);
+    serialize(&mut stream)?;
+    stream
+        .flush()
+        .map_err(|error| format!("failed to flush {}: {}", path.display(), error))?;
+    let size = stream
+        .seek(SeekFrom::Current(0))
+        .map_err(|error| format!("failed to seek {}: {}", path.display(), error))?;
+    if size > MAX_SNAPSHOT_DATA_FILE_SIZE {
+        return Err(format!(
+            "snapshot data file {} is {} bytes (limit {})",
+            path.display(),
+            size,
+            MAX_SNAPSHOT_DATA_FILE_SIZE
+        ));
+    }
+    stream
+        .get_ref()
+        .sync_all()
+        .map_err(|error| format!("failed to sync {}: {}", path.display(), error))?;
+    Ok(size)
 }
 
 pub fn private_state_dir(scratch_root: Option<&str>) -> Result<TempDir, String> {

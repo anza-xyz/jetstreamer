@@ -96,6 +96,10 @@ RUNTIME_WORKERS = {
 RUNTIME_AUXILIARY_WORKERS = {
     "solana-v1.2.32-mainnet-epoch68-transition": (
         (
+            "V1_2_32",
+            "jetstreamer-historical-worker-v1-2-32",
+        ),
+        (
             "V1_2_24_EPOCH67_PRE_CPI",
             "jetstreamer-historical-worker-v1-2-24-epoch67-pre-cpi",
         ),

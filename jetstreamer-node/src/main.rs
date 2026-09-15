@@ -13632,11 +13632,11 @@ async fn run_multi_runtime_epoch_supervisor(
 }
 
 /// Replays the first, mixed-runtime member of a root-checkpoint cohort while
-/// retaining the destination worker for the following epoch. The source and
-/// destination are independently checkpointed on each side of the canonical
-/// handoff, assembled with V3 provenance, and only then admitted as one cohort
-/// member. The shared destination verifier remains open until the cohort's
-/// later root checkpoint is reached.
+/// retaining the terminal worker for the following epoch. Every span is
+/// independently checkpointed, each adjacent pair is joined by its registered
+/// canonical handoff, and all segment archives are assembled with V3
+/// provenance before the member is admitted. The terminal verifier remains
+/// open until the cohort's later root checkpoint is reached.
 #[allow(clippy::too_many_arguments)]
 async fn run_mixed_runtime_root_cohort_first_epoch(
     epoch: u64,
@@ -13661,32 +13661,20 @@ async fn run_mixed_runtime_root_cohort_first_epoch(
         epoch_start..epoch_end.saturating_add(1),
         allow_candidate_runtime,
     )?;
-    if spans.len() != 2 {
+    if spans.len() < 2 {
         return Err(format!(
-            "mixed-runtime root cohort requires exactly two spans in its first epoch, got {}",
+            "mixed-runtime root cohort requires at least two spans in its first epoch, got {}",
             spans.len()
         ));
     }
-    let handoff = spans[1]
-        .handoff
-        .ok_or_else(|| "mixed-runtime root cohort has no canonical handoff".to_string())?;
-    let bootstrap_slot = bootstrap.slot()?;
-    let source_plan = QualificationPlan {
-        epoch,
-        bootstrap_slot,
-        replay_start: bootstrap_slot
-            .checked_add(1)
-            .ok_or_else(|| "mixed-runtime bootstrap slot has no successor".to_string())?,
-        output_slot_start: epoch_start,
-        end_inclusive: spans[0].slots.end - 1,
-    };
-    let destination_plan = QualificationPlan {
-        epoch,
-        bootstrap_slot: handoff.snapshot.slot,
-        replay_start: handoff.boundary_slot,
-        output_slot_start: handoff.boundary_slot,
-        end_inclusive: epoch_end,
-    };
+    for (index, span) in spans.iter().enumerate().skip(1) {
+        if span.handoff.is_none() {
+            return Err(format!(
+                "mixed-runtime root cohort span {index} {}..{} has no canonical handoff",
+                span.slots.start, span.slots.end
+            ));
+        }
+    }
     let work_dir = runtime_segment_work_dir(staged_output)?;
     fs::create_dir_all(&work_dir)
         .map_err(|error| format!("failed to create {}: {error}", work_dir.display()))?;
@@ -13694,96 +13682,104 @@ async fn run_mixed_runtime_root_cohort_first_epoch(
     fs::create_dir_all(&handoff_dir)
         .map_err(|error| format!("failed to create {}: {error}", handoff_dir.display()))?;
 
-    let source_expected = all_expectations
-        .iter()
-        .filter(|(slot, _)| **slot <= handoff.snapshot.slot)
-        .map(|(slot, hash)| (*slot, *hash))
-        .collect::<BTreeMap<_, _>>();
-    if !source_expected.contains_key(&bootstrap_slot)
-        || !source_expected.contains_key(&handoff.snapshot.slot)
-    {
-        return Err(
-            "mixed-runtime source expectations do not bind bootstrap and handoff checkpoints"
-                .to_string(),
-        );
-    }
-    let source_verifier = Arc::new(SnapshotVerifier::new(
-        source_expected,
-        Some(shutdown.clone()),
-    ));
-    let source_output = runtime_segment_archive_path(&work_dir, epoch, 0, &spans[0]);
-    let source_result = run_geyser_replay(
-        epoch,
-        allow_candidate_runtime,
-        dest_dir,
-        replay_scratch,
-        bootstrap,
-        shutdown.clone(),
-        cursor.clone(),
-        restart_tracker.clone(),
-        Some(source_verifier),
-        source_output.clone(),
-        Some(source_plan),
-        None,
-        range_progress.clone(),
-        Some(shared_progress.clone()),
-        Some(audited_bootstrap),
-        Some(source_plan.end_inclusive),
-        Some(&handoff_dir),
-        false,
-    )
-    .await?;
-    publish_historical_segment_manifest(
-        epoch,
-        source_plan,
-        &source_output,
-        &source_result,
-        allow_candidate_runtime,
-    )?;
-    let source_evidence = source_result
-        .historical_evidence
-        .ok_or_else(|| "mixed-runtime source produced no checkpoint evidence".to_string())?;
-    let handoff_path = handoff_dir.join(handoff.snapshot.archive_name());
-    validate_canonical_handoff_snapshot(&handoff_path, handoff)?;
+    let mut current_bootstrap = bootstrap.clone();
+    let mut first_bootstrap_evidence = None;
+    let mut terminal_evidence = None;
+    let mut carried_state = None;
+    for (index, span) in spans.iter().enumerate() {
+        let is_terminal = index + 1 == spans.len();
+        let bootstrap_slot = current_bootstrap.slot()?;
+        let plan = QualificationPlan {
+            epoch,
+            bootstrap_slot,
+            replay_start: bootstrap_slot
+                .checked_add(1)
+                .ok_or_else(|| "mixed-runtime bootstrap slot has no successor".to_string())?,
+            output_slot_start: span.slots.start,
+            end_inclusive: span.slots.end - 1,
+        };
+        if plan.replay_start != span.slots.start && index != 0 {
+            return Err(format!(
+                "mixed-runtime span {index} starts at {}, but its handoff resumes at {}",
+                span.slots.start, plan.replay_start
+            ));
+        }
 
-    let destination_bootstrap = ReplayBootstrap::SnapshotArchive(handoff_path);
-    let destination_output = runtime_segment_archive_path(&work_dir, epoch, 1, &spans[1]);
-    let mut destination_result = run_geyser_replay(
-        epoch,
-        allow_candidate_runtime,
-        dest_dir,
-        replay_scratch,
-        &destination_bootstrap,
-        shutdown.clone(),
-        cursor,
-        restart_tracker,
-        Some(destination_verifier),
-        destination_output.clone(),
-        Some(destination_plan),
-        None,
-        range_progress,
-        Some(shared_progress),
-        None,
-        Some(epoch_to_slot_range(final_epoch).1),
-        None,
-        true,
-    )
-    .await?;
-    publish_historical_segment_manifest(
-        epoch,
-        destination_plan,
-        &destination_output,
-        &destination_result,
-        allow_candidate_runtime,
-    )?;
-    let destination_evidence = destination_result
-        .historical_evidence
-        .clone()
-        .ok_or_else(|| "mixed-runtime destination produced no checkpoint evidence".to_string())?;
-    let carried_state = destination_result
-        .carried_state
-        .take()
-        .ok_or_else(|| "mixed-runtime destination did not retain its worker".to_string())?;
+        let verifier = if is_terminal {
+            destination_verifier.clone()
+        } else {
+            let expected = all_expectations
+                .iter()
+                .filter(|(slot, _)| (bootstrap_slot..=plan.end_inclusive).contains(slot))
+                .map(|(slot, hash)| (*slot, *hash))
+                .collect::<BTreeMap<_, _>>();
+            if !expected.contains_key(&bootstrap_slot)
+                || !expected.contains_key(&plan.end_inclusive)
+            {
+                return Err(format!(
+                    "mixed-runtime span {index} expectations do not bind bootstrap {} and handoff {}",
+                    bootstrap_slot, plan.end_inclusive
+                ));
+            }
+            Arc::new(SnapshotVerifier::new(expected, Some(shutdown.clone())))
+        };
+        let output = runtime_segment_archive_path(&work_dir, epoch, index, span);
+        let mut result = run_geyser_replay(
+            epoch,
+            allow_candidate_runtime,
+            dest_dir,
+            replay_scratch,
+            &current_bootstrap,
+            shutdown.clone(),
+            cursor.clone(),
+            restart_tracker.clone(),
+            Some(verifier),
+            output.clone(),
+            Some(plan),
+            None,
+            range_progress.clone(),
+            Some(shared_progress.clone()),
+            (index == 0).then_some(audited_bootstrap),
+            Some(if is_terminal {
+                epoch_to_slot_range(final_epoch).1
+            } else {
+                plan.end_inclusive
+            }),
+            (!is_terminal).then_some(handoff_dir.as_path()),
+            is_terminal,
+        )
+        .await?;
+        publish_historical_segment_manifest(
+            epoch,
+            plan,
+            &output,
+            &result,
+            allow_candidate_runtime,
+        )?;
+        let evidence = result
+            .historical_evidence
+            .clone()
+            .ok_or_else(|| format!("mixed-runtime span {index} produced no checkpoint evidence"))?;
+        first_bootstrap_evidence.get_or_insert_with(|| evidence.bootstrap.clone());
+        terminal_evidence = Some(evidence.terminal);
+
+        if is_terminal {
+            carried_state = result.carried_state.take();
+        } else {
+            let handoff = spans[index + 1]
+                .handoff
+                .expect("all successor spans were checked above");
+            let handoff_path = handoff_dir.join(handoff.snapshot.archive_name());
+            validate_canonical_handoff_snapshot(&handoff_path, handoff)?;
+            current_bootstrap = ReplayBootstrap::SnapshotArchive(handoff_path);
+        }
+    }
+    let first_bootstrap_evidence = first_bootstrap_evidence
+        .ok_or_else(|| "mixed-runtime cohort produced no bootstrap evidence".to_string())?;
+    let terminal_evidence = terminal_evidence
+        .ok_or_else(|| "mixed-runtime cohort produced no terminal evidence".to_string())?;
+    let carried_state = carried_state
+        .ok_or_else(|| "mixed-runtime terminal span did not retain its worker".to_string())?;
 
     let assembly_hashes = replay_scratch.join("mixed-runtime-root-cohort-hashes.txt");
     write_epoch_hashes_file(&assembly_hashes, all_expectations)?;
@@ -13824,8 +13820,8 @@ async fn run_mixed_runtime_root_cohort_first_epoch(
         staged_output: staged_output.to_path_buf(),
         final_output: final_output.to_path_buf(),
         evidence: CohortEpochEvidence {
-            bootstrap: source_evidence.bootstrap,
-            terminal: destination_evidence.terminal,
+            bootstrap: first_bootstrap_evidence,
+            terminal: terminal_evidence,
             emitted_write_versions: None,
         },
         archive_chain,
@@ -17934,14 +17930,16 @@ async fn main() {
             .unwrap_or_default();
         complete_cohort_expectations = Some(expected.clone());
         if mixed_root_first_epoch {
-            let handoff_slot = first_epoch_spans[1]
+            let handoff_slot = first_epoch_spans
+                .last()
+                .expect("mixed-runtime cohort has a terminal span")
                 .handoff
                 .expect("mixed-runtime cohort was validated with a handoff")
                 .snapshot
                 .slot;
-            // The source segment independently consumes bootstrap..handoff.
-            // The destination verifier begins from the same committed handoff
-            // and remains live through the final root checkpoint.
+            // Every preceding segment independently consumes its checkpoint
+            // interval. The terminal verifier begins from the last committed
+            // handoff and remains live through the final root checkpoint.
             expected.retain(|slot, _| *slot >= handoff_slot);
         }
         Some(Arc::new(SnapshotVerifier::new(
@@ -18362,6 +18360,29 @@ async fn main() {
 mod early_snapshot_tests {
     use super::*;
 
+    #[test]
+    fn epoch67_checkpoint_set_includes_both_registered_handoffs() {
+        let mut expected = BTreeMap::new();
+        add_runtime_handoff_expectations(28_944_000..29_376_000, &mut expected).unwrap();
+        assert_eq!(expected.len(), 2);
+        for (slot, hash) in [
+            (
+                compatibility::SOLANA_V1_2_32_TO_V1_2_24_HANDOFF_SNAPSHOT_SLOT,
+                compatibility::SOLANA_V1_2_32_TO_V1_2_24_HANDOFF_ACCOUNTS_HASH,
+            ),
+            (
+                compatibility::SOLANA_V1_2_24_TO_V1_2_32_HANDOFF_SNAPSHOT_SLOT,
+                compatibility::SOLANA_V1_2_24_TO_V1_2_32_HANDOFF_ACCOUNTS_HASH,
+            ),
+        ] {
+            let expected_hash: Hash = hash.parse().unwrap();
+            assert_eq!(
+                expected.get(&slot),
+                Some(&BankHashExpectation::LegacyAccountsHash(expected_hash))
+            );
+        }
+    }
+
     fn historical_checkpoint(
         slot: Slot,
         accounts_hash: Hash,
@@ -18407,6 +18428,13 @@ mod early_snapshot_tests {
             compatibility::RuntimeBackend::SolanaV1_0_23
         );
         assert!(selection.descriptor.permits_live_epoch_handoff());
+
+        let epoch67 = root_checkpoint_cohort_runtime(67, 68, true).unwrap();
+        assert_eq!(
+            epoch67.backend,
+            compatibility::RuntimeBackend::SolanaV1_2_32Epoch68Transition
+        );
+        assert!(epoch67.descriptor.permits_live_epoch_handoff());
 
         let error = root_checkpoint_cohort_runtime(11, 12, true).unwrap_err();
         assert!(error.contains("changes runtime at epoch 12"), "{error}");

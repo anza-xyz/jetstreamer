@@ -347,6 +347,10 @@ struct BlockHashes {
     /// Full-mode PoH could not be recomputed: the stored parent hash is the
     /// writer's zeroed resume placeholder, so there is no seed to fold from.
     poh_unseeded: bool,
+    /// Slot zero starts from the genesis bank rather than an ordinary prior
+    /// block. Its zero parent is a protocol sentinel, not a PoH seed from
+    /// which the slot's terminal blockhash can be recomputed.
+    genesis_poh_sentinel: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -370,6 +374,10 @@ fn genesis_sentinel(blocks: &[BlockHashes]) -> Option<ChainPoint> {
             slot: 0,
             blockhash: Hash::default(),
         })
+}
+
+fn is_genesis_poh_sentinel(slot: u64, parent_slot: u64, parent_blockhash: &Hash) -> bool {
+    slot == 0 && parent_slot == 0 && *parent_blockhash == Hash::default()
 }
 
 fn find_parent_slot_mismatches(
@@ -551,9 +559,12 @@ impl SlotVisitor for ScanVisitor {
                 ) {
                     self.count_mismatches.push(mismatch);
                 }
+                let genesis_poh_sentinel = self.full
+                    && is_genesis_poh_sentinel(meta.slot, meta.parent_slot, &meta.parent_blockhash);
                 let poh_unseeded =
                     self.full && meta.slot != 0 && meta.parent_blockhash == Hash::default();
                 let poh_ok = !self.full
+                    || genesis_poh_sentinel
                     || poh_unseeded
                     || recompute_blockhash(&meta.parent_blockhash, entries, &self.cur_sigs)
                         == Some(meta.blockhash);
@@ -564,6 +575,7 @@ impl SlotVisitor for ScanVisitor {
                     blockhash: meta.blockhash,
                     poh_ok,
                     poh_unseeded,
+                    genesis_poh_sentinel,
                 });
             }
         }
@@ -737,6 +749,11 @@ fn run_scan(
         .filter(|b| b.poh_unseeded)
         .map(|b| b.slot)
         .collect();
+    let genesis_poh_sentinels: Vec<u64> = blocks
+        .iter()
+        .filter(|b| b.genesis_poh_sentinel)
+        .map(|b| b.slot)
+        .collect();
 
     let elapsed = start.elapsed().as_secs_f64();
     println!("\n=== verify summary ({elapsed:.1}s, {threads} threads) ===");
@@ -815,9 +832,13 @@ fn run_scan(
 
     if full {
         println!("\n=== full PoH verification ===");
+        let recomputed_ok = block_count
+            - poh_failures.len() as u64
+            - poh_unseeded.len() as u64
+            - genesis_poh_sentinels.len() as u64;
         println!(
-            "  PoH recompute: {} OK, {} mismatched{}",
-            commas(block_count - poh_failures.len() as u64 - poh_unseeded.len() as u64),
+            "  PoH recompute: {} OK, {} mismatched{}{}",
+            commas(recomputed_ok),
             commas(poh_failures.len() as u64),
             if poh_unseeded.is_empty() {
                 String::new()
@@ -825,6 +846,14 @@ fn run_scan(
                 format!(
                     ", {} unverifiable (zeroed parent seed at resume points)",
                     commas(poh_unseeded.len() as u64)
+                )
+            },
+            if genesis_poh_sentinels.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    ", {} genesis sentinel(s) anchored without recomputation",
+                    commas(genesis_poh_sentinels.len() as u64)
                 )
             },
         );
@@ -867,9 +896,12 @@ fn run_scan(
     let anchor_ok = anchored || !(full || require_anchor);
     let ok = internal_ok && anchor_ok;
     if ok && anchored {
-        let detail = if full {
+        let detail = if full && genesis_poh_sentinels.is_empty() {
             "every block's PoH recomputes to its stored blockhash and the chain links cleanly \
              from the anchor"
+        } else if full {
+            "every non-genesis block's PoH recomputes to its stored blockhash and the chain links \
+             cleanly from the genesis sentinel"
         } else {
             "all buckets checksum-verified, every slot/transaction/update decoded, blockhash \
              chain intact, tallies consistent"
@@ -1181,6 +1213,7 @@ mod tests {
             blockhash: Hash::default(),
             poh_ok: true,
             poh_unseeded: false,
+            genesis_poh_sentinel: false,
         }
     }
 
@@ -1247,6 +1280,7 @@ mod tests {
             blockhash,
             poh_ok: true,
             poh_unseeded: false,
+            genesis_poh_sentinel: true,
         }];
         let sentinel = genesis_sentinel(&blocks);
         assert!(find_parent_slot_mismatches(&blocks, sentinel).is_empty());
@@ -1254,6 +1288,18 @@ mod tests {
 
         blocks[0].parent_blockhash = Hash::new_from_array([9; 32]);
         assert_eq!(find_hash_link_breaks(&blocks, sentinel).len(), 1);
+    }
+
+    #[test]
+    fn full_poh_scan_exempts_only_the_canonical_genesis_sentinel() {
+        assert!(is_genesis_poh_sentinel(0, 0, &Hash::default()));
+        assert!(!is_genesis_poh_sentinel(0, 1, &Hash::default()));
+        assert!(!is_genesis_poh_sentinel(
+            0,
+            0,
+            &Hash::new_from_array([1; 32])
+        ));
+        assert!(!is_genesis_poh_sentinel(1, 0, &Hash::default()));
     }
 
     #[test]
@@ -1269,6 +1315,7 @@ mod tests {
             blockhash: Hash::new_from_array([4; 32]),
             poh_ok: true,
             poh_unseeded: false,
+            genesis_poh_sentinel: false,
         }];
         assert!(find_parent_slot_mismatches(&blocks, Some(anchor)).is_empty());
         assert!(find_hash_link_breaks(&blocks, Some(anchor)).is_empty());

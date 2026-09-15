@@ -53,7 +53,7 @@ still requires explicit opt-in and trusted checkpoint validation.
 
 The sibling virtual workspaces have independent old-format lockfiles. Workers
 through v1.0.18 are pinned to `1.42.0-x86_64-unknown-linux-gnu`; v1.0.23,
-v1.0.24, v1.1.15, v1.1.23, and v1.2.32 use
+v1.0.24, v1.1.15, v1.1.23, and the v1.2.32 workers use
 `1.43.0-x86_64-unknown-linux-gnu`; v1.3.19
 uses `1.45.1-x86_64-unknown-linux-gnu`. They cannot share dependency
 resolution because the exact upstream graphs require incompatible
@@ -80,14 +80,15 @@ SHA-NI is guarded by feature detection, every unsafe load/store operates on
 fixed-size owned arrays, and randomized tests cover optimized, paired, and
 forced-portable paths.
 
-The v1.2.32 and v1.3.19 workers also perform the storage-only duties that their
-validators normally delegated to `AccountsBackgroundService`. After a rooted
-bank is squashed and all observable writes are drained, the worker reclaims
-dead and stale AppendVec storage and periodically runs account cleaning. This
-maintenance is synchronous because the standalone worker has no concurrent
-`BankForks` owner. It fails closed if the global account write cursor changes,
-and tests preserve logical account state while proving that obsolete physical
-storage is actually removed.
+The v1.2.32 transition, general v1.2.32, and v1.3.19 workers also perform the
+storage-only duties that their validators normally delegated to
+`AccountsBackgroundService`. After a rooted bank is squashed and all
+observable writes are drained, the worker reclaims dead and stale AppendVec
+storage and periodically runs account cleaning. This maintenance is
+synchronous because the standalone worker has no concurrent `BankForks`
+owner. It fails closed if the global account write cursor changes, and tests
+preserve logical account state while proving that obsolete physical storage
+is actually removed.
 
 The narrow v1.1.15 envelope covers epoch 30; canonical metadata identifies
 v1.1.14 at its bootstrap and v1.1.15 at both trusted checkpoints, and those
@@ -96,10 +97,16 @@ hard-fork marker at slot 13,334,463 when bootstrapping from the preceding
 snapshot; snapshots after that slot must contain the persisted marker with its
 exact count. The following v1.1.23 envelope retains
 mainnet's epoch-34 BPF-loader activation
-and the runtime's epoch-40 system-program transition. The v1.2.32 envelope
-retains the Stable-cluster CPI transition at epoch 63. Static loader bindings
-reproduce the exact linked processors without relying on mutable,
-deployment-adjacent shared libraries.
+and the runtime's epoch-40 system-program transition. Historical snapshot
+creator versions do not establish the runtime that processed the ledger. The
+canonical epoch-67 stream instead provides direct execution evidence: BPF
+transactions using `sol_create_program_address` fail before the mainnet
+transition and succeed afterward. The bounded epoch-67/68 worker therefore
+uses the exact v1.2.32 execution tree while preserving the preceding CPI and
+vote-timestamp rules through slot 29,371,187.
+The surrounding v1.2.32 ranges remain independently checkpoint-gated. Static
+loader bindings reproduce the exact linked processors without relying on
+mutable shared libraries next to the deployment.
 
 The executable handshake reports candidate status, protocol version, Solana
 tag and commit, Rust toolchain, target, and required mainnet genesis hash. The
@@ -138,7 +145,8 @@ Each vendored runtime directory contains the upstream `runtime/` crate and an
 | `v1_0_24` | `a93915f1bddb73480f86fc09f487315ae191897d` | registered but unassigned differential candidate |
 | `v1_1_15` | `2cdd3f835f00ca531af7141459d657f0ea60a946` | checkpoint-gated diagnostic envelope, epoch 30 |
 | `v1_1_23` | `263fc25992ebae85e7ba2f176e9a066449489c3e` | checkpoint-gated diagnostic envelope, epochs 31–60 |
-| `v1_2_32` | `8c989da68342918f1717c60aa60fdfab7d1e676e` | checkpoint-gated diagnostic envelope, epochs 61–91 |
+| `v1_2_32_epoch68_transition` | `8c989da68342918f1717c60aa60fdfab7d1e676e` + explicit mainnet activation state | checkpoint-gated transition envelope, epochs 67-68 |
+| `v1_2_32` | `8c989da68342918f1717c60aa60fdfab7d1e676e` | checkpoint-gated diagnostic envelopes, epochs 61-66 and 69-91 |
 | `v1_3_19` | `15a49d75086f95573ad319b22e4843639bdf2169` | checkpoint-gated diagnostic envelope, epochs 92–100 |
 
 The source has only these integration changes:
@@ -153,6 +161,10 @@ The source has only these integration changes:
    their persisted `write_version`, plus the next write version.  This is the
    worker's only runtime instrumentation and does not alter account storage,
    hashing, transaction execution, or serialization.
-4. The v1.0.7 and v1.0.8 `AccountsDB` scanners keep zero- and one-AppendVec
-   scans on the caller thread, avoiding an old Rayon-pool wakeup when no scan
-   parallelism exists. The multi-storage path is unchanged.
+4. Workers carrying the `AccountsDB` scan fast path keep zero- and
+   one-AppendVec scans on the caller thread, avoiding an old Rayon-pool wakeup
+   when no scan parallelism exists. The multi-storage path is unchanged.
+5. The epoch-67/68 v1.2.32 worker reconstructs the two serde-skipped mainnet
+   consensus flags at the behaviorally proven slot `29,371,188`. Its vendored
+   bank and vote program keep the preceding rules before that slot and the
+   upstream v1.2.32 behavior from that slot onward.

@@ -80,6 +80,10 @@ RUNTIME_WORKERS = {
     "solana-v1.0.23": ("V1_0_23", "jetstreamer-historical-worker-v1-0-23"),
     "solana-v1.1.15": ("V1_1_15", "jetstreamer-historical-worker-v1-1-15"),
     "solana-v1.1.23": ("V1_1_23", "jetstreamer-historical-worker-v1-1-23"),
+    "solana-v1.2.32-mainnet-epoch68-transition": (
+        "V1_2_32_EPOCH68_TRANSITION",
+        "jetstreamer-historical-worker-v1-2-32-epoch68-transition",
+    ),
     "solana-v1.2.32": ("V1_2_32", "jetstreamer-historical-worker-v1-2-32"),
     "solana-v1.3.19": ("V1_3_19", "jetstreamer-historical-worker-v1-3-19"),
 }

@@ -6,7 +6,7 @@
     "hourly_objects": 34741,
     "hourly_sha256": "f829f7e865ad4dacc20556a27e0196043210c6ef351693775452a40b772a1bc1"
   },
-  "manifest_fingerprint": "sha256:888df3d89187e3fb8cd307e65eab1a4770153887965f3defd74f048504fc3f1a",
+  "manifest_fingerprint": "sha256:0f972577503068f9a3d74c2a427f20363da0e5fa3b727f3eb5bcba220cf7e976",
   "epoch_count": 100,
   "cohort_count": 81,
   "multi_epoch_cohorts": [
@@ -22,7 +22,7 @@
     {"epochs": [56, 57], "bootstrap_root_slot": 24191928, "final_root_slot": 25055977, "runtime": "solana-v1.1.23"},
     {"epochs": [58, 59], "bootstrap_root_slot": 25055977, "final_root_slot": 25919917, "runtime": "solana-v1.1.23"},
     {"epochs": [65, 66], "bootstrap_root_slot": 28079956, "final_root_slot": 28943975, "runtime": "solana-v1.2.32"},
-    {"epochs": [67, 68], "bootstrap_root_slot": 28943975, "final_root_slot": 29460107, "runtime": "solana-v1.2.32"},
+    {"epochs": [67, 68], "bootstrap_root_slot": 28943975, "final_root_slot": 29460107, "runtime": "solana-v1.2.32-mainnet-epoch68-transition"},
     {"epochs": [71, 72], "bootstrap_root_slot": 30671950, "final_root_slot": 31535921, "runtime": "solana-v1.2.32"},
     {"epochs": [81, 82], "bootstrap_root_slot": 34991671, "final_root_slot": 35855942, "runtime": "solana-v1.2.32"},
     {"epochs": [86, 87], "bootstrap_root_slot": 37151959, "final_root_slot": 38015941, "runtime": "solana-v1.2.32"},

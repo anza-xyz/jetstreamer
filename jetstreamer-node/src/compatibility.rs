@@ -66,6 +66,11 @@ pub const SOLANA_V1_1_15_CANDIDATE_END_SLOT_EXCLUSIVE: Slot = 13_392_000;
 pub const SOLANA_V1_1_23_CANDIDATE_START_SLOT: Slot = SOLANA_V1_1_15_CANDIDATE_END_SLOT_EXCLUSIVE;
 pub const SOLANA_V1_1_23_CANDIDATE_END_SLOT_EXCLUSIVE: Slot = 26_352_000;
 pub const SOLANA_V1_2_32_CANDIDATE_START_SLOT: Slot = SOLANA_V1_1_23_CANDIDATE_END_SLOT_EXCLUSIVE;
+/// The canonical stream proves that the CPI and vote-timestamp changes remained
+/// disabled through slot 29,371,187. Keep that state reconstruction in a
+/// distinct v1.2.32 worker bounded to the epoch-67/68 checkpoint cohort.
+pub const SOLANA_V1_2_32_EPOCH68_TRANSITION_START_SLOT: Slot = 28_944_000;
+pub const SOLANA_V1_2_32_EPOCH68_TRANSITION_END_SLOT_EXCLUSIVE: Slot = 29_808_000;
 pub const SOLANA_V1_2_32_CANDIDATE_END_SLOT_EXCLUSIVE: Slot = 39_744_000;
 pub const SOLANA_V1_3_19_CANDIDATE_START_SLOT: Slot = SOLANA_V1_2_32_CANDIDATE_END_SLOT_EXCLUSIVE;
 pub const SOLANA_V1_3_19_CANDIDATE_END_SLOT_EXCLUSIVE: Slot = 43_632_000;
@@ -103,6 +108,8 @@ pub const SOLANA_V1_0_23_REVISION: &str = "825c0e2b6e39ae67431ed0a8282260ad3914c
 pub const SOLANA_V1_0_24_REVISION: &str = "a93915f1bddb73480f86fc09f487315ae191897d";
 pub const SOLANA_V1_1_15_REVISION: &str = "2cdd3f835f00ca531af7141459d657f0ea60a946";
 pub const SOLANA_V1_1_23_REVISION: &str = "263fc25992ebae85e7ba2f176e9a066449489c3e";
+pub const SOLANA_V1_2_32_EPOCH68_TRANSITION_REVISION: &str =
+    "8c989da68342918f1717c60aa60fdfab7d1e676e";
 pub const SOLANA_V1_2_32_REVISION: &str = "8c989da68342918f1717c60aa60fdfab7d1e676e";
 pub const SOLANA_V1_3_19_REVISION: &str = "15a49d75086f95573ad319b22e4843639bdf2169";
 
@@ -164,8 +171,11 @@ pub enum RuntimeBackend {
     /// Exact terminal v1.1 patch used only in the checkpoint-gated diagnostic
     /// envelope for epochs 31 through 60.
     SolanaV1_1_23,
+    /// Exact v1.2.32 execution with mainnet's CPI and vote-timestamp state
+    /// transition reconstructed at slot 29,371,188, bounded to epochs 67–68.
+    SolanaV1_2_32Epoch68Transition,
     /// Exact terminal v1.2 patch used only in the checkpoint-gated diagnostic
-    /// envelope for epochs 61 through 91.
+    /// envelopes surrounding epochs 67 and 68.
     SolanaV1_2_32,
     /// Exact terminal v1.3 patch used only in the checkpoint-gated diagnostic
     /// envelope for epochs 92 through 100.
@@ -306,6 +316,7 @@ impl RuntimeDescriptor {
             | RuntimeBackend::SolanaV1_0_24
             | RuntimeBackend::SolanaV1_1_15
             | RuntimeBackend::SolanaV1_1_23
+            | RuntimeBackend::SolanaV1_2_32Epoch68Transition
             | RuntimeBackend::SolanaV1_2_32
             | RuntimeBackend::SolanaV1_3_19 => {
                 BootstrapStateLoader::HistoricalWorkerSnapshotArchive
@@ -655,6 +666,28 @@ pub static SOLANA_V1_1_23_RUNTIME: RuntimeDescriptor = RuntimeDescriptor {
     }),
 };
 
+pub static SOLANA_V1_2_32_EPOCH68_TRANSITION_RUNTIME: RuntimeDescriptor = RuntimeDescriptor {
+    backend: RuntimeBackend::SolanaV1_2_32Epoch68Transition,
+    identity: RuntimeIdentity {
+        name: "solana-v1.2.32-mainnet-epoch68-transition",
+        revision: SOLANA_V1_2_32_EPOCH68_TRANSITION_REVISION,
+        rust_toolchain: "rustc 1.43.0 (4fb7144ed 2020-04-20)",
+        target: Some("x86_64-unknown-linux-gnu"),
+        genesis_hash: MAINNET_GENESIS_HASH,
+    },
+    bootstrap: BootstrapState {
+        loader: BootstrapStateLoader::HistoricalWorkerSnapshotArchive,
+        archive_extensions: &[".tar.bz2", ".tar.zst"],
+        snapshot_hash_kind: SnapshotHashKind::LegacyAccountsHash,
+        permits_in_memory_handoff: false,
+    },
+    worker: Some(WorkerExecutable {
+        identity: "jetstreamer-historical-worker-v1-2-32-epoch68-transition",
+        environment_override: "JETSTREAMER_HISTORICAL_WORKER_V1_2_32_EPOCH68_TRANSITION",
+        default_manifest_relative_path: "../historical-runtime/v1_2_32_epoch68_transition/target/release/jetstreamer-historical-worker-v1-2-32-epoch68-transition",
+    }),
+};
+
 pub static SOLANA_V1_2_32_RUNTIME: RuntimeDescriptor = RuntimeDescriptor {
     backend: RuntimeBackend::SolanaV1_2_32,
     identity: RuntimeIdentity {
@@ -743,6 +776,8 @@ pub static SNAPSHOT_ISOLATED_RUNTIME_BOUNDARIES: &[Slot] = &[
     SOLANA_V1_1_15_CANDIDATE_START_SLOT,
     SOLANA_V1_1_23_CANDIDATE_START_SLOT,
     SOLANA_V1_2_32_CANDIDATE_START_SLOT,
+    SOLANA_V1_2_32_EPOCH68_TRANSITION_START_SLOT,
+    SOLANA_V1_2_32_EPOCH68_TRANSITION_END_SLOT_EXCLUSIVE,
     SOLANA_V1_3_19_CANDIDATE_START_SLOT,
 ];
 
@@ -761,6 +796,7 @@ pub static RUNTIME_DESCRIPTORS: &[&RuntimeDescriptor] = &[
     &SOLANA_V1_0_24_RUNTIME,
     &SOLANA_V1_1_15_RUNTIME,
     &SOLANA_V1_1_23_RUNTIME,
+    &SOLANA_V1_2_32_EPOCH68_TRANSITION_RUNTIME,
     &SOLANA_V1_2_32_RUNTIME,
     &SOLANA_V1_3_19_RUNTIME,
     &AGAVE_V3_RUNTIME,
@@ -958,8 +994,22 @@ pub static RUNTIME_ERAS: &[RuntimeEra] = &[
         admission: AdmissionLevel::Candidate,
     },
     RuntimeEra {
-        name: "solana-v1.2.32-epochs-61-91-differential-candidate",
+        name: "solana-v1.2.32-epochs-61-66-differential-candidate",
         start_slot: SOLANA_V1_2_32_CANDIDATE_START_SLOT,
+        end_slot_exclusive: Some(SOLANA_V1_2_32_EPOCH68_TRANSITION_START_SLOT),
+        backend: EraBackend::Available(&SOLANA_V1_2_32_RUNTIME),
+        admission: AdmissionLevel::Candidate,
+    },
+    RuntimeEra {
+        name: "solana-v1.2.32-mainnet-epochs-67-68-transition-candidate",
+        start_slot: SOLANA_V1_2_32_EPOCH68_TRANSITION_START_SLOT,
+        end_slot_exclusive: Some(SOLANA_V1_2_32_EPOCH68_TRANSITION_END_SLOT_EXCLUSIVE),
+        backend: EraBackend::Available(&SOLANA_V1_2_32_EPOCH68_TRANSITION_RUNTIME),
+        admission: AdmissionLevel::Candidate,
+    },
+    RuntimeEra {
+        name: "solana-v1.2.32-epochs-69-91-differential-candidate",
+        start_slot: SOLANA_V1_2_32_EPOCH68_TRANSITION_END_SLOT_EXCLUSIVE,
         end_slot_exclusive: Some(SOLANA_V1_2_32_CANDIDATE_END_SLOT_EXCLUSIVE),
         backend: EraBackend::Available(&SOLANA_V1_2_32_RUNTIME),
         admission: AdmissionLevel::Candidate,
@@ -1520,7 +1570,7 @@ mod tests {
     #[test]
     fn runtime_registry_is_complete_and_well_formed() {
         validate_runtime_registry().unwrap();
-        assert_eq!(RUNTIME_DESCRIPTORS.len(), 13);
+        assert_eq!(RUNTIME_DESCRIPTORS.len(), 14);
         for descriptor in RUNTIME_DESCRIPTORS.iter().copied() {
             assert!(std::ptr::eq(
                 descriptor,
@@ -1630,6 +1680,12 @@ mod tests {
                 "../historical-runtime/v1_1_23/target/release/jetstreamer-historical-worker-v1-1-23",
             ),
             (
+                RuntimeBackend::SolanaV1_2_32Epoch68Transition,
+                SOLANA_V1_2_32_EPOCH68_TRANSITION_REVISION,
+                "JETSTREAMER_HISTORICAL_WORKER_V1_2_32_EPOCH68_TRANSITION",
+                "../historical-runtime/v1_2_32_epoch68_transition/target/release/jetstreamer-historical-worker-v1-2-32-epoch68-transition",
+            ),
+            (
                 RuntimeBackend::SolanaV1_2_32,
                 SOLANA_V1_2_32_REVISION,
                 "JETSTREAMER_HISTORICAL_WORKER_V1_2_32",
@@ -1712,7 +1768,11 @@ mod tests {
             assert_eq!(bootstrap.archive_extensions, &[".tar.bz2"]);
         }
 
-        for backend in [RuntimeBackend::SolanaV1_2_32, RuntimeBackend::SolanaV1_3_19] {
+        for backend in [
+            RuntimeBackend::SolanaV1_2_32Epoch68Transition,
+            RuntimeBackend::SolanaV1_2_32,
+            RuntimeBackend::SolanaV1_3_19,
+        ] {
             let descriptor = backend.descriptor().unwrap();
             assert_eq!(
                 descriptor.bootstrap.snapshot_hash_kind,
@@ -1909,7 +1969,7 @@ mod tests {
     }
 
     #[test]
-    fn epochs_12_through_100_route_to_checkpoint_gated_terminal_patch_candidates() {
+    fn epochs_12_through_100_route_to_checkpoint_gated_exact_candidates() {
         for (range, backend, descriptor, boundary) in [
             (
                 SOLANA_V1_0_23_CANDIDATE_START_SLOT..SOLANA_V1_0_23_CANDIDATE_END_SLOT_EXCLUSIVE,
@@ -1930,10 +1990,24 @@ mod tests {
                 SOLANA_V1_1_23_CANDIDATE_START_SLOT,
             ),
             (
-                SOLANA_V1_2_32_CANDIDATE_START_SLOT..SOLANA_V1_2_32_CANDIDATE_END_SLOT_EXCLUSIVE,
+                SOLANA_V1_2_32_CANDIDATE_START_SLOT..SOLANA_V1_2_32_EPOCH68_TRANSITION_START_SLOT,
                 RuntimeBackend::SolanaV1_2_32,
                 &SOLANA_V1_2_32_RUNTIME,
                 SOLANA_V1_2_32_CANDIDATE_START_SLOT,
+            ),
+            (
+                SOLANA_V1_2_32_EPOCH68_TRANSITION_START_SLOT
+                    ..SOLANA_V1_2_32_EPOCH68_TRANSITION_END_SLOT_EXCLUSIVE,
+                RuntimeBackend::SolanaV1_2_32Epoch68Transition,
+                &SOLANA_V1_2_32_EPOCH68_TRANSITION_RUNTIME,
+                SOLANA_V1_2_32_EPOCH68_TRANSITION_START_SLOT,
+            ),
+            (
+                SOLANA_V1_2_32_EPOCH68_TRANSITION_END_SLOT_EXCLUSIVE
+                    ..SOLANA_V1_2_32_CANDIDATE_END_SLOT_EXCLUSIVE,
+                RuntimeBackend::SolanaV1_2_32,
+                &SOLANA_V1_2_32_RUNTIME,
+                SOLANA_V1_2_32_EPOCH68_TRANSITION_END_SLOT_EXCLUSIVE,
             ),
             (
                 SOLANA_V1_3_19_CANDIDATE_START_SLOT..SOLANA_V1_3_19_CANDIDATE_END_SLOT_EXCLUSIVE,

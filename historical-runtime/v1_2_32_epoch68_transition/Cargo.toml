@@ -1,0 +1,17 @@
+[workspace]
+members = [
+    "protocol",
+    "worker",
+]
+exclude = [
+    "vendor/solana-bpf-loader-program-1.2.32",
+    "vendor/solana-runtime-1.2.32",
+]
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3
+
+[patch."https://github.com/solana-labs/solana.git"]
+solana-vote-program = { path = "vendor/solana-vote-program-1.2.32" }

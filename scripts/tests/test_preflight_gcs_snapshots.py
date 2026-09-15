@@ -292,6 +292,13 @@ class SelectionTests(unittest.TestCase):
             10: "solana-v1.0.14",
             11: "solana-v1.0.14",
             12: "solana-v1.0.23",
+            61: "solana-v1.2.32",
+            66: "solana-v1.2.32",
+            67: "solana-v1.2.32-mainnet-epoch68-transition",
+            68: "solana-v1.2.32-mainnet-epoch68-transition",
+            69: "solana-v1.2.32",
+            91: "solana-v1.2.32",
+            92: "solana-v1.3.19",
         }
         for epoch, runtime in expected.items():
             with self.subTest(epoch=epoch):

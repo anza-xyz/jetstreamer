@@ -61,7 +61,14 @@ RUNTIME_ROUTES = (
     (12, 29, "solana-v1.0.23", (".tar.bz2",)),
     (30, 30, "solana-v1.1.15", (".tar.bz2",)),
     (31, 60, "solana-v1.1.23", (".tar.bz2",)),
-    (61, 91, "solana-v1.2.32", (".tar.bz2", ".tar.zst")),
+    (61, 66, "solana-v1.2.32", (".tar.bz2", ".tar.zst")),
+    (
+        67,
+        68,
+        "solana-v1.2.32-mainnet-epoch68-transition",
+        (".tar.bz2", ".tar.zst"),
+    ),
+    (69, 91, "solana-v1.2.32", (".tar.bz2", ".tar.zst")),
     (92, 100, "solana-v1.3.19", (".tar.bz2", ".tar.zst")),
 )
 ROOT_COHORT_HISTORICAL_RUNTIMES = frozenset(
@@ -72,6 +79,7 @@ ROOT_COHORT_HISTORICAL_RUNTIMES = frozenset(
         "solana-v1.0.23",
         "solana-v1.1.15",
         "solana-v1.1.23",
+        "solana-v1.2.32-mainnet-epoch68-transition",
         "solana-v1.2.32",
         "solana-v1.3.19",
     }

@@ -6855,6 +6855,9 @@ fn historical_worker_profile(
         compatibility::RuntimeBackend::SolanaV1_0_24 => historical::SOLANA_V1_0_24_CANDIDATE,
         compatibility::RuntimeBackend::SolanaV1_1_15 => historical::SOLANA_V1_1_15_CANDIDATE,
         compatibility::RuntimeBackend::SolanaV1_1_23 => historical::SOLANA_V1_1_23_CANDIDATE,
+        compatibility::RuntimeBackend::SolanaV1_2_32Epoch68Transition => {
+            historical::SOLANA_V1_2_32_EPOCH68_TRANSITION_CANDIDATE
+        }
         compatibility::RuntimeBackend::SolanaV1_2_32 => historical::SOLANA_V1_2_32_CANDIDATE,
         compatibility::RuntimeBackend::SolanaV1_3_19 => historical::SOLANA_V1_3_19_CANDIDATE,
         compatibility::RuntimeBackend::AgaveV3 => {
@@ -9864,6 +9867,7 @@ async fn run_geyser_replay(
             | compatibility::RuntimeBackend::SolanaV1_0_24
             | compatibility::RuntimeBackend::SolanaV1_1_15
             | compatibility::RuntimeBackend::SolanaV1_1_23
+            | compatibility::RuntimeBackend::SolanaV1_2_32Epoch68Transition
             | compatibility::RuntimeBackend::SolanaV1_2_32
             | compatibility::RuntimeBackend::SolanaV1_3_19 => {
                 let worker_profile = historical_worker_profile(runtime_descriptor)?;
@@ -11769,6 +11773,7 @@ fn validated_epoch_archive_multi_runtime(
         | compatibility::RuntimeBackend::SolanaV1_0_24
         | compatibility::RuntimeBackend::SolanaV1_1_15
         | compatibility::RuntimeBackend::SolanaV1_1_23
+        | compatibility::RuntimeBackend::SolanaV1_2_32Epoch68Transition
         | compatibility::RuntimeBackend::SolanaV1_2_32
         | compatibility::RuntimeBackend::SolanaV1_3_19 => StateCommitmentKind::LegacyAccountsHash,
         compatibility::RuntimeBackend::AgaveV3 => StateCommitmentKind::AccountsLtHash,

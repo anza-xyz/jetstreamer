@@ -344,7 +344,9 @@ select a runtime. The current registry is deliberately conservative:
 | `5,184,000..12,960,000` | pinned Solana v1.0.23 worker | diagnostic candidate for epochs 12-29 |
 | `12,960,000..13,392,000` | pinned Solana v1.1.15 worker | diagnostic candidate for epoch 30 |
 | `13,392,000..26,352,000` | pinned Solana v1.1.23 worker | diagnostic candidate for epochs 31-60 |
-| `26,352,000..39,744,000` | pinned Solana v1.2.32 worker | diagnostic candidate for epochs 61-91 |
+| `26,352,000..28,944,000` | pinned Solana v1.2.32 worker | diagnostic candidate for epochs 61-66 |
+| `28,944,000..29,808,000` | pinned Solana v1.2.32 mainnet transition worker | checkpoint-gated CPI/vote-state reconstruction for epochs 67-68 |
+| `29,808,000..39,744,000` | pinned Solana v1.2.32 worker | diagnostic candidate for epochs 69-91 |
 | `39,744,000..43,632,000` | pinned Solana v1.3.19 worker | diagnostic candidate for epochs 92-100 |
 | `43,632,000..406,080,000` | none | unsupported; replay fails closed |
 | `406,080,000..` | in-process Agave v3 | verified |
@@ -417,7 +419,7 @@ JETSTREAMER_ALLOW_CANDIDATE_RUNTIME=1 \
   cargo run --release -p jetstreamer-node --bin jetstreamer-node -- \
   17-19 /path/to/output --verify --root-checkpoint-cohort \
   --cohort-manifest=/secure/path/preflight-1-100.json \
-  --cohort-manifest-fingerprint=sha256:888df3d89187e3fb8cd307e65eab1a4770153887965f3defd74f048504fc3f1a
+  --cohort-manifest-fingerprint=sha256:0f972577503068f9a3d74c2a427f20363da0e5fa3b727f3eb5bcba220cf7e976
 ```
 
 This mode keeps one historical worker and one root-only verifier alive across every epoch

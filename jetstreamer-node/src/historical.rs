@@ -99,6 +99,13 @@ const SOLANA_V1_1_23_TAG: &str = "v1.1.23";
 const SOLANA_V1_1_23_COMMIT: &str = "263fc25992ebae85e7ba2f176e9a066449489c3e";
 const SOLANA_V1_1_23_RUST_TOOLCHAIN: &str = "rustc 1.43.0 (4fb7144ed 2020-04-20)";
 const SOLANA_V1_1_23_TARGET: &str = "x86_64-unknown-linux-gnu";
+const SOLANA_V1_2_32_EPOCH68_TRANSITION_BACKEND_ID: &str =
+    "solana-v1.2.32-mainnet-epoch68-transition";
+const SOLANA_V1_2_32_EPOCH68_TRANSITION_TAG: &str = "v1.2.32";
+const SOLANA_V1_2_32_EPOCH68_TRANSITION_COMMIT: &str = "8c989da68342918f1717c60aa60fdfab7d1e676e";
+const SOLANA_V1_2_32_EPOCH68_TRANSITION_RUST_TOOLCHAIN: &str =
+    "rustc 1.43.0 (4fb7144ed 2020-04-20)";
+const SOLANA_V1_2_32_EPOCH68_TRANSITION_TARGET: &str = "x86_64-unknown-linux-gnu";
 const SOLANA_V1_2_32_BACKEND_ID: &str = "solana-v1.2.32";
 const SOLANA_V1_2_32_TAG: &str = "v1.2.32";
 const SOLANA_V1_2_32_COMMIT: &str = "8c989da68342918f1717c60aa60fdfab7d1e676e";
@@ -122,6 +129,7 @@ fn backend_supports_entry_batches(backend_id: &str) -> bool {
             | SOLANA_V1_0_23_BACKEND_ID
             | SOLANA_V1_1_15_BACKEND_ID
             | SOLANA_V1_1_23_BACKEND_ID
+            | SOLANA_V1_2_32_EPOCH68_TRANSITION_BACKEND_ID
             | SOLANA_V1_2_32_BACKEND_ID
             | SOLANA_V1_3_19_BACKEND_ID
     )
@@ -263,6 +271,16 @@ pub const SOLANA_V1_1_23_CANDIDATE: WorkerProfile = WorkerProfile {
     target: SOLANA_V1_1_23_TARGET,
     required_genesis_hash: protocol::MAINNET_GENESIS_HASH,
     snapshot_archive_extensions: &[".tar.bz2"],
+};
+
+pub const SOLANA_V1_2_32_EPOCH68_TRANSITION_CANDIDATE: WorkerProfile = WorkerProfile {
+    backend_id: SOLANA_V1_2_32_EPOCH68_TRANSITION_BACKEND_ID,
+    solana_tag: SOLANA_V1_2_32_EPOCH68_TRANSITION_TAG,
+    solana_commit: SOLANA_V1_2_32_EPOCH68_TRANSITION_COMMIT,
+    rust_toolchain: SOLANA_V1_2_32_EPOCH68_TRANSITION_RUST_TOOLCHAIN,
+    target: SOLANA_V1_2_32_EPOCH68_TRANSITION_TARGET,
+    required_genesis_hash: protocol::MAINNET_GENESIS_HASH,
+    snapshot_archive_extensions: &[".tar.bz2", ".tar.zst"],
 };
 
 pub const SOLANA_V1_2_32_CANDIDATE: WorkerProfile = WorkerProfile {
@@ -3761,6 +3779,9 @@ mod tests {
         assert!(backend_supports_entry_batches(SOLANA_V1_0_18_BACKEND_ID));
         assert!(backend_supports_entry_batches(SOLANA_V1_0_23_BACKEND_ID));
         assert!(backend_supports_entry_batches(SOLANA_V1_1_23_BACKEND_ID));
+        assert!(backend_supports_entry_batches(
+            SOLANA_V1_2_32_EPOCH68_TRANSITION_BACKEND_ID
+        ));
         assert!(backend_supports_entry_batches(SOLANA_V1_2_32_BACKEND_ID));
         assert!(backend_supports_entry_batches(SOLANA_V1_3_19_BACKEND_ID));
         assert!(!backend_supports_entry_batches(SOLANA_V1_0_24_BACKEND_ID));
@@ -5217,7 +5238,11 @@ mod tests {
             ));
         }
 
-        for profile in [SOLANA_V1_2_32_CANDIDATE, SOLANA_V1_3_19_CANDIDATE] {
+        for profile in [
+            SOLANA_V1_2_32_EPOCH68_TRANSITION_CANDIDATE,
+            SOLANA_V1_2_32_CANDIDATE,
+            SOLANA_V1_3_19_CANDIDATE,
+        ] {
             assert_eq!(
                 profile.snapshot_archive_extensions,
                 &[".tar.bz2", ".tar.zst"]
@@ -5251,6 +5276,7 @@ mod tests {
             SOLANA_V1_0_18_CANDIDATE,
             SOLANA_V1_0_23_CANDIDATE,
             SOLANA_V1_1_23_CANDIDATE,
+            SOLANA_V1_2_32_EPOCH68_TRANSITION_CANDIDATE,
             SOLANA_V1_2_32_CANDIDATE,
             SOLANA_V1_3_19_CANDIDATE,
         ] {

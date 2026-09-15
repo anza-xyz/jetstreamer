@@ -22,7 +22,8 @@ use lencode::Decode;
 use solana_address::Address;
 
 struct Finder {
-    target: Address,
+    target: Option<Address>,
+    dump_matches: bool,
     first_mismatch: Option<String>,
     matching_transactions: u64,
 }
@@ -38,38 +39,120 @@ impl SlotVisitor for Finder {
             VersionedMessage::Legacy(message) => message.account_keys.as_slice(),
             VersionedMessage::V0(message) => message.account_keys.as_slice(),
         };
-        let Some(account_index) = keys.iter().position(|key| *key == self.target) else {
+        if self
+            .target
+            .is_some_and(|target| !keys.iter().any(|key| *key == target))
+        {
             return;
-        };
-        self.matching_transactions += 1;
-        let Some(source_post) = tx.post_balances.get(account_index).copied() else {
-            self.first_mismatch = Some(format!(
-                "slot={slot} tx={tx_index}: target account index {account_index} has no post balance"
-            ));
-            return;
-        };
-        let replayed = tx
-            .iter_account_updates()
-            .filter(|(update, _)| update.pubkey == self.target)
-            .map(|(update, _)| update.lamports)
-            .last();
-        let Some(replayed) = replayed else {
-            return;
-        };
-        if replayed != source_post {
-            self.first_mismatch = Some(format!(
-                "slot={slot} tx={tx_index} signature={} status={:?} source_pre={} source_post={} replayed_post={replayed}",
+        }
+
+        if self.dump_matches {
+            self.matching_transactions += 1;
+            let replayed_updates = tx
+                .iter_account_updates()
+                .filter(|(update, _)| self.target.is_none_or(|target| update.pubkey == target))
+                .map(|(update, data)| {
+                    format!(
+                        "{}:lamports={} owner={} executable={} rent_epoch={} data_len={}",
+                        update.pubkey,
+                        update.lamports,
+                        update.owner,
+                        update.executable,
+                        update.rent_epoch,
+                        data.len(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            println!(
+                "slot={slot} tx={tx_index} signature={} status={:?} fee={}\nmessage={:?}\nsource_pre_balances={:?}\nsource_post_balances={:?}\nreplayed_updates={replayed_updates:?}",
                 tx.signatures
                     .first()
                     .map(ToString::to_string)
                     .unwrap_or_else(|| "<none>".to_string()),
                 tx.status,
-                tx.pre_balances
-                    .get(account_index)
-                    .copied()
-                    .unwrap_or_default(),
-                source_post,
-            ));
+                tx.fee,
+                tx.message,
+                tx.pre_balances.as_slice(),
+                tx.post_balances.as_slice(),
+            );
+            return;
+        }
+
+        let mut replayed_posts = Vec::<(Address, u64)>::new();
+        for (update, _) in tx.iter_account_updates() {
+            if self.target.is_some_and(|target| update.pubkey != target) {
+                continue;
+            }
+            if let Some((_, lamports)) = replayed_posts
+                .iter_mut()
+                .find(|(pubkey, _)| *pubkey == update.pubkey)
+            {
+                *lamports = update.lamports;
+            } else {
+                replayed_posts.push((update.pubkey, update.lamports));
+            }
+        }
+        if replayed_posts.is_empty() {
+            if let Some(target) = self.target {
+                let account_index = keys
+                    .iter()
+                    .position(|key| *key == target)
+                    .expect("target presence was checked above");
+                let source_pre = tx.pre_balances.get(account_index).copied();
+                let source_post = tx.post_balances.get(account_index).copied();
+                if source_pre
+                    .zip(source_post)
+                    .is_some_and(|(pre, post)| pre != post)
+                {
+                    self.first_mismatch = Some(format!(
+                        "slot={slot} tx={tx_index} signature={} account={target}: source changes balance without a replay update; status={:?} fee={} source_pre={source_pre:?} source_post={source_post:?}\nmessage={:?}\nsource_pre_balances={:?}\nsource_post_balances={:?}",
+                        tx.signatures
+                            .first()
+                            .map(ToString::to_string)
+                            .unwrap_or_else(|| "<none>".to_string()),
+                        tx.status,
+                        tx.fee,
+                        tx.message,
+                        tx.pre_balances.as_slice(),
+                        tx.post_balances.as_slice(),
+                    ));
+                }
+            }
+            return;
+        }
+        self.matching_transactions += 1;
+        for &(pubkey, replayed) in &replayed_posts {
+            let Some(account_index) = keys.iter().position(|key| *key == pubkey) else {
+                self.first_mismatch = Some(format!(
+                    "slot={slot} tx={tx_index}: replayed update {pubkey} is absent from message keys"
+                ));
+                return;
+            };
+            let Some(source_post) = tx.post_balances.get(account_index).copied() else {
+                self.first_mismatch = Some(format!(
+                    "slot={slot} tx={tx_index}: account {pubkey} index {account_index} has no source post balance"
+                ));
+                return;
+            };
+            if replayed != source_post {
+                self.first_mismatch = Some(format!(
+                    "slot={slot} tx={tx_index} signature={} account={pubkey} status={:?} fee={} source_pre={} source_post={source_post} replayed_post={replayed}\nmessage={:?}\nsource_pre_balances={:?}\nsource_post_balances={:?}\nreplayed_post_updates={replayed_posts:?}",
+                    tx.signatures
+                        .first()
+                        .map(ToString::to_string)
+                        .unwrap_or_else(|| "<none>".to_string()),
+                    tx.status,
+                    tx.fee,
+                    tx.pre_balances
+                        .get(account_index)
+                        .copied()
+                        .unwrap_or_default(),
+                    tx.message,
+                    tx.pre_balances.as_slice(),
+                    tx.post_balances.as_slice(),
+                ));
+                return;
+            }
         }
     }
 
@@ -82,18 +165,22 @@ impl SlotVisitor for Finder {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: find_archive_balance_divergence <partial.jet> <address> <start-slot> <slot-count>"
+        "usage: find_archive_balance_divergence <partial.jet> <address|all> <start-slot> <slot-count> [--dump]"
     );
     std::process::exit(2);
 }
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    if args.len() != 5 {
+    if args.len() != 5 && !(args.len() == 6 && args[5] == "--dump") {
         usage();
     }
     let path = Path::new(&args[1]);
-    let target = Address::from_str(&args[2]).unwrap_or_else(|_| usage());
+    let target = if args[2] == "all" {
+        None
+    } else {
+        Some(Address::from_str(&args[2]).unwrap_or_else(|_| usage()))
+    };
     let start_slot = args[3].parse::<u64>().unwrap_or_else(|_| usage());
     let slot_count = args[4].parse::<u64>().unwrap_or_else(|_| usage());
     let requested_end = start_slot.saturating_add(slot_count);
@@ -114,6 +201,7 @@ fn main() {
     decoder.materialize_block_account_update_arenas = false;
     let mut finder = Finder {
         target,
+        dump_matches: args.len() == 6,
         first_mismatch: None,
         matching_transactions: 0,
     };
@@ -152,6 +240,10 @@ fn main() {
             );
             std::process::exit(1);
         }
+        None if finder.dump_matches => println!(
+            "dumped {} matching transaction(s)",
+            finder.matching_transactions
+        ),
         None => println!(
             "no replay/source post-balance mismatch in {} matching transaction(s)",
             finder.matching_transactions

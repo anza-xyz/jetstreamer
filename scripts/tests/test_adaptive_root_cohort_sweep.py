@@ -533,6 +533,43 @@ class CommandTests(unittest.TestCase):
         self.assertIn("--root-checkpoint-cohort", command)
         self.assertIn("--verify", command)
 
+    def test_transition_cohort_binds_both_exact_workers(self) -> None:
+        cohort = sweep.Cohort(1, 1, "solana-v1.0.7-to-v1.0.8")
+        command = sweep.build_producer_command(
+            cohort=cohort,
+            lane=self.lane,
+            deploy=self.deploy,
+            manifest=self.manifest,
+            fingerprint=self.fingerprint,
+            unit="transition-test.service",
+        )
+        properties = command_properties(command)
+        environment = {
+            item.removeprefix("--setenv=")
+            for item in command
+            if item.startswith("--setenv=")
+        }
+
+        self.assertEqual(
+            properties["ExecPaths"].split(),
+            [
+                str(self.deploy / "jetstreamer-node"),
+                str(self.deploy / "jetstreamer-historical-worker-v1-0-7"),
+                str(self.deploy / "jetstreamer-historical-worker-v1-0-8"),
+                str(self.lane.root),
+            ],
+        )
+        self.assertIn(
+            "JETSTREAMER_HISTORICAL_WORKER_V1_0_7="
+            + str(self.deploy / "jetstreamer-historical-worker-v1-0-7"),
+            environment,
+        )
+        self.assertIn(
+            "JETSTREAMER_HISTORICAL_WORKER_V1_0_8="
+            + str(self.deploy / "jetstreamer-historical-worker-v1-0-8"),
+            environment,
+        )
+
     def test_resource_limits_propagate_to_producer_and_importer(self) -> None:
         common = {
             "cohort": self.cohort,

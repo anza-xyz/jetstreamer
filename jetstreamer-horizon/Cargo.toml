@@ -41,6 +41,8 @@ tempfile.workspace = true
 jetstreamer-firehose.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread"] }
 futures-util.workspace = true
+rayon.workspace = true
+sha2-fast = { package = "sha2", version = "=0.9.9", features = ["compress"] }
 solana-message.workspace = true
 solana-pubkey.workspace = true
 # verify_archive --full: canonical PoH recompute + seed fetch

@@ -560,7 +560,7 @@ mod tests {
                 6 => 12_499,
                 _ => rng.gen_range(0, 2_000),
             };
-            let transaction_mixin = if rng.gen() { Some(mixin) } else { None };
+            let transaction_mixin = if rng.r#gen() { Some(mixin) } else { None };
             assert_eq!(
                 sdk_next_hash(start, count, transaction_mixin),
                 next_hash(start, count, transaction_mixin)

@@ -29,6 +29,48 @@ use jetstreamer_horizon::archive::{
 use jetstreamer_horizon::transactions::Transaction;
 use solana_hash::Hash;
 
+// Reuse the historical runtime's differential-tested SHA-NI implementation
+// for production verifier builds. PoH wire semantics are unchanged across
+// the historical releases covered by Horizon.
+#[cfg(not(test))]
+#[path = "../../historical-runtime/v1_0_8/worker/src/poh_backend.rs"]
+#[allow(dead_code, unexpected_cfgs, unsafe_op_in_unsafe_fn)]
+#[rustfmt::skip]
+mod fast_poh;
+
+// Keep this example's unit tests independent of the historical worker's own
+// old-Solana test dependencies. Those tests exercise the same wrapper against
+// `solana_entry::entry::next_hash`; release builds use the backend above.
+#[cfg(test)]
+mod fast_poh {
+    use sha2::{Digest, Sha256};
+
+    fn digest(parts: &[&[u8]]) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        for part in parts {
+            hasher.update(part);
+        }
+        hasher.finalize().into()
+    }
+
+    pub fn next_hash(
+        current: [u8; 32],
+        num_hashes: u64,
+        transaction_mixin: Option<[u8; 32]>,
+    ) -> [u8; 32] {
+        let mut current = current;
+        let ordinary = if transaction_mixin.is_some() {
+            num_hashes.saturating_sub(1)
+        } else {
+            num_hashes
+        };
+        for _ in 0..ordinary {
+            current = digest(&[&current]);
+        }
+        transaction_mixin.map_or_else(|| current, |mixin| digest(&[&current, &mixin]))
+    }
+}
+
 struct Tally {
     epochs: u64,
     blocks: u64,
@@ -331,7 +373,13 @@ fn recompute_blockhash(
             })
             .collect();
         idx = end;
-        poh = solana_entry::entry::next_hash(&poh, entry.num_hashes, &entry_txs);
+        let transaction_mixin = (!entry_txs.is_empty())
+            .then(|| solana_entry::entry::hash_transactions(&entry_txs).to_bytes());
+        poh = Hash::new_from_array(fast_poh::next_hash(
+            poh.to_bytes(),
+            entry.num_hashes,
+            transaction_mixin,
+        ));
     }
     (idx == sigs.len()).then_some(poh)
 }

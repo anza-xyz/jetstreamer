@@ -26,10 +26,19 @@ pub const MAX_IX_ACCOUNTS: usize = solana_transaction_context::MAX_ACCOUNTS_PER_
 /// [`solana_transaction_context::MAX_INSTRUCTION_DATA_LEN`].
 pub const MAX_IX_DATA_LEN: usize = solana_transaction_context::MAX_INSTRUCTION_DATA_LEN;
 
-/// Max total inner-instruction trace length across a whole transaction
-/// (top-level + CPI combined). Mirrors
-/// [`solana_transaction_context::MAX_INSTRUCTION_TRACE_LENGTH`].
-pub const MAX_TX_INNER_IX: usize = solana_transaction_context::MAX_INSTRUCTION_TRACE_LENGTH;
+/// Max flattened inner-instruction records retained for one transaction.
+///
+/// This is deliberately larger than
+/// [`solana_transaction_context::MAX_INSTRUCTION_TRACE_LENGTH`]. Historical
+/// runtimes recorded a separate inner-instruction list for each top-level
+/// instruction, so flattening their status metadata can exceed the modern
+/// per-trace limit. Mainnet slot 40,176,160, for example, contains 800 inner
+/// records split across 20 top-level groups. The product below admits a full
+/// trace for every top-level instruction accepted by this archive format.
+/// `ZeroVec` capacity is not serialized, so increasing it preserves existing
+/// Horizon wire bytes.
+pub const MAX_TX_INNER_IX: usize =
+    MAX_TX_INSTRUCTIONS * solana_transaction_context::MAX_INSTRUCTION_TRACE_LENGTH;
 
 /// Max number of address-table lookups in a v0 message. Upper-bounded by
 /// the account-lock limit since each lookup contributes loaded keys.
@@ -144,7 +153,7 @@ mod tests {
         assert_eq!(MAX_TX_ACCOUNTS, 256);
         assert_eq!(MAX_IX_ACCOUNTS, 255);
         assert_eq!(MAX_IX_DATA_LEN, 10 * 1024);
-        assert_eq!(MAX_TX_INNER_IX, 64);
+        assert_eq!(MAX_TX_INNER_IX, 4_096);
         assert_eq!(MAX_TX_ADDR_LOOKUPS, 128);
         assert_eq!(MAX_TX_ACCOUNT_UPDATES, 128);
         assert_eq!(MAX_RETURN_DATA_LEN, 1024);

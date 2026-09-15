@@ -8,11 +8,10 @@
 //! `InnerInstructions`, …) are replaced by zero-alloc counterparts defined
 //! here.
 //!
-//! These structures are large by design — for example [`Transaction`]'s max
-//! inline size is on the order of a few hundred KiB once you account for
-//! signatures, per-instruction data, and log messages. Callers should keep
-//! one instance per worker thread (thread-local + reuse) rather than creating
-//! many on the stack.
+//! These structures are large by design — [`Transaction`]'s maximum inline
+//! footprint is tens of MiB once historical inner-instruction traces and
+//! account-update data are included. Callers should keep one instance per
+//! worker thread (thread-local + reuse) rather than creating it on the stack.
 use lencode::prelude::*;
 use solana_address::Address;
 use solana_hash::Hash;
@@ -377,6 +376,107 @@ impl InnerInstruction {
     }
 }
 
+/// Wire-compatible optional inner-instruction arena.
+///
+/// This encodes exactly like `Option<ZeroVec<MAX_TX_INNER_IX,
+/// InnerInstruction>>`: one boolean presence tag followed by the `ZeroVec`
+/// when present. Keeping the arena allocated inline even while absent lets
+/// conversion and decoding reuse its storage directly; constructing
+/// `Some(ZeroVec::new())` would otherwise create a roughly 43 MiB temporary
+/// on an ordinary thread stack at the historical capacity.
+#[derive(Debug, PartialEq, Eq)]
+#[repr(C)]
+pub struct OptionalInnerInstructions {
+    present: bool,
+    value: ZeroVec<MAX_TX_INNER_IX, InnerInstruction>,
+}
+
+impl OptionalInnerInstructions {
+    #[inline]
+    pub const fn new() -> Self {
+        Self {
+            present: false,
+            value: ZeroVec::new(),
+        }
+    }
+
+    #[inline]
+    pub fn get_or_insert(&mut self) -> &mut ZeroVec<MAX_TX_INNER_IX, InnerInstruction> {
+        self.present = true;
+        &mut self.value
+    }
+
+    #[inline]
+    pub fn as_ref(&self) -> Option<&ZeroVec<MAX_TX_INNER_IX, InnerInstruction>> {
+        self.present.then_some(&self.value)
+    }
+
+    #[inline]
+    pub fn is_none(&self) -> bool {
+        !self.present
+    }
+
+    #[inline]
+    pub fn clear(&mut self) {
+        self.present = false;
+        self.value.clear();
+    }
+
+    /// Decodes the legacy `Option<ZeroVec<...>>` wire form directly into the
+    /// reusable inline arena.
+    pub(crate) fn decode_into<R: Read>(
+        &mut self,
+        reader: &mut R,
+        mut ctx: Option<&mut lencode::context::DecoderContext>,
+    ) -> lencode::Result<()> {
+        self.present = bool::decode_ext(reader, ctx.as_deref_mut())?;
+        if self.present {
+            // SAFETY: `InnerInstruction` is composed entirely of fields for
+            // which the all-zero bit pattern is a valid cleared state.
+            unsafe {
+                decode_zerovec_in_place(&mut self.value, reader, ctx)?;
+            }
+        } else {
+            self.value.clear();
+        }
+        Ok(())
+    }
+}
+
+impl Default for OptionalInnerInstructions {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Encode for OptionalInnerInstructions {
+    #[inline]
+    fn encode_ext(
+        &self,
+        writer: &mut impl Write,
+        mut ctx: Option<&mut lencode::context::EncoderContext>,
+    ) -> lencode::Result<usize> {
+        let mut written = self.present.encode_ext(writer, ctx.as_deref_mut())?;
+        if self.present {
+            written += self.value.encode_ext(writer, ctx)?;
+        }
+        Ok(written)
+    }
+}
+
+impl Decode for OptionalInnerInstructions {
+    #[inline]
+    fn decode_ext(
+        reader: &mut impl Read,
+        ctx: Option<&mut lencode::context::DecoderContext>,
+    ) -> lencode::Result<Self> {
+        let mut value = Self::new();
+        value.decode_into(reader, ctx)?;
+        Ok(value)
+    }
+}
+
 /// A transaction's log lines, stored as a flat arena: per-line lengths plus
 /// one shared UTF-8 byte buffer.
 ///
@@ -585,10 +685,10 @@ pub struct TransactionTokenBalance {
 /// A Solana transaction with all associated metadata, stored inline with no
 /// heap allocations.
 ///
-/// Size: on the order of ~12 MiB (dominated by the nested account-update
-/// data arena). Callers should keep one instance per worker thread and reuse
-/// via [`Transaction::clear`], not stack-allocate per transaction. Use
-/// [`Transaction::new_boxed`] to avoid the initial stack copy.
+/// Size: tens of MiB, dominated by the historical inner-instruction and
+/// account-update arenas. Callers should keep one instance per worker thread
+/// and reuse via [`Transaction::clear`], not stack-allocate per transaction.
+/// Use [`Transaction::new_boxed`] to avoid the initial stack copy.
 ///
 /// `Clone` is intentionally **not** derived — cloning would move the whole
 /// struct through the stack and almost always overflow. For duplication,
@@ -611,7 +711,7 @@ pub struct Transaction {
     /// Readonly addresses resolved from the message's address-table lookups.
     pub loaded_readonly_addresses: ZeroVec<MAX_TX_ACCOUNTS, Address>,
     /// Inner-instruction trace, flattened (each entry carries its outer index).
-    pub inner_instructions: Option<ZeroVec<MAX_TX_INNER_IX, InnerInstruction>>,
+    pub inner_instructions: OptionalInnerInstructions,
     pub log_messages: Option<LogMessages>,
     pub pre_token_balances: Option<ZeroVec<MAX_TX_TOKEN_BALANCES, TransactionTokenBalance>>,
     pub post_token_balances: Option<ZeroVec<MAX_TX_TOKEN_BALANCES, TransactionTokenBalance>>,
@@ -635,7 +735,7 @@ pub struct Transaction {
 
 impl Transaction {
     /// Allocates a fresh zero-initialised `Transaction` directly on the
-    /// heap, without routing the large (~12 MiB) struct through the stack.
+    /// heap, without routing the large multi-MiB struct through the stack.
     ///
     /// Uses the global allocator directly to avoid `Box::new_uninit`'s
     /// stack-based `MaybeUninit::<T>::uninit()` intermediate, which would
@@ -667,7 +767,7 @@ impl Transaction {
         self.post_balances.clear();
         self.loaded_writable_addresses.clear();
         self.loaded_readonly_addresses.clear();
-        self.inner_instructions = None;
+        self.inner_instructions.clear();
         self.log_messages = None;
         self.pre_token_balances = None;
         self.post_token_balances = None;
@@ -738,7 +838,7 @@ impl Transaction {
     }
 
     /// Decodes a wire-encoded `Transaction` directly into `self` without
-    /// routing the ~12 MiB struct through the stack.
+    /// routing the large multi-MiB struct through the stack.
     ///
     /// This is the required entry point for any tight-loop decoding: the
     /// stock [`Decode::decode_ext`] would place the entire struct on the
@@ -767,23 +867,11 @@ impl Transaction {
         self.loaded_readonly_addresses
             .decode_into(reader, ctx.as_deref_mut())?;
 
-        // Option<ZeroVec<_, _>>: decode the tag, then decode-in-place on
-        // the inner ZeroVec so we never stack-alloc the full inner buffer.
-        //
-        // `inner_instructions` uses the DecodeInto-aware variant so each
-        // ~10 KiB `InnerInstruction` is decoded directly into its slot in
-        // the vec rather than routed through the stack as a by-value return.
-        //
-        // SAFETY: `InnerInstruction` accepts the all-zero bit pattern as a
-        // valid default (zero `outer_index`, zero-initialised
-        // `CompiledInstruction`, `stack_height` = `None`).
-        unsafe {
-            decode_option_zerovec_in_place(
-                &mut self.inner_instructions,
-                reader,
-                ctx.as_deref_mut(),
-            )?;
-        }
+        // Inner instructions decode into their permanently reserved arena,
+        // preserving the legacy Option wire tag without constructing a
+        // multi-megabyte `Some(ZeroVec::new())` stack temporary.
+        self.inner_instructions
+            .decode_into(reader, ctx.as_deref_mut())?;
         decode_option_log_messages_into(&mut self.log_messages, reader, ctx.as_deref_mut())?;
         decode_option_zerovec_into(&mut self.pre_token_balances, reader, ctx.as_deref_mut())?;
         decode_option_zerovec_into(&mut self.post_token_balances, reader, ctx.as_deref_mut())?;
@@ -853,42 +941,6 @@ pub(crate) fn decode_option_log_messages_into<R: Read>(
         1 => {
             let logs = slot.get_or_insert_with(LogMessages::default);
             logs.decode_into(reader, ctx)?;
-        }
-        _ => return Err(lencode::io::Error::InvalidData),
-    }
-    Ok(())
-}
-
-/// Like [`decode_option_zerovec_into`] but for element types that support
-/// in-place decoding via [`DecodeInto`]. Fills the contained `ZeroVec` via
-/// [`decode_zerovec_in_place`], avoiding the per-element stack roundtrip
-/// that `ZeroVec::decode_into`'s generic non-u8 path would force.
-///
-/// # Safety
-///
-/// Same contract as [`decode_zerovec_in_place`]: `T` must accept the
-/// all-zero bit pattern as a valid state.
-#[inline]
-unsafe fn decode_option_zerovec_in_place<R, const N: usize, T>(
-    slot: &mut Option<ZeroVec<N, T>>,
-    reader: &mut R,
-    mut ctx: Option<&mut lencode::context::DecoderContext>,
-) -> lencode::Result<()>
-where
-    R: Read,
-    T: DecodeInto + Decode + 'static,
-{
-    let tag = u8::decode_ext(reader, ctx.as_deref_mut())?;
-    match tag {
-        0 => {
-            *slot = None;
-        }
-        1 => {
-            let zv = slot.get_or_insert_with(ZeroVec::new);
-            // SAFETY: forwarded from the caller's contract on `T`.
-            unsafe {
-                decode_zerovec_in_place(zv, reader, ctx)?;
-            }
         }
         _ => return Err(lencode::io::Error::InvalidData),
     }
@@ -972,6 +1024,7 @@ impl ZeroAlloc for LegacyMessage {}
 impl ZeroAlloc for V0Message {}
 impl ZeroAlloc for VersionedMessage {}
 impl ZeroAlloc for InnerInstruction {}
+impl ZeroAlloc for OptionalInnerInstructions {}
 impl ZeroAlloc for LogMessages {}
 impl ZeroAlloc for PushLogError {}
 impl ZeroAlloc for ReturnData {}
@@ -1016,6 +1069,10 @@ const _: fn() = || {
     assert_zero_alloc::<CompiledInstruction>(); // instruction
     assert_zero_alloc::<Option<u32>>(); // stack_height
 
+    // `OptionalInnerInstructions` fields
+    assert_zero_alloc::<bool>(); // present
+    assert_zero_alloc::<ZeroVec<MAX_TX_INNER_IX, InnerInstruction>>(); // value
+
     // `LogMessages` fields
     assert_zero_alloc::<ZeroVec<MAX_TX_LOG_MSGS, u32>>(); // lens
     assert_zero_alloc::<ZeroVec<MAX_TX_LOG_DATA, u8>>(); // data
@@ -1050,7 +1107,7 @@ const _: fn() = || {
     assert_zero_alloc::<u64>(); // fee
     assert_zero_alloc::<ZeroVec<MAX_TX_ACCOUNTS, u64>>(); // pre/post balances
     assert_zero_alloc::<ZeroVec<MAX_TX_ACCOUNTS, Address>>(); // loaded writable/readonly addresses
-    assert_zero_alloc::<Option<ZeroVec<MAX_TX_INNER_IX, InnerInstruction>>>();
+    assert_zero_alloc::<OptionalInnerInstructions>();
     assert_zero_alloc::<Option<LogMessages>>();
     assert_zero_alloc::<Option<ZeroVec<MAX_TX_TOKEN_BALANCES, TransactionTokenBalance>>>();
     assert_zero_alloc::<Option<ZeroVec<MAX_TX_REWARDS, Reward>>>();
@@ -1069,6 +1126,7 @@ const _: fn() = || {
     assert_zero_alloc::<V0Message>();
     assert_zero_alloc::<VersionedMessage>();
     assert_zero_alloc::<InnerInstruction>();
+    assert_zero_alloc::<OptionalInnerInstructions>();
     assert_zero_alloc::<LogMessages>();
     assert_zero_alloc::<ReturnData>();
     assert_zero_alloc::<Reward>();
@@ -1198,6 +1256,79 @@ mod tests {
             let mut read_cursor = lencode::io::Cursor::new(&buf[..written]);
             let decoded = InnerInstruction::decode_ext(&mut read_cursor, None).unwrap();
             assert_eq!(decoded, ii);
+        });
+    }
+
+    #[test]
+    fn inner_instruction_capacity_does_not_change_wire_bytes() {
+        run_big_stack(|| {
+            let populate = |ii: &mut InnerInstruction| {
+                ii.outer_index = 7;
+                ii.instruction.program_id_index = 3;
+                ii.instruction.accounts.extend_from_slice(&[1, 2]);
+                ii.instruction.data.extend_from_slice(b"historical-cpi");
+                ii.stack_height = Some(4);
+            };
+
+            let mut old_capacity = ZeroVec::<64, InnerInstruction>::new();
+            let mut old_value = InnerInstruction::default();
+            populate(&mut old_value);
+            old_capacity.push(old_value);
+
+            let old_option = Some(old_capacity);
+
+            let mut current_transaction = Transaction::new_boxed();
+            let mut current_value = InnerInstruction::default();
+            populate(&mut current_value);
+            current_transaction
+                .inner_instructions
+                .get_or_insert()
+                .push(current_value);
+
+            let mut old_bytes = vec![0u8; 1024];
+            let mut old_cursor = lencode::io::Cursor::new(&mut old_bytes[..]);
+            let old_len = old_option.encode_ext(&mut old_cursor, None).unwrap();
+            let mut current_bytes = vec![0u8; 1024];
+            let mut current_cursor = lencode::io::Cursor::new(&mut current_bytes[..]);
+            let current_len = current_transaction
+                .inner_instructions
+                .encode_ext(&mut current_cursor, None)
+                .unwrap();
+
+            assert_eq!(current_len, old_len);
+            assert_eq!(&current_bytes[..current_len], &old_bytes[..old_len]);
+
+            current_transaction.inner_instructions.clear();
+            let mut old_read_cursor = lencode::io::Cursor::new(&old_bytes[..old_len]);
+            current_transaction
+                .inner_instructions
+                .decode_into(&mut old_read_cursor, None)
+                .expect("decode legacy Option wire bytes");
+            assert_eq!(
+                current_transaction
+                    .inner_instructions
+                    .as_ref()
+                    .expect("present inner trace")
+                    .as_slice(),
+                old_option.as_ref().unwrap().as_slice()
+            );
+
+            let old_none: Option<ZeroVec<64, InnerInstruction>> = None;
+            let mut old_none_bytes = [0u8; 1];
+            let old_none_len = old_none
+                .encode_ext(&mut lencode::io::Cursor::new(&mut old_none_bytes[..]), None)
+                .unwrap();
+            current_transaction.inner_instructions.clear();
+            let mut current_none_bytes = [0u8; 1];
+            let current_none_len = current_transaction
+                .inner_instructions
+                .encode_ext(
+                    &mut lencode::io::Cursor::new(&mut current_none_bytes[..]),
+                    None,
+                )
+                .unwrap();
+            assert_eq!(current_none_len, old_none_len);
+            assert_eq!(current_none_bytes, old_none_bytes);
         });
     }
 

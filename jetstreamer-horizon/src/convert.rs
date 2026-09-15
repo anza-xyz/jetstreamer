@@ -39,11 +39,13 @@ use solana_transaction_status::{
 
 use crate::limits::{
     MAX_IX_ACCOUNTS, MAX_IX_DATA_LEN, MAX_RETURN_DATA_LEN, MAX_TX_ACCOUNTS, MAX_TX_ADDR_LOOKUPS,
-    MAX_TX_INSTRUCTIONS, MAX_TX_LOG_MSGS, MAX_TX_REWARDS, MAX_TX_SIGS, MAX_TX_TOKEN_BALANCES,
+    MAX_TX_INNER_IX, MAX_TX_INSTRUCTIONS, MAX_TX_LOG_MSGS, MAX_TX_REWARDS, MAX_TX_SIGS,
+    MAX_TX_TOKEN_BALANCES,
 };
 use crate::transactions::{
-    CompiledInstruction, InnerInstruction, LegacyMessage, Reward, RewardType, TokenAmount,
-    Transaction, TransactionStatus, TransactionTokenBalance, V0Message, VersionedMessage,
+    CompiledInstruction, InnerInstruction, LegacyMessage, OptionalInnerInstructions, Reward,
+    RewardType, TokenAmount, Transaction, TransactionStatus, TransactionTokenBalance, V0Message,
+    VersionedMessage,
 };
 use crate::zero_vec::ZeroVec;
 
@@ -574,20 +576,26 @@ pub fn populate_message(
     Ok(())
 }
 
-// The `populate_*` helpers below each materialise one large
-// `Option<ZeroVec<…>>` payload. They are deliberately separate,
-// never-inlined functions: `get_or_insert_with(ZeroVec::new)` reserves the
-// full inline buffer (hundreds of KiB for inner instructions / logs) in
-// the calling frame, and inlining them all into `populate_transaction`
-// would stack those reservations up in a single frame — overflow on
-// default-size threads in debug builds.
+// The `populate_*` helpers below fill large inline payloads. They are
+// deliberately separate, never-inlined functions so temporary reservations
+// used by the remaining `Option` fields cannot stack up in one debug frame.
 
 #[inline(never)]
 fn populate_inner_instructions(
-    dst: &mut Option<ZeroVec<{ crate::limits::MAX_TX_INNER_IX }, InnerInstruction>>,
+    dst: &mut OptionalInnerInstructions,
     groups: &[solana_transaction_status::InnerInstructions],
 ) -> Result<(), ConvertError> {
-    let list = dst.get_or_insert_with(ZeroVec::new);
+    let count = groups.iter().try_fold(0usize, |count, group| {
+        count.checked_add(group.instructions.len())
+    });
+    let count = count.ok_or(ConvertError::CapacityExceeded {
+        field: "inner_instructions",
+        len: usize::MAX,
+        max: MAX_TX_INNER_IX,
+    })?;
+    check_capacity("inner_instructions", count, MAX_TX_INNER_IX)?;
+
+    let list = dst.get_or_insert();
     list.clear();
     for group in groups {
         for inner in &group.instructions {
@@ -869,7 +877,7 @@ mod tests {
     /// `transactions` test module.
     fn run_big_stack<F: FnOnce() + Send + 'static>(f: F) {
         std::thread::Builder::new()
-            .stack_size(128 * 1024 * 1024)
+            .stack_size(256 * 1024 * 1024)
             .spawn(f)
             .expect("spawn test thread")
             .join()
@@ -990,6 +998,57 @@ mod tests {
         assert!(dst.status.is_ok());
         assert_eq!(dst.loaded_writable_addresses.len(), 0);
         assert!(dst.inner_instructions.is_none());
+    }
+
+    #[test]
+    fn historical_multi_group_inner_trace_converts_without_truncation() {
+        run_big_stack(|| {
+            let tx = VersionedTransaction {
+                signatures: vec![Signature::from([1u8; 64])],
+                message: solana_message::VersionedMessage::Legacy(
+                    solana_message::legacy::Message {
+                        header: MessageHeader {
+                            num_required_signatures: 1,
+                            ..MessageHeader::default()
+                        },
+                        account_keys: vec![pk(1)],
+                        recent_blockhash: Hash::new_unique(),
+                        instructions: vec![],
+                    },
+                ),
+            };
+            let groups = (0u8..20)
+                .map(|outer_index| UpstreamInnerIxGroup {
+                    index: outer_index,
+                    instructions: (0u8..40)
+                        .map(|sequence| UpstreamInnerIx {
+                            instruction: UpstreamIx {
+                                program_id_index: 0,
+                                accounts: vec![],
+                                data: vec![sequence],
+                            },
+                            stack_height: Some(2),
+                        })
+                        .collect(),
+                })
+                .collect();
+            let meta = TransactionStatusMeta {
+                inner_instructions: Some(groups),
+                ..TransactionStatusMeta::default()
+            };
+
+            let mut dst = Transaction::new_boxed();
+            populate_transaction(&mut dst, &tx, &meta).expect("historical trace must fit");
+
+            let inner = dst.inner_instructions.as_ref().expect("inner trace");
+            assert_eq!(inner.len(), 800);
+            assert_eq!(inner.as_slice().first().unwrap().outer_index, 0);
+            assert_eq!(inner.as_slice().last().unwrap().outer_index, 19);
+            assert_eq!(
+                inner.as_slice().last().unwrap().instruction.data.as_slice(),
+                &[39]
+            );
+        });
     }
 
     #[test]

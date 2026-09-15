@@ -1379,7 +1379,7 @@ fn read_tx_record<R: Read>(
     scratch
         .loaded_readonly_addresses
         .decode_into(cur, Some(ctx))?;
-    decode_option_zerovec_into(&mut scratch.inner_instructions, cur, Some(ctx))?;
+    scratch.inner_instructions.decode_into(cur, Some(ctx))?;
     decode_option_log_messages_into(&mut scratch.log_messages, cur, Some(ctx))?;
     decode_option_zerovec_into(&mut scratch.pre_token_balances, cur, Some(ctx))?;
     decode_option_zerovec_into(&mut scratch.post_token_balances, cur, Some(ctx))?;

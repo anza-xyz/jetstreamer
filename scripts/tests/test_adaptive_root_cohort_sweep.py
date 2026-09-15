@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import copy
+import dataclasses
 import hashlib
 import json
 import os
@@ -1664,6 +1665,63 @@ class RecoveryTests(unittest.TestCase):
         # In the tail, starttime field 22 contains decimal 22.
         data = "7 (worker ) with spaces) " + " ".join(tail)
         self.assertEqual(sweep.parse_proc_stat_start_time(data), 22)
+        self.assertEqual(sweep.parse_proc_stat_parent_pid(data), 4)
+
+    def test_direct_supervisor_child_is_one_epoch_claim(self) -> None:
+        parent = sweep.EpochClaim(
+            pid=10,
+            start_time=100,
+            first_epoch=1,
+            last_epoch=1,
+            output=Path("/private/output"),
+            executable_argument=Path("/sealed/jetstreamer-node"),
+            unit="epoch-1.service",
+        )
+        child = sweep.EpochClaim(
+            pid=11,
+            start_time=101,
+            first_epoch=1,
+            last_epoch=1,
+            output=parent.output,
+            executable_argument=parent.executable_argument,
+            unit=parent.unit,
+            parent_pid=parent.pid,
+        )
+
+        self.assertEqual(
+            sweep.collapse_supervised_epoch_claims((parent, child)), (parent,)
+        )
+
+    def test_orphan_or_cross_unit_child_remains_a_conflicting_claim(self) -> None:
+        parent = sweep.EpochClaim(
+            pid=10,
+            start_time=100,
+            first_epoch=1,
+            last_epoch=1,
+            output=Path("/private/output"),
+            executable_argument=Path("/sealed/jetstreamer-node"),
+            unit="epoch-1.service",
+        )
+        cross_unit = dataclasses.replace(
+            parent,
+            pid=11,
+            start_time=101,
+            unit="other.service",
+            parent_pid=parent.pid,
+        )
+        orphan = dataclasses.replace(
+            parent,
+            pid=12,
+            start_time=102,
+            parent_pid=999,
+        )
+
+        observed = sweep.collapse_supervised_epoch_claims(
+            (parent, cross_unit, orphan)
+        )
+        self.assertEqual(observed, (parent, cross_unit, orphan))
+        with self.assertRaisesRegex(sweep.SweepError, "overlapping epoch"):
+            sweep.require_disjoint_epoch_claims(observed)
 
     def test_importing_state_reverts_to_staged_after_controller_restart(self) -> None:
         controller = object.__new__(sweep.Controller)

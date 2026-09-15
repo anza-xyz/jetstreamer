@@ -166,6 +166,7 @@ class EpochClaim:
     output: Path
     executable_argument: Path
     unit: str | None
+    parent_pid: int | None = None
 
     def overlaps(self, cohort: Cohort) -> bool:
         return self.first_epoch <= cohort.last_epoch and cohort.first_epoch <= self.last_epoch
@@ -496,8 +497,23 @@ def parse_proc_stat_start_time(data: str) -> int:
     return int(fields_after_command[19])
 
 
+def parse_proc_stat_parent_pid(data: str) -> int:
+    command_end = data.rfind(")")
+    if command_end < 0:
+        raise ValueError("process stat lacks a closing command delimiter")
+    fields_after_command = data[command_end + 2 :].split()
+    # Field 3 (state) is index 0 here; field 4 (parent PID) is index 1.
+    if len(fields_after_command) <= 1:
+        raise ValueError("process stat is truncated")
+    return int(fields_after_command[1])
+
+
 def proc_start_time(pid: int) -> int:
     return parse_proc_stat_start_time(Path(f"/proc/{pid}/stat").read_text())
+
+
+def proc_parent_pid(pid: int) -> int:
+    return parse_proc_stat_parent_pid(Path(f"/proc/{pid}/stat").read_text())
 
 
 def process_systemd_unit(pid: int) -> str | None:
@@ -624,6 +640,7 @@ def discover_epoch_claims(*, expected_uid: int) -> tuple[EpochClaim, ...]:
                     output,
                     Path(args[0]),
                     process_systemd_unit(pid),
+                    proc_parent_pid(pid),
                 )
             )
         except (
@@ -635,7 +652,36 @@ def discover_epoch_claims(*, expected_uid: int) -> tuple[EpochClaim, ...]:
             OSError,
         ):
             continue
-    return tuple(claims)
+    return collapse_supervised_epoch_claims(claims)
+
+
+def collapse_supervised_epoch_claims(
+    claims: Sequence[EpochClaim],
+) -> tuple[EpochClaim, ...]:
+    """Treat a node and its direct node child as one ownership claim.
+
+    Multi-runtime and range supervisors spawn another ``jetstreamer-node`` in
+    the same systemd unit with the same positional epoch and output arguments.
+    The child is part of the supervisor's claim, not a competing producer. An
+    orphan, a process in another unit, or any non-identical claim remains
+    visible and therefore still fails the global disjointness gate.
+    """
+    by_pid = {claim.pid: claim for claim in claims}
+    collapsed: list[EpochClaim] = []
+    for claim in claims:
+        parent = by_pid.get(claim.parent_pid)
+        if (
+            parent is not None
+            and claim.unit is not None
+            and claim.unit == parent.unit
+            and claim.first_epoch == parent.first_epoch
+            and claim.last_epoch == parent.last_epoch
+            and claim.output == parent.output
+            and claim.executable_argument == parent.executable_argument
+        ):
+            continue
+        collapsed.append(claim)
+    return tuple(collapsed)
 
 
 def require_disjoint_epoch_claims(claims: Sequence[EpochClaim]) -> None:

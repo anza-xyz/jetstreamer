@@ -348,7 +348,7 @@ select a runtime. The current registry is deliberately conservative:
 | `29,327,576..29,371,188` | pinned Solana v1.2.24 pre-CPI worker | starts at the first recorded transaction whose outcome requires CPI to remain disabled; source-lineage replay through slot 29,371,187 binds accounts hash `6ubQSWsXQ8dEtxTkZwgpB8vEVj4nAsQcSGmu9usxVSGR` | qualified second epoch-67 handoff |
 | `29,371,188..29,808,000` | pinned Solana v1.2.32 mainnet transition worker | generated state handoff after the last observed old-semantics transaction; reconstructs the CPI and vote-timestamp activation state | qualified by the terminal epoch-68 checkpoint |
 | `29,808,000..39,744,000` | pinned Solana v1.2.32 worker | independently verified snapshot restart | diagnostic candidate for epochs 69-91 |
-| `39,744,000..43,632,000` | pinned Solana v1.3.19 worker | independently verified snapshot restart | diagnostic candidate for epochs 92-100 |
+| `39,744,000..43,632,000` | pinned Solana v1.3.19 worker | independently verified snapshot restart; bounded extractor admits up to 131,072 members for the audited 104,267–106,520-member epoch-98 through epoch-100 snapshots | diagnostic candidate for epochs 92-100 |
 | `43,632,000..406,080,000` | none | unsupported; replay fails closed | unsupported |
 | `406,080,000..` | in-process Agave v3 | independently verified modern snapshot bootstrap | verified |
 

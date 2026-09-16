@@ -17,7 +17,11 @@ use tar::{Archive, EntryType};
 use tempfile::{Builder, TempDir};
 
 const SNAPSHOT_VERSION_1_2: &str = "1.2.0";
-const MAX_HANDOFF_ARCHIVE_ENTRIES: u64 = 100_000;
+// Audited mainnet snapshots at the end of this runtime envelope contain up to
+// 106,520 members (almost entirely AppendVecs). Keep the count bounded to the
+// next power of two: this admits epochs 98-100 with about 23% headroom while
+// retaining a hard inode and tar-framing amplification ceiling.
+const MAX_HANDOFF_ARCHIVE_ENTRIES: u64 = 131_072;
 const MAX_HANDOFF_ARCHIVE_MEMBER_SIZE: u64 = MAX_SNAPSHOT_DATA_FILE_SIZE;
 const MAX_HANDOFF_ARCHIVE_EXTRACTED_SIZE: u64 = 8 * MAX_SNAPSHOT_DATA_FILE_SIZE;
 const MAX_APPEND_VEC_FILE_SIZE: u64 = 16 * 1024 * 1024 * 1024;

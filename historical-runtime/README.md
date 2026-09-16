@@ -181,3 +181,8 @@ The source has only these integration changes:
    `29,327,576` through slot `29,371,187` and securely exports the resulting
    checkpoint; the successor v1.2.32 worker reconstructs the two serde-skipped
    mainnet consensus flags from slot `29,371,188` onward.
+6. The v1.3.19 snapshot extractor retains all path, entry-type, member-size,
+   aggregate-size, and sparse-map checks while allowing at most 131,072 tar
+   members. Audited epoch-98 through epoch-100 bootstrap snapshots contain
+   104,267, 105,275, and 106,520 members respectively; the previous 100,000
+   ceiling rejected these valid archives before decoding.

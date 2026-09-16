@@ -99,19 +99,22 @@ exact count. The following v1.1.23 envelope retains
 mainnet's epoch-34 BPF-loader activation
 and the runtime's epoch-40 system-program transition. Historical snapshot
 creator versions do not establish the runtime that processed the ledger. The
-canonical epoch-67 stream instead provides direct execution evidence. Exact
-v1.2.24 with CPI disabled matches after the canonical slot-29,186,735 state,
-while v1.2.32 diverges at slot 29,188,719. A root-start v1.2.24 proof diverges
-at checkpoint 29,195,008, proving that v1.2.24 cannot own the epoch boundary.
-The required shape is therefore v1.2.32 through slot 29,186,735, v1.2.24
-through slot 29,371,187, then the v1.2.32 transition worker. The second
-handoff's legacy accounts hash is
-`JBDL7UvkWrgMdcW9PuFyoXmSUjxpiB5gWJGWpG6RTwC8`; the first handoff is bound to
-`9FLn7BisKQrjPkD3Dsz7btr7quMD4J1pGQR6HGvvprFp`. The registered three-span
-route requires a state-bound export at each handoff, and epochs 67–68 continue
-to fail closed unless the immutable root proof and final canonical checkpoint
-both pass. The independent root-to-first-handoff replay matches the first
-hash; complete-cohort publication remains gated on the later checks.
+canonical epoch-67 stream instead provides direct execution evidence. Direct
+source comparisons show v1.2.32 matching at slots 29,188,719 and 29,189,576.
+Its first known divergence is at slot 29,327,576, where Old Faithful records
+BPF-loader error `0x0b9f0002` and v1.2.32 succeeds. The hourly GCS snapshots
+previously used to place the earlier handoff have slot-hash state that
+disagrees with successful Old Faithful votes, so their accounts hashes are not
+source-lineage proof. The candidate shape is v1.2.32 through slot 29,327,575,
+v1.2.24 through slot 29,371,187, then the v1.2.32 transition worker. The
+registered three-span route requires a state-bound export at each handoff. A
+complete source-lineage replay binds the first handoff to accounts hash
+`A286WmNJJ1r5F8G2cnBqykiDGbXgo7aphzJVJqX5ZwbR` and the second handoff to
+`6ubQSWsXQ8dEtxTkZwgpB8vEVj4nAsQcSGmu9usxVSGR`. The successor then matches
+the complete terminal epoch-68 checkpoint at slot 29,807,999, with bank hash
+`439dySBi6LuxMisYQJbt6iPGgu8oSZe3uvvALBRMPXsD` and accounts hash
+`5drX1gEHUyDxfnXEtotcfhZDUrwazrVMoH2A2icSsN3k`. Publication still fails
+closed unless the whole cohort and both checksum commits complete transactionally.
 The surrounding v1.2.32 ranges remain independently checkpoint-gated. Static
 loader bindings reproduce the exact linked processors without relying on
 mutable shared libraries next to the deployment.
@@ -154,7 +157,7 @@ Each vendored runtime directory contains the upstream `runtime/` crate and an
 | `v1_0_24` | `a93915f1bddb73480f86fc09f487315ae191897d` | registered but unassigned differential candidate |
 | `v1_1_15` | `2cdd3f835f00ca531af7141459d657f0ea60a946` | checkpoint-gated diagnostic envelope, epoch 30 |
 | `v1_1_23` | `263fc25992ebae85e7ba2f176e9a066449489c3e` | checkpoint-gated diagnostic envelope, epochs 31–60 |
-| `v1_2_24_epoch67_pre_cpi` | `14bc62398944d6270698506d468cbeddc8513ccd` + explicit pre-CPI mainnet state | unassigned bounded candidate, slots 29,186,736–29,371,187 |
+| `v1_2_24_epoch67_pre_cpi` | `14bc62398944d6270698506d468cbeddc8513ccd` + explicit pre-CPI mainnet state | bounded candidate, slots 29,327,576-29,371,187; source-lineage handoff bound to `6ubQSWsXQ8dEtxTkZwgpB8vEVj4nAsQcSGmu9usxVSGR` |
 | `v1_2_32_epoch68_transition` | `8c989da68342918f1717c60aa60fdfab7d1e676e` + explicit mainnet activation state | slot 29,371,188 through epoch 68 |
 | `v1_2_32` | `8c989da68342918f1717c60aa60fdfab7d1e676e` | checkpoint-gated diagnostic envelopes, epochs 61-66 and 69-91 |
 | `v1_3_19` | `15a49d75086f95573ad319b22e4843639bdf2169` | checkpoint-gated diagnostic envelope, epochs 92–100 |
@@ -175,6 +178,6 @@ The source has only these integration changes:
    one-AppendVec scans on the caller thread, avoiding an old Rayon-pool wakeup
    when no scan parallelism exists. The multi-storage path is unchanged.
 5. The bounded epoch-67 v1.2.24 worker holds CPI disabled from slot
-   `29,186,736` through slot `29,371,187` and securely exports the resulting
+   `29,327,576` through slot `29,371,187` and securely exports the resulting
    checkpoint; the successor v1.2.32 worker reconstructs the two serde-skipped
    mainnet consensus flags from slot `29,371,188` onward.

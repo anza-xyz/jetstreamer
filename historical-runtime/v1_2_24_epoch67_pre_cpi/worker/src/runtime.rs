@@ -29,11 +29,12 @@ use tempfile::TempDir;
 
 const MAX_AGE_CORRECTION_EPOCH: u64 = 14;
 // A root-start proof shows that v1.2.24 is not canonical at the epoch-67
-// boundary. The first canonical state from which this exact runtime is proven
-// is the checkpoint at slot 29,186,735; it then matches through 29,371,187.
+// boundary. The first source transaction whose outcome requires its pre-CPI
+// behavior is in slot 29,327,576, so the handoff snapshot is the preceding
+// slot. The worker remains bounded through slot 29,371,187.
 // Bound both ends so this worker cannot stand in for either adjacent v1.2.32
 // span merely because all three decode the same snapshot format.
-const MIN_SUPPORTED_SNAPSHOT_SLOT: u64 = 29_186_735;
+const MIN_SUPPORTED_SNAPSHOT_SLOT: u64 = 29_327_575;
 const MIN_SUPPORTED_ENTRY_SLOT: u64 = MIN_SUPPORTED_SNAPSHOT_SLOT + 1;
 const MAX_SUPPORTED_SLOT_EXCLUSIVE: u64 = 29_371_188;
 const MAX_SUPPORTED_EPOCH: u64 = 67;

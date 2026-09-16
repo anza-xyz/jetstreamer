@@ -6187,6 +6187,33 @@ const COMPATIBLE_V1_0_7_GENERATION_PROFILES: &[&str] =
 // remains mandatory.
 const COMPATIBLE_V1_0_8_GENERATION_PROFILES: &[&str] =
     &["jetstreamer-node/0.7.0/old-faithful-to-horizon-v2@8154bc9b0057a138afa6e8833468f6ffba39a6a1"];
+// This exact dirty profile produced the independently verified first epoch-67
+// segment and its source-lineage handoff. Later changes only added the second
+// handoff commitment and fail-closed cohort resumption; they do not change the
+// segment's runtime, source interpretation, or Horizon encoding. Reuse remains
+// scoped to v1.2.32 and still checks the exact worker, archive SHA-256, full
+// semantic/PoH decode, bootstrap tuple, terminal tuple, and handoff evidence.
+const COMPATIBLE_EPOCH67_FIRST_SEGMENT_GENERATION_PROFILES: &[&str] = &[
+    "jetstreamer-node/0.7.0/old-faithful-to-horizon-v2@24306fa59e09c17cc8e460e1ffa3c86095187035-dirty-4e6b39e6745313048e230bca",
+];
+// These exact producers completed the source-lineage-qualified epoch-67/68
+// root cohort through both terminal checkpoints. Their subsequent node changes
+// only prepare and safely rebind the private mixed-runtime archive for
+// transactional publication; they do not alter replay, handoff, or archive
+// bytes. Admission is limited to the two transition runtimes that produced the
+// retained epoch-67 assemblies. Worker digests, runtime identities, both
+// handoffs, checkpoint tuples, the archive digest, and a full semantic/PoH
+// decode remain independently checked.
+const COMPATIBLE_EPOCH67_ROOT_COHORT_GENERATION_PROFILES: &[&str] = &[
+    "jetstreamer-node/0.7.0/old-faithful-to-horizon-v2@24306fa59e09c17cc8e460e1ffa3c86095187035-dirty-03efb7ef837c1f3a30a13c41",
+    "jetstreamer-node/0.7.0/old-faithful-to-horizon-v2@24306fa59e09c17cc8e460e1ffa3c86095187035-dirty-f0b76f262e9cb7c983de03c6",
+    "jetstreamer-node/0.7.0/old-faithful-to-horizon-v2@24306fa59e09c17cc8e460e1ffa3c86095187035-dirty-c76586545f4f2b939d59f881",
+];
+const COMPATIBLE_EPOCH67_ROOT_COHORT_ASSEMBLY_PROFILES: &[&str] = &[
+    "jetstreamer-node/0.7.0/verified-runtime-segment-assembly-v1@24306fa59e09c17cc8e460e1ffa3c86095187035-dirty-03efb7ef837c1f3a30a13c41",
+    "jetstreamer-node/0.7.0/verified-runtime-segment-assembly-v1@24306fa59e09c17cc8e460e1ffa3c86095187035-dirty-f0b76f262e9cb7c983de03c6",
+    "jetstreamer-node/0.7.0/verified-runtime-segment-assembly-v1@24306fa59e09c17cc8e460e1ffa3c86095187035-dirty-c76586545f4f2b939d59f881",
+];
 // These exact clean parents produced root-checkpointed historical cohorts.
 // ba39b66 added the sealed sweep path. 45fbea7 is the immutable deployment
 // currently producing epochs 1-6 and 73-100; its replay change is confined to
@@ -6376,6 +6403,16 @@ fn runtime_generation_profile_is_compatible(
             && COMPATIBLE_V1_0_7_GENERATION_PROFILES.contains(&recorded_generation_profile))
         || (runtime_profile == historical::SOLANA_V1_0_8_CANDIDATE.backend_id
             && COMPATIBLE_V1_0_8_GENERATION_PROFILES.contains(&recorded_generation_profile))
+        || (runtime_profile == historical::SOLANA_V1_2_32_CANDIDATE.backend_id
+            && COMPATIBLE_EPOCH67_FIRST_SEGMENT_GENERATION_PROFILES
+                .contains(&recorded_generation_profile))
+        || ([
+            historical::SOLANA_V1_2_24_EPOCH67_PRE_CPI_CANDIDATE.backend_id,
+            historical::SOLANA_V1_2_32_EPOCH68_TRANSITION_CANDIDATE.backend_id,
+        ]
+        .contains(&runtime_profile)
+            && COMPATIBLE_EPOCH67_ROOT_COHORT_GENERATION_PROFILES
+                .contains(&recorded_generation_profile))
 }
 
 fn audited_archive_recovery_provenance_matches(
@@ -6498,6 +6535,11 @@ fn archive_assembly_profile() -> String {
         env!("CARGO_PKG_VERSION"),
         env!("JETSTREAMER_BUILD_REVISION")
     )
+}
+
+fn archive_assembly_profile_is_compatible(epoch: u64, recorded: &str) -> bool {
+    recorded == archive_assembly_profile()
+        || (epoch == 67 && COMPATIBLE_EPOCH67_ROOT_COHORT_ASSEMBLY_PROFILES.contains(&recorded))
 }
 
 fn archive_transaction_metadata_policy(
@@ -6711,6 +6753,32 @@ fn runtime_checkpoint_from_manifest(
         transaction_count: checkpoint.transaction_count,
         tick_height: checkpoint.tick_height,
         slot_complete: checkpoint.slot_complete,
+        next_write_version: checkpoint.next_write_version,
+    })
+}
+
+fn historical_checkpoint_from_segment_manifest(
+    checkpoint: &SegmentCheckpointSummary,
+) -> Result<historical_replay::HistoricalCheckpointSummary, String> {
+    Ok(historical_replay::HistoricalCheckpointSummary {
+        slot: checkpoint.slot,
+        bank_hash: checkpoint
+            .bank_hash_value()
+            .map_err(|error| format!("invalid segment checkpoint bank hash: {error}"))?
+            .to_bytes(),
+        accounts_hash: checkpoint
+            .accounts_hash_value()
+            .map_err(|error| format!("invalid segment checkpoint accounts hash: {error}"))?
+            .to_bytes(),
+        last_blockhash: checkpoint
+            .last_blockhash_value()
+            .map_err(|error| format!("invalid segment checkpoint last blockhash: {error}"))?
+            .to_bytes(),
+        capitalization: checkpoint.capitalization,
+        transaction_count: checkpoint.transaction_count,
+        tick_height: checkpoint.tick_height,
+        slot_complete: checkpoint.slot_complete,
+        write_count: checkpoint.write_count,
         next_write_version: checkpoint.next_write_version,
     })
 }
@@ -11731,7 +11799,7 @@ fn validated_epoch_archive_multi_runtime(
             provenance.version(),
         ));
     };
-    if provenance.assembly_profile != archive_assembly_profile() {
+    if !archive_assembly_profile_is_compatible(epoch, &provenance.assembly_profile) {
         return Err(format!(
             "assembled archive {} uses assembly profile {:?}, expected {:?}",
             path.display(),
@@ -13143,6 +13211,25 @@ fn preserve_existing_output(path: &Path) -> Result<Option<PathBuf>, String> {
     ))
 }
 
+fn preserve_resumed_cohort_output(
+    cohort_run: Option<&CohortRunDirectory>,
+    epoch: u64,
+    path: &Path,
+) -> Result<Option<PathBuf>, String> {
+    if cohort_run.is_none_or(|run| !run.resumed()) {
+        return Ok(None);
+    }
+    let preserved = preserve_existing_output(path)?;
+    if let Some(backup) = preserved.as_ref() {
+        warn!(
+            "epoch {epoch}: preserved prior private cohort archive {} as {} before replaying resumed live evidence",
+            path.display(),
+            backup.display()
+        );
+    }
+    Ok(preserved)
+}
+
 fn publish_verified_runtime_assembly(
     epoch: u64,
     staged_archive: &Path,
@@ -13637,6 +13724,72 @@ async fn run_multi_runtime_epoch_supervisor(
 /// canonical handoff, and all segment archives are assembled with V3
 /// provenance before the member is admitted. The terminal verifier remains
 /// open until the cohort's later root checkpoint is reached.
+fn prepare_mixed_runtime_cohort_archive_permissions(
+    staged_output: &Path,
+    destination: &Path,
+) -> Result<(), String> {
+    let staged_file = jetstreamer_node::archive_checksum::open_regular_nofollow(staged_output)
+        .map_err(|error| {
+            format!(
+                "failed to bind assembled mixed-runtime cohort archive {}: {error}",
+                staged_output.display()
+            )
+        })?;
+    let staged_identity = jetstreamer_node::archive_checksum::archive_file_identity(&staged_file)
+        .map_err(|error| {
+        format!(
+            "failed to identify assembled mixed-runtime cohort archive {}: {error}",
+            staged_output.display()
+        )
+    })?;
+    if !jetstreamer_node::archive_checksum::path_matches_archive_identity(
+        staged_output,
+        staged_identity,
+    )
+    .map_err(|error| {
+        format!(
+            "failed to bind assembled mixed-runtime cohort archive path {}: {error}",
+            staged_output.display()
+        )
+    })? {
+        return Err(format!(
+            "assembled mixed-runtime cohort archive path changed before permission preparation: {}",
+            staged_output.display()
+        ));
+    }
+    jetstreamer_node::archive_checksum::prepare_archive_permissions(&staged_file, destination)
+        .and_then(|()| staged_file.sync_all())
+        .map_err(|error| {
+            format!(
+                "failed to prepare assembled mixed-runtime cohort archive {}: {error}",
+                staged_output.display()
+            )
+        })?;
+    let prepared_identity = jetstreamer_node::archive_checksum::archive_file_identity(&staged_file)
+        .map_err(|error| {
+            format!(
+                "failed to reidentify assembled mixed-runtime cohort archive {}: {error}",
+                staged_output.display()
+            )
+        })?;
+    if !jetstreamer_node::archive_checksum::path_matches_archive_identity(
+        staged_output,
+        prepared_identity,
+    )
+    .map_err(|error| {
+        format!(
+            "failed to rebind assembled mixed-runtime cohort archive path {}: {error}",
+            staged_output.display()
+        )
+    })? {
+        return Err(format!(
+            "assembled mixed-runtime cohort archive path changed during permission preparation: {}",
+            staged_output.display()
+        ));
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_mixed_runtime_root_cohort_first_epoch(
     epoch: u64,
@@ -13724,6 +13877,98 @@ async fn run_mixed_runtime_root_cohort_first_epoch(
             Arc::new(SnapshotVerifier::new(expected, Some(shutdown.clone())))
         };
         let output = runtime_segment_archive_path(&work_dir, epoch, index, span);
+        // A root-cohort process may be restarted after a transient source
+        // failure. Re-admit any completed non-terminal segment against the
+        // active registry, its exact bootstrap, and its generated successor
+        // handoff. The terminal segment must still run so its live worker state
+        // can be carried into the following epoch.
+        if !is_terminal {
+            let reusable = (|| -> Result<_, String> {
+                let segment = load_validated_runtime_segment(&output, epoch, span)?;
+                if index == 0 {
+                    audited_bootstrap.revalidate()?;
+                    let bootstrap_name = audited_bootstrap
+                        .path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .ok_or_else(|| {
+                            format!(
+                                "audited cohort bootstrap has no UTF-8 filename: {}",
+                                audited_bootstrap.path.display()
+                            )
+                        })?;
+                    let (expected_slot, SnapshotHash(expected_hash)) =
+                        parse_snapshot_archive_name(bootstrap_name)?;
+                    if segment.manifest.bootstrap.slot != expected_slot
+                        || segment
+                            .manifest
+                            .bootstrap
+                            .accounts_hash_value()
+                            .map_err(|error| {
+                                format!("invalid retained segment bootstrap hash: {error}")
+                            })?
+                            != expected_hash
+                    {
+                        return Err(format!(
+                            "retained runtime segment bootstrap does not match audited cohort snapshot {}",
+                            audited_bootstrap.path.display()
+                        ));
+                    }
+                } else {
+                    let incoming_handoff = span.handoff.ok_or_else(|| {
+                        format!(
+                            "retained runtime segment {index} has no registered incoming handoff"
+                        )
+                    })?;
+                    let incoming_path = current_bootstrap.snapshot_archive().ok_or_else(|| {
+                        format!("retained runtime segment {index} has no snapshot bootstrap")
+                    })?;
+                    let incoming =
+                        validate_canonical_handoff_snapshot(incoming_path, incoming_handoff)?;
+                    if segment.manifest.bootstrap_archive_sha256 != Some(incoming.archive_sha256) {
+                        return Err(format!(
+                            "retained runtime segment {index} was produced from a different handoff archive"
+                        ));
+                    }
+                }
+                let successor = spans[index + 1]
+                    .handoff
+                    .expect("mixed-runtime successor handoff was checked above");
+                let successor_path = handoff_dir.join(successor.snapshot.archive_name());
+                let successor_manifest =
+                    validate_canonical_handoff_snapshot(&successor_path, successor)?;
+                if !handoff_snapshot_matches_predecessor(&successor_manifest, &segment) {
+                    return Err(format!(
+                        "retained runtime segment {index} does not bind its successor handoff"
+                    ));
+                }
+                let bootstrap =
+                    historical_checkpoint_from_segment_manifest(&segment.manifest.bootstrap)?;
+                let terminal =
+                    historical_checkpoint_from_segment_manifest(&segment.manifest.terminal)?;
+                Ok((bootstrap, terminal, successor_path))
+            })();
+            match reusable {
+                Ok((bootstrap_evidence, terminal, successor_path)) => {
+                    info!(
+                        "epoch {epoch}: re-admitted completed root-cohort runtime segment {index} {}..{}",
+                        span.slots.start, span.slots.end
+                    );
+                    first_bootstrap_evidence.get_or_insert(bootstrap_evidence);
+                    terminal_evidence = Some(terminal);
+                    current_bootstrap = ReplayBootstrap::SnapshotArchive(successor_path);
+                    continue;
+                }
+                Err(error) => {
+                    if output.exists() {
+                        let preserved = preserve_existing_output(&output)?;
+                        warn!(
+                            "epoch {epoch}: retained root-cohort runtime segment {index} is not reusable and will be replayed: {error}; preserved prior artifact as {preserved:?}"
+                        );
+                    }
+                }
+            }
+        }
         let mut result = run_geyser_replay(
             epoch,
             allow_candidate_runtime,
@@ -13800,6 +14045,8 @@ async fn run_mixed_runtime_root_cohort_first_epoch(
         shutdown.clone(),
     )
     .await?;
+
+    prepare_mixed_runtime_cohort_archive_permissions(staged_output, dest_dir)?;
 
     let mut archive_chain = ArchiveChainEvidence::default();
     let validated = validated_epoch_archive_multi_runtime(
@@ -13932,10 +14179,24 @@ impl BoundDestination {
 }
 
 const COHORT_RUN_STATE_FILE: &str = "cohort-state.json";
+const ROOT_COHORT_RESUME_RUN_ENV: &str = "JETSTREAMER_ROOT_COHORT_RESUME_RUN";
+const MAX_COHORT_RUN_STATE_BYTES: u64 = 64 * 1024;
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CohortRunState {
+    end_epoch: u64,
+    manifest_fingerprint: String,
+    schema: String,
+    start_epoch: u64,
+    status: String,
+}
+
+#[derive(Debug)]
 struct CohortRunDirectory {
     path: PathBuf,
     parent: PathBuf,
+    resumed: bool,
 }
 
 impl CohortRunDirectory {
@@ -13948,6 +14209,18 @@ impl CohortRunDirectory {
         use std::{io::Write as _, os::unix::fs::OpenOptionsExt as _};
 
         create_or_validate_private_directory(&parent)?;
+        if let Some(path) = env::var_os(ROOT_COHORT_RESUME_RUN_ENV) {
+            if path.is_empty() {
+                return Err(format!("{ROOT_COHORT_RESUME_RUN_ENV} must not be empty"));
+            }
+            return Self::resume(
+                parent,
+                PathBuf::from(path),
+                start_epoch,
+                end_epoch,
+                manifest_fingerprint,
+            );
+        }
         let path = parent.join(format!(
             "run-{}-{}",
             std::process::id(),
@@ -13990,11 +14263,120 @@ impl CohortRunDirectory {
         fs::File::open(&path)
             .and_then(|directory| directory.sync_all())
             .map_err(|error| format!("failed to sync cohort run directory: {error}"))?;
-        Ok(Self { path, parent })
+        Ok(Self {
+            path,
+            parent,
+            resumed: false,
+        })
+    }
+
+    fn resume(
+        parent: PathBuf,
+        path: PathBuf,
+        start_epoch: u64,
+        end_epoch: u64,
+        manifest_fingerprint: &str,
+    ) -> Result<Self, String> {
+        use std::{
+            io::Read as _,
+            os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _},
+        };
+
+        create_or_validate_private_directory(&parent)?;
+        if !path.is_absolute()
+            || path.parent() != Some(parent.as_path())
+            || path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_none_or(|name| !name.starts_with("run-"))
+        {
+            return Err(format!(
+                "{ROOT_COHORT_RESUME_RUN_ENV} must name a direct run-* child of {}",
+                parent.display()
+            ));
+        }
+        create_or_validate_private_directory(&path)?;
+        let state_path = path.join(COHORT_RUN_STATE_FILE);
+        let mut file = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(&state_path)
+            .map_err(|error| {
+                format!(
+                    "failed to open resumable cohort state {}: {error}",
+                    state_path.display()
+                )
+            })?;
+        let metadata = file.metadata().map_err(|error| {
+            format!(
+                "failed to inspect resumable cohort state {}: {error}",
+                state_path.display()
+            )
+        })?;
+        if !metadata.file_type().is_file()
+            || metadata.uid() != effective_user_id()
+            || metadata.permissions().mode() & 0o777 != 0o600
+            || metadata.len() > MAX_COHORT_RUN_STATE_BYTES
+        {
+            return Err(format!(
+                "resumable cohort state is not a bounded owner-only regular file: {}",
+                state_path.display()
+            ));
+        }
+        let mut bytes = Vec::with_capacity(metadata.len() as usize);
+        file.read_to_end(&mut bytes).map_err(|error| {
+            format!(
+                "failed to read resumable cohort state {}: {error}",
+                state_path.display()
+            )
+        })?;
+        if file
+            .metadata()
+            .map_err(|error| {
+                format!(
+                    "failed to recheck resumable cohort state {}: {error}",
+                    state_path.display()
+                )
+            })?
+            .len()
+            != metadata.len()
+        {
+            return Err(format!(
+                "resumable cohort state changed while it was read: {}",
+                state_path.display()
+            ));
+        }
+        let state: CohortRunState = serde_json::from_slice(&bytes).map_err(|error| {
+            format!(
+                "invalid resumable cohort state {}: {error}",
+                state_path.display()
+            )
+        })?;
+        if state.schema != "jetstreamer-root-cohort-run-v1"
+            || state.status != "running-private"
+            || state.start_epoch != start_epoch
+            || state.end_epoch != end_epoch
+            || state.manifest_fingerprint != manifest_fingerprint
+        {
+            return Err(format!(
+                "resumable cohort state does not match requested epochs {start_epoch}-{end_epoch} and manifest {manifest_fingerprint}: {}",
+                state_path.display()
+            ));
+        }
+        info!("resuming sealed private root cohort run {}", path.display());
+        Ok(Self {
+            path,
+            parent,
+            resumed: true,
+        })
     }
 
     fn path(&self) -> &Path {
         &self.path
+    }
+
+    fn resumed(&self) -> bool {
+        self.resumed
     }
 
     fn archives_path(&self) -> PathBuf {
@@ -17281,21 +17663,67 @@ async fn main() {
             eprintln!("error: {err}");
             exit(1);
         }
-        let snapshot_path = match download_exact_snapshot_uri_generation(
-            root_slot,
-            &plan.bootstrap.uri,
-            plan.bootstrap.generation,
-            &input_dir,
-        )
-        .await
-        {
-            Ok(path) => path,
-            Err(err) => {
-                eprintln!(
-                    "error: failed to download audited predecessor snapshot generation {}: {err}",
-                    plan.bootstrap.generation
-                );
-                exit(1);
+        let retained_snapshot = input_dir.join(&name);
+        let snapshot_path = if cohort_run.as_ref().is_some_and(CohortRunDirectory::resumed) {
+            match fs::symlink_metadata(&retained_snapshot) {
+                Ok(metadata) if metadata.file_type().is_file() => {
+                    info!(
+                        "resumed root-checkpoint cohort is re-admitting retained audited bootstrap {}",
+                        retained_snapshot.display()
+                    );
+                    retained_snapshot
+                }
+                Ok(_) => {
+                    eprintln!(
+                        "error: retained cohort bootstrap is not a regular file: {}",
+                        retained_snapshot.display()
+                    );
+                    exit(1);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    match download_exact_snapshot_uri_generation(
+                        root_slot,
+                        &plan.bootstrap.uri,
+                        plan.bootstrap.generation,
+                        &input_dir,
+                    )
+                    .await
+                    {
+                        Ok(path) => path,
+                        Err(err) => {
+                            eprintln!(
+                                "error: failed to download audited predecessor snapshot generation {}: {err}",
+                                plan.bootstrap.generation
+                            );
+                            exit(1);
+                        }
+                    }
+                }
+                Err(error) => {
+                    eprintln!(
+                        "error: failed to inspect retained cohort bootstrap {}: {error}",
+                        retained_snapshot.display()
+                    );
+                    exit(1);
+                }
+            }
+        } else {
+            match download_exact_snapshot_uri_generation(
+                root_slot,
+                &plan.bootstrap.uri,
+                plan.bootstrap.generation,
+                &input_dir,
+            )
+            .await
+            {
+                Ok(path) => path,
+                Err(err) => {
+                    eprintln!(
+                        "error: failed to download audited predecessor snapshot generation {}: {err}",
+                        plan.bootstrap.generation
+                    );
+                    exit(1);
+                }
             }
         };
         let binding = match bind_cohort_snapshot_download(&snapshot_path, &plan.bootstrap) {
@@ -18070,6 +18498,13 @@ async fn main() {
         } else {
             None
         };
+
+        if let Err(err) =
+            preserve_resumed_cohort_output(cohort_run.as_ref(), epoch, &horizon_output)
+        {
+            eprintln!("error: {err}");
+            exit(1);
+        }
 
         let result = run_geyser_replay(
             epoch,
@@ -19345,6 +19780,50 @@ mod early_snapshot_tests {
             historical::SOLANA_V1_0_14_CANDIDATE.backend_id,
             AUDITED_EPOCH_11_RECOVERY_PROFILE,
         ));
+        let epoch67_profile = COMPATIBLE_EPOCH67_FIRST_SEGMENT_GENERATION_PROFILES[0];
+        assert!(runtime_generation_profile_is_compatible(
+            historical::SOLANA_V1_2_32_CANDIDATE.backend_id,
+            epoch67_profile,
+        ));
+        assert!(!runtime_generation_profile_is_compatible(
+            historical::SOLANA_V1_2_24_EPOCH67_PRE_CPI_CANDIDATE.backend_id,
+            epoch67_profile,
+        ));
+        assert!(!runtime_generation_profile_is_compatible(
+            historical::SOLANA_V1_2_32_CANDIDATE.backend_id,
+            &format!("{epoch67_profile}0"),
+        ));
+        for epoch67_root_cohort in COMPATIBLE_EPOCH67_ROOT_COHORT_GENERATION_PROFILES {
+            for runtime in [
+                historical::SOLANA_V1_2_24_EPOCH67_PRE_CPI_CANDIDATE.backend_id,
+                historical::SOLANA_V1_2_32_EPOCH68_TRANSITION_CANDIDATE.backend_id,
+            ] {
+                assert!(runtime_generation_profile_is_compatible(
+                    runtime,
+                    epoch67_root_cohort,
+                ));
+            }
+            assert!(!runtime_generation_profile_is_compatible(
+                historical::SOLANA_V1_2_32_CANDIDATE.backend_id,
+                epoch67_root_cohort,
+            ));
+            assert!(!runtime_generation_profile_is_compatible(
+                historical::SOLANA_V1_2_24_EPOCH67_PRE_CPI_CANDIDATE.backend_id,
+                &format!("{epoch67_root_cohort}0"),
+            ));
+        }
+        assert!(archive_assembly_profile_is_compatible(
+            1,
+            &archive_assembly_profile(),
+        ));
+        for epoch67_assembly in COMPATIBLE_EPOCH67_ROOT_COHORT_ASSEMBLY_PROFILES {
+            assert!(archive_assembly_profile_is_compatible(67, epoch67_assembly,));
+            assert!(!archive_assembly_profile_is_compatible(1, epoch67_assembly,));
+            assert!(!archive_assembly_profile_is_compatible(
+                67,
+                &format!("{epoch67_assembly}0"),
+            ));
+        }
     }
 
     fn audited_archive_recovery_provenance(recovery: &AuditedArchiveRecovery) -> ArchiveProvenance {
@@ -21099,6 +21578,28 @@ mod early_snapshot_tests {
     }
 
     #[test]
+    fn mixed_runtime_cohort_permission_preparation_rebinds_after_chmod() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let root = tempfile::TempDir::new().unwrap();
+        let private = root.path().join("private");
+        let destination = root.path().join("destination");
+        fs::create_dir(&private).unwrap();
+        fs::create_dir(&destination).unwrap();
+        fs::set_permissions(&private, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&destination, fs::Permissions::from_mode(0o3770)).unwrap();
+        let staged = private.join("epoch-67.jet");
+        fs::write(&staged, b"verified mixed-runtime cohort").unwrap();
+        fs::set_permissions(&staged, fs::Permissions::from_mode(0o600)).unwrap();
+
+        prepare_mixed_runtime_cohort_archive_permissions(&staged, &destination).unwrap();
+
+        let prepared = fs::metadata(&staged).unwrap();
+        assert_eq!(prepared.permissions().mode() & 0o777, 0o440);
+        assert_eq!(prepared.gid(), fs::metadata(&destination).unwrap().gid());
+    }
+
+    #[test]
     fn multi_runtime_reuse_rejects_non_mainnet_genesis() {
         let wrong = Hash::new_from_array([0xff; 32]);
         let error = validate_multi_runtime_genesis(Path::new("epoch-1.jet"), wrong).unwrap_err();
@@ -21250,6 +21751,58 @@ mod early_snapshot_tests {
 
         run.cleanup_after_commit().unwrap();
         assert!(!run_path.exists());
+    }
+
+    #[test]
+    fn cohort_run_directory_resume_is_exact_and_fail_closed() {
+        let fixture = tempfile::tempdir().unwrap();
+        let parent = fixture.path().join("cohort");
+        let fingerprint = "sha256:9254f661c0f14628426d23fc3a84d0c078bfd7bfbf326a877478f817bb1dd48d";
+        let run = CohortRunDirectory::create(parent.clone(), 67, 68, fingerprint).unwrap();
+        let run_path = run.path().to_path_buf();
+        drop(run);
+
+        let resumed =
+            CohortRunDirectory::resume(parent.clone(), run_path.clone(), 67, 68, fingerprint)
+                .unwrap();
+        assert!(resumed.resumed());
+        assert_eq!(resumed.path(), run_path);
+        assert!(
+            CohortRunDirectory::resume(parent, run_path.clone(), 67, 69, fingerprint,)
+                .unwrap_err()
+                .contains("does not match requested epochs")
+        );
+
+        resumed.cleanup_after_commit().unwrap();
+        assert!(!run_path.exists());
+    }
+
+    #[test]
+    fn resumed_cohort_preserves_a_prior_member_before_live_replay() {
+        let fixture = tempfile::tempdir().unwrap();
+        let parent = fixture.path().join("cohort");
+        let fingerprint = "sha256:9254f661c0f14628426d23fc3a84d0c078bfd7bfbf326a877478f817bb1dd48d";
+        let run = CohortRunDirectory::create(parent.clone(), 67, 68, fingerprint).unwrap();
+        let run_path = run.path().to_path_buf();
+        let archives = run.archives_path();
+        create_or_validate_private_directory(&archives).unwrap();
+        let staged = archives.join("epoch-68.jet");
+        fs::write(&staged, b"previous validated member").unwrap();
+
+        assert!(
+            preserve_resumed_cohort_output(Some(&run), 68, &staged)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(fs::read(&staged).unwrap(), b"previous validated member");
+        drop(run);
+
+        let resumed = CohortRunDirectory::resume(parent, run_path, 67, 68, fingerprint).unwrap();
+        let backup = preserve_resumed_cohort_output(Some(&resumed), 68, &staged)
+            .unwrap()
+            .unwrap();
+        assert!(!staged.exists());
+        assert_eq!(fs::read(backup).unwrap(), b"previous validated member");
     }
 
     #[test]

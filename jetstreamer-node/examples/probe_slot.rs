@@ -12,10 +12,12 @@
 //!
 //! Usage:
 //!   cargo run --release -p jetstreamer-node --example probe_slot -- \
-//!       [start_slot] [count] [transaction_index]
+//!       [start_slot] [count] [transaction_index] [account]
 //! Defaults to slots 411195440..=411195445 (around the slot that failed).
 //! When `transaction_index` is present, the probe also prints that source
-//! transaction's signature and complete status metadata.
+//! transaction's signature and complete status metadata. When `account` is
+//! present, it additionally prints every transaction whose static account
+//! keys contain that address.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::AtomicBool;
@@ -33,6 +35,7 @@ use solana_entry::entry::EntrySummary;
 use solana_geyser_plugin_manager::block_metadata_notifier_interface::BlockMetadataNotifier;
 use solana_hash::Hash;
 use solana_ledger::entry_notifier_interface::EntryNotifier;
+use solana_pubkey::Pubkey;
 use solana_rpc::transaction_notifier_interface::TransactionNotifier;
 use solana_runtime::bank::KeyedRewardsAndNumPartitions;
 use solana_signature::Signature;
@@ -58,6 +61,8 @@ struct SlotTally {
 struct Probe {
     slots: Mutex<BTreeMap<Slot, SlotTally>>,
     transaction_index: Option<usize>,
+    account: Option<Pubkey>,
+    dump_all_transactions: bool,
 }
 
 impl TransactionNotifier for Probe {
@@ -82,7 +87,25 @@ impl TransactionNotifier for Probe {
 
 impl SourcedTransactionNotifier for Probe {
     fn notify_transaction(&self, transaction: SourcedTransaction<'_>) {
-        if self.transaction_index != Some(transaction.transaction_slot_index) {
+        let index_match = self.transaction_index == Some(transaction.transaction_slot_index);
+        let account_match = self.account.is_some_and(|account| {
+            transaction
+                .transaction
+                .message
+                .static_account_keys()
+                .contains(&account)
+        });
+        if !index_match && !account_match && !self.dump_all_transactions {
+            return;
+        }
+        if self.dump_all_transactions {
+            println!(
+                "source transaction slot={} index={} signature={} static_accounts={:?}",
+                transaction.slot,
+                transaction.transaction_slot_index,
+                transaction.signature,
+                transaction.transaction.message.static_account_keys(),
+            );
             return;
         }
         match transaction.status {
@@ -94,6 +117,9 @@ impl SourcedTransactionNotifier for Probe {
                 "source transaction slot={} index={} signature={} status_meta=<missing>",
                 transaction.slot, transaction.transaction_slot_index, transaction.signature
             ),
+        }
+        if index_match || account_match {
+            println!("source transaction body={:#?}", transaction.transaction);
         }
     }
 }
@@ -119,10 +145,10 @@ impl BlockMetadataNotifier for Probe {
     fn notify_block_metadata(
         &self,
         _parent_slot: u64,
-        _parent_blockhash: &str,
+        parent_blockhash: &str,
         slot: u64,
-        _blockhash: &str,
-        _rewards: &KeyedRewardsAndNumPartitions,
+        blockhash: &str,
+        rewards: &KeyedRewardsAndNumPartitions,
         _block_time: Option<UnixTimestamp>,
         _block_height: Option<u64>,
         executed_transaction_count: u64,
@@ -136,6 +162,21 @@ impl BlockMetadataNotifier for Probe {
         t.block_meta_seen = true;
         t.declared_txs = executed_transaction_count;
         t.declared_entries = entry_count;
+        if self.dump_all_transactions {
+            println!(
+                "source block identity slot={slot} parent_blockhash={parent_blockhash} blockhash={blockhash}"
+            );
+            println!(
+                "source block rewards slot={slot} rewards={:?}",
+                rewards.keyed_rewards
+            );
+        } else if let Some(account) = self.account {
+            for (pubkey, reward) in &rewards.keyed_rewards {
+                if pubkey == &account {
+                    println!("source reward slot={slot} account={pubkey} reward={reward:?}");
+                }
+            }
+        }
     }
 }
 
@@ -156,6 +197,14 @@ fn main() {
             .parse()
             .expect("transaction_index must be a non-negative integer")
     });
+    let dump_all_transactions = args.get(3).is_some_and(|value| value == "all");
+    let account: Option<Pubkey> = args.get(3).and_then(|value| {
+        (!dump_all_transactions).then(|| {
+            value
+                .parse()
+                .expect("account must be a base58-encoded public key or 'all'")
+        })
+    });
     let end = start + count; // exclusive
     let epoch = slot_to_epoch(start);
     eprintln!("probing slots {start}..{end} (epoch {epoch}) via firehose from {BASE_URL}\n");
@@ -166,6 +215,8 @@ fn main() {
     let shutdown = Arc::new(AtomicBool::new(false));
     let probe = Arc::new(Probe {
         transaction_index,
+        account,
+        dump_all_transactions,
         ..Probe::default()
     });
 

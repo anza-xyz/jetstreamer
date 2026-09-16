@@ -2,8 +2,10 @@
 
 This isolated worker executes mainnet slots
 `29,371,188..29,807,999`. It accepts only a completed snapshot in
-`29,371,187..29,807,999`, with production routing committed to the canonical
+`29,371,187..29,807,999`, with candidate routing bound to the source-lineage
 slot-`29,371,187` snapshot exported by the exact v1.2.24 predecessor. Its
+accounts hash is
+`6ubQSWsXQ8dEtxTkZwgpB8vEVj4nAsQcSGmu9usxVSGR`. Its
 runtime, BPF loader, stake program, vote program, and SDK are pinned to
 upstream Solana v1.2.32 at
 `8c989da68342918f1717c60aa60fdfab7d1e676e`.

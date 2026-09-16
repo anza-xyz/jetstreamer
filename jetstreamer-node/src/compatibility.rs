@@ -66,18 +66,22 @@ pub const SOLANA_V1_1_15_CANDIDATE_END_SLOT_EXCLUSIVE: Slot = 13_392_000;
 pub const SOLANA_V1_1_23_CANDIDATE_START_SLOT: Slot = SOLANA_V1_1_15_CANDIDATE_END_SLOT_EXCLUSIVE;
 pub const SOLANA_V1_1_23_CANDIDATE_END_SLOT_EXCLUSIVE: Slot = 26_352_000;
 pub const SOLANA_V1_2_32_CANDIDATE_START_SLOT: Slot = SOLANA_V1_1_23_CANDIDATE_END_SLOT_EXCLUSIVE;
-/// Canonical epoch-67 state boundary between the root-start v1.2.32 span and
-/// the exact pre-CPI v1.2.24 span.
-pub const SOLANA_V1_2_32_TO_V1_2_24_HANDOFF_SNAPSHOT_SLOT: Slot = 29_186_735;
+/// Source-status-derived epoch-67 state boundary between the root-start
+/// v1.2.32 span and the exact pre-CPI v1.2.24 span. The first transaction
+/// whose recorded outcome requires CPI to remain disabled is in the child
+/// slot immediately after this snapshot.
+pub const SOLANA_V1_2_32_TO_V1_2_24_HANDOFF_SNAPSHOT_SLOT: Slot = 29_327_575;
 pub const SOLANA_V1_2_32_TO_V1_2_24_HANDOFF_ACCOUNTS_HASH: &str =
-    "9FLn7BisKQrjPkD3Dsz7btr7quMD4J1pGQR6HGvvprFp";
+    "A286WmNJJ1r5F8G2cnBqykiDGbXgo7aphzJVJqX5ZwbR";
 pub const SOLANA_V1_2_24_EPOCH67_PRE_CPI_START_SLOT: Slot =
     SOLANA_V1_2_32_TO_V1_2_24_HANDOFF_SNAPSHOT_SLOT + 1;
-/// Canonical state boundary immediately before CPI and vote-timestamp
-/// semantics change in epoch 67.
+/// Source-status-derived candidate boundary immediately before the restored
+/// CPI and vote-timestamp semantics in epoch 67.
 pub const SOLANA_V1_2_24_TO_V1_2_32_HANDOFF_SNAPSHOT_SLOT: Slot = 29_371_187;
+/// Source-lineage accounts hash produced by the bounded v1.2.24 replay from
+/// the verified first handoff through this frozen checkpoint.
 pub const SOLANA_V1_2_24_TO_V1_2_32_HANDOFF_ACCOUNTS_HASH: &str =
-    "JBDL7UvkWrgMdcW9PuFyoXmSUjxpiB5gWJGWpG6RTwC8";
+    "6ubQSWsXQ8dEtxTkZwgpB8vEVj4nAsQcSGmu9usxVSGR";
 pub const SOLANA_V1_2_32_EPOCH68_TRANSITION_START_SLOT: Slot =
     SOLANA_V1_2_24_TO_V1_2_32_HANDOFF_SNAPSHOT_SLOT + 1;
 pub const SOLANA_V1_2_32_EPOCH68_TRANSITION_END_SLOT_EXCLUSIVE: Slot = 29_808_000;
@@ -822,7 +826,8 @@ pub static SOLANA_V1_2_24_TO_V1_2_32_EPOCH67_HANDOFF: RuntimeHandoff = RuntimeHa
     },
 };
 
-/// Canonical snapshot transitions keyed by their destination slot.
+/// Hash-bound snapshot transitions keyed by their destination slot. Candidate
+/// transitions remain unpublished until their complete replay gates pass.
 pub static RUNTIME_HANDOFFS: &[&RuntimeHandoff] = &[
     &SOLANA_V1_0_7_TO_V1_0_8_HANDOFF,
     &SOLANA_V1_2_32_TO_V1_2_24_EPOCH67_HANDOFF,
@@ -2097,10 +2102,10 @@ mod tests {
     }
 
     #[test]
-    fn epoch_67_has_two_canonical_handoffs_and_three_exact_spans() {
+    fn epoch_67_has_two_source_lineage_handoffs_and_three_exact_spans() {
         let spans = plan_runtime_spans(28_944_000..29_376_000, true).unwrap();
         assert_eq!(spans.len(), 3);
-        assert_eq!(spans[0].slots, 28_944_000..29_186_736);
+        assert_eq!(spans[0].slots, 28_944_000..29_327_576);
         assert!(matches!(
             spans[0].execution.backend,
             EraBackend::Available(descriptor)
@@ -2108,7 +2113,7 @@ mod tests {
         ));
         assert!(spans[0].handoff.is_none());
 
-        assert_eq!(spans[1].slots, 29_186_736..29_371_188);
+        assert_eq!(spans[1].slots, 29_327_576..29_371_188);
         assert!(matches!(
             spans[1].execution.backend,
             EraBackend::Available(descriptor)

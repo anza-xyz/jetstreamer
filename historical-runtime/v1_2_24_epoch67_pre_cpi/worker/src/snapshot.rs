@@ -1605,8 +1605,8 @@ mod tests {
     #[test]
     #[ignore]
     fn loads_and_verifies_v1_2_24_boundary_snapshot() {
-        let path = std::env::var("JETSTREAMER_SNAPSHOT_29186735")
-            .expect("set JETSTREAMER_SNAPSHOT_29186735 to run this integration test");
+        let path = std::env::var("JETSTREAMER_SNAPSHOT_29327575")
+            .expect("set JETSTREAMER_SNAPSHOT_29327575 to run this integration test");
         let ledger = std::env::var("JETSTREAMER_MAINNET_LEDGER")
             .expect("set JETSTREAMER_MAINNET_LEDGER to run this integration test");
         let state_dir = private_state_dir(None).unwrap();
@@ -1616,7 +1616,7 @@ mod tests {
             solana_sdk::genesis_config::OperatingMode::Stable
         );
         let loaded = load_archive(Path::new(&path), &state_dir, &genesis).unwrap();
-        assert_eq!(loaded.bank.slot(), 29_186_735);
+        assert_eq!(loaded.bank.slot(), 29_327_575);
         assert!(loaded.bank.verify_snapshot_bank());
     }
 

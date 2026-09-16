@@ -42,10 +42,11 @@ const MAX_SUPPORTED_EPOCH: u64 = 91;
 const POH_THREADS_ENV: &str = "JETSTREAMER_HISTORICAL_POH_THREADS";
 const ABSOLUTE_MAX_POH_THREADS: usize = 256;
 // This generic worker is used across a broad candidate range, but its export
-// authority is deliberately limited to the one canonically proven epoch-67
-// handoff. It must not become a general snapshot-packaging RPC.
-const EPOCH67_FIRST_HANDOFF_SLOT: u64 = 29_186_735;
-const EPOCH67_FIRST_HANDOFF_ACCOUNTS_HASH: &str = "9FLn7BisKQrjPkD3Dsz7btr7quMD4J1pGQR6HGvvprFp";
+// authority is deliberately limited to the one source-lineage epoch-67
+// candidate handoff. It must not become a general snapshot-packaging RPC.
+const EPOCH67_FIRST_HANDOFF_SLOT: u64 = 29_327_575;
+const EPOCH67_FIRST_HANDOFF_ACCOUNTS_HASH: &str =
+    "A286WmNJJ1r5F8G2cnBqykiDGbXgo7aphzJVJqX5ZwbR";
 // The validator runs AccountsBackgroundService alongside replay. This worker
 // has no BankForks service, so perform the same storage-only maintenance at
 // deterministic rooted-bank boundaries instead. At most one stale store is
@@ -1932,7 +1933,10 @@ mod tests {
                 &checkpoint.accounts_hash,
             )
             .unwrap_err();
-        assert!(error.contains("authorized only for epoch-67 handoff slot 29186735"));
+        assert!(error.contains(&format!(
+            "authorized only for epoch-67 handoff slot {}",
+            EPOCH67_FIRST_HANDOFF_SLOT
+        )));
         assert!(state
             .export_snapshot(
                 0,
@@ -2105,8 +2109,8 @@ mod tests {
     #[test]
     #[ignore]
     fn exports_and_restores_exact_epoch67_handoff_snapshot() {
-        let archive = std::env::var("JETSTREAMER_SNAPSHOT_29186735")
-            .expect("set JETSTREAMER_SNAPSHOT_29186735");
+        let archive = std::env::var("JETSTREAMER_SNAPSHOT_29327575")
+            .expect("set JETSTREAMER_SNAPSHOT_29327575");
         let ledger =
             std::env::var("JETSTREAMER_MAINNET_LEDGER").expect("set JETSTREAMER_MAINNET_LEDGER");
         let (mut state, initialized) = RuntimeState::initialize(

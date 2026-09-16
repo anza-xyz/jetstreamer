@@ -344,18 +344,18 @@ select a runtime. The current registry is deliberately conservative:
 | `5,184,000..12,960,000` | pinned Solana v1.0.23 worker | anchored at canonical snapshot slot 5,183,736, warms slots 5,183,737-5,183,999, then starts output at 5,184,000 | diagnostic candidate for epochs 12-29 |
 | `12,960,000..13,392,000` | pinned Solana v1.1.15 worker | independently verified snapshot restart; restores and strictly validates the mainnet hard-fork marker at slot 13,334,463 | diagnostic candidate for epoch 30 |
 | `13,392,000..26,352,000` | pinned Solana v1.1.23 worker | independently verified snapshot restart; retains the upstream epoch-34 BPF-loader and epoch-40 system-program transitions | diagnostic candidate for epochs 31-60 |
-| `26,352,000..29,186,736` | pinned Solana v1.2.32 worker | independently verified snapshot restart, ending at the hash-bound epoch-67 handoff snapshot | diagnostic candidate through the first epoch-67 handoff |
-| `29,186,736..29,371,188` | pinned Solana v1.2.24 pre-CPI worker | canonical state handoff from snapshot slot 29,186,735; keeps CPI disabled and exports the next hash-bound handoff state | exact epoch-67 candidate between canonical handoffs |
-| `29,371,188..29,808,000` | pinned Solana v1.2.32 mainnet transition worker | canonical state handoff from snapshot slot 29,371,187; reconstructs the mainnet CPI and vote-timestamp activation state | fail-closed epoch-67/68 candidate after the second handoff |
+| `26,352,000..29,327,576` | pinned Solana v1.2.32 worker | independently verified snapshot restart; source-lineage replay through slot 29,327,575 binds accounts hash `A286WmNJJ1r5F8G2cnBqykiDGbXgo7aphzJVJqX5ZwbR` | qualified first epoch-67 handoff |
+| `29,327,576..29,371,188` | pinned Solana v1.2.24 pre-CPI worker | starts at the first recorded transaction whose outcome requires CPI to remain disabled; source-lineage replay through slot 29,371,187 binds accounts hash `6ubQSWsXQ8dEtxTkZwgpB8vEVj4nAsQcSGmu9usxVSGR` | qualified second epoch-67 handoff |
+| `29,371,188..29,808,000` | pinned Solana v1.2.32 mainnet transition worker | generated state handoff after the last observed old-semantics transaction; reconstructs the CPI and vote-timestamp activation state | qualified by the terminal epoch-68 checkpoint |
 | `29,808,000..39,744,000` | pinned Solana v1.2.32 worker | independently verified snapshot restart | diagnostic candidate for epochs 69-91 |
 | `39,744,000..43,632,000` | pinned Solana v1.3.19 worker | independently verified snapshot restart | diagnostic candidate for epochs 92-100 |
 | `43,632,000..406,080,000` | none | unsupported; replay fails closed | unsupported |
 | `406,080,000..` | in-process Agave v3 | independently verified modern snapshot bootstrap | verified |
 
 For epochs 0-100 this is 12 execution envelopes backed by 11 historical worker variants. The
-11 runtime boundaries consist of three hash-bound canonical state handoffs and eight independently
-verified snapshot restarts. The v1.2.32 worker is used on both sides of the two specialized
-epoch-67 ranges.
+11 runtime boundaries consist of one hash-bound canonical state handoff, two source-lineage-verified
+epoch-67 handoffs, and eight independently verified snapshot restarts. The
+v1.2.32 worker is used on both sides of the two specialized epoch-67 ranges.
 
 Five execution interventions go beyond choosing a pinned worker and restarting from an independently
 verified boundary snapshot:
@@ -363,7 +363,7 @@ verified boundary snapshot:
 1. The behaviorally safe v1.0.7 to v1.0.8 state handoff at slot 619,849.
 2. The fixed epoch-12 bootstrap at slot 5,183,736 and warmup through slot 5,183,999.
 3. Reconstruction and validation of the epoch-30 hard-fork marker at slot 13,334,463.
-4. The v1.2.32 to pre-CPI v1.2.24 state handoff at slot 29,186,736.
+4. The v1.2.32 to pre-CPI v1.2.24 state handoff at slot 29,327,576.
 5. The return to v1.2.32 at slot 29,371,188 with CPI and vote-timestamp state reconstructed.
 
 Input repair is planned independently of execution and adds three more historical interventions:
@@ -389,16 +389,20 @@ explicitly non-canonical until its checkpoint replay completes. Additional exact
 registered but unassigned until differential evidence requires a narrower runtime boundary. This
 includes the v1.0.17 worker, which remains available for comparison without claiming a slot range.
 
-Epoch 67 requires more than one intra-epoch runtime handoff. Exact v1.2.24 with CPI disabled matches
-from the canonical checkpoint at slot 29,186,735 through slot 29,371,187, while v1.2.32 diverges at
-slot 29,188,719. A separate root-start proof rejects using v1.2.24 from the epoch boundary: it
-diverges at checkpoint 29,195,008. The registered shape is therefore v1.2.32 through slot
-29,186,735, v1.2.24 through slot 29,371,187, and the v1.2.32 transition runtime afterward. The
-handoffs are bound to accounts hashes `9FLn7BisKQrjPkD3Dsz7btr7quMD4J1pGQR6HGvvprFp` and
-`JBDL7UvkWrgMdcW9PuFyoXmSUjxpiB5gWJGWpG6RTwC8`. Candidate publication remains fail closed unless
-the immutable root-to-handoff replay and the final canonical checkpoint both pass. The independent
-root-to-first-handoff replay matches the first hash; the complete cohort still gates publication on
-the second handoff and terminal epoch-68 checkpoint.
+Epoch 67 requires more than one intra-epoch runtime handoff. Direct comparisons with Old Faithful
+show that v1.2.32 still matches recorded execution at slots 29,188,719 and 29,189,576. The first
+known source transaction requiring CPI to remain disabled is at slot 29,327,576, where v1.2.32
+succeeds but Old Faithful records BPF-loader error `0x0b9f0002`. The hourly GCS snapshots previously
+used to place the first handoff are not independent proof: their persisted slot-hash state disagrees
+with successful votes in the Old Faithful stream. The candidate route therefore keeps v1.2.32
+through slot 29,327,575, uses v1.2.24 through slot 29,371,187, and uses the v1.2.32 transition
+runtime afterward. Corrected source-lineage replay binds the first handoff at slot 29,327,575
+to accounts hash `A286WmNJJ1r5F8G2cnBqykiDGbXgo7aphzJVJqX5ZwbR` and the second at slot 29,371,187
+to `6ubQSWsXQ8dEtxTkZwgpB8vEVj4nAsQcSGmu9usxVSGR`. The successor then matches the complete
+terminal checkpoint at slot 29,807,999: bank hash
+`439dySBi6LuxMisYQJbt6iPGgu8oSZe3uvvALBRMPXsD` and accounts hash
+`5drX1gEHUyDxfnXEtotcfhZDUrwazrVMoH2A2icSsN3k`. Transactional cohort publication and both
+checksum commits remain mandatory; neither superseded handoff hash is treated as proof.
 
 Epoch 12 starts v1.0.23 from the canonical snapshot at slot 5,183,736 with legacy accounts hash
 `BUqwiSm2GgH9ByKrBDF6epXHYK9RRh3vyZDKtUqtMXfR`. Production discovery binds both values, so a

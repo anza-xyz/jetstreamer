@@ -134,8 +134,19 @@ cargo run --release --bin horizon_pipeline -- \
   0:100 /path/to/horizon --threads 16 --verify-only
 ```
 
-This checks plugin compatibility and stream delivery. Archive acceptance should also verify each
-`.sha256` sidecar and run the full ordered-chain archive verifier.
+This checks plugin compatibility and stream delivery. Archive acceptance also requires every
+`.sha256` sidecar and a strict ordered-chain scan. Large ranges can recompute PoH in parallel by
+pairing one non-full chain scan with one internal full scan per archive:
+
+```bash
+verify_archive --chain /path/to/horizon/epoch-{0..100}.jet --threads 8
+verify_archive /path/to/horizon/epoch-42.jet \
+  --full --internal-full --threads 12
+```
+
+The internal scan checks every within-archive link and recomputes every block's PoH. It is not an
+acceptance result by itself because it does not anchor the first block. The successful chain scan
+supplies that proof across every archive boundary.
 
 ### TUI dashboard
 

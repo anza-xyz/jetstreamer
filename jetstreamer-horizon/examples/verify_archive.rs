@@ -16,6 +16,10 @@
 //!
 //! Use `--chain <path>...` for strict verification of ordered archives. It
 //! carries the final canonical slot and blockhash across every file boundary.
+//! A parallel release audit may pair one successful non-full `--chain` pass
+//! with `--full --internal-full` on every individual archive. The latter
+//! verifies all within-archive structure and PoH while the former independently
+//! proves the boundaries that individual jobs cannot share.
 
 use std::io::BufReader;
 use std::str::FromStr;
@@ -34,7 +38,13 @@ use solana_hash::Hash;
 // the historical releases covered by Horizon.
 #[cfg(not(test))]
 #[path = "../../historical-runtime/v1_0_8/worker/src/poh_backend.rs"]
-#[allow(dead_code, unexpected_cfgs, unsafe_op_in_unsafe_fn)]
+#[allow(
+    dead_code,
+    unexpected_cfgs,
+    unsafe_op_in_unsafe_fn,
+    clippy::chunks_exact_to_as_chunks,
+    clippy::needless_borrow
+)]
 #[rustfmt::skip]
 mod fast_poh;
 
@@ -648,6 +658,10 @@ struct ScanOutcome {
     last_block_slot: Option<u64>,
 }
 
+fn anchor_requirement_satisfied(anchored: bool, require_anchor: bool) -> bool {
+    anchored || !require_anchor
+}
+
 /// Parallel verification across `threads`: each thread scans a disjoint bucket
 /// range (counts, byte stats, per-block identities); in `full` mode it also
 /// recomputes every block's PoH. After merging, a sequential linkage pass
@@ -941,7 +955,10 @@ fn run_scan(
         && poh_unseeded.is_empty()
         && scan.count_mismatches.is_empty()
         && counts_ok;
-    let anchor_ok = anchored || !(full || require_anchor);
+    // Full internal verification can deliberately leave the first boundary
+    // unanchored when an independent ordered-chain pass proves that boundary.
+    // Every within-archive link and every block's PoH is still checked here.
+    let anchor_ok = anchor_requirement_satisfied(anchored, require_anchor);
     let ok = internal_ok && anchor_ok;
     if ok && anchored {
         let detail = if full && genesis_poh_sentinels.is_empty() {
@@ -1000,12 +1017,15 @@ fn run_scan(
 
 fn usage() -> ! {
     eprintln!(
-        "usage: verify_archive <path> [max_slots] [start_slot] [--full] [--anchor SLOT HASH] [--threads N]"
+        "usage: verify_archive <path> [max_slots] [start_slot] [--full] [--internal-full] [--anchor SLOT HASH] [--threads N]"
     );
     eprintln!(
         "       verify_archive --chain <path>... [--full] [--anchor SLOT HASH] [--threads N]"
     );
     eprintln!("  --full              recompute every block's PoH hash");
+    eprintln!(
+        "  --internal-full     with --full, verify all within-archive invariants without requiring an external boundary anchor; requires a separate successful --chain pass"
+    );
     eprintln!("  --anchor SLOT HASH  trusted canonical block immediately before the range");
     eprintln!("  --chain              verify ordered, contiguous archives as one chain");
     eprintln!("  --threads N          parallelism within each whole-file scan");
@@ -1097,6 +1117,7 @@ fn main() {
         usage();
     }
     let mut full = false;
+    let mut internal_full = false;
     let mut anchor = None;
     let mut threads = std::thread::available_parallelism()
         .map(|n| n.get())
@@ -1115,6 +1136,7 @@ fn main() {
                         .unwrap_or_else(|| usage());
                 }
                 "--full" => full = true,
+                "--internal-full" => usage(),
                 "--anchor" => anchor = Some(parse_anchor(&args, &mut i)),
                 value if value.starts_with("--") => usage(),
                 path => paths.push(path.to_string()),
@@ -1140,6 +1162,7 @@ fn main() {
                     .unwrap_or_else(|| usage());
             }
             "--full" => full = true,
+            "--internal-full" => internal_full = true,
             "--anchor" => anchor = Some(parse_anchor(&args, &mut i)),
             value if value.starts_with("--") => usage(),
             other => positionals.push(
@@ -1153,11 +1176,15 @@ fn main() {
     let max_slots = positionals.first().copied().unwrap_or(u64::MAX);
     let start_slot_arg: Option<u64> = positionals.get(1).copied();
 
+    if internal_full && (!full || anchor.is_some() || !positionals.is_empty()) {
+        usage();
+    }
+
     // `--full` and whole-file normal verification both run the parallel scanner.
     // A partial slice (max_slots / start_slot, for throughput sampling) keeps the
     // single-pass path below.
     if full {
-        let outcome = run_scan(&path, threads, true, anchor, true);
+        let outcome = run_scan(&path, threads, true, anchor, !internal_full);
         let end = outcome.slot_start.saturating_add(outcome.slot_count);
         let tail_ok = outcome.last_block_slot == end.checked_sub(1);
         if !tail_ok {
@@ -1248,6 +1275,14 @@ mod tests {
     use super::*;
     use jetstreamer_horizon::archive::{ArchiveWriter, ArchiveWriterConfig};
     use jetstreamer_horizon::block_metas::BlockMeta;
+
+    #[test]
+    fn explicit_internal_pass_may_omit_an_external_anchor() {
+        assert!(anchor_requirement_satisfied(true, true));
+        assert!(anchor_requirement_satisfied(true, false));
+        assert!(anchor_requirement_satisfied(false, false));
+        assert!(!anchor_requirement_satisfied(false, true));
+    }
 
     fn sig(b: u8) -> Signature {
         Signature::from([b; 64])
@@ -1497,6 +1532,22 @@ mod tests {
         let path = path.to_str().unwrap();
         assert!(!run_scan(path, 1, false, None, true).ok);
         assert!(run_scan(path, 1, false, Some(parent), true).ok);
+    }
+
+    #[test]
+    fn full_internal_scan_accepts_only_the_deliberately_unanchored_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("epoch-5.jet");
+        let parent_hash = Hash::new_from_array([6; 32]);
+        std::fs::write(
+            &path,
+            write_archive(5, 1_000, &[Some((999, parent_hash, parent_hash))]),
+        )
+        .unwrap();
+
+        let path = path.to_str().unwrap();
+        assert!(run_scan(path, 1, true, None, false).ok);
+        assert!(!run_scan(path, 1, true, None, true).ok);
     }
 
     /// `recompute_blockhash` must split the flat per-tx signature list into

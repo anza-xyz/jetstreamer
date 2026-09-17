@@ -77,6 +77,115 @@ cleanup_children() {
 }
 trap cleanup_children EXIT
 
+remove_child() {
+    local target=$1
+    local child
+    local remaining=()
+    for child in "${children[@]}"; do
+        if [[ $child != "$target" ]]; then
+            remaining+=("$child")
+        fi
+    done
+    children=("${remaining[@]}")
+}
+
+read_sidecar_sha() {
+    local epoch=$1
+    local name="epoch-$epoch.jet"
+    local archive="$archive_dir/$name"
+    local sidecar="$archive.sha256"
+    [[ -f $archive && ! -L $archive && -f $sidecar && ! -L $sidecar ]] || return 1
+
+    local line
+    line=$(<"$sidecar")
+    if [[ ! $line =~ ^([0-9a-f]{64})\ \ (epoch-[0-9]+\.jet)$ ]] \
+        || [[ ${BASH_REMATCH[2]:-} != "$name" ]]; then
+        echo "invalid SHA-256 sidecar format: $sidecar" >&2
+        return 2
+    fi
+    printf '%s\n' "${BASH_REMATCH[1]}"
+}
+
+run_full_epoch() {
+    local epoch=$1
+    local archive="$archive_dir/epoch-$epoch.jet"
+    local archive_sha sidecar_status
+    if archive_sha=$(read_sidecar_sha "$epoch"); then
+        :
+    else
+        sidecar_status=$?
+        ((sidecar_status == 1)) && return 0
+        return "$sidecar_status"
+    fi
+
+    local receipt="$state_dir/receipts/epoch-$epoch.full.ok"
+    local prior_archive="" prior_verifier="" prior_script=""
+    if [[ -f $receipt ]]; then
+        read -r prior_archive prior_verifier prior_script <"$receipt" || true
+        if [[ $prior_archive == "$archive_sha" \
+            && $prior_verifier == "$verifier_sha" \
+            && $prior_script == "$script_sha" ]]; then
+            return 0
+        fi
+    fi
+
+    local actual
+    actual=$(sha256sum -- "$archive" | awk '{print $1}')
+    if [[ $actual != "$archive_sha" ]]; then
+        echo "SHA-256 mismatch for $archive: expected=$archive_sha actual=$actual" >&2
+        return 1
+    fi
+
+    local log_tmp="$state_dir/tmp/epoch-$epoch.$$.tmp"
+    echo "[$(date -u +%FT%TZ)] epoch $epoch full PoH verification started"
+    if nice -n 19 ionice -c 3 "$verifier" "$archive" --full --internal-full \
+        --threads "$threads_per_job" >"$log_tmp" 2>&1; then
+        actual=$(sha256sum -- "$archive" | awk '{print $1}')
+        if [[ $actual != "$archive_sha" ]]; then
+            mv -f -- "$log_tmp" "$state_dir/logs/epoch-$epoch.full.changed.$(date -u +%Y%m%dT%H%M%SZ).log"
+            echo "archive changed during epoch $epoch verification: expected=$archive_sha actual=$actual" >&2
+            return 1
+        fi
+        mv -f -- "$log_tmp" "$state_dir/logs/epoch-$epoch.full.log"
+        local receipt_tmp="$state_dir/tmp/epoch-$epoch-receipt.$$.tmp"
+        printf '%s %s %s\n' "$archive_sha" "$verifier_sha" "$script_sha" >"$receipt_tmp"
+        mv -f -- "$receipt_tmp" "$receipt"
+        echo "[$(date -u +%FT%TZ)] epoch $epoch full PoH verification passed"
+        return 0
+    fi
+    mv -f -- "$log_tmp" "$state_dir/logs/epoch-$epoch.full.failed.$(date -u +%Y%m%dT%H%M%SZ).log"
+    echo "epoch $epoch full PoH verification failed" >&2
+    return 1
+}
+
+run_full_pool() {
+    local active=()
+    local failed=0
+    local epoch pid first
+    for ((epoch = start_epoch; epoch <= end_epoch; epoch++)); do
+        run_full_epoch "$epoch" &
+        pid=$!
+        children+=("$pid")
+        active+=("$pid")
+        if ((${#active[@]} >= jobs)); then
+            first=${active[0]}
+            if ! wait "$first"; then
+                failed=1
+            fi
+            remove_child "$first"
+            active=("${active[@]:1}")
+            ((failed == 0)) || break
+        fi
+    done
+    for pid in "${active[@]}"; do
+        if ! wait "$pid"; then
+            failed=1
+        fi
+        remove_child "$pid"
+    done
+    return "$failed"
+}
+
 while true; do
     missing=()
     for ((epoch = start_epoch; epoch <= end_epoch; epoch++)); do
@@ -91,6 +200,8 @@ while true; do
     fi
     printf '[%s] waiting for archive pairs; missing=%s\n' \
         "$(date -u +%FT%TZ)" "${missing[*]}"
+    echo "[$(date -u +%FT%TZ)] verifying completed epochs while the range is still open"
+    run_full_pool
     sleep 300
 done
 
@@ -152,71 +263,6 @@ run_chain() {
     return 1
 }
 
-run_full_epoch() {
-    local epoch=$1
-    local archive="$archive_dir/epoch-$epoch.jet"
-    local archive_sha
-    archive_sha=$(awk -v name="epoch-$epoch.jet" '$2 == name { print $1 }' \
-        "$state_dir/archive-manifest.sha256")
-    [[ $archive_sha =~ ^[0-9a-f]{64}$ ]] || {
-        echo "manifest entry missing for epoch $epoch" >&2
-        return 1
-    }
-
-    local receipt="$state_dir/receipts/epoch-$epoch.full.ok"
-    local prior_archive="" prior_verifier="" prior_script=""
-    if [[ -f $receipt ]]; then
-        read -r prior_archive prior_verifier prior_script <"$receipt" || true
-        if [[ $prior_archive == "$archive_sha" \
-            && $prior_verifier == "$verifier_sha" \
-            && $prior_script == "$script_sha" ]]; then
-            echo "[$(date -u +%FT%TZ)] epoch $epoch full receipt matches; skipping"
-            return 0
-        fi
-    fi
-
-    local log_tmp="$state_dir/tmp/epoch-$epoch.$$.tmp"
-    echo "[$(date -u +%FT%TZ)] epoch $epoch full PoH verification started"
-    if nice -n 19 ionice -c 3 "$verifier" "$archive" --full --internal-full \
-        --threads "$threads_per_job" >"$log_tmp" 2>&1; then
-        mv -f -- "$log_tmp" "$state_dir/logs/epoch-$epoch.full.log"
-        local receipt_tmp="$state_dir/tmp/epoch-$epoch-receipt.$$.tmp"
-        printf '%s %s %s\n' "$archive_sha" "$verifier_sha" "$script_sha" >"$receipt_tmp"
-        mv -f -- "$receipt_tmp" "$receipt"
-        echo "[$(date -u +%FT%TZ)] epoch $epoch full PoH verification passed"
-        return 0
-    fi
-    mv -f -- "$log_tmp" "$state_dir/logs/epoch-$epoch.full.failed.$(date -u +%Y%m%dT%H%M%SZ).log"
-    echo "epoch $epoch full PoH verification failed" >&2
-    return 1
-}
-
-run_full_pool() {
-    local active=()
-    local failed=0
-    local epoch pid first
-    for ((epoch = start_epoch; epoch <= end_epoch; epoch++)); do
-        run_full_epoch "$epoch" &
-        pid=$!
-        children+=("$pid")
-        active+=("$pid")
-        if ((${#active[@]} >= jobs)); then
-            first=${active[0]}
-            if ! wait "$first"; then
-                failed=1
-            fi
-            active=("${active[@]:1}")
-            ((failed == 0)) || break
-        fi
-    done
-    for pid in "${active[@]}"; do
-        if ! wait "$pid"; then
-            failed=1
-        fi
-    done
-    return "$failed"
-}
-
 run_chain &
 chain_pid=$!
 children+=("$chain_pid")
@@ -228,6 +274,7 @@ fi
 if ! wait "$chain_pid"; then
     failed=1
 fi
+remove_child "$chain_pid"
 ((failed == 0)) || exit 1
 
 echo "[$(date -u +%FT%TZ)] verification passes complete; rechecking archive SHA-256 values"

@@ -148,6 +148,11 @@ The internal scan checks every within-archive link and recomputes every block's 
 acceptance result by itself because it does not anchor the first block. The successful chain scan
 supplies that proof across every archive boundary.
 
+`scripts/verify_horizon_range.sh` starts the independent full scan for each archive as soon as its
+SHA-256 sidecar appears. After the complete range is present, it verifies the range manifest, runs
+the ordered chain scan, and rehashes every archive before recording acceptance. Receipts include
+the archive, verifier, and script hashes, so a restart only repeats stale or unfinished work.
+
 ### TUI dashboard
 
 Add `--tui` to render a live terminal dashboard instead of plain log output:

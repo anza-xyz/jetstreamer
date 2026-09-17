@@ -121,6 +121,22 @@ or an inclusive `<start>:<end>` slot range on the command line. See
 [`JetstreamerRunner::parse_cli_args`](https://docs.rs/jetstreamer/latest/jetstreamer/fn.parse_cli_args.html)
 for the precise rules.
 
+### Horizon plugin pipeline
+
+`horizon_pipeline` runs the zero-copy Horizon plugin interface over local `.jet` files or an
+HTTP base URL. Its verification plugin writes no database rows. It consumes every delivered
+block, transaction, entry, account update, and account-data byte, then checks complete slot
+coverage, per-worker ordering, transaction and entry counts, and epoch metadata before allowing
+the epoch to finish.
+
+```bash
+cargo run --release --bin horizon_pipeline -- \
+  0:100 /path/to/horizon --threads 16 --verify-only
+```
+
+This checks plugin compatibility and stream delivery. Archive acceptance should also verify each
+`.sha256` sidecar and run the full ordered-chain archive verifier.
+
 ### TUI dashboard
 
 Add `--tui` to render a live terminal dashboard instead of plain log output:

@@ -8,3 +8,5 @@ pub mod program_tracking;
 pub mod pubkey_stats;
 /// Horizon-native port of the pubkey mention tracker.
 pub mod pubkey_stats_horizon;
+/// Read-only end-to-end validation of Horizon plugin delivery.
+pub mod verification;

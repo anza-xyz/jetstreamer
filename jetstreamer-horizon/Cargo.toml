@@ -25,6 +25,7 @@ solana-reward-info.workspace = true
 solana-transaction-context.workspace = true
 solana-system-interface.workspace = true
 solana-cpi.workspace = true
+solana-entry.workspace = true
 once_cell.workspace = true
 sha2.workspace = true
 zstd.workspace = true
@@ -45,8 +46,6 @@ rayon.workspace = true
 sha2-fast = { package = "sha2", version = "=0.9.9", features = ["compress"] }
 solana-message.workspace = true
 solana-pubkey.workspace = true
-# verify_archive --full: canonical PoH recompute + seed fetch
-solana-entry.workspace = true
 # shred_compression example: wire-format baseline. bincode here is deliberate
 # and correct: it IS the turbine wire encoding in agave 3.x. Swap to wincode
 # (byte-identical, preferred) once the workspace reaches solana-transaction

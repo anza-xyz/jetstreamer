@@ -351,6 +351,44 @@ pub enum ArchiveFormatError {
         source_first_slot: u64,
         destination_first_slot: Option<u64>,
     },
+    #[error("initial parent repair requires a complete, densely covered archive")]
+    InitialParentRepairRequiresCompleteArchive,
+    #[error("initial parent repair is invalid for a slot-zero archive")]
+    InitialParentRepairAtGenesis,
+    #[error("initial parent repair requires a nonzero predecessor blockhash")]
+    InitialParentRepairZeroPredecessor,
+    #[error(
+        "initial parent repair predecessor slot {parent_slot} is not before archive start {slot_start}"
+    )]
+    InitialParentRepairInvalidPredecessorSlot { parent_slot: u64, slot_start: u64 },
+    #[error("initial parent repair expected a zero source PoH anchor, got {actual}")]
+    InitialParentRepairNonzeroAnchor { actual: Hash },
+    #[error(
+        "initial parent repair expected first block parent slot {expected}, got {actual} at slot {slot}"
+    )]
+    InitialParentRepairParentSlot {
+        slot: u64,
+        expected: u64,
+        actual: u64,
+    },
+    #[error(
+        "initial parent repair expected the first block's stored parent hash to be zero at slot {slot}, got {actual}"
+    )]
+    InitialParentRepairNonzeroParent { slot: u64, actual: Hash },
+    #[error("initial parent repair found another zero parent hash at slot {slot}")]
+    InitialParentRepairAdditionalZeroParent { slot: u64 },
+    #[error("initial parent repair source contains no block")]
+    InitialParentRepairMissingBlock,
+    #[error("initial parent repair expected exactly one source zero-parent artifact, got {actual}")]
+    InitialParentRepairArtifactCount { actual: u64 },
+    #[error(
+        "initial parent repair PoH proof failed at slot {slot}: recomputed {recomputed:?}, stored {stored}"
+    )]
+    InitialParentRepairPohMismatch {
+        slot: u64,
+        recomputed: Option<Hash>,
+        stored: Hash,
+    },
     #[error("blockhash chain continuity check failed at slot {slot}")]
     PohMismatch { slot: u64 },
     #[error("invalid archive provenance: {0}")]

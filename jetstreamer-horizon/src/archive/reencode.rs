@@ -11,6 +11,10 @@ use std::io::{Read, Seek, SeekFrom, Write};
 
 use lencode::Encode;
 use sha2::{Digest, Sha256};
+use solana_hash::Hash;
+use solana_message::VersionedMessage;
+use solana_signature::Signature;
+use solana_transaction::versioned::VersionedTransaction;
 
 use crate::account_updates::AccountUpdateView;
 use crate::transactions::Transaction;
@@ -41,6 +45,20 @@ pub struct ReencodeOptions {
     pub buckets: BucketSelection,
 }
 
+/// Canonical predecessor used to repair one historical archive-boundary
+/// placeholder.
+///
+/// Old writers could start an otherwise complete archive with both the first
+/// bucket PoH anchor and first block `parent_blockhash` set to zero. Repair is
+/// permitted only for that first non-genesis block, after its stored blockhash
+/// has been recomputed from this predecessor and the archive's own entries and
+/// transaction signatures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InitialParentRepair {
+    pub parent_slot: u64,
+    pub parent_blockhash: Hash,
+}
+
 /// Source/destination accounting from one re-encoding pass.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ReencodeStats {
@@ -62,8 +80,16 @@ pub struct ReencodeStats {
     /// parent-blockhash mismatches accepted only because the stored parent was
     /// zero. Re-encoding preserves those zero values unchanged.
     pub source_zero_parent_resume_artifacts: u64,
+    /// Zero-parent resume artifacts expected after the transformation. This
+    /// equals the source count normally and is zero after the sole initial
+    /// placeholder is repaired.
+    pub output_zero_parent_resume_artifacts: u64,
     /// SHA-256 of the selected source events in decoded semantic order.
     pub source_semantic_sha256: [u8; 32],
+    /// SHA-256 of decoded destination events. This equals the source digest
+    /// for ordinary re-encoding and differs only by the proven parent hash for
+    /// an initial-parent repair.
+    pub output_semantic_sha256: [u8; 32],
     /// Destination writer counters.
     pub output: ArchiveStats,
 }
@@ -177,6 +203,47 @@ impl SemanticDigest {
         self.hasher.update(self.event_count.to_le_bytes());
         Ok(self.hasher.finalize().into())
     }
+
+    fn record_block(
+        &mut self,
+        notification: &BlockNotification,
+        entries: &[EntryRecord],
+        parent_blockhash_override: Option<Hash>,
+    ) {
+        match notification {
+            BlockNotification::Skipped(skipped) => {
+                self.record_event(EVENT_SKIPPED_END, |writer| {
+                    skipped.slot.encode_ext(writer, None)?;
+                    (entries.len() as u64).encode_ext(writer, None)?;
+                    for entry in entries {
+                        entry.encode_ext(writer, None)?;
+                    }
+                    Ok(())
+                });
+            }
+            BlockNotification::Block(meta) => {
+                self.record_event(EVENT_BLOCK_END, |writer| {
+                    meta.slot.encode_ext(writer, None)?;
+                    meta.parent_slot.encode_ext(writer, None)?;
+                    parent_blockhash_override
+                        .unwrap_or(meta.parent_blockhash)
+                        .encode_ext(writer, None)?;
+                    meta.blockhash.encode_ext(writer, None)?;
+                    meta.block_time.encode_ext(writer, None)?;
+                    meta.block_height.encode_ext(writer, None)?;
+                    meta.executed_transaction_count.encode_ext(writer, None)?;
+                    meta.entry_count.encode_ext(writer, None)?;
+                    meta.rewards.encode_ext(writer, None)?;
+                    meta.num_partitions.encode_ext(writer, None)?;
+                    (entries.len() as u64).encode_ext(writer, None)?;
+                    for entry in entries {
+                        entry.encode_ext(writer, None)?;
+                    }
+                    Ok(())
+                });
+            }
+        }
+    }
 }
 
 impl SlotVisitor for SemanticDigest {
@@ -216,37 +283,7 @@ impl SlotVisitor for SemanticDigest {
     }
 
     fn on_block(&mut self, notification: &BlockNotification, entries: &[EntryRecord]) {
-        match notification {
-            BlockNotification::Skipped(skipped) => {
-                self.record_event(EVENT_SKIPPED_END, |writer| {
-                    skipped.slot.encode_ext(writer, None)?;
-                    (entries.len() as u64).encode_ext(writer, None)?;
-                    for entry in entries {
-                        entry.encode_ext(writer, None)?;
-                    }
-                    Ok(())
-                });
-            }
-            BlockNotification::Block(meta) => {
-                self.record_event(EVENT_BLOCK_END, |writer| {
-                    meta.slot.encode_ext(writer, None)?;
-                    meta.parent_slot.encode_ext(writer, None)?;
-                    meta.parent_blockhash.encode_ext(writer, None)?;
-                    meta.blockhash.encode_ext(writer, None)?;
-                    meta.block_time.encode_ext(writer, None)?;
-                    meta.block_height.encode_ext(writer, None)?;
-                    meta.executed_transaction_count.encode_ext(writer, None)?;
-                    meta.entry_count.encode_ext(writer, None)?;
-                    meta.rewards.encode_ext(writer, None)?;
-                    meta.num_partitions.encode_ext(writer, None)?;
-                    (entries.len() as u64).encode_ext(writer, None)?;
-                    for entry in entries {
-                        entry.encode_ext(writer, None)?;
-                    }
-                    Ok(())
-                });
-            }
-        }
+        self.record_block(notification, entries, None);
     }
 
     fn consumption(&self) -> Consumption {
@@ -264,9 +301,42 @@ impl SlotVisitor for SemanticDigest {
 /// envelope byte-for-byte. Bucket subsets omit it because its declared slot
 /// range would overstate the subset actually written.
 pub fn reencode_archive<R, W>(
+    source: R,
+    sink: W,
+    options: ReencodeOptions,
+) -> Result<(W, ReencodeStats), ArchiveFormatError>
+where
+    R: Read + Seek,
+    W: Write,
+{
+    reencode_archive_inner(source, sink, options, None)
+}
+
+/// Re-encodes a complete archive while repairing its single initial
+/// zero-parent placeholder from a canonical predecessor.
+///
+/// The transformation fails closed unless the source is dense, the first
+/// non-genesis block has exactly the supplied parent slot and a zero stored
+/// parent hash, that block's PoH recomputes to its stored blockhash from the
+/// supplied parent hash, and no later block has a zero parent hash.
+pub fn reencode_archive_with_initial_parent_repair<R, W>(
+    source: R,
+    sink: W,
+    options: ReencodeOptions,
+    repair: InitialParentRepair,
+) -> Result<(W, ReencodeStats), ArchiveFormatError>
+where
+    R: Read + Seek,
+    W: Write,
+{
+    reencode_archive_inner(source, sink, options, Some(repair))
+}
+
+fn reencode_archive_inner<R, W>(
     mut source: R,
     sink: W,
     options: ReencodeOptions,
+    repair: Option<InitialParentRepair>,
 ) -> Result<(W, ReencodeStats), ArchiveFormatError>
 where
     R: Read + Seek,
@@ -310,6 +380,25 @@ where
     let selection_is_complete = source_layout_is_dense
         && selected.len() == reader.bucket_count()
         && selected.iter().copied().eq(0..reader.bucket_count());
+    if let Some(repair) = repair {
+        if !selection_is_complete || !reader.has_complete_slot_coverage()? {
+            return Err(ArchiveFormatError::InitialParentRepairRequiresCompleteArchive);
+        }
+        if header.slot_start == 0 {
+            return Err(ArchiveFormatError::InitialParentRepairAtGenesis);
+        }
+        if repair.parent_blockhash == Hash::default() {
+            return Err(ArchiveFormatError::InitialParentRepairZeroPredecessor);
+        }
+        if repair.parent_slot >= header.slot_start {
+            return Err(
+                ArchiveFormatError::InitialParentRepairInvalidPredecessorSlot {
+                    parent_slot: repair.parent_slot,
+                    slot_start: header.slot_start,
+                },
+            );
+        }
+    }
     if !selection_is_complete
         && !selected.is_empty()
         && destination_bucket_slots != header.bucket_slots
@@ -351,10 +440,13 @@ where
         options.writer,
         preserved_provenance,
     )?;
+    if let Some(repair) = repair {
+        writer.preserve_initial_poh_anchor(header.slot_start, repair.parent_blockhash)?;
+    }
     let mut slots_reencoded = 0u64;
 
-    let source_semantic_sha256 = {
-        let mut visitor = ReencodeVisitor::new(&mut writer);
+    let (source_semantic_sha256, output_semantic_sha256) = {
+        let mut visitor = ReencodeVisitor::new(&mut writer, repair);
         for index in selected.iter().copied() {
             if selection_is_complete
                 && destination_bucket_slots != header.bucket_slots
@@ -364,10 +456,11 @@ where
                     index,
                     &mut visitor,
                     |source_header, visitor| {
-                        visitor.writer.preserve_initial_poh_anchor(
-                            source_header.first_slot,
-                            source_header.poh_start_hash,
-                        )
+                        let anchor =
+                            repaired_initial_anchor(index, source_header.poh_start_hash, repair)?;
+                        visitor
+                            .writer
+                            .preserve_initial_poh_anchor(source_header.first_slot, anchor)
                     },
                 )?;
             } else {
@@ -382,17 +475,33 @@ where
                         "reader did not retain the decoded bucket header",
                     ),
                 )?;
-                visitor.writer.preserve_current_bucket_poh_anchor(
-                    source_header.first_slot,
-                    source_header.poh_start_hash,
-                )?;
+                let anchor = repaired_initial_anchor(index, source_header.poh_start_hash, repair)?;
+                visitor
+                    .writer
+                    .preserve_current_bucket_poh_anchor(source_header.first_slot, anchor)?;
             }
         }
-        visitor.digest.finish()?
+        if repair.is_some() && !visitor.repair_applied {
+            return Err(ArchiveFormatError::InitialParentRepairMissingBlock);
+        }
+        (
+            visitor.source_digest.finish()?,
+            visitor.output_digest.finish()?,
+        )
     };
 
     let (sink, output) = writer.finish()?;
     let source_zero_parent_resume_artifacts = reader.zero_parent_resume_artifacts();
+    let output_zero_parent_resume_artifacts = if repair.is_some() {
+        if source_zero_parent_resume_artifacts != 1 {
+            return Err(ArchiveFormatError::InitialParentRepairArtifactCount {
+                actual: source_zero_parent_resume_artifacts,
+            });
+        }
+        0
+    } else {
+        source_zero_parent_resume_artifacts
+    };
     Ok((
         sink,
         ReencodeStats {
@@ -404,23 +513,76 @@ where
             source_buckets: selected.len() as u64,
             slots_reencoded,
             source_zero_parent_resume_artifacts,
+            output_zero_parent_resume_artifacts,
             source_semantic_sha256,
+            output_semantic_sha256,
             output,
         },
     ))
 }
 
+fn repaired_initial_anchor(
+    bucket_index: usize,
+    source_anchor: Hash,
+    repair: Option<InitialParentRepair>,
+) -> Result<Hash, ArchiveFormatError> {
+    let Some(repair) = repair.filter(|_| bucket_index == 0) else {
+        return Ok(source_anchor);
+    };
+    if source_anchor != Hash::default() {
+        return Err(ArchiveFormatError::InitialParentRepairNonzeroAnchor {
+            actual: source_anchor,
+        });
+    }
+    Ok(repair.parent_blockhash)
+}
+
+fn recompute_blockhash(
+    parent: Hash,
+    entries: &[EntryRecord],
+    signatures: &[Vec<Signature>],
+) -> Option<Hash> {
+    let mut poh = parent;
+    let mut index = 0usize;
+    for entry in entries {
+        let count = entry.tx_count as usize;
+        let end = index.checked_add(count)?;
+        let transactions: Vec<VersionedTransaction> = signatures
+            .get(index..end)?
+            .iter()
+            .map(|signatures| VersionedTransaction {
+                signatures: signatures.clone(),
+                message: VersionedMessage::default(),
+            })
+            .collect();
+        index = end;
+        #[allow(deprecated)]
+        {
+            poh = solana_entry::entry::next_hash(&poh, entry.num_hashes, &transactions);
+        }
+    }
+    (index == signatures.len()).then_some(poh)
+}
+
 struct ReencodeVisitor<'a, W: Write> {
     writer: &'a mut ArchiveWriter<W>,
-    digest: SemanticDigest,
+    source_digest: SemanticDigest,
+    output_digest: SemanticDigest,
+    repair: Option<InitialParentRepair>,
+    repair_applied: bool,
+    first_block_signatures: Vec<Vec<Signature>>,
     error: Option<ArchiveFormatError>,
 }
 
 impl<'a, W: Write> ReencodeVisitor<'a, W> {
-    fn new(writer: &'a mut ArchiveWriter<W>) -> Self {
+    fn new(writer: &'a mut ArchiveWriter<W>, repair: Option<InitialParentRepair>) -> Self {
         Self {
             writer,
-            digest: SemanticDigest::new(),
+            source_digest: SemanticDigest::new(),
+            output_digest: SemanticDigest::new(),
+            repair,
+            repair_applied: false,
+            first_block_signatures: Vec::new(),
             error: None,
         }
     }
@@ -440,7 +602,8 @@ impl<W: Write> SlotVisitor for ReencodeVisitor<'_, W> {
         if self.error.is_some() {
             return;
         }
-        self.digest.on_slot_start(slot, kind);
+        self.source_digest.on_slot_start(slot, kind);
+        self.output_digest.on_slot_start(slot, kind);
         let result = match kind {
             SlotKind::Skipped => self.writer.write_skipped_slot(slot),
             SlotKind::Block => self.writer.begin_slot(slot),
@@ -452,7 +615,8 @@ impl<W: Write> SlotVisitor for ReencodeVisitor<'_, W> {
         if self.error.is_some() {
             return;
         }
-        self.digest.on_epoch(meta);
+        self.source_digest.on_epoch(meta);
+        self.output_digest.on_epoch(meta);
         let result = self.writer.write_epoch_meta(meta);
         self.record(result);
     }
@@ -461,7 +625,8 @@ impl<W: Write> SlotVisitor for ReencodeVisitor<'_, W> {
         if self.error.is_some() {
             return;
         }
-        self.digest.on_pre_account_update(slot, update);
+        self.source_digest.on_pre_account_update(slot, update);
+        self.output_digest.on_pre_account_update(slot, update);
         let result = self.writer.write_reencoded_pre_update(update);
         self.record(result);
     }
@@ -470,7 +635,12 @@ impl<W: Write> SlotVisitor for ReencodeVisitor<'_, W> {
         if self.error.is_some() {
             return;
         }
-        self.digest.on_transaction(slot, tx_index, tx);
+        self.source_digest.on_transaction(slot, tx_index, tx);
+        self.output_digest.on_transaction(slot, tx_index, tx);
+        if self.repair.is_some() && !self.repair_applied {
+            self.first_block_signatures
+                .push(tx.signatures.as_slice().to_vec());
+        }
         let result = self.writer.write_transaction(tx);
         self.record(result);
     }
@@ -479,7 +649,8 @@ impl<W: Write> SlotVisitor for ReencodeVisitor<'_, W> {
         if self.error.is_some() {
             return;
         }
-        self.digest.on_post_account_update(slot, update);
+        self.source_digest.on_post_account_update(slot, update);
+        self.output_digest.on_post_account_update(slot, update);
         let result = self.writer.write_reencoded_post_update(update);
         self.record(result);
     }
@@ -488,10 +659,66 @@ impl<W: Write> SlotVisitor for ReencodeVisitor<'_, W> {
         if self.error.is_some() {
             return;
         }
-        self.digest.on_block(notification, entries);
+        self.source_digest.record_block(notification, entries, None);
         if let BlockNotification::Block(meta) = notification {
-            let result = self.writer.end_reencoded_slot(meta, entries);
+            let parent_override = if let Some(repair) = self.repair {
+                if self.repair_applied {
+                    if meta.parent_blockhash == Hash::default() {
+                        self.error = Some(
+                            ArchiveFormatError::InitialParentRepairAdditionalZeroParent {
+                                slot: meta.slot,
+                            },
+                        );
+                        return;
+                    }
+                    None
+                } else {
+                    if meta.parent_slot != repair.parent_slot {
+                        self.error = Some(ArchiveFormatError::InitialParentRepairParentSlot {
+                            slot: meta.slot,
+                            expected: repair.parent_slot,
+                            actual: meta.parent_slot,
+                        });
+                        return;
+                    }
+                    if meta.parent_blockhash != Hash::default() {
+                        self.error = Some(ArchiveFormatError::InitialParentRepairNonzeroParent {
+                            slot: meta.slot,
+                            actual: meta.parent_blockhash,
+                        });
+                        return;
+                    }
+                    let recomputed = recompute_blockhash(
+                        repair.parent_blockhash,
+                        entries,
+                        &self.first_block_signatures,
+                    );
+                    if recomputed != Some(meta.blockhash) {
+                        self.error = Some(ArchiveFormatError::InitialParentRepairPohMismatch {
+                            slot: meta.slot,
+                            recomputed,
+                            stored: meta.blockhash,
+                        });
+                        return;
+                    }
+                    self.repair_applied = true;
+                    self.first_block_signatures.clear();
+                    Some(repair.parent_blockhash)
+                }
+            } else {
+                None
+            };
+            self.output_digest
+                .record_block(notification, entries, parent_override);
+            let result = match parent_override {
+                Some(parent) => self
+                    .writer
+                    .end_reencoded_slot_with_parent_blockhash(meta, entries, parent),
+                None => self.writer.end_reencoded_slot(meta, entries),
+            };
             self.record(result);
+        } else {
+            self.output_digest.record_block(notification, entries, None);
         }
     }
 
@@ -503,6 +730,8 @@ impl<W: Write> SlotVisitor for ReencodeVisitor<'_, W> {
 #[cfg(test)]
 mod tests {
     use solana_address::Address;
+
+    use crate::block_metas::BlockMeta;
 
     use super::*;
 
@@ -522,10 +751,165 @@ mod tests {
         digest.finish().unwrap()
     }
 
+    fn archive_semantic_sha256(bytes: &[u8]) -> [u8; 32] {
+        let mut reader = ArchiveReader::open(std::io::Cursor::new(bytes)).unwrap();
+        let mut digest = SemanticDigest::new();
+        reader.read_slots(0, u64::MAX, &mut digest).unwrap();
+        digest.finish().unwrap()
+    }
+
     #[test]
     fn semantic_digest_detects_same_count_field_and_data_mutations() {
         let original = one_update_digest(7, b"account state");
         assert_ne!(original, one_update_digest(8, b"account state"));
         assert_ne!(original, one_update_digest(7, b"account STATE"));
+    }
+
+    #[derive(Default)]
+    struct ParentCollector(Vec<(u64, Hash)>);
+
+    impl SlotVisitor for ParentCollector {
+        fn on_block(&mut self, notification: &BlockNotification, _entries: &[EntryRecord]) {
+            if let BlockNotification::Block(meta) = notification {
+                self.0.push((meta.parent_slot, meta.parent_blockhash));
+            }
+        }
+
+        fn consumption(&self) -> Consumption {
+            Consumption::all()
+                .without_account_update_data()
+                .without_block_account_update_arenas()
+        }
+    }
+
+    #[allow(deprecated)]
+    fn tick_hash(parent: Hash) -> Hash {
+        solana_entry::entry::next_hash(&parent, 1, &[])
+    }
+
+    fn zero_parent_source(second_parent_is_zero: bool) -> (Vec<u8>, InitialParentRepair) {
+        let repair = InitialParentRepair {
+            parent_slot: 999,
+            parent_blockhash: Hash::new_from_array([0xa5; 32]),
+        };
+        let mut writer = ArchiveWriter::new(
+            Vec::new(),
+            1,
+            1_000,
+            2,
+            ArchiveWriterConfig {
+                compression: super::super::Compression::None,
+                bucket_slots: 2,
+                ..ArchiveWriterConfig::default()
+            },
+        )
+        .unwrap();
+        let entries = [EntryRecord {
+            num_hashes: 1,
+            tx_count: 0,
+        }];
+        let first_hash = tick_hash(repair.parent_blockhash);
+        writer.begin_slot(1_000).unwrap();
+        let mut first = BlockMeta::new_boxed();
+        first.slot = 1_000;
+        first.parent_slot = repair.parent_slot;
+        first.parent_blockhash = Hash::default();
+        first.blockhash = first_hash;
+        first.entry_count = 1;
+        writer.end_slot(&first, &entries).unwrap();
+
+        writer.begin_slot(1_001).unwrap();
+        let mut second = BlockMeta::new_boxed();
+        second.slot = 1_001;
+        second.parent_slot = 1_000;
+        second.parent_blockhash = if second_parent_is_zero {
+            Hash::default()
+        } else {
+            first_hash
+        };
+        second.blockhash = tick_hash(first_hash);
+        second.entry_count = 1;
+        writer.end_slot(&second, &entries).unwrap();
+        (writer.finish().unwrap().0, repair)
+    }
+
+    #[test]
+    fn initial_parent_repair_is_poh_proven_and_strictly_readable() {
+        let (source, repair) = zero_parent_source(false);
+        let (output, stats) = reencode_archive_with_initial_parent_repair(
+            std::io::Cursor::new(source),
+            Vec::new(),
+            ReencodeOptions {
+                writer: ArchiveWriterConfig {
+                    compression: super::super::Compression::None,
+                    bucket_slots: 2,
+                    ..ArchiveWriterConfig::default()
+                },
+                buckets: BucketSelection::All,
+            },
+            repair,
+        )
+        .unwrap();
+        assert_eq!(stats.source_zero_parent_resume_artifacts, 1);
+        assert_eq!(stats.output_zero_parent_resume_artifacts, 0);
+        assert_ne!(stats.source_semantic_sha256, stats.output_semantic_sha256);
+        assert_eq!(
+            stats.output_semantic_sha256,
+            archive_semantic_sha256(&output)
+        );
+
+        let mut reader = ArchiveReader::open(std::io::Cursor::new(output)).unwrap();
+        reader.verify_chain = true;
+        let mut initial_anchor = None;
+        let mut parents = ParentCollector::default();
+        assert_eq!(
+            reader
+                .read_bucket_with_header(0, &mut parents, |header, _| {
+                    initial_anchor = Some(header.poh_start_hash);
+                    Ok(())
+                })
+                .unwrap(),
+            2
+        );
+        assert_eq!(initial_anchor, Some(repair.parent_blockhash));
+        assert_eq!(
+            parents.0,
+            vec![
+                (repair.parent_slot, repair.parent_blockhash),
+                (1_000, tick_hash(repair.parent_blockhash))
+            ]
+        );
+    }
+
+    #[test]
+    fn initial_parent_repair_rejects_wrong_anchor_and_later_zero_parent() {
+        let (source, repair) = zero_parent_source(false);
+        let error = reencode_archive_with_initial_parent_repair(
+            std::io::Cursor::new(source),
+            Vec::new(),
+            ReencodeOptions::default(),
+            InitialParentRepair {
+                parent_blockhash: Hash::new_from_array([0xb6; 32]),
+                ..repair
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ArchiveFormatError::InitialParentRepairPohMismatch { slot: 1_000, .. }
+        ));
+
+        let (source, repair) = zero_parent_source(true);
+        let error = reencode_archive_with_initial_parent_repair(
+            std::io::Cursor::new(source),
+            Vec::new(),
+            ReencodeOptions::default(),
+            repair,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ArchiveFormatError::InitialParentRepairAdditionalZeroParent { slot: 1_001 }
+        ));
     }
 }

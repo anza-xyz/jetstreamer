@@ -19,23 +19,27 @@
 //!     <source.jet> <destination.jet> \
 //!     [--buckets 1,7,42] [--format v1|v2] \
 //!     [--compression none|zstd|lz4] \
-//!     [--diff adaptive|rle|outer|disabled] [--zstd-level N] [--bucket-slots N]
+//!     [--diff adaptive|rle|outer|disabled] [--zstd-level N] [--bucket-slots N] \
+//!     [--repair-initial-parent PARENT_SLOT PARENT_BLOCKHASH]
 //! ```
 
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use jetstreamer_horizon::archive::{
     ArchiveReader, ArchiveVersion, BlockNotification, BucketSelection, ChainMismatchPolicy,
-    Compression, Consumption, EpochMeta, ReencodeOptions, ReencodeStats, SemanticDigest, SlotKind,
-    SlotVisitor, reencode_archive,
+    Compression, Consumption, EpochMeta, InitialParentRepair, ReencodeOptions, ReencodeStats,
+    SemanticDigest, SlotKind, SlotVisitor, reencode_archive,
+    reencode_archive_with_initial_parent_repair,
 };
 use jetstreamer_horizon::transactions::Transaction;
 use lencode::diff::DiffPolicy;
+use solana_hash::Hash;
 
 const IO_BUFFER_BYTES: usize = 16 << 20;
 const WORKER_STACK_BYTES: usize = 256 << 20;
@@ -50,6 +54,7 @@ struct Args {
     diff_policy: DiffPolicy,
     zstd_level: i32,
     bucket_slots: Option<u16>,
+    initial_parent_repair: Option<InitialParentRepair>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -86,6 +91,7 @@ struct Completed {
     destination: PathBuf,
     stats: ReencodeStats,
     output_file_bytes: u64,
+    repaired_initial_parent: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -213,7 +219,8 @@ fn usage() -> &'static str {
     "usage: reencode_archive <source.jet> <destination.jet> \
      [--buckets 1,7,42] [--format v1|v2] \
      [--compression none|zstd|lz4] \
-     [--diff adaptive|rle|outer|disabled] [--zstd-level N] [--bucket-slots N]"
+     [--diff adaptive|rle|outer|disabled] [--zstd-level N] [--bucket-slots N] \
+     [--repair-initial-parent PARENT_SLOT PARENT_BLOCKHASH]"
 }
 
 fn take_value(args: &[String], index: &mut usize, flag: &str) -> Result<String, String> {
@@ -254,6 +261,7 @@ fn parse_args(args: Vec<String>) -> Result<Option<Args>, String> {
     // conversion cost. This matches the archive writer default.
     let mut zstd_level = 9;
     let mut bucket_slots = None;
+    let mut initial_parent_repair = None;
     let mut seen_compression = false;
     let mut seen_format = false;
     let mut seen_diff = false;
@@ -333,6 +341,25 @@ fn parse_args(args: Vec<String>) -> Result<Option<Args>, String> {
                 bucket_slots = Some(parsed);
                 seen_bucket_slots = true;
             }
+            "--repair-initial-parent" => {
+                if initial_parent_repair.is_some() {
+                    return Err("--repair-initial-parent may be specified only once".to_string());
+                }
+                let parent_slot =
+                    take_value(args.as_slice(), &mut index, "--repair-initial-parent")?
+                        .parse::<u64>()
+                        .map_err(|_| "invalid repair parent slot".to_string())?;
+                let parent_blockhash = Hash::from_str(&take_value(
+                    args.as_slice(),
+                    &mut index,
+                    "--repair-initial-parent",
+                )?)
+                .map_err(|error| format!("invalid repair parent blockhash: {error}"))?;
+                initial_parent_repair = Some(InitialParentRepair {
+                    parent_slot,
+                    parent_blockhash,
+                });
+            }
             value if value.starts_with('-') => {
                 return Err(format!("unknown option `{value}`"));
             }
@@ -354,6 +381,9 @@ fn parse_args(args: Vec<String>) -> Result<Option<Args>, String> {
     if seen_zstd_level && !matches!(compression, CompressionName::Zstd) {
         return Err("--zstd-level requires --compression zstd".to_string());
     }
+    if initial_parent_repair.is_some() && buckets.is_some() {
+        return Err("--repair-initial-parent cannot be combined with --buckets".to_string());
+    }
 
     Ok(Some(Args {
         source: positionals.remove(0),
@@ -364,6 +394,7 @@ fn parse_args(args: Vec<String>) -> Result<Option<Args>, String> {
         diff_policy,
         zstd_level,
         bucket_slots,
+        initial_parent_repair,
     }))
 }
 
@@ -451,6 +482,7 @@ fn verify_output(
     expected: &ReencodeStats,
     expected_version: ArchiveVersion,
     expected_bucket_slots: u16,
+    repaired_initial_parent: bool,
 ) -> Result<File, String> {
     let file = File::open(path)
         .map_err(|error| format!("reopen partial output {}: {error}", path.display()))?;
@@ -461,7 +493,9 @@ fn verify_output(
     let mut reader = ArchiveReader::open(source)
         .map_err(|error| format!("open partial output as an archive: {error}"))?;
     reader.verify_chain = true;
-    reader.chain_mismatch_policy = ChainMismatchPolicy::AllowZeroParentResume;
+    if !repaired_initial_parent {
+        reader.chain_mismatch_policy = ChainMismatchPolicy::AllowZeroParentResume;
+    }
     let header_checks = [
         (
             "format version",
@@ -550,19 +584,19 @@ fn verify_output(
             "verification {label} mismatch: decoded {decoded}, wrote {written}"
         ));
     }
-    if zero_parent_resume_artifacts != expected.source_zero_parent_resume_artifacts {
+    if zero_parent_resume_artifacts != expected.output_zero_parent_resume_artifacts {
         return Err(format!(
-            "verification zero-parent resume artifact mismatch: decoded {zero_parent_resume_artifacts}, source had {}",
-            expected.source_zero_parent_resume_artifacts
+            "verification zero-parent resume artifact mismatch: decoded {zero_parent_resume_artifacts}, transformation expected {}",
+            expected.output_zero_parent_resume_artifacts
         ));
     }
     let output_semantic_sha256 = tally
         .digest
         .finish()
         .map_err(|error| format!("finalize output semantic SHA-256: {error}"))?;
-    if output_semantic_sha256 != expected.source_semantic_sha256 {
+    if output_semantic_sha256 != expected.output_semantic_sha256 {
         return Err(
-            "verification semantic SHA-256 mismatch: decoded output differs from source"
+            "verification semantic SHA-256 mismatch: decoded output differs from the transformation result"
                 .to_string(),
         );
     }
@@ -714,6 +748,12 @@ fn run(
         "encoding:    {:?}, {:?}, {:?}, zstd level {}",
         args.format, args.compression, args.diff_policy, args.zstd_level
     );
+    if let Some(repair) = args.initial_parent_repair {
+        eprintln!(
+            "repair:      first block parent = slot {} hash {} (PoH proof required)",
+            repair.parent_slot, repair.parent_blockhash
+        );
+    }
 
     let source_reader = BufReader::with_capacity(IO_BUFFER_BYTES, source_file);
     let output_writer = BufWriter::with_capacity(IO_BUFFER_BYTES, output_file);
@@ -728,8 +768,16 @@ fn run(
         buckets: selection,
     };
 
-    let (mut output_writer, stats) = reencode_archive(source_reader, output_writer, options)
-        .map_err(|error| format!("re-encode failed: {error}"))?;
+    let (mut output_writer, stats) = match args.initial_parent_repair {
+        Some(repair) => reencode_archive_with_initial_parent_repair(
+            source_reader,
+            output_writer,
+            options,
+            repair,
+        ),
+        None => reencode_archive(source_reader, output_writer, options),
+    }
+    .map_err(|error| format!("re-encode failed: {error}"))?;
     output_writer
         .flush()
         .map_err(|error| format!("flush partial output: {error}"))?;
@@ -754,7 +802,13 @@ fn run(
         "verifying {} output buckets by checksum, decompression, and full decode",
         stats.output.buckets
     );
-    let verified_output = verify_output(&partial, &stats, args.format, destination_bucket_slots)?;
+    let verified_output = verify_output(
+        &partial,
+        &stats,
+        args.format,
+        destination_bucket_slots,
+        args.initial_parent_repair.is_some(),
+    )?;
     ensure_path_matches_open_file(&partial, &verified_output, "before publication")?;
     ensure_source_unchanged(&source_guard, &source_fingerprint)?;
 
@@ -813,6 +867,7 @@ fn run(
         destination,
         stats,
         output_file_bytes,
+        repaired_initial_parent: args.initial_parent_repair.is_some(),
     }))
 }
 
@@ -830,8 +885,16 @@ fn print_completed(completed: &Completed) {
     println!("  selected buckets:     {}", stats.source_buckets);
     println!("  slots re-encoded:     {}", stats.slots_reencoded);
     println!(
-        "  zero-parent resumes:   {} (preserved unchanged)",
-        stats.source_zero_parent_resume_artifacts
+        "  initial parent:       {}",
+        if completed.repaired_initial_parent {
+            "repaired with PoH proof"
+        } else {
+            "preserved"
+        }
+    );
+    println!(
+        "  zero-parent resumes:   {} source, {} output",
+        stats.source_zero_parent_resume_artifacts, stats.output_zero_parent_resume_artifacts
     );
     println!("  source bucket bytes:  {}", stats.source_bucket_bytes);
     println!(
@@ -914,6 +977,31 @@ mod tests {
     fn zstd_level_is_not_silently_ignored_for_other_codecs() {
         let error = parse(&["--compression", "lz4", "--zstd-level", "9"]).unwrap_err();
         assert_eq!(error, "--zstd-level requires --compression zstd");
+    }
+
+    #[test]
+    fn initial_parent_repair_requires_canonical_slot_and_hash_and_full_input() {
+        let hash = Hash::new_from_array([0xa5; 32]);
+        let args = parse(&["--repair-initial-parent", "999", &hash.to_string()]).unwrap();
+        assert_eq!(
+            args.initial_parent_repair,
+            Some(InitialParentRepair {
+                parent_slot: 999,
+                parent_blockhash: hash,
+            })
+        );
+        let error = parse(&[
+            "--repair-initial-parent",
+            "999",
+            &hash.to_string(),
+            "--buckets",
+            "0",
+        ])
+        .unwrap_err();
+        assert_eq!(
+            error,
+            "--repair-initial-parent cannot be combined with --buckets"
+        );
     }
 
     #[test]

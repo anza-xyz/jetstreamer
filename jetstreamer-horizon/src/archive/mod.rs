@@ -98,6 +98,22 @@
 //!   --format v2 --compression zstd --zstd-level 9 --diff outer
 //! ```
 //!
+//! A narrowly scoped migration can repair an old writer's zeroed initial PoH
+//! anchor and first-block parent without replaying the epoch:
+//!
+//! ```text
+//! cargo run --release -p jetstreamer-horizon --example reencode_archive -- \
+//!   epoch-old.jet epoch-repaired.jet \
+//!   --repair-initial-parent PREVIOUS_BLOCK_SLOT PREVIOUS_BLOCKHASH
+//! ```
+//!
+//! [`reencode_archive_with_initial_parent_repair`] accepts only a complete,
+//! densely covered non-genesis archive. It requires a zero source anchor and
+//! zero parent on the first block, recomputes that block's PoH from the supplied
+//! canonical predecessor, and rejects a wrong predecessor or any later zero
+//! parent. The source remains unchanged and the CLI publishes only after a
+//! strict decode of the new file.
+//!
 //! # PoH material and continuity checking
 //!
 //! Storing every entry hash would cost 32 B times about 800 entries times
@@ -118,9 +134,11 @@
 //! Every bucket payload carries an xxh64 checksum (computed over the stored,
 //! possibly-compressed bytes), and the index carries its own xxh64. These
 //! detect accidental corruption but are not cryptographic authentication.
-//! Callers must authenticate the source archive separately. The re-encoder's
-//! semantic SHA-256 proves that its decoded output matches the decoded source;
-//! it does not prove that the source itself is authentic.
+//! Callers must authenticate the source archive separately. For ordinary
+//! re-encoding, the source and destination semantic SHA-256 values must match.
+//! Initial-parent repair instead computes distinct expected source and output
+//! digests, differing only through the PoH-proven parent replacement. Neither
+//! digest proves that the source itself is authentic.
 //!
 //! # Streaming reads
 //!

@@ -186,10 +186,13 @@ fn encode_update_record(
 /// slot, which the frame header carries).
 fn encode_block_meta_fields(
     meta: &BlockMeta,
+    parent_blockhash_override: Option<Hash>,
     buf: &mut impl lencode::io::Write,
 ) -> lencode::Result<()> {
     meta.parent_slot.encode_ext(buf, None)?;
-    meta.parent_blockhash.encode_ext(buf, None)?;
+    parent_blockhash_override
+        .unwrap_or(meta.parent_blockhash)
+        .encode_ext(buf, None)?;
     meta.blockhash.encode_ext(buf, None)?;
     meta.block_time.encode_ext(buf, None)?;
     meta.block_height.encode_ext(buf, None)?;
@@ -1189,7 +1192,7 @@ impl<W: std::io::Write> ArchiveWriter<W> {
             meta.pre_updates.is_empty() && meta.post_updates.is_empty(),
             "end_slot ignores meta's orphan arenas; use write_orphan_update"
         );
-        self.end_slot_inner(meta, entries)
+        self.end_slot_inner(meta, entries, None)
     }
 
     /// Closes a slot replayed by the archive decoder. Its `BlockMeta`
@@ -1200,13 +1203,28 @@ impl<W: std::io::Write> ArchiveWriter<W> {
         meta: &BlockMeta,
         entries: &[EntryRecord],
     ) -> Result<(), ArchiveFormatError> {
-        self.end_slot_inner(meta, entries)
+        self.end_slot_inner(meta, entries, None)
+    }
+
+    /// Closes a replayed slot while replacing only its encoded parent hash.
+    ///
+    /// This is intentionally private to archive transformations. The
+    /// boundary-repair path proves the replacement by recomputing the block's
+    /// PoH before calling it; ordinary writers cannot override live metadata.
+    pub(super) fn end_reencoded_slot_with_parent_blockhash(
+        &mut self,
+        meta: &BlockMeta,
+        entries: &[EntryRecord],
+        parent_blockhash: Hash,
+    ) -> Result<(), ArchiveFormatError> {
+        self.end_slot_inner(meta, entries, Some(parent_blockhash))
     }
 
     fn end_slot_inner(
         &mut self,
         meta: &BlockMeta,
         entries: &[EntryRecord],
+        parent_blockhash_override: Option<Hash>,
     ) -> Result<(), ArchiveFormatError> {
         self.ensure_writable()?;
         self.validate_frame_sequence_count("entry records", entries.len() as u64)?;
@@ -1259,7 +1277,7 @@ impl<W: std::io::Write> ArchiveWriter<W> {
 
             // Section 5: block metadata scalars + rewards (stateless; the
             // frame's slot is authoritative, so meta.slot isn't re-encoded).
-            encode_block_meta_fields(meta, buf)?;
+            encode_block_meta_fields(meta, parent_blockhash_override, buf)?;
 
             // Section 6: entry records.
             (entries.len() as u64).encode_ext(buf, None)?;

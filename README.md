@@ -378,6 +378,15 @@ Using this narrower definition, which excludes ordinary version pinning, snapsho
 PoH optimization, and AccountsDB maintenance, epochs 0-100 currently require eight distinct
 slot- or record-specific compatibility interventions.
 
+Archive-container repair is tracked separately from execution compatibility. Early independently
+generated epoch 1-6 files can carry the old writer's zero placeholder as both their first bucket
+PoH anchor and first block `parent_blockhash`, even though the preceding archive contains the
+canonical parent. The re-encoding pipeline may replace only that initial placeholder: it requires
+the preceding canonical slot and blockhash, recomputes the first block's PoH to its already stored
+blockhash, rejects any other zero-parent block, writes a new file, and strictly decodes it before
+publication. This does not alter transaction, account-update, entry, or runtime semantics and is
+not counted as another execution intervention.
+
 Candidate mode requires the exact runtime identity, an explicit
 `JETSTREAMER_ALLOW_CANDIDATE_RUNTIME=1`, snapshot verification, and at least one canonical
 checkpoint after the bootstrap slot. Unknown opt-in values are rejected. Current behavioral

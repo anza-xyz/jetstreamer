@@ -662,6 +662,14 @@ fn anchor_requirement_satisfied(anchored: bool, require_anchor: bool) -> bool {
     anchored || !require_anchor
 }
 
+fn tail_requirement_satisfied(
+    last_block_slot: Option<u64>,
+    end_slot_exclusive: u64,
+    require_tail: bool,
+) -> bool {
+    !require_tail || last_block_slot == end_slot_exclusive.checked_sub(1)
+}
+
 /// Parallel verification across `threads`: each thread scans a disjoint bucket
 /// range (counts, byte stats, per-block identities); in `full` mode it also
 /// recomputes every block's PoH. After merging, a sequential linkage pass
@@ -1186,10 +1194,15 @@ fn main() {
     if full {
         let outcome = run_scan(&path, threads, true, anchor, !internal_full);
         let end = outcome.slot_start.saturating_add(outcome.slot_count);
-        let tail_ok = outcome.last_block_slot == end.checked_sub(1);
+        let tail_ok = tail_requirement_satisfied(outcome.last_block_slot, end, !internal_full);
         if !tail_ok {
             println!(
                 "STRICT TAIL FAIL: no successor block proves skipped slots through {}",
+                end.saturating_sub(1)
+            );
+        } else if internal_full && outcome.last_block_slot != end.checked_sub(1) {
+            println!(
+                "INTERNAL TAIL: trailing skipped slots through {} require the ordered-chain pass",
                 end.saturating_sub(1)
             );
         }
@@ -1282,6 +1295,15 @@ mod tests {
         assert!(anchor_requirement_satisfied(true, false));
         assert!(anchor_requirement_satisfied(false, false));
         assert!(!anchor_requirement_satisfied(false, true));
+    }
+
+    #[test]
+    fn explicit_internal_pass_may_defer_trailing_skip_proof() {
+        assert!(tail_requirement_satisfied(Some(9), 10, true));
+        assert!(tail_requirement_satisfied(Some(8), 10, false));
+        assert!(tail_requirement_satisfied(None, 10, false));
+        assert!(!tail_requirement_satisfied(Some(8), 10, true));
+        assert!(!tail_requirement_satisfied(None, 10, true));
     }
 
     fn sig(b: u8) -> Signature {

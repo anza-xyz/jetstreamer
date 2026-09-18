@@ -145,8 +145,9 @@ verify_archive /path/to/horizon/epoch-42.jet \
 ```
 
 The internal scan checks every within-archive link and recomputes every block's PoH. It is not an
-acceptance result by itself because it does not anchor the first block. The successful chain scan
-supplies that proof across every archive boundary.
+acceptance result by itself because it cannot prove the incoming boundary or trailing skipped slots
+without an adjacent archive. The successful chain scan supplies those proofs across every archive
+boundary.
 
 `scripts/verify_horizon_range.sh` starts the independent full scan for each archive as soon as its
 SHA-256 sidecar appears. After the complete range is present, it verifies the range manifest, runs

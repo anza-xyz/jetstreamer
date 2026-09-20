@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import contextlib
 import copy
 import dataclasses
 import hashlib
@@ -1279,6 +1280,9 @@ class CrashSafetyTests(unittest.TestCase):
         controller.lane_output_identity = mock.Mock(
             return_value=sweep.DirectoryIdentity(1, 2)
         )
+        controller.serialized_public_import_admission = mock.Mock(
+            return_value=contextlib.nullcontext()
+        )
         return controller, cohort, assignment
 
     def test_import_waits_while_public_destination_is_claimed(self) -> None:
@@ -1305,6 +1309,42 @@ class CrashSafetyTests(unittest.TestCase):
         self.assertEqual(assignment["phase"], "staged")
         self.assertIsNone(controller.state["import_owner"])
         controller.require_live_source_receipt.assert_not_called()
+        controller.save.assert_not_called()
+
+    def test_import_rechecks_public_claim_under_serialized_admission(self) -> None:
+        controller, cohort, assignment = self.staged_import_controller()
+        public_claim = sweep.EpochClaim(
+            pid=1234,
+            start_time=5678,
+            first_epoch=67,
+            last_epoch=68,
+            output=controller.args.public_dir,
+            executable_argument=Path("/sealed/jetstreamer-node"),
+            unit="other-controller-import.service",
+        )
+        with (
+            mock.patch.object(
+                sweep, "public_recovery_marker_present", return_value=False
+            ),
+            mock.patch.object(
+                sweep, "discover_epoch_claims", side_effect=((), (public_claim,))
+            ),
+            mock.patch.object(sweep, "verify_deployment"),
+            mock.patch.object(
+                sweep,
+                "capture_committed_receipt_evidence",
+                return_value=fake_receipt_evidence(cohort),
+            ) as capture,
+            mock.patch.object(sweep.subprocess, "run") as launch,
+        ):
+            self.assertFalse(controller.import_one())
+
+        capture.assert_called_once()
+        controller.serialized_public_import_admission.assert_called_once()
+        launch.assert_not_called()
+        self.assertEqual(assignment["phase"], "staged")
+        self.assertIsNone(controller.state["import_owner"])
+        self.assertEqual(controller.state["sequence"], 0)
         controller.save.assert_not_called()
 
     def test_successful_import_is_durable_before_unit_retirement(self) -> None:

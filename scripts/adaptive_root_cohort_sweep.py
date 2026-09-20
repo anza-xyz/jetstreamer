@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+from contextlib import contextmanager
 import dataclasses
 from decimal import Decimal, InvalidOperation
 import fcntl
@@ -2543,6 +2544,19 @@ class Controller:
         for binding in getattr(self, "directory_bindings", {}).values():
             binding.revalidate()
 
+    @contextmanager
+    def serialized_public_import_admission(self) -> Iterable[None]:
+        """Serialize the final public-writer claim check across controllers."""
+
+        binding = self.directory_bindings[self.args.public_dir]
+        binding.revalidate()
+        fcntl.flock(binding.descriptor, fcntl.LOCK_EX)
+        try:
+            binding.revalidate()
+            yield
+        finally:
+            fcntl.flock(binding.descriptor, fcntl.LOCK_UN)
+
     def close(self) -> None:
         for binding in getattr(self, "directory_bindings", {}).values():
             binding.close()
@@ -3284,35 +3298,58 @@ class Controller:
                 rehash_archives=True,
             )
         verify_deployment(self.args.deploy_dir, self.args.manifest, (cohort,))
-        sequence = int(self.state.get("sequence", 0)) + 1
-        unit = (
-            f"jetstreamer-root-import-{self.args.controller_id}-"
-            f"e{cohort.first_epoch}-{cohort.last_epoch}-{sequence}.service"
-        )
-        require_unused_unit_name(unit)
-        self.state["sequence"] = sequence
-        raw["source_evidence"] = source_evidence
-        command = build_import_command(
-            cohort=cohort,
-            receipt=receipt,
-            deploy=self.args.deploy_dir,
-            manifest=self.args.manifest,
-            fingerprint=self.args.manifest_fingerprint,
-            public_dir=self.args.public_dir,
-            public_private_root=self.args.public_private_root,
-            unit=unit,
-            memory_high_gib=self.args.memory_high_gib,
-            memory_max_gib=self.args.memory_max_gib,
-            cpu_quota_percent=self.args.cpu_quota_percent,
-        )
-        print(f"importing validated cohort {cohort.label} from {lane_name}", flush=True)
-        raw["phase"] = "importing"
-        raw["import_unit"] = unit
-        self.state["import_owner"] = lane_name
-        self.save()
-        self.revalidate_operational_directories()
-        verify_bound_receipt_file(source_evidence)
-        result = subprocess.run(command, check=False, capture_output=True, text=True)
+        with self.serialized_public_import_admission():
+            self.revalidate_operational_directories()
+            claims = discover_epoch_claims(expected_uid=self.sol_uid)
+            require_disjoint_epoch_claims(claims)
+            if any(
+                claim.overlaps(cohort)
+                or claim.output == self.lanes[lane_name].output
+                or claim.output == self.args.public_dir
+                for claim in claims
+            ):
+                return False
+            if (
+                public_recovery_marker_present(
+                    self.args.public_dir, self.sol_uid
+                )
+                != recovery_pending
+            ):
+                return False
+            sequence = int(self.state.get("sequence", 0)) + 1
+            unit = (
+                f"jetstreamer-root-import-{self.args.controller_id}-"
+                f"e{cohort.first_epoch}-{cohort.last_epoch}-{sequence}.service"
+            )
+            require_unused_unit_name(unit)
+            self.state["sequence"] = sequence
+            raw["source_evidence"] = source_evidence
+            command = build_import_command(
+                cohort=cohort,
+                receipt=receipt,
+                deploy=self.args.deploy_dir,
+                manifest=self.args.manifest,
+                fingerprint=self.args.manifest_fingerprint,
+                public_dir=self.args.public_dir,
+                public_private_root=self.args.public_private_root,
+                unit=unit,
+                memory_high_gib=self.args.memory_high_gib,
+                memory_max_gib=self.args.memory_max_gib,
+                cpu_quota_percent=self.args.cpu_quota_percent,
+            )
+            print(
+                f"importing validated cohort {cohort.label} from {lane_name}",
+                flush=True,
+            )
+            raw["phase"] = "importing"
+            raw["import_unit"] = unit
+            self.state["import_owner"] = lane_name
+            self.save()
+            self.revalidate_operational_directories()
+            verify_bound_receipt_file(source_evidence)
+            result = subprocess.run(
+                command, check=False, capture_output=True, text=True
+            )
         if result.returncode != 0:
             status = unit_status(unit)
             if status.exists:

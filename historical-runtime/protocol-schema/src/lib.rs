@@ -233,7 +233,7 @@ pub enum TransactionError {
     ClusterMaintenance,
 }
 
-/// The normalized Solana v1 instruction-error superset through v1.3.19.
+/// The normalized Solana v1 instruction-error superset through v1.4.25.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum InstructionError {
     GenericError,
@@ -280,6 +280,14 @@ pub enum InstructionError {
     /// discriminants remain unchanged.
     InvalidRealloc,
     ComputationalBudgetExceeded,
+    /// Appended in the same order as the v1.4.25 SDK enum. Existing variant
+    /// discriminants remain unchanged.
+    PrivilegeEscalation,
+    ProgramEnvironmentSetupFailure,
+    ProgramFailedToComplete,
+    ProgramFailedToCompile,
+    Immutable,
+    IncorrectAuthority,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -560,6 +568,24 @@ mod tests {
             bincode::serialize(&InstructionError::ComputationalBudgetExceeded).unwrap(),
             37u32.to_le_bytes()
         );
+    }
+
+    #[test]
+    fn v1_4_error_extensions_preserve_all_prior_discriminants() {
+        let cases = [
+            (InstructionError::PrivilegeEscalation, 38u32),
+            (InstructionError::ProgramEnvironmentSetupFailure, 39),
+            (InstructionError::ProgramFailedToComplete, 40),
+            (InstructionError::ProgramFailedToCompile, 41),
+            (InstructionError::Immutable, 42),
+            (InstructionError::IncorrectAuthority, 43),
+        ];
+        for (error, discriminant) in cases.iter() {
+            assert_eq!(
+                bincode::serialize(error).unwrap(),
+                discriminant.to_le_bytes()
+            );
+        }
     }
 
     #[test]

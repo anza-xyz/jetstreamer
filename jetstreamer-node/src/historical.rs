@@ -126,6 +126,11 @@ const SOLANA_V1_3_23_TAG: &str = "v1.3.23";
 const SOLANA_V1_3_23_COMMIT: &str = "ab235b8160f1c76e5066eee52d62d976d12f42f1";
 const SOLANA_V1_3_23_RUST_TOOLCHAIN: &str = "rustc 1.45.1 (c367798cf 2020-07-26)";
 const SOLANA_V1_3_23_TARGET: &str = "x86_64-unknown-linux-gnu";
+const SOLANA_V1_4_25_BACKEND_ID: &str = "solana-v1.4.25";
+const SOLANA_V1_4_25_TAG: &str = "v1.4.25";
+const SOLANA_V1_4_25_COMMIT: &str = "893cc7647248a3536fb6e6d0b5e51c71446b862d";
+const SOLANA_V1_4_25_RUST_TOOLCHAIN: &str = "rustc 1.46.0 (04488afe3 2020-08-24)";
+const SOLANA_V1_4_25_TARGET: &str = "x86_64-unknown-linux-gnu";
 
 fn backend_supports_entry_batches(backend_id: &str) -> bool {
     matches!(
@@ -144,6 +149,7 @@ fn backend_supports_entry_batches(backend_id: &str) -> bool {
             | SOLANA_V1_2_32_BACKEND_ID
             | SOLANA_V1_3_19_BACKEND_ID
             | SOLANA_V1_3_23_BACKEND_ID
+            | SOLANA_V1_4_25_BACKEND_ID
     )
 }
 
@@ -331,6 +337,16 @@ pub const SOLANA_V1_3_23_CANDIDATE: WorkerProfile = WorkerProfile {
     solana_commit: SOLANA_V1_3_23_COMMIT,
     rust_toolchain: SOLANA_V1_3_23_RUST_TOOLCHAIN,
     target: SOLANA_V1_3_23_TARGET,
+    required_genesis_hash: protocol::MAINNET_GENESIS_HASH,
+    snapshot_archive_extensions: &[".tar.bz2", ".tar.zst"],
+};
+
+pub const SOLANA_V1_4_25_CANDIDATE: WorkerProfile = WorkerProfile {
+    backend_id: SOLANA_V1_4_25_BACKEND_ID,
+    solana_tag: SOLANA_V1_4_25_TAG,
+    solana_commit: SOLANA_V1_4_25_COMMIT,
+    rust_toolchain: SOLANA_V1_4_25_RUST_TOOLCHAIN,
+    target: SOLANA_V1_4_25_TARGET,
     required_genesis_hash: protocol::MAINNET_GENESIS_HASH,
     snapshot_archive_extensions: &[".tar.bz2", ".tar.zst"],
 };
@@ -2461,7 +2477,7 @@ pub fn normalize_transaction_error(
 }
 
 /// Normalize a current instruction status into the version-neutral historical
-/// vocabulary through v1.3.19. `Custom` preserves its numeric value.
+/// vocabulary through v1.4.25. `Custom` preserves its numeric value.
 #[allow(deprecated)]
 pub fn normalize_instruction_error(
     error: &CurrentInstructionError,
@@ -2508,13 +2524,13 @@ pub fn normalize_instruction_error(
         Current::InvalidSeeds => Old::InvalidSeeds,
         Current::InvalidRealloc => Old::InvalidRealloc,
         Current::ComputationalBudgetExceeded => Old::ComputationalBudgetExceeded,
-        Current::PrivilegeEscalation
-        | Current::ProgramEnvironmentSetupFailure
-        | Current::ProgramFailedToComplete
-        | Current::ProgramFailedToCompile
-        | Current::Immutable
-        | Current::IncorrectAuthority
-        | Current::BorshIoError
+        Current::PrivilegeEscalation => Old::PrivilegeEscalation,
+        Current::ProgramEnvironmentSetupFailure => Old::ProgramEnvironmentSetupFailure,
+        Current::ProgramFailedToComplete => Old::ProgramFailedToComplete,
+        Current::ProgramFailedToCompile => Old::ProgramFailedToCompile,
+        Current::Immutable => Old::Immutable,
+        Current::IncorrectAuthority => Old::IncorrectAuthority,
+        Current::BorshIoError
         | Current::AccountNotRentExempt
         | Current::InvalidAccountOwner
         | Current::ArithmeticOverflow
@@ -2562,7 +2578,7 @@ pub fn denormalize_transaction_error(
     }
 }
 
-/// Convert a historical instruction status through v1.3.19 into the current
+/// Convert a historical instruction status through v1.4.25 into the current
 /// superset.
 #[allow(deprecated)]
 pub fn denormalize_instruction_error(
@@ -2610,6 +2626,12 @@ pub fn denormalize_instruction_error(
         Old::InvalidSeeds => Current::InvalidSeeds,
         Old::InvalidRealloc => Current::InvalidRealloc,
         Old::ComputationalBudgetExceeded => Current::ComputationalBudgetExceeded,
+        Old::PrivilegeEscalation => Current::PrivilegeEscalation,
+        Old::ProgramEnvironmentSetupFailure => Current::ProgramEnvironmentSetupFailure,
+        Old::ProgramFailedToComplete => Current::ProgramFailedToComplete,
+        Old::ProgramFailedToCompile => Current::ProgramFailedToCompile,
+        Old::Immutable => Current::Immutable,
+        Old::IncorrectAuthority => Current::IncorrectAuthority,
     }
 }
 
@@ -3819,6 +3841,7 @@ mod tests {
         assert!(backend_supports_entry_batches(SOLANA_V1_2_32_BACKEND_ID));
         assert!(backend_supports_entry_batches(SOLANA_V1_3_19_BACKEND_ID));
         assert!(backend_supports_entry_batches(SOLANA_V1_3_23_BACKEND_ID));
+        assert!(backend_supports_entry_batches(SOLANA_V1_4_25_BACKEND_ID));
         assert!(!backend_supports_entry_batches(SOLANA_V1_0_24_BACKEND_ID));
         assert!(!backend_supports_entry_batches("unknown"));
     }
@@ -5279,6 +5302,7 @@ mod tests {
             SOLANA_V1_2_32_CANDIDATE,
             SOLANA_V1_3_19_CANDIDATE,
             SOLANA_V1_3_23_CANDIDATE,
+            SOLANA_V1_4_25_CANDIDATE,
         ] {
             assert_eq!(
                 profile.snapshot_archive_extensions,
@@ -5318,6 +5342,7 @@ mod tests {
             SOLANA_V1_2_32_CANDIDATE,
             SOLANA_V1_3_19_CANDIDATE,
             SOLANA_V1_3_23_CANDIDATE,
+            SOLANA_V1_4_25_CANDIDATE,
         ] {
             verify_handshake(profile, &valid_handshake_for(profile)).unwrap();
         }
@@ -5559,7 +5584,7 @@ mod tests {
 
     #[test]
     #[allow(deprecated)]
-    fn maps_every_v1_3_instruction_status_and_rejects_newer_statuses() {
+    fn maps_every_v1_4_instruction_status_and_rejects_newer_statuses() {
         use CurrentInstructionError as Current;
         use protocol::InstructionError as Old;
 
@@ -5629,15 +5654,27 @@ mod tests {
                 Current::ComputationalBudgetExceeded,
                 Old::ComputationalBudgetExceeded,
             ),
+            (Current::PrivilegeEscalation, Old::PrivilegeEscalation),
+            (
+                Current::ProgramEnvironmentSetupFailure,
+                Old::ProgramEnvironmentSetupFailure,
+            ),
+            (
+                Current::ProgramFailedToComplete,
+                Old::ProgramFailedToComplete,
+            ),
+            (Current::ProgramFailedToCompile, Old::ProgramFailedToCompile),
+            (Current::Immutable, Old::Immutable),
+            (Current::IncorrectAuthority, Old::IncorrectAuthority),
         ];
         for (current, expected) in cases {
             assert_eq!(normalize_instruction_error(&current).unwrap(), expected);
             assert_eq!(denormalize_instruction_error(&expected), current);
         }
         assert!(matches!(
-            normalize_instruction_error(&Current::PrivilegeEscalation),
+            normalize_instruction_error(&Current::BorshIoError),
             Err(HistoricalRuntimeError::UnsupportedInstructionError(
-                Current::PrivilegeEscalation
+                Current::BorshIoError
             ))
         ));
     }

@@ -308,6 +308,8 @@ class SelectionTests(unittest.TestCase):
             100: "solana-v1.3.19",
             101: "solana-v1.3.23",
             118: "solana-v1.3.23",
+            119: "solana-v1.4.25",
+            147: "solana-v1.4.25",
         }
         for epoch, runtime in expected.items():
             with self.subTest(epoch=epoch):
@@ -316,7 +318,7 @@ class SelectionTests(unittest.TestCase):
         with self.assertRaises(preflight.PreflightError):
             preflight.requested_slot_range(0, 1)
         with self.assertRaises(preflight.PreflightError):
-            preflight.requested_slot_range(118, 119)
+            preflight.requested_slot_range(147, 148)
 
     def test_builds_all_epoch_plans_and_keeps_hourly_bootstrap_only(self) -> None:
         root_raw, hourly_raw = complete_inventory()

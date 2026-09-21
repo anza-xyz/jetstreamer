@@ -233,7 +233,7 @@ pub enum TransactionError {
     ClusterMaintenance,
 }
 
-/// The normalized Solana v1 instruction-error superset through v1.4.25.
+/// The normalized Solana v1 instruction-error superset through v1.5.19.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum InstructionError {
     GenericError,
@@ -288,6 +288,13 @@ pub enum InstructionError {
     ProgramFailedToCompile,
     Immutable,
     IncorrectAuthority,
+    /// Appended in the same order as the v1.5.19 SDK enum. The historical SDK
+    /// carried a diagnostic string for `BorshIoError`, but the current public
+    /// Solana type intentionally exposes only the category, so the normalized
+    /// protocol does the same.
+    BorshIoError,
+    AccountNotRentExempt,
+    InvalidAccountOwner,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -579,6 +586,21 @@ mod tests {
             (InstructionError::ProgramFailedToCompile, 41),
             (InstructionError::Immutable, 42),
             (InstructionError::IncorrectAuthority, 43),
+        ];
+        for (error, discriminant) in cases.iter() {
+            assert_eq!(
+                bincode::serialize(error).unwrap(),
+                discriminant.to_le_bytes()
+            );
+        }
+    }
+
+    #[test]
+    fn v1_5_error_extensions_preserve_all_prior_discriminants() {
+        let cases = [
+            (InstructionError::BorshIoError, 44u32),
+            (InstructionError::AccountNotRentExempt, 45),
+            (InstructionError::InvalidAccountOwner, 46),
         ];
         for (error, discriminant) in cases.iter() {
             assert_eq!(

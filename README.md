@@ -384,15 +384,16 @@ select a runtime. The current registry is deliberately conservative:
 | `39,744,000..43,632,000` | pinned Solana v1.3.19 worker | independently verified snapshot restart; bounded extractor admits up to 131,072 members for the audited 104,267–106,520-member epoch-98 through epoch-100 snapshots | diagnostic candidate for epochs 92-100 |
 | `43,632,000..51,408,000` | pinned Solana v1.3.23 worker | independently verified snapshot restart; every cohort must match all canonical post-bootstrap roots | unqualified diagnostic candidate for epochs 101-118 |
 | `51,408,000..63,936,000` | pinned Solana v1.4.25 worker | independently verified snapshot restart; carries the v1.4 transaction-status vocabulary through the shared stream protocol; every cohort must match all canonical post-bootstrap roots | unqualified diagnostic candidate for epochs 119-147 |
-| `63,936,000..406,080,000` | none | unsupported; replay fails closed | unsupported |
+| `63,936,000..75,168,000` | pinned Solana v1.5.19 worker | independently verified snapshot restart; normalizes the v1.5 status renames and additions for current plugins; every cohort must match all canonical post-bootstrap roots | unqualified diagnostic candidate for epochs 148-173 |
+| `75,168,000..406,080,000` | none | unsupported; replay fails closed | unsupported |
 | `406,080,000..` | in-process Agave v3 | independently verified modern snapshot bootstrap | verified |
 
 Verified epochs 0-100 use 12 execution envelopes backed by 11 historical worker variants. The
 11 runtime boundaries consist of one hash-bound canonical state handoff, two source-lineage-verified
 epoch-67 handoffs, and eight independently verified snapshot restarts. The
-v1.2.32 worker is used on both sides of the two specialized epoch-67 ranges. The v1.3.23 and
-v1.4.25 candidates add two snapshot-isolated envelopes. Each remains unqualified until replay
-matches every root in its first complete cohort.
+v1.2.32 worker is used on both sides of the two specialized epoch-67 ranges. The v1.3.23,
+v1.4.25, and v1.5.19 candidates add three snapshot-isolated envelopes. Each remains
+unqualified until replay matches every root in its first complete cohort.
 
 Five execution interventions go beyond choosing a pinned worker and restarting from an independently
 verified boundary snapshot:

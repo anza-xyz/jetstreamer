@@ -131,6 +131,11 @@ const SOLANA_V1_4_25_TAG: &str = "v1.4.25";
 const SOLANA_V1_4_25_COMMIT: &str = "893cc7647248a3536fb6e6d0b5e51c71446b862d";
 const SOLANA_V1_4_25_RUST_TOOLCHAIN: &str = "rustc 1.46.0 (04488afe3 2020-08-24)";
 const SOLANA_V1_4_25_TARGET: &str = "x86_64-unknown-linux-gnu";
+const SOLANA_V1_5_19_BACKEND_ID: &str = "solana-v1.5.19";
+const SOLANA_V1_5_19_TAG: &str = "v1.5.19";
+const SOLANA_V1_5_19_COMMIT: &str = "936ff7424e1306b0df07dabcd6863bf7896d2cb5";
+const SOLANA_V1_5_19_RUST_TOOLCHAIN: &str = "rustc 1.49.0 (e1884a8e3 2020-12-29)";
+const SOLANA_V1_5_19_TARGET: &str = "x86_64-unknown-linux-gnu";
 
 fn backend_supports_entry_batches(backend_id: &str) -> bool {
     matches!(
@@ -150,6 +155,7 @@ fn backend_supports_entry_batches(backend_id: &str) -> bool {
             | SOLANA_V1_3_19_BACKEND_ID
             | SOLANA_V1_3_23_BACKEND_ID
             | SOLANA_V1_4_25_BACKEND_ID
+            | SOLANA_V1_5_19_BACKEND_ID
     )
 }
 
@@ -347,6 +353,16 @@ pub const SOLANA_V1_4_25_CANDIDATE: WorkerProfile = WorkerProfile {
     solana_commit: SOLANA_V1_4_25_COMMIT,
     rust_toolchain: SOLANA_V1_4_25_RUST_TOOLCHAIN,
     target: SOLANA_V1_4_25_TARGET,
+    required_genesis_hash: protocol::MAINNET_GENESIS_HASH,
+    snapshot_archive_extensions: &[".tar.bz2", ".tar.zst"],
+};
+
+pub const SOLANA_V1_5_19_CANDIDATE: WorkerProfile = WorkerProfile {
+    backend_id: SOLANA_V1_5_19_BACKEND_ID,
+    solana_tag: SOLANA_V1_5_19_TAG,
+    solana_commit: SOLANA_V1_5_19_COMMIT,
+    rust_toolchain: SOLANA_V1_5_19_RUST_TOOLCHAIN,
+    target: SOLANA_V1_5_19_TARGET,
     required_genesis_hash: protocol::MAINNET_GENESIS_HASH,
     snapshot_archive_extensions: &[".tar.bz2", ".tar.zst"],
 };
@@ -2477,7 +2493,7 @@ pub fn normalize_transaction_error(
 }
 
 /// Normalize a current instruction status into the version-neutral historical
-/// vocabulary through v1.4.25. `Custom` preserves its numeric value.
+/// vocabulary through v1.5.19. `Custom` preserves its numeric value.
 #[allow(deprecated)]
 pub fn normalize_instruction_error(
     error: &CurrentInstructionError,
@@ -2530,10 +2546,10 @@ pub fn normalize_instruction_error(
         Current::ProgramFailedToCompile => Old::ProgramFailedToCompile,
         Current::Immutable => Old::Immutable,
         Current::IncorrectAuthority => Old::IncorrectAuthority,
-        Current::BorshIoError
-        | Current::AccountNotRentExempt
-        | Current::InvalidAccountOwner
-        | Current::ArithmeticOverflow
+        Current::BorshIoError => Old::BorshIoError,
+        Current::AccountNotRentExempt => Old::AccountNotRentExempt,
+        Current::InvalidAccountOwner => Old::InvalidAccountOwner,
+        Current::ArithmeticOverflow
         | Current::UnsupportedSysvar
         | Current::IllegalOwner
         | Current::MaxAccountsDataAllocationsExceeded
@@ -2578,7 +2594,7 @@ pub fn denormalize_transaction_error(
     }
 }
 
-/// Convert a historical instruction status through v1.4.25 into the current
+/// Convert a historical instruction status through v1.5.19 into the current
 /// superset.
 #[allow(deprecated)]
 pub fn denormalize_instruction_error(
@@ -2632,6 +2648,9 @@ pub fn denormalize_instruction_error(
         Old::ProgramFailedToCompile => Current::ProgramFailedToCompile,
         Old::Immutable => Current::Immutable,
         Old::IncorrectAuthority => Current::IncorrectAuthority,
+        Old::BorshIoError => Current::BorshIoError,
+        Old::AccountNotRentExempt => Current::AccountNotRentExempt,
+        Old::InvalidAccountOwner => Current::InvalidAccountOwner,
     }
 }
 
@@ -3842,6 +3861,7 @@ mod tests {
         assert!(backend_supports_entry_batches(SOLANA_V1_3_19_BACKEND_ID));
         assert!(backend_supports_entry_batches(SOLANA_V1_3_23_BACKEND_ID));
         assert!(backend_supports_entry_batches(SOLANA_V1_4_25_BACKEND_ID));
+        assert!(backend_supports_entry_batches(SOLANA_V1_5_19_BACKEND_ID));
         assert!(!backend_supports_entry_batches(SOLANA_V1_0_24_BACKEND_ID));
         assert!(!backend_supports_entry_batches("unknown"));
     }
@@ -5303,6 +5323,7 @@ mod tests {
             SOLANA_V1_3_19_CANDIDATE,
             SOLANA_V1_3_23_CANDIDATE,
             SOLANA_V1_4_25_CANDIDATE,
+            SOLANA_V1_5_19_CANDIDATE,
         ] {
             assert_eq!(
                 profile.snapshot_archive_extensions,
@@ -5343,6 +5364,7 @@ mod tests {
             SOLANA_V1_3_19_CANDIDATE,
             SOLANA_V1_3_23_CANDIDATE,
             SOLANA_V1_4_25_CANDIDATE,
+            SOLANA_V1_5_19_CANDIDATE,
         ] {
             verify_handshake(profile, &valid_handshake_for(profile)).unwrap();
         }
@@ -5584,7 +5606,7 @@ mod tests {
 
     #[test]
     #[allow(deprecated)]
-    fn maps_every_v1_4_instruction_status_and_rejects_newer_statuses() {
+    fn maps_every_v1_5_instruction_status_and_rejects_newer_statuses() {
         use CurrentInstructionError as Current;
         use protocol::InstructionError as Old;
 
@@ -5666,15 +5688,18 @@ mod tests {
             (Current::ProgramFailedToCompile, Old::ProgramFailedToCompile),
             (Current::Immutable, Old::Immutable),
             (Current::IncorrectAuthority, Old::IncorrectAuthority),
+            (Current::BorshIoError, Old::BorshIoError),
+            (Current::AccountNotRentExempt, Old::AccountNotRentExempt),
+            (Current::InvalidAccountOwner, Old::InvalidAccountOwner),
         ];
         for (current, expected) in cases {
             assert_eq!(normalize_instruction_error(&current).unwrap(), expected);
             assert_eq!(denormalize_instruction_error(&expected), current);
         }
         assert!(matches!(
-            normalize_instruction_error(&Current::BorshIoError),
+            normalize_instruction_error(&Current::ArithmeticOverflow),
             Err(HistoricalRuntimeError::UnsupportedInstructionError(
-                Current::BorshIoError
+                Current::ArithmeticOverflow
             ))
         ));
     }

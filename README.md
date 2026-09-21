@@ -382,13 +382,16 @@ select a runtime. The current registry is deliberately conservative:
 | `29,371,188..29,808,000` | pinned Solana v1.2.32 mainnet transition worker | generated state handoff after the last observed old-semantics transaction; reconstructs the CPI and vote-timestamp activation state | qualified by the terminal epoch-68 checkpoint |
 | `29,808,000..39,744,000` | pinned Solana v1.2.32 worker | independently verified snapshot restart | diagnostic candidate for epochs 69-91 |
 | `39,744,000..43,632,000` | pinned Solana v1.3.19 worker | independently verified snapshot restart; bounded extractor admits up to 131,072 members for the audited 104,267–106,520-member epoch-98 through epoch-100 snapshots | diagnostic candidate for epochs 92-100 |
-| `43,632,000..406,080,000` | none | unsupported; replay fails closed | unsupported |
+| `43,632,000..51,408,000` | pinned Solana v1.3.23 worker | independently verified snapshot restart; every cohort must match all canonical post-bootstrap roots | unqualified diagnostic candidate for epochs 101-118 |
+| `51,408,000..406,080,000` | none | unsupported; replay fails closed | unsupported |
 | `406,080,000..` | in-process Agave v3 | independently verified modern snapshot bootstrap | verified |
 
-For epochs 0-100 this is 12 execution envelopes backed by 11 historical worker variants. The
+Verified epochs 0-100 use 12 execution envelopes backed by 11 historical worker variants. The
 11 runtime boundaries consist of one hash-bound canonical state handoff, two source-lineage-verified
 epoch-67 handoffs, and eight independently verified snapshot restarts. The
-v1.2.32 worker is used on both sides of the two specialized epoch-67 ranges.
+v1.2.32 worker is used on both sides of the two specialized epoch-67 ranges. The v1.3.23
+candidate adds one snapshot-isolated envelope; it remains unqualified until replay matches every
+root in its first complete cohort.
 
 Five execution interventions go beyond choosing a pinned worker and restarting from an independently
 verified boundary snapshot:

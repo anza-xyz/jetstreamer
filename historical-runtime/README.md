@@ -17,7 +17,7 @@ release is correct for a range merely because of its release date. Runtime
 selection is slot-driven, candidate use requires an explicit opt-in, and a
 generated epoch is publishable only after all canonical post-bootstrap
 snapshot checkpoints in that epoch match. The wider terminal-patch envelopes
-for epochs 12 through 100 are diagnostic: the first mismatch must split an
+from epoch 12 onward are diagnostic: the first mismatch must split an
 envelope around an earlier exact worker rather than weakening validation.
 
 The current early-history route assigns one v1.0.14 era to slots 3888000
@@ -54,7 +54,7 @@ still requires explicit opt-in and trusted checkpoint validation.
 The sibling virtual workspaces have independent old-format lockfiles. Workers
 through v1.0.18 are pinned to `1.42.0-x86_64-unknown-linux-gnu`; v1.0.23,
 v1.0.24, v1.1.15, v1.1.23, v1.2.24, and the v1.2.32 workers use
-`1.43.0-x86_64-unknown-linux-gnu`; v1.3.19
+`1.43.0-x86_64-unknown-linux-gnu`; v1.3.19 and v1.3.23
 uses `1.45.1-x86_64-unknown-linux-gnu`. They cannot share dependency
 resolution because the exact upstream graphs require incompatible
 pre-release cryptography packages. The old `AppendVec` persisted native Rust
@@ -80,7 +80,7 @@ SHA-NI is guarded by feature detection, every unsafe load/store operates on
 fixed-size owned arrays, and randomized tests cover optimized, paired, and
 forced-portable paths.
 
-The v1.2.32 transition, general v1.2.32, and v1.3.19 workers also perform the
+The v1.2.32 transition, general v1.2.32, v1.3.19, and v1.3.23 workers also perform the
 storage-only duties that their validators normally delegated to
 `AccountsBackgroundService`. After a rooted bank is squashed and all
 observable writes are drained, the worker reclaims dead and stale AppendVec
@@ -161,6 +161,7 @@ Each vendored runtime directory contains the upstream `runtime/` crate and an
 | `v1_2_32_epoch68_transition` | `8c989da68342918f1717c60aa60fdfab7d1e676e` + explicit mainnet activation state | slot 29,371,188 through epoch 68 |
 | `v1_2_32` | `8c989da68342918f1717c60aa60fdfab7d1e676e` | checkpoint-gated diagnostic envelopes, epochs 61-66 and 69-91 |
 | `v1_3_19` | `15a49d75086f95573ad319b22e4843639bdf2169` | checkpoint-gated diagnostic envelope, epochs 92–100 |
+| `v1_3_23` | `ab235b8160f1c76e5066eee52d62d976d12f42f1` | unqualified checkpoint-gated diagnostic envelope, epochs 101-118 |
 
 The source has only these integration changes:
 

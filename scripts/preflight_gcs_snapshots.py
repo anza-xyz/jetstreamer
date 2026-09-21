@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Read-only GCS snapshot inventory preflight for mainnet epochs 1 through 100.
+"""Read-only GCS snapshot inventory preflight for supported mainnet epochs.
 
 Each epoch with a root checkpoint is an independent verification cohort. A run
 of epochs without a root checkpoint is joined to the first later epoch with a
@@ -45,6 +45,7 @@ BILLING_PROJECT = "principal-lane-200702"
 LOCAL_ROOT = Path("/home/sol/horizon")
 FIRST_EPOCH = 1
 LAST_EPOCH = 100
+MAX_SUPPORTED_EPOCH = 118
 EPOCH_SLOTS = 432_000
 UINT64_MAX = (1 << 64) - 1
 SCHEMA = "jetstreamer-gcs-snapshot-preflight-v2"
@@ -70,6 +71,7 @@ RUNTIME_ROUTES = (
     ),
     (69, 91, "solana-v1.2.32", (".tar.bz2", ".tar.zst")),
     (92, 100, "solana-v1.3.19", (".tar.bz2", ".tar.zst")),
+    (101, 118, "solana-v1.3.23", (".tar.bz2", ".tar.zst")),
 )
 ROOT_COHORT_HISTORICAL_RUNTIMES = frozenset(
     {
@@ -82,6 +84,7 @@ ROOT_COHORT_HISTORICAL_RUNTIMES = frozenset(
         "solana-v1.2.32-mainnet-epoch68-transition",
         "solana-v1.2.32",
         "solana-v1.3.19",
+        "solana-v1.3.23",
     }
 )
 SNAPSHOT_ARCHIVE_EXTENSIONS = (".tar.zst", ".tar.lz4", ".tar.bz2")
@@ -313,10 +316,14 @@ def _parse_snapshot_object(
 def requested_slot_range(
     first_epoch: int = FIRST_EPOCH, last_epoch: int = LAST_EPOCH
 ) -> Tuple[int, int]:
-    if first_epoch < FIRST_EPOCH or last_epoch > LAST_EPOCH or first_epoch > last_epoch:
+    if (
+        first_epoch < FIRST_EPOCH
+        or last_epoch > MAX_SUPPORTED_EPOCH
+        or first_epoch > last_epoch
+    ):
         raise PreflightError(
             f"requested epoch range {first_epoch}-{last_epoch} is outside "
-            f"{FIRST_EPOCH}-{LAST_EPOCH}"
+            f"{FIRST_EPOCH}-{MAX_SUPPORTED_EPOCH}"
         )
     return (first_epoch - 1) * EPOCH_SLOTS, (last_epoch + 1) * EPOCH_SLOTS - 1
 
@@ -369,7 +376,9 @@ def runtime_route(epoch: int) -> Tuple[str, Tuple[str, ...]]:
     for first, last, runtime, extensions in RUNTIME_ROUTES:
         if first <= epoch <= last:
             return runtime, extensions
-    raise PreflightError(f"epoch {epoch} is outside supported range {FIRST_EPOCH}-{LAST_EPOCH}")
+    raise PreflightError(
+        f"epoch {epoch} is outside supported range {FIRST_EPOCH}-{MAX_SUPPORTED_EPOCH}"
+    )
 
 
 def accepted_extensions(epoch: int) -> Tuple[str, ...]:

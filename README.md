@@ -382,8 +382,8 @@ select a runtime. The current registry is deliberately conservative:
 | `29,371,188..29,808,000` | pinned Solana v1.2.32 mainnet transition worker | generated state handoff after the last observed old-semantics transaction; reconstructs the CPI and vote-timestamp activation state | qualified by the terminal epoch-68 checkpoint |
 | `29,808,000..39,744,000` | pinned Solana v1.2.32 worker | independently verified snapshot restart | diagnostic candidate for epochs 69-91 |
 | `39,744,000..43,632,000` | pinned Solana v1.3.19 worker | independently verified snapshot restart; bounded extractor admits up to 131,072 members for the audited 104,267–106,520-member epoch-98 through epoch-100 snapshots | diagnostic candidate for epochs 92-100 |
-| `43,632,000..52,704,000` | pinned Solana v1.3.23 worker | independently verified snapshot restart; epoch 121 remains on v1.3 semantics because mainnet accepted a 4,008-byte stake initialization at slot 52,276,272 that v1.4.11+ rejects; the extractor remains byte-bounded while admitting the later snapshot's 131,072+ members; every cohort must match all canonical post-bootstrap roots | unqualified diagnostic candidate for epochs 101-121 |
-| `52,704,000..63,936,000` | pinned Solana v1.4.25 worker | independently verified snapshot restart; carries the v1.4 transaction-status vocabulary through the shared stream protocol; every cohort must match all canonical post-bootstrap roots | unqualified diagnostic candidate for epochs 122-147 |
+| `43,632,000..54,432,000` | pinned Solana v1.3.23 worker | independently verified snapshot restart; mainnet accepted 4,008-byte stake initializations at slots 51,450,068, 52,718,785, and 54,045,188 that v1.4.11+ rejects; the extractor remains byte-bounded while admitting the later snapshot's 131,072+ members; every cohort must match all canonical post-bootstrap roots | unqualified diagnostic candidate for epochs 101-125 |
+| `54,432,000..63,936,000` | pinned Solana v1.4.25 worker | independently verified snapshot restart; carries the v1.4 transaction-status vocabulary through the shared stream protocol; every cohort must match all canonical post-bootstrap roots | unqualified diagnostic candidate for epochs 126-147 |
 | `63,936,000..75,168,000` | pinned Solana v1.5.19 worker | independently verified snapshot restart; normalizes the v1.5 status renames and additions for current plugins; every cohort must match all canonical post-bootstrap roots | unqualified diagnostic candidate for epochs 148-173 |
 | `75,168,000..86,832,000` | pinned Solana v1.6.15 worker | independently verified snapshot restart; reproduces the v1.6 loader set, write-lock demotion, and expanded status vocabulary for current plugins; every cohort must match all canonical post-bootstrap roots | unqualified diagnostic candidate for epochs 174-200 |
 | `86,832,000..406,080,000` | none | unsupported; replay fails closed | unsupported |
@@ -404,8 +404,9 @@ verified boundary snapshot:
 3. Reconstruction and validation of the epoch-30 hard-fork marker at slot 13,334,463.
 4. The v1.2.32 to pre-CPI v1.2.24 state handoff at slot 29,327,576.
 5. The return to v1.2.32 at slot 29,371,188 with CPI and vote-timestamp state reconstructed.
-6. The v1.3.23 envelope extends through epoch 121 because canonical execution at slot 52,276,272
-   predates v1.4's exact-size stake-initialization rule; publication still requires the terminal root.
+6. The v1.3.23 envelope extends through epoch 125 because canonical execution at slots 51,450,068,
+   52,718,785, and 54,045,188 predates v1.4's exact-size stake-initialization rule; publication still
+   requires the terminal root.
 
 Input repair is planned independently of execution and adds three more historical interventions:
 

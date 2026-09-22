@@ -258,7 +258,10 @@ impl RuntimeState {
                 for (transaction, result) in transactions.iter().zip(&results.execution_results) {
                     if matches!(
                         result.0,
-                        Err(TransactionError::InstructionError(_, InstructionError::Custom(2)))
+                        Err(TransactionError::InstructionError(
+                            _,
+                            InstructionError::Custom(2)
+                        ))
                     ) {
                         let slot_hashes = self
                             .bank
@@ -961,18 +964,25 @@ fn validate_mainnet_genesis_programs(genesis: &GenesisConfig) -> Result<(), Stri
 /// deployment-adjacent shared objects.
 pub(crate) fn mainnet_additional_builtins() -> Builtins {
     Builtins {
-        genesis_builtins: vec![Builtin::new(
-            "solana_bpf_loader_deprecated_program",
-            solana_sdk::bpf_loader_deprecated::id(),
-            solana_bpf_loader_program::process_instruction,
-        )],
-        feature_builtins: vec![(
+        genesis_builtins: vec![
+            Builtin::new(
+                "solana_bpf_loader_deprecated_program",
+                solana_sdk::bpf_loader_deprecated::id(),
+                solana_bpf_loader_program::process_instruction,
+            ),
             Builtin::new(
                 "solana_bpf_loader_program",
                 solana_sdk::bpf_loader::id(),
                 solana_bpf_loader_program::process_instruction,
             ),
-            feature_set::bpf_loader2_program::id(),
+        ],
+        feature_builtins: vec![(
+            Builtin::new(
+                "solana_bpf_loader_upgradeable_program",
+                solana_sdk::bpf_loader_upgradeable::id(),
+                solana_bpf_loader_program::process_instruction,
+            ),
+            feature_set::bpf_loader_upgradeable_program::id(),
             ActivationType::NewProgram,
         )],
     }
@@ -1319,6 +1329,29 @@ mod tests {
         assert!(validate_mainnet_genesis_programs(&genesis)
             .unwrap_err()
             .contains("requires MainnetBeta cluster type"));
+    }
+
+    #[test]
+    fn additional_loader_table_matches_upstream_v1_5_19_ledger() {
+        let builtins = mainnet_additional_builtins();
+        assert_eq!(builtins.genesis_builtins.len(), 2);
+        assert_eq!(
+            builtins.genesis_builtins[0].id,
+            solana_sdk::bpf_loader_deprecated::id()
+        );
+        assert_eq!(
+            builtins.genesis_builtins[1].id,
+            solana_sdk::bpf_loader::id()
+        );
+        assert_eq!(builtins.feature_builtins.len(), 1);
+        assert_eq!(
+            builtins.feature_builtins[0].0.id,
+            solana_sdk::bpf_loader_upgradeable::id()
+        );
+        assert_eq!(
+            builtins.feature_builtins[0].1,
+            feature_set::bpf_loader_upgradeable_program::id()
+        );
     }
 
     #[test]

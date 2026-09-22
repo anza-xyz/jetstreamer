@@ -89,11 +89,12 @@ pub const SOLANA_V1_2_32_CANDIDATE_END_SLOT_EXCLUSIVE: Slot = 39_744_000;
 pub const SOLANA_V1_3_19_CANDIDATE_START_SLOT: Slot = SOLANA_V1_2_32_CANDIDATE_END_SLOT_EXCLUSIVE;
 pub const SOLANA_V1_3_19_CANDIDATE_END_SLOT_EXCLUSIVE: Slot = 43_632_000;
 pub const SOLANA_V1_3_23_CANDIDATE_START_SLOT: Slot = SOLANA_V1_3_19_CANDIDATE_END_SLOT_EXCLUSIVE;
-/// Epochs 101 through 121. Canonical execution at slot 52,276,272 still used
-/// the v1.3 stake-initialization semantics rejected by v1.4.11 and later.
-pub const SOLANA_V1_3_23_CANDIDATE_END_SLOT_EXCLUSIVE: Slot = 52_704_000;
+/// Epochs 101 through 125. Canonical execution at slots 51,450,068,
+/// 52,718,785, and 54,045,188 still used the v1.3 stake-initialization
+/// semantics rejected by v1.4.11 and later.
+pub const SOLANA_V1_3_23_CANDIDATE_END_SLOT_EXCLUSIVE: Slot = 54_432_000;
 pub const SOLANA_V1_4_25_CANDIDATE_START_SLOT: Slot = SOLANA_V1_3_23_CANDIDATE_END_SLOT_EXCLUSIVE;
-/// Epochs 122 through 147, ending at the first v1.5 candidate epoch.
+/// Epochs 126 through 147, ending at the first v1.5 candidate epoch.
 pub const SOLANA_V1_4_25_CANDIDATE_END_SLOT_EXCLUSIVE: Slot = 63_936_000;
 pub const SOLANA_V1_5_19_CANDIDATE_START_SLOT: Slot = SOLANA_V1_4_25_CANDIDATE_END_SLOT_EXCLUSIVE;
 /// Epochs 148 through 173, ending at the first v1.6 candidate epoch.
@@ -217,10 +218,10 @@ pub enum RuntimeBackend {
     /// envelope for epochs 92 through 100.
     SolanaV1_3_19,
     /// Exact terminal v1.3 patch used only in the independently
-    /// checkpoint-gated diagnostic envelope for epochs 101 through 121.
+    /// checkpoint-gated diagnostic envelope for epochs 101 through 125.
     SolanaV1_3_23,
     /// Exact terminal v1.4 patch used only in the independently
-    /// checkpoint-gated diagnostic envelope for epochs 122 through 147.
+    /// checkpoint-gated diagnostic envelope for epochs 126 through 147.
     SolanaV1_4_25,
     /// Exact terminal v1.5 patch used only in the independently
     /// checkpoint-gated diagnostic envelope for epochs 148 through 173.
@@ -1227,14 +1228,14 @@ pub static RUNTIME_ERAS: &[RuntimeEra] = &[
         admission: AdmissionLevel::Candidate,
     },
     RuntimeEra {
-        name: "solana-v1.3.23-epochs-101-121-differential-candidate",
+        name: "solana-v1.3.23-epochs-101-125-differential-candidate",
         start_slot: SOLANA_V1_3_23_CANDIDATE_START_SLOT,
         end_slot_exclusive: Some(SOLANA_V1_3_23_CANDIDATE_END_SLOT_EXCLUSIVE),
         backend: EraBackend::Available(&SOLANA_V1_3_23_RUNTIME),
         admission: AdmissionLevel::Candidate,
     },
     RuntimeEra {
-        name: "solana-v1.4.25-epochs-122-147-differential-candidate",
+        name: "solana-v1.4.25-epochs-126-147-differential-candidate",
         start_slot: SOLANA_V1_4_25_CANDIDATE_START_SLOT,
         end_slot_exclusive: Some(SOLANA_V1_4_25_CANDIDATE_END_SLOT_EXCLUSIVE),
         backend: EraBackend::Available(&SOLANA_V1_4_25_RUNTIME),

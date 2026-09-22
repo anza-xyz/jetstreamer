@@ -258,7 +258,10 @@ impl RuntimeState {
                 for (transaction, result) in transactions.iter().zip(&results.execution_results) {
                     if matches!(
                         result.0,
-                        Err(TransactionError::InstructionError(_, InstructionError::Custom(2)))
+                        Err(TransactionError::InstructionError(
+                            _,
+                            InstructionError::Custom(2)
+                        ))
                     ) {
                         let slot_hashes = self
                             .bank
@@ -961,18 +964,25 @@ fn validate_mainnet_genesis_programs(genesis: &GenesisConfig) -> Result<(), Stri
 /// deployment-adjacent shared objects.
 pub(crate) fn mainnet_additional_builtins() -> Builtins {
     Builtins {
-        genesis_builtins: vec![Builtin::new(
-            "solana_bpf_loader_deprecated_program",
-            solana_sdk::bpf_loader_deprecated::id(),
-            solana_bpf_loader_program::process_instruction,
-        )],
-        feature_builtins: vec![(
+        genesis_builtins: vec![
+            Builtin::new(
+                "solana_bpf_loader_deprecated_program",
+                solana_sdk::bpf_loader_deprecated::id(),
+                solana_bpf_loader_program::process_instruction,
+            ),
             Builtin::new(
                 "solana_bpf_loader_program",
                 solana_sdk::bpf_loader::id(),
                 solana_bpf_loader_program::process_instruction,
             ),
-            feature_set::bpf_loader2_program::id(),
+        ],
+        feature_builtins: vec![(
+            Builtin::new(
+                "solana_bpf_loader_upgradeable_program",
+                solana_sdk::bpf_loader_upgradeable::id(),
+                solana_bpf_loader_program::process_instruction,
+            ),
+            feature_set::bpf_loader_upgradeable_program::id(),
             ActivationType::NewProgram,
         )],
     }
@@ -1130,6 +1140,10 @@ mod tests {
         instruction::{AccountMeta, Instruction},
         signature::{Keypair, Signer},
         system_instruction, system_program, system_transaction, sysvar,
+    };
+    use solana_stake_program::{
+        stake_instruction::StakeInstruction,
+        stake_state::{Authorized, Lockup},
     };
     use solana_vote_program::vote_state::{VoteInit, VoteState};
     use std::collections::HashSet;
@@ -1296,6 +1310,29 @@ mod tests {
     }
 
     #[test]
+    fn additional_loader_table_matches_upstream_v1_4_25_ledger() {
+        let builtins = mainnet_additional_builtins();
+        assert_eq!(builtins.genesis_builtins.len(), 2);
+        assert_eq!(
+            builtins.genesis_builtins[0].id,
+            solana_sdk::bpf_loader_deprecated::id()
+        );
+        assert_eq!(
+            builtins.genesis_builtins[1].id,
+            solana_sdk::bpf_loader::id()
+        );
+        assert_eq!(builtins.feature_builtins.len(), 1);
+        assert_eq!(
+            builtins.feature_builtins[0].0.id,
+            solana_sdk::bpf_loader_upgradeable::id()
+        );
+        assert_eq!(
+            builtins.feature_builtins[0].1,
+            feature_set::bpf_loader_upgradeable_program::id()
+        );
+    }
+
+    #[test]
     fn v1_4_25_rejects_old_form_vote_initialization_without_node_instruction_account() {
         let leader = Pubkey::new_from_array([7; 32]);
         let mut genesis = create_genesis_config_with_leader(1_000_000, &leader, 500_000);
@@ -1335,6 +1372,64 @@ mod tests {
             })
         );
         assert!(state.bank.get_account(&vote_account.pubkey()).is_none());
+    }
+
+    #[test]
+    fn v1_4_25_rejects_oversized_stake_initialization() {
+        let leader = Pubkey::new_from_array([7; 32]);
+        let mut genesis = create_genesis_config_with_leader(10_000_000_000, &leader, 500_000);
+        set_exact_mainnet_native_programs(&mut genesis.genesis_config);
+        let state_dir = snapshot::private_state_dir(None).unwrap();
+        let account_paths = snapshot::private_account_paths(&state_dir).unwrap();
+        let builtins = mainnet_additional_builtins();
+        let bank = Bank::new_with_paths(
+            &genesis.genesis_config,
+            account_paths,
+            &[],
+            None,
+            Some(&builtins),
+            HashSet::new(),
+        );
+        let mut state = RuntimeState::from_test_bank(bank, true, state_dir);
+        let stake_account = Keypair::new();
+        let authorized = Authorized::auto(&genesis.mint_keypair.pubkey());
+        let lamports = state
+            .bank
+            .get_minimum_balance_for_rent_exemption(4_008)
+            .saturating_add(1);
+        let transaction = Transaction::new_signed_with_payer(
+            &[
+                system_instruction::create_account(
+                    &genesis.mint_keypair.pubkey(),
+                    &stake_account.pubkey(),
+                    lamports,
+                    4_008,
+                    &solana_stake_program::id(),
+                ),
+                Instruction::new(
+                    solana_stake_program::id(),
+                    &StakeInstruction::Initialize(authorized, Lockup::default()),
+                    vec![
+                        AccountMeta::new(stake_account.pubkey(), false),
+                        AccountMeta::new_readonly(sysvar::rent::id(), false),
+                    ],
+                ),
+            ],
+            Some(&genesis.mint_keypair.pubkey()),
+            &[&genesis.mint_keypair, &stake_account],
+            state.bank.last_blockhash(),
+        );
+
+        let processed = state
+            .process_entry(request_for(&state, 0, 0, 1, &[transaction]))
+            .unwrap();
+        assert_eq!(
+            processed.outcomes[0].error,
+            Some(WireTransactionError::InstructionError {
+                instruction_index: 1,
+                error: WireInstructionError::InvalidAccountData,
+            })
+        );
     }
 
     #[test]

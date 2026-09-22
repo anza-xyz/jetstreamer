@@ -207,7 +207,7 @@ pub struct SnapshotExport {
     pub archive_sha256: Vec<u8>,
 }
 
-/// The normalized Solana v1 transaction-error superset through v1.1.23.
+/// The normalized Solana v1 transaction-error superset through v1.6.15.
 /// Older workers emit only the variants present in their exact release.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum TransactionError {
@@ -231,9 +231,11 @@ pub enum TransactionError {
     SanitizeFailure,
     /// Appended for v1.1.23. Existing variant discriminants remain unchanged.
     ClusterMaintenance,
+    /// Appended for v1.6.15. Existing variant discriminants remain unchanged.
+    AccountBorrowOutstanding,
 }
 
-/// The normalized Solana v1 instruction-error superset through v1.5.19.
+/// The normalized Solana v1 instruction-error superset through v1.6.15.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum InstructionError {
     GenericError,
@@ -295,6 +297,11 @@ pub enum InstructionError {
     BorshIoError,
     AccountNotRentExempt,
     InvalidAccountOwner,
+    /// Appended in the same order as the v1.6.15 SDK enum. Existing variant
+    /// discriminants remain unchanged.
+    ArithmeticOverflow,
+    UnsupportedSysvar,
+    IllegalOwner,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -601,6 +608,25 @@ mod tests {
             (InstructionError::BorshIoError, 44u32),
             (InstructionError::AccountNotRentExempt, 45),
             (InstructionError::InvalidAccountOwner, 46),
+        ];
+        for (error, discriminant) in cases.iter() {
+            assert_eq!(
+                bincode::serialize(error).unwrap(),
+                discriminant.to_le_bytes()
+            );
+        }
+    }
+
+    #[test]
+    fn v1_6_error_extensions_preserve_all_prior_discriminants() {
+        assert_eq!(
+            bincode::serialize(&TransactionError::AccountBorrowOutstanding).unwrap(),
+            16u32.to_le_bytes()
+        );
+        let cases = [
+            (InstructionError::ArithmeticOverflow, 47u32),
+            (InstructionError::UnsupportedSysvar, 48),
+            (InstructionError::IllegalOwner, 49),
         ];
         for (error, discriminant) in cases.iter() {
             assert_eq!(

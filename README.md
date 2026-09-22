@@ -385,14 +385,15 @@ select a runtime. The current registry is deliberately conservative:
 | `43,632,000..51,408,000` | pinned Solana v1.3.23 worker | independently verified snapshot restart; every cohort must match all canonical post-bootstrap roots | unqualified diagnostic candidate for epochs 101-118 |
 | `51,408,000..63,936,000` | pinned Solana v1.4.25 worker | independently verified snapshot restart; carries the v1.4 transaction-status vocabulary through the shared stream protocol; every cohort must match all canonical post-bootstrap roots | unqualified diagnostic candidate for epochs 119-147 |
 | `63,936,000..75,168,000` | pinned Solana v1.5.19 worker | independently verified snapshot restart; normalizes the v1.5 status renames and additions for current plugins; every cohort must match all canonical post-bootstrap roots | unqualified diagnostic candidate for epochs 148-173 |
-| `75,168,000..406,080,000` | none | unsupported; replay fails closed | unsupported |
+| `75,168,000..86,832,000` | pinned Solana v1.6.15 worker | independently verified snapshot restart; reproduces the v1.6 loader set, write-lock demotion, and expanded status vocabulary for current plugins; every cohort must match all canonical post-bootstrap roots | unqualified diagnostic candidate for epochs 174-200 |
+| `86,832,000..406,080,000` | none | unsupported; replay fails closed | unsupported |
 | `406,080,000..` | in-process Agave v3 | independently verified modern snapshot bootstrap | verified |
 
 Verified epochs 0-100 use 12 execution envelopes backed by 11 historical worker variants. The
 11 runtime boundaries consist of one hash-bound canonical state handoff, two source-lineage-verified
 epoch-67 handoffs, and eight independently verified snapshot restarts. The
 v1.2.32 worker is used on both sides of the two specialized epoch-67 ranges. The v1.3.23,
-v1.4.25, and v1.5.19 candidates add three snapshot-isolated envelopes. Each remains
+v1.4.25, v1.5.19, and v1.6.15 candidates add four snapshot-isolated envelopes. Each remains
 unqualified until replay matches every root in its first complete cohort.
 
 Five execution interventions go beyond choosing a pinned worker and restarting from an independently

@@ -6941,6 +6941,7 @@ fn historical_worker_profile(
         compatibility::RuntimeBackend::SolanaV1_3_23 => historical::SOLANA_V1_3_23_CANDIDATE,
         compatibility::RuntimeBackend::SolanaV1_4_25 => historical::SOLANA_V1_4_25_CANDIDATE,
         compatibility::RuntimeBackend::SolanaV1_5_19 => historical::SOLANA_V1_5_19_CANDIDATE,
+        compatibility::RuntimeBackend::SolanaV1_6_15 => historical::SOLANA_V1_6_15_CANDIDATE,
         compatibility::RuntimeBackend::AgaveV3 => {
             return Err(
                 "the in-process Agave runtime has no historical worker profile".to_string(),
@@ -9976,7 +9977,8 @@ async fn run_geyser_replay(
             | compatibility::RuntimeBackend::SolanaV1_3_19
             | compatibility::RuntimeBackend::SolanaV1_3_23
             | compatibility::RuntimeBackend::SolanaV1_4_25
-            | compatibility::RuntimeBackend::SolanaV1_5_19 => {
+            | compatibility::RuntimeBackend::SolanaV1_5_19
+            | compatibility::RuntimeBackend::SolanaV1_6_15 => {
                 let worker_profile = historical_worker_profile(runtime_descriptor)?;
                 if let Some(CarriedRuntimeState::Historical {
                     client,
@@ -11886,7 +11888,8 @@ fn validated_epoch_archive_multi_runtime(
         | compatibility::RuntimeBackend::SolanaV1_3_19
         | compatibility::RuntimeBackend::SolanaV1_3_23
         | compatibility::RuntimeBackend::SolanaV1_4_25
-        | compatibility::RuntimeBackend::SolanaV1_5_19 => StateCommitmentKind::LegacyAccountsHash,
+        | compatibility::RuntimeBackend::SolanaV1_5_19
+        | compatibility::RuntimeBackend::SolanaV1_6_15 => StateCommitmentKind::LegacyAccountsHash,
         compatibility::RuntimeBackend::AgaveV3 => StateCommitmentKind::AccountsLtHash,
     };
     if provenance.bootstrap_state.kind != expected_commitment_kind {

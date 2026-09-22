@@ -136,6 +136,11 @@ const SOLANA_V1_5_19_TAG: &str = "v1.5.19";
 const SOLANA_V1_5_19_COMMIT: &str = "936ff7424e1306b0df07dabcd6863bf7896d2cb5";
 const SOLANA_V1_5_19_RUST_TOOLCHAIN: &str = "rustc 1.49.0 (e1884a8e3 2020-12-29)";
 const SOLANA_V1_5_19_TARGET: &str = "x86_64-unknown-linux-gnu";
+const SOLANA_V1_6_15_BACKEND_ID: &str = "solana-v1.6.15";
+const SOLANA_V1_6_15_TAG: &str = "v1.6.15";
+const SOLANA_V1_6_15_COMMIT: &str = "5c2dab8055e8162386fcac313b6547f223fd386c";
+const SOLANA_V1_6_15_RUST_TOOLCHAIN: &str = "rustc 1.51.0 (2fd73fabe 2021-03-23)";
+const SOLANA_V1_6_15_TARGET: &str = "x86_64-unknown-linux-gnu";
 
 fn backend_supports_entry_batches(backend_id: &str) -> bool {
     matches!(
@@ -156,6 +161,7 @@ fn backend_supports_entry_batches(backend_id: &str) -> bool {
             | SOLANA_V1_3_23_BACKEND_ID
             | SOLANA_V1_4_25_BACKEND_ID
             | SOLANA_V1_5_19_BACKEND_ID
+            | SOLANA_V1_6_15_BACKEND_ID
     )
 }
 
@@ -363,6 +369,16 @@ pub const SOLANA_V1_5_19_CANDIDATE: WorkerProfile = WorkerProfile {
     solana_commit: SOLANA_V1_5_19_COMMIT,
     rust_toolchain: SOLANA_V1_5_19_RUST_TOOLCHAIN,
     target: SOLANA_V1_5_19_TARGET,
+    required_genesis_hash: protocol::MAINNET_GENESIS_HASH,
+    snapshot_archive_extensions: &[".tar.bz2", ".tar.zst"],
+};
+
+pub const SOLANA_V1_6_15_CANDIDATE: WorkerProfile = WorkerProfile {
+    backend_id: SOLANA_V1_6_15_BACKEND_ID,
+    solana_tag: SOLANA_V1_6_15_TAG,
+    solana_commit: SOLANA_V1_6_15_COMMIT,
+    rust_toolchain: SOLANA_V1_6_15_RUST_TOOLCHAIN,
+    target: SOLANA_V1_6_15_TARGET,
     required_genesis_hash: protocol::MAINNET_GENESIS_HASH,
     snapshot_archive_extensions: &[".tar.bz2", ".tar.zst"],
 };
@@ -2434,7 +2450,7 @@ pub fn encode_legacy_transaction(
 }
 
 /// Normalize a current transaction status into the version-neutral historical
-/// vocabulary through v1.1.23. Newer-only statuses fail closed instead of
+/// vocabulary through v1.6.15. Newer-only statuses fail closed instead of
 /// being conflated.
 pub fn normalize_transaction_error(
     error: &CurrentTransactionError,
@@ -2462,8 +2478,8 @@ pub fn normalize_transaction_error(
         Current::InvalidProgramForExecution => Old::InvalidProgramForExecution,
         Current::SanitizeFailure => Old::SanitizeFailure,
         Current::ClusterMaintenance => Old::ClusterMaintenance,
-        Current::AccountBorrowOutstanding
-        | Current::WouldExceedMaxBlockCostLimit
+        Current::AccountBorrowOutstanding => Old::AccountBorrowOutstanding,
+        Current::WouldExceedMaxBlockCostLimit
         | Current::UnsupportedVersion
         | Current::InvalidWritableAccount
         | Current::WouldExceedMaxAccountCostLimit
@@ -2493,7 +2509,7 @@ pub fn normalize_transaction_error(
 }
 
 /// Normalize a current instruction status into the version-neutral historical
-/// vocabulary through v1.5.19. `Custom` preserves its numeric value.
+/// vocabulary through v1.6.15. `Custom` preserves its numeric value.
 #[allow(deprecated)]
 pub fn normalize_instruction_error(
     error: &CurrentInstructionError,
@@ -2549,10 +2565,10 @@ pub fn normalize_instruction_error(
         Current::BorshIoError => Old::BorshIoError,
         Current::AccountNotRentExempt => Old::AccountNotRentExempt,
         Current::InvalidAccountOwner => Old::InvalidAccountOwner,
-        Current::ArithmeticOverflow
-        | Current::UnsupportedSysvar
-        | Current::IllegalOwner
-        | Current::MaxAccountsDataAllocationsExceeded
+        Current::ArithmeticOverflow => Old::ArithmeticOverflow,
+        Current::UnsupportedSysvar => Old::UnsupportedSysvar,
+        Current::IllegalOwner => Old::IllegalOwner,
+        Current::MaxAccountsDataAllocationsExceeded
         | Current::MaxAccountsExceeded
         | Current::MaxInstructionTraceLengthExceeded
         | Current::BuiltinProgramsMustConsumeComputeUnits => {
@@ -2563,7 +2579,7 @@ pub fn normalize_instruction_error(
     })
 }
 
-/// Convert a historical transaction status through v1.1.23 back into the
+/// Convert a historical transaction status through v1.6.15 back into the
 /// current status type used by Horizon metadata.
 pub fn denormalize_transaction_error(
     error: &protocol::TransactionError,
@@ -2591,10 +2607,11 @@ pub fn denormalize_transaction_error(
         Old::InvalidProgramForExecution => Current::InvalidProgramForExecution,
         Old::SanitizeFailure => Current::SanitizeFailure,
         Old::ClusterMaintenance => Current::ClusterMaintenance,
+        Old::AccountBorrowOutstanding => Current::AccountBorrowOutstanding,
     }
 }
 
-/// Convert a historical instruction status through v1.5.19 into the current
+/// Convert a historical instruction status through v1.6.15 into the current
 /// superset.
 #[allow(deprecated)]
 pub fn denormalize_instruction_error(
@@ -2651,6 +2668,9 @@ pub fn denormalize_instruction_error(
         Old::BorshIoError => Current::BorshIoError,
         Old::AccountNotRentExempt => Current::AccountNotRentExempt,
         Old::InvalidAccountOwner => Current::InvalidAccountOwner,
+        Old::ArithmeticOverflow => Current::ArithmeticOverflow,
+        Old::UnsupportedSysvar => Current::UnsupportedSysvar,
+        Old::IllegalOwner => Current::IllegalOwner,
     }
 }
 
@@ -3862,6 +3882,7 @@ mod tests {
         assert!(backend_supports_entry_batches(SOLANA_V1_3_23_BACKEND_ID));
         assert!(backend_supports_entry_batches(SOLANA_V1_4_25_BACKEND_ID));
         assert!(backend_supports_entry_batches(SOLANA_V1_5_19_BACKEND_ID));
+        assert!(backend_supports_entry_batches(SOLANA_V1_6_15_BACKEND_ID));
         assert!(!backend_supports_entry_batches(SOLANA_V1_0_24_BACKEND_ID));
         assert!(!backend_supports_entry_batches("unknown"));
     }
@@ -5324,6 +5345,7 @@ mod tests {
             SOLANA_V1_3_23_CANDIDATE,
             SOLANA_V1_4_25_CANDIDATE,
             SOLANA_V1_5_19_CANDIDATE,
+            SOLANA_V1_6_15_CANDIDATE,
         ] {
             assert_eq!(
                 profile.snapshot_archive_extensions,
@@ -5365,6 +5387,7 @@ mod tests {
             SOLANA_V1_3_23_CANDIDATE,
             SOLANA_V1_4_25_CANDIDATE,
             SOLANA_V1_5_19_CANDIDATE,
+            SOLANA_V1_6_15_CANDIDATE,
         ] {
             verify_handshake(profile, &valid_handshake_for(profile)).unwrap();
         }
@@ -5558,7 +5581,7 @@ mod tests {
     }
 
     #[test]
-    fn maps_every_v1_1_transaction_status_and_rejects_newer_statuses() {
+    fn maps_every_v1_6_transaction_status_and_rejects_newer_statuses() {
         use CurrentTransactionError as Current;
         use protocol::TransactionError as Old;
 
@@ -5591,6 +5614,10 @@ mod tests {
             ),
             (Current::SanitizeFailure, Old::SanitizeFailure),
             (Current::ClusterMaintenance, Old::ClusterMaintenance),
+            (
+                Current::AccountBorrowOutstanding,
+                Old::AccountBorrowOutstanding,
+            ),
         ];
         for (current, expected) in cases {
             assert_eq!(normalize_transaction_error(&current).unwrap(), expected);
@@ -5606,7 +5633,7 @@ mod tests {
 
     #[test]
     #[allow(deprecated)]
-    fn maps_every_v1_5_instruction_status_and_rejects_newer_statuses() {
+    fn maps_every_v1_6_instruction_status_and_rejects_newer_statuses() {
         use CurrentInstructionError as Current;
         use protocol::InstructionError as Old;
 
@@ -5691,15 +5718,18 @@ mod tests {
             (Current::BorshIoError, Old::BorshIoError),
             (Current::AccountNotRentExempt, Old::AccountNotRentExempt),
             (Current::InvalidAccountOwner, Old::InvalidAccountOwner),
+            (Current::ArithmeticOverflow, Old::ArithmeticOverflow),
+            (Current::UnsupportedSysvar, Old::UnsupportedSysvar),
+            (Current::IllegalOwner, Old::IllegalOwner),
         ];
         for (current, expected) in cases {
             assert_eq!(normalize_instruction_error(&current).unwrap(), expected);
             assert_eq!(denormalize_instruction_error(&expected), current);
         }
         assert!(matches!(
-            normalize_instruction_error(&Current::ArithmeticOverflow),
+            normalize_instruction_error(&Current::MaxAccountsDataAllocationsExceeded),
             Err(HistoricalRuntimeError::UnsupportedInstructionError(
-                Current::ArithmeticOverflow
+                Current::MaxAccountsDataAllocationsExceeded
             ))
         ));
     }

@@ -19,6 +19,89 @@ fn writer_defaults_to_measured_archival_zstd_level() {
     assert_eq!(ArchiveWriterConfig::default().zstd_level, 9);
 }
 
+#[test]
+fn historical_epoch_boundary_pre_updates_exceed_legacy_16k_cap() {
+    const OBSERVED_MINIMUM: usize = 16_385;
+    let mut writer = ArchiveWriter::new(
+        Vec::new(),
+        174,
+        75_168_000,
+        1,
+        ArchiveWriterConfig {
+            compression: Compression::None,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    writer.begin_slot(75_168_000).unwrap();
+    for write_version in 0..OBSERVED_MINIMUM as u64 {
+        writer
+            .write_orphan_update(&AccountUpdateView {
+                pubkey: Address::new_from_array([7; 32]),
+                lamports: write_version,
+                owner: Address::new_from_array([9; 32]),
+                executable: false,
+                rent_epoch: 0,
+                write_version,
+                data: &[],
+            })
+            .unwrap();
+    }
+    let mut meta = BlockMeta::new_boxed();
+    meta.slot = 75_168_000;
+    writer.end_slot(&meta, &[]).unwrap();
+    let (archive, _) = writer.finish().unwrap();
+
+    #[derive(Default)]
+    struct CountPreUpdates(usize);
+    impl SlotVisitor for CountPreUpdates {
+        fn on_pre_account_update(&mut self, _slot: u64, _update: &AccountUpdateView<'_>) {
+            self.0 += 1;
+        }
+    }
+
+    let mut reader = ArchiveReader::open(std::io::Cursor::new(archive)).unwrap();
+    let mut count = CountPreUpdates::default();
+    reader.read_slots(0, u64::MAX, &mut count).unwrap();
+    assert_eq!(count.0, OBSERVED_MINIMUM);
+}
+
+#[test]
+fn pre_update_count_ceiling_remains_fail_closed() {
+    let mut writer = ArchiveWriter::new(
+        Vec::new(),
+        174,
+        75_168_000,
+        1,
+        ArchiveWriterConfig {
+            compression: Compression::None,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    writer.begin_slot(75_168_000).unwrap();
+    let update = AccountUpdateView {
+        pubkey: Address::new_from_array([7; 32]),
+        lamports: 1,
+        owner: Address::new_from_array([9; 32]),
+        executable: false,
+        rent_epoch: 0,
+        write_version: 0,
+        data: &[],
+    };
+    for _ in 0..crate::limits::MAX_SLOT_PRE_UPDATES {
+        writer.write_orphan_update(&update).unwrap();
+    }
+    assert!(matches!(
+        writer.write_orphan_update(&update),
+        Err(ArchiveFormatError::SectionTooLarge {
+            section: "pre-transaction account updates",
+            bytes: 65_537,
+            limit: 65_536,
+        })
+    ));
+}
+
 fn sample_archive_provenance_v1() -> ArchiveProvenanceV1 {
     ArchiveProvenanceV1 {
         generation_profile: "jetstreamer-node/historical-replay-v1".into(),

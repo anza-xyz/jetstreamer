@@ -135,6 +135,7 @@ class SnapshotObject:
     generation: int
     metageneration: int
     crc32c: str
+    md5_hash: Optional[str]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -224,6 +225,21 @@ def _validate_crc32c(value: str, context: str) -> None:
         raise PreflightError(f"{context}: crc32c must encode exactly four bytes")
 
 
+def _optional_md5_hash(metadata: Mapping[str, Any], context: str) -> Optional[str]:
+    value = metadata.get("md5Hash")
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value:
+        raise PreflightError(f"{context}: md5Hash must be a non-empty string")
+    try:
+        decoded = base64.b64decode(value, validate=True)
+    except (binascii.Error, ValueError) as error:
+        raise PreflightError(f"{context}: md5Hash is not canonical base64") from error
+    if len(decoded) != 16 or base64.b64encode(decoded).decode("ascii") != value:
+        raise PreflightError(f"{context}: md5Hash must encode exactly 16 bytes")
+    return value
+
+
 def _parse_snapshot_object(
     raw: Any,
     source: str,
@@ -274,6 +290,7 @@ def _parse_snapshot_object(
     size = _canonical_u64(metadata.get("size"), "metadata.size", context, nonzero=True)
     crc32c = _required_string(metadata, "crc32c", context)
     _validate_crc32c(crc32c, context)
+    md5_hash = _optional_md5_hash(metadata, context)
 
     uri = f"{BUCKET_URI}/{object_name}"
     expected_versioned_uri = f"{uri}#{generation_text}"
@@ -316,6 +333,7 @@ def _parse_snapshot_object(
         generation=generation,
         metageneration=metageneration,
         crc32c=crc32c,
+        md5_hash=md5_hash,
     )
 
 
@@ -411,6 +429,24 @@ def _unique_newest(
         (item for item in candidates if item.slot == newest_slot),
         key=lambda item: item.versioned_uri,
     )
+    # Historical snapshots were sometimes copied byte-for-byte from an hourly
+    # path into the canonical root path. Treat those as one candidate only
+    # when both GCS content digests and every snapshot identity field agree.
+    if len(newest) > 1:
+        identities = {
+            (
+                item.accounts_hash,
+                item.extension,
+                item.size,
+                item.crc32c,
+                item.md5_hash,
+            )
+            for item in newest
+        }
+        if len(identities) == 1 and newest[0].md5_hash is not None:
+            root_copies = [item for item in newest if item.source == "root"]
+            if len(root_copies) == 1:
+                return root_copies[0]
     if len(newest) != 1:
         choices = ", ".join(item.versioned_uri for item in newest)
         raise PreflightError(

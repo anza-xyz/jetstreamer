@@ -383,7 +383,7 @@ select a runtime. The current registry is deliberately conservative:
 | `29,808,000..39,744,000` | pinned Solana v1.2.32 worker | independently verified snapshot restart | diagnostic candidate for epochs 69-91 |
 | `39,744,000..43,632,000` | pinned Solana v1.3.19 worker | independently verified snapshot restart; bounded extractor admits up to 131,072 members for the audited 104,267–106,520-member epoch-98 through epoch-100 snapshots | diagnostic candidate for epochs 92-100 |
 | `43,632,000..51,408,000` | pinned Solana v1.3.23 worker | independently verified snapshot restart; every cohort must match all canonical post-bootstrap roots | unqualified diagnostic candidate for epochs 101-118 |
-| `51,408,000..63,936,000` | pinned Solana v1.4.25 worker | independently verified snapshot restart; carries the v1.4 transaction-status vocabulary through the shared stream protocol; every cohort must match all canonical post-bootstrap roots | unqualified diagnostic candidate for epochs 119-147 |
+| `51,408,000..63,936,000` | pinned Solana v1.4.25 worker | independently verified snapshot restart; carries the v1.4 transaction-status vocabulary through the shared stream protocol; the checkpoint-free epoch 119 is joined to epoch 120 and every cohort must match all canonical post-bootstrap roots | unqualified diagnostic candidate for epochs 119-147 |
 | `63,936,000..75,168,000` | pinned Solana v1.5.19 worker | independently verified snapshot restart; normalizes the v1.5 status renames and additions for current plugins; every cohort must match all canonical post-bootstrap roots | unqualified diagnostic candidate for epochs 148-173 |
 | `75,168,000..86,832,000` | pinned Solana v1.6.15 worker | independently verified snapshot restart; reproduces the v1.6 loader set, write-lock demotion, and expanded status vocabulary for current plugins; every cohort must match all canonical post-bootstrap roots | unqualified diagnostic candidate for epochs 174-200 |
 | `86,832,000..406,080,000` | none | unsupported; replay fails closed | unsupported |
@@ -416,6 +416,14 @@ Input repair is planned independently of execution and adds three more historica
 Using this narrower definition, which excludes ordinary version pinning, snapshot-format support,
 PoH optimization, and AccountsDB maintenance, epochs 0-100 currently require eight distinct
 slot- or record-specific compatibility interventions.
+
+Snapshot selection and current-plugin streaming add two non-execution compatibility rules for the
+later range. Both are general invariants rather than slot-special-case branches:
+
+| First observed at | General handling | Safety boundary |
+|---|---|---|
+| bootstrap slot `61,328,765` for epoch 142 | coalesce an hourly object and canonical root object only when slot, accounts hash, extension, byte length, CRC32C, and MD5 all match; prefer the root object | any digest or identity disagreement remains an ambiguous-preflight failure |
+| epoch-boundary slot `75,168,000` | permit up to 65,536 pre-transaction runtime-direct account writes and 65,536 reward records in one archive block (observed: 19,300+ writes and 18,552 rewards) | both counts remain finite and the independent 32 MiB account-data arena, per-account, bucket, and decode-work limits remain enforced; wire encoding is unchanged |
 
 Archive-container repair is tracked separately from execution compatibility. Early independently
 generated epoch 1-6 files can carry the old writer's zero placeholder as both their first bucket

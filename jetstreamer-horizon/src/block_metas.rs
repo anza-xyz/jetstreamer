@@ -482,6 +482,18 @@ mod tests {
                 commission: None,
             });
         }
+        assert!(
+            src.rewards
+                .try_push(Reward {
+                    pubkey: Address::default(),
+                    lamports: 0,
+                    post_balance: 0,
+                    reward_type: None,
+                    commission: None,
+                })
+                .is_err(),
+            "reward count must remain fail-closed above the configured ceiling"
+        );
         let mut buf = vec![0u8; 4 << 20];
         let mut cur = lencode::io::Cursor::new(&mut buf[..]);
         let n = src.encode_ext(&mut cur, None).unwrap();

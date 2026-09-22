@@ -109,16 +109,18 @@ pub const MAX_TX_TOKEN_BALANCES: usize = MAX_TX_ACCOUNTS;
 /// typical custom error strings are tiny program-defined messages.
 pub const MAX_CUSTOM_ERROR_LEN: usize = 256;
 
-/// Max rewards in a single block's reward list. Practical: partitioned
-/// epoch-reward distribution credits at most 4 096 stake accounts per slot;
-/// headroom for the boundary slot's vote-reward burst.
-pub const MAX_BLOCK_REWARDS: usize = 8_192;
+/// Max rewards in a single block's reward list. Historical epoch-boundary
+/// processing at mainnet slot 75,168,000 reports 18,552 rewards in one block.
+/// The 65,536-record ceiling leaves measured headroom while remaining finite
+/// and below the archive bucket's independent byte and decode-work limits.
+pub const MAX_BLOCK_REWARDS: usize = 65_536;
 
 /// Max runtime-direct ("orphan") account updates attached to one block's
-/// pre-transaction phase. Practical: dominated by the epoch-boundary
-/// vote-reward burst (one write per vote account) plus per-slot sysvars and
-/// a 4 096-entry stake reward partition.
-pub const MAX_SLOT_PRE_UPDATES: usize = 16_384;
+/// pre-transaction phase. Historical epoch-boundary processing at mainnet
+/// slot 75,168,000 emits more than 16,384 writes before transactions. Keep a
+/// finite 65,536-record ceiling while the independent 32 MiB data-arena and
+/// bucket limits continue to bound memory and decoding work.
+pub const MAX_SLOT_PRE_UPDATES: usize = 65_536;
 
 /// Combined data-byte cap for one block's pre-transaction orphan updates.
 /// Practical: worst case ≈ vote-reward burst (thousands of ~3.7 KiB vote

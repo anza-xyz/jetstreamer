@@ -17,6 +17,7 @@ import preflight_gcs_snapshots as preflight  # noqa: E402
 ZERO_HASH = "1" * 32
 ONE_HASH = "1" * 31 + "2"
 CRC32C = "AAAAAA=="
+MD5_HASH = "AAAAAAAAAAAAAAAAAAAAAA=="
 
 
 def inventory_record(
@@ -28,6 +29,7 @@ def inventory_record(
     identity: str = ZERO_HASH,
     size: int = 100,
     generation: int | None = None,
+    md5_hash: str | None = MD5_HASH,
 ) -> dict:
     anchor = slot if anchor is None else anchor
     generation = slot + 1 if generation is None else generation
@@ -43,6 +45,7 @@ def inventory_record(
             "metageneration": "1",
             "name": name,
             "size": str(size),
+            **({"md5Hash": md5_hash} if md5_hash is not None else {}),
         },
         "type": "cloud_object",
         "url": f"{preflight.BUCKET_URI}/{name}#{generation}",
@@ -425,6 +428,72 @@ class SelectionTests(unittest.TestCase):
 
         with self.assertRaisesRegex(preflight.PreflightError, "newest.*ambiguous"):
             preflight.build_epoch_plans(root, (), epoch, epoch)
+
+    def test_byte_identical_hourly_copy_prefers_canonical_root_bootstrap(self) -> None:
+        epoch = 61
+        boundary = epoch * preflight.EPOCH_SLOTS - 1
+        checkpoint = epoch * preflight.EPOCH_SLOTS + 1
+        root = preflight.parse_inventory_json(
+            json.dumps(
+                [
+                    inventory_record(boundary, extension=".tar.zst", generation=10),
+                    inventory_record(checkpoint, extension=".tar.zst"),
+                ]
+            ),
+            "root",
+        )
+        hourly = preflight.parse_inventory_json(
+            json.dumps(
+                [
+                    inventory_record(
+                        boundary,
+                        source="hourly",
+                        anchor=boundary - 100,
+                        extension=".tar.zst",
+                        generation=11,
+                    )
+                ]
+            ),
+            "hourly",
+        )
+
+        plan = preflight.build_epoch_plans(root, hourly, epoch, epoch)[0]
+
+        self.assertEqual(plan.bootstrap.source, "root")
+        self.assertEqual(plan.bootstrap.generation, 10)
+
+    def test_hourly_copy_with_different_md5_remains_ambiguous(self) -> None:
+        epoch = 61
+        boundary = epoch * preflight.EPOCH_SLOTS - 1
+        root = preflight.parse_inventory_json(
+            json.dumps(
+                [
+                    inventory_record(boundary, extension=".tar.zst"),
+                    inventory_record(
+                        epoch * preflight.EPOCH_SLOTS + 1,
+                        extension=".tar.zst",
+                    ),
+                ]
+            ),
+            "root",
+        )
+        hourly = preflight.parse_inventory_json(
+            json.dumps(
+                [
+                    inventory_record(
+                        boundary,
+                        source="hourly",
+                        anchor=boundary - 100,
+                        extension=".tar.zst",
+                        md5_hash="AQAAAAAAAAAAAAAAAAAAAA==",
+                    )
+                ]
+            ),
+            "hourly",
+        )
+
+        with self.assertRaisesRegex(preflight.PreflightError, "newest.*ambiguous"):
+            preflight.build_epoch_plans(root, hourly, epoch, epoch)
 
     def test_hourly_object_does_not_satisfy_checkpoint_requirement(self) -> None:
         epoch = 12

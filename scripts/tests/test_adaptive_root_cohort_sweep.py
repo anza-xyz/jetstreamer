@@ -946,6 +946,28 @@ class AdmissionTests(unittest.TestCase):
             3,
         )
 
+    def test_configured_concurrency_can_exceed_legacy_eight_lane_cap(self) -> None:
+        parser = sweep.build_argument_parser()
+
+        def options(maximum: int) -> argparse.Namespace:
+            return parser.parse_args(
+                [
+                    "--deploy-dir=/deploy",
+                    "--manifest=/deploy/manifest.json",
+                    "--manifest-fingerprint=sha256:" + "a" * 64,
+                    "--public-private-root=/private",
+                    "--state-dir=/state",
+                    "--lane=lane-a=/lane-a",
+                    "--initial-concurrency=1",
+                    f"--target-concurrency={maximum}",
+                    f"--max-concurrency={maximum}",
+                ]
+            )
+
+        sweep.validate_options(options(9))
+        with self.assertRaisesRegex(sweep.SweepError, "max <= 32"):
+            sweep.validate_options(options(33))
+
 
 class PublicStateTests(unittest.TestCase):
     def test_public_batch_marker_must_be_one_safe_real_directory(self) -> None:
@@ -1543,10 +1565,20 @@ class CrashSafetyTests(unittest.TestCase):
             ),
             mock.patch.object(sweep.subprocess, "run", return_value=launched),
         ):
-            self.assertEqual(controller.schedule(), 1)
+            self.assertEqual(controller._schedule_locked(), 1)
 
         self.assertEqual(persisted_phases, ["launching", "producer"])
         self.assertNotIn("failed", persisted_phases)
+
+    def test_schedule_serializes_cross_controller_admission(self) -> None:
+        controller = object.__new__(sweep.Controller)
+        admission = mock.Mock(return_value=contextlib.nullcontext())
+        controller.serialized_public_import_admission = admission
+        controller._schedule_locked = mock.Mock(return_value=1)
+
+        self.assertEqual(controller.schedule(), 1)
+        admission.assert_called_once_with()
+        controller._schedule_locked.assert_called_once_with()
 
     def test_nonzero_producer_launch_with_existing_unit_remains_launching(self) -> None:
         cohort = sweep.Cohort(22, 22, "solana-v1.0.23")
@@ -1713,7 +1745,7 @@ class SchedulingTests(unittest.TestCase):
             mock.patch.object(sweep, "discover_epoch_claims", return_value=()),
             mock.patch.object(sweep, "public_output_files", return_value=()),
         ):
-            self.assertEqual(controller.schedule(), 1)
+            self.assertEqual(controller._schedule_locked(), 1)
 
         launched = controller.launch_producer.call_args.args
         self.assertEqual(launched[2], adopt_only)
@@ -1740,7 +1772,7 @@ class SchedulingTests(unittest.TestCase):
             ),
             mock.patch.object(sweep, "public_output_files", return_value=()),
         ):
-            self.assertEqual(controller.schedule(), 1)
+            self.assertEqual(controller._schedule_locked(), 1)
 
         launched = controller.launch_producer.call_args.args
         self.assertEqual(launched[2], scheduled)

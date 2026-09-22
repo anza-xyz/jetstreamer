@@ -586,7 +586,11 @@ Concurrency begins at the configured floor and increases gradually when CPU, mem
 headroom allow it. Disk admission reserves a fixed safety margin and conservatively budgets the
 full configured private-storage allowance for every live producer before starting another one;
 it never terminates live work merely because available space falls below that estimate. Every
-producer runs as the unprivileged `sol` user in a resource-bounded systemd unit.
+producer runs as the unprivileged `sol` user in a resource-bounded systemd unit. A plan may
+configure up to 32 lanes, but admission is still capped by the number of provisioned lanes and by
+the live CPU, hard-cgroup-memory, and disk calculations. The final global claim check and launch
+are serialized through the bound public-directory lock, so controllers for different runtime eras
+cannot consume the same capacity slot concurrently.
 The controller will adopt existing work only when the process identity, arguments, cgroup, lane,
 runtime, manifest, and complete sandbox configuration match the sealed plan. Overlapping epoch or
 lane claims stop scheduling.

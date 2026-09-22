@@ -50,6 +50,7 @@ DEFAULT_LAST_EPOCH = 100
 DEFAULT_INITIAL_CONCURRENCY = 2
 DEFAULT_TARGET_CONCURRENCY = 6
 DEFAULT_MAX_CONCURRENCY = 8
+MAX_CONFIGURED_CONCURRENCY = 32
 DEFAULT_SETTLE_SECONDS = 600
 DEFAULT_POLL_SECONDS = 15
 DEFAULT_MEMORY_HIGH_GIB = 48
@@ -3436,6 +3437,13 @@ class Controller:
         return capacity
 
     def schedule(self) -> int:
+        # Every controller observes producers from all runtime-era queues.
+        # Serialize the final capacity check and launch so two controllers
+        # cannot both consume the same last global slot.
+        with self.serialized_public_import_admission():
+            return self._schedule_locked()
+
+    def _schedule_locked(self) -> int:
         if self.state.get("import_owner") is not None or public_recovery_marker_present(
             self.args.public_dir, self.sol_uid
         ):
@@ -3610,9 +3618,15 @@ def validate_options(args: argparse.Namespace) -> None:
     if args.first_epoch > args.last_epoch:
         raise SweepError("first epoch exceeds last epoch")
     if not (
-        args.initial_concurrency <= args.target_concurrency <= args.max_concurrency <= 8
+        args.initial_concurrency
+        <= args.target_concurrency
+        <= args.max_concurrency
+        <= MAX_CONFIGURED_CONCURRENCY
     ):
-        raise SweepError("concurrency must satisfy initial <= target <= max <= 8")
+        raise SweepError(
+            "concurrency must satisfy initial <= target <= max "
+            f"<= {MAX_CONFIGURED_CONCURRENCY}"
+        )
     if args.memory_high_gib >= args.memory_max_gib:
         raise SweepError("memory-high-gib must be lower than memory-max-gib")
     if args.execute and not args.controller_sha256:

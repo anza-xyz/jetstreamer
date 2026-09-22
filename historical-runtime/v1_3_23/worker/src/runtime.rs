@@ -29,14 +29,16 @@ use tempfile::TempDir;
 
 const MAX_AGE_CORRECTION_EPOCH: u64 = 14;
 // The epoch-100 terminal checkpoint is the bootstrap for this candidate.
-// Admit entries only for epochs 101 through 118; epoch 119 is the first
-// checkpoint-gated v1.4 candidate envelope.
-// Compatibility must be demonstrated by trusted checkpoints before the
-// parent may route or publish this candidate. Snapshot creator metadata alone
-// is not treated as evidence that v1.3.23 execution semantics apply out of era.
+// Mainnet was still executing v1.3 stake semantics in epoch 121: transaction
+// 28ijZbni... at slot 52,276,272 initialized a 4,008-byte stake account, while
+// v1.4.11 and later reject any size other than StakeState's exact size. Keep
+// the later envelope available for checkpoint-gated qualification rather than
+// guessing an activation slot from release tags. Compatibility must be
+// demonstrated by trusted checkpoints before the parent may publish a cohort;
+// snapshot creator metadata alone is not evidence that these semantics apply.
 const MIN_SUPPORTED_SNAPSHOT_SLOT: u64 = 43_631_879;
 const MIN_SUPPORTED_ENTRY_SLOT: u64 = MIN_SUPPORTED_SNAPSHOT_SLOT + 1;
-const MAX_SUPPORTED_SLOT_EXCLUSIVE: u64 = 51_408_000;
+const MAX_SUPPORTED_SLOT_EXCLUSIVE: u64 = 63_936_000;
 const POH_THREADS_ENV: &str = "JETSTREAMER_HISTORICAL_POH_THREADS";
 const ABSOLUTE_MAX_POH_THREADS: usize = 256;
 // The validator runs AccountsBackgroundService alongside replay. This worker
@@ -1873,6 +1875,34 @@ mod tests {
             checkpoint.tick_height,
             checkpoint.slot_complete
         );
+        assert_eq!(checkpoint.accounts_hash, expected_accounts_hash);
+    }
+
+    #[test]
+    #[ignore]
+    fn initializes_and_checkpoints_epoch_121_bootstrap_snapshot() {
+        const SNAPSHOT_SLOT: u64 = 52_267_139;
+        let archive = std::env::var("JETSTREAMER_SNAPSHOT_52267139")
+            .expect("set JETSTREAMER_SNAPSHOT_52267139");
+        let ledger =
+            std::env::var("JETSTREAMER_MAINNET_LEDGER").expect("set JETSTREAMER_MAINNET_LEDGER");
+        let (mut state, initialized) = RuntimeState::initialize(
+            &ledger,
+            &jetstreamer_historical_protocol::InitialState::SnapshotArchive {
+                archive_path: archive,
+            },
+            None,
+        )
+        .unwrap();
+        let expected_accounts_hash = match &initialized.source {
+            InitializedSource::SnapshotArchive {
+                expected_accounts_hash,
+                ..
+            } => expected_accounts_hash.clone(),
+            InitializedSource::Genesis => unreachable!(),
+        };
+        assert_eq!(initialized.slot, SNAPSHOT_SLOT);
+        let checkpoint = state.freeze_checkpoint(SNAPSHOT_SLOT).unwrap();
         assert_eq!(checkpoint.accounts_hash, expected_accounts_hash);
     }
 }

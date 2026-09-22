@@ -17,11 +17,11 @@ use tar::{Archive, EntryType};
 use tempfile::{Builder, TempDir};
 
 const SNAPSHOT_VERSION_1_2: &str = "1.2.0";
-// Audited mainnet snapshots at the end of this runtime envelope contain up to
-// 106,520 members (almost entirely AppendVecs). Keep the count bounded to the
-// next power of two: this admits epochs 98-100 with about 23% headroom while
-// retaining a hard inode and tar-framing amplification ceiling.
-const MAX_HANDOFF_ARCHIVE_ENTRIES: u64 = 131_072;
+// Epochs 98-100 contain 104,267 to 106,520 members, while later v1.3 mainnet
+// snapshots exceed 131,072 account-storage members. Match the independently
+// bounded v1.4 envelope; byte, per-member, path, and decompression limits still
+// apply before any bank is decoded.
+const MAX_HANDOFF_ARCHIVE_ENTRIES: u64 = 524_288;
 const MAX_HANDOFF_ARCHIVE_MEMBER_SIZE: u64 = MAX_SNAPSHOT_DATA_FILE_SIZE;
 const MAX_HANDOFF_ARCHIVE_EXTRACTED_SIZE: u64 = 8 * MAX_SNAPSHOT_DATA_FILE_SIZE;
 const MAX_APPEND_VEC_FILE_SIZE: u64 = 16 * 1024 * 1024 * 1024;

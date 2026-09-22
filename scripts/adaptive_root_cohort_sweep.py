@@ -61,6 +61,7 @@ DEFAULT_DISK_RESERVE_GIB = 512
 DEFAULT_DISK_BUDGET_PER_WORKER_GIB = 2048
 DEFAULT_CPUS_PER_LANE = 8
 DEFAULT_CPU_QUOTA_PERCENT = 1000
+RELOAD_STABLE_RESTRICT_NAMESPACES = "cgroup"
 DEFAULT_ACCOUNT = "sam.johnson@anza.xyz"
 DEFAULT_PROJECT = "principal-lane-200702"
 MAX_U64 = (1 << 64) - 1
@@ -845,7 +846,7 @@ def build_producer_command(
         "ProtectControlGroups=yes",
         "ProtectClock=yes",
         "ProtectHostname=yes",
-        "RestrictNamespaces=yes",
+        f"RestrictNamespaces={RELOAD_STABLE_RESTRICT_NAMESPACES}",
         "RestrictRealtime=yes",
         "RestrictSUIDSGID=yes",
         "LockPersonality=yes",
@@ -944,7 +945,7 @@ def build_import_command(
         "ProtectControlGroups=yes",
         "ProtectClock=yes",
         "ProtectHostname=yes",
-        "RestrictNamespaces=yes",
+        f"RestrictNamespaces={RELOAD_STABLE_RESTRICT_NAMESPACES}",
         "RestrictRealtime=yes",
         "RestrictSUIDSGID=yes",
         "LockPersonality=yes",
@@ -1127,6 +1128,80 @@ def systemd_properties(unit: str, names: Sequence[str]) -> dict[str, str] | None
     return properties
 
 
+def read_bounded_proc_file(path: Path, maximum: int) -> bytes:
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(path, flags)
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode):
+            raise SweepError(f"expected a regular proc file: {path}")
+        chunks: list[bytes] = []
+        total = 0
+        while chunk := os.read(descriptor, min(64 * 1024, maximum + 1 - total)):
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > maximum:
+                raise SweepError(f"proc file exceeds {maximum} bytes: {path}")
+        return b"".join(chunks)
+    finally:
+        os.close(descriptor)
+
+
+def reloaded_namespace_filter_is_attested(
+    unit: str,
+    process: ProducerProcess,
+    *,
+    transient_root: Path = Path("/run/systemd/transient"),
+    proc_root: Path = Path("/proc"),
+    manager_uid: int = 0,
+) -> bool:
+    """Recognize systemd 255's lossy serialization of an all-denied mask.
+
+    ``systemd-run RestrictNamespaces=yes`` installs the intended seccomp
+    filter but writes an empty ``RestrictNamespaces=`` line into its transient
+    unit file. A later daemon reload interprets that line as the default
+    policy. The filter already installed in the live process is unaffected.
+    Accept that live process only when the root-owned transient record has the
+    exact lossy marker and the same PID still has no-new-privileges plus active
+    seccomp filters. New units use a reload-stable policy instead.
+    """
+
+    if SYSTEMD_UNIT_RE.fullmatch(unit) is None or process.pid <= 0:
+        return False
+    unit_path = transient_root / unit
+    try:
+        data, identity = read_regular_nofollow_with_identity(unit_path, 1024 * 1024)
+        mode = stat.S_IMODE(identity["mode"])
+        if (
+            identity["uid"] != manager_uid
+            or mode & 0o022
+            or data.count(b"\nRestrictNamespaces=\n") != 1
+            or b"created programmatically via the systemd API" not in data
+        ):
+            return False
+        status = read_bounded_proc_file(proc_root / str(process.pid) / "status", 1024 * 1024)
+        proc_stat = read_bounded_proc_file(
+            proc_root / str(process.pid) / "stat", 1024 * 1024
+        ).decode("ascii", "strict")
+        fields: dict[bytes, bytes] = {}
+        for line in status.splitlines():
+            key, separator, value = line.partition(b":")
+            if separator:
+                fields[key] = value.strip()
+        filters = int(fields.get(b"Seccomp_filters", b"0"))
+        start_time = parse_proc_stat_start_time(proc_stat)
+    except (OSError, SweepError, UnicodeError, ValueError):
+        return False
+    return (
+        fields.get(b"NoNewPrivs") == b"1"
+        and fields.get(b"Seccomp") == b"2"
+        and filters > 0
+        and start_time == process.start_time
+    )
+
+
 def parse_systemd_timespan_usec(value: str) -> int | None:
     match = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?)(us|ms|s|min|h)", value)
     if match is None:
@@ -1255,7 +1330,7 @@ def unit_is_hardened_for_adoption(
         "ProtectClock": "yes",
         "ProtectHostname": "yes",
         "NoNewPrivileges": "yes",
-        "RestrictNamespaces": "yes",
+        "RestrictNamespaces": RELOAD_STABLE_RESTRICT_NAMESPACES,
         "RestrictRealtime": "yes",
         "RestrictSUIDSGID": "yes",
         "LockPersonality": "yes",
@@ -1264,6 +1339,17 @@ def unit_is_hardened_for_adoption(
         "AmbientCapabilities": "",
         "BindReadOnlyPaths": f"{deploy}:{deploy}:rbind",
     }
+    namespace_policy = properties.get("RestrictNamespaces")
+    if namespace_policy == "yes":
+        # Compatibility with live producers launched before the reload-stable
+        # policy was introduced and not yet subjected to a daemon reload.
+        exact["RestrictNamespaces"] = "yes"
+    elif namespace_policy == "no" and reloaded_namespace_filter_is_attested(
+        unit, process
+    ):
+        # The running process retains the filter even though the reloaded
+        # transient unit can no longer describe it.
+        exact["RestrictNamespaces"] = "no"
     if any(properties.get(key) != value for key, value in exact.items()):
         return False
     if parse_systemd_timespan_usec(properties.get("CPUQuotaPerSecUSec", "")) != (

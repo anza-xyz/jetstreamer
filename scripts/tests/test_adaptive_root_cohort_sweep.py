@@ -535,6 +535,10 @@ class CommandTests(unittest.TestCase):
         self.assertNotIn("/home/sol/horizon", "\0".join(command))
         self.assertIn("--root-checkpoint-cohort", command)
         self.assertIn("--verify", command)
+        self.assertEqual(
+            properties["RestrictNamespaces"],
+            sweep.RELOAD_STABLE_RESTRICT_NAMESPACES,
+        )
 
     def test_resource_limits_propagate_to_producer_and_importer(self) -> None:
         common = {
@@ -703,6 +707,88 @@ class AdoptionHardeningTests(unittest.TestCase):
                     self.cohort,
                     self.lane,
                     self.deploy,
+                )
+            )
+
+    def test_reload_serialized_namespace_policy_requires_live_attestation(self) -> None:
+        properties = self.hardened_properties()
+        properties["RestrictNamespaces"] = "no"
+        with (
+            mock.patch.object(sweep, "systemd_properties", return_value=properties),
+            mock.patch.object(
+                sweep, "reloaded_namespace_filter_is_attested", return_value=True
+            ) as attested,
+        ):
+            self.assertTrue(
+                sweep.unit_is_hardened_for_adoption(
+                    self.unit,
+                    self.process,
+                    self.cohort,
+                    self.lane,
+                    self.deploy,
+                )
+            )
+            attested.assert_called_once_with(self.unit, self.process)
+
+        with (
+            mock.patch.object(sweep, "systemd_properties", return_value=properties),
+            mock.patch.object(
+                sweep, "reloaded_namespace_filter_is_attested", return_value=False
+            ),
+        ):
+            self.assertFalse(
+                sweep.unit_is_hardened_for_adoption(
+                    self.unit,
+                    self.process,
+                    self.cohort,
+                    self.lane,
+                    self.deploy,
+                )
+            )
+
+    def test_reload_serialized_namespace_attestation_is_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw).resolve()
+            transient = root / "transient"
+            proc = root / "proc"
+            process_dir = proc / str(self.process.pid)
+            transient.mkdir()
+            process_dir.mkdir(parents=True)
+            unit_file = transient / self.unit
+            unit_file.write_text(
+                "# This is a transient unit file, created programmatically via the systemd API.\n"
+                "[Service]\nRestrictNamespaces=\n"
+            )
+            unit_file.chmod(0o644)
+            (process_dir / "status").write_text(
+                "Name:\tnode\nNoNewPrivs:\t1\nSeccomp:\t2\nSeccomp_filters:\t30\n"
+            )
+            fields = ["S", "1"] + ["0"] * 18
+            fields[19] = str(self.process.start_time)
+            (process_dir / "stat").write_text(
+                f"{self.process.pid} (node) {' '.join(fields)}\n"
+            )
+
+            self.assertTrue(
+                sweep.reloaded_namespace_filter_is_attested(
+                    self.unit,
+                    self.process,
+                    transient_root=transient,
+                    proc_root=proc,
+                    manager_uid=os.getuid(),
+                )
+            )
+
+            (process_dir / "status").write_text(
+                "Name:\tnode\nNoNewPrivs:\t0\nSeccomp:\t2\nSeccomp_filters:\t30\n"
+            )
+            self.assertFalse(
+                sweep.reloaded_namespace_filter_is_attested(
+                    self.unit,
+                    self.process,
+                    transient_root=transient,
+                    proc_root=proc,
+                    manager_uid=os.getuid(),
                 )
             )
 

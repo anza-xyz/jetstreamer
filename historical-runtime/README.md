@@ -164,8 +164,8 @@ Each vendored runtime directory contains the upstream `runtime/` crate and an
 | `v1_2_32_epoch68_transition` | `8c989da68342918f1717c60aa60fdfab7d1e676e` + explicit mainnet activation state | slot 29,371,188 through epoch 68 |
 | `v1_2_32` | `8c989da68342918f1717c60aa60fdfab7d1e676e` | checkpoint-gated diagnostic envelopes, epochs 61-66 and 69-91 |
 | `v1_3_19` | `15a49d75086f95573ad319b22e4843639bdf2169` | checkpoint-gated diagnostic envelope, epochs 92–100 |
-| `v1_3_23` | `ab235b8160f1c76e5066eee52d62d976d12f42f1` | unqualified checkpoint-gated diagnostic envelope, epochs 101-125 |
-| `v1_4_25` | `893cc7647248a3536fb6e6d0b5e51c71446b862d` | unqualified checkpoint-gated diagnostic envelope, epochs 126-147 |
+| `v1_3_23` | `ab235b8160f1c76e5066eee52d62d976d12f42f1` | unqualified checkpoint-gated diagnostic envelope, epochs 101-128 |
+| `v1_4_25` | `893cc7647248a3536fb6e6d0b5e51c71446b862d` | unqualified checkpoint-gated diagnostic envelope, epochs 129-147 |
 | `v1_5_5` | `10e12d14e105bc2a5cd9c216ffe943a28d2aabf1` | bounded checkpoint-qualified candidate for epochs 148-149 |
 | `v1_5_19` | `936ff7424e1306b0df07dabcd6863bf7896d2cb5` | registered but unassigned comparison candidate |
 | `v1_5_6` | `01e4d0a1e9917701d1a148e1043b0ccf545c27f1` | bounded checkpoint-qualified candidate from epoch 150; later cohorts remain checkpoint-gated |

@@ -89,12 +89,14 @@ pub const SOLANA_V1_2_32_CANDIDATE_END_SLOT_EXCLUSIVE: Slot = 39_744_000;
 pub const SOLANA_V1_3_19_CANDIDATE_START_SLOT: Slot = SOLANA_V1_2_32_CANDIDATE_END_SLOT_EXCLUSIVE;
 pub const SOLANA_V1_3_19_CANDIDATE_END_SLOT_EXCLUSIVE: Slot = 43_632_000;
 pub const SOLANA_V1_3_23_CANDIDATE_START_SLOT: Slot = SOLANA_V1_3_19_CANDIDATE_END_SLOT_EXCLUSIVE;
-/// Epochs 101 through 125. Canonical execution at slots 51,450,068,
-/// 52,718,785, and 54,045,188 still used the v1.3 stake-initialization
-/// semantics rejected by v1.4.11 and later.
-pub const SOLANA_V1_3_23_CANDIDATE_END_SLOT_EXCLUSIVE: Slot = 54_432_000;
+/// Epochs 101 through 128. Canonical execution still accepted a 4,008-byte
+/// stake initialization at slot 55,686,407. At slot 55,728,001, the first
+/// produced slot of epoch 129, five feature IDs absent from v1.3 activated
+/// with one ID whose meaning changed in v1.4. The v1.4 worker must own that
+/// activation boundary.
+pub const SOLANA_V1_3_23_CANDIDATE_END_SLOT_EXCLUSIVE: Slot = 55_728_000;
 pub const SOLANA_V1_4_25_CANDIDATE_START_SLOT: Slot = SOLANA_V1_3_23_CANDIDATE_END_SLOT_EXCLUSIVE;
-/// Epochs 126 through 147, ending at the first v1.5 candidate epoch.
+/// Epochs 129 through 147, ending at the first v1.5 candidate epoch.
 pub const SOLANA_V1_4_25_CANDIDATE_END_SLOT_EXCLUSIVE: Slot = 63_936_000;
 pub const SOLANA_V1_5_5_CANDIDATE_START_SLOT: Slot = SOLANA_V1_4_25_CANDIDATE_END_SLOT_EXCLUSIVE;
 /// Epochs 148 and 149. Exact v1.5.5 execution matches the trusted
@@ -227,10 +229,10 @@ pub enum RuntimeBackend {
     /// envelope for epochs 92 through 100.
     SolanaV1_3_19,
     /// Exact terminal v1.3 patch used only in the independently
-    /// checkpoint-gated diagnostic envelope for epochs 101 through 125.
+    /// checkpoint-gated diagnostic envelope for epochs 101 through 128.
     SolanaV1_3_23,
     /// Exact terminal v1.4 patch used only in the independently
-    /// checkpoint-gated diagnostic envelope for epochs 126 through 147.
+    /// checkpoint-gated diagnostic envelope for epochs 129 through 147.
     SolanaV1_4_25,
     /// Exact v1.5.5 execution selected for epochs 148 and 149 by canonical
     /// checkpoint evidence.
@@ -1292,14 +1294,14 @@ pub static RUNTIME_ERAS: &[RuntimeEra] = &[
         admission: AdmissionLevel::Candidate,
     },
     RuntimeEra {
-        name: "solana-v1.3.23-epochs-101-125-differential-candidate",
+        name: "solana-v1.3.23-epochs-101-128-differential-candidate",
         start_slot: SOLANA_V1_3_23_CANDIDATE_START_SLOT,
         end_slot_exclusive: Some(SOLANA_V1_3_23_CANDIDATE_END_SLOT_EXCLUSIVE),
         backend: EraBackend::Available(&SOLANA_V1_3_23_RUNTIME),
         admission: AdmissionLevel::Candidate,
     },
     RuntimeEra {
-        name: "solana-v1.4.25-epochs-126-147-differential-candidate",
+        name: "solana-v1.4.25-epochs-129-147-differential-candidate",
         start_slot: SOLANA_V1_4_25_CANDIDATE_START_SLOT,
         end_slot_exclusive: Some(SOLANA_V1_4_25_CANDIDATE_END_SLOT_EXCLUSIVE),
         backend: EraBackend::Available(&SOLANA_V1_4_25_RUNTIME),

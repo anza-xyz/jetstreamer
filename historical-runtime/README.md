@@ -56,7 +56,7 @@ through v1.0.18 are pinned to `1.42.0-x86_64-unknown-linux-gnu`; v1.0.23,
 v1.0.24, v1.1.15, v1.1.23, v1.2.24, and the v1.2.32 workers use
 `1.43.0-x86_64-unknown-linux-gnu`; v1.3.19 and v1.3.23 use
 `1.45.1-x86_64-unknown-linux-gnu`; v1.4.25 uses
-`1.46.0-x86_64-unknown-linux-gnu`; v1.5.19 uses
+`1.46.0-x86_64-unknown-linux-gnu`; v1.5.5, v1.5.6, and v1.5.19 use
 `1.49.0-x86_64-unknown-linux-gnu`; and v1.6.15 uses
 `1.51.0-x86_64-unknown-linux-gnu`. They cannot share dependency
 resolution because the exact upstream graphs require incompatible
@@ -84,7 +84,7 @@ fixed-size owned arrays, and randomized tests cover optimized, paired, and
 forced-portable paths.
 
 The v1.2.32 transition, general v1.2.32, v1.3.19, v1.3.23, v1.4.25,
-v1.5.19, and v1.6.15 workers also perform the storage-only duties that their validators normally delegated to
+v1.5.5, v1.5.6, v1.5.19, and v1.6.15 workers also perform the storage-only duties that their validators normally delegated to
 `AccountsBackgroundService`. After a rooted bank is squashed and all
 observable writes are drained, the worker reclaims dead and stale AppendVec
 storage and periodically runs account cleaning. This maintenance is
@@ -166,7 +166,8 @@ Each vendored runtime directory contains the upstream `runtime/` crate and an
 | `v1_3_19` | `15a49d75086f95573ad319b22e4843639bdf2169` | checkpoint-gated diagnostic envelope, epochs 92–100 |
 | `v1_3_23` | `ab235b8160f1c76e5066eee52d62d976d12f42f1` | unqualified checkpoint-gated diagnostic envelope, epochs 101-125 |
 | `v1_4_25` | `893cc7647248a3536fb6e6d0b5e51c71446b862d` | unqualified checkpoint-gated diagnostic envelope, epochs 126-147 |
-| `v1_5_19` | `936ff7424e1306b0df07dabcd6863bf7896d2cb5` | unqualified comparison envelope, epochs 148-149 |
+| `v1_5_5` | `10e12d14e105bc2a5cd9c216ffe943a28d2aabf1` | bounded checkpoint-qualified candidate for epochs 148-149 |
+| `v1_5_19` | `936ff7424e1306b0df07dabcd6863bf7896d2cb5` | registered but unassigned comparison candidate |
 | `v1_5_6` | `01e4d0a1e9917701d1a148e1043b0ccf545c27f1` | bounded checkpoint-qualified candidate from epoch 150; later cohorts remain checkpoint-gated |
 | `v1_6_15` | `5c2dab8055e8162386fcac313b6547f223fd386c` | unqualified checkpoint-gated diagnostic envelope, epochs 174-200 |
 
@@ -197,7 +198,7 @@ The source has only these integration changes:
 7. The v1.4.25 extractor applies the same checks with a 524,288-member ceiling.
    The boundary and terminal snapshots contain 144,901 and 380,435 members,
    so the smaller historical ceiling cannot safely admit the whole envelope.
-8. The v1.5.19 and v1.5.6 workers disable the account cache. This keeps every
+8. The v1.5.5, v1.5.6, and v1.5.19 workers disable the account cache. This keeps every
    physical replay write and global write version available to the ordered
    plugin stream instead of collapsing repeated writes by pubkey.
 9. The v1.6.15 worker retains that cache policy and consumes the snapshot's

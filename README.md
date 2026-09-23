@@ -384,7 +384,7 @@ select a runtime. The current registry is deliberately conservative:
 | `39,744,000..43,632,000` | pinned Solana v1.3.19 worker | independently verified snapshot restart; bounded extractor admits up to 131,072 members for the audited 104,267–106,520-member epoch-98 through epoch-100 snapshots | diagnostic candidate for epochs 92-100 |
 | `43,632,000..54,432,000` | pinned Solana v1.3.23 worker | independently verified snapshot restart; mainnet accepted 4,008-byte stake initializations at slots 51,450,068, 52,718,785, and 54,045,188 that v1.4.11+ rejects; the extractor remains byte-bounded while admitting the later snapshot's 131,072+ members; every cohort must match all canonical post-bootstrap roots | unqualified diagnostic candidate for epochs 101-125 |
 | `54,432,000..63,936,000` | pinned Solana v1.4.25 worker | independently verified snapshot restart; carries the v1.4 transaction-status vocabulary through the shared stream protocol; every cohort must match all canonical post-bootstrap roots | unqualified diagnostic candidate for epochs 126-147 |
-| `63,936,000..64,800,000` | pinned Solana v1.5.19 worker | retained comparison candidate for epochs 148-149 while their exact patch is qualified; every cohort must match all canonical post-bootstrap roots | unqualified diagnostic candidate for epochs 148-149 |
+| `63,936,000..64,800,000` | pinned Solana v1.5.5 worker | exact v1.5.5 reproduces the trusted slot-63,948,761 accounts hash; normalizes v1.5 status variants for current plugins; every production cohort must still match all canonical post-bootstrap roots | bounded checkpoint-qualified candidate for epochs 148-149 |
 | `64,800,000..75,168,000` | pinned Solana v1.5.6 worker | exact v1.5.6 reproduces epoch 150's first canonical vote and the trusted slot-64,807,725 accounts hash; normalizes v1.5 status variants for current plugins; later cohorts remain independently checkpoint-gated | bounded checkpoint-qualified candidate for epochs 150-173 |
 | `75,168,000..86,832,000` | pinned Solana v1.6.15 worker | independently verified snapshot restart; reproduces the v1.6 loader set, write-lock demotion, and expanded status vocabulary for current plugins; every cohort must match all canonical post-bootstrap roots | unqualified diagnostic candidate for epochs 174-200 |
 | `86,832,000..406,080,000` | none | unsupported; replay fails closed | unsupported |
@@ -394,9 +394,10 @@ Verified epochs 0-100 use 12 execution envelopes backed by 11 historical worker 
 11 runtime boundaries consist of one hash-bound canonical state handoff, two source-lineage-verified
 epoch-67 handoffs, and eight independently verified snapshot restarts. The
 v1.2.32 worker is used on both sides of the two specialized epoch-67 ranges. The v1.3.23,
-v1.4.25, v1.5.19, v1.5.6, and v1.6.15 candidates add five snapshot-isolated envelopes. The
-v1.5.6 envelope has passed its first bounded post-boundary checkpoint; each still requires every
-root in its first complete cohort before publication.
+v1.4.25, v1.5.5, v1.5.6, and v1.6.15 candidates add five snapshot-isolated envelopes. The
+v1.5.5 and v1.5.6 envelopes have each passed their first bounded post-boundary checkpoint; every
+complete production cohort still requires all canonical roots before publication. The terminal
+v1.5.19 worker remains registered only as an unassigned comparison candidate.
 
 Six execution interventions go beyond choosing a pinned worker and restarting from an independently
 verified boundary snapshot:

@@ -96,12 +96,12 @@ pub const SOLANA_V1_3_23_CANDIDATE_END_SLOT_EXCLUSIVE: Slot = 54_432_000;
 pub const SOLANA_V1_4_25_CANDIDATE_START_SLOT: Slot = SOLANA_V1_3_23_CANDIDATE_END_SLOT_EXCLUSIVE;
 /// Epochs 126 through 147, ending at the first v1.5 candidate epoch.
 pub const SOLANA_V1_4_25_CANDIDATE_END_SLOT_EXCLUSIVE: Slot = 63_936_000;
-pub const SOLANA_V1_5_19_CANDIDATE_START_SLOT: Slot = SOLANA_V1_4_25_CANDIDATE_END_SLOT_EXCLUSIVE;
-/// Epochs 148 and 149. The terminal v1.5 patch is retained only as the
-/// previously registered comparison candidate until this range is qualified
-/// against the exact patch required by its checkpoints.
-pub const SOLANA_V1_5_19_CANDIDATE_END_SLOT_EXCLUSIVE: Slot = 64_800_000;
-pub const SOLANA_V1_5_6_CANDIDATE_START_SLOT: Slot = SOLANA_V1_5_19_CANDIDATE_END_SLOT_EXCLUSIVE;
+pub const SOLANA_V1_5_5_CANDIDATE_START_SLOT: Slot = SOLANA_V1_4_25_CANDIDATE_END_SLOT_EXCLUSIVE;
+/// Epochs 148 and 149. Exact v1.5.5 execution matches the trusted
+/// slot-63,948,761 accounts hash. Each production cohort remains gated on all
+/// of its canonical post-bootstrap roots.
+pub const SOLANA_V1_5_5_CANDIDATE_END_SLOT_EXCLUSIVE: Slot = 64_800_000;
+pub const SOLANA_V1_5_6_CANDIDATE_START_SLOT: Slot = SOLANA_V1_5_5_CANDIDATE_END_SLOT_EXCLUSIVE;
 /// Epochs 150 through 173. Exact v1.5.6 execution matches the first canonical
 /// epoch-150 vote and the trusted slot-64,807,725 accounts hash. Every later
 /// cohort remains checkpoint-gated and may identify a narrower successor.
@@ -151,6 +151,7 @@ pub const SOLANA_V1_2_32_REVISION: &str = "8c989da68342918f1717c60aa60fdfab7d1e6
 pub const SOLANA_V1_3_19_REVISION: &str = "15a49d75086f95573ad319b22e4843639bdf2169";
 pub const SOLANA_V1_3_23_REVISION: &str = "ab235b8160f1c76e5066eee52d62d976d12f42f1";
 pub const SOLANA_V1_4_25_REVISION: &str = "893cc7647248a3536fb6e6d0b5e51c71446b862d";
+pub const SOLANA_V1_5_5_REVISION: &str = "10e12d14e105bc2a5cd9c216ffe943a28d2aabf1";
 pub const SOLANA_V1_5_19_REVISION: &str = "936ff7424e1306b0df07dabcd6863bf7896d2cb5";
 pub const SOLANA_V1_5_6_REVISION: &str = "01e4d0a1e9917701d1a148e1043b0ccf545c27f1";
 pub const SOLANA_V1_6_15_REVISION: &str = "5c2dab8055e8162386fcac313b6547f223fd386c";
@@ -231,8 +232,11 @@ pub enum RuntimeBackend {
     /// Exact terminal v1.4 patch used only in the independently
     /// checkpoint-gated diagnostic envelope for epochs 126 through 147.
     SolanaV1_4_25,
-    /// Exact terminal v1.5 patch retained as the independently
-    /// checkpoint-gated comparison candidate for epochs 148 and 149.
+    /// Exact v1.5.5 execution selected for epochs 148 and 149 by canonical
+    /// checkpoint evidence.
+    SolanaV1_5_5,
+    /// Exact terminal v1.5 patch retained as an unassigned comparison
+    /// candidate.
     SolanaV1_5_19,
     /// Exact v1.5.6 execution selected from epoch 150 by canonical vote and
     /// checkpoint evidence.
@@ -382,6 +386,7 @@ impl RuntimeDescriptor {
             | RuntimeBackend::SolanaV1_3_19
             | RuntimeBackend::SolanaV1_3_23
             | RuntimeBackend::SolanaV1_4_25
+            | RuntimeBackend::SolanaV1_5_5
             | RuntimeBackend::SolanaV1_5_19
             | RuntimeBackend::SolanaV1_5_6
             | RuntimeBackend::SolanaV1_6_15 => {
@@ -864,6 +869,28 @@ pub static SOLANA_V1_4_25_RUNTIME: RuntimeDescriptor = RuntimeDescriptor {
     }),
 };
 
+pub static SOLANA_V1_5_5_RUNTIME: RuntimeDescriptor = RuntimeDescriptor {
+    backend: RuntimeBackend::SolanaV1_5_5,
+    identity: RuntimeIdentity {
+        name: "solana-v1.5.5",
+        revision: SOLANA_V1_5_5_REVISION,
+        rust_toolchain: "rustc 1.49.0 (e1884a8e3 2020-12-29)",
+        target: Some("x86_64-unknown-linux-gnu"),
+        genesis_hash: MAINNET_GENESIS_HASH,
+    },
+    bootstrap: BootstrapState {
+        loader: BootstrapStateLoader::HistoricalWorkerSnapshotArchive,
+        archive_extensions: &[".tar.bz2", ".tar.zst"],
+        snapshot_hash_kind: SnapshotHashKind::LegacyAccountsHash,
+        permits_in_memory_handoff: false,
+    },
+    worker: Some(WorkerExecutable {
+        identity: "jetstreamer-historical-worker-v1-5-5",
+        environment_override: "JETSTREAMER_HISTORICAL_WORKER_V1_5_5",
+        default_manifest_relative_path: "../historical-runtime/v1_5_5/target/release/jetstreamer-historical-worker-v1-5-5",
+    }),
+};
+
 pub static SOLANA_V1_5_19_RUNTIME: RuntimeDescriptor = RuntimeDescriptor {
     backend: RuntimeBackend::SolanaV1_5_19,
     identity: RuntimeIdentity {
@@ -1005,7 +1032,7 @@ pub static SNAPSHOT_ISOLATED_RUNTIME_BOUNDARIES: &[Slot] = &[
     SOLANA_V1_3_19_CANDIDATE_START_SLOT,
     SOLANA_V1_3_23_CANDIDATE_START_SLOT,
     SOLANA_V1_4_25_CANDIDATE_START_SLOT,
-    SOLANA_V1_5_19_CANDIDATE_START_SLOT,
+    SOLANA_V1_5_5_CANDIDATE_START_SLOT,
     SOLANA_V1_5_6_CANDIDATE_START_SLOT,
     SOLANA_V1_6_15_CANDIDATE_START_SLOT,
 ];
@@ -1031,6 +1058,7 @@ pub static RUNTIME_DESCRIPTORS: &[&RuntimeDescriptor] = &[
     &SOLANA_V1_3_19_RUNTIME,
     &SOLANA_V1_3_23_RUNTIME,
     &SOLANA_V1_4_25_RUNTIME,
+    &SOLANA_V1_5_5_RUNTIME,
     &SOLANA_V1_5_19_RUNTIME,
     &SOLANA_V1_5_6_RUNTIME,
     &SOLANA_V1_6_15_RUNTIME,
@@ -1278,10 +1306,10 @@ pub static RUNTIME_ERAS: &[RuntimeEra] = &[
         admission: AdmissionLevel::Candidate,
     },
     RuntimeEra {
-        name: "solana-v1.5.19-epochs-148-149-comparison-candidate",
-        start_slot: SOLANA_V1_5_19_CANDIDATE_START_SLOT,
-        end_slot_exclusive: Some(SOLANA_V1_5_19_CANDIDATE_END_SLOT_EXCLUSIVE),
-        backend: EraBackend::Available(&SOLANA_V1_5_19_RUNTIME),
+        name: "solana-v1.5.5-epochs-148-149-checkpoint-candidate",
+        start_slot: SOLANA_V1_5_5_CANDIDATE_START_SLOT,
+        end_slot_exclusive: Some(SOLANA_V1_5_5_CANDIDATE_END_SLOT_EXCLUSIVE),
+        backend: EraBackend::Available(&SOLANA_V1_5_5_RUNTIME),
         admission: AdmissionLevel::Candidate,
     },
     RuntimeEra {
@@ -1847,7 +1875,7 @@ mod tests {
     #[test]
     fn runtime_registry_is_complete_and_well_formed() {
         validate_runtime_registry().unwrap();
-        assert_eq!(RUNTIME_DESCRIPTORS.len(), 20);
+        assert_eq!(RUNTIME_DESCRIPTORS.len(), 21);
         for descriptor in RUNTIME_DESCRIPTORS.iter().copied() {
             assert!(std::ptr::eq(
                 descriptor,
@@ -1993,6 +2021,12 @@ mod tests {
                 "../historical-runtime/v1_4_25/target/release/jetstreamer-historical-worker-v1-4-25",
             ),
             (
+                RuntimeBackend::SolanaV1_5_5,
+                SOLANA_V1_5_5_REVISION,
+                "JETSTREAMER_HISTORICAL_WORKER_V1_5_5",
+                "../historical-runtime/v1_5_5/target/release/jetstreamer-historical-worker-v1-5-5",
+            ),
+            (
                 RuntimeBackend::SolanaV1_5_19,
                 SOLANA_V1_5_19_REVISION,
                 "JETSTREAMER_HISTORICAL_WORKER_V1_5_19",
@@ -2088,6 +2122,7 @@ mod tests {
             RuntimeBackend::SolanaV1_3_19,
             RuntimeBackend::SolanaV1_3_23,
             RuntimeBackend::SolanaV1_4_25,
+            RuntimeBackend::SolanaV1_5_5,
             RuntimeBackend::SolanaV1_5_19,
             RuntimeBackend::SolanaV1_5_6,
             RuntimeBackend::SolanaV1_6_15,
@@ -2340,10 +2375,10 @@ mod tests {
                 SOLANA_V1_4_25_CANDIDATE_START_SLOT,
             ),
             (
-                SOLANA_V1_5_19_CANDIDATE_START_SLOT..SOLANA_V1_5_19_CANDIDATE_END_SLOT_EXCLUSIVE,
-                RuntimeBackend::SolanaV1_5_19,
-                &SOLANA_V1_5_19_RUNTIME,
-                SOLANA_V1_5_19_CANDIDATE_START_SLOT,
+                SOLANA_V1_5_5_CANDIDATE_START_SLOT..SOLANA_V1_5_5_CANDIDATE_END_SLOT_EXCLUSIVE,
+                RuntimeBackend::SolanaV1_5_5,
+                &SOLANA_V1_5_5_RUNTIME,
+                SOLANA_V1_5_5_CANDIDATE_START_SLOT,
             ),
             (
                 SOLANA_V1_5_6_CANDIDATE_START_SLOT..SOLANA_V1_5_6_CANDIDATE_END_SLOT_EXCLUSIVE,

@@ -136,6 +136,11 @@ const SOLANA_V1_5_19_TAG: &str = "v1.5.19";
 const SOLANA_V1_5_19_COMMIT: &str = "936ff7424e1306b0df07dabcd6863bf7896d2cb5";
 const SOLANA_V1_5_19_RUST_TOOLCHAIN: &str = "rustc 1.49.0 (e1884a8e3 2020-12-29)";
 const SOLANA_V1_5_19_TARGET: &str = "x86_64-unknown-linux-gnu";
+const SOLANA_V1_5_6_BACKEND_ID: &str = "solana-v1.5.6";
+const SOLANA_V1_5_6_TAG: &str = "v1.5.6";
+const SOLANA_V1_5_6_COMMIT: &str = "01e4d0a1e9917701d1a148e1043b0ccf545c27f1";
+const SOLANA_V1_5_6_RUST_TOOLCHAIN: &str = "rustc 1.49.0 (e1884a8e3 2020-12-29)";
+const SOLANA_V1_5_6_TARGET: &str = "x86_64-unknown-linux-gnu";
 const SOLANA_V1_6_15_BACKEND_ID: &str = "solana-v1.6.15";
 const SOLANA_V1_6_15_TAG: &str = "v1.6.15";
 const SOLANA_V1_6_15_COMMIT: &str = "5c2dab8055e8162386fcac313b6547f223fd386c";
@@ -161,6 +166,7 @@ fn backend_supports_entry_batches(backend_id: &str) -> bool {
             | SOLANA_V1_3_23_BACKEND_ID
             | SOLANA_V1_4_25_BACKEND_ID
             | SOLANA_V1_5_19_BACKEND_ID
+            | SOLANA_V1_5_6_BACKEND_ID
             | SOLANA_V1_6_15_BACKEND_ID
     )
 }
@@ -369,6 +375,16 @@ pub const SOLANA_V1_5_19_CANDIDATE: WorkerProfile = WorkerProfile {
     solana_commit: SOLANA_V1_5_19_COMMIT,
     rust_toolchain: SOLANA_V1_5_19_RUST_TOOLCHAIN,
     target: SOLANA_V1_5_19_TARGET,
+    required_genesis_hash: protocol::MAINNET_GENESIS_HASH,
+    snapshot_archive_extensions: &[".tar.bz2", ".tar.zst"],
+};
+
+pub const SOLANA_V1_5_6_CANDIDATE: WorkerProfile = WorkerProfile {
+    backend_id: SOLANA_V1_5_6_BACKEND_ID,
+    solana_tag: SOLANA_V1_5_6_TAG,
+    solana_commit: SOLANA_V1_5_6_COMMIT,
+    rust_toolchain: SOLANA_V1_5_6_RUST_TOOLCHAIN,
+    target: SOLANA_V1_5_6_TARGET,
     required_genesis_hash: protocol::MAINNET_GENESIS_HASH,
     snapshot_archive_extensions: &[".tar.bz2", ".tar.zst"],
 };
@@ -3882,6 +3898,7 @@ mod tests {
         assert!(backend_supports_entry_batches(SOLANA_V1_3_23_BACKEND_ID));
         assert!(backend_supports_entry_batches(SOLANA_V1_4_25_BACKEND_ID));
         assert!(backend_supports_entry_batches(SOLANA_V1_5_19_BACKEND_ID));
+        assert!(backend_supports_entry_batches(SOLANA_V1_5_6_BACKEND_ID));
         assert!(backend_supports_entry_batches(SOLANA_V1_6_15_BACKEND_ID));
         assert!(!backend_supports_entry_batches(SOLANA_V1_0_24_BACKEND_ID));
         assert!(!backend_supports_entry_batches("unknown"));
@@ -5345,6 +5362,7 @@ mod tests {
             SOLANA_V1_3_23_CANDIDATE,
             SOLANA_V1_4_25_CANDIDATE,
             SOLANA_V1_5_19_CANDIDATE,
+            SOLANA_V1_5_6_CANDIDATE,
             SOLANA_V1_6_15_CANDIDATE,
         ] {
             assert_eq!(
@@ -5387,6 +5405,7 @@ mod tests {
             SOLANA_V1_3_23_CANDIDATE,
             SOLANA_V1_4_25_CANDIDATE,
             SOLANA_V1_5_19_CANDIDATE,
+            SOLANA_V1_5_6_CANDIDATE,
             SOLANA_V1_6_15_CANDIDATE,
         ] {
             verify_handshake(profile, &valid_handshake_for(profile)).unwrap();

@@ -92,6 +92,7 @@ RUNTIME_WORKERS = {
     "solana-v1.3.23": ("V1_3_23", "jetstreamer-historical-worker-v1-3-23"),
     "solana-v1.4.25": ("V1_4_25", "jetstreamer-historical-worker-v1-4-25"),
     "solana-v1.5.19": ("V1_5_19", "jetstreamer-historical-worker-v1-5-19"),
+    "solana-v1.5.6": ("V1_5_6", "jetstreamer-historical-worker-v1-5-6"),
     "solana-v1.6.15": ("V1_6_15", "jetstreamer-historical-worker-v1-6-15"),
 }
 # A manifest cohort normally names the only worker it needs. A cohort that

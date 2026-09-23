@@ -318,7 +318,9 @@ class SelectionTests(unittest.TestCase):
             126: "solana-v1.4.25",
             147: "solana-v1.4.25",
             148: "solana-v1.5.19",
-            173: "solana-v1.5.19",
+            149: "solana-v1.5.19",
+            150: "solana-v1.5.6",
+            173: "solana-v1.5.6",
             174: "solana-v1.6.15",
             200: "solana-v1.6.15",
         }

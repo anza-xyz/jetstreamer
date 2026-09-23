@@ -3,6 +3,20 @@
 Major project results, newest first. Each entry records the UTC date and the
 code revision that produced the result.
 
+## 2026-09-23: Archive acceptance made 15.8x faster
+
+- Commit: `72a52e8dd65bc46bd155c610d623d2729f0190c3`.
+- On the verified 380.1 MiB epoch-0 archive, full decoding took 2.834 seconds
+  after the change, compared with 44.816 seconds through the previous semantic
+  hashing path. This is a 15.812x speedup in archive acceptance.
+- Removed a SHA-256 pass over the reconstructed semantic stream whose result
+  was discarded because there was no trusted digest to compare against.
+  Validation still reconstructs every account-data byte, checks stored bucket
+  integrity and the PoH chain, validates framing and provenance, then SHA-256
+  binds the exact archive inode used for publication.
+- The optimized node passed all 361 `jetstreamer-node` tests and strict Clippy
+  checks before deployment to the epoch 101-200 production queue.
+
 ## 2026-09-23: Exact Solana v1.5.5 qualified for epochs 148-149
 
 - Commit: `6e4be7a889ebc62e42ba3b372c6b5c3d2a637350`.

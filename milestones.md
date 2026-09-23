@@ -3,6 +3,19 @@
 Major project results, newest first. Each entry records the UTC date and the
 code revision that produced the result.
 
+## 2026-09-23: Exact Solana v1.5.5 qualified for epochs 148-149
+
+- Commit: `6e4be7a889ebc62e42ba3b372c6b5c3d2a637350`.
+- Replayed 13,102 slots from the canonical slot-63,935,659 snapshot through
+  trusted checkpoint slot 63,948,761 using the exact upstream v1.5.5 runtime.
+- Matched canonical accounts hash
+  `64X5VqKPzxqsTu5gTd9aZRi7nE7PtHZGqkmmg65ZcVEz` and bank hash
+  `DUo7Vw9hPD4C2yjpyPmJNuZCs2cKdbYtrZThzkjnBtAF`, with capitalization
+  `488586234469265886`, transaction count `10817258255`, and tick height
+  `4092720768`.
+- Added automatic slot-range routing for epochs 148-149 while retaining
+  v1.5.19 only as an unassigned comparison candidate.
+
 ## 2026-09-21: Mainnet epochs 0-100 fully verified
 
 - Commits:

@@ -154,6 +154,12 @@ SHA-256 sidecar appears. After the complete range is present, it verifies the ra
 the ordered chain scan, and rehashes every archive before recording acceptance. Receipts include
 the archive, verifier, and script hashes, so a restart only repeats stale or unfinished work.
 
+`scripts/verify_horizon_plugin_range.sh` is the corresponding progressive launcher for the
+consumer/API gate. It waits for every archive and well-formed sidecar in an inclusive epoch range,
+then runs a pinned `horizon_pipeline --verify-only` binary over the complete range. Run both scripts
+for final acceptance: the archive verifier proves integrity, boundaries, and PoH, while the plugin
+verifier proves that the current streaming interface can consume every record and account-data byte.
+
 ### TUI dashboard
 
 Add `--tui` to render a live terminal dashboard instead of plain log output:

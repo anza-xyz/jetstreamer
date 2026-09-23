@@ -949,6 +949,8 @@ class AdmissionTests(unittest.TestCase):
         cpus: int = 64,
         initial: int = 2,
         target: int = 6,
+        lane_count: int = 8,
+        maximum: int = 8,
         current: list[int | None] | None = None,
         peak: list[int | None] | None = None,
         disk_available_gib: int = 20_000,
@@ -963,10 +965,10 @@ class AdmissionTests(unittest.TestCase):
             logical_cpus=cpus,
             active=active,
             elapsed_seconds=elapsed,
-            lane_count=8,
+            lane_count=lane_count,
             initial=initial,
             target=target,
-            maximum=8,
+            maximum=maximum,
             settle_seconds=600,
             memory_max=64 * sweep.GIB,
             memory_reserve=64 * sweep.GIB,
@@ -1053,6 +1055,28 @@ class AdmissionTests(unittest.TestCase):
         sweep.validate_options(options(9))
         with self.assertRaisesRegex(sweep.SweepError, "max <= 32"):
             sweep.validate_options(options(33))
+
+    def test_local_lane_count_does_not_become_the_global_ceiling(self) -> None:
+        self.assertEqual(
+            self.capacity(
+                active=7,
+                initial=8,
+                target=8,
+                lane_count=1,
+                maximum=8,
+            ),
+            8,
+        )
+        self.assertEqual(
+            self.capacity(
+                active=0,
+                initial=8,
+                target=8,
+                lane_count=1,
+                maximum=8,
+            ),
+            1,
+        )
 
 
 class PublicStateTests(unittest.TestCase):

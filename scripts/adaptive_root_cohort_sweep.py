@@ -1040,7 +1040,13 @@ def admission_capacity(
     # controller persists the new limit and starts a fresh window.
     ramp_steps = min(1, int(elapsed_seconds // max(1, settle_seconds)))
     ramp = min(target, initial + ramp_steps)
-    configured = min(maximum, lane_count, ramp)
+    # `active` is global across every controller, while `lane_count` is local
+    # to this controller. A one-lane runtime queue must therefore be able to
+    # fill one free global slot instead of accidentally imposing a one-process
+    # global ceiling. The serialized schedule gate re-observes claims before
+    # every launch, and the lane loop still limits this controller to its own
+    # idle lanes.
+    configured = min(maximum, active + lane_count, ramp)
     capacity = min(configured, static_memory, live_memory, disk, cpu)
     if active >= initial:
         if any(value is None for value in memory_current):

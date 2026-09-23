@@ -600,8 +600,10 @@ producer runs as the unprivileged `sol` user in a resource-bounded systemd unit.
 configure up to 32 lanes, but admission is still capped by the number of provisioned lanes and by
 the live CPU, hard-cgroup-memory, and disk calculations. The final global claim check and launch
 are serialized through the bound public-directory lock, so controllers for different runtime eras
-cannot consume the same capacity slot concurrently. Producer namespace filtering uses a
-reload-stable cgroup-only allow-list; user namespaces and every other namespace type remain denied,
+cannot consume the same capacity slot concurrently. A queue's local lane count limits only how many
+jobs that queue can add; it does not become an accidental ceiling on the global producer count.
+Producer namespace filtering uses a reload-stable cgroup-only allow-list; user namespaces and every
+other namespace type remain denied,
 and the empty capability set prevents the unprivileged worker from using the nominal cgroup option.
 The controller will adopt existing work only when the process identity, arguments, cgroup, lane,
 runtime, manifest, and complete sandbox configuration match the sealed plan. Overlapping epoch or

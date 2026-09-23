@@ -46,14 +46,11 @@ use jetstreamer_horizon::archive::{
     AccountsHashKind, ArchiveFormatError, ArchiveProvenance, ArchiveProvenanceV1,
     ArchiveProvenanceV2, ArchiveProvenanceV3, ArchiveWriterConfig, BootstrapStateKind,
     BucketHeader as HorizonBucketHeader, Consumption, RuntimeAdmission, RuntimeHandoffProvenance,
-    RuntimeSegmentProvenance, RuntimeSegmentSource, RuntimeStateCheckpoint, SemanticDigest,
-    SlotKind, SlotVisitor, StateCommitment, StateCommitmentKind, TransactionMetadataPolicy,
-    WriteVersionNormalization, merge_runtime_segments,
+    RuntimeSegmentProvenance, RuntimeSegmentSource, RuntimeStateCheckpoint, SlotVisitor,
+    StateCommitment, StateCommitmentKind, TransactionMetadataPolicy, WriteVersionNormalization,
+    merge_runtime_segments,
 };
-use jetstreamer_horizon::{
-    account_updates::AccountUpdateView, block_metas::BlockNotification, entries::EntryRecord,
-    epochs::EpochMeta, transactions::Transaction as HorizonTransaction,
-};
+use jetstreamer_horizon::{block_metas::BlockNotification, entries::EntryRecord};
 use jetstreamer_node::handoff_snapshot::{
     HANDOFF_SNAPSHOT_MANIFEST_SCHEMA_VERSION, HistoricalHandoffSnapshotManifest,
     handoff_snapshot_manifest_path, read_and_validate_handoff_snapshot_manifest,
@@ -12976,14 +12973,12 @@ struct ArchiveChainEvidence {
 }
 
 struct ArchiveVerificationVisitor {
-    digest: SemanticDigest,
     chain: ArchiveChainEvidence,
 }
 
 impl ArchiveVerificationVisitor {
     fn new() -> Self {
         Self {
-            digest: SemanticDigest::new(),
             chain: ArchiveChainEvidence::default(),
         }
     }
@@ -13012,29 +13007,14 @@ impl ArchiveVerificationVisitor {
     }
 }
 
+// Do not add a SemanticDigest here unless validation has a trusted expected
+// digest to compare against. Hashing a freshly generated semantic stream and
+// discarding the result provides no authenticity, while re-hashing terabytes
+// of reconstructed account data can dominate acceptance. The reader still
+// checks bucket integrity, fully decodes account data, and verifies the chain;
+// the caller then SHA-256 binds the validated archive inode for publication.
 impl SlotVisitor for ArchiveVerificationVisitor {
-    fn on_slot_start(&mut self, slot: u64, kind: SlotKind) {
-        self.digest.on_slot_start(slot, kind);
-    }
-
-    fn on_epoch(&mut self, meta: &EpochMeta) {
-        self.digest.on_epoch(meta);
-    }
-
-    fn on_pre_account_update(&mut self, slot: u64, update: &AccountUpdateView<'_>) {
-        self.digest.on_pre_account_update(slot, update);
-    }
-
-    fn on_transaction(&mut self, slot: u64, tx_index: u32, tx: &HorizonTransaction) {
-        self.digest.on_transaction(slot, tx_index, tx);
-    }
-
-    fn on_post_account_update(&mut self, slot: u64, update: &AccountUpdateView<'_>) {
-        self.digest.on_post_account_update(slot, update);
-    }
-
-    fn on_block(&mut self, notification: &BlockNotification, entries: &[EntryRecord]) {
-        self.digest.on_block(notification, entries);
+    fn on_block(&mut self, notification: &BlockNotification, _entries: &[EntryRecord]) {
         if let BlockNotification::Block(meta) = notification {
             let block = ArchiveBlockEvidence {
                 slot: meta.slot,
@@ -13048,7 +13028,11 @@ impl SlotVisitor for ArchiveVerificationVisitor {
     }
 
     fn consumption(&self) -> Consumption {
-        self.digest.consumption()
+        // Deep validation must still reconstruct every account-data byte so
+        // malformed keyed diffs and compressed payloads fail closed. Grouped
+        // block arenas are redundant because this visitor observes updates in
+        // wire order and only retains block-chain evidence.
+        Consumption::all().without_block_account_update_arenas()
     }
 }
 
@@ -13107,10 +13091,7 @@ fn verify_open_archive_payload(
             )
             .ok_or_else(|| "assembled archive decoded slot count overflow".to_string())?;
     }
-    let ArchiveVerificationVisitor { digest, chain } = visitor;
-    digest
-        .finish()
-        .map_err(|err| format!("archive semantic verification failed: {err}"))?;
+    let chain = visitor.chain;
     if visited != expected_count {
         return Err(format!(
             "archive {} decoded {visited} slots, expected {expected_count}",
@@ -21509,6 +21490,13 @@ mod early_snapshot_tests {
                 successor_bootstrap_write_count: 0,
             }],
         }
+    }
+
+    #[test]
+    fn archive_verifier_fully_reconstructs_account_data() {
+        let consumption = ArchiveVerificationVisitor::new().consumption();
+        assert!(consumption.account_update_data);
+        assert!(!consumption.block_account_update_arenas);
     }
 
     #[test]

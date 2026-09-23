@@ -413,9 +413,9 @@ verified boundary snapshot:
 3. Reconstruction and validation of the epoch-30 hard-fork marker at slot 13,334,463.
 4. The v1.2.32 to pre-CPI v1.2.24 state handoff at slot 29,327,576.
 5. The return to v1.2.32 at slot 29,371,188 with CPI and vote-timestamp state reconstructed.
-6. The v1.3.23 envelope extends through epoch 125 because canonical execution at slots 51,450,068,
-   52,718,785, and 54,045,188 predates v1.4's exact-size stake-initialization rule; publication still
-   requires the terminal root.
+6. The v1.3.23 envelope extends through epoch 128 because mainnet still accepted 4,008-byte stake
+   initializations through slot 55,725,865, while none were found after the epoch-129 feature boundary
+   at slot 55,728,000; publication still requires every terminal root.
 
 Input repair is planned independently of execution and adds three more historical interventions:
 

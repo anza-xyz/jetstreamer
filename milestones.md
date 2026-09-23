@@ -3,6 +3,19 @@
 Major project results, newest first. Each entry records the UTC date and the
 code revision that produced the result.
 
+## 2026-09-23: Solana v1.3.23 qualified across the epoch-126 divergence
+
+- Commit: `099f5ef2633d9c911cdab8afde8b4a42e5517638`.
+- Replayed slots 54,676,313 through 54,684,686 with the exact upstream
+  v1.3.23 runtime, including the stake initialization at slot 54,681,962 that
+  v1.4.25 rejects.
+- Matched canonical accounts hash
+  `DvbSn4RPv615yNpsFCuYSajL3zGy5oK57XDxUwKi36gv` and bank hash
+  `BpiynHZekZybrfotnE8i5Ua6EL65uQz97rFL18NCjwZj` at slot 54,684,686.
+- A source scan found 42 successful 4,008-byte stake initializations through
+  slot 55,725,865 and none after the epoch-129 feature boundary at slot
+  55,728,000. Epochs 101-128 now route to v1.3.23; v1.4.25 starts at epoch 129.
+
 ## 2026-09-23: Archive acceptance made 15.8x faster
 
 - Commit: `72a52e8dd65bc46bd155c610d623d2729f0190c3`.

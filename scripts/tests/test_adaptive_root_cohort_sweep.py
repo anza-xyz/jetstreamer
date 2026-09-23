@@ -944,6 +944,7 @@ class AdmissionTests(unittest.TestCase):
         self,
         *,
         active: int = 2,
+        owned_active: int | None = None,
         elapsed: int = 0,
         available_gib: int = 735,
         cpus: int = 64,
@@ -959,11 +960,13 @@ class AdmissionTests(unittest.TestCase):
     ) -> int:
         current = [5 * sweep.GIB] * active if current is None else current
         peak = [6 * sweep.GIB] * active if peak is None else peak
+        owned_active = active if owned_active is None else owned_active
         return sweep.admission_capacity(
             memory_total=1024 * sweep.GIB,
             memory_available=available_gib * sweep.GIB,
             logical_cpus=cpus,
             active=active,
+            owned_active=owned_active,
             elapsed_seconds=elapsed,
             lane_count=lane_count,
             initial=initial,
@@ -1016,6 +1019,21 @@ class AdmissionTests(unittest.TestCase):
             2,
         )
 
+    def test_unrelated_high_memory_producer_does_not_freeze_local_queue(self) -> None:
+        self.assertEqual(
+            self.capacity(
+                active=7,
+                owned_active=0,
+                initial=1,
+                target=1,
+                lane_count=1,
+                maximum=1,
+                current=[],
+                peak=[],
+            ),
+            8,
+        )
+
     def test_disk_budget_never_stops_live_work_but_blocks_unsafe_launches(self) -> None:
         self.assertEqual(
             self.capacity(active=2, elapsed=10_000, disk_available_gib=4_100),
@@ -1060,22 +1078,35 @@ class AdmissionTests(unittest.TestCase):
         self.assertEqual(
             self.capacity(
                 active=7,
-                initial=8,
-                target=8,
+                owned_active=0,
+                initial=1,
+                target=1,
                 lane_count=1,
-                maximum=8,
+                maximum=1,
             ),
             8,
         )
         self.assertEqual(
             self.capacity(
                 active=0,
-                initial=8,
-                target=8,
+                owned_active=0,
+                initial=1,
+                target=1,
                 lane_count=1,
-                maximum=8,
+                maximum=1,
             ),
             1,
+        )
+        self.assertEqual(
+            self.capacity(
+                active=8,
+                owned_active=1,
+                initial=1,
+                target=1,
+                lane_count=1,
+                maximum=1,
+            ),
+            8,
         )
 
 

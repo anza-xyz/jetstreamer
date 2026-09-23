@@ -1001,6 +1001,7 @@ def admission_capacity(
     memory_available: int,
     logical_cpus: int,
     active: int,
+    owned_active: int,
     elapsed_seconds: float,
     lane_count: int,
     initial: int,
@@ -1040,15 +1041,13 @@ def admission_capacity(
     # controller persists the new limit and starts a fresh window.
     ramp_steps = min(1, int(elapsed_seconds // max(1, settle_seconds)))
     ramp = min(target, initial + ramp_steps)
-    # `active` is global across every controller, while `lane_count` is local
-    # to this controller. A one-lane runtime queue must therefore be able to
-    # fill one free global slot instead of accidentally imposing a one-process
-    # global ceiling. The serialized schedule gate re-observes claims before
-    # every launch, and the lane loop still limits this controller to its own
-    # idle lanes.
-    configured = min(maximum, active + lane_count, ramp)
+    # Concurrency limits are local to this controller, but `active` counts
+    # producers from every controller. Convert the unused local allowance to
+    # a global ceiling so a one-lane queue can start beside unrelated work.
+    local_limit = min(maximum, lane_count, ramp)
+    configured = active + max(0, local_limit - owned_active)
     capacity = min(configured, static_memory, live_memory, disk, cpu)
-    if active >= initial:
+    if owned_active >= initial:
         if any(value is None for value in memory_current):
             return min(active, capacity)
         if any(value is not None and value >= memory_high for value in memory_current):
@@ -3493,6 +3492,13 @@ class Controller:
     def desired_capacity(self, claims: Sequence[EpochClaim]) -> int:
         total, available = parse_meminfo(Path("/proc/meminfo").read_text())
         statuses = self.all_live_producer_statuses(claims)
+        lane_outputs = {lane.output for lane in self.lanes.values()}
+        owned_statuses = [
+            status
+            for claim, status in zip(claims, statuses)
+            if claim.output in lane_outputs
+        ]
+        owned_active = len(owned_statuses)
         now = time.time()
         current_limit = max(
             self.args.initial_concurrency,
@@ -3507,6 +3513,7 @@ class Controller:
             memory_available=available,
             logical_cpus=os.cpu_count() or 0,
             active=len(statuses),
+            owned_active=owned_active,
             elapsed_seconds=elapsed,
             lane_count=len(self.lanes),
             initial=current_limit,
@@ -3517,8 +3524,8 @@ class Controller:
             memory_reserve=self.args.memory_reserve_gib * GIB,
             protected_memory=self.args.protected_memory_gib * GIB,
             cpus_per_lane=self.args.cpus_per_lane,
-            memory_current=[status.memory_current for status in statuses],
-            memory_peak=[status.memory_peak for status in statuses],
+            memory_current=[status.memory_current for status in owned_statuses],
+            memory_peak=[status.memory_peak for status in owned_statuses],
             memory_high=self.args.memory_high_gib * GIB,
             disk_available=disk_available,
             disk_reserve=self.args.disk_reserve_gib * GIB,

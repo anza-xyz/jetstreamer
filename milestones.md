@@ -3,6 +3,19 @@
 Major project results, newest first. Each entry records the UTC date and the
 code revision that produced the result.
 
+## 2026-09-24: Mainnet epoch 121 published and independently verified
+
+- Commit: `51eb8353b8f3fed60324f9d4101112df72d27708`.
+- Replayed epoch 121 with the exact upstream Solana v1.3.23 runtime and matched
+  canonical bank hash `GAhkbqM5kR4HLNYBFi77YxaokkGisZyMGHcqKvbS2zTw` and accounts hash
+  `CC3783AY4R84L3QuGrd2Sra5m8GBXsCDyE4XSaH7AjeG` at slot 52,703,999.
+- Published the 50,272,206,002-byte archive atomically with SHA-256
+  `9d118075932b64e494754625612f3ddece1186193ec94d3f35f840bf6c033b20`.
+  The controller's durable publication attestation records the same digest.
+- A separate verifier checked the complete archive, including its PoH chain
+  and semantic contents, in 35 minutes, 41 seconds. Its receipt records the
+  published SHA-256 digest.
+
 ## 2026-09-23: Solana v1.3.23 qualified across the epoch-126 divergence
 
 - Commit: `099f5ef2633d9c911cdab8afde8b4a42e5517638`.

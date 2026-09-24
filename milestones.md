@@ -3,6 +3,24 @@
 Major project results, newest first. Each entry records the UTC date and the
 code revision that produced the result.
 
+## 2026-09-24: Mainnet epochs 101-102 published and independently verified
+
+- Commit: `36c8f0ed79a419f7018bc484675527107d707184`.
+- Replayed both epochs with the exact upstream Solana v1.3.23 runtime. Epoch
+  101 matched bank hash `4bgJCXM1ZLuRaMHrhaPtRMYFeS6UsS13em4gY4jKREvi`
+  and accounts hash `Ehb5xhJs9wcugxp4NNU1xssH8mV15ujDtRh3jzwVaoxt` at
+  slot 44,063,999. Epoch 102 matched bank hash
+  `4Pbbf4aU72nDkY2epd3E2pDPctaqmtBTTrAmc5voBvdV` and accounts hash
+  `7EBFFxPXq2WxTBTRfdR4kVwxJ9tG53GH9R9vqBeX1sKL` at slot 44,495,999.
+- Published 84,123,732,275 bytes atomically. Epoch 101 has SHA-256
+  `244ade25b1c149e054b20786ff18f3920984f9d9d846d36714889caa02e983db`;
+  epoch 102 has SHA-256
+  `f9bd81c906951a6418f5929cdb996e92cf1b8262bd91f9eb7d777fc9095c4ba7`.
+  The controller's durable publication attestation records both digests.
+- Separate full-PoH verifiers checked both archives in parallel. Epoch 101
+  completed in 29 minutes, 49 seconds, and epoch 102 completed in 29 minutes,
+  35 seconds. Both receipts record the published SHA-256 digests.
+
 ## 2026-09-24: Mainnet epoch 121 published and independently verified
 
 - Commit: `51eb8353b8f3fed60324f9d4101112df72d27708`.

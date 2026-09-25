@@ -3,6 +3,21 @@
 Major project results, newest first. Each entry records the UTC date and the
 code revision that produced the result.
 
+## 2026-09-25: Mainnet epoch 176 published and independently verified
+
+- Commit: `f8cd608b2d4546921773b8f22c01d287acef1275`.
+- Replayed epoch 176 with the exact upstream runtime and matched bank hash
+  `4yVPT8FTqd5r3oE9UWXZMmvpkqQHrsDJ2sBDZRA8ZUx2` and accounts hash
+  `Aub7D7zwqSdKd5Zhy2DvvUT1wqeuW77pDRnRwuwCCkhb` at slot 76,463,996.
+- Published the 130,778,395,846-byte archive atomically with SHA-256
+  `27dcc6656117b19a64fb570617a3220fa17c5e6421b8f0ea248639cbe5b91728`.
+  Publication transaction
+  `05e6e5124b24e6d3a5601c045cbe0e91740d94fbfb31131d36fc38e15cbc28da`
+  records the same digest.
+- The current independent verifier completed the full PoH and semantic audit
+  in 42 minutes, 36 seconds. Its receipt binds the archive digest, verifier
+  binary, and audit script.
+
 ## 2026-09-25: Mainnet epoch 175 published and independently verified
 
 - Commit: `f8cd608b2d4546921773b8f22c01d287acef1275`; the historical

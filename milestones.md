@@ -3,6 +3,25 @@
 Major project results, newest first. Each entry records the UTC date and the
 code revision that produced the result.
 
+## 2026-09-25: Mainnet epoch 175 published and independently verified
+
+- Commit: `f8cd608b2d4546921773b8f22c01d287acef1275`; the historical
+  update-limit fix was introduced in
+  `cb3fb22cb77c4163350301e3922879eb00509d44`.
+- Replayed epoch 175 with the exact upstream runtime and matched bank hash
+  `Bfm9YGVCT13hcoQmVeqWokhKfB7aiMMpY7627yDQnAxy` and accounts hash
+  `EMLejzoioxxv2NTmiVPg2ZNyv6LvBLmrR4U9H8FSa2NY` at slot 76,031,999.
+- Published the 121,545,913,295-byte archive atomically with SHA-256
+  `2a9c9228be8651c8ecc87c3f8ca50356c3c685d02fe0c7526b6c9556d002ae80`.
+  Publication transaction
+  `cddf71073c2621746d03f680b3a73b8c07492d29f561510f7f9f00992946af43`
+  records the same digest.
+- The first audit exposed a stale 16,384-record verifier cap at a valid
+  20,811-update epoch-boundary section. The current reader keeps a finite
+  65,536-record ceiling plus an independent 32 MiB data limit. Its archive
+  tests passed 67/67, and the rebuilt verifier completed the full PoH and
+  semantic audit in 43 minutes, 59 seconds.
+
 ## 2026-09-24: Mainnet epochs 101-102 published and independently verified
 
 - Commit: `36c8f0ed79a419f7018bc484675527107d707184`.

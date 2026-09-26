@@ -3,6 +3,19 @@
 Major project results, newest first. Each entry records the UTC date and the
 code revision that produced the result.
 
+## 2026-09-26: Bounded historical rent-burst support proven on mainnet
+
+- Commit: `ed00144fbf303723304090655b84230af61e7a12`.
+- Three independent Solana v1.6.15 replays using the previous 4,096-record
+  post-freeze limit stopped on the 4,097th update: epoch 178 at slot
+  76,920,172, epoch 179 at slot 77,374,128, and epoch 181 at slot 78,204,496.
+- The corrected runtime retains finite, independent safeguards: at most 8,192
+  post-freeze records and 8 MiB of post-freeze account data per slot.
+- Production retries with the corrected binary passed all three former failure
+  points without relaxing any other archive or decode limit. At the evidence
+  checkpoint, epoch 178 had reached slot 76,944,153, epoch 179 slot 77,380,085,
+  and epoch 181 slot 78,204,930; all three replays remained active and healthy.
+
 ## 2026-09-26: Mainnet epoch 126 published and independently verified
 
 - Commits: `099f5ef2633d9c911cdab8afde8b4a42e5517638` qualified the exact

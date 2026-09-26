@@ -39,10 +39,7 @@ impl SlotVisitor for Finder {
             VersionedMessage::Legacy(message) => message.account_keys.as_slice(),
             VersionedMessage::V0(message) => message.account_keys.as_slice(),
         };
-        if self
-            .target
-            .is_some_and(|target| !keys.iter().any(|key| *key == target))
-        {
+        if self.target.is_some_and(|target| !keys.contains(&target)) {
             return;
         }
 

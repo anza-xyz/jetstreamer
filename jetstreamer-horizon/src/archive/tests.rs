@@ -102,6 +102,89 @@ fn pre_update_count_ceiling_remains_fail_closed() {
     ));
 }
 
+#[test]
+fn historical_rent_collection_exceeds_legacy_4k_post_update_cap() {
+    const OBSERVED_MINIMUM: usize = 4_097;
+    let mut writer = ArchiveWriter::new(
+        Vec::new(),
+        181,
+        78_204_496,
+        1,
+        ArchiveWriterConfig {
+            compression: Compression::None,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    writer.begin_slot(78_204_496).unwrap();
+    for write_version in 0..OBSERVED_MINIMUM as u64 {
+        writer
+            .write_reencoded_post_update(&AccountUpdateView {
+                pubkey: Address::new_from_array([7; 32]),
+                lamports: write_version,
+                owner: Address::new_from_array([9; 32]),
+                executable: false,
+                rent_epoch: 0,
+                write_version,
+                data: &[],
+            })
+            .unwrap();
+    }
+    let mut meta = BlockMeta::new_boxed();
+    meta.slot = 78_204_496;
+    writer.end_slot(&meta, &[]).unwrap();
+    let (archive, _) = writer.finish().unwrap();
+
+    #[derive(Default)]
+    struct CountPostUpdates(usize);
+    impl SlotVisitor for CountPostUpdates {
+        fn on_post_account_update(&mut self, _slot: u64, _update: &AccountUpdateView<'_>) {
+            self.0 += 1;
+        }
+    }
+
+    let mut reader = ArchiveReader::open(std::io::Cursor::new(archive)).unwrap();
+    let mut count = CountPostUpdates::default();
+    reader.read_slots(0, u64::MAX, &mut count).unwrap();
+    assert_eq!(count.0, OBSERVED_MINIMUM);
+}
+
+#[test]
+fn post_update_count_ceiling_remains_fail_closed() {
+    let mut writer = ArchiveWriter::new(
+        Vec::new(),
+        181,
+        78_204_496,
+        1,
+        ArchiveWriterConfig {
+            compression: Compression::None,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    writer.begin_slot(78_204_496).unwrap();
+    let update = AccountUpdateView {
+        pubkey: Address::new_from_array([7; 32]),
+        lamports: 1,
+        owner: Address::new_from_array([9; 32]),
+        executable: false,
+        rent_epoch: 0,
+        write_version: 0,
+        data: &[],
+    };
+    for _ in 0..crate::limits::MAX_SLOT_POST_UPDATES {
+        writer.write_reencoded_post_update(&update).unwrap();
+    }
+    assert!(matches!(
+        writer.write_reencoded_post_update(&update),
+        Err(ArchiveFormatError::SectionTooLarge {
+            section: "post-transaction account updates",
+            bytes: 8_193,
+            limit: 8_192,
+        })
+    ));
+}
+
 fn sample_archive_provenance_v1() -> ArchiveProvenanceV1 {
     ArchiveProvenanceV1 {
         generation_profile: "jetstreamer-node/historical-replay-v1".into(),

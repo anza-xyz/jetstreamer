@@ -276,8 +276,8 @@ fn read_fingerprints(path: &Path) -> Result<HashMap<Address, AccountFingerprint>
         let data_sha256 = read_array(&mut reader)?;
         // Historical AccountsDB scans may expose zero-lamport tombstones.
         // They are absent from the live state and from the accounts hash.
-        if lamports != 0 {
-            if accounts
+        if lamports != 0
+            && accounts
                 .insert(
                     pubkey,
                     AccountFingerprint {
@@ -291,9 +291,8 @@ fn read_fingerprints(path: &Path) -> Result<HashMap<Address, AccountFingerprint>
                     },
                 )
                 .is_some()
-            {
-                return Err(format!("{} contains a duplicate pubkey", path.display()));
-            }
+        {
+            return Err(format!("{} contains a duplicate pubkey", path.display()));
         }
     }
     Ok(accounts)

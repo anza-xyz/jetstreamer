@@ -3,6 +3,31 @@
 Major project results, newest first. Each entry records the UTC date and the
 code revision that produced the result.
 
+## 2026-09-26: Mainnet epochs 115-116 published and independently verified
+
+- Commits: `36c8f0ed79a419f7018bc484675527107d707184` introduced the
+  checkpoint-gated Solana v1.3.23 replay candidate, and
+  `cb3fb22cb77c4163350301e3922879eb00509d44` supplied the historical
+  archive limits used by these replays.
+- Epoch 115 matched bank hash
+  `CftETQCv4Tx5Wz35H9j6sHPDwuRF2nZQmFYnTZBncKM5` and accounts hash
+  `Asp6SdvTboWmGQb9MoaTrCU3AEVL9sxDpay6MgV76UAV` at slot 50,111,999.
+  Epoch 116 matched bank hash
+  `5hV7MBKNjzcSbH2DJDgPViG51C9Gy5KhhPWXqXzFRERw` and accounts hash
+  `5LdE9mpyeLv18JFHbhK3SfLmVuHu46U94F3vVHFKa31t` at slot 50,543,999.
+- Published 97,566,250,920 bytes atomically. Epoch 115 has SHA-256
+  `e46560111400be904ea230d5c8693cb13342db75c6d4d6017d90555806bfe1e6`;
+  epoch 116 has SHA-256
+  `d9d3ff5607a03e07deac3ce8b9f5a0d557329f3d1bacf75bc8321f79893f731c`.
+  Publication transaction
+  `c5a75a671faa89c4a0839ff213f2da14b36e19dced5def11ca5ace12da345ba1`
+  records both digests.
+- Separate current verifiers checked both complete archives in parallel.
+  Epoch 115 completed in 34 minutes, 54 seconds and epoch 116 in 34 minutes,
+  22 seconds; together they verified all semantic contents and 784,978 stored
+  PoH links. Each receipt binds the archive digest, verifier binary, and audit
+  script.
+
 ## 2026-09-26: Bounded historical rent-burst support proven on mainnet
 
 - Commit: `ed00144fbf303723304090655b84230af61e7a12`.

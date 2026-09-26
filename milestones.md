@@ -3,6 +3,69 @@
 Major project results, newest first. Each entry records the UTC date and the
 code revision that produced the result.
 
+## 2026-09-26: Mainnet epoch 126 published and independently verified
+
+- Commits: `099f5ef2633d9c911cdab8afde8b4a42e5517638` qualified the exact
+  Solana v1.3.23 runtime across the epoch-126 divergence, and
+  `cb3fb22cb77c4163350301e3922879eb00509d44` supplied the historical
+  archive limits used by the replay and verifier.
+- Replayed epoch 126 and matched bank hash
+  `G1zw8VTkFEbbiwqNUN9tkYa6gNGhZ4LvDVJqkfznrxar` and accounts hash
+  `NiLtZQDK1L5o7Gi788wqYZpDLQg4gqmR5WmBDLJo8H7` at slot 54,863,999.
+- Published the 84,663,787,927-byte archive atomically with SHA-256
+  `560458b9847cf1c7c5c30291a09b188625c2ed95bb4a3cda989ac01bd9bb1cdd`.
+  Publication transaction
+  `011997a6ee9750b7201a7a5a367f26dcb2eeb15c36e62ba23ccf22732974b7f6`
+  records the same digest.
+- The current independent verifier checked all 432,000 slot frames, 318,205
+  produced blocks, the complete PoH chain, and semantic contents in 33
+  minutes, 55 seconds. Its receipt binds the archive digest, verifier binary,
+  and audit script.
+
+## 2026-09-26: Mainnet epochs 108-109 published and independently verified
+
+- Commits: `36c8f0ed79a419f7018bc484675527107d707184` introduced the
+  checkpoint-gated Solana v1.3.23 replay candidate, and
+  `cb3fb22cb77c4163350301e3922879eb00509d44` supplied the historical
+  archive limits used by these replays.
+- Epoch 108 matched bank hash
+  `8S29XN11ZG9z2s3zTh7s8rBAs3Dhwhm5jinLFYTxFxuR` and accounts hash
+  `DE4Bh4Kf2bc5mUzrTZS1FfU86deYficyG976nDsoYGCc` at slot 47,087,999.
+  Epoch 109 matched bank hash
+  `GnQEAKLCg44cwhz3DLAqQ5ukcEt2zrJmgr2MLr5rVaLF` and accounts hash
+  `3kFWbD8t8tjQTEJDux47CiQzTRPH6afLY6UresiG2D1K` at slot 47,519,999.
+- Published 94,567,115,462 bytes atomically. Epoch 108 has SHA-256
+  `4bb38edb70ac14ab62f2a7ae14a2f221963b65ca6d0f13dcf793546df3796a5b`;
+  epoch 109 has SHA-256
+  `5fd6fbb84fc4202fd98f5f73aba8c8102c5d9df8f0f427ad880153f4fa704189`.
+  Publication transaction
+  `72a1efad5505c1003b31150e0e1a0557b15c017daf8edbaf93140c5e0b398d4c`
+  records both digests.
+- Separate current verifiers checked both complete archives in parallel.
+  Epoch 108 completed in 31 minutes, 39 seconds and epoch 109 in 32 minutes,
+  59 seconds; together they verified 797,334 produced blocks and both full
+  PoH chains. Each receipt binds its archive digest, verifier binary, and
+  audit script.
+
+## 2026-09-25: Mainnet epoch 117 published and independently verified
+
+- Commits: `36c8f0ed79a419f7018bc484675527107d707184` introduced the
+  checkpoint-gated Solana v1.3.23 replay candidate, and
+  `cb3fb22cb77c4163350301e3922879eb00509d44` supplied the historical
+  archive limits used by this replay.
+- Replayed epoch 117 and matched bank hash
+  `5i6LPtbD8cE55SNtmvc7XtWPKjk5tgP68b9oNQmLBq6z` and accounts hash
+  `HsC3ANL3pzeYFx9suVNS86THC4t9kvnPRGsGBcajMiQx` at slot 50,975,999.
+- Published the 50,255,468,131-byte archive atomically with SHA-256
+  `b0bf0fbdb73fd32ce261ed33c2aeb09d5785d601123a747cbd7dbf2bde74d933`.
+  Publication transaction
+  `526f20e439a323ac89b1bdf2c5d515e6674fab8eb2ffbaba3351d06c78df66f9`
+  records the same digest.
+- The current independent verifier checked all 432,000 slot frames, 369,692
+  produced blocks, the complete PoH chain, and semantic contents in 32
+  minutes, 52 seconds. Its receipt binds the archive digest, verifier binary,
+  and audit script.
+
 ## 2026-09-25: Mainnet epoch 114 published and independently verified
 
 - Commits: `36c8f0ed79a419f7018bc484675527107d707184` introduced the

@@ -429,8 +429,8 @@ Using this narrower definition, which excludes ordinary version pinning, snapsho
 PoH optimization, and AccountsDB maintenance, epochs 0-100 currently require eight distinct
 slot- or record-specific compatibility interventions.
 
-Snapshot selection and current-plugin streaming add two non-execution compatibility rules for the
-later range. Both are general invariants rather than slot-special-case branches:
+Snapshot selection and current-plugin streaming add three non-execution compatibility rules for the
+later range. All are general invariants rather than slot-special-case branches:
 
 | First observed at | General handling | Safety boundary |
 |---|---|---|

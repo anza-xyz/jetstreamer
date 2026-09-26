@@ -128,11 +128,11 @@ pub const MAX_SLOT_PRE_UPDATES: usize = 65_536;
 pub const MAX_SLOT_PRE_UPDATE_DATA: usize = 32 * 1024 * 1024;
 
 /// Max orphan updates in one block's post-transaction (freeze) phase.
-/// Historical rent collection at mainnet slots 76,920,172 and 78,204,496
-/// emits more than 4,096 writes before the other freeze-time writes are
-/// included. Keep a finite 8,192-record ceiling while the independent 8 MiB
-/// data arena, per-account, bucket, and decode-work limits continue to bound
-/// resource use.
+/// Historical rent collection at mainnet slots 76,920,172, 77,374,128, and
+/// 78,204,496 emits more than 4,096 writes before the other freeze-time writes
+/// are included. Keep a finite 8,192-record ceiling while the independent
+/// 8 MiB data arena, per-account, bucket, and decode-work limits continue to
+/// bound resource use.
 pub const MAX_SLOT_POST_UPDATES: usize = 8_192;
 
 /// Combined data-byte cap for one block's post-transaction orphan updates.

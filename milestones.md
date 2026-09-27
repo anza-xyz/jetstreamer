@@ -3,6 +3,20 @@
 Major project results, newest first. Each entry records the UTC date and the
 code revision that produced the result.
 
+## 2026-09-27: All 22 published epochs reverified with the current limits
+
+- Commit: `ed00144fbf303723304090655b84230af61e7a12` raised the bounded
+  historical post-freeze record limit from 4,096 to 8,192 while retaining an
+  independent 8 MiB account-data limit per slot.
+- The current verifier independently checked epochs 101-117, 121, 126, and
+  174-176. The set contains 1,279,648,807,329 archive bytes. Each check
+  recomputed the complete stored PoH chain and decoded every semantic record.
+- All 22 checks passed between 12:22 and 18:14 UTC. The receipts bind each
+  archive digest to verifier SHA-256
+  `51bb4a90dcac0a2475b46b2820470c3a53a0a541720a233dac288934cc864336`
+  and audit-script SHA-256
+  `a64fed21248715b2214292ea961a82afc5367a34b337d35afdbbc48d62c04bed`.
+
 ## 2026-09-26: Mainnet epochs 115-116 published and independently verified
 
 - Commits: `36c8f0ed79a419f7018bc484675527107d707184` introduced the

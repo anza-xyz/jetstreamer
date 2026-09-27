@@ -436,7 +436,7 @@ later range. All are general invariants rather than slot-special-case branches:
 |---|---|---|
 | bootstrap slot `61,328,765` for epoch 142 | coalesce an hourly object and canonical root object only when slot, accounts hash, extension, byte length, CRC32C, and MD5 all match; prefer the root object | any digest or identity disagreement remains an ambiguous-preflight failure |
 | epoch-boundary slot `75,168,000` | permit up to 65,536 pre-transaction runtime-direct account writes and 65,536 reward records in one archive block (observed: 19,300+ writes and 18,552 rewards) | both counts remain finite and the independent 32 MiB account-data arena, per-account, bucket, and decode-work limits remain enforced; wire encoding is unchanged |
-| rent-collection slots `76,920,172`, `77,374,128`, `77,882,688`, and `78,204,496` | permit up to 8,192 post-transaction runtime-direct account writes in one archive block (observed: at least 4,097 writes at each slot) | the count remains finite and the independent 8 MiB account-data arena, per-account, bucket, and decode-work limits remain enforced; wire encoding is unchanged |
+| rent-collection slots `76,611,288`, `76,920,172`, `77,374,128`, `77,882,688`, and `78,204,496` | permit up to 8,192 post-transaction runtime-direct account writes in one archive block (observed: at least 4,097 writes at each slot) | the count remains finite and the independent 8 MiB account-data arena, per-account, bucket, and decode-work limits remain enforced; wire encoding is unchanged |
 
 Archive-container repair is tracked separately from execution compatibility. Early independently
 generated epoch 1-6 files can carry the old writer's zero placeholder as both their first bucket

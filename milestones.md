@@ -76,13 +76,13 @@ code revision that produced the result.
   epoch 180 at slot 77,882,688, and epoch 181 at slot 78,204,496.
 - The corrected runtime retains finite, independent safeguards: at most 8,192
   post-freeze records and 8 MiB of post-freeze account data per slot.
-- Production retries with the corrected binary passed the first three known
-  failure points without relaxing any other archive or decode limit. At the
-  evidence checkpoint, epoch 178 had reached slot 76,944,153, epoch 179 slot
-  77,380,085, and epoch 181 slot 78,204,930; all three replays remained active
-  and healthy.
-  Corrected epoch-177 and epoch-180 retries are queued behind GCS
-  reauthentication.
+- Production retries with the corrected binary have passed four of the five
+  known failure points without relaxing any other archive or decode limit.
+  Epoch 178 reached slot 76,944,153, epoch 179 reached 77,380,085, and epoch
+  181 reached 78,204,930. At 21:35 UTC on September 27, epoch 180 reached slot
+  77,884,656, which is 1,968 slots beyond its previous failure point. All five
+  corrected replays remained active and healthy. Epoch 177 was at slot
+  76,597,465, with 13,823 slots left before the final known boundary.
 
 ## 2026-09-26: Mainnet epoch 126 published and independently verified
 

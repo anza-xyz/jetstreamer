@@ -3,6 +3,32 @@
 Major project results, newest first. Each entry records the UTC date and the
 code revision that produced the result.
 
+## 2026-09-28: Mainnet epoch 127 published and independently verified
+
+- Commits: `36c8f0ed79a419f7018bc484675527107d707184` introduced the
+  checkpoint-gated Solana v1.3.23 replay candidate, and
+  `cb3fb22cb77c4163350301e3922879eb00509d44` supplied the historical
+  archive limits used by this replay.
+- Replayed all 432,000 slots and matched bank hash
+  `4V8Nd7BB7wt7Lh2HzzXAoR6j1vcU2mgTWjNDyDx1KNE3` and accounts hash
+  `6Cg7xdrVJUztYHD6tj4DNjbmXJurCrK6ij6uzezWqg5P` at slot 55,295,999.
+- Published the 82,554,677,007-byte archive atomically with SHA-256
+  `976090f0a8078d3b56d7c287b58ca160d18d4f07996af2e93c07612d6e36af1d`.
+  Publication transaction
+  `8964418fc3221a58e2b2365657613ad0278a394c8cc48499b78af51cb224962e`
+  records the same digest.
+- A transient controller lock collision left the first import uncommitted and
+  preserved its complete source receipt. The retained importer published the
+  same verified archive after all controller lock holders were paused. Commit
+  `a5099f043cd06b5467efafc20a9508e1438d2fb4` adds a bounded,
+  identity-checked wait before future import mutations.
+- The current independent verifier checked all slot frames, 334,264 produced
+  blocks, the complete PoH chain, and semantic contents in 34 minutes, 13
+  seconds. Its receipt binds the archive digest to verifier SHA-256
+  `51bb4a90dcac0a2475b46b2820470c3a53a0a541720a233dac288934cc864336`
+  and audit-script SHA-256
+  `a64fed21248715b2214292ea961a82afc5367a34b337d35afdbbc48d62c04bed`.
+
 ## 2026-09-27: All 22 published epochs reverified with the current limits
 
 - Commit: `ed00144fbf303723304090655b84230af61e7a12` raised the bounded

@@ -1157,6 +1157,7 @@ class PublicStateTests(unittest.TestCase):
         controller.state = {
             "assignments": {},
             "import_owner": None,
+            "completed": {scheduled.label: {}, adopt_only.label: {}},
         }
         controller.trusted_public_complete = mock.Mock(
             side_effect=lambda cohort, final=False: cohort == scheduled
@@ -1171,12 +1172,36 @@ class PublicStateTests(unittest.TestCase):
             [mock.call(scheduled, final=True), mock.call(adopt_only, final=True)],
         )
 
+    def test_all_complete_does_not_rehash_an_incomplete_range(self) -> None:
+        completed = sweep.Cohort(21, 21, "solana-v1.0.23")
+        pending = sweep.Cohort(22, 22, "solana-v1.0.23")
+        controller = object.__new__(sweep.Controller)
+        controller.args = mock.Mock(public_dir=Path("/public"))
+        controller.sol_uid = os.getuid()
+        controller.managed_cohorts = (completed, pending)
+        controller.state = {
+            "assignments": {},
+            "import_owner": None,
+            "completed": {completed.label: {}},
+        }
+        controller.trusted_public_complete = mock.Mock(return_value=True)
+
+        with mock.patch.object(
+            sweep, "public_recovery_marker_present", return_value=False
+        ):
+            self.assertFalse(controller.all_complete())
+        controller.trusted_public_complete.assert_not_called()
+
     def test_batch_marker_prevents_all_complete_without_rehashing(self) -> None:
         controller = object.__new__(sweep.Controller)
         controller.args = mock.Mock(public_dir=Path("/public"))
         controller.sol_uid = os.getuid()
         controller.managed_cohorts = (sweep.Cohort(22, 22, "solana-v1.0.23"),)
-        controller.state = {"assignments": {}, "import_owner": None}
+        controller.state = {
+            "assignments": {},
+            "import_owner": None,
+            "completed": {"22": {}},
+        }
         controller.trusted_public_complete = mock.Mock(return_value=True)
 
         with mock.patch.object(

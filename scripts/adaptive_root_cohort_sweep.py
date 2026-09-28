@@ -3612,6 +3612,13 @@ class Controller:
             or public_recovery_marker_present(self.args.public_dir, self.sol_uid)
         ):
             return False
+        # The final check rehashes every archive, so only perform it once the
+        # durable controller state says every managed cohort has completed.
+        # Otherwise each admission poll would rehash the completed prefix
+        # before reaching the first pending cohort.
+        completed = self.state["completed"]
+        if any(cohort.label not in completed for cohort in self.managed_cohorts):
+            return False
         return all(
             self.trusted_public_complete(cohort, final=True)
             for cohort in self.managed_cohorts

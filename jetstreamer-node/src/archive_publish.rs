@@ -43,7 +43,7 @@ use {
             },
         },
         path::{Path, PathBuf},
-        time::{SystemTime, UNIX_EPOCH},
+        time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     },
 };
 
@@ -61,6 +61,7 @@ const ARCHIVE_BATCH_JOURNAL_VERSION: u32 = 2;
 const MAX_ARCHIVE_BATCH_ITEMS: usize = 4096;
 const MAX_ARCHIVE_BATCH_JOURNAL_BYTES: u64 = 8 << 20;
 const MAX_ARCHIVE_BATCH_CONTEXT_BYTES: usize = 4 << 20;
+const ARCHIVE_WRITER_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(25);
 
 #[derive(Debug)]
 pub struct ArchivePublication {
@@ -806,6 +807,7 @@ pub fn publish_verified_archive_batch(
         items,
         None,
         false,
+        None,
         |_| Ok(()),
     )
 }
@@ -827,6 +829,7 @@ pub fn publish_verified_archive_batch_if_absent(
         items,
         None,
         true,
+        None,
         |_| Ok(()),
     )
 }
@@ -843,6 +846,7 @@ pub fn publish_verified_archive_batch_with_context(
         items,
         Some(publication_context),
         false,
+        None,
         |_| Ok(()),
     )
 }
@@ -859,6 +863,29 @@ pub fn publish_verified_archive_batch_if_absent_with_context(
         items,
         Some(publication_context),
         true,
+        None,
+        |_| Ok(()),
+    )
+}
+
+/// Publishes an absence-only cohort after waiting a bounded time for a
+/// transient destination writer. The wait happens before any namespace
+/// mutation. Every attempt reopens the destination without following symlinks
+/// and repeats the complete directory identity check.
+pub fn publish_verified_archive_batch_if_absent_with_context_and_lock_timeout(
+    manifest_fingerprint: [u8; 32],
+    expected_epochs: &[u64],
+    items: &[ArchiveBatchItem],
+    publication_context: &[u8],
+    writer_lock_timeout: Duration,
+) -> Result<ArchiveBatchPublication, ArchivePublicationError> {
+    publish_verified_archive_batch_with_expected_epochs_absence_and_hook(
+        manifest_fingerprint,
+        expected_epochs,
+        items,
+        Some(publication_context),
+        true,
+        Some(writer_lock_timeout),
         |_| Ok(()),
     )
 }
@@ -869,6 +896,7 @@ fn publish_verified_archive_batch_with_expected_epochs_absence_and_hook<F>(
     items: &[ArchiveBatchItem],
     publication_context: Option<&[u8]>,
     destination_must_be_absent: bool,
+    writer_lock_timeout: Option<Duration>,
     mut hook: F,
 ) -> Result<ArchiveBatchPublication, ArchivePublicationError>
 where
@@ -885,13 +913,23 @@ where
         ));
     }
     let destination_path = validate_archive_batch_request(expected_epochs, items)?;
-    let writer_lock =
-        acquire_archive_destination_writer_lock(&destination_path).map_err(|error| {
-            preflight_error(format!(
-                "failed to acquire archive destination writer lock for {}: {error}",
-                destination_path.display()
-            ))
-        })?;
+    let destination = BoundDirectory::bind_absolute_nofollow(
+        &destination_path,
+        DirectoryPolicy::SharedDestination,
+    )
+    .map_err(preflight_error)?;
+    let writer_lock = acquire_archive_destination_writer_lock_with_timeout(
+        &destination_path,
+        writer_lock_timeout,
+    )
+    .map_err(|error| {
+        preflight_error(format!(
+            "failed to acquire archive destination writer lock for {}: {error}",
+            destination_path.display()
+        ))
+    })?;
+    require_writer_lock_binding(&writer_lock, &destination)?;
+    destination.recheck_path().map_err(preflight_error)?;
     if archive_batch_marker_exists(&destination_path).map_err(preflight_error)? {
         return Err(preflight_error(format!(
             "an interrupted archive batch transaction exists in {}; call recover_archive_publication_batch before starting another cohort",
@@ -1097,6 +1135,7 @@ where
         items,
         None,
         false,
+        None,
         hook,
     )
 }
@@ -2709,6 +2748,33 @@ impl PublicationTransaction {
                     "reversed exchange right",
                 )
             }
+        }
+    }
+}
+
+fn acquire_archive_destination_writer_lock_with_timeout(
+    destination: &Path,
+    timeout: Option<Duration>,
+) -> io::Result<ArchiveDestinationWriterLock> {
+    let Some(timeout) = timeout else {
+        return acquire_archive_destination_writer_lock(destination);
+    };
+    let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "archive destination writer lock timeout exceeds the monotonic clock range",
+        )
+    })?;
+    loop {
+        match acquire_archive_destination_writer_lock(destination) {
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(error);
+                }
+                std::thread::sleep(ARCHIVE_WRITER_LOCK_RETRY_INTERVAL.min(remaining));
+            }
+            result => return result,
         }
     }
 }
@@ -6692,6 +6758,65 @@ mod tests {
             publish_verified_archive_batch(BATCH_MANIFEST_FINGERPRINT, &expected_epochs, &items)
                 .unwrap();
         acknowledge_archive_publication_batch(destination, publication.transaction_id).unwrap();
+    }
+
+    #[test]
+    fn absence_only_batch_waits_for_a_transient_destination_writer() {
+        let (_root, items) = corrected_batch_fixture(8, false);
+        remove_batch_destination_namespaces(&items);
+        let destination = items[0].destination_archive.parent().unwrap().to_path_buf();
+        let expected_epochs = batch_expected_epochs(&items);
+        let writer_lock = acquire_archive_destination_writer_lock(&destination).unwrap();
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            drop(writer_lock);
+        });
+
+        let publication = publish_verified_archive_batch_if_absent_with_context_and_lock_timeout(
+            BATCH_MANIFEST_FINGERPRINT,
+            &expected_epochs,
+            &items,
+            b"bound root checkpoint gate",
+            Duration::from_secs(1),
+        )
+        .unwrap();
+
+        releaser.join().unwrap();
+        assert_batch_committed(&items);
+        acknowledge_archive_publication_batch(&destination, publication.transaction_id).unwrap();
+    }
+
+    #[test]
+    fn absence_only_batch_writer_wait_is_bounded_and_nonmutating() {
+        let (_root, items) = corrected_batch_fixture(8, false);
+        remove_batch_destination_namespaces(&items);
+        let destination = items[0].destination_archive.parent().unwrap();
+        let expected_epochs = batch_expected_epochs(&items);
+        let writer_lock = acquire_archive_destination_writer_lock(destination).unwrap();
+
+        let error = publish_verified_archive_batch_if_absent_with_context_and_lock_timeout(
+            BATCH_MANIFEST_FINGERPRINT,
+            &expected_epochs,
+            &items,
+            b"bound root checkpoint gate",
+            Duration::from_millis(50),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("writer lock is held"), "{error}");
+        assert_eq!(
+            error.commit_state(),
+            ArchivePublicationCommitState::NotCommitted
+        );
+        assert!(items.iter().all(|item| item.staged_archive.exists()));
+        assert!(items.iter().all(|item| !item.destination_archive.exists()));
+        assert!(
+            !destination
+                .join(ARCHIVE_BATCH_TRANSACTION_DIRECTORY)
+                .exists()
+        );
+        assert!(!destination.join(ARCHIVE_BATCH_OUTCOME_DIRECTORY).exists());
+        drop(writer_lock);
     }
 
     #[test]

@@ -184,6 +184,7 @@ const MAX_WAVE_TXS: usize = 256;
 const DEFAULT_POST_FIREHOSE_INCOMPLETE_RETRY_ATTEMPTS: usize = 16;
 const DEFAULT_EMPTY_SLOT_BUFFER_GAP_LIMIT: u64 = 0;
 const DEFAULT_FIREHOSE_BACKPRESSURE_SLOT_GAP_LIMIT: u64 = 128;
+const COHORT_IMPORT_WRITER_LOCK_TIMEOUT: Duration = Duration::from_secs(60);
 static LOGGED_FIRST_ACCOUNT_UPDATE: AtomicBool = AtomicBool::new(false);
 static LOGGED_PROGRAM_CACHE_ASSIGN_FAIL: AtomicBool = AtomicBool::new(false);
 static PROGRAM_CACHE_ASSIGN_FAIL_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -9245,11 +9246,12 @@ fn recover_staged_root_cohort_only(
         &admitted.root_checkpoint_gate,
     )?;
     let publication =
-        jetstreamer_node::archive_publish::publish_verified_archive_batch_if_absent_with_context(
+        jetstreamer_node::archive_publish::publish_verified_archive_batch_if_absent_with_context_and_lock_timeout(
             manifest_fingerprint,
             &expected_epochs,
             &items,
             &gate_context,
+            COHORT_IMPORT_WRITER_LOCK_TIMEOUT,
         )
         .map_err(|error| {
             format!(

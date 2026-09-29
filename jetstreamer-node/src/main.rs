@@ -12977,6 +12977,13 @@ struct ArchiveChainEvidence {
     terminal_block: Option<ArchiveBlockEvidence>,
 }
 
+#[derive(Debug)]
+struct ArchiveBucketRangeEvidence {
+    first_bucket: usize,
+    visited_slots: u64,
+    chain: ArchiveChainEvidence,
+}
+
 struct ArchiveVerificationVisitor {
     chain: ArchiveChainEvidence,
 }
@@ -13041,10 +13048,105 @@ impl SlotVisitor for ArchiveVerificationVisitor {
     }
 }
 
+fn verify_archive_bucket_range(
+    path: &Path,
+    expected_identity: jetstreamer_node::archive_checksum::ArchiveFileIdentity,
+    first_bucket: usize,
+    end_bucket: usize,
+    cancellation: Option<&AtomicBool>,
+) -> Result<ArchiveBucketRangeEvidence, String> {
+    let file = jetstreamer_node::archive_checksum::open_regular_nofollow(path)
+        .map_err(|err| format!("failed to open archive worker {}: {err}", path.display()))?;
+    let identity =
+        jetstreamer_node::archive_checksum::archive_file_identity(&file).map_err(|err| {
+            format!(
+                "failed to identify archive worker {}: {err}",
+                path.display()
+            )
+        })?;
+    if identity != expected_identity {
+        return Err(format!(
+            "archive inode {} changed before parallel bucket validation",
+            path.display()
+        ));
+    }
+    let mut reader = jetstreamer_horizon::archive::ArchiveReader::open(
+        std::io::BufReader::with_capacity(8 * 1024 * 1024, file),
+    )
+    .map_err(|err| format!("failed to open archive worker {}: {err}", path.display()))?;
+    if end_bucket > reader.bucket_count() || first_bucket >= end_bucket {
+        return Err(format!(
+            "archive {} received invalid parallel bucket range {first_bucket}..{end_bucket}",
+            path.display()
+        ));
+    }
+    reader.verify_chain = true;
+    let mut visitor = ArchiveVerificationVisitor::new();
+    let mut visited_slots = 0u64;
+    for bucket in first_bucket..end_bucket {
+        if cancellation.is_some_and(|cancelled| cancelled.load(Ordering::Relaxed)) {
+            return Err(format!("archive validation cancelled: {}", path.display()));
+        }
+        visited_slots = visited_slots
+            .checked_add(
+                reader
+                    .read_bucket_with_header(bucket, &mut visitor, |header, visitor| {
+                        visitor.on_bucket_header(header)
+                    })
+                    .map_err(|err| {
+                        format!("archive {} failed full decode: {err}", path.display())
+                    })?,
+            )
+            .ok_or_else(|| "assembled archive decoded slot count overflow".to_string())?;
+    }
+    Ok(ArchiveBucketRangeEvidence {
+        first_bucket,
+        visited_slots,
+        chain: visitor.chain,
+    })
+}
+
+fn merge_archive_bucket_ranges(
+    path: &Path,
+    mut ranges: Vec<ArchiveBucketRangeEvidence>,
+) -> Result<(u64, ArchiveChainEvidence), String> {
+    ranges.sort_unstable_by_key(|range| range.first_bucket);
+    let mut visited_slots = 0u64;
+    let mut merged = ArchiveChainEvidence::default();
+    for range in ranges {
+        let expected_anchor = merged
+            .terminal_block
+            .map(|block| block.blockhash)
+            .or(merged.initial_poh_anchor);
+        if let Some(expected_anchor) = expected_anchor
+            && range.chain.initial_poh_anchor != Some(expected_anchor)
+        {
+            return Err(format!(
+                "archive {} failed full decode: PoH mismatch at bucket {}",
+                path.display(),
+                range.first_bucket
+            ));
+        }
+        if merged.initial_poh_anchor.is_none() {
+            merged.initial_poh_anchor = range.chain.initial_poh_anchor;
+        }
+        if merged.first_block.is_none() {
+            merged.first_block = range.chain.first_block;
+        }
+        if range.chain.terminal_block.is_some() {
+            merged.terminal_block = range.chain.terminal_block;
+        }
+        visited_slots = visited_slots
+            .checked_add(range.visited_slots)
+            .ok_or_else(|| "assembled archive decoded slot count overflow".to_string())?;
+    }
+    Ok((visited_slots, merged))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn verify_open_archive_payload(
     path: &Path,
-    mut reader: jetstreamer_horizon::archive::ArchiveReader<std::io::BufReader<fs::File>>,
+    reader: jetstreamer_horizon::archive::ArchiveReader<std::io::BufReader<fs::File>>,
     measurement_file: &fs::File,
     expected_epoch: u64,
     expected_start: Slot,
@@ -13077,26 +13179,36 @@ fn verify_open_archive_payload(
             path.display()
         ));
     }
-    reader.verify_chain = true;
-    let mut visitor = ArchiveVerificationVisitor::new();
-    let mut visited = 0u64;
-    for bucket in 0..reader.bucket_count() {
-        if cancellation.is_some_and(|cancelled| cancelled.load(Ordering::Relaxed)) {
-            return Err(format!("archive validation cancelled: {}", path.display()));
-        }
-        visited = visited
-            .checked_add(
-                reader
-                    .read_bucket_with_header(bucket, &mut visitor, |header, visitor| {
-                        visitor.on_bucket_header(header)
-                    })
-                    .map_err(|err| {
-                        format!("archive {} failed full decode: {err}", path.display())
-                    })?,
+    let bucket_count = reader.bucket_count();
+    let worker_count = rayon::current_num_threads().max(1).min(bucket_count.max(1));
+    let buckets_per_worker = bucket_count.div_ceil(worker_count);
+    let ranges = (0..worker_count)
+        .filter_map(|worker| {
+            let first_bucket = worker.checked_mul(buckets_per_worker)?;
+            (first_bucket < bucket_count).then_some((
+                first_bucket,
+                (first_bucket + buckets_per_worker).min(bucket_count),
+            ))
+        })
+        .collect::<Vec<_>>();
+    // The initial reader has already bound and validated the complete header,
+    // index, and provenance. Every parallel worker opens the same path with
+    // O_NOFOLLOW and requires the exact same inode identity before decoding a
+    // disjoint contiguous bucket range.
+    drop(reader);
+    let range_evidence = ranges
+        .into_par_iter()
+        .map(|(first_bucket, end_bucket)| {
+            verify_archive_bucket_range(
+                path,
+                initial_identity,
+                first_bucket,
+                end_bucket,
+                cancellation,
             )
-            .ok_or_else(|| "assembled archive decoded slot count overflow".to_string())?;
-    }
-    let chain = visitor.chain;
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let (visited, chain) = merge_archive_bucket_ranges(path, range_evidence)?;
     if visited != expected_count {
         return Err(format!(
             "archive {} decoded {visited} slots, expected {expected_count}",
@@ -21505,37 +21617,151 @@ mod early_snapshot_tests {
     }
 
     #[test]
+    fn parallel_archive_ranges_merge_in_bucket_order_and_bind_poh() {
+        let path = Path::new("parallel-range-test.jet");
+        let anchor = Hash::new_from_array([0x11; 32]);
+        let terminal = Hash::new_from_array([0x22; 32]);
+        let block = ArchiveBlockEvidence {
+            slot: 127,
+            parent_slot: 126,
+            parent_blockhash: Hash::new_from_array([0x10; 32]),
+            blockhash: anchor,
+        };
+        let next = ArchiveBlockEvidence {
+            slot: 255,
+            parent_slot: 254,
+            parent_blockhash: Hash::new_from_array([0x21; 32]),
+            blockhash: terminal,
+        };
+        let ranges = vec![
+            ArchiveBucketRangeEvidence {
+                first_bucket: 1,
+                visited_slots: 128,
+                chain: ArchiveChainEvidence {
+                    initial_poh_anchor: Some(anchor),
+                    first_block: Some(next),
+                    terminal_block: Some(next),
+                },
+            },
+            ArchiveBucketRangeEvidence {
+                first_bucket: 0,
+                visited_slots: 128,
+                chain: ArchiveChainEvidence {
+                    initial_poh_anchor: Some(Hash::new_from_array([0x01; 32])),
+                    first_block: Some(block),
+                    terminal_block: Some(block),
+                },
+            },
+        ];
+        let (visited, merged) = merge_archive_bucket_ranges(path, ranges).unwrap();
+        assert_eq!(visited, 256);
+        assert_eq!(merged.first_block, Some(block));
+        assert_eq!(merged.terminal_block, Some(next));
+
+        let mismatch = vec![
+            ArchiveBucketRangeEvidence {
+                first_bucket: 0,
+                visited_slots: 128,
+                chain: ArchiveChainEvidence {
+                    initial_poh_anchor: Some(Hash::new_from_array([0x01; 32])),
+                    first_block: Some(block),
+                    terminal_block: Some(block),
+                },
+            },
+            ArchiveBucketRangeEvidence {
+                first_bucket: 1,
+                visited_slots: 128,
+                chain: ArchiveChainEvidence {
+                    initial_poh_anchor: Some(Hash::new_from_array([0xff; 32])),
+                    first_block: Some(next),
+                    terminal_block: Some(next),
+                },
+            },
+        ];
+        let error = merge_archive_bucket_ranges(path, mismatch).unwrap_err();
+        assert!(error.contains("PoH mismatch at bucket 1"), "{error}");
+    }
+
+    #[test]
     fn assembled_archive_verifier_rejects_bucket_corruption() {
         let directory = tempfile::TempDir::new().unwrap();
         let path = directory.path().join("tiny-v3.jet");
         let slot_start = 432_000;
-        let provenance = tiny_multi_runtime_provenance(slot_start);
+        let slot_count = 257;
+        let mut provenance = tiny_multi_runtime_provenance(slot_start);
+        provenance.requested_slot_count = slot_count;
+        provenance.runtime_segments[0].slot_count = 128;
+        provenance.runtime_segments[1].slot_start = slot_start + 128;
+        provenance.runtime_segments[1].slot_count = slot_count - 128;
+        provenance.handoffs[0].boundary_slot = slot_start + 128;
+        provenance.handoffs[0].predecessor.slot = slot_start + 127;
+        provenance.handoffs[0].successor.slot = slot_start + 127;
         let mut writer = jetstreamer_horizon::archive::ArchiveWriter::new_with_provenance(
             Vec::new(),
             1,
             slot_start,
-            2,
+            slot_count,
             ArchiveWriterConfig::default(),
             &ArchiveProvenance::V3(provenance.clone()),
         )
         .unwrap();
-        writer.write_skipped_slot(slot_start).unwrap();
-        writer.write_skipped_slot(slot_start + 1).unwrap();
+        for slot in slot_start..slot_start + slot_count {
+            writer.write_skipped_slot(slot).unwrap();
+        }
         let (mut bytes, _) = writer.finish().unwrap();
         fs::write(&path, &bytes).unwrap();
-        verify_assembled_runtime_archive_range(&path, 1, slot_start, 2, &provenance).unwrap();
+        verify_assembled_runtime_archive_range(&path, 1, slot_start, slot_count, &provenance)
+            .unwrap();
 
         let reader = jetstreamer_horizon::archive::ArchiveReader::open(std::io::Cursor::new(
             bytes.as_slice(),
         ))
         .unwrap();
-        let first_bucket = reader.bucket_index()[0];
-        let corrupt_at = usize::try_from(first_bucket.offset + first_bucket.len - 1).unwrap();
+        assert!(reader.bucket_count() >= 3);
+        let last_bucket = reader.bucket_index()[reader.bucket_count() - 1];
+        let corrupt_at = usize::try_from(last_bucket.offset + last_bucket.len - 1).unwrap();
         bytes[corrupt_at] ^= 0x80;
         fs::write(&path, bytes).unwrap();
-        let error = verify_assembled_runtime_archive_range(&path, 1, slot_start, 2, &provenance)
-            .unwrap_err();
+        let error =
+            verify_assembled_runtime_archive_range(&path, 1, slot_start, slot_count, &provenance)
+                .unwrap_err();
         assert!(error.contains("failed full decode"), "{error}");
+    }
+
+    #[test]
+    #[ignore = "set JETSTREAMER_TEST_ARCHIVE_PATH and JETSTREAMER_TEST_ARCHIVE_SHA256"]
+    fn parallel_archive_verifier_accepts_external_fixture() {
+        let path = PathBuf::from(
+            env::var("JETSTREAMER_TEST_ARCHIVE_PATH").expect("set JETSTREAMER_TEST_ARCHIVE_PATH"),
+        );
+        let expected_sha256 = env::var("JETSTREAMER_TEST_ARCHIVE_SHA256")
+            .expect("set JETSTREAMER_TEST_ARCHIVE_SHA256");
+        let file = jetstreamer_node::archive_checksum::open_regular_nofollow(&path).unwrap();
+        let identity = jetstreamer_node::archive_checksum::archive_file_identity(&file).unwrap();
+        let measurement_file = file.try_clone().unwrap();
+        let reader = jetstreamer_horizon::archive::ArchiveReader::open(
+            std::io::BufReader::with_capacity(8 * 1024 * 1024, file),
+        )
+        .unwrap();
+        let header = reader.header().clone();
+        let provenance = reader.provenance().unwrap().unwrap();
+        let validated = verify_open_archive_payload(
+            &path,
+            reader,
+            &measurement_file,
+            header.epoch,
+            header.slot_start,
+            header.slot_count,
+            &provenance,
+            identity,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            jetstreamer_node::segment_manifest::sha256_hex_string(&validated.sha256),
+            expected_sha256
+        );
     }
 
     #[test]

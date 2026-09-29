@@ -3223,6 +3223,24 @@ class Controller:
                     self.save()
                 continue
             if phase == "staged":
+                # A root-owned recovery importer may finish after its original
+                # controller was replaced. Accept that result only through the
+                # same completion-attestation path as a directly supervised
+                # import: the public transaction must be complete, its receipt
+                # must match the pre-bound source semantics, and archive bytes
+                # are rehashed before the assignment is released.
+                if self.public_complete(cohort, rehash=False):
+                    source_evidence = raw.get("source_evidence")
+                    if not receipt_evidence_is_valid(source_evidence, cohort):
+                        raise SweepError(
+                            f"public cohort {cohort.label} lacks bound source "
+                            "receipt evidence"
+                        )
+                    self.finalize_import(lane_name, cohort, source_evidence)
+                    print(
+                        f"recovered externally completed import for cohort {cohort.label}",
+                        flush=True,
+                    )
                 continue
             if phase == "importing":
                 unit = raw.get("import_unit")

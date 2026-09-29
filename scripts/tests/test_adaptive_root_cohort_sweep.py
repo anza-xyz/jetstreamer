@@ -1473,6 +1473,27 @@ class CrashSafetyTests(unittest.TestCase):
         )
         return controller, cohort, assignment
 
+    def test_staged_public_cohort_is_finalized_through_bound_attestation(self) -> None:
+        controller, cohort, assignment = self.staged_import_controller()
+        source_evidence = fake_receipt_evidence(cohort)
+        assignment["source_evidence"] = source_evidence
+        controller.state["import_owner"] = "lane-a"
+        controller.public_complete = mock.Mock(return_value=True)
+        controller.capture_completion_attestation = mock.Mock(
+            return_value={"durable": True}
+        )
+
+        controller.refresh_assignments()
+
+        self.assertNotIn("lane-a", controller.state["assignments"])
+        self.assertIsNone(controller.state["import_owner"])
+        self.assertEqual(controller.state["completed"], {"22": {"durable": True}})
+        controller.public_complete.assert_called_once_with(cohort, rehash=False)
+        controller.capture_completion_attestation.assert_called_once_with(
+            cohort, source_evidence
+        )
+        controller.save.assert_called_once()
+
     def test_import_waits_while_public_destination_is_claimed(self) -> None:
         controller, _cohort, assignment = self.staged_import_controller()
         public_claim = sweep.EpochClaim(

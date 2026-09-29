@@ -1274,6 +1274,11 @@ pub enum BlockData {
         blockhash: Hash,
         /// Rewards keyed by account and partition information.
         rewards: KeyedRewardsAndNumPartitions,
+        /// Whether the stored rewards contain a basis-point commission (SIMD-0291).
+        /// Commission values are normalized to basis points regardless of this flag.
+        /// False when no stored reward contains a basis-point commission, including
+        /// blocks without rewards.
+        commission_rate_in_basis_points: bool,
         /// Optional Unix timestamp for the block.
         block_time: Option<i64>,
         /// Optional ledger block height.
@@ -2304,8 +2309,10 @@ where
 
                                     if block_enabled {
                                         if let Some(on_block_cb) = on_block.as_ref() {
-                                            let rewards =
-                                                std::mem::take(&mut this_block_rewards).rewards;
+                                            let DecodedRewards {
+                                                rewards,
+                                                commission_rate_in_basis_points,
+                                            } = std::mem::take(&mut this_block_rewards);
                                             if slot > last_emitted_slot {
                                                 on_block_cb(
                                                     thread_index,
@@ -2315,6 +2322,7 @@ where
                                                         slot: block.slot,
                                                         blockhash: latest_entry_blockhash,
                                                         rewards,
+                                                        commission_rate_in_basis_points,
                                                         block_time: Some(block.meta.blocktime as i64),
                                                         block_height: block.meta.block_height,
                                                         executed_transaction_count:

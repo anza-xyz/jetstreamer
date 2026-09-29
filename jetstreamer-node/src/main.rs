@@ -6937,6 +6937,7 @@ fn historical_worker_profile(
         compatibility::RuntimeBackend::SolanaV1_2_32 => historical::SOLANA_V1_2_32_CANDIDATE,
         compatibility::RuntimeBackend::SolanaV1_3_19 => historical::SOLANA_V1_3_19_CANDIDATE,
         compatibility::RuntimeBackend::SolanaV1_3_23 => historical::SOLANA_V1_3_23_CANDIDATE,
+        compatibility::RuntimeBackend::SolanaV1_4_17 => historical::SOLANA_V1_4_17_CANDIDATE,
         compatibility::RuntimeBackend::SolanaV1_4_25 => historical::SOLANA_V1_4_25_CANDIDATE,
         compatibility::RuntimeBackend::SolanaV1_5_5 => historical::SOLANA_V1_5_5_CANDIDATE,
         compatibility::RuntimeBackend::SolanaV1_5_19 => historical::SOLANA_V1_5_19_CANDIDATE,
@@ -9977,6 +9978,7 @@ async fn run_geyser_replay(
             | compatibility::RuntimeBackend::SolanaV1_2_32
             | compatibility::RuntimeBackend::SolanaV1_3_19
             | compatibility::RuntimeBackend::SolanaV1_3_23
+            | compatibility::RuntimeBackend::SolanaV1_4_17
             | compatibility::RuntimeBackend::SolanaV1_4_25
             | compatibility::RuntimeBackend::SolanaV1_5_5
             | compatibility::RuntimeBackend::SolanaV1_5_19
@@ -11890,6 +11892,7 @@ fn validated_epoch_archive_multi_runtime(
         | compatibility::RuntimeBackend::SolanaV1_2_32
         | compatibility::RuntimeBackend::SolanaV1_3_19
         | compatibility::RuntimeBackend::SolanaV1_3_23
+        | compatibility::RuntimeBackend::SolanaV1_4_17
         | compatibility::RuntimeBackend::SolanaV1_4_25
         | compatibility::RuntimeBackend::SolanaV1_5_5
         | compatibility::RuntimeBackend::SolanaV1_5_19

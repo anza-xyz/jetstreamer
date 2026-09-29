@@ -6192,6 +6192,13 @@ const COMPATIBLE_V1_0_8_GENERATION_PROFILES: &[&str] =
 // archive size, and SHA-256 are still validated independently.
 const COMPATIBLE_V1_5_5_GENERATION_PROFILES: &[&str] =
     &["jetstreamer-node/0.7.0/old-faithful-to-horizon-v2@4b51568437afe361dca9deeaa2d4e8cbdf953bf6"];
+// This exact clean producer generated the sealed epoch-150 archive before
+// importer-only parallel validation changed the node build revision. Keep
+// admission scoped to v1.5.6; the exact worker/runtime, bootstrap and terminal
+// checkpoint evidence, full semantic/PoH decode, inode identity, size, and
+// SHA-256 remain independently mandatory.
+const COMPATIBLE_V1_5_6_GENERATION_PROFILES: &[&str] =
+    &["jetstreamer-node/0.7.0/old-faithful-to-horizon-v2@cf4f1eb43414104f20e0688e175e4771e246f2e8"];
 // This exact clean producer generated sealed v1.6.15 archives before the
 // importer-only parallel validation change. Keep admission runtime-scoped;
 // all executable, bootstrap/checkpoint, content, chain, inode, and digest
@@ -6416,6 +6423,8 @@ fn runtime_generation_profile_is_compatible(
             && COMPATIBLE_V1_0_8_GENERATION_PROFILES.contains(&recorded_generation_profile))
         || (runtime_profile == historical::SOLANA_V1_5_5_CANDIDATE.backend_id
             && COMPATIBLE_V1_5_5_GENERATION_PROFILES.contains(&recorded_generation_profile))
+        || (runtime_profile == historical::SOLANA_V1_5_6_CANDIDATE.backend_id
+            && COMPATIBLE_V1_5_6_GENERATION_PROFILES.contains(&recorded_generation_profile))
         || (runtime_profile == historical::SOLANA_V1_6_15_CANDIDATE.backend_id
             && COMPATIBLE_V1_6_15_GENERATION_PROFILES.contains(&recorded_generation_profile))
         || (runtime_profile == historical::SOLANA_V1_2_32_CANDIDATE.backend_id
@@ -19859,11 +19868,13 @@ mod early_snapshot_tests {
         let prior_v1_0_7 = COMPATIBLE_V1_0_7_GENERATION_PROFILES[0];
         let prior_v1_0_8 = COMPATIBLE_V1_0_8_GENERATION_PROFILES[0];
         let prior_v1_5_5 = COMPATIBLE_V1_5_5_GENERATION_PROFILES[0];
+        let prior_v1_5_6 = COMPATIBLE_V1_5_6_GENERATION_PROFILES[0];
         let prior_v1_6_15 = COMPATIBLE_V1_6_15_GENERATION_PROFILES[0];
         for (runtime, prior) in [
             (historical::SOLANA_V1_0_7_CANDIDATE.backend_id, prior_v1_0_7),
             (historical::SOLANA_V1_0_8_CANDIDATE.backend_id, prior_v1_0_8),
             (historical::SOLANA_V1_5_5_CANDIDATE.backend_id, prior_v1_5_5),
+            (historical::SOLANA_V1_5_6_CANDIDATE.backend_id, prior_v1_5_6),
             (
                 historical::SOLANA_V1_6_15_CANDIDATE.backend_id,
                 prior_v1_6_15,
@@ -19918,6 +19929,14 @@ mod early_snapshot_tests {
         ));
         assert!(!runtime_generation_profile_is_compatible(
             historical::SOLANA_V1_4_25_CANDIDATE.backend_id,
+            prior_v1_5_5,
+        ));
+        assert!(!runtime_generation_profile_is_compatible(
+            historical::SOLANA_V1_5_5_CANDIDATE.backend_id,
+            prior_v1_5_6,
+        ));
+        assert!(!runtime_generation_profile_is_compatible(
+            historical::SOLANA_V1_5_6_CANDIDATE.backend_id,
             prior_v1_5_5,
         ));
         assert!(!runtime_generation_profile_is_compatible(

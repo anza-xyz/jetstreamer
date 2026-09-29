@@ -3,6 +3,27 @@
 Major project results, newest first. Each entry records the UTC date and the
 code revision that produced the result.
 
+## 2026-09-29: Mainnet epoch 118 published and independently verified
+
+- Commits: `36c8f0ed79a419f7018bc484675527107d707184` introduced the
+  checkpoint-gated Solana v1.3.23 replay candidate, and
+  `cb3fb22cb77c4163350301e3922879eb00509d44` supplied the historical
+  archive limits used by this replay.
+- Replayed all 432,000 slots and matched bank hash
+  `6UzELcv2UP2oPjrkGdCXQHwLcidAc19Teg8zeGA1aUgp` and accounts hash
+  `5zVyDX9nRih9b8X354ir1WqKtoF2rj298FS5ggJ5dBP4` at slot 51,407,999.
+- Published the 49,749,923,223-byte archive atomically with SHA-256
+  `326425e0bbc84f26e532f3f1e7eee08b65069bab95e46991dcbd5333b749e025`.
+  Publication transaction
+  `9aec5f49c42d13bc3c3f2f34735e90f876e48b3d6595d98bf1ceacd8aa7f274c`
+  records the same digest.
+- The current independent verifier checked every slot frame, the complete PoH
+  chain, and semantic contents in 34 minutes, 30 seconds. Its receipt binds
+  the archive digest to verifier SHA-256
+  `51bb4a90dcac0a2475b46b2820470c3a53a0a541720a233dac288934cc864336`
+  and audit-script SHA-256
+  `a64fed21248715b2214292ea961a82afc5367a34b337d35afdbbc48d62c04bed`.
+
 ## 2026-09-29: Mainnet epoch 179 published and independently verified
 
 - Commit `ed00144fbf303723304090655b84230af61e7a12` supplied the bounded

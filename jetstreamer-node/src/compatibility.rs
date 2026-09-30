@@ -95,12 +95,14 @@ pub const SOLANA_V1_3_23_CANDIDATE_START_SLOT: Slot = SOLANA_V1_3_19_CANDIDATE_E
 /// with one ID whose meaning changed in v1.4. The v1.4 worker must own that
 /// activation boundary.
 pub const SOLANA_V1_3_23_CANDIDATE_END_SLOT_EXCLUSIVE: Slot = 55_728_000;
-/// Epoch 129. Exact v1.4.17 preserves the canonical successful vote at slot
-/// 55,728,002 where terminal v1.4.25 returns `SlotHashMismatch`. Publication
-/// remains gated on every canonical checkpoint in the epoch.
+/// Epochs 129 and 130. Exact v1.4.17 preserves the canonical successful vote
+/// at slot 55,728,002 where terminal v1.4.25 returns `SlotHashMismatch`. Exact
+/// source status at slot 56,298,256 also retains the v1.4.17 BPF-loader custom
+/// error 0x0b9f0002 where v1.4.25 returns `ProgramFailedToComplete`.
+/// Publication remains gated on every canonical checkpoint in each epoch.
 pub const SOLANA_V1_4_17_CANDIDATE_START_SLOT: Slot = SOLANA_V1_3_23_CANDIDATE_END_SLOT_EXCLUSIVE;
-pub const SOLANA_V1_4_17_CANDIDATE_END_SLOT_EXCLUSIVE: Slot = 56_160_000;
-/// Epochs 130 through 147, ending at the first v1.5 candidate epoch.
+pub const SOLANA_V1_4_17_CANDIDATE_END_SLOT_EXCLUSIVE: Slot = 56_592_000;
+/// Epochs 131 through 147, ending at the first v1.5 candidate epoch.
 pub const SOLANA_V1_4_25_CANDIDATE_START_SLOT: Slot = SOLANA_V1_4_17_CANDIDATE_END_SLOT_EXCLUSIVE;
 pub const SOLANA_V1_4_25_CANDIDATE_END_SLOT_EXCLUSIVE: Slot = 63_936_000;
 pub const SOLANA_V1_5_5_CANDIDATE_START_SLOT: Slot = SOLANA_V1_4_25_CANDIDATE_END_SLOT_EXCLUSIVE;
@@ -1381,14 +1383,14 @@ pub static RUNTIME_ERAS: &[RuntimeEra] = &[
         admission: AdmissionLevel::Candidate,
     },
     RuntimeEra {
-        name: "solana-v1.4.17-epoch-129-differential-candidate",
+        name: "solana-v1.4.17-epochs-129-130-differential-candidate",
         start_slot: SOLANA_V1_4_17_CANDIDATE_START_SLOT,
         end_slot_exclusive: Some(SOLANA_V1_4_17_CANDIDATE_END_SLOT_EXCLUSIVE),
         backend: EraBackend::Available(&SOLANA_V1_4_17_RUNTIME),
         admission: AdmissionLevel::Candidate,
     },
     RuntimeEra {
-        name: "solana-v1.4.25-epochs-130-147-differential-candidate",
+        name: "solana-v1.4.25-epochs-131-147-differential-candidate",
         start_slot: SOLANA_V1_4_25_CANDIDATE_START_SLOT,
         end_slot_exclusive: Some(SOLANA_V1_4_25_CANDIDATE_END_SLOT_EXCLUSIVE),
         backend: EraBackend::Available(&SOLANA_V1_4_25_RUNTIME),

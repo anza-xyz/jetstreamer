@@ -160,6 +160,51 @@ then runs a pinned `horizon_pipeline --verify-only` binary over the complete ran
 for final acceptance: the archive verifier proves integrity, boundaries, and PoH, while the plugin
 verifier proves that the current streaming interface can consume every record and account-data byte.
 
+### Horizon R2 delivery
+
+`jetstreamer-r2` delivers accepted Horizon archives to an append-only Cloudflare R2 bucket. The
+`HORIZON_S3_ENDPOINT` value is an HTTPS R2 endpoint whose path is the bucket name; credentials come
+from `HORIZON_ACCESS_KEY_ID` and `HORIZON_SECRET_ACCESS_KEY`. Credential values are never written to
+receipts or logs.
+
+R2's S3 `UploadPart` currently rejects `x-amz-checksum-sha256` even though the R2 compatibility
+matrix advertises composite SHA-256. The uploader therefore sends R2-validated `Content-MD5` for
+every part, reconstructs and checks the final multipart ETag, uploads the canonical whole-file
+`.sha256` sidecar, reads the completed archive back through R2 while recomputing its whole-file
+SHA-256, and reads the sidecar back byte-for-byte. If R2 exposes a native composite SHA-256 for an
+object, the uploader validates and uses it. A private, fsynced receipt is the prerequisite for
+optional local retirement. The binary intentionally has no completed-object delete operation and
+refuses to replace an existing remote object that does not match local evidence.
+
+```bash
+cargo build --release -p jetstreamer-r2
+
+# Sync every complete local pair. Omit --delete-local while an active historical
+# controller still uses this directory as its completion ledger.
+target/release/jetstreamer-r2 sync /path/to/horizon \
+  --receipt-directory /path/to/private/r2-receipts \
+  --legacy-part-size-mib 5
+
+# Restrict work to an inclusive range and retire proven local pairs.
+target/release/jetstreamer-r2 sync /path/to/horizon \
+  --epochs 0-100 \
+  --receipt-directory /path/to/private/r2-receipts \
+  --legacy-part-size-mib 5 \
+  --legacy-etag-only \
+  --delete-local
+```
+
+`--legacy-etag-only` is only for a pre-existing multipart object whose provenance is already
+trusted. It still rehashes the local archive, reconstructs the legacy multipart ETag, and reads the
+remote sidecar, but skips downloading the whole object. Newly uploaded objects always require native
+R2 SHA-256 evidence or a successful whole-object SHA-256 readback before a receipt can authorize
+local deletion.
+
+The checked-in `horizon-r2` Codex skill inventories R2 first, selects missing work, uses the
+historical compatibility pipeline, and invokes this binary after replay and plugin verification.
+With no requested range it starts at the lowest supported missing epoch; an explicit range bounds
+generation, verification, delivery, and cleanup.
+
 ### TUI dashboard
 
 Add `--tui` to render a live terminal dashboard instead of plain log output:

@@ -4,6 +4,7 @@ members = [
     "jetstreamer-horizon",
     "jetstreamer-node",
     "jetstreamer-plugin",
+    "jetstreamer-r2",
     "jetstreamer-utils",
 ]
 # Historical consensus workers are separate workspaces pinned to their exact
@@ -136,6 +137,7 @@ aws-credential-types = "1"
 aws-sdk-s3 = "1"
 aws-smithy-types = "1"
 aws-types = "1"
+md-5 = "0.10"
 
 [dependencies]
 # Same allocator choice (and reason) as jetstreamer-node: glibc malloc's

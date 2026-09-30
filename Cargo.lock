@@ -4806,6 +4806,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "jetstreamer-r2"
+version = "0.7.0"
+dependencies = [
+ "anyhow",
+ "aws-credential-types",
+ "aws-sdk-s3",
+ "aws-types",
+ "base64 0.22.1",
+ "libc",
+ "md-5",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "tokio",
+ "url 2.5.8",
+]
+
+[[package]]
 name = "jetstreamer-utils"
 version = "0.7.0"
 dependencies = [

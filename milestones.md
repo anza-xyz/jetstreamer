@@ -3,6 +3,20 @@
 Major project results, newest first. Each entry records the UTC date and the
 code revision that produced the result.
 
+## 2026-09-30: First Horizon archive delivered to append-only R2
+
+- Commit: `d7243fbbd8f1b4234256a57c9a1003cb0fcdc3a8` added the fail-closed
+  `jetstreamer-r2` delivery tool and portable `horizon-r2` Codex skill.
+- Uploaded the 37,448,762,331-byte epoch-107 archive in 559 parts. R2 checked
+  each part's `Content-MD5`, and the reconstructed multipart ETag matched
+  `364ccc22ecb71b9421a11d6483fa273e-559`.
+- Read the completed archive back through R2 and reproduced SHA-256
+  `3f832480dc694be004ee27a79054d266c753496ac78c77b82fe8c795ad402f1d`.
+  The canonical checksum sidecar also matched byte-for-byte.
+- Fsynced the private delivery receipt only after both remote objects were
+  re-observed. The canary left the local pair intact and left no incomplete
+  multipart upload.
+
 ## 2026-09-29: Mainnet epoch 180 published and independently verified
 
 - Commits: `ed00144fbf303723304090655b84230af61e7a12` supplied the

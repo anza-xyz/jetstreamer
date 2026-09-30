@@ -22,6 +22,12 @@ def absolute_directory(value: str) -> Path:
     return path
 
 
+def sha256(value: str) -> str:
+    if SHA256.fullmatch(value) is None:
+        raise argparse.ArgumentTypeError("expected a lowercase SHA-256 digest")
+    return value
+
+
 def regular_file(path: Path) -> bool:
     try:
         metadata = path.lstat()
@@ -42,9 +48,22 @@ def read_words(path: Path, count: int) -> list[str] | None:
     return words
 
 
-def read_gate(directory: Path, epoch: int, suffix: str) -> str | None:
+def read_gate(
+    directory: Path,
+    epoch: int,
+    suffix: str,
+    *,
+    verifier_sha256: str | None = None,
+    script_sha256: str | None = None,
+) -> str | None:
     words = read_words(directory / f"epoch-{epoch}.{suffix}.ok", 3)
-    return words[0] if words is not None else None
+    if words is None:
+        return None
+    if verifier_sha256 is not None and words[1] != verifier_sha256:
+        return None
+    if script_sha256 is not None and words[2] != script_sha256:
+        return None
+    return words[0]
 
 
 def read_r2(directory: Path, epoch: int) -> str | None:
@@ -87,6 +106,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("last_epoch", type=int)
     parser.add_argument("--full-receipts", required=True, type=absolute_directory)
     parser.add_argument("--plugin-receipts", required=True, type=absolute_directory)
+    parser.add_argument("--plugin-pipeline-sha256", required=True, type=sha256)
+    parser.add_argument("--plugin-verifier-script-sha256", required=True, type=sha256)
     parser.add_argument("--boundary-receipts", required=True, type=absolute_directory)
     parser.add_argument("--r2-receipts", required=True, type=absolute_directory)
     parser.add_argument(
@@ -105,7 +126,13 @@ def audit(args: argparse.Namespace) -> list[str]:
     digests: dict[int, str] = {}
     for epoch in range(args.first_epoch, args.last_epoch + 1):
         full = read_gate(args.full_receipts, epoch, "full")
-        plugin = read_gate(args.plugin_receipts, epoch, "plugin")
+        plugin = read_gate(
+            args.plugin_receipts,
+            epoch,
+            "plugin",
+            verifier_sha256=args.plugin_pipeline_sha256,
+            script_sha256=args.plugin_verifier_script_sha256,
+        )
         r2 = read_r2(args.r2_receipts, epoch)
         missing = [
             name

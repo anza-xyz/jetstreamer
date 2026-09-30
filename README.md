@@ -212,7 +212,8 @@ An existing destination is accepted only when it already matches the receipt. Pa
 can be resumed safely; unrelated or mismatching files are never overwritten.
 
 `scripts/audit_horizon_receipts.py` is the local-file-independent completion gate. It requires the
-full, current-plugin, R2, and adjacent-boundary receipts to agree on every archive SHA-256. Add
+full, current-plugin, R2, and adjacent-boundary receipts to agree on every archive SHA-256, and
+requires the approved plugin binary and verifier-script SHA-256 values explicitly. Add
 `--require-outer-boundaries` for a strict range publication audit that also proves the incoming
 predecessor boundary and the trailing successor boundary.
 

@@ -29,15 +29,15 @@ use std::{cmp, collections::HashMap, env, path::Path, sync::Arc};
 use tempfile::TempDir;
 
 const MAX_AGE_CORRECTION_EPOCH: u64 = 14;
-// Narrow epoch-129/130 candidate envelope. The minimum is the exact canonical
-// epoch-129 predecessor snapshot used by production. Source status at slot
-// 56,298,256 proves that v1.4.19 semantics remain required during epoch 130;
-// v1.4.25 resumes from epoch 131's independent predecessor snapshot. The
+// Narrow epoch-131/133 candidate envelope. The minimum is the exact canonical
+// epoch-131 predecessor snapshot used by qualification. Complete source-status
+// scans retain the pre-v1.4.20 BPF-loader error contract through epoch 133;
+// v1.4.25 resumes from epoch 134's independent predecessor snapshot. The
 // parent binds snapshot hashes and every later checkpoint before publication;
 // snapshot creator metadata alone is never runtime-selection evidence.
 const MIN_SUPPORTED_SNAPSHOT_SLOT: u64 = 56_591_999;
 const MIN_SUPPORTED_ENTRY_SLOT: u64 = MIN_SUPPORTED_SNAPSHOT_SLOT + 1;
-const MAX_SUPPORTED_SLOT_EXCLUSIVE: u64 = 57_024_000;
+const MAX_SUPPORTED_SLOT_EXCLUSIVE: u64 = 57_888_000;
 const POH_THREADS_ENV: &str = "JETSTREAMER_HISTORICAL_POH_THREADS";
 const ABSOLUTE_MAX_POH_THREADS: usize = 256;
 // The validator runs AccountsBackgroundService alongside replay. This worker

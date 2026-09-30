@@ -102,12 +102,14 @@ pub const SOLANA_V1_3_23_CANDIDATE_END_SLOT_EXCLUSIVE: Slot = 55_728_000;
 /// Publication remains gated on every canonical checkpoint in each epoch.
 pub const SOLANA_V1_4_17_CANDIDATE_START_SLOT: Slot = SOLANA_V1_3_23_CANDIDATE_END_SLOT_EXCLUSIVE;
 pub const SOLANA_V1_4_17_CANDIDATE_END_SLOT_EXCLUSIVE: Slot = 56_592_000;
-/// Epoch 131 retains the pre-v1.4.20 BPF-loader error contract. Exact
-/// v1.4.19 is the latest upstream patch with that contract; publication is
-/// still gated on source-status and canonical checkpoint differentials.
+/// Epochs 131 through 133 retain the pre-v1.4.20 BPF-loader error contract.
+/// Complete source-status scans found the legacy custom error in epochs 131,
+/// 132, and 133, and no `ProgramFailedToComplete` status in those epochs.
+/// Exact v1.4.19 is the latest upstream patch with that contract; publication
+/// is still gated on source-status and canonical checkpoint differentials.
 pub const SOLANA_V1_4_19_CANDIDATE_START_SLOT: Slot = SOLANA_V1_4_17_CANDIDATE_END_SLOT_EXCLUSIVE;
-pub const SOLANA_V1_4_19_CANDIDATE_END_SLOT_EXCLUSIVE: Slot = 57_024_000;
-/// Epochs 132 through 147, ending at the first v1.5 candidate epoch.
+pub const SOLANA_V1_4_19_CANDIDATE_END_SLOT_EXCLUSIVE: Slot = 57_888_000;
+/// Epochs 134 through 147, ending at the first v1.5 candidate epoch.
 pub const SOLANA_V1_4_25_CANDIDATE_START_SLOT: Slot = SOLANA_V1_4_19_CANDIDATE_END_SLOT_EXCLUSIVE;
 pub const SOLANA_V1_4_25_CANDIDATE_END_SLOT_EXCLUSIVE: Slot = 63_936_000;
 pub const SOLANA_V1_5_5_CANDIDATE_START_SLOT: Slot = SOLANA_V1_4_25_CANDIDATE_END_SLOT_EXCLUSIVE;
@@ -266,10 +268,10 @@ pub enum RuntimeBackend {
     /// differential evidence and kept behind canonical checkpoint gates.
     SolanaV1_4_17,
     /// Exact final v1.4 patch before the BPF-loader failure mapping changed,
-    /// initially bounded to epoch 131 while differential replay qualifies it.
+    /// bounded to epochs 131 through 133 by complete source-status scans.
     SolanaV1_4_19,
     /// Exact terminal v1.4 patch used only in the independently
-    /// checkpoint-gated diagnostic envelope for epochs 130 through 147.
+    /// checkpoint-gated diagnostic envelope for epochs 134 through 147.
     SolanaV1_4_25,
     /// Exact v1.5.5 execution selected for epochs 148 and 149 by canonical
     /// checkpoint evidence.
@@ -1424,14 +1426,14 @@ pub static RUNTIME_ERAS: &[RuntimeEra] = &[
         admission: AdmissionLevel::Candidate,
     },
     RuntimeEra {
-        name: "solana-v1.4.19-epoch-131-differential-candidate",
+        name: "solana-v1.4.19-epochs-131-133-differential-candidate",
         start_slot: SOLANA_V1_4_19_CANDIDATE_START_SLOT,
         end_slot_exclusive: Some(SOLANA_V1_4_19_CANDIDATE_END_SLOT_EXCLUSIVE),
         backend: EraBackend::Available(&SOLANA_V1_4_19_RUNTIME),
         admission: AdmissionLevel::Candidate,
     },
     RuntimeEra {
-        name: "solana-v1.4.25-epochs-132-147-differential-candidate",
+        name: "solana-v1.4.25-epochs-134-147-differential-candidate",
         start_slot: SOLANA_V1_4_25_CANDIDATE_START_SLOT,
         end_slot_exclusive: Some(SOLANA_V1_4_25_CANDIDATE_END_SLOT_EXCLUSIVE),
         backend: EraBackend::Available(&SOLANA_V1_4_25_RUNTIME),

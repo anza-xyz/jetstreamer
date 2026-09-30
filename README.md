@@ -199,7 +199,8 @@ specific authorization to replace the affected keys.
 `jetstreamer-r2 restore` reconstructs a local archive pair from R2 for audits that need retired
 neighbors. It requires an explicit epoch range and the private R2 receipt directory, conditionally
 downloads the exact recorded ETag, recomputes the whole-file SHA-256 and multipart ETag, validates
-the canonical sidecar, and publishes with no-clobber semantics:
+the canonical sidecar, and publishes with no-clobber semantics. Long downloads and remote
+SHA-256 readbacks resume with conditional ranged GETs after transient stalls or early EOFs:
 
 ```bash
 jetstreamer-r2 restore /absolute/scratch/directory \

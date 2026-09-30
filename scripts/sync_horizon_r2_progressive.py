@@ -2,7 +2,9 @@
 """Progressively upload complete Horizon epoch pairs to R2.
 
 This is deliberately a thin orchestrator around ``jetstreamer-r2``. The Rust
-binary owns hashing, multipart integrity, remote readback, and receipt writes.
+binary owns hashing, multipart integrity, remote readback, receipt writes, and
+optional local deletion. This process only delegates retirement after the full
+archive and current-plugin receipts bind the same archive digest.
 """
 
 from __future__ import annotations
@@ -19,6 +21,9 @@ import time
 
 
 SIDECAR_PATTERN = re.compile(r"([0-9a-f]{64})  epoch-([0-9]+)\.jet\n\Z")
+GATE_RECEIPT_PATTERN = re.compile(
+    r"([0-9a-f]{64}) ([0-9a-f]{64}) ([0-9a-f]{64})\n\Z"
+)
 
 
 def absolute_directory(value: str) -> Path:
@@ -40,6 +45,18 @@ def positive_integer(value: str) -> int:
     if parsed <= 0:
         raise argparse.ArgumentTypeError("value must be positive")
     return parsed
+
+
+def epoch_range(value: str) -> tuple[int, int]:
+    parts = value.split("-", 1)
+    try:
+        first = int(parts[0])
+        last = int(parts[-1])
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("invalid epoch range") from error
+    if first < 0 or last < first:
+        raise argparse.ArgumentTypeError("invalid epoch range")
+    return first, last
 
 
 def regular_file(path: Path) -> os.stat_result | None:
@@ -91,12 +108,40 @@ def receipt_matches(
             and receipt.get("archive_sha256") == digest
             and receipt.get("archive_length") == archive_metadata.st_size
             and receipt.get("verified_unix_seconds", -1) >= archive_metadata.st_mtime
+            and (
+                receipt.get("remote_sha256_readback") is True
+                or isinstance(receipt.get("r2_composite_sha256"), str)
+            )
         )
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError):
         return False
 
 
-def sync_epoch(args: argparse.Namespace, epoch: int) -> None:
+def gate_receipt_matches(directory: Path, epoch: int, suffix: str, digest: str) -> bool:
+    path = directory / f"epoch-{epoch}.{suffix}.ok"
+    try:
+        if regular_file(path) is None:
+            return False
+        match = GATE_RECEIPT_PATTERN.fullmatch(path.read_text(encoding="ascii"))
+        return match is not None and match.group(1) == digest
+    except (OSError, UnicodeDecodeError):
+        return False
+
+
+def retirement_allowed(args: argparse.Namespace, epoch: int, digest: str) -> bool:
+    return (
+        args.delete_local
+        and not any(first <= epoch <= last for first, last in args.defer_epochs)
+        and gate_receipt_matches(
+            args.full_receipt_directory, epoch, "full", digest
+        )
+        and gate_receipt_matches(
+            args.plugin_receipt_directory, epoch, "plugin", digest
+        )
+    )
+
+
+def sync_epoch(args: argparse.Namespace, epoch: int, *, delete_local: bool = False) -> None:
     command = [
         str(args.uploader),
         "sync",
@@ -110,6 +155,8 @@ def sync_epoch(args: argparse.Namespace, epoch: int) -> None:
         "--concurrency",
         str(args.concurrency),
     ]
+    if delete_local:
+        command.append("--delete-local")
     print(f"epoch {epoch}: progressive R2 sync started", flush=True)
     subprocess.run(command, check=True)
     print(f"epoch {epoch}: progressive R2 sync complete", flush=True)
@@ -125,9 +172,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--poll-seconds", type=positive_integer, default=300)
     parser.add_argument("--concurrency", type=positive_integer, default=4)
     parser.add_argument("--legacy-part-size-mib", type=positive_integer, default=5)
+    parser.add_argument("--delete-local", action="store_true")
+    parser.add_argument("--full-receipt-directory", type=absolute_directory)
+    parser.add_argument("--plugin-receipt-directory", type=absolute_directory)
+    parser.add_argument(
+        "--defer-epochs", type=epoch_range, action="append", default=[]
+    )
     args = parser.parse_args()
     if args.first_epoch < 0 or args.last_epoch < args.first_epoch:
         parser.error("invalid inclusive epoch range")
+    if args.delete_local and (
+        args.full_receipt_directory is None
+        or args.plugin_receipt_directory is None
+    ):
+        parser.error(
+            "--delete-local requires --full-receipt-directory and "
+            "--plugin-receipt-directory"
+        )
     return args
 
 
@@ -143,9 +204,12 @@ def main() -> int:
                     incomplete += 1
                 continue
             _archive, _sidecar, digest, archive_metadata = pair
+            retire = retirement_allowed(args, epoch, digest)
             if receipt_matches(receipt_path, epoch, digest, archive_metadata):
+                if retire:
+                    sync_epoch(args, epoch, delete_local=True)
                 continue
-            sync_epoch(args, epoch)
+            sync_epoch(args, epoch, delete_local=retire)
         if incomplete == 0:
             print(
                 f"epochs {args.first_epoch}-{args.last_epoch}: every epoch has an R2 receipt",

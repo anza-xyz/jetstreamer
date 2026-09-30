@@ -9,7 +9,7 @@ Treat R2 as durable storage. Never call `DeleteObject` or `DeleteObjects`. Abort
 
 Use the repository's `jetstreamer-r2` binary for upload and remote proof. Do not reimplement its multipart protocol in shell or Python. R2's S3 `UploadPart` currently rejects its advertised SHA-256 header, so the binary uses R2-enforced `Content-MD5`, checks the multipart ETag independently, reads the completed remote object back while computing its whole-file SHA-256, uploads and reads back the canonical `.sha256` sidecar, and fsyncs a private receipt before optional local retirement. If R2 begins returning native composite SHA-256 evidence, the binary validates and prefers it.
 
-For a long-running range, use `scripts/sync_horizon_r2_progressive.py` to discover newly completed local pairs and invoke the Rust uploader serially. Do not run two progressive uploaders over overlapping ranges. The Python process only schedules work; it never implements remote integrity checks or local deletion.
+For a long-running range, use `scripts/sync_horizon_r2_progressive.py` to discover newly completed local pairs and invoke the Rust uploader serially. Do not run two progressive uploaders over overlapping ranges. The Python process never implements remote integrity checks or unlinks files itself. With its explicit `--delete-local` mode, it requires digest-matching full-verification and current-plugin receipts, honors every `--defer-epochs` range, and then delegates a fresh remote verification plus local retirement to the Rust uploader.
 
 ## Resolve the work
 
@@ -42,6 +42,19 @@ target/release/jetstreamer-r2 sync "$HORIZON_DIR" \
 ```
 
 Add `--epochs START-END` for an explicit range. Add `--delete-local` only after checking the matching plugin receipt and that no active controller or verifier still requires those local paths. Existing deployed controllers may use the public directory as their completion ledger; defer retirement for their managed range until that controller finishes or is deliberately upgraded to understand R2 receipts.
+
+For progressive retirement, pass both receipt directories and explicitly defer every active
+controller range:
+
+```sh
+scripts/sync_horizon_r2_progressive.py \
+  target/release/jetstreamer-r2 "$HORIZON_DIR" \
+  "$HOME/.jetstreamer-private/r2-receipts" START END \
+  --delete-local \
+  --full-receipt-directory "$HOME/.jetstreamer-private/final-audits/receipts" \
+  --plugin-receipt-directory "$HOME/.jetstreamer-private/plugin-audits/receipts" \
+  --defer-epochs ACTIVE_START-ACTIVE_END
+```
 
 The binary must fail closed on an existing remote mismatch by default. If the user explicitly authorizes replacement, `--overwrite-existing` replaces both the archive and sidecar, performs a fresh whole-object SHA-256 readback, and atomically replaces the private receipt. A native R2 checksum, when present, must report type `COMPOSITE` and match local part-SHA-256 evidence. Objects without native R2 checksums require a matching reconstructed ETag, canonical sidecar, and, unless explicitly trusted as legacy, a successful whole-object SHA-256 readback.
 

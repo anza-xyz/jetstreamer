@@ -16,6 +16,10 @@
 //!
 //! Use `--chain <path>...` for strict verification of ordered archives. It
 //! carries the final canonical slot and blockhash across every file boundary.
+//! Add `--segment` when verifying a proper subset of a larger ordered chain:
+//! the first archive's incoming anchor and the last archive's trailing skipped
+//! slots are deliberately deferred, while every boundary inside the segment
+//! remains mandatory. A segment must contain at least two archives.
 //! A parallel release audit may pair one successful non-full `--chain` pass
 //! with `--full --internal-full` on every individual archive. The latter
 //! verifies all within-archive structure and PoH while the former independently
@@ -1028,7 +1032,7 @@ fn usage() -> ! {
         "usage: verify_archive <path> [max_slots] [start_slot] [--full] [--internal-full] [--anchor SLOT HASH] [--threads N]"
     );
     eprintln!(
-        "       verify_archive --chain <path>... [--full] [--anchor SLOT HASH] [--threads N]"
+        "       verify_archive --chain <path>... [--segment] [--full] [--anchor SLOT HASH] [--threads N]"
     );
     eprintln!("  --full              recompute every block's PoH hash");
     eprintln!(
@@ -1036,6 +1040,9 @@ fn usage() -> ! {
     );
     eprintln!("  --anchor SLOT HASH  trusted canonical block immediately before the range");
     eprintln!("  --chain              verify ordered, contiguous archives as one chain");
+    eprintln!(
+        "  --segment            verify only the boundaries inside a multi-archive chain segment; defer both outer boundaries"
+    );
     eprintln!("  --threads N          parallelism within each whole-file scan");
     std::process::exit(2);
 }
@@ -1058,7 +1065,12 @@ fn run_ordered_chain(
     threads: usize,
     full: bool,
     anchor: Option<ChainPoint>,
+    segment: bool,
 ) -> i32 {
+    if segment && paths.len() < 2 {
+        println!("SEGMENT FAIL: at least two archives are required");
+        return 1;
+    }
     let mut previous = anchor;
     let mut previous_end: Option<u64> = None;
     let mut previous_epoch: Option<u64> = None;
@@ -1066,9 +1078,14 @@ fn run_ordered_chain(
     let mut final_end = None;
     let mut final_block_slot = None;
 
-    for path in paths {
+    for (index, path) in paths.iter().enumerate() {
         println!("\n=== ordered archive: {path} ===");
-        let outcome = run_scan(path, threads, full, previous, true);
+        // A segment's first archive is intentionally allowed to omit its
+        // incoming anchor. Every later archive must link to the terminal block
+        // carried from its predecessor, which is the boundary evidence this
+        // mode exists to produce.
+        let require_anchor = !segment || index != 0 || anchor.is_some();
+        let outcome = run_scan(path, threads, full, previous, require_anchor);
         let end = outcome
             .slot_start
             .checked_add(outcome.slot_count)
@@ -1092,7 +1109,8 @@ fn run_ordered_chain(
             );
             chain_ok = false;
         }
-        chain_ok &= outcome.ok && outcome.anchored;
+        let boundary_anchor_ok = outcome.anchored || (segment && index == 0);
+        chain_ok &= outcome.ok && boundary_anchor_ok;
         previous = outcome.terminal;
         previous_end = Some(end);
         previous_epoch = Some(outcome.epoch);
@@ -1100,7 +1118,8 @@ fn run_ordered_chain(
         final_block_slot = outcome.last_block_slot;
     }
 
-    if let Some(end) = final_end
+    if !segment
+        && let Some(end) = final_end
         && final_block_slot != end.checked_sub(1)
     {
         println!(
@@ -1110,7 +1129,12 @@ fn run_ordered_chain(
         chain_ok = false;
     }
 
-    if chain_ok {
+    if chain_ok && segment {
+        println!(
+            "\nSEGMENT RESULT: OK: every archive and internal boundary verifies; outer boundaries are deferred."
+        );
+        0
+    } else if chain_ok {
         println!("\nCHAIN RESULT: OK: all ordered archives and boundaries verify.");
         0
     } else {
@@ -1133,6 +1157,7 @@ fn main() {
 
     if args[0] == "--chain" {
         let mut paths = Vec::new();
+        let mut segment = false;
         let mut i = 1;
         while i < args.len() {
             match args[i].as_str() {
@@ -1144,6 +1169,7 @@ fn main() {
                         .unwrap_or_else(|| usage());
                 }
                 "--full" => full = true,
+                "--segment" => segment = true,
                 "--internal-full" => usage(),
                 "--anchor" => anchor = Some(parse_anchor(&args, &mut i)),
                 value if value.starts_with("--") => usage(),
@@ -1154,7 +1180,7 @@ fn main() {
         if paths.is_empty() {
             usage();
         }
-        std::process::exit(run_ordered_chain(&paths, threads, full, anchor));
+        std::process::exit(run_ordered_chain(&paths, threads, full, anchor, segment));
     }
 
     let path = args[0].clone();
@@ -1480,7 +1506,7 @@ mod tests {
             first_path.to_string_lossy().into_owned(),
             second_path.to_string_lossy().into_owned(),
         ];
-        assert_eq!(run_ordered_chain(&paths, 2, false, None), 1);
+        assert_eq!(run_ordered_chain(&paths, 2, false, None, false), 1);
     }
 
     #[test]
@@ -1504,7 +1530,7 @@ mod tests {
             first_path.to_string_lossy().into_owned(),
             second_path.to_string_lossy().into_owned(),
         ];
-        assert_eq!(run_ordered_chain(&paths, 2, false, None), 0);
+        assert_eq!(run_ordered_chain(&paths, 2, false, None, false), 0);
     }
 
     #[test]
@@ -1524,7 +1550,62 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            run_ordered_chain(&[path.to_string_lossy().into_owned()], 2, false, None),
+            run_ordered_chain(
+                &[path.to_string_lossy().into_owned()],
+                2,
+                false,
+                None,
+                false,
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn ordered_segment_proves_internal_boundary_and_defers_outer_boundaries() {
+        let dir = tempfile::tempdir().unwrap();
+        let first_path = dir.path().join("epoch-5.jet");
+        let second_path = dir.path().join("epoch-6.jet");
+        let claimed_parent = Hash::new_from_array([9; 32]);
+        let first_blockhash = Hash::new_from_array([1; 32]);
+        let second_blockhash = Hash::new_from_array([2; 32]);
+        std::fs::write(
+            &first_path,
+            write_archive(5, 10, &[Some((9, claimed_parent, first_blockhash))]),
+        )
+        .unwrap();
+        std::fs::write(
+            &second_path,
+            write_archive(
+                6,
+                11,
+                &[Some((10, first_blockhash, second_blockhash)), None],
+            ),
+        )
+        .unwrap();
+        let paths = vec![
+            first_path.to_string_lossy().into_owned(),
+            second_path.to_string_lossy().into_owned(),
+        ];
+
+        // Strict mode rejects the unanchored start and trailing skipped slot.
+        assert_eq!(run_ordered_chain(&paths, 2, false, None, false), 1);
+        // Segment mode verifies the 5 -> 6 boundary and deliberately leaves
+        // those two outer proofs to adjacent segments.
+        assert_eq!(run_ordered_chain(&paths, 2, false, None, true), 0);
+    }
+
+    #[test]
+    fn ordered_segment_requires_an_actual_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("epoch-5.jet");
+        std::fs::write(
+            &path,
+            write_archive(5, 10, &[Some((9, Hash::new_unique(), Hash::new_unique()))]),
+        )
+        .unwrap();
+        assert_eq!(
+            run_ordered_chain(&[path.to_string_lossy().into_owned()], 2, false, None, true),
             1
         );
     }

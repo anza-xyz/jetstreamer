@@ -154,6 +154,15 @@ SHA-256 sidecar appears. After the complete range is present, it verifies the ra
 the ordered chain scan, and rehashes every archive before recording acceptance. Receipts include
 the archive, verifier, and script hashes, so a restart only repeats stale or unfinished work.
 
+Large ranges need not remain on local disk simultaneously. `verify_archive --chain --segment`
+verifies every archive and boundary inside a multi-archive segment while deliberately deferring
+the segment's incoming anchor and trailing skipped-slot proof to its neighbors.
+`scripts/verify_horizon_boundaries_progressive.sh` applies that mode to each available adjacent
+pair and writes an fsynced receipt bound to both archive SHA-256 values and the exact verifier.
+Once every archive has its full receipt and every adjacent boundary has a receipt, the range has
+the same internal chain coverage as one monolithic scan; the two outer boundaries must still be
+proved by the neighboring epochs or explicit canonical anchors.
+
 `scripts/verify_horizon_plugin_range.sh` is the corresponding progressive launcher for the
 consumer/API gate. It waits for every archive and well-formed sidecar in an inclusive epoch range,
 then runs a pinned `horizon_pipeline --verify-only` binary over the complete range. Run both scripts

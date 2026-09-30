@@ -667,12 +667,15 @@ state under root-controlled ancestry. The controller derives every work boundary
 fingerprinted preflight manifest and will not split a verification cohort.
 
 Concurrency begins at the configured floor and increases gradually when CPU, memory, and disk
-headroom allow it. Disk admission reserves a fixed safety margin and conservatively budgets the
-full configured private-storage allowance for every live producer before starting another one;
+headroom allow it. The optional `--memory-admission-gib` keeps the measured non-reclaimable
+per-worker reservation separate from the larger `MemoryMax` safety ceiling; it defaults to that
+ceiling unless an operator supplies measured evidence. Disk admission reserves a fixed safety
+margin and conservatively budgets the full configured private-storage allowance for every live
+producer before starting another one;
 it never terminates live work merely because available space falls below that estimate. Every
 producer runs as the unprivileged `sol` user in a resource-bounded systemd unit. A plan may
 configure up to 32 lanes, but admission is still capped by the number of provisioned lanes and by
-the live CPU, hard-cgroup-memory, and disk calculations. The final global claim check and launch
+the live CPU, memory-admission, and disk calculations. The final global claim check and launch
 are serialized through the bound public-directory lock, so controllers for different runtime eras
 cannot consume the same capacity slot concurrently. A queue's local lane count limits only how many
 jobs that queue can add; it does not become an accidental ceiling on the global producer count.

@@ -957,6 +957,8 @@ class AdmissionTests(unittest.TestCase):
         disk_available_gib: int = 20_000,
         disk_reserve_gib: int = 512,
         disk_budget_per_worker_gib: int = 2_048,
+        memory_admission_gib: int = 64,
+        cpus_per_lane: int = 8,
     ) -> int:
         current = [5 * sweep.GIB] * active if current is None else current
         peak = [6 * sweep.GIB] * active if peak is None else peak
@@ -974,9 +976,10 @@ class AdmissionTests(unittest.TestCase):
             maximum=maximum,
             settle_seconds=600,
             memory_max=64 * sweep.GIB,
+            memory_admission=memory_admission_gib * sweep.GIB,
             memory_reserve=64 * sweep.GIB,
             protected_memory=350 * sweep.GIB,
-            cpus_per_lane=8,
+            cpus_per_lane=cpus_per_lane,
             memory_current=current,
             memory_peak=peak,
             memory_high=48 * sweep.GIB,
@@ -1007,6 +1010,27 @@ class AdmissionTests(unittest.TestCase):
                 target=6,
             ),
             4,
+        )
+
+    def test_admission_reservation_is_distinct_from_hard_cgroup_limit(self) -> None:
+        self.assertEqual(
+            self.capacity(
+                active=10,
+                owned_active=0,
+                elapsed=10_000,
+                available_gib=625,
+                initial=4,
+                target=4,
+                lane_count=4,
+                maximum=4,
+                cpus=64,
+                cpus_per_lane=3,
+                disk_available_gib=4_224,
+                disk_reserve_gib=1_024,
+                disk_budget_per_worker_gib=225,
+                memory_admission_gib=20,
+            ),
+            14,
         )
 
     def test_unknown_or_high_cgroup_memory_freezes_ramp(self) -> None:
@@ -1070,9 +1094,20 @@ class AdmissionTests(unittest.TestCase):
                 ]
             )
 
-        sweep.validate_options(options(9))
+        valid = options(9)
+        sweep.validate_options(valid)
+        self.assertEqual(valid.memory_admission_gib, valid.memory_max_gib)
         with self.assertRaisesRegex(sweep.SweepError, "max <= 32"):
             sweep.validate_options(options(33))
+
+        excessive_memory_admission = options(9)
+        excessive_memory_admission.memory_admission_gib = (
+            excessive_memory_admission.memory_max_gib + 1
+        )
+        with self.assertRaisesRegex(
+            sweep.SweepError, "memory-admission-gib must not exceed"
+        ):
+            sweep.validate_options(excessive_memory_admission)
 
     def test_local_lane_count_does_not_become_the_global_ceiling(self) -> None:
         self.assertEqual(

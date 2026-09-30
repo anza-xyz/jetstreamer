@@ -1012,6 +1012,7 @@ def admission_capacity(
     maximum: int,
     settle_seconds: int,
     memory_max: int,
+    memory_admission: int,
     memory_reserve: int,
     protected_memory: int,
     cpus_per_lane: int,
@@ -1031,8 +1032,14 @@ def admission_capacity(
         disk_budget_per_worker,
     ) <= 0:
         return min(active, 1)
-    static_memory = max(0, memory_total - protected_memory - memory_reserve) // memory_max
-    live_additional = max(0, memory_available - memory_reserve) // memory_max
+    # Keep admission budgeting distinct from the cgroup's hard ceiling. Historical
+    # replay retains a large, reclaimable file cache, so MemoryMax is intentionally
+    # much higher than the measured anonymous working set. Treating the ceiling as
+    # committed RAM needlessly serializes otherwise safe lanes.
+    static_memory = (
+        max(0, memory_total - protected_memory - memory_reserve) // memory_admission
+    )
+    live_additional = max(0, memory_available - memory_reserve) // memory_admission
     live_memory = active + live_additional
     # Treat each live producer as if it may still consume its complete disk
     # budget. This intentionally double-counts space it already allocated: an
@@ -2236,6 +2243,7 @@ def controller_configuration_sha256(
         "poll_seconds": args.poll_seconds,
         "memory_high_gib": args.memory_high_gib,
         "memory_max_gib": args.memory_max_gib,
+        "memory_admission_gib": args.memory_admission_gib,
         "memory_reserve_gib": args.memory_reserve_gib,
         "protected_memory_gib": args.protected_memory_gib,
         "disk_reserve_gib": args.disk_reserve_gib,
@@ -3542,6 +3550,7 @@ class Controller:
             maximum=self.args.max_concurrency,
             settle_seconds=self.args.settle_seconds,
             memory_max=self.args.memory_max_gib * GIB,
+            memory_admission=self.args.memory_admission_gib * GIB,
             memory_reserve=self.args.memory_reserve_gib * GIB,
             protected_memory=self.args.protected_memory_gib * GIB,
             cpus_per_lane=self.args.cpus_per_lane,
@@ -3699,6 +3708,14 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--poll-seconds", type=int, default=DEFAULT_POLL_SECONDS)
     parser.add_argument("--memory-high-gib", type=int, default=DEFAULT_MEMORY_HIGH_GIB)
     parser.add_argument("--memory-max-gib", type=int, default=DEFAULT_MEMORY_MAX_GIB)
+    parser.add_argument(
+        "--memory-admission-gib",
+        type=int,
+        help=(
+            "per-producer non-reclaimable memory reservation used only for admission; "
+            "defaults to --memory-max-gib"
+        ),
+    )
     parser.add_argument("--memory-reserve-gib", type=int, default=DEFAULT_MEMORY_RESERVE_GIB)
     parser.add_argument("--protected-memory-gib", type=int, default=DEFAULT_PROTECTED_MEMORY_GIB)
     parser.add_argument("--disk-reserve-gib", type=int, default=DEFAULT_DISK_RESERVE_GIB)
@@ -3723,6 +3740,8 @@ def build_argument_parser() -> argparse.ArgumentParser:
 
 
 def validate_options(args: argparse.Namespace) -> None:
+    if args.memory_admission_gib is None:
+        args.memory_admission_gib = args.memory_max_gib
     if not SAFE_NAME_RE.fullmatch(args.controller_id):
         raise SweepError("controller-id must contain only lowercase letters, digits, and hyphens")
     numbers = (
@@ -3735,6 +3754,7 @@ def validate_options(args: argparse.Namespace) -> None:
         args.poll_seconds,
         args.memory_high_gib,
         args.memory_max_gib,
+        args.memory_admission_gib,
         args.memory_reserve_gib,
         args.protected_memory_gib,
         args.disk_reserve_gib,
@@ -3758,6 +3778,8 @@ def validate_options(args: argparse.Namespace) -> None:
         )
     if args.memory_high_gib >= args.memory_max_gib:
         raise SweepError("memory-high-gib must be lower than memory-max-gib")
+    if args.memory_admission_gib > args.memory_max_gib:
+        raise SweepError("memory-admission-gib must not exceed memory-max-gib")
     if args.execute and not args.controller_sha256:
         raise SweepError("--execute requires --controller-sha256")
     names = [lane.name for lane in args.lane]
@@ -3899,6 +3921,7 @@ def print_plan(
         "initial_concurrency": args.initial_concurrency,
         "target_concurrency": args.target_concurrency,
         "max_concurrency": args.max_concurrency,
+        "memory_admission_gib": args.memory_admission_gib,
         "disk_reserve_gib": args.disk_reserve_gib,
         "disk_budget_per_worker_gib": args.disk_budget_per_worker_gib,
         "completed": completed,

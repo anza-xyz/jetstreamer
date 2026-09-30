@@ -392,7 +392,9 @@ select a runtime. The current registry is deliberately conservative:
 | `55,728,000..56,160,000` | pinned Solana v1.4.17 worker | owns epoch 129's v1.4 feature boundary and reproduces the canonical successful vote at slot 55,728,002 where terminal v1.4.25 returns `SlotHashMismatch`; every canonical post-bootstrap root must still match before publication | source-status-qualified, checkpoint-gated candidate for epoch 129 |
 | `56,160,000..63,936,000` | pinned Solana v1.4.25 worker | independently verified snapshot restart; carries the v1.4 transaction-status vocabulary through the shared stream protocol; every cohort must match all canonical post-bootstrap roots | unqualified diagnostic candidate for epochs 130-147 |
 | `63,936,000..64,800,000` | pinned Solana v1.5.5 worker | exact v1.5.5 reproduces the trusted slot-63,948,761 accounts hash; normalizes v1.5 status variants for current plugins; every production cohort must still match all canonical post-bootstrap roots | bounded checkpoint-qualified candidate for epochs 148-149 |
-| `64,800,000..75,168,000` | pinned Solana v1.5.6 worker | exact v1.5.6 reproduces epoch 150's first canonical vote and the trusted slot-64,807,725 accounts hash; normalizes v1.5 status variants for current plugins; later cohorts remain independently checkpoint-gated | bounded checkpoint-qualified candidate for epochs 150-173 |
+| `64,800,000..66,528,000` | pinned Solana v1.5.6 worker | exact v1.5.6 reproduces epoch 150's first canonical vote and the trusted slot-64,807,725 accounts hash; normalizes v1.5 status variants for current plugins | bounded checkpoint-qualified candidate for epochs 150-153 |
+| `66,528,000..66,960,000` | pinned Solana v1.5.8 worker | anchored at canonical snapshot slot 66,527,778, warms slots 66,527,779-66,527,999, and reproduces the source-successful transaction at slot 66,528,004 that v1.5.6 rejects; terminal v1.5.19 already diverges during warmup at slot 66,527,779 | source-status-selected, terminal-checkpoint-gated candidate for epoch 154 |
+| `66,960,000..75,168,000` | pinned Solana v1.5.6 worker | independently verified snapshot restart after the narrow v1.5.8 envelope; later cohorts remain independently checkpoint-gated | checkpoint-gated candidate for epochs 155-173 |
 | `75,168,000..86,832,000` | pinned Solana v1.6.15 worker | independently verified snapshot restart; reproduces the v1.6 loader set, write-lock demotion, and expanded status vocabulary for current plugins; every cohort must match all canonical post-bootstrap roots | unqualified diagnostic candidate for epochs 174-200 |
 | `86,832,000..406,080,000` | none | unsupported; replay fails closed | unsupported |
 | `406,080,000..` | in-process Agave v3 | independently verified modern snapshot bootstrap | verified |
@@ -401,12 +403,12 @@ Verified epochs 0-100 use 12 execution envelopes backed by 11 historical worker 
 11 runtime boundaries consist of one hash-bound canonical state handoff, two source-lineage-verified
 epoch-67 handoffs, and eight independently verified snapshot restarts. The
 v1.2.32 worker is used on both sides of the two specialized epoch-67 ranges. The v1.3.23,
-v1.4.17, v1.4.25, v1.5.5, v1.5.6, and v1.6.15 candidates add six snapshot-isolated envelopes. The
+v1.4.17, v1.4.25, v1.5.5, v1.5.6, v1.5.8, and v1.6.15 candidates add eight snapshot-isolated envelopes. The
 v1.5.5 and v1.5.6 envelopes have each passed their first bounded post-boundary checkpoint; every
 complete production cohort still requires all canonical roots before publication. The terminal
 v1.5.19 worker remains registered only as an unassigned comparison candidate.
 
-Seven execution interventions are explicitly recorded in addition to the ordinary
+Eight execution interventions are explicitly recorded in addition to the ordinary
 epoch-aligned pinned-worker snapshot restarts:
 
 1. The behaviorally safe v1.0.7 to v1.0.8 state handoff at slot 619,849.
@@ -420,6 +422,9 @@ epoch-aligned pinned-worker snapshot restarts:
 7. Epoch 129 uses exact v1.4.17 because its first canonical vote at slot 55,728,002 succeeds under
    v1.4.17 but terminal v1.4.25 rolls it back with `SlotHashMismatch`; v1.4.25 resumes from the
    independent epoch-130 predecessor snapshot, and both ranges remain checkpoint-gated.
+8. Epoch 154 uses exact v1.5.8 from the hash-bound slot-66,527,778 snapshot because v1.5.6 rejects
+   a source-successful transaction at slot 66,528,004 while terminal v1.5.19 already disagrees at
+   slot 66,527,779; v1.5.6 resumes at epoch 155, and publication remains terminal-checkpoint-gated.
 
 Input repair is planned independently of execution and adds three more historical interventions:
 

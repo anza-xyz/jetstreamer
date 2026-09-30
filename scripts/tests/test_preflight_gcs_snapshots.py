@@ -323,6 +323,9 @@ class SelectionTests(unittest.TestCase):
             148: "solana-v1.5.5",
             149: "solana-v1.5.5",
             150: "solana-v1.5.6",
+            153: "solana-v1.5.6",
+            154: "solana-v1.5.8",
+            155: "solana-v1.5.6",
             173: "solana-v1.5.6",
             174: "solana-v1.6.15",
             200: "solana-v1.6.15",
@@ -423,6 +426,32 @@ class SelectionTests(unittest.TestCase):
 
         self.assertEqual(plan.bootstrap.slot, preflight.EPOCH_12_BOOTSTRAP_SLOT)
         self.assertEqual(plan.bootstrap.extension, ".tar.bz2")
+
+    def test_epoch_154_requires_the_registered_v1_5_8_bootstrap(self) -> None:
+        epoch = 154
+        root = preflight.parse_inventory_json(
+            json.dumps(
+                [
+                    inventory_record(
+                        preflight.EPOCH_154_BOOTSTRAP_SLOT,
+                        extension=".tar.zst",
+                        identity=preflight.EPOCH_154_BOOTSTRAP_ACCOUNTS_HASH,
+                    ),
+                    inventory_record(epoch * preflight.EPOCH_SLOTS + 1),
+                ]
+            ),
+            "root",
+            preflight.requested_slot_range(epoch, epoch),
+        )
+
+        plan = preflight.build_epoch_plans(root, (), epoch, epoch)[0]
+
+        self.assertEqual(plan.runtime, "solana-v1.5.8")
+        self.assertEqual(plan.bootstrap.slot, preflight.EPOCH_154_BOOTSTRAP_SLOT)
+        self.assertEqual(
+            plan.bootstrap.accounts_hash,
+            preflight.EPOCH_154_BOOTSTRAP_ACCOUNTS_HASH,
+        )
 
     def test_ambiguous_newest_bootstrap_fails_without_fallback(self) -> None:
         epoch = 61

@@ -53,6 +53,10 @@ EPOCH_12_BOOTSTRAP_SLOT = 5_183_736
 EPOCH_12_BOOTSTRAP_ACCOUNTS_HASH = (
     "BUqwiSm2GgH9ByKrBDF6epXHYK9RRh3vyZDKtUqtMXfR"
 )
+EPOCH_154_BOOTSTRAP_SLOT = 66_527_778
+EPOCH_154_BOOTSTRAP_ACCOUNTS_HASH = (
+    "CocT95ybNYZNtjH1kWmybzknzb1D17up3Rbt5MT9iCxY"
+)
 RUNTIME_ROUTES = (
     (1, 1, "solana-v1.0.7-to-v1.0.8", (".tar.bz2",)),
     (2, 7, "solana-v1.0.8", (".tar.bz2",)),
@@ -75,7 +79,9 @@ RUNTIME_ROUTES = (
     (129, 129, "solana-v1.4.17", (".tar.bz2", ".tar.zst")),
     (130, 147, "solana-v1.4.25", (".tar.bz2", ".tar.zst")),
     (148, 149, "solana-v1.5.5", (".tar.bz2", ".tar.zst")),
-    (150, 173, "solana-v1.5.6", (".tar.bz2", ".tar.zst")),
+    (150, 153, "solana-v1.5.6", (".tar.bz2", ".tar.zst")),
+    (154, 154, "solana-v1.5.8", (".tar.bz2", ".tar.zst")),
+    (155, 173, "solana-v1.5.6", (".tar.bz2", ".tar.zst")),
     (174, 200, "solana-v1.6.15", (".tar.bz2", ".tar.zst")),
 )
 ROOT_COHORT_HISTORICAL_RUNTIMES = frozenset(
@@ -95,6 +101,7 @@ ROOT_COHORT_HISTORICAL_RUNTIMES = frozenset(
         "solana-v1.5.5",
         "solana-v1.5.19",
         "solana-v1.5.6",
+        "solana-v1.5.8",
         "solana-v1.6.15",
     }
 )
@@ -482,6 +489,13 @@ def _select_bootstrap(
             if item.slot == EPOCH_12_BOOTSTRAP_SLOT
             and item.accounts_hash == EPOCH_12_BOOTSTRAP_ACCOUNTS_HASH
         ]
+    elif epoch == 154:
+        eligible = [
+            item
+            for item in eligible
+            if item.slot == EPOCH_154_BOOTSTRAP_SLOT
+            and item.accounts_hash == EPOCH_154_BOOTSTRAP_ACCOUNTS_HASH
+        ]
     source = "root bootstrap" if root_only else "bootstrap"
     try:
         return _unique_newest(eligible, source)
@@ -491,6 +505,12 @@ def _select_bootstrap(
                 "epoch 12: required canonical bootstrap "
                 f"snapshot-{EPOCH_12_BOOTSTRAP_SLOT}-"
                 f"{EPOCH_12_BOOTSTRAP_ACCOUNTS_HASH}.tar.bz2 is absent or ambiguous"
+            ) from error
+        if epoch == 154:
+            raise PreflightError(
+                "epoch 154: required canonical bootstrap "
+                f"snapshot-{EPOCH_154_BOOTSTRAP_SLOT}-"
+                f"{EPOCH_154_BOOTSTRAP_ACCOUNTS_HASH} is absent or ambiguous"
             ) from error
         raise PreflightError(
             f"epoch {epoch}: {error} in prior-epoch slots {prior_start}..={prior_end}"

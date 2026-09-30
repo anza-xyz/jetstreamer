@@ -109,9 +109,18 @@ pub const SOLANA_V1_5_5_CANDIDATE_START_SLOT: Slot = SOLANA_V1_4_25_CANDIDATE_EN
 /// of its canonical post-bootstrap roots.
 pub const SOLANA_V1_5_5_CANDIDATE_END_SLOT_EXCLUSIVE: Slot = 64_800_000;
 pub const SOLANA_V1_5_6_CANDIDATE_START_SLOT: Slot = SOLANA_V1_5_5_CANDIDATE_END_SLOT_EXCLUSIVE;
-/// Epochs 150 through 173. Exact v1.5.6 execution matches the first canonical
-/// epoch-150 vote and the trusted slot-64,807,725 accounts hash. Every later
-/// cohort remains checkpoint-gated and may identify a narrower successor.
+/// Epochs 150 through 153. Exact v1.5.6 execution matches the first canonical
+/// epoch-150 vote and the trusted slot-64,807,725 accounts hash. It diverges
+/// from source status at slot 66,528,004 in epoch 154.
+pub const SOLANA_V1_5_6_EPOCH150_153_END_SLOT_EXCLUSIVE: Slot = 66_528_000;
+/// Epoch 154. Exact v1.5.8 is selected by a source-status differential at
+/// slot 66,528,004 and remains gated on the canonical terminal checkpoint.
+pub const SOLANA_V1_5_8_CANDIDATE_START_SLOT: Slot = SOLANA_V1_5_6_EPOCH150_153_END_SLOT_EXCLUSIVE;
+pub const SOLANA_V1_5_8_CANDIDATE_END_SLOT_EXCLUSIVE: Slot = 66_960_000;
+/// Epochs 155 through 173 continue with v1.5.6 unless checkpoint evidence
+/// identifies another narrower successor.
+pub const SOLANA_V1_5_6_RESUMED_CANDIDATE_START_SLOT: Slot =
+    SOLANA_V1_5_8_CANDIDATE_END_SLOT_EXCLUSIVE;
 pub const SOLANA_V1_5_6_CANDIDATE_END_SLOT_EXCLUSIVE: Slot = 75_168_000;
 pub const SOLANA_V1_6_15_CANDIDATE_START_SLOT: Slot = SOLANA_V1_5_6_CANDIDATE_END_SLOT_EXCLUSIVE;
 /// Epochs 174 through 200, ending at the first unsupported epoch.
@@ -162,7 +171,15 @@ pub const SOLANA_V1_4_25_REVISION: &str = "893cc7647248a3536fb6e6d0b5e51c71446b8
 pub const SOLANA_V1_5_5_REVISION: &str = "10e12d14e105bc2a5cd9c216ffe943a28d2aabf1";
 pub const SOLANA_V1_5_19_REVISION: &str = "936ff7424e1306b0df07dabcd6863bf7896d2cb5";
 pub const SOLANA_V1_5_6_REVISION: &str = "01e4d0a1e9917701d1a148e1043b0ccf545c27f1";
+pub const SOLANA_V1_5_8_REVISION: &str = "460c643f8e549d22c09a9cddc3b0f5be9c7b2204";
 pub const SOLANA_V1_6_15_REVISION: &str = "5c2dab8055e8162386fcac313b6547f223fd386c";
+
+/// Canonical epoch-153 snapshot used to qualify and bootstrap the isolated
+/// v1.5.8 epoch-154 route.
+pub const SOLANA_V1_5_8_INITIAL_SNAPSHOT_SLOT: Slot = 66_527_778;
+pub const SOLANA_V1_5_8_INITIAL_SNAPSHOT_ACCOUNTS_HASH: &str =
+    "CocT95ybNYZNtjH1kWmybzknzb1D17up3Rbt5MT9iCxY";
+pub const SOLANA_V1_5_8_INITIAL_REPLAY_SLOT: Slot = SOLANA_V1_5_8_INITIAL_SNAPSHOT_SLOT + 1;
 
 /// Latest mainnet slot currently known to exercise the pre-v1.0.8
 /// three-account vote initialization successfully. This is behavioral
@@ -252,6 +269,9 @@ pub enum RuntimeBackend {
     /// Exact v1.5.6 execution selected from epoch 150 by canonical vote and
     /// checkpoint evidence.
     SolanaV1_5_6,
+    /// Exact v1.5.8 execution selected for epoch 154 by source-status
+    /// differential evidence and kept behind canonical checkpoint gates.
+    SolanaV1_5_8,
     /// Exact terminal v1.6 patch used only in the independently
     /// checkpoint-gated diagnostic envelope for epochs 174 through 200.
     SolanaV1_6_15,
@@ -401,6 +421,7 @@ impl RuntimeDescriptor {
             | RuntimeBackend::SolanaV1_5_5
             | RuntimeBackend::SolanaV1_5_19
             | RuntimeBackend::SolanaV1_5_6
+            | RuntimeBackend::SolanaV1_5_8
             | RuntimeBackend::SolanaV1_6_15 => {
                 BootstrapStateLoader::HistoricalWorkerSnapshotArchive
             }
@@ -969,6 +990,28 @@ pub static SOLANA_V1_5_6_RUNTIME: RuntimeDescriptor = RuntimeDescriptor {
     }),
 };
 
+pub static SOLANA_V1_5_8_RUNTIME: RuntimeDescriptor = RuntimeDescriptor {
+    backend: RuntimeBackend::SolanaV1_5_8,
+    identity: RuntimeIdentity {
+        name: "solana-v1.5.8",
+        revision: SOLANA_V1_5_8_REVISION,
+        rust_toolchain: "rustc 1.49.0 (e1884a8e3 2020-12-29)",
+        target: Some("x86_64-unknown-linux-gnu"),
+        genesis_hash: MAINNET_GENESIS_HASH,
+    },
+    bootstrap: BootstrapState {
+        loader: BootstrapStateLoader::HistoricalWorkerSnapshotArchive,
+        archive_extensions: &[".tar.bz2", ".tar.zst"],
+        snapshot_hash_kind: SnapshotHashKind::LegacyAccountsHash,
+        permits_in_memory_handoff: false,
+    },
+    worker: Some(WorkerExecutable {
+        identity: "jetstreamer-historical-worker-v1-5-8",
+        environment_override: "JETSTREAMER_HISTORICAL_WORKER_V1_5_8",
+        default_manifest_relative_path: "../historical-runtime/v1_5_8/target/release/jetstreamer-historical-worker-v1-5-8",
+    }),
+};
+
 pub static SOLANA_V1_6_15_RUNTIME: RuntimeDescriptor = RuntimeDescriptor {
     backend: RuntimeBackend::SolanaV1_6_15,
     identity: RuntimeIdentity {
@@ -1069,6 +1112,8 @@ pub static SNAPSHOT_ISOLATED_RUNTIME_BOUNDARIES: &[Slot] = &[
     SOLANA_V1_4_25_CANDIDATE_START_SLOT,
     SOLANA_V1_5_5_CANDIDATE_START_SLOT,
     SOLANA_V1_5_6_CANDIDATE_START_SLOT,
+    SOLANA_V1_5_8_CANDIDATE_START_SLOT,
+    SOLANA_V1_5_6_RESUMED_CANDIDATE_START_SLOT,
     SOLANA_V1_6_15_CANDIDATE_START_SLOT,
 ];
 
@@ -1097,6 +1142,7 @@ pub static RUNTIME_DESCRIPTORS: &[&RuntimeDescriptor] = &[
     &SOLANA_V1_5_5_RUNTIME,
     &SOLANA_V1_5_19_RUNTIME,
     &SOLANA_V1_5_6_RUNTIME,
+    &SOLANA_V1_5_8_RUNTIME,
     &SOLANA_V1_6_15_RUNTIME,
     &AGAVE_V3_RUNTIME,
 ];
@@ -1356,8 +1402,22 @@ pub static RUNTIME_ERAS: &[RuntimeEra] = &[
         admission: AdmissionLevel::Candidate,
     },
     RuntimeEra {
-        name: "solana-v1.5.6-epochs-150-173-checkpoint-candidate",
+        name: "solana-v1.5.6-epochs-150-153-checkpoint-candidate",
         start_slot: SOLANA_V1_5_6_CANDIDATE_START_SLOT,
+        end_slot_exclusive: Some(SOLANA_V1_5_6_EPOCH150_153_END_SLOT_EXCLUSIVE),
+        backend: EraBackend::Available(&SOLANA_V1_5_6_RUNTIME),
+        admission: AdmissionLevel::Candidate,
+    },
+    RuntimeEra {
+        name: "solana-v1.5.8-epoch-154-differential-candidate",
+        start_slot: SOLANA_V1_5_8_CANDIDATE_START_SLOT,
+        end_slot_exclusive: Some(SOLANA_V1_5_8_CANDIDATE_END_SLOT_EXCLUSIVE),
+        backend: EraBackend::Available(&SOLANA_V1_5_8_RUNTIME),
+        admission: AdmissionLevel::Candidate,
+    },
+    RuntimeEra {
+        name: "solana-v1.5.6-epochs-155-173-checkpoint-candidate",
+        start_slot: SOLANA_V1_5_6_RESUMED_CANDIDATE_START_SLOT,
         end_slot_exclusive: Some(SOLANA_V1_5_6_CANDIDATE_END_SLOT_EXCLUSIVE),
         backend: EraBackend::Available(&SOLANA_V1_5_6_RUNTIME),
         admission: AdmissionLevel::Candidate,
@@ -1918,7 +1978,7 @@ mod tests {
     #[test]
     fn runtime_registry_is_complete_and_well_formed() {
         validate_runtime_registry().unwrap();
-        assert_eq!(RUNTIME_DESCRIPTORS.len(), 22);
+        assert_eq!(RUNTIME_DESCRIPTORS.len(), 23);
         for descriptor in RUNTIME_DESCRIPTORS.iter().copied() {
             assert!(std::ptr::eq(
                 descriptor,
@@ -2088,6 +2148,12 @@ mod tests {
                 "../historical-runtime/v1_5_6/target/release/jetstreamer-historical-worker-v1-5-6",
             ),
             (
+                RuntimeBackend::SolanaV1_5_8,
+                SOLANA_V1_5_8_REVISION,
+                "JETSTREAMER_HISTORICAL_WORKER_V1_5_8",
+                "../historical-runtime/v1_5_8/target/release/jetstreamer-historical-worker-v1-5-8",
+            ),
+            (
                 RuntimeBackend::SolanaV1_6_15,
                 SOLANA_V1_6_15_REVISION,
                 "JETSTREAMER_HISTORICAL_WORKER_V1_6_15",
@@ -2175,6 +2241,7 @@ mod tests {
             RuntimeBackend::SolanaV1_5_5,
             RuntimeBackend::SolanaV1_5_19,
             RuntimeBackend::SolanaV1_5_6,
+            RuntimeBackend::SolanaV1_5_8,
             RuntimeBackend::SolanaV1_6_15,
         ] {
             let descriptor = backend.descriptor().unwrap();
@@ -2373,6 +2440,52 @@ mod tests {
     }
 
     #[test]
+    fn epoch_154_uses_the_v1_5_8_snapshot_isolated_warmup() {
+        assert_eq!(SOLANA_V1_5_8_CANDIDATE_START_SLOT, 66_528_000);
+        assert_eq!(SOLANA_V1_5_8_INITIAL_REPLAY_SLOT, 66_527_779);
+        assert_eq!(
+            SOLANA_V1_5_8_CANDIDATE_START_SLOT - SOLANA_V1_5_8_INITIAL_REPLAY_SLOT,
+            221
+        );
+        assert!(SNAPSHOT_ISOLATED_RUNTIME_BOUNDARIES.contains(&SOLANA_V1_5_8_CANDIDATE_START_SLOT));
+
+        let selection = select_runtime_with_snapshot_warmup(
+            SOLANA_V1_5_8_INITIAL_REPLAY_SLOT,
+            SOLANA_V1_5_8_CANDIDATE_START_SLOT..SOLANA_V1_5_8_CANDIDATE_END_SLOT_EXCLUSIVE,
+            true,
+        )
+        .unwrap();
+        assert_eq!(selection.backend, RuntimeBackend::SolanaV1_5_8);
+        assert!(std::ptr::eq(selection.descriptor, &SOLANA_V1_5_8_RUNTIME));
+
+        let spans = plan_runtime_spans(
+            SOLANA_V1_5_8_INITIAL_REPLAY_SLOT..SOLANA_V1_5_8_CANDIDATE_END_SLOT_EXCLUSIVE,
+            true,
+        )
+        .unwrap();
+        assert_eq!(spans.len(), 2);
+        assert_eq!(
+            spans[0].slots,
+            SOLANA_V1_5_8_INITIAL_REPLAY_SLOT..SOLANA_V1_5_8_CANDIDATE_START_SLOT
+        );
+        assert!(matches!(
+            spans[0].execution.backend,
+            EraBackend::Available(descriptor)
+                if std::ptr::eq(descriptor, &SOLANA_V1_5_6_RUNTIME)
+        ));
+        assert_eq!(
+            spans[1].slots,
+            SOLANA_V1_5_8_CANDIDATE_START_SLOT..SOLANA_V1_5_8_CANDIDATE_END_SLOT_EXCLUSIVE
+        );
+        assert!(matches!(
+            spans[1].execution.backend,
+            EraBackend::Available(descriptor)
+                if std::ptr::eq(descriptor, &SOLANA_V1_5_8_RUNTIME)
+        ));
+        assert!(spans.iter().all(|span| span.handoff.is_none()));
+    }
+
+    #[test]
     fn epochs_12_through_200_route_to_checkpoint_gated_exact_candidates() {
         for (range, backend, descriptor, boundary) in [
             (
@@ -2437,10 +2550,23 @@ mod tests {
                 SOLANA_V1_5_5_CANDIDATE_START_SLOT,
             ),
             (
-                SOLANA_V1_5_6_CANDIDATE_START_SLOT..SOLANA_V1_5_6_CANDIDATE_END_SLOT_EXCLUSIVE,
+                SOLANA_V1_5_6_CANDIDATE_START_SLOT..SOLANA_V1_5_6_EPOCH150_153_END_SLOT_EXCLUSIVE,
                 RuntimeBackend::SolanaV1_5_6,
                 &SOLANA_V1_5_6_RUNTIME,
                 SOLANA_V1_5_6_CANDIDATE_START_SLOT,
+            ),
+            (
+                SOLANA_V1_5_8_CANDIDATE_START_SLOT..SOLANA_V1_5_8_CANDIDATE_END_SLOT_EXCLUSIVE,
+                RuntimeBackend::SolanaV1_5_8,
+                &SOLANA_V1_5_8_RUNTIME,
+                SOLANA_V1_5_8_CANDIDATE_START_SLOT,
+            ),
+            (
+                SOLANA_V1_5_6_RESUMED_CANDIDATE_START_SLOT
+                    ..SOLANA_V1_5_6_CANDIDATE_END_SLOT_EXCLUSIVE,
+                RuntimeBackend::SolanaV1_5_6,
+                &SOLANA_V1_5_6_RUNTIME,
+                SOLANA_V1_5_6_RESUMED_CANDIDATE_START_SLOT,
             ),
             (
                 SOLANA_V1_6_15_CANDIDATE_START_SLOT..SOLANA_V1_6_15_CANDIDATE_END_SLOT_EXCLUSIVE,

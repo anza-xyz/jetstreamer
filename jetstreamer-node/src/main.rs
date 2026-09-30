@@ -5102,8 +5102,8 @@ impl ReplayBootstrap {
 }
 
 impl QualificationPlan {
-    fn runtime_range(self) -> std::ops::Range<Slot> {
-        self.replay_start..self.end_inclusive.saturating_add(1)
+    fn output_runtime_range(self) -> std::ops::Range<Slot> {
+        self.output_slot_start..self.end_inclusive.saturating_add(1)
     }
 
     fn slot_count(self) -> u64 {
@@ -5196,7 +5196,7 @@ fn runtime_slot_range(
 ) -> std::ops::Range<Slot> {
     if let Some(plan) = qualification {
         debug_assert_eq!(plan.epoch, epoch);
-        plan.runtime_range()
+        plan.output_runtime_range()
     } else {
         let (start, end_inclusive) = epoch_to_slot_range(epoch);
         start..end_inclusive.saturating_add(1)
@@ -6968,6 +6968,7 @@ fn historical_worker_profile(
         compatibility::RuntimeBackend::SolanaV1_5_5 => historical::SOLANA_V1_5_5_CANDIDATE,
         compatibility::RuntimeBackend::SolanaV1_5_19 => historical::SOLANA_V1_5_19_CANDIDATE,
         compatibility::RuntimeBackend::SolanaV1_5_6 => historical::SOLANA_V1_5_6_CANDIDATE,
+        compatibility::RuntimeBackend::SolanaV1_5_8 => historical::SOLANA_V1_5_8_CANDIDATE,
         compatibility::RuntimeBackend::SolanaV1_6_15 => historical::SOLANA_V1_6_15_CANDIDATE,
         compatibility::RuntimeBackend::AgaveV3 => {
             return Err(
@@ -7041,9 +7042,9 @@ impl SnapshotBootstrapBounds {
 
 /// Returns the complete bootstrap policy for a normal (non-qualification)
 /// epoch run. Most epochs accept any snapshot from the predecessor epoch.
-/// Epoch 12 is intentionally narrower: its v1.0.23 route starts from one exact
-/// canonical anchor, so a later epoch-11 snapshot must not silently shorten
-/// the registered warmup span.
+/// Epochs 12 and 154 are intentionally narrower: each route starts from one
+/// exact canonical anchor, so a later predecessor snapshot must not silently
+/// shorten the registered warmup span.
 fn normal_epoch_bootstrap_bounds(epoch: u64) -> Result<SnapshotBootstrapBounds, String> {
     if epoch == 0 {
         return Err("epoch 0 bootstraps from genesis, not a snapshot".to_string());
@@ -7069,6 +7070,26 @@ fn normal_epoch_bootstrap_bounds(epoch: u64) -> Result<SnapshotBootstrapBounds, 
             .parse::<Hash>()
             .map_err(|err| {
                 format!("runtime registry has an invalid epoch-12 bootstrap accounts hash: {err}")
+            })?;
+        return Ok(SnapshotBootstrapBounds::exact(slot, Some(accounts_hash)));
+    }
+    if epoch_to_slot(epoch) == compatibility::SOLANA_V1_5_8_CANDIDATE_START_SLOT {
+        let slot = compatibility::SOLANA_V1_5_8_INITIAL_SNAPSHOT_SLOT;
+        if !(min_slot..=max_slot).contains(&slot) {
+            return Err(format!(
+                "runtime registry epoch-154 bootstrap slot {slot} is outside predecessor bounds {min_slot}..={max_slot}"
+            ));
+        }
+        if slot.checked_add(1) != Some(compatibility::SOLANA_V1_5_8_INITIAL_REPLAY_SLOT) {
+            return Err(
+                "runtime registry epoch-154 bootstrap and initial replay slots are inconsistent"
+                    .to_string(),
+            );
+        }
+        let accounts_hash = compatibility::SOLANA_V1_5_8_INITIAL_SNAPSHOT_ACCOUNTS_HASH
+            .parse::<Hash>()
+            .map_err(|err| {
+                format!("runtime registry has an invalid epoch-154 bootstrap accounts hash: {err}")
             })?;
         return Ok(SnapshotBootstrapBounds::exact(slot, Some(accounts_hash)));
     }
@@ -9630,7 +9651,8 @@ fn publish_historical_segment_manifest(
             evidence.terminal.slot, plan.end_inclusive
         ));
     }
-    let selection = compatibility::select_runtime(plan.runtime_range(), allow_candidate_runtime)?;
+    let selection =
+        compatibility::select_runtime(plan.output_runtime_range(), allow_candidate_runtime)?;
     let identity = selection.descriptor.identity;
     let worker_executable_sha256 = result.historical_worker_executable_sha256.ok_or_else(|| {
         format!(
@@ -10009,6 +10031,7 @@ async fn run_geyser_replay(
             | compatibility::RuntimeBackend::SolanaV1_5_5
             | compatibility::RuntimeBackend::SolanaV1_5_19
             | compatibility::RuntimeBackend::SolanaV1_5_6
+            | compatibility::RuntimeBackend::SolanaV1_5_8
             | compatibility::RuntimeBackend::SolanaV1_6_15 => {
                 let worker_profile = historical_worker_profile(runtime_descriptor)?;
                 if let Some(CarriedRuntimeState::Historical {
@@ -11923,6 +11946,7 @@ fn validated_epoch_archive_multi_runtime(
         | compatibility::RuntimeBackend::SolanaV1_5_5
         | compatibility::RuntimeBackend::SolanaV1_5_19
         | compatibility::RuntimeBackend::SolanaV1_5_6
+        | compatibility::RuntimeBackend::SolanaV1_5_8
         | compatibility::RuntimeBackend::SolanaV1_6_15 => StateCommitmentKind::LegacyAccountsHash,
         compatibility::RuntimeBackend::AgaveV3 => StateCommitmentKind::AccountsLtHash,
     };
@@ -20361,6 +20385,50 @@ mod early_snapshot_tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn epoch_154_bootstrap_is_hash_bound_and_selects_v1_5_8_after_warmup() {
+        let expected_hash: Hash = compatibility::SOLANA_V1_5_8_INITIAL_SNAPSHOT_ACCOUNTS_HASH
+            .parse()
+            .unwrap();
+        let snapshot = ReplayBootstrap::SnapshotArchive(PathBuf::from(format!(
+            "snapshot-{}-{expected_hash}.tar.zst",
+            compatibility::SOLANA_V1_5_8_INITIAL_SNAPSHOT_SLOT
+        )));
+        let epoch_start = compatibility::SOLANA_V1_5_8_CANDIDATE_START_SLOT;
+
+        assert_eq!(
+            validate_epoch_bootstrap_snapshot(154, snapshot.snapshot_archive().unwrap()).unwrap(),
+            compatibility::SOLANA_V1_5_8_INITIAL_SNAPSHOT_SLOT
+        );
+        let replay_start = replay_start_for_bootstrap(&snapshot, 154, epoch_start).unwrap();
+        assert_eq!(
+            replay_start,
+            compatibility::SOLANA_V1_5_8_INITIAL_REPLAY_SLOT
+        );
+        let selection = compatibility::select_runtime_with_snapshot_warmup(
+            replay_start,
+            epoch_start..compatibility::SOLANA_V1_5_8_CANDIDATE_END_SLOT_EXCLUSIVE,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            selection.backend,
+            compatibility::RuntimeBackend::SolanaV1_5_8
+        );
+
+        let wrong_hash = Hash::new_unique();
+        assert_ne!(wrong_hash, expected_hash);
+        assert!(
+            validate_epoch_bootstrap_identity(
+                154,
+                compatibility::SOLANA_V1_5_8_INITIAL_SNAPSHOT_SLOT,
+                wrong_hash,
+            )
+            .is_err()
+        );
+        assert!(validate_epoch_bootstrap_identity(154, 66_527_999, expected_hash).is_err());
     }
 
     #[test]

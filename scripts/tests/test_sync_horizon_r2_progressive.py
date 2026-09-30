@@ -98,10 +98,19 @@ class ProgressiveR2Tests(unittest.TestCase):
                 defer_epochs=[],
                 full_receipt_directory=full,
                 plugin_receipt_directory=plugin,
+                plugin_pipeline_sha256=verifier,
+                plugin_verifier_script_sha256=script,
                 boundary_receipt_directory=boundary,
             )
             self.assertTrue(progressive.retirement_allowed(args, 7, digest))
             self.assertFalse(progressive.retirement_allowed(args, 7, "01" * 32))
+
+            args.plugin_pipeline_sha256 = "03" * 32
+            self.assertFalse(progressive.retirement_allowed(args, 7, digest))
+            args.plugin_pipeline_sha256 = verifier
+            args.plugin_verifier_script_sha256 = "04" * 32
+            self.assertFalse(progressive.retirement_allowed(args, 7, digest))
+            args.plugin_verifier_script_sha256 = script
 
             (boundary / "boundary-7-8.ok").unlink()
             self.assertFalse(progressive.retirement_allowed(args, 7, digest))

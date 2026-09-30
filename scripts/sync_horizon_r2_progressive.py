@@ -48,6 +48,12 @@ def positive_integer(value: str) -> int:
     return parsed
 
 
+def sha256(value: str) -> str:
+    if re.fullmatch(r"[0-9a-f]{64}", value) is None:
+        raise argparse.ArgumentTypeError("expected a lowercase SHA-256 digest")
+    return value
+
+
 def epoch_range(value: str) -> tuple[int, int]:
     parts = value.split("-", 1)
     try:
@@ -118,13 +124,26 @@ def receipt_matches(
         return False
 
 
-def gate_receipt_matches(directory: Path, epoch: int, suffix: str, digest: str) -> bool:
+def gate_receipt_matches(
+    directory: Path,
+    epoch: int,
+    suffix: str,
+    digest: str,
+    *,
+    verifier_sha256: str | None = None,
+    script_sha256: str | None = None,
+) -> bool:
     path = directory / f"epoch-{epoch}.{suffix}.ok"
     try:
         if regular_file(path) is None:
             return False
         match = GATE_RECEIPT_PATTERN.fullmatch(path.read_text(encoding="ascii"))
-        return match is not None and match.group(1) == digest
+        return (
+            match is not None
+            and match.group(1) == digest
+            and (verifier_sha256 is None or match.group(2) == verifier_sha256)
+            and (script_sha256 is None or match.group(3) == script_sha256)
+        )
     except (OSError, UnicodeDecodeError):
         return False
 
@@ -159,7 +178,12 @@ def retirement_allowed(args: argparse.Namespace, epoch: int, digest: str) -> boo
             args.full_receipt_directory, epoch, "full", digest
         )
         and gate_receipt_matches(
-            args.plugin_receipt_directory, epoch, "plugin", digest
+            args.plugin_receipt_directory,
+            epoch,
+            "plugin",
+            digest,
+            verifier_sha256=args.plugin_pipeline_sha256,
+            script_sha256=args.plugin_verifier_script_sha256,
         )
         and (
             epoch == 0
@@ -215,6 +239,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--delete-local", action="store_true")
     parser.add_argument("--full-receipt-directory", type=absolute_directory)
     parser.add_argument("--plugin-receipt-directory", type=absolute_directory)
+    parser.add_argument("--plugin-pipeline-sha256", type=sha256)
+    parser.add_argument("--plugin-verifier-script-sha256", type=sha256)
     parser.add_argument("--boundary-receipt-directory", type=absolute_directory)
     parser.add_argument(
         "--defer-epochs", type=epoch_range, action="append", default=[]
@@ -225,11 +251,14 @@ def parse_args() -> argparse.Namespace:
     if args.delete_local and (
         args.full_receipt_directory is None
         or args.plugin_receipt_directory is None
+        or args.plugin_pipeline_sha256 is None
+        or args.plugin_verifier_script_sha256 is None
         or args.boundary_receipt_directory is None
     ):
         parser.error(
             "--delete-local requires --full-receipt-directory and "
-            "--plugin-receipt-directory and --boundary-receipt-directory"
+            "--plugin-receipt-directory, --plugin-pipeline-sha256, "
+            "--plugin-verifier-script-sha256 and --boundary-receipt-directory"
         )
     return args
 

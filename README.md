@@ -247,8 +247,9 @@ generation, verification, delivery, and cleanup.
 
 For an actively generated range, `scripts/sync_horizon_r2_progressive.py` watches for complete
 archive/sidecar pairs and invokes `jetstreamer-r2` serially. It checks whether an existing private
-receipt still describes the local archive before skipping it. The watcher never deletes local or
-remote data; retirement remains a separate, gated operation.
+receipt still describes the local archive before skipping it. Local retirement additionally
+requires receipts from the exact approved plugin binary and verifier script plus both adjacent
+archive boundaries. The watcher never deletes remote data.
 
 ### TUI dashboard
 

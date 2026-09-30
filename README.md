@@ -213,6 +213,11 @@ historical compatibility pipeline, and invokes this binary after replay and plug
 With no requested range it starts at the lowest supported missing epoch; an explicit range bounds
 generation, verification, delivery, and cleanup.
 
+For an actively generated range, `scripts/sync_horizon_r2_progressive.py` watches for complete
+archive/sidecar pairs and invokes `jetstreamer-r2` serially. It checks whether an existing private
+receipt still describes the local archive before skipping it. The watcher never deletes local or
+remote data; retirement remains a separate, gated operation.
+
 ### TUI dashboard
 
 Add `--tui` to render a live terminal dashboard instead of plain log output:

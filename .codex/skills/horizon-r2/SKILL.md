@@ -9,6 +9,8 @@ Treat R2 as durable storage. Never call `DeleteObject` or `DeleteObjects`. Abort
 
 Use the repository's `jetstreamer-r2` binary for upload and remote proof. Do not reimplement its multipart protocol in shell or Python. R2's S3 `UploadPart` currently rejects its advertised SHA-256 header, so the binary uses R2-enforced `Content-MD5`, checks the multipart ETag independently, reads the completed remote object back while computing its whole-file SHA-256, uploads and reads back the canonical `.sha256` sidecar, and fsyncs a private receipt before optional local retirement. If R2 begins returning native composite SHA-256 evidence, the binary validates and prefers it.
 
+For a long-running range, use `scripts/sync_horizon_r2_progressive.py` to discover newly completed local pairs and invoke the Rust uploader serially. Do not run two progressive uploaders over overlapping ranges. The Python process only schedules work; it never implements remote integrity checks or local deletion.
+
 ## Resolve the work
 
 - Treat invocation without an epoch argument as authorization to start the next missing supported

@@ -5,7 +5,7 @@ description: Generate, verify, upload, and safely retire Horizon epoch archives 
 
 # Horizon R2
 
-Treat R2 as append-only durable storage. Never call `DeleteObject`, `DeleteObjects`, overwrite a mismatching object, or remove an R2 checksum sidecar. Aborting an incomplete multipart upload is allowed.
+Treat R2 as durable storage. Never call `DeleteObject` or `DeleteObjects`. Aborting an incomplete multipart upload is allowed. Preserve an existing object by default; use the uploader's explicit overwrite mode only after the user authorizes replacement of mismatching data.
 
 Use the repository's `jetstreamer-r2` binary for upload and remote proof. Do not reimplement its multipart protocol in shell or Python. R2's S3 `UploadPart` currently rejects its advertised SHA-256 header, so the binary uses R2-enforced `Content-MD5`, checks the multipart ETag independently, reads the completed remote object back while computing its whole-file SHA-256, uploads and reads back the canonical `.sha256` sidecar, and fsyncs a private receipt before optional local retirement. If R2 begins returning native composite SHA-256 evidence, the binary validates and prefers it.
 
@@ -25,7 +25,7 @@ Use the repository's `jetstreamer-r2` binary for upload and remote proof. Do not
 
 - Use the repository's sealed historical replay/controller path and automatic slot-range runtime selection. Do not invent a compatibility override.
 - Run generation in a persistent systemd unit so loss of the interactive session cannot kill it. Respect unrelated jobs and configured RAM/disk reserves.
-- Require the normal replay/root-checkpoint verification and a successful current Horizon verification-plugin pass before delivery. Preserve the canonical lowercase coreutils sidecar format: `<64 hex>  epoch-N.jet\n`.
+- Start the current Horizon verification plugin as soon as each local archive is available. Physical upload may run concurrently, but an epoch is not published or eligible for local retirement until its per-epoch plugin receipt is bound to the archive SHA-256 and plugin binary. Preserve the canonical lowercase coreutils sidecar format: `<64 hex>  epoch-N.jet\n`.
 
 ## Deliver
 
@@ -39,16 +39,18 @@ target/release/jetstreamer-r2 sync "$HORIZON_DIR" \
   --legacy-part-size-mib 5
 ```
 
-Add `--epochs START-END` for an explicit range. Add `--delete-local` only after checking that no active controller or verifier still requires those local paths. Existing deployed controllers may use the public directory as their completion ledger; defer retirement for their managed range until that controller finishes or is deliberately upgraded to understand R2 receipts.
+Add `--epochs START-END` for an explicit range. Add `--delete-local` only after checking the matching plugin receipt and that no active controller or verifier still requires those local paths. Existing deployed controllers may use the public directory as their completion ledger; defer retirement for their managed range until that controller finishes or is deliberately upgraded to understand R2 receipts.
 
-The binary must fail closed on an existing remote mismatch. A native R2 checksum, when present, must report type `COMPOSITE` and match local part-SHA-256 evidence. Objects without native R2 checksums require a matching reconstructed ETag, canonical sidecar, and, unless explicitly trusted as legacy, a successful whole-object SHA-256 readback.
+The binary must fail closed on an existing remote mismatch by default. If the user explicitly authorizes replacement, `--overwrite-existing` replaces both the archive and sidecar, performs a fresh whole-object SHA-256 readback, and atomically replaces the private receipt. A native R2 checksum, when present, must report type `COMPOSITE` and match local part-SHA-256 evidence. Objects without native R2 checksums require a matching reconstructed ETag, canonical sidecar, and, unless explicitly trusted as legacy, a successful whole-object SHA-256 readback.
 
 Do not use `--legacy-etag-only` unless the user has explicitly established that a pre-existing object is trusted. Newly uploaded archives always require native R2 SHA-256 evidence or whole-object SHA-256 readback.
 
 ## Operate safely
 
 - Never delete from R2, including during cleanup or retries.
+- Never use `--overwrite-existing` without explicit user authorization for the affected range.
 - Never remove a local archive before its durable receipt exists and both remote objects have been re-observed.
+- Treat upload completion without a matching current-plugin receipt as staged, not published.
 - Do not treat a sidecar alone as proof that the archive was uploaded.
 - Resume idempotently from R2 inventory and private receipts after interruption.
 - Monitor long jobs at 20-30 minute intervals unless a failure needs immediate work.

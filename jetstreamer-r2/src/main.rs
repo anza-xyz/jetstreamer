@@ -48,6 +48,7 @@ struct Config {
     legacy_part_size: Option<u64>,
     concurrency: usize,
     legacy_etag_only: bool,
+    overwrite_existing: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -113,7 +114,8 @@ fn usage() -> ! {
     eprintln!(concat!(
         "usage: horizon-r2 <sync|verify> DIRECTORY [--epochs START-END] ",
         "--receipt-directory DIRECTORY [--delete-local] [--part-size-mib N] ",
-        "[--legacy-part-size-mib N] [--legacy-etag-only] [--concurrency N]"
+        "[--legacy-part-size-mib N] [--legacy-etag-only] [--overwrite-existing] ",
+        "[--concurrency N]"
     ));
     std::process::exit(2);
 }
@@ -137,6 +139,7 @@ fn parse_args() -> Result<Config> {
     let mut legacy_part_size = None;
     let mut concurrency = DEFAULT_CONCURRENCY;
     let mut legacy_etag_only = false;
+    let mut overwrite_existing = false;
     while let Some(argument) = args.next() {
         let argument = argument
             .into_string()
@@ -154,6 +157,7 @@ fn parse_args() -> Result<Config> {
             "--part-size-mib" => part_size = parse_mib(&value()?)?,
             "--legacy-part-size-mib" => legacy_part_size = Some(parse_mib(&value()?)?),
             "--legacy-etag-only" => legacy_etag_only = true,
+            "--overwrite-existing" => overwrite_existing = true,
             "--concurrency" => {
                 concurrency = value()?.parse().context("invalid --concurrency")?;
                 ensure!(
@@ -178,6 +182,10 @@ fn parse_args() -> Result<Config> {
         !delete_local || command == Command::Sync,
         "--delete-local is valid only with sync"
     );
+    ensure!(
+        !overwrite_existing || command == Command::Sync,
+        "--overwrite-existing is valid only with sync"
+    );
     let epochs = match epochs {
         Some(epochs) => epochs,
         None => discover_local_epochs(&directory)?,
@@ -196,6 +204,7 @@ fn parse_args() -> Result<Config> {
         legacy_part_size,
         concurrency,
         legacy_etag_only,
+        overwrite_existing,
     })
 }
 
@@ -542,6 +551,7 @@ async fn upload_archive(
     local: &LocalArchive,
     part_size: u64,
     concurrency: usize,
+    overwrite_existing: bool,
 ) -> Result<(String, String)> {
     let key = format!("epoch-{}.jet", local.epoch);
     let created = client
@@ -658,17 +668,22 @@ async fn upload_archive(
                     .build()
             })
             .collect::<Vec<_>>();
-        let response = client
+        let request = client
             .complete_multipart_upload()
             .bucket(bucket)
             .key(&key)
             .upload_id(&upload_id)
-            .if_none_match("*")
             .multipart_upload(
                 CompletedMultipartUpload::builder()
                     .set_parts(Some(parts))
                     .build(),
-            )
+            );
+        let request = if overwrite_existing {
+            request
+        } else {
+            request.if_none_match("*")
+        };
+        let response = request
             .send()
             .await
             .map_err(|error| anyhow!("failed to complete multipart upload: {error:?}"))?;
@@ -699,20 +714,27 @@ async fn upload_archive(
     operation
 }
 
-async fn put_sidecar(client: &Client, bucket: &str, local: &LocalArchive) -> Result<()> {
+async fn put_sidecar(
+    client: &Client,
+    bucket: &str,
+    local: &LocalArchive,
+    overwrite_existing: bool,
+) -> Result<()> {
     let key = format!("epoch-{}.jet.sha256", local.epoch);
     let content_md5 = BASE64_STANDARD.encode(Md5::digest(&local.sidecar));
-    match client
+    let request = client
         .put_object()
         .bucket(bucket)
         .key(&key)
-        .if_none_match("*")
         .content_type("text/plain; charset=us-ascii")
         .content_md5(content_md5)
-        .body(ByteStream::from(local.sidecar.clone()))
-        .send()
-        .await
-    {
+        .body(ByteStream::from(local.sidecar.clone()));
+    let request = if overwrite_existing {
+        request
+    } else {
+        request.if_none_match("*")
+    };
+    match request.send().await {
         Ok(_) => Ok(()),
         Err(error) => {
             // A racing append-only writer may have won. It is acceptable only
@@ -730,7 +752,7 @@ fn receipt_path(directory: &Path, epoch: u64) -> PathBuf {
     directory.join(format!("epoch-{epoch}.r2.json"))
 }
 
-fn write_receipt(directory: &Path, receipt: &Receipt) -> Result<PathBuf> {
+fn write_receipt(directory: &Path, receipt: &Receipt, overwrite_existing: bool) -> Result<PathBuf> {
     fs::create_dir_all(directory)?;
     fs::set_permissions(
         directory,
@@ -739,12 +761,14 @@ fn write_receipt(directory: &Path, receipt: &Receipt) -> Result<PathBuf> {
     let final_path = receipt_path(directory, receipt.epoch);
     if final_path.exists() {
         let existing: Receipt = serde_json::from_slice(&fs::read(&final_path)?)?;
+        if same_receipt_evidence(&existing, receipt) {
+            return Ok(final_path);
+        }
         ensure!(
-            same_receipt_evidence(&existing, receipt),
+            overwrite_existing,
             "existing R2 receipt differs for epoch {}",
             receipt.epoch
         );
-        return Ok(final_path);
     }
     let temporary = directory.join(format!(
         ".epoch-{}.r2.{}.tmp",
@@ -864,14 +888,18 @@ async fn sync_epoch(client: &Client, r2: &R2Config, config: &Config, epoch: u64)
     let archive_key = format!("epoch-{epoch}.jet");
     let checksum_key = format!("epoch-{epoch}.jet.sha256");
     let existing = head_archive(client, &r2.bucket, &archive_key).await?;
-    let was_existing = existing.is_some();
+    let was_existing = existing.is_some() && !config.overwrite_existing;
     let effective_part_size = if let Some(remote) = &existing {
-        remote
-            .multipart_part_size
-            .or(config.legacy_part_size)
-            .ok_or_else(|| {
-                anyhow!("epoch {epoch} already exists but has no part-size metadata and --legacy-part-size-mib was not supplied")
-            })?
+        if config.overwrite_existing {
+            config.part_size
+        } else {
+            remote
+                .multipart_part_size
+                .or(config.legacy_part_size)
+                .ok_or_else(|| {
+                    anyhow!("epoch {epoch} already exists but has no part-size metadata and --legacy-part-size-mib was not supplied")
+                })?
+        }
     } else {
         config.part_size
     };
@@ -885,58 +913,65 @@ async fn sync_epoch(client: &Client, r2: &R2Config, config: &Config, epoch: u64)
         proof.sha256_hex == local.sha256_hex,
         "local SHA-256 mismatch for epoch {epoch}"
     );
-    let (etag, remote_composite_sha256) = if let Some(remote) = existing {
-        ensure!(
-            remote.length == local.length,
-            "remote length mismatch for epoch {epoch}"
-        );
-        ensure!(
-            remote.etag == proof.multipart_etag,
-            "remote ETag mismatch for epoch {epoch}"
-        );
-        if let Some(metadata_sha256) = remote.metadata_sha256 {
+    let (etag, remote_composite_sha256) =
+        if let Some(remote) = existing.filter(|_| !config.overwrite_existing) {
             ensure!(
-                metadata_sha256 == local.sha256_hex,
-                "remote SHA-256 metadata mismatch"
-            );
-        }
-        if let Some(checksum) = remote.composite_sha256.as_deref() {
-            ensure!(
-                remote.checksum_type == Some(ChecksumType::Composite),
-                "unexpected remote checksum type"
+                remote.length == local.length,
+                "remote length mismatch for epoch {epoch}"
             );
             ensure!(
-                composite_checksum_matches(
-                    checksum,
-                    &proof.composite_sha256,
-                    local.length.div_ceil(effective_part_size)
-                ),
-                "remote composite SHA-256 mismatch for epoch {epoch}"
+                remote.etag == proof.multipart_etag,
+                "remote ETag mismatch for epoch {epoch}"
             );
-        }
-        (remote.etag, remote.composite_sha256)
-    } else {
-        ensure!(
-            config.command == Command::Sync,
-            "remote archive is missing for epoch {epoch}"
-        );
-        eprintln!("epoch {epoch}: uploading {} bytes", local.length);
-        let (etag, _locally_expected_composite_checksum) = upload_archive(
-            client,
-            &r2.bucket,
-            &local,
-            config.part_size,
-            config.concurrency,
-        )
-        .await?;
-        (etag, None)
-    };
+            if let Some(metadata_sha256) = remote.metadata_sha256 {
+                ensure!(
+                    metadata_sha256 == local.sha256_hex,
+                    "remote SHA-256 metadata mismatch"
+                );
+            }
+            if let Some(checksum) = remote.composite_sha256.as_deref() {
+                ensure!(
+                    remote.checksum_type == Some(ChecksumType::Composite),
+                    "unexpected remote checksum type"
+                );
+                ensure!(
+                    composite_checksum_matches(
+                        checksum,
+                        &proof.composite_sha256,
+                        local.length.div_ceil(effective_part_size)
+                    ),
+                    "remote composite SHA-256 mismatch for epoch {epoch}"
+                );
+            }
+            (remote.etag, remote.composite_sha256)
+        } else {
+            ensure!(
+                config.command == Command::Sync,
+                "remote archive is missing for epoch {epoch}"
+            );
+            eprintln!("epoch {epoch}: uploading {} bytes", local.length);
+            let (etag, _locally_expected_composite_checksum) = upload_archive(
+                client,
+                &r2.bucket,
+                &local,
+                config.part_size,
+                config.concurrency,
+                config.overwrite_existing,
+            )
+            .await?;
+            (etag, None)
+        };
     match remote_sidecar(client, &r2.bucket, &checksum_key).await? {
+        Some(_) if config.overwrite_existing => {
+            put_sidecar(client, &r2.bucket, &local, true).await?
+        }
         Some(bytes) => ensure!(
             bytes == local.sidecar,
             "remote sidecar mismatch for epoch {epoch}"
         ),
-        None if config.command == Command::Sync => put_sidecar(client, &r2.bucket, &local).await?,
+        None if config.command == Command::Sync => {
+            put_sidecar(client, &r2.bucket, &local, false).await?
+        }
         None => bail!("remote sidecar is missing for epoch {epoch}"),
     }
     ensure!(
@@ -1008,7 +1043,11 @@ async fn sync_epoch(client: &Client, r2: &R2Config, config: &Config, epoch: u64)
         multipart_part_size: effective_part_size,
         verified_unix_seconds: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
     };
-    let receipt_path = write_receipt(&config.receipt_directory, &receipt)?;
+    let receipt_path = write_receipt(
+        &config.receipt_directory,
+        &receipt,
+        config.overwrite_existing,
+    )?;
     if config.delete_local {
         retire_local(&local)?;
         eprintln!(
@@ -1085,6 +1124,38 @@ mod tests {
         let mut later = receipt.clone();
         later.verified_unix_seconds = 2;
         assert!(same_receipt_evidence(&receipt, &later));
+    }
+
+    #[test]
+    fn receipt_replacement_requires_explicit_overwrite() {
+        let directory = tempfile::tempdir().unwrap();
+        let receipt = Receipt {
+            schema: RECEIPT_SCHEMA.to_owned(),
+            bucket: "bucket".to_owned(),
+            epoch: 7,
+            archive_key: "epoch-7.jet".to_owned(),
+            checksum_key: "epoch-7.jet.sha256".to_owned(),
+            archive_length: 10,
+            archive_sha256: "ab".repeat(32),
+            archive_etag: "old-etag".to_owned(),
+            r2_composite_sha256: None,
+            remote_sha256_readback: true,
+            multipart_part_size: 5 * 1024 * 1024,
+            verified_unix_seconds: 1,
+        };
+        write_receipt(directory.path(), &receipt, false).unwrap();
+
+        let mut replacement = receipt.clone();
+        replacement.archive_etag = "new-etag".to_owned();
+        replacement.verified_unix_seconds = 2;
+        assert!(write_receipt(directory.path(), &replacement, false).is_err());
+        write_receipt(directory.path(), &replacement, true).unwrap();
+
+        let stored: Receipt = serde_json::from_slice(
+            &fs::read(receipt_path(directory.path(), replacement.epoch)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(stored, replacement);
     }
 
     #[test]

@@ -160,6 +160,11 @@ then runs a pinned `horizon_pipeline --verify-only` binary over the complete ran
 for final acceptance: the archive verifier proves integrity, boundaries, and PoH, while the plugin
 verifier proves that the current streaming interface can consume every record and account-data byte.
 
+`scripts/verify_horizon_plugin_progressive.sh` runs that consumer/API gate per epoch as soon as a
+complete archive pair appears. Its fsynced receipt binds the archive SHA-256, the exact
+`horizon_pipeline` binary, and the verification script. R2 upload may overlap this work, but an
+uploaded object is staged—not published or eligible for local retirement—until this receipt exists.
+
 ### Horizon R2 delivery
 
 `jetstreamer-r2` delivers accepted Horizon archives to an append-only Cloudflare R2 bucket. The
@@ -174,7 +179,10 @@ every part, reconstructs and checks the final multipart ETag, uploads the canoni
 SHA-256, and reads the sidecar back byte-for-byte. If R2 exposes a native composite SHA-256 for an
 object, the uploader validates and uses it. A private, fsynced receipt is the prerequisite for
 optional local retirement. The binary intentionally has no completed-object delete operation and
-refuses to replace an existing remote object that does not match local evidence.
+refuses to replace an existing remote object that does not match local evidence by default.
+`--overwrite-existing` is an explicit recovery mode: it replaces both remote objects, performs a
+fresh full-object SHA-256 readback, and atomically replaces the private receipt. Use it only with
+specific authorization to replace the affected keys.
 
 ```bash
 cargo build --release -p jetstreamer-r2
@@ -435,7 +443,8 @@ select a runtime. The current registry is deliberately conservative:
 | `39,744,000..43,632,000` | pinned Solana v1.3.19 worker | independently verified snapshot restart; bounded extractor admits up to 131,072 members for the audited 104,267–106,520-member epoch-98 through epoch-100 snapshots | diagnostic candidate for epochs 92-100 |
 | `43,632,000..55,728,000` | pinned Solana v1.3.23 worker | independently verified snapshot restart; mainnet still accepted a 4,008-byte stake initialization at slot 55,686,407; the extractor remains byte-bounded while admitting the later snapshot's 131,072+ members; every cohort must match all canonical post-bootstrap roots | unqualified diagnostic candidate for epochs 101-128 |
 | `55,728,000..56,592,000` | pinned Solana v1.4.17 worker | owns epoch 129's v1.4 feature boundary; reproduces the canonical successful vote at slot 55,728,002 where terminal v1.4.25 returns `SlotHashMismatch`, and the source-recorded BPF-loader custom error at slot 56,298,256 where v1.4.25 returns `ProgramFailedToComplete`; every canonical post-bootstrap root must still match before publication | source-status-selected, checkpoint-gated candidate for epochs 129-130 |
-| `56,592,000..63,936,000` | pinned Solana v1.4.25 worker | independently verified snapshot restart; carries the v1.4 transaction-status vocabulary through the shared stream protocol; every cohort must match all canonical post-bootstrap roots | unqualified diagnostic candidate for epochs 131-147 |
+| `56,592,000..57,024,000` | pinned Solana v1.4.19 worker | all 7 relevant source failures in epoch 131 retain the legacy loader custom error and none use `ProgramFailedToComplete`; v1.4.19 is the final upstream patch before that error contract changed | source-status-selected candidate; focused checkpoint qualification in progress |
+| `57,024,000..63,936,000` | pinned Solana v1.4.25 worker | independently verified snapshot restart; carries the later v1.4 transaction-status vocabulary through the shared stream protocol; every cohort must match all canonical post-bootstrap roots | unqualified diagnostic candidate for epochs 132-147 |
 | `63,936,000..64,800,000` | pinned Solana v1.5.5 worker | exact v1.5.5 reproduces the trusted slot-63,948,761 accounts hash; normalizes v1.5 status variants for current plugins; every production cohort must still match all canonical post-bootstrap roots | bounded checkpoint-qualified candidate for epochs 148-149 |
 | `64,800,000..66,528,000` | pinned Solana v1.5.6 worker | exact v1.5.6 reproduces epoch 150's first canonical vote and the trusted slot-64,807,725 accounts hash; normalizes v1.5 status variants for current plugins | bounded checkpoint-qualified candidate for epochs 150-153 |
 | `66,528,000..66,960,000` | pinned Solana v1.5.8 worker | anchored at canonical snapshot slot 66,527,778, warms slots 66,527,779-66,527,999, and reproduces the source-successful transaction at slot 66,528,004 that v1.5.6 rejects; terminal v1.5.19 already diverges during warmup at slot 66,527,779 | source-status-selected, terminal-checkpoint-gated candidate for epoch 154 |
@@ -448,12 +457,12 @@ Verified epochs 0-100 use 12 execution envelopes backed by 11 historical worker 
 11 runtime boundaries consist of one hash-bound canonical state handoff, two source-lineage-verified
 epoch-67 handoffs, and eight independently verified snapshot restarts. The
 v1.2.32 worker is used on both sides of the two specialized epoch-67 ranges. The v1.3.23,
-v1.4.17, v1.4.25, v1.5.5, v1.5.6, v1.5.8, and v1.6.15 candidates add eight snapshot-isolated envelopes. The
+v1.4.17, v1.4.19, v1.4.25, v1.5.5, v1.5.6, v1.5.8, and v1.6.15 candidates add nine snapshot-isolated envelopes. The
 v1.5.5 and v1.5.6 envelopes have each passed their first bounded post-boundary checkpoint; every
 complete production cohort still requires all canonical roots before publication. The terminal
 v1.5.19 worker remains registered only as an unassigned comparison candidate.
 
-Eight execution interventions are explicitly recorded in addition to the ordinary
+Nine execution interventions are explicitly recorded in addition to the ordinary
 epoch-aligned pinned-worker snapshot restarts:
 
 1. The behaviorally safe v1.0.7 to v1.0.8 state handoff at slot 619,849.
@@ -467,9 +476,11 @@ epoch-aligned pinned-worker snapshot restarts:
 7. Epochs 129-130 use exact v1.4.17 because the first canonical epoch-129 vote at slot 55,728,002
    succeeds under v1.4.17 while terminal v1.4.25 rolls it back with `SlotHashMismatch`, and slot
    56,298,256 records BPF-loader custom error `0x0b9f0002` while v1.4.25 returns
-   `ProgramFailedToComplete`; v1.4.25 resumes from the independent epoch-131 predecessor snapshot,
-   and both ranges remain checkpoint-gated.
-8. Epoch 154 uses exact v1.5.8 from the hash-bound slot-66,527,778 snapshot because v1.5.6 rejects
+   `ProgramFailedToComplete`; both epochs remain checkpoint-gated.
+8. Epoch 131 uses exact v1.4.19 because a complete source-status scan found 7 legacy loader custom
+   errors and no `ProgramFailedToComplete` records. Exact v1.4.20 and later changed that mapping;
+   v1.4.25 resumes from the independent epoch-132 predecessor snapshot after qualification.
+9. Epoch 154 uses exact v1.5.8 from the hash-bound slot-66,527,778 snapshot because v1.5.6 rejects
    a source-successful transaction at slot 66,528,004 while terminal v1.5.19 already disagrees at
    slot 66,527,779; v1.5.6 resumes at epoch 155, and publication remains terminal-checkpoint-gated.
 

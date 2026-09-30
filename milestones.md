@@ -3,6 +3,21 @@
 Major project results, newest first. Each entry records the UTC date and the
 code revision that produced the result.
 
+## 2026-09-30: Measured-memory admission raised historical replay concurrency to 14
+
+- Commit `c70b757032a2d28d7694bb23c55e51e33bf48ceb` separated the measured
+  non-reclaimable admission reservation from each worker's larger hard cgroup
+  memory ceiling.
+- Live cgroup measurements across ten producers showed 2.4–12.5 GiB of
+  anonymous memory per worker; most of their 22–68 GiB `MemoryCurrent` was
+  reclaimable file cache. The live-shaped admission benchmark increased from
+  10 to 14 producers while retaining 64/68 GiB `MemoryHigh`/`MemoryMax` limits
+  and the 1 TiB disk reserve.
+- The checksum-pinned controller immediately admitted epoch 131 and cohorts
+  182, 183–184, and 185. All four downloaded and bound their canonical GCS
+  predecessor snapshots and started isolated historical workers successfully.
+- All 98 scheduler and preflight tests passed before deployment.
+
 ## 2026-09-30: Current Horizon plugin consumed the complete epoch-101 archive
 
 - Commit `343238c3e1cc15469df08a81fc2badf895fc125b` added the progressive,

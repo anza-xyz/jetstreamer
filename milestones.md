@@ -3,6 +3,23 @@
 Major project results, newest first. Each entry records the UTC date and the
 code revision that produced the result.
 
+## 2026-09-30: Current Horizon plugin consumed the complete epoch-101 archive
+
+- Commit `343238c3e1cc15469df08a81fc2badf895fc125b` added the progressive,
+  receipt-bound current-plugin gate used for this run.
+- The plugin consumed all 432,000 slots, including 411,371 produced blocks,
+  109,333,914 entries, 84,903,526 transactions, 218,072,888 transaction
+  updates, and 2,615,394 orphan updates in 27 minutes, 53 seconds.
+- It processed 13,485,130,897,497 account-data bytes and produced deterministic
+  stream SHA-256
+  `ee5e9dd0f3212c820a5f67de75cfc0074c060e37bbbf5f81c245516485925b80`.
+- The fsynced gate receipt binds archive SHA-256
+  `244ade25b1c149e054b20786ff18f3920984f9d9d846d36714889caa02e983db`
+  to `horizon_pipeline` SHA-256
+  `f2d6cda1e7a1f2c3ad670ef84d13cb2461ba2e7699d3d38dde216c633d9e7f1a`
+  and verification-script SHA-256
+  `966fba1a0a08715db2e328532662450ec432f5dfe42dc3af076db56a14c6e1cf`.
+
 ## 2026-09-30: First Horizon archive delivered to append-only R2
 
 - Commit: `d7243fbbd8f1b4234256a57c9a1003cb0fcdc3a8` added the fail-closed

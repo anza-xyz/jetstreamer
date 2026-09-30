@@ -196,6 +196,20 @@ refuses to replace an existing remote object that does not match local evidence 
 fresh full-object SHA-256 readback, and atomically replaces the private receipt. Use it only with
 specific authorization to replace the affected keys.
 
+`jetstreamer-r2 restore` reconstructs a local archive pair from R2 for audits that need retired
+neighbors. It requires an explicit epoch range and the private R2 receipt directory, conditionally
+downloads the exact recorded ETag, recomputes the whole-file SHA-256 and multipart ETag, validates
+the canonical sidecar, and publishes with no-clobber semantics:
+
+```bash
+jetstreamer-r2 restore /absolute/scratch/directory \
+  --epochs 101-107 \
+  --receipt-directory /absolute/private/r2-receipts
+```
+
+An existing destination is accepted only when it already matches the receipt. Partial restores
+can be resumed safely; unrelated or mismatching files are never overwritten.
+
 ```bash
 cargo build --release -p jetstreamer-r2
 

@@ -1,6 +1,6 @@
 [package]
 name = "jetstreamer-r2"
-description = "Fail-closed Cloudflare R2 delivery for verified Horizon archives"
+description = "Fail-closed Cloudflare R2 delivery and restore for verified Horizon archives"
 edition.workspace = true
 version.workspace = true
 authors.workspace = true
@@ -20,8 +20,8 @@ libc.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true, features = ["std"] }
 sha2.workspace = true
+tempfile.workspace = true
 tokio = { workspace = true, features = ["fs", "io-util", "macros", "rt-multi-thread"] }
 url.workspace = true
 
 [dev-dependencies]
-tempfile.workspace = true

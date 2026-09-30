@@ -1,4 +1,5 @@
-//! Upload verified Horizon archives to Cloudflare R2 and retire local copies.
+//! Upload verified Horizon archives to Cloudflare R2, restore verified copies,
+//! and retire local copies.
 //!
 //! The remote API surface is intentionally append-only: this program contains
 //! no DeleteObject operation. A local archive is removed only after its exact
@@ -55,6 +56,7 @@ struct Config {
 enum Command {
     Sync,
     Verify,
+    Restore,
 }
 
 #[derive(Clone, Debug)]
@@ -112,7 +114,7 @@ struct Receipt {
 
 fn usage() -> ! {
     eprintln!(concat!(
-        "usage: horizon-r2 <sync|verify> DIRECTORY [--epochs START-END] ",
+        "usage: horizon-r2 <sync|verify|restore> DIRECTORY [--epochs START-END] ",
         "--receipt-directory DIRECTORY [--delete-local] [--part-size-mib N] ",
         "[--legacy-part-size-mib N] [--legacy-etag-only] [--overwrite-existing] ",
         "[--concurrency N]"
@@ -129,6 +131,7 @@ fn parse_args() -> Result<Config> {
     {
         Some("sync") => Command::Sync,
         Some("verify") => Command::Verify,
+        Some("restore") => Command::Restore,
         _ => usage(),
     };
     let directory = args.next().map(PathBuf::from).unwrap_or_else(|| usage());
@@ -186,9 +189,10 @@ fn parse_args() -> Result<Config> {
         !overwrite_existing || command == Command::Sync,
         "--overwrite-existing is valid only with sync"
     );
-    let epochs = match epochs {
-        Some(epochs) => epochs,
-        None => discover_local_epochs(&directory)?,
+    let epochs = match (command, epochs) {
+        (Command::Restore, None) => bail!("restore requires --epochs START-END"),
+        (_, Some(epochs)) => epochs,
+        (_, None) => discover_local_epochs(&directory)?,
     };
     ensure!(
         !epochs.is_empty(),
@@ -802,6 +806,248 @@ fn same_receipt_evidence(left: &Receipt, right: &Receipt) -> bool {
         && left.multipart_part_size == right.multipart_part_size
 }
 
+fn read_restore_receipt(directory: &Path, bucket: &str, epoch: u64) -> Result<Receipt> {
+    let path = receipt_path(directory, epoch);
+    let before = regular_identity(&path)?;
+    ensure!(before.length <= 16 * 1024, "oversized R2 receipt");
+    let receipt: Receipt = serde_json::from_slice(&fs::read(&path)?)?;
+    ensure!(
+        regular_identity(&path)? == before,
+        "R2 receipt changed while read"
+    );
+    ensure!(
+        receipt.schema == RECEIPT_SCHEMA,
+        "unsupported R2 receipt schema"
+    );
+    ensure!(
+        receipt.bucket == bucket,
+        "R2 receipt names a different bucket"
+    );
+    ensure!(receipt.epoch == epoch, "R2 receipt names a different epoch");
+    ensure!(
+        receipt.archive_key == format!("epoch-{epoch}.jet")
+            && receipt.checksum_key == format!("epoch-{epoch}.jet.sha256"),
+        "R2 receipt contains noncanonical object keys"
+    );
+    ensure!(
+        receipt.archive_length > 0,
+        "R2 receipt has an empty archive"
+    );
+    ensure!(
+        receipt.archive_sha256.len() == 64
+            && receipt
+                .archive_sha256
+                .bytes()
+                .all(|byte| { byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase() }),
+        "R2 receipt has an invalid archive SHA-256"
+    );
+    ensure!(
+        receipt.multipart_part_size >= 5 * 1024 * 1024,
+        "R2 receipt has an invalid multipart part size"
+    );
+    Ok(receipt)
+}
+
+fn canonical_sidecar(receipt: &Receipt) -> Vec<u8> {
+    format!("{}  epoch-{}.jet\n", receipt.archive_sha256, receipt.epoch).into_bytes()
+}
+
+fn validate_restored_archive(path: &Path, receipt: &Receipt) -> Result<()> {
+    let identity = regular_identity(path)?;
+    ensure!(
+        identity.length == receipt.archive_length,
+        "restored archive length mismatch"
+    );
+    let proof = hash_and_etag(path, identity, receipt.multipart_part_size)?;
+    ensure!(
+        proof.sha256_hex == receipt.archive_sha256,
+        "restored archive SHA-256 mismatch"
+    );
+    ensure!(
+        proof.multipart_etag == receipt.archive_etag,
+        "restored archive multipart ETag mismatch"
+    );
+    Ok(())
+}
+
+fn validate_restored_sidecar(path: &Path, expected: &[u8]) -> Result<()> {
+    let identity = regular_identity(path)?;
+    ensure!(
+        identity.length <= MAX_SIDECAR_BYTES,
+        "restored sidecar is oversized"
+    );
+    ensure!(fs::read(path)? == expected, "restored sidecar mismatch");
+    ensure!(
+        regular_identity(path)? == identity,
+        "restored sidecar changed while read"
+    );
+    Ok(())
+}
+
+fn validate_remote_against_receipt(remote: &RemoteArchive, receipt: &Receipt) -> Result<()> {
+    ensure!(
+        remote.length == receipt.archive_length,
+        "remote archive length differs from receipt"
+    );
+    ensure!(
+        remote.etag == receipt.archive_etag,
+        "remote archive ETag differs from receipt"
+    );
+    if let Some(metadata_sha256) = &remote.metadata_sha256 {
+        ensure!(
+            metadata_sha256 == &receipt.archive_sha256,
+            "remote archive SHA-256 metadata differs from receipt"
+        );
+    }
+    if let Some(expected) = &receipt.r2_composite_sha256 {
+        ensure!(
+            remote.checksum_type == Some(ChecksumType::Composite)
+                && remote.composite_sha256.as_ref() == Some(expected),
+            "remote composite SHA-256 differs from receipt"
+        );
+    }
+    Ok(())
+}
+
+fn persist_noclobber(mut temporary: tempfile::NamedTempFile, destination: &Path) -> Result<()> {
+    temporary.as_file_mut().sync_all()?;
+    fs::set_permissions(
+        temporary.path(),
+        std::os::unix::fs::PermissionsExt::from_mode(0o440),
+    )?;
+    temporary.persist_noclobber(destination).map_err(|error| {
+        anyhow!(
+            "failed to publish {}: {}",
+            destination.display(),
+            error.error
+        )
+    })?;
+    Ok(())
+}
+
+async fn restore_epoch(client: &Client, r2: &R2Config, config: &Config, epoch: u64) -> Result<()> {
+    use tokio::io::AsyncReadExt as _;
+
+    let receipt = read_restore_receipt(&config.receipt_directory, &r2.bucket, epoch)?;
+    let archive_path = config.directory.join(&receipt.archive_key);
+    let sidecar_path = config.directory.join(&receipt.checksum_key);
+    let expected_sidecar = canonical_sidecar(&receipt);
+
+    let remote = head_archive(client, &r2.bucket, &receipt.archive_key)
+        .await?
+        .ok_or_else(|| anyhow!("remote archive is missing"))?;
+    validate_remote_against_receipt(&remote, &receipt)?;
+    ensure!(
+        remote_sidecar(client, &r2.bucket, &receipt.checksum_key)
+            .await?
+            .as_deref()
+            == Some(expected_sidecar.as_slice()),
+        "remote checksum sidecar differs from receipt"
+    );
+
+    let archive_exists = archive_path
+        .try_exists()
+        .context("failed to inspect restore destination")?;
+    let sidecar_exists = sidecar_path
+        .try_exists()
+        .context("failed to inspect restore destination")?;
+    if archive_exists {
+        validate_restored_archive(&archive_path, &receipt)?;
+    }
+    if sidecar_exists {
+        validate_restored_sidecar(&sidecar_path, &expected_sidecar)?;
+    }
+    if archive_exists && sidecar_exists {
+        eprintln!("epoch {epoch}: verified local restore already exists");
+        return Ok(());
+    }
+
+    if !archive_exists {
+        eprintln!(
+            "epoch {epoch}: restoring {} bytes from R2",
+            receipt.archive_length
+        );
+        let response = client
+            .get_object()
+            .bucket(&r2.bucket)
+            .key(&receipt.archive_key)
+            .if_match(format!("\"{}\"", receipt.archive_etag))
+            .send()
+            .await
+            .context("failed to begin R2 restore")?;
+        ensure!(
+            response
+                .content_length()
+                .and_then(|value| u64::try_from(value).ok())
+                == Some(receipt.archive_length),
+            "R2 restore length differs from receipt"
+        );
+        ensure!(
+            response.e_tag().map(normalize_etag) == Some(receipt.archive_etag.as_str()),
+            "R2 restore ETag differs from receipt"
+        );
+        let mut reader = response.body.into_async_read();
+        let mut temporary = tempfile::Builder::new()
+            .prefix(&format!(".epoch-{epoch}.restore."))
+            .tempfile_in(&config.directory)?;
+        let mut digest = Sha256::new();
+        let mut received = 0u64;
+        let mut buffer = vec![0u8; 8 * 1024 * 1024];
+        loop {
+            let count = reader.read(&mut buffer).await?;
+            if count == 0 {
+                break;
+            }
+            temporary.as_file_mut().write_all(&buffer[..count])?;
+            digest.update(&buffer[..count]);
+            received = received
+                .checked_add(u64::try_from(count)?)
+                .ok_or_else(|| anyhow!("R2 restore length overflow"))?;
+            ensure!(
+                received <= receipt.archive_length,
+                "R2 restore exceeded expected length"
+            );
+        }
+        ensure!(
+            received == receipt.archive_length,
+            "R2 restore was truncated"
+        );
+        ensure!(
+            format!("{:x}", digest.finalize()) == receipt.archive_sha256,
+            "R2 restore SHA-256 mismatch"
+        );
+        persist_noclobber(temporary, &archive_path)?;
+    }
+
+    if !sidecar_exists {
+        let mut temporary = tempfile::Builder::new()
+            .prefix(&format!(".epoch-{epoch}.sidecar.restore."))
+            .tempfile_in(&config.directory)?;
+        temporary.as_file_mut().write_all(&expected_sidecar)?;
+        persist_noclobber(temporary, &sidecar_path)?;
+    }
+    File::open(&config.directory)?.sync_all()?;
+
+    validate_restored_archive(&archive_path, &receipt)?;
+    validate_restored_sidecar(&sidecar_path, &expected_sidecar)?;
+    let remote = head_archive(client, &r2.bucket, &receipt.archive_key)
+        .await?
+        .ok_or_else(|| anyhow!("remote archive disappeared after restore"))?;
+    validate_remote_against_receipt(&remote, &receipt)?;
+    ensure!(
+        remote_sidecar(client, &r2.bucket, &receipt.checksum_key)
+            .await?
+            .as_deref()
+            == Some(expected_sidecar.as_slice()),
+        "remote checksum sidecar changed during restore"
+    );
+    eprintln!(
+        "epoch {epoch}: restored and verified in {}",
+        config.directory.display()
+    );
+    Ok(())
+}
+
 async fn verify_remote_sha256(
     client: &Client,
     bucket: &str,
@@ -1073,9 +1319,14 @@ async fn main() -> Result<()> {
     let r2 = r2_config_from_env()?;
     let client = s3_client(&r2);
     for &epoch in &config.epochs {
-        sync_epoch(&client, &r2, &config, epoch)
-            .await
-            .with_context(|| format!("epoch {epoch} R2 delivery failed"))?;
+        match config.command {
+            Command::Restore => restore_epoch(&client, &r2, &config, epoch)
+                .await
+                .with_context(|| format!("epoch {epoch} R2 restore failed"))?,
+            Command::Sync | Command::Verify => sync_epoch(&client, &r2, &config, epoch)
+                .await
+                .with_context(|| format!("epoch {epoch} R2 delivery failed"))?,
+        }
     }
     Ok(())
 }
@@ -1156,6 +1407,85 @@ mod tests {
         )
         .unwrap();
         assert_eq!(stored, replacement);
+    }
+
+    #[test]
+    fn restore_receipt_accepts_legacy_evidence_for_fresh_readback() {
+        let directory = tempfile::tempdir().unwrap();
+        let receipt = Receipt {
+            schema: RECEIPT_SCHEMA.to_owned(),
+            bucket: "bucket".to_owned(),
+            epoch: 7,
+            archive_key: "epoch-7.jet".to_owned(),
+            checksum_key: "epoch-7.jet.sha256".to_owned(),
+            archive_length: 10,
+            archive_sha256: "ab".repeat(32),
+            archive_etag: "etag".to_owned(),
+            r2_composite_sha256: None,
+            remote_sha256_readback: false,
+            multipart_part_size: 5 * 1024 * 1024,
+            verified_unix_seconds: 1,
+        };
+        fs::write(
+            receipt_path(directory.path(), receipt.epoch),
+            serde_json::to_vec(&receipt).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            read_restore_receipt(directory.path(), "bucket", 7).unwrap(),
+            receipt
+        );
+
+        let mut proven = receipt.clone();
+        proven.remote_sha256_readback = true;
+        fs::write(
+            receipt_path(directory.path(), proven.epoch),
+            serde_json::to_vec(&proven).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            read_restore_receipt(directory.path(), "bucket", 7).unwrap(),
+            proven
+        );
+        assert!(read_restore_receipt(directory.path(), "other", 7).is_err());
+    }
+
+    #[test]
+    fn restore_publish_never_clobbers_existing_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("epoch-7.jet");
+        fs::write(&destination, b"existing").unwrap();
+        let mut temporary = tempfile::NamedTempFile::new_in(directory.path()).unwrap();
+        temporary.write_all(b"replacement").unwrap();
+        assert!(persist_noclobber(temporary, &destination).is_err());
+        assert_eq!(fs::read(destination).unwrap(), b"existing");
+    }
+
+    #[test]
+    fn restored_archive_is_bound_to_receipt_hash_and_etag() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("epoch-7.jet");
+        fs::write(&path, b"archive").unwrap();
+        let part_size = 5 * 1024 * 1024;
+        let proof = hash_and_etag(&path, regular_identity(&path).unwrap(), part_size).unwrap();
+        let receipt = Receipt {
+            schema: RECEIPT_SCHEMA.to_owned(),
+            bucket: "bucket".to_owned(),
+            epoch: 7,
+            archive_key: "epoch-7.jet".to_owned(),
+            checksum_key: "epoch-7.jet.sha256".to_owned(),
+            archive_length: 7,
+            archive_sha256: proof.sha256_hex,
+            archive_etag: proof.multipart_etag,
+            r2_composite_sha256: None,
+            remote_sha256_readback: true,
+            multipart_part_size: part_size,
+            verified_unix_seconds: 1,
+        };
+        validate_restored_archive(&path, &receipt).unwrap();
+
+        fs::write(&path, b"changed").unwrap();
+        assert!(validate_restored_archive(&path, &receipt).is_err());
     }
 
     #[test]

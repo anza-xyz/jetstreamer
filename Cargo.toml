@@ -57,7 +57,7 @@ tar = "0.4"
 env_logger = "0.11"
 base64 = "0.22"
 bincode = "1"
-serial_test = "3"
+serial_test = "4"
 criterion = { version = "0.5", features = ["html_reports"] }
 wincode = { version = "0.2", features = ["derive", "solana-short-vec"] }
 bs58 = { version = "0", default-features = false }
@@ -155,8 +155,8 @@ jetstreamer-horizon.workspace = true
 jetstreamer-plugin.workspace = true
 jetstreamer-utils.workspace = true
 url.workspace = true
-ratatui = "0.29"
-crossterm = "0.28"
+ratatui = "0.30"
+crossterm = "0.29"
 libc = "0.2"
 sysinfo = "0.33"
 solana-sysvar.workspace = true

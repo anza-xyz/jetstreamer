@@ -1,5 +1,5 @@
 use {
-    crate::{SharedError, node::Kind, utils::Buffer},
+    crate::{SharedError, node::Kind, node_reader::cid_from_cbor_link, utils::Buffer},
     cid::Cid,
     std::vec::Vec,
 };
@@ -83,9 +83,7 @@ impl DataFrame {
                 } else {
                     let mut nexts = vec![];
                     for cid in next {
-                        if let serde_cbor::Value::Bytes(cid) = cid {
-                            nexts.push(Cid::try_from(cid[1..].to_vec()).unwrap());
-                        }
+                        nexts.push(cid_from_cbor_link(cid)?);
                     }
                     data_frame.next = Some(nexts);
                 }

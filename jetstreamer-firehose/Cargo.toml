@@ -81,5 +81,5 @@ aws-types = { workspace = true, optional = true }
 [dev-dependencies]
 sha2.workspace = true
 tempfile.workspace = true
-serial_test = "3"
+serial_test = "4"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

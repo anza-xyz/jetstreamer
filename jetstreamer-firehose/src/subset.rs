@@ -1,5 +1,5 @@
 use {
-    crate::{SharedError, node::Kind},
+    crate::{SharedError, node::Kind, node_reader::cid_from_cbor_link},
     cid::Cid,
     std::vec::Vec,
 };
@@ -63,11 +63,7 @@ impl Subset {
 
             if let Some(serde_cbor::Value::Array(blocks)) = &array.get(3) {
                 for block in blocks {
-                    if let serde_cbor::Value::Bytes(block) = block {
-                        subset
-                            .blocks
-                            .push(Cid::try_from(block[1..].to_vec()).unwrap());
-                    }
+                    subset.blocks.push(cid_from_cbor_link(block)?);
                 }
             }
         }

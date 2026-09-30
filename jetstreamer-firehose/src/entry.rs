@@ -2,6 +2,7 @@ use {
     crate::{
         SharedError,
         node::Kind,
+        node_reader::cid_from_cbor_link,
         utils::{self, Hash},
     },
     cid::Cid,
@@ -67,11 +68,7 @@ impl Entry {
 
             if let Some(serde_cbor::Value::Array(transactions)) = &array.get(3) {
                 for transaction in transactions {
-                    if let serde_cbor::Value::Bytes(transaction) = transaction {
-                        entry
-                            .transactions
-                            .push(Cid::try_from(transaction[1..].to_vec()).unwrap());
-                    }
+                    entry.transactions.push(cid_from_cbor_link(transaction)?);
                 }
             }
         }

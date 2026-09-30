@@ -1,5 +1,5 @@
 use {
-    crate::{SharedError, node::Kind},
+    crate::{SharedError, node::Kind, node_reader::cid_from_cbor_link},
     cid::Cid,
     std::vec::Vec,
 };
@@ -95,11 +95,7 @@ impl Block {
 
             if let Some(serde_cbor::Value::Array(entries)) = &array.get(3) {
                 for entry in entries {
-                    if let serde_cbor::Value::Bytes(entry) = entry {
-                        block
-                            .entries
-                            .push(Cid::try_from(entry[1..].to_vec()).unwrap());
-                    }
+                    block.entries.push(cid_from_cbor_link(entry)?);
                 }
             }
 
@@ -107,8 +103,8 @@ impl Block {
                 block.meta = SlotMeta::from_cbor(serde_cbor::Value::Array(meta.clone()));
             }
 
-            if let Some(serde_cbor::Value::Bytes(rewards)) = &array.get(5) {
-                block.rewards = Cid::try_from(rewards[1..].to_vec()).unwrap();
+            if let Some(rewards @ serde_cbor::Value::Bytes(_)) = array.get(5) {
+                block.rewards = cid_from_cbor_link(rewards)?;
             }
         }
         Ok(block)
@@ -148,6 +144,37 @@ impl Block {
 #[cfg(test)]
 mod block_tests {
     use super::*;
+
+    /// A DAG-CBOR CID link is a byte string whose first byte is the `0x00` multibase
+    /// prefix followed by the CID bytes. Malformed Old Faithful archives can supply an
+    /// empty or truncated byte string; decoding such a block must surface an error rather
+    /// than panic (previously `Cid::try_from(bytes[1..]).unwrap()` panicked on both).
+    #[test]
+    fn test_block_from_cbor_rejects_malformed_cid_links_without_panicking() {
+        let block_with_entry_link = |link: Vec<u8>| {
+            serde_cbor::Value::Array(vec![
+                serde_cbor::Value::Integer(2),    // Kind::Block
+                serde_cbor::Value::Integer(1),    // slot
+                serde_cbor::Value::Array(vec![]), // shredding
+                serde_cbor::Value::Array(vec![serde_cbor::Value::Bytes(link)]), // entries
+            ])
+        };
+
+        // Empty byte string: `bytes[1..]` used to panic with an out-of-range slice start.
+        assert!(Block::from_cbor(block_with_entry_link(vec![])).is_err());
+        // Valid prefix but non-CID payload: `Cid::try_from(..).unwrap()` used to panic.
+        assert!(Block::from_cbor(block_with_entry_link(vec![0, 1, 2, 3])).is_err());
+
+        // A well-formed link still decodes without error.
+        let valid_cid = vec![
+            1, 113, 18, 32, 56, 148, 167, 251, 237, 117, 200, 226, 181, 134, 79, 115, 131, 220,
+            232, 143, 20, 67, 224, 179, 48, 130, 197, 123, 226, 85, 85, 56, 38, 84, 106, 225,
+        ];
+        let mut link = vec![0u8];
+        link.extend_from_slice(&valid_cid);
+        let decoded = Block::from_cbor(block_with_entry_link(link)).expect("valid link decodes");
+        assert_eq!(decoded.entries.len(), 1);
+    }
 
     #[test]
     fn test_block() {

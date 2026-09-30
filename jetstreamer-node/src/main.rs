@@ -66,7 +66,10 @@ use jetstreamer_node::snapshots::{
 };
 use log::{error, info, warn};
 use rayon::prelude::*;
-use reqwest::{Client, Url, header::RANGE};
+use reqwest::{
+    Client, StatusCode, Url,
+    header::{RANGE, RETRY_AFTER},
+};
 use serde::Deserialize;
 use serde_cbor::Value;
 use sha2::{Digest as _, Sha256};
@@ -131,6 +134,9 @@ const SLOT_TO_CID_KIND: &[u8] = b"slot-to-cid";
 const METADATA_KEY_KIND: &[u8] = b"index_kind";
 const METADATA_KEY_EPOCH: &[u8] = b"epoch";
 const CAR_HEADER_PREFETCH_BYTES: u64 = 4 * 1024;
+const COMPACT_INDEX_FETCH_MAX_RETRIES: usize = 10;
+const COMPACT_INDEX_FETCH_BASE_DELAY: Duration = Duration::from_secs(10);
+const COMPACT_INDEX_FETCH_MAX_DELAY: Duration = Duration::from_secs(300);
 
 const BANK_SNAPSHOTS_DIR: &str = "snapshots";
 const ACCOUNTS_HARDLINKS_DIR: &str = "accounts_hardlinks";
@@ -8455,24 +8461,85 @@ async fn fetch_url_range(
         return Ok(Vec::new());
     }
     let range = format!("bytes={start}-{end}");
-    let response = client
-        .get(url.clone())
-        .header(RANGE, range)
-        .send()
-        .await
-        .map_err(|err| format!("failed to fetch {}: {err}", url.as_str()))?;
-    if !response.status().is_success() {
-        return Err(format!(
-            "unexpected HTTP status {} fetching {}",
-            response.status(),
-            url.as_str()
-        ));
+    let mut attempt = 0usize;
+    loop {
+        let response = match client
+            .get(url.clone())
+            .header(RANGE, range.clone())
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(err) if attempt < COMPACT_INDEX_FETCH_MAX_RETRIES => {
+                let delay = compact_index_retry_delay(attempt, None);
+                warn!(
+                    "network error fetching {url}: {err}; retrying in {:.1}s (attempt {}/{})",
+                    delay.as_secs_f64(),
+                    attempt + 1,
+                    COMPACT_INDEX_FETCH_MAX_RETRIES
+                );
+                attempt += 1;
+                tokio::time::sleep(delay).await;
+                continue;
+            }
+            Err(err) => return Err(format!("failed to fetch {}: {err}", url.as_str())),
+        };
+
+        let status = response.status();
+        if matches!(
+            status,
+            StatusCode::TOO_MANY_REQUESTS | StatusCode::SERVICE_UNAVAILABLE
+        ) && attempt < COMPACT_INDEX_FETCH_MAX_RETRIES
+        {
+            let delay = compact_index_retry_delay(
+                attempt,
+                response
+                    .headers()
+                    .get(RETRY_AFTER)
+                    .and_then(|value| value.to_str().ok()),
+            );
+            warn!(
+                "HTTP {status} fetching {url}; retrying in {:.1}s (attempt {}/{})",
+                delay.as_secs_f64(),
+                attempt + 1,
+                COMPACT_INDEX_FETCH_MAX_RETRIES
+            );
+            attempt += 1;
+            tokio::time::sleep(delay).await;
+            continue;
+        }
+        if !status.is_success() {
+            return Err(format!("unexpected HTTP status {status} fetching {url}"));
+        }
+
+        match response.bytes().await {
+            Ok(bytes) => return Ok(bytes.to_vec()),
+            Err(err) if attempt < COMPACT_INDEX_FETCH_MAX_RETRIES => {
+                let delay = compact_index_retry_delay(attempt, None);
+                warn!(
+                    "failed to read {url}: {err}; retrying in {:.1}s (attempt {}/{})",
+                    delay.as_secs_f64(),
+                    attempt + 1,
+                    COMPACT_INDEX_FETCH_MAX_RETRIES
+                );
+                attempt += 1;
+                tokio::time::sleep(delay).await;
+            }
+            Err(err) => return Err(format!("failed to read {}: {err}", url.as_str())),
+        }
     }
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|err| format!("failed to read {}: {err}", url.as_str()))?;
-    Ok(bytes.to_vec())
+}
+
+fn compact_index_retry_delay(attempt: usize, retry_after_secs: Option<&str>) -> Duration {
+    if let Some(delay) = retry_after_secs
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(Duration::from_secs)
+    {
+        return delay.min(COMPACT_INDEX_FETCH_MAX_DELAY);
+    }
+    COMPACT_INDEX_FETCH_BASE_DELAY
+        .saturating_mul(1u32 << attempt.min(5))
+        .min(COMPACT_INDEX_FETCH_MAX_DELAY)
 }
 
 async fn fetch_epoch_root_cid(client: &Client, car_url: &Url) -> Result<Cid, String> {
@@ -18963,6 +19030,26 @@ async fn main() {
 #[cfg(test)]
 mod early_snapshot_tests {
     use super::*;
+
+    #[test]
+    fn compact_index_retry_delay_honors_retry_after_and_caps_backoff() {
+        assert_eq!(
+            compact_index_retry_delay(0, Some("17")),
+            Duration::from_secs(17)
+        );
+        assert_eq!(
+            compact_index_retry_delay(0, Some("9999")),
+            COMPACT_INDEX_FETCH_MAX_DELAY
+        );
+        assert_eq!(
+            compact_index_retry_delay(0, Some("not-a-delay")),
+            COMPACT_INDEX_FETCH_BASE_DELAY
+        );
+        assert_eq!(
+            compact_index_retry_delay(usize::MAX, None),
+            COMPACT_INDEX_FETCH_MAX_DELAY
+        );
+    }
 
     #[test]
     fn epoch67_checkpoint_set_includes_both_registered_handoffs() {

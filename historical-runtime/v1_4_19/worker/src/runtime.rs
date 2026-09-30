@@ -35,7 +35,7 @@ const MAX_AGE_CORRECTION_EPOCH: u64 = 14;
 // v1.4.25 resumes from epoch 134's independent predecessor snapshot. The
 // parent binds snapshot hashes and every later checkpoint before publication;
 // snapshot creator metadata alone is never runtime-selection evidence.
-const MIN_SUPPORTED_SNAPSHOT_SLOT: u64 = 56_591_999;
+const MIN_SUPPORTED_SNAPSHOT_SLOT: u64 = 56_591_729;
 const MIN_SUPPORTED_ENTRY_SLOT: u64 = MIN_SUPPORTED_SNAPSHOT_SLOT + 1;
 const MAX_SUPPORTED_SLOT_EXCLUSIVE: u64 = 57_888_000;
 const POH_THREADS_ENV: &str = "JETSTREAMER_HISTORICAL_POH_THREADS";

@@ -9,7 +9,7 @@ Treat R2 as durable storage. Never call `DeleteObject` or `DeleteObjects`. Abort
 
 Use the repository's `jetstreamer-r2` binary for upload and remote proof. Do not reimplement its multipart protocol in shell or Python. R2's S3 `UploadPart` currently rejects its advertised SHA-256 header, so the binary uses R2-enforced `Content-MD5`, checks the multipart ETag independently, reads the completed remote object back while computing its whole-file SHA-256, uploads and reads back the canonical `.sha256` sidecar, and fsyncs a private receipt before optional local retirement. If R2 begins returning native composite SHA-256 evidence, the binary validates and prefers it.
 
-For a long-running range, use `scripts/sync_horizon_r2_progressive.py` to discover newly completed local pairs and invoke the Rust uploader serially. Do not run two progressive uploaders over overlapping ranges. The Python process never implements remote integrity checks or unlinks files itself. With its explicit `--delete-local` mode, it requires digest-matching full-verification and current-plugin receipts, honors every `--defer-epochs` range, and then delegates a fresh remote verification plus local retirement to the Rust uploader.
+For a long-running range, use `scripts/sync_horizon_r2_progressive.py` to discover newly completed local pairs and invoke the Rust uploader serially. Do not run two progressive uploaders over overlapping ranges. The Python process never implements remote integrity checks or unlinks files itself. With its explicit `--delete-local` mode, it requires digest-matching full-verification, current-plugin, and both adjacent-boundary receipts, honors every `--defer-epochs` range, and then delegates a fresh remote verification plus local retirement to the Rust uploader.
 
 ## Resolve the work
 
@@ -53,6 +53,7 @@ scripts/sync_horizon_r2_progressive.py \
   --delete-local \
   --full-receipt-directory "$HOME/.jetstreamer-private/final-audits/receipts" \
   --plugin-receipt-directory "$HOME/.jetstreamer-private/plugin-audits/receipts" \
+  --boundary-receipt-directory "$HOME/.jetstreamer-private/boundary-audits/receipts" \
   --defer-epochs ACTIVE_START-ACTIVE_END
 ```
 

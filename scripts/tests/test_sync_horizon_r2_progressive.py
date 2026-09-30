@@ -74,8 +74,10 @@ class ProgressiveR2Tests(unittest.TestCase):
             root = Path(temporary)
             full = root / "full"
             plugin = root / "plugin"
+            boundary = root / "boundary"
             full.mkdir()
             plugin.mkdir()
+            boundary.mkdir()
             digest = "ab" * 32
             verifier = "cd" * 32
             script = "ef" * 32
@@ -85,15 +87,27 @@ class ProgressiveR2Tests(unittest.TestCase):
             (plugin / "epoch-7.plugin.ok").write_text(
                 f"{digest} {verifier} {script}\n", encoding="ascii"
             )
+            (boundary / "boundary-6-7.ok").write_text(
+                f"{'01' * 32} {digest} {verifier} {script}\n", encoding="ascii"
+            )
+            (boundary / "boundary-7-8.ok").write_text(
+                f"{digest} {'02' * 32} {verifier} {script}\n", encoding="ascii"
+            )
             args = SimpleNamespace(
                 delete_local=True,
                 defer_epochs=[],
                 full_receipt_directory=full,
                 plugin_receipt_directory=plugin,
+                boundary_receipt_directory=boundary,
             )
             self.assertTrue(progressive.retirement_allowed(args, 7, digest))
             self.assertFalse(progressive.retirement_allowed(args, 7, "01" * 32))
 
+            (boundary / "boundary-7-8.ok").unlink()
+            self.assertFalse(progressive.retirement_allowed(args, 7, digest))
+            (boundary / "boundary-7-8.ok").write_text(
+                f"{digest} {'02' * 32} {verifier} {script}\n", encoding="ascii"
+            )
             args.defer_epochs = [(7, 9)]
             self.assertFalse(progressive.retirement_allowed(args, 7, digest))
 

@@ -173,6 +173,9 @@ verifier proves that the current streaming interface can consume every record an
 complete archive pair appears. Its fsynced receipt binds the archive SHA-256, the exact
 `horizon_pipeline` binary, and the verification script. R2 upload may overlap this work, but an
 uploaded object is staged—not published or eligible for local retirement—until this receipt exists.
+Local retirement also requires receipts for both adjacent archive boundaries. This preserves the
+ordered-chain proof when a range is larger than available local disk; an epoch remains local until
+its predecessor and successor boundaries have both been checked against the exact archive digest.
 
 ### Horizon R2 delivery
 

@@ -4,7 +4,8 @@
 This is deliberately a thin orchestrator around ``jetstreamer-r2``. The Rust
 binary owns hashing, multipart integrity, remote readback, receipt writes, and
 optional local deletion. This process only delegates retirement after the full
-archive and current-plugin receipts bind the same archive digest.
+archive, current-plugin, and both adjacent-boundary receipts bind the same
+archive digest.
 """
 
 from __future__ import annotations
@@ -128,6 +129,28 @@ def gate_receipt_matches(directory: Path, epoch: int, suffix: str, digest: str) 
         return False
 
 
+def boundary_receipt_matches(
+    directory: Path,
+    left_epoch: int,
+    right_epoch: int,
+    digest: str,
+    *,
+    digest_field: int,
+) -> bool:
+    path = directory / f"boundary-{left_epoch}-{right_epoch}.ok"
+    try:
+        if regular_file(path) is None:
+            return False
+        fields = path.read_text(encoding="ascii").split()
+        return (
+            len(fields) == 4
+            and all(re.fullmatch(r"[0-9a-f]{64}", field) for field in fields)
+            and fields[digest_field] == digest
+        )
+    except (OSError, UnicodeDecodeError):
+        return False
+
+
 def retirement_allowed(args: argparse.Namespace, epoch: int, digest: str) -> bool:
     return (
         args.delete_local
@@ -137,6 +160,23 @@ def retirement_allowed(args: argparse.Namespace, epoch: int, digest: str) -> boo
         )
         and gate_receipt_matches(
             args.plugin_receipt_directory, epoch, "plugin", digest
+        )
+        and (
+            epoch == 0
+            or boundary_receipt_matches(
+                args.boundary_receipt_directory,
+                epoch - 1,
+                epoch,
+                digest,
+                digest_field=1,
+            )
+        )
+        and boundary_receipt_matches(
+            args.boundary_receipt_directory,
+            epoch,
+            epoch + 1,
+            digest,
+            digest_field=0,
         )
     )
 
@@ -175,6 +215,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--delete-local", action="store_true")
     parser.add_argument("--full-receipt-directory", type=absolute_directory)
     parser.add_argument("--plugin-receipt-directory", type=absolute_directory)
+    parser.add_argument("--boundary-receipt-directory", type=absolute_directory)
     parser.add_argument(
         "--defer-epochs", type=epoch_range, action="append", default=[]
     )
@@ -184,10 +225,11 @@ def parse_args() -> argparse.Namespace:
     if args.delete_local and (
         args.full_receipt_directory is None
         or args.plugin_receipt_directory is None
+        or args.boundary_receipt_directory is None
     ):
         parser.error(
             "--delete-local requires --full-receipt-directory and "
-            "--plugin-receipt-directory"
+            "--plugin-receipt-directory and --boundary-receipt-directory"
         )
     return args
 

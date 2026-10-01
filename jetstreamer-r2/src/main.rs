@@ -52,6 +52,7 @@ struct Config {
     concurrency: usize,
     legacy_etag_only: bool,
     overwrite_existing: bool,
+    repair_orphaned_archive: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -119,6 +120,7 @@ fn usage() -> ! {
         "usage: horizon-r2 <sync|verify|restore> DIRECTORY [--epochs START-END] ",
         "--receipt-directory DIRECTORY [--delete-local] [--part-size-mib N] ",
         "[--legacy-part-size-mib N] [--legacy-etag-only] [--overwrite-existing] ",
+        "[--repair-orphaned-archive] ",
         "[--concurrency N]"
     ));
     std::process::exit(2);
@@ -145,6 +147,7 @@ fn parse_args() -> Result<Config> {
     let mut concurrency = DEFAULT_CONCURRENCY;
     let mut legacy_etag_only = false;
     let mut overwrite_existing = false;
+    let mut repair_orphaned_archive = false;
     while let Some(argument) = args.next() {
         let argument = argument
             .into_string()
@@ -163,6 +166,7 @@ fn parse_args() -> Result<Config> {
             "--legacy-part-size-mib" => legacy_part_size = Some(parse_mib(&value()?)?),
             "--legacy-etag-only" => legacy_etag_only = true,
             "--overwrite-existing" => overwrite_existing = true,
+            "--repair-orphaned-archive" => repair_orphaned_archive = true,
             "--concurrency" => {
                 concurrency = value()?.parse().context("invalid --concurrency")?;
                 ensure!(
@@ -191,6 +195,14 @@ fn parse_args() -> Result<Config> {
         !overwrite_existing || command == Command::Sync,
         "--overwrite-existing is valid only with sync"
     );
+    ensure!(
+        !repair_orphaned_archive || command == Command::Sync,
+        "--repair-orphaned-archive is valid only with sync"
+    );
+    ensure!(
+        !repair_orphaned_archive || !overwrite_existing,
+        "--repair-orphaned-archive and --overwrite-existing are mutually exclusive"
+    );
     let epochs = match (command, epochs) {
         (Command::Restore, None) => bail!("restore requires --epochs START-END"),
         (_, Some(epochs)) => epochs,
@@ -211,6 +223,7 @@ fn parse_args() -> Result<Config> {
         concurrency,
         legacy_etag_only,
         overwrite_existing,
+        repair_orphaned_archive,
     })
 }
 
@@ -1170,16 +1183,39 @@ fn retire_local(local: &LocalArchive) -> Result<()> {
     Ok(())
 }
 
+fn validate_remote_pair_state(
+    has_archive: bool,
+    remote_sidecar: Option<&[u8]>,
+    local_sidecar: &[u8],
+    repair_orphaned_archive: bool,
+) -> Result<bool> {
+    if has_archive || remote_sidecar.is_none() {
+        return Ok(false);
+    }
+    ensure!(
+        repair_orphaned_archive,
+        "remote completion sidecar exists without its archive"
+    );
+    ensure!(
+        remote_sidecar == Some(local_sidecar),
+        "orphaned remote completion sidecar differs from the verified local sidecar"
+    );
+    Ok(true)
+}
+
 async fn sync_epoch(client: &Client, r2: &R2Config, config: &Config, epoch: u64) -> Result<()> {
     let local = read_local_archive(&config.directory, epoch)?;
     let archive_key = format!("epoch-{epoch}.jet");
     let checksum_key = format!("epoch-{epoch}.jet.sha256");
     let existing = head_archive(client, &r2.bucket, &archive_key).await?;
     let existing_sidecar = remote_sidecar(client, &r2.bucket, &checksum_key).await?;
-    ensure!(
-        existing.is_some() || existing_sidecar.is_none(),
-        "remote completion sidecar exists without its archive for epoch {epoch}"
-    );
+    let repairing_orphan = validate_remote_pair_state(
+        existing.is_some(),
+        existing_sidecar.as_deref(),
+        &local.sidecar,
+        config.repair_orphaned_archive,
+    )
+    .with_context(|| format!("invalid remote pair state for epoch {epoch}"))?;
     let was_existing = existing.is_some() && !config.overwrite_existing;
     let effective_part_size = if let Some(remote) = &existing {
         if config.overwrite_existing {
@@ -1205,54 +1241,58 @@ async fn sync_epoch(client: &Client, r2: &R2Config, config: &Config, epoch: u64)
         proof.sha256_hex == local.sha256_hex,
         "local SHA-256 mismatch for epoch {epoch}"
     );
-    let (etag, _upload_composite_sha256) =
-        if let Some(remote) = existing.filter(|_| !config.overwrite_existing) {
+    let (etag, _upload_composite_sha256) = if let Some(remote) =
+        existing.filter(|_| !config.overwrite_existing)
+    {
+        ensure!(
+            remote.length == local.length,
+            "remote length mismatch for epoch {epoch}"
+        );
+        ensure!(
+            remote.etag == proof.multipart_etag,
+            "remote ETag mismatch for epoch {epoch}"
+        );
+        if let Some(metadata_sha256) = remote.metadata_sha256 {
             ensure!(
-                remote.length == local.length,
-                "remote length mismatch for epoch {epoch}"
+                metadata_sha256 == local.sha256_hex,
+                "remote SHA-256 metadata mismatch"
+            );
+        }
+        if let Some(checksum) = remote.composite_sha256.as_deref() {
+            ensure!(
+                remote.checksum_type == Some(ChecksumType::Composite),
+                "unexpected remote checksum type"
             );
             ensure!(
-                remote.etag == proof.multipart_etag,
-                "remote ETag mismatch for epoch {epoch}"
+                composite_checksum_matches(
+                    checksum,
+                    &proof.composite_sha256,
+                    local.length.div_ceil(effective_part_size)
+                ),
+                "remote composite SHA-256 mismatch for epoch {epoch}"
             );
-            if let Some(metadata_sha256) = remote.metadata_sha256 {
-                ensure!(
-                    metadata_sha256 == local.sha256_hex,
-                    "remote SHA-256 metadata mismatch"
-                );
-            }
-            if let Some(checksum) = remote.composite_sha256.as_deref() {
-                ensure!(
-                    remote.checksum_type == Some(ChecksumType::Composite),
-                    "unexpected remote checksum type"
-                );
-                ensure!(
-                    composite_checksum_matches(
-                        checksum,
-                        &proof.composite_sha256,
-                        local.length.div_ceil(effective_part_size)
-                    ),
-                    "remote composite SHA-256 mismatch for epoch {epoch}"
-                );
-            }
-            (remote.etag, remote.composite_sha256)
-        } else {
-            ensure!(
-                config.command == Command::Sync,
-                "remote archive is missing for epoch {epoch}"
-            );
-            eprintln!("epoch {epoch}: uploading {} bytes", local.length);
-            let (etag, _locally_expected_composite_checksum) = upload_archive(
-                client,
-                &r2.bucket,
-                &local,
-                config.part_size,
-                config.concurrency,
-                config.overwrite_existing,
-            )
-            .await?;
-            (etag, None)
-        };
+        }
+        (remote.etag, remote.composite_sha256)
+    } else {
+        ensure!(
+            config.command == Command::Sync,
+            "remote archive is missing for epoch {epoch}"
+        );
+        if repairing_orphan {
+            eprintln!("epoch {epoch}: repairing missing archive bound by matching remote sidecar");
+        }
+        eprintln!("epoch {epoch}: uploading {} bytes", local.length);
+        let (etag, _locally_expected_composite_checksum) = upload_archive(
+            client,
+            &r2.bucket,
+            &local,
+            config.part_size,
+            config.concurrency,
+            config.overwrite_existing,
+        )
+        .await?;
+        (etag, None)
+    };
     let remote = head_archive(client, &r2.bucket, &archive_key)
         .await?
         .ok_or_else(|| anyhow!("remote archive disappeared for epoch {epoch}"))?;
@@ -1430,6 +1470,16 @@ mod tests {
             discover_local_epochs(directory.path()).unwrap(),
             BTreeSet::from([1])
         );
+    }
+
+    #[test]
+    fn orphaned_remote_sidecar_repair_requires_an_exact_local_match() {
+        let sidecar = b"digest  epoch-7.jet\n";
+        assert!(!validate_remote_pair_state(true, Some(sidecar), sidecar, false).unwrap());
+        assert!(!validate_remote_pair_state(false, None, sidecar, false).unwrap());
+        assert!(validate_remote_pair_state(false, Some(sidecar), sidecar, false).is_err());
+        assert!(validate_remote_pair_state(false, Some(b"other"), sidecar, true).is_err());
+        assert!(validate_remote_pair_state(false, Some(sidecar), sidecar, true).unwrap());
     }
 
     #[test]
@@ -1641,8 +1691,10 @@ mod tests {
         assert!(remote_readback < sidecar_publication);
         assert!(local_revalidation < sidecar_publication);
         assert!(
-            sync_epoch.contains("remote completion sidecar exists without its archive"),
-            "orphan completion markers must fail closed"
+            sync_epoch.contains("validate_remote_pair_state(")
+                && sync_epoch.contains("existing_sidecar.as_deref()")
+                && sync_epoch.contains("&local.sidecar"),
+            "orphan completion markers must be checked against the local sidecar"
         );
     }
 }

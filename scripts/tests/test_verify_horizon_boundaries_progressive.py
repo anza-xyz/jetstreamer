@@ -12,6 +12,8 @@ SCRIPT = (
     Path(__file__).resolve().parents[1]
     / "verify_horizon_boundaries_progressive.sh"
 )
+FULL_VERIFIER_SHA256 = "1" * 64
+FULL_SCRIPT_SHA256 = "2" * 64
 
 
 class ProgressiveBoundaryVerificationTests(unittest.TestCase):
@@ -25,7 +27,8 @@ class ProgressiveBoundaryVerificationTests(unittest.TestCase):
             f"{digest}  epoch-{epoch}.jet\n", encoding="ascii"
         )
         (full_receipts / f"epoch-{epoch}.full.ok").write_text(
-            f"{digest} {'1' * 64} {'2' * 64}\n", encoding="ascii"
+            f"{digest} {FULL_VERIFIER_SHA256} {FULL_SCRIPT_SHA256}\n",
+            encoding="ascii",
         )
 
     def write_verifier(self, root: Path, exit_code: int = 0) -> Path:
@@ -43,6 +46,8 @@ class ProgressiveBoundaryVerificationTests(unittest.TestCase):
                 str(verifier),
                 str(archives),
                 str(full_receipts),
+                FULL_VERIFIER_SHA256,
+                FULL_SCRIPT_SHA256,
                 str(state),
                 "7",
                 "8",

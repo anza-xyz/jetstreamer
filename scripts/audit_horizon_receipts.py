@@ -117,6 +117,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("first_epoch", type=int)
     parser.add_argument("last_epoch", type=int)
     parser.add_argument("--full-receipts", required=True, type=absolute_directory)
+    parser.add_argument("--full-verifier-sha256", required=True, type=sha256)
+    parser.add_argument("--full-verifier-script-sha256", required=True, type=sha256)
     parser.add_argument("--plugin-receipts", required=True, type=absolute_directory)
     parser.add_argument("--plugin-pipeline-sha256", required=True, type=sha256)
     parser.add_argument("--plugin-verifier-script-sha256", required=True, type=sha256)
@@ -141,7 +143,13 @@ def audit(args: argparse.Namespace) -> list[str]:
     errors: list[str] = []
     digests: dict[int, str] = {}
     for epoch in range(args.first_epoch, args.last_epoch + 1):
-        full = read_gate(args.full_receipts, epoch, "full")
+        full = read_gate(
+            args.full_receipts,
+            epoch,
+            "full",
+            verifier_sha256=args.full_verifier_sha256,
+            script_sha256=args.full_verifier_script_sha256,
+        )
         plugin = read_gate(
             args.plugin_receipts,
             epoch,

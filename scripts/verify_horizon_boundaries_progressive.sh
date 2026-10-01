@@ -13,19 +13,21 @@ export LC_ALL=C
 export PATH=/usr/bin:/bin
 
 usage() {
-    echo "usage: $0 VERIFY_BOUNDARY ARCHIVE_DIR FULL_RECEIPT_DIR STATE_DIR START_EPOCH END_EPOCH [POLL_SECONDS]" >&2
+    echo "usage: $0 VERIFY_BOUNDARY ARCHIVE_DIR FULL_RECEIPT_DIR FULL_VERIFIER_SHA256 FULL_SCRIPT_SHA256 STATE_DIR START_EPOCH END_EPOCH [POLL_SECONDS]" >&2
     exit 2
 }
 
-[[ $# -ge 6 && $# -le 7 ]] || usage
+[[ $# -ge 8 && $# -le 9 ]] || usage
 
 verifier=$1
 archive_dir=$2
 full_receipt_dir=$3
-state_dir=$4
-start_epoch=$5
-end_epoch=$6
-poll_seconds=${7:-300}
+full_verifier_sha=$4
+full_script_sha=$5
+state_dir=$6
+start_epoch=$7
+end_epoch=$8
+poll_seconds=${9:-300}
 
 for value in "$start_epoch" "$end_epoch" "$poll_seconds"; do
     [[ $value =~ ^[0-9]+$ ]] || usage
@@ -33,6 +35,7 @@ done
 ((start_epoch < end_epoch)) || usage
 ((poll_seconds >= 1 && poll_seconds <= 86400)) || usage
 [[ $verifier == /* && $archive_dir == /* && $full_receipt_dir == /* && $state_dir == /* ]] || usage
+[[ $full_verifier_sha =~ ^[0-9a-f]{64}$ && $full_script_sha =~ ^[0-9a-f]{64}$ ]] || usage
 [[ -f $verifier && -x $verifier && ! -L $verifier ]] || {
     echo "verifier must be an executable regular file, not a symlink: $verifier" >&2
     exit 2
@@ -88,8 +91,10 @@ validate_pair() {
         echo "invalid full-verification receipt: $full_receipt" >&2
         return 2
     }
-    [[ $full_sha == "$expected" ]] || {
-        echo "full-verification receipt does not match $sidecar" >&2
+    [[ $full_sha == "$expected" \
+        && $full_verifier == "$full_verifier_sha" \
+        && $full_script == "$full_script_sha" ]] || {
+        echo "full-verification receipt does not match approved evidence for $sidecar" >&2
         return 2
     }
     printf '%s\n' "$expected"

@@ -218,7 +218,7 @@ can be resumed safely; unrelated or mismatching files are never overwritten.
 
 `scripts/audit_horizon_receipts.py` is the local-file-independent completion gate. It requires the
 full, current-plugin, R2, and adjacent-boundary receipts to agree on every archive SHA-256, and
-requires the approved plugin and boundary-verifier binary/script SHA-256 values explicitly. Add
+requires the approved full, plugin, and boundary-verifier binary/script SHA-256 values explicitly. Add
 `--require-outer-boundaries` for a strict range publication audit that also proves the incoming
 predecessor boundary and the trailing successor boundary.
 
@@ -254,8 +254,8 @@ generation, verification, delivery, and cleanup.
 For an actively generated range, `scripts/sync_horizon_r2_progressive.py` watches for complete
 archive/sidecar pairs and invokes `jetstreamer-r2` serially. It checks whether an existing private
 receipt still describes the local archive before skipping it. Local retirement additionally
-requires receipts from the exact approved plugin binary/script and boundary verifier/script plus
-both adjacent archive boundaries. The watcher never deletes remote data.
+requires receipts from the exact approved full verifier/script, plugin binary/script, and boundary
+verifier/script plus both adjacent archive boundaries. The watcher never deletes remote data.
 
 ### TUI dashboard
 

@@ -179,7 +179,12 @@ def retirement_allowed(args: argparse.Namespace, epoch: int, digest: str) -> boo
         args.delete_local
         and not any(first <= epoch <= last for first, last in args.defer_epochs)
         and gate_receipt_matches(
-            args.full_receipt_directory, epoch, "full", digest
+            args.full_receipt_directory,
+            epoch,
+            "full",
+            digest,
+            verifier_sha256=args.full_verifier_sha256,
+            script_sha256=args.full_verifier_script_sha256,
         )
         and gate_receipt_matches(
             args.plugin_receipt_directory,
@@ -246,6 +251,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--legacy-part-size-mib", type=positive_integer, default=5)
     parser.add_argument("--delete-local", action="store_true")
     parser.add_argument("--full-receipt-directory", type=absolute_directory)
+    parser.add_argument("--full-verifier-sha256", type=sha256)
+    parser.add_argument("--full-verifier-script-sha256", type=sha256)
     parser.add_argument("--plugin-receipt-directory", type=absolute_directory)
     parser.add_argument("--plugin-pipeline-sha256", type=sha256)
     parser.add_argument("--plugin-verifier-script-sha256", type=sha256)
@@ -260,6 +267,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("invalid inclusive epoch range")
     if args.delete_local and (
         args.full_receipt_directory is None
+        or args.full_verifier_sha256 is None
+        or args.full_verifier_script_sha256 is None
         or args.plugin_receipt_directory is None
         or args.plugin_pipeline_sha256 is None
         or args.plugin_verifier_script_sha256 is None
@@ -268,7 +277,8 @@ def parse_args() -> argparse.Namespace:
         or args.boundary_verifier_script_sha256 is None
     ):
         parser.error(
-            "--delete-local requires --full-receipt-directory and "
+            "--delete-local requires --full-receipt-directory, "
+            "--full-verifier-sha256, --full-verifier-script-sha256 and "
             "--plugin-receipt-directory, --plugin-pipeline-sha256, "
             "--plugin-verifier-script-sha256, --boundary-receipt-directory, "
             "--boundary-verifier-sha256 and --boundary-verifier-script-sha256"

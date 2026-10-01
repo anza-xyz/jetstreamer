@@ -97,6 +97,8 @@ class ProgressiveR2Tests(unittest.TestCase):
                 delete_local=True,
                 defer_epochs=[],
                 full_receipt_directory=full,
+                full_verifier_sha256=verifier,
+                full_verifier_script_sha256=script,
                 plugin_receipt_directory=plugin,
                 plugin_pipeline_sha256=verifier,
                 plugin_verifier_script_sha256=script,
@@ -106,6 +108,13 @@ class ProgressiveR2Tests(unittest.TestCase):
             )
             self.assertTrue(progressive.retirement_allowed(args, 7, digest))
             self.assertFalse(progressive.retirement_allowed(args, 7, "01" * 32))
+
+            args.full_verifier_sha256 = "07" * 32
+            self.assertFalse(progressive.retirement_allowed(args, 7, digest))
+            args.full_verifier_sha256 = verifier
+            args.full_verifier_script_sha256 = "08" * 32
+            self.assertFalse(progressive.retirement_allowed(args, 7, digest))
+            args.full_verifier_script_sha256 = script
 
             args.plugin_pipeline_sha256 = "03" * 32
             self.assertFalse(progressive.retirement_allowed(args, 7, digest))

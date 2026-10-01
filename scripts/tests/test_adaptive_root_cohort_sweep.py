@@ -443,6 +443,110 @@ class ReceiptTests(unittest.TestCase):
                 {},
             )
 
+    def test_r2_receipts_can_replace_only_an_exact_prior_attestation(self) -> None:
+        cohort = sweep.Cohort(7, 8, "solana-v1.0.23")
+        digests = {7: "7" * 64, 8: "8" * 64}
+        completion = {
+            "members": [
+                {"epoch": epoch, "archive_sha256": digests[epoch]}
+                for epoch in cohort.epochs
+            ],
+            "recorded_unix": 100,
+        }
+        with tempfile.TemporaryDirectory() as raw:
+            receipts = Path(raw).resolve()
+            receipts.chmod(0o700)
+            for epoch in cohort.epochs:
+                path = receipts / f"epoch-{epoch}.r2.json"
+                path.write_text(
+                    json.dumps(
+                        {
+                            "schema": sweep.R2_RECEIPT_SCHEMA,
+                            "bucket": "test-bucket",
+                            "epoch": epoch,
+                            "archive_key": f"epoch-{epoch}.jet",
+                            "checksum_key": f"epoch-{epoch}.jet.sha256",
+                            "archive_length": 1234 + epoch,
+                            "archive_sha256": digests[epoch],
+                            "archive_etag": f"etag-{epoch}",
+                            "multipart_part_size": 5 * 1024 * 1024,
+                            "r2_composite_sha256": None,
+                            "remote_sha256_readback": True,
+                            "verified_unix_seconds": 101,
+                        }
+                    )
+                )
+                path.chmod(0o600)
+
+            self.assertTrue(
+                sweep.r2_receipts_prove_completion(
+                    receipts, "test-bucket", cohort, completion, os.getuid()
+                )
+            )
+
+            bad = receipts / "epoch-8.r2.json"
+            receipt = json.loads(bad.read_text())
+            receipt["archive_sha256"] = "f" * 64
+            bad.write_text(json.dumps(receipt))
+            bad.chmod(0o600)
+            with self.assertRaisesRegex(
+                sweep.SweepError, "does not prove attested epoch 8"
+            ):
+                sweep.r2_receipts_prove_completion(
+                    receipts, "test-bucket", cohort, completion, os.getuid()
+                )
+
+    def test_r2_completion_requires_every_receipt_and_a_remote_hash_proof(self) -> None:
+        cohort = sweep.Cohort(9, 9, "solana-v1.0.23")
+        completion = {
+            "members": [{"epoch": 9, "archive_sha256": "9" * 64}],
+            "recorded_unix": 200,
+        }
+        with tempfile.TemporaryDirectory() as raw:
+            receipts = Path(raw).resolve()
+            receipts.chmod(0o700)
+            self.assertFalse(
+                sweep.r2_receipts_prove_completion(
+                    receipts, "test-bucket", cohort, completion, os.getuid()
+                )
+            )
+            path = receipts / "epoch-9.r2.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "schema": sweep.R2_RECEIPT_SCHEMA,
+                        "bucket": "test-bucket",
+                        "epoch": 9,
+                        "archive_key": "epoch-9.jet",
+                        "checksum_key": "epoch-9.jet.sha256",
+                        "archive_length": 999,
+                        "archive_sha256": "9" * 64,
+                        "archive_etag": "etag-9",
+                        "multipart_part_size": 5 * 1024 * 1024,
+                        "r2_composite_sha256": None,
+                        "remote_sha256_readback": False,
+                        "verified_unix_seconds": 201,
+                    }
+                )
+            )
+            path.chmod(0o600)
+            with self.assertRaisesRegex(
+                sweep.SweepError, "does not prove attested epoch 9"
+            ):
+                sweep.r2_receipts_prove_completion(
+                    receipts, "test-bucket", cohort, completion, os.getuid()
+                )
+
+            receipt = json.loads(path.read_text())
+            receipt["r2_composite_sha256"] = "composite-proof"
+            path.write_text(json.dumps(receipt))
+            path.chmod(0o600)
+            self.assertTrue(
+                sweep.r2_receipts_prove_completion(
+                    receipts, "test-bucket", cohort, completion, os.getuid()
+                )
+            )
+
 
 class DirectoryBindingTests(unittest.TestCase):
     def test_bound_directory_rejects_path_inode_replacement(self) -> None:
@@ -506,6 +610,31 @@ class CommandTests(unittest.TestCase):
         self.cohort = sweep.Cohort(31, 32, "solana-v1.1.23")
         self.manifest = self.deploy / "preflight.json"
         self.fingerprint = "sha256:" + "a" * 64
+
+    def test_r2_completion_source_requires_an_exact_bucket_binding(self) -> None:
+        parser = sweep.build_argument_parser()
+        base = [
+            "--deploy-dir=/deploy",
+            "--manifest=/deploy/manifest.json",
+            "--manifest-fingerprint=sha256:" + "a" * 64,
+            "--public-private-root=/private",
+            "--state-dir=/state",
+            "--lane=lane-a=/lane-a",
+        ]
+        incomplete = parser.parse_args(
+            [*base, "--r2-receipt-directory=/r2-receipts"]
+        )
+        with self.assertRaisesRegex(sweep.SweepError, "must be supplied together"):
+            sweep.validate_options(incomplete)
+
+        complete = parser.parse_args(
+            [
+                *base,
+                "--r2-receipt-directory=/r2-receipts",
+                "--r2-bucket=test-bucket",
+            ]
+        )
+        sweep.validate_options(complete)
 
     def test_producer_uses_one_whole_lane_mount_and_recursive_sealed_bind(self) -> None:
         command = sweep.build_producer_command(
@@ -1349,6 +1478,56 @@ class PublicStateTests(unittest.TestCase):
         ):
             self.assertFalse(controller.all_complete())
         controller.trusted_public_complete.assert_not_called()
+
+    def test_attested_cohort_can_remain_complete_after_receipt_gated_r2_retirement(
+        self,
+    ) -> None:
+        cohort = sweep.Cohort(22, 22, "solana-v1.0.23")
+        public = Path("/public")
+        private = Path("/public-private")
+        r2 = Path("/r2-receipts")
+        record = {
+            **fake_receipt_evidence(cohort, private / "receipt.json"),
+            "first_epoch": 22,
+            "last_epoch": 22,
+            "recorded_unix": 100.0,
+        }
+        controller = object.__new__(sweep.Controller)
+        controller.args = mock.Mock(
+            public_dir=public,
+            public_private_root=private,
+            r2_receipt_directory=r2,
+            r2_bucket="test-bucket",
+            manifest_fingerprint="sha256:" + "a" * 64,
+        )
+        controller.sol_uid = os.getuid()
+        controller.horizon_gid = os.getgid()
+        controller.public_destination_identity = sweep.DirectoryIdentity(3, 4)
+        controller.state = {"completed": {cohort.label: record}}
+        binding = mock.Mock()
+        controller.directory_bindings = {r2: binding}
+        controller.revalidate_operational_directories = mock.Mock()
+
+        with (
+            mock.patch.object(sweep, "identity_matches", return_value=True),
+            mock.patch.object(
+                sweep, "checksum_file", return_value=record["receipt_sha256"]
+            ),
+            mock.patch.object(
+                sweep, "public_archive_namespace_complete", return_value=False
+            ),
+            mock.patch.object(
+                sweep, "r2_receipts_prove_completion", return_value=True
+            ) as r2_proof,
+            mock.patch.object(sweep, "discover_committed_receipts") as discover,
+        ):
+            self.assertTrue(controller.trusted_public_complete(cohort, final=True))
+
+        binding.revalidate.assert_called_once_with()
+        r2_proof.assert_called_once_with(
+            r2, "test-bucket", cohort, record, os.getuid()
+        )
+        discover.assert_not_called()
 
 
 class StateTests(unittest.TestCase):

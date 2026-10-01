@@ -45,7 +45,9 @@ PUBLICATION_GATE = "all-archives-validated-and-final-root-verified"
 STATE_SCHEMA = "jetstreamer-adaptive-root-cohort-sweep-v3"
 MAX_MANIFEST_BYTES = 16 * 1024 * 1024
 MAX_RECEIPT_BYTES = 32 * 1024 * 1024
+MAX_R2_RECEIPT_BYTES = 64 * 1024
 MAX_COHORT_RUN_STATE_BYTES = 64 * 1024
+R2_RECEIPT_SCHEMA = "jetstreamer-horizon-r2-receipt-v1"
 ROOT_COHORT_RESUME_RUN_ENV = "JETSTREAMER_ROOT_COHORT_RESUME_RUN"
 ROOT_COHORT_RUN_STATE_SCHEMA = "jetstreamer-root-cohort-run-v1"
 DEFAULT_FIRST_EPOCH = 22
@@ -1566,6 +1568,107 @@ def public_archive_namespace_complete(
     return present == len(cohort.epochs)
 
 
+def r2_receipts_prove_completion(
+    receipt_directory: Path,
+    expected_bucket: str,
+    cohort: Cohort,
+    completion: Mapping[str, Any],
+    expected_uid: int,
+) -> bool:
+    """Prove that an already-attested cohort has a durable R2 copy.
+
+    R2 is never accepted as the original completion authority. The caller
+    must first validate the root controller's local completion attestation;
+    these receipts only allow the matching public archive bytes to be retired.
+    """
+
+    members = completion.get("members")
+    if (
+        not isinstance(members, list)
+        or len(members) != len(cohort.epochs)
+    ):
+        raise SweepError(
+            f"completion attestation for cohort {cohort.label} is malformed"
+        )
+    expected: dict[int, str] = {}
+    for member in members:
+        if not isinstance(member, dict):
+            raise SweepError(
+                f"completion attestation for cohort {cohort.label} is malformed"
+            )
+        epoch = member.get("epoch")
+        digest = member.get("archive_sha256")
+        if (
+            not isinstance(epoch, int)
+            or isinstance(epoch, bool)
+            or epoch not in cohort.epochs
+            or epoch in expected
+            or not isinstance(digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+        ):
+            raise SweepError(
+                f"completion attestation for cohort {cohort.label} is malformed"
+            )
+        expected[epoch] = digest
+    if set(expected) != set(cohort.epochs):
+        raise SweepError(
+            f"completion attestation for cohort {cohort.label} is malformed"
+        )
+
+    for epoch in cohort.epochs:
+        path = receipt_directory / f"epoch-{epoch}.r2.json"
+        try:
+            path.lstat()
+        except FileNotFoundError:
+            return False
+        receipt_bytes, receipt_identity = read_regular_nofollow_with_identity(
+            path, MAX_R2_RECEIPT_BYTES
+        )
+        if (
+            receipt_identity["uid"] != expected_uid
+            or receipt_identity["link_count"] != 1
+            or stat.S_IMODE(receipt_identity["mode"]) != 0o600
+            or stat.S_IMODE(receipt_identity["mode"]) & 0o7000
+        ):
+            raise SweepError(f"unsafe R2 receipt for epoch {epoch}: {path}")
+        receipt = strict_json(receipt_bytes, path)
+        if not isinstance(receipt, dict):
+            raise SweepError(f"malformed R2 receipt for epoch {epoch}: {path}")
+        length = receipt.get("archive_length")
+        verified = receipt.get("verified_unix_seconds")
+        etag = receipt.get("archive_etag")
+        part_size = receipt.get("multipart_part_size")
+        composite = receipt.get("r2_composite_sha256")
+        readback = receipt.get("remote_sha256_readback")
+        if (
+            receipt.get("schema") != R2_RECEIPT_SCHEMA
+            or receipt.get("bucket") != expected_bucket
+            or receipt.get("epoch") != epoch
+            or receipt.get("archive_key") != f"epoch-{epoch}.jet"
+            or receipt.get("checksum_key") != f"epoch-{epoch}.jet.sha256"
+            or receipt.get("archive_sha256") != expected[epoch]
+            or not isinstance(length, int)
+            or isinstance(length, bool)
+            or length <= 0
+            or not isinstance(verified, int)
+            or isinstance(verified, bool)
+            or verified <= 0
+            or not isinstance(etag, str)
+            or not etag
+            or not isinstance(part_size, int)
+            or isinstance(part_size, bool)
+            or part_size < 5 * 1024 * 1024
+            or not (
+                readback is True
+                or (isinstance(composite, str) and bool(composite))
+            )
+        ):
+            raise SweepError(
+                f"R2 receipt does not prove attested epoch {epoch}: {path}"
+            )
+    return True
+
+
 def public_recovery_marker_present(public_dir: Path, expected_uid: int) -> bool:
     present: list[Path] = []
     for name in ARCHIVE_BATCH_MARKERS:
@@ -2310,6 +2413,17 @@ def controller_configuration_sha256(
         "public_private_root_identity": directory_identity(
             args.public_private_root
         ).as_json(),
+        "r2_receipt_directory": (
+            str(args.r2_receipt_directory)
+            if args.r2_receipt_directory is not None
+            else None
+        ),
+        "r2_receipt_directory_identity": (
+            directory_identity(args.r2_receipt_directory).as_json()
+            if args.r2_receipt_directory is not None
+            else None
+        ),
+        "r2_bucket": args.r2_bucket,
         "state_dir": str(args.state_dir),
         "state_dir_identity": directory_identity(args.state_dir).as_json(),
         "scheduled_cohorts": [dataclasses.asdict(cohort) for cohort in cohorts],
@@ -2693,6 +2807,8 @@ class Controller:
                 )
             ),
         }
+        if args.r2_receipt_directory is not None:
+            binding_paths.add(args.r2_receipt_directory)
         self.directory_bindings: dict[Path, BoundDirectory] = {}
         try:
             for path in sorted(binding_paths):
@@ -2873,6 +2989,24 @@ class Controller:
             or checksum_file(receipt) != record.get("receipt_sha256")
         ):
             raise SweepError(f"completion attestation changed for cohort {cohort.label}")
+        namespace_complete = public_archive_namespace_complete(
+            self.args.public_dir,
+            cohort,
+            self.sol_uid,
+            self.horizon_gid,
+            rehash=False,
+        )
+        if not namespace_complete and self.args.r2_receipt_directory is not None:
+            self.directory_bindings[self.args.r2_receipt_directory].revalidate()
+            if r2_receipts_prove_completion(
+                self.args.r2_receipt_directory,
+                self.args.r2_bucket,
+                cohort,
+                record,
+                self.sol_uid,
+            ):
+                self.revalidate_operational_directories()
+                return True
         receipts = discover_committed_receipts(
             self.args.public_dir,
             self.args.public_private_root,
@@ -3779,6 +3913,18 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--manifest-fingerprint", required=True)
     parser.add_argument("--public-dir", type=Path, default=Path("/home/sol/horizon"))
     parser.add_argument("--public-private-root", type=Path, required=True)
+    parser.add_argument(
+        "--r2-receipt-directory",
+        type=Path,
+        help=(
+            "accept matching R2 receipts as durable storage only after this "
+            "controller has attested the local cohort"
+        ),
+    )
+    parser.add_argument(
+        "--r2-bucket",
+        help="bucket that every accepted R2 receipt must bind",
+    )
     parser.add_argument("--state-dir", type=Path, required=True)
     parser.add_argument("--lane", action="append", type=parse_lane, required=True)
     parser.add_argument("--first-epoch", type=int, default=DEFAULT_FIRST_EPOCH)
@@ -3874,6 +4020,19 @@ def validate_options(args: argparse.Namespace) -> None:
         raise SweepError("memory-admission-gib must not exceed memory-max-gib")
     if args.execute and not args.controller_sha256:
         raise SweepError("--execute requires --controller-sha256")
+    if (args.r2_receipt_directory is None) != (args.r2_bucket is None):
+        raise SweepError(
+            "--r2-receipt-directory and --r2-bucket must be supplied together"
+        )
+    if args.r2_bucket is not None and (
+        not args.r2_bucket
+        or len(args.r2_bucket) > 255
+        or any(
+            character.isspace() or character == "\0"
+            for character in args.r2_bucket
+        )
+    ):
+        raise SweepError("r2-bucket must be a nonempty single token")
     names = [lane.name for lane in args.lane]
     roots = [lane.root for lane in args.lane]
     if len(names) != len(set(names)) or len(roots) != len(set(roots)):
@@ -3898,6 +4057,10 @@ def prepare(
         if not path.is_absolute():
             raise SweepError(f"{attribute.replace('_', '-')} must be absolute")
         setattr(args, attribute, path.resolve(strict=True))
+    if args.r2_receipt_directory is not None:
+        if not args.r2_receipt_directory.is_absolute():
+            raise SweepError("r2-receipt-directory must be absolute")
+        args.r2_receipt_directory = args.r2_receipt_directory.resolve(strict=True)
     operational_paths = [
         ("deployment", args.deploy_dir),
         ("public destination", args.public_dir),
@@ -3905,6 +4068,8 @@ def prepare(
         ("controller state", args.state_dir),
         *((f"lane {lane.name}", lane.root.resolve(strict=True)) for lane in args.lane),
     ]
+    if args.r2_receipt_directory is not None:
+        operational_paths.append(("R2 receipt directory", args.r2_receipt_directory))
     for index, (label, path) in enumerate(operational_paths):
         for other_label, other_path in operational_paths[index + 1 :]:
             if path == other_path or path in other_path.parents or other_path in path.parents:
@@ -3950,6 +4115,10 @@ def prepare(
     public_private = validate_real_directory(
         args.public_private_root, uid=sol_uid, gid=horizon_gid, mode=0o700
     )
+    if args.r2_receipt_directory is not None:
+        validate_real_directory(
+            args.r2_receipt_directory, uid=sol_uid, mode=0o700, owner_only=True
+        )
     if public.stat().st_dev != public_private.stat().st_dev:
         raise SweepError("public private root must be on the public destination filesystem")
     lanes = tuple(
@@ -3972,18 +4141,28 @@ def print_plan(
     lanes: Sequence[Lane],
 ) -> None:
     sol_uid = pwd.getpwnam("sol").pw_uid
-    completed = [
-        cohort.label
-        for cohort in cohorts
+    horizon_gid = grp.getgrnam("horizon").gr_gid
+    completed = []
+    for cohort in cohorts:
+        if (
+            args.r2_receipt_directory is not None
+            and not public_archive_namespace_complete(
+                args.public_dir, cohort, sol_uid, horizon_gid, rehash=False
+            )
+        ):
+            # The root-owned controller state, loaded below in execute mode,
+            # is the authority for whether a missing local cohort was attested
+            # before its matching R2 receipt allowed retirement.
+            continue
         if public_cohort_complete(
             args.public_dir,
             args.public_private_root,
             cohort,
             args.manifest_fingerprint,
             sol_uid,
-            grp.getgrnam("horizon").gr_gid,
-        )
-    ]
+            horizon_gid,
+        ):
+            completed.append(cohort.label)
     managed = (*cohorts, *adopted_cohorts)
     live = [
         {
@@ -4016,6 +4195,12 @@ def print_plan(
         "memory_admission_gib": args.memory_admission_gib,
         "disk_reserve_gib": args.disk_reserve_gib,
         "disk_budget_per_worker_gib": args.disk_budget_per_worker_gib,
+        "r2_receipt_directory": (
+            str(args.r2_receipt_directory)
+            if args.r2_receipt_directory is not None
+            else None
+        ),
+        "r2_bucket": args.r2_bucket,
         "completed": completed,
         "live_epoch_claims": live,
         "public_write_path": "jetstreamer-node --recover-staged-cohort-only only",

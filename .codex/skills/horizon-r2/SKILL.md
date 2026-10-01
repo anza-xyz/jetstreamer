@@ -27,6 +27,7 @@ For a long-running range, use `scripts/sync_horizon_r2_progressive.py` to discov
 
 - Use the repository's sealed historical replay/controller path and automatic slot-range runtime selection. Do not invent a compatibility override.
 - Run generation in a persistent systemd unit so loss of the interactive session cannot kill it. Respect unrelated jobs and configured RAM/disk reserves.
+- For adaptive ranges, start the controller with `--r2-receipt-directory "$HOME/.jetstreamer-private/r2-receipts" --r2-bucket BUCKET`. The controller accepts receipts from that exact bucket only for bytes already bound by its root-owned local completion attestation; R2 can replace local storage, but can never establish initial completion.
 - Start the current Horizon verification plugin as soon as each local archive is available. R2 work may run concurrently with replay of other epochs, but an archive is not eligible for upload or local retirement until its full, current-plugin, and both adjacent-boundary receipts bind the same archive SHA-256. Preserve the canonical lowercase coreutils sidecar format: `<64 hex>  epoch-N.jet\n`.
 
 ## Deliver
@@ -42,6 +43,8 @@ target/release/jetstreamer-r2 sync "$HORIZON_DIR" \
 ```
 
 Add `--epochs START-END` for an explicit range. Add `--delete-local` only after checking the matching plugin receipt and that no active controller or verifier still requires those local paths. Existing deployed controllers may use the public directory as their completion ledger; defer retirement for their managed range until that controller finishes or is deliberately upgraded to understand R2 receipts.
+
+After an adaptive controller has been deliberately deployed with `--r2-receipt-directory`, its completed cohorts no longer need a matching `--defer-epochs` entry: the progressive uploader may retire them after all normal publication gates pass. Never remove the defer for a controller that lacks this flag.
 
 For progressive retirement, pass both receipt directories and explicitly defer every active
 controller range:

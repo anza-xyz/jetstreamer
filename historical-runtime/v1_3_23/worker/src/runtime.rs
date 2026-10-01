@@ -39,6 +39,15 @@ const MAX_AGE_CORRECTION_EPOCH: u64 = 14;
 const MIN_SUPPORTED_SNAPSHOT_SLOT: u64 = 43_631_879;
 const MIN_SUPPORTED_ENTRY_SLOT: u64 = MIN_SUPPORTED_SNAPSHOT_SLOT + 1;
 const MAX_SUPPORTED_SLOT_EXCLUSIVE: u64 = 63_936_000;
+// Mainnet's first restart marker is already persisted in every snapshot this
+// worker accepts. The December 2020 restart introduced a second marker at
+// slot 53,180,900. A predecessor snapshot cannot contain that future marker,
+// because validators supplied it through `--hard-fork` when restarting. Add
+// it exactly once before replay; later snapshots must persist both markers.
+// Omitting it produces the pre-extension hash EZzqCD... at the restart slot,
+// while the canonical vote stream commits to Fi4p8z....
+const FIRST_MAINNET_HARD_FORK_SLOT: u64 = 13_334_463;
+const SECOND_MAINNET_HARD_FORK_SLOT: u64 = 53_180_900;
 const POH_THREADS_ENV: &str = "JETSTREAMER_HISTORICAL_POH_THREADS";
 const ABSOLUTE_MAX_POH_THREADS: usize = 256;
 // The validator runs AccountsBackgroundService alongside replay. This worker
@@ -117,6 +126,7 @@ impl RuntimeState {
                 ));
             }
         };
+        restore_mainnet_hard_forks(&bank)?;
         let write_cursor = bank.accounts().accounts_db.next_write_version();
         let last_entry_hash = bank.last_blockhash();
         let initialized = Initialized {
@@ -692,6 +702,54 @@ fn validate_candidate_entry_slot(slot: u64) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+fn restore_mainnet_hard_forks(bank: &Bank) -> Result<(), String> {
+    let hard_forks = bank.hard_forks();
+    let mut hard_forks = hard_forks.write().unwrap();
+    let mut first_count = None;
+    let mut second_count = None;
+    for &(slot, count) in hard_forks.iter() {
+        let marker = match slot {
+            FIRST_MAINNET_HARD_FORK_SLOT => &mut first_count,
+            SECOND_MAINNET_HARD_FORK_SLOT => &mut second_count,
+            _ => {
+                return Err(format!(
+                    "snapshot contains unsupported mainnet hard fork ({}, {})",
+                    slot, count
+                ));
+            }
+        };
+        if marker.replace(count).is_some() {
+            return Err(format!(
+                "snapshot contains duplicate mainnet hard fork {}",
+                slot
+            ));
+        }
+    }
+
+    if first_count != Some(1) {
+        return Err(format!(
+            "snapshot mainnet hard fork {} has count {:?}, expected 1",
+            FIRST_MAINNET_HARD_FORK_SLOT, first_count
+        ));
+    }
+    match second_count {
+        Some(1) => Ok(()),
+        Some(count) => Err(format!(
+            "snapshot mainnet hard fork {} has count {}, expected 1",
+            SECOND_MAINNET_HARD_FORK_SLOT, count
+        )),
+        None if bank.slot() < SECOND_MAINNET_HARD_FORK_SLOT => {
+            hard_forks.register(SECOND_MAINNET_HARD_FORK_SLOT);
+            Ok(())
+        }
+        None => Err(format!(
+            "snapshot at slot {} is missing applied mainnet hard fork {}",
+            bank.slot(),
+            SECOND_MAINNET_HARD_FORK_SLOT
+        )),
+    }
 }
 
 fn build_poh_pool() -> Result<ThreadPool, String> {
@@ -1281,6 +1339,63 @@ mod tests {
         assert!(validate_mainnet_genesis_programs(&genesis)
             .unwrap_err()
             .contains("requires MainnetBeta cluster type"));
+    }
+
+    #[test]
+    fn mainnet_hard_forks_are_restored_once_and_strictly_validated() {
+        let leader = Pubkey::new_from_array([7; 32]);
+        let genesis = create_genesis_config_with_leader(1_000_000, &leader, 500_000);
+        let bank = Bank::new(&genesis.genesis_config);
+        bank.hard_forks()
+            .write()
+            .unwrap()
+            .register(FIRST_MAINNET_HARD_FORK_SLOT);
+
+        restore_mainnet_hard_forks(&bank).unwrap();
+        restore_mainnet_hard_forks(&bank).unwrap();
+        assert_eq!(
+            bank.hard_forks()
+                .read()
+                .unwrap()
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec![
+                (FIRST_MAINNET_HARD_FORK_SLOT, 1),
+                (SECOND_MAINNET_HARD_FORK_SLOT, 1),
+            ]
+        );
+
+        bank.hard_forks()
+            .write()
+            .unwrap()
+            .register(SECOND_MAINNET_HARD_FORK_SLOT);
+        assert!(restore_mainnet_hard_forks(&bank)
+            .unwrap_err()
+            .contains("has count 2, expected 1"));
+
+        let missing_first = Bank::new(&genesis.genesis_config);
+        assert!(restore_mainnet_hard_forks(&missing_first)
+            .unwrap_err()
+            .contains("expected 1"));
+
+        let unexpected = Bank::new(&genesis.genesis_config);
+        unexpected.hard_forks().write().unwrap().register(42);
+        assert!(restore_mainnet_hard_forks(&unexpected)
+            .unwrap_err()
+            .contains("unsupported mainnet hard fork"));
+    }
+
+    #[test]
+    fn epoch123_hard_fork_marker_matches_canonical_vote_witness() {
+        use std::str::FromStr;
+
+        let pre_marker = Hash::from_str("EZzqCDxdzWF4sak54hfhz9CMExLjgoh9qtKbMn8TdNLA").unwrap();
+        let canonical = solana_sdk::hash::extend_and_hash(&pre_marker, &1u64.to_le_bytes());
+        assert_eq!(
+            canonical.to_string(),
+            "Fi4p8z3AkfsuGXZzQ4TD28N8QDNSWC7ccqAqTs2GPdPu"
+        );
     }
 
     #[test]

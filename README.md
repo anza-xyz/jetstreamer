@@ -488,7 +488,7 @@ select a runtime. The current registry is deliberately conservative:
 | `29,371,188..29,808,000` | pinned Solana v1.2.32 mainnet transition worker | generated state handoff after the last observed old-semantics transaction; reconstructs the CPI and vote-timestamp activation state | qualified by the terminal epoch-68 checkpoint |
 | `29,808,000..39,744,000` | pinned Solana v1.2.32 worker | independently verified snapshot restart | diagnostic candidate for epochs 69-91 |
 | `39,744,000..43,632,000` | pinned Solana v1.3.19 worker | independently verified snapshot restart; bounded extractor admits up to 131,072 members for the audited 104,267–106,520-member epoch-98 through epoch-100 snapshots | diagnostic candidate for epochs 92-100 |
-| `43,632,000..55,728,000` | pinned Solana v1.3.23 worker | independently verified snapshot restart; mainnet still accepted a 4,008-byte stake initialization at slot 55,686,407; the extractor remains byte-bounded while admitting the later snapshot's 131,072+ members; every cohort must match all canonical post-bootstrap roots | unqualified diagnostic candidate for epochs 101-128 |
+| `43,632,000..55,728,000` | pinned Solana v1.3.23 worker | independently verified snapshot restart; restores and strictly validates mainnet's second hard-fork marker at slot 53,180,900; mainnet still accepted a 4,008-byte stake initialization at slot 55,686,407; the extractor remains byte-bounded while admitting the later snapshot's 131,072+ members; every cohort must match all canonical post-bootstrap roots | unqualified diagnostic candidate for epochs 101-128 |
 | `55,728,000..56,592,000` | pinned Solana v1.4.17 worker | owns epoch 129's v1.4 feature boundary; reproduces the canonical successful vote at slot 55,728,002 where terminal v1.4.25 returns `SlotHashMismatch`, and the source-recorded BPF-loader custom error at slot 56,298,256 where v1.4.25 returns `ProgramFailedToComplete`; every canonical post-bootstrap root must still match before publication | source-status-selected, checkpoint-gated candidate for epochs 129-130 |
 | `56,592,000..57,888,000` | pinned Solana v1.4.19 worker | complete source-status scans found 7, 1, and 12 legacy loader custom errors in epochs 131, 132, and 133 respectively, with no `ProgramFailedToComplete` status; v1.4.19 is the final upstream patch before that error contract changed; focused replay matched the canonical epoch-131 checkpoint at slot 56,705,196 | source-status-selected, bounded checkpoint-qualified candidate for epochs 131-133 |
 | `57,888,000..63,936,000` | pinned Solana v1.4.25 worker | epoch 134's complete source-status scan contains neither loader-error form; independently verified snapshot restart carries the later v1.4 transaction-status vocabulary through the shared stream protocol; every cohort must match all canonical post-bootstrap roots | unqualified diagnostic candidate for epochs 134-147 |
@@ -509,7 +509,7 @@ v1.4.19, v1.5.5, and v1.5.6 envelopes have each passed their first bounded post-
 every complete production cohort still requires all canonical roots before publication. The terminal
 v1.5.19 worker remains registered only as an unassigned comparison candidate.
 
-Nine execution interventions are explicitly recorded in addition to the ordinary
+Ten execution interventions are explicitly recorded in addition to the ordinary
 epoch-aligned pinned-worker snapshot restarts:
 
 1. The behaviorally safe v1.0.7 to v1.0.8 state handoff at slot 619,849.
@@ -520,15 +520,20 @@ epoch-aligned pinned-worker snapshot restarts:
 6. The v1.3.23 envelope extends through epoch 128 because mainnet still accepted 4,008-byte stake
    initializations through slot 55,725,865, while none were found after the epoch-129 feature boundary
    at slot 55,728,000; publication still requires every terminal root.
-7. Epochs 129-130 use exact v1.4.17 because the first canonical epoch-129 vote at slot 55,728,002
+7. The v1.3.23 worker reconstructs mainnet's externally supplied hard-fork marker at slot
+   53,180,900 when starting from its predecessor snapshot, and requires both persisted mainnet
+   markers in later snapshots. The marker transforms the otherwise matching pre-extension bank hash
+   `EZzqCDxdzWF4sak54hfhz9CMExLjgoh9qtKbMn8TdNLA` into the canonical vote witness
+   `Fi4p8z3AkfsuGXZzQ4TD28N8QDNSWC7ccqAqTs2GPdPu`.
+8. Epochs 129-130 use exact v1.4.17 because the first canonical epoch-129 vote at slot 55,728,002
    succeeds under v1.4.17 while terminal v1.4.25 rolls it back with `SlotHashMismatch`, and slot
    56,298,256 records BPF-loader custom error `0x0b9f0002` while v1.4.25 returns
    `ProgramFailedToComplete`; both epochs remain checkpoint-gated.
-8. Epochs 131 through 133 use exact v1.4.19 because complete source-status scans found 7, 1, and
+9. Epochs 131 through 133 use exact v1.4.19 because complete source-status scans found 7, 1, and
    12 legacy loader custom errors respectively and no `ProgramFailedToComplete` records. Exact
    v1.4.20 and later changed that mapping; v1.4.25 resumes from the independent epoch-134
    predecessor snapshot after qualification.
-9. Epoch 154 uses exact v1.5.8 from the hash-bound slot-66,527,778 snapshot because v1.5.6 rejects
+10. Epoch 154 uses exact v1.5.8 from the hash-bound slot-66,527,778 snapshot because v1.5.6 rejects
    a source-successful transaction at slot 66,528,004 while terminal v1.5.19 already disagrees at
    slot 66,527,779; v1.5.6 resumes at epoch 155, and publication remains terminal-checkpoint-gated.
 

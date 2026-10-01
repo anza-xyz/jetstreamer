@@ -122,6 +122,14 @@ The surrounding v1.2.32 ranges remain independently checkpoint-gated. Static
 loader bindings reproduce the exact linked processors without relying on
 mutable shared libraries next to the deployment.
 
+The v1.3.23 worker also reconstructs mainnet's second externally configured
+hard-fork marker at slot 53,180,900. Predecessor snapshots must already carry
+the first marker at slot 13,334,463; snapshots after the second restart must
+carry both markers with count one. The new marker is added exactly once only
+when replay starts before it. Its hash extension converts the locally
+reproduced pre-marker bank hash into the exact canonical hash committed by the
+first subsequent vote.
+
 The executable handshake reports candidate status, protocol version, Solana
 tag and commit, Rust toolchain, target, and required mainnet genesis hash. The
 parent also hashes the executable itself and records that SHA-256 in historical

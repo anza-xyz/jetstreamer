@@ -174,7 +174,8 @@ Each vendored runtime directory contains the upstream `runtime/` crate and an
 | `v1_3_19` | `15a49d75086f95573ad319b22e4843639bdf2169` | checkpoint-gated diagnostic envelope, epochs 92–100 |
 | `v1_3_23` | `ab235b8160f1c76e5066eee52d62d976d12f42f1` | unqualified checkpoint-gated diagnostic envelope, epochs 101-128 |
 | `v1_4_17` | `599b22baf31c90a80c75b720cd06b4840f5b29fe` | source-status-selected, checkpoint-gated diagnostic envelope, epochs 129-130 |
-| `v1_4_25` | `893cc7647248a3536fb6e6d0b5e51c71446b862d` | unqualified checkpoint-gated diagnostic envelope, epochs 131-147 |
+| `v1_4_19` | `9466ad3c1f11fb90df6015d6c910f0e89747a553` | source-status-selected, bounded checkpoint-qualified diagnostic envelope, epochs 131-133 |
+| `v1_4_25` | `893cc7647248a3536fb6e6d0b5e51c71446b862d` | unqualified checkpoint-gated diagnostic envelope, epochs 134-147 |
 | `v1_5_5` | `10e12d14e105bc2a5cd9c216ffe943a28d2aabf1` | bounded checkpoint-qualified candidate for epochs 148-149 |
 | `v1_5_19` | `936ff7424e1306b0df07dabcd6863bf7896d2cb5` | registered but unassigned comparison candidate |
 | `v1_5_6` | `01e4d0a1e9917701d1a148e1043b0ccf545c27f1` | bounded checkpoint-qualified candidate from epoch 150; later cohorts remain checkpoint-gated |
@@ -204,14 +205,16 @@ The source has only these integration changes:
    members. Audited epoch-98 through epoch-100 bootstrap snapshots contain
    104,267, 105,275, and 106,520 members respectively; the previous 100,000
    ceiling rejected these valid archives before decoding.
-7. The v1.4.17 and v1.4.25 extractors apply the same checks with a 524,288-member ceiling.
+7. The v1.4.17, v1.4.19, and v1.4.25 extractors apply the same checks with a 524,288-member ceiling.
    The boundary and terminal snapshots contain 144,901 and 380,435 members,
    so the smaller historical ceiling cannot safely admit the whole envelope.
-8. Epoch 129 is routed to exact v1.4.17 because the canonical vote at slot
+8. Epochs 129 and 130 are routed to exact v1.4.17 because the canonical vote at slot
    55,728,002 succeeds there while v1.4.25 returns `SlotHashMismatch`. The
    differential result selects the candidate; canonical checkpoints still
-   gate archive publication. v1.4.25 starts again from epoch 130's independent
-   predecessor snapshot.
+   gate archive publication. Exact v1.4.19 owns epochs 131-133 because complete
+   source-status scans preserve their legacy loader custom-error contract;
+   v1.4.25 starts from epoch 134's independent predecessor snapshot after the
+   corresponding complete scans switch entirely to the later error contract.
 9. The v1.5.5, v1.5.6, and v1.5.19 workers disable the account cache. This keeps every
    physical replay write and global write version available to the ordered
    plugin stream instead of collapsing repeated writes by pubkey.

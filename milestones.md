@@ -3,6 +3,29 @@
 Major project results, newest first. Each entry records the UTC date and the
 code revision that produced the result.
 
+## 2026-10-01: Mainnet epoch-123 restart marker restored and canonically qualified
+
+- Commit `ad889245396c96e0f682a888f0b6b8b85d75e2f1` restores the historical
+  hard-fork marker at slot 53,180,900 in the exact Solana v1.3.23 runtime.
+  Snapshot markers are validated strictly: the pre-existing slot-13,334,463
+  marker and the restart marker must each occur exactly once, and unknown
+  markers are rejected.
+- Before the marker, replay produced bank hash
+  `EZzqCDxdzWF4sak54hfhz9CMExLjgoh9qtKbMn8TdNLA`; applying the canonical
+  one-count extension produces
+  `Fi4p8z3AkfsuGXZzQ4TD28N8QDNSWC7ccqAqTs2GPdPu`, matching the first
+  post-restart vote stream exactly.
+- The production v1.3.23 worker replayed slots 53,180,854 through 53,199,885
+  and matched terminal bank hash
+  `EQXtC91MHAc8e4fpdtxJEmkweu2rztuQDrDqa9fUe1b2` and accounts hash
+  `Ah3EL9YhkP5djcuJyRgzTSvQ4dQU8pNNz6Z1ypWSZQnA`. The complete replay and
+  post-write archive validation finished in 48 minutes, 59 seconds.
+- The verified segment has SHA-256
+  `1a63218cebb80079a0978e6c57aebb9f39ae707a71c7eedda1e16a7528e43a9c`.
+  Its evidence manifest binds production worker SHA-256
+  `20c8d1031ae89889f53210aae5fcfdf5f4b08154012f6ff1494d80aeacb30966`
+  and both canonical checkpoints.
+
 ## 2026-10-01: Receipt-composed boundary verification reduced a multi-hour audit to seconds
 
 - Commit `49fb9996e5053ee17733b2dffcd309c72852e2cc` replaced overlapping full

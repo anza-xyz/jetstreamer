@@ -14,6 +14,7 @@ SCRIPT = (
 )
 FULL_VERIFIER_SHA256 = "1" * 64
 FULL_SCRIPT_SHA256 = "2" * 64
+FULL_VERIFIER_ALLOWLIST = f"{'0' * 64},{FULL_VERIFIER_SHA256}"
 
 
 class ProgressiveBoundaryVerificationTests(unittest.TestCase):
@@ -46,7 +47,7 @@ class ProgressiveBoundaryVerificationTests(unittest.TestCase):
                 str(verifier),
                 str(archives),
                 str(full_receipts),
-                FULL_VERIFIER_SHA256,
+                FULL_VERIFIER_ALLOWLIST,
                 FULL_SCRIPT_SHA256,
                 str(state),
                 "7",

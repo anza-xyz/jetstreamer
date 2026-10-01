@@ -164,6 +164,9 @@ archive SHA-256 values and the exact boundary verifier. This avoids redundantly 
 gigabytes for every overlapping pair while retaining the same proof: the full receipts cover all
 within-archive structure and PoH, and the edge receipt covers the only cross-archive link. The two
 outer boundaries must still be proved by the neighboring epochs or explicit canonical anchors.
+The full-verifier argument is an explicit comma-separated SHA-256 allowlist so a boundary spanning
+a verifier upgrade can compose two independently approved full receipts without weakening either
+side of the proof.
 
 `scripts/verify_horizon_plugin_range.sh` is the corresponding progressive launcher for the
 consumer/API gate. It waits for every archive and well-formed sidecar in an inclusive epoch range,

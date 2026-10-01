@@ -710,6 +710,111 @@ class AdoptionHardeningTests(unittest.TestCase):
                 )
             )
 
+    def test_exact_node_authored_resume_environment_is_accepted(self) -> None:
+        properties = self.hardened_properties()
+        resume = (
+            f"{sweep.ROOT_COHORT_RESUME_RUN_ENV}="
+            "/private/sweep/lane-c/private/destination-"
+            f"{'b' * 64}/work/root-cohort-31-32/run-123-456"
+        )
+        properties["Environment"] += f" {resume}"
+        with (
+            mock.patch.object(
+                sweep, "systemd_properties", return_value=properties
+            ),
+            mock.patch.object(
+                sweep,
+                "root_cohort_resume_environment_is_valid",
+                return_value=True,
+            ) as validate_resume,
+        ):
+            self.assertTrue(
+                sweep.unit_is_hardened_for_adoption(
+                    self.unit,
+                    self.process,
+                    self.cohort,
+                    self.lane,
+                    self.deploy,
+                )
+            )
+            validate_resume.assert_called_once_with(
+                resume, self.process, self.cohort, self.lane
+            )
+
+    def test_resume_environment_requires_exact_private_state(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            cohort = sweep.Cohort(32, 32, self.cohort.runtime)
+            process = dataclasses.replace(self.process, cohort=cohort)
+            lane_root = Path(raw).resolve() / "lane-c"
+            lane = sweep.Lane("lane-c", lane_root)
+            lane.private.mkdir(parents=True)
+            destination = lane.private / f"destination-{'c' * 64}"
+            run = destination / "work" / "root-cohort-32-32" / "run-123-456"
+            run.mkdir(parents=True)
+            private_directories = (
+                lane_root,
+                lane.private,
+                destination,
+                destination / "work",
+                run.parent,
+                run,
+            )
+            for path in private_directories:
+                path.chmod(0o700)
+            state = run / "cohort-state.json"
+            state.write_text(
+                json.dumps(
+                    {
+                        "end_epoch": cohort.last_epoch,
+                        "manifest_fingerprint": process.fingerprint,
+                        "schema": sweep.ROOT_COHORT_RUN_STATE_SCHEMA,
+                        "start_epoch": cohort.first_epoch,
+                        "status": "running-private",
+                    }
+                )
+            )
+            state.chmod(0o600)
+            item = f"{sweep.ROOT_COHORT_RESUME_RUN_ENV}={run}"
+
+            self.assertTrue(
+                sweep.root_cohort_resume_environment_is_valid(
+                    item, process, cohort, lane
+                )
+            )
+
+            state.chmod(0o640)
+            self.assertFalse(
+                sweep.root_cohort_resume_environment_is_valid(
+                    item, process, cohort, lane
+                )
+            )
+            state.chmod(0o600)
+            changed = json.loads(state.read_text())
+            changed["manifest_fingerprint"] = "sha256:" + "d" * 64
+            state.write_text(json.dumps(changed))
+            state.chmod(0o600)
+            self.assertFalse(
+                sweep.root_cohort_resume_environment_is_valid(
+                    item, process, cohort, lane
+                )
+            )
+
+    def test_unrecognized_extra_environment_is_rejected(self) -> None:
+        properties = self.hardened_properties()
+        properties["Environment"] += " UNRECOGNIZED_CAPABILITY=1"
+        with mock.patch.object(
+            sweep, "systemd_properties", return_value=properties
+        ):
+            self.assertFalse(
+                sweep.unit_is_hardened_for_adoption(
+                    self.unit,
+                    self.process,
+                    self.cohort,
+                    self.lane,
+                    self.deploy,
+                )
+            )
+
     def test_reload_serialized_namespace_policy_requires_live_attestation(self) -> None:
         properties = self.hardened_properties()
         properties["RestrictNamespaces"] = "no"

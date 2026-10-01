@@ -45,6 +45,9 @@ PUBLICATION_GATE = "all-archives-validated-and-final-root-verified"
 STATE_SCHEMA = "jetstreamer-adaptive-root-cohort-sweep-v3"
 MAX_MANIFEST_BYTES = 16 * 1024 * 1024
 MAX_RECEIPT_BYTES = 32 * 1024 * 1024
+MAX_COHORT_RUN_STATE_BYTES = 64 * 1024
+ROOT_COHORT_RESUME_RUN_ENV = "JETSTREAMER_ROOT_COHORT_RESUME_RUN"
+ROOT_COHORT_RUN_STATE_SCHEMA = "jetstreamer-root-cohort-run-v1"
 DEFAULT_FIRST_EPOCH = 22
 DEFAULT_LAST_EPOCH = 100
 DEFAULT_INITIAL_CONCURRENCY = 2
@@ -76,6 +79,8 @@ ARCHIVE_BATCH_MARKERS = (
 FINGERPRINT_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
 SAFE_NAME_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,31}\Z")
 SYSTEMD_UNIT_RE = re.compile(r"[A-Za-z0-9_.@:-]{1,240}\.service\Z")
+DESTINATION_SCOPE_RE = re.compile(r"destination-[0-9a-f]{64}\Z")
+COHORT_RUN_DIRECTORY_RE = re.compile(r"run-[0-9]+-[0-9]+\Z")
 RUNTIME_WORKERS = {
     "solana-v1.0.8": ("V1_0_8", "jetstreamer-historical-worker-v1-0-8"),
     "solana-v1.0.13": ("V1_0_13", "jetstreamer-historical-worker-v1-0-13"),
@@ -1237,6 +1242,84 @@ def parse_systemd_timespan_usec(value: str) -> int | None:
     return int(result) if result == result.to_integral_value() else None
 
 
+def root_cohort_resume_environment_is_valid(
+    item: str,
+    process: ProducerProcess,
+    cohort: Cohort,
+    lane: Lane,
+) -> bool:
+    """Validate the node's fail-closed retained-run admission capability.
+
+    A controller normally accepts only the exact producer environment it
+    generated. A root operator may, however, restart a node-authored private
+    cohort after a failed replay by adding one environment variable naming the
+    retained run. Accept that one capability only when it is confined to the
+    claimed lane and its owner-only state binds the same cohort and manifest.
+    The node independently revalidates this state and every retained input.
+    """
+
+    name, separator, raw_path = item.partition("=")
+    if name != ROOT_COHORT_RESUME_RUN_ENV or not separator or not raw_path:
+        return False
+    path = Path(raw_path)
+    if not path.is_absolute():
+        return False
+    try:
+        if path.resolve(strict=True) != path:
+            return False
+        relative = path.relative_to(lane.private)
+        lane_info = lane.root.lstat()
+    except (OSError, ValueError):
+        return False
+    parts = relative.parts
+    if (
+        len(parts) != 4
+        or DESTINATION_SCOPE_RE.fullmatch(parts[0]) is None
+        or parts[1] != "work"
+        or parts[2] != f"root-cohort-{cohort.first_epoch}-{cohort.last_epoch}"
+        or COHORT_RUN_DIRECTORY_RE.fullmatch(parts[3]) is None
+        or not stat.S_ISDIR(lane_info.st_mode)
+    ):
+        return False
+    expected_uid = lane_info.st_uid
+    current = lane.private
+    for component in parts:
+        current /= component
+        try:
+            info = current.lstat()
+        except OSError:
+            return False
+        if (
+            not stat.S_ISDIR(info.st_mode)
+            or info.st_uid != expected_uid
+            or stat.S_IMODE(info.st_mode) & 0o077
+        ):
+            return False
+    state_path = path / "cohort-state.json"
+    try:
+        info = state_path.lstat()
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != expected_uid
+            or info.st_nlink != 1
+            or stat.S_IMODE(info.st_mode) != 0o600
+            or info.st_size > MAX_COHORT_RUN_STATE_BYTES
+        ):
+            return False
+        data = strict_json(
+            read_regular_nofollow(state_path, MAX_COHORT_RUN_STATE_BYTES), state_path
+        )
+    except (OSError, SweepError, ValueError):
+        return False
+    return data == {
+        "end_epoch": cohort.last_epoch,
+        "manifest_fingerprint": process.fingerprint,
+        "schema": ROOT_COHORT_RUN_STATE_SCHEMA,
+        "start_epoch": cohort.first_epoch,
+        "status": "running-private",
+    }
+
+
 def unit_is_hardened_for_adoption(
     unit: str,
     process: ProducerProcess,
@@ -1377,10 +1460,19 @@ def unit_is_hardened_for_adoption(
         configured_environment = set(shlex.split(properties.get("Environment", "")))
     except ValueError:
         return False
-    if configured_environment != set(
+    expected_environment = set(
         producer_environment(cohort, deploy, lane, account, project)
-    ):
-        return False
+    )
+    if configured_environment != expected_environment:
+        extras = configured_environment - expected_environment
+        if (
+            not expected_environment.issubset(configured_environment)
+            or len(extras) != 1
+            or not root_cohort_resume_environment_is_valid(
+                next(iter(extras)), process, cohort, lane
+            )
+        ):
+            return False
     node = deploy / "jetstreamer-node"
     if re.match(
         rf"^\{{ path={re.escape(str(node))} ; argv\[\]={re.escape(str(node))} ",

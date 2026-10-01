@@ -181,6 +181,11 @@ uploaded object is staged—not published or eligible for local retirement—unt
 Local retirement also requires receipts for both adjacent archive boundaries. This preserves the
 ordered-chain proof when a range is larger than available local disk; an epoch remains local until
 its predecessor and successor boundaries have both been checked against the exact archive digest.
+For a long-lived range, `scripts/watch_horizon_plugin_progressive.sh` checks the sidecar and exact
+receipt first, then dispatches that sealed verifier only for a newly available or stale epoch. It
+therefore does not repeatedly hash already verified archives while waiting for later epochs; the
+dispatched verifier still hashes before and after the plugin scan, and R2 independently hashes the
+local source before upload.
 
 ### Horizon R2 delivery
 

@@ -185,6 +185,52 @@ fn post_update_count_ceiling_remains_fail_closed() {
     ));
 }
 
+#[test]
+fn post_update_data_ceiling_admits_observed_rent_burst_and_remains_fail_closed() {
+    let mut writer = ArchiveWriter::new(
+        Vec::new(),
+        185,
+        80_017_516,
+        1,
+        ArchiveWriterConfig {
+            compression: Compression::None,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    writer.begin_slot(80_017_516).unwrap();
+
+    let nine_mib = vec![0u8; 9 * 1024 * 1024];
+    let seven_mib = vec![0u8; 7 * 1024 * 1024];
+    let one_byte = [0u8; 1];
+    let update = |data| AccountUpdateView {
+        pubkey: Address::new_from_array([7; 32]),
+        lamports: 1,
+        owner: Address::new_from_array([9; 32]),
+        executable: false,
+        rent_epoch: 0,
+        write_version: 0,
+        data,
+    };
+
+    // A single 9 MiB record proves the historical 8 MiB aggregate ceiling is
+    // no longer applied. The aggregate remains bounded at exactly 16 MiB.
+    writer
+        .write_reencoded_post_update(&update(&nine_mib))
+        .unwrap();
+    writer
+        .write_reencoded_post_update(&update(&seven_mib))
+        .unwrap();
+    assert!(matches!(
+        writer.write_reencoded_post_update(&update(&one_byte)),
+        Err(ArchiveFormatError::SectionTooLarge {
+            section: "post-transaction account updates",
+            bytes: 16_777_217,
+            limit: 16_777_216,
+        })
+    ));
+}
+
 fn sample_archive_provenance_v1() -> ArchiveProvenanceV1 {
     ArchiveProvenanceV1 {
         generation_profile: "jetstreamer-node/historical-replay-v1".into(),

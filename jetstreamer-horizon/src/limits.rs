@@ -131,12 +131,16 @@ pub const MAX_SLOT_PRE_UPDATE_DATA: usize = 32 * 1024 * 1024;
 /// Historical rent collection at mainnet slots 76,920,172, 77,374,128, and
 /// 78,204,496 emits more than 4,096 writes before the other freeze-time writes
 /// are included. Keep a finite 8,192-record ceiling while the independent
-/// 8 MiB data arena, per-account, bucket, and decode-work limits continue to
+/// data arena, per-account, bucket, and decode-work limits continue to
 /// bound resource use.
 pub const MAX_SLOT_POST_UPDATES: usize = 8_192;
 
 /// Combined data-byte cap for one block's post-transaction orphan updates.
-pub const MAX_SLOT_POST_UPDATE_DATA: usize = 8 * 1024 * 1024;
+/// Mainnet slot 80,017,516 emitted 9,141,825 bytes during historical rent
+/// collection. 16 MiB admits that observed block with 83% headroom while
+/// remaining finite and independently bounded by the per-account, bucket, and
+/// cumulative decode-work limits. This capacity is not encoded on the wire.
+pub const MAX_SLOT_POST_UPDATE_DATA: usize = 16 * 1024 * 1024;
 
 /// Max account updates attributed directly to an epoch notification
 /// (feature activations, builtin migrations at the boundary bank).

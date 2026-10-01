@@ -186,12 +186,15 @@ receipts or logs.
 
 R2's S3 `UploadPart` currently rejects `x-amz-checksum-sha256` even though the R2 compatibility
 matrix advertises composite SHA-256. The uploader therefore sends R2-validated `Content-MD5` for
-every part, reconstructs and checks the final multipart ETag, uploads the canonical whole-file
-`.sha256` sidecar, reads the completed archive back through R2 while recomputing its whole-file
-SHA-256, and reads the sidecar back byte-for-byte. If R2 exposes a native composite SHA-256 for an
-object, the uploader validates and uses it. A private, fsynced receipt is the prerequisite for
-optional local retirement. The binary intentionally has no completed-object delete operation and
-refuses to replace an existing remote object that does not match local evidence by default.
+every part, reconstructs and checks the final multipart ETag, and reads the completed archive back
+through R2 while recomputing its whole-file SHA-256. Only after those checks and local source
+revalidation does it upload and read back the canonical whole-file `.sha256` sidecar. The sidecar
+is therefore the remote completion marker; an archive key without its sidecar is staged and must
+not be consumed as complete. An orphan sidecar with no archive fails closed. If R2 exposes a native
+composite SHA-256 for an object, the uploader validates and uses it. A private, fsynced receipt is
+the prerequisite for optional local retirement. The binary intentionally has no completed-object
+delete operation and refuses to replace an existing remote object that does not match local
+evidence by default.
 `--overwrite-existing` is an explicit recovery mode: it replaces both remote objects, performs a
 fresh full-object SHA-256 readback, and atomically replaces the private receipt. Use it only with
 specific authorization to replace the affected keys.

@@ -4,7 +4,8 @@
 //! The remote API surface is intentionally append-only: this program contains
 //! no DeleteObject operation. A local archive is removed only after its exact
 //! SHA-256 sidecar, length, multipart ETag, and immutable metadata have been
-//! observed in R2 and a private receipt has been fsynced.
+//! observed in R2 and a private receipt has been fsynced. The sidecar is
+//! published last and serves as the remote completion marker.
 
 use {
     anyhow::{Context, Result, anyhow, bail, ensure},
@@ -1174,6 +1175,11 @@ async fn sync_epoch(client: &Client, r2: &R2Config, config: &Config, epoch: u64)
     let archive_key = format!("epoch-{epoch}.jet");
     let checksum_key = format!("epoch-{epoch}.jet.sha256");
     let existing = head_archive(client, &r2.bucket, &archive_key).await?;
+    let existing_sidecar = remote_sidecar(client, &r2.bucket, &checksum_key).await?;
+    ensure!(
+        existing.is_some() || existing_sidecar.is_none(),
+        "remote completion sidecar exists without its archive for epoch {epoch}"
+    );
     let was_existing = existing.is_some() && !config.overwrite_existing;
     let effective_part_size = if let Some(remote) = &existing {
         if config.overwrite_existing {
@@ -1199,7 +1205,7 @@ async fn sync_epoch(client: &Client, r2: &R2Config, config: &Config, epoch: u64)
         proof.sha256_hex == local.sha256_hex,
         "local SHA-256 mismatch for epoch {epoch}"
     );
-    let (etag, remote_composite_sha256) =
+    let (etag, _upload_composite_sha256) =
         if let Some(remote) = existing.filter(|_| !config.overwrite_existing) {
             ensure!(
                 remote.length == local.length,
@@ -1247,26 +1253,6 @@ async fn sync_epoch(client: &Client, r2: &R2Config, config: &Config, epoch: u64)
             .await?;
             (etag, None)
         };
-    match remote_sidecar(client, &r2.bucket, &checksum_key).await? {
-        Some(_) if config.overwrite_existing => {
-            put_sidecar(client, &r2.bucket, &local, true).await?
-        }
-        Some(bytes) => ensure!(
-            bytes == local.sidecar,
-            "remote sidecar mismatch for epoch {epoch}"
-        ),
-        None if config.command == Command::Sync => {
-            put_sidecar(client, &r2.bucket, &local, false).await?
-        }
-        None => bail!("remote sidecar is missing for epoch {epoch}"),
-    }
-    ensure!(
-        remote_sidecar(client, &r2.bucket, &checksum_key)
-            .await?
-            .as_deref()
-            == Some(&local.sidecar),
-        "remote sidecar readback failed"
-    );
     let remote = head_archive(client, &r2.bucket, &archive_key)
         .await?
         .ok_or_else(|| anyhow!("remote archive disappeared for epoch {epoch}"))?;
@@ -1280,20 +1266,17 @@ async fn sync_epoch(client: &Client, r2: &R2Config, config: &Config, epoch: u64)
             "remote metadata changed"
         );
     }
-    if remote_composite_sha256.is_some() {
+    if let Some(checksum) = remote.composite_sha256.as_deref() {
         ensure!(
             remote.checksum_type == Some(ChecksumType::Composite),
             "remote checksum type changed"
         );
         ensure!(
-            remote
-                .composite_sha256
-                .as_deref()
-                .is_some_and(|checksum| composite_checksum_matches(
-                    checksum,
-                    &proof.composite_sha256,
-                    local.length.div_ceil(effective_part_size),
-                )),
+            composite_checksum_matches(
+                checksum,
+                &proof.composite_sha256,
+                local.length.div_ceil(effective_part_size),
+            ),
             "remote composite SHA-256 changed after verification"
         );
     }
@@ -1315,6 +1298,59 @@ async fn sync_epoch(client: &Client, r2: &R2Config, config: &Config, epoch: u64)
             true
         };
     revalidate_local(&local)?;
+
+    // The sidecar is the public completion marker. Publish it only after the
+    // complete archive has passed every available remote integrity proof and
+    // the source files have been revalidated. Consumers may therefore treat a
+    // canonical sidecar as meaning that the corresponding archive was fully
+    // uploaded and verified by this publisher.
+    match remote_sidecar(client, &r2.bucket, &checksum_key).await? {
+        Some(_) if config.overwrite_existing => {
+            put_sidecar(client, &r2.bucket, &local, true).await?
+        }
+        Some(bytes) => ensure!(
+            bytes == local.sidecar,
+            "remote sidecar mismatch for epoch {epoch}"
+        ),
+        None if config.command == Command::Sync => {
+            put_sidecar(client, &r2.bucket, &local, false).await?
+        }
+        None => bail!("remote sidecar is missing for epoch {epoch}"),
+    }
+    ensure!(
+        remote_sidecar(client, &r2.bucket, &checksum_key)
+            .await?
+            .as_deref()
+            == Some(&local.sidecar),
+        "remote sidecar readback failed"
+    );
+    let final_remote = head_archive(client, &r2.bucket, &archive_key)
+        .await?
+        .ok_or_else(|| anyhow!("remote archive disappeared after sidecar publication"))?;
+    ensure!(
+        final_remote.length == local.length && final_remote.etag == etag,
+        "remote archive changed during sidecar publication"
+    );
+    if final_remote.metadata_sha256.is_some() {
+        ensure!(
+            final_remote.metadata_sha256.as_deref() == Some(local.sha256_hex.as_str()),
+            "remote metadata changed during sidecar publication"
+        );
+    }
+    if native_sha256_proven {
+        ensure!(
+            final_remote.checksum_type == Some(ChecksumType::Composite)
+                && final_remote
+                    .composite_sha256
+                    .as_deref()
+                    .is_some_and(|checksum| composite_checksum_matches(
+                        checksum,
+                        &proof.composite_sha256,
+                        local.length.div_ceil(effective_part_size),
+                    )),
+            "remote composite SHA-256 changed during sidecar publication"
+        );
+    }
     let receipt = Receipt {
         schema: RECEIPT_SCHEMA.to_owned(),
         bucket: r2.bucket.clone(),
@@ -1324,7 +1360,7 @@ async fn sync_epoch(client: &Client, r2: &R2Config, config: &Config, epoch: u64)
         archive_length: local.length,
         archive_sha256: local.sha256_hex.clone(),
         archive_etag: etag,
-        r2_composite_sha256: remote.composite_sha256,
+        r2_composite_sha256: final_remote.composite_sha256,
         remote_sha256_readback,
         multipart_part_size: effective_part_size,
         verified_unix_seconds: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
@@ -1591,5 +1627,22 @@ mod tests {
                 "forbidden R2 operation: {operation}"
             );
         }
+    }
+
+    #[test]
+    fn sidecar_publication_follows_archive_integrity_proof() {
+        let source = include_str!("main.rs");
+        let start = source.find("async fn sync_epoch(").unwrap();
+        let end = source[start..].find("\nasync fn main(").unwrap() + start;
+        let sync_epoch = &source[start..end];
+        let remote_readback = sync_epoch.find("verify_remote_sha256(").unwrap();
+        let local_revalidation = sync_epoch.find("revalidate_local(&local)").unwrap();
+        let sidecar_publication = sync_epoch.find("put_sidecar(").unwrap();
+        assert!(remote_readback < sidecar_publication);
+        assert!(local_revalidation < sidecar_publication);
+        assert!(
+            sync_epoch.contains("remote completion sidecar exists without its archive"),
+            "orphan completion markers must fail closed"
+        );
     }
 }

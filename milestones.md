@@ -7,14 +7,17 @@ code revision that produced the result.
 
 - Commit `49fb9996e5053ee17733b2dffcd309c72852e2cc` replaced overlapping full
   archive rescans with an exact cross-archive edge proof composed with each
-  archive's existing full-verification receipt.
+  archive's existing full-verification receipt. Follow-up commit
+  `ae48d49d4ab2de64590f4b1d5415d2c79bcd68cb` pins the approved full verifier
+  and script identities throughout the composition and retirement gates.
 - On the live 45.3 GiB epoch-108 and 49.3 GiB epoch-109 pair, the old verifier
   had not completed after 2 hours, 40 minutes. The new production workflow
   verified and fsynced the same boundary in 17 seconds end to end.
 - The verifier requires contiguous epoch and slot ranges, the successor's
   initial PoH anchor to equal the predecessor's terminal blockhash, and the
   successor's first block to name that exact parent slot and hash. R2 local
-  retirement now also pins the approved boundary binary and script SHA-256.
+  retirement now pins the approved full, plugin, and boundary binary/script
+  SHA-256 values.
 
 ## 2026-09-30: Measured-memory admission raised historical replay concurrency to 14
 

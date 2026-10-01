@@ -155,6 +155,8 @@ def boundary_receipt_matches(
     digest: str,
     *,
     digest_field: int,
+    verifier_sha256: str,
+    script_sha256: str,
 ) -> bool:
     path = directory / f"boundary-{left_epoch}-{right_epoch}.ok"
     try:
@@ -165,6 +167,8 @@ def boundary_receipt_matches(
             len(fields) == 4
             and all(re.fullmatch(r"[0-9a-f]{64}", field) for field in fields)
             and fields[digest_field] == digest
+            and fields[2] == verifier_sha256
+            and fields[3] == script_sha256
         )
     except (OSError, UnicodeDecodeError):
         return False
@@ -193,6 +197,8 @@ def retirement_allowed(args: argparse.Namespace, epoch: int, digest: str) -> boo
                 epoch,
                 digest,
                 digest_field=1,
+                verifier_sha256=args.boundary_verifier_sha256,
+                script_sha256=args.boundary_verifier_script_sha256,
             )
         )
         and boundary_receipt_matches(
@@ -201,6 +207,8 @@ def retirement_allowed(args: argparse.Namespace, epoch: int, digest: str) -> boo
             epoch + 1,
             digest,
             digest_field=0,
+            verifier_sha256=args.boundary_verifier_sha256,
+            script_sha256=args.boundary_verifier_script_sha256,
         )
     )
 
@@ -242,6 +250,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--plugin-pipeline-sha256", type=sha256)
     parser.add_argument("--plugin-verifier-script-sha256", type=sha256)
     parser.add_argument("--boundary-receipt-directory", type=absolute_directory)
+    parser.add_argument("--boundary-verifier-sha256", type=sha256)
+    parser.add_argument("--boundary-verifier-script-sha256", type=sha256)
     parser.add_argument(
         "--defer-epochs", type=epoch_range, action="append", default=[]
     )
@@ -254,11 +264,14 @@ def parse_args() -> argparse.Namespace:
         or args.plugin_pipeline_sha256 is None
         or args.plugin_verifier_script_sha256 is None
         or args.boundary_receipt_directory is None
+        or args.boundary_verifier_sha256 is None
+        or args.boundary_verifier_script_sha256 is None
     ):
         parser.error(
             "--delete-local requires --full-receipt-directory and "
             "--plugin-receipt-directory, --plugin-pipeline-sha256, "
-            "--plugin-verifier-script-sha256 and --boundary-receipt-directory"
+            "--plugin-verifier-script-sha256, --boundary-receipt-directory, "
+            "--boundary-verifier-sha256 and --boundary-verifier-script-sha256"
         )
     return args
 

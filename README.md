@@ -154,14 +154,16 @@ SHA-256 sidecar appears. After the complete range is present, it verifies the ra
 the ordered chain scan, and rehashes every archive before recording acceptance. Receipts include
 the archive, verifier, and script hashes, so a restart only repeats stale or unfinished work.
 
-Large ranges need not remain on local disk simultaneously. `verify_archive --chain --segment`
-verifies every archive and boundary inside a multi-archive segment while deliberately deferring
-the segment's incoming anchor and trailing skipped-slot proof to its neighbors.
-`scripts/verify_horizon_boundaries_progressive.sh` applies that mode to each available adjacent
-pair and writes an fsynced receipt bound to both archive SHA-256 values and the exact verifier.
-Once every archive has its full receipt and every adjacent boundary has a receipt, the range has
-the same internal chain coverage as one monolithic scan; the two outer boundaries must still be
-proved by the neighboring epochs or explicit canonical anchors.
+Large ranges need not remain on local disk simultaneously. After both adjacent archives have exact
+full-verification receipts, `archive_boundaries --verify-pair` decodes the left archive's terminal
+bucket and the right archive's leading bucket(s). It requires contiguous epoch and slot ranges, the
+right initial PoH anchor to equal the left terminal blockhash, and the right first block's parent
+slot and hash to name that same terminal block. `scripts/verify_horizon_boundaries_progressive.sh`
+composes that edge proof with the two full receipts and writes an fsynced receipt bound to both
+archive SHA-256 values and the exact boundary verifier. This avoids redundantly decoding tens of
+gigabytes for every overlapping pair while retaining the same proof: the full receipts cover all
+within-archive structure and PoH, and the edge receipt covers the only cross-archive link. The two
+outer boundaries must still be proved by the neighboring epochs or explicit canonical anchors.
 
 `scripts/verify_horizon_plugin_range.sh` is the corresponding progressive launcher for the
 consumer/API gate. It waits for every archive and well-formed sidecar in an inclusive epoch range,
@@ -216,7 +218,7 @@ can be resumed safely; unrelated or mismatching files are never overwritten.
 
 `scripts/audit_horizon_receipts.py` is the local-file-independent completion gate. It requires the
 full, current-plugin, R2, and adjacent-boundary receipts to agree on every archive SHA-256, and
-requires the approved plugin binary and verifier-script SHA-256 values explicitly. Add
+requires the approved plugin and boundary-verifier binary/script SHA-256 values explicitly. Add
 `--require-outer-boundaries` for a strict range publication audit that also proves the incoming
 predecessor boundary and the trailing successor boundary.
 
@@ -252,8 +254,8 @@ generation, verification, delivery, and cleanup.
 For an actively generated range, `scripts/sync_horizon_r2_progressive.py` watches for complete
 archive/sidecar pairs and invokes `jetstreamer-r2` serially. It checks whether an existing private
 receipt still describes the local archive before skipping it. Local retirement additionally
-requires receipts from the exact approved plugin binary and verifier script plus both adjacent
-archive boundaries. The watcher never deletes remote data.
+requires receipts from the exact approved plugin binary/script and boundary verifier/script plus
+both adjacent archive boundaries. The watcher never deletes remote data.
 
 ### TUI dashboard
 

@@ -2,8 +2,10 @@
 # Verify each available boundary between adjacent Horizon archives.
 #
 # A successful receipt binds both archive SHA-256 values to the exact verifier
-# and this script. The verifier's segment mode deliberately defers the two
-# outer boundaries while requiring the boundary inside the two-archive pair.
+# and this script. Each archive must already have a matching full-verification
+# receipt. The boundary verifier therefore only needs to decode the left
+# terminal edge and right initial edge; the independent full receipts prove
+# all within-archive structure and PoH for those exact SHA-256 values.
 set -Eeuo pipefail
 
 umask 077
@@ -11,27 +13,26 @@ export LC_ALL=C
 export PATH=/usr/bin:/bin
 
 usage() {
-    echo "usage: $0 VERIFY_ARCHIVE ARCHIVE_DIR STATE_DIR START_EPOCH END_EPOCH [THREADS] [POLL_SECONDS]" >&2
+    echo "usage: $0 VERIFY_BOUNDARY ARCHIVE_DIR FULL_RECEIPT_DIR STATE_DIR START_EPOCH END_EPOCH [POLL_SECONDS]" >&2
     exit 2
 }
 
-[[ $# -ge 5 && $# -le 7 ]] || usage
+[[ $# -ge 6 && $# -le 7 ]] || usage
 
 verifier=$1
 archive_dir=$2
-state_dir=$3
-start_epoch=$4
-end_epoch=$5
-threads=${6:-8}
+full_receipt_dir=$3
+state_dir=$4
+start_epoch=$5
+end_epoch=$6
 poll_seconds=${7:-300}
 
-for value in "$start_epoch" "$end_epoch" "$threads" "$poll_seconds"; do
+for value in "$start_epoch" "$end_epoch" "$poll_seconds"; do
     [[ $value =~ ^[0-9]+$ ]] || usage
 done
 ((start_epoch < end_epoch)) || usage
-((threads >= 1 && threads <= 256)) || usage
 ((poll_seconds >= 1 && poll_seconds <= 86400)) || usage
-[[ $verifier == /* && $archive_dir == /* && $state_dir == /* ]] || usage
+[[ $verifier == /* && $archive_dir == /* && $full_receipt_dir == /* && $state_dir == /* ]] || usage
 [[ -f $verifier && -x $verifier && ! -L $verifier ]] || {
     echo "verifier must be an executable regular file, not a symlink: $verifier" >&2
     exit 2
@@ -40,9 +41,14 @@ done
     echo "archive directory must be a regular directory, not a symlink: $archive_dir" >&2
     exit 2
 }
+[[ -d $full_receipt_dir && ! -L $full_receipt_dir ]] || {
+    echo "full receipt directory must be a regular directory, not a symlink: $full_receipt_dir" >&2
+    exit 2
+}
 
 verifier=$(realpath "$verifier")
 archive_dir=$(realpath "$archive_dir")
+full_receipt_dir=$(realpath "$full_receipt_dir")
 mkdir -p "$state_dir/logs" "$state_dir/receipts" "$state_dir/tmp"
 for directory in "$state_dir" "$state_dir/logs" "$state_dir/receipts" "$state_dir/tmp"; do
     [[ -d $directory && ! -L $directory ]] || {
@@ -62,7 +68,7 @@ validate_pair() {
     local sidecar="$archive.sha256"
     [[ -f $archive && ! -L $archive && -f $sidecar && ! -L $sidecar ]] || return 1
 
-    local line expected actual
+    local line expected
     line=$(<"$sidecar")
     if [[ ! $line =~ ^([0-9a-f]{64})\ \ (epoch-[0-9]+\.jet)$ ]] \
         || [[ ${BASH_REMATCH[2]:-} != "$name" ]]; then
@@ -70,12 +76,30 @@ validate_pair() {
         return 2
     fi
     expected=${BASH_REMATCH[1]}
-    actual=$(sha256sum --binary "$archive" | cut -d' ' -f1)
-    [[ $actual == "$expected" ]] || {
-        echo "SHA-256 mismatch for $archive: sidecar=$expected actual=$actual" >&2
+
+    local full_receipt="$full_receipt_dir/epoch-$epoch.full.ok"
+    local full_sha="" full_verifier="" full_script="" extra=""
+    [[ -f $full_receipt && ! -L $full_receipt ]] || return 1
+    read -r full_sha full_verifier full_script extra <"$full_receipt" || return 1
+    [[ $full_sha =~ ^[0-9a-f]{64}$ \
+        && $full_verifier =~ ^[0-9a-f]{64}$ \
+        && $full_script =~ ^[0-9a-f]{64}$ \
+        && -z $extra ]] || {
+        echo "invalid full-verification receipt: $full_receipt" >&2
         return 2
     }
-    printf '%s\n' "$actual"
+    [[ $full_sha == "$expected" ]] || {
+        echo "full-verification receipt does not match $sidecar" >&2
+        return 2
+    }
+    printf '%s\n' "$expected"
+}
+
+archive_identity() {
+    local epoch=$1
+    local archive="$archive_dir/epoch-$epoch.jet"
+    [[ -f $archive && ! -L $archive ]] || return 1
+    stat --format='%d:%i:%s:%y:%z:%h' -- "$archive"
 }
 
 receipt_is_current() {
@@ -131,15 +155,22 @@ while true; do
 
         left_archive="$archive_dir/epoch-$left.jet"
         right_archive="$archive_dir/epoch-$right.jet"
+        left_identity=$(archive_identity "$left") || exit $?
+        right_identity=$(archive_identity "$right") || exit $?
         log_tmp="$state_dir/tmp/boundary-$left-$right.$$.tmp"
         echo "[$(date -u +%FT%TZ)] boundary $left-$right verification started"
         if nice -n 19 ionice -c 3 \
-            "$verifier" --chain "$left_archive" "$right_archive" \
-            --segment --threads "$threads" >"$log_tmp" 2>&1; then
+            "$verifier" --verify-pair "$left_archive" "$right_archive" \
+            >"$log_tmp" 2>&1; then
             after_left=$(validate_pair "$left") || exit $?
             after_right=$(validate_pair "$right") || exit $?
             [[ $after_left == "$left_sha" && $after_right == "$right_sha" ]] || {
-                echo "archive changed during boundary $left-$right verification" >&2
+                echo "archive evidence changed during boundary $left-$right verification" >&2
+                exit 1
+            }
+            [[ $(archive_identity "$left") == "$left_identity" \
+                && $(archive_identity "$right") == "$right_identity" ]] || {
+                echo "archive identity changed during boundary $left-$right verification" >&2
                 exit 1
             }
             [[ $(sha256sum --binary "$verifier" | cut -d' ' -f1) == "$verifier_sha" ]] || {

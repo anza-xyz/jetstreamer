@@ -49,6 +49,8 @@ class HorizonReceiptAuditTests(unittest.TestCase):
             plugin_pipeline_sha256="cd" * 32,
             plugin_verifier_script_sha256="ef" * 32,
             boundary_receipts=root / "boundary",
+            boundary_verifier_sha256="01" * 32,
+            boundary_verifier_script_sha256="02" * 32,
             r2_receipts=root / "r2",
             require_outer_boundaries=False,
         )
@@ -100,6 +102,25 @@ class HorizonReceiptAuditTests(unittest.TestCase):
             errors = audit.audit(args)
             self.assertTrue(
                 any("epoch 7: missing/invalid plugin receipt" in e for e in errors)
+            )
+
+    def test_wrong_boundary_identity_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for name in ("full", "plugin", "boundary", "r2"):
+                (root / name).mkdir()
+            left = hashlib.sha256(b"left").hexdigest()
+            right = hashlib.sha256(b"right").hexdigest()
+            self.write_epoch(root, 7, left)
+            self.write_epoch(root, 8, right)
+            (root / "boundary" / "boundary-7-8.ok").write_text(
+                f"{left} {right} {'01' * 32} {'02' * 32}\n", encoding="ascii"
+            )
+            args = self.args(root)
+            args.boundary_verifier_sha256 = "03" * 32
+            errors = audit.audit(args)
+            self.assertTrue(
+                any("boundary 7-8: missing/invalid receipt" in e for e in errors)
             )
 
 

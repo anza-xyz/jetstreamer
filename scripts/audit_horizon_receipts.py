@@ -95,9 +95,21 @@ def read_r2(directory: Path, epoch: int) -> str | None:
     return digest if valid else None
 
 
-def read_boundary(directory: Path, left: int, right: int) -> tuple[str, str] | None:
+def read_boundary(
+    directory: Path,
+    left: int,
+    right: int,
+    verifier_sha256: str,
+    script_sha256: str,
+) -> tuple[str, str] | None:
     words = read_words(directory / f"boundary-{left}-{right}.ok", 4)
-    return (words[0], words[1]) if words is not None else None
+    return (
+        (words[0], words[1])
+        if words is not None
+        and words[2] == verifier_sha256
+        and words[3] == script_sha256
+        else None
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -109,6 +121,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--plugin-pipeline-sha256", required=True, type=sha256)
     parser.add_argument("--plugin-verifier-script-sha256", required=True, type=sha256)
     parser.add_argument("--boundary-receipts", required=True, type=absolute_directory)
+    parser.add_argument("--boundary-verifier-sha256", required=True, type=sha256)
+    parser.add_argument(
+        "--boundary-verifier-script-sha256", required=True, type=sha256
+    )
     parser.add_argument("--r2-receipts", required=True, type=absolute_directory)
     parser.add_argument(
         "--require-outer-boundaries",
@@ -167,7 +183,13 @@ def audit(args: argparse.Namespace) -> list[str]:
 
     for left in range(boundary_first, boundary_last):
         right = left + 1
-        boundary = read_boundary(args.boundary_receipts, left, right)
+        boundary = read_boundary(
+            args.boundary_receipts,
+            left,
+            right,
+            args.boundary_verifier_sha256,
+            args.boundary_verifier_script_sha256,
+        )
         if boundary is None:
             errors.append(f"boundary {left}-{right}: missing/invalid receipt")
             continue

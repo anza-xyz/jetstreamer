@@ -3,14 +3,15 @@
 
 This is deliberately a thin orchestrator around ``jetstreamer-r2``. The Rust
 binary owns hashing, multipart integrity, remote readback, receipt writes, and
-optional local deletion. This process only delegates retirement after the full
-archive, current-plugin, and both adjacent-boundary receipts bind the same
-archive digest.
+optional local deletion. This process delegates upload or retirement only after
+the full archive, current-plugin, and both adjacent-boundary receipts bind the
+same archive digest.
 """
 
 from __future__ import annotations
 
 import argparse
+from collections.abc import Collection
 import json
 import os
 from pathlib import Path
@@ -52,6 +53,25 @@ def sha256(value: str) -> str:
     if re.fullmatch(r"[0-9a-f]{64}", value) is None:
         raise argparse.ArgumentTypeError("expected a lowercase SHA-256 digest")
     return value
+
+
+def sha256_allowlist(value: str) -> tuple[str, ...]:
+    values = value.split(",")
+    if not values or any(re.fullmatch(r"[0-9a-f]{64}", item) is None for item in values):
+        raise argparse.ArgumentTypeError(
+            "expected a comma-separated lowercase SHA-256 allowlist"
+        )
+    if len(set(values)) != len(values):
+        raise argparse.ArgumentTypeError("duplicate SHA-256 allowlist entry")
+    return tuple(values)
+
+
+def digest_allowed(expected: str | Collection[str] | None, actual: str) -> bool:
+    if expected is None:
+        return True
+    if isinstance(expected, str):
+        return actual == expected
+    return actual in expected
 
 
 def epoch_range(value: str) -> tuple[int, int]:
@@ -130,7 +150,7 @@ def gate_receipt_matches(
     suffix: str,
     digest: str,
     *,
-    verifier_sha256: str | None = None,
+    verifier_sha256: str | Collection[str] | None = None,
     script_sha256: str | None = None,
 ) -> bool:
     path = directory / f"epoch-{epoch}.{suffix}.ok"
@@ -141,7 +161,7 @@ def gate_receipt_matches(
         return (
             match is not None
             and match.group(1) == digest
-            and (verifier_sha256 is None or match.group(2) == verifier_sha256)
+            and digest_allowed(verifier_sha256, match.group(2))
             and (script_sha256 is None or match.group(3) == script_sha256)
         )
     except (OSError, UnicodeDecodeError):
@@ -155,7 +175,7 @@ def boundary_receipt_matches(
     digest: str,
     *,
     digest_field: int,
-    verifier_sha256: str,
+    verifier_sha256: str | Collection[str],
     script_sha256: str,
 ) -> bool:
     path = directory / f"boundary-{left_epoch}-{right_epoch}.ok"
@@ -167,18 +187,16 @@ def boundary_receipt_matches(
             len(fields) == 4
             and all(re.fullmatch(r"[0-9a-f]{64}", field) for field in fields)
             and fields[digest_field] == digest
-            and fields[2] == verifier_sha256
+            and digest_allowed(verifier_sha256, fields[2])
             and fields[3] == script_sha256
         )
     except (OSError, UnicodeDecodeError):
         return False
 
 
-def retirement_allowed(args: argparse.Namespace, epoch: int, digest: str) -> bool:
+def publication_allowed(args: argparse.Namespace, epoch: int, digest: str) -> bool:
     return (
-        args.delete_local
-        and not any(first <= epoch <= last for first, last in args.defer_epochs)
-        and gate_receipt_matches(
+        gate_receipt_matches(
             args.full_receipt_directory,
             epoch,
             "full",
@@ -218,6 +236,14 @@ def retirement_allowed(args: argparse.Namespace, epoch: int, digest: str) -> boo
     )
 
 
+def retirement_allowed(args: argparse.Namespace, epoch: int, digest: str) -> bool:
+    return (
+        args.delete_local
+        and not any(first <= epoch <= last for first, last in args.defer_epochs)
+        and publication_allowed(args, epoch, digest)
+    )
+
+
 def sync_epoch(args: argparse.Namespace, epoch: int, *, delete_local: bool = False) -> None:
     command = [
         str(args.uploader),
@@ -251,13 +277,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--legacy-part-size-mib", type=positive_integer, default=5)
     parser.add_argument("--delete-local", action="store_true")
     parser.add_argument("--full-receipt-directory", type=absolute_directory)
-    parser.add_argument("--full-verifier-sha256", type=sha256)
+    parser.add_argument("--full-verifier-sha256", type=sha256_allowlist)
     parser.add_argument("--full-verifier-script-sha256", type=sha256)
     parser.add_argument("--plugin-receipt-directory", type=absolute_directory)
-    parser.add_argument("--plugin-pipeline-sha256", type=sha256)
+    parser.add_argument("--plugin-pipeline-sha256", type=sha256_allowlist)
     parser.add_argument("--plugin-verifier-script-sha256", type=sha256)
     parser.add_argument("--boundary-receipt-directory", type=absolute_directory)
-    parser.add_argument("--boundary-verifier-sha256", type=sha256)
+    parser.add_argument("--boundary-verifier-sha256", type=sha256_allowlist)
     parser.add_argument("--boundary-verifier-script-sha256", type=sha256)
     parser.add_argument(
         "--defer-epochs", type=epoch_range, action="append", default=[]
@@ -265,7 +291,7 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if args.first_epoch < 0 or args.last_epoch < args.first_epoch:
         parser.error("invalid inclusive epoch range")
-    if args.delete_local and (
+    if (
         args.full_receipt_directory is None
         or args.full_verifier_sha256 is None
         or args.full_verifier_script_sha256 is None
@@ -277,7 +303,7 @@ def parse_args() -> argparse.Namespace:
         or args.boundary_verifier_script_sha256 is None
     ):
         parser.error(
-            "--delete-local requires --full-receipt-directory, "
+            "upload requires --full-receipt-directory, "
             "--full-verifier-sha256, --full-verifier-script-sha256 and "
             "--plugin-receipt-directory, --plugin-pipeline-sha256, "
             "--plugin-verifier-script-sha256, --boundary-receipt-directory, "
@@ -298,10 +324,18 @@ def main() -> int:
                     incomplete += 1
                 continue
             _archive, _sidecar, digest, archive_metadata = pair
+            publish = publication_allowed(args, epoch, digest)
             retire = retirement_allowed(args, epoch, digest)
             if receipt_matches(receipt_path, epoch, digest, archive_metadata):
                 if retire:
                     sync_epoch(args, epoch, delete_local=True)
+                continue
+            if not publish:
+                incomplete += 1
+                print(
+                    f"epoch {epoch}: waiting for exact full, plugin, and adjacent-boundary receipts",
+                    flush=True,
+                )
                 continue
             sync_epoch(args, epoch, delete_local=retire)
         if incomplete == 0:

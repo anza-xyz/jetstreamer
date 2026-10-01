@@ -107,7 +107,14 @@ class ProgressiveR2Tests(unittest.TestCase):
                 boundary_verifier_script_sha256=script,
             )
             self.assertTrue(progressive.retirement_allowed(args, 7, digest))
+            self.assertTrue(progressive.publication_allowed(args, 7, digest))
             self.assertFalse(progressive.retirement_allowed(args, 7, "01" * 32))
+            self.assertFalse(progressive.publication_allowed(args, 7, "01" * 32))
+
+            args.full_verifier_sha256 = ("07" * 32, verifier)
+            args.plugin_pipeline_sha256 = ("08" * 32, verifier)
+            args.boundary_verifier_sha256 = ("09" * 32, verifier)
+            self.assertTrue(progressive.publication_allowed(args, 7, digest))
 
             args.full_verifier_sha256 = "07" * 32
             self.assertFalse(progressive.retirement_allowed(args, 7, digest))

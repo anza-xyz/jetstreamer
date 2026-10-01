@@ -176,9 +176,9 @@ verifier proves that the current streaming interface can consume every record an
 
 `scripts/verify_horizon_plugin_progressive.sh` runs that consumer/API gate per epoch as soon as a
 complete archive pair appears. Its fsynced receipt binds the archive SHA-256, the exact
-`horizon_pipeline` binary, and the verification script. R2 upload may overlap this work, but an
-uploaded object is staged—not published or eligible for local retirement—until this receipt exists.
-Local retirement also requires receipts for both adjacent archive boundaries. This preserves the
+`horizon_pipeline` binary, and the verification script. R2 work remains concurrent with replay, but
+upload is not eligible until this receipt, the full receipt, and both adjacent-boundary receipts
+exist for the exact archive digest. Local retirement uses the same gates. This preserves the
 ordered-chain proof when a range is larger than available local disk; an epoch remains local until
 its predecessor and successor boundaries have both been checked against the exact archive digest.
 For a long-lived range, `scripts/watch_horizon_plugin_progressive.sh` checks the sidecar and exact

@@ -144,6 +144,24 @@ class HorizonReceiptAuditTests(unittest.TestCase):
                 any("boundary 7-8: missing/invalid receipt" in e for e in errors)
             )
 
+    def test_verifier_transitions_accept_explicit_allowlists(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for name in ("full", "plugin", "boundary", "r2"):
+                (root / name).mkdir()
+            left = hashlib.sha256(b"left").hexdigest()
+            right = hashlib.sha256(b"right").hexdigest()
+            self.write_epoch(root, 7, left)
+            self.write_epoch(root, 8, right)
+            (root / "boundary" / "boundary-7-8.ok").write_text(
+                f"{left} {right} {'01' * 32} {'02' * 32}\n", encoding="ascii"
+            )
+            args = self.args(root)
+            args.full_verifier_sha256 = ("03" * 32, "cd" * 32)
+            args.plugin_pipeline_sha256 = ("04" * 32, "cd" * 32)
+            args.boundary_verifier_sha256 = ("05" * 32, "01" * 32)
+            self.assertEqual(audit.audit(args), [])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -13,15 +13,26 @@ For a long-running range, use `scripts/sync_horizon_r2_progressive.py` to discov
 
 ## Resolve the work
 
+- On a fresh host, or whenever any requested epoch is outside the checked-in runtime registry,
+  read [references/fresh-server.md](references/fresh-server.md) before downloading snapshots or
+  launching replay. An explicit range assigns work; it does not authorize guessing an execution
+  runtime or weakening a compatibility boundary.
 - Treat invocation without an epoch argument as authorization to start the next missing supported
-  work, not as an inventory-only request. Accept either one epoch or an inclusive `START-END` range
-  when the user supplies a bound. Do not ask for a range merely because it was omitted.
+  work, not as an inventory-only request. If the lowest missing requested epoch is unsupported,
+  begin the compatibility-qualification path in the fresh-server reference instead of silently
+  skipping it. Accept either one epoch or an inclusive `START-END` range when the user supplies a
+  bound. Do not ask for a range merely because it was omitted.
 - Locate the Jetstreamer repository and read its current historical compatibility table and active controller state before starting generation.
 - Use `HORIZON_DIR` when set; otherwise use `$HOME/horizon`. Keep only `epoch-N.jet` and `epoch-N.jet.sha256` in that public directory.
 - Credentials are `HORIZON_S3_ENDPOINT`, `HORIZON_ACCESS_KEY_ID`, and `HORIZON_SECRET_ACCESS_KEY`. Check only that they exist; never print their values. The endpoint path names the bucket.
 - With an explicit user range, restrict generation, verification, upload, and cleanup to that range.
 - Without a range, inventory canonical R2 pairs first. Upload any complete local pairs missing from R2, then begin with the lowest missing epoch supported by the repository's compatibility manifests. Continue in bounded cohorts as resources permit.
 - An R2 epoch is complete only when both `epoch-N.jet` and `epoch-N.jet.sha256` exist and agree with verified local evidence. A checksum-only or archive-only epoch is incomplete.
+
+Remote object pairs are the shared inventory between servers; private receipts and controller
+state are host-local evidence and must not be copied to make another host believe work completed.
+Give concurrently operating hosts disjoint explicit epoch ranges. Existing R2 objects are never a
+lease: if ranges overlap accidentally, stop the duplicate producer rather than racing publication.
 
 ## Produce and verify
 

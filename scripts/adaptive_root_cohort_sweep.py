@@ -793,6 +793,13 @@ def producer_environment(
         "JETSTREAMER_ALLOW_CANDIDATE_RUNTIME=1",
         *runtime_worker_environment(cohort.runtime, deploy),
         "JETSTREAMER_HISTORICAL_POH_THREADS=10",
+        # Old Banks can retain tens of GiB of private account state.  The
+        # worker acknowledges Shutdown only after replay and checkpoint work
+        # is complete, but destructing that state can exceed the library's
+        # deliberately short emergency-reap default.  Give production cohorts
+        # a bounded graceful window so cleanup latency cannot discard a
+        # multi-day, otherwise sealed replay.
+        "JETSTREAMER_HISTORICAL_REAP_TIMEOUT_SECS=600",
         "RAYON_NUM_THREADS=10",
         "JETSTREAMER_ARCHIVE_BACKEND=http",
         "JETSTREAMER_HTTP_BASE_URL=https://files.old-faithful.net/",

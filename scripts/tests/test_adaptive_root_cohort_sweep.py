@@ -752,6 +752,7 @@ class CommandTests(unittest.TestCase):
             f"{self.deploy}/jetstreamer-historical-worker-v1-2-24-epoch67-pre-cpi",
             environments,
         )
+        self.assertIn("JETSTREAMER_HISTORICAL_REAP_TIMEOUT_SECS=600", environments)
 
     def test_importer_has_no_mount_namespace_or_systemd_path_bind(self) -> None:
         command = sweep.build_import_command(

@@ -49,6 +49,7 @@ MAX_R2_RECEIPT_BYTES = 64 * 1024
 MAX_COHORT_RUN_STATE_BYTES = 64 * 1024
 R2_RECEIPT_SCHEMA = "jetstreamer-horizon-r2-receipt-v1"
 ROOT_COHORT_RESUME_RUN_ENV = "JETSTREAMER_ROOT_COHORT_RESUME_RUN"
+PRODUCTION_REAP_ENV = "JETSTREAMER_HISTORICAL_REAP_TIMEOUT_SECS=600"
 ROOT_COHORT_RUN_STATE_SCHEMA = "jetstreamer-root-cohort-run-v1"
 DEFAULT_FIRST_EPOCH = 22
 DEFAULT_LAST_EPOCH = 100
@@ -799,7 +800,7 @@ def producer_environment(
         # deliberately short emergency-reap default.  Give production cohorts
         # a bounded graceful window so cleanup latency cannot discard a
         # multi-day, otherwise sealed replay.
-        "JETSTREAMER_HISTORICAL_REAP_TIMEOUT_SECS=600",
+        PRODUCTION_REAP_ENV,
         "RAYON_NUM_THREADS=10",
         "JETSTREAMER_ARCHIVE_BACKEND=http",
         "JETSTREAMER_HTTP_BASE_URL=https://files.old-faithful.net/",
@@ -1473,10 +1474,18 @@ def unit_is_hardened_for_adoption(
         producer_environment(cohort, deploy, lane, account, project)
     )
     if configured_environment != expected_environment:
+        # A controller upgrade may add only the longer graceful retirement
+        # window while already sealed producers are still live.  Its absence
+        # changes cleanup latency after the protocol commit point, not replay
+        # semantics or sandbox authority, so those exact legacy producers are
+        # safe to adopt through this one-way transition.  Any different value
+        # remains an unrecognized environment capability and fails closed.
+        missing = expected_environment - configured_environment
         extras = configured_environment - expected_environment
-        if (
-            not expected_environment.issubset(configured_environment)
-            or len(extras) != 1
+        if missing not in (set(), {PRODUCTION_REAP_ENV}):
+            return False
+        if extras and (
+            len(extras) != 1
             or not root_cohort_resume_environment_is_valid(
                 next(iter(extras)), process, cohort, lane
             )

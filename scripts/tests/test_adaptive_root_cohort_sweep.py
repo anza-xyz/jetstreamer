@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shlex
 import stat
 import sys
 import tempfile
@@ -932,6 +933,43 @@ class AdoptionHardeningTests(unittest.TestCase):
     def test_unrecognized_extra_environment_is_rejected(self) -> None:
         properties = self.hardened_properties()
         properties["Environment"] += " UNRECOGNIZED_CAPABILITY=1"
+        with mock.patch.object(
+            sweep, "systemd_properties", return_value=properties
+        ):
+            self.assertFalse(
+                sweep.unit_is_hardened_for_adoption(
+                    self.unit,
+                    self.process,
+                    self.cohort,
+                    self.lane,
+                    self.deploy,
+                )
+            )
+
+    def test_legacy_worker_without_extended_reap_window_is_accepted(self) -> None:
+        properties = self.hardened_properties()
+        environment = set(shlex.split(properties["Environment"]))
+        environment.remove(sweep.PRODUCTION_REAP_ENV)
+        properties["Environment"] = " ".join(sorted(environment))
+        with mock.patch.object(
+            sweep, "systemd_properties", return_value=properties
+        ):
+            self.assertTrue(
+                sweep.unit_is_hardened_for_adoption(
+                    self.unit,
+                    self.process,
+                    self.cohort,
+                    self.lane,
+                    self.deploy,
+                )
+            )
+
+    def test_different_reap_window_is_rejected(self) -> None:
+        properties = self.hardened_properties()
+        properties["Environment"] = properties["Environment"].replace(
+            sweep.PRODUCTION_REAP_ENV,
+            "JETSTREAMER_HISTORICAL_REAP_TIMEOUT_SECS=5",
+        )
         with mock.patch.object(
             sweep, "systemd_properties", return_value=properties
         ):

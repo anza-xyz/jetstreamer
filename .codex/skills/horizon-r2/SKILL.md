@@ -37,7 +37,7 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
 ## Produce and verify
 
 - Use the repository's sealed historical replay/controller path and automatic slot-range runtime selection. Do not invent a compatibility override.
-- Run generation in a persistent systemd unit so loss of the interactive session cannot kill it. Respect unrelated jobs and configured RAM/disk reserves.
+- Run generation and long-lived verification/upload watchers in persistent systemd units so loss of the interactive session cannot kill them. Set `Restart=on-failure` with a bounded retry delay; do not use `Restart=always`, because successful completion must remain terminal. Respect unrelated jobs and configured RAM/disk reserves.
 - For adaptive ranges, start the controller with `--r2-receipt-directory "$HOME/.jetstreamer-private/r2-receipts" --r2-bucket BUCKET`. The controller accepts receipts from that exact bucket only for bytes already bound by its root-owned local completion attestation; R2 can replace local storage, but can never establish initial completion.
 - Start the current Horizon verification plugin as soon as each local archive is available. R2 work may run concurrently with replay of other epochs, but an archive is not eligible for upload or local retirement until its full, current-plugin, and both adjacent-boundary receipts bind the same archive SHA-256. Preserve the canonical lowercase coreutils sidecar format: `<64 hex>  epoch-N.jet\n`.
 

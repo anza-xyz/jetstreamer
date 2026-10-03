@@ -3,9 +3,12 @@
 
 This is deliberately a thin orchestrator around ``jetstreamer-r2``. The Rust
 binary owns hashing, multipart integrity, remote readback, receipt writes, and
-optional local deletion. This process delegates upload or retirement only after
-the full archive, current-plugin, and both adjacent-boundary receipts bind the
-same archive digest.
+optional local deletion. This process delegates upload only after the full
+archive and current-plugin receipts bind the same archive digest. Local
+retirement additionally requires both adjacent-boundary receipts. Keeping those
+gates separate lets disjoint producers publish complete archives through R2 so
+their neighbors can be restored for boundary verification without weakening the
+local-deletion gate.
 """
 
 from __future__ import annotations
@@ -212,7 +215,14 @@ def publication_allowed(args: argparse.Namespace, epoch: int, digest: str) -> bo
             verifier_sha256=args.plugin_pipeline_sha256,
             script_sha256=args.plugin_verifier_script_sha256,
         )
-        and (
+    )
+
+
+def adjacent_boundaries_allowed(
+    args: argparse.Namespace, epoch: int, digest: str
+) -> bool:
+    return (
+        (
             epoch == 0
             or boundary_receipt_matches(
                 args.boundary_receipt_directory,
@@ -241,6 +251,7 @@ def retirement_allowed(args: argparse.Namespace, epoch: int, digest: str) -> boo
         args.delete_local
         and not any(first <= epoch <= last for first, last in args.defer_epochs)
         and publication_allowed(args, epoch, digest)
+        and adjacent_boundaries_allowed(args, epoch, digest)
     )
 
 
@@ -333,7 +344,7 @@ def main() -> int:
             if not publish:
                 incomplete += 1
                 print(
-                    f"epoch {epoch}: waiting for exact full, plugin, and adjacent-boundary receipts",
+                    f"epoch {epoch}: waiting for exact full and plugin receipts",
                     flush=True,
                 )
                 continue

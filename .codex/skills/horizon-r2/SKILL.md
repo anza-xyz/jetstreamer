@@ -9,7 +9,7 @@ Treat R2 as durable storage. Never call `DeleteObject` or `DeleteObjects`. Abort
 
 Use the repository's `jetstreamer-r2` binary for upload and remote proof. Do not reimplement its multipart protocol in shell or Python. R2's S3 `UploadPart` currently rejects its advertised SHA-256 header, so the binary uses R2-enforced `Content-MD5`, checks the multipart ETag independently, and reads the completed remote object back while computing its whole-file SHA-256. It publishes and reads back the canonical `.sha256` sidecar only after the archive passes those checks and local source revalidation, then fsyncs a private receipt before optional local retirement. Treat the sidecar as the remote completion marker; an archive without one is staged, and a sidecar without an archive is an error. If R2 begins returning native composite SHA-256 evidence, the binary validates and prefers it.
 
-For a long-running range, use `scripts/sync_horizon_r2_progressive.py` to discover newly completed local pairs and invoke the Rust uploader serially. Do not run two progressive uploaders over overlapping ranges. The Python process never implements remote integrity checks or unlinks files itself. Upload and optional local retirement both require digest-matching full-verification, current-plugin, and both adjacent-boundary receipts. It requires the exact approved binary and verifier-script SHA-256 values, accepts explicit comma-separated binary-hash allowlists during a pinned verifier transition, honors every `--defer-epochs` range for retirement, and then delegates remote verification plus optional local retirement to the Rust uploader.
+For a long-running range, use `scripts/sync_horizon_r2_progressive.py` to discover newly completed local pairs and invoke the Rust uploader serially. Do not run two progressive uploaders over overlapping ranges. The Python process never implements remote integrity checks or unlinks files itself. Upload requires digest-matching full-verification and current-plugin receipts. Optional local retirement additionally requires both adjacent-boundary receipts. This separation lets disjoint servers publish complete archives so a retired neighbor can be restored from R2 to close a cross-host boundary without circularly weakening retirement. The orchestrator requires the exact approved binary and verifier-script SHA-256 values, accepts explicit comma-separated binary-hash allowlists during a pinned verifier transition, honors every `--defer-epochs` range for retirement, and then delegates remote verification plus optional local retirement to the Rust uploader.
 
 ## Resolve the work
 
@@ -39,7 +39,7 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
 - Use the repository's sealed historical replay/controller path and automatic slot-range runtime selection. Do not invent a compatibility override.
 - Run generation and long-lived verification/upload watchers in persistent systemd units so loss of the interactive session cannot kill them. Set `Restart=on-failure` with a bounded retry delay; do not use `Restart=always`, because successful completion must remain terminal. Respect unrelated jobs and configured RAM/disk reserves.
 - For adaptive ranges, start the controller with `--r2-receipt-directory "$HOME/.jetstreamer-private/r2-receipts" --r2-bucket BUCKET`. The controller accepts receipts from that exact bucket only for bytes already bound by its root-owned local completion attestation; R2 can replace local storage, but can never establish initial completion.
-- Start the current Horizon verification plugin as soon as each local archive is available. R2 work may run concurrently with replay of other epochs, but an archive is not eligible for upload or local retirement until its full, current-plugin, and both adjacent-boundary receipts bind the same archive SHA-256. Preserve the canonical lowercase coreutils sidecar format: `<64 hex>  epoch-N.jet\n`.
+- Start the current Horizon verification plugin as soon as each local archive is available. R2 work may run concurrently with replay of other epochs. An archive is eligible for upload only after its full and current-plugin receipts bind the same archive SHA-256. It is not eligible for local retirement until both adjacent-boundary receipts bind that digest as well. Preserve the canonical lowercase coreutils sidecar format: `<64 hex>  epoch-N.jet\n`.
 
 ## Deliver
 
@@ -94,7 +94,7 @@ Do not use `--legacy-etag-only` unless the user has explicitly established that 
 - Never delete from R2, including during cleanup or retries.
 - Never use `--overwrite-existing` without explicit user authorization for the affected range.
 - Never remove a local archive before its durable receipt exists and both remote objects have been re-observed.
-- Refuse to begin upload without exact full, current-plugin, and adjacent-boundary receipts.
+- Refuse to begin upload without exact full and current-plugin receipts. Refuse local retirement without both adjacent-boundary receipts as well.
 - Do not treat a sidecar alone as proof that the archive was uploaded.
 - Resume idempotently from R2 inventory and private receipts after interruption.
 - Monitor long jobs at 20-30 minute intervals unless a failure needs immediate work.

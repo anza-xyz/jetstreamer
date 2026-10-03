@@ -69,9 +69,11 @@ manifest and normal root-checkpoint gates.
 
 - Give each server a disjoint explicit range and bind every controller to that range. For the
   Foundation host assigned 201–300, leave 101–200 to the existing host.
-- Publication still requires full archive verification, the current plugin, and both adjacent
-  boundary receipts. Restore a retired neighboring epoch from R2 into explicit private scratch when
-  an outer edge proof needs it; never restore over the public namespace.
+- Publication requires full archive verification and the current plugin. Local retirement also
+  requires both adjacent boundary receipts. This ordering is deliberate: publish a verified edge
+  archive so the neighboring host can restore it into explicit private scratch, close the
+  cross-host boundary, and only then retire either local edge. Never restore over the public
+  namespace.
 - Run replay, verification, and uploads concurrently as resources allow. Upload the archive first
   and the canonical SHA-256 sidecar last. Only the host that holds the exact local gates and durable
   R2 receipt may retire its local pair.

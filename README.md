@@ -224,6 +224,11 @@ jetstreamer-r2 restore /absolute/scratch/directory \
 An existing destination is accepted only when it already matches the receipt. Partial restores
 can be resumed safely; unrelated or mismatching files are never overwritten.
 
+`scripts/sync_horizon_r2_progressive.py` permits R2 publication after the full and current-plugin
+receipts agree with the archive. Local retirement remains stricter and additionally requires both
+adjacent-boundary receipts. This allows disjoint producers to exchange a verified boundary neighbor
+through R2 without creating a circular upload dependency.
+
 `scripts/audit_horizon_receipts.py` is the local-file-independent completion gate. It requires the
 full, current-plugin, R2, and adjacent-boundary receipts to agree on every archive SHA-256, and
 requires the approved full, plugin, and boundary-verifier binary/script SHA-256 values explicitly. Add

@@ -69,7 +69,7 @@ class ProgressiveR2Tests(unittest.TestCase):
             (directory / "epoch-9.jet").write_bytes(b"partial")
             self.assertIsNone(progressive.local_pair(directory, 9))
 
-    def test_retirement_requires_both_digest_bound_gates(self) -> None:
+    def test_publication_and_retirement_have_distinct_digest_bound_gates(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             full = root / "full"
@@ -108,6 +108,9 @@ class ProgressiveR2Tests(unittest.TestCase):
             )
             self.assertTrue(progressive.retirement_allowed(args, 7, digest))
             self.assertTrue(progressive.publication_allowed(args, 7, digest))
+            self.assertTrue(
+                progressive.adjacent_boundaries_allowed(args, 7, digest)
+            )
             self.assertFalse(progressive.retirement_allowed(args, 7, "01" * 32))
             self.assertFalse(progressive.publication_allowed(args, 7, "01" * 32))
 
@@ -132,13 +135,16 @@ class ProgressiveR2Tests(unittest.TestCase):
 
             args.boundary_verifier_sha256 = "05" * 32
             self.assertFalse(progressive.retirement_allowed(args, 7, digest))
+            self.assertTrue(progressive.publication_allowed(args, 7, digest))
             args.boundary_verifier_sha256 = verifier
             args.boundary_verifier_script_sha256 = "06" * 32
             self.assertFalse(progressive.retirement_allowed(args, 7, digest))
+            self.assertTrue(progressive.publication_allowed(args, 7, digest))
             args.boundary_verifier_script_sha256 = script
 
             (boundary / "boundary-7-8.ok").unlink()
             self.assertFalse(progressive.retirement_allowed(args, 7, digest))
+            self.assertTrue(progressive.publication_allowed(args, 7, digest))
             (boundary / "boundary-7-8.ok").write_text(
                 f"{digest} {'02' * 32} {verifier} {script}\n", encoding="ascii"
             )

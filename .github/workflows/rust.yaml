@@ -57,7 +57,11 @@ jobs:
       - name: Run sccache-cache
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
       - name: cargo test (${{ matrix.name }})
-        run: cargo test --workspace ${{ matrix.flags }}
+        run: |
+          cargo test --workspace ${{ matrix.flags }}
+          cargo test -p jetstreamer-horizon ${{ matrix.flags }} \
+            --example reencode_archive \
+            --example verify_archive
 
   cargo-fmt:
     name: cargo fmt

@@ -1,0 +1,206 @@
+{
+  "schema": 1,
+  "source_note": "Old Faithful production HTTPS does not expose GCS generation or CRC32C. Identity is bound by URL, total object length, exact byte range, index-record SHA-256, captured-range SHA-256, node CID and offsets, CID verification, and raw/decompressed metadata SHA-256.",
+  "fixtures": [
+    {
+      "slot": 38879999,
+      "epoch": 89,
+      "transaction_index": 117,
+      "transaction_signature": "5citNAdRxMGWQ9rYnvCUj8LD1y22ww6g4XRri2Z7kZc8sLUtdsSyZUP4tZ57aJyVHiN1E4ru3KUJEmdGaRCy2kgZ",
+      "index": {
+        "url": "https://files.old-faithful.net/89/epoch-89-slot-ranges.raw",
+        "record_offset": 5183988,
+        "record_length": 12,
+        "record_sha256": "23581abeec7d57aef0f798b516c8e71ad32b73c0ea3a2e41c04fb859f1fa6c31"
+      },
+      "car": {
+        "url": "https://files.old-faithful.net/89/epoch-89.car",
+        "object_length": 55861826400,
+        "range_start": 55844814840,
+        "range_end_inclusive": 55844991317,
+        "range_length": 176478,
+        "range_sha256": "e8dad3ff748e27c1ef74d840cdcb0c93bb82fa113e040c8a5e9fb0be923e7d45"
+      },
+      "transaction_node": {
+        "ordinal_zero_based": 398,
+        "cid": "bafyreico42kaim7qgcx2klqbwbzkpuh6q6jrmv677ajozabrlx3ws46evu",
+        "car_section_prefix_offset": 55844894275,
+        "car_section_body_offset": 55844894277,
+        "car_cbor_offset": 55844894313,
+        "car_section_end_exclusive": 55844895138,
+        "cid_multihash_code": 18,
+        "cid_digest": "4ee6940433f030afa52e01b072a7d0fe87931657dff812ec80315df76973c4ad",
+        "computed_cbor_sha256": "4ee6940433f030afa52e01b072a7d0fe87931657dff812ec80315df76973c4ad",
+        "cid_verified": true
+      },
+      "metadata_frame": {
+        "length": 164,
+        "sha256": "8e950f11d61ad0a02c80941e9b20eab6b1154c2712bb4608d170702756e6a1e3"
+      },
+      "decompressed_metadata": {
+        "length": 456,
+        "sha256": "6c51568e4763c336dc5261d76220cf1360217eae3aa027970a81e9c642153f87"
+      }
+    },
+    {
+      "slot": 40607999,
+      "epoch": 93,
+      "transaction_index": 173,
+      "transaction_signature": "sfZqV6n4bRnZY51g196FrrKFPHmTcTLMVdBZUhvvkBWq6hDTVRtYZGztRySFGACJNP7zwpcJYS9zYjihyinkx1b",
+      "index": {
+        "url": "https://files.old-faithful.net/93/epoch-93-slot-ranges.raw",
+        "record_offset": 5183988,
+        "record_length": 12,
+        "record_sha256": "2d71dba1f540231da0c6a34e1fc209844566df3e3ba8934c3f0d3d676ee616c6"
+      },
+      "car": {
+        "url": "https://files.old-faithful.net/93/epoch-93.car",
+        "object_length": 54794317797,
+        "range_start": 54777261506,
+        "range_end_inclusive": 54777383617,
+        "range_length": 122112,
+        "range_sha256": "a57653153b0c2171602b311758a40af83e4155f062174d1aeab4ab6a56147837"
+      },
+      "transaction_node": {
+        "ordinal_zero_based": 381,
+        "cid": "bafyreifnibq6o36jgd2ur34wca2al6f2gpv5u776cq7h3pvenr757xhgbu",
+        "car_section_prefix_offset": 54777365049,
+        "car_section_body_offset": 54777365051,
+        "car_cbor_offset": 54777365087,
+        "car_section_end_exclusive": 54777365876,
+        "cid_multihash_code": 18,
+        "cid_digest": "ad4061e76fc930f548ef96103405f8ba33ebda7ffe143e7dbea46c7fdfdce60d",
+        "computed_cbor_sha256": "ad4061e76fc930f548ef96103405f8ba33ebda7ffe143e7dbea46c7fdfdce60d",
+        "cid_verified": true
+      },
+      "metadata_frame": {
+        "length": 131,
+        "sha256": "d56b58dfc2d3d89f874cff68a329aa6b3022e03e67840b9f1f7720af5437de70"
+      },
+      "decompressed_metadata": {
+        "length": 333,
+        "sha256": "8335de6abd0f462a9a93e20122e343009a90301846ab4beee4d33502f27e31fe"
+      }
+    },
+    {
+      "slot": 66550000,
+      "epoch": 154,
+      "transaction_index": 500,
+      "transaction_signature": "5zihxEwgZjTg4T7d7bjSMW6UrUKXCbfpREAcsPtCxSrCh6j8fMRKh16WigFCRpEYsZgMPVp3TdawShjSUkn8ztAX",
+      "index": {
+        "url": "https://files.old-faithful.net/154/epoch-154-slot-ranges.raw",
+        "record_offset": 264000,
+        "record_length": 12,
+        "record_sha256": "9a12899acf7e9f6cbd4604038c12eba1789be30923c77d13e9d44f4089dc0d8a"
+      },
+      "car": {
+        "url": "https://files.old-faithful.net/154/epoch-154.car",
+        "object_length": 217237328935,
+        "range_start": 11892337195,
+        "range_end_inclusive": 11893295470,
+        "range_length": 958276,
+        "range_sha256": "6e67feea23b8301bac2067c4f46719bcef65ebed379ab9dc919ceff474c394fe"
+      },
+      "transaction_node": {
+        "ordinal_zero_based": 969,
+        "cid": "bafyreiewq3pl62vonxwhokz2rqein6okridnny3a7yac7s5jqit2uxo7u4",
+        "car_section_prefix_offset": 11892634007,
+        "car_section_body_offset": 11892634009,
+        "car_cbor_offset": 11892634045,
+        "car_section_end_exclusive": 11892634771,
+        "cid_multihash_code": 18,
+        "cid_digest": "9686debf6aae6dec772b3a8c0886f9ca8a06d6e360fe002fcba98227aa5ddfa7",
+        "computed_cbor_sha256": "9686debf6aae6dec772b3a8c0886f9ca8a06d6e360fe002fcba98227aa5ddfa7",
+        "cid_verified": true
+      },
+      "metadata_frame": {
+        "length": 142,
+        "sha256": "515609e736909072ac9450a3d0d88615ffc7b5d8ef62ca0b853a8f968ee19210"
+      },
+      "decompressed_metadata": {
+        "length": 238,
+        "sha256": "26b88974fb2c88a93cb6e03380590c52321e9ed03a5d83d4447f59d71589269f"
+      }
+    },
+    {
+      "slot": 67700000,
+      "epoch": 156,
+      "transaction_index": 57,
+      "transaction_signature": "31AbaUUKgb8epDiSGuQ6rPy8qsuyFPbGzm5q3WmGz5CqH5CqqLGuv4n9Csg64ufFsMNQ7LjqrYFDjFDLwZ82qGm3",
+      "index": {
+        "url": "https://files.old-faithful.net/156/epoch-156-slot-ranges.raw",
+        "record_offset": 3696000,
+        "record_length": 12,
+        "record_sha256": "a6445c63d821490042efaf3825af30f9cbbf60606fda3523d03b882f2a69d268"
+      },
+      "car": {
+        "url": "https://files.old-faithful.net/156/epoch-156.car",
+        "object_length": 181682528152,
+        "range_start": 133603418903,
+        "range_end_inclusive": 133604450468,
+        "range_length": 1031566,
+        "range_sha256": "5a82048877465d2fe137fefa2f0e4e981bb0501e7a9267d68443338f1cd984a9"
+      },
+      "transaction_node": {
+        "ordinal_zero_based": 93,
+        "cid": "bafyreidoyceqc5cgtcpnxhpqcg24mwpug6h756hvgkuh62socwyq4pzmi4",
+        "car_section_prefix_offset": 133603451451,
+        "car_section_body_offset": 133603451453,
+        "car_cbor_offset": 133603451489,
+        "car_section_end_exclusive": 133603452164,
+        "cid_multihash_code": 18,
+        "cid_digest": "6ec089017446989edb9df011b5c659f4378ffef8f532a87f6a4e15b10e3f2c47",
+        "computed_cbor_sha256": "6ec089017446989edb9df011b5c659f4378ffef8f532a87f6a4e15b10e3f2c47",
+        "cid_verified": true
+      },
+      "metadata_frame": {
+        "length": 231,
+        "sha256": "6919f207e2e9581a08eeffcae6610148f9184e92a3a49401eed15740a88895de"
+      },
+      "decompressed_metadata": {
+        "length": 544,
+        "sha256": "db8cc6332ca542423c86f7924727dc3200d0213427b4f72e32e43e48f0685aa8"
+      }
+    },
+    {
+      "slot": 67823992,
+      "epoch": 156,
+      "transaction_index": 0,
+      "transaction_signature": "5gBaEEKnCwbKAUQ8dhjDLQM4QvtNSVEbU3AEDv7WwFKWs4Nm4xYYDrSZTm4bJFRar4boDBsxzVCVJP11N4BTBEGb",
+      "index": {
+        "url": "https://files.old-faithful.net/156/epoch-156-slot-ranges.raw",
+        "record_offset": 5183904,
+        "record_length": 12,
+        "record_sha256": "2fdf862edcbd2e8d039c3a2a4d921809570a4268c26fee99959f06f17bbbba8d"
+      },
+      "car": {
+        "url": "https://files.old-faithful.net/156/epoch-156.car",
+        "object_length": 181682528152,
+        "range_start": 181664487417,
+        "range_end_inclusive": 181664560024,
+        "range_length": 72608,
+        "range_sha256": "fdf9bd95d88d602901fe3fbe05f88c4011f3fb1c4cddde008d4ad2405291585f"
+      },
+      "transaction_node": {
+        "ordinal_zero_based": 315,
+        "cid": "bafyreig2goxpkgaast2hy4tptyqwmql6sqtzur5nnkppxvw266xrvpr5ay",
+        "car_section_prefix_offset": 181664511672,
+        "car_section_body_offset": 181664511674,
+        "car_cbor_offset": 181664511710,
+        "car_section_end_exclusive": 181664512112,
+        "cid_multihash_code": 18,
+        "cid_digest": "da33aef5180094f47c726f9e2166417e94279a47ad6a9efbd6daf7af1abe3d06",
+        "computed_cbor_sha256": "da33aef5180094f47c726f9e2166417e94279a47ad6a9efbd6daf7af1abe3d06",
+        "cid_verified": true
+      },
+      "metadata_frame": {
+        "length": 53,
+        "sha256": "8a65919ac6a70f818be79c2871aa4e2a5c9f1095f640aa121f59d4dbf863f254"
+      },
+      "decompressed_metadata": {
+        "length": 53,
+        "sha256": "13546d3b3e2f2e924661a39c647211cb42664362cb49fe2d37907c8b85da4d20"
+      }
+    }
+  ]
+}

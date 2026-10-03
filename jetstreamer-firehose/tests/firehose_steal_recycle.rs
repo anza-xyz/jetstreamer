@@ -5,6 +5,7 @@ use jetstreamer_firehose::firehose::{
     BlockData, OnEntryFn, OnErrorFn, OnRewardFn, OnStatsTrackingFn, TransactionData, firehose,
     thread_activity,
 };
+use jetstreamer_firehose::transaction::parse_versioned_transaction_from_slice;
 use serde_cbor::Value::{self, Array, Bytes, Integer, Map, Null, Text};
 use sha2::{Digest, Sha256};
 use std::{
@@ -65,8 +66,7 @@ fn archive() -> (Vec<u8>, Vec<u8>) {
     let mut nodes = Vec::new();
     let mut records = Vec::new();
     let transaction = STANDARD.decode(TRANSACTION).unwrap();
-    let parsed: solana_transaction::versioned::VersionedTransaction =
-        wincode::deserialize(&transaction).unwrap();
+    let parsed = parse_versioned_transaction_from_slice(&transaction).unwrap();
     parsed
         .verify_and_hash_message()
         .expect("valid fixture signature");

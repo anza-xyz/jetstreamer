@@ -96,7 +96,6 @@ impl Plugin for ProgramTrackingPlugin {
             let (account_keys, instructions) = match message {
                 VersionedMessage::Legacy(msg) => (&msg.account_keys, &msg.instructions),
                 VersionedMessage::V0(msg) => (&msg.account_keys, &msg.instructions),
-                VersionedMessage::V1(msg) => (&msg.account_keys, &msg.instructions),
             };
             if instructions.is_empty() {
                 return Ok(());
@@ -122,11 +121,7 @@ impl Plugin for ProgramTrackingPlugin {
                 .entry(slot)
                 .or_insert_with(|| HashMap::with_hasher(RandomState::new()));
             for program_id in program_ids.iter() {
-                let this_program_cu = if program_count == 0 {
-                    0
-                } else {
-                    total_cu / program_count
-                };
+                let this_program_cu = total_cu.checked_div(program_count).unwrap_or(0);
                 let event =
                     slot_entry
                         .entry((*program_id, is_vote))

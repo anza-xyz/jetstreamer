@@ -2,7 +2,6 @@ use crossbeam_channel::{Receiver, Sender, unbounded};
 use dashmap::{DashMap, DashSet};
 use futures_util::future::BoxFuture;
 use reqwest::{Client, Url};
-use solana_accounts_db::stake_rewards::StakeRewardInfo;
 use solana_address::Address;
 use solana_geyser_plugin_manager::{
     block_metadata_notifier_interface::BlockMetadataNotifier,
@@ -10,12 +9,12 @@ use solana_geyser_plugin_manager::{
 };
 use solana_hash::Hash;
 use solana_ledger::entry_notifier_interface::EntryNotifier;
-use solana_reward_info::RewardType;
+use solana_reward_info::RewardInfo;
 use solana_rpc::{
     optimistically_confirmed_bank_tracker::SlotNotification,
     transaction_notifier_interface::TransactionNotifier,
 };
-use solana_runtime::bank::KeyedRewardsAndNumPartitions;
+use solana_runtime::bank::{KeyedRewardsAndNumPartitions, RewardType};
 use solana_sdk_ids::vote::id as vote_program_id;
 use solana_transaction::versioned::VersionedTransaction;
 use std::{
@@ -46,7 +45,12 @@ use crate::{
     },
     index::{SLOT_OFFSET_INDEX, SlotOffsetIndexError},
     node_reader::NodeReader,
+    transaction_status_meta::decode_transaction_status_meta,
     utils,
+};
+
+pub use crate::transaction_status_meta::{
+    OLD_FAITHFUL_PROTOBUF_META_START_SLOT, OldFaithfulMetaEncoding, old_faithful_meta_encoding,
 };
 
 /// Timeout applied to each asynchronous firehose operation (fetching epoch stream, reading
@@ -59,9 +63,6 @@ const OP_TIMEOUT_SEQUENTIAL: std::time::Duration = std::time::Duration::from_sec
 // double the wait up to the cap, and any forward progress resets it.
 const RETRY_BACKOFF_BASE: std::time::Duration = std::time::Duration::from_secs(1);
 const RETRY_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(32);
-// Epochs earlier than this were bincode-encoded in Old Faithful.
-const BINCODE_EPOCH_CUTOFF: u64 = 157;
-
 fn poll_shutdown(
     flag: &Arc<std::sync::atomic::AtomicBool>,
     receiver: &mut Option<broadcast::Receiver<()>>,
@@ -231,6 +232,17 @@ pub mod thread_activity {
             .get(&thread_index)
             .map(|stamp| now_ms().saturating_sub(*stamp))
     }
+}
+
+/// Last entry hash in a block's node set — by construction the block's blockhash.
+/// Used to prime the parent-hash chain from a preceding, non-emitted slot so the
+/// first emitted block records its true `parent_blockhash` instead of
+/// `Hash::default()`.
+fn last_entry_hash(nodes: &crate::node::NodesWithCids) -> Option<Hash> {
+    nodes.0.iter().rev().find_map(|nwc| match nwc.get_node() {
+        crate::node::Node::Entry(entry) => Some(Hash::from(entry.hash.to_bytes())),
+        _ => None,
+    })
 }
 
 /// Default launch-gate grace: how long to wait for every running thread to turn green before
@@ -529,8 +541,15 @@ async fn request_steal(
 fn reverse_resume_after_error(
     slot: u64,
     last_counted_slot: u64,
+    has_counted_slot: bool,
     highest_remaining_epoch: Option<u64>,
 ) -> (Option<u64>, Option<u64>) {
+    // `last_counted_slot == 0` is ambiguous for a range beginning at genesis:
+    // it can mean either "nothing processed" or "slot 0 processed".  Before
+    // slot 0 is counted there is no completed epoch to advance past.
+    if !has_counted_slot {
+        return (Some(0), highest_remaining_epoch);
+    }
     let resume_slot = if slot <= last_counted_slot {
         last_counted_slot.saturating_add(1)
     } else {
@@ -554,6 +573,25 @@ fn reverse_resume_after_error(
     } else {
         (Some(resume_slot), highest_remaining_epoch)
     }
+}
+
+#[inline]
+fn next_uncounted_slot(range_start: u64, last_counted_slot: u64, has_counted_slot: bool) -> u64 {
+    if has_counted_slot {
+        last_counted_slot.saturating_add(1)
+    } else {
+        range_start
+    }
+}
+
+#[inline]
+fn slot_already_counted(slot: u64, last_counted_slot: u64, has_counted_slot: bool) -> bool {
+    has_counted_slot && slot <= last_counted_slot
+}
+
+#[inline]
+fn slot_should_emit(slot: u64, last_emitted_slot: u64, has_emitted_slot: bool) -> bool {
+    !has_emitted_slot || slot > last_emitted_slot
 }
 
 /// Per-thread restart pacing: consecutive failures on the same slot double the delay up to
@@ -594,7 +632,7 @@ pub enum FirehoseError {
     /// Failure while reading the Old Faithful CAR header.
     ReadHeader(SharedError),
     /// Error emitted by the Solana Geyser plugin service.
-    GeyserPluginService(GeyserPluginServiceError),
+    GeyserPluginService(Box<GeyserPluginServiceError>),
     /// Transaction notifier could not be acquired from the Geyser service.
     FailedToGetTransactionNotifier,
     /// Failure while reading data until the next block boundary.
@@ -604,7 +642,7 @@ pub enum FirehoseError {
     /// Failed to decode a node at the given index.
     NodeDecodingError(usize, SharedError),
     /// Error surfaced when querying the slot offset index.
-    SlotOffsetIndexError(SlotOffsetIndexError),
+    SlotOffsetIndexError(Box<SlotOffsetIndexError>),
     /// Failure while seeking to a slot within the Old Faithful CAR stream.
     SeekToSlotError(SharedError),
     /// Error surfaced during the plugin `on_load` stage.
@@ -707,6 +745,62 @@ impl Display for FirehoseError {
     }
 }
 
+/// Bundles optional Geyser notifiers for in-process replay.
+pub struct GeyserNotifiers {
+    /// Optional notifier for transaction updates.
+    pub transaction_notifier: Option<Arc<dyn TransactionNotifier + Send + Sync + 'static>>,
+    /// Optional transaction notifier that also receives whether Old Faithful
+    /// actually carried status metadata. The ordinary Geyser interface cannot
+    /// represent a missing metadata frame, so its compatibility path receives
+    /// `TransactionStatusMeta::default()` as before.
+    pub sourced_transaction_notifier:
+        Option<Arc<dyn SourcedTransactionNotifier + Send + Sync + 'static>>,
+    /// Optional notifier for entry updates.
+    pub entry_notifier: Option<Arc<dyn EntryNotifier + Send + Sync + 'static>>,
+    /// Optional notifier for block metadata updates.
+    pub block_metadata_notifier: Option<Arc<dyn BlockMetadataNotifier + Send + Sync + 'static>>,
+}
+
+/// A transaction notification that preserves source-metadata provenance.
+pub struct SourcedTransaction<'a> {
+    /// Slot containing the transaction.
+    pub slot: u64,
+    /// Zero-based transaction index within the slot.
+    pub transaction_slot_index: usize,
+    /// First transaction signature.
+    pub signature: &'a solana_signature::Signature,
+    /// Hash of the transaction message.
+    pub message_hash: &'a Hash,
+    /// Whether this is a simple vote transaction.
+    pub is_vote: bool,
+    /// Source status and its provenance.
+    pub status: SourcedTransactionStatus<'a>,
+    /// Original versioned transaction.
+    pub transaction: &'a VersionedTransaction,
+}
+
+/// Transaction status carried by the archive source.
+#[derive(Clone, Copy, Debug)]
+pub enum SourcedTransactionStatus<'a> {
+    /// Status metadata was present and decoded from the source record.
+    Observed(&'a solana_transaction_status::TransactionStatusMeta),
+    /// The source record carried no status metadata.
+    Missing,
+}
+
+/// Direct-replay transaction callback retaining information that the Geyser
+/// transaction interface cannot express.
+pub trait SourcedTransactionNotifier: Send + Sync {
+    /// Reports a transaction together with whether its source status exists.
+    fn notify_transaction(&self, transaction: SourcedTransaction<'_>);
+}
+
+/// Receives a decoded block's parent edge before its payload callbacks.
+pub trait BlockParentNotifier: Send + Sync {
+    /// Reports that decoded block `slot` names `parent_slot` as its parent.
+    fn notify_block_parent(&self, parent_slot: u64, slot: u64);
+}
+
 impl From<reqwest::Error> for FirehoseError {
     fn from(e: reqwest::Error) -> Self {
         FirehoseError::Reqwest(e)
@@ -715,13 +809,13 @@ impl From<reqwest::Error> for FirehoseError {
 
 impl From<GeyserPluginServiceError> for FirehoseError {
     fn from(e: GeyserPluginServiceError) -> Self {
-        FirehoseError::GeyserPluginService(e)
+        FirehoseError::GeyserPluginService(Box::new(e))
     }
 }
 
 impl From<SlotOffsetIndexError> for FirehoseError {
     fn from(e: SlotOffsetIndexError) -> Self {
-        FirehoseError::SlotOffsetIndexError(e)
+        FirehoseError::SlotOffsetIndexError(Box::new(e))
     }
 }
 
@@ -882,7 +976,10 @@ fn decode_transaction_status_meta_from_frame(
         return Ok(solana_transaction_status::TransactionStatusMeta::default());
     }
 
-    match utils::decompress_zstd(reassembled_metadata.as_slice()) {
+    match utils::decompress_zstd_with_limit(
+        reassembled_metadata.as_slice(),
+        utils::MAX_TRANSACTION_METADATA_FRAME_SIZE,
+    ) {
         Ok(decompressed) => {
             decode_transaction_status_meta(slot, decompressed.as_slice()).map_err(|err| {
                 Box::new(std::io::Error::other(format!(
@@ -902,51 +999,18 @@ fn decode_transaction_status_meta_from_frame(
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct DecodedRewards {
-    /// Rewards in the runtime's representation, ready to hand to block handlers and the geyser
-    /// block metadata notifier without further conversion.
-    rewards: KeyedRewardsAndNumPartitions,
-    /// Whether the ledger recorded vote commission in basis points (SIMD-0291) rather than
-    /// whole percent for this block. Forwarded to the geyser block metadata notifier so it
-    /// renders `commission`/`commission_bps` the same way a live validator would have.
-    commission_rate_in_basis_points: bool,
-}
-
-impl Default for DecodedRewards {
-    fn default() -> Self {
-        Self::empty()
-    }
+    keyed_rewards: Vec<(Address, RewardInfo)>,
+    num_partitions: Option<u64>,
 }
 
 impl DecodedRewards {
     fn empty() -> Self {
         Self {
-            rewards: KeyedRewardsAndNumPartitions {
-                keyed_rewards: Vec::new(),
-                num_partitions: None,
-            },
-            commission_rate_in_basis_points: false,
+            keyed_rewards: Vec::new(),
+            num_partitions: None,
         }
-    }
-
-    /// Copies the rewards into the form conveyed to reward [`Handler`] callbacks.
-    fn to_handler_rewards(&self) -> Vec<(Address, StakeRewardInfo)> {
-        self.rewards
-            .keyed_rewards
-            .iter()
-            .map(|(address, reward)| {
-                (
-                    *address,
-                    StakeRewardInfo {
-                        reward_type: reward.reward_type,
-                        lamports: reward.lamports,
-                        post_balance: reward.post_balance,
-                        commission_bps: reward.commission_bps,
-                    },
-                )
-            })
-            .collect()
     }
 }
 
@@ -980,17 +1044,18 @@ fn decode_rewards_from_frame(
 fn decode_rewards_from_bytes(slot: u64, bytes: &[u8]) -> Result<DecodedRewards, SharedError> {
     let epoch = slot_to_epoch(slot);
     let proto_attempt: Result<solana_storage_proto::convert::generated::Rewards, _> =
-        prost_014::Message::decode(bytes);
+        prost_011::Message::decode(bytes);
     match proto_attempt {
         Ok(proto) => {
-            let rewards = convert_proto_rewards(&proto).map_err(|err| {
+            let num_partitions = proto.num_partitions.as_ref().map(|p| p.num_partitions);
+            let keyed_rewards = convert_proto_rewards(&proto).map_err(|err| {
                 Box::new(std::io::Error::other(format!(
                     "convert rewards proto failed (epoch {epoch}): {err}"
                 ))) as SharedError
             })?;
             Ok(DecodedRewards {
-                rewards,
-                commission_rate_in_basis_points: proto_commission_in_basis_points(&proto),
+                keyed_rewards,
+                num_partitions,
             })
         }
         Err(proto_err) => {
@@ -1001,81 +1066,39 @@ fn decode_rewards_from_bytes(slot: u64, bytes: &[u8]) -> Result<DecodedRewards, 
                     ))) as SharedError
                 })?;
             let proto: solana_storage_proto::convert::generated::Rewards = stored.into();
-            let rewards = convert_proto_rewards(&proto).map_err(|err| {
+            let num_partitions = proto.num_partitions.as_ref().map(|p| p.num_partitions);
+            let keyed_rewards = convert_proto_rewards(&proto).map_err(|err| {
                 Box::new(std::io::Error::other(format!(
                     "convert rewards bincode fallback failed (epoch {epoch}); protobuf error: {proto_err}; conversion error: {err}"
                 ))) as SharedError
             })?;
             Ok(DecodedRewards {
-                rewards,
-                commission_rate_in_basis_points: proto_commission_in_basis_points(&proto),
+                keyed_rewards,
+                num_partitions,
             })
         }
     }
 }
 
-/// Returns `true` when the stored rewards carry a basis-point commission (SIMD-0291), i.e. the
-/// block was produced after the `commission_rate_in_basis_points` feature activated.
-fn proto_commission_in_basis_points(
-    proto: &solana_storage_proto::convert::generated::Rewards,
-) -> bool {
-    proto
-        .rewards
-        .iter()
-        .any(|reward| !reward.commission_bps.is_empty())
-}
-
-fn decode_transaction_status_meta(
-    slot: u64,
-    metadata_bytes: &[u8],
-) -> Result<solana_transaction_status::TransactionStatusMeta, SharedError> {
-    let epoch = slot_to_epoch(slot);
-    let mut bincode_err: Option<String> = None;
-    if epoch < BINCODE_EPOCH_CUTOFF {
-        match bincode::deserialize::<solana_storage_proto::StoredTransactionStatusMeta>(
-            metadata_bytes,
-        ) {
-            Ok(stored) => return Ok(stored.into()),
-            Err(err) => {
-                bincode_err = Some(err.to_string());
-            }
-        }
-    }
-
-    let bin_err_for_proto = bincode_err.clone();
-    let proto: solana_storage_proto::convert::generated::TransactionStatusMeta =
-        prost_014::Message::decode(metadata_bytes).map_err(|err| {
-            // If we already tried bincode, surface both failures for easier debugging.
-            if let Some(ref bin_err) = bin_err_for_proto {
-                Box::new(std::io::Error::other(format!(
-                    "protobuf decode transaction metadata failed (epoch {epoch}); bincode failed earlier: {bin_err}; protobuf error: {err}"
-                ))) as SharedError
-            } else {
-                Box::new(std::io::Error::other(format!(
-                    "protobuf decode transaction metadata: {err}"
-                ))) as SharedError
-            }
-        })?;
-
-    proto.try_into().map_err(|err| {
-        if let Some(ref bin_err) = bincode_err {
-            Box::new(std::io::Error::other(format!(
-                "convert transaction metadata proto failed (epoch {epoch}); bincode failed earlier: {bin_err}; conversion error: {err}"
-            ))) as SharedError
-        } else {
-            Box::new(std::io::Error::other(format!(
-                "convert transaction metadata proto: {err}"
-            ))) as SharedError
-        }
-    })
-}
-
 #[cfg(test)]
 mod metadata_decode_tests {
-    use super::{decode_transaction_status_meta, decode_transaction_status_meta_from_frame};
+    use super::decode_transaction_status_meta_from_frame;
+    use crate::transaction_status_meta::decode_transaction_status_meta;
+    use serde::Serialize;
     use solana_message::v0::LoadedAddresses;
-    use solana_storage_proto::StoredTransactionStatusMeta;
     use solana_transaction_status::TransactionStatusMeta;
+
+    #[derive(Serialize)]
+    struct LegacyWireMeta {
+        status: Result<(), u8>,
+        fee: u64,
+        pre_balances: Vec<u64>,
+        post_balances: Vec<u64>,
+        inner_instructions: Option<Vec<u8>>,
+        log_messages: Option<Vec<String>>,
+        pre_token_balances: Option<Vec<u8>>,
+        post_token_balances: Option<Vec<u8>>,
+    }
 
     fn sample_meta() -> TransactionStatusMeta {
         TransactionStatusMeta {
@@ -1094,8 +1117,8 @@ mod metadata_decode_tests {
     }
 
     #[test]
-    fn decodes_bincode_metadata_for_early_epochs() {
-        let stored = StoredTransactionStatusMeta {
+    fn decodes_cutoff_schema_bincode_metadata_for_early_epochs() {
+        let wire = LegacyWireMeta {
             status: Ok(()),
             fee: 42,
             pre_balances: vec![1, 2],
@@ -1104,14 +1127,21 @@ mod metadata_decode_tests {
             log_messages: Some(vec!["hello".into()]),
             pre_token_balances: Some(Vec::new()),
             post_token_balances: Some(Vec::new()),
-            rewards: Some(Vec::new()),
-            return_data: None,
-            compute_units_consumed: Some(7),
-            cost_units: Some(9),
         };
-        let bytes = bincode::serialize(&stored).expect("bincode serialize");
+        let bytes = bincode::serialize(&wire).expect("bincode serialize");
         let decoded = decode_transaction_status_meta(0, &bytes).expect("decode");
-        assert_eq!(decoded, TransactionStatusMeta::from(stored));
+        assert_eq!(
+            decoded,
+            TransactionStatusMeta {
+                fee: 42,
+                pre_balances: vec![1, 2],
+                post_balances: vec![3, 4],
+                log_messages: Some(vec!["hello".into()]),
+                pre_token_balances: Some(Vec::new()),
+                post_token_balances: Some(Vec::new()),
+                ..TransactionStatusMeta::default()
+            }
+        );
     }
 
     #[test]
@@ -1119,20 +1149,37 @@ mod metadata_decode_tests {
         let meta = sample_meta();
         let generated: solana_storage_proto::convert::generated::TransactionStatusMeta =
             meta.clone().into();
-        let bytes = prost_014::Message::encode_to_vec(&generated);
+        let bytes = prost_011::Message::encode_to_vec(&generated);
         let decoded = decode_transaction_status_meta(157 * 432000, &bytes).expect("decode");
         assert_eq!(decoded, meta);
     }
 
     #[test]
-    fn falls_back_to_proto_when_early_epoch_bytes_are_proto() {
+    fn decodes_protobuf_metadata_before_the_archive_cutoff() {
         let meta = sample_meta();
         let generated: solana_storage_proto::convert::generated::TransactionStatusMeta =
             meta.clone().into();
-        let bytes = prost_014::Message::encode_to_vec(&generated);
-        // Epoch 100 should try bincode first; if those bytes are proto, we must fall back.
-        let decoded = decode_transaction_status_meta(100 * 432000, &bytes).expect("decode");
-        assert_eq!(decoded, meta);
+        let bytes = prost_011::Message::encode_to_vec(&generated);
+        assert_eq!(
+            decode_transaction_status_meta(100 * 432000, &bytes).unwrap(),
+            meta
+        );
+    }
+
+    #[test]
+    fn rejects_bincode_metadata_after_the_archive_cutoff() {
+        let wire = LegacyWireMeta {
+            status: Ok(()),
+            fee: 42,
+            pre_balances: vec![1, 2],
+            post_balances: vec![3, 4],
+            inner_instructions: None,
+            log_messages: None,
+            pre_token_balances: Some(Vec::new()),
+            post_token_balances: Some(Vec::new()),
+        };
+        let bytes = bincode::serialize(&wire).expect("bincode serialize");
+        assert!(decode_transaction_status_meta(157 * 432000, &bytes).is_err());
     }
 
     #[test]
@@ -1143,24 +1190,30 @@ mod metadata_decode_tests {
 
     #[test]
     fn raw_bincode_frame_without_zstd_still_decodes() {
-        let stored = StoredTransactionStatusMeta {
+        let wire = LegacyWireMeta {
             status: Ok(()),
             fee: 1,
-            pre_balances: vec![],
-            post_balances: vec![],
+            pre_balances: vec![2],
+            post_balances: vec![1],
             inner_instructions: None,
             log_messages: None,
             pre_token_balances: Some(Vec::new()),
             post_token_balances: Some(Vec::new()),
-            rewards: Some(Vec::new()),
-            return_data: None,
-            compute_units_consumed: None,
-            cost_units: None,
         };
-        let raw_bytes = bincode::serialize(&stored).expect("serialize");
+        let raw_bytes = bincode::serialize(&wire).expect("serialize");
         let decoded =
             decode_transaction_status_meta_from_frame(0, raw_bytes).expect("decode fallback");
-        assert_eq!(decoded, TransactionStatusMeta::from(stored));
+        assert_eq!(
+            decoded,
+            TransactionStatusMeta {
+                fee: 1,
+                pre_balances: vec![2],
+                post_balances: vec![1],
+                pre_token_balances: Some(Vec::new()),
+                post_token_balances: Some(Vec::new()),
+                ..TransactionStatusMeta::default()
+            }
+        );
     }
 }
 
@@ -1181,16 +1234,15 @@ mod rewards_decode_tests {
                 post_balance: 10,
                 reward_type: solana_storage_proto::convert::generated::RewardType::Fee as i32,
                 commission: "1".to_string(),
-                commission_bps: String::new(),
             }],
             num_partitions: Some(solana_storage_proto::convert::generated::NumPartitions {
                 num_partitions: 2,
             }),
         };
-        let bytes = prost_014::Message::encode_to_vec(&proto);
+        let bytes = prost_011::Message::encode_to_vec(&proto);
         let decoded = decode_rewards_from_bytes(0, &bytes).expect("decode proto rewards");
-        assert_eq!(decoded.rewards.keyed_rewards.len(), 1);
-        assert_eq!(decoded.rewards.num_partitions, Some(2));
+        assert_eq!(decoded.keyed_rewards.len(), 1);
+        assert_eq!(decoded.num_partitions, Some(2));
     }
 
     #[test]
@@ -1202,13 +1254,12 @@ mod rewards_decode_tests {
             post_balance: 9,
             reward_type: Some(RewardType::Rent),
             commission: Some(3),
-            commission_bps: None,
         };
         let stored_rewards: StoredExtendedRewards = vec![reward.into()];
         let bytes = bincode::serialize(&stored_rewards).expect("bincode serialize");
         let decoded = decode_rewards_from_bytes(0, &bytes).expect("decode bincode rewards");
-        assert_eq!(decoded.rewards.keyed_rewards.len(), 1);
-        assert_eq!(decoded.rewards.num_partitions, None);
+        assert_eq!(decoded.keyed_rewards.len(), 1);
+        assert_eq!(decoded.num_partitions, None);
     }
 }
 
@@ -1227,6 +1278,9 @@ pub struct TransactionData {
     pub is_vote: bool,
     /// Status metadata returned by the Solana runtime.
     pub transaction_status_meta: solana_transaction_status::TransactionStatusMeta,
+    /// Whether the source carried the adjacent status metadata. If false, the
+    /// value is a compatibility default rather than an observed result.
+    pub status_meta_available: bool,
     /// Fully decoded transaction.
     pub transaction: VersionedTransaction,
 }
@@ -1252,11 +1306,7 @@ pub struct RewardsData {
     /// Slot the rewards correspond to.
     pub slot: u64,
     /// Reward recipients and their associated reward information.
-    ///
-    /// Agave 4.x no longer exports `solana_runtime`'s `RewardInfo`, so rewards are conveyed as
-    /// [`solana_accounts_db::stake_rewards::StakeRewardInfo`], which has the same fields and
-    /// converts into the runtime type.
-    pub rewards: Vec<(Address, StakeRewardInfo)>,
+    pub rewards: Vec<(Address, RewardInfo)>,
 }
 
 /// Block-level data streamed to block handlers.
@@ -1655,7 +1705,6 @@ where
             );
             let log_target = format!("{}::T{:03}", LOG_MODULE, thread_index);
             let mut skip_until_index = None;
-            let mut last_emitted_slot = slot_range.start.saturating_sub(1);
             let block_enabled = on_block.is_some();
             let tx_enabled = on_tx.is_some();
             let entry_enabled = on_entry.is_some();
@@ -1667,6 +1716,9 @@ where
                     .or_insert_with(|| DashSet::with_hasher(ahash::RandomState::new()));
             }
             let mut last_counted_slot = slot_range.start.saturating_sub(1);
+            let mut has_counted_slot = slot_range.start > 0;
+            let mut last_emitted_slot_global = slot_range.start.saturating_sub(1);
+            let mut has_emitted_slot_global = slot_range.start > 0;
             // Reverse-mode state preserved across retries. `None` for the highest remaining
             // epoch explicitly means "every epoch is complete" — required so completing
             // epoch 0 is distinguishable from epoch 0 still pending.
@@ -1694,6 +1746,7 @@ where
             } else {
                 None
             };
+            let mut retry_parent: Option<(u64, Hash)> = None;
 
             let mut pending_stats = false;
             let mut retry_backoff = RetryBackoff::new();
@@ -1727,7 +1780,7 @@ where
                 }
                 // A stats failure happens after the slot's data callbacks have succeeded.
                 // Retry that pulse before opening another stream, including when the failed
-                // pulse belonged to the final slot of the range or the final reverse epoch.
+                // pulse belonged to the final slot of the range or final reverse epoch.
                 if pending_stats && let Some(ref stats) = thread_stats {
                     maybe_emit_stats(
                         stats_tracking.as_ref(),
@@ -1779,6 +1832,14 @@ where
                 } else {
                     epoch_range.clone().collect()
                 };
+                let mut previous_blockhash = if sequential_mode {
+                    retry_parent
+                        .map(|(_, blockhash)| blockhash)
+                        .unwrap_or_default()
+                } else {
+                    Hash::default()
+                };
+                let mut latest_entry_blockhash = previous_blockhash;
                 for epoch_num in epoch_iter {
                     if poll_shutdown(&shutdown_flag, &mut shutdown_rx) {
                         log::info!(
@@ -1856,17 +1917,21 @@ where
                     };
                     log::debug!(target: &log_target, "read epoch {} header: {:?}", epoch_num, header);
 
-                    let mut previous_blockhash = Hash::default();
-                    let mut latest_entry_blockhash = Hash::default();
+                    if reverse_mode_local || local_start > epoch_start {
+                        previous_blockhash = Hash::default();
+                        latest_entry_blockhash = Hash::default();
+                    }
                     // Reset counters to align to the local epoch slice; prevents boundary slots
                     // from being treated as already-counted after a restart.
                     last_counted_slot = local_start.saturating_sub(1);
+                    has_counted_slot = local_start > 0;
                     current_slot = None;
                     if reverse_mode_local {
                         // In reverse mode each epoch is processed forward independently;
                         // the cross-epoch monotonic dedup check would otherwise reject every
                         // slot below the previously processed (higher) epoch's range.
-                        last_emitted_slot = local_start.saturating_sub(1);
+                        last_emitted_slot_global = local_start.saturating_sub(1);
+                        has_emitted_slot_global = local_start > 0;
                     }
                     if tracking_enabled
                         && let Some(ref mut stats) = thread_stats {
@@ -1883,8 +1948,18 @@ where
                         // before starting the timeout clock: with hundreds of threads the permit
                         // queue alone can exceed the op timeout, and that wait is pacing, not a
                         // stall.
+                        //
+                        // Enter one present slot early when the index allows: the preceding
+                        // block is decoded but not emitted (the below-start guard skips it),
+                        // which primes the parent-hash chain so the first emitted block
+                        // carries its true parent_blockhash instead of Hash::default() —
+                        // otherwise every mid-epoch (re)start stamps a zero parent into
+                        // consumers (one linkage break per retry in written archives).
+                        let seek_target = crate::index::prev_present_slot(epoch_start, local_start)
+                            .await
+                            .unwrap_or(local_start);
                         reader.prime_seek_permit().await;
-                        let seek_fut = reader.seek_to_slot(local_start);
+                        let seek_fut = reader.seek_to_slot(seek_target);
                         match timeout(op_timeout, seek_fut).await {
                             Ok(res) => res.map_err(|e| (e, local_start))?,
                             Err(_) => {
@@ -1943,10 +2018,15 @@ where
                         // `slot_range.end`, and the `slot >= slot_range.end` guard below
                         // completes the range before any out-of-range data is emitted.
                         if work_stealing {
+                            let resume_position = next_uncounted_slot(
+                                local_start,
+                                last_counted_slot,
+                                has_counted_slot,
+                            );
                             service_steal_inbox(
                                 &mut steal_inbox,
                                 &mut slot_range,
-                                last_counted_slot.saturating_add(1),
+                                resume_position,
                                 &work_registry[thread_index],
                                 &log_target,
                                 true,
@@ -1964,8 +2044,16 @@ where
                             // of the epoch, the stream was truncated and completing here
                             // would silently drop those slots.
                             let scan_end = local_end_inclusive.min(slot_range.end.saturating_sub(1));
-                            if let Some(missing) =
-                                crate::index::next_present_slot(last_counted_slot, scan_end).await
+                            let next_unprocessed = next_uncounted_slot(
+                                local_start,
+                                last_counted_slot,
+                                has_counted_slot,
+                            );
+                            if let Some(missing) = crate::index::first_present_slot_at_or_after(
+                                next_unprocessed,
+                                scan_end,
+                            )
+                            .await
                             {
                                 log::warn!(
                                     target: &log_target,
@@ -1975,7 +2063,7 @@ where
                                 );
                                 return Err((
                                     FirehoseError::PrematureStreamEnd,
-                                    last_counted_slot.saturating_add(1),
+                                    next_unprocessed,
                                 ));
                             }
                             log::info!(
@@ -2037,6 +2125,13 @@ where
                                     slot_range.start
                                 );
                             }
+                            // Fold the skipped block's entries into the hash chain: its
+                            // last entry hash is its blockhash, i.e. the next block's
+                            // true parent.
+                            if let Some(hash) = last_entry_hash(&nodes) {
+                                latest_entry_blockhash = hash;
+                                previous_blockhash = hash;
+                            }
                             continue;
                         }
                         current_slot = Some(slot);
@@ -2090,13 +2185,17 @@ where
                                             )
                                         })?;
                                         let reassembled_metadata = nodes
-                                            .reassemble_dataframes(&tx.metadata)
+                                            .reassemble_dataframes_bounded(
+                                                &tx.metadata,
+                                                utils::MAX_TRANSACTION_METADATA_FRAME_SIZE,
+                                            )
                                             .map_err(|err| {
                                                 (
                                                     FirehoseError::NodeDecodingError(item_index, err),
                                                     error_slot,
                                                 )
                                             })?;
+                                        let status_meta_available = !reassembled_metadata.is_empty();
 
                                         let as_native_metadata = decode_transaction_status_meta_from_frame(
                                             block.slot,
@@ -2153,6 +2252,7 @@ where
                                                 message_hash,
                                                 is_vote,
                                                 transaction_status_meta: as_native_metadata,
+                                                status_meta_available,
                                                 transaction: versioned_tx,
                                             },
                                         )
@@ -2229,11 +2329,13 @@ where
                                 Block(block) => {
                                     let prev_last_counted_slot = last_counted_slot;
 
-                                    let next_expected_slot = prev_last_counted_slot.saturating_add(1);
-                                    let skip_start_from_previous = last_counted_slot.saturating_add(1);
-                                    let skip_start = skip_start_from_previous.max(next_expected_slot);
+                                    let skip_start = next_uncounted_slot(
+                                        local_start,
+                                        last_counted_slot,
+                                        has_counted_slot,
+                                    );
 
-                                    let skipped_epoch = slot_to_epoch(last_counted_slot);
+                                    let skipped_epoch = epoch_num;
                                     for skipped_slot in skip_start..slot {
                                         if slot_to_epoch(skipped_slot) != skipped_epoch {
                                             break;
@@ -2253,7 +2355,12 @@ where
                                         }
                                         if block_enabled
                                             && let Some(on_block_cb) = on_block.as_ref()
-                                            && skipped_slot > last_emitted_slot {
+                                            && slot_should_emit(
+                                                skipped_slot,
+                                                last_emitted_slot_global,
+                                                has_emitted_slot_global,
+                                            )
+                                        {
                                                 on_block_cb(
                                                     thread_index,
                                                     BlockData::PossibleLeaderSkipped {
@@ -2267,7 +2374,8 @@ where
                                                         skipped_slot,
                                                     )
                                                 })?;
-                                                last_emitted_slot = skipped_slot;
+                                                last_emitted_slot_global = skipped_slot;
+                                                has_emitted_slot_global = true;
                                             }
                                         if tracking_enabled {
                                             overall_slots_processed.fetch_add(1, Ordering::Relaxed);
@@ -2279,6 +2387,7 @@ where
                                             }
                                         }
                                         last_counted_slot = skipped_slot;
+                                        has_counted_slot = true;
                                     }
 
                                     let cleared_pending_skip = if block_enabled {
@@ -2291,7 +2400,12 @@ where
                                         false
                                     };
 
-                                    if slot <= last_counted_slot && !cleared_pending_skip {
+                                    if slot_already_counted(
+                                        slot,
+                                        last_counted_slot,
+                                        has_counted_slot,
+                                    ) && !cleared_pending_skip
+                                    {
                                         log::debug!(
                                             target: &log_target,
                                             "duplicate block {}, already counted (last_counted={})",
@@ -2304,9 +2418,15 @@ where
 
                                     if block_enabled {
                                         if let Some(on_block_cb) = on_block.as_ref() {
-                                            let rewards =
-                                                std::mem::take(&mut this_block_rewards).rewards;
-                                            if slot > last_emitted_slot {
+                                            let DecodedRewards {
+                                                keyed_rewards,
+                                                num_partitions,
+                                            } = std::mem::take(&mut this_block_rewards);
+                                            if slot_should_emit(
+                                                slot,
+                                                last_emitted_slot_global,
+                                                has_emitted_slot_global,
+                                            ) {
                                                 on_block_cb(
                                                     thread_index,
                                                     BlockData::Block {
@@ -2314,7 +2434,10 @@ where
                                                         parent_blockhash: previous_blockhash,
                                                         slot: block.slot,
                                                         blockhash: latest_entry_blockhash,
-                                                        rewards,
+                                                        rewards: KeyedRewardsAndNumPartitions {
+                                                            keyed_rewards,
+                                                            num_partitions,
+                                                        },
                                                         block_time: Some(block.meta.blocktime as i64),
                                                         block_height: block.meta.block_height,
                                                         executed_transaction_count:
@@ -2329,7 +2452,8 @@ where
                                                         error_slot,
                                                     )
                                                 })?;
-                                                last_emitted_slot = slot;
+                                                last_emitted_slot_global = slot;
+                                                has_emitted_slot_global = true;
                                             }
                                         }
                                     } else {
@@ -2338,14 +2462,22 @@ where
                                     previous_blockhash = latest_entry_blockhash;
 
                                     // Data delivery is complete. A later stats error must resume
-                                    // after this slot so transactions cannot outlive their block callback.
-                                    if slot > last_counted_slot {
+                                    // after this slot so transactions cannot outlive their block
+                                    // callback.
+                                    if !has_counted_slot || slot > last_counted_slot {
                                         last_counted_slot = slot;
+                                        has_counted_slot = true;
                                     }
+                                    retry_parent = Some((slot, latest_entry_blockhash));
                                     if work_stealing {
-                                        work_registry[thread_index]
-                                            .next
-                                            .store(last_counted_slot.saturating_add(1), Ordering::SeqCst);
+                                        work_registry[thread_index].next.store(
+                                            next_uncounted_slot(
+                                                local_start,
+                                                last_counted_slot,
+                                                has_counted_slot,
+                                            ),
+                                            Ordering::SeqCst,
+                                        );
                                     }
 
                                     if tracking_enabled {
@@ -2435,7 +2567,7 @@ where
                                                 thread_index,
                                                 RewardsData {
                                                     slot: block.slot,
-                                                    rewards: decoded_rewards.to_handler_rewards(),
+                                                    rewards: decoded_rewards.keyed_rewards.clone(),
                                                 },
                                             )
                                             .await
@@ -2449,7 +2581,7 @@ where
                                         this_block_rewards = decoded_rewards;
                                         if let Some(ref mut stats) = thread_stats {
                                             stats.rewards_processed +=
-                                                this_block_rewards.rewards.keyed_rewards.len() as u64;
+                                                this_block_rewards.keyed_rewards.len() as u64;
                                         }
                                     }
                                 }
@@ -2504,7 +2636,7 @@ where
                         }
                     }
                     if let Some(expected_last_slot) = slot_range.end.checked_sub(1)
-                        && last_counted_slot < expected_last_slot
+                        && (!has_counted_slot || last_counted_slot < expected_last_slot)
                     {
                         // Do not synthesize skipped slots during final flush; another thread may
                         // cover the remaining range (especially across epoch boundaries).
@@ -2556,10 +2688,15 @@ where
                     if work_stealing {
                         let assignment_start =
                             work_registry[thread_index].start.load(Ordering::SeqCst);
+                        let assignment_end = next_uncounted_slot(
+                            assignment_start,
+                            last_counted_slot,
+                            has_counted_slot,
+                        );
                         coverage_log
                             .lock()
                             .unwrap()
-                            .push((assignment_start, last_counted_slot.saturating_add(1)));
+                            .push((assignment_start, assignment_end));
                     }
                     // This thread is done with its own range: publish "nothing remaining" so
                     // hunters stop targeting it, then drain any pending steal proposals with
@@ -2600,7 +2737,9 @@ where
                         thread_activity::clear_finished(thread_index);
                         slot_range = stolen;
                         last_counted_slot = slot_range.start.saturating_sub(1);
-                        last_emitted_slot = slot_range.start.saturating_sub(1);
+                        has_counted_slot = slot_range.start > 0;
+                        last_emitted_slot_global = slot_range.start.saturating_sub(1);
+                        has_emitted_slot_global = slot_range.start > 0;
                         reverse_partial_resume = None;
                         skip_until_index = None;
                         if let Some(ref mut stats) = thread_stats {
@@ -2682,12 +2821,17 @@ where
                     let (resume, highest) = reverse_resume_after_error(
                         slot,
                         last_counted_slot,
+                        has_counted_slot,
                         reverse_highest_remaining_epoch,
                     );
                     reverse_partial_resume = resume;
                     reverse_highest_remaining_epoch = highest;
-                } else if slot <= last_counted_slot {
+                } else if slot_already_counted(slot, last_counted_slot, has_counted_slot) {
                     slot_range.start = last_counted_slot.saturating_add(1);
+                } else if !has_counted_slot {
+                    // Nothing in a genesis-starting slice has completed.  Preserve slot 0
+                    // so retries cannot lose its PoH entries or a leading skipped run.
+                    slot_range.start = 0;
                 } else {
                     slot_range.start = slot;
                 }
@@ -2777,8 +2921,8 @@ where
         }
         let mut real_holes = 0usize;
         for (hole_start, hole_end) in &holes {
-            if let Some(missing) = crate::index::next_present_slot(
-                hole_start.saturating_sub(1),
+            if let Some(missing) = crate::index::first_present_slot_at_or_after(
+                *hole_start,
                 hole_end.saturating_sub(1),
             )
             .await
@@ -2846,7 +2990,6 @@ where
     Ok(())
 }
 
-#[allow(clippy::result_large_err)]
 /// Builds a Geyser-backed firehose and returns a slot notification stream.
 ///
 /// This helper is used by [`firehose`] when Geyser plugins need to be stood up in-process
@@ -2869,7 +3012,6 @@ pub fn firehose_geyser(
         ));
     }
     log::info!(target: LOG_MODULE, "starting firehose...");
-    log::info!(target: LOG_MODULE, "index base url: {}", index_base_url);
     let (confirmed_bank_sender, confirmed_bank_receiver) = unbounded();
     let mut entry_notifier_maybe = None;
     let mut block_meta_notifier_maybe = None;
@@ -2898,6 +3040,125 @@ pub fn firehose_geyser(
         log::debug!(target: LOG_MODULE, "geyser plugin service initialized.");
     }
 
+    let notifiers = GeyserNotifiers {
+        transaction_notifier: transaction_notifier_maybe,
+        sourced_transaction_notifier: None,
+        entry_notifier: entry_notifier_maybe,
+        block_metadata_notifier: block_meta_notifier_maybe,
+    };
+
+    firehose_geyser_with_notifiers(
+        rt,
+        slot_range,
+        notifiers,
+        confirmed_bank_sender,
+        index_base_url,
+        client,
+        Arc::new(AtomicBool::new(false)),
+        on_load,
+        threads,
+        false,
+        None,
+    )?;
+    Ok(confirmed_bank_receiver)
+}
+
+#[allow(clippy::too_many_arguments)]
+/// Builds a Geyser-backed firehose using caller-provided notifiers.
+///
+/// When `sequential` is `true`, a single firehose thread is used and `threads` configures
+/// ripget range-request concurrency instead. `buffer_window_bytes` controls the ripget
+/// hot/cold window; pass `None` for the default.
+pub fn firehose_geyser_with_notifiers(
+    rt: Arc<tokio::runtime::Runtime>,
+    slot_range: Range<u64>,
+    notifiers: GeyserNotifiers,
+    confirmed_bank_sender: Sender<SlotNotification>,
+    index_base_url: &Url,
+    client: &Client,
+    shutdown: Arc<AtomicBool>,
+    on_load: impl Future<Output = Result<(), SharedError>> + Send + 'static,
+    threads: u64,
+    sequential: bool,
+    buffer_window_bytes: Option<u64>,
+) -> Result<(), (FirehoseError, u64)> {
+    firehose_geyser_with_notifiers_and_block_parent(
+        rt,
+        slot_range,
+        notifiers,
+        None,
+        None,
+        confirmed_bank_sender,
+        index_base_url,
+        client,
+        shutdown,
+        on_load,
+        threads,
+        sequential,
+        buffer_window_bytes,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+/// Builds a Geyser-backed firehose with an early block-parent callback.
+///
+/// The callback runs after a block is decoded and before any transaction or
+/// entry callbacks for that block. Callers that do not need this ordering can
+/// use [`firehose_geyser_with_notifiers`]. `initial_parent` binds the first
+/// replayed block to a trusted bootstrap slot and blockhash and requires
+/// sequential mode.
+pub fn firehose_geyser_with_notifiers_and_block_parent(
+    rt: Arc<tokio::runtime::Runtime>,
+    slot_range: Range<u64>,
+    notifiers: GeyserNotifiers,
+    block_parent_notifier: Option<Arc<dyn BlockParentNotifier + Send + Sync + 'static>>,
+    initial_parent: Option<(u64, Hash)>,
+    confirmed_bank_sender: Sender<SlotNotification>,
+    index_base_url: &Url,
+    client: &Client,
+    shutdown: Arc<AtomicBool>,
+    on_load: impl Future<Output = Result<(), SharedError>> + Send + 'static,
+    threads: u64,
+    sequential: bool,
+    buffer_window_bytes: Option<u64>,
+) -> Result<(), (FirehoseError, u64)> {
+    if initial_parent.is_some() && !sequential {
+        return Err((
+            FirehoseError::OnLoadError(
+                "an initial previous blockhash requires sequential replay".into(),
+            ),
+            slot_range.start,
+        ));
+    }
+    if threads == 0 {
+        return Err((
+            FirehoseError::OnLoadError("Number of threads must be greater than 0".into()),
+            slot_range.start,
+        ));
+    }
+    log::info!(target: LOG_MODULE, "starting firehose...");
+    log::info!(target: LOG_MODULE, "index base url: {}", index_base_url);
+    let firehose_threads = if sequential { 1 } else { threads };
+    let sequential_download_threads = std::cmp::max(1, threads as usize);
+    let sequential_buffer_window_bytes = buffer_window_bytes
+        .filter(|value| *value >= 2)
+        .unwrap_or_else(crate::system::default_firehose_buffer_window_bytes);
+    if sequential {
+        log::info!(
+            target: LOG_MODULE,
+            "sequential mode enabled: firehose_threads=1, ripget_threads={}, ripget_window={}",
+            sequential_download_threads,
+            crate::system::format_byte_size(sequential_buffer_window_bytes)
+        );
+    }
+
+    let transaction_notifier_maybe = Arc::new(notifiers.transaction_notifier);
+    let sourced_transaction_notifier_maybe = Arc::new(notifiers.sourced_transaction_notifier);
+    let entry_notifier_maybe = Arc::new(notifiers.entry_notifier);
+    let block_parent_notifier_maybe = Arc::new(block_parent_notifier);
+    let block_meta_notifier_maybe = Arc::new(notifiers.block_metadata_notifier);
+    let initial_parent = Arc::new(initial_parent);
+
     if entry_notifier_maybe.is_some() {
         log::debug!(target: LOG_MODULE, "entry notifications enabled")
     } else {
@@ -2907,14 +3168,24 @@ pub fn firehose_geyser(
     rt.spawn(on_load);
 
     let slot_range = Arc::new(slot_range);
-    let transaction_notifier_maybe = Arc::new(transaction_notifier_maybe);
-    let entry_notifier_maybe = Arc::new(entry_notifier_maybe);
-    let block_meta_notifier_maybe = Arc::new(block_meta_notifier_maybe);
     let confirmed_bank_sender = Arc::new(confirmed_bank_sender);
 
+    // Build a shared ripget HTTP client so TCP connections survive across epoch transitions.
+    let shared_ripget_client: Option<ripget::Client> = if sequential {
+        Some(
+            ripget::build_client(Some(&format!(
+                "jetstreamer-firehose/{}",
+                env!("CARGO_PKG_VERSION")
+            )))
+            .expect("failed to build ripget HTTP client"),
+        )
+    } else {
+        None
+    };
+
     // divide slot_range into n subranges
-    let subranges = generate_subranges(&slot_range, threads);
-    if threads > 1 {
+    let subranges = generate_subranges(&slot_range, firehose_threads);
+    if firehose_threads > 1 {
         log::info!(target: LOG_MODULE, "⚡ thread sub-ranges: {:?}", subranges);
     }
 
@@ -2925,36 +3196,45 @@ pub fn firehose_geyser(
 
     for (i, slot_range) in subranges.into_iter().enumerate() {
         let transaction_notifier_maybe = (*transaction_notifier_maybe).clone();
+        let sourced_transaction_notifier_maybe = (*sourced_transaction_notifier_maybe).clone();
         let entry_notifier_maybe = (*entry_notifier_maybe).clone();
+        let block_parent_notifier_maybe = (*block_parent_notifier_maybe).clone();
         let block_meta_notifier_maybe = (*block_meta_notifier_maybe).clone();
+        let initial_parent = *initial_parent;
         let confirmed_bank_sender = (*confirmed_bank_sender).clone();
         let client = client.clone();
         let error_counts = error_counts.clone();
+        let shutdown = shutdown.clone();
+        let ripget_client = shared_ripget_client.clone();
 
         let rt_clone = rt.clone();
 
         let handle = std::thread::spawn(move || {
-            rt_clone.block_on(async {
-                firehose_geyser_thread(
-                    slot_range,
-                    transaction_notifier_maybe,
-                    entry_notifier_maybe,
-                    block_meta_notifier_maybe,
-                    confirmed_bank_sender,
-                    &client,
-                    if threads > 1 { Some(i) } else { None },
-                    error_counts,
-                )
-                .await
-                .unwrap();
-            });
+            rt_clone.block_on(firehose_geyser_thread(
+                slot_range,
+                transaction_notifier_maybe,
+                sourced_transaction_notifier_maybe,
+                entry_notifier_maybe,
+                block_parent_notifier_maybe,
+                block_meta_notifier_maybe,
+                initial_parent,
+                confirmed_bank_sender,
+                &client,
+                if firehose_threads > 1 { Some(i) } else { None },
+                error_counts,
+                shutdown,
+                sequential,
+                sequential_download_threads,
+                sequential_buffer_window_bytes,
+                ripget_client,
+            ))
         });
         handles.push(handle);
     }
 
     // Wait for all threads to complete
     for handle in handles {
-        handle.join().unwrap();
+        handle.join().unwrap()?;
     }
     log::info!(target: LOG_MODULE, "🚒 firehose finished successfully.");
     if let Some(block_meta_notifier) = block_meta_notifier_maybe.as_ref() {
@@ -2971,10 +3251,9 @@ pub fn firehose_geyser(
             None,
             0,
             0,
-            false,
         );
     }
-    Ok(confirmed_bank_receiver)
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2982,12 +3261,22 @@ pub fn firehose_geyser(
 async fn firehose_geyser_thread(
     mut slot_range: Range<u64>,
     transaction_notifier_maybe: Option<Arc<dyn TransactionNotifier + Send + Sync + 'static>>,
+    sourced_transaction_notifier_maybe: Option<
+        Arc<dyn SourcedTransactionNotifier + Send + Sync + 'static>,
+    >,
     entry_notifier_maybe: Option<Arc<dyn EntryNotifier + Send + Sync + 'static>>,
+    block_parent_notifier_maybe: Option<Arc<dyn BlockParentNotifier + Send + Sync + 'static>>,
     block_meta_notifier_maybe: Option<Arc<dyn BlockMetadataNotifier + Send + Sync + 'static>>,
+    initial_parent: Option<(u64, Hash)>,
     confirmed_bank_sender: Sender<SlotNotification>,
     client: &Client,
     thread_index: Option<usize>,
     error_counts: Arc<Vec<AtomicU32>>,
+    shutdown: Arc<AtomicBool>,
+    sequential_mode: bool,
+    ripget_threads: usize,
+    ripget_buffer_window_bytes: u64,
+    ripget_client: Option<ripget::Client>,
 ) -> Result<(), (FirehoseError, u64)> {
     let start_time = std::time::Instant::now();
     let log_target = if let Some(thread_index) = thread_index {
@@ -2998,9 +3287,22 @@ async fn firehose_geyser_thread(
     let initial_slot_range = slot_range.clone();
     let mut skip_until_index = None;
     let mut last_counted_slot = slot_range.start.saturating_sub(1);
+    // `saturating_sub(1)` cannot distinguish "nothing processed" from slot 0.
+    // Keep that distinction explicit so a range beginning at genesis does not
+    // discard slot 0 as a duplicate.
+    let mut has_counted_slot = slot_range.start > 0;
     let mut retry_backoff = RetryBackoff::new();
+    let mut retry_parent: Option<(u64, Hash)> = None;
     // let mut triggered = false;
     while let Err((err, slot)) = async {
+            if shutdown.load(Ordering::Relaxed) {
+                return Ok(());
+            }
+            let op_timeout = if sequential_mode {
+                OP_TIMEOUT_SEQUENTIAL
+            } else {
+                OP_TIMEOUT
+            };
             let epoch_range = slot_to_epoch(slot_range.start)..=slot_to_epoch(slot_range.end - 1);
             log::info!(
                 target: &log_target,
@@ -3015,27 +3317,20 @@ async fn firehose_geyser_thread(
 
             // for each epoch
             let mut current_slot: Option<u64> = None;
+            let mut initial_parent_pending = if slot_range.start == initial_slot_range.start {
+                initial_parent
+            } else {
+                retry_parent
+            };
+            let mut todo_previous_blockhash = initial_parent_pending
+                .map(|(_, blockhash)| blockhash)
+                .unwrap_or_default();
+            let mut todo_latest_entry_blockhash = todo_previous_blockhash;
             for epoch_num in epoch_range.clone() {
+                if shutdown.load(Ordering::Relaxed) {
+                    return Ok(());
+                }
                 log::info!(target: &log_target, "entering epoch {}", epoch_num);
-                let stream = match timeout(OP_TIMEOUT, fetch_epoch_stream(epoch_num, client)).await {
-                    Ok(stream) => stream,
-                    Err(_) => {
-                        return Err((FirehoseError::OperationTimeout("fetch_epoch_stream"), current_slot.unwrap_or(slot_range.start)));
-                    }
-                };
-                let mut reader = NodeReader::new(stream);
-
-                let header_fut = reader.read_raw_header();
-                let header = match timeout(OP_TIMEOUT, header_fut).await {
-                    Ok(res) => res
-                        .map_err(FirehoseError::ReadHeader)
-                        .map_err(|e| (e, current_slot.unwrap_or(slot_range.start)))?,
-                    Err(_) => {
-                        return Err((FirehoseError::OperationTimeout("read_raw_header"), current_slot.unwrap_or(slot_range.start)));
-                    }
-                };
-                log::debug!(target: &log_target, "read epoch {} header: {:?}", epoch_num, header);
-
                 let (epoch_start, epoch_end_inclusive) = epoch_to_slot_range(epoch_num);
                 let local_start = std::cmp::max(slot_range.start, epoch_start);
                 let local_end_inclusive =
@@ -3050,12 +3345,52 @@ async fn firehose_geyser_thread(
                     );
                     continue;
                 }
+                let use_sequential_stream = sequential_mode && local_start == epoch_start;
+                let stream = match timeout(op_timeout, async {
+                    if use_sequential_stream {
+                        fetch_epoch_stream_with_options(
+                            epoch_num,
+                            client,
+                            Some(FetchEpochStreamOptions {
+                                sequential: true,
+                                ripget_threads,
+                                buffer_window_bytes: ripget_buffer_window_bytes,
+                                ripget_client: ripget_client.clone(),
+                            }),
+                        )
+                        .await
+                    } else {
+                        fetch_epoch_stream(epoch_num, client).await
+                    }
+                })
+                .await
+                {
+                    Ok(stream) => stream,
+                    Err(_) => {
+                        return Err((FirehoseError::OperationTimeout("fetch_epoch_stream"), current_slot.unwrap_or(slot_range.start)));
+                    }
+                };
+                let mut reader = NodeReader::new(stream);
 
-                let mut todo_previous_blockhash = Hash::default();
-                let mut todo_latest_entry_blockhash = Hash::default();
+                let header_fut = reader.read_raw_header();
+                let header = match timeout(op_timeout, header_fut).await {
+                    Ok(res) => res
+                        .map_err(FirehoseError::ReadHeader)
+                        .map_err(|e| (e, current_slot.unwrap_or(slot_range.start)))?,
+                    Err(_) => {
+                        return Err((FirehoseError::OperationTimeout("read_raw_header"), current_slot.unwrap_or(slot_range.start)));
+                    }
+                };
+                log::debug!(target: &log_target, "read epoch {} header: {:?}", epoch_num, header);
+
+                if local_start > epoch_start && initial_parent_pending.is_none() {
+                    todo_previous_blockhash = Hash::default();
+                    todo_latest_entry_blockhash = Hash::default();
+                }
                 // Reset counters to align to the local epoch slice; prevents boundary slots
                 // from being treated as already-counted after a restart.
                 last_counted_slot = local_start.saturating_sub(1);
+                has_counted_slot = local_start > 0;
                 current_slot = None;
 
                 if local_start > epoch_start {
@@ -3067,9 +3402,19 @@ async fn firehose_geyser_thread(
                     // before starting the timeout clock: with hundreds of threads the permit
                     // queue alone can exceed the op timeout, and that wait is pacing, not a
                     // stall.
+                    //
+                    // Enter one present slot early when the index allows: the preceding
+                    // block is decoded but not emitted (the below-start guard skips it),
+                    // which primes the parent-hash chain so the first emitted block
+                    // carries its true parent_blockhash instead of Hash::default() —
+                    // otherwise every mid-epoch (re)start stamps a zero parent into
+                    // consumers (one linkage break per retry in written archives).
+                    let seek_target = crate::index::prev_present_slot(epoch_start, local_start)
+                        .await
+                        .unwrap_or(local_start);
                     reader.prime_seek_permit().await;
-                    let seek_fut = reader.seek_to_slot(local_start);
-                    match timeout(OP_TIMEOUT, seek_fut).await {
+                    let seek_fut = reader.seek_to_slot(seek_target);
+                    match timeout(op_timeout, seek_fut).await {
                         Ok(res) => res.map_err(|e| (e, local_start))?,
                         Err(_) => {
                             return Err((
@@ -3084,8 +3429,11 @@ async fn firehose_geyser_thread(
                 let mut item_index = 0;
                 let mut displayed_skip_message = false;
                 loop {
+                    if shutdown.load(Ordering::Relaxed) {
+                        return Ok(());
+                    }
                     let read_fut = reader.read_until_block();
-                    let nodes = match timeout(OP_TIMEOUT, read_fut).await {
+                    let nodes = match timeout(op_timeout, read_fut).await {
                         Ok(result) => result
                             .map_err(FirehoseError::ReadUntilBlockError)
                             .map_err(|e| (e, current_slot.unwrap_or(slot_range.start)))?,
@@ -3099,6 +3447,9 @@ async fn firehose_geyser_thread(
                             ));
                         }
                     };
+                    if shutdown.load(Ordering::Relaxed) {
+                        return Ok(());
+                    }
                     thread_activity::note(thread_index.unwrap_or(0));
                     let stream_ended = nodes.is_empty()
                         || nodes
@@ -3109,8 +3460,16 @@ async fn firehose_geyser_thread(
                         // EOF is ambiguous (genuine epoch end vs a connection the CDN closed
                         // mid-transfer); consult the slot index before completing.
                         let scan_end = local_end_inclusive.min(slot_range.end.saturating_sub(1));
-                        if let Some(missing) =
-                            crate::index::next_present_slot(last_counted_slot, scan_end).await
+                        let next_unprocessed = next_uncounted_slot(
+                            local_start,
+                            last_counted_slot,
+                            has_counted_slot,
+                        );
+                        if let Some(missing) = crate::index::first_present_slot_at_or_after(
+                            next_unprocessed,
+                            scan_end,
+                        )
+                        .await
                         {
                             log::warn!(
                                 target: &log_target,
@@ -3120,7 +3479,7 @@ async fn firehose_geyser_thread(
                             );
                             return Err((
                                 FirehoseError::PrematureStreamEnd,
-                                last_counted_slot.saturating_add(1),
+                                next_unprocessed,
                             ));
                         }
                         log::info!(target: &log_target, "reached end of epoch {}", epoch_num);
@@ -3170,6 +3529,36 @@ async fn firehose_geyser_thread(
                                 local_start
                             );
                         }
+                        // Fold the skipped block's entries into the hash chain: its
+                        // last entry hash is its blockhash, i.e. the next block's
+                        // true parent.
+                        if let Some(hash) = last_entry_hash(&nodes) {
+                            match initial_parent_pending {
+                                Some((parent_slot, expected_hash)) if block.slot == parent_slot => {
+                                    if hash != expected_hash {
+                                        return Err((
+                                            FirehoseError::OnLoadError(
+                                                std::io::Error::new(
+                                                    std::io::ErrorKind::InvalidData,
+                                                    format!(
+                                                        "bootstrap blockhash does not match decoded block {parent_slot}"
+                                                    ),
+                                                )
+                                                .into(),
+                                            ),
+                                            local_start,
+                                        ));
+                                    }
+                                    todo_latest_entry_blockhash = hash;
+                                    todo_previous_blockhash = hash;
+                                }
+                                Some(_) => {}
+                                None => {
+                                    todo_latest_entry_blockhash = hash;
+                                    todo_previous_blockhash = hash;
+                                }
+                            }
+                        }
                         continue;
                     }
                     current_slot = Some(slot);
@@ -3178,7 +3567,7 @@ async fn firehose_geyser_thread(
                     let mut this_block_entry_count: u64 = 0;
                     let mut this_block_rewards = DecodedRewards::empty();
 
-                    if slot <= last_counted_slot {
+                    if slot_already_counted(slot, last_counted_slot, has_counted_slot) {
                         log::debug!(
                             target: &log_target,
                             "duplicate block {}, already counted (last_counted={})",
@@ -3186,6 +3575,36 @@ async fn firehose_geyser_thread(
                             last_counted_slot,
                         );
                         continue;
+                    }
+
+                    if shutdown.load(Ordering::Relaxed) {
+                        return Ok(());
+                    }
+
+                    match initial_parent_pending.take() {
+                        Some((expected_parent_slot, expected_parent_hash))
+                            if block.meta.parent_slot != expected_parent_slot
+                                || todo_previous_blockhash != expected_parent_hash =>
+                        {
+                            return Err((
+                                FirehoseError::OnLoadError(
+                                    std::io::Error::new(
+                                        std::io::ErrorKind::InvalidData,
+                                        format!(
+                                            "first replayed block {slot} does not link to bootstrap block {expected_parent_slot}"
+                                        ),
+                                    )
+                                    .into(),
+                                ),
+                                local_start,
+                            ));
+                        }
+                        _ => {}
+                    }
+
+                    if let Some(block_parent_notifier) = block_parent_notifier_maybe.as_ref() {
+                        block_parent_notifier
+                            .notify_block_parent(block.meta.parent_slot, block.slot);
                     }
 
                     nodes.each(|node_with_cid| -> Result<(), SharedError> {
@@ -3222,7 +3641,11 @@ async fn firehose_geyser_thread(
                         match node {
                             Transaction(tx) => {
                                 let versioned_tx = tx.as_parsed()?;
-                                let reassembled_metadata = nodes.reassemble_dataframes(&tx.metadata)?;
+                                let reassembled_metadata = nodes.reassemble_dataframes_bounded(
+                                    &tx.metadata,
+                                    utils::MAX_TRANSACTION_METADATA_FRAME_SIZE,
+                                )?;
+                                let status_meta_available = !reassembled_metadata.is_empty();
 
                                 let as_native_metadata = decode_transaction_status_meta_from_frame(
                                     block.slot,
@@ -3263,6 +3686,23 @@ async fn firehose_geyser_thread(
                                         &versioned_tx,
                                     );
                                 }
+                                if let Some(transaction_notifier) =
+                                    sourced_transaction_notifier_maybe.as_ref()
+                                {
+                                    transaction_notifier.notify_transaction(SourcedTransaction {
+                                        slot: block.slot,
+                                        transaction_slot_index: tx.index.unwrap() as usize,
+                                        signature,
+                                        message_hash: &message_hash,
+                                        is_vote,
+                                        status: if status_meta_available {
+                                            SourcedTransactionStatus::Observed(&as_native_metadata)
+                                        } else {
+                                            SourcedTransactionStatus::Missing
+                                        },
+                                        transaction: &versioned_tx,
+                                    });
+                                }
 
                             }
                             Entry(entry) => {
@@ -3301,26 +3741,32 @@ async fn firehose_geyser_thread(
 
                                 if block_meta_notifier_maybe.is_none() {
                                     last_counted_slot = block.slot;
+                                    has_counted_slot = true;
                                     return Ok(());
                                 }
-                                let decoded_rewards = std::mem::take(&mut this_block_rewards);
-                                let commission_rate_in_basis_points =
-                                    decoded_rewards.commission_rate_in_basis_points;
+                                let DecodedRewards {
+                                    keyed_rewards,
+                                    num_partitions,
+                                } = std::mem::take(&mut this_block_rewards);
                                 let block_meta_notifier = block_meta_notifier_maybe.as_ref().unwrap();
                                 block_meta_notifier.notify_block_metadata(
                                     block.meta.parent_slot,
                                     todo_previous_blockhash.to_string().as_str(),
                                     block.slot,
                                     todo_latest_entry_blockhash.to_string().as_str(),
-                                    &decoded_rewards.rewards,
+                                    &KeyedRewardsAndNumPartitions {
+                                        keyed_rewards,
+                                        num_partitions,
+                                    },
                                     Some(block.meta.blocktime as i64),
                                     block.meta.block_height,
                                     this_block_executed_transaction_count,
                                     this_block_entry_count,
-                                    commission_rate_in_basis_points,
                                 );
                                 todo_previous_blockhash = todo_latest_entry_blockhash;
+                                retry_parent = Some((block.slot, todo_latest_entry_blockhash));
                                 last_counted_slot = block.slot;
+                                has_counted_slot = true;
                                 std::thread::yield_now();
                             }
                             Subset(_subset) => (),
@@ -3387,6 +3833,9 @@ async fn firehose_geyser_thread(
             );
             return Ok(());
         }
+        if matches!(err, FirehoseError::OnLoadError(_)) {
+            return Err((err, slot));
+        }
         log::error!(
             target: &log_target,
             "🧯💦🔥 firehose encountered an error at slot {} in epoch {} and will roll back one slot and retry:",
@@ -3417,8 +3866,11 @@ async fn firehose_geyser_thread(
             );
             // Update slot range to resume from the failed slot, not the original start.
             // If the failing slot was already fully processed, resume from the next slot.
-            if slot <= last_counted_slot {
+            if slot_already_counted(slot, last_counted_slot, has_counted_slot) {
                 slot_range.start = last_counted_slot.saturating_add(1);
+            } else if !has_counted_slot {
+                // Preserve slot 0 until a complete block has been delivered.
+                slot_range.start = 0;
             } else {
                 slot_range.start = slot;
             }
@@ -3467,16 +3919,15 @@ fn is_simple_vote_transaction(versioned_tx: &VersionedTransaction) -> bool {
 #[inline(always)]
 fn convert_proto_rewards(
     proto_rewards: &solana_storage_proto::convert::generated::Rewards,
-) -> Result<KeyedRewardsAndNumPartitions, SharedError> {
+) -> Result<Vec<(Address, RewardInfo)>, SharedError> {
     let mut keyed_rewards = Vec::with_capacity(proto_rewards.rewards.len());
     for proto_reward in proto_rewards.rewards.iter() {
-        let reward = StakeRewardInfo {
+        let reward = RewardInfo {
             reward_type: match proto_reward.reward_type - 1 {
                 0 => RewardType::Fee,
                 1 => RewardType::Rent,
                 2 => RewardType::Staking,
                 3 => RewardType::Voting,
-                4 => RewardType::DeactivatedStake,
                 typ => {
                     return Err(Box::new(std::io::Error::other(format!(
                         "unsupported reward type {}",
@@ -3486,29 +3937,15 @@ fn convert_proto_rewards(
             },
             lamports: proto_reward.lamports,
             post_balance: proto_reward.post_balance,
-            // Blocks recorded before SIMD-0291 only carry a whole-percent commission; scale it
-            // so the runtime's basis-point field is populated either way.
-            commission_bps: proto_reward.commission_bps.parse::<u16>().ok().or_else(|| {
-                proto_reward
-                    .commission
-                    .parse::<u8>()
-                    .ok()
-                    .map(|percent| u16::from(percent) * 100)
-            }),
+            commission: proto_reward.commission.parse::<u8>().ok(),
         };
         let pubkey = proto_reward
             .pubkey
             .parse::<Address>()
             .map_err(|err| Box::new(err) as SharedError)?;
-        keyed_rewards.push((pubkey, reward.into()));
+        keyed_rewards.push((pubkey, reward));
     }
-    Ok(KeyedRewardsAndNumPartitions {
-        keyed_rewards,
-        num_partitions: proto_rewards
-            .num_partitions
-            .as_ref()
-            .map(|p| p.num_partitions),
-    })
+    Ok(keyed_rewards)
 }
 
 #[inline]
@@ -3612,7 +4049,7 @@ mod reverse_resume_tests {
 
     #[test]
     fn test_mid_epoch_error_resumes_in_place() {
-        let (resume, highest) = reverse_resume_after_error(388799951, 388799950, Some(899));
+        let (resume, highest) = reverse_resume_after_error(388799951, 388799950, true, Some(899));
         assert_eq!(resume, Some(388799951));
         assert_eq!(highest, Some(899));
     }
@@ -3621,7 +4058,7 @@ mod reverse_resume_tests {
     fn test_tail_timeout_marks_epoch_complete() {
         // Error attributed to the next epoch's first slot after the tail slot was counted:
         // the epoch slice is done; resuming from the slice start would double-emit it.
-        let (resume, highest) = reverse_resume_after_error(388800000, 388799999, Some(899));
+        let (resume, highest) = reverse_resume_after_error(388800000, 388799999, true, Some(899));
         assert_eq!(resume, None);
         assert_eq!(highest, Some(898));
     }
@@ -3630,7 +4067,7 @@ mod reverse_resume_tests {
     fn test_tail_error_attributed_within_epoch_marks_complete() {
         // Decoding error attributed to the already-counted tail slot: resume would be
         // tail + 1, crossing the boundary — same completion case.
-        let (resume, highest) = reverse_resume_after_error(388799999, 388799999, Some(899));
+        let (resume, highest) = reverse_resume_after_error(388799999, 388799999, true, Some(899));
         assert_eq!(resume, None);
         assert_eq!(highest, Some(898));
     }
@@ -3639,7 +4076,7 @@ mod reverse_resume_tests {
     fn test_seek_error_before_any_progress_keeps_epoch() {
         // First epoch (900) seek fails before any block; last_counted is still the
         // pre-range sentinel in epoch 899. The higher epoch must not be marked complete.
-        let (resume, highest) = reverse_resume_after_error(388800000, 388799899, Some(900));
+        let (resume, highest) = reverse_resume_after_error(388800000, 388799899, true, Some(900));
         assert_eq!(resume, None);
         assert_eq!(highest, Some(900));
     }
@@ -3649,7 +4086,7 @@ mod reverse_resume_tests {
         // Epoch 900 finished (last_counted in 900); epoch 899's seek fails with the error
         // attributed inside 899. Not a tail crossing — keep a resume marker (which the
         // epoch-match check resolves to the slice start of 899).
-        let (resume, highest) = reverse_resume_after_error(388799900, 388800099, Some(899));
+        let (resume, highest) = reverse_resume_after_error(388799900, 388800099, true, Some(899));
         assert_eq!(resume, Some(388800100));
         assert_eq!(highest, Some(899));
     }
@@ -3659,9 +4096,34 @@ mod reverse_resume_tests {
         // Epoch 0's tail is slot 431999; the error is attributed to slot 432000 (epoch 1).
         // "No epochs remaining" must be explicit (`None`) — a saturating subtraction would
         // silently pin at 0 and replay epoch 0 forever.
-        let (resume, highest) = reverse_resume_after_error(432000, 431999, Some(0));
+        let (resume, highest) = reverse_resume_after_error(432000, 431999, true, Some(0));
         assert_eq!(resume, None);
         assert_eq!(highest, None);
+    }
+
+    #[test]
+    fn test_epoch_zero_error_before_first_count_retries_slot_zero() {
+        let (resume, highest) = reverse_resume_after_error(0, 0, false, Some(0));
+        assert_eq!(resume, Some(0));
+        assert_eq!(highest, Some(0));
+    }
+
+    #[test]
+    fn test_epoch_zero_error_after_first_count_advances() {
+        let (resume, highest) = reverse_resume_after_error(0, 0, true, Some(0));
+        assert_eq!(resume, Some(1));
+        assert_eq!(highest, Some(0));
+    }
+
+    #[test]
+    fn test_genesis_slot_cursor_distinguishes_unprocessed_from_counted_zero() {
+        assert_eq!(next_uncounted_slot(0, 0, false), 0);
+        assert!(!slot_already_counted(0, 0, false));
+        assert!(slot_should_emit(0, 0, false));
+
+        assert_eq!(next_uncounted_slot(0, 0, true), 1);
+        assert!(slot_already_counted(0, 0, true));
+        assert!(!slot_should_emit(0, 0, true));
     }
 }
 
@@ -4592,6 +5054,143 @@ async fn test_firehose_gap_coverage_near_known_missing_range() {
         missing.len(),
         &missing[..missing.len().min(10)]
     );
+}
+
+#[cfg(test)]
+#[serial]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_firehose_sequential_carries_parent_hash_across_epoch_boundary() {
+    use std::sync::{Arc, Mutex};
+
+    solana_logger::setup_with_default("info");
+    const SLOT_COUNT: u64 = 100;
+
+    let (epoch_900_start, _) = epoch_to_slot_range(900);
+    let slot_range = (epoch_900_start - SLOT_COUNT)..(epoch_900_start + SLOT_COUNT);
+    let observed = Arc::new(Mutex::new(Vec::new()));
+
+    firehose(
+        1,
+        true,
+        false,
+        None,
+        slot_range,
+        Some({
+            let observed = observed.clone();
+            move |_thread_id: usize, block: BlockData| {
+                let observed = observed.clone();
+                async move {
+                    if let BlockData::Block {
+                        parent_slot,
+                        parent_blockhash,
+                        slot,
+                        blockhash,
+                        ..
+                    } = block
+                    {
+                        observed.lock().unwrap().push((
+                            slot,
+                            parent_slot,
+                            parent_blockhash,
+                            blockhash,
+                        ));
+                    }
+                    Ok(())
+                }
+                .boxed()
+            }
+        }),
+        None::<OnTxFn>,
+        None::<OnEntryFn>,
+        None::<OnRewardFn>,
+        None::<OnErrorFn>,
+        None::<OnStatsTrackingFn>,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let observed = observed.lock().unwrap();
+    let first_upper = observed
+        .iter()
+        .position(|(slot, ..)| *slot >= epoch_900_start)
+        .expect("expected a block in epoch 900");
+    assert!(first_upper > 0, "expected a preceding epoch 899 block");
+    let (previous_slot, _, _, previous_hash) = observed[first_upper - 1];
+    let (slot, parent_slot, parent_hash, _) = observed[first_upper];
+    assert_eq!(slot_to_epoch(previous_slot), 899);
+    assert_eq!(slot_to_epoch(slot), 900);
+    assert_eq!(parent_slot, previous_slot);
+    assert_eq!(parent_hash, previous_hash);
+}
+
+#[cfg(test)]
+#[test]
+fn test_seeded_geyser_requires_sequential_mode() {
+    let runtime = Arc::new(tokio::runtime::Runtime::new().expect("runtime"));
+    let notifiers = GeyserNotifiers {
+        transaction_notifier: None,
+        sourced_transaction_notifier: None,
+        entry_notifier: None,
+        block_metadata_notifier: None,
+    };
+    let (confirmed_bank_sender, _confirmed_bank_receiver) = unbounded();
+    let index_base_url = Url::parse(crate::epochs::BASE_URL).expect("base URL");
+    let client = Client::new();
+    let result = firehose_geyser_with_notifiers_and_block_parent(
+        runtime,
+        345_600_000..345_600_001,
+        notifiers,
+        None,
+        Some((345_599_999, Hash::new_unique())),
+        confirmed_bank_sender,
+        &index_base_url,
+        &client,
+        Arc::new(AtomicBool::new(false)),
+        async { Ok(()) },
+        2,
+        false,
+        None,
+    );
+    assert!(matches!(
+        result,
+        Err((FirehoseError::OnLoadError(_), 345_600_000))
+    ));
+}
+
+#[cfg(test)]
+#[serial]
+#[test]
+fn test_seeded_geyser_propagates_initial_parent_mismatch() {
+    let runtime = Arc::new(tokio::runtime::Runtime::new().expect("runtime"));
+    let notifiers = GeyserNotifiers {
+        transaction_notifier: None,
+        sourced_transaction_notifier: None,
+        entry_notifier: None,
+        block_metadata_notifier: None,
+    };
+    let (confirmed_bank_sender, _confirmed_bank_receiver) = unbounded();
+    let index_base_url = Url::parse(crate::epochs::BASE_URL).expect("base URL");
+    let client = Client::new();
+    let result = firehose_geyser_with_notifiers_and_block_parent(
+        runtime,
+        345_600_000..345_600_001,
+        notifiers,
+        None,
+        Some((1, Hash::new_unique())),
+        confirmed_bank_sender,
+        &index_base_url,
+        &client,
+        Arc::new(AtomicBool::new(false)),
+        async { Ok(()) },
+        4,
+        true,
+        None,
+    );
+    assert!(matches!(
+        result,
+        Err((FirehoseError::OnLoadError(_), 345_600_000))
+    ));
 }
 
 #[cfg(test)]

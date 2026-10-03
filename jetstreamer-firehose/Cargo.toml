@@ -30,6 +30,7 @@ serial_test.workspace = true
 solana-rpc.workspace = true
 solana-runtime.workspace = true
 solana-hash.workspace = true
+solana-account-decoder-client-types.workspace = true
 solana-geyser-plugin-manager.workspace = true
 solana-storage-proto.workspace = true
 solana-address.workspace = true
@@ -39,12 +40,12 @@ solana-transaction-status.workspace = true
 solana-ledger.workspace = true
 solana-signature.workspace = true
 solana-sdk-ids.workspace = true
-solana-accounts-db.workspace = true
-prost_014.workspace = true
+prost_011.workspace = true
 solana-entry.workspace = true
 reqwest = { workspace = true, features = ["json", "stream"] }
-tokio.workspace = true
+tokio = { workspace = true, features = ["rt", "sync", "io-util", "fs"] }
 futures-util.workspace = true
+jetstreamer-horizon.workspace = true
 serde = { workspace = true, features = ["derive"] }
 thiserror.workspace = true
 cid.workspace = true
@@ -61,6 +62,9 @@ fnv.workspace = true
 serde_json.workspace = true
 zstd.workspace = true
 solana-reward-info.workspace = true
+solana-instruction-error.workspace = true
+solana-serde.workspace = true
+solana-transaction-error.workspace = true
 bincode.workspace = true
 xxhash-rust.workspace = true
 ahash.workspace = true
@@ -75,6 +79,7 @@ aws-smithy-types = { workspace = true, optional = true }
 aws-types = { workspace = true, optional = true }
 
 [dev-dependencies]
+sha2.workspace = true
 tempfile.workspace = true
 serial_test = "4"
-sha2.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

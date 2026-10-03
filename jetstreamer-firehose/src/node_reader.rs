@@ -268,7 +268,7 @@ impl<R: AsyncRead + Unpin + AsyncSeek + Len> NodeReader<R> {
                 }
                 // Surface index failures as SlotOffsetIndexError so callers can invalidate the
                 // cached epoch index and retry with fresh data.
-                Err(err) => return Err(FirehoseError::SlotOffsetIndexError(err)),
+                Err(err) => return Err(err.into()),
             }
         }
     }
@@ -297,15 +297,13 @@ impl<R: AsyncRead + Unpin + AsyncSeek + Len> NodeReader<R> {
                     return self.seek_to_offset(offset + length).await;
                 }
                 Err(SlotOffsetIndexError::SlotNotFound(..)) => continue,
-                Err(err) => return Err(FirehoseError::SlotOffsetIndexError(err)),
+                Err(err) => return Err(err.into()),
             }
         }
         // An index that reports every slot of an epoch as skipped is corrupt; surface an index
         // error so callers invalidate the cached epoch index and refetch instead of retrying
         // against the same bad data forever.
-        Err(FirehoseError::SlotOffsetIndexError(
-            SlotOffsetIndexError::EpochHasNoIndexedSlots(epoch),
-        ))
+        Err(SlotOffsetIndexError::EpochHasNoIndexedSlots(epoch).into())
     }
 
     async fn seek_to_offset(&mut self, offset: u64) -> Result<(), FirehoseError> {

@@ -65,12 +65,15 @@
 //! Old Faithful snapshots expose different metadata as the Solana protocol evolved. Use the
 //! table below to decide which replay windows fit your requirements:
 //!
-//! | Epoch range | Slot range    | Comment |
-//! |-------------|---------------|--------------------------------------------------|
-//! | 0–156       | 0–?           | Incompatible with modern Geyser plugins          |
-//! | 157+        | ?             | Compatible with modern Geyser plugins            |
-//! | 0–449       | 0–194184610   | CU tracking not available (reported as `0`)      |
-//! | 450+        | 194184611+    | CU tracking fully available                      |
+//! | Epoch/range | Slot range        | Comment |
+//! |-------------|-------------------|-----------------------------------------------|
+//! | 0-156       | 0-67,823,999      | Bincode transaction metadata (auto-decoded)   |
+//! | 157+        | 67,824,000+       | Protobuf transaction metadata                 |
+//! | through 449 | 0-194,184,610     | CU tracking unavailable (reported as `0`)     |
+//! | from 449    | 194,184,611+      | CU tracking available                         |
+//!
+//! These are input/output metadata boundaries, not consensus-runtime
+//! boundaries. Historical execution must be selected independently.
 //!
 //! Detailed helpers for translating between epochs and slots live in the [`epochs`] module.
 //!
@@ -182,6 +185,9 @@ pub mod epoch;
 pub mod epochs;
 /// Streaming interface for fetching and parsing firehose blocks.
 pub mod firehose;
+/// Horizon-native firehose: streams `.jet` archives via async `rseek`
+/// seeking, driving zero-copy `SlotVisitor` callbacks.
+pub mod firehose_horizon;
 /// Slot offset index client for locating blocks in Old Faithful CAR archives.
 pub mod index;
 /// Helpers for working with network metadata and endpoints.
@@ -198,6 +204,7 @@ pub mod subset;
 pub mod system;
 /// Transaction decoding and helpers.
 pub mod transaction;
+mod transaction_status_meta;
 /// Shared helpers used throughout the firehose crate.
 pub mod utils;
 

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Horizon R2"
+  short_description: "Upload and verify Horizon epochs in R2"
+  default_prompt: "Use $horizon-r2 to upload and verify all missing Horizon epochs."

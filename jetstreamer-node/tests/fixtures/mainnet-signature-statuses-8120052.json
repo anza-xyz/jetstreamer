@@ -1,0 +1,358 @@
+{
+  "rpc_url": "https://api.mainnet-beta.solana.com",
+  "request": {
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "getSignatureStatuses",
+    "params": [
+      [
+        "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"
+      ],
+      {
+        "searchTransactionHistory": true
+      }
+    ]
+  },
+  "response": {
+    "id": 1,
+    "jsonrpc": "2.0",
+    "result": {
+      "context": {
+        "apiVersion": "4.3.0-rc.0",
+        "slot": 446114994
+      },
+      "value": [
+        {
+          "confirmationStatus": "finalized",
+          "confirmations": null,
+          "err": null,
+          "slot": 8120052,
+          "status": {
+            "Ok": null
+          }
+        },
+        {
+          "confirmationStatus": "finalized",
+          "confirmations": null,
+          "err": null,
+          "slot": 8120052,
+          "status": {
+            "Ok": null
+          }
+        },
+        {
+          "confirmationStatus": "finalized",
+          "confirmations": null,
+          "err": null,
+          "slot": 8120052,
+          "status": {
+            "Ok": null
+          }
+        },
+        {
+          "confirmationStatus": "finalized",
+          "confirmations": null,
+          "err": null,
+          "slot": 8120052,
+          "status": {
+            "Ok": null
+          }
+        },
+        {
+          "confirmationStatus": "finalized",
+          "confirmations": null,
+          "err": null,
+          "slot": 8120052,
+          "status": {
+            "Ok": null
+          }
+        },
+        {
+          "confirmationStatus": "finalized",
+          "confirmations": null,
+          "err": null,
+          "slot": 8120052,
+          "status": {
+            "Ok": null
+          }
+        },
+        {
+          "confirmationStatus": "finalized",
+          "confirmations": null,
+          "err": null,
+          "slot": 8120052,
+          "status": {
+            "Ok": null
+          }
+        },
+        {
+          "confirmationStatus": "finalized",
+          "confirmations": null,
+          "err": null,
+          "slot": 8120052,
+          "status": {
+            "Ok": null
+          }
+        },
+        {
+          "confirmationStatus": "finalized",
+          "confirmations": null,
+          "err": null,
+          "slot": 8120052,
+          "status": {
+            "Ok": null
+          }
+        },
+        {
+          "confirmationStatus": "finalized",
+          "confirmations": null,
+          "err": null,
+          "slot": 8120052,
+          "status": {
+            "Ok": null
+          }
+        },
+        {
+          "confirmationStatus": "finalized",
+          "confirmations": null,
+          "err": null,
+          "slot": 8120052,
+          "status": {
+            "Ok": null
+          }
+        },
+        {
+          "confirmationStatus": "finalized",
+          "confirmations": null,
+          "err": null,
+          "slot": 8120052,
+          "status": {
+            "Ok": null
+          }
+        },
+        {
+          "confirmationStatus": "finalized",
+          "confirmations": null,
+          "err": null,
+          "slot": 8120052,
+          "status": {
+            "Ok": null
+          }
+        },
+        {
+          "confirmationStatus": "finalized",
+          "confirmations": null,
+          "err": null,
+          "slot": 8120052,
+          "status": {
+            "Ok": null
+          }
+        },
+        {
+          "confirmationStatus": "finalized",
+          "confirmations": null,
+          "err": null,
+          "slot": 8120052,
+          "status": {
+            "Ok": null
+          }
+        },
+        {
+          "confirmationStatus": "finalized",
+          "confirmations": null,
+          "err": null,
+          "slot": 8120052,
+          "status": {
+            "Ok": null
+          }
+        },
+        {
+          "confirmationStatus": "finalized",
+          "confirmations": null,
+          "err": null,
+          "slot": 8120052,
+          "status": {
+            "Ok": null
+          }
+        },
+        {
+          "confirmationStatus": "finalized",
+          "confirmations": null,
+          "err": null,
+          "slot": 8120052,
+          "status": {
+            "Ok": null
+          }
+        },
+        {
+          "confirmationStatus": "finalized",
+          "confirmations": null,
+          "err": null,
+          "slot": 8120052,
+          "status": {
+            "Ok": null
+          }
+        },
+        {
+          "confirmationStatus": "finalized",
+          "confirmations": null,
+          "err": null,
+          "slot": 8120052,
+          "status": {
+            "Ok": null
+          }
+        },
+        {
+          "confirmationStatus": "finalized",
+          "confirmations": null,
+          "err": null,
+          "slot": 8120052,
+          "status": {
+            "Ok": null
+          }
+        },
+        {
+          "confirmationStatus": "finalized",
+          "confirmations": null,
+          "err": null,
+          "slot": 8120052,
+          "status": {
+            "Ok": null
+          }
+        },
+        {
+          "confirmationStatus": "finalized",
+          "confirmations": null,
+          "err": null,
+          "slot": 8120052,
+          "status": {
+            "Ok": null
+          }
+        },
+        {
+          "confirmationStatus": "finalized",
+          "confirmations": null,
+          "err": null,
+          "slot": 8120052,
+          "status": {
+            "Ok": null
+          }
+        },
+        {
+          "confirmationStatus": "finalized",
+          "confirmations": null,
+          "err": null,
+          "slot": 8120052,
+          "status": {
+            "Ok": null
+          }
+        },
+        {
+          "confirmationStatus": "finalized",
+          "confirmations": null,
+          "err": null,
+          "slot": 8120052,
+          "status": {
+            "Ok": null
+          }
+        },
+        {
+          "confirmationStatus": "finalized",
+          "confirmations": null,
+          "err": null,
+          "slot": 8120052,
+          "status": {
+            "Ok": null
+          }
+        },
+        {
+          "confirmationStatus": "finalized",
+          "confirmations": null,
+          "err": null,
+          "slot": 8120052,
+          "status": {
+            "Ok": null
+          }
+        },
+        {
+          "confirmationStatus": "finalized",
+          "confirmations": null,
+          "err": null,
+          "slot": 8120052,
+          "status": {
+            "Ok": null
+          }
+        },
+        {
+          "confirmationStatus": "finalized",
+          "confirmations": null,
+          "err": null,
+          "slot": 8120052,
+          "status": {
+            "Ok": null
+          }
+        },
+        {
+          "confirmationStatus": "finalized",
+          "confirmations": null,
+          "err": null,
+          "slot": 8120052,
+          "status": {
+            "Ok": null
+          }
+        },
+        {
+          "confirmationStatus": "finalized",
+          "confirmations": null,
+          "err": null,
+          "slot": 8120052,
+          "status": {
+            "Ok": null
+          }
+        },
+        {
+          "confirmationStatus": "finalized",
+          "confirmations": null,
+          "err": null,
+          "slot": 8120052,
+          "status": {
+            "Ok": null
+          }
+        }
+      ]
+    }
+  }
+}
+

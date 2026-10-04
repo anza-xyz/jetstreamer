@@ -784,6 +784,11 @@ the live CPU, memory-admission, and disk calculations. The final global claim ch
 are serialized through the bound public-directory lock, so controllers for different runtime eras
 cannot consume the same capacity slot concurrently. A queue's local lane count limits only how many
 jobs that queue can add; it does not become an accidental ceiling on the global producer count.
+Producer services deliberately use a minimal PATH. If `gcloud` is installed outside
+`/usr/bin`—for example by Homebrew—pass its absolute path with `--gcloud-bin`. The controller
+resolves and validates that executable, binds its SHA-256 into the sealed configuration, adds only
+its parent directory to the producer PATH, and requires the same environment when adopting a live
+unit.
 Producer namespace filtering uses a reload-stable cgroup-only allow-list; user namespaces and every
 other namespace type remain denied,
 and the empty capability set prevents the unprivileged worker from using the nominal cgroup option.

@@ -714,6 +714,59 @@ class CommandTests(unittest.TestCase):
                 )
                 self.assertNotIn("/home/sol", "\0".join(command))
 
+    def test_producer_uses_explicit_gcloud_parent_path(self) -> None:
+        gcloud = Path("/home/linuxbrew/.linuxbrew/share/google-cloud-sdk/bin/gcloud")
+        command = sweep.build_producer_command(
+            cohort=self.cohort,
+            lane=self.lane,
+            deploy=self.deploy,
+            manifest=self.manifest,
+            fingerprint=self.fingerprint,
+            unit="producer-gcloud-test.service",
+            producer_user="ubuntu",
+            archive_group="ubuntu",
+            producer_home=Path("/home/ubuntu"),
+            gcloud_bin=gcloud,
+        )
+        environment = {
+            item.removeprefix("--setenv=")
+            for item in command
+            if item.startswith("--setenv=")
+        }
+        self.assertIn(
+            f"PATH={gcloud.parent}:{sweep.DEFAULT_PRODUCER_PATH}", environment
+        )
+
+    def test_gcloud_bin_is_resolved_and_must_be_executable(self) -> None:
+        parser = sweep.build_argument_parser()
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw).resolve()
+            real = root / "sdk" / "gcloud"
+            real.parent.mkdir()
+            real.write_text("#!/bin/sh\nexit 0\n")
+            real.chmod(0o755)
+            link = root / "bin" / "gcloud"
+            link.parent.mkdir()
+            link.symlink_to(real)
+            args = parser.parse_args(
+                [
+                    "--deploy-dir=/deploy",
+                    "--manifest=/deploy/manifest.json",
+                    "--manifest-fingerprint=sha256:" + "a" * 64,
+                    "--public-private-root=/private",
+                    "--state-dir=/state",
+                    "--lane=lane-a=/lane-a",
+                    f"--gcloud-bin={link}",
+                ]
+            )
+            sweep.validate_options(args)
+            self.assertEqual(args.gcloud_bin, real)
+
+            real.chmod(0o644)
+            args.gcloud_bin = real
+            with self.assertRaisesRegex(sweep.SweepError, "executable regular file"):
+                sweep.validate_options(args)
+
     def test_producer_uses_one_whole_lane_mount_and_recursive_sealed_bind(self) -> None:
         command = sweep.build_producer_command(
             cohort=self.cohort,

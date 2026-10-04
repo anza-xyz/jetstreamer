@@ -67,6 +67,7 @@ DEFAULT_DISK_RESERVE_GIB = 512
 DEFAULT_DISK_BUDGET_PER_WORKER_GIB = 2048
 DEFAULT_CPUS_PER_LANE = 8
 DEFAULT_CPU_QUOTA_PERCENT = 1000
+DEFAULT_PRODUCER_PATH = "/usr/bin:/bin"
 RELOAD_STABLE_RESTRICT_NAMESPACES = "cgroup"
 DEFAULT_ACCOUNT = "sam.johnson@anza.xyz"
 DEFAULT_PROJECT = "principal-lane-200702"
@@ -852,13 +853,19 @@ def producer_environment(
     project: str,
     producer_user: str = "sol",
     producer_home: Path = Path("/home/sol"),
+    gcloud_bin: Path | None = None,
 ) -> tuple[str, ...]:
+    producer_path = (
+        DEFAULT_PRODUCER_PATH
+        if gcloud_bin is None
+        else f"{gcloud_bin.parent}:{DEFAULT_PRODUCER_PATH}"
+    )
     return (
         f"HOME={producer_home}",
         f"USER={producer_user}",
         f"LOGNAME={producer_user}",
         "LANG=C.UTF-8",
-        "PATH=/usr/bin:/bin",
+        f"PATH={producer_path}",
         f"XDG_CONFIG_HOME={lane.root / 'config'}",
         f"CLOUDSDK_CONFIG={lane.cloud_config}",
         "CLOUDSDK_CORE_DISABLE_PROMPTS=1",
@@ -910,6 +917,7 @@ def build_producer_command(
     producer_user: str = "sol",
     archive_group: str = "horizon",
     producer_home: Path = Path("/home/sol"),
+    gcloud_bin: Path | None = None,
 ) -> list[str]:
     node = deploy / "jetstreamer-node"
     workers = tuple(deploy / name for _, name in runtime_workers(cohort))
@@ -978,6 +986,7 @@ def build_producer_command(
             project,
             producer_user,
             producer_home,
+            gcloud_bin,
         )
     )
     command.extend(
@@ -1434,6 +1443,7 @@ def unit_is_hardened_for_adoption(
     producer_user: str = "sol",
     archive_group: str = "horizon",
     producer_home: Path = Path("/home/sol"),
+    gcloud_bin: Path | None = None,
 ) -> bool:
     properties = systemd_properties(
         unit,
@@ -1574,6 +1584,7 @@ def unit_is_hardened_for_adoption(
             project,
             producer_user,
             producer_home,
+            gcloud_bin,
         )
     )
     if configured_environment != expected_environment:
@@ -2578,6 +2589,10 @@ def controller_configuration_sha256(
         "cpu_quota_percent": args.cpu_quota_percent,
         "gcloud_account": args.gcloud_account,
         "gcloud_project": args.gcloud_project,
+        "gcloud_bin": str(args.gcloud_bin) if args.gcloud_bin is not None else None,
+        "gcloud_bin_sha256": (
+            checksum_file(args.gcloud_bin) if args.gcloud_bin is not None else None
+        ),
         "producer_user": args.producer_user,
         "producer_uid": producer_uid,
         "producer_home": str(producer_home),
@@ -3231,6 +3246,7 @@ class Controller:
             self.args.producer_user,
             self.args.archive_group,
             self.producer_home,
+            self.args.gcloud_bin,
         ):
             raise SweepError(
                 f"matching producer PID {process.pid} for cohort {cohort.label} "
@@ -3527,6 +3543,7 @@ class Controller:
             producer_user=self.args.producer_user,
             archive_group=self.args.archive_group,
             producer_home=self.producer_home,
+            gcloud_bin=self.args.gcloud_bin,
         )
         self.revalidate_operational_directories()
         result = subprocess.run(command, check=False, capture_output=True, text=True)
@@ -4101,6 +4118,14 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cpu-quota-percent", type=int, default=DEFAULT_CPU_QUOTA_PERCENT)
     parser.add_argument("--gcloud-account", default=DEFAULT_ACCOUNT)
     parser.add_argument("--gcloud-project", default=DEFAULT_PROJECT)
+    parser.add_argument(
+        "--gcloud-bin",
+        type=Path,
+        help=(
+            "absolute gcloud executable path when producer services need a PATH "
+            "outside /usr/bin:/bin (for example a Homebrew installation)"
+        ),
+    )
     parser.add_argument("--producer-user", default="sol")
     parser.add_argument("--archive-group", default="horizon")
     parser.add_argument("--controller-id", default="historical-v1")
@@ -4181,6 +4206,26 @@ def validate_options(args: argparse.Namespace) -> None:
     for name in (args.gcloud_account, args.gcloud_project):
         if not name or any(character.isspace() or character == "\0" for character in name):
             raise SweepError("gcloud account and project must be nonempty single tokens")
+    if args.gcloud_bin is not None:
+        configured = args.gcloud_bin
+        if (
+            not configured.is_absolute()
+            or configured.name != "gcloud"
+            or any(character in str(configured) for character in (":", "\n", "\0"))
+        ):
+            raise SweepError("gcloud-bin must be an absolute gcloud executable path")
+        try:
+            resolved = configured.resolve(strict=True)
+            info = resolved.stat()
+        except OSError as error:
+            raise SweepError(f"failed to resolve gcloud-bin {configured}: {error}") from error
+        if (
+            resolved.name != "gcloud"
+            or not stat.S_ISREG(info.st_mode)
+            or info.st_mode & 0o111 == 0
+        ):
+            raise SweepError("gcloud-bin must resolve to an executable regular file named gcloud")
+        args.gcloud_bin = resolved
 
 
 def resolve_service_identity(args: argparse.Namespace) -> tuple[int, int, Path]:
@@ -4362,6 +4407,15 @@ def print_plan(
             else None
         ),
         "r2_bucket": args.r2_bucket,
+        "gcloud_bin": str(args.gcloud_bin) if args.gcloud_bin is not None else None,
+        "gcloud_bin_sha256": (
+            checksum_file(args.gcloud_bin) if args.gcloud_bin is not None else None
+        ),
+        "producer_path": (
+            DEFAULT_PRODUCER_PATH
+            if args.gcloud_bin is None
+            else f"{args.gcloud_bin.parent}:{DEFAULT_PRODUCER_PATH}"
+        ),
         "producer_user": args.producer_user,
         "producer_uid": sol_uid,
         "producer_home": str(producer_home),

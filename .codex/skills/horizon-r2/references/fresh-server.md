@@ -21,6 +21,9 @@ epochs touch a slot interval marked unsupported by the checked-in runtime regist
    controller defaults to `sol:horizon`; on a host with a different dedicated identity, pass
    `--producer-user USER --archive-group GROUP` and verify the printed plan resolves the intended
    UID, GID, and home directory. Do not create placeholder accounts merely to satisfy the defaults.
+   If `gcloud` is installed outside `/usr/bin` (including Homebrew), pass its absolute executable
+   path with `--gcloud-bin` and verify the printed producer path. Do not rely on an interactive
+   shell startup file inside a detached systemd producer.
 4. Build from that recorded commit and pin the hashes of the producer, full verifier, current
    plugin pipeline, boundary verifier, and their launcher scripts before creating a production
    service. Deploy immutable binaries and manifests into root-owned, non-writable paths; do not run

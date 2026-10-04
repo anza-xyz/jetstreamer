@@ -1,0 +1,16 @@
+{
+  "epoch": 215,
+  "role": "canonical terminal root and v1.6.20 candidate bootstrap",
+  "versioned_uri": "gs://mainnet-beta-ledger-us-ny5/93311535/snapshot-93311535-AvfrHApo6e2gHkmffiBEWLLw78DwQNYYoNCsRpA4F1DQ.tar.zst#1630236146120022",
+  "slot": 93311535,
+  "accounts_hash": "AvfrHApo6e2gHkmffiBEWLLw78DwQNYYoNCsRpA4F1DQ",
+  "generation": "1630236146120022",
+  "size": 8922663727,
+  "crc32c_base64": "3IWi3Q==",
+  "md5_base64": "frdIsJPVH8z4tbEgAHxG1Q==",
+  "runtime_range": {
+    "first_epoch": 216,
+    "last_epoch": 232,
+    "max_slot_exclusive": 100656000
+  }
+}

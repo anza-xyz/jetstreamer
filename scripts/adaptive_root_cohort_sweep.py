@@ -81,6 +81,7 @@ ARCHIVE_BATCH_MARKERS = (
 )
 FINGERPRINT_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
 SAFE_NAME_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,31}\Z")
+SERVICE_IDENTITY_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_.-]{0,63}\Z")
 SYSTEMD_UNIT_RE = re.compile(r"[A-Za-z0-9_.@:-]{1,240}\.service\Z")
 DESTINATION_SCOPE_RE = re.compile(r"destination-[0-9a-f]{64}\Z")
 COHORT_RUN_DIRECTORY_RE = re.compile(r"run-[0-9]+-[0-9]+\Z")
@@ -106,6 +107,11 @@ RUNTIME_WORKERS = {
     "solana-v1.5.6": ("V1_5_6", "jetstreamer-historical-worker-v1-5-6"),
     "solana-v1.5.8": ("V1_5_8", "jetstreamer-historical-worker-v1-5-8"),
     "solana-v1.6.15": ("V1_6_15", "jetstreamer-historical-worker-v1-6-15"),
+    "solana-v1.6.16": ("V1_6_16", "jetstreamer-historical-worker-v1-6-16"),
+    "solana-v1.6.17": ("V1_6_17", "jetstreamer-historical-worker-v1-6-17"),
+    "solana-v1.6.20": ("V1_6_20", "jetstreamer-historical-worker-v1-6-20"),
+    "solana-v1.7.15": ("V1_7_15", "jetstreamer-historical-worker-v1-7-15"),
+    "solana-v1.8.11": ("V1_8_11", "jetstreamer-historical-worker-v1-8-11"),
 }
 # A manifest cohort normally names the only worker it needs. A cohort that
 # crosses a canonical runtime handoff must also expose the source worker: the
@@ -125,22 +131,29 @@ RUNTIME_AUXILIARY_WORKERS = {
         ),
     ),
 }
-SENSITIVE_PATHS = (
-    "/home/sol/.ssh",
-    "/home/sol/workspace",
-    "/home/sol/.gnupg",
-    "/home/sol/.codex",
-    "/home/sol/.claude",
-    "/home/sol/.claude.json",
-    "/home/sol/.copilot",
-    "/home/sol/.cargo",
-    "/home/sol/.rustup",
-    "/home/sol/.gsutil",
-    "/home/sol/identity",
-    "/home/sol/.bash_history",
-    "/home/sol/.zsh_history",
-    "/home/sol/.config",
+SENSITIVE_HOME_PATHS = (
+    ".ssh",
+    "workspace",
+    ".gnupg",
+    ".codex",
+    ".claude",
+    ".claude.json",
+    ".copilot",
+    ".cargo",
+    ".rustup",
+    ".gsutil",
+    "identity",
+    ".bash_history",
+    ".zsh_history",
+    ".config",
 )
+
+
+def sensitive_paths(producer_home: Path) -> tuple[str, ...]:
+    return tuple(str(producer_home / item) for item in SENSITIVE_HOME_PATHS)
+
+
+SENSITIVE_PATHS = sensitive_paths(Path("/home/sol"))
 
 
 class SweepError(RuntimeError):
@@ -790,8 +803,13 @@ def process_is_same(pid: int, start_time: int) -> bool:
         return False
 
 
-def require_private_network_namespace() -> None:
-    interfaces = {item.name for item in Path("/sys/class/net").iterdir()}
+def require_private_network_namespace(
+    network_class: Path = Path("/sys/class/net"),
+) -> None:
+    # Some kernels expose class-level controls such as ``bonding_masters`` as
+    # regular files beside the interface device links. Only directory-like
+    # class devices are network interfaces.
+    interfaces = {item.name for item in network_class.iterdir() if item.is_dir()}
     if interfaces != {"lo"}:
         raise SweepError(
             "--execute requires PrivateNetwork=yes and a loopback-only controller namespace"
@@ -832,11 +850,13 @@ def producer_environment(
     lane: Lane,
     account: str,
     project: str,
+    producer_user: str = "sol",
+    producer_home: Path = Path("/home/sol"),
 ) -> tuple[str, ...]:
     return (
-        "HOME=/home/sol",
-        "USER=sol",
-        "LOGNAME=sol",
+        f"HOME={producer_home}",
+        f"USER={producer_user}",
+        f"LOGNAME={producer_user}",
         "LANG=C.UTF-8",
         "PATH=/usr/bin:/bin",
         f"XDG_CONFIG_HOME={lane.root / 'config'}",
@@ -887,6 +907,9 @@ def build_producer_command(
     memory_high_gib: int = DEFAULT_MEMORY_HIGH_GIB,
     memory_max_gib: int = DEFAULT_MEMORY_MAX_GIB,
     cpu_quota_percent: int = DEFAULT_CPU_QUOTA_PERCENT,
+    producer_user: str = "sol",
+    archive_group: str = "horizon",
+    producer_home: Path = Path("/home/sol"),
 ) -> list[str]:
     node = deploy / "jetstreamer-node"
     workers = tuple(deploy / name for _, name in runtime_workers(cohort))
@@ -928,13 +951,14 @@ def build_producer_command(
         "CapabilityBoundingSet=",
         "AmbientCapabilities=",
         "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6",
-        "NoExecPaths=/home/sol",
+        f"NoExecPaths={producer_home}",
         f"ExecPaths={node} {' '.join(map(str, workers))} {whole_lane_paths}",
         f"ReadWritePaths={whole_lane_paths}",
         f"BindReadOnlyPaths={deploy}:{deploy}:rbind",
-        "InaccessiblePaths=" + " ".join(f"-{item}" for item in SENSITIVE_PATHS),
-        "User=sol",
-        "Group=horizon",
+        "InaccessiblePaths="
+        + " ".join(f"-{item}" for item in sensitive_paths(producer_home)),
+        f"User={producer_user}",
+        f"Group={archive_group}",
         f"WorkingDirectory={deploy}",
     )
     command = [
@@ -946,7 +970,15 @@ def build_producer_command(
     command.extend(f"--property={item}" for item in properties)
     command.extend(
         f"--setenv={item}"
-        for item in producer_environment(cohort, deploy, lane, account, project)
+        for item in producer_environment(
+            cohort,
+            deploy,
+            lane,
+            account,
+            project,
+            producer_user,
+            producer_home,
+        )
     )
     command.extend(
         [
@@ -975,12 +1007,15 @@ def build_import_command(
     memory_high_gib: int = DEFAULT_MEMORY_HIGH_GIB,
     memory_max_gib: int = DEFAULT_MEMORY_MAX_GIB,
     cpu_quota_percent: int = DEFAULT_CPU_QUOTA_PERCENT,
+    producer_user: str = "sol",
+    archive_group: str = "horizon",
+    producer_home: Path = Path("/home/sol"),
 ) -> list[str]:
     node = deploy / "jetstreamer-node"
     environment = (
-        "HOME=/home/sol",
-        "USER=sol",
-        "LOGNAME=sol",
+        f"HOME={producer_home}",
+        f"USER={producer_user}",
+        f"LOGNAME={producer_user}",
         "LANG=C.UTF-8",
         "PATH=/usr/bin:/bin",
         "JETSTREAMER_ALLOW_CANDIDATE_RUNTIME=1",
@@ -1027,12 +1062,13 @@ def build_import_command(
         "CapabilityBoundingSet=",
         "AmbientCapabilities=",
         "RestrictAddressFamilies=AF_UNIX",
-        "NoExecPaths=/home/sol",
+        f"NoExecPaths={producer_home}",
         f"ExecPaths={node}",
-        "User=sol",
-        "Group=horizon",
+        f"User={producer_user}",
+        f"Group={archive_group}",
         f"WorkingDirectory={deploy}",
-        "InaccessiblePaths=" + " ".join(f"-{item}" for item in SENSITIVE_PATHS),
+        "InaccessiblePaths="
+        + " ".join(f"-{item}" for item in sensitive_paths(producer_home)),
     )
     command = [
         "/usr/bin/systemd-run",
@@ -1395,6 +1431,9 @@ def unit_is_hardened_for_adoption(
     cpu_quota_percent: int = DEFAULT_CPU_QUOTA_PERCENT,
     account: str = DEFAULT_ACCOUNT,
     project: str = DEFAULT_PROJECT,
+    producer_user: str = "sol",
+    archive_group: str = "horizon",
+    producer_home: Path = Path("/home/sol"),
 ) -> bool:
     properties = systemd_properties(
         unit,
@@ -1471,16 +1510,18 @@ def unit_is_hardened_for_adoption(
         "LimitNOFILE": "1048576",
         "OOMPolicy": "stop",
         "UMask": "0077",
-        "User": "sol",
-        "Group": "horizon",
+        "User": producer_user,
+        "Group": archive_group,
         "WorkingDirectory": str(deploy),
         "ReadWritePaths": str(lane.root),
         "ExecPaths": (
             f"{deploy / 'jetstreamer-node'} "
             f"{' '.join(map(str, workers))} {lane.root}"
         ),
-        "NoExecPaths": "/home/sol",
-        "InaccessiblePaths": " ".join(f"-{item}" for item in SENSITIVE_PATHS),
+        "NoExecPaths": str(producer_home),
+        "InaccessiblePaths": " ".join(
+            f"-{item}" for item in sensitive_paths(producer_home)
+        ),
         "PrivateTmp": "yes",
         "PrivateDevices": "yes",
         "PrivateIPC": "yes",
@@ -1525,7 +1566,15 @@ def unit_is_hardened_for_adoption(
     except ValueError:
         return False
     expected_environment = set(
-        producer_environment(cohort, deploy, lane, account, project)
+        producer_environment(
+            cohort,
+            deploy,
+            lane,
+            account,
+            project,
+            producer_user,
+            producer_home,
+        )
     )
     if configured_environment != expected_environment:
         # A controller upgrade may add only the longer graceful retirement
@@ -2471,6 +2520,7 @@ def controller_configuration_sha256(
     adopted_cohorts: Sequence[Cohort],
     lanes: Sequence[Lane],
 ) -> str:
+    producer_uid, archive_gid, producer_home = resolve_service_identity(args)
     configuration = {
         "schema": STATE_SCHEMA,
         "manifest_fingerprint": args.manifest_fingerprint,
@@ -2528,6 +2578,11 @@ def controller_configuration_sha256(
         "cpu_quota_percent": args.cpu_quota_percent,
         "gcloud_account": args.gcloud_account,
         "gcloud_project": args.gcloud_project,
+        "producer_user": args.producer_user,
+        "producer_uid": producer_uid,
+        "producer_home": str(producer_home),
+        "archive_group": args.archive_group,
+        "archive_gid": archive_gid,
         "controller_id": args.controller_id,
         "controller_sha256": args.controller_sha256,
     }
@@ -2857,8 +2912,9 @@ class Controller:
             for item in self.managed_cohorts
         }
         self.lanes = {lane.name: lane for lane in lanes}
-        self.sol_uid = pwd.getpwnam("sol").pw_uid
-        self.horizon_gid = grp.getgrnam("horizon").gr_gid
+        self.sol_uid, self.horizon_gid, self.producer_home = (
+            resolve_service_identity(args)
+        )
         self.node = args.deploy_dir / "jetstreamer-node"
         self.stopping = False
         binding_paths = {
@@ -3172,6 +3228,9 @@ class Controller:
             self.args.cpu_quota_percent,
             self.args.gcloud_account,
             self.args.gcloud_project,
+            self.args.producer_user,
+            self.args.archive_group,
+            self.producer_home,
         ):
             raise SweepError(
                 f"matching producer PID {process.pid} for cohort {cohort.label} "
@@ -3465,6 +3524,9 @@ class Controller:
             memory_high_gib=self.args.memory_high_gib,
             memory_max_gib=self.args.memory_max_gib,
             cpu_quota_percent=self.args.cpu_quota_percent,
+            producer_user=self.args.producer_user,
+            archive_group=self.args.archive_group,
+            producer_home=self.producer_home,
         )
         self.revalidate_operational_directories()
         result = subprocess.run(command, check=False, capture_output=True, text=True)
@@ -3759,6 +3821,9 @@ class Controller:
                 memory_high_gib=self.args.memory_high_gib,
                 memory_max_gib=self.args.memory_max_gib,
                 cpu_quota_percent=self.args.cpu_quota_percent,
+                producer_user=self.args.producer_user,
+                archive_group=self.args.archive_group,
+                producer_home=self.producer_home,
             )
             print(
                 f"importing validated cohort {cohort.label} from {lane_name}",
@@ -4036,6 +4101,8 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cpu-quota-percent", type=int, default=DEFAULT_CPU_QUOTA_PERCENT)
     parser.add_argument("--gcloud-account", default=DEFAULT_ACCOUNT)
     parser.add_argument("--gcloud-project", default=DEFAULT_PROJECT)
+    parser.add_argument("--producer-user", default="sol")
+    parser.add_argument("--archive-group", default="horizon")
     parser.add_argument("--controller-id", default="historical-v1")
     parser.add_argument("--controller-sha256")
     parser.add_argument("--execute", action="store_true")
@@ -4052,6 +4119,10 @@ def validate_options(args: argparse.Namespace) -> None:
         args.memory_admission_gib = args.memory_max_gib
     if not SAFE_NAME_RE.fullmatch(args.controller_id):
         raise SweepError("controller-id must contain only lowercase letters, digits, and hyphens")
+    if not SERVICE_IDENTITY_RE.fullmatch(args.producer_user):
+        raise SweepError("producer-user is not a safe service account name")
+    if not SERVICE_IDENTITY_RE.fullmatch(args.archive_group):
+        raise SweepError("archive-group is not a safe service group name")
     numbers = (
         args.first_epoch,
         args.last_epoch,
@@ -4110,6 +4181,27 @@ def validate_options(args: argparse.Namespace) -> None:
     for name in (args.gcloud_account, args.gcloud_project):
         if not name or any(character.isspace() or character == "\0" for character in name):
             raise SweepError("gcloud account and project must be nonempty single tokens")
+
+
+def resolve_service_identity(args: argparse.Namespace) -> tuple[int, int, Path]:
+    try:
+        producer = pwd.getpwnam(args.producer_user)
+    except KeyError as error:
+        raise SweepError(
+            f"producer user {args.producer_user!r} does not exist"
+        ) from error
+    try:
+        archive_group = grp.getgrnam(args.archive_group)
+    except KeyError as error:
+        raise SweepError(
+            f"archive group {args.archive_group!r} does not exist"
+        ) from error
+    producer_home = Path(producer.pw_dir)
+    if not producer_home.is_absolute() or producer_home == Path("/"):
+        raise SweepError(
+            f"producer user {args.producer_user!r} has an unsafe home directory"
+        )
+    return producer.pw_uid, archive_group.gr_gid, producer_home
 
 
 def prepare(
@@ -4175,8 +4267,8 @@ def prepare(
         verify_controller_source(
             Path(__file__).resolve(strict=True), args.controller_sha256
         )
-    sol_uid = pwd.getpwnam("sol").pw_uid
-    horizon_gid = grp.getgrnam("horizon").gr_gid
+    sol_uid, horizon_gid, producer_home = resolve_service_identity(args)
+    args.producer_home = producer_home
     public = validate_real_directory(
         args.public_dir, uid=sol_uid, gid=horizon_gid, mode=0o3770
     )
@@ -4210,8 +4302,7 @@ def print_plan(
     adopted_cohorts: Sequence[Cohort],
     lanes: Sequence[Lane],
 ) -> None:
-    sol_uid = pwd.getpwnam("sol").pw_uid
-    horizon_gid = grp.getgrnam("horizon").gr_gid
+    sol_uid, horizon_gid, producer_home = resolve_service_identity(args)
     completed = []
     for cohort in cohorts:
         if (
@@ -4271,6 +4362,11 @@ def print_plan(
             else None
         ),
         "r2_bucket": args.r2_bucket,
+        "producer_user": args.producer_user,
+        "producer_uid": sol_uid,
+        "producer_home": str(producer_home),
+        "archive_group": args.archive_group,
+        "archive_gid": horizon_gid,
         "completed": completed,
         "live_epoch_claims": live,
         "public_write_path": "jetstreamer-node --recover-staged-cohort-only only",

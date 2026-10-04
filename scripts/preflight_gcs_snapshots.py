@@ -45,7 +45,7 @@ BILLING_PROJECT = "principal-lane-200702"
 LOCAL_ROOT = Path("/home/sol/horizon")
 FIRST_EPOCH = 1
 LAST_EPOCH = 100
-MAX_SUPPORTED_EPOCH = 200
+MAX_SUPPORTED_EPOCH = 301
 EPOCH_SLOTS = 432_000
 UINT64_MAX = (1 << 64) - 1
 SCHEMA = "jetstreamer-gcs-snapshot-preflight-v2"
@@ -84,6 +84,11 @@ RUNTIME_ROUTES = (
     (154, 154, "solana-v1.5.8", (".tar.bz2", ".tar.zst")),
     (155, 173, "solana-v1.5.6", (".tar.bz2", ".tar.zst")),
     (174, 200, "solana-v1.6.15", (".tar.bz2", ".tar.zst")),
+    (201, 201, "solana-v1.6.16", (".tar.bz2", ".tar.zst")),
+    (214, 215, "solana-v1.6.17", (".tar.bz2", ".tar.zst")),
+    (216, 232, "solana-v1.6.20", (".tar.bz2", ".tar.zst")),
+    (233, 265, "solana-v1.7.15", (".tar.bz2", ".tar.zst")),
+    (266, 301, "solana-v1.8.11", (".tar.bz2", ".tar.zst")),
 )
 ROOT_COHORT_HISTORICAL_RUNTIMES = frozenset(
     {
@@ -105,6 +110,11 @@ ROOT_COHORT_HISTORICAL_RUNTIMES = frozenset(
         "solana-v1.5.6",
         "solana-v1.5.8",
         "solana-v1.6.15",
+        "solana-v1.6.16",
+        "solana-v1.6.17",
+        "solana-v1.6.20",
+        "solana-v1.7.15",
+        "solana-v1.8.11",
     }
 )
 SNAPSHOT_ARCHIVE_EXTENSIONS = (".tar.zst", ".tar.lz4", ".tar.bz2")

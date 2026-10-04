@@ -1,0 +1,42 @@
+{
+  "candidate": "solana-v1.7.15",
+  "status": "private-checkpoint-gated",
+  "upstream": {
+    "tag": "v1.7.15",
+    "commit": "4892eb4e1ad278d5249b6cda8983f88effb3e98b",
+    "runtime_tree": "9370e13aa8b093fffa908ad3a1388fe2e85c2100",
+    "bpf_loader_tree": "530dbb500c5580b774be3fe33c30e53ace46c4f9"
+  },
+  "admission": {
+    "bootstrap_snapshot_slot": 100655540,
+    "first_entry_slot": 100655541,
+    "max_slot_exclusive": 114912000,
+    "first_epoch": 233,
+    "last_epoch": 265
+  },
+  "bootstrap": {
+    "versioned_uri": "gs://mainnet-beta-ledger-us-ny5/100655540/snapshot-100655540-A11g8aGUD2GCEGp7qcciMSW2Lf1StGPaUUZTLP1BHrRL.tar.zst#1634136853781030",
+    "accounts_hash": "A11g8aGUD2GCEGp7qcciMSW2Lf1StGPaUUZTLP1BHrRL",
+    "size": 10738664792,
+    "crc32c_base64": "j3ZZuQ==",
+    "md5_base64": "msPRq77oL5tKjw1tOfGaBQ=="
+  },
+  "terminal_checkpoint": {
+    "slot": 114910768,
+    "accounts_hash": "HnePfSpTtWaPDFx9RrPeuamDZREhoUXa7xpK6fbtPGyK",
+    "generation": "1641767242524970",
+    "size": 16826334350,
+    "crc32c_base64": "i85Rcw==",
+    "md5_base64": "frRtvWbKEzOW/onIQa3MeQ=="
+  },
+  "fallback_first_epoch_candidate": {
+    "tag": "v1.7.13",
+    "commit": "257ddbeee1e8e7db2daa54e86f8eeedf76ace8f1",
+    "reason": "Epoch 233 compatibility remains independently checkpoint-gated."
+  },
+  "loader_key_attribution": {
+    "invariant": "signature attribution includes only writable non-loader keys, matching runtime account storage",
+    "runtime_source_sha256": "31d33a5c0f16db77d0560d9917e94cfd4a9489dcb404561faf12c12a91b93721"
+  },
+  "publication_gate": "locked-tests-release-build-and-canonical-checkpoint-qualification"
+}

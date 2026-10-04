@@ -4192,6 +4192,16 @@ impl SlotExecutionBuffer {
                 ));
             }
             (
+                compatibility::TransactionStatusValidation::RuntimeOnly,
+                TransactionMetadataInput::Missing(
+                    compatibility::MissingTransactionStatusEvidence::Canonical(_),
+                ),
+            ) => {
+                return Err(format!(
+                    "canonical post-cutover status evidence is invalid for runtime-only slot {slot}"
+                ));
+            }
+            (
                 compatibility::TransactionStatusValidation::RuntimeAuthoritative,
                 TransactionMetadataInput::Observed(metadata),
             ) => (None, true, metadata),
@@ -4243,9 +4253,40 @@ impl SlotExecutionBuffer {
                 ));
             }
             (
+                compatibility::TransactionStatusValidation::RuntimeAuthoritative,
+                TransactionMetadataInput::Missing(
+                    compatibility::MissingTransactionStatusEvidence::Canonical(_),
+                ),
+            ) => {
+                return Err(format!(
+                    "canonical source-exact status evidence is invalid for runtime-authoritative slot {slot}"
+                ));
+            }
+            (
                 compatibility::TransactionStatusValidation::SourceExact,
                 TransactionMetadataInput::Observed(metadata),
             ) => (Some(metadata.status.clone()), false, metadata),
+            (
+                compatibility::TransactionStatusValidation::SourceExact,
+                TransactionMetadataInput::Missing(
+                    compatibility::MissingTransactionStatusEvidence::Canonical(canonical),
+                ),
+            ) => {
+                let canonical = *canonical;
+                if canonical.slot != slot
+                    || usize::try_from(canonical.transaction_slot_index) != Ok(index)
+                    || tx.signatures.first() != Some(&canonical.signature)
+                {
+                    return Err(format!(
+                        "canonical missing-status evidence identity mismatch at slot {slot} index {index}"
+                    ));
+                }
+                (
+                    Some(canonical.metadata.status.clone()),
+                    false,
+                    canonical.metadata,
+                )
+            }
             (
                 compatibility::TransactionStatusValidation::SourceExact,
                 TransactionMetadataInput::Missing(_),
@@ -5212,6 +5253,63 @@ fn runtime_slot_range(
     }
 }
 
+fn plan_runtime_spans_for_invocation(
+    range: std::ops::Range<Slot>,
+    allow_candidate_runtime: bool,
+    focused_qualification: bool,
+) -> Result<Vec<compatibility::RuntimeSpan>, String> {
+    if focused_qualification {
+        compatibility::plan_focused_qualification_runtime_spans(range, allow_candidate_runtime)
+    } else {
+        compatibility::plan_runtime_spans(range, allow_candidate_runtime)
+    }
+}
+
+fn plan_replay_for_invocation(
+    range: std::ops::Range<Slot>,
+    allow_candidate_runtime: bool,
+    focused_qualification: bool,
+) -> Result<Vec<compatibility::ReplaySegment>, String> {
+    if focused_qualification {
+        compatibility::plan_focused_qualification_replay(range, allow_candidate_runtime)
+    } else {
+        compatibility::plan_replay(range, allow_candidate_runtime)
+    }
+}
+
+fn select_runtime_for_invocation(
+    range: std::ops::Range<Slot>,
+    allow_candidate_runtime: bool,
+    focused_qualification: bool,
+) -> Result<compatibility::RuntimeSelection, String> {
+    if focused_qualification {
+        compatibility::select_focused_qualification_runtime(range, allow_candidate_runtime)
+    } else {
+        compatibility::select_runtime(range, allow_candidate_runtime)
+    }
+}
+
+fn select_runtime_with_snapshot_warmup_for_invocation(
+    replay_start: Slot,
+    output_range: std::ops::Range<Slot>,
+    allow_candidate_runtime: bool,
+    focused_qualification: bool,
+) -> Result<compatibility::RuntimeSelection, String> {
+    if focused_qualification {
+        compatibility::select_focused_qualification_runtime_with_snapshot_warmup(
+            replay_start,
+            output_range,
+            allow_candidate_runtime,
+        )
+    } else {
+        compatibility::select_runtime_with_snapshot_warmup(
+            replay_start,
+            output_range,
+            allow_candidate_runtime,
+        )
+    }
+}
+
 fn runtime_span_selection(
     span: &compatibility::RuntimeSpan,
 ) -> Result<compatibility::RuntimeSelection, String> {
@@ -5238,8 +5336,13 @@ fn runtime_span_selection(
 fn bootstrap_runtime_selection(
     slot_range: std::ops::Range<Slot>,
     allow_candidate_runtime: bool,
+    focused_qualification: bool,
 ) -> Result<compatibility::RuntimeSelection, String> {
-    let spans = compatibility::plan_runtime_spans(slot_range, allow_candidate_runtime)?;
+    let spans = plan_runtime_spans_for_invocation(
+        slot_range,
+        allow_candidate_runtime,
+        focused_qualification,
+    )?;
     runtime_span_selection(spans.first().expect("runtime planner rejects empty ranges"))
 }
 
@@ -6098,12 +6201,22 @@ fn range_supports_private_replay_scratch(
     end_epoch: u64,
     allow_candidate_runtime: bool,
     load_from_dir: bool,
+    focused_qualification: bool,
 ) -> Result<bool, String> {
     for epoch in start_epoch..=end_epoch {
         let (slot_start, slot_end_inclusive) = epoch_to_slot_range(epoch);
-        let spans = compatibility::plan_runtime_spans(
-            slot_start..slot_end_inclusive.saturating_add(1),
+        let range = if focused_qualification {
+            // Focused qualification is restricted by CLI validation to one
+            // epoch and supplies its exact output span separately. The full
+            // epoch is nevertheless inside the same bounded diagnostic era.
+            epoch_to_slot(epoch)..epoch_to_slot(epoch.saturating_add(1))
+        } else {
+            slot_start..slot_end_inclusive.saturating_add(1)
+        };
+        let spans = plan_runtime_spans_for_invocation(
+            range,
             allow_candidate_runtime,
+            focused_qualification,
         )?;
         if !runtime_spans_support_private_replay_scratch(&spans, load_from_dir)? {
             return Ok(false);
@@ -6980,6 +7093,12 @@ fn historical_worker_profile(
         compatibility::RuntimeBackend::SolanaV1_5_6 => historical::SOLANA_V1_5_6_CANDIDATE,
         compatibility::RuntimeBackend::SolanaV1_5_8 => historical::SOLANA_V1_5_8_CANDIDATE,
         compatibility::RuntimeBackend::SolanaV1_6_15 => historical::SOLANA_V1_6_15_CANDIDATE,
+        compatibility::RuntimeBackend::SolanaV1_6_16 => historical::SOLANA_V1_6_16_CANDIDATE,
+        compatibility::RuntimeBackend::SolanaV1_6_17 => historical::SOLANA_V1_6_17_CANDIDATE,
+        compatibility::RuntimeBackend::SolanaV1_6_20 => historical::SOLANA_V1_6_20_CANDIDATE,
+        compatibility::RuntimeBackend::SolanaV1_7_13 => historical::SOLANA_V1_7_13_CANDIDATE,
+        compatibility::RuntimeBackend::SolanaV1_7_15 => historical::SOLANA_V1_7_15_CANDIDATE,
+        compatibility::RuntimeBackend::SolanaV1_8_11 => historical::SOLANA_V1_8_11_CANDIDATE,
         compatibility::RuntimeBackend::AgaveV3 => {
             return Err(
                 "the in-process Agave runtime has no historical worker profile".to_string(),
@@ -9722,8 +9841,10 @@ fn publish_historical_segment_manifest(
             evidence.terminal.slot, plan.end_inclusive
         ));
     }
-    let selection =
-        compatibility::select_runtime(plan.output_runtime_range(), allow_candidate_runtime)?;
+    let selection = compatibility::select_focused_qualification_runtime(
+        plan.output_runtime_range(),
+        allow_candidate_runtime,
+    )?;
     let identity = selection.descriptor.identity;
     let worker_executable_sha256 = result.historical_worker_executable_sha256.ok_or_else(|| {
         format!(
@@ -9867,13 +9988,18 @@ async fn run_geyser_replay(
     };
     let replay_end = end_inclusive.saturating_add(1);
     let execution = if carried_state.is_none() && bootstrap.snapshot_archive().is_some() {
-        compatibility::select_runtime_with_snapshot_warmup(
+        select_runtime_with_snapshot_warmup_for_invocation(
             replay_start,
             output_slot_start..replay_end,
             allow_candidate_runtime,
+            qualification.is_some(),
         )?
     } else {
-        compatibility::select_runtime(replay_start..replay_end, allow_candidate_runtime)?
+        select_runtime_for_invocation(
+            replay_start..replay_end,
+            allow_candidate_runtime,
+            qualification.is_some(),
+        )?
     };
     if qualification.is_some() || execution.admission == compatibility::AdmissionLevel::Candidate {
         let Some(verifier) = snapshot_verifier.as_ref() else {
@@ -10104,7 +10230,13 @@ async fn run_geyser_replay(
             | compatibility::RuntimeBackend::SolanaV1_5_19
             | compatibility::RuntimeBackend::SolanaV1_5_6
             | compatibility::RuntimeBackend::SolanaV1_5_8
-            | compatibility::RuntimeBackend::SolanaV1_6_15 => {
+            | compatibility::RuntimeBackend::SolanaV1_6_15
+            | compatibility::RuntimeBackend::SolanaV1_6_16
+            | compatibility::RuntimeBackend::SolanaV1_6_17
+            | compatibility::RuntimeBackend::SolanaV1_6_20
+            | compatibility::RuntimeBackend::SolanaV1_7_13
+            | compatibility::RuntimeBackend::SolanaV1_7_15
+            | compatibility::RuntimeBackend::SolanaV1_8_11 => {
                 let worker_profile = historical_worker_profile(runtime_descriptor)?;
                 if let Some(CarriedRuntimeState::Historical {
                     client,
@@ -12021,7 +12153,13 @@ fn validated_epoch_archive_multi_runtime(
         | compatibility::RuntimeBackend::SolanaV1_5_19
         | compatibility::RuntimeBackend::SolanaV1_5_6
         | compatibility::RuntimeBackend::SolanaV1_5_8
-        | compatibility::RuntimeBackend::SolanaV1_6_15 => StateCommitmentKind::LegacyAccountsHash,
+        | compatibility::RuntimeBackend::SolanaV1_6_15
+        | compatibility::RuntimeBackend::SolanaV1_6_16
+        | compatibility::RuntimeBackend::SolanaV1_6_17
+        | compatibility::RuntimeBackend::SolanaV1_6_20
+        | compatibility::RuntimeBackend::SolanaV1_7_13
+        | compatibility::RuntimeBackend::SolanaV1_7_15
+        | compatibility::RuntimeBackend::SolanaV1_8_11 => StateCommitmentKind::LegacyAccountsHash,
         compatibility::RuntimeBackend::AgaveV3 => StateCommitmentKind::AccountsLtHash,
     };
     if provenance.bootstrap_state.kind != expected_commitment_kind {
@@ -16341,6 +16479,7 @@ async fn run_epoch_range_supervisor_adaptive(
         end_epoch,
         allow_candidate_runtime,
         load_from_dir,
+        false,
     )? {
         return Err(
             "adaptive epoch concurrency requires every runtime to support private replay scratch"
@@ -17600,7 +17739,11 @@ async fn main() {
     }
     for epoch in start_epoch..=end_epoch {
         let slot_range = runtime_slot_range(epoch, qualification);
-        let spans = match compatibility::plan_runtime_spans(slot_range, allow_candidate_runtime) {
+        let spans = match plan_runtime_spans_for_invocation(
+            slot_range,
+            allow_candidate_runtime,
+            qualification.is_some(),
+        ) {
             Ok(spans) => spans,
             Err(err) => {
                 eprintln!("error: epoch {epoch}: {err}");
@@ -17622,9 +17765,10 @@ async fn main() {
         }
     }
     if replay_scratch.is_some() {
-        let spans = compatibility::plan_runtime_spans(
+        let spans = plan_runtime_spans_for_invocation(
             runtime_slot_range(start_epoch, qualification),
             allow_candidate_runtime,
+            qualification.is_some(),
         )
         .expect("requested range was preflighted above");
         if !runtime_spans_support_private_replay_scratch(
@@ -17650,9 +17794,10 @@ async fn main() {
         let mut first_incomplete = start_epoch;
         while first_incomplete <= end_epoch {
             let (slot_start, slot_end_inclusive) = epoch_to_slot_range(first_incomplete);
-            let spans = compatibility::plan_runtime_spans(
+            let spans = plan_runtime_spans_for_invocation(
                 slot_start..slot_end_inclusive.saturating_add(1),
                 allow_candidate_runtime,
+                qualification.is_some(),
             )
             .expect("requested range was preflighted above");
             let path = dest_dir.join(format!("epoch-{first_incomplete}.jet"));
@@ -17724,7 +17869,11 @@ async fn main() {
     }
     for epoch in effective_start..=end_epoch {
         let slot_range = runtime_slot_range(epoch, qualification);
-        match compatibility::plan_runtime_spans(slot_range.clone(), allow_candidate_runtime) {
+        match plan_runtime_spans_for_invocation(
+            slot_range.clone(),
+            allow_candidate_runtime,
+            qualification.is_some(),
+        ) {
             Ok(runtime_spans) => {
                 for span in runtime_spans {
                     let selection = runtime_span_selection(&span)
@@ -17752,7 +17901,11 @@ async fn main() {
                         );
                     }
                 }
-                match compatibility::plan_replay(slot_range, allow_candidate_runtime) {
+                match plan_replay_for_invocation(
+                    slot_range,
+                    allow_candidate_runtime,
+                    qualification.is_some(),
+                ) {
                     Ok(segments) => {
                         for segment in segments {
                             info!(
@@ -17783,6 +17936,7 @@ async fn main() {
     let effective_runtime = bootstrap_runtime_selection(
         runtime_slot_range(effective_start, qualification),
         allow_candidate_runtime,
+        qualification.is_some(),
     )
     .expect("requested range was preflighted above");
     let effective_archive_extensions = effective_runtime.descriptor.bootstrap.archive_extensions;
@@ -17826,6 +17980,7 @@ async fn main() {
         end_epoch,
         allow_candidate_runtime,
         env_truthy("JETSTREAMER_LOAD_FROM_DIR"),
+        qualification.is_some(),
     )
     .expect("requested range was preflighted above");
     if adaptive_requested && !private_scratch_capable {
@@ -18164,6 +18319,7 @@ async fn main() {
             let selection = bootstrap_runtime_selection(
                 slot_start..slot_end.saturating_add(1),
                 allow_candidate_runtime,
+                false,
             )
             .expect("requested range was preflighted above");
             match ensure_epoch_boundary_snapshot(
@@ -18305,6 +18461,7 @@ async fn main() {
                 let selection = bootstrap_runtime_selection(
                     epoch_start_slot..epoch_end_slot.saturating_add(1),
                     allow_candidate_runtime,
+                    false,
                 )
                 .expect("requested range was preflighted above");
                 let bootstrap_state = selection.descriptor.bootstrap;
@@ -18457,9 +18614,10 @@ async fn main() {
     // Split the epoch into registry-owned qualification children, prove the
     // canonical snapshot transition independently on both sides, and assemble
     // their complete V2 archives into one V3 archive.
-    let effective_epoch_spans = compatibility::plan_runtime_spans(
+    let effective_epoch_spans = plan_runtime_spans_for_invocation(
         runtime_slot_range(effective_start, qualification),
         allow_candidate_runtime,
+        qualification.is_some(),
     )
     .expect("requested range was preflighted above");
     if qualification.is_none() && effective_start == end_epoch && effective_epoch_spans.len() > 1 {
@@ -18585,9 +18743,10 @@ async fn main() {
             .map(|plan| plan.replay_start)
             .unwrap_or_else(|| epoch_to_slot_range(effective_start).0),
     ));
-    let first_epoch_spans = compatibility::plan_runtime_spans(
-        epoch_to_slot(effective_start)..epoch_to_slot(effective_start.saturating_add(1)),
+    let first_epoch_spans = plan_runtime_spans_for_invocation(
+        runtime_slot_range(effective_start, qualification),
         allow_candidate_runtime,
+        qualification.is_some(),
     )
     .expect("requested range was preflighted above");
     let mixed_root_first_epoch = root_checkpoint_cohort && first_epoch_spans.len() > 1;
@@ -20926,6 +21085,86 @@ mod early_snapshot_tests {
     }
 
     #[test]
+    fn epoch_208_route_is_available_only_to_the_explicit_focused_plan() {
+        let snapshot =
+            PathBuf::from("snapshot-89855469-9i59TwLmzXvbomizFZNuXgPygtx8zJ3P4nWDQuNxrTxK.tar.zst");
+        let plan = qualification_plan(
+            208,
+            208,
+            Some(90_287_519),
+            Some(true),
+            Some(&snapshot),
+            Some(Path::new("epoch-hashes-208.txt")),
+            Some(Path::new("epoch-208-through-90287519.jet")),
+        )
+        .unwrap()
+        .unwrap();
+
+        let output_range = runtime_slot_range(208, Some(plan));
+        assert!(
+            compatibility::plan_runtime_spans(output_range.clone(), true).is_err(),
+            "normal replay must retain the post-201 unsupported gap"
+        );
+        let spans = plan_runtime_spans_for_invocation(output_range.clone(), true, true).unwrap();
+        assert_eq!(spans.len(), 1);
+        assert_eq!(
+            runtime_span_selection(&spans[0]).unwrap().backend,
+            compatibility::RuntimeBackend::SolanaV1_6_16
+        );
+        let selection = select_runtime_with_snapshot_warmup_for_invocation(
+            plan.replay_start,
+            output_range,
+            true,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            selection.backend,
+            compatibility::RuntimeBackend::SolanaV1_6_16
+        );
+    }
+
+    #[test]
+    fn epoch_213_route_is_available_only_to_the_explicit_focused_plan() {
+        let snapshot =
+            PathBuf::from("snapshot-92015419-VkTNdojvP5U4pPTSUQfK997eJsxMVfwt8HYxhgcV4nU.tar.zst");
+        let plan = qualification_plan(
+            213,
+            213,
+            Some(92_447_542),
+            Some(true),
+            Some(&snapshot),
+            Some(Path::new("epoch-hashes-213.txt")),
+            Some(Path::new("epoch-213-through-92447542.jet")),
+        )
+        .unwrap()
+        .unwrap();
+
+        let output_range = runtime_slot_range(213, Some(plan));
+        assert!(
+            compatibility::plan_runtime_spans(output_range.clone(), true).is_err(),
+            "normal replay must retain the post-201 unsupported gap"
+        );
+        let spans = plan_runtime_spans_for_invocation(output_range.clone(), true, true).unwrap();
+        assert_eq!(spans.len(), 1);
+        assert_eq!(
+            runtime_span_selection(&spans[0]).unwrap().backend,
+            compatibility::RuntimeBackend::SolanaV1_6_16
+        );
+        let selection = select_runtime_with_snapshot_warmup_for_invocation(
+            plan.replay_start,
+            output_range,
+            true,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            selection.backend,
+            compatibility::RuntimeBackend::SolanaV1_6_16
+        );
+    }
+
+    #[test]
     fn runtime_boundary_detection_forces_epoch_one_range_isolation() {
         assert_eq!(
             epoch_isolation_plan(1, 2, false, true).unwrap(),
@@ -23204,6 +23443,56 @@ mod scheduler_tests {
         let scheduled = authoritative.txs[0].as_ref().unwrap();
         assert!(scheduled.expected_status.is_none());
         assert!(scheduled.reconstruct_fee);
+    }
+
+    #[test]
+    fn finalized_rpc_gap_metadata_remains_source_exact() {
+        let signature: Signature =
+            "35MSjAdZmC64dHst4EVTj8ZsqyvUB9y9RcDijYdA1S4dmnntowUUtvdQSeBRJebb51urCrGdBt349NjfwMvPiBbB"
+                .parse()
+                .unwrap();
+        let evidence = compatibility::resolve_missing_transaction_status(89_856_001, 0, &signature)
+            .unwrap()
+            .unwrap();
+        let compatibility::MissingTransactionStatusEvidence::Canonical(canonical) = &evidence
+        else {
+            panic!("epoch-208 gap must resolve through finalized canonical metadata");
+        };
+        let expected_metadata = canonical.metadata.clone();
+        let mut buffer = SlotExecutionBuffer::default();
+        buffer
+            .insert_transaction(
+                89_856_001,
+                0,
+                VersionedTransaction {
+                    signatures: vec![signature],
+                    ..VersionedTransaction::default()
+                },
+                TransactionMetadataInput::Missing(evidence),
+                TransactionStatusValidation::SourceExact,
+            )
+            .unwrap();
+        let scheduled = buffer.txs[0].as_ref().unwrap();
+        assert_eq!(
+            scheduled.expected_status,
+            Some(expected_metadata.status.clone())
+        );
+        assert!(!scheduled.reconstruct_fee);
+        assert_eq!(scheduled.status_meta, expected_metadata);
+
+        let evidence = compatibility::resolve_missing_transaction_status(89_856_001, 0, &signature)
+            .unwrap()
+            .unwrap();
+        let error = SlotExecutionBuffer::default()
+            .insert_transaction(
+                89_856_001,
+                0,
+                VersionedTransaction::default(),
+                TransactionMetadataInput::Missing(evidence),
+                TransactionStatusValidation::SourceExact,
+            )
+            .unwrap_err();
+        assert!(error.contains("evidence identity mismatch"), "{error}");
     }
 
     #[test]

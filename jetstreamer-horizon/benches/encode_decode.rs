@@ -1290,7 +1290,7 @@ fn write_simulated_archive(
     let started = std::time::Instant::now();
     let sink = std::io::Cursor::new(Vec::new());
     let mut writer = ArchiveWriter::new(sink, 900, 0, n_slots, config).expect("writer");
-    // Reusable boxed BlockMeta (the type is ~40 MiB with its orphan arenas).
+    // Reusable boxed BlockMeta (the type is ~121 MiB with its orphan arenas).
     let mut meta_scratch = jetstreamer_horizon::block_metas::BlockMeta::new_boxed();
 
     let mut corpus_pos = 0usize;

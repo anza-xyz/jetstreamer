@@ -1,0 +1,41 @@
+{
+  "candidate": "solana-v1.7.13",
+  "status": "private-unassigned-comparison-candidate",
+  "upstream": {
+    "tag": "v1.7.13",
+    "commit": "257ddbeee1e8e7db2daa54e86f8eeedf76ace8f1",
+    "runtime_tree": "c1fa10cc93911eaecfdb3599f5c751984f354e5d",
+    "bpf_loader_tree": "b83c5c8c91610938ff9f778d536b6cdfcab60280"
+  },
+  "admission": {
+    "bootstrap_snapshot_slot": 100655540,
+    "first_entry_slot": 100655541,
+    "comparison_epoch": 233,
+    "assignment": "none"
+  },
+  "bootstrap": {
+    "versioned_uri": "gs://mainnet-beta-ledger-us-ny5/100655540/snapshot-100655540-A11g8aGUD2GCEGp7qcciMSW2Lf1StGPaUUZTLP1BHrRL.tar.zst#1634136853781030",
+    "accounts_hash": "A11g8aGUD2GCEGp7qcciMSW2Lf1StGPaUUZTLP1BHrRL",
+    "size": 10738664792,
+    "crc32c_base64": "j3ZZuQ==",
+    "md5_base64": "msPRq77oL5tKjw1tOfGaBQ=="
+  },
+  "local_validation": {
+    "completed_at_utc": "2026-10-04T06:08:58Z",
+    "cargo_test_workspace_locked": "pass (16 protocol, 43 worker, 2 ignored, 1 stdio)",
+    "cargo_test_forced_soft_poh": "pass (5)",
+    "cargo_build_workspace_release_locked": "pass",
+    "worker_sha256": "cca793b2bc5a8fcb962c71bf9eb238ca74fae67b4ebda51ff092d5b4d82fdf2d",
+    "worker_size": 6310288
+  },
+  "fallback_first_epoch_candidate": {
+    "tag": "v1.7.12",
+    "commit": "ca83167cfcc4f5cdb0837bf04d99041e7377c516",
+    "reason": "Epoch 233 compatibility remains independently checkpoint-gated."
+  },
+  "loader_key_attribution": {
+    "invariant": "signature attribution includes only writable non-loader keys, matching runtime account storage",
+    "runtime_source_sha256": "772d257ac8fb9ac5e6d8a2a201d28af26636f1f9138050d65a558afd22ffcec5"
+  },
+  "publication_gate": "locked-tests-release-build-and-canonical-checkpoint-qualification"
+}

@@ -14,7 +14,13 @@ epochs touch a slot interval marked unsupported by the checked-in runtime regist
    account and read access to the snapshot buckets used by `scripts/preflight_gcs_snapshots.py`.
 3. Keep public output in `${HORIZON_DIR:-$HOME/horizon}` and private runs, manifests, receipts,
    restore scratch, and controller state outside that directory. The public directory may contain
-   only canonical `epoch-N.jet` and `epoch-N.jet.sha256` pairs.
+   only canonical `epoch-N.jet` and `epoch-N.jet.sha256` pairs. Before launching a service as an
+   unprivileged replay user, create each private run-root parent under that user, set it to mode
+   `0700`, and verify it is neither group- nor world-writable. Do this before the first launch so a
+   pre-replay permissions failure does not consume a bounded restart attempt. The adaptive
+   controller defaults to `sol:horizon`; on a host with a different dedicated identity, pass
+   `--producer-user USER --archive-group GROUP` and verify the printed plan resolves the intended
+   UID, GID, and home directory. Do not create placeholder accounts merely to satisfy the defaults.
 4. Build from that recorded commit and pin the hashes of the producer, full verifier, current
    plugin pipeline, boundary verifier, and their launcher scripts before creating a production
    service. Deploy immutable binaries and manifests into root-owned, non-writable paths; do not run
@@ -33,13 +39,19 @@ requested epoch and require the registry to plan all of it. Then run the snapsho
 planning mode for the exact epoch range. An `unsupported runtime era` or `outside ... supported`
 error is a required stop, not a setup problem to bypass.
 
-In the current registry, epoch 200 ends at slot `86,832,000`; slots
-`86,832,000..406,080,000` are deliberately unsupported. Therefore a request for epochs 201–300
-must initially perform compatibility qualification beginning at epoch 201. It must not extend the
-v1.6.15 envelope beyond epoch 200, route the range through modern Agave, or publish diagnostic
-output merely because epoch 201 is adjacent to a known era. Keep this statement conditional on the
-registry: once a reviewed commit has genuinely qualified the range, the checked-in registry is the
-authority.
+The registry may contain bounded candidate eras separated by explicit unsupported gaps. A request
+for epochs 201–300 must plan the complete range and begin compatibility qualification at its lowest
+unsupported slot; support for a later bounded envelope does not authorize skipping an earlier gap.
+Do not extend the preceding worker by adjacency, route historical slots through modern Agave, or
+publish diagnostic output. Once a reviewed commit has genuinely qualified a bounded range, the
+checked-in registry is the authority.
+
+A checked-in focused-qualification-only route may exercise a separately documented, bounded
+diagnostic envelope while the ordinary registry continues to expose an unsupported gap. Such a
+route must be unreachable from normal epoch/range replay, archive reuse, and publication; require
+one epoch, an explicit snapshot, canonical checkpoint file, private output, `--verify`, and
+candidate opt-in; and leave the diagnostic archive without a checksum sidecar. Its success is
+evidence for a later reviewed registry change, not permission to publish by itself.
 
 ## Qualify the next unsupported era
 

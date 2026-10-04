@@ -57,8 +57,9 @@ v1.0.24, v1.1.15, v1.1.23, v1.2.24, and the v1.2.32 workers use
 `1.43.0-x86_64-unknown-linux-gnu`; v1.3.19 and v1.3.23 use
 `1.45.1-x86_64-unknown-linux-gnu`; v1.4.17 and v1.4.25 use
 `1.46.0-x86_64-unknown-linux-gnu`; v1.5.5, v1.5.6, and v1.5.19 use
-`1.49.0-x86_64-unknown-linux-gnu`; and v1.6.15 uses
-`1.51.0-x86_64-unknown-linux-gnu`. They cannot share dependency
+`1.49.0-x86_64-unknown-linux-gnu`; v1.6.15, v1.6.16, v1.6.17, and v1.6.20 use
+`1.51.0-x86_64-unknown-linux-gnu`; and v1.7.13, v1.7.15, and v1.8.11 use
+`1.52.1-x86_64-unknown-linux-gnu`. They cannot share dependency
 resolution because the exact upstream graphs require incompatible
 pre-release cryptography packages. The old `AppendVec` persisted native Rust
 layout, so compiling a runtime with another compiler can interpret historical
@@ -84,7 +85,7 @@ fixed-size owned arrays, and randomized tests cover optimized, paired, and
 forced-portable paths.
 
 The v1.2.32 transition, general v1.2.32, v1.3.19, v1.3.23, v1.4.17, v1.4.25,
-v1.5.5, v1.5.6, v1.5.19, and v1.6.15 workers also perform the storage-only duties that their validators normally delegated to
+v1.5.5, v1.5.6, v1.5.19, v1.6.15, v1.6.16, v1.6.17, v1.6.20, v1.7.13, v1.7.15, and v1.8.11 workers also perform the storage-only duties that their validators normally delegated to
 `AccountsBackgroundService`. After a rooted bank is squashed and all
 observable writes are drained, the worker reclaims dead and stale AppendVec
 storage and periodically runs account cleaning. This maintenance is
@@ -180,6 +181,12 @@ Each vendored runtime directory contains the upstream `runtime/` crate and an
 | `v1_5_19` | `936ff7424e1306b0df07dabcd6863bf7896d2cb5` | registered but unassigned comparison candidate |
 | `v1_5_6` | `01e4d0a1e9917701d1a148e1043b0ccf545c27f1` | bounded checkpoint-qualified candidate from epoch 150; later cohorts remain checkpoint-gated |
 | `v1_6_15` | `5c2dab8055e8162386fcac313b6547f223fd386c` | unqualified checkpoint-gated diagnostic envelope, epochs 174-200 |
+| `v1_6_16` | `86c26f843276581509c3434acc2efbf4202c44e0` | exact-source-equivalent diagnostic admission through epoch 213 only through the explicit focused-qualification planner; ordinary replay remains checkpoint-gated to epoch 201 until each later checkpoint qualifies |
+| `v1_6_17` | `8f3ce5fc578da93405ccedf22150b9fae2bd83c7` | independently restarted, checkpoint-gated diagnostic envelope for epochs 214-215 |
+| `v1_6_20` | `77bdb45d4af61fc687161ec06cc0178ff79726d5` | independently restarted, checkpoint-gated diagnostic envelope for epochs 216-232 |
+| `v1_7_13` | `257ddbeee1e8e7db2daa54e86f8eeedf76ace8f1` | registered but unassigned fallback comparison candidate for the epoch-233 boundary |
+| `v1_7_15` | `4892eb4e1ad278d5249b6cda8983f88effb3e98b` | independently restarted, checkpoint-gated diagnostic envelope for epochs 233-265 |
+| `v1_8_11` | `423a4d65461e36fefb371a2f164c20c4e7ed5afa` | independently restarted, checkpoint-gated diagnostic envelope for epochs 266-301; epoch 301 is a verification tail |
 
 The source has only these integration changes:
 
@@ -218,6 +225,10 @@ The source has only these integration changes:
 9. The v1.5.5, v1.5.6, and v1.5.19 workers disable the account cache. This keeps every
    physical replay write and global write version available to the ordered
    plugin stream instead of collapsing repeated writes by pubkey.
-10. The v1.6.15 worker retains that cache policy and consumes the snapshot's
+10. The v1.6.15, source-equivalent v1.6.16, and independently restarted v1.6.17, v1.6.20, v1.7.13, v1.7.15, and v1.8.11 workers retain that cache policy and consume the snapshot's
    unpacked AppendVec map exactly once. Missing, duplicate, non-regular, and
    unreferenced storage files fail restoration before replay begins.
+11. Account-write signature attribution applies the same non-loader-key filter
+    as the pinned runtime's account storage path. Historically writable loader
+    keys therefore cannot create false cross-transaction conflicts, while a
+    genuine duplicate writable data account still fails closed.

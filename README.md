@@ -510,18 +510,39 @@ select a runtime. The current registry is deliberately conservative:
 | `68,140,177..68,256,000` | pinned Solana v1.5.8 worker | starts from the hash-bound v1.5.6 handoff immediately before the first transaction whose canonical `ProgramFailedToComplete` result differs from v1.5.6's `ComputationalBudgetExceeded`, then matches the canonical terminal accounts hash at slot 68,255,828 | source-status-selected, checkpoint-qualified candidate for the epoch-157 suffix |
 | `68,256,000..75,168,000` | pinned Solana v1.5.6 worker | independently verified snapshot restart at the epoch-158 boundary; later cohorts remain independently checkpoint-gated | checkpoint-gated candidate for epochs 158-173 |
 | `75,168,000..86,832,000` | pinned Solana v1.6.15 worker | independently verified snapshot restart; reproduces the v1.6 loader set, write-lock demotion, and expanded status vocabulary for current plugins; every cohort must match all canonical post-bootstrap roots | unqualified diagnostic candidate for epochs 174-200 |
-| `86,832,000..406,080,000` | none | unsupported; replay fails closed | unsupported |
+| `86,832,000..87,264,000` | pinned Solana v1.6.16 worker | independently restarted epoch-201 canary; upstream execution source is byte-identical to v1.6.15, while the exact tag identity and canonical terminal root remain independently gated | unqualified diagnostic candidate for epoch 201 |
+| `87,264,000..92,448,000` | pinned Solana v1.6.16 worker | focused-qualification-only search envelope; requires the explicit snapshot, checkpoint file, private output, `--verify`, and candidate opt-in; ordinary replay still fails closed. Preserved first-boundary attempts for epochs 209-213 reached their canonical bootstrap roots, then stopped at the former block-reward bound as their first observed failure (`146,527..=180,866` observed versus the current tested `262,144` limit), so those epochs remain diagnostic until fresh terminal checkpoints pass | diagnostic-only epochs 202-213 |
+| `92,448,000..93,312,000` | pinned Solana v1.6.17 worker | independently restarted from canonical snapshot slot 92,447,542; that destination worker owns only the exact 457-slot pre-output warmup; exact upstream tag identity and terminal root at slot 93,311,535 remain checkpoint-gated | unqualified diagnostic candidate for epochs 214-215 |
+| `93,312,000..100,656,000` | pinned Solana v1.6.20 worker | independently restarted from canonical snapshot slot 93,311,535; that destination worker owns only the exact 464-slot pre-output warmup and every cohort remains canonical-root-gated | unqualified diagnostic candidate for epochs 216-232 |
+| `100,656,000..114,912,000` | pinned Solana v1.7.15 worker | independently restarted from canonical snapshot slot 100,655,540; owns the exact 459-slot pre-output warmup and remains canonical-root-gated | unqualified diagnostic candidate for epochs 233-265 |
+| `114,912,000..130,464,000` | pinned Solana v1.8.11 worker | independently restarted from canonical snapshot slot 114,910,768; owns the exact 1,231-slot pre-output warmup; epochs 266-300 are the current publication range and epoch 301 is retained as a verification tail | unqualified diagnostic candidate for epochs 266-301 |
+| `130,464,000..406,080,000` | none | unsupported; replay fails closed | unsupported |
 | `406,080,000..` | in-process Agave v3 | independently verified modern snapshot bootstrap | verified |
 
 Verified epochs 0-100 use 12 execution envelopes backed by 11 historical worker variants. The
 11 runtime boundaries consist of one hash-bound canonical state handoff, two source-lineage-verified
 epoch-67 handoffs, and eight independently verified snapshot restarts. The
 v1.2.32 worker is used on both sides of the two specialized epoch-67 ranges. The v1.3.23,
-v1.4.17, v1.4.19, v1.4.25, v1.5.5, v1.5.6, v1.5.8, and v1.6.15 candidates add ten
-snapshot-isolated envelopes and one hash-bound epoch-157 handoff. The
+v1.4.17, v1.4.19, v1.4.25, v1.5.5, v1.5.6, v1.5.8, v1.6.15, and v1.6.16
+candidates add snapshot-isolated envelopes plus one hash-bound epoch-157
+handoff. The v1.6.17 envelope is
+independently bootstrapped across an unsupported gap rather than treated as an
+adjacent runtime handoff. The
 v1.4.19, v1.5.5, and v1.5.6 envelopes have each passed their first bounded post-boundary checkpoint;
 every complete production cohort still requires all canonical roots before publication. The terminal
-v1.5.19 worker remains registered only as an unassigned comparison candidate.
+v1.5.19 worker remains registered only as an unassigned comparison candidate. The v1.6.16
+worker advances one epoch at a time and is currently limited to the independently
+checkpoint-gated epoch-201 canary for ordinary replay. A separate focused-qualification-only
+planner may exercise the documented v1.6.16 diagnostic envelope through epoch 213, but it cannot
+be used by normal epoch/range replay, archive reuse, or publication; every such diagnostic must
+still reproduce its explicit terminal checkpoint before its evidence can advance the ordinary
+registry. The independently restarted v1.6.17 worker is
+limited to epochs 214-215; the preceding gap remains unsupported.
+The independently restarted v1.6.20 worker is bounded to epochs 216-232.
+Exact v1.7.13 remains an unassigned fallback comparison candidate. The primary
+v1.7.15 envelope covers epochs 233-265, and v1.8.11 covers epochs 266-301 so
+epoch 301 can serve as a verification tail beyond the current epoch-300
+publication boundary.
 
 Eleven execution interventions are explicitly recorded in addition to the ordinary
 epoch-aligned pinned-worker snapshot restarts:
@@ -563,7 +584,7 @@ epoch-aligned pinned-worker snapshot restarts:
     accounts hash `AVreSVPd46H4WiihQ2pFUcRExPRQwL1MxhzQHVGky8bH`; every production replay remains
     independently checkpoint-gated.
 
-Input repair is planned independently of execution and adds four more historical interventions:
+Input repair is planned independently of execution and adds five more historical interventions:
 
 | Slots or records | Input handling | Evidence gate |
 |---|---|---|
@@ -571,6 +592,7 @@ Input repair is planned independently of execution and adds four more historical
 | `4,258,776..43,632,000` | use runtime-associated status and fee because the early writer could pair source statuses with the wrong transactions | exact worker identity plus canonical account-state checkpoints |
 | 1,084 exact records across 15 post-cutover slots | admit a missing status only for a checked-in `(slot, transaction index, signature)` match | hashed audit registry plus captured finalized RPC evidence |
 | `67,681,336..67,824,000` | exclude pre-v1.5.13 bincode candidates while retaining guarded protobuf fallback; this resolves bytes that are valid but unequal under both v1.5.12 and v1.5.13 | CID-verified contiguous boundary audit: protobuf at the last present predecessor slot 67,681,331, absent slots 67,681,332-335, and five v1.5.13-only records at the first present successor slot 67,681,336; the exact dual-valid slot-67,711,948 fixture is checked in |
+| 73,688 exact records across 88 present slots in `89,856,001..89,856,107` | replace the empty source frame with full finalized-block metadata only after slot, transaction index, signature order, and transaction signature all match | hash-bound full-epoch source audit plus 88 canonicalized finalized `getBlock` captures |
 
 Using this narrower definition, which excludes ordinary version pinning, snapshot-format support,
 PoH optimization, and AccountsDB maintenance, epochs 0-100 currently require eight distinct
@@ -582,7 +604,7 @@ later range. All are general invariants rather than slot-special-case branches:
 | First observed at | General handling | Safety boundary |
 |---|---|---|
 | bootstrap slot `61,328,765` for epoch 142 | coalesce an hourly object and canonical root object only when slot, accounts hash, extension, byte length, CRC32C, and MD5 all match; prefer the root object | any digest or identity disagreement remains an ambiguous-preflight failure |
-| epoch-boundary slot `75,168,000` | permit up to 65,536 pre-transaction runtime-direct account writes and 65,536 reward records in one archive block (observed: 19,300+ writes and 18,552 rewards) | both counts remain finite and the independent 32 MiB account-data arena, per-account, bucket, and decode-work limits remain enforced; wire encoding is unchanged |
+| epoch-boundary slots `75,168,000`, `86,832,000`, `88,560,000`, `88,992,000`, `89,424,000`, and `90,288,004` | permit up to 262,144 pre-transaction runtime-direct account writes, 64 MiB of their data, and 262,144 reward records in one archive block (observed: 131,073 writes, more than 32 MiB of write data, and 155,661 rewards) | all three limits remain finite and the independent per-account, bucket, and decode-work limits remain enforced; wire encoding is unchanged |
 | rent-collection slots `76,611,288`, `76,920,172`, `77,374,128`, `77,882,688`, `78,204,496`, and `80,017,516` | permit up to 8,192 post-transaction runtime-direct account writes and 16 MiB of their data in one archive block (observed: at least 4,097 writes at each earlier slot and 9,141,825 data bytes at slot 80,017,516) | both limits remain finite and the independent per-account, bucket, and cumulative decode-work limits remain enforced; the capacity is not encoded, so wire encoding is unchanged |
 
 Archive-container repair is tracked separately from execution compatibility. Early independently
@@ -630,7 +652,7 @@ Transaction metadata is an independent compatibility dimension. Old Faithful has
 before slot `4,258,776`; the pinned historical runtime reconstructs transaction status there, while
 the remaining metadata stays explicitly unavailable. At and after that slot, a missing status frame
 is rejected unless it matches a checked-in audited `(slot, transaction index, signature)` anomaly.
-The audit table binds all 1,084 known holes across 15 slots to finalized RPC status evidence. For 463
+The early audit table binds 1,084 known holes across 15 slots to finalized RPC status evidence. For 463
 of them, finalized block RPC data also preserves the original balance vectors. For the other 621,
 complete metadata was absent from the captured RPC evidence and the other fields remain absent or
 at their defaults. The early source writer also stored execution results beside the wrong
@@ -642,7 +664,12 @@ Later canonical account-state checkpoints remain the admission gate for that rec
 Because the same writer defect could select another transaction's durable-nonce fee calculator,
 protocol-v5 workers also return the runtime-associated fee. Replay uses that fee for source-present
 records and audited missing-frame exceptions in the affected writer era. This policy changes during
-epoch 9 without changing the execution runtime.
+epoch 9 without changing the execution runtime. Separately, the epoch-208 archive has a bounded
+prefix gap covering every transaction in 88 present slots from `89,856,001` through `89,856,106`.
+A full-epoch audit found exactly 73,688 empty frames, and finalized block captures reproduce the
+same ordered signatures with non-null metadata for every record. Those records remain source-exact:
+replay admits only the checked-in `(slot, transaction index, signature)` identity, carries the full
+canonical metadata into Horizon, and still requires the replayed status to match it individually.
 
 Generated Horizon archives record the selected runtime identity and admission level, genesis,
 bootstrap state, output slot range, and transaction-metadata policy in a versioned provenance
@@ -746,8 +773,12 @@ per-worker reservation separate from the larger `MemoryMax` safety ceiling; it d
 ceiling unless an operator supplies measured evidence. Disk admission reserves a fixed safety
 margin and conservatively budgets the full configured private-storage allowance for every live
 producer before starting another one;
-it never terminates live work merely because available space falls below that estimate. Every
-producer runs as the unprivileged `sol` user in a resource-bounded systemd unit. A plan may
+it never terminates live work merely because available space falls below that estimate. By
+default, every producer runs as the unprivileged `sol:horizon` identity in a resource-bounded
+systemd unit. Hosts with a different dedicated identity must pass `--producer-user` and
+`--archive-group`; the controller resolves that account's home directory and applies it to the
+service environment, home execution barrier, sensitive-path isolation, ownership checks, live-unit
+adoption policy, sealed configuration digest, and printed plan. A plan may
 configure up to 32 lanes, but admission is still capped by the number of provisioned lanes and by
 the live CPU, memory-admission, and disk calculations. The final global claim check and launch
 are serialized through the bound public-directory lock, so controllers for different runtime eras

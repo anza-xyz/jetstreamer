@@ -333,6 +333,15 @@ class SelectionTests(unittest.TestCase):
             173: "solana-v1.5.6",
             174: "solana-v1.6.15",
             200: "solana-v1.6.15",
+            201: "solana-v1.6.16",
+            214: "solana-v1.6.17",
+            215: "solana-v1.6.17",
+            216: "solana-v1.6.20",
+            232: "solana-v1.6.20",
+            233: "solana-v1.7.15",
+            265: "solana-v1.7.15",
+            266: "solana-v1.8.11",
+            301: "solana-v1.8.11",
         }
         for epoch, runtime in expected.items():
             with self.subTest(epoch=epoch):
@@ -341,7 +350,13 @@ class SelectionTests(unittest.TestCase):
         with self.assertRaises(preflight.PreflightError):
             preflight.requested_slot_range(0, 1)
         with self.assertRaises(preflight.PreflightError):
-            preflight.requested_slot_range(200, 201)
+            preflight.runtime_route(202)
+        with self.assertRaises(preflight.PreflightError):
+            preflight.runtime_route(213)
+        with self.assertRaises(preflight.PreflightError):
+            preflight.runtime_route(302)
+        with self.assertRaises(preflight.PreflightError):
+            preflight.requested_slot_range(301, 302)
 
     def test_builds_all_epoch_plans_and_keeps_hourly_bootstrap_only(self) -> None:
         root_raw, hourly_raw = complete_inventory()

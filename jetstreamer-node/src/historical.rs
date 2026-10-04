@@ -49,6 +49,13 @@ const MAX_HISTORICAL_GENESIS_BIN_BYTES: u64 = 10 * 1024 * 1024;
 // response item into the parent.
 const MAX_HISTORICAL_ACCOUNT_DATA_BYTES: usize = 10 * 1024 * 1024;
 
+// Old Faithful's confirmed-block recovery for this bounded range preserves
+// canonical transaction order and each blockhash but not the PoH tick entries.
+// The v1.6.16 worker accepts only the exact recovered shape and advances the
+// missing tick heights before entering the next present slot.
+const RECONSTRUCTED_CONFIRMED_BLOCK_START: u64 = 89_856_107;
+const RECONSTRUCTED_CONFIRMED_BLOCK_END: u64 = 89_856_602;
+
 const SOLANA_V1_0_24_BACKEND_ID: &str = "solana-v1.0.24";
 const SOLANA_V1_0_24_TAG: &str = "v1.0.24";
 const SOLANA_V1_0_24_COMMIT: &str = "a93915f1bddb73480f86fc09f487315ae191897d";
@@ -166,6 +173,36 @@ const SOLANA_V1_6_15_TAG: &str = "v1.6.15";
 const SOLANA_V1_6_15_COMMIT: &str = "5c2dab8055e8162386fcac313b6547f223fd386c";
 const SOLANA_V1_6_15_RUST_TOOLCHAIN: &str = "rustc 1.51.0 (2fd73fabe 2021-03-23)";
 const SOLANA_V1_6_15_TARGET: &str = "x86_64-unknown-linux-gnu";
+const SOLANA_V1_6_16_BACKEND_ID: &str = "solana-v1.6.16";
+const SOLANA_V1_6_16_TAG: &str = "v1.6.16";
+const SOLANA_V1_6_16_COMMIT: &str = "86c26f843276581509c3434acc2efbf4202c44e0";
+const SOLANA_V1_6_16_RUST_TOOLCHAIN: &str = "rustc 1.51.0 (2fd73fabe 2021-03-23)";
+const SOLANA_V1_6_16_TARGET: &str = "x86_64-unknown-linux-gnu";
+const SOLANA_V1_6_17_BACKEND_ID: &str = "solana-v1.6.17";
+const SOLANA_V1_6_17_TAG: &str = "v1.6.17";
+const SOLANA_V1_6_17_COMMIT: &str = "8f3ce5fc578da93405ccedf22150b9fae2bd83c7";
+const SOLANA_V1_6_17_RUST_TOOLCHAIN: &str = "rustc 1.51.0 (2fd73fabe 2021-03-23)";
+const SOLANA_V1_6_17_TARGET: &str = "x86_64-unknown-linux-gnu";
+const SOLANA_V1_6_20_BACKEND_ID: &str = "solana-v1.6.20";
+const SOLANA_V1_6_20_TAG: &str = "v1.6.20";
+const SOLANA_V1_6_20_COMMIT: &str = "77bdb45d4af61fc687161ec06cc0178ff79726d5";
+const SOLANA_V1_6_20_RUST_TOOLCHAIN: &str = "rustc 1.51.0 (2fd73fabe 2021-03-23)";
+const SOLANA_V1_6_20_TARGET: &str = "x86_64-unknown-linux-gnu";
+const SOLANA_V1_7_13_BACKEND_ID: &str = "solana-v1.7.13";
+const SOLANA_V1_7_13_TAG: &str = "v1.7.13";
+const SOLANA_V1_7_13_COMMIT: &str = "257ddbeee1e8e7db2daa54e86f8eeedf76ace8f1";
+const SOLANA_V1_7_13_RUST_TOOLCHAIN: &str = "rustc 1.52.1 (9bc8c42bb 2021-05-09)";
+const SOLANA_V1_7_13_TARGET: &str = "x86_64-unknown-linux-gnu";
+const SOLANA_V1_7_15_BACKEND_ID: &str = "solana-v1.7.15";
+const SOLANA_V1_7_15_TAG: &str = "v1.7.15";
+const SOLANA_V1_7_15_COMMIT: &str = "4892eb4e1ad278d5249b6cda8983f88effb3e98b";
+const SOLANA_V1_7_15_RUST_TOOLCHAIN: &str = "rustc 1.52.1 (9bc8c42bb 2021-05-09)";
+const SOLANA_V1_7_15_TARGET: &str = "x86_64-unknown-linux-gnu";
+const SOLANA_V1_8_11_BACKEND_ID: &str = "solana-v1.8.11";
+const SOLANA_V1_8_11_TAG: &str = "v1.8.11";
+const SOLANA_V1_8_11_COMMIT: &str = "423a4d65461e36fefb371a2f164c20c4e7ed5afa";
+const SOLANA_V1_8_11_RUST_TOOLCHAIN: &str = "rustc 1.52.1 (9bc8c42bb 2021-05-09)";
+const SOLANA_V1_8_11_TARGET: &str = "x86_64-unknown-linux-gnu";
 
 fn backend_supports_entry_batches(backend_id: &str) -> bool {
     matches!(
@@ -192,6 +229,12 @@ fn backend_supports_entry_batches(backend_id: &str) -> bool {
             | SOLANA_V1_5_6_BACKEND_ID
             | SOLANA_V1_5_8_BACKEND_ID
             | SOLANA_V1_6_15_BACKEND_ID
+            | SOLANA_V1_6_16_BACKEND_ID
+            | SOLANA_V1_6_17_BACKEND_ID
+            | SOLANA_V1_6_20_BACKEND_ID
+            | SOLANA_V1_7_13_BACKEND_ID
+            | SOLANA_V1_7_15_BACKEND_ID
+            | SOLANA_V1_8_11_BACKEND_ID
     )
 }
 
@@ -459,6 +502,66 @@ pub const SOLANA_V1_6_15_CANDIDATE: WorkerProfile = WorkerProfile {
     solana_commit: SOLANA_V1_6_15_COMMIT,
     rust_toolchain: SOLANA_V1_6_15_RUST_TOOLCHAIN,
     target: SOLANA_V1_6_15_TARGET,
+    required_genesis_hash: protocol::MAINNET_GENESIS_HASH,
+    snapshot_archive_extensions: &[".tar.bz2", ".tar.zst"],
+};
+
+pub const SOLANA_V1_6_16_CANDIDATE: WorkerProfile = WorkerProfile {
+    backend_id: SOLANA_V1_6_16_BACKEND_ID,
+    solana_tag: SOLANA_V1_6_16_TAG,
+    solana_commit: SOLANA_V1_6_16_COMMIT,
+    rust_toolchain: SOLANA_V1_6_16_RUST_TOOLCHAIN,
+    target: SOLANA_V1_6_16_TARGET,
+    required_genesis_hash: protocol::MAINNET_GENESIS_HASH,
+    snapshot_archive_extensions: &[".tar.bz2", ".tar.zst"],
+};
+
+pub const SOLANA_V1_6_17_CANDIDATE: WorkerProfile = WorkerProfile {
+    backend_id: SOLANA_V1_6_17_BACKEND_ID,
+    solana_tag: SOLANA_V1_6_17_TAG,
+    solana_commit: SOLANA_V1_6_17_COMMIT,
+    rust_toolchain: SOLANA_V1_6_17_RUST_TOOLCHAIN,
+    target: SOLANA_V1_6_17_TARGET,
+    required_genesis_hash: protocol::MAINNET_GENESIS_HASH,
+    snapshot_archive_extensions: &[".tar.bz2", ".tar.zst"],
+};
+
+pub const SOLANA_V1_6_20_CANDIDATE: WorkerProfile = WorkerProfile {
+    backend_id: SOLANA_V1_6_20_BACKEND_ID,
+    solana_tag: SOLANA_V1_6_20_TAG,
+    solana_commit: SOLANA_V1_6_20_COMMIT,
+    rust_toolchain: SOLANA_V1_6_20_RUST_TOOLCHAIN,
+    target: SOLANA_V1_6_20_TARGET,
+    required_genesis_hash: protocol::MAINNET_GENESIS_HASH,
+    snapshot_archive_extensions: &[".tar.bz2", ".tar.zst"],
+};
+
+pub const SOLANA_V1_7_13_CANDIDATE: WorkerProfile = WorkerProfile {
+    backend_id: SOLANA_V1_7_13_BACKEND_ID,
+    solana_tag: SOLANA_V1_7_13_TAG,
+    solana_commit: SOLANA_V1_7_13_COMMIT,
+    rust_toolchain: SOLANA_V1_7_13_RUST_TOOLCHAIN,
+    target: SOLANA_V1_7_13_TARGET,
+    required_genesis_hash: protocol::MAINNET_GENESIS_HASH,
+    snapshot_archive_extensions: &[".tar.bz2", ".tar.zst"],
+};
+
+pub const SOLANA_V1_7_15_CANDIDATE: WorkerProfile = WorkerProfile {
+    backend_id: SOLANA_V1_7_15_BACKEND_ID,
+    solana_tag: SOLANA_V1_7_15_TAG,
+    solana_commit: SOLANA_V1_7_15_COMMIT,
+    rust_toolchain: SOLANA_V1_7_15_RUST_TOOLCHAIN,
+    target: SOLANA_V1_7_15_TARGET,
+    required_genesis_hash: protocol::MAINNET_GENESIS_HASH,
+    snapshot_archive_extensions: &[".tar.bz2", ".tar.zst"],
+};
+
+pub const SOLANA_V1_8_11_CANDIDATE: WorkerProfile = WorkerProfile {
+    backend_id: SOLANA_V1_8_11_BACKEND_ID,
+    solana_tag: SOLANA_V1_8_11_TAG,
+    solana_commit: SOLANA_V1_8_11_COMMIT,
+    rust_toolchain: SOLANA_V1_8_11_RUST_TOOLCHAIN,
+    target: SOLANA_V1_8_11_TARGET,
     required_genesis_hash: protocol::MAINNET_GENESIS_HASH,
     snapshot_archive_extensions: &[".tar.bz2", ".tar.zst"],
 };
@@ -2322,6 +2425,14 @@ impl HistoricalRuntimeClient {
                 )
             })?;
         if expected.slot > self.current_slot {
+            if is_reconstructed_confirmed_block_slot(self.current_slot) {
+                // The worker reports transaction entries before it advances
+                // the source-obscured ticks.  On the first entry of the next
+                // present slot it has completed those ticks and created the
+                // child bank, so mirror that bounded transition here before
+                // validating the returned tick height.
+                self.current_tick_height = current_max_tick_height;
+            }
             if self.current_tick_height != current_max_tick_height {
                 return Err(HistoricalRuntimeError::InvalidEntryStream(format!(
                     "entry advances from incomplete slot {} at tick height {} (slot completes at {})",
@@ -2383,6 +2494,10 @@ impl HistoricalRuntimeClient {
         )?;
         Ok(())
     }
+}
+
+fn is_reconstructed_confirmed_block_slot(slot: u64) -> bool {
+    (RECONSTRUCTED_CONFIRMED_BLOCK_START..=RECONSTRUCTED_CONFIRMED_BLOCK_END).contains(&slot)
 }
 
 fn normalize_outcomes(
@@ -2537,7 +2652,7 @@ pub fn encode_legacy_transaction(
 }
 
 /// Normalize a current transaction status into the version-neutral historical
-/// vocabulary through v1.6.15. Newer-only statuses fail closed instead of
+/// vocabulary through v1.7.13. Newer-only statuses fail closed instead of
 /// being conflated.
 pub fn normalize_transaction_error(
     error: &CurrentTransactionError,
@@ -2566,10 +2681,10 @@ pub fn normalize_transaction_error(
         Current::SanitizeFailure => Old::SanitizeFailure,
         Current::ClusterMaintenance => Old::ClusterMaintenance,
         Current::AccountBorrowOutstanding => Old::AccountBorrowOutstanding,
-        Current::WouldExceedMaxBlockCostLimit
-        | Current::UnsupportedVersion
-        | Current::InvalidWritableAccount
-        | Current::WouldExceedMaxAccountCostLimit
+        Current::WouldExceedMaxBlockCostLimit => Old::WouldExceedMaxBlockCostLimit,
+        Current::UnsupportedVersion => Old::UnsupportedVersion,
+        Current::InvalidWritableAccount => Old::InvalidWritableAccount,
+        Current::WouldExceedMaxAccountCostLimit
         | Current::WouldExceedAccountDataBlockLimit
         | Current::TooManyAccountLocks
         | Current::AddressLookupTableNotFound
@@ -2596,7 +2711,7 @@ pub fn normalize_transaction_error(
 }
 
 /// Normalize a current instruction status into the version-neutral historical
-/// vocabulary through v1.6.15. `Custom` preserves its numeric value.
+/// vocabulary through v1.7.13. `Custom` preserves its numeric value.
 #[allow(deprecated)]
 pub fn normalize_instruction_error(
     error: &CurrentInstructionError,
@@ -2666,7 +2781,7 @@ pub fn normalize_instruction_error(
     })
 }
 
-/// Convert a historical transaction status through v1.6.15 back into the
+/// Convert a historical transaction status through v1.7.13 back into the
 /// current status type used by Horizon metadata.
 pub fn denormalize_transaction_error(
     error: &protocol::TransactionError,
@@ -2695,10 +2810,13 @@ pub fn denormalize_transaction_error(
         Old::SanitizeFailure => Current::SanitizeFailure,
         Old::ClusterMaintenance => Current::ClusterMaintenance,
         Old::AccountBorrowOutstanding => Current::AccountBorrowOutstanding,
+        Old::WouldExceedMaxBlockCostLimit => Current::WouldExceedMaxBlockCostLimit,
+        Old::UnsupportedVersion => Current::UnsupportedVersion,
+        Old::InvalidWritableAccount => Current::InvalidWritableAccount,
     }
 }
 
-/// Convert a historical instruction status through v1.6.15 into the current
+/// Convert a historical instruction status through v1.7.13 into the current
 /// superset.
 #[allow(deprecated)]
 pub fn denormalize_instruction_error(
@@ -3977,6 +4095,12 @@ mod tests {
         assert!(backend_supports_entry_batches(SOLANA_V1_5_6_BACKEND_ID));
         assert!(backend_supports_entry_batches(SOLANA_V1_5_8_BACKEND_ID));
         assert!(backend_supports_entry_batches(SOLANA_V1_6_15_BACKEND_ID));
+        assert!(backend_supports_entry_batches(SOLANA_V1_6_16_BACKEND_ID));
+        assert!(backend_supports_entry_batches(SOLANA_V1_6_17_BACKEND_ID));
+        assert!(backend_supports_entry_batches(SOLANA_V1_6_20_BACKEND_ID));
+        assert!(backend_supports_entry_batches(SOLANA_V1_7_13_BACKEND_ID));
+        assert!(backend_supports_entry_batches(SOLANA_V1_7_15_BACKEND_ID));
+        assert!(backend_supports_entry_batches(SOLANA_V1_8_11_BACKEND_ID));
         assert!(!backend_supports_entry_batches(SOLANA_V1_0_24_BACKEND_ID));
         assert!(!backend_supports_entry_batches("unknown"));
     }
@@ -4889,6 +5013,31 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn reconstructed_confirmed_block_transition_advances_obscured_ticks() {
+        let (mut client, _child_id) = scripted_response_client(&[]);
+        client.initialized.ticks_per_slot = 64;
+        client.current_slot = RECONSTRUCTED_CONFIRMED_BLOCK_START;
+        client.current_tick_height = RECONSTRUCTED_CONFIRMED_BLOCK_START * 64;
+
+        let next_slot = RECONSTRUCTED_CONFIRMED_BLOCK_START + 1;
+        client
+            .validate_entry_end(
+                ExpectedEntryResponse {
+                    slot: next_slot,
+                    entry_index: 0,
+                    transaction_count: 1,
+                },
+                next_slot * 64,
+                false,
+            )
+            .unwrap();
+
+        assert_eq!(client.current_slot, next_slot);
+        assert_eq!(client.current_tick_height, next_slot * 64);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn entry_batch_rejects_incorrect_tick_height() {
         let (mut client, child_id) = client_with_response(&wire_entry_end(1, 0, 0, 0, 2, true, 0));
 
@@ -5478,6 +5627,12 @@ mod tests {
             SOLANA_V1_5_6_CANDIDATE,
             SOLANA_V1_5_8_CANDIDATE,
             SOLANA_V1_6_15_CANDIDATE,
+            SOLANA_V1_6_16_CANDIDATE,
+            SOLANA_V1_6_17_CANDIDATE,
+            SOLANA_V1_6_20_CANDIDATE,
+            SOLANA_V1_7_13_CANDIDATE,
+            SOLANA_V1_7_15_CANDIDATE,
+            SOLANA_V1_8_11_CANDIDATE,
         ] {
             assert_eq!(
                 profile.snapshot_archive_extensions,
@@ -5525,6 +5680,12 @@ mod tests {
             SOLANA_V1_5_6_CANDIDATE,
             SOLANA_V1_5_8_CANDIDATE,
             SOLANA_V1_6_15_CANDIDATE,
+            SOLANA_V1_6_16_CANDIDATE,
+            SOLANA_V1_6_17_CANDIDATE,
+            SOLANA_V1_6_20_CANDIDATE,
+            SOLANA_V1_7_13_CANDIDATE,
+            SOLANA_V1_7_15_CANDIDATE,
+            SOLANA_V1_8_11_CANDIDATE,
         ] {
             verify_handshake(profile, &valid_handshake_for(profile)).unwrap();
         }
@@ -5718,7 +5879,7 @@ mod tests {
     }
 
     #[test]
-    fn maps_every_v1_6_transaction_status_and_rejects_newer_statuses() {
+    fn maps_every_v1_7_transaction_status_and_rejects_newer_statuses() {
         use CurrentTransactionError as Current;
         use protocol::TransactionError as Old;
 
@@ -5755,15 +5916,21 @@ mod tests {
                 Current::AccountBorrowOutstanding,
                 Old::AccountBorrowOutstanding,
             ),
+            (
+                Current::WouldExceedMaxBlockCostLimit,
+                Old::WouldExceedMaxBlockCostLimit,
+            ),
+            (Current::UnsupportedVersion, Old::UnsupportedVersion),
+            (Current::InvalidWritableAccount, Old::InvalidWritableAccount),
         ];
         for (current, expected) in cases {
             assert_eq!(normalize_transaction_error(&current).unwrap(), expected);
             assert_eq!(denormalize_transaction_error(&expected), current);
         }
         assert!(matches!(
-            normalize_transaction_error(&Current::UnsupportedVersion),
+            normalize_transaction_error(&Current::WouldExceedMaxAccountCostLimit),
             Err(HistoricalRuntimeError::UnsupportedTransactionError(
-                Current::UnsupportedVersion
+                Current::WouldExceedMaxAccountCostLimit
             ))
         ));
     }

@@ -60,8 +60,12 @@ fn entry_handler() -> impl firehose::Handler<EntryData> {
     move |_thread_id, entry| {
         async move {
             println!(
-                "ENTRY slot={} index={} transactions={:?}",
-                entry.slot, entry.entry_index, entry.transaction_indexes
+                "ENTRY slot={} index={} transactions={:?} num_hashes={} hash={}",
+                entry.slot,
+                entry.entry_index,
+                entry.transaction_indexes,
+                entry.num_hashes,
+                entry.hash,
             );
             Ok(())
         }
@@ -71,17 +75,25 @@ fn entry_handler() -> impl firehose::Handler<EntryData> {
 
 #[tokio::main]
 async fn main() {
-    let slot: u64 = std::env::args()
+    let start_slot: u64 = std::env::args()
         .nth(1)
-        .expect("usage: inspect_slot SLOT")
+        .expect("usage: inspect_slot START_SLOT [END_SLOT_EXCLUSIVE]")
         .parse()
-        .expect("slot must be an integer");
+        .expect("start slot must be an integer");
+    let end_slot: u64 = std::env::args()
+        .nth(2)
+        .map(|value| value.parse().expect("end slot must be an integer"))
+        .unwrap_or(start_slot + 1);
+    assert!(
+        end_slot > start_slot,
+        "end slot must be greater than start slot"
+    );
     firehose::firehose(
         1,
         false,
         false,
         None,
-        slot..slot + 1,
+        start_slot..end_slot,
         Some(block_handler()),
         Some(transaction_handler()),
         Some(entry_handler()),

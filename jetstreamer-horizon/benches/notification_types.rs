@@ -230,7 +230,7 @@ fn bench_notification_decode_cycle(c: &mut Criterion) {
     // Production pattern (what ArchiveReader does): two scratches pinned to
     // their variants — block frames decode into the Block scratch's meta in
     // place, skipped frames touch only the tiny Skipped scratch. No variant
-    // swap, no 40 MiB memset.
+    // swap, no 121 MiB memset.
     {
         let mut block_scratch = BlockNotification::new_boxed();
         // Pin to Block once.
@@ -258,7 +258,7 @@ fn bench_notification_decode_cycle(c: &mut Criterion) {
     }
 
     // Anti-pattern kept as documentation: a single scratch swapping
-    // variants pays a full-enum memset per swap (~40 MiB). This is why the
+    // variants pays a full-enum memset per swap (~121 MiB). This is why the
     // reader pins two scratches.
     {
         let mut scratch = BlockNotification::new_boxed();
@@ -304,9 +304,9 @@ fn bench_clear_and_alloc(c: &mut Criterion) {
     });
 
     // new_boxed: one-time per-thread cost — measured so we know what a
-    // worker pays at startup (BlockMeta ≈ 40 MiB zeroed, Transaction ≈ 12 MiB).
+    // worker pays at startup (BlockMeta ≈ 121 MiB zeroed, Transaction ≈ 12 MiB).
     group.sample_size(20);
-    group.bench_function("block_meta_new_boxed_40MiB", |b| {
+    group.bench_function("block_meta_new_boxed_114MiB", |b| {
         b.iter(|| {
             let m = BlockMeta::new_boxed();
             black_box(m.slot);

@@ -26,7 +26,7 @@
 //! provides the authoritative total order as a cross-check.)
 //!
 //! Like [`Transaction`](crate::transactions::Transaction), instances are
-//! large (~40 MiB, dominated by the orphan-update arenas) and must be
+//! large (~121 MiB, dominated by the orphan-update arenas) and must be
 //! heap-allocated via [`BlockNotification::new_boxed`] /
 //! [`BlockMeta::new_boxed`] and reused.
 use lencode::prelude::*;
@@ -57,7 +57,7 @@ pub struct SkippedSlot {
 /// Block-level metadata plus the block's runtime-direct account updates.
 ///
 /// `Clone` is intentionally **not** derived — the orphan arenas make this
-/// a ~40 MiB struct; cloning through the stack would overflow.
+/// a ~121 MiB struct; cloning through the stack would overflow.
 #[derive(Encode, Decode, Debug, PartialEq, Eq)]
 #[repr(C)]
 pub struct BlockMeta {
@@ -90,7 +90,7 @@ pub struct BlockMeta {
 }
 
 impl Default for BlockMeta {
-    /// **Warning:** ~40 MiB by value; prefer [`Self::new_boxed`].
+    /// **Warning:** ~121 MiB by value; prefer [`Self::new_boxed`].
     fn default() -> Self {
         Self {
             slot: 0,
@@ -111,7 +111,7 @@ impl Default for BlockMeta {
 
 impl BlockMeta {
     /// Allocates a fresh zero-initialised `BlockMeta` directly on the heap,
-    /// without routing the ~40 MiB struct through the stack.
+    /// without routing the ~121 MiB struct through the stack.
     pub fn new_boxed() -> Box<Self> {
         use std::alloc::{Layout, alloc_zeroed, handle_alloc_error};
         let layout = Layout::new::<Self>();
@@ -173,7 +173,7 @@ impl BlockMeta {
 // variant swap in [`Self::decode_into`] (same technique as
 // `VersionedMessage`).
 //
-// The variant size gap (8 B vs ~40 MiB) is intentional: boxing `BlockMeta`
+// The variant size gap (8 B vs ~121 MiB) is intentional: boxing `BlockMeta`
 // would reintroduce a heap indirection and break the zero-alloc /
 // `decode_into`-in-place design. Instances are always heap-pinned via
 // `new_boxed()` and reused, so the size is paid once per scratch, not per
@@ -188,7 +188,7 @@ pub enum BlockNotification {
 }
 
 impl Default for BlockNotification {
-    /// **Warning:** ~40 MiB by value; prefer [`Self::new_boxed`].
+    /// **Warning:** ~121 MiB by value; prefer [`Self::new_boxed`].
     fn default() -> Self {
         Self::Skipped(SkippedSlot::default())
     }
@@ -196,7 +196,7 @@ impl Default for BlockNotification {
 
 impl BlockNotification {
     /// Allocates a fresh `BlockNotification` (Skipped(0)) directly on the
-    /// heap without routing the ~40 MiB enum through the stack.
+    /// heap without routing the ~121 MiB enum through the stack.
     pub fn new_boxed() -> Box<Self> {
         use std::alloc::{Layout, alloc_zeroed, handle_alloc_error};
         let layout = Layout::new::<Self>();
@@ -236,7 +236,7 @@ impl BlockNotification {
     }
 
     /// Decodes the wire form into `self` without stack-allocating the
-    /// ~40 MiB enum, swapping variants in place when the incoming
+    /// ~121 MiB enum, swapping variants in place when the incoming
     /// discriminant differs from the active one.
     pub fn decode_into<R: Read>(
         &mut self,
@@ -494,7 +494,7 @@ mod tests {
                 .is_err(),
             "reward count must remain fail-closed above the configured ceiling"
         );
-        let mut buf = vec![0u8; 4 << 20];
+        let mut buf = vec![0u8; 16 << 20];
         let mut cur = lencode::io::Cursor::new(&mut buf[..]);
         let n = src.encode_ext(&mut cur, None).unwrap();
 
@@ -536,5 +536,17 @@ mod tests {
         let mut rd = lencode::io::Cursor::new(&buf[..n]);
         dst.decode_into(&mut rd, None).unwrap();
         assert_eq!(*dst, *src);
+    }
+
+    #[test]
+    fn epoch_206_pre_update_data_exceeds_legacy_32_mib_cap_but_stays_bounded() {
+        let payload = vec![0xA5; 8 << 20];
+        let mut meta = BlockMeta::new_boxed();
+        meta.slot = 88_992_000;
+        for key in 1..=8 {
+            meta.pre_updates.push(&view(key, &payload)).unwrap();
+        }
+        assert_eq!(meta.pre_updates.data_len(), 64 << 20);
+        assert!(meta.pre_updates.push(&view(9, &[0])).is_err());
     }
 }

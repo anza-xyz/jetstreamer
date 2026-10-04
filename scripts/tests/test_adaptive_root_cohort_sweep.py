@@ -637,6 +637,83 @@ class CommandTests(unittest.TestCase):
         )
         sweep.validate_options(complete)
 
+    def test_private_network_check_ignores_class_control_files(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            network_class = Path(raw)
+            (network_class / "lo").mkdir()
+            (network_class / "bonding_masters").write_text("")
+            sweep.require_private_network_namespace(network_class)
+
+            (network_class / "eth0").mkdir()
+            with self.assertRaisesRegex(sweep.SweepError, "loopback-only"):
+                sweep.require_private_network_namespace(network_class)
+
+    def test_service_identity_defaults_and_unsafe_names(self) -> None:
+        parser = sweep.build_argument_parser()
+        base = [
+            "--deploy-dir=/deploy",
+            "--manifest=/deploy/manifest.json",
+            "--manifest-fingerprint=sha256:" + "a" * 64,
+            "--public-private-root=/private",
+            "--state-dir=/state",
+            "--lane=lane-a=/lane-a",
+        ]
+        defaults = parser.parse_args(base)
+        self.assertEqual(defaults.producer_user, "sol")
+        self.assertEqual(defaults.archive_group, "horizon")
+
+        for option in (
+            "--producer-user=ubuntu\nroot",
+            "--archive-group=ubuntu/root",
+        ):
+            with self.subTest(option=option):
+                args = parser.parse_args([*base, option])
+                with self.assertRaisesRegex(sweep.SweepError, "safe service"):
+                    sweep.validate_options(args)
+
+    def test_custom_service_identity_is_applied_to_both_units(self) -> None:
+        common = {
+            "cohort": self.cohort,
+            "deploy": self.deploy,
+            "manifest": self.manifest,
+            "fingerprint": self.fingerprint,
+            "producer_user": "ubuntu",
+            "archive_group": "ubuntu",
+            "producer_home": Path("/home/ubuntu"),
+        }
+        producer = sweep.build_producer_command(
+            lane=self.lane,
+            unit="producer-test.service",
+            **common,
+        )
+        importer = sweep.build_import_command(
+            receipt=Path("/private/receipt.json"),
+            public_dir=Path("/home/ubuntu/horizon"),
+            public_private_root=Path("/home/ubuntu/.private-public"),
+            unit="import-test.service",
+            **common,
+        )
+
+        for command in (producer, importer):
+            with self.subTest(command=command[1]):
+                properties = command_properties(command)
+                environment = {
+                    item.removeprefix("--setenv=")
+                    for item in command
+                    if item.startswith("--setenv=")
+                }
+                self.assertEqual(properties["User"], "ubuntu")
+                self.assertEqual(properties["Group"], "ubuntu")
+                self.assertEqual(properties["NoExecPaths"], "/home/ubuntu")
+                self.assertIn("HOME=/home/ubuntu", environment)
+                self.assertIn("USER=ubuntu", environment)
+                self.assertIn("LOGNAME=ubuntu", environment)
+                self.assertIn(
+                    "-/home/ubuntu/.ssh",
+                    properties["InaccessiblePaths"].split(),
+                )
+                self.assertNotIn("/home/sol", "\0".join(command))
+
     def test_producer_uses_one_whole_lane_mount_and_recursive_sealed_bind(self) -> None:
         command = sweep.build_producer_command(
             cohort=self.cohort,
@@ -849,7 +926,7 @@ class AdoptionHardeningTests(unittest.TestCase):
             argv=(),
         )
 
-    def hardened_properties(self) -> dict[str, str]:
+    def hardened_properties(self, **identity: object) -> dict[str, str]:
         command = sweep.build_producer_command(
             cohort=self.cohort,
             lane=self.lane,
@@ -857,6 +934,7 @@ class AdoptionHardeningTests(unittest.TestCase):
             manifest=self.deploy / "preflight.json",
             fingerprint="sha256:" + "a" * 64,
             unit=self.unit,
+            **identity,
         )
         properties = command_properties(command)
         properties["MainPID"] = str(self.process.pid)
@@ -877,6 +955,28 @@ class AdoptionHardeningTests(unittest.TestCase):
         properties.pop("CPUQuota")
         properties["IOSchedulingClass"] = "2"
         return properties
+
+    def test_custom_identity_hardened_unit_is_accepted(self) -> None:
+        identity = {
+            "producer_user": "ubuntu",
+            "archive_group": "ubuntu",
+            "producer_home": Path("/home/ubuntu"),
+        }
+        with mock.patch.object(
+            sweep,
+            "systemd_properties",
+            return_value=self.hardened_properties(**identity),
+        ):
+            self.assertTrue(
+                sweep.unit_is_hardened_for_adoption(
+                    self.unit,
+                    self.process,
+                    self.cohort,
+                    self.lane,
+                    self.deploy,
+                    **identity,
+                )
+            )
 
     def test_exact_hardened_unit_is_accepted(self) -> None:
         with mock.patch.object(
@@ -1860,8 +1960,11 @@ class CrashSafetyTests(unittest.TestCase):
             memory_high_gib=17,
             memory_max_gib=19,
             cpu_quota_percent=725,
+            producer_user="sol",
+            archive_group="horizon",
         )
         controller.sol_uid = os.getuid()
+        controller.producer_home = Path("/home/sol")
         controller.lanes = {lane.name: lane}
         controller.by_bounds = {(22, 22): cohort}
         controller.state = {
@@ -2119,8 +2222,11 @@ class CrashSafetyTests(unittest.TestCase):
             memory_high_gib=17,
             memory_max_gib=19,
             cpu_quota_percent=725,
+            producer_user="sol",
+            archive_group="horizon",
         )
         controller.sol_uid = os.getuid()
+        controller.producer_home = Path("/home/sol")
         controller.managed_cohorts = (cohort,)
         controller.scheduled_bounds = {(22, 22)}
         controller.lanes = {lane.name: lane}
@@ -2196,8 +2302,11 @@ class CrashSafetyTests(unittest.TestCase):
             memory_high_gib=17,
             memory_max_gib=19,
             cpu_quota_percent=725,
+            producer_user="sol",
+            archive_group="horizon",
         )
         controller.sol_uid = os.getuid()
+        controller.producer_home = Path("/home/sol")
         controller.lanes = {lane.name: lane}
         controller.state = {"sequence": 0, "attempts": {}}
         controller.save = mock.Mock()

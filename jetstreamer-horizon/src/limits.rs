@@ -97,9 +97,12 @@ pub const MAX_TX_LOG_MSGS: usize = 16_384;
 /// headroom on epochs with older compute-cost models.
 pub const MAX_TX_LOG_DATA: usize = 4 * 1024 * 1024;
 
-/// Max number of rewards attached to a transaction. Practical — real
-/// transactions attach at most one or two (vote/stake).
-pub const MAX_TX_REWARDS: usize = 16;
+/// Max number of rewards attached to a transaction. Transaction-status
+/// rewards are the per-account rent debits collected while executing the
+/// transaction, so their count is bounded by the transaction's loaded
+/// accounts. Mainnet slot 88,185,193 contains a transaction with 17 rewards,
+/// above the former practical limit of 16.
+pub const MAX_TX_REWARDS: usize = MAX_TX_ACCOUNTS;
 
 /// Max number of token balance entries (pre or post). Upper bound matches
 /// [`MAX_TX_ACCOUNTS`] since each token balance is keyed by account index.
@@ -109,23 +112,27 @@ pub const MAX_TX_TOKEN_BALANCES: usize = MAX_TX_ACCOUNTS;
 /// typical custom error strings are tiny program-defined messages.
 pub const MAX_CUSTOM_ERROR_LEN: usize = 256;
 
-/// Max rewards in a single block's reward list. Historical epoch-boundary
-/// processing at mainnet slot 75,168,000 reports 18,552 rewards in one block.
-/// The 65,536-record ceiling leaves measured headroom while remaining finite
-/// and below the archive bucket's independent byte and decode-work limits.
-pub const MAX_BLOCK_REWARDS: usize = 65_536;
+/// Max rewards in a single block's reward list. Mainnet epoch-boundary replay
+/// observed 150,959 rewards at slot 88,992,000, 151,620 at slot 89,424,000,
+/// and 155,661 at slot 90,288,004. Keep a finite 262,144-record ceiling while
+/// the archive bucket's independent byte and decode-work limits remain in
+/// force.
+pub const MAX_BLOCK_REWARDS: usize = 262_144;
 
 /// Max runtime-direct ("orphan") account updates attached to one block's
-/// pre-transaction phase. Historical epoch-boundary processing at mainnet
-/// slot 75,168,000 emits more than 16,384 writes before transactions. Keep a
-/// finite 65,536-record ceiling while the independent 32 MiB data-arena and
-/// bucket limits continue to bound memory and decoding work.
-pub const MAX_SLOT_PRE_UPDATES: usize = 65_536;
+/// pre-transaction phase. Mainnet slot 86,832,000 has 70,318 reward recipients,
+/// while slots 88,560,000 and 88,992,000 each emit 131,073 writes before
+/// transactions. Keep a finite 262,144-record ceiling while the independent
+/// 64 MiB data-arena and bucket limits continue to bound memory and decoding
+/// work.
+pub const MAX_SLOT_PRE_UPDATES: usize = 262_144;
 
 /// Combined data-byte cap for one block's pre-transaction orphan updates.
-/// Practical: worst case ≈ vote-reward burst (thousands of ~3.7 KiB vote
-/// states) + SlotHashes (~20 KiB) + a stake partition (~1 MiB).
-pub const MAX_SLOT_PRE_UPDATE_DATA: usize = 32 * 1024 * 1024;
+/// Mainnet epoch-boundary slots 88,992,000 and 89,424,000 both exceed the
+/// former 32 MiB arena while applying 131,073 reward writes. The 64 MiB cap
+/// admits that observed shape while remaining finite and independently
+/// bounded by the per-account, bucket, and cumulative decode-work limits.
+pub const MAX_SLOT_PRE_UPDATE_DATA: usize = 64 * 1024 * 1024;
 
 /// Max orphan updates in one block's post-transaction (freeze) phase.
 /// Historical rent collection at mainnet slots 76,920,172, 77,374,128, and
@@ -166,5 +173,14 @@ mod tests {
         assert_eq!(MAX_TX_ADDR_LOOKUPS, 128);
         assert_eq!(MAX_TX_ACCOUNT_UPDATES, 128);
         assert_eq!(MAX_RETURN_DATA_LEN, 1024);
+        assert_eq!(MAX_BLOCK_REWARDS, 262_144);
+        assert_eq!(MAX_SLOT_PRE_UPDATE_DATA, 64 * 1024 * 1024);
+    }
+
+    #[test]
+    fn historical_epoch_209_rewards_fit_but_the_bound_remains_finite() {
+        const OBSERVED_REWARDS_AT_SLOT_90_288_004: usize = 155_661;
+        assert!(OBSERVED_REWARDS_AT_SLOT_90_288_004 <= MAX_BLOCK_REWARDS);
+        assert_eq!(MAX_BLOCK_REWARDS, 262_144);
     }
 }

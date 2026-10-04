@@ -207,7 +207,7 @@ pub struct SnapshotExport {
     pub archive_sha256: Vec<u8>,
 }
 
-/// The normalized Solana v1 transaction-error superset through v1.6.15.
+/// The normalized Solana v1 transaction-error superset through v1.7.13.
 /// Older workers emit only the variants present in their exact release.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum TransactionError {
@@ -233,6 +233,11 @@ pub enum TransactionError {
     ClusterMaintenance,
     /// Appended for v1.6.15. Existing variant discriminants remain unchanged.
     AccountBorrowOutstanding,
+    /// Appended in the same order as the v1.7.13 SDK enum. Existing variant
+    /// discriminants remain unchanged.
+    WouldExceedMaxBlockCostLimit,
+    UnsupportedVersion,
+    InvalidWritableAccount,
 }
 
 /// The normalized Solana v1 instruction-error superset through v1.6.15.

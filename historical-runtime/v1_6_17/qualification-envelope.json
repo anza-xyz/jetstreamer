@@ -1,0 +1,45 @@
+{
+  "candidate": "solana-v1.6.17",
+  "status": "private-checkpoint-gated",
+  "upstream": {
+    "tag": "v1.6.17",
+    "commit": "8f3ce5fc578da93405ccedf22150b9fae2bd83c7",
+    "runtime_tree": "a104ed90d95efdced2d89c6eb397598a48d05a42",
+    "bpf_loader_tree": "df63d92af7eb6f402aad95e521a07b8ba7407f2b"
+  },
+  "admission": {
+    "bootstrap_snapshot_slot": 92447542,
+    "first_entry_slot": 92447543,
+    "max_slot_exclusive": 93312000,
+    "first_epoch": 214,
+    "last_epoch": 215,
+    "cohort_note": "No canonical root lies inside epoch 214; qualify epochs 214-215 as one runtime-homogeneous cohort through the epoch 215 terminal root."
+  },
+  "bootstrap": {
+    "versioned_uri": "gs://mainnet-beta-ledger-us-ny5/92447542/snapshot-92447542-4gX8J8Y3c36L6W4D38ax2RYShfKmYxHWuDHAkQKeNzqd.tar.zst#1629744948337785",
+    "accounts_hash": "4gX8J8Y3c36L6W4D38ax2RYShfKmYxHWuDHAkQKeNzqd",
+    "size": 8894131881,
+    "crc32c_base64": "2aRcEQ==",
+    "md5_base64": "cjxmnTAGSMNCZcYD91XjbQ=="
+  },
+  "terminal": {
+    "versioned_uri": "gs://mainnet-beta-ledger-us-ny5/93311535/snapshot-93311535-AvfrHApo6e2gHkmffiBEWLLw78DwQNYYoNCsRpA4F1DQ.tar.zst#1630236146120022",
+    "accounts_hash": "AvfrHApo6e2gHkmffiBEWLLw78DwQNYYoNCsRpA4F1DQ",
+    "size": 8922663727,
+    "crc32c_base64": "3IWi3Q==",
+    "md5_base64": "frdIsJPVH8z4tbEgAHxG1Q=="
+  },
+  "local_validation": {
+    "completed_at_utc": "2026-10-04T06:09:28Z",
+    "cargo_test_workspace_locked": "pass (16 protocol, 43 worker, 2 ignored, 1 stdio)",
+    "cargo_test_forced_soft_poh": "pass (5)",
+    "cargo_build_workspace_release_locked": "pass",
+    "worker_sha256": "e7cae45b245bb6bc4c6bd9cdfc7ad198d7ce3648e22534bb6d72f949f9d5f98e",
+    "worker_size": 8966864
+  },
+  "loader_key_attribution": {
+    "invariant": "signature attribution includes only writable non-loader keys, matching runtime account storage",
+    "runtime_source_sha256": "f278463f1d3443560d3c3d19dad568a48f484877e419333132f85ff1d0fdfe70"
+  },
+  "publication_gate": "locked-tests-release-build-and-canonical-checkpoint-qualification"
+}

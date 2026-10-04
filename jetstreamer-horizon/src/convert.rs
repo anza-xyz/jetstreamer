@@ -1082,4 +1082,40 @@ mod tests {
             })
         ));
     }
+
+    #[test]
+    fn historical_transaction_with_seventeen_rent_rewards_converts() {
+        run_big_stack(|| {
+            let tx = VersionedTransaction {
+                signatures: vec![Signature::from([1u8; 64])],
+                message: solana_message::VersionedMessage::Legacy(
+                    solana_message::legacy::Message {
+                        header: MessageHeader::default(),
+                        account_keys: vec![pk(1)],
+                        recent_blockhash: Hash::new_unique(),
+                        instructions: vec![],
+                    },
+                ),
+            };
+            let rewards = (0u8..17)
+                .map(|index| solana_transaction_status::Reward {
+                    pubkey: pk(index).to_string(),
+                    lamports: -(i64::from(index) + 1),
+                    post_balance: u64::from(index),
+                    reward_type: Some(solana_reward_info::RewardType::Rent),
+                    commission: None,
+                })
+                .collect();
+            let meta = TransactionStatusMeta {
+                rewards: Some(rewards),
+                ..TransactionStatusMeta::default()
+            };
+
+            let mut dst = Transaction::new_boxed();
+            populate_transaction(&mut dst, &tx, &meta)
+                .expect("slot 88,185,193 transaction reward shape must fit");
+
+            assert_eq!(dst.rewards.as_ref().expect("rewards").len(), 17);
+        });
+    }
 }

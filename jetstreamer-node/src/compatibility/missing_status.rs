@@ -13,6 +13,10 @@ use {
     super::{
         OLD_FAITHFUL_STATUS_REQUIRED_START_SLOT,
         OLD_FAITHFUL_UNTRUSTED_STATUS_ASSOCIATION_END_SLOT_EXCLUSIVE,
+        canonical_missing_status::{
+            CanonicalMissingTransactionStatus, resolve_canonical_missing_transaction_status,
+            validate_canonical_missing_status_registry,
+        },
     },
     serde::Deserialize,
     sha2::{Digest as _, Sha256},
@@ -88,6 +92,9 @@ pub(crate) enum MissingTransactionStatusEvidence {
     PreCutoverRuntime,
     /// An exact post-cutover source hole with captured historical RPC evidence.
     Audited(Box<AuditedMissingTransactionStatus>),
+    /// An exact source-era hole recovered from finalized block RPC, retaining
+    /// the complete canonical metadata and its transaction association.
+    Canonical(Box<CanonicalMissingTransactionStatus>),
 }
 
 #[derive(Clone, Debug)]
@@ -323,7 +330,8 @@ fn audited_records() -> Result<&'static [AuditedRecord], String> {
 }
 
 pub(crate) fn validate_audited_missing_status_registry() -> Result<(), String> {
-    audited_records().map(|_| ())
+    audited_records()?;
+    validate_canonical_missing_status_registry()
 }
 
 /// Resolves one source-missing transaction without weakening the slot-wide
@@ -339,6 +347,13 @@ pub(crate) fn resolve_missing_transaction_status(
 ) -> Result<Option<MissingTransactionStatusEvidence>, String> {
     if slot < OLD_FAITHFUL_STATUS_REQUIRED_START_SLOT {
         return Ok(Some(MissingTransactionStatusEvidence::PreCutoverRuntime));
+    }
+    if let Some(canonical) =
+        resolve_canonical_missing_transaction_status(slot, transaction_slot_index, signature)?
+    {
+        return Ok(Some(MissingTransactionStatusEvidence::Canonical(Box::new(
+            canonical,
+        ))));
     }
     let Ok(transaction_slot_index) = u32::try_from(transaction_slot_index) else {
         return Ok(None);

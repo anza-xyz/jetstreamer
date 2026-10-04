@@ -469,7 +469,8 @@ slot 194,184,611, partway through epoch 449.
 
 | Epoch/range | Slot range        | Comment |
 |-------------|-------------------|-----------------------------------------------|
-| 0-156       | 0-67,823,999      | Bincode transaction metadata (auto-decoded)   |
+| 0-155; early 156 | 0-67,681,335  | Historical bincode schemas with guarded protobuf fallback |
+| 156         | 67,681,336-67,823,999 | v1.5.13 bincode with guarded protobuf fallback |
 | 157+        | 67,824,000+       | Protobuf transaction metadata                 |
 | through 449 | 0-194,184,610     | CU tracking unavailable (reported as `0`)     |
 | from 449    | 194,184,611+      | CU tracking available                         |
@@ -562,13 +563,14 @@ epoch-aligned pinned-worker snapshot restarts:
     accounts hash `AVreSVPd46H4WiihQ2pFUcRExPRQwL1MxhzQHVGky8bH`; every production replay remains
     independently checkpoint-gated.
 
-Input repair is planned independently of execution and adds three more historical interventions:
+Input repair is planned independently of execution and adds four more historical interventions:
 
 | Slots or records | Input handling | Evidence gate |
 |---|---|---|
 | `0..4,258,776` | reconstruct status and fee from the selected runtime because the archive has no status frames | canonical account-state checkpoints |
 | `4,258,776..43,632,000` | use runtime-associated status and fee because the early writer could pair source statuses with the wrong transactions | exact worker identity plus canonical account-state checkpoints |
 | 1,084 exact records across 15 post-cutover slots | admit a missing status only for a checked-in `(slot, transaction index, signature)` match | hashed audit registry plus captured finalized RPC evidence |
+| `67,681,336..67,824,000` | exclude pre-v1.5.13 bincode candidates while retaining guarded protobuf fallback; this resolves bytes that are valid but unequal under both v1.5.12 and v1.5.13 | CID-verified contiguous boundary audit: protobuf at the last present predecessor slot 67,681,331, absent slots 67,681,332-335, and five v1.5.13-only records at the first present successor slot 67,681,336; the exact dual-valid slot-67,711,948 fixture is checked in |
 
 Using this narrower definition, which excludes ordinary version pinning, snapshot-format support,
 PoH optimization, and AccountsDB maintenance, epochs 0-100 currently require eight distinct

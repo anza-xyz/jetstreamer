@@ -123,7 +123,8 @@
 //!
 //! | Epoch/range | Slot range        | Comment |
 //! |-------------|-------------------|-----------------------------------------------|
-//! | 0-156       | 0-67,823,999      | Bincode transaction metadata (auto-decoded)   |
+//! | 0-155; early 156 | 0-67,681,335  | Historical bincode schemas with guarded protobuf fallback |
+//! | 156         | 67,681,336-67,823,999 | v1.5.13 bincode with guarded protobuf fallback |
 //! | 157+        | 67,824,000+       | Protobuf transaction metadata                 |
 //! | through 449 | 0-194,184,610     | CU tracking unavailable (reported as `0`)     |
 //! | from 449    | 194,184,611+      | CU tracking available                         |

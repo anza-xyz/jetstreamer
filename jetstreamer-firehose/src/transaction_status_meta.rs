@@ -233,12 +233,25 @@ impl From<LegacyInnerInstructions> for InnerInstructions {
 /// an archive-input boundary, independent of the runtime that executed a slot.
 pub const OLD_FAITHFUL_PROTOBUF_META_START_SLOT: u64 = 157 * 432_000;
 
+/// First present slot written with Solana v1.5.13 transaction metadata.
+///
+/// A CID-verified contiguous archive audit found protobuf at the last present
+/// predecessor slot (67,681,331), no blocks at 67,681,332 through 67,681,335,
+/// and five v1.5.13-only records at 67,681,336. Protobuf remains a guarded
+/// candidate until [`OLD_FAITHFUL_PROTOBUF_META_START_SLOT`] because the source
+/// archive contains pre-cutoff protobuf records as well.
+pub const OLD_FAITHFUL_V1_5_13_META_START_SLOT: u64 = 67_681_336;
+
 /// Transaction-metadata encoding selected from the source slot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OldFaithfulMetaEncoding {
     /// Try the Solana f64, v1.5.9 string, and v1.5.13 bincode schemas plus
     /// guarded protobuf, rejecting successful decodes that disagree.
     BincodeWithProtobufFallback,
+    /// Decode the v1.5.13 bincode schema plus guarded protobuf. Older bincode
+    /// schemas are excluded after their audited source boundary so a byte
+    /// sequence valid under both releases cannot be interpreted two ways.
+    V1_5_13BincodeWithProtobufFallback,
     /// Decode protobuf directly.
     Protobuf,
 }
@@ -246,10 +259,12 @@ pub enum OldFaithfulMetaEncoding {
 /// Selects the Old Faithful transaction-metadata decoder solely from `slot`.
 #[inline]
 pub const fn old_faithful_meta_encoding(slot: u64) -> OldFaithfulMetaEncoding {
-    if slot < OLD_FAITHFUL_PROTOBUF_META_START_SLOT {
-        OldFaithfulMetaEncoding::BincodeWithProtobufFallback
-    } else {
+    if slot >= OLD_FAITHFUL_PROTOBUF_META_START_SLOT {
         OldFaithfulMetaEncoding::Protobuf
+    } else if slot >= OLD_FAITHFUL_V1_5_13_META_START_SLOT {
+        OldFaithfulMetaEncoding::V1_5_13BincodeWithProtobufFallback
+    } else {
+        OldFaithfulMetaEncoding::BincodeWithProtobufFallback
     }
 }
 
@@ -641,6 +656,25 @@ pub(crate) fn decode_transaction_status_meta(
                 ),
             ],
         ),
+        OldFaithfulMetaEncoding::V1_5_13BincodeWithProtobufFallback => select_unique_metadata(
+            slot,
+            epoch,
+            [
+                (
+                    "Solana v1.5.13 bincode",
+                    decode_legacy_candidate::<LegacyV1_5_13UiTokenAmount>(
+                        slot,
+                        epoch,
+                        "Solana v1.5.13 bincode",
+                        metadata_bytes,
+                    ),
+                ),
+                (
+                    "protobuf",
+                    decode_protobuf(slot, epoch, metadata_bytes).map_err(|error| error.to_string()),
+                ),
+            ],
+        ),
         OldFaithfulMetaEncoding::Protobuf => decode_protobuf(slot, epoch, metadata_bytes),
     }
 }
@@ -652,9 +686,10 @@ mod tests {
             LegacyInnerInstructions, LegacyInstructionError, LegacyTransactionError,
             LegacyTransactionStatusMeta, LegacyTransactionTokenBalance, LegacyV1_5_9UiTokenAmount,
             LegacyV1_5_12UiTokenAmount, LegacyV1_5_13UiTokenAmount,
-            OLD_FAITHFUL_PROTOBUF_META_START_SLOT, OldFaithfulMetaEncoding, decode_legacy_bincode,
-            decode_transaction_status_meta, decode_v1_5_9_candidate, legacy_v1_5_12_ui_amount,
-            old_faithful_meta_encoding, select_unique_metadata,
+            OLD_FAITHFUL_PROTOBUF_META_START_SLOT, OLD_FAITHFUL_V1_5_13_META_START_SLOT,
+            OldFaithfulMetaEncoding, decode_legacy_bincode, decode_transaction_status_meta,
+            decode_v1_5_9_candidate, legacy_v1_5_12_ui_amount, old_faithful_meta_encoding,
+            select_unique_metadata,
         },
         serde::Serialize,
         sha2::{Digest as _, Sha256},
@@ -759,10 +794,18 @@ mod tests {
     }
 
     #[test]
-    fn metadata_encoding_switches_at_the_configured_slot() {
+    fn metadata_encoding_switches_at_the_audited_slots() {
+        assert_eq!(
+            old_faithful_meta_encoding(OLD_FAITHFUL_V1_5_13_META_START_SLOT - 1),
+            OldFaithfulMetaEncoding::BincodeWithProtobufFallback
+        );
+        assert_eq!(
+            old_faithful_meta_encoding(OLD_FAITHFUL_V1_5_13_META_START_SLOT),
+            OldFaithfulMetaEncoding::V1_5_13BincodeWithProtobufFallback
+        );
         assert_eq!(
             old_faithful_meta_encoding(OLD_FAITHFUL_PROTOBUF_META_START_SLOT - 1),
-            OldFaithfulMetaEncoding::BincodeWithProtobufFallback
+            OldFaithfulMetaEncoding::V1_5_13BincodeWithProtobufFallback
         );
         assert_eq!(
             old_faithful_meta_encoding(OLD_FAITHFUL_PROTOBUF_META_START_SLOT),
@@ -1230,6 +1273,30 @@ mod tests {
     }
 
     #[test]
+    fn audited_v1_5_13_boundary_resolves_dual_valid_metadata() {
+        // Old Faithful epoch 156, slot 67,711,948, transaction index 98.
+        // The CID-verified frame is syntactically valid under both v1.5.12
+        // and v1.5.13 but normalizes differently. Five other records in this
+        // same slot are v1.5.13-only, and the slot is after the independently
+        // audited v1.5.13 source boundary.
+        // Decompressed bytes SHA-256:
+        // 3de7ed9f0d0df0451d5a9613e8f9e6c2984216c5bd73786ceb2cc470c74631dc
+        let bytes = decode_hex_fixture(include_str!(
+            "../tests/fixtures/old-faithful-meta-slot-67711948-v1.5.13-ambiguous.hex"
+        ));
+        let v1_5_12 = decode_legacy_bincode::<LegacyV1_5_12UiTokenAmount>(&bytes)
+            .expect("fixture is intentionally valid v1.5.12 input");
+        let v1_5_13 = decode_legacy_bincode::<LegacyV1_5_13UiTokenAmount>(&bytes)
+            .expect("fixture is valid v1.5.13 input");
+
+        assert_ne!(v1_5_12, v1_5_13);
+        assert_eq!(
+            decode_transaction_status_meta(67_711_948, &bytes).expect("decode audited fixture"),
+            v1_5_13
+        );
+    }
+
+    #[test]
     fn rejects_different_successful_schema_results() {
         let first = TransactionStatusMeta {
             fee: 1,
@@ -1257,7 +1324,7 @@ mod tests {
         ))
         .expect("valid fixture provenance manifest");
         let fixtures = manifest["fixtures"].as_array().expect("fixture array");
-        assert_eq!(fixtures.len(), 5);
+        assert_eq!(fixtures.len(), 6);
 
         for (expected_slot, fixture_path) in [
             (
@@ -1275,6 +1342,12 @@ mod tests {
             (
                 67_700_000,
                 include_str!("../tests/fixtures/old-faithful-meta-slot-67700000-v1.5.13.hex"),
+            ),
+            (
+                67_711_948,
+                include_str!(
+                    "../tests/fixtures/old-faithful-meta-slot-67711948-v1.5.13-ambiguous.hex"
+                ),
             ),
             (
                 67_823_992,

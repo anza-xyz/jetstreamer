@@ -50,7 +50,8 @@ use crate::{
 };
 
 pub use crate::transaction_status_meta::{
-    OLD_FAITHFUL_PROTOBUF_META_START_SLOT, OldFaithfulMetaEncoding, old_faithful_meta_encoding,
+    OLD_FAITHFUL_PROTOBUF_META_START_SLOT, OLD_FAITHFUL_V1_5_13_META_START_SLOT,
+    OldFaithfulMetaEncoding, old_faithful_meta_encoding,
 };
 
 /// Timeout applied to each asynchronous firehose operation (fetching epoch stream, reading

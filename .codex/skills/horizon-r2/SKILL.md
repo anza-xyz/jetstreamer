@@ -87,6 +87,13 @@ It never admits a mismatching sidecar and is mutually exclusive with `--overwrit
 
 Use `jetstreamer-r2 restore` when an ordered-chain or boundary audit needs an archive that has already been retired locally. Restore only into an explicit scratch directory, require `--epochs` and the private `--receipt-directory`, and let the Rust command enforce the recorded length, ETag, whole-file SHA-256, canonical sidecar, resumable conditional ranged GET, and no-clobber publication. Never download directly over a public Horizon archive.
 
+When a restore or audit runs in a systemd sandbox with `ProtectHome=read-only` and the scratch
+directory itself named in `ReadWritePaths=`, clean the directory's contents but keep the empty
+scratch directory. Removing that directory requires write access to its parent and fails with
+`EROFS`; under `Restart=on-failure` this can otherwise trigger an unnecessary restore loop. Create
+the mount-point directory before starting the sandbox, validate its exact canonical path before
+cleanup, and constrain deletion to that directory with `find "$scratch" -xdev -mindepth 1 -delete`.
+
 Do not use `--legacy-etag-only` unless the user has explicitly established that a pre-existing object is trusted. Newly uploaded archives always require native R2 SHA-256 evidence or whole-object SHA-256 readback.
 
 ## Operate safely

@@ -3,6 +3,32 @@
 Major project results, newest first. Each entry records the UTC date and the
 code revision that produced the result.
 
+## 2026-10-04: Mainnet epoch 131 published and verified in R2
+
+- Commits `343238c3e1cc15469df08a81fc2badf895fc125b`,
+  `a22146d9d5602461e92f44dadf2c42dc4ad3d3af`,
+  `29af7f5dc53e6745c207ad7705ddfec68d751599`, and
+  `4941f317be133c7b1f888d293dfeaafe79b70a55` added and qualified the Solana
+  v1.4.19 runtime, selected the canonical predecessor snapshot, and recorded
+  the terminal checkpoint used by this replay.
+- Replay covered all 432,000 slots and matched bank hash
+  `2Fa11iFuTN3FAMZzrvf4SnPFs7GSeJuYX74yBWq355GW` and accounts hash
+  `9Y55jp7GoaLWgpjt5GuFfXtPo2NHbwVuTNAJCEzCS8n8` at the last rooted slot,
+  57,023,995. The sealed source transaction was
+  `b82d09bcee7ca9dcf978d8ab14fef05bdae6f8b79b4842a7a038e56e3307fd13`;
+  the public import transaction was
+  `85a919bc85db66b31bc895422ac09c16f7823652c0f9096739f49082b3143183`.
+- The 90,639,807,772-byte archive has SHA-256
+  `05fd174fca4eeb966817b82cec473cd9b303be9485bf1e8a83d3b7dff0cd14b2`.
+  Independent full PoH verification passed, and the current plugin consumed
+  130,468,649 transactions, 417,401,988 transaction updates, and 5,076,722
+  orphan updates with stream SHA-256
+  `6f8acdbd763ca0573f35c6d4732aeffee0a0ffafcacc23e3aa23d8b0cf43ec0a`.
+- R2 validated the multipart ETag
+  `8fe43b1c01479493118315cd2e5dec32-1351` and a complete remote readback
+  reproduced the archive SHA-256 before the canonical sidecar and durable
+  receipt were accepted.
+
 ## 2026-10-01: Mainnet epoch-123 restart marker restored and canonically qualified
 
 - Commit `ad889245396c96e0f682a888f0b6b8b85d75e2f1` restores the historical

@@ -211,6 +211,7 @@ class EpochClaim:
     executable_argument: Path
     unit: str | None
     parent_pid: int | None = None
+    bounded_qualification: bool = False
 
     def overlaps(self, cohort: Cohort) -> bool:
         return self.first_epoch <= cohort.last_epoch and cohort.first_epoch <= self.last_epoch
@@ -655,6 +656,36 @@ def discover_producers(
     return tuple(found)
 
 
+def is_bounded_qualification(args: Sequence[str], output_root: Path) -> bool:
+    end_slots = [
+        item.split("=", 1)[1]
+        for item in args
+        if item.startswith("--qualification-end-slot=")
+    ]
+    horizon_outputs = [
+        item.split("=", 1)[1]
+        for item in args
+        if item.startswith("--horizon-output=")
+    ]
+    if len(end_slots) != 1 or len(horizon_outputs) != 1:
+        return False
+    try:
+        end_slot = int(end_slots[0])
+        horizon_output = Path(horizon_outputs[0])
+        horizon_parent = horizon_output.parent.resolve(strict=True)
+    except (OSError, ValueError):
+        return False
+    return (
+        0 <= end_slot <= MAX_U64
+        and horizon_output.is_absolute()
+        and horizon_parent == output_root
+        and args.count("--verify") == 1
+        and "--no-verify" not in args
+        and "--root-checkpoint-cohort" not in args
+        and "--recover-staged-cohort-only" not in args
+    )
+
+
 def discover_epoch_claims(*, expected_uid: int) -> tuple[EpochClaim, ...]:
     claims: list[EpochClaim] = []
     for entry in Path("/proc").iterdir():
@@ -685,6 +716,7 @@ def discover_epoch_claims(*, expected_uid: int) -> tuple[EpochClaim, ...]:
                     Path(args[0]),
                     process_systemd_unit(pid),
                     proc_parent_pid(pid),
+                    is_bounded_qualification(args, output),
                 )
             )
         except (
@@ -722,6 +754,7 @@ def collapse_supervised_epoch_claims(
             and claim.last_epoch == parent.last_epoch
             and claim.output == parent.output
             and claim.executable_argument == parent.executable_argument
+            and claim.bounded_qualification == parent.bounded_qualification
         ):
             continue
         collapsed.append(claim)
@@ -735,7 +768,15 @@ def require_disjoint_epoch_claims(claims: Sequence[EpochClaim]) -> None:
                 claim.first_epoch <= other.last_epoch
                 and other.first_epoch <= claim.last_epoch
             )
-            if overlaps or claim.output == other.output:
+            # A bounded, verified qualification deliberately replays a private
+            # copy of an epoch and can overlap a production claim. It still
+            # counts toward global resource admission below, and sharing an
+            # output root remains a hard conflict. Two publication-capable
+            # producers may never overlap.
+            publication_overlap = overlaps and not (
+                claim.bounded_qualification or other.bounded_qualification
+            )
+            if publication_overlap or claim.output == other.output:
                 raise SweepError(
                     f"jetstreamer PIDs {claim.pid} and {other.pid} have "
                     "overlapping epoch or output claims"
@@ -761,14 +802,27 @@ def _path_arg(path: Path) -> str:
     return str(path)
 
 
-def runtime_workers(runtime: str) -> tuple[tuple[str, str], ...]:
-    return (RUNTIME_WORKERS[runtime],) + RUNTIME_AUXILIARY_WORKERS.get(runtime, ())
+def runtime_workers(cohort: Cohort) -> tuple[tuple[str, str], ...]:
+    workers = (RUNTIME_WORKERS[cohort.runtime],) + RUNTIME_AUXILIARY_WORKERS.get(
+        cohort.runtime, ()
+    )
+    # The sealed preflight manifest predates two narrower compatibility
+    # findings and therefore still labels both epochs with their surrounding
+    # v1.5.6 era. Epoch 154 is wholly routed to v1.5.8, while epoch 157 starts
+    # with v1.5.6 and crosses a registered handoff into v1.5.8. Keep the extra
+    # executable capability limited to cohorts that contain either exception.
+    needs_v1_5_8 = any(
+        cohort.first_epoch <= epoch <= cohort.last_epoch for epoch in (154, 157)
+    )
+    if cohort.runtime == "solana-v1.5.6" and needs_v1_5_8:
+        workers += (("V1_5_8", "jetstreamer-historical-worker-v1-5-8"),)
+    return workers
 
 
-def runtime_worker_environment(runtime: str, deploy: Path) -> tuple[str, ...]:
+def runtime_worker_environment(cohort: Cohort, deploy: Path) -> tuple[str, ...]:
     return tuple(
         f"JETSTREAMER_HISTORICAL_WORKER_{worker_env}={deploy / worker_name}"
-        for worker_env, worker_name in runtime_workers(runtime)
+        for worker_env, worker_name in runtime_workers(cohort)
     )
 
 
@@ -792,7 +846,7 @@ def producer_environment(
         f"CLOUDSDK_CORE_PROJECT={project}",
         f"CLOUDSDK_CORE_ACCOUNT={account}",
         "JETSTREAMER_ALLOW_CANDIDATE_RUNTIME=1",
-        *runtime_worker_environment(cohort.runtime, deploy),
+        *runtime_worker_environment(cohort, deploy),
         "JETSTREAMER_HISTORICAL_POH_THREADS=10",
         # Old Banks can retain tens of GiB of private account state.  The
         # worker acknowledges Shutdown only after replay and checkpoint work
@@ -835,7 +889,7 @@ def build_producer_command(
     cpu_quota_percent: int = DEFAULT_CPU_QUOTA_PERCENT,
 ) -> list[str]:
     node = deploy / "jetstreamer-node"
-    workers = tuple(deploy / name for _, name in runtime_workers(cohort.runtime))
+    workers = tuple(deploy / name for _, name in runtime_workers(cohort))
     whole_lane_paths = f"{lane.root}"
     properties = (
         "Type=exec",
@@ -930,7 +984,7 @@ def build_import_command(
         "LANG=C.UTF-8",
         "PATH=/usr/bin:/bin",
         "JETSTREAMER_ALLOW_CANDIDATE_RUNTIME=1",
-        *runtime_worker_environment(cohort.runtime, deploy),
+        *runtime_worker_environment(cohort, deploy),
         "RAYON_NUM_THREADS=10",
         "JETSTREAMER_ENFORCE_ARCHIVE_HASH=1",
         f"JETSTREAMER_PRIVATE_RUN_ROOT={public_private_root}",
@@ -1398,7 +1452,7 @@ def unit_is_hardened_for_adoption(
     )
     if properties is None:
         return False
-    workers = tuple(deploy / name for _, name in runtime_workers(cohort.runtime))
+    workers = tuple(deploy / name for _, name in runtime_workers(cohort))
     exact = {
         "MainPID": str(process.pid),
         "ControlGroup": f"/system.slice/{unit}",
@@ -2337,7 +2391,7 @@ def verify_deployment(
     required.update(
         worker_name
         for cohort in cohorts
-        for _, worker_name in runtime_workers(cohort.runtime)
+        for _, worker_name in runtime_workers(cohort)
     )
     for name in sorted(required):
         path = deploy / name

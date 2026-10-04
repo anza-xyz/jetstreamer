@@ -1913,6 +1913,7 @@ impl HistoricalRuntimeClient {
         slot: u64,
         output_directory: &Path,
         expected_accounts_hash: [u8; HASH_BYTES],
+        expected_archive_extension: &str,
     ) -> Result<HistoricalSnapshotExport, HistoricalRuntimeError> {
         let output_directory = canonical_directory(output_directory, "snapshot-output")?;
         let output_directory_string = path_string(&output_directory)?;
@@ -1946,7 +1947,13 @@ impl HistoricalRuntimeClient {
                 });
             }
         };
-        match validate_snapshot_export(&output_directory, slot, expected_accounts_hash, exported) {
+        match validate_snapshot_export(
+            &output_directory,
+            slot,
+            expected_accounts_hash,
+            expected_archive_extension,
+            exported,
+        ) {
             Ok(exported) => Ok(exported),
             Err(error) => self.abort_after_response(error),
         }
@@ -3413,6 +3420,7 @@ fn validate_snapshot_export(
     output_directory: &Path,
     expected_slot: u64,
     expected_accounts_hash: [u8; HASH_BYTES],
+    expected_archive_extension: &str,
     exported: protocol::SnapshotExport,
 ) -> Result<HistoricalSnapshotExport, HistoricalRuntimeError> {
     if exported.slot != expected_slot {
@@ -3427,9 +3435,10 @@ fn validate_snapshot_export(
     }
     let reported_sha256 = array_32("snapshot_export.archive_sha256", exported.archive_sha256)?;
     let expected_path = output_directory.join(format!(
-        "snapshot-{}-{}.tar.bz2",
+        "snapshot-{}-{}{}",
         expected_slot,
-        bs58::encode(expected_accounts_hash).into_string()
+        bs58::encode(expected_accounts_hash).into_string(),
+        expected_archive_extension,
     ));
     if exported.archive_path != path_string(&expected_path)? {
         return Err(HistoricalRuntimeError::SnapshotExportPathMismatch {
@@ -5311,10 +5320,31 @@ mod tests {
             archive_sha256: archive_sha256.to_vec(),
         };
         let validated =
-            validate_snapshot_export(directory.path(), 42, accounts_hash, wire).unwrap();
+            validate_snapshot_export(directory.path(), 42, accounts_hash, ".tar.bz2", wire)
+                .unwrap();
         assert_eq!(validated.archive_path, path);
         assert_eq!(validated.archive_size, 16);
         assert_eq!(validated.archive_sha256, sha256_file(&path).unwrap());
+
+        let zstd_path = directory.path().join(format!(
+            "snapshot-42-{}.tar.zst",
+            bs58::encode(accounts_hash).into_string()
+        ));
+        fs::write(&zstd_path, b"zstd snapshot fixture").unwrap();
+        let zstd_sha256 = sha256_file(&zstd_path).unwrap();
+        let zstd_wire = protocol::SnapshotExport {
+            slot: 42,
+            archive_path: zstd_path.to_str().unwrap().to_owned(),
+            accounts_hash: accounts_hash.to_vec(),
+            archive_size: 21,
+            archive_sha256: zstd_sha256.to_vec(),
+        };
+        let zstd_validated =
+            validate_snapshot_export(directory.path(), 42, accounts_hash, ".tar.zst", zstd_wire)
+                .unwrap();
+        assert_eq!(zstd_validated.archive_path, zstd_path);
+        assert_eq!(zstd_validated.archive_size, 21);
+        assert_eq!(zstd_validated.archive_sha256, zstd_sha256);
 
         let wrong_size = protocol::SnapshotExport {
             slot: 42,
@@ -5324,7 +5354,7 @@ mod tests {
             archive_sha256: archive_sha256.to_vec(),
         };
         assert!(matches!(
-            validate_snapshot_export(directory.path(), 42, accounts_hash, wrong_size),
+            validate_snapshot_export(directory.path(), 42, accounts_hash, ".tar.bz2", wrong_size,),
             Err(HistoricalRuntimeError::SnapshotExportSizeMismatch {
                 reported: 15,
                 actual: 16
@@ -5343,7 +5373,7 @@ mod tests {
             archive_sha256: archive_sha256.to_vec(),
         };
         assert!(matches!(
-            validate_snapshot_export(directory.path(), 42, accounts_hash, wrong_path),
+            validate_snapshot_export(directory.path(), 42, accounts_hash, ".tar.bz2", wrong_path,),
             Err(HistoricalRuntimeError::SnapshotExportPathMismatch { .. })
         ));
 
@@ -5355,7 +5385,13 @@ mod tests {
             archive_sha256: vec![0x55; HASH_BYTES],
         };
         assert!(matches!(
-            validate_snapshot_export(directory.path(), 42, accounts_hash, wrong_digest),
+            validate_snapshot_export(
+                directory.path(),
+                42,
+                accounts_hash,
+                ".tar.bz2",
+                wrong_digest,
+            ),
             Err(HistoricalRuntimeError::SnapshotExportDigestMismatch { .. })
         ));
 
@@ -5367,7 +5403,13 @@ mod tests {
             archive_sha256: vec![0x55; HASH_BYTES - 1],
         };
         assert!(matches!(
-            validate_snapshot_export(directory.path(), 42, accounts_hash, short_digest),
+            validate_snapshot_export(
+                directory.path(),
+                42,
+                accounts_hash,
+                ".tar.bz2",
+                short_digest,
+            ),
             Err(HistoricalRuntimeError::InvalidArrayLength {
                 field: "snapshot_export.archive_sha256",
                 expected: HASH_BYTES,

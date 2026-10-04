@@ -667,6 +667,7 @@ impl HistoricalReplay {
         slot: Slot,
         output_directory: &Path,
         expected_accounts_hash: [u8; 32],
+        expected_archive_extension: &str,
     ) -> Result<HistoricalSnapshotExport, String> {
         let mut state = self
             .state
@@ -682,7 +683,12 @@ impl HistoricalReplay {
             .client
             .as_mut()
             .ok_or_else(|| "historical client was already carried into another epoch".to_string())?
-            .export_snapshot(slot, output_directory, expected_accounts_hash);
+            .export_snapshot(
+                slot,
+                output_directory,
+                expected_accounts_hash,
+                expected_archive_extension,
+            );
         // Export is a one-use operation in both the parent client and worker.
         // Once attempted, the cached checkpoint can still serve as evidence,
         // but it no longer proves that an export seal is available. Force the

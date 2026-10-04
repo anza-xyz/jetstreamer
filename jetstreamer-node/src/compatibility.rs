@@ -126,10 +126,17 @@ pub const SOLANA_V1_5_6_EPOCH150_153_END_SLOT_EXCLUSIVE: Slot = 66_528_000;
 /// slot 66,528,004 and remains gated on the canonical terminal checkpoint.
 pub const SOLANA_V1_5_8_CANDIDATE_START_SLOT: Slot = SOLANA_V1_5_6_EPOCH150_153_END_SLOT_EXCLUSIVE;
 pub const SOLANA_V1_5_8_CANDIDATE_END_SLOT_EXCLUSIVE: Slot = 66_960_000;
-/// Epochs 155 through 173 continue with v1.5.6 unless checkpoint evidence
-/// identifies another narrower successor.
+/// Epochs 155 through 173 normally use v1.5.6. Epoch 157 contains one narrow
+/// source-status-derived v1.5.8 interval beginning at the first transaction
+/// whose canonical result v1.5.6 cannot reproduce.
 pub const SOLANA_V1_5_6_RESUMED_CANDIDATE_START_SLOT: Slot =
     SOLANA_V1_5_8_CANDIDATE_END_SLOT_EXCLUSIVE;
+pub const SOLANA_V1_5_6_TO_V1_5_8_EPOCH157_HANDOFF_SNAPSHOT_SLOT: Slot = 68_140_176;
+pub const SOLANA_V1_5_6_TO_V1_5_8_EPOCH157_HANDOFF_ACCOUNTS_HASH: &str =
+    "3TNSv7MXDB4GxhyRyHJcuBNeXaumYC8W8vu5WrwCXhhZ";
+pub const SOLANA_V1_5_8_EPOCH157_TRANSITION_START_SLOT: Slot =
+    SOLANA_V1_5_6_TO_V1_5_8_EPOCH157_HANDOFF_SNAPSHOT_SLOT + 1;
+pub const SOLANA_V1_5_8_EPOCH157_TRANSITION_END_SLOT_EXCLUSIVE: Slot = 68_256_000;
 pub const SOLANA_V1_5_6_CANDIDATE_END_SLOT_EXCLUSIVE: Slot = 75_168_000;
 pub const SOLANA_V1_6_15_CANDIDATE_START_SLOT: Slot = SOLANA_V1_5_6_CANDIDATE_END_SLOT_EXCLUSIVE;
 /// Epochs 174 through 200, ending at the first unsupported epoch.
@@ -1122,12 +1129,24 @@ pub static SOLANA_V1_2_24_TO_V1_2_32_EPOCH67_HANDOFF: RuntimeHandoff = RuntimeHa
     },
 };
 
+pub static SOLANA_V1_5_6_TO_V1_5_8_EPOCH157_HANDOFF: RuntimeHandoff = RuntimeHandoff {
+    boundary_slot: SOLANA_V1_5_8_EPOCH157_TRANSITION_START_SLOT,
+    source: &SOLANA_V1_5_6_RUNTIME,
+    destination: &SOLANA_V1_5_8_RUNTIME,
+    snapshot: CanonicalSnapshotIdentity {
+        slot: SOLANA_V1_5_6_TO_V1_5_8_EPOCH157_HANDOFF_SNAPSHOT_SLOT,
+        accounts_hash_base58: SOLANA_V1_5_6_TO_V1_5_8_EPOCH157_HANDOFF_ACCOUNTS_HASH,
+        archive_extension: ".tar.zst",
+    },
+};
+
 /// Hash-bound snapshot transitions keyed by their destination slot. Candidate
 /// transitions remain unpublished until their complete replay gates pass.
 pub static RUNTIME_HANDOFFS: &[&RuntimeHandoff] = &[
     &SOLANA_V1_0_7_TO_V1_0_8_HANDOFF,
     &SOLANA_V1_2_32_TO_V1_2_24_EPOCH67_HANDOFF,
     &SOLANA_V1_2_24_TO_V1_2_32_EPOCH67_HANDOFF,
+    &SOLANA_V1_5_6_TO_V1_5_8_EPOCH157_HANDOFF,
 ];
 
 /// Runtime changes at these epoch boundaries are deliberately serviced by a
@@ -1151,6 +1170,7 @@ pub static SNAPSHOT_ISOLATED_RUNTIME_BOUNDARIES: &[Slot] = &[
     SOLANA_V1_5_6_CANDIDATE_START_SLOT,
     SOLANA_V1_5_8_CANDIDATE_START_SLOT,
     SOLANA_V1_5_6_RESUMED_CANDIDATE_START_SLOT,
+    SOLANA_V1_5_8_EPOCH157_TRANSITION_END_SLOT_EXCLUSIVE,
     SOLANA_V1_6_15_CANDIDATE_START_SLOT,
 ];
 
@@ -1461,8 +1481,22 @@ pub static RUNTIME_ERAS: &[RuntimeEra] = &[
         admission: AdmissionLevel::Candidate,
     },
     RuntimeEra {
-        name: "solana-v1.5.6-epochs-155-173-checkpoint-candidate",
+        name: "solana-v1.5.6-epochs-155-157-prefix-candidate",
         start_slot: SOLANA_V1_5_6_RESUMED_CANDIDATE_START_SLOT,
+        end_slot_exclusive: Some(SOLANA_V1_5_8_EPOCH157_TRANSITION_START_SLOT),
+        backend: EraBackend::Available(&SOLANA_V1_5_6_RUNTIME),
+        admission: AdmissionLevel::Candidate,
+    },
+    RuntimeEra {
+        name: "solana-v1.5.8-epoch-157-source-status-candidate",
+        start_slot: SOLANA_V1_5_8_EPOCH157_TRANSITION_START_SLOT,
+        end_slot_exclusive: Some(SOLANA_V1_5_8_EPOCH157_TRANSITION_END_SLOT_EXCLUSIVE),
+        backend: EraBackend::Available(&SOLANA_V1_5_8_RUNTIME),
+        admission: AdmissionLevel::Candidate,
+    },
+    RuntimeEra {
+        name: "solana-v1.5.6-epochs-158-173-checkpoint-candidate",
+        start_slot: SOLANA_V1_5_8_EPOCH157_TRANSITION_END_SLOT_EXCLUSIVE,
         end_slot_exclusive: Some(SOLANA_V1_5_6_CANDIDATE_END_SLOT_EXCLUSIVE),
         backend: EraBackend::Available(&SOLANA_V1_5_6_RUNTIME),
         admission: AdmissionLevel::Candidate,
@@ -2538,6 +2572,53 @@ mod tests {
     }
 
     #[test]
+    fn epoch_157_uses_one_hash_bound_v1_5_6_to_v1_5_8_handoff() {
+        assert_eq!(
+            SOLANA_V1_5_8_EPOCH157_TRANSITION_START_SLOT,
+            SOLANA_V1_5_6_TO_V1_5_8_EPOCH157_HANDOFF_SNAPSHOT_SLOT + 1
+        );
+        let spans = plan_runtime_spans(
+            67_824_000..SOLANA_V1_5_8_EPOCH157_TRANSITION_END_SLOT_EXCLUSIVE,
+            true,
+        )
+        .unwrap();
+        assert_eq!(spans.len(), 2);
+        assert_eq!(
+            spans[0].slots,
+            67_824_000..SOLANA_V1_5_8_EPOCH157_TRANSITION_START_SLOT
+        );
+        assert!(matches!(
+            spans[0].execution.backend,
+            EraBackend::Available(descriptor)
+                if std::ptr::eq(descriptor, &SOLANA_V1_5_6_RUNTIME)
+        ));
+        assert!(spans[0].handoff.is_none());
+
+        assert_eq!(
+            spans[1].slots,
+            SOLANA_V1_5_8_EPOCH157_TRANSITION_START_SLOT
+                ..SOLANA_V1_5_8_EPOCH157_TRANSITION_END_SLOT_EXCLUSIVE
+        );
+        assert!(matches!(
+            spans[1].execution.backend,
+            EraBackend::Available(descriptor)
+                if std::ptr::eq(descriptor, &SOLANA_V1_5_8_RUNTIME)
+        ));
+        assert!(std::ptr::eq(
+            spans[1].handoff.unwrap(),
+            &SOLANA_V1_5_6_TO_V1_5_8_EPOCH157_HANDOFF
+        ));
+        assert!(
+            !SNAPSHOT_ISOLATED_RUNTIME_BOUNDARIES
+                .contains(&SOLANA_V1_5_8_EPOCH157_TRANSITION_START_SLOT)
+        );
+        assert!(
+            SNAPSHOT_ISOLATED_RUNTIME_BOUNDARIES
+                .contains(&SOLANA_V1_5_8_EPOCH157_TRANSITION_END_SLOT_EXCLUSIVE)
+        );
+    }
+
+    #[test]
     fn epochs_12_through_200_route_to_checkpoint_gated_exact_candidates() {
         for (range, backend, descriptor, boundary) in [
             (
@@ -2621,10 +2702,17 @@ mod tests {
             ),
             (
                 SOLANA_V1_5_6_RESUMED_CANDIDATE_START_SLOT
-                    ..SOLANA_V1_5_6_CANDIDATE_END_SLOT_EXCLUSIVE,
+                    ..SOLANA_V1_5_8_EPOCH157_TRANSITION_START_SLOT,
                 RuntimeBackend::SolanaV1_5_6,
                 &SOLANA_V1_5_6_RUNTIME,
                 SOLANA_V1_5_6_RESUMED_CANDIDATE_START_SLOT,
+            ),
+            (
+                SOLANA_V1_5_8_EPOCH157_TRANSITION_END_SLOT_EXCLUSIVE
+                    ..SOLANA_V1_5_6_CANDIDATE_END_SLOT_EXCLUSIVE,
+                RuntimeBackend::SolanaV1_5_6,
+                &SOLANA_V1_5_6_RUNTIME,
+                SOLANA_V1_5_8_EPOCH157_TRANSITION_END_SLOT_EXCLUSIVE,
             ),
             (
                 SOLANA_V1_6_15_CANDIDATE_START_SLOT..SOLANA_V1_6_15_CANDIDATE_END_SLOT_EXCLUSIVE,

@@ -33,13 +33,15 @@ const MAX_AGE_CORRECTION_EPOCH: u64 = 14;
 // Exact v1.5.6 matches the source through slot 66,528,003 but rejects a
 // canonical success at slot 66,528,004. Terminal v1.5.19 already disagrees at
 // slot 66,527,779. The v1.5.8 release date brackets both observations and this
-// worker remains bounded to epoch 154 until its terminal checkpoint qualifies.
+// Epoch 157 reuses these semantics from the source-status-derived handoff at
+// slot 68,140,177 through the epoch boundary. The intervening v1.5.6 span and
+// the later v1.5.6 restart remain separately bounded by the parent registry.
 // Compatibility must be demonstrated by trusted checkpoints before the
 // parent may route or publish this candidate. Snapshot creator metadata alone
 // is not treated as evidence that v1.5.8 execution semantics apply out of era.
 const MIN_SUPPORTED_SNAPSHOT_SLOT: u64 = 66_527_778;
 const MIN_SUPPORTED_ENTRY_SLOT: u64 = MIN_SUPPORTED_SNAPSHOT_SLOT + 1;
-const MAX_SUPPORTED_SLOT_EXCLUSIVE: u64 = 66_960_000;
+const MAX_SUPPORTED_SLOT_EXCLUSIVE: u64 = 68_256_000;
 const POH_THREADS_ENV: &str = "JETSTREAMER_HISTORICAL_POH_THREADS";
 const ABSOLUTE_MAX_POH_THREADS: usize = 256;
 // The validator runs AccountsBackgroundService alongside replay. This worker
@@ -1940,5 +1942,36 @@ mod tests {
             checkpoint.slot_complete
         );
         assert_eq!(checkpoint.accounts_hash, expected_accounts_hash);
+    }
+
+    #[test]
+    #[ignore]
+    fn initializes_epoch157_v1_5_6_handoff_in_v1_5_8() {
+        let archive = std::env::var("JETSTREAMER_SNAPSHOT_68140176")
+            .expect("set JETSTREAMER_SNAPSHOT_68140176");
+        let ledger =
+            std::env::var("JETSTREAMER_MAINNET_LEDGER").expect("set JETSTREAMER_MAINNET_LEDGER");
+        let (mut state, initialized) = RuntimeState::initialize(
+            &ledger,
+            &jetstreamer_historical_protocol::InitialState::SnapshotArchive {
+                archive_path: archive,
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(initialized.slot, 68_140_176);
+        let checkpoint = state.freeze_checkpoint(initialized.slot).unwrap();
+        assert_eq!(
+            Hash::new(&checkpoint.bank_hash).to_string(),
+            "649PT4VUyy3e9uHjsBKrJedSk8VW5YLhmMrXGdazPWb1"
+        );
+        assert_eq!(
+            Hash::new(&checkpoint.accounts_hash).to_string(),
+            "3TNSv7MXDB4GxhyRyHJcuBNeXaumYC8W8vu5WrwCXhhZ"
+        );
+        assert_eq!(checkpoint.capitalization, 490_287_533_276_355_794);
+        assert_eq!(checkpoint.transaction_count, 13_041_831_150);
+        assert_eq!(checkpoint.tick_height, 4_360_971_328);
+        assert!(checkpoint.slot_complete);
     }
 }

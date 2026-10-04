@@ -2344,6 +2344,7 @@ trait ReplayExecutor: Send + Sync {
         _slot: Slot,
         _output_directory: &Path,
         _expected_accounts_hash: [u8; 32],
+        _expected_archive_extension: &str,
     ) -> Result<Option<historical::HistoricalSnapshotExport>, String> {
         Ok(None)
     }
@@ -2395,12 +2396,14 @@ impl ReplayExecutor for historical_replay::HistoricalReplay {
         slot: Slot,
         output_directory: &Path,
         expected_accounts_hash: [u8; 32],
+        expected_archive_extension: &str,
     ) -> Result<Option<historical::HistoricalSnapshotExport>, String> {
         historical_replay::HistoricalReplay::export_snapshot(
             self,
             slot,
             output_directory,
             expected_accounts_hash,
+            expected_archive_extension,
         )
         .map(Some)
     }
@@ -11388,6 +11391,7 @@ async fn run_geyser_replay(
                 handoff.snapshot.slot,
                 output_directory,
                 expected_accounts_hash.to_bytes(),
+                handoff.snapshot.archive_extension,
             )?
             .ok_or_else(|| {
                 format!(

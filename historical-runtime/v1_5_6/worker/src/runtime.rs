@@ -1,8 +1,8 @@
 use crate::{leader_schedule, poh_backend, snapshot};
 use jetstreamer_historical_protocol::{
     AccountWrite, Checkpoint, EntryProcessed, EntryRequest, Initialized, InitializedSource,
-    InstructionError as WireInstructionError, TransactionError as WireTransactionError,
-    TransactionOutcome, MAX_ENTRIES_PER_BATCH,
+    InstructionError as WireInstructionError, SnapshotExport,
+    TransactionError as WireTransactionError, TransactionOutcome, MAX_ENTRIES_PER_BATCH,
 };
 use rayon::{prelude::*, ThreadPool, ThreadPoolBuilder};
 use solana_merkle_tree::MerkleTree;
@@ -63,6 +63,13 @@ pub struct RuntimeState {
     enforce_candidate_range: bool,
     last_accounts_clean_block_height: u64,
     accounts_shrink_consumed_budget: usize,
+    snapshot_export_seal: Option<SnapshotExportSeal>,
+}
+
+#[derive(Clone, Copy)]
+struct SnapshotExportSeal {
+    slot: u64,
+    accounts_hash: Hash,
 }
 
 pub enum ProcessEntriesError<E> {
@@ -143,6 +150,7 @@ impl RuntimeState {
                 enforce_candidate_range: true,
                 last_accounts_clean_block_height: 0,
                 accounts_shrink_consumed_budget: 0,
+                snapshot_export_seal: None,
             },
             initialized,
         ))
@@ -151,6 +159,7 @@ impl RuntimeState {
     /// Preserve the original one-entry request surface while sharing exactly
     /// the same fail-closed preparation and commit path as a batch.
     pub fn process_entry(&mut self, request: EntryRequest) -> Result<EntryProcessed, String> {
+        self.snapshot_export_seal = None;
         let mut processed = self.process_entries(vec![request])?;
         Ok(processed.remove(0))
     }
@@ -182,6 +191,7 @@ impl RuntimeState {
     where
         F: FnMut(EntryProcessed) -> Result<(), E>,
     {
+        self.snapshot_export_seal = None;
         if requests.is_empty() {
             return Err(ProcessEntriesError::Runtime(
                 "entry batch must contain at least one entry".to_string(),
@@ -506,6 +516,7 @@ impl RuntimeState {
     }
 
     pub fn freeze_checkpoint(&mut self, expected_slot: u64) -> Result<Checkpoint, String> {
+        self.snapshot_export_seal = None;
         if expected_slot != self.bank.slot() {
             return Err(format!(
                 "checkpoint requested for slot {}, current bank is {}",
@@ -530,7 +541,7 @@ impl RuntimeState {
         }
         let writes = self.freeze_root_and_drain()?;
         let accounts_hash = self.bank.update_accounts_hash();
-        Ok(Checkpoint {
+        let checkpoint = Checkpoint {
             slot: self.bank.slot(),
             bank_hash: self.bank.hash().as_ref().to_vec(),
             accounts_hash: accounts_hash.as_ref().to_vec(),
@@ -541,6 +552,69 @@ impl RuntimeState {
             slot_complete: self.bank.is_complete(),
             writes,
             next_write_version: self.write_cursor,
+        };
+        self.snapshot_export_seal = Some(SnapshotExportSeal {
+            slot: checkpoint.slot,
+            accounts_hash,
+        });
+        Ok(checkpoint)
+    }
+
+    pub fn invalidate_snapshot_export(&mut self) {
+        self.snapshot_export_seal = None;
+    }
+
+    pub fn export_snapshot(
+        &mut self,
+        slot: u64,
+        output_directory: &str,
+        expected_accounts_hash: &[u8],
+    ) -> Result<SnapshotExport, String> {
+        let seal = self.snapshot_export_seal.take().ok_or_else(|| {
+            "snapshot export requires the immediately preceding successful checkpoint".to_string()
+        })?;
+        if seal.slot != slot || self.bank.slot() != slot {
+            return Err(format!(
+                "snapshot export slot {} does not match checkpoint slot {} and bank slot {}",
+                slot,
+                seal.slot,
+                self.bank.slot()
+            ));
+        }
+        if expected_accounts_hash.len() != 32 {
+            return Err(format!(
+                "expected accounts hash has {} bytes, expected 32",
+                expected_accounts_hash.len()
+            ));
+        }
+        let expected_accounts_hash = Hash::new(expected_accounts_hash);
+        if expected_accounts_hash != seal.accounts_hash {
+            return Err(format!(
+                "snapshot export hash {} does not match checkpoint hash {}",
+                expected_accounts_hash, seal.accounts_hash
+            ));
+        }
+        let exported = snapshot::export_archive(
+            &self.bank,
+            Path::new(output_directory),
+            expected_accounts_hash,
+        )?;
+        let archive_path = exported
+            .archive_path
+            .to_str()
+            .ok_or_else(|| {
+                format!(
+                    "snapshot archive path is not UTF-8: {}",
+                    exported.archive_path.display()
+                )
+            })?
+            .to_string();
+        Ok(SnapshotExport {
+            slot,
+            archive_path,
+            accounts_hash: exported.accounts_hash.as_ref().to_vec(),
+            archive_size: exported.archive_size,
+            archive_sha256: exported.archive_sha256.to_vec(),
         })
     }
 
@@ -672,6 +746,7 @@ impl RuntimeState {
             enforce_candidate_range: false,
             last_accounts_clean_block_height: 0,
             accounts_shrink_consumed_budget: 0,
+            snapshot_export_seal: None,
         }
     }
 }
@@ -1132,6 +1207,7 @@ fn normalize_instruction_error(error: InstructionError) -> WireInstructionError 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::Digest;
     use solana_runtime::genesis_utils::create_genesis_config_with_leader;
     use solana_sdk::{
         account::Account,
@@ -1797,6 +1873,110 @@ mod tests {
         let second_tick = request_for(&state, 0, 1, 1, &[]);
         state.process_entry(second_tick).unwrap();
         assert!(state.freeze_checkpoint(0).unwrap().slot_complete);
+    }
+
+    #[test]
+    fn checkpoint_export_is_one_use_no_clobber_and_restore_compatible() {
+        let leader = Pubkey::new_from_array([7; 32]);
+        let mut genesis = create_genesis_config_with_leader(1_000_000, &leader, 500_000);
+        genesis.genesis_config.ticks_per_slot = 1;
+        genesis.genesis_config.poh_config.hashes_per_tick = Some(2);
+        let state_dir = snapshot::private_state_dir(None).unwrap();
+        let account_paths = snapshot::private_account_paths(&state_dir).unwrap();
+        let bank = Bank::new_with_paths(
+            &genesis.genesis_config,
+            account_paths,
+            &[],
+            None,
+            None,
+            HashSet::new(),
+            false,
+        );
+        let mut state = RuntimeState::from_test_bank(bank, false, state_dir);
+        let transaction = system_transaction::transfer(
+            &genesis.mint_keypair,
+            &Pubkey::new_from_array([55; 32]),
+            1,
+            state.bank.last_blockhash(),
+        );
+        state
+            .process_entry(request_for(&state, 0, 0, 1, &[transaction]))
+            .unwrap();
+        state
+            .process_entry(request_for(&state, 0, 1, 1, &[]))
+            .unwrap();
+        let checkpoint = state.freeze_checkpoint(0).unwrap();
+        let output = tempfile::tempdir().unwrap();
+
+        let mut wrong_hash = checkpoint.accounts_hash.clone();
+        wrong_hash[0] ^= 1;
+        assert!(state
+            .export_snapshot(0, output.path().to_str().unwrap(), &wrong_hash)
+            .unwrap_err()
+            .contains("does not match checkpoint hash"));
+        assert!(state
+            .export_snapshot(
+                0,
+                output.path().to_str().unwrap(),
+                &checkpoint.accounts_hash,
+            )
+            .unwrap_err()
+            .contains("immediately preceding successful checkpoint"));
+
+        let checkpoint = state.freeze_checkpoint(0).unwrap();
+        let exported = state
+            .export_snapshot(
+                0,
+                output.path().to_str().unwrap(),
+                &checkpoint.accounts_hash,
+            )
+            .unwrap();
+        assert_eq!(exported.slot, 0);
+        assert_eq!(exported.accounts_hash, checkpoint.accounts_hash);
+        let archive_path = Path::new(&exported.archive_path);
+        assert!(exported.archive_path.ends_with(".tar.zst"));
+        assert_eq!(
+            std::fs::metadata(archive_path).unwrap().len(),
+            exported.archive_size
+        );
+        let archive_bytes = std::fs::read(archive_path).unwrap();
+        let mut archive_hasher = sha2::Sha256::new();
+        archive_hasher.input(&archive_bytes);
+        assert_eq!(
+            exported.archive_sha256.as_slice(),
+            archive_hasher.result().as_slice()
+        );
+
+        let restore_state = snapshot::private_state_dir(None).unwrap();
+        let empty_builtins = Builtins {
+            genesis_builtins: Vec::new(),
+            feature_builtins: Vec::new(),
+        };
+        let restored = snapshot::load_archive(
+            archive_path,
+            &restore_state,
+            &genesis.genesis_config,
+            &empty_builtins,
+        )
+        .unwrap();
+        assert_eq!(restored.bank.slot(), 0);
+        assert_eq!(
+            restored.expected_accounts_hash.as_ref(),
+            checkpoint.accounts_hash.as_slice()
+        );
+        assert!(restored.bank.verify_snapshot_bank());
+        assert_eq!(restored.bank.src.roots(), state.bank.src.roots());
+
+        let checkpoint = state.freeze_checkpoint(0).unwrap();
+        assert!(state
+            .export_snapshot(
+                0,
+                output.path().to_str().unwrap(),
+                &checkpoint.accounts_hash,
+            )
+            .unwrap_err()
+            .contains("refusing to replace existing snapshot archive"));
+        assert!(archive_path.is_file());
     }
 
     #[test]

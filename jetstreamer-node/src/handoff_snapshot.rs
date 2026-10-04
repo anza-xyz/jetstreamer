@@ -27,6 +27,7 @@ pub const HANDOFF_SNAPSHOT_MANIFEST_SCHEMA_VERSION: u32 = 1;
 pub const HANDOFF_SNAPSHOT_MANIFEST_SUFFIX: &str = ".handoff.json";
 const MAX_HANDOFF_SNAPSHOT_MANIFEST_BYTES: u64 = 1 << 20;
 const MAX_IDENTITY_TEXT_BYTES: usize = 1 << 10;
+const HANDOFF_SNAPSHOT_ARCHIVE_EXTENSIONS: &[&str] = &[".tar.bz2", ".tar.zst"];
 
 /// Evidence adjacent to one generated cross-runtime snapshot archive.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -157,7 +158,7 @@ pub enum HandoffSnapshotManifestError {
     PathIdentityChanged(PathBuf),
 }
 
-/// Returns `snapshot-....tar.bz2.handoff.json` for an archive path.
+/// Appends `.handoff.json` to a supported snapshot archive filename.
 pub fn handoff_snapshot_manifest_path(
     archive_path: impl AsRef<Path>,
 ) -> Result<PathBuf, HandoffSnapshotManifestError> {
@@ -265,14 +266,19 @@ fn validate_archive_filename(
     path: &Path,
     manifest: &HistoricalHandoffSnapshotManifest,
 ) -> Result<(), HandoffSnapshotManifestError> {
-    let expected = format!(
-        "snapshot-{}-{}.tar.bz2",
+    let identity = format!(
+        "snapshot-{}-{}",
         manifest.snapshot_slot, manifest.accounts_hash
     );
-    if path.file_name().and_then(|name| name.to_str()) != Some(expected.as_str()) {
+    let actual = path.file_name().and_then(|name| name.to_str());
+    if !HANDOFF_SNAPSHOT_ARCHIVE_EXTENSIONS
+        .iter()
+        .any(|extension| actual == Some(format!("{identity}{extension}").as_str()))
+    {
         return Err(invalid(format!(
-            "snapshot archive {} does not have manifest identity {expected}",
-            path.display()
+            "snapshot archive {} does not have manifest identity {identity} with a supported extension ({})",
+            path.display(),
+            HANDOFF_SNAPSHOT_ARCHIVE_EXTENSIONS.join(", "),
         )));
     }
     Ok(())
@@ -547,9 +553,17 @@ mod tests {
     }
 
     fn write_archive(directory: &TempDir, evidence: &HistoricalHandoffSnapshotManifest) -> PathBuf {
+        write_archive_with_extension(directory, evidence, ".tar.bz2")
+    }
+
+    fn write_archive_with_extension(
+        directory: &TempDir,
+        evidence: &HistoricalHandoffSnapshotManifest,
+        extension: &str,
+    ) -> PathBuf {
         let path = directory.path().join(format!(
-            "snapshot-{}-{}.tar.bz2",
-            evidence.snapshot_slot, evidence.accounts_hash
+            "snapshot-{}-{}{}",
+            evidence.snapshot_slot, evidence.accounts_hash, extension
         ));
         fs::write(&path, b"complete snapshot including status cache").unwrap();
         path
@@ -570,6 +584,25 @@ mod tests {
         );
         assert_ne!(written.archive_sha256, [0; 32]);
         assert_eq!(written.archive_size, fs::metadata(&archive).unwrap().len());
+        assert_eq!(
+            read_and_validate_handoff_snapshot_manifest(&archive).unwrap(),
+            written
+        );
+    }
+
+    #[test]
+    fn zstd_sidecar_round_trip_binds_every_archive_byte() {
+        let directory = TempDir::new().unwrap();
+        let evidence = manifest();
+        let archive = write_archive_with_extension(&directory, &evidence, ".tar.zst");
+        let (sidecar, written) = write_handoff_snapshot_manifest(&archive, evidence).unwrap();
+        assert_eq!(
+            sidecar,
+            directory.path().join(format!(
+                "{}.handoff.json",
+                archive.file_name().unwrap().to_string_lossy()
+            ))
+        );
         assert_eq!(
             read_and_validate_handoff_snapshot_manifest(&archive).unwrap(),
             written

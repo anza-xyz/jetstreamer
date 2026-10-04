@@ -504,8 +504,10 @@ select a runtime. The current registry is deliberately conservative:
 | `57,888,000..63,936,000` | pinned Solana v1.4.25 worker | complete source-status scans across epochs 134-147 found no legacy loader custom errors; per-epoch `ProgramFailedToComplete` counts were `134:0, 135:0, 136:1, 137:0, 138:0, 139:1, 140:1314, 141:0, 142:0, 143:0, 144:2, 145:204, 146:3, 147:2`, confirming the later error contract throughout this range; independently verified snapshot restart carries that vocabulary through the shared stream protocol, and every cohort must still match all canonical post-bootstrap roots | unqualified diagnostic candidate for epochs 134-147 |
 | `63,936,000..64,800,000` | pinned Solana v1.5.5 worker | exact v1.5.5 reproduces the trusted slot-63,948,761 accounts hash; normalizes v1.5 status variants for current plugins; every production cohort must still match all canonical post-bootstrap roots | bounded checkpoint-qualified candidate for epochs 148-149 |
 | `64,800,000..66,528,000` | pinned Solana v1.5.6 worker | exact v1.5.6 reproduces epoch 150's first canonical vote and the trusted slot-64,807,725 accounts hash; normalizes v1.5 status variants for current plugins | bounded checkpoint-qualified candidate for epochs 150-153 |
-| `66,528,000..66,960,000` | pinned Solana v1.5.8 worker | anchored at canonical snapshot slot 66,527,778, warms slots 66,527,779-66,527,999, and reproduces the source-successful transaction at slot 66,528,004 that v1.5.6 rejects; terminal v1.5.19 already diverges during warmup at slot 66,527,779 | source-status-selected, terminal-checkpoint-gated candidate for epoch 154 |
-| `66,960,000..75,168,000` | pinned Solana v1.5.6 worker | independently verified snapshot restart after the narrow v1.5.8 envelope; later cohorts remain independently checkpoint-gated | checkpoint-gated candidate for epochs 155-173 |
+| `66,528,000..66,960,000` | pinned Solana v1.5.8 worker | anchored at canonical snapshot slot 66,527,778, warms slots 66,527,779-66,527,999, reproduces the source-successful transaction at slot 66,528,004 that v1.5.6 rejects, and matches the canonical terminal accounts hash at slot 66,958,784; terminal v1.5.19 already diverges during warmup at slot 66,527,779 | source-status-selected, checkpoint-qualified candidate for epoch 154 |
+| `66,960,000..68,140,177` | pinned Solana v1.5.6 worker | independently verified snapshot restart after the epoch-154 v1.5.8 envelope; source-exact replay binds the frozen slot-68,140,176 handoff to accounts hash `3TNSv7MXDB4GxhyRyHJcuBNeXaumYC8W8vu5WrwCXhhZ` | checkpoint-gated candidate for epochs 155 through the epoch-157 prefix |
+| `68,140,177..68,256,000` | pinned Solana v1.5.8 worker | starts from the hash-bound v1.5.6 handoff immediately before the first transaction whose canonical `ProgramFailedToComplete` result differs from v1.5.6's `ComputationalBudgetExceeded`, then matches the canonical terminal accounts hash at slot 68,255,828 | source-status-selected, checkpoint-qualified candidate for the epoch-157 suffix |
+| `68,256,000..75,168,000` | pinned Solana v1.5.6 worker | independently verified snapshot restart at the epoch-158 boundary; later cohorts remain independently checkpoint-gated | checkpoint-gated candidate for epochs 158-173 |
 | `75,168,000..86,832,000` | pinned Solana v1.6.15 worker | independently verified snapshot restart; reproduces the v1.6 loader set, write-lock demotion, and expanded status vocabulary for current plugins; every cohort must match all canonical post-bootstrap roots | unqualified diagnostic candidate for epochs 174-200 |
 | `86,832,000..406,080,000` | none | unsupported; replay fails closed | unsupported |
 | `406,080,000..` | in-process Agave v3 | independently verified modern snapshot bootstrap | verified |
@@ -514,12 +516,13 @@ Verified epochs 0-100 use 12 execution envelopes backed by 11 historical worker 
 11 runtime boundaries consist of one hash-bound canonical state handoff, two source-lineage-verified
 epoch-67 handoffs, and eight independently verified snapshot restarts. The
 v1.2.32 worker is used on both sides of the two specialized epoch-67 ranges. The v1.3.23,
-v1.4.17, v1.4.19, v1.4.25, v1.5.5, v1.5.6, v1.5.8, and v1.6.15 candidates add nine snapshot-isolated envelopes. The
+v1.4.17, v1.4.19, v1.4.25, v1.5.5, v1.5.6, v1.5.8, and v1.6.15 candidates add ten
+snapshot-isolated envelopes and one hash-bound epoch-157 handoff. The
 v1.4.19, v1.5.5, and v1.5.6 envelopes have each passed their first bounded post-boundary checkpoint;
 every complete production cohort still requires all canonical roots before publication. The terminal
 v1.5.19 worker remains registered only as an unassigned comparison candidate.
 
-Ten execution interventions are explicitly recorded in addition to the ordinary
+Eleven execution interventions are explicitly recorded in addition to the ordinary
 epoch-aligned pinned-worker snapshot restarts:
 
 1. The behaviorally safe v1.0.7 to v1.0.8 state handoff at slot 619,849.
@@ -548,7 +551,16 @@ epoch-aligned pinned-worker snapshot restarts:
    predecessor snapshot after qualification.
 10. Epoch 154 uses exact v1.5.8 from the hash-bound slot-66,527,778 snapshot because v1.5.6 rejects
    a source-successful transaction at slot 66,528,004 while terminal v1.5.19 already disagrees at
-   slot 66,527,779; v1.5.6 resumes at epoch 155, and publication remains terminal-checkpoint-gated.
+   slot 66,527,779. It reproduces the canonical slot-66,958,784 terminal accounts hash
+   `AVQPbbxxeLMaSyjVrcBC2fZpemNuGZhUF1CsQPBP16Ns`; v1.5.6 resumes at epoch 155, and every
+   production replay remains independently checkpoint-gated.
+11. Epoch 157 switches from v1.5.6 to v1.5.8 at slot 68,140,177. The preceding frozen v1.5.6 bank
+    has accounts hash `3TNSv7MXDB4GxhyRyHJcuBNeXaumYC8W8vu5WrwCXhhZ`; v1.5.8 reproduces the
+    source-recorded `ProgramFailedToComplete` result where v1.5.6 returns
+    `ComputationalBudgetExceeded`. Epoch 158 restarts v1.5.6 from its independently verified
+    predecessor snapshot. The v1.5.8 suffix reproduces the canonical slot-68,255,828 terminal
+    accounts hash `AVreSVPd46H4WiihQ2pFUcRExPRQwL1MxhzQHVGky8bH`; every production replay remains
+    independently checkpoint-gated.
 
 Input repair is planned independently of execution and adds three more historical interventions:
 

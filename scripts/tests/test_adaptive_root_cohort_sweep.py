@@ -755,6 +755,57 @@ class CommandTests(unittest.TestCase):
         )
         self.assertIn("JETSTREAMER_HISTORICAL_REAP_TIMEOUT_SECS=600", environments)
 
+    def test_v158_exception_cohorts_expose_the_v158_worker(self) -> None:
+        for epoch in (154, 157):
+            cohort = sweep.Cohort(epoch, epoch, "solana-v1.5.6")
+            command = sweep.build_producer_command(
+                cohort=cohort,
+                lane=self.lane,
+                deploy=self.deploy,
+                manifest=self.manifest,
+                fingerprint=self.fingerprint,
+                unit=f"epoch{epoch}-v158-test.service",
+            )
+            properties = command_properties(command)
+            environments = {
+                item.removeprefix("--setenv=")
+                for item in command
+                if item.startswith("--setenv=")
+            }
+
+            self.assertEqual(
+                properties["ExecPaths"].split(),
+                [
+                    str(self.deploy / "jetstreamer-node"),
+                    str(self.deploy / "jetstreamer-historical-worker-v1-5-6"),
+                    str(self.deploy / "jetstreamer-historical-worker-v1-5-8"),
+                    str(self.lane.root),
+                ],
+            )
+            self.assertIn(
+                "JETSTREAMER_HISTORICAL_WORKER_V1_5_6="
+                f"{self.deploy}/jetstreamer-historical-worker-v1-5-6",
+                environments,
+            )
+            self.assertIn(
+                "JETSTREAMER_HISTORICAL_WORKER_V1_5_8="
+                f"{self.deploy}/jetstreamer-historical-worker-v1-5-8",
+                environments,
+            )
+
+        ordinary = sweep.build_producer_command(
+            cohort=sweep.Cohort(156, 156, "solana-v1.5.6"),
+            lane=self.lane,
+            deploy=self.deploy,
+            manifest=self.manifest,
+            fingerprint=self.fingerprint,
+            unit="epoch156-no-handoff-test.service",
+        )
+        self.assertNotIn(
+            str(self.deploy / "jetstreamer-historical-worker-v1-5-8"),
+            command_properties(ordinary)["ExecPaths"].split(),
+        )
+
     def test_importer_has_no_mount_namespace_or_systemd_path_bind(self) -> None:
         command = sweep.build_import_command(
             cohort=self.cohort,
@@ -2378,6 +2429,36 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(sweep.parse_proc_stat_start_time(data), 22)
         self.assertEqual(sweep.parse_proc_stat_parent_pid(data), 4)
 
+    def test_bounded_qualification_requires_private_verified_output(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw).resolve()
+            output = root / "qualification"
+            output.mkdir()
+            args = [
+                "/sealed/jetstreamer-node",
+                "154",
+                str(output),
+                "--verify",
+                "--qualification-end-slot=66958784",
+                f"--horizon-output={output}/epoch-154.jet",
+            ]
+            self.assertTrue(sweep.is_bounded_qualification(args, output))
+            for invalid in (
+                [*args, "--no-verify"],
+                [*args, "--root-checkpoint-cohort"],
+                [*args, "--recover-staged-cohort-only"],
+                [item for item in args if item != "--verify"],
+                [item for item in args if not item.startswith("--horizon-output=")],
+                [*args, "--qualification-end-slot=66958785"],
+                [
+                    item
+                    if not item.startswith("--horizon-output=")
+                    else f"--horizon-output={root}/shared/epoch-154.jet"
+                    for item in args
+                ],
+            ):
+                self.assertFalse(sweep.is_bounded_qualification(invalid, output))
+
     def test_direct_supervisor_child_is_one_epoch_claim(self) -> None:
         parent = sweep.EpochClaim(
             pid=10,
@@ -2433,6 +2514,36 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(observed, (parent, cross_unit, orphan))
         with self.assertRaisesRegex(sweep.SweepError, "overlapping epoch"):
             sweep.require_disjoint_epoch_claims(observed)
+
+    def test_private_bounded_qualification_may_overlap_production(self) -> None:
+        production = sweep.EpochClaim(
+            pid=10,
+            start_time=100,
+            first_epoch=154,
+            last_epoch=154,
+            output=Path("/private/production"),
+            executable_argument=Path("/sealed/jetstreamer-node"),
+            unit="epoch-154.service",
+        )
+        qualification = dataclasses.replace(
+            production,
+            pid=11,
+            start_time=101,
+            output=Path("/private/qualification"),
+            unit="epoch-154-qualification.service",
+            bounded_qualification=True,
+        )
+
+        sweep.require_disjoint_epoch_claims((production, qualification))
+
+        with self.assertRaisesRegex(sweep.SweepError, "overlapping epoch"):
+            sweep.require_disjoint_epoch_claims(
+                (production, dataclasses.replace(qualification, bounded_qualification=False))
+            )
+        with self.assertRaisesRegex(sweep.SweepError, "overlapping epoch or output"):
+            sweep.require_disjoint_epoch_claims(
+                (production, dataclasses.replace(qualification, output=production.output))
+            )
 
     def test_importing_state_reverts_to_staged_after_controller_restart(self) -> None:
         controller = object.__new__(sweep.Controller)

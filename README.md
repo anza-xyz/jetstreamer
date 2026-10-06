@@ -544,6 +544,11 @@ v1.7.15 envelope covers epochs 233-265, and v1.8.11 covers epochs 266-301 so
 epoch 301 can serve as a verification tail beyond the current epoch-300
 publication boundary.
 
+The final sealed root cohort therefore replays epochs 298-301 in a private lane. Its importer must
+use `--publish-through-epoch=300`: it deeply revalidates all four archives and the epoch-301 root
+gate, transactionally publishes only epochs 298-300, and leaves epoch 301 in private storage as
+boundary evidence. Epoch 301 must never enter the public Horizon directory or the R2 upload range.
+
 Before a completed focused artifact is used as registry evidence, independently revalidate it with
 `cargo run --release -p jetstreamer-node --bin jetstreamer-qualification-verify -- ...`. The
 validator requires the exact epoch, output start, bootstrap and terminal slots, runtime profile,

@@ -403,7 +403,7 @@ fn convert_loaded_addresses(
         writable: loaded
             .writable
             .into_iter()
-            .map(|address| parse(address))
+            .map(&parse)
             .collect::<Result<Vec<_>, _>>()?,
         readonly: loaded
             .readonly

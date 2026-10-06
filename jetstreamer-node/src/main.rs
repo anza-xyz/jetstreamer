@@ -5022,7 +5022,7 @@ fn usage(program: &str) -> String {
          \x20      [--qualification-end-slot=SLOT] [--root-checkpoint-cohort]\n\
          \x20      [--cohort-manifest=PATH --cohort-manifest-fingerprint=sha256:HEX]\n\
          \x20      [--recover-staged-only | --recover-staged-cohort-only]\n\
-         \x20      [--source-cohort-receipt=PATH]\n\
+         \x20      [--source-cohort-receipt=PATH] [--publish-through-epoch=N]\n\
          \n\
          <epoch|range> is a single epoch (950) or an inclusive range (950-955).\n\
          Replays each epoch and writes a horizon archive to <dest-dir>/epoch-<N>.jet.\n\
@@ -5068,8 +5068,10 @@ fn usage(program: &str) -> String {
          --recover-staged-cohort-only imports the exact nonzero epoch range bound\n\
          by a sealed cohort manifest and a committed private-lane publication\n\
          receipt. It deeply validates every archive and publishes the whole range\n\
-         only if all public destination names are absent. It never replays or\n\
-         accesses snapshot storage or the network."
+         only if all public destination names are absent. An explicit\n\
+         --publish-through-epoch may retain a verified suffix as private boundary\n\
+         evidence while transactionally publishing only the contiguous prefix.\n\
+         It never replays or accesses snapshot storage or the network."
     )
 }
 
@@ -5437,9 +5439,15 @@ fn validate_staged_cohort_recovery_mode(
     has_manifest: bool,
     has_manifest_fingerprint: bool,
     has_source_receipt: bool,
+    publish_through_epoch: Option<u64>,
     has_conflicting_override: bool,
 ) -> Result<(), String> {
     if !enabled {
+        if publish_through_epoch.is_some() {
+            return Err(
+                "--publish-through-epoch requires --recover-staged-cohort-only".to_string(),
+            );
+        }
         return Ok(());
     }
     if start_epoch == 0 || start_epoch > end_epoch {
@@ -5454,6 +5462,11 @@ fn validate_staged_cohort_recovery_mode(
     if cohort_len > MAX_ROOT_CHECKPOINT_COHORT_EPOCHS {
         return Err(format!(
             "--recover-staged-cohort-only range contains {cohort_len} epochs, exceeding the limit of {MAX_ROOT_CHECKPOINT_COHORT_EPOCHS}"
+        ));
+    }
+    if publish_through_epoch.is_some_and(|epoch| epoch < start_epoch || epoch > end_epoch) {
+        return Err(format!(
+            "--publish-through-epoch must be within the recovered cohort {start_epoch}-{end_epoch}"
         ));
     }
     if explicit_verify != Some(true) || verify_option_count != 1 {
@@ -9398,6 +9411,33 @@ fn validate_recovered_cohort_gate(
     Ok(())
 }
 
+fn verified_cohort_publication_prefix(
+    start_epoch: u64,
+    end_epoch: u64,
+    publish_through_epoch: u64,
+    full_gate: &cohort_publication::RootCheckpointGateEvidence,
+) -> Result<(Vec<u64>, cohort_publication::RootCheckpointGateEvidence), String> {
+    if publish_through_epoch < start_epoch || publish_through_epoch > end_epoch {
+        return Err(format!(
+            "publication boundary {publish_through_epoch} is outside verified cohort {start_epoch}-{end_epoch}"
+        ));
+    }
+    let full_epochs = (start_epoch..=end_epoch).collect::<Vec<_>>();
+    if full_gate.members.len() != full_epochs.len()
+        || full_gate
+            .members
+            .iter()
+            .zip(&full_epochs)
+            .any(|(member, epoch)| member.epoch != *epoch)
+    {
+        return Err("verified cohort gate does not bind the complete source range".to_string());
+    }
+    let publication_epochs = (start_epoch..=publish_through_epoch).collect::<Vec<_>>();
+    let mut publication_gate = full_gate.clone();
+    publication_gate.members.truncate(publication_epochs.len());
+    Ok((publication_epochs, publication_gate))
+}
+
 #[allow(clippy::too_many_arguments)] // recovery keeps every bound capability explicit at the call site
 fn recover_staged_root_cohort_only(
     start_epoch: u64,
@@ -9405,6 +9445,7 @@ fn recover_staged_root_cohort_only(
     destination: &BoundDestination,
     receipt_directory: &Path,
     source_receipt: &Path,
+    publish_through_epoch: u64,
     plan: &RootCheckpointCohortPlan,
     selection: compatibility::RuntimeSelection,
     shutdown: Arc<AtomicBool>,
@@ -9481,8 +9522,15 @@ fn recover_staged_root_cohort_only(
     if shutdown.load(Ordering::SeqCst) {
         return Err("cohort import was interrupted before publication".to_string());
     }
+    let (publication_epochs, publication_gate) = verified_cohort_publication_prefix(
+        start_epoch,
+        end_epoch,
+        publish_through_epoch,
+        &admitted.root_checkpoint_gate,
+    )?;
     let items = recovered
         .iter()
+        .filter(|archive| archive.epoch <= publish_through_epoch)
         .map(
             |archive| jetstreamer_node::archive_publish::ArchiveBatchItem {
                 epoch: archive.epoch,
@@ -9494,6 +9542,7 @@ fn recover_staged_root_cohort_only(
         .collect::<Vec<_>>();
     let expected = recovered
         .iter()
+        .filter(|archive| archive.epoch <= publish_through_epoch)
         .map(|archive| cohort_publication::ExpectedCohortArchive {
             epoch: archive.epoch,
             destination_archive: &archive.destination_archive,
@@ -9502,13 +9551,13 @@ fn recover_staged_root_cohort_only(
         .collect::<Vec<_>>();
     let gate_context = cohort_publication::encode_root_checkpoint_gate_context(
         manifest_fingerprint,
-        &expected_epochs,
-        &admitted.root_checkpoint_gate,
+        &publication_epochs,
+        &publication_gate,
     )?;
     let publication =
         jetstreamer_node::archive_publish::publish_verified_archive_batch_if_absent_with_context_and_lock_timeout(
             manifest_fingerprint,
-            &expected_epochs,
+            &publication_epochs,
             &items,
             &gate_context,
             COHORT_IMPORT_WRITER_LOCK_TIMEOUT,
@@ -9526,7 +9575,7 @@ fn recover_staged_root_cohort_only(
         manifest_fingerprint,
         &expected,
         &publication,
-        &admitted.root_checkpoint_gate,
+        &publication_gate,
     )
 }
 
@@ -17306,6 +17355,7 @@ async fn main() {
     let mut cohort_manifest: Option<PathBuf> = None;
     let mut cohort_manifest_fingerprint: Option<String> = None;
     let mut source_cohort_receipt: Option<PathBuf> = None;
+    let mut publish_through_epoch: Option<u64> = None;
     for arg in args {
         if arg == "--verify" {
             verify_snapshots = true;
@@ -17378,6 +17428,18 @@ async fn main() {
             if source_cohort_receipt.replace(PathBuf::from(path)).is_some() {
                 eprintln!("duplicate --source-cohort-receipt option");
                 exit(2);
+            }
+        } else if let Some(epoch) = arg.strip_prefix("--publish-through-epoch=") {
+            if publish_through_epoch.is_some() {
+                eprintln!("duplicate --publish-through-epoch option");
+                exit(2);
+            }
+            match epoch.parse::<u64>() {
+                Ok(epoch) => publish_through_epoch = Some(epoch),
+                Err(err) => {
+                    eprintln!("invalid --publish-through-epoch '{epoch}': {err}");
+                    exit(2);
+                }
             }
         } else if arg.starts_with('-') {
             eprintln!("unknown option '{arg}'");
@@ -17454,6 +17516,7 @@ async fn main() {
         cohort_manifest.is_some(),
         cohort_manifest_fingerprint.is_some(),
         source_cohort_receipt.is_some(),
+        publish_through_epoch,
         recover_staged_only
             || root_checkpoint_cohort
             || horizon_output.is_some()
@@ -17692,15 +17755,17 @@ async fn main() {
             source_cohort_receipt
                 .as_deref()
                 .expect("source cohort receipt option was required"),
+            publish_through_epoch.unwrap_or(end_epoch),
             cohort_plan.as_ref().expect("cohort plan was validated"),
             cohort_runtime.expect("cohort runtime was validated"),
             shutdown.clone(),
         ) {
             Ok(publication) => {
                 info!(
-                    "recovered root-checkpoint cohort {}-{} published {} archive(s) in transaction {}; receipt {} is durable",
+                    "recovered root-checkpoint cohort {}-{} published through epoch {} ({} archive(s)) in transaction {}; receipt {} is durable",
                     start_epoch,
                     end_epoch,
+                    publish_through_epoch.unwrap_or(end_epoch),
                     publication.archive_count,
                     jetstreamer_node::segment_manifest::sha256_hex_string(
                         &publication.transaction_id
@@ -19599,6 +19664,27 @@ mod early_snapshot_tests {
         };
 
         validate_recovered_cohort_gate(&plan, &recovered, &gate).unwrap();
+        let (publication_epochs, publication_gate) =
+            verified_cohort_publication_prefix(17, 19, 18, &gate).unwrap();
+        assert_eq!(publication_epochs, [17, 18]);
+        assert_eq!(
+            publication_gate
+                .members
+                .iter()
+                .map(|member| member.epoch)
+                .collect::<Vec<_>>(),
+            [17, 18]
+        );
+        assert_eq!(
+            publication_gate.verified_manifest_checkpoints,
+            gate.verified_manifest_checkpoints
+        );
+        let error = verified_cohort_publication_prefix(17, 19, 16, &gate).unwrap_err();
+        assert!(error.contains("outside verified cohort"), "{error}");
+        let mut incomplete_gate = gate.clone();
+        incomplete_gate.members.pop();
+        let error = verified_cohort_publication_prefix(17, 19, 18, &incomplete_gate).unwrap_err();
+        assert!(error.contains("complete source range"), "{error}");
         let mut wrong_manifest_checkpoint = gate.clone();
         wrong_manifest_checkpoint.verified_manifest_checkpoints[0].accounts_hash[0] ^= 1;
         let error = validate_recovered_cohort_gate(&plan, &recovered, &wrong_manifest_checkpoint)
@@ -20882,13 +20968,14 @@ mod early_snapshot_tests {
                 true,
                 true,
                 true,
+                None,
                 false,
             )
             .is_ok()
         );
         assert!(
             validate_staged_cohort_recovery_mode(
-                false, 0, 0, None, 0, true, false, false, false, true,
+                false, 0, 0, None, 0, true, false, false, false, None, true,
             )
             .is_ok()
         );
@@ -20903,6 +20990,7 @@ mod early_snapshot_tests {
                 true,
                 true,
                 true,
+                None,
                 false,
             )
             .unwrap_err();
@@ -20918,6 +21006,7 @@ mod early_snapshot_tests {
             true,
             true,
             true,
+            None,
             false,
         )
         .unwrap_err();
@@ -20937,6 +21026,7 @@ mod early_snapshot_tests {
                 manifest,
                 fingerprint,
                 receipt,
+                None,
                 false,
             )
             .unwrap_err();
@@ -20952,10 +21042,65 @@ mod early_snapshot_tests {
             true,
             true,
             true,
+            None,
             true,
         )
         .unwrap_err();
         assert!(error.contains("cannot be combined"), "{error}");
+
+        for publish_through in [17, 18, 19] {
+            assert!(
+                validate_staged_cohort_recovery_mode(
+                    true,
+                    17,
+                    19,
+                    Some(true),
+                    1,
+                    false,
+                    true,
+                    true,
+                    true,
+                    Some(publish_through),
+                    false,
+                )
+                .is_ok()
+            );
+        }
+        for publish_through in [16, 20] {
+            let error = validate_staged_cohort_recovery_mode(
+                true,
+                17,
+                19,
+                Some(true),
+                1,
+                false,
+                true,
+                true,
+                true,
+                Some(publish_through),
+                false,
+            )
+            .unwrap_err();
+            assert!(error.contains("must be within"), "{error}");
+        }
+        let error = validate_staged_cohort_recovery_mode(
+            false,
+            17,
+            19,
+            Some(true),
+            1,
+            false,
+            true,
+            true,
+            true,
+            Some(18),
+            false,
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("requires --recover-staged-cohort-only"),
+            "{error}"
+        );
     }
 
     fn make_private_test_directory(path: &Path) {

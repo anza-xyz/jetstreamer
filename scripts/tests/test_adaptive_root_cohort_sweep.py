@@ -960,6 +960,42 @@ class CommandTests(unittest.TestCase):
         self.assertIn("--property=NoExecPaths=/home/sol", command)
         self.assertIn("--recover-staged-cohort-only", command)
         self.assertIn("--source-cohort-receipt=/private/receipt.json", command)
+        self.assertFalse(
+            any(item.startswith("--publish-through-epoch=") for item in command)
+        )
+
+    def test_importer_can_publish_only_a_verified_cohort_prefix(self) -> None:
+        cohort = sweep.Cohort(298, 301, "solana-v1.8.11")
+        command = sweep.build_import_command(
+            cohort=cohort,
+            receipt=Path("/private/final-receipt.json"),
+            deploy=self.deploy,
+            manifest=self.manifest,
+            fingerprint=self.fingerprint,
+            public_dir=Path("/home/sol/horizon"),
+            public_private_root=Path("/home/sol/.private-public"),
+            unit="final-import-test.service",
+            publish_through_epoch=300,
+        )
+
+        self.assertIn("--publish-through-epoch=300", command)
+        self.assertEqual(command.count("--publish-through-epoch=300"), 1)
+        for boundary in (297, 302):
+            with self.subTest(boundary=boundary):
+                with self.assertRaisesRegex(
+                    sweep.SweepError, "outside sealed cohort 298-301"
+                ):
+                    sweep.build_import_command(
+                        cohort=cohort,
+                        receipt=Path("/private/final-receipt.json"),
+                        deploy=self.deploy,
+                        manifest=self.manifest,
+                        fingerprint=self.fingerprint,
+                        public_dir=Path("/home/sol/horizon"),
+                        public_private_root=Path("/home/sol/.private-public"),
+                        unit="invalid-final-import-test.service",
+                        publish_through_epoch=boundary,
+                    )
 
 
 class AdoptionHardeningTests(unittest.TestCase):

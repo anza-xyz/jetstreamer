@@ -1019,7 +1019,15 @@ def build_import_command(
     producer_user: str = "sol",
     archive_group: str = "horizon",
     producer_home: Path = Path("/home/sol"),
+    publish_through_epoch: int | None = None,
 ) -> list[str]:
+    if publish_through_epoch is not None and not (
+        cohort.first_epoch <= publish_through_epoch <= cohort.last_epoch
+    ):
+        raise SweepError(
+            f"publication boundary {publish_through_epoch} is outside "
+            f"sealed cohort {cohort.label}"
+        )
     node = deploy / "jetstreamer-node"
     environment = (
         f"HOME={producer_home}",
@@ -1088,16 +1096,18 @@ def build_import_command(
     command.extend(f"--setenv={item}" for item in environment)
     command.extend(
         [
-        _path_arg(node),
-        cohort.label,
-        _path_arg(public_dir),
-        "--verify",
-        "--recover-staged-cohort-only",
-        f"--cohort-manifest={manifest}",
-        f"--cohort-manifest-fingerprint={fingerprint}",
-        f"--source-cohort-receipt={receipt}",
+            _path_arg(node),
+            cohort.label,
+            _path_arg(public_dir),
+            "--verify",
+            "--recover-staged-cohort-only",
+            f"--cohort-manifest={manifest}",
+            f"--cohort-manifest-fingerprint={fingerprint}",
+            f"--source-cohort-receipt={receipt}",
         ]
     )
+    if publish_through_epoch is not None:
+        command.append(f"--publish-through-epoch={publish_through_epoch}")
     return command
 
 

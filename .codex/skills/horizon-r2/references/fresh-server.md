@@ -31,14 +31,16 @@ epochs touch a slot interval marked unsupported by the checked-in runtime regist
 5. Before the first replay, record each unit's exact scratch path and keep the diagnostic evidence
    needed after failure outside that tree. Failed-replay scratch cleanup is authorized by default:
    once failure is confirmed, stop the service and retry path, preserve its logs, replay state,
-   snapshots, checkpoints, manifests, receipts, and any partial archive needed for diagnosis, and
+   checkpoints, manifests, receipts, any partial archive needed for diagnosis, and any snapshot
+   still needed for diagnosis, lineage, restart, or a staged epoch, and
    then delete the exact unreferenced scratch tree immediately. Verify no live process or staged
    relaunch refers to it first. Retain a controlled stop only when it can genuinely resume in place;
    after a clean bootstrap relaunch into a new isolated generation with no resume cursor, reclaim
    older unreferenced generations promptly as well.
 6. Treat disk cleanup as part of admission control. Proactively remove reproducible build caches,
-   download caches, and obsolete scratch generations once their exact canonical paths have been
-   checked against live processes and staged units. Keep the immutable manifest or receipt that
+   download caches, obsolete snapshots, and obsolete scratch generations once their exact
+   canonical paths have been checked against live processes and staged units. Keep the immutable
+   manifest or receipt that
    identifies any removed generation-pinned download, record before/after free space, and preserve
    every required input, resumable state tree, diagnostic artifact, checkpoint, receipt, public
    archive, and R2 object.

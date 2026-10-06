@@ -44,7 +44,7 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
 
 - Use the repository's sealed historical replay/controller path and automatic slot-range runtime selection. Do not invent a compatibility override.
 - Run generation and long-lived verification/upload watchers in persistent systemd units so loss of the interactive session cannot kill them. Set `Restart=on-failure` with a bounded retry delay; do not use `Restart=always`, because successful completion must remain terminal. Respect unrelated jobs and configured RAM/disk reserves.
-- Failed-replay scratch cleanup is authorized by default for this workflow. After confirming the failure and capturing the evidence needed to diagnose or reproduce it, stop the service and retry path, verify that no live process or staged relaunch references the exact scratch path, and delete that failed run's scratch immediately instead of allowing failures to accumulate. Preserve diagnostic output, partial archives, replay state, logs, snapshots, checkpoints, manifests, and receipts outside the scratch tree. Never apply this cleanup rule to a controlled stop that can genuinely resume in place. If a relaunch demonstrably starts from the bootstrap in a new isolated runtime generation with no resume cursor, verify the new worker's exact generation and reclaim older unreferenced generations promptly; preserving them does not make that replay resumable.
+- Failed-replay scratch cleanup is authorized by default for this workflow. After confirming the failure and capturing the evidence needed to diagnose or reproduce it, stop the service and retry path, verify that no live process or staged relaunch references the exact scratch path, and delete that failed run's scratch immediately instead of allowing failures to accumulate. Preserve diagnostic output, partial archives, replay state, logs, checkpoints, manifests, receipts, and any snapshot still needed for diagnosis, lineage, restart, or a staged epoch outside the scratch tree. Never apply this cleanup rule to a controlled stop that can genuinely resume in place. If a relaunch demonstrably starts from the bootstrap in a new isolated runtime generation with no resume cursor, verify the new worker's exact generation and reclaim older unreferenced generations promptly; preserving them does not make that replay resumable.
 - Do not raise replay concurrency from low CPU or RAM utilization alone. Snapshot extraction and
   historical account state can consume hundreds of GiB per worker; require the controller's
   configured per-worker disk admission budget and measured filesystem growth to leave the reserve
@@ -53,10 +53,10 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
 - Reclaim local disk proactively when admission is constrained, but only from positively
   reproducible caches and obsolete scratch generations. Resolve each deletion target to an exact
   canonical path, prove no live process or staged unit references it, preserve the manifest or
-  receipt needed to reproduce it, and record the before/after evidence. Build caches and fully
-  generation-pinned snapshot caches may be removed after those checks; required inputs, active
-  scratch, resumable state, diagnostic evidence, checkpoints, receipts, public archives, and all R2
-  objects must remain untouched.
+  receipt needed to reproduce it, and record the before/after evidence. Build caches, obsolete
+  snapshots, and fully generation-pinned snapshot caches may be removed after those checks;
+  required inputs, active scratch, resumable state, diagnostic evidence, checkpoints, receipts,
+  public archives, and all R2 objects must remain untouched.
 - For adaptive ranges, start the controller with `--r2-receipt-directory "$HOME/.jetstreamer-private/r2-receipts" --r2-bucket BUCKET`. The controller accepts receipts from that exact bucket only for bytes already bound by its root-owned local completion attestation; R2 can replace local storage, but can never establish initial completion.
 - Start the current Horizon verification plugin as soon as each local archive is available. R2 work may run concurrently with replay of other epochs. An archive is eligible for upload only after its full and current-plugin receipts bind the same archive SHA-256. It is not eligible for local retirement until both adjacent-boundary receipts bind that digest as well. Preserve the canonical lowercase coreutils sidecar format: `<64 hex>  epoch-N.jet\n`.
 

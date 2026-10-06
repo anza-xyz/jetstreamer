@@ -5543,6 +5543,28 @@ fn root_checkpoint_cohort_runtime(
     Ok(terminal_selection.expect("nonempty cohort has a runtime"))
 }
 
+fn manifest_runtime_matches_cohort(
+    manifest_runtime: &str,
+    start_epoch: u64,
+    end_epoch: u64,
+    selection: compatibility::RuntimeSelection,
+) -> bool {
+    if manifest_runtime == selection.descriptor.identity.name {
+        return true;
+    }
+
+    // The sealed 150-173 preflight predates the two narrower v1.5.8
+    // compatibility findings. Its snapshot identities and checkpoint gates
+    // remain authoritative, but its runtime label still names the surrounding
+    // v1.5.6 era. Keep this exception exact: epoch 154 is entirely v1.5.8 and
+    // epoch 157 terminates in v1.5.8 after its hash-bound v1.5.6 handoff.
+    // No other stale label, range, or destination runtime is admitted.
+    start_epoch == end_epoch
+        && matches!(start_epoch, 154 | 157)
+        && manifest_runtime == compatibility::SOLANA_V1_5_6_RUNTIME.identity.name
+        && std::ptr::eq(selection.descriptor, &compatibility::SOLANA_V1_5_8_RUNTIME)
+}
+
 const COHORT_MANIFEST_SCHEMA: &str = "jetstreamer-gcs-snapshot-preflight-v2";
 const COHORT_PUBLICATION_GATE: &str = "all-archives-validated-and-final-root-verified";
 const COHORT_MANIFEST_MAX_BYTES: u64 = 16 * 1024 * 1024;
@@ -5856,7 +5878,7 @@ fn root_checkpoint_cohort_plan_from_report(
         .into_iter()
         .next()
         .expect("one overlap was required");
-    if entry.runtime != selection.descriptor.identity.name {
+    if !manifest_runtime_matches_cohort(&entry.runtime, start_epoch, end_epoch, selection) {
         return Err(format!(
             "cohort manifest runtime {} does not match selected runtime {}",
             entry.runtime, selection.descriptor.identity.name
@@ -19413,6 +19435,38 @@ mod early_snapshot_tests {
             root_checkpoint_cohort_plan_from_report(changed, &fingerprint, 17, 19, selection)
                 .unwrap_err();
         assert!(error.contains("fingerprint mismatch"), "{error}");
+    }
+
+    #[test]
+    fn sealed_legacy_v156_manifest_admits_only_the_exact_v158_exceptions() {
+        for epoch in [154, 157] {
+            let selection = root_checkpoint_cohort_runtime(epoch, epoch, true).unwrap();
+            assert_eq!(
+                selection.backend,
+                compatibility::RuntimeBackend::SolanaV1_5_8
+            );
+            assert!(manifest_runtime_matches_cohort(
+                "solana-v1.5.6",
+                epoch,
+                epoch,
+                selection,
+            ));
+        }
+
+        let v156 = root_checkpoint_cohort_runtime(156, 156, true).unwrap();
+        assert!(!manifest_runtime_matches_cohort(
+            "solana-v1.5.8",
+            156,
+            156,
+            v156,
+        ));
+        let v158 = root_checkpoint_cohort_runtime(157, 157, true).unwrap();
+        assert!(!manifest_runtime_matches_cohort(
+            "solana-v1.5.6",
+            154,
+            157,
+            v158,
+        ));
     }
 
     #[test]

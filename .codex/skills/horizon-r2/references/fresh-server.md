@@ -74,7 +74,11 @@ evidence for a later reviewed registry change, not permission to publish by itse
    candidate era rather than claiming the entire requested range.
 3. Differentially check transaction outcomes/status vocabulary around the proposed boundary and
    replay from a digest-bound canonical predecessor snapshot through every available canonical
-   root checkpoint. A candidate must reproduce those checkpoints before it can generate a
+   root checkpoint. After a focused replay succeeds, independently run the repository's
+   `jetstreamer-qualification-verify` binary with the exact sealed epoch, output range, bootstrap,
+   terminal, runtime-profile, worker-digest, and private-root expectations. Treat the diagnostic
+   artifact as registry evidence only if that full re-read passes and the canonical `.sha256`
+   sidecar remains absent. A candidate must reproduce those checkpoints before it can generate a
    publishable archive.
 4. Locate later runtime boundaries by evidence, not release dates. Extend the supported interval
    in bounded steps; add another descriptor or isolated restart whenever checkpoint or status

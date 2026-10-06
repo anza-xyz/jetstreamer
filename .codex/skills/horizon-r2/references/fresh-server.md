@@ -92,6 +92,12 @@ Diagnostic `.jet` files remain private and receive no checksum sidecar. Only aft
 snapshot preflight accept a bounded range may the adaptive controller run it with a fingerprinted
 manifest and normal root-checkpoint gates.
 
+The user-assigned end epoch is also the publication boundary. If its final sealed verification
+cohort extends beyond that epoch to obtain a terminal root, replay and independently validate the
+whole cohort in a private lane, then use the repository's bounded staged-cohort recovery option to
+publish only the contiguous in-range prefix. Leave every verification-tail `.jet` private and
+sidecar-free; never place it in the public Horizon directory or include it in the R2 upload range.
+
 ## Coordinate a second server
 
 - Give each server a disjoint explicit range and bind every controller to that range. For the

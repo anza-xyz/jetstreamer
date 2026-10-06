@@ -25,7 +25,13 @@ For a long-running range, use `scripts/sync_horizon_r2_progressive.py` to discov
 - Locate the Jetstreamer repository and read its current historical compatibility table and active controller state before starting generation.
 - Use `HORIZON_DIR` when set; otherwise use `$HOME/horizon`. Keep only `epoch-N.jet` and `epoch-N.jet.sha256` in that public directory.
 - Credentials are `HORIZON_S3_ENDPOINT`, `HORIZON_ACCESS_KEY_ID`, and `HORIZON_SECRET_ACCESS_KEY`. Check only that they exist; never print their values. The endpoint path names the bucket.
-- With an explicit user range, restrict generation, verification, upload, and cleanup to that range.
+- With an explicit user range, restrict ordinary generation, verification, upload, and cleanup to
+  that range; the only permitted out-of-range work is the isolated verification tail below.
+- Treat the explicit range end as the publication boundary even when a sealed verification cohort
+  must replay farther to reach its terminal root. Keep every out-of-range verification-tail archive
+  in private storage, give it no canonical sidecar, and exclude it from the public Horizon directory
+  and R2. Deeply validate the complete sealed cohort before transactionally importing only the
+  requested contiguous prefix through the repository's bounded recovery option.
 - Without a range, inventory canonical R2 pairs first. Upload any complete local pairs missing from R2, then begin with the lowest missing epoch supported by the repository's compatibility manifests. Continue in bounded cohorts as resources permit.
 - An R2 epoch is complete only when both `epoch-N.jet` and `epoch-N.jet.sha256` exist and agree with verified local evidence. A checksum-only or archive-only epoch is incomplete.
 

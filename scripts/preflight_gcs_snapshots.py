@@ -335,10 +335,6 @@ def _parse_snapshot_object(
         raise PreflightError(f"{context}: path belongs to the {location} inventory")
     anchor_slot = _path_u64(match.group("anchor"), "anchor slot", context)
     snapshot_slot = _path_u64(match.group("slot"), "snapshot slot", context)
-    if location == "root" and anchor_slot != snapshot_slot:
-        raise PreflightError(f"{context}: root directory slot does not match filename slot")
-    if location == "hourly" and anchor_slot > snapshot_slot:
-        raise PreflightError(f"{context}: hourly anchor is later than snapshot slot")
     identity = match.group("identity")
     if not _base58_decodes_to_32_bytes(identity):
         raise PreflightError(f"{context}: snapshot identity is not a 32-byte base58 hash")
@@ -380,6 +376,7 @@ def parse_inventory_json(
     text: str,
     source: str,
     relevant_slots: Optional[Tuple[int, int]] = None,
+    exclusions: Optional[List[Dict[str, Any]]] = None,
 ) -> Tuple[SnapshotObject, ...]:
     """Parse one raw gcloud JSON listing and validate every returned object."""
     if source not in ("root", "hourly"):
@@ -415,6 +412,74 @@ def parse_inventory_json(
                 f"{source} inventory has conflicting metadata for object {item.object_name!r}"
             )
         seen[item.object_name] = item
+
+    def same_snapshot_payload(left: SnapshotObject, right: SnapshotObject) -> bool:
+        return (
+            left.filename == right.filename
+            and left.accounts_hash == right.accounts_hash
+            and left.extension == right.extension
+            and left.size == right.size
+            and left.crc32c == right.crc32c
+            and left.md5_hash is not None
+            and left.md5_hash == right.md5_hash
+        )
+
+    def record_exclusion(
+        item: SnapshotObject, reason: str, retained: Optional[SnapshotObject]
+    ) -> None:
+        if exclusions is None:
+            return
+        exclusions.append(
+            {
+                "crc32c": item.crc32c,
+                "generation": item.generation,
+                "md5_hash": item.md5_hash,
+                "object_name": item.object_name,
+                "reason": reason,
+                "retained_object_name": retained.object_name if retained else None,
+                "size": item.size,
+                "source": item.source,
+            }
+        )
+
+    if source == "root":
+        for item in tuple(seen.values()):
+            if item.anchor_slot == item.slot:
+                continue
+            canonical_name = f"{item.slot}/{item.filename}"
+            canonical = seen.get(canonical_name)
+            if canonical is None:
+                raise PreflightError(
+                    f"root inventory object {item.object_name!r} has a directory slot "
+                    "that does not match its filename slot and no canonical copy exists"
+                )
+            if not same_snapshot_payload(item, canonical):
+                raise PreflightError(
+                    f"root inventory object {item.object_name!r} has a directory slot "
+                    "that does not match its filename slot and differs from its canonical copy"
+                )
+            record_exclusion(item, "digest-identical-misrooted-root-alias", canonical)
+            del seen[item.object_name]
+    else:
+        for item in tuple(seen.values()):
+            if item.anchor_slot <= item.slot:
+                continue
+            valid_copies = (
+                candidate
+                for candidate in seen.values()
+                if candidate.object_name != item.object_name
+                and candidate.anchor_slot <= candidate.slot
+                and same_snapshot_payload(item, candidate)
+            )
+            valid_copy = next(valid_copies, None)
+            if valid_copy is not None:
+                record_exclusion(
+                    item, "digest-identical-late-anchor-hourly-alias", valid_copy
+                )
+                del seen[item.object_name]
+                continue
+            record_exclusion(item, "invalid-late-anchor-hourly-quarantine", None)
+            del seen[item.object_name]
     return tuple(
         sorted(seen.values(), key=lambda item: (item.slot, item.object_name, item.generation))
     )
@@ -967,8 +1032,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         root_text, hourly_text = load_inventory_texts(
             arguments.inventory_root_json, arguments.inventory_hourly_json
         )
-        root_objects = parse_inventory_json(root_text, "root", relevant_slots)
-        hourly_objects = parse_inventory_json(hourly_text, "hourly", relevant_slots)
+        inventory_exclusions: List[Dict[str, Any]] = []
+        root_objects = parse_inventory_json(
+            root_text, "root", relevant_slots, inventory_exclusions
+        )
+        hourly_objects = parse_inventory_json(
+            hourly_text, "hourly", relevant_slots, inventory_exclusions
+        )
         plans = build_epoch_plans(
             root_objects,
             hourly_objects,
@@ -981,6 +1051,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         report = {
             "free_bytes": storage["free_bytes"],
             "inventory_objects": {"hourly": len(hourly_objects), "root": len(root_objects)},
+            "inventory_exclusions": inventory_exclusions,
             "manifest": manifest,
             "manifest_fingerprint": fingerprint,
             "missing_local_bootstrap_bytes": storage["missing_local_bootstrap_bytes"],

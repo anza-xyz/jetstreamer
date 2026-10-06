@@ -160,8 +160,16 @@ class InventoryParsingTests(unittest.TestCase):
                     parsed(record)
 
         hourly = inventory_record(slot, source="hourly", anchor=slot + 1)
-        with self.assertRaises(preflight.PreflightError):
-            parsed(hourly, "hourly")
+        exclusions: list[dict] = []
+        self.assertEqual(
+            preflight.parse_inventory_json(
+                json.dumps([hourly]), "hourly", exclusions=exclusions
+            ),
+            (),
+        )
+        self.assertEqual(
+            exclusions[0]["reason"], "invalid-late-anchor-hourly-quarantine"
+        )
 
     def test_strict_json_rejects_duplicate_keys_but_coalesces_duplicate_rows(self) -> None:
         with self.assertRaises(preflight.PreflightError):
@@ -190,6 +198,91 @@ class InventoryParsingTests(unittest.TestCase):
 
         with self.assertRaises(preflight.PreflightError):
             preflight.parse_inventory_json(json.dumps([record]), "root")
+
+    def test_coalesces_digest_identical_misplaced_root_alias(self) -> None:
+        slot = preflight.FIRST_EPOCH * preflight.EPOCH_SLOTS - 1
+        canonical = inventory_record(slot, size=1234, generation=10)
+        alias = inventory_record(
+            slot,
+            anchor=slot + 1_000,
+            size=1234,
+            generation=20,
+        )
+
+        items = preflight.parse_inventory_json(
+            json.dumps([alias, canonical]), "root"
+        )
+
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0].object_name, canonical["metadata"]["name"])
+        self.assertEqual(items[0].generation, 10)
+
+    def test_rejects_unproven_misplaced_root_alias(self) -> None:
+        slot = preflight.FIRST_EPOCH * preflight.EPOCH_SLOTS - 1
+        canonical = inventory_record(slot, size=1234)
+        mismatched = inventory_record(slot, anchor=slot + 1_000, size=1235)
+        missing_md5 = inventory_record(
+            slot, anchor=slot + 1_000, size=1234, md5_hash=None
+        )
+
+        for alias in (mismatched, missing_md5):
+            with self.subTest(alias=alias["metadata"]["name"]):
+                with self.assertRaises(preflight.PreflightError):
+                    preflight.parse_inventory_json(
+                        json.dumps([canonical, alias]), "root"
+                    )
+
+    def test_coalesces_digest_identical_late_anchor_hourly_alias(self) -> None:
+        slot = preflight.FIRST_EPOCH * preflight.EPOCH_SLOTS - 1
+        valid = inventory_record(
+            slot, source="hourly", anchor=0, size=1234, generation=10
+        )
+        alias = inventory_record(
+            slot,
+            source="hourly",
+            anchor=slot + 1_000,
+            size=1234,
+            generation=20,
+        )
+
+        items = preflight.parse_inventory_json(
+            json.dumps([alias, valid]), "hourly"
+        )
+
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0].object_name, valid["metadata"]["name"])
+        self.assertEqual(items[0].generation, 10)
+
+    def test_quarantines_unproven_late_anchor_hourly_object(self) -> None:
+        slot = preflight.FIRST_EPOCH * preflight.EPOCH_SLOTS - 1
+        valid = inventory_record(slot, source="hourly", anchor=0, size=1234)
+        mismatched = inventory_record(
+            slot, source="hourly", anchor=slot + 1_000, size=1235
+        )
+        missing_md5 = inventory_record(
+            slot,
+            source="hourly",
+            anchor=slot + 1_000,
+            size=1234,
+            md5_hash=None,
+        )
+
+        for records, expected_count in (
+            ([mismatched], 0),
+            ([valid, mismatched], 1),
+            ([valid, missing_md5], 1),
+        ):
+            with self.subTest(records=records):
+                exclusions: list[dict] = []
+                items = preflight.parse_inventory_json(
+                    json.dumps(records), "hourly", exclusions=exclusions
+                )
+                self.assertEqual(len(items), expected_count)
+                self.assertEqual(len(exclusions), 1)
+                self.assertEqual(
+                    exclusions[0]["reason"],
+                    "invalid-late-anchor-hourly-quarantine",
+                )
 
     def test_requested_subrange_sets_inventory_trust_boundary(self) -> None:
         relevant_slots = preflight.requested_slot_range(12, 16)

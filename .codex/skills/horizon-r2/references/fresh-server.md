@@ -29,13 +29,13 @@ epochs touch a slot interval marked unsupported by the checked-in runtime regist
    service. Deploy immutable binaries and manifests into root-owned, non-writable paths; do not run
    a long replay from `target/` in a mutable worktree.
 5. Before the first replay, record each unit's exact scratch path and keep the diagnostic evidence
-   needed after failure outside that tree. When local scratch cleanup is authorized, a confirmed
-   failed run must stop its service and retry path, preserve its logs, replay state, snapshots,
-   checkpoints, manifests, receipts, and any partial archive needed for diagnosis, and then delete
-   the exact unreferenced scratch tree promptly. Verify no live process or staged relaunch refers to
-   it first. Retain a controlled stop only when it can genuinely resume in place; after a clean
-   bootstrap relaunch into a new isolated generation with no resume cursor, reclaim older
-   unreferenced generations promptly as well.
+   needed after failure outside that tree. Failed-replay scratch cleanup is authorized by default:
+   once failure is confirmed, stop the service and retry path, preserve its logs, replay state,
+   snapshots, checkpoints, manifests, receipts, and any partial archive needed for diagnosis, and
+   then delete the exact unreferenced scratch tree immediately. Verify no live process or staged
+   relaunch refers to it first. Retain a controlled stop only when it can genuinely resume in place;
+   after a clean bootstrap relaunch into a new isolated generation with no resume cursor, reclaim
+   older unreferenced generations promptly as well.
 
 Inventory canonical archive/sidecar pairs in R2 before scheduling. The sidecar is the remote
 completion marker, but a private receipt from another host is not portable completion evidence.

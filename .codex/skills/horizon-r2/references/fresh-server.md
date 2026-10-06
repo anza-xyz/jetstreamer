@@ -31,7 +31,10 @@ epochs touch a slot interval marked unsupported by the checked-in runtime regist
 4. Build from that recorded commit and pin the hashes of the producer, full verifier, current
    plugin pipeline, boundary verifier, and their launcher scripts before creating a production
    service. Deploy immutable binaries and manifests into root-owned, non-writable paths; do not run
-   a long replay from `target/` in a mutable worktree.
+   a long replay from `target/` in a mutable worktree. Initialize each recurring monitor's
+   last-observed state from the replay's authoritative launch time before starting its timer, then
+   run the monitor once manually to prove it can write evidence. A monitor setup failure does not
+   justify restarting a healthy producer.
 5. Before the first replay, record each unit's exact scratch path and keep the diagnostic evidence
    needed after failure outside that tree. Failed-replay scratch cleanup is authorized by default:
    once failure is confirmed, stop the service and retry path, preserve its logs, replay state,

@@ -44,6 +44,10 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
 
 - Use the repository's sealed historical replay/controller path and automatic slot-range runtime selection. Do not invent a compatibility override.
 - Run generation and long-lived verification/upload watchers in persistent systemd units so loss of the interactive session cannot kill them. Set `Restart=on-failure` with a bounded retry delay; do not use `Restart=always`, because successful completion must remain terminal. Respect unrelated jobs and configured RAM/disk reserves.
+- Before starting a recurring status timer, initialize its last-observed state to the replay's
+  authoritative launch time and validate the monitor once manually. A timer that exists without
+  this state is not monitoring the replay; diagnose monitor failures without restarting a healthy
+  producer.
 - When launching into a fresh isolated diagnostic-output directory, ensure it contains the verified
   same-cluster genesis expected by the loader. A cached snapshot does not imply the genesis is
   present. Preseed only from digest-bound retained evidence and verify the copied digest and

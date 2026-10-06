@@ -36,6 +36,12 @@ epochs touch a slot interval marked unsupported by the checked-in runtime regist
    relaunch refers to it first. Retain a controlled stop only when it can genuinely resume in place;
    after a clean bootstrap relaunch into a new isolated generation with no resume cursor, reclaim
    older unreferenced generations promptly as well.
+6. Treat disk cleanup as part of admission control. Proactively remove reproducible build caches,
+   download caches, and obsolete scratch generations once their exact canonical paths have been
+   checked against live processes and staged units. Keep the immutable manifest or receipt that
+   identifies any removed generation-pinned download, record before/after free space, and preserve
+   every required input, resumable state tree, diagnostic artifact, checkpoint, receipt, public
+   archive, and R2 object.
 
 Inventory canonical archive/sidecar pairs in R2 before scheduling. The sidecar is the remote
 completion marker, but a private receipt from another host is not portable completion evidence.

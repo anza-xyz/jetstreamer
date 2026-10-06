@@ -50,6 +50,13 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
   configured per-worker disk admission budget and measured filesystem growth to leave the reserve
   intact before launching another cohort. If a manual canary set would violate that gate, stop the
   newest units and preserve their private run directories for later resumption.
+- Reclaim local disk proactively when admission is constrained, but only from positively
+  reproducible caches and obsolete scratch generations. Resolve each deletion target to an exact
+  canonical path, prove no live process or staged unit references it, preserve the manifest or
+  receipt needed to reproduce it, and record the before/after evidence. Build caches and fully
+  generation-pinned snapshot caches may be removed after those checks; required inputs, active
+  scratch, resumable state, diagnostic evidence, checkpoints, receipts, public archives, and all R2
+  objects must remain untouched.
 - For adaptive ranges, start the controller with `--r2-receipt-directory "$HOME/.jetstreamer-private/r2-receipts" --r2-bucket BUCKET`. The controller accepts receipts from that exact bucket only for bytes already bound by its root-owned local completion attestation; R2 can replace local storage, but can never establish initial completion.
 - Start the current Horizon verification plugin as soon as each local archive is available. R2 work may run concurrently with replay of other epochs. An archive is eligible for upload only after its full and current-plugin receipts bind the same archive SHA-256. It is not eligible for local retirement until both adjacent-boundary receipts bind that digest as well. Preserve the canonical lowercase coreutils sidecar format: `<64 hex>  epoch-N.jet\n`.
 

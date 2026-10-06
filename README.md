@@ -544,6 +544,13 @@ v1.7.15 envelope covers epochs 233-265, and v1.8.11 covers epochs 266-301 so
 epoch 301 can serve as a verification tail beyond the current epoch-300
 publication boundary.
 
+Before a completed focused artifact is used as registry evidence, independently revalidate it with
+`cargo run --release -p jetstreamer-node --bin jetstreamer-qualification-verify -- ...`. The
+validator requires the exact epoch, output start, bootstrap and terminal slots, runtime profile,
+worker SHA-256, and private root. It fully re-reads the Horizon source and bound segment manifest,
+rejects non-private or multiply linked files, and fails if a canonical `.sha256` publication
+sidecar exists.
+
 Eleven execution interventions are explicitly recorded in addition to the ordinary
 epoch-aligned pinned-worker snapshot restarts:
 

@@ -23,7 +23,11 @@ epochs touch a slot interval marked unsupported by the checked-in runtime regist
    UID, GID, and home directory. Do not create placeholder accounts merely to satisfy the defaults.
    If `gcloud` is installed outside `/usr/bin` (including Homebrew), pass its absolute executable
    path with `--gcloud-bin` and verify the printed producer path. Do not rely on an interactive
-   shell startup file inside a detached systemd producer.
+   shell startup file inside a detached systemd producer. A fresh isolated diagnostic-output
+   directory may still request `genesis.tar.bz2` even when its snapshot is already cached. Before
+   launch, preseed a retained same-cluster genesis only when its digest matches previously verified
+   run evidence, then recheck the destination digest and ownership; otherwise prove that gcloud
+   authentication works noninteractively for the service identity.
 4. Build from that recorded commit and pin the hashes of the producer, full verifier, current
    plugin pipeline, boundary verifier, and their launcher scripts before creating a production
    service. Deploy immutable binaries and manifests into root-owned, non-writable paths; do not run

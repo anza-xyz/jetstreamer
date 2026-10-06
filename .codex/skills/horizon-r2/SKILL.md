@@ -44,6 +44,10 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
 
 - Use the repository's sealed historical replay/controller path and automatic slot-range runtime selection. Do not invent a compatibility override.
 - Run generation and long-lived verification/upload watchers in persistent systemd units so loss of the interactive session cannot kill them. Set `Restart=on-failure` with a bounded retry delay; do not use `Restart=always`, because successful completion must remain terminal. Respect unrelated jobs and configured RAM/disk reserves.
+- When launching into a fresh isolated diagnostic-output directory, ensure it contains the verified
+  same-cluster genesis expected by the loader. A cached snapshot does not imply the genesis is
+  present. Preseed only from digest-bound retained evidence and verify the copied digest and
+  ownership; otherwise validate noninteractive gcloud authentication for the service identity.
 - Failed-replay scratch cleanup is authorized by default for this workflow. After confirming the failure and capturing the evidence needed to diagnose or reproduce it, stop the service and retry path, verify that no live process or staged relaunch references the exact scratch path, and delete that failed run's scratch immediately instead of allowing failures to accumulate. Preserve diagnostic output, partial archives, replay state, logs, checkpoints, manifests, receipts, and any snapshot still needed for diagnosis, lineage, restart, or a staged epoch outside the scratch tree. Never apply this cleanup rule to a controlled stop that can genuinely resume in place. If a relaunch demonstrably starts from the bootstrap in a new isolated runtime generation with no resume cursor, verify the new worker's exact generation and reclaim older unreferenced generations promptly; preserving them does not make that replay resumable.
 - Do not raise replay concurrency from low CPU or RAM utilization alone. Snapshot extraction and
   historical account state can consume hundreds of GiB per worker; require the controller's

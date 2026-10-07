@@ -6,7 +6,7 @@ use {
     crc::{CRC_64_GO_ISO, Crc},
     fnv::FnvHasher,
     std::{
-        collections::HashMap,
+        collections::{HashMap, HashSet},
         fmt,
         io::{self, Read},
         vec::Vec,
@@ -85,10 +85,18 @@ impl NodesWithCids {
         let mut data = Vec::with_capacity(first_dataframe.data.len());
         data.extend_from_slice(first_dataframe.data.as_slice());
 
+        // A continuation may not revisit a frame the traversal already consumed; a cycle would reappend the same chunks forever.
+        let mut visited = HashSet::new();
         let mut next_arr = first_dataframe.next.as_deref();
         while let Some(next_cids) = next_arr {
             let mut next_segment = None;
             for next_cid in next_cids {
+                if !visited.insert(*next_cid) {
+                    return Err(Box::new(std::io::Error::other(std::format!(
+                        "Cyclic dataframe continuation: {:?}",
+                        next_cid
+                    ))) as SharedError);
+                }
                 let next_node = self.get_by_cid(next_cid).ok_or_else(|| {
                     Box::new(std::io::Error::other(std::format!(
                         "Missing CID: {:?}",
@@ -613,5 +621,46 @@ impl<R: Read> NodeReader<R> {
     /// Returns the number of CAR items read so far.
     pub const fn get_item_index(&self) -> u64 {
         self.item_index
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use {super::*, crate::dataframe::DataFrame, crate::utils::Buffer};
+
+    /// The standard CID bytes used by the decoder fixtures.
+    fn test_cid() -> Cid {
+        Cid::try_from(
+            vec![
+                1, 113, 18, 32, 56, 148, 167, 251, 237, 117, 200, 226, 181, 134, 79, 115, 131, 220,
+                232, 143, 20, 67, 224, 179, 48, 130, 197, 123, 226, 85, 85, 56, 38, 84, 106, 225,
+            ]
+            .as_slice(),
+        )
+        .unwrap()
+    }
+
+    /// A continuation that points back at a frame the traversal already
+    /// consumed keeps reappending the same chunk forever; the reassembly
+    /// must fail instead of looping.
+    #[test]
+    fn reassembly_fails_on_a_cyclic_continuation() {
+        let cid = test_cid();
+        let frame = DataFrame {
+            kind: Kind::DataFrame.to_u64(),
+            hash: None,
+            index: None,
+            total: None,
+            data: Buffer::from_vec(vec![1u8; 1024]),
+            next: Some(vec![cid]),
+        };
+        let mut nodes = NodesWithCids::new();
+        nodes.push(NodeWithCid::new(cid, Node::DataFrame(frame.clone())));
+
+        let err = nodes.reassemble_dataframes(&frame).unwrap_err();
+        assert!(
+            err.to_string().contains("Cyclic"),
+            "unexpected error: {err}"
+        );
     }
 }

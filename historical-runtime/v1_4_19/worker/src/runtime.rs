@@ -29,16 +29,15 @@ use std::{cmp, collections::HashMap, env, path::Path, sync::Arc};
 use tempfile::TempDir;
 
 const MAX_AGE_CORRECTION_EPOCH: u64 = 14;
-// Narrow epoch-131/133 candidate envelope plus one checkpoint-bound epoch-134
-// diagnostic tail. The minimum is the exact canonical epoch-131 predecessor
-// snapshot used by qualification. Normal replay still switches to v1.4.25 at
-// epoch 134; only the parent's focused-qualification planner can select this
-// worker from the canonical slot-58,011,320 snapshot through the next hourly
-// checkpoint. The parent binds snapshot hashes and every later checkpoint;
-// snapshot creator metadata alone is never runtime-selection evidence.
+// Epoch-131/134 candidate envelope. The minimum is the exact canonical
+// epoch-131 predecessor snapshot used by qualification. A focused replay from
+// the canonical slot-58,011,320 snapshot reproduced epoch 134's first observed
+// source-status divergence and the next canonical checkpoint. The parent binds
+// snapshot hashes and every later checkpoint before publication; snapshot
+// creator metadata alone is never runtime-selection evidence.
 const MIN_SUPPORTED_SNAPSHOT_SLOT: u64 = 56_591_729;
 const MIN_SUPPORTED_ENTRY_SLOT: u64 = MIN_SUPPORTED_SNAPSHOT_SLOT + 1;
-const MAX_SUPPORTED_SLOT_EXCLUSIVE: u64 = 58_019_045;
+const MAX_SUPPORTED_SLOT_EXCLUSIVE: u64 = 58_320_000;
 const POH_THREADS_ENV: &str = "JETSTREAMER_HISTORICAL_POH_THREADS";
 const ABSOLUTE_MAX_POH_THREADS: usize = 256;
 // The validator runs AccountsBackgroundService alongside replay. This worker

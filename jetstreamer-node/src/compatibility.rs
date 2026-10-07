@@ -106,21 +106,17 @@ pub const SOLANA_V1_3_23_CANDIDATE_END_SLOT_EXCLUSIVE: Slot = 55_728_000;
 /// Publication remains gated on every canonical checkpoint in each epoch.
 pub const SOLANA_V1_4_17_CANDIDATE_START_SLOT: Slot = SOLANA_V1_3_23_CANDIDATE_END_SLOT_EXCLUSIVE;
 pub const SOLANA_V1_4_17_CANDIDATE_END_SLOT_EXCLUSIVE: Slot = 56_592_000;
-/// Epochs 131 through 133 retain the pre-v1.4.20 BPF-loader error contract.
+/// Epochs 131 through 134 retain the pre-v1.4.20 BPF-loader error contract.
 /// Complete source-status scans found the legacy custom error in epochs 131,
-/// 132, and 133, and no `ProgramFailedToComplete` status in those epochs.
-/// Exact v1.4.19 is the latest upstream patch with that contract; publication
-/// is still gated on source-status and canonical checkpoint differentials.
+/// 132, and 133, no `ProgramFailedToComplete` status through epoch 134, and a
+/// canonical `ComputationalBudgetExceeded` at slot 58,011,466 where v1.4.25
+/// returns `ProgramFailedToComplete`. A focused v1.4.19 replay from the
+/// canonical slot-58,011,320 snapshot reproduced that status and the canonical
+/// slot-58,019,044 accounts hash. Publication remains gated on the terminal
+/// epoch checkpoint.
 pub const SOLANA_V1_4_19_CANDIDATE_START_SLOT: Slot = SOLANA_V1_4_17_CANDIDATE_END_SLOT_EXCLUSIVE;
-pub const SOLANA_V1_4_19_CANDIDATE_END_SLOT_EXCLUSIVE: Slot = 57_888_000;
-/// Bounded diagnostic route around the first observed epoch-134 status
-/// divergence.  The canonical hourly snapshot at 58,011,320 is the bootstrap
-/// and the snapshot at 58,019,044 is the terminal checkpoint.  Keeping this
-/// route focused-qualification-only lets us test the earlier loader contract
-/// without changing normal epoch-134 replay or making its output publishable.
-pub const SOLANA_V1_4_19_EPOCH134_FOCUSED_QUALIFICATION_START_SLOT: Slot = 58_011_321;
-pub const SOLANA_V1_4_19_EPOCH134_FOCUSED_QUALIFICATION_END_SLOT_EXCLUSIVE: Slot = 58_019_045;
-/// Epochs 134 through 147, ending at the first v1.5 candidate epoch.
+pub const SOLANA_V1_4_19_CANDIDATE_END_SLOT_EXCLUSIVE: Slot = 58_320_000;
+/// Epochs 135 through 147, ending at the first v1.5 candidate epoch.
 pub const SOLANA_V1_4_25_CANDIDATE_START_SLOT: Slot = SOLANA_V1_4_19_CANDIDATE_END_SLOT_EXCLUSIVE;
 pub const SOLANA_V1_4_25_CANDIDATE_END_SLOT_EXCLUSIVE: Slot = 63_936_000;
 pub const SOLANA_V1_5_5_CANDIDATE_START_SLOT: Slot = SOLANA_V1_4_25_CANDIDATE_END_SLOT_EXCLUSIVE;
@@ -329,10 +325,11 @@ pub enum RuntimeBackend {
     /// differential evidence and kept behind canonical checkpoint gates.
     SolanaV1_4_17,
     /// Exact final v1.4 patch before the BPF-loader failure mapping changed,
-    /// bounded to epochs 131 through 133 by complete source-status scans.
+    /// bounded to epochs 131 through 134 by source-status and checkpoint
+    /// differentials.
     SolanaV1_4_19,
     /// Exact terminal v1.4 patch used only in the independently
-    /// checkpoint-gated diagnostic envelope for epochs 134 through 147.
+    /// checkpoint-gated diagnostic envelope for epochs 135 through 147.
     SolanaV1_4_25,
     /// Exact v1.5.5 execution selected for epochs 148 and 149 by canonical
     /// checkpoint evidence.
@@ -1696,14 +1693,14 @@ pub static RUNTIME_ERAS: &[RuntimeEra] = &[
         admission: AdmissionLevel::Candidate,
     },
     RuntimeEra {
-        name: "solana-v1.4.19-epochs-131-133-differential-candidate",
+        name: "solana-v1.4.19-epochs-131-134-differential-candidate",
         start_slot: SOLANA_V1_4_19_CANDIDATE_START_SLOT,
         end_slot_exclusive: Some(SOLANA_V1_4_19_CANDIDATE_END_SLOT_EXCLUSIVE),
         backend: EraBackend::Available(&SOLANA_V1_4_19_RUNTIME),
         admission: AdmissionLevel::Candidate,
     },
     RuntimeEra {
-        name: "solana-v1.4.25-epochs-134-147-differential-candidate",
+        name: "solana-v1.4.25-epochs-135-147-differential-candidate",
         start_slot: SOLANA_V1_4_25_CANDIDATE_START_SLOT,
         end_slot_exclusive: Some(SOLANA_V1_4_25_CANDIDATE_END_SLOT_EXCLUSIVE),
         backend: EraBackend::Available(&SOLANA_V1_4_25_RUNTIME),
@@ -2165,21 +2162,13 @@ fn runtime_at(slot: Slot) -> Result<&'static RuntimeEra, String> {
         .ok_or_else(|| format!("no runtime era contains slot {slot}"))
 }
 
-/// Deliberately separate routes for checkpoint-bound focused qualification.
+/// A deliberately separate route for checkpoint-bound focused qualification.
 ///
 /// Keeping this out of `RUNTIME_ERAS` is the fail-closed boundary: ordinary
 /// epoch replay, range replay, archive reuse, and publication continue to see
-/// the normal registry. Only the focused qualification CLI, which requires an
-/// explicit snapshot, checkpoint file, private output, and `--verify`, may ask
-/// the dedicated planner to use these envelopes.
-static SOLANA_V1_4_19_EPOCH134_FOCUSED_QUALIFICATION_ERA: RuntimeEra = RuntimeEra {
-    name: "solana-v1.4.19-epoch-134-status-focused-qualification-candidate",
-    start_slot: SOLANA_V1_4_19_EPOCH134_FOCUSED_QUALIFICATION_START_SLOT,
-    end_slot_exclusive: Some(SOLANA_V1_4_19_EPOCH134_FOCUSED_QUALIFICATION_END_SLOT_EXCLUSIVE),
-    backend: EraBackend::Available(&SOLANA_V1_4_19_RUNTIME),
-    admission: AdmissionLevel::Candidate,
-};
-
+/// the post-201 gap as unsupported. Only the focused qualification CLI, which
+/// requires an explicit snapshot, checkpoint file, private output, and
+/// `--verify`, may ask the dedicated planner to use this envelope.
 static SOLANA_V1_6_16_FOCUSED_QUALIFICATION_ERA: RuntimeEra = RuntimeEra {
     name: "solana-v1.6.16-epochs-202-213-focused-qualification-candidate",
     start_slot: SOLANA_V1_6_16_CANDIDATE_END_SLOT_EXCLUSIVE,
@@ -2199,10 +2188,6 @@ fn runtime_at_for_scope(
     scope: RuntimePlanningScope,
 ) -> Result<&'static RuntimeEra, String> {
     if scope == RuntimePlanningScope::FocusedQualification
-        && SOLANA_V1_4_19_EPOCH134_FOCUSED_QUALIFICATION_ERA.contains(slot)
-    {
-        Ok(&SOLANA_V1_4_19_EPOCH134_FOCUSED_QUALIFICATION_ERA)
-    } else if scope == RuntimePlanningScope::FocusedQualification
         && SOLANA_V1_6_16_FOCUSED_QUALIFICATION_ERA.contains(slot)
     {
         Ok(&SOLANA_V1_6_16_FOCUSED_QUALIFICATION_ERA)
@@ -3582,27 +3567,14 @@ mod tests {
     }
 
     #[test]
-    fn epoch_134_status_probe_is_isolated_to_focused_qualification() {
-        let start = SOLANA_V1_4_19_EPOCH134_FOCUSED_QUALIFICATION_START_SLOT;
-        let end = SOLANA_V1_4_19_EPOCH134_FOCUSED_QUALIFICATION_END_SLOT_EXCLUSIVE;
+    fn epoch_134_uses_v1_4_19_and_epoch_135_restarts_v1_4_25() {
+        let epoch_134 = select_runtime(57_888_000..58_320_000, true).unwrap();
+        assert_eq!(epoch_134.backend, RuntimeBackend::SolanaV1_4_19);
+        assert!(std::ptr::eq(epoch_134.descriptor, &SOLANA_V1_4_19_RUNTIME));
 
-        let normal = select_runtime(start..end, true).unwrap();
-        assert_eq!(normal.backend, RuntimeBackend::SolanaV1_4_25);
-        assert!(std::ptr::eq(normal.descriptor, &SOLANA_V1_4_25_RUNTIME));
-
-        let candidate_disabled =
-            select_focused_qualification_runtime(start..end, false).unwrap_err();
-        assert!(candidate_disabled.contains("candidate-only"));
-
-        let focused = select_focused_qualification_runtime(start..end, true).unwrap();
-        assert_eq!(focused.backend, RuntimeBackend::SolanaV1_4_19);
-        assert!(std::ptr::eq(focused.descriptor, &SOLANA_V1_4_19_RUNTIME));
-        assert_eq!(focused.admission, AdmissionLevel::Candidate);
-
-        let before = select_focused_qualification_runtime(start - 1..start, true).unwrap();
-        assert_eq!(before.backend, RuntimeBackend::SolanaV1_4_25);
-        let after = select_focused_qualification_runtime(end..end + 1, true).unwrap();
-        assert_eq!(after.backend, RuntimeBackend::SolanaV1_4_25);
+        let epoch_135 = select_runtime(58_320_000..58_752_000, true).unwrap();
+        assert_eq!(epoch_135.backend, RuntimeBackend::SolanaV1_4_25);
+        assert!(std::ptr::eq(epoch_135.descriptor, &SOLANA_V1_4_25_RUNTIME));
     }
 
     #[test]

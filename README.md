@@ -501,8 +501,8 @@ select a runtime. The current registry is deliberately conservative:
 | `39,744,000..43,632,000` | pinned Solana v1.3.19 worker | independently verified snapshot restart; bounded extractor admits up to 131,072 members for the audited 104,267–106,520-member epoch-98 through epoch-100 snapshots | diagnostic candidate for epochs 92-100 |
 | `43,632,000..55,728,000` | pinned Solana v1.3.23 worker | independently verified snapshot restart; restores and strictly validates mainnet's second hard-fork marker at slot 53,180,900; mainnet still accepted a 4,008-byte stake initialization at slot 55,686,407; the extractor remains byte-bounded while admitting the later snapshot's 131,072+ members; every cohort must match all canonical post-bootstrap roots | unqualified diagnostic candidate for epochs 101-128 |
 | `55,728,000..56,592,000` | pinned Solana v1.4.17 worker | owns epoch 129's v1.4 feature boundary; reproduces the canonical successful vote at slot 55,728,002 where terminal v1.4.25 returns `SlotHashMismatch`, and the source-recorded BPF-loader custom error at slot 56,298,256 where v1.4.25 returns `ProgramFailedToComplete`; every canonical post-bootstrap root must still match before publication | source-status-selected, checkpoint-gated candidate for epochs 129-130 |
-| `56,592,000..57,888,000` | pinned Solana v1.4.19 worker | complete source-status scans found 7, 1, and 12 legacy loader custom errors in epochs 131, 132, and 133 respectively, with no `ProgramFailedToComplete` status; v1.4.19 is the final upstream patch before that error contract changed; focused replay matched the canonical epoch-131 checkpoint at slot 56,705,196 | source-status-selected, bounded checkpoint-qualified candidate for epochs 131-133 |
-| `57,888,000..63,936,000` | pinned Solana v1.4.25 worker | complete source-status scans across epochs 134-147 found no legacy loader custom errors; per-epoch `ProgramFailedToComplete` counts were `134:0, 135:0, 136:1, 137:0, 138:0, 139:1, 140:1314, 141:0, 142:0, 143:0, 144:2, 145:204, 146:3, 147:2`, confirming the later error contract throughout this range; independently verified snapshot restart carries that vocabulary through the shared stream protocol, and every cohort must still match all canonical post-bootstrap roots | unqualified diagnostic candidate for epochs 134-147 |
+| `56,592,000..58,320,000` | pinned Solana v1.4.19 worker | complete source-status scans found 7, 1, and 12 legacy loader custom errors in epochs 131, 132, and 133 respectively and no `ProgramFailedToComplete` status through epoch 134; v1.4.25 diverged at slot 58,011,466 by returning `ProgramFailedToComplete` for a canonical `ComputationalBudgetExceeded`; a 7,724-slot focused v1.4.19 replay reproduced that status and the canonical slot-58,019,044 accounts hash | source-status-selected, checkpoint-gated candidate for epochs 131-134 |
+| `58,320,000..63,936,000` | pinned Solana v1.4.25 worker | complete source-status scans across epochs 135-147 found no legacy loader custom errors; per-epoch `ProgramFailedToComplete` counts were `135:0, 136:1, 137:0, 138:0, 139:1, 140:1314, 141:0, 142:0, 143:0, 144:2, 145:204, 146:3, 147:2`, confirming the later error contract throughout this range; independently verified snapshot restart carries that vocabulary through the shared stream protocol, and every cohort must still match all canonical post-bootstrap roots | unqualified diagnostic candidate for epochs 135-147 |
 | `63,936,000..64,800,000` | pinned Solana v1.5.5 worker | exact v1.5.5 reproduces the trusted slot-63,948,761 accounts hash; normalizes v1.5 status variants for current plugins; every production cohort must still match all canonical post-bootstrap roots | bounded checkpoint-qualified candidate for epochs 148-149 |
 | `64,800,000..66,528,000` | pinned Solana v1.5.6 worker | exact v1.5.6 reproduces epoch 150's first canonical vote and the trusted slot-64,807,725 accounts hash; normalizes v1.5 status variants for current plugins | bounded checkpoint-qualified candidate for epochs 150-153 |
 | `66,528,000..66,960,000` | pinned Solana v1.5.8 worker | anchored at canonical snapshot slot 66,527,778, warms slots 66,527,779-66,527,999, reproduces the source-successful transaction at slot 66,528,004 that v1.5.6 rejects, and matches the canonical terminal accounts hash at slot 66,958,784; terminal v1.5.19 already diverges during warmup at slot 66,527,779 | source-status-selected, checkpoint-qualified candidate for epoch 154 |
@@ -576,13 +576,14 @@ epoch-aligned pinned-worker snapshot restarts:
    succeeds under v1.4.17 while terminal v1.4.25 rolls it back with `SlotHashMismatch`, and slot
    56,298,256 records BPF-loader custom error `0x0b9f0002` while v1.4.25 returns
    `ProgramFailedToComplete`; both epochs remain checkpoint-gated.
-9. Epochs 131 through 133 use exact v1.4.19 because complete source-status scans found 7, 1, and
-   12 legacy loader custom errors respectively and no `ProgramFailedToComplete` records. Exact
-   v1.4.20 and later changed that mapping. Complete scans of epochs 134 through 147 found no
-   legacy custom errors and found per-epoch `ProgramFailedToComplete` counts of
-   `134:0, 135:0, 136:1, 137:0, 138:0, 139:1, 140:1314, 141:0, 142:0, 143:0, 144:2,
-   145:204, 146:3, 147:2`, so v1.4.25 resumes from the independent epoch-134
-   predecessor snapshot after qualification.
+9. Epochs 131 through 134 use exact v1.4.19. Complete source-status scans found 7, 1, and 12
+   legacy loader custom errors in epochs 131-133 and no `ProgramFailedToComplete` records through
+   epoch 134. At slot 58,011,466, v1.4.25 returned `ProgramFailedToComplete` for a transaction whose
+   canonical result is `ComputationalBudgetExceeded`; a 7,724-slot focused v1.4.19 replay reproduced
+   that status and the canonical slot-58,019,044 accounts hash. Complete scans of epochs 135-147
+   found no legacy custom errors and found per-epoch `ProgramFailedToComplete` counts of
+   `135:0, 136:1, 137:0, 138:0, 139:1, 140:1314, 141:0, 142:0, 143:0, 144:2,
+   145:204, 146:3, 147:2`, so v1.4.25 resumes from epoch 135's independent predecessor snapshot.
 10. Epoch 154 uses exact v1.5.8 from the hash-bound slot-66,527,778 snapshot because v1.5.6 rejects
    a source-successful transaction at slot 66,528,004 while terminal v1.5.19 already disagrees at
    slot 66,527,779. It reproduces the canonical slot-66,958,784 terminal accounts hash

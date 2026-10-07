@@ -3,6 +3,26 @@
 Major project results, newest first. Each entry records the UTC date and the
 code revision that produced the result.
 
+## 2026-10-07: Exact Solana v1.6.16 qualified for epoch 201
+
+- Commit `0617cbdadaf7ef6a0a04a116d62f09204bc17985` introduced the bounded
+  exact-v1.6.16 epoch-201 candidate and its focused qualification route.
+- Replay started from the canonical predecessor snapshot at slot 86,831,488,
+  warmed through slot 86,831,999, and recorded 431,435 slots from 86,832,000
+  through the terminal rooted slot 87,263,434.
+- The terminal checkpoint matched bank hash
+  `4PSFRcYdkhpxk4uuTHLdF3NzdNNunqHy1n48xmBHAW3z` and accounts hash
+  `Emrm2S17KbKwEg2zmJKrJvGj9PEfZxxoYHidGGsg1QKK`.
+- An independent qualification verifier accepted the complete
+  102,476,168,488-byte private segment with SHA-256
+  `1c1d3e208cc09cd3d36a309bea63e7a53866645868f1dc0697751711fee92e43`.
+  Its evidence binds worker SHA-256
+  `fd15c337a558f995ff168fc8a3d490e2b03190b620aad9596d9fe92bf7ac3432`,
+  exact runtime revision `86c26f843276581509c3434acc2efbf4202c44e0`, and the expected
+  bootstrap/output/terminal range. The diagnostic archive remains private
+  and has no canonical checksum sidecar; normal production remains subject
+  to the full archive, current-plugin, boundary, and R2 publication gates.
+
 ## 2026-10-07: Exact Solana v1.4.19 qualified for epoch 134
 
 - Commit `e45134faefaceb5c5394196fc11f94887deeed0d` extends the exact v1.4.19

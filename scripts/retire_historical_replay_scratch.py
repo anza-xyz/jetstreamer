@@ -1,0 +1,367 @@
+#!/usr/bin/env python3
+"""Delete one bound replay scratch tree after terminal independent validation."""
+
+from __future__ import annotations
+
+import argparse
+from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import stat
+import subprocess
+import sys
+from typing import Any, Sequence
+
+
+RECEIPT_SCHEMA = "jetstreamer-historical-scratch-retirement-v1"
+VALIDATION_SCHEMA = "jetstreamer-focused-qualification-artifact-validation-v1"
+PRIVATE_ROOT = Path("/home/ubuntu/.jetstreamer-private")
+UNIT_NAME = re.compile(r"^[A-Za-z0-9_.@-]+\.service$")
+
+
+class RetirementError(RuntimeError):
+    """A fail-closed scratch-retirement error."""
+
+
+@dataclass(frozen=True)
+class UnitState:
+    unit: str
+    load_state: str
+    active_state: str
+    sub_state: str
+    result: str
+    main_pid: int
+    invocation_id: str
+    restarts: int
+    exec_main_code: int
+    exec_main_status: int
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        while chunk := source.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def parse_systemctl_show(output: str) -> dict[str, str]:
+    fields: dict[str, str] = {}
+    for line in output.splitlines():
+        if "=" in line:
+            name, value = line.split("=", 1)
+            fields[name] = value
+    return fields
+
+
+def sample_unit(unit: str) -> UnitState:
+    if UNIT_NAME.fullmatch(unit) is None:
+        raise RetirementError(f"invalid systemd service name: {unit}")
+    completed = subprocess.run(
+        [
+            "systemctl",
+            "show",
+            unit,
+            "--property=LoadState,ActiveState,SubState,Result,MainPID,InvocationID,NRestarts,ExecMainCode,ExecMainStatus",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if completed.returncode != 0:
+        raise RetirementError(
+            f"cannot inspect {unit}: {completed.stderr.strip() or completed.stdout.strip()}"
+        )
+    fields = parse_systemctl_show(completed.stdout)
+    return UnitState(
+        unit=unit,
+        load_state=fields.get("LoadState", "unknown"),
+        active_state=fields.get("ActiveState", "unknown"),
+        sub_state=fields.get("SubState", "unknown"),
+        result=fields.get("Result", "unknown"),
+        main_pid=int(fields.get("MainPID", "0") or 0),
+        invocation_id=fields.get("InvocationID", ""),
+        restarts=int(fields.get("NRestarts", "0") or 0),
+        exec_main_code=int(fields.get("ExecMainCode", "0") or 0),
+        exec_main_status=int(fields.get("ExecMainStatus", "0") or 0),
+    )
+
+
+def require_terminal_success(state: UnitState) -> None:
+    if (
+        state.load_state != "loaded"
+        or state.active_state != "inactive"
+        or state.result != "success"
+        or state.main_pid != 0
+        or state.restarts != 0
+        or state.exec_main_status != 0
+    ):
+        raise RetirementError(f"unit has not reached clean terminal success: {state}")
+
+
+def require_scratch(path: Path, private_root: Path = PRIVATE_ROOT) -> Path:
+    if os.geteuid() != 0:
+        raise RetirementError("scratch retirement must run as root")
+    if not path.is_absolute():
+        raise RetirementError("scratch path must be absolute")
+    try:
+        resolved_root = private_root.resolve(strict=True)
+        resolved = path.resolve(strict=True)
+        metadata = path.lstat()
+        resolved.relative_to(resolved_root)
+    except (OSError, ValueError) as error:
+        raise RetirementError(f"unsafe or unavailable scratch path {path}: {error}") from error
+    if resolved != path or not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+        raise RetirementError(f"scratch path is not an exact real directory: {path}")
+    if not resolved.name.startswith("replay-scratch-") or os.path.ismount(resolved):
+        raise RetirementError(f"scratch path is not an admitted replay scratch tree: {resolved}")
+    if resolved.parent.parent != resolved_root:
+        raise RetirementError(
+            f"scratch path must be directly beneath one private qualification root: {resolved}"
+        )
+    return resolved
+
+
+def require_private_parent(path: Path, description: str) -> Path:
+    if not path.is_absolute():
+        raise RetirementError(f"{description} must be absolute")
+    try:
+        parent = path.parent.resolve(strict=True)
+        metadata = parent.stat()
+    except OSError as error:
+        raise RetirementError(f"cannot resolve {description} parent: {error}") from error
+    if not stat.S_ISDIR(metadata.st_mode) or stat.S_IMODE(metadata.st_mode) & 0o077:
+        raise RetirementError(f"{description} parent must be owner-only: {parent}")
+    return parent / path.name
+
+
+def read_validation_receipt(
+    path: Path,
+    expected_epoch: int,
+    expected_archive: Path,
+    required_uid: int = 0,
+) -> dict[str, Any]:
+    try:
+        metadata = path.lstat()
+        raw = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as error:
+        raise RetirementError(f"cannot read validation receipt {path}: {error}") from error
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != required_uid
+        or metadata.st_nlink != 1
+        or stat.S_IMODE(metadata.st_mode) & 0o077
+    ):
+        raise RetirementError(f"validation receipt has unsafe identity: {path}")
+    expected = str(expected_archive)
+    if (
+        not isinstance(raw, dict)
+        or raw.get("schema") != VALIDATION_SCHEMA
+        or raw.get("validation") != "pass"
+        or raw.get("epoch") != expected_epoch
+        or raw.get("archive") != expected
+        or raw.get("canonical_checksum_sidecar_absent") is not True
+    ):
+        raise RetirementError("validation receipt does not bind the expected private artifact")
+    archive_digest = raw.get("archive_sha256")
+    if not isinstance(archive_digest, str) or re.fullmatch(r"[0-9a-f]{64}", archive_digest) is None:
+        raise RetirementError("validation receipt has an invalid archive digest")
+    manifest = raw.get("manifest")
+    if not isinstance(manifest, str):
+        raise RetirementError("validation receipt does not bind a segment manifest")
+    expected_identities = (
+        (
+            expected_archive,
+            raw.get("archive_bytes"),
+            raw.get("archive_uid"),
+            raw.get("archive_gid"),
+            raw.get("archive_mode"),
+        ),
+        (
+            Path(manifest),
+            raw.get("manifest_bytes"),
+            raw.get("manifest_uid"),
+            raw.get("manifest_gid"),
+            raw.get("manifest_mode"),
+        ),
+    )
+    for artifact, expected_size, expected_uid, expected_gid, expected_mode in expected_identities:
+        try:
+            artifact_metadata = artifact.lstat()
+        except OSError as error:
+            raise RetirementError(f"validated artifact is unavailable: {artifact}: {error}") from error
+        if not stat.S_ISREG(artifact_metadata.st_mode):
+            raise RetirementError(f"validated artifact is not a regular file: {artifact}")
+        identity = (
+            artifact_metadata.st_size,
+            artifact_metadata.st_uid,
+            artifact_metadata.st_gid,
+            f"{stat.S_IMODE(artifact_metadata.st_mode):04o}",
+        )
+        if identity != (expected_size, expected_uid, expected_gid, expected_mode):
+            raise RetirementError(f"validated artifact identity changed: {artifact}")
+    sidecar = raw.get("canonical_checksum_sidecar")
+    if not isinstance(sidecar, str) or Path(sidecar).exists() or Path(sidecar).is_symlink():
+        raise RetirementError("private validation artifact has an unexpected canonical sidecar")
+    return raw
+
+
+def process_references(scratch: Path, proc_root: Path = Path("/proc")) -> list[str]:
+    needle = os.fsencode(str(scratch))
+    references: list[str] = []
+    for process in proc_root.iterdir():
+        if not process.name.isdigit() or int(process.name) == os.getpid():
+            continue
+        pid = process.name
+        try:
+            command = (process / "cmdline").read_bytes()
+            if needle in command:
+                references.append(f"pid {pid} command line")
+            maps = (process / "maps").read_bytes()
+            if needle in maps:
+                references.append(f"pid {pid} memory maps")
+        except (FileNotFoundError, PermissionError, ProcessLookupError):
+            pass
+        for name in ("cwd", "root", "exe"):
+            try:
+                target = os.readlink(process / name).removesuffix(" (deleted)")
+                Path(target).relative_to(scratch)
+            except (FileNotFoundError, PermissionError, ProcessLookupError, OSError, ValueError):
+                continue
+            references.append(f"pid {pid} {name}")
+        try:
+            descriptors = list((process / "fd").iterdir())
+        except (FileNotFoundError, PermissionError, ProcessLookupError):
+            descriptors = []
+        for descriptor in descriptors:
+            try:
+                target = os.readlink(descriptor).removesuffix(" (deleted)")
+                Path(target).relative_to(scratch)
+            except (FileNotFoundError, PermissionError, ProcessLookupError, OSError, ValueError):
+                continue
+            references.append(f"pid {pid} fd {descriptor.name}")
+    return references
+
+
+def available_bytes(path: Path) -> int:
+    filesystem = os.statvfs(path)
+    return filesystem.f_bavail * filesystem.f_frsize
+
+
+def write_json_noclobber(path: Path, payload: dict[str, Any]) -> None:
+    destination = require_private_parent(path, "retirement receipt")
+    data = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode()
+    descriptor = os.open(
+        destination,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+        0o600,
+    )
+    try:
+        with os.fdopen(descriptor, "wb", closefd=False) as output:
+            output.write(data)
+            output.flush()
+            os.fsync(output.fileno())
+    finally:
+        os.close(descriptor)
+    directory = os.open(destination.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+
+
+def delete_exact_tree(path: Path) -> None:
+    completed = subprocess.run(
+        ["/usr/bin/find", str(path), "-xdev", "-depth", "-delete"],
+        capture_output=True,
+        text=True,
+    )
+    if completed.returncode != 0 or path.exists() or path.is_symlink():
+        raise RetirementError(
+            f"scratch deletion did not complete: {completed.stderr.strip() or completed.stdout.strip()}"
+        )
+
+
+def parse_args(argv: Sequence[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--scratch", type=Path, required=True)
+    parser.add_argument("--confirm-delete-exact", type=Path, required=True)
+    parser.add_argument("--producer-unit", required=True)
+    parser.add_argument("--validator-unit", required=True)
+    parser.add_argument("--validation-receipt", type=Path, required=True)
+    parser.add_argument("--expected-epoch", type=int, required=True)
+    parser.add_argument("--expected-archive", type=Path, required=True)
+    parser.add_argument("--intent-receipt", type=Path, required=True)
+    parser.add_argument("--completion-receipt", type=Path, required=True)
+    args = parser.parse_args(argv)
+    if args.expected_epoch < 0 or not args.expected_archive.is_absolute():
+        parser.error("expected epoch and archive are invalid")
+    if args.scratch != args.confirm_delete_exact:
+        parser.error("--confirm-delete-exact must exactly repeat --scratch")
+    if args.intent_receipt == args.completion_receipt:
+        parser.error("intent and completion receipts must differ")
+    for unit in (args.producer_unit, args.validator_unit):
+        if UNIT_NAME.fullmatch(unit) is None:
+            parser.error(f"invalid systemd service name: {unit}")
+    return args
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = parse_args(sys.argv[1:] if argv is None else argv)
+    scratch = require_scratch(args.scratch)
+    if args.intent_receipt.exists() or args.completion_receipt.exists():
+        raise RetirementError("retirement receipt path already exists")
+    producer = sample_unit(args.producer_unit)
+    validator = sample_unit(args.validator_unit)
+    require_terminal_success(producer)
+    require_terminal_success(validator)
+    validation = read_validation_receipt(
+        args.validation_receipt, args.expected_epoch, args.expected_archive
+    )
+    references = process_references(scratch)
+    if references:
+        raise RetirementError("live process still references scratch: " + "; ".join(references))
+    common = {
+        "schema": RECEIPT_SCHEMA,
+        "scratch": str(scratch),
+        "producer": asdict(producer),
+        "validator": asdict(validator),
+        "validation_receipt": str(args.validation_receipt),
+        "validation_receipt_sha256": sha256_file(args.validation_receipt),
+        "epoch": args.expected_epoch,
+        "archive": str(args.expected_archive),
+        "archive_sha256": validation["archive_sha256"],
+        "r2_mutations": False,
+    }
+    free_before = available_bytes(scratch.parent)
+    write_json_noclobber(
+        args.intent_receipt,
+        {
+            **common,
+            "status": "deletion-intent-fsynced",
+            "observed_at_utc": datetime.now(timezone.utc).isoformat(),
+            "available_bytes_before": free_before,
+        },
+    )
+    delete_exact_tree(scratch)
+    completion = {
+        **common,
+        "status": "deleted",
+        "observed_at_utc": datetime.now(timezone.utc).isoformat(),
+        "available_bytes_before": free_before,
+        "available_bytes_after": available_bytes(args.expected_archive.parent),
+    }
+    write_json_noclobber(args.completion_receipt, completion)
+    print(json.dumps(completion, sort_keys=True), flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except RetirementError as error:
+        print(f"error: {error}", file=sys.stderr)
+        raise SystemExit(1) from error

@@ -1,0 +1,106 @@
+import base64
+import json
+import os
+from pathlib import Path
+import stat
+import tempfile
+import unittest
+from unittest.mock import patch
+
+from scripts import restore_bound_gcs_snapshot as restore
+
+
+FILENAME = "snapshot-87263434-Emrm2S17KbKwEg2zmJKrJvGj9PEfZxxoYHidGGsg1QKK.tar.zst"
+URI = f"gs://{restore.ALLOWED_BUCKET}/87263434/{FILENAME}#1634789740125991"
+
+
+class BoundGcsSnapshotRestoreTest(unittest.TestCase):
+    def test_parses_generation_pinned_root_snapshot(self) -> None:
+        self.assertEqual(
+            restore.parse_versioned_uri(URI),
+            (FILENAME, 1634789740125991, 87263434),
+        )
+
+    def test_parses_generation_pinned_hourly_snapshot(self) -> None:
+        uri = f"gs://{restore.ALLOWED_BUCKET}/87263000/hourly/{FILENAME}#9"
+        self.assertEqual(
+            restore.parse_versioned_uri(uri), (FILENAME, 9, 87263434)
+        )
+
+    def test_rejects_live_object_other_bucket_and_wrong_anchor(self) -> None:
+        invalid = (
+            URI.rsplit("#", 1)[0],
+            URI.replace(restore.ALLOWED_BUCKET, "other-bucket"),
+            URI.replace("/87263434/", "/87263433/"),
+            URI.replace("#1634789740125991", "#0"),
+        )
+        for uri in invalid:
+            with self.subTest(uri=uri), self.assertRaises(restore.RestoreError):
+                restore.parse_versioned_uri(uri)
+
+    def test_canonical_base64_requires_exact_decoded_size(self) -> None:
+        value = base64.b64encode(b"1234").decode()
+        self.assertEqual(restore.canonical_base64(value, 4, "CRC"), value)
+        for invalid in ("not base64", base64.b64encode(b"123").decode(), value.rstrip("=")):
+            with self.subTest(invalid=invalid), self.assertRaises(restore.RestoreError):
+                restore.canonical_base64(invalid, 4, "CRC")
+
+    def test_publish_is_noclobber_and_durable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            temporary = root / "temporary"
+            destination = root / "destination"
+            temporary.write_bytes(b"snapshot")
+            os.chmod(temporary, 0o600)
+            self.assertTrue(restore.publish_noclobber(temporary, destination))
+            self.assertEqual(destination.read_bytes(), b"snapshot")
+            replacement = root / "replacement"
+            replacement.write_bytes(b"other")
+            self.assertFalse(restore.publish_noclobber(replacement, destination))
+            self.assertEqual(destination.read_bytes(), b"snapshot")
+
+    def test_receipt_is_owner_only_noclobber_and_fsynced(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            os.chmod(root, 0o700)
+            receipt = root / "receipt.json"
+            restore.write_receipt_noclobber(receipt, {"ok": True})
+            self.assertEqual(json.loads(receipt.read_text()), {"ok": True})
+            self.assertEqual(stat.S_IMODE(receipt.stat().st_mode), 0o600)
+            with self.assertRaises(FileExistsError):
+                restore.write_receipt_noclobber(receipt, {})
+
+    @patch("scripts.restore_bound_gcs_snapshot.run_checked")
+    def test_local_hashes_require_one_complete_result(self, run_checked: object) -> None:
+        run_checked.return_value.stdout = json.dumps(
+            [
+                {
+                    "crc32c_hash": base64.b64encode(b"1234").decode(),
+                    "md5_hash": base64.b64encode(b"1234567890123456").decode(),
+                    "digest_format": "base64",
+                    "url": "/snapshot",
+                }
+            ]
+        )
+        self.assertEqual(
+            restore.local_hashes(Path("/usr/bin/gcloud"), Path("/snapshot")),
+            ("MTIzNA==", "MTIzNDU2Nzg5MDEyMzQ1Ng=="),
+        )
+
+    @patch("scripts.restore_bound_gcs_snapshot.local_hashes")
+    def test_validate_file_checks_identity_size_and_hashes(self, hashes: object) -> None:
+        crc = base64.b64encode(b"1234").decode()
+        md5 = base64.b64encode(b"1234567890123456").decode()
+        hashes.return_value = (crc, md5)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "snapshot"
+            path.write_bytes(b"payload")
+            os.chmod(path, 0o600)
+            details = restore.validate_file(Path("/gcloud"), path, 7, crc, md5)
+            self.assertEqual(details["size"], 7)
+            with self.assertRaisesRegex(restore.RestoreError, "size mismatch"):
+                restore.validate_file(Path("/gcloud"), path, 8, crc, md5)
+
+
+if __name__ == "__main__":
+    unittest.main()

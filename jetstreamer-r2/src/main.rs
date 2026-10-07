@@ -45,7 +45,7 @@ struct Config {
     command: Command,
     directory: PathBuf,
     epochs: BTreeSet<u64>,
-    receipt_directory: PathBuf,
+    receipt_directory: Option<PathBuf>,
     delete_local: bool,
     part_size: u64,
     legacy_part_size: Option<u64>,
@@ -57,6 +57,7 @@ struct Config {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Command {
+    Inventory,
     Sync,
     Verify,
     Restore,
@@ -117,8 +118,8 @@ struct Receipt {
 
 fn usage() -> ! {
     eprintln!(concat!(
-        "usage: horizon-r2 <sync|verify|restore> DIRECTORY [--epochs START-END] ",
-        "--receipt-directory DIRECTORY [--delete-local] [--part-size-mib N] ",
+        "usage: horizon-r2 <inventory|sync|verify|restore> DIRECTORY [--epochs START-END] ",
+        "[--receipt-directory DIRECTORY] [--delete-local] [--part-size-mib N] ",
         "[--legacy-part-size-mib N] [--legacy-etag-only] [--overwrite-existing] ",
         "[--repair-orphaned-archive] ",
         "[--concurrency N]"
@@ -133,6 +134,7 @@ fn parse_args() -> Result<Config> {
         .and_then(|value| value.into_string().ok())
         .as_deref()
     {
+        Some("inventory") => Command::Inventory,
         Some("sync") => Command::Sync,
         Some("verify") => Command::Verify,
         Some("restore") => Command::Restore,
@@ -181,12 +183,18 @@ fn parse_args() -> Result<Config> {
         directory.is_absolute(),
         "archive directory must be absolute"
     );
-    let receipt_directory =
-        receipt_directory.ok_or_else(|| anyhow!("--receipt-directory is required"))?;
-    ensure!(
-        receipt_directory.is_absolute(),
-        "receipt directory must be absolute"
-    );
+    if command != Command::Inventory {
+        ensure!(
+            receipt_directory.is_some(),
+            "--receipt-directory is required"
+        );
+    }
+    if let Some(receipt_directory) = &receipt_directory {
+        ensure!(
+            receipt_directory.is_absolute(),
+            "receipt directory must be absolute"
+        );
+    }
     ensure!(
         !delete_local || command == Command::Sync,
         "--delete-local is valid only with sync"
@@ -204,14 +212,12 @@ fn parse_args() -> Result<Config> {
         "--repair-orphaned-archive and --overwrite-existing are mutually exclusive"
     );
     let epochs = match (command, epochs) {
+        (Command::Inventory, None) => bail!("inventory requires --epochs START-END"),
         (Command::Restore, None) => bail!("restore requires --epochs START-END"),
         (_, Some(epochs)) => epochs,
         (_, None) => discover_local_epochs(&directory)?,
     };
-    ensure!(
-        !epochs.is_empty(),
-        "no complete local Horizon archive pairs found"
-    );
+    ensure!(!epochs.is_empty(), "no Horizon epochs selected");
     Ok(Config {
         command,
         directory,
@@ -362,22 +368,8 @@ fn read_local_archive(directory: &Path, epoch: u64) -> Result<LocalArchive> {
         "oversized checksum sidecar"
     );
     let sidecar = fs::read(&sidecar_path).context("failed to read checksum sidecar")?;
-    let expected_suffix = format!("  epoch-{epoch}.jet\n");
-    ensure!(
-        sidecar.len() == 64 + expected_suffix.len(),
-        "noncanonical checksum sidecar"
-    );
-    ensure!(
-        &sidecar[64..] == expected_suffix.as_bytes(),
-        "checksum names wrong archive"
-    );
-    let digest = std::str::from_utf8(&sidecar[..64]).context("checksum is not ASCII")?;
-    ensure!(
-        digest
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()),
-        "checksum is not lowercase SHA-256"
-    );
+    let digest = parse_canonical_sidecar(epoch, &sidecar)
+        .ok_or_else(|| anyhow!("noncanonical checksum sidecar"))?;
     ensure!(
         regular_identity(&sidecar_path)? == sidecar_identity,
         "sidecar changed while read"
@@ -389,7 +381,7 @@ fn read_local_archive(directory: &Path, epoch: u64) -> Result<LocalArchive> {
         identity,
         sidecar_identity,
         length: identity.length,
-        sha256_hex: digest.to_owned(),
+        sha256_hex: digest,
         sidecar,
     })
 }
@@ -502,6 +494,123 @@ struct RemoteArchive {
     composite_sha256: Option<String>,
     checksum_type: Option<ChecksumType>,
     multipart_part_size: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum InventoryState {
+    Missing,
+    ArchiveOnly,
+    SidecarOnly,
+    InvalidSidecar,
+    MetadataMismatch,
+    ReadyPair,
+}
+
+#[derive(Debug, Serialize)]
+struct InventoryEntry {
+    epoch: u64,
+    state: InventoryState,
+    archive_length: Option<u64>,
+    archive_etag: Option<String>,
+    archive_metadata_sha256: Option<String>,
+    sidecar_sha256: Option<String>,
+    native_composite_sha256: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct InventoryReport {
+    schema: &'static str,
+    first_epoch: u64,
+    last_epoch: u64,
+    requested_epochs: usize,
+    ready_pairs: usize,
+    archive_only: usize,
+    missing: usize,
+    anomalies: usize,
+    entries: Vec<InventoryEntry>,
+}
+
+fn parse_canonical_sidecar(epoch: u64, sidecar: &[u8]) -> Option<String> {
+    let expected_suffix = format!("  epoch-{epoch}.jet\n");
+    if sidecar.len() != 64 + expected_suffix.len() || &sidecar[64..] != expected_suffix.as_bytes() {
+        return None;
+    }
+    let digest = std::str::from_utf8(&sidecar[..64]).ok()?;
+    if !digest
+        .bytes()
+        .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return None;
+    }
+    Some(digest.to_owned())
+}
+
+fn classify_inventory_entry(
+    epoch: u64,
+    archive: Option<RemoteArchive>,
+    sidecar: Option<Vec<u8>>,
+) -> InventoryEntry {
+    let sidecar_sha256 = sidecar
+        .as_deref()
+        .and_then(|bytes| parse_canonical_sidecar(epoch, bytes));
+    let state = match (&archive, &sidecar, &sidecar_sha256) {
+        (None, None, _) => InventoryState::Missing,
+        (Some(_), None, _) => InventoryState::ArchiveOnly,
+        (None, Some(_), _) => InventoryState::SidecarOnly,
+        (Some(_), Some(_), None) => InventoryState::InvalidSidecar,
+        (Some(archive), Some(_), Some(digest))
+            if archive
+                .metadata_sha256
+                .as_deref()
+                .is_some_and(|metadata| metadata != digest) =>
+        {
+            InventoryState::MetadataMismatch
+        }
+        (Some(_), Some(_), Some(_)) => InventoryState::ReadyPair,
+    };
+    InventoryEntry {
+        epoch,
+        state,
+        archive_length: archive.as_ref().map(|value| value.length),
+        archive_etag: archive.as_ref().map(|value| value.etag.clone()),
+        archive_metadata_sha256: archive
+            .as_ref()
+            .and_then(|value| value.metadata_sha256.clone()),
+        sidecar_sha256,
+        native_composite_sha256: archive
+            .as_ref()
+            .is_some_and(|value| value.composite_sha256.is_some()),
+    }
+}
+
+async fn inventory_epoch(client: &Client, r2: &R2Config, epoch: u64) -> Result<InventoryEntry> {
+    let archive_key = format!("epoch-{epoch}.jet");
+    let checksum_key = format!("epoch-{epoch}.jet.sha256");
+    let archive = head_archive(client, &r2.bucket, &archive_key).await?;
+    let sidecar = remote_sidecar(client, &r2.bucket, &checksum_key).await?;
+    Ok(classify_inventory_entry(epoch, archive, sidecar))
+}
+
+fn inventory_report(entries: Vec<InventoryEntry>) -> InventoryReport {
+    let first_epoch = entries.first().map_or(0, |entry| entry.epoch);
+    let last_epoch = entries.last().map_or(0, |entry| entry.epoch);
+    let count = |state| entries.iter().filter(|entry| entry.state == state).count();
+    let ready_pairs = count(InventoryState::ReadyPair);
+    let archive_only = count(InventoryState::ArchiveOnly);
+    let missing = count(InventoryState::Missing);
+    let anomalies = entries.len() - ready_pairs - archive_only - missing;
+    InventoryReport {
+        schema: "jetstreamer-horizon-r2-inventory-v1",
+        first_epoch,
+        last_epoch,
+        requested_epochs: entries.len(),
+        ready_pairs,
+        archive_only,
+        missing,
+        anomalies,
+        entries,
+    }
 }
 
 async fn head_archive(client: &Client, bucket: &str, key: &str) -> Result<Option<RemoteArchive>> {
@@ -1047,7 +1156,14 @@ async fn read_remote_sha256_resumable<W: Write>(
 }
 
 async fn restore_epoch(client: &Client, r2: &R2Config, config: &Config, epoch: u64) -> Result<()> {
-    let receipt = read_restore_receipt(&config.receipt_directory, &r2.bucket, epoch)?;
+    let receipt = read_restore_receipt(
+        config
+            .receipt_directory
+            .as_deref()
+            .expect("restore requires a receipt directory"),
+        &r2.bucket,
+        epoch,
+    )?;
     let archive_path = config.directory.join(&receipt.archive_key);
     let sidecar_path = config.directory.join(&receipt.checksum_key);
     let expected_sidecar = canonical_sidecar(&receipt);
@@ -1406,7 +1522,10 @@ async fn sync_epoch(client: &Client, r2: &R2Config, config: &Config, epoch: u64)
         verified_unix_seconds: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
     };
     let receipt_path = write_receipt(
-        &config.receipt_directory,
+        config
+            .receipt_directory
+            .as_deref()
+            .expect("delivery requires a receipt directory"),
         &receipt,
         config.overwrite_existing,
     )?;
@@ -1429,11 +1548,29 @@ async fn sync_epoch(client: &Client, r2: &R2Config, config: &Config, epoch: u64)
 async fn main() -> Result<()> {
     let config = parse_args()?;
     ensure!(
-        config.directory.is_dir(),
+        config.command == Command::Inventory || config.directory.is_dir(),
         "archive directory does not exist"
     );
     let r2 = r2_config_from_env()?;
     let client = s3_client(&r2);
+    if config.command == Command::Inventory {
+        let mut entries = Vec::with_capacity(config.epochs.len());
+        for &epoch in &config.epochs {
+            entries.push(
+                inventory_epoch(&client, &r2, epoch)
+                    .await
+                    .with_context(|| format!("epoch {epoch} R2 inventory failed"))?,
+            );
+        }
+        let report = inventory_report(entries);
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        ensure!(
+            report.anomalies == 0,
+            "R2 inventory contains {} anomalous pair state(s)",
+            report.anomalies
+        );
+        return Ok(());
+    }
     for &epoch in &config.epochs {
         match config.command {
             Command::Restore => restore_epoch(&client, &r2, &config, epoch)
@@ -1442,6 +1579,7 @@ async fn main() -> Result<()> {
             Command::Sync | Command::Verify => sync_epoch(&client, &r2, &config, epoch)
                 .await
                 .with_context(|| format!("epoch {epoch} R2 delivery failed"))?,
+            Command::Inventory => unreachable!("inventory handled above"),
         }
     }
     Ok(())
@@ -1470,6 +1608,86 @@ mod tests {
             discover_local_epochs(directory.path()).unwrap(),
             BTreeSet::from([1])
         );
+    }
+
+    fn inventory_archive(metadata_sha256: Option<&str>) -> RemoteArchive {
+        RemoteArchive {
+            length: 123,
+            etag: "etag".to_owned(),
+            metadata_sha256: metadata_sha256.map(str::to_owned),
+            composite_sha256: None,
+            checksum_type: None,
+            multipart_part_size: Some(64 * 1024 * 1024),
+        }
+    }
+
+    fn inventory_sidecar(epoch: u64, digest: &str) -> Vec<u8> {
+        format!("{digest}  epoch-{epoch}.jet\n").into_bytes()
+    }
+
+    #[test]
+    fn inventory_classifies_remote_pair_states_without_mutation() {
+        let digest = "ab".repeat(32);
+        assert_eq!(
+            classify_inventory_entry(7, None, None).state,
+            InventoryState::Missing
+        );
+        assert_eq!(
+            classify_inventory_entry(7, Some(inventory_archive(None)), None).state,
+            InventoryState::ArchiveOnly
+        );
+        assert_eq!(
+            classify_inventory_entry(7, None, Some(inventory_sidecar(7, &digest))).state,
+            InventoryState::SidecarOnly
+        );
+        assert_eq!(
+            classify_inventory_entry(
+                7,
+                Some(inventory_archive(None)),
+                Some(b"not canonical".to_vec()),
+            )
+            .state,
+            InventoryState::InvalidSidecar
+        );
+        assert_eq!(
+            classify_inventory_entry(
+                7,
+                Some(inventory_archive(Some(&"cd".repeat(32)))),
+                Some(inventory_sidecar(7, &digest)),
+            )
+            .state,
+            InventoryState::MetadataMismatch
+        );
+        let ready = classify_inventory_entry(
+            7,
+            Some(inventory_archive(Some(&digest))),
+            Some(inventory_sidecar(7, &digest)),
+        );
+        assert_eq!(ready.state, InventoryState::ReadyPair);
+        assert_eq!(ready.sidecar_sha256.as_deref(), Some(digest.as_str()));
+    }
+
+    #[test]
+    fn inventory_report_counts_ready_staged_missing_and_anomalous_epochs() {
+        let digest = "ab".repeat(32);
+        let entries = vec![
+            classify_inventory_entry(
+                7,
+                Some(inventory_archive(Some(&digest))),
+                Some(inventory_sidecar(7, &digest)),
+            ),
+            classify_inventory_entry(8, Some(inventory_archive(None)), None),
+            classify_inventory_entry(9, None, None),
+            classify_inventory_entry(10, None, Some(inventory_sidecar(10, &digest))),
+        ];
+        let report = inventory_report(entries);
+        assert_eq!(report.first_epoch, 7);
+        assert_eq!(report.last_epoch, 10);
+        assert_eq!(report.requested_epochs, 4);
+        assert_eq!(report.ready_pairs, 1);
+        assert_eq!(report.archive_only, 1);
+        assert_eq!(report.missing, 1);
+        assert_eq!(report.anomalies, 1);
     }
 
     #[test]

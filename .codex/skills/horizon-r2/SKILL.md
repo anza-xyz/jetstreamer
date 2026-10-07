@@ -34,6 +34,12 @@ For a long-running range, use `scripts/sync_horizon_r2_progressive.py` to discov
   requested contiguous prefix through the repository's bounded recovery option.
 - Without a range, inventory canonical R2 pairs first. Upload any complete local pairs missing from R2, then begin with the lowest missing epoch supported by the repository's compatibility manifests. Continue in bounded cohorts as resources permit.
 - An R2 epoch is complete only when both `epoch-N.jet` and `epoch-N.jet.sha256` exist and agree with verified local evidence. A checksum-only or archive-only epoch is incomplete.
+- Use the repository binary's mutation-free inventory mode for an authoritative explicit-range
+  census: `jetstreamer-r2 inventory "$HORIZON_DIR" --epochs START-END`. It issues only archive HEAD
+  and sidecar GET requests and reports every epoch in JSON. Treat `ready-pair` as remote presence
+  evidence only; it does not replace the private R2 receipt or the original full/plugin gates.
+  Investigate every `sidecar-only`, `invalid-sidecar`, or `metadata-mismatch` anomaly immediately;
+  never repair or overwrite it merely because inventory detected it.
 
 Remote object pairs are the shared inventory between servers; private receipts and controller
 state are host-local evidence and must not be copied to make another host believe work completed.

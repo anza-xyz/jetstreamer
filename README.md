@@ -209,6 +209,21 @@ evidence by default.
 fresh full-object SHA-256 readback, and atomically replaces the private receipt. Use it only with
 specific authorization to replace the affected keys.
 
+`jetstreamer-r2 inventory` is the mutation-free range census. It issues only
+archive HEAD and sidecar GET requests, requires an explicit epoch range, and
+prints one JSON report classifying every epoch as `missing`, `archive-only`,
+`sidecar-only`, `invalid-sidecar`, `metadata-mismatch`, or `ready-pair`.
+`ready-pair` means the archive and canonical readiness sidecar are both present
+and any whole-file SHA-256 object metadata agrees with the sidecar; it does not
+replace the private upload receipt or the original full/plugin verification
+gates. Sidecar-only, noncanonical-sidecar, and metadata-mismatch states make the
+command fail after emitting the complete report. The positional directory is
+retained for a consistent command-line shape but is not read:
+
+```bash
+jetstreamer-r2 inventory /absolute/horizon/directory --epochs 201-300
+```
+
 `jetstreamer-r2 restore` reconstructs a local archive pair from R2 for audits that need retired
 neighbors. It requires an explicit epoch range and the private R2 receipt directory, conditionally
 downloads the exact recorded ETag, recomputes the whole-file SHA-256 and multipart ETag, validates

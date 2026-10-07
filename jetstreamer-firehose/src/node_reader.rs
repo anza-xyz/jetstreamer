@@ -433,12 +433,112 @@ pub fn cid_from_cbor_link(val: &serde_cbor::Value) -> Result<cid::Cid, SharedErr
     Err("invalid DAG‑CBOR link encoding".into())
 }
 
-#[tokio::test]
-async fn test_async_node_reader() {
-    use crate::epochs::fetch_epoch_stream;
-    let client = crate::network::create_http_client();
-    let stream = fetch_epoch_stream(670, &client).await;
-    let mut reader = NodeReader::new(stream);
-    let nodes = reader.read_until_block().await.unwrap();
-    assert_eq!(nodes.len(), 117);
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_cbor::Value::{self, Array, Bytes, Integer, Map, Null, Text};
+    use sha2::{Digest, Sha256};
+
+    impl Len for io::Cursor<Vec<u8>> {
+        fn len(&self) -> u64 {
+            self.get_ref().len() as u64
+        }
+    }
+
+    fn append_varint(mut value: usize, bytes: &mut Vec<u8>) {
+        while value >= 128 {
+            bytes.push((value as u8 & 0x7f) | 0x80);
+            value >>= 7;
+        }
+        bytes.push(value as u8);
+    }
+
+    fn archive(nodes: &[Value]) -> (Vec<u8>, Vec<Cid>, Vec<u8>) {
+        let mut sections = Vec::new();
+        let mut cids = Vec::new();
+        for node in nodes {
+            let data = serde_cbor::to_vec(node).unwrap();
+            let digest = Sha256::digest(&data);
+            let cid = Cid::new_v1(0x71, multihash::Multihash::wrap(0x12, &digest).unwrap());
+            let cid_bytes = cid.to_bytes();
+            append_varint(cid_bytes.len() + data.len(), &mut sections);
+            sections.extend(cid_bytes);
+            sections.extend(data);
+            cids.push(cid);
+        }
+        let mut root = vec![0];
+        root.extend(cids.last().unwrap().to_bytes());
+        let header = serde_cbor::to_vec(&Map([
+            (Text("roots".into()), Array(vec![Bytes(root)])),
+            (Text("version".into()), Integer(1)),
+        ]
+        .into()))
+        .unwrap();
+        let mut car = Vec::new();
+        append_varint(header.len(), &mut car);
+        car.extend_from_slice(&header);
+        car.extend(sections);
+        (car, cids, header)
+    }
+
+    #[tokio::test]
+    async fn test_async_node_reader() {
+        // A payload larger than 127 bytes exercises a multi-byte section length.
+        let payload = vec![42; 256];
+        let block = |slot| {
+            Array(vec![
+                Integer(2),
+                Integer(slot),
+                Array(vec![]),
+                Array(vec![]),
+                Array(vec![Integer(slot - 1), Integer(1_700_000_000), Integer(7)]),
+                Null,
+            ])
+        };
+        let (car, cids, header) = archive(&[
+            Array(vec![Integer(6), Null, Null, Null, Bytes(payload.clone())]),
+            block(42),
+            block(43),
+        ]);
+        let mut reader = NodeReader::new(io::Cursor::new(car));
+
+        assert_eq!(reader.read_raw_header().await.unwrap(), header);
+        let section_start = reader.reader.position();
+        assert_eq!(reader.read_raw_header().await.unwrap(), header);
+        assert_eq!(reader.reader.position(), section_start);
+
+        let first = reader.read_until_block().await.unwrap();
+        assert_eq!(first.get_cids(), cids[..2]);
+        assert_eq!(
+            first
+                .get(0)
+                .get_node()
+                .get_dataframe()
+                .unwrap()
+                .data
+                .as_slice(),
+            payload,
+        );
+        let first_block = first.get_block().unwrap();
+        assert_eq!(first_block.slot, 42);
+        assert_eq!(first_block.meta.parent_slot, 41);
+        assert_eq!(first_block.meta.blocktime, 1_700_000_000);
+
+        let second = reader.read_until_block().await.unwrap();
+        assert_eq!(second.get_cids(), cids[2..]);
+        assert_eq!(second.get_block().unwrap().slot, 43);
+        assert_eq!(reader.get_item_index(), 3);
+        assert!(reader.read_until_block().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn read_until_block_propagates_invalid_node() {
+        let (car, _, _) = archive(&[Array(vec![Integer(999)])]);
+        let mut reader = NodeReader::new(io::Cursor::new(car));
+        let error = reader.read_until_block().await.err().unwrap();
+        assert_eq!(
+            error.downcast_ref::<io::Error>().unwrap().kind(),
+            io::ErrorKind::Other,
+        );
+    }
 }

@@ -14,8 +14,9 @@ epochs touch a slot interval marked unsupported by the checked-in runtime regist
    account and read access to the snapshot buckets used by `scripts/preflight_gcs_snapshots.py`.
    The historical snapshot bucket is requester-pays: every detached restore must bind the intended
    account and billing project explicitly, not merely inherit an interactive default. Prove the
-   exact generation with those same flags before sealing the unit. Successful token refresh alone
-   is insufficient because an otherwise authenticated download can still fail with
+   exact generation, size, CRC32C, MD5, bucket/name identity, and object ID with those same flags
+   before transferring bytes, and retain that metadata in the restore receipt. Successful token
+   refresh alone is insufficient because an otherwise authenticated download can still fail with
    `UserProjectMissing`.
 3. Keep public output in `${HORIZON_DIR:-$HOME/horizon}` and private runs, manifests, receipts,
    restore scratch, and controller state outside that directory. The public directory may contain

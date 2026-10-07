@@ -34,6 +34,8 @@ class RestoreError(RuntimeError):
 
 
 def canonical_base64(value: str, decoded_size: int, name: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise RestoreError(f"{name} must be a nonempty base64 string")
     try:
         decoded = base64.b64decode(value, validate=True)
     except ValueError as error:
@@ -195,6 +197,72 @@ def download_command(
     ]
 
 
+def describe_command(
+    gcloud: Path,
+    versioned_uri: str,
+    account: str,
+    billing_project: str,
+) -> list[str]:
+    return [
+        str(gcloud),
+        "storage",
+        "objects",
+        "describe",
+        f"--account={account}",
+        f"--billing-project={billing_project}",
+        versioned_uri,
+        "--format=json",
+        "--quiet",
+    ]
+
+
+def describe_remote_snapshot(
+    gcloud: Path,
+    versioned_uri: str,
+    account: str,
+    billing_project: str,
+    expected_size: int,
+    expected_crc32c: str,
+    expected_md5: str,
+) -> dict[str, Any]:
+    match = VERSIONED_URI.fullmatch(versioned_uri)
+    if match is None:
+        raise RestoreError("cannot describe an invalid versioned URI")
+    completed = run_checked(
+        describe_command(gcloud, versioned_uri, account, billing_project)
+    )
+    try:
+        metadata = json.loads(completed.stdout)
+    except json.JSONDecodeError as error:
+        raise RestoreError("gcloud object describe returned invalid JSON") from error
+    if not isinstance(metadata, dict):
+        raise RestoreError("gcloud object describe did not return one metadata object")
+    object_name = match.group("object")
+    generation_text = match.group("generation")
+    if metadata.get("bucket") != ALLOWED_BUCKET or metadata.get("name") != object_name:
+        raise RestoreError("remote snapshot metadata identifies an unexpected object")
+    if metadata.get("generation") != generation_text:
+        raise RestoreError("remote snapshot metadata generation mismatch")
+    if metadata.get("size") != str(expected_size):
+        raise RestoreError("remote snapshot metadata size mismatch")
+    actual_crc32c = canonical_base64(metadata.get("crc32c"), 4, "remote CRC32C")
+    actual_md5 = canonical_base64(metadata.get("md5Hash"), 16, "remote MD5")
+    if actual_crc32c != expected_crc32c or actual_md5 != expected_md5:
+        raise RestoreError("remote snapshot metadata hashes do not match sealed expectations")
+    expected_id = f"{ALLOWED_BUCKET}/{object_name}/{generation_text}"
+    if metadata.get("id") != expected_id:
+        raise RestoreError("remote snapshot metadata id mismatch")
+    return {
+        "bucket": ALLOWED_BUCKET,
+        "name": object_name,
+        "generation": int(generation_text),
+        "size": expected_size,
+        "crc32c_base64": actual_crc32c,
+        "md5_base64": actual_md5,
+        "id": expected_id,
+    }
+
+
 def validate_file(
     gcloud: Path,
     path: Path,
@@ -341,6 +409,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(sys.argv[1:] if argv is None else argv)
     destination: Path = args.destination
     free_bytes_before = require_free_space(args.filesystem, args.minimum_free_bytes)
+    remote_object: dict[str, Any] | None = None
     if destination.exists() or destination.is_symlink():
         details = validate_file(
             args.gcloud_bin,
@@ -351,6 +420,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         source = "preexisting-verified"
     else:
+        remote_object = describe_remote_snapshot(
+            args.gcloud_bin,
+            args.versioned_uri,
+            args.gcloud_account,
+            args.billing_project,
+            args.expected_size,
+            args.expected_crc32c,
+            args.expected_md5,
+        )
         with tempfile.TemporaryDirectory(
             prefix=f".{destination.name}.", suffix=".download", dir=args.destination_parent
         ) as temporary_directory:
@@ -401,6 +479,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "gcloud_bin_sha256": sha256_file(args.gcloud_bin),
         "gcloud_account": args.gcloud_account,
         "billing_project": args.billing_project,
+        "remote_object": remote_object,
         "script_sha256": sha256_file(Path(__file__).resolve(strict=True)),
         "filesystem": str(args.filesystem),
         "minimum_free_bytes": args.minimum_free_bytes,

@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import stat
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -71,6 +72,63 @@ class BoundGcsSnapshotRestoreTest(unittest.TestCase):
         self.assertIn("--billing-project=principal-lane-200702", command)
         self.assertIn(URI, command)
         self.assertEqual(command[-2:], ["/private/payload", "--quiet"])
+
+    @patch("scripts.restore_bound_gcs_snapshot.run_checked")
+    def test_remote_description_binds_generation_identity_and_hashes(
+        self, run_checked: object
+    ) -> None:
+        crc = base64.b64encode(b"1234").decode()
+        md5 = base64.b64encode(b"1234567890123456").decode()
+        object_name = f"87263434/{FILENAME}"
+        run_checked.return_value = SimpleNamespace(
+            stdout=json.dumps(
+                {
+                    "bucket": restore.ALLOWED_BUCKET,
+                    "name": object_name,
+                    "generation": "1634789740125991",
+                    "size": "8081511792",
+                    "crc32c": crc,
+                    "md5Hash": md5,
+                    "id": f"{restore.ALLOWED_BUCKET}/{object_name}/1634789740125991",
+                }
+            )
+        )
+        result = restore.describe_remote_snapshot(
+            Path("/usr/bin/gcloud"),
+            URI,
+            "user@example.com",
+            "principal-lane-200702",
+            8081511792,
+            crc,
+            md5,
+        )
+        self.assertEqual(result["generation"], 1634789740125991)
+        command = run_checked.call_args.args[0]
+        self.assertEqual(
+            command[:4], ["/usr/bin/gcloud", "storage", "objects", "describe"]
+        )
+        self.assertIn("--account=user@example.com", command)
+        self.assertIn("--billing-project=principal-lane-200702", command)
+        self.assertIn(URI, command)
+
+        metadata = json.loads(run_checked.return_value.stdout)
+        metadata["generation"] = "1634789740125992"
+        run_checked.return_value.stdout = json.dumps(metadata)
+        with self.assertRaisesRegex(restore.RestoreError, "generation mismatch"):
+            restore.describe_remote_snapshot(
+                Path("/usr/bin/gcloud"),
+                URI,
+                "user@example.com",
+                "principal-lane-200702",
+                8081511792,
+                crc,
+                md5,
+            )
+
+    def test_canonical_base64_rejects_non_strings(self) -> None:
+        for invalid in (None, 1, b"MTIzNA=="):
+            with self.subTest(invalid=invalid), self.assertRaises(restore.RestoreError):
+                restore.canonical_base64(invalid, 4, "CRC")
 
     @patch("scripts.restore_bound_gcs_snapshot.available_bytes", return_value=99)
     def test_free_space_gate_fails_closed(self, _available: object) -> None:

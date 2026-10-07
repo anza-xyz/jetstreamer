@@ -30,6 +30,7 @@ class UnitSample:
     invocation_id: str
     restarts: int
     control_group: str
+    worker_count: int
     worker_pid: int | None
     worker_vmas: int | None
 
@@ -50,26 +51,40 @@ def read_proc_bytes(path: Path) -> bytes | None:
         return None
 
 
-def worker_vmas(control_group: str, cgroup_root: Path = Path("/sys/fs/cgroup")) -> tuple[int | None, int | None]:
+def is_historical_worker_command(command: bytes) -> bool:
+    executable = command.split(b"\0", 1)[0]
+    return executable.endswith(b"/bound-worker/historical-worker") or executable.endswith(
+        b"/jetstreamer-historical-worker-v1-6-16"
+    )
+
+
+def worker_vmas(
+    control_group: str,
+    cgroup_root: Path = Path("/sys/fs/cgroup"),
+    proc_root: Path = Path("/proc"),
+) -> tuple[int, int | None, int | None]:
     if not control_group.startswith("/") or ".." in Path(control_group).parts:
         raise ValueError(f"invalid control group: {control_group}")
     group = cgroup_root / control_group.lstrip("/")
     if not group.is_dir():
-        return None, None
+        return 0, None, None
     candidates: set[int] = set()
     for process_file in group.rglob("cgroup.procs"):
         try:
             candidates.update(int(value) for value in process_file.read_text().split())
         except (FileNotFoundError, PermissionError, ProcessLookupError, ValueError):
             continue
+    workers: list[tuple[int, int | None]] = []
     for pid in sorted(candidates):
-        command = read_proc_bytes(Path("/proc") / str(pid) / "cmdline")
-        if not command or b"jetstreamer-historical-worker-v1-6-16" not in command:
+        command = read_proc_bytes(proc_root / str(pid) / "cmdline")
+        if not command or not is_historical_worker_command(command):
             continue
-        maps = read_proc_bytes(Path("/proc") / str(pid) / "maps")
-        if maps is not None:
-            return pid, maps.count(b"\n")
-    return None, None
+        maps = read_proc_bytes(proc_root / str(pid) / "maps")
+        workers.append((pid, maps.count(b"\n") if maps is not None else None))
+    if len(workers) != 1:
+        return len(workers), None, None
+    pid, vmas = workers[0]
+    return 1, pid, vmas
 
 
 def sample_unit(unit: str) -> UnitSample:
@@ -88,7 +103,9 @@ def sample_unit(unit: str) -> UnitSample:
     )
     fields = parse_systemctl_show(completed.stdout)
     control_group = fields.get("ControlGroup", "")
-    worker_pid, vmas = worker_vmas(control_group) if control_group else (None, None)
+    worker_count, worker_pid, vmas = (
+        worker_vmas(control_group) if control_group else (0, None, None)
+    )
     return UnitSample(
         unit=unit,
         load_state=fields.get("LoadState", "unknown"),
@@ -99,6 +116,7 @@ def sample_unit(unit: str) -> UnitSample:
         invocation_id=fields.get("InvocationID", ""),
         restarts=int(fields.get("NRestarts", "0") or 0),
         control_group=control_group,
+        worker_count=worker_count,
         worker_pid=worker_pid,
         worker_vmas=vmas,
     )
@@ -129,6 +147,11 @@ def trip_reasons(
             )
         if sample.restarts:
             reasons.append(f"{sample.unit} unexpectedly restarted {sample.restarts} time(s)")
+        if sample.active_state in ("active", "activating"):
+            if sample.worker_count != 1 or sample.worker_vmas is None:
+                reasons.append(
+                    f"{sample.unit} has {sample.worker_count} identifiable historical workers"
+                )
         if sample.worker_vmas is not None and sample.worker_vmas > maximum_worker_vmas:
             reasons.append(
                 f"{sample.unit} worker VMAs {sample.worker_vmas} exceed {maximum_worker_vmas}"

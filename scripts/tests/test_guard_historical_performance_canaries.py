@@ -22,6 +22,7 @@ def sample(**overrides: object) -> guard.UnitSample:
         invocation_id="invocation",
         restarts=0,
         control_group="/system.slice/test.service",
+        worker_count=1,
         worker_pid=124,
         worker_vmas=500_000,
     )
@@ -64,12 +65,62 @@ class HistoricalPerformanceGuardTest(unittest.TestCase):
             sub_state="dead",
             result="success",
             main_pid=0,
+            worker_count=0,
             worker_pid=None,
             worker_vmas=None,
         )
         self.assertEqual(guard.trip_reasons(200, 100, 900_000, [finished]), [])
         self.assertFalse(guard.cohort_running([finished]))
         self.assertTrue(guard.cohort_running([finished, sample()]))
+
+    def test_active_unit_without_exactly_one_measurable_worker_trips(self) -> None:
+        for count, vmas in ((0, None), (1, None), (2, None)):
+            with self.subTest(count=count, vmas=vmas):
+                reasons = guard.trip_reasons(
+                    200,
+                    100,
+                    900_000,
+                    [sample(worker_count=count, worker_pid=None, worker_vmas=vmas)],
+                )
+                self.assertTrue(any("identifiable historical workers" in item for item in reasons))
+
+    def test_recognizes_bound_worker_command_and_original_binary_name(self) -> None:
+        self.assertTrue(
+            guard.is_historical_worker_command(
+                b"/scratch/.historical-runtime/parent/bound-worker/historical-worker\0"
+            )
+        )
+        self.assertTrue(
+            guard.is_historical_worker_command(
+                b"/immutable/jetstreamer-historical-worker-v1-6-16\0--arg\0"
+            )
+        )
+        self.assertFalse(
+            guard.is_historical_worker_command(b"/immutable/jetstreamer-node\0")
+        )
+
+    def test_worker_vmas_reads_bound_worker_from_nested_cgroup(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cgroups = root / "cgroup"
+            proc = root / "proc"
+            group = cgroups / "system.slice" / "test.service" / "worker"
+            group.mkdir(parents=True)
+            (group / "cgroup.procs").write_text("123\n124\n")
+            for pid in (123, 124):
+                (proc / str(pid)).mkdir(parents=True)
+            (proc / "123" / "cmdline").write_bytes(b"/immutable/jetstreamer-node\0")
+            (proc / "123" / "maps").write_bytes(b"node\n")
+            (proc / "124" / "cmdline").write_bytes(
+                b"/scratch/.historical-runtime/x/bound-worker/historical-worker\0"
+            )
+            (proc / "124" / "maps").write_bytes(b"a\nb\nc\n")
+            self.assertEqual(
+                guard.worker_vmas(
+                    "/system.slice/test.service", cgroup_root=cgroups, proc_root=proc
+                ),
+                (1, 124, 3),
+            )
 
     @patch("scripts.guard_historical_performance_canaries.subprocess.run")
     def test_stops_all_active_units_in_one_systemd_transaction(self, run: object) -> None:

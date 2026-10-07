@@ -130,6 +130,14 @@ class BoundGcsSnapshotRestoreTest(unittest.TestCase):
             with self.subTest(invalid=invalid), self.assertRaises(restore.RestoreError):
                 restore.canonical_base64(invalid, 4, "CRC")
 
+    @patch("scripts.restore_bound_gcs_snapshot.subprocess.run")
+    def test_gcloud_commands_disable_prompts(self, run: object) -> None:
+        run.return_value = SimpleNamespace(returncode=0, stderr="", stdout="")
+        restore.run_checked(["/usr/bin/gcloud", "version"])
+        self.assertEqual(
+            run.call_args.kwargs["env"]["CLOUDSDK_CORE_DISABLE_PROMPTS"], "1"
+        )
+
     @patch("scripts.restore_bound_gcs_snapshot.available_bytes", return_value=99)
     def test_free_space_gate_fails_closed(self, _available: object) -> None:
         with self.assertRaisesRegex(restore.RestoreError, "below restore floor"):

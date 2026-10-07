@@ -145,7 +145,14 @@ def sha256_file(path: Path) -> str:
 
 
 def run_checked(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
-    completed = subprocess.run(command, capture_output=True, text=True)
+    environment = os.environ.copy()
+    environment["CLOUDSDK_CORE_DISABLE_PROMPTS"] = "1"
+    completed = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
     if completed.returncode != 0:
         detail = completed.stderr.strip() or completed.stdout.strip()
         raise RestoreError(f"command failed with status {completed.returncode}: {detail}")

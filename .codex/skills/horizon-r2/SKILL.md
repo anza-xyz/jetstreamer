@@ -78,6 +78,12 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
   public archives, and all R2 objects must remain untouched.
 - For adaptive ranges, start the controller with `--r2-receipt-directory "$HOME/.jetstreamer-private/r2-receipts" --r2-bucket BUCKET`. The controller accepts receipts from that exact bucket only for bytes already bound by its root-owned local completion attestation; R2 can replace local storage, but can never establish initial completion.
 - Start the current Horizon verification plugin as soon as each local archive is available. R2 work may run concurrently with replay of other epochs. An archive is eligible for upload only after its full and current-plugin receipts bind the same archive SHA-256. It is not eligible for local retirement until both adjacent-boundary receipts bind that digest as well. Preserve the canonical lowercase coreutils sidecar format: `<64 hex>  epoch-N.jet\n`.
+- Before launching an independent focused-qualification validator, read the durable segment
+  manifest and bind every expectation to it. In particular, pass its `output_slot_start`; do not
+  substitute `bootstrap_slot + 1`. A predecessor snapshot may warm up before the target epoch, so
+  replay can begin at `bootstrap_slot + 1` while recorded output begins at the epoch boundary.
+  Independently check that `terminal_slot - output_slot_start + 1` equals the manifest's
+  `output_slot_count`, and launch a distinct non-restarting attempt if an expectation was wrong.
 
 ## Deliver
 

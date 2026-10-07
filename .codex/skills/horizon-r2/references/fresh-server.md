@@ -104,8 +104,10 @@ evidence for a later reviewed registry change, not permission to publish by itse
    `jetstreamer-qualification-verify` binary with the exact sealed epoch, output range, bootstrap,
    terminal, runtime-profile, worker-digest, and private-root expectations. Treat the diagnostic
    artifact as registry evidence only if that full re-read passes and the canonical `.sha256`
-   sidecar remains absent. A candidate must reproduce those checkpoints before it can generate a
-   publishable archive.
+   sidecar remains absent. Derive the validator's output start from the durable segment manifest
+   and confirm its slot-count equation; never assume it is `bootstrap + 1`, because predecessor
+   snapshot warmup can begin before the epoch boundary where output starts. A candidate must
+   reproduce those checkpoints before it can generate a publishable archive.
 4. Locate later runtime boundaries by evidence, not release dates. Extend the supported interval
    in bounded steps; add another descriptor or isolated restart whenever checkpoint or status
    evidence requires it. Update the compatibility table and focused registry tests with each

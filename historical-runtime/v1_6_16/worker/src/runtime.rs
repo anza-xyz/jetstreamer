@@ -48,6 +48,8 @@ const MAX_SUPPORTED_SLOT_EXCLUSIVE: u64 = 90_288_000;
 const RECONSTRUCTED_CONFIRMED_BLOCK_START: u64 = 89_856_107;
 const RECONSTRUCTED_CONFIRMED_BLOCK_END: u64 = 89_856_602;
 const POH_THREADS_ENV: &str = "JETSTREAMER_HISTORICAL_POH_THREADS";
+const WAVE_METRICS_ENV: &str = "JETSTREAMER_HISTORICAL_WAVE_METRICS";
+const WAVE_METRICS_REPORT_INTERVAL_TRANSACTIONS: u64 = 1_000_000;
 const ABSOLUTE_MAX_POH_THREADS: usize = 256;
 // The validator runs AccountsBackgroundService alongside replay. This worker
 // has no BankForks service, so perform the same storage-only maintenance at
@@ -71,6 +73,75 @@ pub struct RuntimeState {
     enforce_candidate_range: bool,
     last_accounts_clean_block_height: u64,
     accounts_shrink_consumed_budget: usize,
+    execution_wave_metrics: ExecutionWaveMetrics,
+}
+
+#[derive(Default)]
+struct ExecutionWaveMetrics {
+    enabled: bool,
+    transactions: u64,
+    waves: u64,
+    singleton_waves: u64,
+    maximum_wave_size: usize,
+    // Exact sizes 1 through 5, then 6-7 and 8+.
+    size_histogram: [u64; 7],
+    next_report_transactions: u64,
+}
+
+impl ExecutionWaveMetrics {
+    fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            next_report_transactions: WAVE_METRICS_REPORT_INTERVAL_TRANSACTIONS,
+            ..Self::default()
+        }
+    }
+
+    fn observe(&mut self, waves: &[Range<usize>]) {
+        if !self.enabled {
+            return;
+        }
+        for wave in waves {
+            let size = wave.end - wave.start;
+            self.transactions = self.transactions.saturating_add(size as u64);
+            self.waves = self.waves.saturating_add(1);
+            self.singleton_waves = self.singleton_waves.saturating_add(u64::from(size == 1));
+            self.maximum_wave_size = cmp::max(self.maximum_wave_size, size);
+            let bin = match size {
+                1..=5 => size - 1,
+                6..=7 => 5,
+                _ => 6,
+            };
+            self.size_histogram[bin] = self.size_histogram[bin].saturating_add(1);
+        }
+        if self.transactions >= self.next_report_transactions {
+            self.report("periodic");
+            self.next_report_transactions = self
+                .transactions
+                .saturating_add(WAVE_METRICS_REPORT_INTERVAL_TRANSACTIONS);
+        }
+    }
+
+    fn report(&self, reason: &str) {
+        if !self.enabled {
+            return;
+        }
+        eprintln!(
+            "historical execution wave metrics: reason={} transactions={} waves={} singleton_waves={} maximum_wave_size={} size1={} size2={} size3={} size4={} size5={} size6_7={} size8plus={}",
+            reason,
+            self.transactions,
+            self.waves,
+            self.singleton_waves,
+            self.maximum_wave_size,
+            self.size_histogram[0],
+            self.size_histogram[1],
+            self.size_histogram[2],
+            self.size_histogram[3],
+            self.size_histogram[4],
+            self.size_histogram[5],
+            self.size_histogram[6],
+        );
+    }
 }
 
 pub enum ProcessEntriesError<E> {
@@ -152,6 +223,9 @@ impl RuntimeState {
                 enforce_candidate_range: true,
                 last_accounts_clean_block_height: 0,
                 accounts_shrink_consumed_budget: 0,
+                execution_wave_metrics: ExecutionWaveMetrics::new(
+                    env::var_os(WAVE_METRICS_ENV).is_some(),
+                ),
             },
             initialized,
         ))
@@ -259,7 +333,8 @@ impl RuntimeState {
             // keys are unique inside a wave, so drained writes retain exact
             // signature attribution without forcing every transaction through
             // a separate AccountsDb store call.
-            for wave in transaction_waves(&self.bank, &transactions) {
+            let execution_waves = transaction_waves(&self.bank, &transactions);
+            for wave in &execution_waves {
                 let wave_transactions = &transactions[wave.clone()];
                 let signatures_by_writable_key = writable_key_attribution(
                     wave_transactions,
@@ -358,6 +433,7 @@ impl RuntimeState {
                 }
                 writes.extend(wave_writes);
             }
+            self.execution_wave_metrics.observe(&execution_waves);
         }
 
         self.next_entry_index = self
@@ -596,6 +672,7 @@ impl RuntimeState {
         }
         let writes = self.freeze_root_and_drain()?;
         let accounts_hash = self.bank.update_accounts_hash();
+        self.execution_wave_metrics.report("checkpoint");
         Ok(Checkpoint {
             slot: self.bank.slot(),
             bank_hash: self.bank.hash().as_ref().to_vec(),
@@ -774,6 +851,7 @@ impl RuntimeState {
             enforce_candidate_range: false,
             last_accounts_clean_block_height: 0,
             accounts_shrink_consumed_budget: 0,
+            execution_wave_metrics: ExecutionWaveMetrics::new(false),
         }
     }
 }
@@ -1351,6 +1429,22 @@ mod tests {
         assert!(parse_poh_thread_count("0", 64).is_err());
         assert!(parse_poh_thread_count("65", 64).is_err());
         assert!(parse_poh_thread_count("not-a-number", 64).is_err());
+    }
+
+    #[test]
+    fn execution_wave_metrics_count_stable_size_bins() {
+        let mut metrics = ExecutionWaveMetrics::new(true);
+        metrics.observe(&[0..1, 1..3, 3..6, 6..10, 10..15, 15..21, 21..28, 28..36]);
+
+        assert_eq!(metrics.transactions, 36);
+        assert_eq!(metrics.waves, 8);
+        assert_eq!(metrics.singleton_waves, 1);
+        assert_eq!(metrics.maximum_wave_size, 8);
+        assert_eq!(metrics.size_histogram, [1, 1, 1, 1, 1, 2, 1]);
+        assert_eq!(
+            metrics.next_report_transactions,
+            WAVE_METRICS_REPORT_INTERVAL_TRANSACTIONS
+        );
     }
 
     #[test]

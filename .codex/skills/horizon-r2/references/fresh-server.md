@@ -34,7 +34,10 @@ epochs touch a slot interval marked unsupported by the checked-in runtime regist
    a long replay from `target/` in a mutable worktree. Initialize each recurring monitor's
    last-observed state from the replay's authoritative launch time before starting its timer, then
    run the monitor once manually to prove it can write evidence. A monitor setup failure does not
-   justify restarting a healthy producer. Give every automatic retry a distinct diagnostic output
+   justify restarting a healthy producer. A later `systemctl daemon-reload` can move a pending
+   monotonic `OnActiveSec` deadline; after every reload, verify each active monitor's next deadline
+   and immediately run only an overdue oneshot monitor so `OnUnitActiveSec` re-anchors the cadence.
+   Give every automatic retry a distinct diagnostic output
    and scratch path, or use a proven launcher that preserves the failed attempt before the next
    `.jet` is opened; otherwise use a non-restarting unit and relaunch manually after evidence
    capture. Never let `Restart=on-failure` truncate the only partial archive from the failed run.

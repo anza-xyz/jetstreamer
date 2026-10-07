@@ -47,7 +47,11 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
 - Before starting a recurring status timer, initialize its last-observed state to the replay's
   authoritative launch time and validate the monitor once manually. A timer that exists without
   this state is not monitoring the replay; diagnose monitor failures without restarting a healthy
-  producer.
+  producer. After any `systemctl daemon-reload` while monotonic monitor timers are active, re-observe
+  every timer's next deadline: systemd can move a pending `OnActiveSec` deadline relative to the
+  reload. If that delays an already-due check, run only the oneshot monitor immediately and confirm
+  that `OnUnitActiveSec` has re-anchored the next interval; never restart the producer to repair its
+  monitor schedule.
 - When launching into a fresh isolated diagnostic-output directory, ensure it contains the verified
   same-cluster genesis expected by the loader. A cached snapshot does not imply the genesis is
   present. Preseed only from digest-bound retained evidence and verify the copied digest and

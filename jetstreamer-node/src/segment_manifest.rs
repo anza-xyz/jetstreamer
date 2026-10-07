@@ -6,15 +6,20 @@
 //! returning evidence to a caller.
 
 use {
+    crate::archive_checksum::{
+        ArchiveFileIdentity, archive_file_identity, open_regular_nofollow,
+        path_matches_archive_identity,
+    },
     jetstreamer_horizon::{
         account_updates::AccountUpdateView,
         archive::{
             ArchiveFormatError, ArchiveProvenance, ArchiveProvenanceError, ArchiveReader,
-            BlockNotification, Consumption, EntryRecord, EpochMeta, FORMAT_VERSION_V2,
-            RuntimeAdmission, SlotKind, SlotVisitor,
+            BlockNotification, BucketHeader as HorizonBucketHeader, Consumption, EntryRecord,
+            EpochMeta, FORMAT_VERSION_V2, RuntimeAdmission, SlotKind, SlotVisitor,
         },
         transactions::Transaction,
     },
+    rayon::prelude::*,
     serde::{Deserialize, Serialize},
     sha2::{Digest, Sha256},
     solana_hash::Hash,
@@ -34,6 +39,11 @@ pub const SEGMENT_MANIFEST_SCHEMA_VERSION: u32 = 1;
 pub const SEGMENT_MANIFEST_SUFFIX: &str = ".segment.json";
 const MAX_SEGMENT_MANIFEST_BYTES: u64 = 1 << 20;
 const MAX_IDENTITY_TEXT_BYTES: usize = 1 << 10;
+// Deep decoding is independent between indexed bucket ranges, but every
+// reader retains large reusable decode buffers. The epoch-201 benchmark used
+// the full 64-GiB test cgroup at 16 readers, so keep the pool bounded even on
+// hosts with many more CPUs.
+const SEGMENT_VALIDATION_THREADS: usize = 16;
 
 /// Evidence level under which the exact runtime span was admitted.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -282,7 +292,7 @@ pub fn write_segment_manifest(
     archive
         .seek(SeekFrom::Start(0))
         .map_err(|source| io_err("rewinding archive", archive_path, source))?;
-    validate_horizon_source(archive, &manifest)?;
+    validate_horizon_source(archive_path, archive, &manifest)?;
 
     let sidecar_path = segment_manifest_path(archive_path)?;
     let parent = sidecar_path.parent().unwrap_or_else(|| Path::new("."));
@@ -332,15 +342,18 @@ pub fn read_and_validate_segment_manifest(
     archive
         .seek(SeekFrom::Start(0))
         .map_err(|source| io_err("rewinding archive", archive_path, source))?;
-    validate_horizon_source(archive, &manifest)?;
+    validate_horizon_source(archive_path, archive, &manifest)?;
     Ok(manifest)
 }
 
 fn validate_horizon_source(
+    archive_path: &Path,
     archive: File,
     manifest: &HistoricalSegmentManifest,
 ) -> Result<(), SegmentManifestError> {
-    let mut reader =
+    let initial_identity = archive_file_identity(&archive)
+        .map_err(|source| io_err("identifying archive", archive_path, source))?;
+    let reader =
         ArchiveReader::open(BufReader::new(archive)).map_err(SegmentManifestError::Archive)?;
     let header = reader.header().clone();
     if header.format_version != FORMAT_VERSION_V2 {
@@ -434,60 +447,134 @@ fn validate_horizon_source(
         ));
     }
 
-    reader.verify_chain = true;
-    let mut visitor = SegmentValidationVisitor::new(
-        manifest.output_slot_start,
-        manifest.emitted_raw_write_versions.clone(),
-    );
-    let mut decoded_slots = 0u64;
-    for bucket in 0..reader.bucket_count() {
-        let visited = reader
-            .read_bucket(bucket, &mut visitor)
-            .map_err(SegmentManifestError::Archive)?;
-        decoded_slots = decoded_slots
-            .checked_add(visited)
-            .ok_or_else(|| invalid("decoded slot count overflows u64"))?;
-    }
-    visitor.finish()?;
+    let bucket_count = reader.bucket_count();
+    let worker_count = SEGMENT_VALIDATION_THREADS
+        .min(bucket_count.max(1))
+        .min(std::thread::available_parallelism().map_or(1, usize::from));
+    let buckets_per_worker = bucket_count.div_ceil(worker_count);
+    let ranges = (0..worker_count)
+        .filter_map(|worker| {
+            let first_bucket = worker.checked_mul(buckets_per_worker)?;
+            (first_bucket < bucket_count).then_some((
+                first_bucket,
+                (first_bucket + buckets_per_worker).min(bucket_count),
+            ))
+        })
+        .collect::<Vec<_>>();
+    drop(reader);
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(worker_count)
+        .thread_name(|index| format!("segment-verify-{index:02}"))
+        .build()
+        .map_err(|error| invalid(format!("failed to build segment validation pool: {error}")))?;
+    let evidence = pool.install(|| {
+        ranges
+            .into_par_iter()
+            .map(|(first_bucket, end_bucket)| {
+                validate_horizon_bucket_range(
+                    archive_path,
+                    initial_identity,
+                    first_bucket,
+                    end_bucket,
+                    manifest.emitted_raw_write_versions.clone(),
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()
+    })?;
+    let decoded_slots = merge_horizon_bucket_ranges(archive_path, manifest, evidence)?;
     if decoded_slots != manifest.output_slot_count {
         return Err(invalid(format!(
             "Horizon source decoded {decoded_slots} slots, expected {}",
             manifest.output_slot_count
         )));
     }
-    let expected_end = manifest.output_slot_end()?;
-    if visitor.next_slot != expected_end {
+    if !path_matches_archive_identity(archive_path, initial_identity)
+        .map_err(|source| io_err("rechecking archive identity", archive_path, source))?
+    {
         return Err(invalid(format!(
-            "Horizon source slot coverage ended at {}, expected {expected_end}",
-            visitor.next_slot
+            "Horizon source {} changed during parallel validation",
+            archive_path.display()
         )));
     }
     Ok(())
 }
 
-struct SegmentValidationVisitor {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SegmentBlockEvidence {
+    blockhash: Hash,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct SegmentChainEvidence {
+    initial_poh_anchor: Option<Hash>,
+    terminal_block: Option<SegmentBlockEvidence>,
+}
+
+#[derive(Debug)]
+struct SegmentBucketRangeEvidence {
+    first_bucket: usize,
+    first_slot: u64,
     next_slot: u64,
+    first_write: Option<u64>,
+    next_write: Option<u64>,
+    visited_slots: u64,
+    chain: SegmentChainEvidence,
+}
+
+struct SegmentBucketVisitor {
+    first_slot: Option<u64>,
+    next_slot: Option<u64>,
     expected_writes: Range<u64>,
-    next_write: u64,
+    first_write: Option<u64>,
+    next_write: Option<u64>,
     current_slot: Option<u64>,
-    /// Wire order groups updates by owning transaction, while AccountsDB
-    /// assigns write versions in physical store order.  Those orders can
-    /// differ within a slot (notably when a failed transaction's fee debit is
-    /// stored after later successful transactions), so validate the exact
-    /// per-slot set instead of requiring callback order to be monotonic.
     slot_writes: Vec<u64>,
+    chain: SegmentChainEvidence,
     error: Option<String>,
 }
 
-impl SegmentValidationVisitor {
-    fn new(next_slot: u64, expected_writes: Range<u64>) -> Self {
+impl SegmentBucketVisitor {
+    fn new(expected_writes: Range<u64>) -> Self {
         Self {
-            next_slot,
-            next_write: expected_writes.start,
+            first_slot: None,
+            next_slot: None,
             expected_writes,
+            first_write: None,
+            next_write: None,
             current_slot: None,
             slot_writes: Vec::new(),
+            chain: SegmentChainEvidence::default(),
             error: None,
+        }
+    }
+
+    fn on_bucket_header(&mut self, header: &HorizonBucketHeader) -> Result<(), ArchiveFormatError> {
+        if let Some(next_slot) = self.next_slot
+            && header.first_slot != next_slot
+        {
+            return Err(ArchiveFormatError::InvalidContainerLayout(
+                "parallel segment bucket ranges are not slot-contiguous",
+            ));
+        }
+        self.first_slot.get_or_insert(header.first_slot);
+        self.next_slot.get_or_insert(header.first_slot);
+
+        let expected_anchor = self
+            .chain
+            .terminal_block
+            .map(|block| block.blockhash)
+            .or(self.chain.initial_poh_anchor);
+        match expected_anchor {
+            Some(expected) if header.poh_start_hash != expected => {
+                Err(ArchiveFormatError::PohMismatch {
+                    slot: header.first_slot,
+                })
+            }
+            Some(_) => Ok(()),
+            None => {
+                self.chain.initial_poh_anchor = Some(header.poh_start_hash);
+                Ok(())
+            }
         }
     }
 
@@ -520,61 +607,78 @@ impl SegmentValidationVisitor {
             .current_slot
             .expect("account writes are accepted only inside a slot");
         self.slot_writes.sort_unstable();
-        for index in 0..self.slot_writes.len() {
-            let write_version = self.slot_writes[index];
-            if write_version != self.next_write {
+        for &write_version in &self.slot_writes {
+            let expected = match self.next_write {
+                Some(expected) => expected,
+                None => {
+                    self.first_write = Some(write_version);
+                    write_version
+                }
+            };
+            if write_version != expected {
                 self.error = Some(format!(
-                    "account update at slot {slot} has raw write version {write_version}, expected {} within {}..{}",
-                    self.next_write, self.expected_writes.start, self.expected_writes.end
+                    "account update at slot {slot} has raw write version {write_version}, expected {expected} within {}..{}",
+                    self.expected_writes.start, self.expected_writes.end
                 ));
                 break;
             }
-            // `write_version < expected_writes.end` was checked on receipt,
-            // so incrementing cannot overflow even when the declared end is
-            // `u64::MAX`.
-            self.next_write = write_version + 1;
+            self.next_write = Some(write_version + 1);
         }
         self.slot_writes.clear();
     }
 
-    fn finish(&mut self) -> Result<(), SegmentManifestError> {
+    fn finish(
+        mut self,
+        first_bucket: usize,
+        visited_slots: u64,
+    ) -> Result<SegmentBucketRangeEvidence, SegmentManifestError> {
         self.finish_slot_writes();
-        if let Some(error) = &self.error {
-            return Err(invalid(error.clone()));
+        if let Some(error) = self.error {
+            return Err(invalid(error));
         }
-        if self.next_write != self.expected_writes.end {
-            return Err(invalid(format!(
-                "Horizon source raw writes ended at {}, expected {}",
-                self.next_write, self.expected_writes.end
-            )));
-        }
-        Ok(())
+        let first_slot = self
+            .first_slot
+            .ok_or_else(|| invalid("parallel segment range decoded no bucket header"))?;
+        let next_slot = self
+            .next_slot
+            .ok_or_else(|| invalid("parallel segment range decoded no slots"))?;
+        Ok(SegmentBucketRangeEvidence {
+            first_bucket,
+            first_slot,
+            next_slot,
+            first_write: self.first_write,
+            next_write: self.next_write,
+            visited_slots,
+            chain: self.chain,
+        })
     }
 }
 
-impl SlotVisitor for SegmentValidationVisitor {
+impl SlotVisitor for SegmentBucketVisitor {
     fn on_slot_start(&mut self, slot: u64, _kind: SlotKind) {
         self.finish_slot_writes();
         if self.error.is_some() {
             return;
         }
-        if slot != self.next_slot {
+        let expected = self.next_slot.get_or_insert(slot);
+        if slot != *expected {
             self.error = Some(format!(
                 "Horizon source slot coverage expected {}, got {slot}",
-                self.next_slot
+                *expected
             ));
             return;
         }
         self.current_slot = Some(slot);
-        match self.next_slot.checked_add(1) {
-            Some(next) => self.next_slot = next,
+        match slot.checked_add(1) {
+            Some(next) => self.next_slot = Some(next),
             None => self.error = Some("Horizon source slot coverage overflows u64".to_string()),
         }
     }
 
     fn on_epoch(&mut self, meta: &EpochMeta) {
+        let slot = self.next_slot.unwrap_or(0).saturating_sub(1);
         for (update, _) in meta.updates.iter() {
-            self.accept_write(self.next_slot.saturating_sub(1), update.write_version);
+            self.accept_write(slot, update.write_version);
         }
     }
 
@@ -592,8 +696,13 @@ impl SlotVisitor for SegmentValidationVisitor {
         self.accept_write(slot, update.write_version);
     }
 
-    fn on_block(&mut self, _notification: &BlockNotification, _entries: &[EntryRecord]) {
+    fn on_block(&mut self, notification: &BlockNotification, _entries: &[EntryRecord]) {
         self.finish_slot_writes();
+        if let BlockNotification::Block(meta) = notification {
+            self.chain.terminal_block = Some(SegmentBlockEvidence {
+                blockhash: meta.blockhash,
+            });
+        }
     }
 
     fn consumption(&self) -> Consumption {
@@ -601,6 +710,114 @@ impl SlotVisitor for SegmentValidationVisitor {
             .without_account_update_data()
             .without_block_account_update_arenas()
     }
+}
+
+fn validate_horizon_bucket_range(
+    archive_path: &Path,
+    expected_identity: ArchiveFileIdentity,
+    first_bucket: usize,
+    end_bucket: usize,
+    expected_writes: Range<u64>,
+) -> Result<SegmentBucketRangeEvidence, SegmentManifestError> {
+    let archive = open_regular_nofollow(archive_path)
+        .map_err(|source| io_err("opening parallel archive worker", archive_path, source))?;
+    let identity = archive_file_identity(&archive)
+        .map_err(|source| io_err("identifying parallel archive worker", archive_path, source))?;
+    if identity != expected_identity {
+        return Err(invalid(format!(
+            "Horizon source {} changed before parallel validation",
+            archive_path.display()
+        )));
+    }
+    let mut reader = ArchiveReader::open(BufReader::with_capacity(8 * 1024 * 1024, archive))
+        .map_err(SegmentManifestError::Archive)?;
+    if end_bucket > reader.bucket_count() || first_bucket >= end_bucket {
+        return Err(invalid(format!(
+            "Horizon source {} received invalid parallel bucket range {first_bucket}..{end_bucket}",
+            archive_path.display()
+        )));
+    }
+    reader.verify_chain = true;
+    let mut visitor = SegmentBucketVisitor::new(expected_writes);
+    let mut visited_slots = 0u64;
+    for bucket in first_bucket..end_bucket {
+        let visited = reader
+            .read_bucket_with_header(bucket, &mut visitor, |header, visitor| {
+                visitor.on_bucket_header(header)
+            })
+            .map_err(SegmentManifestError::Archive)?;
+        visited_slots = visited_slots
+            .checked_add(visited)
+            .ok_or_else(|| invalid("decoded slot count overflows u64"))?;
+    }
+    visitor.finish(first_bucket, visited_slots)
+}
+
+fn merge_horizon_bucket_ranges(
+    archive_path: &Path,
+    manifest: &HistoricalSegmentManifest,
+    mut ranges: Vec<SegmentBucketRangeEvidence>,
+) -> Result<u64, SegmentManifestError> {
+    ranges.sort_unstable_by_key(|range| range.first_bucket);
+    let mut expected_slot = manifest.output_slot_start;
+    let mut expected_write = manifest.emitted_raw_write_versions.start;
+    let mut decoded_slots = 0u64;
+    let mut chain = SegmentChainEvidence::default();
+    for range in ranges {
+        if range.first_slot != expected_slot {
+            return Err(invalid(format!(
+                "Horizon source slot coverage expected {expected_slot}, got {} at bucket {}",
+                range.first_slot, range.first_bucket
+            )));
+        }
+        expected_slot = range.next_slot;
+        if let Some(first_write) = range.first_write {
+            if first_write != expected_write {
+                return Err(invalid(format!(
+                    "Horizon source raw writes expected {expected_write}, got {first_write} at bucket {}",
+                    range.first_bucket
+                )));
+            }
+            expected_write = range
+                .next_write
+                .expect("a range with a first write also has a next write");
+        }
+        let expected_anchor = chain
+            .terminal_block
+            .map(|block| block.blockhash)
+            .or(chain.initial_poh_anchor);
+        if let Some(expected_anchor) = expected_anchor
+            && range.chain.initial_poh_anchor != Some(expected_anchor)
+        {
+            return Err(invalid(format!(
+                "Horizon source {} has a PoH mismatch at bucket {}",
+                archive_path.display(),
+                range.first_bucket
+            )));
+        }
+        if chain.initial_poh_anchor.is_none() {
+            chain.initial_poh_anchor = range.chain.initial_poh_anchor;
+        }
+        if range.chain.terminal_block.is_some() {
+            chain.terminal_block = range.chain.terminal_block;
+        }
+        decoded_slots = decoded_slots
+            .checked_add(range.visited_slots)
+            .ok_or_else(|| invalid("decoded slot count overflows u64"))?;
+    }
+    let expected_end = manifest.output_slot_end()?;
+    if expected_slot != expected_end {
+        return Err(invalid(format!(
+            "Horizon source slot coverage ended at {expected_slot}, expected {expected_end}"
+        )));
+    }
+    if expected_write != manifest.emitted_raw_write_versions.end {
+        return Err(invalid(format!(
+            "Horizon source raw writes ended at {expected_write}, expected {}",
+            manifest.emitted_raw_write_versions.end
+        )));
+    }
+    Ok(decoded_slots)
 }
 
 fn open_regular_file(path: &Path, operation: &'static str) -> Result<File, SegmentManifestError> {
@@ -839,12 +1056,28 @@ mod tests {
         expected: Range<u64>,
         versions: &[u64],
     ) -> Result<(), SegmentManifestError> {
-        let mut visitor = SegmentValidationVisitor::new(SLOT_START, expected);
+        let expected_start = expected.start;
+        let expected_end = expected.end;
+        let mut visitor = test_bucket_visitor(expected);
         visitor.on_slot_start(SLOT_START, SlotKind::Block);
         for &version in versions {
             visitor.accept_write(SLOT_START, version);
         }
-        visitor.finish()
+        let evidence = visitor.finish(0, 1)?;
+        let actual_end = evidence.next_write.unwrap_or(expected_start);
+        if actual_end != expected_end {
+            return Err(invalid(format!(
+                "Horizon source raw writes ended at {actual_end}, expected {expected_end}"
+            )));
+        }
+        Ok(())
+    }
+
+    fn test_bucket_visitor(expected: Range<u64>) -> SegmentBucketVisitor {
+        let mut visitor = SegmentBucketVisitor::new(expected);
+        visitor.first_slot = Some(SLOT_START);
+        visitor.next_slot = Some(SLOT_START);
+        visitor
     }
 
     fn hash(byte: u8) -> Hash {
@@ -930,7 +1163,10 @@ mod tests {
             EPOCH,
             SLOT_START,
             SLOT_COUNT,
-            ArchiveWriterConfig::default(),
+            ArchiveWriterConfig {
+                bucket_slots: 1,
+                ..ArchiveWriterConfig::default()
+            },
             &provenance(),
         )
         .unwrap();
@@ -1022,27 +1258,106 @@ mod tests {
 
     #[test]
     fn segment_write_permutations_cannot_cross_slot_boundaries() {
-        let mut visitor = SegmentValidationVisitor::new(SLOT_START, 100..103);
+        let mut visitor = test_bucket_visitor(100..103);
         visitor.on_slot_start(SLOT_START, SlotKind::Block);
         visitor.accept_write(SLOT_START, 100);
         visitor.accept_write(SLOT_START, 102);
         visitor.on_slot_start(SLOT_START + 1, SlotKind::Block);
         visitor.accept_write(SLOT_START + 1, 101);
-        assert!(visitor.finish().is_err());
+        assert!(visitor.finish(0, 2).is_err());
+    }
+
+    #[test]
+    fn parallel_range_merge_rejects_cross_range_write_gap() {
+        let mut evidence = manifest();
+        evidence.emitted_raw_write_versions = 100..104;
+        evidence.terminal.next_write_version = 104;
+        let anchor = hash(20);
+        let boundary = hash(21);
+        let ranges = vec![
+            SegmentBucketRangeEvidence {
+                first_bucket: 0,
+                first_slot: SLOT_START,
+                next_slot: SLOT_START + 1,
+                first_write: Some(100),
+                next_write: Some(102),
+                visited_slots: 1,
+                chain: SegmentChainEvidence {
+                    initial_poh_anchor: Some(anchor),
+                    terminal_block: Some(SegmentBlockEvidence {
+                        blockhash: boundary,
+                    }),
+                },
+            },
+            SegmentBucketRangeEvidence {
+                first_bucket: 1,
+                first_slot: SLOT_START + 1,
+                next_slot: SLOT_START + 2,
+                first_write: Some(103),
+                next_write: Some(104),
+                visited_slots: 1,
+                chain: SegmentChainEvidence {
+                    initial_poh_anchor: Some(boundary),
+                    terminal_block: None,
+                },
+            },
+        ];
+        let error =
+            merge_horizon_bucket_ranges(Path::new("epoch-1.jet"), &evidence, ranges).unwrap_err();
+        assert!(error.to_string().contains("expected 102, got 103"));
+    }
+
+    #[test]
+    fn parallel_range_merge_rejects_cross_range_poh_mismatch() {
+        let evidence = manifest();
+        let anchor = hash(20);
+        let boundary = hash(21);
+        let ranges = vec![
+            SegmentBucketRangeEvidence {
+                first_bucket: 0,
+                first_slot: SLOT_START,
+                next_slot: SLOT_START + 1,
+                first_write: None,
+                next_write: None,
+                visited_slots: 1,
+                chain: SegmentChainEvidence {
+                    initial_poh_anchor: Some(anchor),
+                    terminal_block: Some(SegmentBlockEvidence {
+                        blockhash: boundary,
+                    }),
+                },
+            },
+            SegmentBucketRangeEvidence {
+                first_bucket: 1,
+                first_slot: SLOT_START + 1,
+                next_slot: SLOT_START + 2,
+                first_write: None,
+                next_write: None,
+                visited_slots: 1,
+                chain: SegmentChainEvidence {
+                    initial_poh_anchor: Some(hash(22)),
+                    terminal_block: None,
+                },
+            },
+        ];
+        let error =
+            merge_horizon_bucket_ranges(Path::new("epoch-1.jet"), &evidence, ranges).unwrap_err();
+        assert!(error.to_string().contains("PoH mismatch at bucket 1"));
     }
 
     #[test]
     fn segment_write_validation_handles_u64_end_without_range_sized_allocation() {
-        let mut visitor = SegmentValidationVisitor::new(SLOT_START, 0..u64::MAX);
+        let mut visitor = test_bucket_visitor(0..u64::MAX);
         // Memory is proportional to writes observed in the current slot, not
         // the attacker-controlled numeric span declared by the sidecar.
         assert_eq!(visitor.slot_writes.capacity(), 0);
 
-        visitor = SegmentValidationVisitor::new(SLOT_START, (u64::MAX - 2)..u64::MAX);
+        visitor = test_bucket_visitor((u64::MAX - 2)..u64::MAX);
         visitor.on_slot_start(SLOT_START, SlotKind::Block);
         visitor.accept_write(SLOT_START, u64::MAX - 1);
         visitor.accept_write(SLOT_START, u64::MAX - 2);
-        visitor.finish().unwrap();
+        let evidence = visitor.finish(0, 1).unwrap();
+        assert_eq!(evidence.next_write, Some(u64::MAX));
     }
 
     #[test]

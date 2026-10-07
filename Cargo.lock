@@ -4857,6 +4857,7 @@ dependencies = [
  "lencode",
  "libc",
  "log",
+ "md-5",
  "rayon",
  "reqwest 0.13.3",
  "ripget 0.1.0",

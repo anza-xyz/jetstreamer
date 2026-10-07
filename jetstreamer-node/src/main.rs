@@ -65,6 +65,7 @@ use jetstreamer_node::snapshots::{
     download_snapshot_at_or_before_slot_matching, list_snapshots_in_slot_range_matching,
 };
 use log::{error, info, warn};
+use md5::Md5;
 use rayon::prelude::*;
 use reqwest::{
     Client, StatusCode, Url,
@@ -5578,7 +5579,7 @@ fn manifest_runtime_matches_cohort(
         && std::ptr::eq(selection.descriptor, &compatibility::SOLANA_V1_5_8_RUNTIME)
 }
 
-const COHORT_MANIFEST_SCHEMA: &str = "jetstreamer-gcs-snapshot-preflight-v2";
+const COHORT_MANIFEST_SCHEMA: &str = "jetstreamer-gcs-snapshot-preflight-v3";
 const COHORT_PUBLICATION_GATE: &str = "all-archives-validated-and-final-root-verified";
 const COHORT_MANIFEST_MAX_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_ROOT_CHECKPOINT_COHORT_EPOCHS: u64 = 4096;
@@ -5591,6 +5592,7 @@ struct CohortManifestSnapshot {
     crc32c: String,
     extension: String,
     generation: u64,
+    md5_hash: String,
     size: u64,
     slot: Slot,
     source: String,
@@ -5815,6 +5817,18 @@ fn validate_cohort_manifest_snapshot(
     if decoded_crc.len() != 4 {
         return Err(format!(
             "cohort manifest object {} CRC32C does not decode to four bytes",
+            item.versioned_uri
+        ));
+    }
+    let decoded_md5 = BASE64_STANDARD.decode(&item.md5_hash).map_err(|error| {
+        format!(
+            "cohort manifest object {} has invalid MD5: {error}",
+            item.versioned_uri
+        )
+    })?;
+    if decoded_md5.len() != 16 || BASE64_STANDARD.encode(&decoded_md5) != item.md5_hash {
+        return Err(format!(
+            "cohort manifest object {} MD5 is not canonical base64 for sixteen bytes",
             item.versioned_uri
         ));
     }
@@ -6120,6 +6134,7 @@ fn bind_cohort_snapshot_download(
         ));
     }
     let mut sha256 = Sha256::new();
+    let mut md5 = Md5::new();
     let crc32c = Crc::<u32>::new(&CRC_32_ISCSI);
     let mut crc_digest = crc32c.digest();
     let mut buffer = [0u8; 128 * 1024];
@@ -6142,6 +6157,7 @@ fn bind_cohort_snapshot_download(
             ));
         }
         sha256.update(&buffer[..read]);
+        md5.update(&buffer[..read]);
         crc_digest.update(&buffer[..read]);
         offset += read as u64;
     }
@@ -6152,6 +6168,15 @@ fn bind_cohort_snapshot_download(
             path.display(),
             manifest.crc32c,
             actual_crc32c
+        ));
+    }
+    let actual_md5 = BASE64_STANDARD.encode(md5.finalize());
+    if actual_md5 != manifest.md5_hash {
+        return Err(format!(
+            "downloaded cohort bootstrap MD5 mismatch for {}: manifest {}, local {}",
+            path.display(),
+            manifest.md5_hash,
+            actual_md5
         ));
     }
     if jetstreamer_node::archive_checksum::archive_file_identity(&file).map_err(|error| {
@@ -19404,12 +19429,14 @@ mod early_snapshot_tests {
         let name = format!("snapshot-{slot}-{hash}.tar.bz2");
         let uri = format!("{DEFAULT_BUCKET}/{slot}/{name}");
         let crc = Crc::<u32>::new(&CRC_32_ISCSI).checksum(bytes);
+        let md5 = Md5::digest(bytes);
         serde_json::json!({
             "accounts_hash": hash.to_string(),
             "anchor_slot": slot,
             "crc32c": BASE64_STANDARD.encode(crc.to_be_bytes()),
             "extension": ".tar.bz2",
             "generation": generation,
+            "md5_hash": BASE64_STANDARD.encode(md5),
             "size": bytes.len(),
             "slot": slot,
             "source": "root",
@@ -19428,12 +19455,14 @@ mod early_snapshot_tests {
         let name = format!("snapshot-{slot}-{hash}.tar.bz2");
         let uri = format!("{DEFAULT_BUCKET}/{anchor_slot}/hourly/{name}");
         let crc = Crc::<u32>::new(&CRC_32_ISCSI).checksum(bytes);
+        let md5 = Md5::digest(bytes);
         serde_json::json!({
             "accounts_hash": hash.to_string(),
             "anchor_slot": anchor_slot,
             "crc32c": BASE64_STANDARD.encode(crc.to_be_bytes()),
             "extension": ".tar.bz2",
             "generation": generation,
+            "md5_hash": BASE64_STANDARD.encode(md5),
             "size": bytes.len(),
             "slot": slot,
             "source": "hourly",
@@ -20012,6 +20041,11 @@ mod early_snapshot_tests {
         fs::write(&path, generation_one).unwrap();
         let binding = bind_cohort_snapshot_download(&path, &plan.bootstrap).unwrap();
         binding.revalidate().unwrap();
+
+        let mut wrong_md5 = plan.bootstrap.clone();
+        wrong_md5.md5_hash = BASE64_STANDARD.encode([0u8; 16]);
+        let error = bind_cohort_snapshot_download(&path, &wrong_md5).unwrap_err();
+        assert!(error.contains("MD5 mismatch"), "{error}");
 
         fs::remove_file(&path).unwrap();
         fs::write(&path, generation_two).unwrap();

@@ -33,6 +33,7 @@ solana-message.workspace = true
 solana-runtime-transaction.workspace = true
 rayon.workspace = true
 log.workspace = true
+md-5.workspace = true
 bs58.workspace = true
 lencode.workspace = true
 libc.workspace = true

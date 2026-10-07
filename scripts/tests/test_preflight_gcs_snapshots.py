@@ -765,6 +765,10 @@ class SelectionTests(unittest.TestCase):
             manifest["verification_cohorts"][0]["publication_gate"],
             "all-archives-validated-and-final-root-verified",
         )
+        self.assertEqual(
+            manifest["verification_cohorts"][0]["bootstrap"]["md5_hash"],
+            MD5_HASH,
+        )
         self.assertEqual(manifest["epochs"][0]["runtime_state_source"], "root-bootstrap")
         self.assertEqual(
             manifest["epochs"][1]["runtime_state_source"],
@@ -859,6 +863,16 @@ class SelectionTests(unittest.TestCase):
 
 
 class ReportingAndAcquisitionTests(unittest.TestCase):
+    def test_manifest_rejects_selected_snapshot_without_md5(self) -> None:
+        root_raw, hourly_raw = complete_inventory()
+        root_raw[0]["metadata"].pop("md5Hash")
+        plans = preflight.build_epoch_plans(
+            preflight.parse_inventory_json(json.dumps(root_raw), "root"),
+            preflight.parse_inventory_json(json.dumps(hourly_raw), "hourly"),
+        )
+        with self.assertRaisesRegex(preflight.PreflightError, "has no GCS MD5 digest"):
+            preflight.build_manifest(plans)
+
     def test_manifest_fingerprint_is_order_independent_and_binds_metadata(self) -> None:
         root_raw, hourly_raw = complete_inventory()
         plans_a = preflight.build_epoch_plans(
@@ -893,6 +907,17 @@ class ReportingAndAcquisitionTests(unittest.TestCase):
         self.assertNotEqual(
             fingerprint_a,
             preflight.manifest_fingerprint(preflight.build_manifest(plans_changed)),
+        )
+
+        changed_md5 = copy.deepcopy(root_raw)
+        changed_md5[-1]["metadata"]["md5Hash"] = "AQAAAAAAAAAAAAAAAAAAAA=="
+        plans_changed_md5 = preflight.build_epoch_plans(
+            preflight.parse_inventory_json(json.dumps(changed_md5), "root"),
+            preflight.parse_inventory_json(json.dumps(hourly_raw), "hourly"),
+        )
+        self.assertNotEqual(
+            fingerprint_a,
+            preflight.manifest_fingerprint(preflight.build_manifest(plans_changed_md5)),
         )
 
     def test_storage_report_counts_only_exact_regular_local_bootstraps(self) -> None:

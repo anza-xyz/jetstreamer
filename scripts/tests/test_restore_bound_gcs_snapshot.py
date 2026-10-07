@@ -45,6 +45,12 @@ class BoundGcsSnapshotRestoreTest(unittest.TestCase):
             with self.subTest(invalid=invalid), self.assertRaises(restore.RestoreError):
                 restore.canonical_base64(invalid, 4, "CRC")
 
+    @patch("scripts.restore_bound_gcs_snapshot.available_bytes", return_value=99)
+    def test_free_space_gate_fails_closed(self, _available: object) -> None:
+        with self.assertRaisesRegex(restore.RestoreError, "below restore floor"):
+            restore.require_free_space(Path("/filesystem"), 100)
+        self.assertEqual(restore.require_free_space(Path("/filesystem"), 99), 99)
+
     def test_publish_is_noclobber_and_durable(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

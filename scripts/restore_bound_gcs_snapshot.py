@@ -99,6 +99,32 @@ def require_private_directory(path: Path, description: str) -> Path:
     return resolved
 
 
+def require_filesystem(path: Path) -> Path:
+    if not path.is_absolute():
+        raise RestoreError("filesystem must be an absolute directory")
+    try:
+        resolved = path.resolve(strict=True)
+    except OSError as error:
+        raise RestoreError(f"cannot resolve filesystem {path}: {error}") from error
+    if not resolved.is_dir():
+        raise RestoreError(f"filesystem is not a directory: {resolved}")
+    return resolved
+
+
+def available_bytes(path: Path) -> int:
+    filesystem = os.statvfs(path)
+    return filesystem.f_bavail * filesystem.f_frsize
+
+
+def require_free_space(path: Path, minimum_free_bytes: int) -> int:
+    free_bytes = available_bytes(path)
+    if free_bytes < minimum_free_bytes:
+        raise RestoreError(
+            f"available bytes {free_bytes} below restore floor {minimum_free_bytes} on {path}"
+        )
+    return free_bytes
+
+
 def sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as source:
@@ -242,6 +268,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--expected-crc32c", required=True)
     parser.add_argument("--expected-md5", required=True)
     parser.add_argument("--receipt", type=Path, required=True)
+    parser.add_argument("--filesystem", type=Path, required=True)
+    parser.add_argument("--minimum-free-bytes", type=int, required=True)
     return parser
 
 
@@ -253,6 +281,8 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         args.gcloud_bin = require_executable(args.gcloud_bin)
         if args.expected_size < 1:
             raise RestoreError("expected size must be positive")
+        if args.minimum_free_bytes < 1:
+            raise RestoreError("minimum free bytes must be positive")
         args.expected_crc32c = canonical_base64(args.expected_crc32c, 4, "expected CRC32C")
         args.expected_md5 = canonical_base64(args.expected_md5, 16, "expected MD5")
         if not args.destination.is_absolute() or args.destination.name != filename:
@@ -263,6 +293,7 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         args.destination = args.destination_parent / filename
         if not args.receipt.is_absolute() or args.receipt.name in ("", ".", ".."):
             raise RestoreError("receipt must be an absolute file path")
+        args.filesystem = require_filesystem(args.filesystem)
         args.generation = generation
         args.snapshot_slot = slot
     except RestoreError as error:
@@ -273,6 +304,7 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(sys.argv[1:] if argv is None else argv)
     destination: Path = args.destination
+    free_bytes_before = require_free_space(args.filesystem, args.minimum_free_bytes)
     if destination.exists() or destination.is_symlink():
         details = validate_file(
             args.gcloud_bin,
@@ -306,6 +338,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.expected_md5,
             )
             fsync_file_and_directory(temporary)
+            require_free_space(args.filesystem, args.minimum_free_bytes)
             if publish_noclobber(temporary, destination):
                 source = "generation-pinned-download"
             else:
@@ -317,6 +350,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     args.expected_md5,
                 )
                 source = "concurrent-verified-publication"
+
+    free_bytes_after = available_bytes(args.filesystem)
 
     payload = {
         "schema": RECEIPT_SCHEMA,
@@ -330,6 +365,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         "gcloud_bin": str(args.gcloud_bin),
         "gcloud_bin_sha256": sha256_file(args.gcloud_bin),
         "script_sha256": sha256_file(Path(__file__).resolve(strict=True)),
+        "filesystem": str(args.filesystem),
+        "minimum_free_bytes": args.minimum_free_bytes,
+        "available_bytes_before": free_bytes_before,
+        "available_bytes_after": free_bytes_after,
         "remote_mutations": False,
         "r2_mutations": False,
     }

@@ -34,7 +34,10 @@ epochs touch a slot interval marked unsupported by the checked-in runtime regist
    a long replay from `target/` in a mutable worktree. Initialize each recurring monitor's
    last-observed state from the replay's authoritative launch time before starting its timer, then
    run the monitor once manually to prove it can write evidence. A monitor setup failure does not
-   justify restarting a healthy producer.
+   justify restarting a healthy producer. Give every automatic retry a distinct diagnostic output
+   and scratch path, or use a proven launcher that preserves the failed attempt before the next
+   `.jet` is opened; otherwise use a non-restarting unit and relaunch manually after evidence
+   capture. Never let `Restart=on-failure` truncate the only partial archive from the failed run.
 5. Before the first replay, record each unit's exact scratch path and keep the diagnostic evidence
    needed after failure outside that tree. Failed-replay scratch cleanup is authorized by default:
    once failure is confirmed, stop the service and retry path, preserve its logs, replay state,
@@ -51,6 +54,11 @@ epochs touch a slot interval marked unsupported by the checked-in runtime regist
    identifies any removed generation-pinned download, record before/after free space, and preserve
    every required input, resumable state tree, diagnostic artifact, checkpoint, receipt, public
    archive, and R2 object.
+7. Include mmap capacity in the host preflight. Record `vm.max_map_count`, live historical-worker
+   map counts, and the snapshot/account-store baseline. Legacy AppendVec creation may silently exit
+   status 1 at the VMA ceiling because its error log is not necessarily initialized. Establish and
+   persist a host-approved limit with enough full-run growth headroom before launching multiple
+   workers; do not infer this safety from spare CPU, RAM, or disk.
 
 Inventory canonical archive/sidecar pairs in R2 before scheduling. The sidecar is the remote
 completion marker, but a private receipt from another host is not portable completion evidence.

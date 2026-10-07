@@ -43,7 +43,7 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
 ## Produce and verify
 
 - Use the repository's sealed historical replay/controller path and automatic slot-range runtime selection. Do not invent a compatibility override.
-- Run generation and long-lived verification/upload watchers in persistent systemd units so loss of the interactive session cannot kill them. Set `Restart=on-failure` with a bounded retry delay; do not use `Restart=always`, because successful completion must remain terminal. Respect unrelated jobs and configured RAM/disk reserves.
+- Run generation and long-lived verification/upload watchers in persistent systemd units so loss of the interactive session cannot kill them. Use `Restart=on-failure` with a bounded retry delay only when every invocation gets isolated diagnostic output and scratch, or a proven launcher preserves the failed invocation's artifacts before opening the next output. A replay normally creates or truncates its `.jet` at startup, so never let an automatic retry reuse the same diagnostic archive path. Use a fail-closed non-restarting unit and relaunch manually after evidence capture when attempt isolation is unavailable. Do not use `Restart=always`, because successful completion must remain terminal. Respect unrelated jobs and configured RAM/disk reserves.
 - Before starting a recurring status timer, initialize its last-observed state to the replay's
   authoritative launch time and validate the monitor once manually. A timer that exists without
   this state is not monitoring the replay; diagnose monitor failures without restarting a healthy
@@ -58,6 +58,13 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
   configured per-worker disk admission budget and measured filesystem growth to leave the reserve
   intact before launching another cohort. If a manual canary set would violate that gate, stop the
   newest units and preserve their private run directories for later resumption.
+- Preflight the host's VMA ceiling for mmap-backed historical account stores as part of admission.
+  Compare `vm.max_map_count` with live worker map counts and the snapshot/store-file baseline, and
+  leave credible growth headroom for the full replay. Some legacy Solana AppendVec code logs an
+  mmap failure through an uninitialized logger and then calls `exit(1)`, which can otherwise look
+  like a silent worker EOF. When the limit is inadequate and host policy permits, raise it to a
+  documented persistent value before launch and record the effective value; this is independent
+  of free RAM, CPU, and disk checks.
 - Reclaim local disk proactively when admission is constrained, but only from positively
   reproducible caches and obsolete scratch generations. Resolve each deletion target to an exact
   canonical path, prove no live process or staged unit references it, preserve the manifest or

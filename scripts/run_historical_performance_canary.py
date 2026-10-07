@@ -242,6 +242,7 @@ def run_canary(target_slot: int, receipt: Path, command: Sequence[str]) -> int:
     cgroup_before = cgroup_snapshot(cgroup)
     child_usage_before = resource.getrusage(resource.RUSAGE_CHILDREN)
     filesystem_available_before = available_bytes()
+    systemd_invocation_id = os.environ.get("INVOCATION_ID")
     started_unix = time.time()
     started_monotonic = time.monotonic()
     process = subprocess.Popen(
@@ -347,6 +348,7 @@ def run_canary(target_slot: int, receipt: Path, command: Sequence[str]) -> int:
         "child_return_code": return_code,
         "external_signal": external_signal,
         "command": list(command),
+        "systemd_invocation_id": systemd_invocation_id,
         "first_progress": first_progress,
         "final_progress": final_progress,
         "progress_rates": progress_rates,

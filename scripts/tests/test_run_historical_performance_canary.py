@@ -7,6 +7,7 @@ import sys
 import tempfile
 import textwrap
 import unittest
+from unittest.mock import patch
 
 from scripts import run_historical_performance_canary as canary
 
@@ -93,7 +94,8 @@ class HistoricalPerformanceCanaryTest(unittest.TestCase):
         )
         with tempfile.TemporaryDirectory() as directory:
             receipt = Path(directory) / "receipt.json"
-            result = canary.run_canary(100, receipt, [sys.executable, "-c", child])
+            with patch.dict(os.environ, {"INVOCATION_ID": "test-invocation"}):
+                result = canary.run_canary(100, receipt, [sys.executable, "-c", child])
             self.assertEqual(result, 0)
             payload = json.loads(receipt.read_text())
             self.assertTrue(payload["target_reached"])
@@ -101,6 +103,7 @@ class HistoricalPerformanceCanaryTest(unittest.TestCase):
             self.assertEqual(payload["observed_overshoot_slots"], 1)
             self.assertEqual(payload["child_return_code"], 0)
             self.assertIsNone(payload["external_signal"])
+            self.assertEqual(payload["systemd_invocation_id"], "test-invocation")
             self.assertEqual(payload["first_progress"]["transactions"], 10)
             self.assertEqual(payload["final_progress"]["account_updates"], 30)
             self.assertGreaterEqual(payload["progress_rates"]["transactions_per_second"], 0)

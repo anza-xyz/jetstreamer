@@ -3,6 +3,23 @@
 Major project results, newest first. Each entry records the UTC date and the
 code revision that produced the result.
 
+## 2026-10-07: Segment-manifest validation accelerated 13.6x
+
+- Commit `860b2d955d69aba8a661276353b8819bca537f3b` splits indexed Horizon
+  bucket ranges across a bounded 16-thread pool while preserving full decode,
+  slot and raw-write coverage, PoH continuity across ranges, archive identity,
+  and the separate digest and durable-reread gates.
+- The independent epoch-201 fixture is 102,476,168,488 bytes. Its serial
+  validator took about 2 hours, 16 minutes, 28 seconds; the parallel validator
+  accepted the same immutable archive in 10 minutes, 2.349 seconds, a 13.59x
+  wall-time speedup at 170.13 MB/s.
+- The benchmark consumed 8,210.913 CPU-seconds (13.63 effective cores) and
+  reached its 64-GiB cgroup limit. Standalone 16-thread validators therefore
+  need at least 64 GiB and preferably 96 GiB; the pool remains bounded even on
+  larger hosts. The pass reproduced the same archive digest and qualification
+  evidence, left the private archive and manifest unchanged, created no
+  canonical checksum sidecar, and performed no R2 mutation.
+
 ## 2026-10-07: Exact Solana v1.6.16 qualified for epoch 201
 
 - Commit `0617cbdadaf7ef6a0a04a116d62f09204bc17985` introduced the bounded

@@ -12,6 +12,11 @@ epochs touch a slot interval marked unsupported by the checked-in runtime regist
 2. Confirm `HORIZON_S3_ENDPOINT`, `HORIZON_ACCESS_KEY_ID`, and
    `HORIZON_SECRET_ACCESS_KEY` are present without printing their values. Confirm an active gcloud
    account and read access to the snapshot buckets used by `scripts/preflight_gcs_snapshots.py`.
+   The historical snapshot bucket is requester-pays: every detached restore must bind the intended
+   account and billing project explicitly, not merely inherit an interactive default. Prove the
+   exact generation with those same flags before sealing the unit. Successful token refresh alone
+   is insufficient because an otherwise authenticated download can still fail with
+   `UserProjectMissing`.
 3. Keep public output in `${HORIZON_DIR:-$HOME/horizon}` and private runs, manifests, receipts,
    restore scratch, and controller state outside that directory. The public directory may contain
    only canonical `epoch-N.jet` and `epoch-N.jet.sha256` pairs. Before launching a service as an

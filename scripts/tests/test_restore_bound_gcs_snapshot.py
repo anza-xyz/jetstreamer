@@ -45,6 +45,33 @@ class BoundGcsSnapshotRestoreTest(unittest.TestCase):
             with self.subTest(invalid=invalid), self.assertRaises(restore.RestoreError):
                 restore.canonical_base64(invalid, 4, "CRC")
 
+    def test_cloud_identity_is_one_safe_token(self) -> None:
+        self.assertEqual(
+            restore.require_cloud_identity("user@example.com", "account"),
+            "user@example.com",
+        )
+        self.assertEqual(
+            restore.require_cloud_identity("principal-lane-200702", "project"),
+            "principal-lane-200702",
+        )
+        for invalid in ("", " two", "two words", "--project", "two/parts"):
+            with self.subTest(invalid=invalid), self.assertRaises(restore.RestoreError):
+                restore.require_cloud_identity(invalid, "identity")
+
+    def test_download_pins_account_billing_project_and_generation(self) -> None:
+        command = restore.download_command(
+            Path("/usr/bin/gcloud"),
+            URI,
+            Path("/private/payload"),
+            "user@example.com",
+            "principal-lane-200702",
+        )
+        self.assertEqual(command[:3], ["/usr/bin/gcloud", "storage", "cp"])
+        self.assertIn("--account=user@example.com", command)
+        self.assertIn("--billing-project=principal-lane-200702", command)
+        self.assertIn(URI, command)
+        self.assertEqual(command[-2:], ["/private/payload", "--quiet"])
+
     @patch("scripts.restore_bound_gcs_snapshot.available_bytes", return_value=99)
     def test_free_space_gate_fails_closed(self, _available: object) -> None:
         with self.assertRaisesRegex(restore.RestoreError, "below restore floor"):

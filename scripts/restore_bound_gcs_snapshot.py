@@ -26,6 +26,7 @@ VERSIONED_URI = re.compile(
 SNAPSHOT_NAME = re.compile(
     r"^snapshot-(?P<slot>0|[1-9][0-9]*)-[1-9A-HJ-NP-Za-km-z]+\.tar\.(?:zst|lz4|bz2)$"
 )
+CLOUD_IDENTITY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._@:-]*$")
 
 
 class RestoreError(RuntimeError):
@@ -82,6 +83,14 @@ def require_executable(path: Path) -> Path:
     if resolved.name != "gcloud":
         raise RestoreError(f"gcloud executable must resolve to a file named gcloud: {resolved}")
     return resolved
+
+
+def require_cloud_identity(value: str, description: str) -> str:
+    if CLOUD_IDENTITY.fullmatch(value) is None:
+        raise RestoreError(
+            f"{description} must be a nonempty single token containing only cloud identity characters"
+        )
+    return value
 
 
 def require_private_directory(path: Path, description: str) -> Path:
@@ -165,6 +174,25 @@ def local_hashes(gcloud: Path, path: Path) -> tuple[str, str]:
     return canonical_base64(crc32c, 4, "actual CRC32C"), canonical_base64(
         md5, 16, "actual MD5"
     )
+
+
+def download_command(
+    gcloud: Path,
+    versioned_uri: str,
+    destination: Path,
+    account: str,
+    billing_project: str,
+) -> list[str]:
+    return [
+        str(gcloud),
+        "storage",
+        "cp",
+        f"--account={account}",
+        f"--billing-project={billing_project}",
+        versioned_uri,
+        str(destination),
+        "--quiet",
+    ]
 
 
 def validate_file(
@@ -262,6 +290,8 @@ def write_receipt_noclobber(path: Path, payload: dict[str, Any]) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--gcloud-bin", type=Path, required=True)
+    parser.add_argument("--gcloud-account", required=True)
+    parser.add_argument("--billing-project", required=True)
     parser.add_argument("--versioned-uri", required=True)
     parser.add_argument("--destination", type=Path, required=True)
     parser.add_argument("--expected-size", type=int, required=True)
@@ -279,6 +309,12 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     try:
         filename, generation, slot = parse_versioned_uri(args.versioned_uri)
         args.gcloud_bin = require_executable(args.gcloud_bin)
+        args.gcloud_account = require_cloud_identity(
+            args.gcloud_account, "gcloud account"
+        )
+        args.billing_project = require_cloud_identity(
+            args.billing_project, "billing project"
+        )
         if args.expected_size < 1:
             raise RestoreError("expected size must be positive")
         if args.minimum_free_bytes < 1:
@@ -320,14 +356,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         ) as temporary_directory:
             temporary = Path(temporary_directory) / "payload"
             run_checked(
-                [
-                    str(args.gcloud_bin),
-                    "storage",
-                    "cp",
+                download_command(
+                    args.gcloud_bin,
                     args.versioned_uri,
-                    str(temporary),
-                    "--quiet",
-                ]
+                    temporary,
+                    args.gcloud_account,
+                    args.billing_project,
+                )
             )
             os.chmod(temporary, 0o600, follow_symlinks=False)
             details = validate_file(
@@ -364,6 +399,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         "file": details,
         "gcloud_bin": str(args.gcloud_bin),
         "gcloud_bin_sha256": sha256_file(args.gcloud_bin),
+        "gcloud_account": args.gcloud_account,
+        "billing_project": args.billing_project,
         "script_sha256": sha256_file(Path(__file__).resolve(strict=True)),
         "filesystem": str(args.filesystem),
         "minimum_free_bytes": args.minimum_free_bytes,

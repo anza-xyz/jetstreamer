@@ -114,6 +114,16 @@ evidence for a later reviewed registry change, not permission to publish by itse
    and confirm its slot-count equation; never assume it is `bootstrap + 1`, because predecessor
    snapshot warmup can begin before the epoch boundary where output starts. A candidate must
    reproduce those checkpoints before it can generate a publishable archive.
+   For the v1.6.16 epoch-208 qualification, make canonical slot `89,856,107` a required conflict
+   gate. Transactions 7 and 8 both succeed and consecutively write payer account
+   `FJwFtQFEyKEA4M6ZTrosTRPJphEpDA9ckUeMq9pRJdd4`: signature
+   `2jFfi2JubVwgEZd11pQZkX3kBHr9M4CjH5jbeULzJ4JijrfNwS8amU2ipd1Y3BZEfgWYQ143eVseceSn46TkPL1y`
+   leaves `848104700000` lamports, then signature
+   `3oKU6ZkBjX9SP6njWLoiSChvP87y73Y26GBuj6TL8X62nhZ1FABjDfYT3AZc4eS54fppWgFzyPCrSGHKFxDbuyov`
+   leaves `848104695000`. Pass these as the four atomic `--expected-conflict-*` options to
+   `jetstreamer-qualification-verify`. Require its digest-bound JSON evidence to show both
+   successful, correctly attributed writes and increasing write versions; a standalone RPC record
+   or unit test is not qualification evidence.
 4. Locate later runtime boundaries by evidence, not release dates. Extend the supported interval
    in bounded steps; add another descriptor or isolated restart whenever checkpoint or status
    evidence requires it. Update the compatibility table and focused registry tests with each

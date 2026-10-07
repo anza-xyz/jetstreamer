@@ -68,6 +68,13 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
   configured per-worker disk admission budget and measured filesystem growth to leave the reserve
   intact before launching another cohort. If a manual canary set would violate that gate, stop the
   newest units and preserve their private run directories for later resumption.
+- When a live replay's measured growth could cross the filesystem reserve before its next safe
+  milestone, use an actual-free-space guard rather than relying only on projections. Bind the guard
+  to the exact service invocation ID and zero-restart state, fsync a root-owned stop intent before
+  stopping that one producer, and make an intent-only interruption resumable even if free space
+  later recovers. Record completion only after the bound process is inactive. A reserve trip does
+  not authorize deleting its scratch, restarting it automatically, modifying remote objects, or
+  stopping any unbound invocation.
 - Before using scratch growth for admission or cross-host comparisons, resolve the exact live
   `--replay-scratch` argument from the service/process rather than measuring a lane, qualification,
   or retry parent. Record physical bytes, apparent bytes, file count, and a bounded-depth directory

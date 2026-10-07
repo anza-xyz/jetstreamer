@@ -73,10 +73,13 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
   CPUs, and AccountsDb also uses that value as its minimum store fan-out; a high-core host can
   therefore create many extra 4-MiB AppendVecs per busy slot even when replay uses little CPU.
   Confirm this with a per-slot store-count histogram rather than assuming transaction batching is
-  the cause. Before the next immutable generation, use a bounded same-snapshot A/B to select an
-  explicit value appropriate to the worker's actual CPU quota, comparing throughput, physical
-  bytes, file count, and VMAs. Pin the chosen environment in the launch manifest and repeat the
-  normal root/plugin qualification; never change it underneath a live replay.
+  the sole cause. A historical snapshot restored with AccountsDb caching disabled sends every
+  commit directly through store selection, so singleton transaction commits and the minimum-store
+  fan-out can amplify each other. Before the next immutable generation, use a bounded same-snapshot
+  A/B to select an explicit value appropriate to the worker's actual CPU quota, comparing
+  throughput, physical bytes, file count, and VMAs; measure commit-wave changes as a separate A/B.
+  Pin the chosen environment in the launch manifest and repeat the normal root/plugin qualification;
+  never change it underneath a live replay.
 - Preflight the host's VMA ceiling for mmap-backed historical account stores as part of admission.
   Compare `vm.max_map_count` with live worker map counts and the snapshot/store-file baseline, and
   leave credible growth headroom for the full replay. Some legacy Solana AppendVec code logs an

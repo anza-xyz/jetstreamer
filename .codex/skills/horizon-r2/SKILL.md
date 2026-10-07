@@ -91,6 +91,15 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
   known canonical conflicting-write slot before qualification.
   Pin the chosen environment in the launch manifest and repeat the normal root/plugin qualification;
   never change it underneath a live replay.
+- For a bounded performance cohort, capture cgroup CPU, memory peak/events, major-fault, pressure,
+  and I/O counters inside the persistent runner before and after its child; terminal service
+  cgroups may disappear before an external collector can read them. Keep target-slot detection
+  independent of optional throughput-counter parsing so a log-format change cannot let a canary
+  run past its bound. If the runner copies an immutable worker into scratch, make the safety guard
+  recognize the actual bound executable path as well as the source basename. Require exactly one
+  identifiable worker with readable maps in every active or activating lane and trip closed on
+  zero, multiple, or unreadable workers; test the guard against the copied path in a nested fake
+  cgroup before sealing it.
 - Preflight the host's VMA ceiling for mmap-backed historical account stores as part of admission.
   Compare `vm.max_map_count` with live worker map counts and the snapshot/store-file baseline, and
   leave credible growth headroom for the full replay. Some legacy Solana AppendVec code logs an

@@ -15,7 +15,8 @@ class HistoricalPerformanceLaunchTest(unittest.TestCase):
     @patch("scripts.launch_historical_performance_canaries.sample_unit")
     @patch("scripts.launch_historical_performance_canaries.run_systemctl")
     @patch("scripts.launch_historical_performance_canaries.fsync_directory")
-    @patch("scripts.launch_historical_performance_canaries.install_unit_noclobber")
+    @patch("scripts.launch_historical_performance_canaries.install_prepared_unit_noclobber")
+    @patch("scripts.launch_historical_performance_canaries.prepare_unit_installation")
     @patch("scripts.launch_historical_performance_canaries.require_unit_inactive")
     @patch("scripts.launch_historical_performance_canaries.require_unit_absent")
     @patch("scripts.launch_historical_performance_canaries.validate_admission")
@@ -24,6 +25,7 @@ class HistoricalPerformanceLaunchTest(unittest.TestCase):
         validate_admission: object,
         require_absent: object,
         require_inactive: object,
+        prepare: object,
         install: object,
         _fsync: object,
         systemctl: object,
@@ -35,6 +37,13 @@ class HistoricalPerformanceLaunchTest(unittest.TestCase):
             "old.timer", "loaded", "inactive", "dead", "success", 0, "old", 0
         )
         require_inactive.return_value = monitor
+        prepared = launch.PreparedInstallation(
+            Path("/drafts/cohort.service"),
+            Path("/etc/systemd/system/cohort.service"),
+            "c" * 64,
+            b"unit",
+        )
+        prepare.return_value = prepared
         install.return_value = {"destination": "/etc/systemd/system/cohort.service"}
         service = launch.UnitState(
             "cohort.service", "loaded", "active", "running", "success", 123, "new", 0
@@ -65,6 +74,53 @@ class HistoricalPerformanceLaunchTest(unittest.TestCase):
         )
         self.assertEqual(require_absent.call_count, 2)
         self.assertEqual(require_inactive.call_count, 2)
+
+    @patch("scripts.launch_historical_performance_canaries.install_prepared_unit_noclobber")
+    @patch("scripts.launch_historical_performance_canaries.prepare_unit_installation")
+    @patch("scripts.launch_historical_performance_canaries.require_unit_inactive")
+    @patch("scripts.launch_historical_performance_canaries.require_unit_absent")
+    @patch("scripts.launch_historical_performance_canaries.validate_admission")
+    def test_all_unit_drafts_are_prevalidated_before_first_installation(
+        self,
+        validate_admission: object,
+        _require_absent: object,
+        require_inactive: object,
+        prepare: object,
+        install: object,
+    ) -> None:
+        validate_admission.return_value = ({"manifest_sha256": "a" * 64}, "b" * 64)
+        require_inactive.return_value = launch.UnitState(
+            "old.timer", "loaded", "inactive", "dead", "success", 0, "old", 0
+        )
+        first = launch.PreparedInstallation(
+            Path("/drafts/one.service"),
+            Path("/etc/systemd/system/one.service"),
+            "c" * 64,
+            b"one",
+        )
+        prepare.side_effect = [first, launch.LaunchError("invalid second draft")]
+        manifest = {
+            "admission_receipt": "/admission.json",
+            "start_units": ["cohort.service", "guard.timer"],
+            "service_units": ["cohort.service"],
+            "timer_units": ["guard.timer"],
+            "inactive_monitor_unit": "old.timer",
+            "installations": [
+                {
+                    "source": "/drafts/one.service",
+                    "destination": "/etc/systemd/system/one.service",
+                    "sha256": "c" * 64,
+                },
+                {
+                    "source": "/drafts/two.service",
+                    "destination": "/etc/systemd/system/two.service",
+                    "sha256": "d" * 64,
+                },
+            ],
+        }
+        with self.assertRaisesRegex(launch.LaunchError, "invalid second"):
+            launch.launch(manifest)
+        install.assert_not_called()
 
     def test_install_unit_is_noclobber_and_digest_bound(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

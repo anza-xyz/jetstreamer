@@ -41,6 +41,14 @@ class UnitState:
     restarts: int
 
 
+@dataclass(frozen=True)
+class PreparedInstallation:
+    source: Path
+    destination: Path
+    sha256: str
+    data: bytes
+
+
 def sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as source:
@@ -138,13 +146,13 @@ def require_unit_inactive(unit: str) -> UnitState:
     return state
 
 
-def install_unit_noclobber(
+def prepare_unit_installation(
     source: Path,
     destination: Path,
     expected_sha256: str,
     systemd_directory: Path = SYSTEMD_DIRECTORY,
     required_uid: int = 0,
-) -> dict[str, Any]:
+) -> PreparedInstallation:
     if (
         not source.is_absolute()
         or not destination.is_absolute()
@@ -166,31 +174,56 @@ def install_unit_noclobber(
         or stat.S_IMODE(source_metadata.st_mode) != 0o444
     ):
         raise LaunchError(f"unit draft has unsafe identity: {source}")
+    if destination.exists() or destination.is_symlink():
+        raise FileExistsError(f"systemd unit destination already exists: {destination}")
     data = source.read_bytes()
     actual_sha256 = hashlib.sha256(data).hexdigest()
     if actual_sha256 != expected_sha256:
         raise LaunchError(
             f"unit draft SHA-256 mismatch for {source}: expected {expected_sha256}, got {actual_sha256}"
         )
+    return PreparedInstallation(source, destination, actual_sha256, data)
+
+
+def install_prepared_unit_noclobber(
+    prepared: PreparedInstallation,
+) -> dict[str, Any]:
     descriptor = os.open(
-        destination,
+        prepared.destination,
         os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
         0o644,
     )
     try:
         os.fchmod(descriptor, 0o644)
         with os.fdopen(descriptor, "wb", closefd=False) as output:
-            output.write(data)
+            output.write(prepared.data)
             output.flush()
             os.fsync(output.fileno())
     finally:
         os.close(descriptor)
     return {
-        "source": str(source),
-        "destination": str(destination),
-        "sha256": actual_sha256,
-        "bytes": len(data),
+        "source": str(prepared.source),
+        "destination": str(prepared.destination),
+        "sha256": prepared.sha256,
+        "bytes": len(prepared.data),
     }
+
+
+def install_unit_noclobber(
+    source: Path,
+    destination: Path,
+    expected_sha256: str,
+    systemd_directory: Path = SYSTEMD_DIRECTORY,
+    required_uid: int = 0,
+) -> dict[str, Any]:
+    prepared = prepare_unit_installation(
+        source,
+        destination,
+        expected_sha256,
+        systemd_directory,
+        required_uid,
+    )
+    return install_prepared_unit_noclobber(prepared)
 
 
 def fsync_directory(path: Path) -> None:
@@ -295,7 +328,7 @@ def launch(manifest: dict[str, Any]) -> dict[str, Any]:
     raw_installations = manifest.get("installations")
     if not isinstance(raw_installations, list) or not raw_installations:
         raise LaunchError("launch manifest installations must be a nonempty list")
-    installed: list[dict[str, Any]] = []
+    prepared_installations: list[PreparedInstallation] = []
     destinations: set[Path] = set()
     for raw in raw_installations:
         if not isinstance(raw, dict):
@@ -306,7 +339,12 @@ def launch(manifest: dict[str, Any]) -> dict[str, Any]:
         if destination in destinations or not isinstance(digest, str):
             raise LaunchError("duplicate or invalid launch installation")
         destinations.add(destination)
-        installed.append(install_unit_noclobber(source, destination, digest))
+        prepared_installations.append(
+            prepare_unit_installation(source, destination, digest)
+        )
+    installed = [
+        install_prepared_unit_noclobber(item) for item in prepared_installations
+    ]
     fsync_directory(SYSTEMD_DIRECTORY)
     run_systemctl(["daemon-reload"])
     monitor_after = require_unit_inactive(monitor_unit)

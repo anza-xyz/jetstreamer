@@ -569,7 +569,12 @@ Before a completed focused artifact is used as registry evidence, independently 
 validator requires the exact epoch, output start, bootstrap and terminal slots, runtime profile,
 worker SHA-256, and private root. It fully re-reads the Horizon source and bound segment manifest,
 rejects non-private or multiply linked files, and fails if a canonical `.sha256` publication
-sidecar exists.
+sidecar exists. When a candidate range contains a known canonical same-account conflict, supply
+the four `--expected-conflict-*` options together. The validator then seeks back into the already
+digest-bound archive and requires both named transactions to be successful, to retain exactly one
+write of the named account with the expected lamports, and to have increasing write versions. The
+durable JSON result includes that evidence; a partial option set, an out-of-range slot, a failed
+transaction, or incorrect write attribution fails closed.
 
 Eleven execution interventions are explicitly recorded in addition to the ordinary
 epoch-aligned pinned-worker snapshot restarts:

@@ -1,6 +1,7 @@
 //! Read-only, fail-closed validation of a focused qualification artifact.
 
 use {
+    jetstreamer_horizon::archive::{ArchiveReader, ExpectedConflictWrite, verify_conflict_slot},
     jetstreamer_node::{
         archive_checksum::archive_checksum_path,
         segment_manifest::{
@@ -9,13 +10,25 @@ use {
         },
     },
     serde_json::json,
+    solana_address::Address,
+    solana_signature::Signature,
     std::{
         env, fs,
+        fs::File,
+        io::BufReader,
         os::unix::fs::{MetadataExt as _, PermissionsExt as _},
         path::{Path, PathBuf},
         process,
+        str::FromStr,
     },
 };
+
+#[derive(Debug, Eq, PartialEq)]
+struct ConflictExpectation {
+    slot: u64,
+    account: Address,
+    writes: [ExpectedConflictWrite; 2],
+}
 
 #[derive(Debug, Eq, PartialEq)]
 struct Arguments {
@@ -27,6 +40,7 @@ struct Arguments {
     expected_terminal_slot: u64,
     expected_runtime_profile: String,
     expected_worker_sha256: String,
+    expected_conflict: Option<ConflictExpectation>,
 }
 
 fn usage(program: &str) -> String {
@@ -38,7 +52,11 @@ fn usage(program: &str) -> String {
   --expected-bootstrap-slot=SLOT \
   --expected-terminal-slot=SLOT \
   --expected-runtime-profile=NAME \
-  --expected-worker-sha256=HEX"#
+  --expected-worker-sha256=HEX \
+  [--expected-conflict-slot=SLOT \
+   --expected-conflict-account=ADDRESS \
+   --expected-conflict-first=INDEX,SIGNATURE,LAMPORTS \
+   --expected-conflict-second=INDEX,SIGNATURE,LAMPORTS]"#
     )
 }
 
@@ -69,6 +87,35 @@ fn validate_sha256(value: &str) -> Result<String, String> {
     Ok(value.to_owned())
 }
 
+fn parse_conflict_write(value: &str, name: &str) -> Result<ExpectedConflictWrite, String> {
+    let mut fields = value.split(',');
+    let transaction_index = fields
+        .next()
+        .ok_or_else(|| format!("--{name} is missing transaction index"))?
+        .parse()
+        .map_err(|error| format!("invalid --{name} transaction index: {error}"))?;
+    let signature = fields
+        .next()
+        .ok_or_else(|| format!("--{name} is missing signature"))
+        .and_then(|value| {
+            Signature::from_str(value)
+                .map_err(|error| format!("invalid --{name} signature: {error}"))
+        })?;
+    let lamports = fields
+        .next()
+        .ok_or_else(|| format!("--{name} is missing lamports"))?
+        .parse()
+        .map_err(|error| format!("invalid --{name} lamports: {error}"))?;
+    if fields.next().is_some() {
+        return Err(format!("--{name} must contain exactly three fields"));
+    }
+    Ok(ExpectedConflictWrite {
+        transaction_index,
+        signature,
+        lamports,
+    })
+}
+
 fn parse_arguments<I>(arguments: I) -> Result<Arguments, String>
 where
     I: IntoIterator<Item = String>,
@@ -81,6 +128,10 @@ where
     let mut expected_terminal_slot = None;
     let mut expected_runtime_profile = None;
     let mut expected_worker_sha256 = None;
+    let mut expected_conflict_slot = None;
+    let mut expected_conflict_account = None;
+    let mut expected_conflict_first = None;
+    let mut expected_conflict_second = None;
 
     for argument in arguments {
         if let Some(value) = argument.strip_prefix("--private-root=") {
@@ -120,12 +171,63 @@ where
         } else if let Some(value) = argument.strip_prefix("--expected-worker-sha256=") {
             let value = validate_sha256(value)?;
             take_once(&mut expected_worker_sha256, value, "expected-worker-sha256")?;
+        } else if let Some(value) = argument.strip_prefix("--expected-conflict-slot=") {
+            let value = parse_u64(value, "expected-conflict-slot")?;
+            take_once(&mut expected_conflict_slot, value, "expected-conflict-slot")?;
+        } else if let Some(value) = argument.strip_prefix("--expected-conflict-account=") {
+            let value = Address::from_str(value)
+                .map_err(|error| format!("invalid --expected-conflict-account: {error}"))?;
+            take_once(
+                &mut expected_conflict_account,
+                value,
+                "expected-conflict-account",
+            )?;
+        } else if let Some(value) = argument.strip_prefix("--expected-conflict-first=") {
+            let value = parse_conflict_write(value, "expected-conflict-first")?;
+            take_once(
+                &mut expected_conflict_first,
+                value,
+                "expected-conflict-first",
+            )?;
+        } else if let Some(value) = argument.strip_prefix("--expected-conflict-second=") {
+            let value = parse_conflict_write(value, "expected-conflict-second")?;
+            take_once(
+                &mut expected_conflict_second,
+                value,
+                "expected-conflict-second",
+            )?;
         } else if argument.starts_with('-') {
             return Err(format!("unknown option {argument:?}"));
         } else {
             take_once(&mut archive, PathBuf::from(argument), "archive")?;
         }
     }
+
+    let expected_conflict = match (
+        expected_conflict_slot,
+        expected_conflict_account,
+        expected_conflict_first,
+        expected_conflict_second,
+    ) {
+        (None, None, None, None) => None,
+        (Some(slot), Some(account), Some(first), Some(second)) => {
+            if first.transaction_index >= second.transaction_index {
+                return Err(
+                    "expected conflict transaction indices must be strictly increasing".to_string(),
+                );
+            }
+            Some(ConflictExpectation {
+                slot,
+                account,
+                writes: [first, second],
+            })
+        }
+        _ => {
+            return Err(
+                "the four --expected-conflict-* options must be supplied together".to_string(),
+            );
+        }
+    };
 
     Ok(Arguments {
         archive: archive.ok_or_else(|| "missing ARCHIVE".to_string())?,
@@ -141,6 +243,7 @@ where
             .ok_or_else(|| "missing --expected-runtime-profile".to_string())?,
         expected_worker_sha256: expected_worker_sha256
             .ok_or_else(|| "missing --expected-worker-sha256".to_string())?,
+        expected_conflict,
     })
 }
 
@@ -265,6 +368,43 @@ fn verify(arguments: &Arguments) -> Result<serde_json::Value, String> {
         );
     }
 
+    let conflict_write_gate = if let Some(expected) = &arguments.expected_conflict {
+        let output_end = manifest
+            .output_slot_start
+            .checked_add(manifest.output_slot_count)
+            .ok_or_else(|| "validated manifest output range overflows u64".to_string())?;
+        if expected.slot < manifest.output_slot_start || expected.slot >= output_end {
+            return Err(format!(
+                "expected conflict slot {} is outside validated output range [{}, {})",
+                expected.slot, manifest.output_slot_start, output_end
+            ));
+        }
+        let file = File::open(&archive)
+            .map_err(|error| format!("failed to open archive for conflict check: {error}"))?;
+        let mut reader = ArchiveReader::open(BufReader::new(file))
+            .map_err(|error| format!("failed to open archive for conflict check: {error}"))?;
+        let observed = verify_conflict_slot(
+            &mut reader,
+            expected.slot,
+            expected.account,
+            expected.writes,
+        )
+        .map_err(|error| format!("canonical conflict-slot check failed: {error}"))?;
+        Some(json!({
+            "validation": "pass",
+            "slot": expected.slot,
+            "account": expected.account.to_string(),
+            "writes": observed.map(|write| json!({
+                "transaction_index": write.transaction_index,
+                "signature": write.signature.to_string(),
+                "lamports": write.lamports,
+                "write_version": write.write_version,
+            })),
+        }))
+    } else {
+        None
+    };
+
     let archive_after = require_private_regular(&archive, "qualification archive")?;
     let manifest_after = require_private_regular(&manifest_path, "qualification manifest")?;
     require_absent(&checksum_path, "canonical checksum sidecar")?;
@@ -309,6 +449,7 @@ fn verify(arguments: &Arguments) -> Result<serde_json::Value, String> {
         "runtime_revision": manifest.runtime.runtime_revision,
         "runtime_admission": "candidate",
         "worker_executable_sha256": worker_sha256,
+        "conflict_write_gate": conflict_write_gate,
     }))
 }
 
@@ -404,6 +545,46 @@ mod tests {
         assert!(validate_sha256(&format!("{}g", "a".repeat(63))).is_err());
     }
 
+    #[test]
+    fn conflict_expectations_are_all_or_none_and_ordered() {
+        let account = Address::new_from_array([3; 32]);
+        let first_signature = Signature::from([1; 64]);
+        let second_signature = Signature::from([2; 64]);
+        let mut arguments = valid_arguments();
+        arguments.extend([
+            format!("--expected-conflict-slot={TEST_OUTPUT_START}"),
+            format!("--expected-conflict-account={account}"),
+            format!("--expected-conflict-first=7,{first_signature},11"),
+            format!("--expected-conflict-second=8,{second_signature},10"),
+        ]);
+        let parsed = parse_arguments(arguments.clone()).unwrap();
+        let conflict = parsed.expected_conflict.unwrap();
+        assert_eq!(conflict.slot, TEST_OUTPUT_START);
+        assert_eq!(conflict.account, account);
+        assert_eq!(conflict.writes[0].transaction_index, 7);
+        assert_eq!(conflict.writes[1].transaction_index, 8);
+
+        arguments.retain(|argument| !argument.starts_with("--expected-conflict-account="));
+        assert!(
+            parse_arguments(arguments)
+                .unwrap_err()
+                .contains("must be supplied together")
+        );
+
+        let mut reversed = valid_arguments();
+        reversed.extend([
+            format!("--expected-conflict-slot={TEST_OUTPUT_START}"),
+            format!("--expected-conflict-account={account}"),
+            format!("--expected-conflict-first=8,{first_signature},11"),
+            format!("--expected-conflict-second=7,{second_signature},10"),
+        ]);
+        assert!(
+            parse_arguments(reversed)
+                .unwrap_err()
+                .contains("strictly increasing")
+        );
+    }
+
     fn hash(byte: u8) -> Hash {
         Hash::new_from_array([byte; 32])
     }
@@ -493,7 +674,7 @@ mod tests {
         let directory = TempDir::new().unwrap();
         fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let archive = write_qualification_fixture(&directory);
-        let arguments = Arguments {
+        let mut arguments = Arguments {
             archive: archive.clone(),
             private_root: directory.path().to_path_buf(),
             expected_epoch: TEST_EPOCH,
@@ -502,10 +683,31 @@ mod tests {
             expected_terminal_slot: TEST_TERMINAL,
             expected_runtime_profile: "solana-v1.6.16".to_string(),
             expected_worker_sha256: sha256_hex_string(&TEST_WORKER_DIGEST),
+            expected_conflict: None,
         };
         let receipt = verify(&arguments).unwrap();
         assert_eq!(receipt["validation"], "pass");
         assert_eq!(receipt["canonical_checksum_sidecar_absent"], true);
+        assert!(receipt["conflict_write_gate"].is_null());
+
+        arguments.expected_conflict = Some(ConflictExpectation {
+            slot: TEST_OUTPUT_START,
+            account: Address::new_from_array([3; 32]),
+            writes: [
+                ExpectedConflictWrite {
+                    transaction_index: 7,
+                    signature: Signature::from([1; 64]),
+                    lamports: 11,
+                },
+                ExpectedConflictWrite {
+                    transaction_index: 8,
+                    signature: Signature::from([2; 64]),
+                    lamports: 10,
+                },
+            ],
+        });
+        assert!(verify(&arguments).unwrap_err().contains("expected a block"));
+        arguments.expected_conflict = None;
 
         let checksum = archive_checksum_path(&archive).unwrap();
         fs::write(&checksum, b"publication marker must be rejected\n").unwrap();

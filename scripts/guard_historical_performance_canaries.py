@@ -185,6 +185,25 @@ def stop_active_units(samples: Sequence[UnitSample]) -> list[dict[str, Any]]:
     ]
 
 
+def cohort_running(samples: Sequence[UnitSample]) -> bool:
+    return any(
+        sample.active_state in ("active", "activating") for sample in samples
+    )
+
+
+def stop_timer(unit: str) -> dict[str, Any]:
+    completed = subprocess.run(
+        ["systemctl", "stop", unit],
+        capture_output=True,
+        text=True,
+    )
+    return {
+        "unit": unit,
+        "return_code": completed.returncode,
+        "stderr": completed.stderr.strip(),
+    }
+
+
 def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--filesystem", type=Path, required=True)
@@ -230,24 +249,23 @@ def main(argv: Sequence[str] | None = None) -> int:
     }
     print(json.dumps(report, sort_keys=True), flush=True)
     if not reasons:
+        if not cohort_running(samples):
+            print(
+                json.dumps(
+                    {"cohort_finished": True, "timer_stop": stop_timer(args.timer_unit)},
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
         return 0
     stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(observed_at))
     write_json_noclobber(args.receipt_directory / f"guard-trip-{stamp}.json", report)
     stop_outcomes = stop_active_units(samples)
-    timer_stop = subprocess.run(
-        ["systemctl", "stop", args.timer_unit],
-        capture_output=True,
-        text=True,
-    )
     print(
         json.dumps(
             {
                 "stop_outcomes": stop_outcomes,
-                "timer_stop": {
-                    "unit": args.timer_unit,
-                    "return_code": timer_stop.returncode,
-                    "stderr": timer_stop.stderr.strip(),
-                },
+                "timer_stop": stop_timer(args.timer_unit),
             },
             sort_keys=True,
         ),

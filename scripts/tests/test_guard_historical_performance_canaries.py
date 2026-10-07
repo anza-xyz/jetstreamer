@@ -68,6 +68,8 @@ class HistoricalPerformanceGuardTest(unittest.TestCase):
             worker_vmas=None,
         )
         self.assertEqual(guard.trip_reasons(200, 100, 900_000, [finished]), [])
+        self.assertFalse(guard.cohort_running([finished]))
+        self.assertTrue(guard.cohort_running([finished, sample()]))
 
     @patch("scripts.guard_historical_performance_canaries.subprocess.run")
     def test_stops_all_active_units_in_one_systemd_transaction(self, run: object) -> None:

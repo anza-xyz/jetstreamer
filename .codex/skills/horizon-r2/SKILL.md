@@ -78,6 +78,11 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
   fan-out can amplify each other. Before the next immutable generation, use a bounded same-snapshot
   A/B to select an explicit value appropriate to the worker's actual CPU quota, comparing
   throughput, physical bytes, file count, and VMAs; measure commit-wave changes as a separate A/B.
+  A conflict-wave implementation must also preserve the pinned runtime's invalid-transaction lock
+  behavior: sanitize failures and duplicate account keys do not acquire locks, and repeated writable
+  keys within one transaction are not a cross-transaction attribution conflict. Differentially test
+  write/write and write/read barriers, independent batching, invalid duplicate-key handling, and the
+  known canonical conflicting-write slot before qualification.
   Pin the chosen environment in the launch manifest and repeat the normal root/plugin qualification;
   never change it underneath a live replay.
 - Preflight the host's VMA ceiling for mmap-backed historical account stores as part of admission.

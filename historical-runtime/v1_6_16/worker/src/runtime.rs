@@ -1889,6 +1889,19 @@ mod tests {
             write.pubkey == second_recipient.pubkey().as_ref()
                 && write.transaction_signature.as_ref() == Some(&second_signature)
         }));
+        let first_write_version = processed
+            .writes
+            .iter()
+            .find(|write| write.pubkey == first_recipient.pubkey().as_ref())
+            .unwrap()
+            .write_version;
+        let second_write_version = processed
+            .writes
+            .iter()
+            .find(|write| write.pubkey == second_recipient.pubkey().as_ref())
+            .unwrap()
+            .write_version;
+        assert!(first_write_version < second_write_version);
     }
 
     #[test]
@@ -1952,6 +1965,25 @@ mod tests {
         assert_eq!(
             attribution.get(mint_keypair.pubkey().as_ref()),
             Some(&Some(signature))
+        );
+
+        let following_recipient = Keypair::new();
+        let following = system_transaction::transfer(
+            &mint_keypair,
+            &following_recipient.pubkey(),
+            1,
+            state.bank.last_blockhash(),
+        );
+        let probe_transactions = [duplicate.clone(), following];
+        let probe = state.bank.prepare_batch(probe_transactions.iter());
+        assert_eq!(
+            probe.lock_results(),
+            &[Err(TransactionError::AccountLoadedTwice), Ok(())]
+        );
+        drop(probe);
+        assert_eq!(
+            transaction_waves(&state.bank, &probe_transactions),
+            vec![0..1, 1..2]
         );
 
         let request = request_for(&state, 0, 0, 1, &[duplicate]);

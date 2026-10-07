@@ -9,6 +9,38 @@ from scripts import collect_historical_performance_results as collect
 
 
 class HistoricalPerformanceResultsTest(unittest.TestCase):
+    def test_collector_binding_requires_exact_safe_digest_and_path(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            collector = Path(directory) / "collector.py"
+            collector.write_bytes(b"#!/usr/bin/env python3\n")
+            os.chmod(collector, 0o555)
+            digest = collect.sha256_file(collector)
+            manifest = {
+                "collector": {"path": str(collector), "sha256": digest}
+            }
+            self.assertEqual(
+                collect.validate_collector_binding(manifest, executable=collector),
+                {"path": str(collector), "sha256": digest},
+            )
+            with self.assertRaises(collect.CollectionError):
+                collect.validate_collector_binding(
+                    {
+                        "collector": {
+                            "path": str(collector),
+                            "sha256": "0" * 64,
+                        }
+                    },
+                    executable=collector,
+                )
+            other = Path(directory) / "other.py"
+            other.write_bytes(collector.read_bytes())
+            os.chmod(other, 0o555)
+            with self.assertRaises(collect.CollectionError):
+                collect.validate_collector_binding(manifest, executable=other)
+            os.chmod(collector, 0o775)
+            with self.assertRaises(collect.CollectionError):
+                collect.validate_collector_binding(manifest, executable=collector)
+
     def test_terminal_success_accepts_collected_systemd_metadata(self) -> None:
         for invocation_id, exec_main_code in (("invocation", 1), ("", 0)):
             state = collect.UnitState(
@@ -76,6 +108,40 @@ class HistoricalPerformanceResultsTest(unittest.TestCase):
             self.assertEqual(result["symlinks_not_followed"], 1)
             self.assertEqual(result["file_size_histogram"]["le_4_mib"], 1)
             self.assertEqual(result["file_size_histogram"]["gt_4_le_8_mib"], 1)
+
+    def test_tree_statistics_collects_appendvec_store_fanout_by_slot(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "accounts-state"
+            path_zero = root / "0"
+            path_one = root / "1"
+            path_zero.mkdir(parents=True)
+            path_one.mkdir()
+            for relative in (
+                "0/42.1",
+                "1/42.2",
+                "0/43.3",
+                "0/44.4",
+                "1/44.5",
+                "1/44.6",
+            ):
+                (root / relative).write_bytes(b"appendvec")
+            (path_zero / "not-an-appendvec").write_bytes(b"metadata")
+
+            result = collect.tree_statistics(root, collect_appendvec_slots=True)
+
+            self.assertEqual(result["regular_files"], 7)
+            self.assertEqual(
+                result["appendvec_store_fanout"],
+                {
+                    "recognized_appendvec_files": 6,
+                    "unrecognized_regular_files": 1,
+                    "slots_with_stores": 3,
+                    "minimum_stores_per_slot": 1,
+                    "maximum_stores_per_slot": 3,
+                    "mean_stores_per_slot": 2.0,
+                    "store_count_to_slot_count": {"1": 1, "2": 1, "3": 1},
+                },
+            )
 
     def test_validates_successful_canary_receipt(self) -> None:
         payload = {

@@ -26,6 +26,7 @@ PRIVATE_ROOT = Path("/home/ubuntu/.jetstreamer-private/performance-ab-202")
 VARIANT_NAME = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 UNIT_NAME = re.compile(r"^horizon-perf-epoch[0-9]+@[a-z0-9-]+\.service$")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
+APPENDVEC_FILE = re.compile(r"^(?P<slot>[0-9]+)\.(?P<store_id>[0-9]+)$")
 WAVE_METRICS = re.compile(
     r"historical execution wave metrics: reason=(?P<reason>\S+) "
     r"transactions=(?P<transactions>[0-9]+) waves=(?P<waves>[0-9]+) "
@@ -64,6 +65,42 @@ def sha256_file(path: Path) -> str:
         while chunk := source.read(1024 * 1024):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def validate_collector_binding(
+    manifest: dict[str, Any], executable: Path | None = None
+) -> dict[str, str]:
+    binding = manifest.get("collector")
+    if not isinstance(binding, dict):
+        raise CollectionError("results manifest lacks collector binding")
+    raw_path = binding.get("path")
+    expected_sha256 = binding.get("sha256")
+    if (
+        not isinstance(raw_path, str)
+        or not Path(raw_path).is_absolute()
+        or not isinstance(expected_sha256, str)
+        or SHA256.fullmatch(expected_sha256) is None
+    ):
+        raise CollectionError("results manifest has invalid collector binding")
+    declared = Path(raw_path)
+    running = Path(__file__) if executable is None else executable
+    try:
+        metadata = declared.lstat()
+        resolved_declared = declared.resolve(strict=True)
+        resolved_running = running.resolve(strict=True)
+    except OSError as error:
+        raise CollectionError(f"cannot resolve collector binding: {error}") from error
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_nlink != 1
+        or stat.S_IMODE(metadata.st_mode) & 0o022
+        or resolved_declared != resolved_running
+    ):
+        raise CollectionError("collector binding has unsafe or mismatched identity")
+    actual_sha256 = sha256_file(resolved_declared)
+    if actual_sha256 != expected_sha256:
+        raise CollectionError("collector executable digest does not match manifest")
+    return {"path": str(resolved_declared), "sha256": actual_sha256}
 
 
 def load_json_file(
@@ -188,7 +225,9 @@ def size_bucket(size: int) -> str:
     return "gt_1_gib"
 
 
-def tree_statistics(path: Path) -> dict[str, Any]:
+def tree_statistics(
+    path: Path, *, collect_appendvec_slots: bool = False
+) -> dict[str, Any]:
     root = path.resolve(strict=True)
     root_metadata = root.lstat()
     if not stat.S_ISDIR(root_metadata.st_mode):
@@ -200,6 +239,9 @@ def tree_statistics(path: Path) -> dict[str, Any]:
     physical_bytes = root_metadata.st_blocks * 512
     apparent_bytes = root_metadata.st_size
     histogram: dict[str, int] = {}
+    appendvec_stores_per_slot: dict[int, int] = {}
+    appendvec_files = 0
+    unrecognized_regular_files = 0
     for directory, names, filenames in os.walk(root, topdown=True, followlinks=False):
         directory_path = Path(directory)
         retained_names: list[str] = []
@@ -229,7 +271,17 @@ def tree_statistics(path: Path) -> dict[str, Any]:
             apparent_bytes += metadata.st_size
             bucket = size_bucket(metadata.st_size)
             histogram[bucket] = histogram.get(bucket, 0) + 1
-    return {
+            if collect_appendvec_slots:
+                match = APPENDVEC_FILE.fullmatch(name)
+                if match is None:
+                    unrecognized_regular_files += 1
+                else:
+                    slot = int(match.group("slot"))
+                    appendvec_files += 1
+                    appendvec_stores_per_slot[slot] = (
+                        appendvec_stores_per_slot.get(slot, 0) + 1
+                    )
+    result = {
         "path": str(root),
         "device": device,
         "physical_bytes": physical_bytes,
@@ -239,6 +291,28 @@ def tree_statistics(path: Path) -> dict[str, Any]:
         "symlinks_not_followed": symlinks,
         "file_size_histogram": dict(sorted(histogram.items())),
     }
+    if collect_appendvec_slots:
+        store_count_histogram: dict[int, int] = {}
+        for count in appendvec_stores_per_slot.values():
+            store_count_histogram[count] = store_count_histogram.get(count, 0) + 1
+        slots = len(appendvec_stores_per_slot)
+        result["appendvec_store_fanout"] = {
+            "recognized_appendvec_files": appendvec_files,
+            "unrecognized_regular_files": unrecognized_regular_files,
+            "slots_with_stores": slots,
+            "minimum_stores_per_slot": (
+                min(appendvec_stores_per_slot.values()) if slots else None
+            ),
+            "maximum_stores_per_slot": (
+                max(appendvec_stores_per_slot.values()) if slots else None
+            ),
+            "mean_stores_per_slot": (appendvec_files / slots if slots else None),
+            "store_count_to_slot_count": {
+                str(count): store_count_histogram[count]
+                for count in sorted(store_count_histogram)
+            },
+        }
+    return result
 
 
 def find_accounts_state(scratch: Path) -> Path:
@@ -453,7 +527,9 @@ def collect(manifest: dict[str, Any], launch: dict[str, Any]) -> dict[str, Any]:
         if not stat.S_ISREG(archive_metadata.st_mode):
             raise CollectionError(f"{name} archive is not regular")
         scratch_stats = tree_statistics(scratch)
-        accounts_stats = tree_statistics(find_accounts_state(scratch))
+        accounts_stats = tree_statistics(
+            find_accounts_state(scratch), collect_appendvec_slots=True
+        )
         transaction_delta = performance["transaction_delta"]
         scratch_stats["physical_bytes_per_million_transactions"] = (
             scratch_stats["physical_bytes"] * 1_000_000 / transaction_delta
@@ -544,6 +620,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     manifest, manifest_sha256 = load_json_file(
         args.manifest, "results manifest", required_uid=0
     )
+    collector_binding = validate_collector_binding(manifest)
     launch_path = manifest.get("launch_receipt")
     expected_launch_manifest = manifest.get("launch_manifest_sha256")
     if (
@@ -562,6 +639,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "observed_at_utc": datetime.now(timezone.utc).isoformat(),
         "manifest": str(args.manifest),
         "manifest_sha256": manifest_sha256,
+        "collector": collector_binding,
         "launch_receipt": launch_path,
         "launch_receipt_sha256": actual_launch_sha256,
         "evidence": evidence,

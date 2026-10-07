@@ -1,4 +1,6 @@
 import base64
+from contextlib import redirect_stdout
+import io
 import json
 import os
 from pathlib import Path
@@ -137,6 +139,74 @@ class BoundGcsSnapshotRestoreTest(unittest.TestCase):
         self.assertEqual(
             run.call_args.kwargs["env"]["CLOUDSDK_CORE_DISABLE_PROMPTS"], "1"
         )
+
+    @patch("scripts.restore_bound_gcs_snapshot.available_bytes", return_value=999)
+    @patch("scripts.restore_bound_gcs_snapshot.require_free_space", return_value=999)
+    @patch("scripts.restore_bound_gcs_snapshot.validate_file")
+    @patch("scripts.restore_bound_gcs_snapshot.describe_remote_snapshot")
+    def test_preexisting_snapshot_receipt_retains_remote_identity(
+        self,
+        describe: object,
+        validate: object,
+        _free_space: object,
+        _available: object,
+    ) -> None:
+        crc = base64.b64encode(b"1234").decode()
+        md5 = base64.b64encode(b"1234567890123456").decode()
+        remote_object = {
+            "bucket": restore.ALLOWED_BUCKET,
+            "name": f"87263434/{FILENAME}",
+            "generation": 1634789740125991,
+            "size": 8,
+            "crc32c_base64": crc,
+            "md5_base64": md5,
+            "id": f"{restore.ALLOWED_BUCKET}/87263434/{FILENAME}/1634789740125991",
+        }
+        describe.return_value = remote_object
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            os.chmod(root, 0o700)
+            gcloud = root / "gcloud"
+            gcloud.write_text("fake executable")
+            os.chmod(gcloud, 0o700)
+            destination = root / FILENAME
+            destination.write_bytes(b"snapshot")
+            os.chmod(destination, 0o600)
+            validate.return_value = {
+                "device": destination.stat().st_dev,
+                "inode": destination.stat().st_ino,
+                "size": 8,
+                "mtime_ns": destination.stat().st_mtime_ns,
+                "mode": 0o600,
+                "uid": os.geteuid(),
+                "crc32c_base64": crc,
+                "md5_base64": md5,
+            }
+            receipt = root / "receipt.json"
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(
+                    restore.main(
+                        [
+                            f"--gcloud-bin={gcloud}",
+                            "--gcloud-account=user@example.com",
+                            "--billing-project=principal-lane-200702",
+                            f"--versioned-uri={URI}",
+                            f"--destination={destination}",
+                            "--expected-size=8",
+                            f"--expected-crc32c={crc}",
+                            f"--expected-md5={md5}",
+                            f"--receipt={receipt}",
+                            f"--filesystem={root}",
+                            "--minimum-free-bytes=1",
+                        ]
+                    ),
+                    0,
+                )
+            payload = json.loads(receipt.read_text())
+            self.assertEqual(payload["source"], "preexisting-verified")
+            self.assertEqual(payload["remote_object"], remote_object)
+            describe.assert_called_once()
+            validate.assert_called_once()
 
     @patch("scripts.restore_bound_gcs_snapshot.available_bytes", return_value=99)
     def test_free_space_gate_fails_closed(self, _available: object) -> None:

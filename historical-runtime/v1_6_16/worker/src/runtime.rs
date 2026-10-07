@@ -1789,6 +1789,43 @@ mod tests {
     }
 
     #[test]
+    fn write_read_conflict_ends_the_current_execution_wave() {
+        let (state, mint_keypair) = test_state(2, Some(4));
+        let shared_account = Keypair::new();
+        let reader_payer = Keypair::new();
+        let independent_payer = Keypair::new();
+        let independent_recipient = Keypair::new();
+        let recent_blockhash = state.bank.last_blockhash();
+        let writer = system_transaction::transfer(
+            &mint_keypair,
+            &shared_account.pubkey(),
+            1,
+            recent_blockhash,
+        );
+        let reader = Transaction::new_signed_with_payer(
+            &[Instruction {
+                program_id: system_program::id(),
+                accounts: vec![AccountMeta::new_readonly(shared_account.pubkey(), false)],
+                data: vec![0xff],
+            }],
+            Some(&reader_payer.pubkey()),
+            &[&reader_payer],
+            recent_blockhash,
+        );
+        let independent = system_transaction::transfer(
+            &independent_payer,
+            &independent_recipient.pubkey(),
+            1,
+            recent_blockhash,
+        );
+
+        assert_eq!(
+            transaction_waves(&state.bank, &[writer, reader, independent]),
+            vec![0..1, 1..3]
+        );
+    }
+
+    #[test]
     fn poh_and_tick_invariants_fail_before_mutating_the_bank() {
         let (mut state, _mint_keypair) = test_state(2, Some(4));
         let initial_hash = state.last_entry_hash;

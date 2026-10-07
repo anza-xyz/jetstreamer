@@ -409,7 +409,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(sys.argv[1:] if argv is None else argv)
     destination: Path = args.destination
     free_bytes_before = require_free_space(args.filesystem, args.minimum_free_bytes)
-    remote_object: dict[str, Any] | None = None
+    remote_object = describe_remote_snapshot(
+        args.gcloud_bin,
+        args.versioned_uri,
+        args.gcloud_account,
+        args.billing_project,
+        args.expected_size,
+        args.expected_crc32c,
+        args.expected_md5,
+    )
     if destination.exists() or destination.is_symlink():
         details = validate_file(
             args.gcloud_bin,
@@ -420,15 +428,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         source = "preexisting-verified"
     else:
-        remote_object = describe_remote_snapshot(
-            args.gcloud_bin,
-            args.versioned_uri,
-            args.gcloud_account,
-            args.billing_project,
-            args.expected_size,
-            args.expected_crc32c,
-            args.expected_md5,
-        )
         with tempfile.TemporaryDirectory(
             prefix=f".{destination.name}.", suffix=".download", dir=args.destination_parent
         ) as temporary_directory:

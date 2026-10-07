@@ -130,6 +130,74 @@ class HistoricalReplayScratchRetirementTest(unittest.TestCase):
             with self.assertRaises(FileExistsError):
                 retire.write_json_noclobber(receipt, {})
 
+    @patch("scripts.retire_historical_replay_scratch.os.path.ismount", return_value=False)
+    @patch("scripts.retire_historical_replay_scratch.os.geteuid", return_value=0)
+    def test_intent_only_interruption_resumes_and_completion_is_idempotent(
+        self, _geteuid: object, _ismount: object
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            qualification = root / "qualification-204"
+            scratch = qualification / "replay-scratch-v15-retry3"
+            output = qualification / "diagnostic-output"
+            receipts = root / "scratch-retirement-receipts"
+            scratch.mkdir(parents=True)
+            output.mkdir()
+            receipts.mkdir(mode=0o700)
+            (scratch / "store").write_bytes(b"scratch")
+            archive = output / "epoch-204.jet"
+            archive.write_bytes(b"diagnostic archive")
+            validation_receipt = root / "validation.json"
+            validation_receipt.write_text("{}")
+            intent = receipts / "intent.json"
+            completion = receipts / "complete.json"
+            producer = "producer.service"
+            validator = "validator.service"
+            arguments = [
+                f"--scratch={scratch}",
+                f"--confirm-delete-exact={scratch}",
+                f"--producer-unit={producer}",
+                f"--validator-unit={validator}",
+                f"--validation-receipt={validation_receipt}",
+                "--expected-epoch=204",
+                f"--expected-archive={archive}",
+                f"--intent-receipt={intent}",
+                f"--completion-receipt={completion}",
+            ]
+
+            def sample(unit: str) -> retire.UnitState:
+                return successful_unit(unit)
+
+            with (
+                patch.object(retire, "PRIVATE_ROOT", root),
+                patch.object(retire, "ROOT_UID", os.getuid()),
+                patch.object(retire, "sample_unit", side_effect=sample),
+                patch.object(
+                    retire,
+                    "read_validation_receipt",
+                    return_value={"archive_sha256": "a" * 64},
+                ),
+                patch.object(retire, "process_references", return_value=[]),
+            ):
+                with patch.object(
+                    retire,
+                    "delete_exact_tree",
+                    side_effect=retire.RetirementError("simulated interruption"),
+                ):
+                    with self.assertRaisesRegex(retire.RetirementError, "interruption"):
+                        retire.main(arguments)
+                self.assertTrue(intent.is_file())
+                self.assertFalse(completion.exists())
+                self.assertTrue(scratch.is_dir())
+                with patch("builtins.print"):
+                    self.assertEqual(retire.main(arguments), 0)
+                    self.assertEqual(retire.main(arguments), 0)
+            self.assertFalse(scratch.exists())
+            self.assertTrue(completion.is_file())
+            completion_payload = json.loads(completion.read_text())
+            self.assertEqual(completion_payload["status"], "deleted")
+            self.assertEqual(completion_payload["intent_receipt"], str(intent))
+
 
 if __name__ == "__main__":
     unittest.main()

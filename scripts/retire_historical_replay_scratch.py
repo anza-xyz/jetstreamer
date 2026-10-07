@@ -20,6 +20,7 @@ from typing import Any, Sequence
 RECEIPT_SCHEMA = "jetstreamer-historical-scratch-retirement-v1"
 VALIDATION_SCHEMA = "jetstreamer-focused-qualification-artifact-validation-v1"
 PRIVATE_ROOT = Path("/home/ubuntu/.jetstreamer-private")
+ROOT_UID = 0
 UNIT_NAME = re.compile(r"^[A-Za-z0-9_.@-]+\.service$")
 
 
@@ -102,26 +103,42 @@ def require_terminal_success(state: UnitState) -> None:
         raise RetirementError(f"unit has not reached clean terminal success: {state}")
 
 
-def require_scratch(path: Path, private_root: Path = PRIVATE_ROOT) -> Path:
+def require_scratch(
+    path: Path, private_root: Path | None = None, *, allow_missing: bool = False
+) -> Path:
     if os.geteuid() != 0:
         raise RetirementError("scratch retirement must run as root")
     if not path.is_absolute():
         raise RetirementError("scratch path must be absolute")
+    if private_root is None:
+        private_root = PRIVATE_ROOT
     try:
         resolved_root = private_root.resolve(strict=True)
+        resolved_parent = path.parent.resolve(strict=True)
+        resolved_parent.relative_to(resolved_root)
+    except (OSError, ValueError) as error:
+        raise RetirementError(f"unsafe or unavailable scratch path {path}: {error}") from error
+    if (
+        resolved_parent != path.parent
+        or not path.name.startswith("replay-scratch-")
+        or resolved_parent.parent != resolved_root
+    ):
+        raise RetirementError(
+            f"scratch path must be directly beneath one private qualification root: {path}"
+        )
+    if not path.exists() and not path.is_symlink():
+        if allow_missing:
+            return path
+        raise RetirementError(f"scratch path is unavailable: {path}")
+    try:
         resolved = path.resolve(strict=True)
         metadata = path.lstat()
-        resolved.relative_to(resolved_root)
-    except (OSError, ValueError) as error:
+    except OSError as error:
         raise RetirementError(f"unsafe or unavailable scratch path {path}: {error}") from error
     if resolved != path or not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
         raise RetirementError(f"scratch path is not an exact real directory: {path}")
-    if not resolved.name.startswith("replay-scratch-") or os.path.ismount(resolved):
+    if os.path.ismount(resolved):
         raise RetirementError(f"scratch path is not an admitted replay scratch tree: {resolved}")
-    if resolved.parent.parent != resolved_root:
-        raise RetirementError(
-            f"scratch path must be directly beneath one private qualification root: {resolved}"
-        )
     return resolved
 
 
@@ -142,8 +159,10 @@ def read_validation_receipt(
     path: Path,
     expected_epoch: int,
     expected_archive: Path,
-    required_uid: int = 0,
+    required_uid: int | None = None,
 ) -> dict[str, Any]:
+    if required_uid is None:
+        required_uid = ROOT_UID
     try:
         metadata = path.lstat()
         raw = json.loads(path.read_text())
@@ -273,6 +292,48 @@ def write_json_noclobber(path: Path, payload: dict[str, Any]) -> None:
         os.close(directory)
 
 
+def read_retirement_receipt(
+    path: Path,
+    expected_status: str,
+    common: dict[str, Any],
+    required_uid: int | None = None,
+) -> tuple[dict[str, Any], str]:
+    if required_uid is None:
+        required_uid = ROOT_UID
+    try:
+        metadata = path.lstat()
+        payload = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as error:
+        raise RetirementError(f"cannot read retirement receipt {path}: {error}") from error
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != required_uid
+        or metadata.st_nlink != 1
+        or stat.S_IMODE(metadata.st_mode) & 0o077
+        or not isinstance(payload, dict)
+    ):
+        raise RetirementError(f"retirement receipt has unsafe identity: {path}")
+    expected = {
+        "schema": RECEIPT_SCHEMA,
+        "status": expected_status,
+        "scratch": common["scratch"],
+        "validation_receipt": common["validation_receipt"],
+        "validation_receipt_sha256": common["validation_receipt_sha256"],
+        "epoch": common["epoch"],
+        "archive": common["archive"],
+        "archive_sha256": common["archive_sha256"],
+        "r2_mutations": False,
+    }
+    if any(payload.get(key) != value for key, value in expected.items()):
+        raise RetirementError(f"retirement receipt does not bind this exact cleanup: {path}")
+    for key in ("producer", "validator"):
+        recorded = payload.get(key)
+        current = common[key]
+        if not isinstance(recorded, dict) or recorded.get("unit") != current.get("unit"):
+            raise RetirementError(f"retirement receipt has an invalid {key} binding")
+    return payload, sha256_file(path)
+
+
 def delete_exact_tree(path: Path) -> None:
     completed = subprocess.run(
         ["/usr/bin/find", str(path), "-xdev", "-depth", "-delete"],
@@ -311,9 +372,13 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(sys.argv[1:] if argv is None else argv)
-    scratch = require_scratch(args.scratch)
-    if args.intent_receipt.exists() or args.completion_receipt.exists():
-        raise RetirementError("retirement receipt path already exists")
+    intent_exists = args.intent_receipt.exists() or args.intent_receipt.is_symlink()
+    completion_exists = (
+        args.completion_receipt.exists() or args.completion_receipt.is_symlink()
+    )
+    if completion_exists and not intent_exists:
+        raise RetirementError("completion receipt exists without its deletion intent")
+    scratch = require_scratch(args.scratch, allow_missing=intent_exists)
     producer = sample_unit(args.producer_unit)
     validator = sample_unit(args.validator_unit)
     require_terminal_success(producer)
@@ -321,9 +386,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     validation = read_validation_receipt(
         args.validation_receipt, args.expected_epoch, args.expected_archive
     )
-    references = process_references(scratch)
-    if references:
-        raise RetirementError("live process still references scratch: " + "; ".join(references))
     common = {
         "schema": RECEIPT_SCHEMA,
         "scratch": str(scratch),
@@ -336,21 +398,49 @@ def main(argv: Sequence[str] | None = None) -> int:
         "archive_sha256": validation["archive_sha256"],
         "r2_mutations": False,
     }
-    free_before = available_bytes(scratch.parent)
-    write_json_noclobber(
-        args.intent_receipt,
-        {
-            **common,
-            "status": "deletion-intent-fsynced",
-            "observed_at_utc": datetime.now(timezone.utc).isoformat(),
-            "available_bytes_before": free_before,
-        },
-    )
-    delete_exact_tree(scratch)
+    references = process_references(scratch)
+    if references:
+        raise RetirementError("live process still references scratch: " + "; ".join(references))
+    if intent_exists:
+        intent, intent_sha256 = read_retirement_receipt(
+            args.intent_receipt, "deletion-intent-fsynced", common
+        )
+        free_before = intent.get("available_bytes_before")
+        if not isinstance(free_before, int) or isinstance(free_before, bool):
+            raise RetirementError("deletion intent has invalid pre-cleanup free bytes")
+    else:
+        free_before = available_bytes(scratch.parent)
+        write_json_noclobber(
+            args.intent_receipt,
+            {
+                **common,
+                "status": "deletion-intent-fsynced",
+                "observed_at_utc": datetime.now(timezone.utc).isoformat(),
+                "available_bytes_before": free_before,
+            },
+        )
+        intent_sha256 = sha256_file(args.intent_receipt)
+    if completion_exists:
+        completion, _ = read_retirement_receipt(
+            args.completion_receipt, "deleted", common
+        )
+        if completion.get("intent_receipt") != str(args.intent_receipt) or completion.get(
+            "intent_receipt_sha256"
+        ) != intent_sha256:
+            raise RetirementError("completion receipt does not bind the deletion intent")
+        if scratch.exists() or scratch.is_symlink():
+            raise RetirementError("completion receipt exists while scratch remains")
+        print(json.dumps(completion, sort_keys=True), flush=True)
+        return 0
+    if scratch.exists() or scratch.is_symlink():
+        require_scratch(scratch)
+        delete_exact_tree(scratch)
     completion = {
         **common,
         "status": "deleted",
         "observed_at_utc": datetime.now(timezone.utc).isoformat(),
+        "intent_receipt": str(args.intent_receipt),
+        "intent_receipt_sha256": intent_sha256,
         "available_bytes_before": free_before,
         "available_bytes_after": available_bytes(args.expected_archive.parent),
     }

@@ -25,7 +25,7 @@ use solana_sdk::{
     transaction::{Transaction, TransactionError},
 };
 use solana_vote_program::vote_instruction::VoteInstruction;
-use std::{cmp, collections::HashMap, env, path::Path, sync::Arc};
+use std::{cmp, collections::HashMap, env, ops::Range, path::Path, sync::Arc};
 use tempfile::TempDir;
 
 const MAX_AGE_CORRECTION_EPOCH: u64 = 14;
@@ -252,19 +252,20 @@ impl RuntimeState {
             let max_age = processing_max_age(self.stable_cluster, self.bank.epoch());
             // Old Faithful contains canonical entries with multiple successful
             // transactions that write the same account (for example mainnet
-            // slot 89_856_107).  Executing the whole entry as one Bank batch
-            // would turn the later transaction into AccountInUse, while the
-            // old attribution map could not associate both writes with their
-            // transaction signatures.  Execute in wire order and drain after
-            // each commit.  Conflict-free transactions are deterministic in
-            // either order, and conflicting transactions now retain the
-            // canonical sequential account state and write attribution.
-            for (index, transaction) in transactions.iter().enumerate() {
-                let signature = transaction
-                    .signatures
-                    .get(0)
-                    .map(|signature| signature.as_ref().to_vec());
-                let batch = self.bank.prepare_batch(std::iter::once(transaction));
+            // slot 89_856_107). A whole-entry batch would turn the later
+            // transaction into AccountInUse. Preserve wire order by ending a
+            // wave immediately before its first lock conflict, then commit the
+            // largest conflict-free consecutive prefix together. Writable
+            // keys are unique inside a wave, so drained writes retain exact
+            // signature attribution without forcing every transaction through
+            // a separate AccountsDb store call.
+            for wave in transaction_waves(&self.bank, &transactions) {
+                let wave_transactions = &transactions[wave.clone()];
+                let signatures_by_writable_key = writable_key_attribution(
+                    wave_transactions,
+                    self.bank.demote_sysvar_write_locks(),
+                )?;
+                let batch = self.bank.prepare_batch(wave_transactions.iter());
                 let (results, _balances, _inner_instructions, _log_messages) =
                     self.bank.load_execute_and_commit_transactions(
                         &batch,
@@ -275,60 +276,87 @@ impl RuntimeState {
                         &mut ExecuteTimings::default(),
                     );
                 drop(batch);
-                if env::var_os("JETSTREAMER_HISTORICAL_TRACE").is_some()
-                    && matches!(
-                        results.execution_results[0].0,
-                        Err(TransactionError::InstructionError(
-                            _,
-                            InstructionError::Custom(2)
-                        ))
-                    )
-                {
-                    let slot_hashes = self
-                        .bank
-                        .get_account(&slot_hashes::id())
-                        .and_then(|account| from_account::<SlotHashes, _>(&account));
-                    let vote = transaction
-                        .message
-                        .instructions
-                        .get(0)
-                        .and_then(|instruction| {
-                            bincode::deserialize::<VoteInstruction>(&instruction.data).ok()
-                        });
-                    eprintln!(
-                        "historical trace: bank_slot={} parent_slot={} parent_hash={:?} vote={:?} slot_hashes={:?}",
-                        self.bank.slot(),
-                        self.bank.parent_slot(),
-                        self.bank.parent().map(|parent| parent.hash()),
-                        vote,
-                        slot_hashes,
-                    );
+                if env::var_os("JETSTREAMER_HISTORICAL_TRACE").is_some() {
+                    for (transaction, result) in
+                        wave_transactions.iter().zip(&results.execution_results)
+                    {
+                        if !matches!(
+                            result.0,
+                            Err(TransactionError::InstructionError(
+                                _,
+                                InstructionError::Custom(2)
+                            ))
+                        ) {
+                            continue;
+                        }
+                        let slot_hashes = self
+                            .bank
+                            .get_account(&slot_hashes::id())
+                            .and_then(|account| from_account::<SlotHashes, _>(&account));
+                        let vote =
+                            transaction
+                                .message
+                                .instructions
+                                .get(0)
+                                .and_then(|instruction| {
+                                    bincode::deserialize::<VoteInstruction>(&instruction.data).ok()
+                                });
+                        eprintln!(
+                            "historical trace: bank_slot={} parent_slot={} parent_hash={:?} vote={:?} slot_hashes={:?}",
+                            self.bank.slot(),
+                            self.bank.parent_slot(),
+                            self.bank.parent().map(|parent| parent.hash()),
+                            vote,
+                            slot_hashes,
+                        );
+                    }
                 }
-                if let Some(error) = results.fee_collection_results[0].as_ref().err() {
+                if let Some((wave_index, error)) = results
+                    .fee_collection_results
+                    .iter()
+                    .enumerate()
+                    .find_map(|(index, result)| result.as_ref().err().map(|error| (index, error)))
+                {
                     return Err(format!(
                         "entry fee collection failed for transaction {}: {:?}",
-                        index, error
+                        wave.start + wave_index,
+                        error
                     ));
                 }
-                let fee_calculator = results.execution_results[0]
-                    .1
-                    .as_ref()
-                    .and_then(|nonce| nonce.fee_calculator())
-                    .or_else(|| {
-                        self.bank
-                            .get_fee_calculator(&transaction.message.recent_blockhash)
-                    })
-                    .ok_or_else(|| format!("missing fee calculator for transaction {}", index))?;
-                outcomes.push(TransactionOutcome {
-                    signature: signature.clone(),
-                    error: results.execution_results[0]
-                        .0
-                        .clone()
-                        .err()
-                        .map(normalize_transaction_error),
-                    fee: fee_calculator.calculate_fee(&transaction.message),
-                });
-                writes.extend(self.drain_writes(signature)?);
+                for (wave_index, transaction) in wave_transactions.iter().enumerate() {
+                    let index = wave.start + wave_index;
+                    let fee_calculator = results.execution_results[wave_index]
+                        .1
+                        .as_ref()
+                        .and_then(|nonce| nonce.fee_calculator())
+                        .or_else(|| {
+                            self.bank
+                                .get_fee_calculator(&transaction.message.recent_blockhash)
+                        })
+                        .ok_or_else(|| {
+                            format!("missing fee calculator for transaction {}", index)
+                        })?;
+                    outcomes.push(TransactionOutcome {
+                        signature: transaction
+                            .signatures
+                            .get(0)
+                            .map(|signature| signature.as_ref().to_vec()),
+                        error: results.execution_results[wave_index]
+                            .0
+                            .clone()
+                            .err()
+                            .map(normalize_transaction_error),
+                        fee: fee_calculator.calculate_fee(&transaction.message),
+                    });
+                }
+                let mut wave_writes = self.drain_writes(None)?;
+                for write in &mut wave_writes {
+                    write.transaction_signature = signatures_by_writable_key
+                        .get(write.pubkey.as_slice())
+                        .cloned()
+                        .unwrap_or(None);
+                }
+                writes.extend(wave_writes);
             }
         }
 
@@ -1071,6 +1099,53 @@ fn processing_max_age(stable_cluster: bool, epoch: u64) -> usize {
     }
 }
 
+/// Partition transactions into the largest consecutive prefixes accepted by
+/// the Bank's own account-lock implementation. Probing acquires no lasting
+/// locks and mutates no Bank state; dropping each batch before execution makes
+/// the first conflicting transaction the start of the next canonical wave.
+fn transaction_waves(bank: &Bank, transactions: &[Transaction]) -> Vec<Range<usize>> {
+    let mut waves = Vec::new();
+    let mut start = 0;
+    while start < transactions.len() {
+        let probe = bank.prepare_batch(transactions[start..].iter());
+        let conflict = probe.lock_results().iter().position(Result::is_err);
+        drop(probe);
+        let wave_len = conflict.unwrap_or(transactions.len() - start).max(1);
+        let end = start + wave_len;
+        waves.push(start..end);
+        start = end;
+    }
+    waves
+}
+
+fn writable_key_attribution(
+    transactions: &[Transaction],
+    demote_sysvar_write_locks: bool,
+) -> Result<HashMap<Vec<u8>, Option<Vec<u8>>>, String> {
+    let mut by_key = HashMap::new();
+    for transaction in transactions {
+        let signature = transaction
+            .signatures
+            .get(0)
+            .map(|signature| signature.as_ref().to_vec());
+        for (index, pubkey) in transaction.message.account_keys.iter().enumerate() {
+            if transaction
+                .message
+                .is_writable(index, demote_sysvar_write_locks)
+            {
+                let key = pubkey.as_ref().to_vec();
+                if by_key.insert(key.clone(), signature.clone()).is_some() {
+                    return Err(format!(
+                        "multiple transactions in one execution wave write account {}",
+                        pubkey
+                    ));
+                }
+            }
+        }
+    }
+    Ok(by_key)
+}
+
 fn normalize_account_write(write: OwnedAccountWrite, signature: Option<Vec<u8>>) -> AccountWrite {
     AccountWrite {
         slot: write.slot,
@@ -1569,6 +1644,10 @@ mod tests {
         let signature = transaction.signatures[0].as_ref().to_vec();
         let second_signature = second_transaction.signatures[0].as_ref().to_vec();
         let entry_transactions = vec![transaction.clone(), second_transaction.clone()];
+        assert_eq!(
+            transaction_waves(&state.bank, &entry_transactions),
+            vec![0..1, 1..2]
+        );
         let entry_hash = next_entry_hash(&state.last_entry_hash, 1, &entry_transactions);
         let processed = state
             .process_entry(EntryRequest {
@@ -1634,6 +1713,79 @@ mod tests {
             .writes
             .iter()
             .all(|write| write.transaction_signature.is_none()));
+    }
+
+    #[test]
+    fn independent_transactions_share_one_attributed_execution_wave() {
+        let leader = Pubkey::new_from_array([8; 32]);
+        let genesis = create_genesis_config_with_leader(1_000_000, &leader, 500_000);
+        let state_dir = snapshot::private_state_dir(None).unwrap();
+        let account_paths = snapshot::private_account_paths(&state_dir).unwrap();
+        let bank0 = Bank::new_with_paths(
+            &genesis.genesis_config,
+            account_paths,
+            &[],
+            None,
+            None,
+            AccountSecondaryIndexes::default(),
+            false,
+        );
+        let second_payer = Keypair::new();
+        bank0
+            .transfer(10_000, &genesis.mint_keypair, &second_payer.pubkey())
+            .unwrap();
+        let mut tick_hash = bank0.last_blockhash();
+        for tick in 0..bank0.ticks_per_slot() {
+            tick_hash = hashv(&[tick_hash.as_ref(), &tick.to_le_bytes()]);
+            bank0.register_tick(&tick_hash);
+        }
+        let mut state = RuntimeState::from_test_bank(bank0, false, state_dir);
+        let first_recipient = Keypair::new();
+        let second_recipient = Keypair::new();
+        let first = system_transaction::transfer(
+            &genesis.mint_keypair,
+            &first_recipient.pubkey(),
+            123,
+            state.bank.last_blockhash(),
+        );
+        let second = system_transaction::transfer(
+            &second_payer,
+            &second_recipient.pubkey(),
+            321,
+            state.bank.last_blockhash(),
+        );
+        let first_signature = first.signatures[0].as_ref().to_vec();
+        let second_signature = second.signatures[0].as_ref().to_vec();
+        let entry_transactions = vec![first.clone(), second.clone()];
+        assert_eq!(
+            transaction_waves(&state.bank, &entry_transactions),
+            vec![0..2]
+        );
+
+        let entry_hash = next_entry_hash(&state.last_entry_hash, 1, &entry_transactions);
+        let processed = state
+            .process_entry(EntryRequest {
+                slot: 1,
+                entry_index: 0,
+                num_hashes: 1,
+                hash: entry_hash.as_ref().to_vec(),
+                transactions: vec![
+                    bincode::serialize(&first).unwrap(),
+                    bincode::serialize(&second).unwrap(),
+                ],
+            })
+            .unwrap();
+        assert_eq!(processed.outcomes.len(), 2);
+        assert_eq!(processed.outcomes[0].error, None);
+        assert_eq!(processed.outcomes[1].error, None);
+        assert!(processed.writes.iter().any(|write| {
+            write.pubkey == first_recipient.pubkey().as_ref()
+                && write.transaction_signature.as_ref() == Some(&first_signature)
+        }));
+        assert!(processed.writes.iter().any(|write| {
+            write.pubkey == second_recipient.pubkey().as_ref()
+                && write.transaction_signature.as_ref() == Some(&second_signature)
+        }));
     }
 
     #[test]

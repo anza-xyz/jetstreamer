@@ -3,6 +3,23 @@
 Major project results, newest first. Each entry records the UTC date and the
 code revision that produced the result.
 
+## 2026-10-07: Exact Solana v1.4.19 qualified for epoch 134
+
+- Commit `e45134faefaceb5c5394196fc11f94887deeed0d` extends the exact v1.4.19
+  runtime through epoch 134 and starts v1.4.25 at epoch 135.
+- Exact v1.4.25 diverged at slot 58,011,466, returning
+  `ProgramFailedToComplete` for a transaction whose canonical result is
+  `ComputationalBudgetExceeded`.
+- An isolated v1.4.19 replay covered 7,724 slots from the generation-pinned
+  slot-58,011,320 snapshot, reproduced the canonical transaction result, and
+  matched accounts hash `4NGJU97xLttWc3MuLjvu2myJXeAGLvGeJ988uneYSuVj`
+  and bank hash `C986Gd3TCxMxroMVxPkvUivHg49GRVM16oY4VB7wDuyQ` at slot
+  58,019,044.
+- An independent qualification verifier accepted the complete private segment,
+  whose SHA-256 is
+  `af8a310da81738901cc93300c6c6d5bb6a2106e44a320c4b56db8aacea91765e`.
+  Normal epoch publication remains gated on its terminal canonical checkpoint.
+
 ## 2026-10-04: Mainnet epoch 131 published and verified in R2
 
 - Commits `343238c3e1cc15469df08a81fc2badf895fc125b`,

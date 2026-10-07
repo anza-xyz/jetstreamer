@@ -100,6 +100,16 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
   identifiable worker with readable maps in every active or activating lane and trip closed on
   zero, multiple, or unreadable workers; test the guard against the copied path in a nested fake
   cgroup before sealing it.
+- After a bounded performance cohort has a root-owned, fsynced result receipt containing every
+  lane's exact scratch measurements, retire its scratch promptly without discarding the evidence
+  needed to choose or qualify a winner. For a multi-lane cohort, bind every exact scratch path in
+  one root-owned plan, require all producer units to remain at clean terminal success, and scan
+  process command lines, maps, cwd/root/exe links, and file descriptors for live references. Fsync
+  one intent covering the complete set before the first deletion, make an intent-only interruption
+  safely resumable, and fsync completion only after every bound tree is absent. Preserve partial
+  diagnostic archives, segment manifests, canary/result/guard receipts, configurations, genesis,
+  journals, and immutable manifests outside the scratch trees. This cleanup never authorizes
+  publication, a canonical sidecar, or an R2 mutation.
 - Preflight the host's VMA ceiling for mmap-backed historical account stores as part of admission.
   Compare `vm.max_map_count` with live worker map counts and the snapshot/store-file baseline, and
   leave credible growth headroom for the full replay. Some legacy Solana AppendVec code logs an

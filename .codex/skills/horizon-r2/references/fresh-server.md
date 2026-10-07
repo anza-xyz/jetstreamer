@@ -124,6 +124,12 @@ evidence for a later reviewed registry change, not permission to publish by itse
    `jetstreamer-qualification-verify`. Require its digest-bound JSON evidence to show both
    successful, correctly attributed writes and increasing write versions; a standalone RPC record
    or unit test is not qualification evidence.
+   Before launch, also inspect the exact immutable worker's internal snapshot and entry bounds and
+   require them to admit the requested terminal slot. The focused planner's search envelope may be
+   wider than the current worker guard. If so, defer the lane until the worker bound is deliberately
+   extended in reviewed source, range tests and the relevant suites pass, the change is committed
+   and pushed to every required SSH remote, and a newly deployed immutable worker digest is bound
+   by the launch manifest. Planner acceptance must never be used to bypass a narrower worker guard.
 4. Locate later runtime boundaries by evidence, not release dates. Extend the supported interval
    in bounded steps; add another descriptor or isolated restart whenever checkpoint or status
    evidence requires it. Update the compatibility table and focused registry tests with each

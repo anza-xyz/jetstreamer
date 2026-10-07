@@ -148,6 +148,14 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
   replay can begin at `bootstrap_slot + 1` while recorded output begins at the epoch boundary.
   Independently check that `terminal_slot - output_slot_start + 1` equals the manifest's
   `output_slot_count`, and launch a distinct non-restarting attempt if an expectation was wrong.
+- Before scheduling or launching a focused qualification, separately prove that the exact immutable
+  worker's own snapshot and entry bounds admit the requested terminal slot. A parent focused planner
+  may intentionally describe a wider search envelope than the currently deployed worker accepts;
+  planner routing alone is not launch authority. If the terminal lies beyond the worker's internal
+  bound, defer that lane until a reviewed source change extends the bound, range tests and the
+  relevant suites pass, the change is committed and pushed to every required SSH remote, and a new
+  immutable worker digest is bound in the launch manifest. Never silently substitute a nearby epoch
+  or weaken the worker guard.
 
 ## Deliver
 

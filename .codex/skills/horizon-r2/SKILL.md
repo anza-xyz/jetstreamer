@@ -62,6 +62,12 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
   configured per-worker disk admission budget and measured filesystem growth to leave the reserve
   intact before launching another cohort. If a manual canary set would violate that gate, stop the
   newest units and preserve their private run directories for later resumption.
+- Before using scratch growth for admission or cross-host comparisons, resolve the exact live
+  `--replay-scratch` argument from the service/process rather than measuring a lane, qualification,
+  or retry parent. Record physical bytes, apparent bytes, file count, and a bounded-depth directory
+  breakdown for that exact generation. When growth is nonlinear, compare account-store file-size
+  distributions and disk/VMA growth per million transactions before attributing it to host capacity
+  or launching another worker.
 - Preflight the host's VMA ceiling for mmap-backed historical account stores as part of admission.
   Compare `vm.max_map_count` with live worker map counts and the snapshot/store-file baseline, and
   leave credible growth headroom for the full replay. Some legacy Solana AppendVec code logs an
@@ -78,6 +84,15 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
   public archives, and all R2 objects must remain untouched.
 - For adaptive ranges, start the controller with `--r2-receipt-directory "$HOME/.jetstreamer-private/r2-receipts" --r2-bucket BUCKET`. The controller accepts receipts from that exact bucket only for bytes already bound by its root-owned local completion attestation; R2 can replace local storage, but can never establish initial completion.
 - Start the current Horizon verification plugin as soon as each local archive is available. R2 work may run concurrently with replay of other epochs. An archive is eligible for upload only after its full and current-plugin receipts bind the same archive SHA-256. It is not eligible for local retirement until both adjacent-boundary receipts bind that digest as well. Preserve the canonical lowercase coreutils sidecar format: `<64 hex>  epoch-N.jet\n`.
+- Report single-job latency and fleet completion cadence separately. Historical slot density varies,
+  so compare transaction and account-update throughput as well as slots per second. For live memory,
+  CPU, disk, or VMA experiments, use incremental pre/post windows after a settling interval rather
+  than cumulative rates; preserve invocation identity and do not restart a healthy replay merely to
+  obtain a cleaner sample.
+- Time replay terminal, archive close/fsync, each full validation, plugin verification, boundary
+  verification, upload, remote readback, and sidecar publication as distinct phases. Parallelize or
+  overlap independent work when safe, but do not collapse a producer scan and an independent durable
+  reread into one trust event or remove a verification gate merely to improve end-to-end latency.
 - Before launching an independent focused-qualification validator, read the durable segment
   manifest and bind every expectation to it. In particular, pass its `output_slot_start`; do not
   substitute `bootstrap_slot + 1`. A predecessor snapshot may warm up before the target epoch, so

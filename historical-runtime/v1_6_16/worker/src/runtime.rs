@@ -1123,7 +1123,7 @@ fn writable_key_attribution(
     demote_sysvar_write_locks: bool,
 ) -> Result<HashMap<Vec<u8>, Option<Vec<u8>>>, String> {
     let mut by_key = HashMap::new();
-    for transaction in transactions {
+    for (transaction_index, transaction) in transactions.iter().enumerate() {
         let signature = transaction
             .signatures
             .get(0)
@@ -1134,16 +1134,25 @@ fn writable_key_attribution(
                 .is_writable(index, demote_sysvar_write_locks)
             {
                 let key = pubkey.as_ref().to_vec();
-                if by_key.insert(key.clone(), signature.clone()).is_some() {
-                    return Err(format!(
-                        "multiple transactions in one execution wave write account {}",
-                        pubkey
-                    ));
+                match by_key.get(&key) {
+                    Some((existing_index, _)) if *existing_index != transaction_index => {
+                        return Err(format!(
+                            "multiple transactions in one execution wave write account {}",
+                            pubkey
+                        ));
+                    }
+                    Some(_) => {}
+                    None => {
+                        by_key.insert(key, (transaction_index, signature.clone()));
+                    }
                 }
             }
         }
     }
-    Ok(by_key)
+    Ok(by_key
+        .into_iter()
+        .map(|(key, (_transaction_index, signature))| (key, signature))
+        .collect())
 }
 
 fn normalize_account_write(write: OwnedAccountWrite, signature: Option<Vec<u8>>) -> AccountWrite {
@@ -1822,6 +1831,39 @@ mod tests {
         assert_eq!(
             transaction_waves(&state.bank, &[writer, reader, independent]),
             vec![0..1, 1..3]
+        );
+    }
+
+    #[test]
+    fn duplicate_writable_key_inside_one_transaction_is_not_an_attribution_conflict() {
+        let (mut state, mint_keypair) = test_state(2, Some(4));
+        let recipient = Keypair::new();
+        let mut duplicate = system_transaction::transfer(
+            &mint_keypair,
+            &recipient.pubkey(),
+            1,
+            state.bank.last_blockhash(),
+        );
+        let signature = duplicate.signatures[0].as_ref().to_vec();
+        duplicate.message.account_keys[1] = duplicate.message.account_keys[0];
+
+        assert_eq!(
+            transaction_waves(&state.bank, &[duplicate.clone()]),
+            vec![0..1]
+        );
+        let attribution =
+            writable_key_attribution(&[duplicate.clone()], state.bank.demote_sysvar_write_locks())
+                .unwrap();
+        assert_eq!(attribution.len(), 1);
+        assert_eq!(
+            attribution.get(mint_keypair.pubkey().as_ref()),
+            Some(&Some(signature))
+        );
+
+        let request = request_for(&state, 0, 0, 1, &[duplicate]);
+        assert_eq!(
+            state.process_entry(request).unwrap_err(),
+            "entry fee collection failed for transaction 0: AccountLoadedTwice"
         );
     }
 

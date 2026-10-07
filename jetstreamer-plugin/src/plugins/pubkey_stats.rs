@@ -338,6 +338,7 @@ mod tests {
                 keyed_rewards: vec![],
                 num_partitions: None,
             },
+            commission_rate_in_basis_points: false,
             block_time,
             block_height: Some(slot),
             executed_transaction_count: 0,

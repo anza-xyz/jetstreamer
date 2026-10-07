@@ -208,7 +208,12 @@ Do not use `--legacy-etag-only` unless the user has explicitly established that 
 
 - Use SSH URLs for Git network operations. Select a currently loaded keychain agent socket for the
   active login session by verifying it with `ssh-add -l`; never hard-code an ephemeral socket path
-  from an earlier session.
+  from an earlier session. Check the inherited environment for required service credentials before
+  sourcing interactive shell startup files in a detached command. A startup file may attach to a
+  stale empty agent and return nonzero when it cannot prompt for the key passphrase even though a
+  different current-login socket is healthy. After any shell initialization, rediscover all
+  candidate sockets and select only one whose `ssh-add -l` succeeds and lists an identity; never
+  treat the socket exported by the startup file itself as proof that Git authentication is ready.
 - Never delete from R2, including during cleanup or retries.
 - Never use `--overwrite-existing` without both positive evidence that the existing remote `.jet` is erroneous and explicit user authorization for its replacement.
 - Upload the sidecar only after the complete `.jet` has passed remote readback and local source revalidation; the matching sidecar is the readiness marker.

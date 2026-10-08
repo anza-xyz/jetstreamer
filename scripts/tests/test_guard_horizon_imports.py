@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import sys
+import tempfile
 import unittest
 from unittest import mock
 
@@ -52,11 +54,17 @@ class GuardHorizonImportsTests(unittest.TestCase):
                 side_effect=[["validated-a"], RuntimeError("bad digest")],
             ),
             mock.patch.object(guard, "run", execute),
+            mock.patch.object(guard, "persist_pause_state") as persist,
             self.assertRaisesRegex(RuntimeError, "bad digest"),
         ):
-            guard.stop_controllers(controllers)
+            guard.stop_controllers(
+                "jetstreamer-root-import-test.service",
+                "a" * 32,
+                controllers,
+            )
 
         execute.assert_not_called()
+        persist.assert_not_called()
 
     def test_stop_controllers_captures_validated_late_arrivals(self) -> None:
         first = "jetstreamer-a-controller.service"
@@ -69,13 +77,18 @@ class GuardHorizonImportsTests(unittest.TestCase):
                 side_effect=lambda unit: ["resume", unit],
             ) as authenticate,
             mock.patch.object(guard, "run") as execute,
+            mock.patch.object(guard, "persist_pause_state") as persist,
             mock.patch.object(
                 guard,
                 "running_units",
                 side_effect=[{late}, set()],
             ),
         ):
-            commands = guard.stop_controllers((first,))
+            commands = guard.stop_controllers(
+                "jetstreamer-root-import-test.service",
+                "a" * 32,
+                (first,),
+            )
 
         self.assertEqual(
             commands,
@@ -86,12 +99,235 @@ class GuardHorizonImportsTests(unittest.TestCase):
             [mock.call(first), mock.call(late)],
         )
         self.assertEqual(
+            persist.call_args_list,
+            [
+                mock.call(
+                    "jetstreamer-root-import-test.service",
+                    "a" * 32,
+                    {first: ["resume", first]},
+                ),
+                mock.call(
+                    "jetstreamer-root-import-test.service",
+                    "a" * 32,
+                    {first: ["resume", first], late: ["resume", late]},
+                ),
+            ],
+        )
+        self.assertEqual(
             execute.call_args_list,
             [
                 mock.call(["/usr/bin/systemctl", "stop", first]),
                 mock.call(["/usr/bin/systemctl", "stop", late]),
             ],
         )
+
+    def test_pause_state_round_trip_and_extension(self) -> None:
+        importer = "jetstreamer-root-import-test.service"
+        invocation = "a" * 32
+        first = "jetstreamer-a-controller.service"
+        second = "jetstreamer-b-controller.service"
+        commands = {
+            first: ["/usr/bin/python3", "first", "--retry-failed"],
+        }
+        extended = {
+            **commands,
+            second: ["/usr/bin/python3", "second", "--retry-failed"],
+        }
+
+        with tempfile.TemporaryDirectory() as directory:
+            os.chmod(directory, 0o700)
+            with (
+                mock.patch.object(guard, "PAUSE_STATE_DIRECTORY", directory),
+                mock.patch.object(
+                    guard,
+                    "validate_controller_command",
+                    side_effect=lambda _unit, command: list(command),
+                ),
+            ):
+                self.assertIsNone(guard.load_pause_state())
+                guard.persist_pause_state(importer, invocation, commands)
+                self.assertEqual(
+                    guard.load_pause_state(),
+                    {
+                        "schema": guard.PAUSE_STATE_SCHEMA,
+                        "importer": importer,
+                        "importer_invocation_id": invocation,
+                        "controllers": commands,
+                    },
+                )
+                guard.persist_pause_state(importer, invocation, extended)
+                self.assertEqual(guard.load_pause_state()["controllers"], extended)
+                guard.remove_pause_state()
+                self.assertIsNone(guard.load_pause_state())
+
+    def test_pause_state_refuses_conflicting_importer(self) -> None:
+        controller = "jetstreamer-a-controller.service"
+        commands = {controller: ["/usr/bin/python3", "first", "--retry-failed"]}
+
+        with tempfile.TemporaryDirectory() as directory:
+            os.chmod(directory, 0o700)
+            with (
+                mock.patch.object(guard, "PAUSE_STATE_DIRECTORY", directory),
+                mock.patch.object(
+                    guard,
+                    "validate_controller_command",
+                    side_effect=lambda _unit, command: list(command),
+                ),
+            ):
+                guard.persist_pause_state(
+                    "jetstreamer-root-import-first.service",
+                    "a" * 32,
+                    commands,
+                )
+                with self.assertRaisesRegex(RuntimeError, "conflicts"):
+                    guard.persist_pause_state(
+                        "jetstreamer-root-import-second.service",
+                        "b" * 32,
+                        commands,
+                    )
+
+    def test_recovery_finishes_pause_before_waiting_for_importer(self) -> None:
+        importer = "jetstreamer-root-import-test.service"
+        invocation = "a" * 32
+        stopped = "jetstreamer-a-controller.service"
+        still_running = "jetstreamer-b-controller.service"
+        state = {
+            "importer": importer,
+            "importer_invocation_id": invocation,
+            "controllers": {stopped: ["resume", stopped]},
+        }
+        terminal = {
+            "InvocationID": invocation,
+            "NRestarts": "0",
+            "SubState": "exited",
+        }
+
+        with (
+            mock.patch.object(guard, "load_pause_state", return_value=state),
+            mock.patch.object(
+                guard,
+                "unit_properties",
+                return_value={
+                    "InvocationID": invocation,
+                    "NRestarts": "0",
+                    "SubState": "running",
+                },
+            ),
+            mock.patch.object(
+                guard,
+                "running_units",
+                return_value={still_running},
+            ),
+            mock.patch.object(
+                guard,
+                "stop_controllers",
+                return_value={
+                    stopped: ["resume", stopped],
+                    still_running: ["resume", still_running],
+                },
+            ) as stop,
+            mock.patch.object(guard, "wait_for_importer", return_value=terminal),
+            mock.patch.object(guard, "controllers_deliberately_paused", return_value=False),
+            mock.patch.object(guard, "start_controller") as start,
+            mock.patch.object(guard, "remove_pause_state") as remove,
+        ):
+            self.assertTrue(guard.recover_paused_controllers())
+
+        stop.assert_called_once_with(
+            importer,
+            invocation,
+            (still_running,),
+            known_commands={stopped: ["resume", stopped]},
+        )
+        self.assertEqual(start.call_count, 2)
+        remove.assert_called_once_with()
+
+    def test_recovery_accepts_collected_bound_importer_when_no_importer_is_live(self) -> None:
+        importer = "jetstreamer-root-import-test.service"
+        controller = "jetstreamer-a-controller.service"
+        command = ["resume", controller]
+        state = {
+            "importer": importer,
+            "importer_invocation_id": "a" * 32,
+            "controllers": {controller: command},
+        }
+
+        with (
+            mock.patch.object(guard, "load_pause_state", return_value=state),
+            mock.patch.object(
+                guard,
+                "unit_properties",
+                side_effect=[
+                    {
+                        "LoadState": "not-found",
+                        "ActiveState": "inactive",
+                        "SubState": "dead",
+                        "InvocationID": "",
+                    },
+                    {"LoadState": "not-found"},
+                ],
+            ),
+            mock.patch.object(guard, "running_units", return_value=set()),
+            mock.patch.object(guard, "controllers_deliberately_paused", return_value=False),
+            mock.patch.object(guard, "start_controller") as start,
+            mock.patch.object(guard, "remove_pause_state") as remove,
+        ):
+            self.assertTrue(guard.recover_paused_controllers())
+
+        start.assert_called_once_with(controller, command)
+        remove.assert_called_once_with()
+
+    def test_recovery_refuses_collected_importer_when_another_importer_is_live(self) -> None:
+        state = {
+            "importer": "jetstreamer-root-import-test.service",
+            "importer_invocation_id": "a" * 32,
+            "controllers": {
+                "jetstreamer-a-controller.service": ["resume"],
+            },
+        }
+
+        with (
+            mock.patch.object(guard, "load_pause_state", return_value=state),
+            mock.patch.object(
+                guard,
+                "unit_properties",
+                return_value={
+                    "LoadState": "not-found",
+                    "ActiveState": "inactive",
+                    "SubState": "dead",
+                    "InvocationID": "",
+                },
+            ),
+            mock.patch.object(
+                guard,
+                "running_units",
+                return_value={"jetstreamer-root-import-other.service"},
+            ),
+            mock.patch.object(guard, "start_controller") as start,
+            self.assertRaisesRegex(RuntimeError, "another importer is live"),
+        ):
+            guard.recover_paused_controllers()
+
+        start.assert_not_called()
+
+    def test_wait_for_importer_waits_through_deactivation(self) -> None:
+        deactivating = {
+            "ActiveState": "deactivating",
+            "SubState": "stop-sigterm",
+        }
+        terminal = {"ActiveState": "inactive", "SubState": "dead"}
+
+        with (
+            mock.patch.object(
+                guard,
+                "unit_properties",
+                side_effect=[deactivating, terminal],
+            ),
+            mock.patch.object(guard.time, "sleep") as sleep,
+        ):
+            self.assertEqual(guard.wait_for_importer("example.service"), terminal)
+
+        sleep.assert_called_once_with(guard.POLL_SECONDS)
 
     def test_command_reads_live_execstart_from_systemd(self) -> None:
         unit = "jetstreamer-example-controller-v1.service"

@@ -107,6 +107,14 @@ fn json_bool(value: &serde_json::Value, pointer: &str, label: &str) -> Result<bo
         .ok_or_else(|| format!("{label} JSON field {pointer} is not a boolean"))
 }
 
+fn epoch_edge_evidence<'a>(
+    value: &'a serde_json::Value,
+    epoch: u64,
+    label: &str,
+) -> Result<&'a serde_json::Value, String> {
+    json_path(value, &format!("/epoch{epoch}"), label)
+}
+
 fn validate_failure_evidence(value: &serde_json::Value, plan: &RecoveryPlan) -> Result<(), String> {
     let label = "failure evidence";
     let manifest = &plan.manifest;
@@ -146,25 +154,20 @@ fn validate_edge_evidence(value: &serde_json::Value, plan: &RecoveryPlan) -> Res
     let label = "archive edge evidence";
     let manifest = &plan.manifest;
     let expected_archive = plan.archive.to_string_lossy();
+    let epoch = epoch_edge_evidence(value, manifest.epoch, label)?;
     if json_str(value, "/schema", label)? != "horizon-private-archive-edge-evidence-v1"
-        || json_u64(value, "/epoch204/archive_bytes", label)? != plan.archive_identity.bytes
-        || json_str(value, "/epoch204/archive", label)? != expected_archive
-        || json_u64(value, "/epoch204/output_start_slot", label)? != manifest.output_slot_start
-        || json_u64(value, "/epoch204/observed_first_write_version", label)?
+        || json_u64(epoch, "/archive_bytes", label)? != plan.archive_identity.bytes
+        || json_str(epoch, "/archive", label)? != expected_archive
+        || json_u64(epoch, "/output_start_slot", label)? != manifest.output_slot_start
+        || json_u64(epoch, "/observed_first_write_version", label)?
             != manifest.emitted_raw_write_versions.start
-        || json_u64(value, "/epoch204/terminal_slot", label)? != manifest.terminal.slot
-        || json_str(value, "/epoch204/terminal_kind", label)? != "block"
-        || json_u64(
-            value,
-            "/epoch204/observed_terminal_next_write_version",
-            label,
-        )? != manifest.emitted_raw_write_versions.end
-        || json_u64(
-            value,
-            "/epoch204/derived_terminal_checkpoint_write_count",
-            label,
-        )? != manifest.terminal.write_count
-        || json_str(value, "/epoch204/observed_terminal_blockhash", label)?
+        || json_u64(epoch, "/terminal_slot", label)? != manifest.terminal.slot
+        || json_str(epoch, "/terminal_kind", label)? != "block"
+        || json_u64(epoch, "/observed_terminal_next_write_version", label)?
+            != manifest.emitted_raw_write_versions.end
+        || json_u64(epoch, "/derived_terminal_checkpoint_write_count", label)?
+            != manifest.terminal.write_count
+        || json_str(epoch, "/observed_terminal_blockhash", label)?
             != manifest.terminal.last_blockhash
         || json_bool(value, "/archive_mutations", label)?
         || json_bool(value, "/sidecar_created", label)?
@@ -648,5 +651,19 @@ mod tests {
         assert!(canonical_sha256(&"a".repeat(64), "digest").is_ok());
         assert!(canonical_sha256(&"A".repeat(64), "digest").is_err());
         assert!(canonical_sha256(&"a".repeat(63), "digest").is_err());
+    }
+
+    #[test]
+    fn archive_edge_evidence_is_selected_by_manifest_epoch() {
+        let evidence = serde_json::json!({
+            "epoch151": {"archive_bytes": 151},
+            "epoch204": {"archive_bytes": 204},
+        });
+        let selected = epoch_edge_evidence(&evidence, 151, "archive edge evidence").unwrap();
+        assert_eq!(
+            json_u64(selected, "/archive_bytes", "archive edge evidence").unwrap(),
+            151
+        );
+        assert!(epoch_edge_evidence(&evidence, 152, "archive edge evidence").is_err());
     }
 }

@@ -6450,6 +6450,8 @@ struct AuditedArchiveRecovery {
 const AUDITED_DIRTY_RECOVERY_PROFILE: &str = "jetstreamer-node/0.7.0/old-faithful-to-horizon-v2@ba260be5771123de874438d89822fc6b121842a8-dirty-d74af39026d3f16cfbb43d76";
 const AUDITED_EPOCH_11_RECOVERY_PROFILE: &str =
     "jetstreamer-node/0.7.0/old-faithful-to-horizon-v2@0a8ec77094ddf2b21ff22e6f4a55fef836f8f2c6";
+const AUDITED_EPOCH_151_RECOVERY_PROFILE: &str =
+    "jetstreamer-node/0.7.0/old-faithful-to-horizon-v2@72a52e8dd65bc46bd155c610d623d2729f0190c3";
 static AUDITED_ARCHIVE_RECOVERIES: &[AuditedArchiveRecovery] = &[
     AuditedArchiveRecovery {
         epoch: 7,
@@ -6590,6 +6592,29 @@ jetstreamer-historical-worker-v1-0-23",
         requested_slot_start: 8_640_000,
         requested_slot_count: 432_000,
         transaction_metadata: TransactionMetadataPolicy::runtime_reconstructed_status_and_fee(),
+    },
+    AuditedArchiveRecovery {
+        epoch: 151,
+        generation_profile: AUDITED_EPOCH_151_RECOVERY_PROFILE,
+        archive_bytes: 121_043_189_652,
+        archive_sha256: [
+            0x60, 0x4e, 0x33, 0x63, 0x01, 0x94, 0xb9, 0x5b, 0xee, 0xc6, 0xd0, 0x1d, 0x19, 0xaf,
+            0x60, 0x22, 0x58, 0x7b, 0xc6, 0xff, 0xde, 0x18, 0xb7, 0x23, 0x4a, 0xca, 0x88, 0x9c,
+            0x13, 0x0c, 0x64, 0x76,
+        ],
+        worker_path: "/usr/local/lib/jetstreamer/deploy-epochs150-173-20260923-v2/\
+jetstreamer-historical-worker-v1-5-6",
+        worker_sha256: [
+            0x2a, 0xd5, 0x57, 0x5a, 0x61, 0xb8, 0x15, 0x89, 0xfa, 0xa5, 0x96, 0xf5, 0xbf, 0xc3,
+            0x77, 0x1a, 0xbe, 0xed, 0x3f, 0xca, 0xe1, 0x33, 0xca, 0x38, 0xfb, 0x29, 0xbf, 0xc0,
+            0xcf, 0xaa, 0xbd, 0xb1,
+        ],
+        runtime_descriptor: &compatibility::SOLANA_V1_5_6_RUNTIME,
+        bootstrap_slot: 65_231_862,
+        bootstrap_hash: "3a597JjJKXJWaxCy5yEqhNwZBFsB8GDx7XMw17ectXQr",
+        requested_slot_start: 65_232_000,
+        requested_slot_count: 432_000,
+        transaction_metadata: TransactionMetadataPolicy::observed(),
     },
 ];
 
@@ -20550,7 +20575,12 @@ mod early_snapshot_tests {
                 changed.base.requested_slot_count -= 1
             });
             assert_audited_archive_provenance_mutation_rejected(recovery, &provenance, |changed| {
-                changed.base.transaction_metadata = TransactionMetadataPolicy::observed()
+                changed.base.transaction_metadata =
+                    if recovery.transaction_metadata == TransactionMetadataPolicy::observed() {
+                        TransactionMetadataPolicy::runtime_reconstructed_status_and_fee()
+                    } else {
+                        TransactionMetadataPolicy::observed()
+                    }
             });
             assert_audited_archive_provenance_mutation_rejected(recovery, &provenance, |changed| {
                 changed.worker_executable_sha256[0] ^= 1

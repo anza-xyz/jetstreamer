@@ -207,6 +207,16 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
   still treat any hash, bank verification, or checkpoint mismatch as a real qualification failure.
   Pin the chosen environment in the launch manifest and repeat the normal root/plugin qualification;
   never change it underneath a live replay.
+  When a regression lives inside an excluded vendored runtime crate, do not assume the worker suite
+  executes that crate's own `#[cfg(test)]` tests. Old Cargo can also walk upward into the modern root
+  manifest, while a standalone copied crate can resolve newly published dependencies that its pinned
+  compiler cannot parse. Test it in a uniquely named disposable copy of the complete historical
+  workspace: add only the exact vendor crate as a temporary workspace member, retain the historical
+  `Cargo.lock` and toolchain, resolve offline, and remove an upstream dev-dependency only from that
+  disposable manifest when it is unused and absent from the pinned lock. Never alter production
+  workspace membership to make a vendor test run. Preserve failure output until a corrected retry is
+  proven, then delete the disposable tree promptly; the normal worker suite and real boundary-snapshot
+  gates remain independently required.
 - For a bounded performance cohort, capture cgroup CPU, memory peak/events, major-fault, pressure,
   and I/O counters inside the persistent runner before and after its child; terminal service
   cgroups may disappear before an external collector can read them. Keep target-slot detection

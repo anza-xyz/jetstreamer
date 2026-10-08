@@ -279,6 +279,10 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
   snapshots, and fully generation-pinned snapshot caches may be removed after those checks;
   required inputs, active scratch, resumable state, diagnostic evidence, checkpoints, receipts,
   public archives, and all R2 objects must remain untouched.
+  Treat command-line and mmap references as exact paths or descendants, not raw string prefixes:
+  a live `scratch-store8` sibling is not a reference to an empty completed `scratch` tree. Use the
+  repository retirement scanners' path-boundary checks, and still fail closed on any genuine
+  command, map, cwd/root/exe, or descriptor reference beneath the exact target.
 - For adaptive ranges, start the controller with `--r2-receipt-directory "$HOME/.jetstreamer-private/r2-receipts" --r2-bucket BUCKET`. The controller accepts receipts from that exact bucket only for bytes already bound by its root-owned local completion attestation; R2 can replace local storage, but can never establish initial completion.
 - Start the current Horizon verification plugin as soon as each local archive is available. R2 work may run concurrently with replay of other epochs. An archive is eligible for upload only after its full and current-plugin receipts bind the same archive SHA-256. It is not eligible for local retirement until both adjacent-boundary receipts bind that digest as well. Preserve the canonical lowercase coreutils sidecar format: `<64 hex>  epoch-N.jet\n`.
 - Report single-job latency and fleet completion cadence separately. Historical slot density varies,

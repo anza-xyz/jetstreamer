@@ -133,6 +133,12 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
   identifiable worker with readable maps in every active or activating lane and trip closed on
   zero, multiple, or unreadable workers; test the guard against the copied path in a nested fake
   cgroup before sealing it.
+- When a follow-up performance cohort must preserve its predecessor's systemd unit identity as
+  durable result or cleanup evidence, give the follow-up producer template a distinct constrained
+  namespace instead of replacing or prematurely removing the predecessor template. Bind that
+  namespace transitively in the launch receipt, result manifest, collector, retirement plan, and
+  scratch retirer; reject undeclared or mismatched namespaces. A different template name does not
+  relax lane-path, invocation-ID, terminal-success, or live-reference checks.
 - After a bounded performance cohort has a root-owned, fsynced result receipt containing every
   lane's exact scratch measurements, retire its scratch promptly without discarding the evidence
   needed to choose or qualify a winner. For a multi-lane cohort, bind every exact scratch path in

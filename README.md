@@ -842,7 +842,11 @@ The selector requires exact zero-restart terminal evidence for the control and c
 the policy-bound result manifest, applies every throughput and resource ratio plus the material
 storage-win rule, and fsyncs a no-clobber root-owned selection receipt. Selection alone never
 authorizes a qualification launch or publication; fresh inventory and resource admission remain
-separate gates.
+separate gates. A dormant qualification service can bind that decision with
+`scripts/check_historical_performance_selection.py`: the gate requires the exact selected variant,
+policy digest, and sealed selector digest while also requiring the receipt to keep qualification
+launch, publication, and remote mutation unauthorized. Passing this check proves only which
+environment was selected; the service must still receive a separate fresh admission before start.
 Producer namespace filtering uses a reload-stable cgroup-only allow-list; user namespaces and every
 other namespace type remain denied,
 and the empty capability set prevents the unprivileged worker from using the nominal cgroup option.

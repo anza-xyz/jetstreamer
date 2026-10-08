@@ -300,6 +300,14 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
   replay can begin at `bootstrap_slot + 1` while recorded output begins at the epoch boundary.
   Independently check that `terminal_slot - output_slot_start + 1` equals the manifest's
   `output_slot_count`, and launch a distinct non-restarting attempt if an expectation was wrong.
+- Before spending a full archive scan on the current per-epoch plugin, also compare the segment
+  manifest's output start, terminal slot, and count with that epoch's complete canonical slot
+  range. A focused checkpoint artifact that starts at the epoch boundary but stops even one slot
+  before the epoch end can pass its own sealed partial-range validator while the current plugin
+  must reject its epoch notification. Preserve that artifact as diagnostic evidence, but do not
+  launch the production plugin gate, create a plugin receipt, canonicalize it, or publish it. Run
+  the plugin against such an artifact only when the explicit purpose is to exercise and record the
+  expected rejection path; mark that run diagnostic-only and give it no publication authority.
 - Before scheduling or launching a focused qualification, separately prove that the exact immutable
   worker's own snapshot and entry bounds admit the requested terminal slot. A parent focused planner
   may intentionally describe a wider search envelope than the currently deployed worker accepts;

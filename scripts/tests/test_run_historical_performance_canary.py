@@ -138,6 +138,50 @@ class HistoricalPerformanceCanaryTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "not owner-only"):
                 canary.write_json_noclobber(Path(directory) / "receipt.json", {})
 
+    def test_snapshots_live_scratch_before_controlled_stop(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            scratch = root / "scratch"
+            accounts = (
+                scratch
+                / ".historical-runtime"
+                / "parent"
+                / "jetstreamer-historical-worker"
+                / "accounts-state"
+                / "0"
+            )
+            accounts.mkdir(parents=True)
+            (accounts / "42.1").write_bytes(b"appendvec")
+            child = textwrap.dedent(
+                """
+                import signal
+                import sys
+                import time
+                signal.signal(signal.SIGINT, lambda *_: sys.exit(1))
+                print("progress slot 101/200 txs=14 accounts=30", flush=True)
+                while True:
+                    time.sleep(0.05)
+                """
+            )
+            receipt = root / "receipt.json"
+            result = canary.run_canary(
+                100,
+                receipt,
+                [sys.executable, "-c", child, f"--replay-scratch={scratch}"],
+            )
+            payload = json.loads(receipt.read_text())
+            self.assertEqual(result, 0)
+            self.assertIsNone(payload["scratch_snapshot_error"])
+            self.assertEqual(
+                payload["scratch_snapshot"]["scratch"]["path"], str(scratch)
+            )
+            self.assertEqual(
+                payload["scratch_snapshot"]["accounts_state"][
+                    "appendvec_store_fanout"
+                ]["recognized_appendvec_files"],
+                1,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

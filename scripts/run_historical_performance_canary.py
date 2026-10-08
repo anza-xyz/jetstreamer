@@ -4,12 +4,14 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import json
 import os
 from pathlib import Path
 import re
 import resource
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -22,6 +24,7 @@ PROGRESS = re.compile(
 )
 PROGRESS_SLOT = re.compile(r"\bprogress slot ([0-9]+)/")
 RECEIPT_SCHEMA = "jetstreamer-historical-performance-canary-v2"
+APPENDVEC_FILE = re.compile(r"^(?P<slot>[0-9]+)\.(?P<store_id>[0-9]+)$")
 
 
 def parse_progress(line: str) -> dict[str, int] | None:
@@ -195,6 +198,142 @@ def usage_fields(usage: resource.struct_rusage) -> dict[str, int | float]:
     }
 
 
+def replay_scratch_from_command(command: Sequence[str]) -> Path | None:
+    values = [
+        item.split("=", 1)[1]
+        for item in command
+        if item.startswith("--replay-scratch=")
+    ]
+    if not values:
+        return None
+    if len(values) != 1 or not values[0]:
+        raise ValueError(
+            "canary command must contain at most one nonempty --replay-scratch"
+        )
+    scratch = Path(values[0])
+    if not scratch.is_absolute():
+        raise ValueError("--replay-scratch must be absolute")
+    return scratch
+
+
+def tree_statistics(
+    root: Path, collect_appendvec_slots: bool = False
+) -> dict[str, object]:
+    metadata = root.lstat()
+    if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+        raise ValueError(f"scratch measurement root is not a real directory: {root}")
+    device = metadata.st_dev
+    physical_bytes = metadata.st_blocks * 512
+    apparent_bytes = metadata.st_size
+    files = 0
+    directories = 1
+    symlinks = 0
+    file_size_histogram: Counter[str] = Counter()
+    appendvec_stores_per_slot: Counter[int] = Counter()
+    unrecognized_regular_files = 0
+    for directory, names, filenames in os.walk(root, topdown=True, followlinks=False):
+        directory_path = Path(directory)
+        retained_names: list[str] = []
+        for name in names:
+            entry = directory_path / name
+            entry_metadata = entry.lstat()
+            if stat.S_ISLNK(entry_metadata.st_mode):
+                symlinks += 1
+                continue
+            if not stat.S_ISDIR(entry_metadata.st_mode) or entry_metadata.st_dev != device:
+                continue
+            directories += 1
+            physical_bytes += entry_metadata.st_blocks * 512
+            apparent_bytes += entry_metadata.st_size
+            retained_names.append(name)
+        names[:] = retained_names
+        for name in filenames:
+            entry = directory_path / name
+            entry_metadata = entry.lstat()
+            if stat.S_ISLNK(entry_metadata.st_mode):
+                symlinks += 1
+                continue
+            if not stat.S_ISREG(entry_metadata.st_mode) or entry_metadata.st_dev != device:
+                continue
+            files += 1
+            physical_bytes += entry_metadata.st_blocks * 512
+            apparent_bytes += entry_metadata.st_size
+            size = entry_metadata.st_size
+            if size <= 4 * 1024 * 1024:
+                bucket = "le_4_mib"
+            elif size <= 8 * 1024 * 1024:
+                bucket = "gt_4_le_8_mib"
+            elif size <= 16 * 1024 * 1024:
+                bucket = "gt_8_le_16_mib"
+            elif size <= 64 * 1024 * 1024:
+                bucket = "gt_16_le_64_mib"
+            elif size <= 256 * 1024 * 1024:
+                bucket = "gt_64_le_256_mib"
+            elif size <= 1024 * 1024 * 1024:
+                bucket = "gt_256_mib_le_1_gib"
+            else:
+                bucket = "gt_1_gib"
+            file_size_histogram[bucket] += 1
+            if collect_appendvec_slots:
+                match = APPENDVEC_FILE.fullmatch(name)
+                if match is None:
+                    unrecognized_regular_files += 1
+                else:
+                    appendvec_stores_per_slot[int(match.group("slot"))] += 1
+    result: dict[str, object] = {
+        "path": str(root),
+        "device": device,
+        "physical_bytes": physical_bytes,
+        "apparent_bytes": apparent_bytes,
+        "regular_files": files,
+        "directories": directories,
+        "symlinks_not_followed": symlinks,
+        "file_size_histogram": dict(sorted(file_size_histogram.items())),
+    }
+    if collect_appendvec_slots:
+        store_count_to_slot_count = Counter(appendvec_stores_per_slot.values())
+        slot_count = len(appendvec_stores_per_slot)
+        appendvec_files = sum(appendvec_stores_per_slot.values())
+        result["appendvec_store_fanout"] = {
+            "recognized_appendvec_files": appendvec_files,
+            "unrecognized_regular_files": unrecognized_regular_files,
+            "slots_with_stores": slot_count,
+            "minimum_stores_per_slot": min(
+                appendvec_stores_per_slot.values(), default=None
+            ),
+            "maximum_stores_per_slot": max(
+                appendvec_stores_per_slot.values(), default=None
+            ),
+            "mean_stores_per_slot": (
+                appendvec_files / slot_count if slot_count else None
+            ),
+            "store_count_to_slot_count": {
+                str(count): store_count_to_slot_count[count]
+                for count in sorted(store_count_to_slot_count)
+            },
+        }
+    return result
+
+
+def snapshot_replay_scratch(scratch: Path) -> dict[str, object]:
+    matches = [
+        item
+        for item in scratch.glob(
+            ".historical-runtime/*/jetstreamer-historical-*/accounts-state"
+        )
+        if item.is_dir() and not item.is_symlink()
+    ]
+    if len(matches) != 1:
+        raise ValueError(
+            f"expected exactly one live accounts-state beneath {scratch}, found {len(matches)}"
+        )
+    return {
+        "captured_unix_seconds": time.time(),
+        "scratch": tree_statistics(scratch),
+        "accounts_state": tree_statistics(matches[0], collect_appendvec_slots=True),
+    }
+
+
 def write_json_noclobber(path: Path, payload: dict[str, Any]) -> None:
     if not path.is_absolute():
         raise ValueError("receipt path must be absolute")
@@ -264,12 +403,16 @@ def run_canary(target_slot: int, receipt: Path, command: Sequence[str]) -> int:
         stderr=subprocess.STDOUT,
         text=True,
         bufsize=1,
+        start_new_session=True,
     )
     external_signal: int | None = None
     target_reached = False
     observed_stop_slot: int | None = None
     first_progress: dict[str, int | float] | None = None
     final_progress: dict[str, int | float] | None = None
+    replay_scratch = replay_scratch_from_command(command)
+    scratch_snapshot: dict[str, object] | None = None
+    scratch_snapshot_error: str | None = None
 
     def forward_signal(signum: int, _frame: object) -> None:
         nonlocal external_signal
@@ -299,6 +442,14 @@ def run_canary(target_slot: int, receipt: Path, command: Sequence[str]) -> int:
                     observed_stop_slot = slot
                 if not target_reached and slot is not None and slot >= target_slot:
                     target_reached = True
+                    if replay_scratch is not None:
+                        os.killpg(process.pid, signal.SIGSTOP)
+                        try:
+                            scratch_snapshot = snapshot_replay_scratch(replay_scratch)
+                        except (OSError, ValueError) as error:
+                            scratch_snapshot_error = str(error)
+                        finally:
+                            os.killpg(process.pid, signal.SIGCONT)
                     process.send_signal(signal.SIGINT)
         return_code = process.wait()
     finally:
@@ -362,6 +513,8 @@ def run_canary(target_slot: int, receipt: Path, command: Sequence[str]) -> int:
         "child_return_code": return_code,
         "controlled_stop_signal": signal.SIGINT if target_reached else None,
         "runner_return_code": normalized_runner_exit_code,
+        "scratch_snapshot": scratch_snapshot,
+        "scratch_snapshot_error": scratch_snapshot_error,
         "external_signal": external_signal,
         "command": list(command),
         "systemd_invocation_id": systemd_invocation_id,
@@ -381,6 +534,8 @@ def run_canary(target_slot: int, receipt: Path, command: Sequence[str]) -> int:
         "filesystem_available_bytes_after": available_bytes(),
     }
     write_json_noclobber(receipt, payload)
+    if target_reached and replay_scratch is not None and scratch_snapshot is None:
+        return 2
     return normalized_runner_exit_code
 
 

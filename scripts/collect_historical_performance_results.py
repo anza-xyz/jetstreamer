@@ -449,7 +449,66 @@ def validate_canary_receipt(
         ),
         "observed_overshoot_slots": payload.get("observed_overshoot_slots"),
         "child_return_code": payload.get("child_return_code"),
+        "scratch_snapshot": payload.get("scratch_snapshot"),
     }
+
+
+def validate_recorded_tree_statistics(
+    payload: object, expected_path: Path, description: str
+) -> dict[str, Any]:
+    if not isinstance(payload, dict) or payload.get("path") != str(expected_path):
+        raise CollectionError(f"{description} has an unexpected path")
+    for field in (
+        "device",
+        "physical_bytes",
+        "apparent_bytes",
+        "regular_files",
+        "directories",
+        "symlinks_not_followed",
+    ):
+        value = payload.get(field)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise CollectionError(f"{description} has invalid {field}")
+    histogram = payload.get("file_size_histogram")
+    if not isinstance(histogram, dict) or any(
+        not isinstance(key, str)
+        or not isinstance(value, int)
+        or isinstance(value, bool)
+        or value < 0
+        for key, value in histogram.items()
+    ):
+        raise CollectionError(f"{description} has an invalid file-size histogram")
+    return payload
+
+
+def validate_scratch_snapshot(
+    payload: object, scratch: Path
+) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    if payload is None:
+        return None
+    if not isinstance(payload, dict) or not isinstance(
+        payload.get("captured_unix_seconds"), (int, float)
+    ):
+        raise CollectionError("canary scratch snapshot is invalid")
+    scratch_stats = validate_recorded_tree_statistics(
+        payload.get("scratch"), scratch, "recorded scratch"
+    )
+    accounts_payload = payload.get("accounts_state")
+    if not isinstance(accounts_payload, dict) or not isinstance(
+        accounts_payload.get("path"), str
+    ):
+        raise CollectionError("recorded accounts-state is invalid")
+    accounts_path = Path(accounts_payload["path"])
+    try:
+        accounts_path.relative_to(scratch)
+    except ValueError as error:
+        raise CollectionError("recorded accounts-state escapes scratch") from error
+    accounts_stats = validate_recorded_tree_statistics(
+        accounts_payload, accounts_path, "recorded accounts-state"
+    )
+    if not isinstance(accounts_stats.get("appendvec_store_fanout"), dict):
+        raise CollectionError("recorded accounts-state lacks AppendVec fanout")
+    return scratch_stats, accounts_stats
 
 
 def parse_allowed_target_stop_return_codes(value: object) -> tuple[int, ...]:
@@ -604,10 +663,16 @@ def collect(manifest: dict[str, Any], launch: dict[str, Any]) -> dict[str, Any]:
         archive_metadata = archive.lstat()
         if not stat.S_ISREG(archive_metadata.st_mode):
             raise CollectionError(f"{name} archive is not regular")
-        scratch_stats = tree_statistics(scratch)
-        accounts_stats = tree_statistics(
-            find_accounts_state(scratch), collect_appendvec_slots=True
+        recorded_stats = validate_scratch_snapshot(
+            performance["scratch_snapshot"], scratch
         )
+        if recorded_stats is None:
+            scratch_stats = tree_statistics(scratch)
+            accounts_stats = tree_statistics(
+                find_accounts_state(scratch), collect_appendvec_slots=True
+            )
+        else:
+            scratch_stats, accounts_stats = recorded_stats
         transaction_delta = performance["transaction_delta"]
         scratch_stats["physical_bytes_per_million_transactions"] = (
             scratch_stats["physical_bytes"] * 1_000_000 / transaction_delta

@@ -266,6 +266,36 @@ class HistoricalPerformanceResultsTest(unittest.TestCase):
             ):
                 collect.parse_allowed_target_stop_return_codes(invalid)
 
+    def test_validates_recorded_scratch_snapshot(self) -> None:
+        scratch = Path("/scratch")
+        common = {
+            "device": 1,
+            "physical_bytes": 2,
+            "apparent_bytes": 3,
+            "regular_files": 4,
+            "directories": 5,
+            "symlinks_not_followed": 0,
+            "file_size_histogram": {"le_4_mib": 4},
+        }
+        snapshot = {
+            "captured_unix_seconds": 1.0,
+            "scratch": {**common, "path": str(scratch)},
+            "accounts_state": {
+                **common,
+                "path": str(scratch / "runtime" / "accounts-state"),
+                "appendvec_store_fanout": {"recognized_appendvec_files": 4},
+            },
+        }
+        scratch_stats, accounts_stats = collect.validate_scratch_snapshot(
+            snapshot, scratch
+        )
+        self.assertEqual(scratch_stats["physical_bytes"], 2)
+        self.assertIn("appendvec_store_fanout", accounts_stats)
+        broken = json.loads(json.dumps(snapshot))
+        broken["accounts_state"]["path"] = "/outside/accounts-state"
+        with self.assertRaises(collect.CollectionError):
+            collect.validate_scratch_snapshot(broken, scratch)
+
     def test_result_receipt_is_owner_only_and_noclobber(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

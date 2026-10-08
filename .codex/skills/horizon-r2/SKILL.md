@@ -138,6 +138,10 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
   observed the bound, retain the actual child return code and stop signal in its durable receipt,
   and keep pre-target exit 1 fatal. Bind any accepted controlled-stop codes in the result manifest;
   collectors and scratch retirement must reject codes outside that sealed allowlist.
+  Historical runtime state may live in a temporary directory that the parent removes during
+  shutdown. Freeze the bounded child process group and capture the exact scratch/accounts-state
+  statistics before sending the controlled stop; then resume and stop it. Do not design a terminal
+  collector that assumes those temporary AppendVecs will still exist after the parent exits.
 - When a follow-up performance cohort must preserve its predecessor's systemd unit identity as
   durable result or cleanup evidence, give the follow-up producer template a distinct constrained
   namespace instead of replacing or prematurely removing the predecessor template. Bind that

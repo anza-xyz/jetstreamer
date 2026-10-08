@@ -38,6 +38,9 @@ const DEFAULT_CONCURRENCY: usize = 8;
 const MAX_SIDECAR_BYTES: u64 = 512;
 const MAX_PART_ATTEMPTS: usize = 8;
 const MAX_REMOTE_READ_ATTEMPTS: usize = 64;
+const MAX_REMOTE_READ_RANGE_SIZE: u64 = 64 * 1024 * 1024;
+const MIN_REMOTE_READ_RANGE_SIZE: u64 = 8 * 1024 * 1024;
+const REMOTE_READ_BUFFER_BUDGET: u64 = 512 * 1024 * 1024;
 const RECEIPT_SCHEMA: &str = "jetstreamer-horizon-r2-receipt-v1";
 
 #[derive(Debug)]
@@ -1049,43 +1052,62 @@ fn persist_noclobber(mut temporary: tempfile::NamedTempFile, destination: &Path)
     Ok(())
 }
 
-async fn read_remote_sha256_resumable<W: Write>(
-    client: &Client,
-    bucket: &str,
-    key: &str,
-    etag: &str,
-    expected_length: u64,
-    expected_sha256: &str,
-    writer: &mut W,
-) -> Result<()> {
-    use tokio::io::AsyncReadExt as _;
+fn remote_read_ranges(expected_length: u64, concurrency: usize) -> Vec<(u64, u64)> {
+    let range_size = (REMOTE_READ_BUFFER_BUDGET / concurrency.max(1) as u64)
+        .clamp(MIN_REMOTE_READ_RANGE_SIZE, MAX_REMOTE_READ_RANGE_SIZE);
+    let mut ranges = Vec::new();
+    let mut start = 0u64;
+    while start < expected_length {
+        let end = start.saturating_add(range_size).min(expected_length);
+        ranges.push((start, end));
+        start = end;
+    }
+    ranges
+}
 
-    let mut digest = Sha256::new();
-    let mut received = 0u64;
+#[derive(Clone, Copy)]
+struct RemoteReadSpec<'a> {
+    bucket: &'a str,
+    key: &'a str,
+    etag: &'a str,
+    expected_length: u64,
+    expected_sha256: &'a str,
+    concurrency: usize,
+}
+
+async fn read_remote_range(
+    client: &Client,
+    spec: RemoteReadSpec<'_>,
+    start: u64,
+    end: u64,
+) -> Result<Vec<u8>> {
+    ensure!(
+        start < end && end <= spec.expected_length,
+        "invalid remote range"
+    );
+    let range_length = end - start;
+    let range = format!("bytes={start}-{}", end - 1);
+    let expected_content_range = format!("bytes {start}-{}/{}", end - 1, spec.expected_length);
     let mut failures = 0usize;
-    let mut buffer = vec![0u8; 8 * 1024 * 1024];
-    while received < expected_length {
-        let offset = received;
-        let request = client
+    loop {
+        let response = match client
             .get_object()
-            .bucket(bucket)
-            .key(key)
-            .if_match(format!("\"{etag}\""));
-        let request = if offset == 0 {
-            request
-        } else {
-            request.range(format!("bytes={offset}-"))
-        };
-        let response = match request.send().await {
+            .bucket(spec.bucket)
+            .key(spec.key)
+            .if_match(format!("\"{}\"", spec.etag))
+            .range(&range)
+            .send()
+            .await
+        {
             Ok(response) => response,
             Err(error) => {
                 failures += 1;
                 ensure!(
                     failures <= MAX_REMOTE_READ_ATTEMPTS,
-                    "remote read failed after {MAX_REMOTE_READ_ATTEMPTS} attempts: {error:?}"
+                    "remote range {range} failed after {MAX_REMOTE_READ_ATTEMPTS} attempts: {error:?}"
                 );
                 eprintln!(
-                    "warning: remote read retry {failures}/{MAX_REMOTE_READ_ATTEMPTS} at byte {offset}: {error:?}"
+                    "warning: remote range {range} retry {failures}/{MAX_REMOTE_READ_ATTEMPTS}: {error:?}"
                 );
                 tokio::time::sleep(std::time::Duration::from_secs(
                     (1u64 << failures.saturating_sub(1).min(5)).min(30),
@@ -1094,62 +1116,83 @@ async fn read_remote_sha256_resumable<W: Write>(
                 continue;
             }
         };
-        let expected_response_length = expected_length - offset;
         ensure!(
             response
                 .content_length()
                 .and_then(|value| u64::try_from(value).ok())
-                == Some(expected_response_length),
-            "remote ranged read length mismatch at byte {offset}"
+                == Some(range_length),
+            "remote range {range} length mismatch"
         );
         ensure!(
-            response.e_tag().map(normalize_etag) == Some(etag),
-            "remote ranged read ETag mismatch"
+            response.content_range() == Some(expected_content_range.as_str()),
+            "remote range {range} Content-Range mismatch"
         );
-
-        let mut reader = response.body.into_async_read();
-        let mut stream_error = None;
-        loop {
-            match reader.read(&mut buffer).await {
-                Ok(0) => break,
-                Ok(count) => {
-                    writer.write_all(&buffer[..count])?;
-                    digest.update(&buffer[..count]);
-                    received = received
-                        .checked_add(u64::try_from(count)?)
-                        .ok_or_else(|| anyhow!("remote read length overflow"))?;
-                    ensure!(
-                        received <= expected_length,
-                        "remote read exceeded expected length"
-                    );
-                }
-                Err(error) => {
-                    stream_error = Some(error.to_string());
-                    break;
-                }
+        ensure!(
+            response.e_tag().map(normalize_etag) == Some(spec.etag),
+            "remote range {range} ETag mismatch"
+        );
+        match response.body.collect().await {
+            Ok(bytes) => {
+                let bytes = bytes.into_bytes();
+                ensure!(
+                    bytes.len() == usize::try_from(range_length)?,
+                    "remote range {range} body length mismatch"
+                );
+                return Ok(bytes.to_vec());
+            }
+            Err(error) => {
+                failures += 1;
+                ensure!(
+                    failures <= MAX_REMOTE_READ_ATTEMPTS,
+                    "remote range {range} remained incomplete after {MAX_REMOTE_READ_ATTEMPTS} attempts: {error}"
+                );
+                eprintln!(
+                    "warning: remote range {range} stream retry {failures}/{MAX_REMOTE_READ_ATTEMPTS}: {error}"
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(
+                    (1u64 << failures.saturating_sub(1).min(5)).min(30),
+                ))
+                .await;
             }
         }
-        if received == expected_length {
-            break;
-        }
-
-        failures += 1;
-        ensure!(
-            failures <= MAX_REMOTE_READ_ATTEMPTS,
-            "remote stream remained incomplete after {MAX_REMOTE_READ_ATTEMPTS} attempts"
-        );
-        eprintln!(
-            "warning: remote stream retry {failures}/{MAX_REMOTE_READ_ATTEMPTS} at byte {received}: {}",
-            stream_error.unwrap_or_else(|| "stream ended before expected length".to_owned())
-        );
-        tokio::time::sleep(std::time::Duration::from_secs(
-            (1u64 << failures.saturating_sub(1).min(5)).min(30),
-        ))
-        .await;
     }
-    ensure!(received == expected_length, "remote read was truncated");
+}
+
+async fn read_remote_sha256_resumable<W: Write>(
+    client: &Client,
+    spec: RemoteReadSpec<'_>,
+    writer: &mut W,
+) -> Result<()> {
+    use futures_util::{StreamExt as _, stream};
+
+    let mut digest = Sha256::new();
+    let mut received = 0u64;
+    // `buffered` polls several range requests concurrently but yields them in
+    // input order. The writer and whole-object digest therefore still see one
+    // canonical byte stream.
+    let downloads = stream::iter(remote_read_ranges(spec.expected_length, spec.concurrency))
+        .map(|(start, end)| async move {
+            read_remote_range(client, spec, start, end)
+                .await
+                .map(|bytes| (start, bytes))
+        })
+        .buffered(spec.concurrency);
+    futures_util::pin_mut!(downloads);
+    while let Some(download) = downloads.next().await {
+        let (start, bytes) = download?;
+        ensure!(start == received, "remote ranges arrived out of order");
+        writer.write_all(&bytes)?;
+        digest.update(&bytes);
+        received = received
+            .checked_add(u64::try_from(bytes.len())?)
+            .ok_or_else(|| anyhow!("remote read length overflow"))?;
+    }
     ensure!(
-        format!("{:x}", digest.finalize()) == expected_sha256,
+        received == spec.expected_length,
+        "remote read was truncated"
+    );
+    ensure!(
+        format!("{:x}", digest.finalize()) == spec.expected_sha256,
         "remote SHA-256 mismatch"
     );
     Ok(())
@@ -1205,17 +1248,17 @@ async fn restore_epoch(client: &Client, r2: &R2Config, config: &Config, epoch: u
         let mut temporary = tempfile::Builder::new()
             .prefix(&format!(".epoch-{epoch}.restore."))
             .tempfile_in(&config.directory)?;
-        read_remote_sha256_resumable(
-            client,
-            &r2.bucket,
-            &receipt.archive_key,
-            &receipt.archive_etag,
-            receipt.archive_length,
-            &receipt.archive_sha256,
-            temporary.as_file_mut(),
-        )
-        .await
-        .context("failed to restore and hash R2 archive")?;
+        let spec = RemoteReadSpec {
+            bucket: &r2.bucket,
+            key: &receipt.archive_key,
+            etag: &receipt.archive_etag,
+            expected_length: receipt.archive_length,
+            expected_sha256: &receipt.archive_sha256,
+            concurrency: config.concurrency,
+        };
+        read_remote_sha256_resumable(client, spec, temporary.as_file_mut())
+            .await
+            .context("failed to restore and hash R2 archive")?;
         persist_noclobber(temporary, &archive_path)?;
     }
 
@@ -1255,18 +1298,19 @@ async fn verify_remote_sha256(
     etag: &str,
     expected_length: u64,
     expected_sha256: &str,
+    concurrency: usize,
 ) -> Result<()> {
-    read_remote_sha256_resumable(
-        client,
+    let spec = RemoteReadSpec {
         bucket,
         key,
         etag,
         expected_length,
         expected_sha256,
-        &mut std::io::sink(),
-    )
-    .await
-    .context("failed remote SHA-256 readback")
+        concurrency,
+    };
+    read_remote_sha256_resumable(client, spec, &mut std::io::sink())
+        .await
+        .context("failed remote SHA-256 readback")
 }
 
 fn revalidate_local(local: &LocalArchive) -> Result<()> {
@@ -1449,6 +1493,7 @@ async fn sync_epoch(client: &Client, r2: &R2Config, config: &Config, epoch: u64)
                 &etag,
                 local.length,
                 &local.sha256_hex,
+                config.concurrency,
             )
             .await?;
             true
@@ -1595,6 +1640,23 @@ mod tests {
         assert!(parse_epoch_range("9-7").is_err());
         assert_eq!(parse_mib("64").unwrap(), 64 * 1024 * 1024);
         assert!(parse_mib("4").is_err());
+    }
+
+    #[test]
+    fn remote_read_ranges_are_contiguous_and_memory_bounded() {
+        assert!(remote_read_ranges(0, 8).is_empty());
+        for concurrency in [1, 4, 8, 64] {
+            let length = 3 * MAX_REMOTE_READ_RANGE_SIZE + 17;
+            let ranges = remote_read_ranges(length, concurrency);
+            assert_eq!(ranges.first().map(|range| range.0), Some(0));
+            assert_eq!(ranges.last().map(|range| range.1), Some(length));
+            for pair in ranges.windows(2) {
+                assert_eq!(pair[0].1, pair[1].0);
+            }
+            let largest = ranges.iter().map(|(start, end)| end - start).max().unwrap();
+            assert!((MIN_REMOTE_READ_RANGE_SIZE..=MAX_REMOTE_READ_RANGE_SIZE).contains(&largest));
+            assert!(largest * concurrency as u64 <= REMOTE_READ_BUFFER_BUDGET);
+        }
     }
 
     #[test]

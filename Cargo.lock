@@ -4932,6 +4932,7 @@ dependencies = [
  "aws-sdk-s3",
  "aws-types",
  "base64 0.22.1",
+ "futures-util",
  "libc",
  "md-5",
  "serde",

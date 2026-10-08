@@ -73,6 +73,53 @@ class HistoricalPerformanceGuardTest(unittest.TestCase):
     def test_healthy_cohort_has_no_trip_reason(self) -> None:
         self.assertEqual(guard.trip_reasons(200, 100, 900_000, [sample()]), [])
 
+    def test_exact_invocation_binding_trips_only_on_mismatch(self) -> None:
+        expected = {sample().unit: "a" * 32}
+        self.assertEqual(
+            guard.trip_reasons(
+                200,
+                100,
+                900_000,
+                [sample(invocation_id="a" * 32)],
+                expected,
+            ),
+            [],
+        )
+        reasons = guard.trip_reasons(200, 100, 900_000, [sample()], expected)
+        self.assertTrue(any("does not match" in reason for reason in reasons))
+
+    def test_expected_invocation_cli_must_bind_every_guarded_unit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            args = guard.parse_args(
+                [
+                    f"--filesystem={root}",
+                    "--minimum-free-bytes=1",
+                    "--maximum-worker-vmas=1",
+                    f"--receipt-directory={root}",
+                    "--timer-unit=horizon-monitor-recurring-test.timer",
+                    "--expected-invocation=horizon-qualify-a.service=" + "a" * 32,
+                    "horizon-qualify-a.service",
+                ]
+            )
+            self.assertEqual(
+                args.expected_invocations,
+                {"horizon-qualify-a.service": "a" * 32},
+            )
+            with self.assertRaises(SystemExit):
+                guard.parse_args(
+                    [
+                        f"--filesystem={root}",
+                        "--minimum-free-bytes=1",
+                        "--maximum-worker-vmas=1",
+                        f"--receipt-directory={root}",
+                        "--timer-unit=horizon-monitor-recurring-test.timer",
+                        "--expected-invocation=horizon-qualify-a.service=" + "a" * 32,
+                        "horizon-qualify-a.service",
+                        "horizon-qualify-b.service",
+                    ]
+                )
+
     def test_disk_vma_restart_and_failure_trip_independently(self) -> None:
         reasons = guard.trip_reasons(
             99,

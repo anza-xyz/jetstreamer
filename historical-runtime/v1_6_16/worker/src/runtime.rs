@@ -13,7 +13,7 @@ use solana_runtime::{
     builtins::ActivationType,
 };
 use solana_sdk::{
-    account::from_account,
+    account::{from_account, ReadableAccount},
     clock::{MAX_PROCESSING_AGE, MAX_RECENT_BLOCKHASHES},
     feature_set,
     genesis_config::{ClusterType, GenesisConfig},
@@ -21,7 +21,7 @@ use solana_sdk::{
     instruction::InstructionError,
     pubkey::Pubkey,
     system_program,
-    sysvar::{slot_hashes, slot_hashes::SlotHashes},
+    sysvar::{self, slot_hashes, slot_hashes::SlotHashes},
     transaction::{Transaction, TransactionError},
 };
 use solana_vote_program::vote_instruction::VoteInstruction;
@@ -378,13 +378,33 @@ impl RuntimeState {
                                 .and_then(|instruction| {
                                     bincode::deserialize::<VoteInstruction>(&instruction.data).ok()
                                 });
+                        let vote_tip = match &vote {
+                            Some(VoteInstruction::Vote(vote))
+                            | Some(VoteInstruction::VoteSwitch(vote, _)) => {
+                                vote.slots.last().map(|slot| (*slot, vote.hash))
+                            }
+                            _ => None,
+                        };
+                        let slot_hash = vote_tip.and_then(|(slot, _)| {
+                            slot_hashes.as_ref().and_then(|hashes| {
+                                hashes
+                                    .iter()
+                                    .find(|(candidate, _)| *candidate == slot)
+                                    .map(|(_, hash)| *hash)
+                            })
+                        });
+                        if vote_tip.is_none() {
+                            continue;
+                        }
                         eprintln!(
-                            "historical trace: bank_slot={} parent_slot={} parent_hash={:?} vote={:?} slot_hashes={:?}",
+                            "historical vote trace: bank_slot={} parent_slot={} parent_hash={:?} signature={:?} result={:?} vote_tip={:?} slot_hash={:?}",
                             self.bank.slot(),
                             self.bank.parent_slot(),
                             self.bank.parent().map(|parent| parent.hash()),
-                            vote,
-                            slot_hashes,
+                            transaction.signatures.get(0),
+                            result.0,
+                            vote_tip,
+                            slot_hash,
                         );
                     }
                 }
@@ -737,6 +757,16 @@ impl RuntimeState {
                 max_tick_height
             ));
         }
+        if env::var_os("JETSTREAMER_HISTORICAL_TRACE").is_some() {
+            eprintln!(
+                "historical reconstructed tick trace: slot={} tick_height={} max_tick_height={} block_boundaries={} repeated_blockhash={}",
+                self.bank.slot(),
+                tick_height,
+                max_tick_height,
+                max_tick_height.saturating_sub(tick_height) / self.bank.ticks_per_slot(),
+                blockhash,
+            );
+        }
         for _ in tick_height..max_tick_height {
             self.bank.register_tick(&blockhash);
         }
@@ -758,6 +788,30 @@ impl RuntimeState {
             ));
         }
         self.bank.freeze();
+        if env::var_os("JETSTREAMER_HISTORICAL_TRACE").is_some()
+            && is_reconstructed_confirmed_block_slot(self.bank.slot())
+        {
+            let accounts_delta = self
+                .bank
+                .accounts()
+                .bank_hash_info_at(self.bank.slot())
+                .hash;
+            let recent_blockhashes_data_hash = self
+                .bank
+                .get_account(&sysvar::recent_blockhashes::id())
+                .map(|account| solana_sdk::hash::hash(account.data()));
+            eprintln!(
+                "historical reconstructed bank trace: slot={} parent_slot={} parent_hash={} bank_hash={} accounts_delta={} signature_count={} last_blockhash={} recent_blockhashes_data_hash={:?}",
+                self.bank.slot(),
+                self.bank.parent_slot(),
+                self.bank.parent_hash(),
+                self.bank.hash(),
+                accounts_delta,
+                self.bank.signature_count(),
+                self.bank.last_blockhash(),
+                recent_blockhashes_data_hash,
+            );
+        }
         let mut writes = self.drain_writes(None)?;
         self.bank.squash();
         // Bank::squash does not currently store accounts, but draining again
@@ -1384,6 +1438,79 @@ mod tests {
         assert!(!is_reconstructed_confirmed_block_slot(
             RECONSTRUCTED_CONFIRMED_BLOCK_END + 1
         ));
+    }
+
+    #[test]
+    fn repeating_final_hash_across_a_skipped_slot_changes_bank_state() {
+        fn bank_from_genesis(genesis: &GenesisConfig) -> (Arc<Bank>, TempDir) {
+            let state_dir = snapshot::private_state_dir(None).unwrap();
+            let account_paths = snapshot::private_account_paths(&state_dir).unwrap();
+            let bank = Bank::new_with_paths(
+                genesis,
+                account_paths,
+                &[],
+                None,
+                None,
+                AccountSecondaryIndexes::default(),
+                false,
+            );
+            let boundary_hash = bank.last_blockhash();
+            for _ in 0..bank.ticks_per_slot() {
+                bank.register_tick(&boundary_hash);
+            }
+            bank.freeze();
+            (Arc::new(bank), state_dir)
+        }
+
+        let leader = Pubkey::new_from_array([7; 32]);
+        let mut genesis = create_genesis_config_with_leader(1_000_000, &leader, 500_000);
+        genesis.genesis_config.ticks_per_slot = 2;
+        genesis.genesis_config.poh_config.hashes_per_tick = None;
+
+        let (canonical_parent, _canonical_dir) = bank_from_genesis(&genesis.genesis_config);
+        let (reconstructed_parent, _reconstructed_dir) = bank_from_genesis(&genesis.genesis_config);
+        assert_eq!(canonical_parent.hash(), reconstructed_parent.hash());
+
+        // Jumping from slot 0 to slot 2 spans the block boundary for skipped
+        // slot 1 as well as slot 2's own boundary. The canonical ledger has a
+        // distinct PoH hash at each boundary. Confirmed-block recovery knows
+        // only the final hash and currently repeats it at both boundaries.
+        let skipped_boundary_hash = Hash::new_from_array([0x51; 32]);
+        let final_hash = Hash::new_from_array([0x52; 32]);
+        let canonical = Bank::new_from_parent(&canonical_parent, &leader, 2);
+        canonical.register_tick(&skipped_boundary_hash);
+        canonical.register_tick(&skipped_boundary_hash);
+        canonical.register_tick(&final_hash);
+        canonical.register_tick(&final_hash);
+        canonical.freeze();
+
+        let reconstructed = Bank::new_from_parent(&reconstructed_parent, &leader, 2);
+        for _ in 0..4 {
+            reconstructed.register_tick(&final_hash);
+        }
+        reconstructed.freeze();
+
+        let canonical_recent = canonical
+            .get_account(&sysvar::recent_blockhashes::id())
+            .and_then(|account| {
+                from_account::<sysvar::recent_blockhashes::RecentBlockhashes, _>(&account)
+            })
+            .unwrap();
+        let reconstructed_recent = reconstructed
+            .get_account(&sysvar::recent_blockhashes::id())
+            .and_then(|account| {
+                from_account::<sysvar::recent_blockhashes::RecentBlockhashes, _>(&account)
+            })
+            .unwrap();
+
+        assert!(canonical_recent
+            .iter()
+            .any(|entry| entry.blockhash == skipped_boundary_hash));
+        assert!(!reconstructed_recent
+            .iter()
+            .any(|entry| entry.blockhash == skipped_boundary_hash));
+        assert_ne!(canonical_recent, reconstructed_recent);
+        assert_ne!(canonical.hash(), reconstructed.hash());
     }
 
     fn set_exact_mainnet_native_programs(genesis: &mut GenesisConfig) {

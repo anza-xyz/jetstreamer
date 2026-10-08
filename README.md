@@ -824,6 +824,10 @@ Producer services deliberately use a minimal PATH. If `gcloud` is installed outs
 resolves and validates that executable, binds its SHA-256 into the sealed configuration, adds only
 its parent directory to the producer PATH, and requires the same environment when adopting a live
 unit.
+Every new sweep must also pass `--solana-rayon-threads` with the value selected by a bounded,
+same-snapshot performance qualification. The controller binds that value into its configuration,
+producer environment, and live-unit adoption checks. This prevents a high-core host from silently
+falling back to the legacy half-visible-CPU store fan-out and changing scratch amplification.
 Producer namespace filtering uses a reload-stable cgroup-only allow-list; user namespaces and every
 other namespace type remain denied,
 and the empty capability set prevents the unprivileged worker from using the nominal cgroup option.

@@ -62,6 +62,7 @@ DEFAULT_INITIAL_CONCURRENCY = 2
 DEFAULT_TARGET_CONCURRENCY = 6
 DEFAULT_MAX_CONCURRENCY = 8
 MAX_CONFIGURED_CONCURRENCY = 32
+MAX_SOLANA_RAYON_THREADS = 256
 DEFAULT_SETTLE_SECONDS = 600
 DEFAULT_POLL_SECONDS = 15
 DEFAULT_MEMORY_HIGH_GIB = 48
@@ -881,6 +882,7 @@ def producer_environment(
     producer_user: str = "sol",
     producer_home: Path = Path("/home/sol"),
     gcloud_bin: Path | None = None,
+    solana_rayon_threads: int | None = None,
 ) -> tuple[str, ...]:
     producer_path = (
         DEFAULT_PRODUCER_PATH
@@ -901,6 +903,11 @@ def producer_environment(
         f"CLOUDSDK_CORE_ACCOUNT={account}",
         "JETSTREAMER_ALLOW_CANDIDATE_RUNTIME=1",
         *runtime_worker_environment(cohort, deploy),
+        *(
+            (f"SOLANA_RAYON_THREADS={solana_rayon_threads}",)
+            if solana_rayon_threads is not None
+            else ()
+        ),
         "JETSTREAMER_HISTORICAL_POH_THREADS=10",
         # Old Banks can retain tens of GiB of private account state.  The
         # worker acknowledges Shutdown only after replay and checkpoint work
@@ -945,6 +952,7 @@ def build_producer_command(
     archive_group: str = "horizon",
     producer_home: Path = Path("/home/sol"),
     gcloud_bin: Path | None = None,
+    solana_rayon_threads: int | None = None,
 ) -> list[str]:
     node = deploy / "jetstreamer-node"
     workers = tuple(deploy / name for _, name in runtime_workers(cohort))
@@ -1014,6 +1022,7 @@ def build_producer_command(
             producer_user,
             producer_home,
             gcloud_bin,
+            solana_rayon_threads,
         )
     )
     command.extend(
@@ -1481,6 +1490,7 @@ def unit_is_hardened_for_adoption(
     archive_group: str = "horizon",
     producer_home: Path = Path("/home/sol"),
     gcloud_bin: Path | None = None,
+    solana_rayon_threads: int | None = None,
 ) -> bool:
     properties = systemd_properties(
         unit,
@@ -1622,6 +1632,7 @@ def unit_is_hardened_for_adoption(
             producer_user,
             producer_home,
             gcloud_bin,
+            solana_rayon_threads,
         )
     )
     if configured_environment != expected_environment:
@@ -2624,6 +2635,7 @@ def controller_configuration_sha256(
         "disk_budget_per_worker_gib": args.disk_budget_per_worker_gib,
         "cpus_per_lane": args.cpus_per_lane,
         "cpu_quota_percent": args.cpu_quota_percent,
+        "solana_rayon_threads": args.solana_rayon_threads,
         "gcloud_account": args.gcloud_account,
         "gcloud_project": args.gcloud_project,
         "gcloud_bin": str(args.gcloud_bin) if args.gcloud_bin is not None else None,
@@ -3284,6 +3296,7 @@ class Controller:
             self.args.archive_group,
             self.producer_home,
             self.args.gcloud_bin,
+            self.args.solana_rayon_threads,
         ):
             raise SweepError(
                 f"matching producer PID {process.pid} for cohort {cohort.label} "
@@ -3581,6 +3594,7 @@ class Controller:
             archive_group=self.args.archive_group,
             producer_home=self.producer_home,
             gcloud_bin=self.args.gcloud_bin,
+            solana_rayon_threads=self.args.solana_rayon_threads,
         )
         self.revalidate_operational_directories()
         result = subprocess.run(command, check=False, capture_output=True, text=True)
@@ -4153,6 +4167,15 @@ def build_argument_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--cpus-per-lane", type=int, default=DEFAULT_CPUS_PER_LANE)
     parser.add_argument("--cpu-quota-percent", type=int, default=DEFAULT_CPU_QUOTA_PERCENT)
+    parser.add_argument(
+        "--solana-rayon-threads",
+        type=int,
+        required=True,
+        help=(
+            "explicit legacy Solana rayon/store fan-out selected by a bounded "
+            "same-snapshot performance qualification"
+        ),
+    )
     parser.add_argument("--gcloud-account", default=DEFAULT_ACCOUNT)
     parser.add_argument("--gcloud-project", default=DEFAULT_PROJECT)
     parser.add_argument(
@@ -4202,6 +4225,7 @@ def validate_options(args: argparse.Namespace) -> None:
         args.disk_budget_per_worker_gib,
         args.cpus_per_lane,
         args.cpu_quota_percent,
+        args.solana_rayon_threads,
     )
     if any(value <= 0 for value in numbers):
         raise SweepError("epoch bounds, concurrency, intervals, and resource limits must be positive")
@@ -4221,6 +4245,10 @@ def validate_options(args: argparse.Namespace) -> None:
         raise SweepError("memory-high-gib must be lower than memory-max-gib")
     if args.memory_admission_gib > args.memory_max_gib:
         raise SweepError("memory-admission-gib must not exceed memory-max-gib")
+    if args.solana_rayon_threads > MAX_SOLANA_RAYON_THREADS:
+        raise SweepError(
+            f"solana-rayon-threads must not exceed {MAX_SOLANA_RAYON_THREADS}"
+        )
     if args.execute and not args.controller_sha256:
         raise SweepError("--execute requires --controller-sha256")
     if (args.r2_receipt_directory is None) != (args.r2_bucket is None):
@@ -4438,6 +4466,7 @@ def print_plan(
         "memory_admission_gib": args.memory_admission_gib,
         "disk_reserve_gib": args.disk_reserve_gib,
         "disk_budget_per_worker_gib": args.disk_budget_per_worker_gib,
+        "solana_rayon_threads": args.solana_rayon_threads,
         "r2_receipt_directory": (
             str(args.r2_receipt_directory)
             if args.r2_receipt_directory is not None

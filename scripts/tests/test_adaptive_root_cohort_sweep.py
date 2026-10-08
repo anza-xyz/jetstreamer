@@ -663,6 +663,7 @@ class CommandTests(unittest.TestCase):
             "--public-private-root=/private",
             "--state-dir=/state",
             "--lane=lane-a=/lane-a",
+            "--solana-rayon-threads=16",
         ]
         incomplete = parser.parse_args(
             [*base, "--r2-receipt-directory=/r2-receipts"]
@@ -699,6 +700,7 @@ class CommandTests(unittest.TestCase):
             "--public-private-root=/private",
             "--state-dir=/state",
             "--lane=lane-a=/lane-a",
+            "--solana-rayon-threads=16",
         ]
         defaults = parser.parse_args(base)
         self.assertEqual(defaults.producer_user, "sol")
@@ -799,6 +801,7 @@ class CommandTests(unittest.TestCase):
                     "--state-dir=/state",
                     "--lane=lane-a=/lane-a",
                     f"--gcloud-bin={link}",
+                    "--solana-rayon-threads=16",
                 ]
             )
             sweep.validate_options(args)
@@ -841,6 +844,23 @@ class CommandTests(unittest.TestCase):
             properties["RestrictNamespaces"],
             sweep.RELOAD_STABLE_RESTRICT_NAMESPACES,
         )
+
+    def test_producer_pins_selected_solana_rayon_threads(self) -> None:
+        command = sweep.build_producer_command(
+            cohort=self.cohort,
+            lane=self.lane,
+            deploy=self.deploy,
+            manifest=self.manifest,
+            fingerprint=self.fingerprint,
+            unit="rayon-test.service",
+            solana_rayon_threads=16,
+        )
+        environment = {
+            item.removeprefix("--setenv=")
+            for item in command
+            if item.startswith("--setenv=")
+        }
+        self.assertIn("SOLANA_RAYON_THREADS=16", environment)
 
     def test_resource_limits_propagate_to_producer_and_importer(self) -> None:
         common = {
@@ -1120,6 +1140,32 @@ class AdoptionHardeningTests(unittest.TestCase):
                     self.cohort,
                     self.lane,
                     self.deploy,
+                )
+            )
+
+    def test_hardened_unit_binds_selected_solana_rayon_threads(self) -> None:
+        properties = self.hardened_properties(solana_rayon_threads=16)
+        with mock.patch.object(
+            sweep, "systemd_properties", return_value=properties
+        ):
+            self.assertTrue(
+                sweep.unit_is_hardened_for_adoption(
+                    self.unit,
+                    self.process,
+                    self.cohort,
+                    self.lane,
+                    self.deploy,
+                    solana_rayon_threads=16,
+                )
+            )
+            self.assertFalse(
+                sweep.unit_is_hardened_for_adoption(
+                    self.unit,
+                    self.process,
+                    self.cohort,
+                    self.lane,
+                    self.deploy,
+                    solana_rayon_threads=32,
                 )
             )
 
@@ -1644,6 +1690,7 @@ class AdmissionTests(unittest.TestCase):
                     "--state-dir=/state",
                     "--lane=lane-a=/lane-a",
                     "--initial-concurrency=1",
+                    "--solana-rayon-threads=16",
                     f"--target-concurrency={maximum}",
                     f"--max-concurrency={maximum}",
                 ]
@@ -1654,6 +1701,13 @@ class AdmissionTests(unittest.TestCase):
         self.assertEqual(valid.memory_admission_gib, valid.memory_max_gib)
         with self.assertRaisesRegex(sweep.SweepError, "max <= 32"):
             sweep.validate_options(options(33))
+
+        excessive_rayon_threads = options(9)
+        excessive_rayon_threads.solana_rayon_threads = (
+            sweep.MAX_SOLANA_RAYON_THREADS + 1
+        )
+        with self.assertRaisesRegex(sweep.SweepError, "solana-rayon-threads"):
+            sweep.validate_options(excessive_rayon_threads)
 
         excessive_memory_admission = options(9)
         excessive_memory_admission.memory_admission_gib = (
@@ -2091,6 +2145,7 @@ class CrashSafetyTests(unittest.TestCase):
             memory_high_gib=17,
             memory_max_gib=19,
             cpu_quota_percent=725,
+            solana_rayon_threads=16,
             producer_user="sol",
             archive_group="horizon",
         )
@@ -2353,6 +2408,7 @@ class CrashSafetyTests(unittest.TestCase):
             memory_high_gib=17,
             memory_max_gib=19,
             cpu_quota_percent=725,
+            solana_rayon_threads=16,
             producer_user="sol",
             archive_group="horizon",
         )
@@ -2433,6 +2489,7 @@ class CrashSafetyTests(unittest.TestCase):
             memory_high_gib=17,
             memory_max_gib=19,
             cpu_quota_percent=725,
+            solana_rayon_threads=16,
             producer_user="sol",
             archive_group="horizon",
         )

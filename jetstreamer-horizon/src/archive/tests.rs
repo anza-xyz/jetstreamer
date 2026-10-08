@@ -197,7 +197,7 @@ fn historical_rent_collection_exceeds_legacy_4k_post_update_cap() {
 }
 
 #[test]
-fn post_update_count_ceiling_remains_fail_closed() {
+fn post_update_count_ceiling_admits_epoch_213_rent_burst_and_remains_fail_closed() {
     let mut writer = ArchiveWriter::new(
         Vec::new(),
         181,
@@ -219,6 +219,8 @@ fn post_update_count_ceiling_remains_fail_closed() {
         write_version: 0,
         data: &[],
     };
+    // Mainnet slot 92,054,408 exceeds the old 8,192-record ceiling. Admit
+    // that observed shape while retaining a finite upper bound.
     for _ in 0..crate::limits::MAX_SLOT_POST_UPDATES {
         writer.write_reencoded_post_update(&update).unwrap();
     }
@@ -226,8 +228,8 @@ fn post_update_count_ceiling_remains_fail_closed() {
         writer.write_reencoded_post_update(&update),
         Err(ArchiveFormatError::SectionTooLarge {
             section: "post-transaction account updates",
-            bytes: 8_193,
-            limit: 8_192,
+            bytes: 16_385,
+            limit: 16_384,
         })
     ));
 }

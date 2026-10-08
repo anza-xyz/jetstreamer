@@ -136,6 +136,13 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
   overshoot the reserve before their next samples. Record the exact budget formula and live claims
   in the launch receipt; reduce the protected amount only from newer measured evidence, never from
   idle CPU or current scratch size alone.
+  Do not treat an unsandboxed manual guard invocation or an `active (waiting)` timer as proof that
+  the installed guard works. Before considering a producer protected, observe the timer's first
+  real service invocation complete with exit status zero under the deployed sandbox, and preserve
+  its sampled invocation ID, restart count, available bytes, floor, and no-trip result. If the
+  sandboxed invocation cannot traverse or write its private receipt path, stop that broken timer,
+  preserve its failure journal, correct the least-privilege capability or path policy, and repeat
+  this first-fire proof without restarting the producer.
 - Before using scratch growth for admission or cross-host comparisons, resolve the exact live
   `--replay-scratch` argument from the service/process rather than measuring a lane, qualification,
   or retry parent. Record physical bytes, apparent bytes, file count, and a bounded-depth directory

@@ -2113,7 +2113,8 @@ class SourceRecoveryTests(unittest.TestCase):
             }
             controller.launch_producer = mock.Mock(return_value=True)
 
-            self.assertTrue(controller.import_one())
+            with mock.patch.object(sweep, "discover_epoch_claims", return_value=()):
+                self.assertTrue(controller.import_one())
             self.assertEqual(raw_assignment["phase"], "producer")
             self.assertIsNone(controller.state["import_owner"])
             controller.launch_producer.assert_called_once_with(
@@ -2312,6 +2313,7 @@ class CrashSafetyTests(unittest.TestCase):
             True, True, False, "success", None, 1024, 1024, "running"
         )
         with (
+            mock.patch.object(sweep, "discover_epoch_claims", return_value=()),
             mock.patch.object(
                 sweep, "public_recovery_marker_present", return_value=False
             ),
@@ -2342,6 +2344,7 @@ class CrashSafetyTests(unittest.TestCase):
             True, False, True, "success", 0, 0, 0, "exited"
         )
         with (
+            mock.patch.object(sweep, "discover_epoch_claims", return_value=()),
             mock.patch.object(
                 sweep, "public_recovery_marker_present", return_value=False
             ),
@@ -2370,6 +2373,7 @@ class CrashSafetyTests(unittest.TestCase):
             False, False, False, "not-found", None, None, None, ""
         )
         with (
+            mock.patch.object(sweep, "discover_epoch_claims", return_value=()),
             mock.patch.object(
                 sweep, "public_recovery_marker_present", return_value=False
             ),

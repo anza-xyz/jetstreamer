@@ -56,6 +56,15 @@ epochs touch a slot interval marked unsupported by the checked-in runtime regist
    relaunch refers to it first. Retain a controlled stop only when it can genuinely resume in place;
    after a clean bootstrap relaunch into a new isolated generation with no resume cursor, reclaim
    older unreferenced generations promptly as well.
+   An ordered historical-worker `ShuttingDown` response is the protocol commit point. On very large
+   mmap-backed account stores, SIGKILL may remain pending in an uninterruptible kernel operation past
+   a second reap window. Deploy a parent that hands this delayed cleanup to its detached reaper and
+   continues sealed manifest publication; the scratch retirement reference scan remains the deletion
+   gate. If an older parent reports this condition as a post-archive failure, quarantine every staged
+   restart first, preserve the terminal checkpoint, archive-complete log, diagnostic archive, and
+   snapshot, then delete only the unreferenced scratch. A sealed archive without its producer segment
+   manifest remains private until a reviewed recovery tool reconstructs the evidence and performs a
+   complete independent reread.
 6. Treat disk cleanup as part of admission control. Proactively remove reproducible build caches,
    download caches, obsolete snapshots, and obsolete scratch generations once their exact
    canonical paths have been checked against live processes and staged units. Keep the immutable

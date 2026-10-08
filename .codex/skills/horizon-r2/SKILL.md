@@ -63,6 +63,17 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
   present. Preseed only from digest-bound retained evidence and verify the copied digest and
   ownership; otherwise validate noninteractive gcloud authentication for the service identity.
 - Failed-replay scratch cleanup is authorized by default for this workflow. After confirming the failure and capturing the evidence needed to diagnose or reproduce it, stop the service and retry path, verify that no live process or staged relaunch references the exact scratch path, and delete that failed run's scratch immediately instead of allowing failures to accumulate. Preserve diagnostic output, partial archives, replay state, logs, checkpoints, manifests, receipts, and any snapshot still needed for diagnosis, lineage, restart, or a staged epoch outside the scratch tree. Never apply this cleanup rule to a controlled stop that can genuinely resume in place. If a relaunch demonstrably starts from the bootstrap in a new isolated runtime generation with no resume cursor, verify the new worker's exact generation and reclaim older unreferenced generations promptly; preserving them does not make that replay resumable.
+- Treat an ordered historical-worker `ShuttingDown` acknowledgement as the worker protocol commit
+  point. A legacy worker can remain uninterruptible for longer than both graceful and forced reap
+  windows while the kernel tears down a multi-terabyte mmap-backed AccountsDb; delayed reaping after
+  that acknowledgement is cleanup latency, not replay divergence. Pin a parent build that transfers
+  the child, private runtime directory, and guardian to a detached reaper without failing the sealed
+  producer. Scratch retirement must still scan commands, maps, cwd/root/exe links, and descriptors
+  and refuse deletion while any process retains the tree. If an older parent instead exits nonzero
+  after the terminal checkpoint and `horizon archive complete`, quarantine its restart path, preserve
+  the archive and exact journal evidence, and reclaim only the unreferenced scratch. Do not invent a
+  missing segment manifest or publish the artifact: require an independently reviewed recovery path
+  and a complete durable archive reread before treating it as qualification evidence.
 - Do not raise replay concurrency from low CPU or RAM utilization alone. Snapshot extraction and
   historical account state can consume hundreds of GiB per worker; require the controller's
   configured per-worker disk admission budget and measured filesystem growth to leave the reserve

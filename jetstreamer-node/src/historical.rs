@@ -767,10 +767,6 @@ pub enum HistoricalRuntimeError {
         operation: &'static str,
         request_id: u64,
     },
-    #[error(
-        "historical worker acknowledged shutdown but did not exit within {timeout:?}; worker was terminated"
-    )]
-    ShutdownExitTimeout { timeout: Duration },
     #[error("{variable} must be a positive integer number of seconds, got {value:?}")]
     InvalidTimeout {
         variable: &'static str,
@@ -2094,13 +2090,19 @@ impl HistoricalRuntimeClient {
         let status = match wait_for_child(&mut child, self.timeouts.reap) {
             Ok(Some(status)) => status,
             Ok(None) => {
-                let reaped = kill_and_reap(
+                let termination_error = child.kill().err();
+                let reaped = reap_or_spawn_reaper(
                     child,
                     self.private_work_dir.take(),
                     self.guardian.take(),
                     self.timeouts.reap,
                 );
                 self.closed = true;
+                if let Some(error) = termination_error
+                    && !reaped
+                {
+                    return Err(HistoricalRuntimeError::Io(error));
+                }
                 if reaped {
                     // A valid, ordered ShuttingDown response is the worker's
                     // protocol commit point: all replay/checkpoint work has
@@ -2115,9 +2117,21 @@ impl HistoricalRuntimeClient {
                     );
                     return Ok(());
                 }
-                return Err(HistoricalRuntimeError::ShutdownExitTimeout {
-                    timeout: self.timeouts.reap,
-                });
+                // SIGKILL can remain pending while a worker is in an
+                // uninterruptible kernel operation (for example, tearing
+                // down a very large mmap-backed AccountsDb). Ownership has
+                // moved to the detached reaper, which retains the private
+                // runtime directory and guardian until wait(2) completes.
+                // The ordered ShuttingDown acknowledgement remains the
+                // protocol commit point, so delayed reaping must not turn a
+                // sealed replay and archive into a producer failure. Any
+                // later scratch retirement independently scans for live
+                // process references and therefore still fails closed.
+                log::warn!(
+                    "historical worker acknowledged shutdown; forced cleanup remained pending after {:?} and was transferred to the detached reaper",
+                    self.timeouts.reap,
+                );
+                return Ok(());
             }
             Err(error) => {
                 kill_and_reap(
@@ -4915,6 +4929,29 @@ mod tests {
         client.shutdown().unwrap();
 
         assert_client_poisoned_and_worker_reaped(&mut client, child_id);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn acknowledged_shutdown_allows_detached_reaper_cleanup() {
+        let (mut client, child_id) = client_with_response(&Response {
+            request_id: 1,
+            body: ResponseBody::ShuttingDown,
+        });
+        client.timeouts.reap = Duration::ZERO;
+        assert!(process_is_running(child_id));
+
+        client.shutdown().unwrap();
+
+        assert!(client.closed);
+        assert!(client.child.is_none());
+        assert!(client.transport.is_none());
+        assert!(matches!(client.ping(), Err(HistoricalRuntimeError::Closed)));
+        let started = Instant::now();
+        while process_is_running(child_id) && started.elapsed() < Duration::from_secs(2) {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!process_is_running(child_id));
     }
 
     #[cfg(unix)]

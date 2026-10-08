@@ -61,6 +61,7 @@ struct Config {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Command {
     Inventory,
+    RetireLocal,
     Sync,
     Verify,
     Restore,
@@ -121,7 +122,7 @@ struct Receipt {
 
 fn usage() -> ! {
     eprintln!(concat!(
-        "usage: horizon-r2 <inventory|sync|verify|restore> DIRECTORY [--epochs START-END] ",
+        "usage: horizon-r2 <inventory|retire-local|sync|verify|restore> DIRECTORY [--epochs START-END] ",
         "[--receipt-directory DIRECTORY] [--delete-local] [--part-size-mib N] ",
         "[--legacy-part-size-mib N] [--legacy-etag-only] [--overwrite-existing] ",
         "[--repair-orphaned-archive] ",
@@ -138,6 +139,7 @@ fn parse_args() -> Result<Config> {
         .as_deref()
     {
         Some("inventory") => Command::Inventory,
+        Some("retire-local") => Command::RetireLocal,
         Some("sync") => Command::Sync,
         Some("verify") => Command::Verify,
         Some("restore") => Command::Restore,
@@ -214,8 +216,13 @@ fn parse_args() -> Result<Config> {
         !repair_orphaned_archive || !overwrite_existing,
         "--repair-orphaned-archive and --overwrite-existing are mutually exclusive"
     );
+    ensure!(
+        !legacy_etag_only || matches!(command, Command::Sync | Command::Verify),
+        "--legacy-etag-only is valid only with sync or verify"
+    );
     let epochs = match (command, epochs) {
         (Command::Inventory, None) => bail!("inventory requires --epochs START-END"),
+        (Command::RetireLocal, None) => bail!("retire-local requires --epochs START-END"),
         (Command::Restore, None) => bail!("restore requires --epochs START-END"),
         (_, Some(epochs)) => epochs,
         (_, None) => discover_local_epochs(&directory)?,
@@ -1331,8 +1338,11 @@ fn revalidate_local(local: &LocalArchive) -> Result<()> {
 
 fn retire_local(local: &LocalArchive) -> Result<()> {
     revalidate_local(local)?;
-    fs::remove_file(&local.archive_path)?;
+    // The sidecar is the readiness marker in both local and remote
+    // namespaces. Remove it first so a crash can leave only an explicitly
+    // incomplete archive, never a completion marker whose archive vanished.
     fs::remove_file(&local.sidecar_path)?;
+    fs::remove_file(&local.archive_path)?;
     File::open(
         local
             .archive_path
@@ -1340,6 +1350,91 @@ fn retire_local(local: &LocalArchive) -> Result<()> {
             .unwrap_or_else(|| Path::new(".")),
     )?
     .sync_all()?;
+    Ok(())
+}
+
+fn validate_local_retirement_proof(
+    local: &LocalArchive,
+    proof: &LocalProof,
+    receipt: &Receipt,
+) -> Result<()> {
+    ensure!(
+        receipt.remote_sha256_readback || receipt.r2_composite_sha256.is_some(),
+        "R2 receipt lacks a durable whole-object SHA-256 proof"
+    );
+    ensure!(
+        local.epoch == receipt.epoch
+            && local.length == receipt.archive_length
+            && local.sha256_hex == receipt.archive_sha256
+            && local.sidecar == canonical_sidecar(receipt),
+        "local archive pair differs from the R2 receipt"
+    );
+    ensure!(
+        proof.sha256_hex == receipt.archive_sha256,
+        "local archive SHA-256 differs from the R2 receipt"
+    );
+    ensure!(
+        proof.multipart_etag == receipt.archive_etag,
+        "local archive multipart ETag differs from the R2 receipt"
+    );
+    if let Some(expected) = receipt.r2_composite_sha256.as_deref() {
+        ensure!(
+            composite_checksum_matches(
+                expected,
+                &proof.composite_sha256,
+                local.length.div_ceil(receipt.multipart_part_size),
+            ),
+            "local archive composite SHA-256 differs from the R2 receipt"
+        );
+    }
+    Ok(())
+}
+
+async fn retire_verified_local_epoch(
+    client: &Client,
+    r2: &R2Config,
+    config: &Config,
+    epoch: u64,
+) -> Result<()> {
+    let receipt = read_restore_receipt(
+        config
+            .receipt_directory
+            .as_deref()
+            .expect("local retirement requires a receipt directory"),
+        &r2.bucket,
+        epoch,
+    )?;
+    ensure!(
+        receipt.remote_sha256_readback || receipt.r2_composite_sha256.is_some(),
+        "R2 receipt lacks a durable whole-object SHA-256 proof"
+    );
+    let local = read_local_archive(&config.directory, epoch)?;
+    let path = local.archive_path.clone();
+    let expected = local.identity;
+    let part_size = receipt.multipart_part_size;
+    let proof =
+        tokio::task::spawn_blocking(move || hash_and_etag(&path, expected, part_size)).await??;
+    validate_local_retirement_proof(&local, &proof, &receipt)?;
+    revalidate_local(&local)?;
+
+    let remote = head_archive(client, &r2.bucket, &receipt.archive_key)
+        .await?
+        .ok_or_else(|| anyhow!("remote archive is missing"))?;
+    validate_remote_against_receipt(&remote, &receipt)?;
+    ensure!(
+        remote_sidecar(client, &r2.bucket, &receipt.checksum_key)
+            .await?
+            .as_deref()
+            == Some(local.sidecar.as_slice()),
+        "remote checksum sidecar differs from the R2 receipt"
+    );
+    let final_remote = head_archive(client, &r2.bucket, &receipt.archive_key)
+        .await?
+        .ok_or_else(|| anyhow!("remote archive disappeared before local retirement"))?;
+    validate_remote_against_receipt(&final_remote, &receipt)?;
+    revalidate_local(&local)?;
+    retire_local(&local)?;
+    eprintln!("epoch {epoch}: durable R2 receipt and remote pair revalidated, local pair retired");
     Ok(())
 }
 
@@ -1618,6 +1713,9 @@ async fn main() -> Result<()> {
     }
     for &epoch in &config.epochs {
         match config.command {
+            Command::RetireLocal => retire_verified_local_epoch(&client, &r2, &config, epoch)
+                .await
+                .with_context(|| format!("epoch {epoch} verified local retirement failed"))?,
             Command::Restore => restore_epoch(&client, &r2, &config, epoch)
                 .await
                 .with_context(|| format!("epoch {epoch} R2 restore failed"))?,
@@ -1781,6 +1879,55 @@ mod tests {
         let mut later = receipt.clone();
         later.verified_unix_seconds = 2;
         assert!(same_receipt_evidence(&receipt, &later));
+    }
+
+    #[test]
+    fn local_retirement_requires_a_durable_receipt_and_exact_local_proof() {
+        let directory = tempfile::tempdir().unwrap();
+        let epoch = 7;
+        let archive_path = directory.path().join("epoch-7.jet");
+        let sidecar_path = directory.path().join("epoch-7.jet.sha256");
+        fs::write(&archive_path, b"verified archive").unwrap();
+        let digest = format!("{:x}", Sha256::digest(b"verified archive"));
+        fs::write(&sidecar_path, format!("{digest}  epoch-7.jet\n")).unwrap();
+        let local = read_local_archive(directory.path(), epoch).unwrap();
+        let part_size = 5 * 1024 * 1024;
+        let proof = hash_and_etag(&archive_path, local.identity, part_size).unwrap();
+        let mut receipt = Receipt {
+            schema: RECEIPT_SCHEMA.to_owned(),
+            bucket: "bucket".to_owned(),
+            epoch,
+            archive_key: "epoch-7.jet".to_owned(),
+            checksum_key: "epoch-7.jet.sha256".to_owned(),
+            archive_length: local.length,
+            archive_sha256: digest,
+            archive_etag: proof.multipart_etag.clone(),
+            r2_composite_sha256: None,
+            remote_sha256_readback: true,
+            multipart_part_size: part_size,
+            verified_unix_seconds: 1,
+        };
+        validate_local_retirement_proof(&local, &proof, &receipt).unwrap();
+
+        receipt.remote_sha256_readback = false;
+        assert!(validate_local_retirement_proof(&local, &proof, &receipt).is_err());
+        receipt.remote_sha256_readback = true;
+        receipt.archive_etag = "different".to_owned();
+        assert!(validate_local_retirement_proof(&local, &proof, &receipt).is_err());
+    }
+
+    #[test]
+    fn local_retirement_removes_completion_marker_and_archive() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive_path = directory.path().join("epoch-7.jet");
+        let sidecar_path = directory.path().join("epoch-7.jet.sha256");
+        fs::write(&archive_path, b"archive").unwrap();
+        let digest = format!("{:x}", Sha256::digest(b"archive"));
+        fs::write(&sidecar_path, format!("{digest}  epoch-7.jet\n")).unwrap();
+        let local = read_local_archive(directory.path(), 7).unwrap();
+        retire_local(&local).unwrap();
+        assert!(!sidecar_path.exists());
+        assert!(!archive_path.exists());
     }
 
     #[test]

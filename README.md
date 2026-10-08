@@ -177,8 +177,8 @@ verifier proves that the current streaming interface can consume every record an
 `scripts/verify_horizon_plugin_progressive.sh` runs that consumer/API gate per epoch as soon as a
 complete archive pair appears. Its fsynced receipt binds the archive SHA-256, the exact
 `horizon_pipeline` binary, and the verification script. R2 work remains concurrent with replay, but
-upload is not eligible until this receipt, the full receipt, and both adjacent-boundary receipts
-exist for the exact archive digest. Local retirement uses the same gates. This preserves the
+upload is not eligible until this receipt and the full receipt exist for the exact archive digest.
+Local retirement additionally requires both adjacent-boundary receipts. This preserves the
 ordered-chain proof when a range is larger than available local disk; an epoch remains local until
 its predecessor and successor boundaries have both been checked against the exact archive digest.
 For a long-lived range, `scripts/watch_horizon_plugin_progressive.sh` checks the sidecar and exact
@@ -239,10 +239,33 @@ jetstreamer-r2 restore /absolute/scratch/directory \
 An existing destination is accepted only when it already matches the receipt. Partial restores
 can be resumed safely; unrelated or mismatching files are never overwritten.
 
+`jetstreamer-r2 retire-local` is the non-mutating-R2 retirement path for an archive that already
+has a durable private receipt. It requires that receipt to record either a completed whole-object
+SHA-256 readback or native composite SHA-256 evidence, rehashes the local archive and reconstructs
+its recorded multipart ETag, then re-observes the remote archive and canonical sidecar. Only after
+all evidence still agrees does it remove the local readiness sidecar followed by the archive. It
+never uploads, overwrites, or deletes an R2 object. This command intentionally does not evaluate
+plugin or adjacent-boundary policy; callers must establish that local retirement is authorized and
+must always select the range explicitly:
+
+```bash
+jetstreamer-r2 retire-local /absolute/horizon/directory \
+  --epochs 129-132 \
+  --receipt-directory /absolute/private/r2-receipts
+```
+
 `scripts/sync_horizon_r2_progressive.py` permits R2 publication after the full and current-plugin
 receipts agree with the archive. Local retirement remains stricter and additionally requires both
 adjacent-boundary receipts. This allows disjoint producers to exchange a verified boundary neighbor
 through R2 without creating a circular upload dependency.
+
+When a user has explicitly authorized local retirement at a filesystem floor,
+`scripts/retire_horizon_at_reserve.py` is the bounded emergency policy wrapper. Configure the
+progressive uploader and this wrapper with the same private `--local-mutation-lock`. Below the
+floor, the wrapper validates the entire public Horizon namespace, invokes `retire-local` for one
+explicit epoch at a time, and stops as soon as the floor is recovered. Above the floor it performs
+no hashing or mutation. It fails closed on a partial pair, an out-of-range file, missing durable R2
+evidence, or exhaustion of eligible local pairs. It never mutates R2.
 
 `scripts/audit_horizon_receipts.py` is the local-file-independent completion gate. It requires the
 full, current-plugin, R2, and adjacent-boundary receipts to agree on every archive SHA-256, and
@@ -283,7 +306,9 @@ For an actively generated range, `scripts/sync_horizon_r2_progressive.py` watche
 archive/sidecar pairs and invokes `jetstreamer-r2` serially. It checks whether an existing private
 receipt still describes the local archive before skipping it. Local retirement additionally
 requires receipts from the exact approved full verifier/script, plugin binary/script, and boundary
-verifier/script plus both adjacent archive boundaries. The watcher never deletes remote data.
+verifier/script plus both adjacent archive boundaries. Use `--local-mutation-lock` when a reserve
+retirement wrapper is installed so upload and local retirement cannot inspect or mutate the same
+pair concurrently. The watcher never deletes remote data.
 
 ### TUI dashboard
 

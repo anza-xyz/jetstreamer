@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 import sys
@@ -14,6 +15,16 @@ import sync_horizon_r2_progressive as progressive  # noqa: E402
 
 
 class ProgressiveR2Tests(unittest.TestCase):
+    def test_local_mutation_lock_is_private_and_regular(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "mutation.lock"
+            with progressive.local_mutation_lock(path):
+                metadata = path.stat()
+                self.assertEqual(metadata.st_uid, os.geteuid())
+                self.assertEqual(metadata.st_mode & 0o077, 0)
+            with progressive.local_mutation_lock(path):
+                pass
+
     def test_local_pair_requires_canonical_matching_sidecar(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)

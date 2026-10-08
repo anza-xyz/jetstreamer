@@ -308,6 +308,7 @@ scripts/sync_horizon_r2_progressive.py \
   target/release/jetstreamer-r2 "$HORIZON_DIR" \
   "$HOME/.jetstreamer-private/r2-receipts" START END \
   --delete-local \
+  --local-mutation-lock "$HOME/.jetstreamer-private/r2-receipts/local-mutation.lock" \
   --full-receipt-directory "$HOME/.jetstreamer-private/final-audits/receipts" \
   --full-verifier-sha256 FULL_VERIFIER_SHA256[,TRANSITION_SHA256] \
   --full-verifier-script-sha256 FULL_SCRIPT_SHA256 \
@@ -329,6 +330,25 @@ preconditions, performs a whole-object SHA-256 readback, and leaves the existing
 It never admits a mismatching sidecar and is mutually exclusive with `--overwrite-existing`.
 
 Use `jetstreamer-r2 restore` when an ordered-chain or boundary audit needs an archive that has already been retired locally. Restore only into an explicit scratch directory, require `--epochs` and the private `--receipt-directory`, and let the Rust command enforce the recorded length, ETag, whole-file SHA-256, canonical sidecar, resumable conditional ranged GET, and no-clobber publication. Never download directly over a public Horizon archive.
+
+Use `jetstreamer-r2 retire-local` only when local retirement has already been authorized by the
+normal boundary gates or by an explicit user-approved backup/emergency policy. It makes no R2
+mutation: it requires a durable receipt with whole-object SHA-256 evidence, rehashes the local
+archive and ETag, re-observes the remote archive and sidecar, then removes the local sidecar before
+the archive. It requires an explicit `--epochs START-END`; never infer a destructive selection from
+directory discovery. The command deliberately does not decide policy, so never treat its integrity
+checks as a substitute for the ordinary full/plugin/boundary gates unless the user explicitly
+authorized that narrower local-retirement exception.
+
+For an explicit user-approved filesystem-floor exception, use
+`scripts/retire_horizon_at_reserve.py` as the policy wrapper and give it the exact same private
+`--local-mutation-lock` as the progressive uploader. The wrapper must recheck actual free space
+after acquiring the lock, validate that the public directory contains only complete canonical
+pairs inside the authorized range, call `retire-local` for one explicit epoch at a time, and stop
+as soon as the floor is recovered. A newly arriving pair must not broaden the selected set. Treat
+no eligible pair below the floor, a partial pair, an out-of-range entry, or failure to recover the
+floor after exhausting pairs as a hard failure. Before enabling its timer, prove one sandboxed
+above-floor invocation performs no archive hashing, no local removal, and no R2 mutation.
 
 When a restore or audit runs in a systemd sandbox with `ProtectHome=read-only` and the scratch
 directory itself named in `ReadWritePaths=`, clean the directory's contents but keep the empty

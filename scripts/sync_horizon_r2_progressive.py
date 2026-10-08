@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Collection
+from contextlib import contextmanager
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -97,6 +99,34 @@ def regular_file(path: Path) -> os.stat_result | None:
     if not stat.S_ISREG(metadata.st_mode):
         raise RuntimeError(f"expected a regular file: {path}")
     return metadata
+
+
+@contextmanager
+def local_mutation_lock(path: Path | None):
+    if path is None:
+        yield
+        return
+    descriptor = os.open(
+        path,
+        os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW,
+        0o600,
+    )
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_nlink != 1
+            or stat.S_IMODE(metadata.st_mode) & 0o077
+        ):
+            raise RuntimeError(f"unsafe local-mutation lock: {path}")
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        current = path.lstat()
+        if (current.st_dev, current.st_ino) != (metadata.st_dev, metadata.st_ino):
+            raise RuntimeError(f"local-mutation lock namespace changed: {path}")
+        yield
+    finally:
+        os.close(descriptor)
 
 
 def local_pair(directory: Path, epoch: int) -> tuple[Path, Path, str, os.stat_result] | None:
@@ -287,6 +317,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--concurrency", type=positive_integer, default=4)
     parser.add_argument("--legacy-part-size-mib", type=positive_integer, default=5)
     parser.add_argument("--delete-local", action="store_true")
+    parser.add_argument("--local-mutation-lock", type=Path)
     parser.add_argument("--full-receipt-directory", type=absolute_directory)
     parser.add_argument("--full-verifier-sha256", type=sha256_allowlist)
     parser.add_argument("--full-verifier-script-sha256", type=sha256)
@@ -320,6 +351,11 @@ def parse_args() -> argparse.Namespace:
             "--plugin-verifier-script-sha256, --boundary-receipt-directory, "
             "--boundary-verifier-sha256 and --boundary-verifier-script-sha256"
         )
+    if args.local_mutation_lock is not None:
+        if not args.local_mutation_lock.is_absolute():
+            parser.error("--local-mutation-lock must be absolute")
+        if args.local_mutation_lock.parent.resolve(strict=True) != args.receipt_directory:
+            parser.error("--local-mutation-lock must be directly inside the receipt directory")
     return args
 
 
@@ -328,27 +364,28 @@ def main() -> int:
     while True:
         incomplete = 0
         for epoch in range(args.first_epoch, args.last_epoch + 1):
-            pair = local_pair(args.horizon_directory, epoch)
-            receipt_path = args.receipt_directory / f"epoch-{epoch}.r2.json"
-            if pair is None:
-                if regular_file(receipt_path) is None:
+            with local_mutation_lock(args.local_mutation_lock):
+                pair = local_pair(args.horizon_directory, epoch)
+                receipt_path = args.receipt_directory / f"epoch-{epoch}.r2.json"
+                if pair is None:
+                    if regular_file(receipt_path) is None:
+                        incomplete += 1
+                    continue
+                _archive, _sidecar, digest, archive_metadata = pair
+                publish = publication_allowed(args, epoch, digest)
+                retire = retirement_allowed(args, epoch, digest)
+                if receipt_matches(receipt_path, epoch, digest, archive_metadata):
+                    if retire:
+                        sync_epoch(args, epoch, delete_local=True)
+                    continue
+                if not publish:
                     incomplete += 1
-                continue
-            _archive, _sidecar, digest, archive_metadata = pair
-            publish = publication_allowed(args, epoch, digest)
-            retire = retirement_allowed(args, epoch, digest)
-            if receipt_matches(receipt_path, epoch, digest, archive_metadata):
-                if retire:
-                    sync_epoch(args, epoch, delete_local=True)
-                continue
-            if not publish:
-                incomplete += 1
-                print(
-                    f"epoch {epoch}: waiting for exact full and plugin receipts",
-                    flush=True,
-                )
-                continue
-            sync_epoch(args, epoch, delete_local=retire)
+                    print(
+                        f"epoch {epoch}: waiting for exact full and plugin receipts",
+                        flush=True,
+                    )
+                    continue
+                sync_epoch(args, epoch, delete_local=retire)
         if incomplete == 0:
             print(
                 f"epochs {args.first_epoch}-{args.last_epoch}: every epoch has an R2 receipt",

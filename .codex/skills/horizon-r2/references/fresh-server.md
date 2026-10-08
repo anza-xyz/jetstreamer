@@ -150,6 +150,18 @@ evidence for a later reviewed registry change, not permission to publish by itse
    parent's Bank/`SlotHashes` hash, investigate reconstructed slot completion and child-Bank sysvar
    continuity; do not promote a singleton guard merely because the affected recovery groups are
    synthetic entry boundaries.
+   Before declaring the underlying PoH or sysvar source unavailable, audit the official regional
+   GCS ledger replicas (`mainnet-beta-ledger-us-ny5`, `mainnet-beta-ledger-europe-fr2`, and
+   `mainnet-beta-ledger-asia-sg1`) by reading their generation-bound `bounds.txt` objects. Bind each
+   object's exact generation or versioned `storage_url`, size, CRC32C, MD5, rooted range, and full
+   data range in a durable receipt. Do this before downloading a hundreds-of-gigabytes RocksDB
+   archive: bounds that end before and restart after the target prove that replica cannot contain
+   the missing shreds. Inspect a nearby canonical snapshot only when its slot is still within the
+   pinned runtime's relevant sysvar-retention window; a later snapshot cannot recover an already
+   expired RecentBlockhashes entry. If every regional ledger excludes the boundary and no retained
+   snapshot can carry it, record source insufficiency and require another independently verifiable
+   raw-shred or exact historical-sysvar source. Never guess the missing hash, force a Bank hash, or
+   weaken terminal/plugin checks to bridge the gap.
    Before launch, also inspect the exact immutable worker's internal snapshot and entry bounds and
    require them to admit the requested terminal slot. The focused planner's search envelope may be
    wider than the current worker guard. If so, defer the lane until the worker bound is deliberately

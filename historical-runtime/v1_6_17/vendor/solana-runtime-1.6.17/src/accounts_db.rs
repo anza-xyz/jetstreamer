@@ -74,6 +74,15 @@ pub const DEFAULT_NUM_THREADS: u32 = 8;
 pub const DEFAULT_NUM_DIRS: u32 = 4;
 pub const SHRINK_RATIO: f64 = 0.80;
 
+// Historical replay commits entries in canonical order from one worker
+// process. Keep the hashing/cleaning pool independently scalable, but avoid
+// making every larger SOLANA_RAYON_THREADS value preallocate that many sparse
+// AppendVecs for every slot. Eight retains upstream's original default scan
+// fan-out while bounding file, VMA, and scratch amplification.
+fn historical_min_num_stores(num_threads: usize) -> usize {
+    std::cmp::min(num_threads, DEFAULT_NUM_THREADS as usize)
+}
+
 // A specially reserved storage id just for entries in the cache, so that
 // operations that take a storage entry can maintain a common interface
 // when interacting with cached accounts. This id is "virtual" in that it
@@ -1096,7 +1105,7 @@ impl Default for AccountsDb {
                 .build()
                 .unwrap(),
             thread_pool_clean: make_min_priority_thread_pool(),
-            min_num_stores: num_threads,
+            min_num_stores: historical_min_num_stores(num_threads),
             bank_hashes: RwLock::new(bank_hashes),
             frozen_accounts: HashMap::new(),
             external_purge_slots_stats: PurgeStats::default(),
@@ -5065,6 +5074,14 @@ pub mod tests {
         thread::{self, sleep, Builder, JoinHandle},
         time::Duration,
     };
+
+    #[test]
+    fn test_historical_min_num_stores_caps_preallocation_without_reducing_small_pools() {
+        assert_eq!(historical_min_num_stores(1), 1);
+        assert_eq!(historical_min_num_stores(8), 8);
+        assert_eq!(historical_min_num_stores(16), 8);
+        assert_eq!(historical_min_num_stores(32), 8);
+    }
 
     fn linear_ancestors(end_slot: u64) -> Ancestors {
         let mut ancestors: Ancestors = vec![(0, 0)].into_iter().collect();

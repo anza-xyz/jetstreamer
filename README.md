@@ -847,6 +847,11 @@ separate gates. A dormant qualification service can bind that decision with
 policy digest, and sealed selector digest while also requiring the receipt to keep qualification
 launch, publication, and remote mutation unauthorized. Passing this check proves only which
 environment was selected; the service must still receive a separate fresh admission before start.
+The sealed performance-admission checker accepts an optional
+`minimum_memory_available_bytes` floor (and optional absolute `meminfo_path`) in addition to its
+filesystem and VMA floors. Use the measured non-reclaimable reservation for every already-live and
+new worker plus the host reserve, rather than multiplying each worker's larger emergency
+`MemoryMax` ceiling.
 Producer namespace filtering uses a reload-stable cgroup-only allow-list; user namespaces and every
 other namespace type remain denied,
 and the empty capability set prevents the unprivileged worker from using the nominal cgroup option.

@@ -30,7 +30,9 @@ use tempfile::TempDir;
 
 const MAX_AGE_CORRECTION_EPOCH: u64 = 14;
 // The epoch-200 terminal checkpoint is the bootstrap for this candidate.
-// Admit diagnostic entries only through epoch 208 while each epoch remains
+// Admit diagnostic entries through the end of epoch 213 so the parent's
+// focused-qualification-only envelope can re-run the preserved 209-213
+// boundary failures after the block-reward capacity repair. Each epoch remains
 // independently checkpoint-qualified. The parent registry retains an explicit
 // unsupported gap after epoch 201 until those checkpoints succeed.
 // Compatibility must be demonstrated by trusted checkpoints before the
@@ -38,7 +40,7 @@ const MAX_AGE_CORRECTION_EPOCH: u64 = 14;
 // is not treated as evidence that v1.6.16 execution semantics apply out of era.
 const MIN_SUPPORTED_SNAPSHOT_SLOT: u64 = 86_831_488;
 const MIN_SUPPORTED_ENTRY_SLOT: u64 = MIN_SUPPORTED_SNAPSHOT_SLOT + 1;
-const MAX_SUPPORTED_SLOT_EXCLUSIVE: u64 = 90_288_000;
+const MAX_SUPPORTED_SLOT_EXCLUSIVE: u64 = 92_448_000;
 // Old Faithful recovered this bounded run from confirmed-block data after the
 // original shreds were unavailable.  Every present block in the run contains
 // only transaction chunks (at most five transactions), with num_hashes=1 and
@@ -1449,6 +1451,7 @@ mod tests {
 
     #[test]
     fn candidate_range_is_closed_at_both_ends() {
+        assert_eq!(MAX_SUPPORTED_SLOT_EXCLUSIVE, 92_448_000);
         assert!(validate_candidate_snapshot_slot(MIN_SUPPORTED_SNAPSHOT_SLOT).is_ok());
         assert!(validate_candidate_snapshot_slot(MAX_SUPPORTED_SLOT_EXCLUSIVE - 1).is_ok());
         assert!(validate_candidate_snapshot_slot(MIN_SUPPORTED_SNAPSHOT_SLOT - 1).is_err());
@@ -1458,6 +1461,24 @@ mod tests {
         assert!(validate_candidate_entry_slot(MAX_SUPPORTED_SLOT_EXCLUSIVE - 1).is_ok());
         assert!(validate_candidate_entry_slot(MIN_SUPPORTED_ENTRY_SLOT - 1).is_err());
         assert!(validate_candidate_entry_slot(MAX_SUPPORTED_SLOT_EXCLUSIVE).is_err());
+    }
+
+    #[test]
+    fn focused_epoch_209_through_213_checkpoints_are_inside_worker_guard() {
+        // Exact predecessor snapshots for the five preserved first-boundary
+        // attempts and the epoch-213 terminal checkpoint. These are range
+        // admission evidence only; successful replay and independent deep
+        // validation remain required before changing the ordinary registry.
+        for snapshot_slot in [
+            90_287_519, 90_719_638, 91_151_575, 91_583_512, 92_015_419, 92_447_542,
+        ]
+        .iter()
+        .copied()
+        {
+            assert!(validate_candidate_snapshot_slot(snapshot_slot).is_ok());
+        }
+        assert!(validate_candidate_entry_slot(92_447_542).is_ok());
+        assert!(validate_candidate_entry_slot(92_448_000).is_err());
     }
 
     fn request_for(

@@ -56,6 +56,13 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
 
 - Use the repository's sealed historical replay/controller path and automatic slot-range runtime selection. Do not invent a compatibility override.
 - Run generation and long-lived verification/upload watchers in persistent systemd units so loss of the interactive session cannot kill them. Use `Restart=on-failure` with a bounded retry delay only when every invocation gets isolated diagnostic output and scratch, or a proven launcher preserves the failed invocation's artifacts before opening the next output. A replay normally creates or truncates its `.jet` at startup, so never let an automatic retry reuse the same diagnostic archive path. Use a fail-closed non-restarting unit and relaunch manually after evidence capture when attempt isolation is unavailable. Do not use `Restart=always`, because successful completion must remain terminal. Respect unrelated jobs and configured RAM/disk reserves.
+- When a guard pauses adaptive controllers around a serialized public import, authenticate and fsync
+  the exact live systemd controller commands plus the importer's invocation ID before stopping the
+  first controller. After a guard restart, recover that state, finish stopping authenticated live
+  controllers (including late arrivals) before waiting on the same zero-restart importer, and keep
+  the state until every controller has been restored or deliberately left paused. A collected
+  importer unit is terminal only when no other public importer is live. Never replace a guard while
+  it has stopped-controller commands only in memory and its bound importer is still active.
 - Before starting a recurring status timer, initialize its last-observed state to the replay's
   authoritative launch time and validate the monitor once manually. A timer that exists without
   this state is not monitoring the replay; diagnose monitor failures without restarting a healthy

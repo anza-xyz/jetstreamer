@@ -37,7 +37,11 @@ For a long-running range, use `scripts/sync_horizon_r2_progressive.py` to discov
   must replay farther to reach its terminal root. Keep every out-of-range verification-tail archive
   in private storage, give it no canonical sidecar, and exclude it from the public Horizon directory
   and R2. Deeply validate the complete sealed cohort before transactionally importing only the
-  requested contiguous prefix through the repository's bounded recovery option.
+  requested contiguous prefix through the repository's bounded recovery option. Seal this intent in
+  the source plan: run `preflight_gcs_snapshots.py` through the first compatible later root with
+  `--last-epoch` set to that verification endpoint and `--publish-through-epoch` set to the user's
+  requested range end. Require the manifest's tail epochs to be marked
+  `verification-tail-private`; never rely on an operator remembering an unrecorded boundary.
 - Without a range, inventory canonical R2 pairs first. Upload any complete local pairs missing from R2, then begin with the lowest missing epoch supported by the repository's compatibility manifests. Continue in bounded cohorts as resources permit.
 - An R2 epoch is complete only when both `epoch-N.jet` and `epoch-N.jet.sha256` exist and agree with verified local evidence. A checksum-only or archive-only epoch is incomplete.
 - Use the repository binary's mutation-free inventory mode for an authoritative explicit-range
@@ -188,6 +192,19 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
   keys within one transaction are not a cross-transaction attribution conflict. Differentially test
   write/write and write/read barriers, independent batching, invalid duplicate-key handling, and the
   known canonical conflicting-write slot before qualification.
+  Derive writable-key attribution with the same feature gate used by that pinned Bank's
+  `prepare_batch` account-lock path. This API is version-specific: the qualified v1.6 workers expose
+  `demote_sysvar_write_locks`, while v1.7 and v1.8 expose `demote_program_write_locks`. Do not copy
+  the older boolean or approximate writable keys across a runtime boundary; inspect the vendored
+  Bank and Message implementations, pass the exact active demotion value to `is_writable`, and add a
+  compile/runtime regression for the selected candidate.
+  Run each real boundary-snapshot integration test from that historical runtime's workspace root,
+  not from the repository root with only `--manifest-path`: rustup selects the pinned legacy
+  toolchain from the current directory, and every worker build script must reject a modern compiler.
+  Give the libtest process `RUST_MIN_STACK=134217728` for these old full-snapshot load/verify gates;
+  the default test-thread stack can overflow inside legacy snapshot restoration even when the same
+  code is valid in the production main thread. Keep this as a test-only environment setting and
+  still treat any hash, bank verification, or checkpoint mismatch as a real qualification failure.
   Pin the chosen environment in the launch manifest and repeat the normal root/plugin qualification;
   never change it underneath a live replay.
 - For a bounded performance cohort, capture cgroup CPU, memory peak/events, major-fault, pressure,

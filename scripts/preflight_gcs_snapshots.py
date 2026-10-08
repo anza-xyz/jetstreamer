@@ -9,7 +9,9 @@ preferred endpoint has no root, the cohort ends at the latest earlier root in
 that target window. Only a target window with no root is extended to the first
 later epoch with one, provided every epoch uses the same runtime. Every
 multi-epoch cohort starts from a root snapshot in the epoch immediately before
-the cohort.
+the cohort. ``--publish-through-epoch`` may make the final part of the planned
+range an isolated verification tail: those epochs participate in the terminal
+root proof but remain private and are never publication candidates.
 Hourly objects remain eligible only as transport bootstraps for single-epoch
 cohorts; they are never trust anchors or replay checkpoints.
 
@@ -791,8 +793,29 @@ def _manifest_object(item: SnapshotObject) -> Dict[str, Any]:
 
 
 def build_manifest(
-    plans: Sequence[EpochPlan], target_cohort_epochs: int = 1
+    plans: Sequence[EpochPlan],
+    target_cohort_epochs: int = 1,
+    publish_through_epoch: Optional[int] = None,
 ) -> Dict[str, Any]:
+    if not plans:
+        if publish_through_epoch is not None:
+            raise PreflightError("cannot bind a publication boundary to an empty plan")
+    else:
+        first_epoch = plans[0].epoch
+        verification_last_epoch = plans[-1].epoch
+        if publish_through_epoch is None:
+            publish_through_epoch = verification_last_epoch
+        if not first_epoch <= publish_through_epoch <= verification_last_epoch:
+            raise PreflightError(
+                f"publication boundary {publish_through_epoch} is outside planned epochs "
+                f"{first_epoch}-{verification_last_epoch}"
+            )
+        final_cohort_first = plans[-1].cohort_first_epoch
+        if publish_through_epoch < final_cohort_first:
+            raise PreflightError(
+                f"verification tail must be contained in the final sealed cohort "
+                f"{final_cohort_first}-{verification_last_epoch}"
+            )
     cohort_records: List[Dict[str, Any]] = []
     for plan in plans:
         key = (plan.cohort_first_epoch, plan.cohort_last_epoch)
@@ -809,6 +832,9 @@ def build_manifest(
                 "bootstrap": _manifest_object(plan.bootstrap),
                 "first_epoch": plan.cohort_first_epoch,
                 "last_epoch": plan.cohort_last_epoch,
+                "publish_through_epoch": min(
+                    plan.cohort_last_epoch, publish_through_epoch
+                ),
                 "publication_gate": "all-archives-validated-and-final-root-verified",
                 "root_checkpoints": [
                     _manifest_object(item) for item in plan.checkpoints
@@ -824,6 +850,7 @@ def build_manifest(
         "first_epoch": plans[0].epoch if plans else None,
         "inventory_patterns": {"hourly": HOURLY_PATTERN, "root": ROOT_PATTERN},
         "last_epoch": plans[-1].epoch if plans else None,
+        "publication_boundary_epoch": publish_through_epoch,
         "runtime_routes": [
             {
                 "accepted_extensions": list(extensions),
@@ -842,6 +869,7 @@ def build_manifest(
             "checkpoint_window": "after-bootstrap-through-cohort-end",
             "newest_slot_must_be_unique": True,
             "publication": "withhold-complete-cohort-until-final-root",
+            "verification_tail": "private-no-sidecar-no-r2",
             "target_cohort_epochs": target_cohort_epochs,
         },
         "verification_cohorts": cohort_records,
@@ -854,6 +882,11 @@ def build_manifest(
                     "start": epoch_slot_range(plan.cohort_first_epoch - 1)[0],
                 },
                 "epoch": plan.epoch,
+                "publication_scope": (
+                    "requested"
+                    if plan.epoch <= publish_through_epoch
+                    else "verification-tail-private"
+                ),
                 "runtime_state_source": (
                     f"{plan.bootstrap.source}-bootstrap"
                     if plan.epoch == plan.cohort_first_epoch
@@ -1062,6 +1095,14 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--first-epoch", type=int, default=FIRST_EPOCH)
     parser.add_argument("--last-epoch", type=int, default=LAST_EPOCH)
     parser.add_argument(
+        "--publish-through-epoch",
+        type=int,
+        help=(
+            "last publishable epoch when --last-epoch includes a private verification tail "
+            "(default: --last-epoch)"
+        ),
+    )
+    parser.add_argument(
         "--target-cohort-epochs",
         type=int,
         choices=range(1, MAX_TARGET_COHORT_EPOCHS + 1),
@@ -1077,6 +1118,15 @@ def build_argument_parser() -> argparse.ArgumentParser:
 def main(argv: Optional[Sequence[str]] = None) -> int:
     arguments = build_argument_parser().parse_args(argv)
     try:
+        if arguments.publish_through_epoch is not None and not (
+            arguments.first_epoch
+            <= arguments.publish_through_epoch
+            <= arguments.last_epoch
+        ):
+            raise PreflightError(
+                f"publication boundary {arguments.publish_through_epoch} is outside requested "
+                f"verification epochs {arguments.first_epoch}-{arguments.last_epoch}"
+            )
         relevant_slots = requested_slot_range(arguments.first_epoch, arguments.last_epoch)
         root_text, hourly_text = load_inventory_texts(
             arguments.inventory_root_json, arguments.inventory_hourly_json
@@ -1095,7 +1145,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             arguments.last_epoch,
             arguments.target_cohort_epochs,
         )
-        manifest = build_manifest(plans, arguments.target_cohort_epochs)
+        manifest = build_manifest(
+            plans,
+            arguments.target_cohort_epochs,
+            arguments.publish_through_epoch,
+        )
         fingerprint = manifest_fingerprint(manifest)
         storage = build_storage_report(plans, arguments.local_root)
         report = {

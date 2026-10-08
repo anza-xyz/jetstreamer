@@ -87,7 +87,7 @@ zstd = { version = "0", default-features = false }
 thousands = "0"
 tokio-stream = { version = "0", default-features = false }
 rangemap = "1"
-rseek = "0.4"
+rseek = "0.4.1"
 ripget = "0.3"
 rayon = "1"
 xxhash-rust = { version = "0.8", features = ["xxh64"] }

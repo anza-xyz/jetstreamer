@@ -23,6 +23,11 @@ For a long-running range, use `scripts/sync_horizon_r2_progressive.py` to discov
   skipping it. Accept either one epoch or an inclusive `START-END` range when the user supplies a
   bound. Do not ask for a range merely because it was omitted.
 - Locate the Jetstreamer repository and read its current historical compatibility table and active controller state before starting generation.
+- Plan missing work as ordered contiguous cohorts before falling back to singleton epochs. Adjacent
+  epochs that share an immutable runtime and checkpoint chain can run in one generation and carry
+  the same live runtime state and AccountsDB scratch forward; do not budget, restore, or clean that
+  scratch as if each cohort member were an independent replay. Apply the detailed cohort boundaries
+  and publication gates in **Produce and verify**.
 - Use `HORIZON_DIR` when set; otherwise use `$HOME/horizon`. Keep only `epoch-N.jet` and `epoch-N.jet.sha256` in that public directory.
 - Credentials are `HORIZON_S3_ENDPOINT`, `HORIZON_ACCESS_KEY_ID`, and `HORIZON_SECRET_ACCESS_KEY`. Check only that they exist; never print their values. The endpoint path names the bucket.
 - With an explicit user range, restrict ordinary generation, verification, upload, and cleanup to

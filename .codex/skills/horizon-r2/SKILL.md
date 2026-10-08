@@ -129,6 +129,13 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
   later recovers. Record completion only after the bound process is inactive. A reserve trip does
   not authorize deleting its scratch, restarting it automatically, modifying remote objects, or
   stopping any unbound invocation.
+  When admitting a new producer beside older live producers, set that producer's stop floor to the
+  global reserve plus the conservative remaining-growth budgets still owed to the older producers,
+  unless one proven aggregate guard serializes the complete fleet's response. Giving every lane an
+  independent guard at only the global reserve lets several lanes consume the same headroom and can
+  overshoot the reserve before their next samples. Record the exact budget formula and live claims
+  in the launch receipt; reduce the protected amount only from newer measured evidence, never from
+  idle CPU or current scratch size alone.
 - Before using scratch growth for admission or cross-host comparisons, resolve the exact live
   `--replay-scratch` argument from the service/process rather than measuring a lane, qualification,
   or retry parent. Record physical bytes, apparent bytes, file count, and a bounded-depth directory

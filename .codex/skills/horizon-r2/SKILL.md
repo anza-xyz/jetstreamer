@@ -99,7 +99,12 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
   newest units and preserve their private run directories for later resumption.
 - Consecutive epochs using the same immutable runtime can be replayed as a bounded contiguous
   cohort so later epochs carry the live runtime state and AccountsDb scratch instead of restoring
-  another bootstrap. Prefer this when duplicated bootstrap/scratch is the admission bottleneck.
+  another bootstrap. A contiguous cohort is one ordered replay generation, not a set of independent
+  epoch jobs: select the complete range before launch, process every member in ascending order, keep
+  the same scratch/AccountsDb state across member boundaries, and do not clean or reinitialize that
+  scratch between epochs. When several still-missing adjacent epochs share the same immutable runtime
+  and checkpoint chain, consider grouping them before admitting more single-epoch workers. Prefer
+  this when duplicated bootstrap/scratch is the admission bottleneck.
   Keep independent root-verifiable cohorts parallel when disk admission is healthy and fleet wall
   time is the priority: historical execution is often mostly serial within one worker, and an
   unnecessarily long cohort increases the restart blast radius. Never merge across a runtime or

@@ -62,6 +62,12 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
   same-cluster genesis expected by the loader. A cached snapshot does not imply the genesis is
   present. Preseed only from digest-bound retained evidence and verify the copied digest and
   ownership; otherwise validate noninteractive gcloud authentication for the service identity.
+- Before sealing a generation-pinned GCS restore helper, exercise its metadata parser against the
+  host's live `gcloud storage objects describe --format=json` output. Current Homebrew gcloud uses
+  normalized `crc32c_hash`, `md5_hash`, integer `size`, and `storage_url` fields, while older
+  releases exposed raw-API `crc32c`, `md5Hash`, string `size`, and `id` fields. Accept both shapes,
+  fail on conflicting aliases, and require either the exact raw object ID or exact versioned
+  `storage_url`; authentication success without this complete identity/hash proof is insufficient.
 - Failed-replay scratch cleanup is authorized by default for this workflow. After confirming the failure and capturing the evidence needed to diagnose or reproduce it, stop the service and retry path, verify that no live process or staged relaunch references the exact scratch path, and delete that failed run's scratch immediately instead of allowing failures to accumulate. Preserve diagnostic output, partial archives, replay state, logs, checkpoints, manifests, receipts, and any snapshot still needed for diagnosis, lineage, restart, or a staged epoch outside the scratch tree. Never apply this cleanup rule to a controlled stop that can genuinely resume in place. If a relaunch demonstrably starts from the bootstrap in a new isolated runtime generation with no resume cursor, verify the new worker's exact generation and reclaim older unreferenced generations promptly; preserving them does not make that replay resumable.
 - Treat an ordered historical-worker `ShuttingDown` acknowledgement as the worker protocol commit
   point. A legacy worker can remain uninterruptible for longer than both graceful and forced reap

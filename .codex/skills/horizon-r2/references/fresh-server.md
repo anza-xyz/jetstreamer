@@ -34,6 +34,11 @@ epochs touch a slot interval marked unsupported by the checked-in runtime regist
    launch, preseed a retained same-cluster genesis only when its digest matches previously verified
    run evidence, then recheck the destination digest and ownership; otherwise prove that gcloud
    authentication works noninteractively for the service identity.
+   Also validate the pinned restore helper against live metadata from the installed gcloud build.
+   Homebrew's current standardized JSON names hashes `crc32c_hash` and `md5_hash`, represents size
+   as an integer, and binds generation through `storage_url`; older raw-API output uses `crc32c`,
+   `md5Hash`, string size, and `id`. The helper must accept either complete shape, reject conflicting
+   aliases, and bind the exact versioned object identity before downloading bytes.
 4. Build from that recorded commit and pin the hashes of the producer, full verifier, current
    plugin pipeline, boundary verifier, and their launcher scripts before creating a production
    service. Deploy immutable binaries and manifests into root-owned, non-writable paths; do not run

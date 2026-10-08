@@ -248,17 +248,52 @@ def describe_remote_snapshot(
     generation_text = match.group("generation")
     if metadata.get("bucket") != ALLOWED_BUCKET or metadata.get("name") != object_name:
         raise RestoreError("remote snapshot metadata identifies an unexpected object")
-    if metadata.get("generation") != generation_text:
+    generation = metadata.get("generation")
+    if str(generation) != generation_text:
         raise RestoreError("remote snapshot metadata generation mismatch")
-    if metadata.get("size") != str(expected_size):
+    size = metadata.get("size")
+    if isinstance(size, bool) or not isinstance(size, (int, str)):
+        raise RestoreError("remote snapshot metadata size is invalid")
+    try:
+        actual_size = int(size)
+    except ValueError as error:
+        raise RestoreError("remote snapshot metadata size is invalid") from error
+    if actual_size != expected_size:
         raise RestoreError("remote snapshot metadata size mismatch")
-    actual_crc32c = canonical_base64(metadata.get("crc32c"), 4, "remote CRC32C")
-    actual_md5 = canonical_base64(metadata.get("md5Hash"), 16, "remote MD5")
+
+    def aliased_hash(
+        raw_name: str, normalized_name: str, decoded_size: int, label: str
+    ) -> str:
+        values = [
+            metadata[name]
+            for name in (raw_name, normalized_name)
+            if name in metadata
+        ]
+        if not values:
+            raise RestoreError(f"remote snapshot metadata omitted {label}")
+        canonical = [
+            canonical_base64(value, decoded_size, label) for value in values
+        ]
+        if any(value != canonical[0] for value in canonical[1:]):
+            raise RestoreError(f"remote snapshot metadata has conflicting {label} fields")
+        return canonical[0]
+
+    # Older gcloud releases exposed the raw JSON API names, while current
+    # Homebrew gcloud normalizes these fields. Accept either spelling but fail
+    # closed if a response happens to contain inconsistent aliases.
+    actual_crc32c = aliased_hash("crc32c", "crc32c_hash", 4, "remote CRC32C")
+    actual_md5 = aliased_hash("md5Hash", "md5_hash", 16, "remote MD5")
     if actual_crc32c != expected_crc32c or actual_md5 != expected_md5:
         raise RestoreError("remote snapshot metadata hashes do not match sealed expectations")
     expected_id = f"{ALLOWED_BUCKET}/{object_name}/{generation_text}"
-    if metadata.get("id") != expected_id:
+    raw_id = metadata.get("id")
+    storage_url = metadata.get("storage_url")
+    if raw_id is None and storage_url is None:
+        raise RestoreError("remote snapshot metadata omitted generation identity")
+    if raw_id is not None and raw_id != expected_id:
         raise RestoreError("remote snapshot metadata id mismatch")
+    if storage_url is not None and storage_url != versioned_uri:
+        raise RestoreError("remote snapshot metadata storage URL mismatch")
     return {
         "bucket": ALLOWED_BUCKET,
         "name": object_name,
@@ -267,6 +302,7 @@ def describe_remote_snapshot(
         "crc32c_base64": actual_crc32c,
         "md5_base64": actual_md5,
         "id": expected_id,
+        "versioned_uri": versioned_uri,
     }
 
 

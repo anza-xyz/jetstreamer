@@ -127,6 +127,55 @@ class BoundGcsSnapshotRestoreTest(unittest.TestCase):
                 md5,
             )
 
+    @patch("scripts.restore_bound_gcs_snapshot.run_checked")
+    def test_remote_description_accepts_current_gcloud_normalized_fields(
+        self, run_checked: object
+    ) -> None:
+        crc = base64.b64encode(b"1234").decode()
+        md5 = base64.b64encode(b"1234567890123456").decode()
+        object_name = f"87263434/{FILENAME}"
+        run_checked.return_value = SimpleNamespace(
+            stdout=json.dumps(
+                {
+                    "bucket": restore.ALLOWED_BUCKET,
+                    "name": object_name,
+                    "generation": "1634789740125991",
+                    "size": 8081511792,
+                    "crc32c_hash": crc,
+                    "md5_hash": md5,
+                    "storage_url": URI,
+                }
+            )
+        )
+        result = restore.describe_remote_snapshot(
+            Path("/usr/bin/gcloud"),
+            URI,
+            "user@example.com",
+            "principal-lane-200702",
+            8081511792,
+            crc,
+            md5,
+        )
+        self.assertEqual(result["versioned_uri"], URI)
+        self.assertEqual(result["crc32c_base64"], crc)
+        self.assertEqual(result["md5_base64"], md5)
+
+        metadata = json.loads(run_checked.return_value.stdout)
+        metadata["crc32c"] = base64.b64encode(b"4321").decode()
+        run_checked.return_value.stdout = json.dumps(metadata)
+        with self.assertRaisesRegex(
+            restore.RestoreError, "conflicting remote CRC32C"
+        ):
+            restore.describe_remote_snapshot(
+                Path("/usr/bin/gcloud"),
+                URI,
+                "user@example.com",
+                "principal-lane-200702",
+                8081511792,
+                crc,
+                md5,
+            )
+
     def test_canonical_base64_rejects_non_strings(self) -> None:
         for invalid in (None, 1, b"MTIzNA=="):
             with self.subTest(invalid=invalid), self.assertRaises(restore.RestoreError):

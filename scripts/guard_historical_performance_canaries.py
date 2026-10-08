@@ -12,7 +12,7 @@ import re
 import subprocess
 import sys
 import time
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 
 RECEIPT_SCHEMA = "jetstreamer-historical-performance-guard-trip-v1"
@@ -137,8 +137,10 @@ def trip_reasons(
     minimum_free_bytes: int,
     maximum_worker_vmas: int,
     samples: Sequence[UnitSample],
+    expected_invocations: Mapping[str, str] | None = None,
 ) -> list[str]:
     reasons: list[str] = []
+    expected_invocations = expected_invocations or {}
     if free_bytes < minimum_free_bytes:
         reasons.append(
             f"available bytes {free_bytes} below floor {minimum_free_bytes}"
@@ -153,6 +155,12 @@ def trip_reasons(
         if sample.restarts:
             reasons.append(f"{sample.unit} unexpectedly restarted {sample.restarts} time(s)")
         if sample.active_state in ("active", "activating"):
+            expected_invocation = expected_invocations.get(sample.unit)
+            if expected_invocation and sample.invocation_id != expected_invocation:
+                reasons.append(
+                    f"{sample.unit} invocation {sample.invocation_id or '<empty>'} "
+                    f"does not match {expected_invocation}"
+                )
             if sample.worker_count != 1 or sample.worker_vmas is None:
                 reasons.append(
                     f"{sample.unit} has {sample.worker_count} identifiable historical workers"
@@ -239,6 +247,13 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument("--maximum-worker-vmas", type=int, required=True)
     parser.add_argument("--receipt-directory", type=Path, required=True)
     parser.add_argument("--timer-unit", required=True)
+    parser.add_argument(
+        "--expected-invocation",
+        action="append",
+        default=[],
+        metavar="UNIT=INVOCATION_ID",
+        help="bind every guarded unit to its exact 32-hex systemd invocation ID",
+    )
     parser.add_argument("units", nargs="+")
     args = parser.parse_args(argv)
     if not args.filesystem.is_absolute() or not args.filesystem.is_dir():
@@ -252,6 +267,23 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     for unit in args.units:
         if not unit.startswith(UNIT_PREFIXES) or not unit.endswith(".service"):
             parser.error(f"invalid canary unit: {unit}")
+    expected_invocations: dict[str, str] = {}
+    for binding in args.expected_invocation:
+        unit, separator, invocation_id = binding.partition("=")
+        if (
+            not separator
+            or unit not in args.units
+            or re.fullmatch(r"[0-9a-f]{32}", invocation_id) is None
+            or unit in expected_invocations
+        ):
+            parser.error(
+                "--expected-invocation must uniquely bind a guarded unit to a "
+                "32-hex invocation ID"
+            )
+        expected_invocations[unit] = invocation_id
+    if expected_invocations and set(expected_invocations) != set(args.units):
+        parser.error("--expected-invocation must bind every guarded unit")
+    args.expected_invocations = expected_invocations
     return args
 
 
@@ -265,6 +297,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         args.minimum_free_bytes,
         args.maximum_worker_vmas,
         samples,
+        args.expected_invocations,
     )
     report: dict[str, Any] = {
         "schema": RECEIPT_SCHEMA,
@@ -273,6 +306,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "available_bytes": free_bytes,
         "minimum_free_bytes": args.minimum_free_bytes,
         "maximum_worker_vmas": args.maximum_worker_vmas,
+        "expected_invocations": args.expected_invocations,
         "timer_unit": args.timer_unit,
         "samples": [asdict(sample) for sample in samples],
         "trip_reasons": reasons,

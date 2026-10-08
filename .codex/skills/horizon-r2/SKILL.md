@@ -138,6 +138,10 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
   diagnostic archives, segment manifests, canary/result/guard receipts, configurations, genesis,
   journals, and immutable manifests outside the scratch trees. This cleanup never authorizes
   publication, a canonical sidecar, or an R2 mutation.
+- Treat a revised admission or launch manifest as a transitive binding change. Before activating
+  that revision, re-seal every downstream result collector, timer, cleanup manifest, and retirement
+  unit that names or hashes the superseded manifest. Validate the final launch receipt against the
+  downstream binding; do not edit an old sealed manifest underneath a live cohort to make it match.
 - Preflight the host's VMA ceiling for mmap-backed historical account stores as part of admission.
   Compare `vm.max_map_count` with live worker map counts and the snapshot/store-file baseline, and
   leave credible growth headroom for the full replay. Some legacy Solana AppendVec code logs an

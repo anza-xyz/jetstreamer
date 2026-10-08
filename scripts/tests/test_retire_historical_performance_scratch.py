@@ -101,6 +101,7 @@ def sealed_payloads(
         "manifest_sha256": manifest_sha256,
         "evidence": {
             "target_slot": 100,
+            "allowed_target_stop_return_codes": [0],
             "variants": evidence_variants,
             "selection_authorized": False,
         },
@@ -125,6 +126,13 @@ class HistoricalPerformanceScratchRetirementTest(unittest.TestCase):
             state = retire.UnitState(**{**state.__dict__, field: value})
             with self.subTest(field=field), self.assertRaises(retire.RetirementError):
                 retire.require_terminal_success(state, "invocation")
+        controlled = successful_unit(unit)
+        controlled = retire.UnitState(
+            **{**controlled.__dict__, "exec_main_status": 1}
+        )
+        with self.assertRaises(retire.RetirementError):
+            retire.require_terminal_success(controlled, "invocation")
+        retire.require_terminal_success(controlled, "invocation", (0, 1))
 
     @patch("scripts.retire_historical_performance_scratch.os.path.ismount", return_value=False)
     def test_scratch_path_is_one_of_exact_admitted_real_directories(self, _ismount: object) -> None:

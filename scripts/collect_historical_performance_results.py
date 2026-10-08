@@ -190,7 +190,11 @@ def sample_unit(unit: str) -> UnitState:
     )
 
 
-def require_terminal_success(state: UnitState, expected_invocation: str) -> None:
+def require_terminal_success(
+    state: UnitState,
+    expected_invocation: str,
+    allowed_exec_main_statuses: tuple[int, ...] = (0,),
+) -> None:
     if (
         state.load_state != "loaded"
         or state.active_state != "inactive"
@@ -198,7 +202,7 @@ def require_terminal_success(state: UnitState, expected_invocation: str) -> None
         or state.main_pid != 0
         or state.restarts != 0
         or state.exec_main_code not in (0, 1)
-        or state.exec_main_status != 0
+        or state.exec_main_status not in allowed_exec_main_statuses
         or state.invocation_id not in ("", expected_invocation)
     ):
         raise CollectionError(f"canary is not exact terminal success: {state}")
@@ -396,7 +400,10 @@ def parse_guard_samples(
 
 
 def validate_canary_receipt(
-    payload: dict[str, Any], expected_target: int, expected_invocation: str
+    payload: dict[str, Any],
+    expected_target: int,
+    expected_invocation: str,
+    allowed_child_return_codes: tuple[int, ...] = (0,),
 ) -> dict[str, Any]:
     final = payload.get("final_progress")
     first = payload.get("first_progress")
@@ -406,7 +413,7 @@ def validate_canary_receipt(
         or payload.get("systemd_invocation_id") != expected_invocation
         or payload.get("target_slot") != expected_target
         or payload.get("target_reached") is not True
-        or payload.get("child_return_code") != 0
+        or payload.get("child_return_code") not in allowed_child_return_codes
         or payload.get("external_signal") is not None
         or not isinstance(first, dict)
         or not isinstance(final, dict)
@@ -441,7 +448,29 @@ def validate_canary_receipt(
             "filesystem_available_bytes_after"
         ),
         "observed_overshoot_slots": payload.get("observed_overshoot_slots"),
+        "child_return_code": payload.get("child_return_code"),
     }
+
+
+def parse_allowed_target_stop_return_codes(value: object) -> tuple[int, ...]:
+    if value is None:
+        return (0,)
+    if (
+        not isinstance(value, list)
+        or not value
+        or any(
+            not isinstance(item, int)
+            or isinstance(item, bool)
+            or item not in (0, 1)
+            for item in value
+        )
+        or len(value) != len(set(value))
+        or 0 not in value
+    ):
+        raise CollectionError(
+            "allowed_target_stop_return_codes must be a distinct subset of [0, 1] containing 0"
+        )
+    return tuple(value)
 
 
 def validate_unit_namespace(value: object) -> str | None:
@@ -525,6 +554,9 @@ def collect(manifest: dict[str, Any], launch: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(target_slot, int):
         raise CollectionError("results manifest lacks target or variants")
     unit_namespace = validate_unit_namespace(manifest.get("unit_namespace"))
+    allowed_return_codes = parse_allowed_target_stop_return_codes(
+        manifest.get("allowed_target_stop_return_codes")
+    )
     variants = validate_variant_set(variants_raw, unit_namespace)
     units = {item["unit"] for item in variants}
     raw_launch_units = launch_evidence.get("units")
@@ -554,13 +586,18 @@ def collect(manifest: dict[str, Any], launch: dict[str, Any]) -> dict[str, Any]:
     for variant in variants:
         name = variant["name"]
         state = sample_unit(variant["unit"])
-        require_terminal_success(state, launch_units[variant["unit"]])
+        require_terminal_success(
+            state, launch_units[variant["unit"]], allowed_return_codes
+        )
         receipt_path = Path(variant["canary_receipt"])
         receipt, receipt_sha256 = load_json_file(
             receipt_path, f"{name} canary receipt", required_uid=1000
         )
         performance = validate_canary_receipt(
-            receipt, target_slot, launch_units[variant["unit"]]
+            receipt,
+            target_slot,
+            launch_units[variant["unit"]],
+            allowed_return_codes,
         )
         scratch = require_under(Path(variant["scratch"]), PRIVATE_ROOT, f"{name} scratch")
         archive = require_under(Path(variant["archive"]), PRIVATE_ROOT, f"{name} archive")
@@ -608,6 +645,7 @@ def collect(manifest: dict[str, Any], launch: dict[str, Any]) -> dict[str, Any]:
         )
     return {
         "target_slot": target_slot,
+        "allowed_target_stop_return_codes": list(allowed_return_codes),
         "variants": collected,
         "selection_authorized": False,
         "next_gate": "review metrics, select one environment, then repeat full root/plugin qualification",

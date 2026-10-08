@@ -137,7 +137,11 @@ def sample_unit(unit: str) -> UnitState:
         raise RetirementError(f"invalid systemd state for {unit}") from error
 
 
-def require_terminal_success(state: UnitState, expected_invocation_id: str) -> None:
+def require_terminal_success(
+    state: UnitState,
+    expected_invocation_id: str,
+    allowed_exec_main_statuses: tuple[int, ...] = (0,),
+) -> None:
     if (
         state.load_state != "loaded"
         or state.active_state != "inactive"
@@ -145,7 +149,7 @@ def require_terminal_success(state: UnitState, expected_invocation_id: str) -> N
         or state.main_pid != 0
         or state.restarts != 0
         or state.exec_main_code not in (0, 1)
-        or state.exec_main_status != 0
+        or state.exec_main_status not in allowed_exec_main_statuses
         or (
             expected_invocation_id
             and state.invocation_id not in ("", expected_invocation_id)
@@ -179,6 +183,27 @@ def require_nonnegative_integer(value: Any, description: str, minimum: int = 0) 
     if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
         raise RetirementError(f"{description} is invalid")
     return value
+
+
+def parse_allowed_target_stop_return_codes(value: object) -> tuple[int, ...]:
+    if value is None:
+        return (0,)
+    if (
+        not isinstance(value, list)
+        or not value
+        or any(
+            not isinstance(item, int)
+            or isinstance(item, bool)
+            or item not in (0, 1)
+            for item in value
+        )
+        or len(value) != len(set(value))
+        or 0 not in value
+    ):
+        raise RetirementError(
+            "allowed_target_stop_return_codes must be a distinct subset of [0, 1] containing 0"
+        )
+    return tuple(value)
 
 
 def validate_manifest_and_results(
@@ -239,6 +264,18 @@ def validate_manifest_and_results(
         )
 
     unit_namespace = validate_unit_namespace(manifest.get("unit_namespace"))
+    allowed_return_codes = parse_allowed_target_stop_return_codes(
+        manifest.get("allowed_target_stop_return_codes")
+    )
+    observed_allowed_return_codes = evidence.get("allowed_target_stop_return_codes")
+    if (
+        observed_allowed_return_codes != list(allowed_return_codes)
+        and not (
+            manifest.get("allowed_target_stop_return_codes") is None
+            and observed_allowed_return_codes is None
+        )
+    ):
+        raise RetirementError("results receipt does not bind controlled-stop return codes")
     bindings: list[ScratchBinding] = []
     for name in manifest_names:
         expected = expected_paths(name, unit_namespace)
@@ -258,7 +295,7 @@ def validate_manifest_and_results(
             or unit.get("active_state") != "inactive"
             or unit.get("main_pid") != 0
             or unit.get("restarts") != 0
-            or unit.get("exec_main_status") != 0
+            or unit.get("exec_main_status") not in allowed_return_codes
             or observed.get("canary_receipt") != str(expected["canary_receipt"])
             or SHA256.fullmatch(str(observed.get("canary_receipt_sha256"))) is None
             or not isinstance(scratch, dict)
@@ -604,7 +641,13 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     units = [sample_unit(binding.unit) for binding in bindings]
     for binding, unit in zip(bindings, units, strict=True):
-        require_terminal_success(unit, binding.expected_invocation_id)
+        require_terminal_success(
+            unit,
+            binding.expected_invocation_id,
+            parse_allowed_target_stop_return_codes(
+                manifest.get("allowed_target_stop_return_codes")
+            ),
+        )
     references = process_references(scratches)
     if references:
         raise RetirementError("live process still references performance scratch: " + "; ".join(references))

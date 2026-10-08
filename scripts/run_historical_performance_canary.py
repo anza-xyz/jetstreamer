@@ -225,6 +225,19 @@ def normalized_exit_code(return_code: int) -> int:
     return min(255, 128 + abs(return_code))
 
 
+def runner_exit_code(target_reached: bool, child_return_code: int) -> int:
+    """Normalize the legacy worker's controlled post-target shutdown.
+
+    The v1.6 historical worker can acknowledge SIGINT, close its ready-entry
+    channel, and exit 1 even though the bounded target was already observed.
+    Keep the actual child code in the receipt, but let systemd regard that
+    narrowly defined post-target outcome as a completed diagnostic canary.
+    """
+    if target_reached and child_return_code in (0, 1):
+        return 0
+    return normalized_exit_code(child_return_code)
+
+
 def run_canary(target_slot: int, receipt: Path, command: Sequence[str]) -> int:
     if target_slot < 1:
         raise ValueError("target slot must be positive")
@@ -331,6 +344,7 @@ def run_canary(target_slot: int, receipt: Path, command: Sequence[str]) -> int:
                 / progress_elapsed,
             }
     cpu_usage_usec = cgroup_delta.get("cpu.usage_usec")
+    normalized_runner_exit_code = runner_exit_code(target_reached, return_code)
     payload = {
         "schema": RECEIPT_SCHEMA,
         "target_slot": target_slot,
@@ -346,6 +360,8 @@ def run_canary(target_slot: int, receipt: Path, command: Sequence[str]) -> int:
         "elapsed_seconds": elapsed_seconds,
         "child_pid": process.pid,
         "child_return_code": return_code,
+        "controlled_stop_signal": signal.SIGINT if target_reached else None,
+        "runner_return_code": normalized_runner_exit_code,
         "external_signal": external_signal,
         "command": list(command),
         "systemd_invocation_id": systemd_invocation_id,
@@ -365,7 +381,7 @@ def run_canary(target_slot: int, receipt: Path, command: Sequence[str]) -> int:
         "filesystem_available_bytes_after": available_bytes(),
     }
     write_json_noclobber(receipt, payload)
-    return normalized_exit_code(return_code)
+    return normalized_runner_exit_code
 
 
 def parse_args(argv: Sequence[str]) -> argparse.Namespace:

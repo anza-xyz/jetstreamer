@@ -133,6 +133,11 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
   identifiable worker with readable maps in every active or activating lane and trip closed on
   zero, multiple, or unreadable workers; test the guard against the copied path in a nested fake
   cgroup before sealing it.
+  A pinned legacy worker may acknowledge the runner's post-target SIGINT and then exit 1 while its
+  ready-entry channel closes. Normalize that exact outcome only after the runner has independently
+  observed the bound, retain the actual child return code and stop signal in its durable receipt,
+  and keep pre-target exit 1 fatal. Bind any accepted controlled-stop codes in the result manifest;
+  collectors and scratch retirement must reject codes outside that sealed allowlist.
 - When a follow-up performance cohort must preserve its predecessor's systemd unit identity as
   durable result or cleanup evidence, give the follow-up producer template a distinct constrained
   namespace instead of replacing or prematurely removing the predecessor template. Bind that
@@ -256,6 +261,12 @@ Do not use `--legacy-etag-only` unless the user has explicitly established that 
   controls and repeat the existence, metadata, digest, and JSON checks through the intended
   privileged reader. Treat an actual unreadable or invalid receipt as a failed gate; never weaken
   its ownership or mode merely to make an unprivileged probe pass.
+  A root systemd service with an empty capability bounding set still cannot traverse a user-owned
+  mode-0700 ancestor: UID 0 needs `CAP_DAC_OVERRIDE` for that traversal. When such a sandbox must
+  read root-owned sealed evidence beneath the private root, retain only that capability (including
+  the effective or ambient set as required by the unit), keep the target mount read-only except for
+  exact receipt directories, and prove the read path in an equivalently sandboxed transient unit.
+  Do not relax private-directory permissions to work around the sandbox.
 - Use SSH URLs for Git network operations. Select a currently loaded keychain agent socket for the
   active login session by verifying it with `ssh-add -l`; never hard-code an ephemeral socket path
   from an earlier session. Check the inherited environment for required service credentials before

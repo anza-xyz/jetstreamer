@@ -117,6 +117,23 @@ class HistoricalPerformanceResultsTest(unittest.TestCase):
                 memory_peak_bytes=None,
             )
             collect.require_terminal_success(state, "invocation")
+        controlled = collect.UnitState(
+            unit="horizon-perf-epoch202@one.service",
+            load_state="loaded",
+            active_state="inactive",
+            sub_state="dead",
+            result="success",
+            main_pid=0,
+            invocation_id="invocation",
+            restarts=0,
+            exec_main_code=1,
+            exec_main_status=1,
+            cpu_usage_nsec=None,
+            memory_peak_bytes=None,
+        )
+        with self.assertRaises(collect.CollectionError):
+            collect.require_terminal_success(controlled, "invocation")
+        collect.require_terminal_success(controlled, "invocation", (0, 1))
 
     def test_parses_latest_wave_metrics(self) -> None:
         prefix = "historical execution wave metrics: "
@@ -228,6 +245,26 @@ class HistoricalPerformanceResultsTest(unittest.TestCase):
                 collect.validate_canary_receipt(broken, 100, "invocation")
         with self.assertRaises(collect.CollectionError):
             collect.validate_canary_receipt(payload, 100, "other-invocation")
+        controlled = {**payload, "child_return_code": 1}
+        with self.assertRaises(collect.CollectionError):
+            collect.validate_canary_receipt(controlled, 100, "invocation")
+        accepted = collect.validate_canary_receipt(
+            controlled, 100, "invocation", (0, 1)
+        )
+        self.assertEqual(accepted["child_return_code"], 1)
+
+    def test_controlled_stop_allowlist_is_narrow(self) -> None:
+        self.assertEqual(
+            collect.parse_allowed_target_stop_return_codes(None), (0,)
+        )
+        self.assertEqual(
+            collect.parse_allowed_target_stop_return_codes([0, 1]), (0, 1)
+        )
+        for invalid in ([], [1], [0, 2], [0, 1, 1], [0, True], "0,1"):
+            with self.subTest(invalid=invalid), self.assertRaises(
+                collect.CollectionError
+            ):
+                collect.parse_allowed_target_stop_return_codes(invalid)
 
     def test_result_receipt_is_owner_only_and_noclobber(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

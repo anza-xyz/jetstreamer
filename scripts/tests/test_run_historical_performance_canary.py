@@ -108,6 +108,30 @@ class HistoricalPerformanceCanaryTest(unittest.TestCase):
             self.assertEqual(payload["final_progress"]["account_updates"], 30)
             self.assertGreaterEqual(payload["progress_rates"]["transactions_per_second"], 0)
 
+    def test_normalizes_legacy_worker_exit_one_only_after_target(self) -> None:
+        child = textwrap.dedent(
+            """
+            import signal
+            import sys
+            import time
+
+            signal.signal(signal.SIGINT, lambda *_: sys.exit(1))
+            print("progress slot 101/200 txs=14 accounts=30", flush=True)
+            while True:
+                time.sleep(0.05)
+            """
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            receipt = Path(directory) / "receipt.json"
+            result = canary.run_canary(100, receipt, [sys.executable, "-c", child])
+            payload = json.loads(receipt.read_text())
+            self.assertEqual(result, 0)
+            self.assertEqual(payload["child_return_code"], 1)
+            self.assertEqual(payload["controlled_stop_signal"], signal.SIGINT)
+            self.assertEqual(payload["runner_return_code"], 0)
+        self.assertEqual(canary.runner_exit_code(False, 1), 1)
+        self.assertEqual(canary.runner_exit_code(True, 2), 2)
+
     def test_refuses_non_owner_only_receipt_directory(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             os.chmod(directory, 0o755)

@@ -27,11 +27,12 @@ class HistoricalPerformanceResultsTest(unittest.TestCase):
                 collect.validate_guard_unit(invalid)
 
     def test_variant_set_accepts_exact_two_way_cohort_and_rejects_ambiguity(self) -> None:
-        def variant(name: str) -> dict[str, object]:
+        def variant(name: str, namespace: str | None = None) -> dict[str, object]:
             root = collect.PRIVATE_ROOT / name
+            unit_namespace = f"-{namespace}" if namespace is not None else ""
             return {
                 "name": name,
-                "unit": f"horizon-perf-epoch202@{name}.service",
+                "unit": f"horizon-perf-epoch202{unit_namespace}@{name}.service",
                 "canary_receipt": str(root / "canary-receipt.json"),
                 "scratch": str(root / "scratch"),
                 "archive": str(root / "output" / "epoch-202-through-87695515.jet"),
@@ -47,6 +48,25 @@ class HistoricalPerformanceResultsTest(unittest.TestCase):
             collect.validate_variant_set(cohort[:1])
         with self.assertRaises(collect.CollectionError):
             collect.validate_variant_set([cohort[0], cohort[0]])
+
+        namespaced = [
+            variant("waves-control-t16", "store8"),
+            variant("waves-store8-t16", "store8"),
+        ]
+        self.assertEqual(
+            [
+                item["unit"]
+                for item in collect.validate_variant_set(namespaced, "store8")
+            ],
+            [item["unit"] for item in namespaced],
+        )
+        with self.assertRaises(collect.CollectionError):
+            collect.validate_variant_set(namespaced)
+        for invalid in ("", "Store8", "store8@other", "store8.service"):
+            with self.subTest(invalid=invalid), self.assertRaises(
+                collect.CollectionError
+            ):
+                collect.validate_unit_namespace(invalid)
 
     def test_collector_binding_requires_exact_safe_digest_and_path(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

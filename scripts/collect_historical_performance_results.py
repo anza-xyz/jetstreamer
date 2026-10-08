@@ -24,7 +24,10 @@ GUARD_SCHEMA = "jetstreamer-historical-performance-guard-trip-v1"
 RECEIPT_SCHEMA = "jetstreamer-historical-performance-results-receipt-v1"
 PRIVATE_ROOT = Path("/home/ubuntu/.jetstreamer-private/performance-ab-202")
 VARIANT_NAME = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
-UNIT_NAME = re.compile(r"^horizon-perf-epoch[0-9]+@[a-z0-9-]+\.service$")
+UNIT_NAMESPACE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+UNIT_NAME = re.compile(
+    r"^horizon-perf-epoch[0-9]+(?:-[a-z0-9]+(?:-[a-z0-9]+)*)?@[a-z0-9-]+\.service$"
+)
 GUARD_UNIT = re.compile(
     r"^horizon-perf-epoch[0-9]+-guard(?:-[a-z0-9]+(?:-[a-z0-9]+)*)?\.service$"
 )
@@ -441,13 +444,28 @@ def validate_canary_receipt(
     }
 
 
-def validate_variant_paths(raw: dict[str, Any]) -> dict[str, Any]:
+def validate_unit_namespace(value: object) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or UNIT_NAMESPACE.fullmatch(value) is None:
+        raise CollectionError("invalid unit namespace")
+    return value
+
+
+def expected_unit(name: str, unit_namespace: str | None) -> str:
+    namespace = f"-{unit_namespace}" if unit_namespace is not None else ""
+    return f"horizon-perf-epoch202{namespace}@{name}.service"
+
+
+def validate_variant_paths(
+    raw: dict[str, Any], unit_namespace: str | None = None
+) -> dict[str, Any]:
     name = raw.get("name")
     if not isinstance(name, str) or VARIANT_NAME.fullmatch(name) is None:
         raise CollectionError("invalid variant name")
     root = PRIVATE_ROOT / name
     expected = {
-        "unit": f"horizon-perf-epoch202@{name}.service",
+        "unit": expected_unit(name, unit_namespace),
         "canary_receipt": root / "canary-receipt.json",
         "scratch": root / "scratch",
         "archive": root / "output" / "epoch-202-through-87695515.jet",
@@ -461,11 +479,15 @@ def validate_variant_paths(raw: dict[str, Any]) -> dict[str, Any]:
     return {**raw, "root": root}
 
 
-def validate_variant_set(variants_raw: object) -> list[dict[str, Any]]:
+def validate_variant_set(
+    variants_raw: object, unit_namespace: str | None = None
+) -> list[dict[str, Any]]:
     if not isinstance(variants_raw, list):
         raise CollectionError("results manifest variants must be a list")
     variants = [
-        validate_variant_paths(item) for item in variants_raw if isinstance(item, dict)
+        validate_variant_paths(item, unit_namespace)
+        for item in variants_raw
+        if isinstance(item, dict)
     ]
     if (
         len(variants) != len(variants_raw)
@@ -502,7 +524,8 @@ def collect(manifest: dict[str, Any], launch: dict[str, Any]) -> dict[str, Any]:
     variants_raw = manifest.get("variants")
     if not isinstance(target_slot, int):
         raise CollectionError("results manifest lacks target or variants")
-    variants = validate_variant_set(variants_raw)
+    unit_namespace = validate_unit_namespace(manifest.get("unit_namespace"))
+    variants = validate_variant_set(variants_raw, unit_namespace)
     units = {item["unit"] for item in variants}
     raw_launch_units = launch_evidence.get("units")
     if not isinstance(raw_launch_units, list):

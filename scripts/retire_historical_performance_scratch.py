@@ -27,7 +27,10 @@ PRIVATE_ROOT = Path("/home/ubuntu/.jetstreamer-private/performance-ab-202")
 VARIANTS = ("singleton-t16", "singleton-t32", "waves-t16", "waves-t32")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 VARIANT_NAME = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
-UNIT_NAME = re.compile(r"^horizon-perf-epoch202@[a-z0-9-]+\.service$")
+UNIT_NAMESPACE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+UNIT_NAME = re.compile(
+    r"^horizon-perf-epoch202(?:-[a-z0-9]+(?:-[a-z0-9]+)*)?@[a-z0-9-]+\.service$"
+)
 
 
 class RetirementError(RuntimeError):
@@ -151,10 +154,21 @@ def require_terminal_success(state: UnitState, expected_invocation_id: str) -> N
         raise RetirementError(f"canary has not reached exact terminal success: {state}")
 
 
-def expected_paths(name: str) -> dict[str, Path | str]:
+def validate_unit_namespace(value: object) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or UNIT_NAMESPACE.fullmatch(value) is None:
+        raise RetirementError("invalid unit namespace")
+    return value
+
+
+def expected_paths(
+    name: str, unit_namespace: str | None = None
+) -> dict[str, Path | str]:
     root = PRIVATE_ROOT / name
+    namespace = f"-{unit_namespace}" if unit_namespace is not None else ""
     return {
-        "unit": f"horizon-perf-epoch202@{name}.service",
+        "unit": f"horizon-perf-epoch202{namespace}@{name}.service",
         "canary_receipt": root / "canary-receipt.json",
         "scratch": root / "scratch",
         "archive": root / "output" / "epoch-202-through-87695515.jet",
@@ -224,9 +238,10 @@ def validate_manifest_and_results(
             "manifest and receipt must bind the same two to sixteen distinct variants"
         )
 
+    unit_namespace = validate_unit_namespace(manifest.get("unit_namespace"))
     bindings: list[ScratchBinding] = []
     for name in manifest_names:
-        expected = expected_paths(name)
+        expected = expected_paths(name, unit_namespace)
         declared = manifest_by_name[name]
         observed = evidence_by_name[name]
         for key in ("unit", "canary_receipt", "scratch", "archive"):

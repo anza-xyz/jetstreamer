@@ -31,12 +31,14 @@ def sealed_payloads(
     manifest_path: Path,
     results_path: Path,
     variants: tuple[str, ...] = retire.VARIANTS,
+    unit_namespace: str | None = None,
 ) -> tuple[dict, dict]:
     manifest_variants = []
     evidence_variants = []
     for name in variants:
         lane = root / name
-        unit_name = f"horizon-perf-epoch202@{name}.service"
+        namespace = f"-{unit_namespace}" if unit_namespace is not None else ""
+        unit_name = f"horizon-perf-epoch202{namespace}@{name}.service"
         canary = lane / "canary-receipt.json"
         scratch = lane / "scratch"
         archive = lane / "output" / "epoch-202-through-87695515.jet"
@@ -88,6 +90,8 @@ def sealed_payloads(
         "remote_mutations_authorized": False,
         "r2_mutations_authorized": False,
     }
+    if unit_namespace is not None:
+        manifest["unit_namespace"] = unit_namespace
     manifest_sha256 = hashlib.sha256(
         (json.dumps(manifest, sort_keys=True) + "\n").encode()
     ).hexdigest()
@@ -203,6 +207,35 @@ class HistoricalPerformanceScratchRetirementTest(unittest.TestCase):
                     results,
                 )
             self.assertEqual([item.name for item in bindings], list(variants))
+
+    def test_results_receipt_accepts_namespaced_two_way_cohort(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            manifest_path = root / "manifest.json"
+            results_path = root / "results.json"
+            variants = ("waves-control-t16", "waves-store8-t16")
+            with patch.object(retire, "PRIVATE_ROOT", root):
+                manifest, results = sealed_payloads(
+                    root,
+                    manifest_path,
+                    results_path,
+                    variants,
+                    unit_namespace="store8",
+                )
+                bindings = retire.validate_manifest_and_results(
+                    manifest_path,
+                    manifest,
+                    results["manifest_sha256"],
+                    results_path,
+                    results,
+                )
+            self.assertEqual(
+                [item.unit for item in bindings],
+                [
+                    "horizon-perf-epoch202-store8@waves-control-t16.service",
+                    "horizon-perf-epoch202-store8@waves-store8-t16.service",
+                ],
+            )
 
     def test_receipt_write_is_owner_only_and_noclobber(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

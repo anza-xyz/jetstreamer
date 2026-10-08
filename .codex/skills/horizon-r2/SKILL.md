@@ -148,6 +148,12 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
   later recovers. Record completion only after the bound process is inactive. A reserve trip does
   not authorize deleting its scratch, restarting it automatically, modifying remote objects, or
   stopping any unbound invocation.
+  For a producer owned by a live adaptive controller, use
+  `scripts/guard_adaptive_replay_reserve.py` and bind both invocation IDs. It must stop and confirm
+  the controller first, then resample and stop only the selected producer; otherwise the controller
+  can race the reserve action by scheduling replacement work. Leave the controller stopped after a
+  trip until an operator has reviewed the durable receipts and chosen a recovery or fresh cohort.
+  Use the single-service guard only for a genuinely standalone producer.
   When admitting a new producer beside older live producers, set that producer's stop floor to the
   global reserve plus the conservative remaining-growth budgets still owed to the older producers,
   unless one proven aggregate guard serializes the complete fleet's response. Giving every lane an

@@ -135,6 +135,15 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
   use a longer bounded run when measured scratch reuse and restart risk justify it. Shorten or split
   the run whenever runtime, root, resource-admission, or live-claim boundaries require it. Prefer
   this when duplicated bootstrap/scratch is the admission bottleneck.
+  When the sealed manifest's exact generation-pinned bootstrap is already retained locally, prefer
+  reusing that cache to downloading a duplicate only through a reviewed cohort input that preserves
+  the manifest's trust boundary. Require an absolute path with the exact canonical snapshot filename,
+  open it as a regular file without following symlinks, verify the manifest size, CRC32C, and MD5,
+  bind its SHA-256 and file identity, and revalidate the open file plus path immediately before worker
+  initialization. Preserve the original restore/download receipt. Never substitute loose directory
+  discovery, a copied filename, or an unbound cache entry for this check; if the deployed parent lacks
+  such an input, keep the cohort staged until authenticated generation-pinned download works or a new
+  immutable parent implementing the gate is qualified and deployed.
   Keep independent root-verifiable cohorts parallel when disk admission is healthy and fleet wall
   time is the priority: historical execution is often mostly serial within one worker, and an
   unnecessarily long cohort increases the restart blast radius. Never merge across a runtime or

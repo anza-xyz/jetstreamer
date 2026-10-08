@@ -1004,6 +1004,10 @@ fn decode_transaction_status_meta_from_frame(
 struct DecodedRewards {
     keyed_rewards: Vec<(Address, RewardInfo)>,
     num_partitions: Option<u64>,
+    // Solana 3.x's reward representation carries whole-percent commission
+    // only. Historical ranges routed through this branch therefore always
+    // expose the legacy format to block callbacks.
+    commission_rate_in_basis_points: bool,
 }
 
 impl DecodedRewards {
@@ -1011,6 +1015,7 @@ impl DecodedRewards {
         Self {
             keyed_rewards: Vec::new(),
             num_partitions: None,
+            commission_rate_in_basis_points: false,
         }
     }
 }
@@ -1057,6 +1062,7 @@ fn decode_rewards_from_bytes(slot: u64, bytes: &[u8]) -> Result<DecodedRewards, 
             Ok(DecodedRewards {
                 keyed_rewards,
                 num_partitions,
+                commission_rate_in_basis_points: false,
             })
         }
         Err(proto_err) => {
@@ -1076,6 +1082,7 @@ fn decode_rewards_from_bytes(slot: u64, bytes: &[u8]) -> Result<DecodedRewards, 
             Ok(DecodedRewards {
                 keyed_rewards,
                 num_partitions,
+                commission_rate_in_basis_points: false,
             })
         }
     }
@@ -1325,6 +1332,10 @@ pub enum BlockData {
         blockhash: Hash,
         /// Rewards keyed by account and partition information.
         rewards: KeyedRewardsAndNumPartitions,
+        /// Whether reward commission values use basis points (SIMD-0291).
+        /// False for the Solana 3.x historical representation, whose commission
+        /// values are whole percentages, and for blocks without rewards.
+        commission_rate_in_basis_points: bool,
         /// Optional Unix timestamp for the block.
         block_time: Option<i64>,
         /// Optional ledger block height.
@@ -2422,6 +2433,7 @@ where
                                             let DecodedRewards {
                                                 keyed_rewards,
                                                 num_partitions,
+                                                commission_rate_in_basis_points,
                                             } = std::mem::take(&mut this_block_rewards);
                                             if slot_should_emit(
                                                 slot,
@@ -2439,6 +2451,7 @@ where
                                                             keyed_rewards,
                                                             num_partitions,
                                                         },
+                                                        commission_rate_in_basis_points,
                                                         block_time: Some(block.meta.blocktime as i64),
                                                         block_height: block.meta.block_height,
                                                         executed_transaction_count:
@@ -3748,6 +3761,7 @@ async fn firehose_geyser_thread(
                                 let DecodedRewards {
                                     keyed_rewards,
                                     num_partitions,
+                                    commission_rate_in_basis_points: _,
                                 } = std::mem::take(&mut this_block_rewards);
                                 let block_meta_notifier = block_meta_notifier_maybe.as_ref().unwrap();
                                 block_meta_notifier.notify_block_metadata(

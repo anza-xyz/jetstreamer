@@ -62,6 +62,66 @@ fn frame(bytes: Vec<u8>) -> Value {
     Array(vec![Integer(6), Null, Null, Null, Bytes(bytes)])
 }
 
+fn reward_payload(slot: u64) -> Option<Vec<u8>> {
+    use solana_storage_proto::{StoredExtendedRewards, convert::generated::Rewards};
+    use solana_transaction_status::{Reward, RewardType};
+
+    let commission = match slot % 6 {
+        0 | 3 => Some(7),
+        1 | 4 => Some(8),
+        2 => Some(9),
+        _ => return None,
+    };
+    let rewards: StoredExtendedRewards = vec![
+        Reward {
+            pubkey: solana_address::Address::new_from_array([7; 32]).to_string(),
+            lamports: 1,
+            post_balance: 10,
+            reward_type: Some(RewardType::Staking),
+            commission,
+        }
+        .into(),
+    ];
+    Some(if slot % 6 < 3 {
+        prost_011::Message::encode_to_vec(&Rewards::from(rewards))
+    } else {
+        bincode::serialize(&rewards).unwrap()
+    })
+}
+
+fn assert_reward_commission_format(block: &BlockData) {
+    let BlockData::Block {
+        slot,
+        rewards,
+        commission_rate_in_basis_points,
+        ..
+    } = block
+    else {
+        return;
+    };
+    // Solana 3.x only exposes legacy whole-percent commission values. Exercise
+    // both protobuf and bincode payloads, and detect stale rewards after reset.
+    let expected_commission = match slot % 6 {
+        0 | 3 => Some(7),
+        1 | 4 => Some(8),
+        2 => Some(9),
+        _ => None,
+    };
+    assert_eq!(*commission_rate_in_basis_points, false, "slot {slot}");
+    assert_eq!(
+        rewards
+            .keyed_rewards
+            .iter()
+            .map(|(_, reward)| reward.commission)
+            .collect::<Vec<_>>(),
+        expected_commission
+            .map(Some)
+            .into_iter()
+            .collect::<Vec<_>>(),
+        "slot {slot}",
+    );
+}
+
 fn archive() -> (Vec<u8>, Vec<u8>) {
     let mut nodes = Vec::new();
     let mut records = Vec::new();
@@ -94,6 +154,12 @@ fn archive() -> (Vec<u8>, Vec<u8>) {
                 Array(vec![link(tx_cid)]),
             ]),
         );
+        let rewards_cid = reward_payload(slot).map(|payload| {
+            append_node(
+                &mut nodes,
+                Array(vec![Integer(5), Integer(slot.into()), frame(payload)]),
+            )
+        });
         root = Some(append_node(
             &mut nodes,
             Array(vec![
@@ -106,6 +172,7 @@ fn archive() -> (Vec<u8>, Vec<u8>) {
                     Integer(0),
                     Integer(slot.into()),
                 ]),
+                rewards_cid.map(link).unwrap_or(Null),
             ]),
         ));
         records.push((offset, nodes.len() - offset));
@@ -252,6 +319,7 @@ async fn assert_callbacks_after_recycle() {
                 let block_slots = block_slots.clone();
                 let first_stolen_slot = first_stolen_slot.clone();
                 async move {
+                    assert_reward_commission_format(&block);
                     if thread_id == 0 {
                         if !victim_paused.swap(true, Ordering::SeqCst) {
                             release_victim.notified().await;

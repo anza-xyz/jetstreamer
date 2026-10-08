@@ -28,7 +28,12 @@ For a long-running range, use `scripts/sync_horizon_r2_progressive.py` to discov
   persistent generation, carrying the same live runtime state and AccountsDb scratch forward across
   epoch boundaries. Do not implement such a cohort as adjacent independent units, and do not budget,
   restore, reinitialize, or clean its scratch as if each member were an independent replay. Apply
-  the detailed cohort boundaries and publication gates in **Produce and verify**.
+  the detailed cohort boundaries and publication gates in **Produce and verify**. When generating a
+  fresh preflight manifest for compatible missing work, explicitly pass
+  `--target-cohort-epochs=3` or `--target-cohort-epochs=4`; the preflight command's default of one
+  epoch preserves legacy behavior and does not implement this preference. Confirm the resulting
+  fingerprinted manifest actually contains the intended multi-epoch cohorts before sealing a
+  controller.
 - Use `HORIZON_DIR` when set; otherwise use `$HOME/horizon`. Keep only `epoch-N.jet` and `epoch-N.jet.sha256` in that public directory.
 - Credentials are `HORIZON_S3_ENDPOINT`, `HORIZON_ACCESS_KEY_ID`, and `HORIZON_SECRET_ACCESS_KEY`. Check only that they exist; never print their values. The endpoint path names the bucket.
 - With an explicit user range, restrict ordinary generation, verification, upload, and cleanup to

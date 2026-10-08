@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """Read-only GCS snapshot inventory preflight for supported mainnet epochs.
 
-Each epoch with a root checkpoint is an independent verification cohort. A run
+By default, each epoch with a root checkpoint is an independent verification
+cohort. ``--target-cohort-epochs`` may deliberately coalesce up to four
+consecutive epochs that use the same runtime, preserving every intermediate
+root checkpoint while amortizing bootstrap and AccountsDb/cache setup. A run
 of epochs without a root checkpoint is joined to the first later epoch with a
-root checkpoint, provided every epoch uses the same runtime. Such a cohort
-starts from a root snapshot in the epoch immediately before the cohort. Hourly
-objects remain eligible only as transport bootstraps for single-epoch cohorts;
-they are never trust anchors or replay checkpoints.
+root checkpoint, provided every epoch uses the same runtime. Every multi-epoch
+cohort starts from a root snapshot in the epoch immediately before the cohort.
+Hourly objects remain eligible only as transport bootstraps for single-epoch
+cohorts; they are never trust anchors or replay checkpoints.
 
 The two fixture options consume the unmodified output of ``gcloud storage ls
 --json``.  Supplying either fixture requires supplying both, and suppresses all
@@ -46,6 +49,7 @@ LOCAL_ROOT = Path("/home/sol/horizon")
 FIRST_EPOCH = 1
 LAST_EPOCH = 100
 MAX_SUPPORTED_EPOCH = 301
+MAX_TARGET_COHORT_EPOCHS = 4
 EPOCH_SLOTS = 432_000
 UINT64_MAX = (1 << 64) - 1
 SCHEMA = "jetstreamer-gcs-snapshot-preflight-v3"
@@ -622,48 +626,45 @@ def build_verification_cohorts(
     hourly_objects: Sequence[SnapshotObject],
     first_epoch: int = FIRST_EPOCH,
     last_epoch: int = LAST_EPOCH,
+    target_cohort_epochs: int = 1,
 ) -> Tuple[VerificationCohort, ...]:
-    """Plan the shortest fail-closed cohorts that end at a root checkpoint."""
+    """Plan root-verifiable cohorts, optionally coalescing same-runtime epochs."""
     requested_slot_range(first_epoch, last_epoch)
+    if not 1 <= target_cohort_epochs <= MAX_TARGET_COHORT_EPOCHS:
+        raise ValueError(
+            f"target_cohort_epochs must be between 1 and {MAX_TARGET_COHORT_EPOCHS}"
+        )
     all_bootstraps = tuple(root_objects) + tuple(hourly_objects)
     cohorts: List[VerificationCohort] = []
     epoch = first_epoch
     while epoch <= last_epoch:
         runtime, extensions = runtime_route(epoch)
-        bootstrap = _select_bootstrap(epoch, all_bootstraps, root_only=False)
-        _, epoch_end = epoch_slot_range(epoch)
-        checkpoints = _root_checkpoints_through(
-            root_objects,
-            bootstrap.slot,
-            epoch_end,
-            extensions,
-            f"epoch {epoch}",
-        )
-        if checkpoints:
-            cohorts.append(
-                VerificationCohort(
-                    epoch,
-                    epoch,
-                    runtime,
-                    extensions,
-                    bootstrap,
-                    checkpoints,
-                )
-            )
-            epoch += 1
-            continue
+        preferred_end = epoch
+        for candidate_end in range(
+            epoch + 1,
+            min(last_epoch, epoch + target_cohort_epochs - 1) + 1,
+        ):
+            next_runtime, next_extensions = runtime_route(candidate_end)
+            if next_runtime != runtime or next_extensions != extensions:
+                break
+            preferred_end = candidate_end
 
-        # A checkpoint-free epoch must be replayed continuously from a root
-        # in its predecessor epoch through the first later root. Replaying the
-        # later epoch from an hourly object would leave the earlier archives
-        # outside the verified state transition.
-        if not root_cohort_runtime_is_historical(runtime):
+        bootstrap = _select_bootstrap(
+            epoch,
+            root_objects if preferred_end > epoch else all_bootstraps,
+            root_only=preferred_end > epoch,
+        )
+
+        # A requested multi-epoch cohort or a checkpoint-free epoch must be
+        # replayed continuously from a root in its predecessor epoch through a
+        # root in the final epoch. Replaying later members from hourly objects
+        # would leave their archives outside the verified state transition.
+        if preferred_end > epoch and not root_cohort_runtime_is_historical(runtime):
             raise PreflightError(
-                f"epoch {epoch}: root-checkpoint gaps require an isolated historical "
+                f"epoch {epoch}: multi-epoch cohorts require an isolated historical "
                 f"Solana runtime, got {runtime}"
             )
-        bootstrap = _select_bootstrap(epoch, root_objects, root_only=True)
-        cohort_end = epoch
+        cohort_end = preferred_end
         cohort_checkpoints: Tuple[SnapshotObject, ...] = ()
         while cohort_end <= last_epoch:
             if cohort_end != epoch:
@@ -684,6 +685,13 @@ def build_verification_cohorts(
             final_start, _ = epoch_slot_range(cohort_end)
             if any(item.slot >= final_start for item in cohort_checkpoints):
                 break
+            if cohort_end == epoch:
+                if not root_cohort_runtime_is_historical(runtime):
+                    raise PreflightError(
+                        f"epoch {epoch}: root-checkpoint gaps require an isolated historical "
+                        f"Solana runtime, got {runtime}"
+                    )
+                bootstrap = _select_bootstrap(epoch, root_objects, root_only=True)
             if cohort_end == last_epoch:
                 cohort_checkpoints = ()
                 break
@@ -712,11 +720,16 @@ def build_epoch_plans(
     hourly_objects: Sequence[SnapshotObject],
     first_epoch: int = FIRST_EPOCH,
     last_epoch: int = LAST_EPOCH,
+    target_cohort_epochs: int = 1,
 ) -> Tuple[EpochPlan, ...]:
     """Expand root-aware verification cohorts into per-epoch work records."""
     plans: List[EpochPlan] = []
     for cohort in build_verification_cohorts(
-        root_objects, hourly_objects, first_epoch, last_epoch
+        root_objects,
+        hourly_objects,
+        first_epoch,
+        last_epoch,
+        target_cohort_epochs,
     ):
         for epoch in range(cohort.first_epoch, cohort.last_epoch + 1):
             epoch_start, epoch_end = epoch_slot_range(epoch)
@@ -759,7 +772,9 @@ def _manifest_object(item: SnapshotObject) -> Dict[str, Any]:
     }
 
 
-def build_manifest(plans: Sequence[EpochPlan]) -> Dict[str, Any]:
+def build_manifest(
+    plans: Sequence[EpochPlan], target_cohort_epochs: int = 1
+) -> Dict[str, Any]:
     cohort_records: List[Dict[str, Any]] = []
     for plan in plans:
         key = (plan.cohort_first_epoch, plan.cohort_last_epoch)
@@ -809,6 +824,7 @@ def build_manifest(plans: Sequence[EpochPlan]) -> Dict[str, Any]:
             "checkpoint_window": "after-bootstrap-through-cohort-end",
             "newest_slot_must_be_unique": True,
             "publication": "withhold-complete-cohort-until-final-root",
+            "target_cohort_epochs": target_cohort_epochs,
         },
         "verification_cohorts": cohort_records,
         "epochs": [
@@ -1027,6 +1043,16 @@ def build_argument_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--first-epoch", type=int, default=FIRST_EPOCH)
     parser.add_argument("--last-epoch", type=int, default=LAST_EPOCH)
+    parser.add_argument(
+        "--target-cohort-epochs",
+        type=int,
+        choices=range(1, MAX_TARGET_COHORT_EPOCHS + 1),
+        default=1,
+        help=(
+            "prefer continuous same-runtime verification cohorts of this many epochs "
+            f"(default: 1; maximum: {MAX_TARGET_COHORT_EPOCHS})"
+        ),
+    )
     return parser
 
 
@@ -1049,8 +1075,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             hourly_objects,
             arguments.first_epoch,
             arguments.last_epoch,
+            arguments.target_cohort_epochs,
         )
-        manifest = build_manifest(plans)
+        manifest = build_manifest(plans, arguments.target_cohort_epochs)
         fingerprint = manifest_fingerprint(manifest)
         storage = build_storage_report(plans, arguments.local_root)
         report = {

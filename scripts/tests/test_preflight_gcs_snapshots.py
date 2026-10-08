@@ -782,6 +782,126 @@ class SelectionTests(unittest.TestCase):
             },
         )
 
+    def test_target_cohort_reuses_root_bootstrap_and_keeps_intermediate_roots(self) -> None:
+        first_epoch = 17
+        last_epoch = 20
+        prior_start, prior_end = preflight.epoch_slot_range(first_epoch - 1)
+        root_bootstrap_slot = prior_end - 100
+        checkpoint_slots = [
+            preflight.epoch_slot_range(epoch)[0] + 10
+            for epoch in range(first_epoch, last_epoch + 1)
+        ]
+        root = preflight.parse_inventory_json(
+            json.dumps(
+                [inventory_record(root_bootstrap_slot)]
+                + [inventory_record(slot, identity=ONE_HASH) for slot in checkpoint_slots]
+            ),
+            "root",
+            preflight.requested_slot_range(first_epoch, last_epoch),
+        )
+        hourly = preflight.parse_inventory_json(
+            json.dumps(
+                [
+                    inventory_record(
+                        prior_end - 1,
+                        source="hourly",
+                        anchor=prior_start,
+                    )
+                ]
+            ),
+            "hourly",
+            preflight.requested_slot_range(first_epoch, last_epoch),
+        )
+
+        cohorts = preflight.build_verification_cohorts(
+            root,
+            hourly,
+            first_epoch,
+            last_epoch,
+            target_cohort_epochs=4,
+        )
+        self.assertEqual(len(cohorts), 1)
+        self.assertEqual(
+            (cohorts[0].first_epoch, cohorts[0].last_epoch),
+            (first_epoch, last_epoch),
+        )
+        self.assertEqual(cohorts[0].bootstrap.source, "root")
+        self.assertEqual(cohorts[0].bootstrap.slot, root_bootstrap_slot)
+        self.assertEqual(
+            [item.slot for item in cohorts[0].checkpoints], checkpoint_slots
+        )
+
+        plans = preflight.build_epoch_plans(
+            root,
+            hourly,
+            first_epoch,
+            last_epoch,
+            target_cohort_epochs=4,
+        )
+        self.assertEqual(
+            [plan.cohort_first_epoch for plan in plans], [first_epoch] * 4
+        )
+        self.assertEqual([plan.cohort_last_epoch for plan in plans], [last_epoch] * 4)
+        self.assertEqual(
+            [plan.bootstrap.slot for plan in plans], [root_bootstrap_slot] * 4
+        )
+        manifest = preflight.build_manifest(plans, target_cohort_epochs=4)
+        self.assertEqual(manifest["selection_policy"]["target_cohort_epochs"], 4)
+        self.assertEqual(len(manifest["verification_cohorts"]), 1)
+        self.assertEqual(
+            [item["runtime_state_source"] for item in manifest["epochs"]],
+            [
+                "root-bootstrap",
+                "carried-from-previous-epoch",
+                "carried-from-previous-epoch",
+                "carried-from-previous-epoch",
+            ],
+        )
+
+    def test_target_cohort_splits_at_every_runtime_boundary(self) -> None:
+        first_epoch = 153
+        last_epoch = 156
+        root = preflight.parse_inventory_json(
+            json.dumps(
+                [inventory_record(preflight.epoch_slot_range(152)[1] - 10)]
+                + [
+                    inventory_record(preflight.epoch_slot_range(epoch)[0] + 10)
+                    for epoch in range(first_epoch, last_epoch + 1)
+                ]
+                + [
+                    inventory_record(
+                        preflight.EPOCH_154_BOOTSTRAP_SLOT,
+                        identity=preflight.EPOCH_154_BOOTSTRAP_ACCOUNTS_HASH,
+                    )
+                ]
+            ),
+            "root",
+            preflight.requested_slot_range(first_epoch, last_epoch),
+        )
+        cohorts = preflight.build_verification_cohorts(
+            root,
+            (),
+            first_epoch,
+            last_epoch,
+            target_cohort_epochs=4,
+        )
+        self.assertEqual(
+            [(item.first_epoch, item.last_epoch) for item in cohorts],
+            [(153, 153), (154, 154), (155, 156)],
+        )
+
+    def test_target_cohort_size_is_bounded(self) -> None:
+        root, hourly = complete_inventory()
+        parsed_root = preflight.parse_inventory_json(json.dumps(root), "root")
+        parsed_hourly = preflight.parse_inventory_json(json.dumps(hourly), "hourly")
+        for invalid in (0, preflight.MAX_TARGET_COHORT_EPOCHS + 1):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                preflight.build_verification_cohorts(
+                    parsed_root,
+                    parsed_hourly,
+                    target_cohort_epochs=invalid,
+                )
+
     def test_newer_hourly_bootstrap_cannot_hide_a_same_epoch_root(self) -> None:
         epoch = 17
         root_bootstrap_slot = 7_343_776

@@ -802,6 +802,13 @@ root-owned service using a root-owned, non-writable deployment tree and owner-on
 state under root-controlled ancestry. The controller derives every work boundary from the
 fingerprinted preflight manifest and will not split a verification cohort.
 
+Snapshot preflight defaults to one epoch per verification cohort when every epoch has a root.
+Pass `--target-cohort-epochs=3` or `4` to deliberately carry one immutable historical runtime
+and its AccountsDb/cache state across consecutive epochs. The planner keeps every intermediate
+root, requires a root bootstrap for any multi-epoch cohort, and splits at runtime boundaries;
+checkpoint gaps may extend a cohort only through the first later root in the same runtime.
+Per-epoch archives and verification gates remain independent even though replay is continuous.
+
 Concurrency begins at the configured floor and increases gradually when CPU, memory, and disk
 headroom allow it. The optional `--memory-admission-gib` keeps the measured non-reclaimable
 per-worker reservation separate from the larger `MemoryMax` safety ceiling; it defaults to that

@@ -82,6 +82,15 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
   fail on conflicting aliases, and require either the exact raw object ID or exact versioned
   `storage_url`; authentication success without this complete identity/hash proof is insufficient.
 - Failed-replay scratch cleanup is authorized by default for this workflow. After confirming the failure and capturing the evidence needed to diagnose or reproduce it, stop the service and retry path, verify that no live process or staged relaunch references the exact scratch path, and delete that failed run's scratch immediately instead of allowing failures to accumulate. Preserve diagnostic output, partial archives, replay state, logs, checkpoints, manifests, receipts, and any snapshot still needed for diagnosis, lineage, restart, or a staged epoch outside the scratch tree. Never apply this cleanup rule to a controlled stop that can genuinely resume in place. If a relaunch demonstrably starts from the bootstrap in a new isolated runtime generation with no resume cursor, verify the new worker's exact generation and reclaim older unreferenced generations promptly; preserving them does not make that replay resumable.
+- Diagnose an archive `SectionTooLarge` against both the record-count and data-arena limits for the
+  named phase. The error's historical `bytes` field is also used for a count overflow, so a value
+  such as `8193 (limit 8192)` can mean the 8,193rd update rather than an 8,193-byte account. Capture
+  the exact slot, phase, observed value, immutable producer identities, and partial archive before
+  cleanup. Never drop, truncate, or misattribute an account update to make replay continue. When the
+  observed canonical shape exceeds a practical inline capacity that is not serialized on the wire,
+  raise it conservatively while retaining independent byte/decode-work bounds, add an exact
+  observed-shape plus one-past-the-new-bound writer/reader regression, and retry only in a fresh
+  isolated archive and scratch generation.
 - Treat an ordered historical-worker `ShuttingDown` acknowledgement as the worker protocol commit
   point. A legacy worker can remain uninterruptible for longer than both graceful and forced reap
   windows while the kernel tears down a multi-terabyte mmap-backed AccountsDb; delayed reaping after

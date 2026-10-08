@@ -366,6 +366,12 @@ Do not use `--legacy-etag-only` unless the user has explicitly established that 
 
 ## Operate safely
 
+- Never use `sync -f PATH` or `sync --file-system PATH` to make a receipt durable on a filesystem
+  containing live replay scratch. GNU `sync -f` calls `syncfs(2)` and flushes the entire filesystem;
+  continuously dirtied mmap-backed AccountsDb pages can keep it blocked indefinitely and impose
+  avoidable writeback pressure on every producer. Durable receipt writers must fsync the receipt's
+  own file descriptor and then its containing directory descriptor, preferably inside the Rust or
+  Python writer that performs the atomic rename. Do not substitute a filesystem-wide flush.
 - Private qualification, admission, guard, and publication receipt directories may deliberately be
   root-only. An unprivileged `test -e`, `stat`, or file read can therefore look like absence even
   when the receipt exists. Before declaring a required receipt missing, inspect the parent access

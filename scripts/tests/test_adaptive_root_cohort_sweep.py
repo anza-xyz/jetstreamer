@@ -22,6 +22,7 @@ import adaptive_root_cohort_sweep as sweep  # noqa: E402
 
 
 def manifest_report(cohorts: list[tuple[int, int, str]]) -> tuple[dict, str]:
+    md5_hash = base64.b64encode(b"0123456789abcdef").decode("ascii")
     body = {
         "schema": sweep.MANIFEST_SCHEMA,
         "bucket": "mainnet-beta-ledger-us-ny5",
@@ -34,7 +35,10 @@ def manifest_report(cohorts: list[tuple[int, int, str]]) -> tuple[dict, str]:
                 "last_epoch": last,
                 "runtime": runtime,
                 "publication_gate": sweep.PUBLICATION_GATE,
-                "root_checkpoints": [{"slot": last * 432_000}],
+                "bootstrap": {"md5_hash": md5_hash},
+                "root_checkpoints": [
+                    {"slot": last * 432_000, "md5_hash": md5_hash}
+                ],
             }
             for first, last, runtime in cohorts
         ],
@@ -197,6 +201,41 @@ def fake_receipt_evidence(
 
 
 class ManifestTests(unittest.TestCase):
+    def test_current_controller_rejects_legacy_v2_manifest(self) -> None:
+        report, _fingerprint = manifest_report([(201, 201, "solana-v1.6.16")])
+        report["manifest"]["schema"] = "jetstreamer-gcs-snapshot-preflight-v2"
+        fingerprint = "sha256:" + hashlib.sha256(
+            sweep.canonical_json(report["manifest"])
+        ).hexdigest()
+        report["manifest_fingerprint"] = fingerprint
+        with tempfile.TemporaryDirectory() as temporary:
+            path = write_manifest(Path(temporary), report)
+            with self.assertRaisesRegex(sweep.SweepError, "schema"):
+                sweep.load_cohorts(path, fingerprint, 201, 201)
+
+    def test_current_controller_accepts_v3_manifest(self) -> None:
+        report, fingerprint = manifest_report([(201, 201, "solana-v1.6.16")])
+        self.assertEqual(
+            report["manifest"]["schema"],
+            "jetstreamer-gcs-snapshot-preflight-v3",
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            path = write_manifest(Path(temporary), report)
+            cohorts = sweep.load_cohorts(path, fingerprint, 201, 201)
+        self.assertEqual(cohorts, (sweep.Cohort(201, 201, "solana-v1.6.16"),))
+
+    def test_v3_manifest_requires_md5_for_every_snapshot(self) -> None:
+        report, _fingerprint = manifest_report([(201, 201, "solana-v1.6.16")])
+        del report["manifest"]["verification_cohorts"][0]["bootstrap"]["md5_hash"]
+        fingerprint = "sha256:" + hashlib.sha256(
+            sweep.canonical_json(report["manifest"])
+        ).hexdigest()
+        report["manifest_fingerprint"] = fingerprint
+        with tempfile.TemporaryDirectory() as temporary:
+            path = write_manifest(Path(temporary), report)
+            with self.assertRaisesRegex(sweep.SweepError, "MD5"):
+                sweep.load_cohorts(path, fingerprint, 201, 201)
+
     def test_selected_range_accepts_an_unselected_transition_runtime(self) -> None:
         raw = [(1, 1, "solana-v1.0.7-to-v1.0.8")]
         raw.extend((epoch, epoch, "solana-v1.0.23") for epoch in range(2, 24))
@@ -223,6 +262,9 @@ class ManifestTests(unittest.TestCase):
         )
         if not path.exists():
             self.skipTest("sealed production manifest is not installed")
+        installed = json.loads(path.read_text())
+        if installed.get("manifest", {}).get("schema") != sweep.MANIFEST_SCHEMA:
+            self.skipTest("installed manifest belongs to an immutable legacy controller")
         cohorts = sweep.load_cohorts(
             path,
             "sha256:888df3d89187e3fb8cd307e65eab1a4770153887965f3defd74f048504fc3f1a",

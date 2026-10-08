@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import binascii
 from contextlib import contextmanager
 import dataclasses
 from decimal import Decimal, InvalidOperation
@@ -38,7 +39,11 @@ from typing import Any, Iterable, Mapping, Sequence
 
 
 GIB = 1024**3
-MANIFEST_SCHEMA = "jetstreamer-gcs-snapshot-preflight-v2"
+# The current node's root-checkpoint cohort loader requires the v3 manifest.
+# Older deployments remain paired with their immutable v2 controller; letting
+# this controller plan a v2 manifest would defer the incompatibility until a
+# costly producer launch and would omit the GCS MD5 binding added in v3.
+MANIFEST_SCHEMA = "jetstreamer-gcs-snapshot-preflight-v3"
 RECEIPT_SCHEMA = "jetstreamer-root-cohort-publication-receipt-v2"
 ROOT_CHECKPOINT_CONTEXT_SCHEMA = "jetstreamer-root-checkpoint-gate-context-v1"
 PUBLICATION_GATE = "all-archives-validated-and-final-root-verified"
@@ -436,6 +441,20 @@ def _stat_identity(info: os.stat_result) -> tuple[int, ...]:
     )
 
 
+def require_manifest_snapshot_md5(raw: object, description: str) -> None:
+    if not isinstance(raw, dict):
+        raise SweepError(f"{description} is not an object")
+    value = raw.get("md5_hash")
+    if not isinstance(value, str) or not value:
+        raise SweepError(f"{description} lacks a GCS MD5 binding")
+    try:
+        decoded = base64.b64decode(value, validate=True)
+    except (ValueError, binascii.Error) as error:
+        raise SweepError(f"{description} has an invalid GCS MD5 binding") from error
+    if len(decoded) != 16 or base64.b64encode(decoded).decode("ascii") != value:
+        raise SweepError(f"{description} has a non-canonical GCS MD5 binding")
+
+
 def load_cohorts(
     manifest_path: Path,
     expected_fingerprint: str,
@@ -499,6 +518,14 @@ def load_cohorts(
             or not raw["root_checkpoints"]
         ):
             raise SweepError(f"manifest cohort {index} is invalid or noncontiguous")
+        require_manifest_snapshot_md5(
+            raw.get("bootstrap"), f"manifest cohort {index} bootstrap"
+        )
+        for checkpoint_index, checkpoint in enumerate(raw["root_checkpoints"]):
+            require_manifest_snapshot_md5(
+                checkpoint,
+                f"manifest cohort {index} root checkpoint {checkpoint_index}",
+            )
         cohorts.append(Cohort(start, end, runtime))
         expected_next = end + 1
     if expected_next != manifest_last + 1:

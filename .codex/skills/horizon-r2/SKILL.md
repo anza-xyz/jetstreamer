@@ -235,6 +235,12 @@ Do not use `--legacy-etag-only` unless the user has explicitly established that 
 
 ## Operate safely
 
+- Private qualification, admission, guard, and publication receipt directories may deliberately be
+  root-only. An unprivileged `test -e`, `stat`, or file read can therefore look like absence even
+  when the receipt exists. Before declaring a required receipt missing, inspect the parent access
+  controls and repeat the existence, metadata, digest, and JSON checks through the intended
+  privileged reader. Treat an actual unreadable or invalid receipt as a failed gate; never weaken
+  its ownership or mode merely to make an unprivileged probe pass.
 - Use SSH URLs for Git network operations. Select a currently loaded keychain agent socket for the
   active login session by verifying it with `ssh-add -l`; never hard-code an ephemeral socket path
   from an earlier session. Check the inherited environment for required service credentials before

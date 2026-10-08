@@ -298,6 +298,25 @@ def available_bytes(path: Path) -> int:
     return filesystem.f_bavail * filesystem.f_frsize
 
 
+def memory_available_bytes(path: Path = Path("/proc/meminfo")) -> int:
+    try:
+        lines = path.read_text().splitlines()
+    except OSError as error:
+        raise AdmissionError(f"cannot read memory availability from {path}: {error}") from error
+    values: dict[str, int] = {}
+    for line in lines:
+        fields = line.split()
+        if len(fields) == 3 and fields[0].endswith(":") and fields[2] == "kB":
+            try:
+                values[fields[0][:-1]] = int(fields[1]) * 1024
+            except ValueError:
+                continue
+    available = values.get("MemAvailable")
+    if available is None or available < 1:
+        raise AdmissionError(f"{path} lacks a positive MemAvailable value")
+    return available
+
+
 def process_references(roots: Sequence[Path], proc_root: Path = Path("/proc")) -> list[str]:
     needles = tuple(os.fsencode(str(root)) for root in roots)
     references: list[str] = []
@@ -447,6 +466,29 @@ def run_admission(manifest: dict[str, Any]) -> dict[str, Any]:
             f"available bytes {free_bytes} below admission floor {minimum_free_bytes}"
         )
 
+    minimum_memory_available_bytes = manifest.get("minimum_memory_available_bytes")
+    meminfo_path = require_absolute_path(
+        manifest.get("meminfo_path", "/proc/meminfo"), "memory information"
+    )
+    available_memory = memory_available_bytes(meminfo_path)
+    if (
+        minimum_memory_available_bytes is not None
+        and (
+            not isinstance(minimum_memory_available_bytes, int)
+            or isinstance(minimum_memory_available_bytes, bool)
+            or minimum_memory_available_bytes < 1
+        )
+    ):
+        raise AdmissionError("minimum_memory_available_bytes must be positive")
+    if (
+        minimum_memory_available_bytes is not None
+        and available_memory < minimum_memory_available_bytes
+    ):
+        raise AdmissionError(
+            f"available memory {available_memory} below admission floor "
+            f"{minimum_memory_available_bytes}"
+        )
+
     vm_path = require_absolute_path(manifest.get("vm_max_map_count_path"), "VMA ceiling")
     minimum_vmas = manifest.get("minimum_vm_max_map_count")
     try:
@@ -477,6 +519,9 @@ def run_admission(manifest: dict[str, Any]) -> dict[str, Any]:
         "filesystem": str(filesystem),
         "available_bytes": free_bytes,
         "minimum_free_bytes": minimum_free_bytes,
+        "meminfo_path": str(meminfo_path),
+        "memory_available_bytes": available_memory,
+        "minimum_memory_available_bytes": minimum_memory_available_bytes,
         "vm_max_map_count": actual_vmas,
         "minimum_vm_max_map_count": minimum_vmas,
         "no_process_reference_roots": [str(item) for item in roots],

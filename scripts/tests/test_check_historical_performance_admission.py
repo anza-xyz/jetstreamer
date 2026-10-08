@@ -172,6 +172,15 @@ class HistoricalPerformanceAdmissionTest(unittest.TestCase):
                 [f"pid 123 fd 7 references {root}"],
             )
 
+    def test_memory_available_is_parsed_in_bytes_and_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory).resolve() / "meminfo"
+            path.write_text("MemTotal: 4096 kB\nMemAvailable: 1234 kB\n")
+            self.assertEqual(admission.memory_available_bytes(path), 1234 * 1024)
+            path.write_text("MemTotal: 4096 kB\n")
+            with self.assertRaisesRegex(admission.AdmissionError, "MemAvailable"):
+                admission.memory_available_bytes(path)
+
     def test_manifest_must_be_owner_only_and_schema_bound(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory).resolve() / "manifest.json"

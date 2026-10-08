@@ -5054,8 +5054,10 @@ fn usage(program: &str) -> String {
          requires a single epoch, --verify,\n\
          --snapshot-archive, --epoch-hashes, and --horizon-output.\n\
          --epoch-hashes=PATH, --snapshot-archive=PATH, --range-info=A-B, and\n\
-         --replay-scratch=PATH are\n\
-         otherwise internal flags passed by the range supervisor to its children.\n\
+         --replay-scratch=PATH are otherwise internal flags passed by the range\n\
+         supervisor to its children. A root-checkpoint cohort may also use an\n\
+         absolute --snapshot-archive path whose exact name and contents match the\n\
+         sealed manifest bootstrap, avoiding a duplicate authenticated download.\n\
          --root-checkpoint-cohort runs a manifest-defined nonzero epoch cohort from one\n\
          predecessor snapshot through a root checkpoint in the final epoch. It requires\n\
          explicit --verify, a sealed preflight manifest and its audited fingerprint,\n\
@@ -6207,6 +6209,41 @@ fn bind_cohort_snapshot_download(
         },
         size: manifest.size,
     })
+}
+
+fn validate_cohort_bootstrap_override(
+    path: &Path,
+    manifest: &CohortManifestSnapshot,
+) -> Result<(), String> {
+    if !path.is_absolute() {
+        return Err(format!(
+            "root-checkpoint cohort snapshot override must be an absolute path: {}",
+            path.display()
+        ));
+    }
+    let expected_name = snapshot_filename(&manifest.uri)?;
+    let actual_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            format!(
+                "root-checkpoint cohort snapshot override has no UTF-8 filename: {}",
+                path.display()
+            )
+        })?;
+    if actual_name != expected_name {
+        return Err(format!(
+            "root-checkpoint cohort snapshot override filename mismatch: expected {expected_name}, got {actual_name}"
+        ));
+    }
+    let (slot, _) = parse_snapshot_archive_name(actual_name)?;
+    if slot != manifest.slot {
+        return Err(format!(
+            "root-checkpoint cohort snapshot override slot mismatch: manifest {}, filename {slot}",
+            manifest.slot
+        ));
+    }
+    Ok(())
 }
 
 fn validate_root_checkpoint_cohort_expectations(
@@ -17527,7 +17564,7 @@ async fn main() {
         eprintln!("--epoch-hashes applies only to a single-epoch (child) invocation");
         exit(2);
     }
-    if snapshot_archive_override.is_some() && start_epoch != end_epoch {
+    if snapshot_archive_override.is_some() && start_epoch != end_epoch && !root_checkpoint_cohort {
         eprintln!("--snapshot-archive applies only to a single-epoch (child) invocation");
         exit(2);
     }
@@ -17597,7 +17634,6 @@ async fn main() {
         if horizon_output.is_some()
             || qualification_end_slot.is_some()
             || epoch_hashes.is_some()
-            || snapshot_archive_override.is_some()
             || range_info.is_some()
             || replay_scratch.is_some()
         {
@@ -17618,6 +17654,9 @@ async fn main() {
         eprintln!("--source-cohort-receipt requires --recover-staged-cohort-only");
         exit(2);
     }
+    let cohort_bootstrap_override = root_checkpoint_cohort
+        .then(|| snapshot_archive_override.take())
+        .flatten();
     let qualification = match qualification_plan(
         start_epoch,
         end_epoch,
@@ -18196,7 +18235,17 @@ async fn main() {
             exit(1);
         }
         let retained_snapshot = input_dir.join(&name);
-        let snapshot_path = if cohort_run.as_ref().is_some_and(CohortRunDirectory::resumed) {
+        let snapshot_path = if let Some(path) = cohort_bootstrap_override {
+            if let Err(err) = validate_cohort_bootstrap_override(&path, &plan.bootstrap) {
+                eprintln!("error: {err}");
+                exit(1);
+            }
+            info!(
+                "root-checkpoint cohort is reusing manifest-bound audited bootstrap {}",
+                path.display()
+            );
+            path
+        } else if cohort_run.as_ref().is_some_and(CohortRunDirectory::resumed) {
             match fs::symlink_metadata(&retained_snapshot) {
                 Ok(metadata) if metadata.file_type().is_file() => {
                     info!(
@@ -20079,6 +20128,43 @@ mod early_snapshot_tests {
 
         let error = bind_cohort_snapshot_download(&path, &plan.bootstrap).unwrap_err();
         assert!(error.contains("CRC32C mismatch"), "{error}");
+    }
+
+    #[test]
+    fn cohort_bootstrap_override_requires_exact_absolute_manifest_file() {
+        use std::os::unix::fs::symlink;
+
+        let contents = b"audited retained cohort bootstrap";
+        let (report, fingerprint) = cohort_manifest_report(contents);
+        let plan = root_checkpoint_cohort_plan_from_report(
+            report,
+            &fingerprint,
+            17,
+            19,
+            root_checkpoint_cohort_runtime(17, 19, true).unwrap(),
+        )
+        .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let expected_name = snapshot_filename(&plan.bootstrap.uri).unwrap();
+        let exact_path = directory.path().join(expected_name);
+        fs::write(&exact_path, contents).unwrap();
+        validate_cohort_bootstrap_override(&exact_path, &plan.bootstrap).unwrap();
+        bind_cohort_snapshot_download(&exact_path, &plan.bootstrap).unwrap();
+
+        let relative = PathBuf::from(expected_name);
+        let error = validate_cohort_bootstrap_override(&relative, &plan.bootstrap).unwrap_err();
+        assert!(error.contains("absolute path"), "{error}");
+
+        let wrong_name = directory.path().join("snapshot-1-wrong.tar.bz2");
+        let error = validate_cohort_bootstrap_override(&wrong_name, &plan.bootstrap).unwrap_err();
+        assert!(error.contains("filename mismatch"), "{error}");
+
+        let symlink_directory = tempfile::tempdir().unwrap();
+        let symlink_path = symlink_directory.path().join(expected_name);
+        symlink(&exact_path, &symlink_path).unwrap();
+        validate_cohort_bootstrap_override(&symlink_path, &plan.bootstrap).unwrap();
+        let error = bind_cohort_snapshot_download(&symlink_path, &plan.bootstrap).unwrap_err();
+        assert!(error.contains("failed to open"), "{error}");
     }
 
     #[test]

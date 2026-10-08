@@ -141,6 +141,15 @@ evidence for a later reviewed registry change, not permission to publish by itse
    `jetstreamer-qualification-verify`. Require its digest-bound JSON evidence to show both
    successful, correctly attributed writes and increasing write versions; a standalone RPC record
    or unit test is not qualification evidence.
+   If this qualification later fails in the reconstructed confirmed-block interval, compare the
+   same input under the conflict-wave worker and the last qualified true-singleton worker before
+   changing batching. An identical slot, signature, expected status, and actual status disproves
+   wave construction as the cause of that failure. For a vote-program `SlotHashMismatch`, capture
+   the voted slot/hash, current parent Bank slot/hash, and the first matching `SlotHashes` sysvar
+   entry in one durable receipt. When the canonical vote hash differs from the reconstructed
+   parent's Bank/`SlotHashes` hash, investigate reconstructed slot completion and child-Bank sysvar
+   continuity; do not promote a singleton guard merely because the affected recovery groups are
+   synthetic entry boundaries.
    Before launch, also inspect the exact immutable worker's internal snapshot and entry bounds and
    require them to admit the requested terminal slot. The focused planner's search envelope may be
    wider than the current worker guard. If so, defer the lane until the worker bound is deliberately

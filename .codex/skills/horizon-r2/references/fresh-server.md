@@ -162,6 +162,14 @@ evidence for a later reviewed registry change, not permission to publish by itse
    snapshot can carry it, record source insufficiency and require another independently verifiable
    raw-shred or exact historical-sysvar source. Never guess the missing hash, force a Bank hash, or
    weaken terminal/plugin checks to bridge the gap.
+   For reconstructed confirmed-block slots, count the PoH block boundaries crossed from the parent
+   tick height through completion. A source that supplies only the slot's final blockhash is
+   insufficient when that count exceeds one: require an independently verifiable ordered hash for
+   every crossed boundary. Never repeat the final hash across multiple boundaries; doing so mutates
+   RecentBlockhashes with the wrong intermediate value and can change the frozen Bank/SlotHashes
+   hash. Keep a synthetic skipped-slot regression that compares distinct canonical boundary hashes
+   with repeated-final reconstruction and proves that both RecentBlockhashes and the Bank hash
+   diverge.
    Before launch, also inspect the exact immutable worker's internal snapshot and entry bounds and
    require them to admit the requested terminal slot. The focused planner's search envelope may be
    wider than the current worker guard. If so, defer the lane until the worker bound is deliberately

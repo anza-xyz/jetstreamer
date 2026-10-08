@@ -58,6 +58,14 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
   reload. If that delays an already-due check, run only the oneshot monitor immediately and confirm
   that `OnUnitActiveSec` has re-anchored the next interval; never restart the producer to repair its
   monitor schedule.
+- A hardened adaptive lane may use an isolated `CLOUDSDK_CONFIG` under its private lane root.
+  Refreshing the interactive user's default GCloud configuration does not refresh those copies.
+  Before retrying a producer after authentication changes, update the isolated configuration with
+  a consistent, permission-preserving copy of the refreshed credential databases, then perform a
+  read-only lookup of one exact generation-bound snapshot through the lane's effective
+  `CLOUDSDK_CONFIG`, account, and project. Never print an access token or infer success from a
+  lookup made through the interactive default configuration. Refresh idle lanes before they are
+  admitted so a controller does not consume an attempt on stale credentials.
 - When launching into a fresh isolated diagnostic-output directory, ensure it contains the verified
   same-cluster genesis expected by the loader. A cached snapshot does not imply the genesis is
   present. Preseed only from digest-bound retained evidence and verify the copied digest and
@@ -89,6 +97,15 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
   configured per-worker disk admission budget and measured filesystem growth to leave the reserve
   intact before launching another cohort. If a manual canary set would violate that gate, stop the
   newest units and preserve their private run directories for later resumption.
+- Consecutive epochs using the same immutable runtime can be replayed as a bounded contiguous
+  cohort so later epochs carry the live runtime state and AccountsDb scratch instead of restoring
+  another bootstrap. Prefer this when duplicated bootstrap/scratch is the admission bottleneck.
+  Keep independent root-verifiable cohorts parallel when disk admission is healthy and fleet wall
+  time is the priority: historical execution is often mostly serial within one worker, and an
+  unnecessarily long cohort increases the restart blast radius. Never merge across a runtime or
+  compatibility boundary, exceed the immutable worker's proven terminal bound, omit an
+  intermediate root check, overlap a live epoch claim, or publish any member before the complete
+  sealed cohort reaches its final root and passes the normal per-archive gates.
 - When a live replay's measured growth could cross the filesystem reserve before its next safe
   milestone, use an actual-free-space guard rather than relying only on projections. Bind the guard
   to the exact service invocation ID and zero-restart state, fsync a root-owned stop intent before

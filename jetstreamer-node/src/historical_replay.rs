@@ -875,14 +875,17 @@ impl HistoricalReplay {
             );
         }
         info!(
-            "historical checkpoint slot={} bank_hash={} accounts_hash={} capitalization={} transactions={} tick_height={} complete={}",
+            "historical checkpoint slot={} bank_hash={} accounts_hash={} last_blockhash={} capitalization={} transactions={} tick_height={} complete={} writes={} next_write_version={}",
             checkpoint.slot,
             Hash::new_from_array(checkpoint.bank_hash),
             Hash::new_from_array(checkpoint.accounts_hash),
+            Hash::new_from_array(checkpoint.last_blockhash),
             checkpoint.capitalization,
             checkpoint.transaction_count,
             checkpoint.tick_height,
             checkpoint.slot_complete,
+            checkpoint.writes.len(),
+            checkpoint.next_write_version,
         );
     }
 

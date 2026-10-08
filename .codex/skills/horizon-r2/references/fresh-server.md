@@ -65,6 +65,9 @@ epochs touch a slot interval marked unsupported by the checked-in runtime regist
    snapshot, then delete only the unreferenced scratch. A sealed archive without its producer segment
    manifest remains private until a reviewed recovery tool reconstructs the evidence and performs a
    complete independent reread.
+   Before deployment, confirm checkpoint logs include last blockhash, checkpoint write count, and
+   next write-version cursor at both bootstrap and terminal checkpoints. These are part of the
+   durable segment evidence and must not exist only in parent memory until manifest publication.
 6. Treat disk cleanup as part of admission control. Proactively remove reproducible build caches,
    download caches, obsolete snapshots, and obsolete scratch generations once their exact
    canonical paths have been checked against live processes and staged units. Keep the immutable

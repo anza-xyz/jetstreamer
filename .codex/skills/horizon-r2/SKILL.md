@@ -74,6 +74,10 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
   the archive and exact journal evidence, and reclaim only the unreferenced scratch. Do not invent a
   missing segment manifest or publish the artifact: require an independently reviewed recovery path
   and a complete durable archive reread before treating it as qualification evidence.
+  Ensure every immutable parent logs the complete bootstrap and terminal checkpoint summaries,
+  including last blockhash, drained-write count, and next write-version cursor. Those fields are
+  required to reconstruct auditable producer evidence after a post-archive parent failure; terminal
+  bank and accounts hashes alone are insufficient.
 - Do not raise replay concurrency from low CPU or RAM utilization alone. Snapshot extraction and
   historical account state can consume hundreds of GiB per worker; require the controller's
   configured per-worker disk admission budget and measured filesystem growth to leave the reserve

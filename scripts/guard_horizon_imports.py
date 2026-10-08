@@ -4,8 +4,9 @@
 Producer and importer units are independent transient services.  This guard
 keeps schedulers from admitting another public importer while the active one
 finishes its last archive validation and commits its batch.  Controller
-commands are recovered from journald and authenticated against their sealed
-script digest before any controller is stopped or later restarted.
+commands are read directly from systemd's live D-Bus state and authenticated
+against their sealed script digest before any controller is stopped or later
+restarted.
 
 If the operator-created pause sentinel exists, controllers stay fail-closed
 after the importer exits and must be resumed deliberately.
@@ -14,7 +15,6 @@ after the importer exits and must be resumed deliberately.
 import hashlib
 import json
 import os
-import shlex
 import stat
 import subprocess
 import time
@@ -76,7 +76,7 @@ def controller_units(units: set[str]) -> tuple[str, ...]:
     Controller unit names are operational identifiers and change whenever a
     scheduler is replaced.  Do not maintain an allowlist here.  The command
     for each discovered unit is independently authenticated by
-    ``command_from_journal`` before the unit can be stopped or restarted.
+    ``command_from_systemd`` before the unit can be stopped or restarted.
     """
 
     controllers = tuple(
@@ -120,26 +120,86 @@ def controllers_deliberately_paused() -> bool:
     return True
 
 
-def command_from_journal(unit: str) -> list[str]:
-    result = run(
+def busctl_json(command: list[str], description: str) -> dict[str, object]:
+    result = run(command)
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise RuntimeError(f"invalid busctl JSON for {description}") from error
+    if not isinstance(payload, dict) or set(payload) != {"type", "data"}:
+        raise RuntimeError(f"unexpected busctl response for {description}")
+    return payload
+
+
+def command_from_systemd(unit: str) -> list[str]:
+    properties = unit_properties(unit)
+    if (
+        properties.get("LoadState") != "loaded"
+        or properties.get("ActiveState") != "active"
+        or properties.get("SubState") != "running"
+        or properties.get("Transient") != "yes"
+        or not properties.get("FragmentPath", "").startswith("/run/systemd/transient/")
+    ):
+        raise RuntimeError(f"controller is not a live transient service: {unit}")
+
+    object_reply = busctl_json(
         [
-            "/usr/bin/journalctl",
-            "--unit",
+            "/usr/bin/busctl",
+            "--json=short",
+            "call",
+            "org.freedesktop.systemd1",
+            "/org/freedesktop/systemd1",
+            "org.freedesktop.systemd1.Manager",
+            "GetUnit",
+            "s",
             unit,
-            "--output=json",
-            "--no-pager",
-        ]
+        ],
+        f"systemd object path for {unit}",
     )
-    command_line = None
-    for line in result.stdout.splitlines():
-        record = json.loads(line)
-        candidate = record.get("_CMDLINE")
-        if isinstance(candidate, str) and candidate.startswith("/usr/bin/python3 "):
-            command_line = candidate
-    if command_line is None:
-        raise RuntimeError(f"no controller command line in journal for {unit}")
-    command = shlex.split(command_line)
-    if len(command) < 3 or command[0] != "/usr/bin/python3":
+    object_data = object_reply.get("data")
+    if (
+        object_reply.get("type") != "o"
+        or not isinstance(object_data, list)
+        or len(object_data) != 1
+        or not isinstance(object_data[0], str)
+        or not object_data[0].startswith("/org/freedesktop/systemd1/unit/")
+    ):
+        raise RuntimeError(f"unexpected systemd object path for {unit}")
+
+    exec_reply = busctl_json(
+        [
+            "/usr/bin/busctl",
+            "--json=short",
+            "get-property",
+            "org.freedesktop.systemd1",
+            object_data[0],
+            "org.freedesktop.systemd1.Service",
+            "ExecStart",
+        ],
+        f"ExecStart for {unit}",
+    )
+    exec_data = exec_reply.get("data")
+    if (
+        exec_reply.get("type") != "a(sasbttttuii)"
+        or not isinstance(exec_data, list)
+        or len(exec_data) != 1
+        or not isinstance(exec_data[0], list)
+        or len(exec_data[0]) != 10
+    ):
+        raise RuntimeError(f"unexpected ExecStart shape for {unit}")
+    executable, command, ignore_errors, *metadata = exec_data[0]
+    if (
+        executable != "/usr/bin/python3"
+        or not isinstance(command, list)
+        or not all(isinstance(value, str) for value in command)
+        or len(command) < 3
+        or command[0] != executable
+        or ignore_errors is not False
+        or not all(
+            isinstance(value, int) and not isinstance(value, bool)
+            for value in metadata
+        )
+    ):
         raise RuntimeError(f"unsafe controller command for {unit}")
     script = command[1]
     if not script.startswith("/usr/local/lib/jetstreamer/adaptive-root-cohort-sweep-"):
@@ -303,7 +363,7 @@ def stop_controllers(controllers: tuple[str, ...]) -> dict[str, list[str]]:
         if len(commands) + len(pending) > MAX_CONTROLLERS:
             raise RuntimeError("too many controller units appeared while pausing")
         # Authenticate the complete batch before mutating any unit in it.
-        batch = {unit: command_from_journal(unit) for unit in pending}
+        batch = {unit: command_from_systemd(unit) for unit in pending}
         commands.update(batch)
         run(["/usr/bin/systemctl", "stop", *pending])
         remaining = controller_units(running_units())

@@ -179,6 +179,12 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
   diagnostic archives, segment manifests, canary/result/guard receipts, configurations, genesis,
   journals, and immutable manifests outside the scratch trees. This cleanup never authorizes
   publication, a canonical sidecar, or an R2 mutation.
+- When a bounded comparison has a precommitted JSON policy, use the repository's
+  `scripts/select_historical_performance_candidate.py` rather than hand-calculating the decision.
+  Seal the selector first, require the exact root-owned terminal result receipt bound by that
+  policy, and preserve its no-clobber selection receipt. A selection receipt chooses an environment
+  only; it must keep qualification launch and publication unauthorized until their separate fresh
+  admission and integrity gates pass.
 - Treat a revised admission or launch manifest as a transitive binding change. Before activating
   that revision, re-seal every downstream result collector, timer, cleanup manifest, and retirement
   unit that names or hashes the superseded manifest. Validate the final launch receipt against the

@@ -836,6 +836,13 @@ Every new sweep must also pass `--solana-rayon-threads` with the value selected 
 same-snapshot performance qualification. The controller binds that value into its configuration,
 producer environment, and live-unit adoption checks. This prevents a high-core host from silently
 falling back to the legacy half-visible-CPU store fan-out and changing scratch amplification.
+When a comparison uses a precommitted JSON selection policy, run
+`scripts/select_historical_performance_candidate.py` against the root-owned terminal result receipt.
+The selector requires exact zero-restart terminal evidence for the control and candidate, validates
+the policy-bound result manifest, applies every throughput and resource ratio plus the material
+storage-win rule, and fsyncs a no-clobber root-owned selection receipt. Selection alone never
+authorizes a qualification launch or publication; fresh inventory and resource admission remain
+separate gates.
 Producer namespace filtering uses a reload-stable cgroup-only allow-list; user namespaces and every
 other namespace type remain denied,
 and the empty capability set prevents the unprivileged worker from using the nominal cgroup option.

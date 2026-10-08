@@ -30,6 +30,23 @@ def sample(**overrides: object) -> guard.UnitSample:
 
 
 class HistoricalPerformanceGuardTest(unittest.TestCase):
+    def test_accepts_dedicated_followup_guard_timer(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            args = guard.parse_args(
+                [
+                    f"--filesystem={root}",
+                    "--minimum-free-bytes=1",
+                    "--maximum-worker-vmas=1",
+                    f"--receipt-directory={root}",
+                    "--timer-unit=horizon-perf-epoch202-guard-store8.timer",
+                    "horizon-perf-epoch202@waves-control-t16.service",
+                ]
+            )
+            self.assertEqual(
+                args.timer_unit, "horizon-perf-epoch202-guard-store8.timer"
+            )
+
     def test_parses_systemctl_properties_without_splitting_values(self) -> None:
         self.assertEqual(
             guard.parse_systemctl_show("LoadState=loaded\nControlGroup=/a=b\n"),

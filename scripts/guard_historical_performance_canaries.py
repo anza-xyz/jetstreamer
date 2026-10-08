@@ -8,6 +8,7 @@ from dataclasses import asdict, dataclass
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import time
@@ -16,7 +17,9 @@ from typing import Any, Sequence
 
 RECEIPT_SCHEMA = "jetstreamer-historical-performance-guard-trip-v1"
 UNIT_PREFIX = "horizon-perf-epoch"
-TIMER_UNIT = "horizon-perf-epoch202-guard.timer"
+TIMER_UNIT = re.compile(
+    r"^horizon-perf-epoch[0-9]+-guard(?:-[a-z0-9]+(?:-[a-z0-9]+)*)?\.timer$"
+)
 
 
 @dataclass(frozen=True)
@@ -233,7 +236,7 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument("--minimum-free-bytes", type=int, required=True)
     parser.add_argument("--maximum-worker-vmas", type=int, required=True)
     parser.add_argument("--receipt-directory", type=Path, required=True)
-    parser.add_argument("--timer-unit", required=True, choices=[TIMER_UNIT])
+    parser.add_argument("--timer-unit", required=True)
     parser.add_argument("units", nargs="+")
     args = parser.parse_args(argv)
     if not args.filesystem.is_absolute() or not args.filesystem.is_dir():
@@ -242,6 +245,8 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         parser.error("tripwire values must be positive")
     if not args.receipt_directory.is_absolute() or not args.receipt_directory.is_dir():
         parser.error("--receipt-directory must be an existing absolute directory")
+    if TIMER_UNIT.fullmatch(args.timer_unit) is None:
+        parser.error("--timer-unit must be a dedicated Horizon performance guard timer")
     for unit in args.units:
         if not unit.startswith(UNIT_PREFIX) or not unit.endswith(".service"):
             parser.error(f"invalid canary unit: {unit}")

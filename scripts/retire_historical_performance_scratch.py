@@ -22,8 +22,11 @@ RESULTS_SCHEMA = "jetstreamer-historical-performance-results-receipt-v1"
 PLAN_SCHEMA = "jetstreamer-historical-performance-scratch-retirement-plan-v1"
 RETIREMENT_SCHEMA = "jetstreamer-historical-performance-scratch-retirement-v1"
 PRIVATE_ROOT = Path("/home/ubuntu/.jetstreamer-private/performance-ab-202")
+# Retained as the original cohort fixture; runtime validation derives the exact
+# admitted variants from the sealed manifest and result receipt.
 VARIANTS = ("singleton-t16", "singleton-t32", "waves-t16", "waves-t32")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
+VARIANT_NAME = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 UNIT_NAME = re.compile(r"^horizon-perf-epoch202@[a-z0-9-]+\.service$")
 
 
@@ -198,24 +201,31 @@ def validate_manifest_and_results(
         or not isinstance(evidence.get("variants"), list)
     ):
         raise RetirementError("results receipt lacks sealed cohort evidence")
-    manifest_by_name = {
-        item.get("name"): item for item in manifest_variants if isinstance(item, dict)
-    }
-    evidence_by_name = {
-        item.get("name"): item
-        for item in evidence["variants"]
-        if isinstance(item, dict)
-    }
-    if (
-        len(manifest_variants) != 4
-        or len(evidence["variants"]) != 4
-        or set(manifest_by_name) != set(VARIANTS)
-        or set(evidence_by_name) != set(VARIANTS)
+    if not all(isinstance(item, dict) for item in manifest_variants) or not all(
+        isinstance(item, dict) for item in evidence["variants"]
     ):
-        raise RetirementError("manifest and receipt must bind exactly four expected variants")
+        raise RetirementError("manifest and receipt variants must be objects")
+    manifest_names = [item.get("name") for item in manifest_variants]
+    evidence_names = [item.get("name") for item in evidence["variants"]]
+    manifest_by_name = dict(zip(manifest_names, manifest_variants, strict=True))
+    evidence_by_name = dict(zip(evidence_names, evidence["variants"], strict=True))
+    if (
+        not 2 <= len(manifest_variants) <= 16
+        or len(evidence["variants"]) != len(manifest_variants)
+        or any(
+            not isinstance(name, str) or VARIANT_NAME.fullmatch(name) is None
+            for name in manifest_names + evidence_names
+        )
+        or len(manifest_by_name) != len(manifest_variants)
+        or len(evidence_by_name) != len(evidence["variants"])
+        or set(manifest_by_name) != set(evidence_by_name)
+    ):
+        raise RetirementError(
+            "manifest and receipt must bind the same two to sixteen distinct variants"
+        )
 
     bindings: list[ScratchBinding] = []
-    for name in VARIANTS:
+    for name in manifest_names:
         expected = expected_paths(name)
         declared = manifest_by_name[name]
         observed = evidence_by_name[name]
@@ -281,11 +291,12 @@ def validate_retirement_plan(
     results_path: Path,
     intent_path: Path,
     completion_path: Path,
+    bindings: Sequence[ScratchBinding],
 ) -> None:
     variants = plan.get("variants")
     expected_variants = [
-        {"name": name, "scratch": str(expected_paths(name)["scratch"])}
-        for name in VARIANTS
+        {"name": binding.name, "scratch": str(binding.scratch)}
+        for binding in bindings
     ]
     executable = plan.get("retirer")
     actual_executable = Path(__file__).resolve()
@@ -309,8 +320,8 @@ def validate_retirement_plan(
         raise RetirementError("retirement plan does not bind this exact local-only cleanup")
 
 
-def require_exact_scratch(path: Path) -> Path:
-    if path not in {Path(expected_paths(name)["scratch"]) for name in VARIANTS}:
+def require_exact_scratch(path: Path, admitted_scratches: set[Path]) -> Path:
+    if path not in admitted_scratches:
         raise RetirementError(f"scratch is outside the exact admitted set: {path}")
     try:
         root = PRIVATE_ROOT.resolve(strict=True)
@@ -438,8 +449,8 @@ def write_json_noclobber(path: Path, payload: dict[str, Any]) -> None:
     fsync_directory(destination.parent)
 
 
-def delete_exact_tree(path: Path) -> None:
-    require_exact_scratch(path)
+def delete_exact_tree(path: Path, admitted_scratches: set[Path]) -> None:
+    require_exact_scratch(path, admitted_scratches)
     completed = subprocess.run(
         ["/usr/bin/find", str(path), "-xdev", "-depth", "-delete"],
         check=False,
@@ -552,14 +563,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     plan, plan_sha256 = load_json_file(args.retirement_plan, "retirement plan")
     manifest, manifest_sha256 = load_json_file(args.manifest, "results manifest")
     results, results_sha256 = load_json_file(args.results_receipt, "results receipt")
-    validate_retirement_plan(
-        plan,
-        args.manifest,
-        manifest_sha256,
-        args.results_receipt,
-        args.intent_receipt,
-        args.completion_receipt,
-    )
     bindings = validate_manifest_and_results(
         args.manifest,
         manifest,
@@ -567,7 +570,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         args.results_receipt,
         results,
     )
+    validate_retirement_plan(
+        plan,
+        args.manifest,
+        manifest_sha256,
+        args.results_receipt,
+        args.intent_receipt,
+        args.completion_receipt,
+        bindings,
+    )
     scratches = [binding.scratch for binding in bindings]
+    admitted_scratches = set(scratches)
 
     intent_exists = args.intent_receipt.exists() or args.intent_receipt.is_symlink()
     completion_exists = args.completion_receipt.exists() or args.completion_receipt.is_symlink()
@@ -595,7 +608,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     else:
         for scratch in scratches:
-            require_exact_scratch(scratch)
+            require_exact_scratch(scratch, admitted_scratches)
         common = receipt_common(
             args.retirement_plan,
             plan_sha256,
@@ -647,7 +660,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     for binding in bindings:
         if binding.scratch.exists() or binding.scratch.is_symlink():
-            delete_exact_tree(binding.scratch)
+            delete_exact_tree(binding.scratch, admitted_scratches)
     if any(path.exists() or path.is_symlink() for path in scratches):
         raise RetirementError("one or more exact scratch trees remain after deletion")
     completion = {

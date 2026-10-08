@@ -458,6 +458,24 @@ def validate_variant_paths(raw: dict[str, Any]) -> dict[str, Any]:
     return {**raw, "root": root}
 
 
+def validate_variant_set(variants_raw: object) -> list[dict[str, Any]]:
+    if not isinstance(variants_raw, list):
+        raise CollectionError("results manifest variants must be a list")
+    variants = [
+        validate_variant_paths(item) for item in variants_raw if isinstance(item, dict)
+    ]
+    if (
+        len(variants) != len(variants_raw)
+        or not 2 <= len(variants) <= 16
+        or len({item["name"] for item in variants}) != len(variants)
+        or len({item["unit"] for item in variants}) != len(variants)
+    ):
+        raise CollectionError(
+            "results manifest must bind between two and sixteen distinct variants"
+        )
+    return variants
+
+
 def collect(manifest: dict[str, Any], launch: dict[str, Any]) -> dict[str, Any]:
     if manifest.get("schema") != MANIFEST_SCHEMA:
         raise CollectionError("unsupported results manifest schema")
@@ -473,16 +491,9 @@ def collect(manifest: dict[str, Any], launch: dict[str, Any]) -> dict[str, Any]:
         raise CollectionError("launch receipt evidence must be an object")
     target_slot = manifest.get("target_slot")
     variants_raw = manifest.get("variants")
-    if not isinstance(target_slot, int) or not isinstance(variants_raw, list):
+    if not isinstance(target_slot, int):
         raise CollectionError("results manifest lacks target or variants")
-    variants = [validate_variant_paths(item) for item in variants_raw if isinstance(item, dict)]
-    if (
-        len(variants) != len(variants_raw)
-        or len(variants) != 4
-        or len({item["name"] for item in variants}) != 4
-        or len({item["unit"] for item in variants}) != 4
-    ):
-        raise CollectionError("results manifest must bind exactly four variants")
+    variants = validate_variant_set(variants_raw)
     units = {item["unit"] for item in variants}
     raw_launch_units = launch_evidence.get("units")
     if not isinstance(raw_launch_units, list):

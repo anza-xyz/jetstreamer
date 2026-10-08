@@ -9,6 +9,28 @@ from scripts import collect_historical_performance_results as collect
 
 
 class HistoricalPerformanceResultsTest(unittest.TestCase):
+    def test_variant_set_accepts_exact_two_way_cohort_and_rejects_ambiguity(self) -> None:
+        def variant(name: str) -> dict[str, object]:
+            root = collect.PRIVATE_ROOT / name
+            return {
+                "name": name,
+                "unit": f"horizon-perf-epoch202@{name}.service",
+                "canary_receipt": str(root / "canary-receipt.json"),
+                "scratch": str(root / "scratch"),
+                "archive": str(root / "output" / "epoch-202-through-87695515.jet"),
+                "wave_metrics": True,
+            }
+
+        cohort = [variant("waves-control-t16"), variant("waves-store8-t16")]
+        self.assertEqual(
+            [item["name"] for item in collect.validate_variant_set(cohort)],
+            ["waves-control-t16", "waves-store8-t16"],
+        )
+        with self.assertRaises(collect.CollectionError):
+            collect.validate_variant_set(cohort[:1])
+        with self.assertRaises(collect.CollectionError):
+            collect.validate_variant_set([cohort[0], cohort[0]])
+
     def test_collector_binding_requires_exact_safe_digest_and_path(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             collector = Path(directory) / "collector.py"

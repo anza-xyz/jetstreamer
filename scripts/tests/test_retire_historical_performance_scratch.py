@@ -26,10 +26,15 @@ def successful_unit(name: str, invocation: str = "invocation") -> retire.UnitSta
     )
 
 
-def sealed_payloads(root: Path, manifest_path: Path, results_path: Path) -> tuple[dict, dict]:
+def sealed_payloads(
+    root: Path,
+    manifest_path: Path,
+    results_path: Path,
+    variants: tuple[str, ...] = retire.VARIANTS,
+) -> tuple[dict, dict]:
     manifest_variants = []
     evidence_variants = []
-    for name in retire.VARIANTS:
+    for name in variants:
         lane = root / name
         unit_name = f"horizon-perf-epoch202@{name}.service"
         canary = lane / "canary-receipt.json"
@@ -118,7 +123,7 @@ class HistoricalPerformanceScratchRetirementTest(unittest.TestCase):
                 retire.require_terminal_success(state, "invocation")
 
     @patch("scripts.retire_historical_performance_scratch.os.path.ismount", return_value=False)
-    def test_scratch_path_is_one_of_four_exact_real_directories(self, _ismount: object) -> None:
+    def test_scratch_path_is_one_of_exact_admitted_real_directories(self, _ismount: object) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
             scratch = root / "singleton-t16" / "scratch"
@@ -126,9 +131,12 @@ class HistoricalPerformanceScratchRetirementTest(unittest.TestCase):
             outside = root / "outside" / "scratch"
             outside.mkdir(parents=True)
             with patch.object(retire, "PRIVATE_ROOT", root):
-                self.assertEqual(retire.require_exact_scratch(scratch), scratch)
+                admitted = {scratch}
+                self.assertEqual(
+                    retire.require_exact_scratch(scratch, admitted), scratch
+                )
                 with self.assertRaisesRegex(retire.RetirementError, "admitted set"):
-                    retire.require_exact_scratch(outside)
+                    retire.require_exact_scratch(outside, admitted)
 
     def test_process_reference_scan_finds_command_maps_and_fd(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -176,6 +184,25 @@ class HistoricalPerformanceScratchRetirementTest(unittest.TestCase):
                         results_path,
                         broken,
                     )
+
+    def test_results_receipt_accepts_exact_two_way_cohort(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            manifest_path = root / "manifest.json"
+            results_path = root / "results.json"
+            variants = ("waves-control-t16", "waves-store8-t16")
+            with patch.object(retire, "PRIVATE_ROOT", root):
+                manifest, results = sealed_payloads(
+                    root, manifest_path, results_path, variants
+                )
+                bindings = retire.validate_manifest_and_results(
+                    manifest_path,
+                    manifest,
+                    results["manifest_sha256"],
+                    results_path,
+                    results,
+                )
+            self.assertEqual([item.name for item in bindings], list(variants))
 
     def test_receipt_write_is_owner_only_and_noclobber(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

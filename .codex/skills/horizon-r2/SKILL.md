@@ -24,10 +24,11 @@ For a long-running range, use `scripts/sync_horizon_r2_progressive.py` to discov
   bound. Do not ask for a range merely because it was omitted.
 - Locate the Jetstreamer repository and read its current historical compatibility table and active controller state before starting generation.
 - Plan missing work as ordered contiguous cohorts before falling back to singleton epochs. Adjacent
-  epochs that share an immutable runtime and checkpoint chain can run in one generation and carry
-  the same live runtime state and AccountsDB scratch forward; do not budget, restore, or clean that
-  scratch as if each cohort member were an independent replay. Apply the detailed cohort boundaries
-  and publication gates in **Produce and verify**.
+  epochs that share an immutable runtime and checkpoint chain should run sequentially in one
+  persistent generation, carrying the same live runtime state and AccountsDb scratch forward across
+  epoch boundaries. Do not implement such a cohort as adjacent independent units, and do not budget,
+  restore, reinitialize, or clean its scratch as if each member were an independent replay. Apply
+  the detailed cohort boundaries and publication gates in **Produce and verify**.
 - Use `HORIZON_DIR` when set; otherwise use `$HOME/horizon`. Keep only `epoch-N.jet` and `epoch-N.jet.sha256` in that public directory.
 - Credentials are `HORIZON_S3_ENDPOINT`, `HORIZON_ACCESS_KEY_ID`, and `HORIZON_SECRET_ACCESS_KEY`. Check only that they exist; never print their values. The endpoint path names the bucket.
 - With an explicit user range, restrict ordinary generation, verification, upload, and cleanup to
@@ -114,13 +115,15 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
 - Consecutive epochs using the same immutable runtime can be replayed as a bounded contiguous
   cohort so later epochs carry the live runtime state and AccountsDb scratch instead of restoring
   another bootstrap. A contiguous cohort is one ordered replay generation, not a set of independent
-  epoch jobs: select the complete range before launch, process every member in ascending order, keep
-  the same scratch/AccountsDb state across member boundaries, and do not clean or reinitialize that
-  scratch between epochs. When several still-missing adjacent epochs share the same immutable runtime
-  and checkpoint chain, normally target three to four epochs per continuous run before admitting
-  more single-epoch workers. Shorten or split the run whenever runtime, root, resource-admission, or
-  live-claim boundaries require it. Prefer this when duplicated bootstrap/scratch is the admission
-  bottleneck.
+  epoch jobs: select the complete range before launch, use one persistent producer/worker and one
+  scratch path, process every member in ascending order, emit a separate archive for each epoch,
+  and keep the same scratch/AccountsDb state live across member boundaries. Never clean,
+  reinitialize, or independently restore that scratch between cohort members. When several
+  still-missing adjacent epochs share the same immutable runtime and checkpoint chain, normally
+  target three to four epochs per continuous run before admitting more single-epoch workers, and
+  use a longer bounded run when measured scratch reuse and restart risk justify it. Shorten or split
+  the run whenever runtime, root, resource-admission, or live-claim boundaries require it. Prefer
+  this when duplicated bootstrap/scratch is the admission bottleneck.
   Keep independent root-verifiable cohorts parallel when disk admission is healthy and fleet wall
   time is the priority: historical execution is often mostly serial within one worker, and an
   unnecessarily long cohort increases the restart blast radius. Never merge across a runtime or

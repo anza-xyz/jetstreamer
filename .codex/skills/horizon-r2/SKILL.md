@@ -109,9 +109,14 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
   Confirm this with a per-slot store-count histogram rather than assuming transaction batching is
   the sole cause. A historical snapshot restored with AccountsDb caching disabled sends every
   commit directly through store selection, so singleton transaction commits and the minimum-store
-  fan-out can amplify each other. Before the next immutable generation, use a bounded same-snapshot
-  A/B to select an explicit value appropriate to the worker's actual CPU quota, comparing
-  throughput, physical bytes, file count, and VMAs; measure commit-wave changes as a separate A/B.
+  fan-out can amplify each other. Treat the unpacked snapshot's files, physical bytes, and VMAs as
+  a baseline: compare settled incremental windows at equal transaction/update work, and never
+  extrapolate a full epoch from one early absolute scratch measurement. Before the next immutable
+  generation, use a bounded same-snapshot A/B to select an explicit value appropriate to the
+  worker's actual CPU quota, comparing throughput, physical bytes, file count, and VMAs; measure
+  commit-wave changes as a separate A/B. Decoupling eager per-slot store fan-out from the rayon
+  pool is also a distinct storage-layout experiment: keep it diagnostic until it wins that bounded
+  comparison and then passes the normal canonical checkpoint and plugin qualification.
   A conflict-wave implementation must also preserve the pinned runtime's invalid-transaction lock
   behavior: sanitize failures and duplicate account keys do not acquire locks, and repeated writable
   keys within one transaction are not a cross-transaction attribution conflict. Differentially test

@@ -806,7 +806,8 @@ Snapshot preflight defaults to one epoch per verification cohort when every epoc
 Pass `--target-cohort-epochs=3` or `4` to deliberately carry one immutable historical runtime
 and its AccountsDb/cache state across consecutive epochs. The planner keeps every intermediate
 root, requires a root bootstrap for any multi-epoch cohort, and splits at runtime boundaries;
-checkpoint gaps may extend a cohort only through the first later root in the same runtime.
+when the preferred endpoint lacks a root it uses the latest earlier root in the target window.
+Only a target window with no root may extend through the first later root in the same runtime.
 Per-epoch archives and verification gates remain independent even though replay is continuous.
 
 Concurrency begins at the configured floor and increases gradually when CPU, memory, and disk

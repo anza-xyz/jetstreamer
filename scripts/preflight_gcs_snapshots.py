@@ -4,10 +4,12 @@
 By default, each epoch with a root checkpoint is an independent verification
 cohort. ``--target-cohort-epochs`` may deliberately coalesce up to four
 consecutive epochs that use the same runtime, preserving every intermediate
-root checkpoint while amortizing bootstrap and AccountsDb/cache setup. A run
-of epochs without a root checkpoint is joined to the first later epoch with a
-root checkpoint, provided every epoch uses the same runtime. Every multi-epoch
-cohort starts from a root snapshot in the epoch immediately before the cohort.
+root checkpoint while amortizing bootstrap and AccountsDb/cache setup. If the
+preferred endpoint has no root, the cohort ends at the latest earlier root in
+that target window. Only a target window with no root is extended to the first
+later epoch with one, provided every epoch uses the same runtime. Every
+multi-epoch cohort starts from a root snapshot in the epoch immediately before
+the cohort.
 Hourly objects remain eligible only as transport bootstraps for single-epoch
 cohorts; they are never trust anchors or replay checkpoints.
 
@@ -666,6 +668,22 @@ def build_verification_cohorts(
             )
         cohort_end = preferred_end
         cohort_checkpoints: Tuple[SnapshotObject, ...] = ()
+        if preferred_end > epoch:
+            _, preferred_end_slot = epoch_slot_range(preferred_end)
+            preferred_checkpoints = _root_checkpoints_through(
+                root_objects,
+                bootstrap.slot,
+                preferred_end_slot,
+                extensions,
+                f"epochs {epoch}-{preferred_end}",
+            )
+            if preferred_checkpoints:
+                # Keep the requested cohort a soft maximum whenever the target
+                # window contains a safe terminal root. Ending at the latest
+                # such root avoids turning a four-epoch preference into a much
+                # larger restart and publication unit merely because the
+                # preferred final epoch itself has no checkpoint.
+                cohort_end = max(item.slot // EPOCH_SLOTS for item in preferred_checkpoints)
         while cohort_end <= last_epoch:
             if cohort_end != epoch:
                 next_runtime, next_extensions = runtime_route(cohort_end)

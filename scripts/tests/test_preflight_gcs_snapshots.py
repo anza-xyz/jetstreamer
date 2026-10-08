@@ -858,6 +858,67 @@ class SelectionTests(unittest.TestCase):
             ],
         )
 
+    def test_target_cohort_ends_at_latest_root_within_target_window(self) -> None:
+        first_epoch = 17
+        last_epoch = 24
+        _, prior_end = preflight.epoch_slot_range(first_epoch - 1)
+        checkpoint_epochs = (17, 18, 19, 24)
+        checkpoint_slots = [
+            preflight.epoch_slot_range(epoch)[0] + 10 for epoch in checkpoint_epochs
+        ]
+        root = preflight.parse_inventory_json(
+            json.dumps(
+                [inventory_record(prior_end - 100)]
+                + [inventory_record(slot, identity=ONE_HASH) for slot in checkpoint_slots]
+            ),
+            "root",
+            preflight.requested_slot_range(first_epoch, last_epoch),
+        )
+
+        cohorts = preflight.build_verification_cohorts(
+            root,
+            (),
+            first_epoch,
+            last_epoch,
+            target_cohort_epochs=4,
+        )
+
+        self.assertEqual(
+            [(item.first_epoch, item.last_epoch) for item in cohorts],
+            [(17, 19), (20, 24)],
+        )
+        self.assertEqual(
+            [[item.slot for item in cohort.checkpoints] for cohort in cohorts],
+            [checkpoint_slots[:3], checkpoint_slots[3:]],
+        )
+
+    def test_target_cohort_extends_only_when_target_window_has_no_root(self) -> None:
+        first_epoch = 17
+        last_epoch = 24
+        _, prior_end = preflight.epoch_slot_range(first_epoch - 1)
+        terminal_slot = preflight.epoch_slot_range(last_epoch)[0] + 10
+        root = preflight.parse_inventory_json(
+            json.dumps(
+                [
+                    inventory_record(prior_end - 100),
+                    inventory_record(terminal_slot, identity=ONE_HASH),
+                ]
+            ),
+            "root",
+            preflight.requested_slot_range(first_epoch, last_epoch),
+        )
+
+        cohort = preflight.build_verification_cohorts(
+            root,
+            (),
+            first_epoch,
+            last_epoch,
+            target_cohort_epochs=4,
+        )[0]
+
+        self.assertEqual((cohort.first_epoch, cohort.last_epoch), (17, 24))
+        self.assertEqual([item.slot for item in cohort.checkpoints], [terminal_slot])
+
     def test_target_cohort_splits_at_every_runtime_boundary(self) -> None:
         first_epoch = 153
         last_epoch = 156

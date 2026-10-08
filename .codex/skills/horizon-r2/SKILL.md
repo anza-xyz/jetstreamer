@@ -105,7 +105,11 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
   unnecessarily long cohort increases the restart blast radius. Never merge across a runtime or
   compatibility boundary, exceed the immutable worker's proven terminal bound, omit an
   intermediate root check, overlap a live epoch claim, or publish any member before the complete
-  sealed cohort reaches its final root and passes the normal per-archive gates.
+  sealed cohort reaches its final root and passes the normal per-archive gates. Treat a requested
+  cohort length as a soft maximum: when its preferred endpoint lacks a root, finish at the latest
+  earlier root in that window; extend to the first later same-runtime root only when the whole
+  target window has no usable root. This bounds restart and publication blast radius without
+  inventing a checkpoint.
 - When a live replay's measured growth could cross the filesystem reserve before its next safe
   milestone, use an actual-free-space guard rather than relying only on projections. Bind the guard
   to the exact service invocation ID and zero-restart state, fsync a root-owned stop intent before

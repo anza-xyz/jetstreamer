@@ -30,6 +30,23 @@ def sample(**overrides: object) -> guard.UnitSample:
 
 
 class HistoricalPerformanceGuardTest(unittest.TestCase):
+    def test_accepts_qualification_unit_and_recurring_timer(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            args = guard.parse_args(
+                [
+                    f"--filesystem={root}",
+                    "--minimum-free-bytes=1",
+                    "--maximum-worker-vmas=1",
+                    f"--receipt-directory={root}",
+                    "--timer-unit=horizon-monitor-recurring-214-215-contiguous-v1.timer",
+                    "horizon-qualify-214-215-contiguous-v1.service",
+                ]
+            )
+            self.assertEqual(
+                args.units, ["horizon-qualify-214-215-contiguous-v1.service"]
+            )
+
     def test_accepts_dedicated_followup_guard_timer(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -110,6 +127,11 @@ class HistoricalPerformanceGuardTest(unittest.TestCase):
         self.assertTrue(
             guard.is_historical_worker_command(
                 b"/immutable/jetstreamer-historical-worker-v1-6-16\0--arg\0"
+            )
+        )
+        self.assertTrue(
+            guard.is_historical_worker_command(
+                b"/sealed/jetstreamer-historical-worker-v1-6-17\0serve\0"
             )
         )
         self.assertFalse(

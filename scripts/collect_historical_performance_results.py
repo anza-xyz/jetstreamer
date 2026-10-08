@@ -25,6 +25,9 @@ RECEIPT_SCHEMA = "jetstreamer-historical-performance-results-receipt-v1"
 PRIVATE_ROOT = Path("/home/ubuntu/.jetstreamer-private/performance-ab-202")
 VARIANT_NAME = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 UNIT_NAME = re.compile(r"^horizon-perf-epoch[0-9]+@[a-z0-9-]+\.service$")
+GUARD_UNIT = re.compile(
+    r"^horizon-perf-epoch[0-9]+-guard(?:-[a-z0-9]+(?:-[a-z0-9]+)*)?\.service$"
+)
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 APPENDVEC_FILE = re.compile(r"^(?P<slot>[0-9]+)\.(?P<store_id>[0-9]+)$")
 WAVE_METRICS = re.compile(
@@ -476,6 +479,12 @@ def validate_variant_set(variants_raw: object) -> list[dict[str, Any]]:
     return variants
 
 
+def validate_guard_unit(value: object) -> str:
+    if not isinstance(value, str) or GUARD_UNIT.fullmatch(value) is None:
+        raise CollectionError("unexpected guard unit")
+    return value
+
+
 def collect(manifest: dict[str, Any], launch: dict[str, Any]) -> dict[str, Any]:
     if manifest.get("schema") != MANIFEST_SCHEMA:
         raise CollectionError("unsupported results manifest schema")
@@ -509,9 +518,7 @@ def collect(manifest: dict[str, Any], launch: dict[str, Any]) -> dict[str, Any]:
     started = launch_evidence.get("started_at_utc")
     if not isinstance(started, str):
         raise CollectionError("launch receipt lacks start time")
-    guard_unit = manifest.get("guard_unit")
-    if guard_unit != "horizon-perf-epoch202-guard.service":
-        raise CollectionError("unexpected guard unit")
+    guard_unit = validate_guard_unit(manifest.get("guard_unit"))
     guard_lines = journal_lines(["-u", guard_unit, "--since", started])
     guard_samples = parse_guard_samples(guard_lines, units)
     if any(

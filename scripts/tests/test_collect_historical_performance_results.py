@@ -9,6 +9,23 @@ from scripts import collect_historical_performance_results as collect
 
 
 class HistoricalPerformanceResultsTest(unittest.TestCase):
+    def test_accepts_dedicated_followup_guard_service_only(self) -> None:
+        self.assertEqual(
+            collect.validate_guard_unit(
+                "horizon-perf-epoch202-guard-store8.service"
+            ),
+            "horizon-perf-epoch202-guard-store8.service",
+        )
+        for invalid in (
+            "horizon-perf-epoch202-results-store8.service",
+            "other-guard.service",
+            "horizon-perf-epoch202-guard-store8.timer",
+        ):
+            with self.subTest(invalid=invalid), self.assertRaises(
+                collect.CollectionError
+            ):
+                collect.validate_guard_unit(invalid)
+
     def test_variant_set_accepts_exact_two_way_cohort_and_rejects_ambiguity(self) -> None:
         def variant(name: str) -> dict[str, object]:
             root = collect.PRIVATE_ROOT / name

@@ -197,7 +197,55 @@ fn historical_rent_collection_exceeds_legacy_4k_post_update_cap() {
 }
 
 #[test]
-fn post_update_count_ceiling_admits_epoch_213_rent_burst_and_remains_fail_closed() {
+fn historical_epoch_213_post_update_count_roundtrips() {
+    const OBSERVED_MINIMUM: usize = 8_193;
+    const SLOT: u64 = 92_054_408;
+    let mut writer = ArchiveWriter::new(
+        Vec::new(),
+        213,
+        SLOT,
+        1,
+        ArchiveWriterConfig {
+            compression: Compression::None,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    writer.begin_slot(SLOT).unwrap();
+    for write_version in 0..OBSERVED_MINIMUM as u64 {
+        writer
+            .write_reencoded_post_update(&AccountUpdateView {
+                pubkey: Address::new_from_array([7; 32]),
+                lamports: write_version,
+                owner: Address::new_from_array([9; 32]),
+                executable: false,
+                rent_epoch: 0,
+                write_version,
+                data: &[],
+            })
+            .unwrap();
+    }
+    let mut meta = BlockMeta::new_boxed();
+    meta.slot = SLOT;
+    writer.end_slot(&meta, &[]).unwrap();
+    let (archive, _) = writer.finish().unwrap();
+
+    #[derive(Default)]
+    struct CountPostUpdates(usize);
+    impl SlotVisitor for CountPostUpdates {
+        fn on_post_account_update(&mut self, _slot: u64, _update: &AccountUpdateView<'_>) {
+            self.0 += 1;
+        }
+    }
+
+    let mut reader = ArchiveReader::open(std::io::Cursor::new(archive)).unwrap();
+    let mut count = CountPostUpdates::default();
+    reader.read_slots(0, u64::MAX, &mut count).unwrap();
+    assert_eq!(count.0, OBSERVED_MINIMUM);
+}
+
+#[test]
+fn post_update_count_ceiling_remains_fail_closed() {
     let mut writer = ArchiveWriter::new(
         Vec::new(),
         181,
@@ -219,8 +267,6 @@ fn post_update_count_ceiling_admits_epoch_213_rent_burst_and_remains_fail_closed
         write_version: 0,
         data: &[],
     };
-    // Mainnet slot 92,054,408 exceeds the old 8,192-record ceiling. Admit
-    // that observed shape while retaining a finite upper bound.
     for _ in 0..crate::limits::MAX_SLOT_POST_UPDATES {
         writer.write_reencoded_post_update(&update).unwrap();
     }

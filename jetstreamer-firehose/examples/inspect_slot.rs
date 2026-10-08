@@ -29,6 +29,10 @@ fn transaction_handler() -> impl firehose::Handler<TransactionData> {
                 solana_message::VersionedMessage::Legacy(message) => &message.instructions,
                 solana_message::VersionedMessage::V0(message) => &message.instructions,
             };
+            let recent_blockhash = match &tx.transaction.message {
+                solana_message::VersionedMessage::Legacy(message) => &message.recent_blockhash,
+                solana_message::VersionedMessage::V0(message) => &message.recent_blockhash,
+            };
             let programs = instructions
                 .iter()
                 .map(|instruction| {
@@ -39,10 +43,11 @@ fn transaction_handler() -> impl firehose::Handler<TransactionData> {
                 })
                 .collect::<Vec<_>>();
             println!(
-                "TX slot={} index={} sig={} status={:?} fee={} available={} programs={:?} keys={:?} instructions={:?}",
+                "TX slot={} index={} sig={} recent_blockhash={} status={:?} fee={} available={} programs={:?} keys={:?} instructions={:?}",
                 tx.slot,
                 tx.transaction_slot_index,
                 tx.signature,
+                recent_blockhash,
                 tx.transaction_status_meta.status,
                 tx.transaction_status_meta.fee,
                 tx.status_meta_available,

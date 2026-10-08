@@ -16,9 +16,10 @@ from typing import Any, Sequence
 
 
 RECEIPT_SCHEMA = "jetstreamer-historical-performance-guard-trip-v1"
-UNIT_PREFIX = "horizon-perf-epoch"
+UNIT_PREFIXES = ("horizon-perf-epoch", "horizon-qualify-")
 TIMER_UNIT = re.compile(
-    r"^horizon-perf-epoch[0-9]+-guard(?:-[a-z0-9]+(?:-[a-z0-9]+)*)?\.timer$"
+    r"^(?:horizon-perf-epoch[0-9]+-guard(?:-[a-z0-9]+(?:-[a-z0-9]+)*)?"
+    r"|horizon-monitor-recurring-[A-Za-z0-9@_.-]+)\.timer$"
 )
 
 
@@ -56,8 +57,9 @@ def read_proc_bytes(path: Path) -> bytes | None:
 
 def is_historical_worker_command(command: bytes) -> bool:
     executable = command.split(b"\0", 1)[0]
-    return executable.endswith(b"/bound-worker/historical-worker") or executable.endswith(
-        b"/jetstreamer-historical-worker-v1-6-16"
+    basename = executable.rsplit(b"/", 1)[-1]
+    return executable.endswith(b"/bound-worker/historical-worker") or basename.startswith(
+        b"jetstreamer-historical-worker-v"
     )
 
 
@@ -91,7 +93,7 @@ def worker_vmas(
 
 
 def sample_unit(unit: str) -> UnitSample:
-    if not unit.startswith(UNIT_PREFIX) or not unit.endswith(".service"):
+    if not unit.startswith(UNIT_PREFIXES) or not unit.endswith(".service"):
         raise ValueError(f"invalid canary unit: {unit}")
     completed = subprocess.run(
         [
@@ -248,7 +250,7 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     if TIMER_UNIT.fullmatch(args.timer_unit) is None:
         parser.error("--timer-unit must be a dedicated Horizon performance guard timer")
     for unit in args.units:
-        if not unit.startswith(UNIT_PREFIX) or not unit.endswith(".service"):
+        if not unit.startswith(UNIT_PREFIXES) or not unit.endswith(".service"):
             parser.error(f"invalid canary unit: {unit}")
     return args
 

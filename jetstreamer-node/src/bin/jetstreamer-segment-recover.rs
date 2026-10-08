@@ -60,6 +60,7 @@ struct RecoveryPlan {
     failure_evidence: EvidenceBinding,
     archive_edge_evidence: EvidenceBinding,
     journal_evidence: EvidenceBinding,
+    full_verification_evidence: EvidenceBinding,
     manifest: HistoricalSegmentManifest,
     canonical_checksum_sidecar_absent: bool,
     existing_segment_manifest_absent: bool,
@@ -214,6 +215,64 @@ fn validate_journal_evidence(value: &serde_json::Value, plan: &RecoveryPlan) -> 
     Ok(())
 }
 
+fn validate_full_verification_evidence(
+    value: &serde_json::Value,
+    plan: &RecoveryPlan,
+    private_root: &Path,
+) -> Result<(), String> {
+    let label = "full verification evidence";
+    let manifest = &plan.manifest;
+    let expected_archive = plan.archive.to_string_lossy();
+    let verifier_sha256 = json_str(value, "/verifier/sha256", label)?;
+    canonical_sha256(verifier_sha256, "full-verifier-sha256")?;
+    let verifier_path = PathBuf::from(json_str(value, "/verifier/path", label)?);
+    require_root_executable(&verifier_path, verifier_sha256, "full verifier")?;
+    let log_path = PathBuf::from(json_str(value, "/log/path", label)?);
+    if log_path == private_root || !log_path.starts_with(private_root) {
+        return Err(format!(
+            "full verification log is outside private root {}: {}",
+            private_root.display(),
+            log_path.display()
+        ));
+    }
+    let log_sha256 = json_str(value, "/log/sha256", label)?;
+    canonical_sha256(log_sha256, "full-verification-log-sha256")?;
+    require_root_evidence(&log_path, log_sha256, "full verification log")?;
+    let result_line = json_str(value, "/result/line", label)?;
+    let invocation_id = json_str(value, "/unit/invocation_id", label)?;
+    if invocation_id.len() != 32
+        || !invocation_id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err("full verification evidence has an invalid invocation ID".to_string());
+    }
+    let threads = json_u64(value, "/command/threads", label)?;
+    if json_str(value, "/schema", label)? != "horizon-private-full-verification-v1"
+        || json_str(value, "/status", label)? != "passed"
+        || json_u64(value, "/epoch", label)? != manifest.epoch
+        || json_str(value, "/archive/path", label)? != expected_archive
+        || json_u64(value, "/archive/bytes", label)? != plan.archive_identity.bytes
+        || json_u64(value, "/archive/uid", label)? != u64::from(plan.archive_identity.uid)
+        || json_u64(value, "/archive/gid", label)? != u64::from(plan.archive_identity.gid)
+        || json_str(value, "/archive/mode", label)? != plan.archive_identity.mode
+        || json_str(value, "/unit/result", label)? != "success"
+        || json_u64(value, "/unit/exec_main_status", label)? != 0
+        || json_u64(value, "/unit/restarts", label)? != 0
+        || !json_bool(value, "/command/full", label)?
+        || !json_bool(value, "/command/internal_full", label)?
+        || threads == 0
+        || threads > 64
+        || !result_line.starts_with("RESULT: OK (internal only):")
+        || json_bool(value, "/archive_mutations", label)?
+        || json_bool(value, "/sidecar_created", label)?
+        || json_bool(value, "/r2_mutations", label)?
+    {
+        return Err("full verification evidence does not bind the recovery archive".to_string());
+    }
+    Ok(())
+}
+
 #[derive(Debug, Serialize)]
 struct RecoveryReceipt {
     schema: &'static str,
@@ -346,6 +405,41 @@ fn require_root_evidence(path: &Path, expected_sha256: &str, label: &str) -> Res
     Ok(())
 }
 
+fn require_root_executable(path: &Path, expected_sha256: &str, label: &str) -> Result<(), String> {
+    if !path.is_absolute() {
+        return Err(format!("{label} path must be absolute: {}", path.display()));
+    }
+    let canonical = fs::canonicalize(path)
+        .map_err(|error| format!("failed to resolve {label} {}: {error}", path.display()))?;
+    if canonical != path {
+        return Err(format!(
+            "{label} path must already be canonical: {}",
+            path.display()
+        ));
+    }
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| format!("failed to inspect {label} {}: {error}", path.display()))?;
+    if !metadata.file_type().is_file()
+        || metadata.uid() != 0
+        || metadata.nlink() != 1
+        || metadata.permissions().mode() & 0o022 != 0
+        || metadata.permissions().mode() & 0o6000 != 0
+        || metadata.permissions().mode() & 0o100 == 0
+    {
+        return Err(format!(
+            "{label} must be a singly linked, root-owned, non-writable executable: {}",
+            path.display()
+        ));
+    }
+    let actual = sha256_file(path)?;
+    if actual != expected_sha256 {
+        return Err(format!(
+            "{label} SHA-256 mismatch: expected {expected_sha256}, got {actual}"
+        ));
+    }
+    Ok(())
+}
+
 fn require_absent(path: &Path, label: &str) -> Result<(), String> {
     match fs::symlink_metadata(path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -463,6 +557,10 @@ fn recover(arguments: &Arguments) -> Result<RecoveryReceipt, String> {
         (&plan.failure_evidence.path, "failure evidence"),
         (&plan.archive_edge_evidence.path, "archive edge evidence"),
         (&plan.journal_evidence.path, "journal evidence"),
+        (
+            &plan.full_verification_evidence.path,
+            "full verification evidence",
+        ),
     ] {
         if path == &private_root || !path.starts_with(&private_root) {
             return Err(format!(
@@ -476,6 +574,10 @@ fn recover(arguments: &Arguments) -> Result<RecoveryReceipt, String> {
         (&plan.failure_evidence, "failure evidence"),
         (&plan.archive_edge_evidence, "archive edge evidence"),
         (&plan.journal_evidence, "journal evidence"),
+        (
+            &plan.full_verification_evidence,
+            "full verification evidence",
+        ),
     ] {
         canonical_sha256(&binding.sha256, label)?;
         require_root_evidence(&binding.path, &binding.sha256, label)?;
@@ -486,6 +588,11 @@ fn recover(arguments: &Arguments) -> Result<RecoveryReceipt, String> {
     validate_edge_evidence(&edge, &plan)?;
     let journal = read_json(&plan.journal_evidence.path, "journal evidence")?;
     validate_journal_evidence(&journal, &plan)?;
+    let full_verification = read_json(
+        &plan.full_verification_evidence.path,
+        "full verification evidence",
+    )?;
+    validate_full_verification_evidence(&full_verification, &plan, &private_root)?;
     let archive = fs::canonicalize(&plan.archive).map_err(|error| {
         format!(
             "failed to resolve archive {}: {error}",

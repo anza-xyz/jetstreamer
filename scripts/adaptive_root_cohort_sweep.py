@@ -573,6 +573,26 @@ def parse_epoch_range(value: str) -> tuple[int, int]:
     return parsed
 
 
+def parse_cohort_bootstrap(value: str) -> tuple[tuple[int, int], Path]:
+    raw_bounds, separator, raw_path = value.partition("=")
+    if not separator:
+        raise argparse.ArgumentTypeError(
+            "cohort bootstrap must be EPOCH_OR_RANGE=/absolute/path"
+        )
+    bounds = parse_epoch_range(raw_bounds)
+    path = Path(raw_path)
+    if not path.is_absolute():
+        raise argparse.ArgumentTypeError("cohort bootstrap path must be absolute")
+    return bounds, path
+
+
+def cohort_bootstrap_for(args: argparse.Namespace, cohort: Cohort) -> Path | None:
+    configured = getattr(args, "cohort_bootstrap", {})
+    if isinstance(configured, dict):
+        return configured.get((cohort.first_epoch, cohort.last_epoch))
+    return None
+
+
 def parse_proc_stat_start_time(data: str) -> int:
     command_end = data.rfind(")")
     if command_end < 0:
@@ -953,6 +973,7 @@ def build_producer_command(
     producer_home: Path = Path("/home/sol"),
     gcloud_bin: Path | None = None,
     solana_rayon_threads: int | None = None,
+    cohort_bootstrap: Path | None = None,
 ) -> list[str]:
     node = deploy / "jetstreamer-node"
     workers = tuple(deploy / name for _, name in runtime_workers(cohort))
@@ -1036,6 +1057,8 @@ def build_producer_command(
             f"--cohort-manifest-fingerprint={fingerprint}",
         ]
     )
+    if cohort_bootstrap is not None:
+        command.append(f"--snapshot-archive={cohort_bootstrap}")
     return command
 
 
@@ -2482,6 +2505,7 @@ def verify_deployment(
     deploy: Path,
     manifest: Path,
     cohorts: Sequence[Cohort],
+    cohort_bootstraps: Sequence[Path] = (),
 ) -> Path:
     deploy = validate_real_directory(deploy)
     if deploy.stat().st_uid != 0 or stat.S_IMODE(deploy.stat().st_mode) & 0o022:
@@ -2501,6 +2525,12 @@ def verify_deployment(
         for cohort in cohorts
         for _, worker_name in runtime_workers(cohort)
     )
+    for bootstrap in cohort_bootstraps:
+        if bootstrap.parent != deploy:
+            raise SweepError(
+                "cohort bootstrap must be a direct member of the sealed deployment"
+            )
+        required.add(bootstrap.name)
     for name in sorted(required):
         path = deploy / name
         info = path.lstat()
@@ -2586,6 +2616,15 @@ def controller_configuration_sha256(
         "manifest": str(args.manifest),
         "deploy_dir": str(args.deploy_dir),
         "deploy_sums_sha256": checksum_file(args.deploy_dir / "SHA256SUMS"),
+        "cohort_bootstraps": {
+            (str(first) if first == last else f"{first}-{last}"): {
+                "path": str(path),
+                "sha256": checksum_file(path),
+            }
+            for (first, last), path in sorted(
+                getattr(args, "cohort_bootstrap", {}).items()
+            )
+        },
         "public_dir": str(args.public_dir),
         "public_dir_identity": directory_identity(args.public_dir).as_json(),
         "public_private_root": str(args.public_private_root),
@@ -3276,6 +3315,9 @@ class Controller:
             f"--cohort-manifest={self.args.manifest}",
             f"--cohort-manifest-fingerprint={self.args.manifest_fingerprint}",
         )
+        cohort_bootstrap = cohort_bootstrap_for(self.args, cohort)
+        if cohort_bootstrap is not None:
+            expected_argv += (f"--snapshot-archive={cohort_bootstrap}",)
         if process.argv != expected_argv:
             raise SweepError(
                 f"matching producer PID {process.pid} for cohort {cohort.label} "
@@ -3577,7 +3619,13 @@ class Controller:
         raw.pop("pid", None)
         raw.pop("pid_start_time", None)
         self.save()
-        verify_deployment(self.args.deploy_dir, self.args.manifest, (cohort,))
+        cohort_bootstrap = cohort_bootstrap_for(self.args, cohort)
+        verify_deployment(
+            self.args.deploy_dir,
+            self.args.manifest,
+            (cohort,),
+            (() if cohort_bootstrap is None else (cohort_bootstrap,)),
+        )
         command = build_producer_command(
             cohort=cohort,
             lane=lane,
@@ -3595,6 +3643,7 @@ class Controller:
             producer_home=self.producer_home,
             gcloud_bin=self.args.gcloud_bin,
             solana_rayon_threads=self.args.solana_rayon_threads,
+            cohort_bootstrap=cohort_bootstrap,
         )
         self.revalidate_operational_directories()
         result = subprocess.run(command, check=False, capture_output=True, text=True)
@@ -4186,6 +4235,16 @@ def build_argument_parser() -> argparse.ArgumentParser:
             "outside /usr/bin:/bin (for example a Homebrew installation)"
         ),
     )
+    parser.add_argument(
+        "--cohort-bootstrap",
+        action="append",
+        type=parse_cohort_bootstrap,
+        default=[],
+        help=(
+            "reuse one manifest-bound snapshot for an exact cohort as "
+            "EPOCH_OR_RANGE=/absolute/path; the file must be a sealed deployment member"
+        ),
+    )
     parser.add_argument("--producer-user", default="sol")
     parser.add_argument("--archive-group", default="horizon")
     parser.add_argument("--controller-id", default="historical-v1")
@@ -4372,7 +4431,38 @@ def prepare(
                     f"{kind} cohort {first}-{last} overlaps {other_kind} "
                     f"cohort {other_first}-{other_last}"
                 )
-    verify_deployment(args.deploy_dir, args.manifest, (*cohorts, *adopted))
+    managed = (*cohorts, *adopted)
+    managed_bounds = {
+        (cohort.first_epoch, cohort.last_epoch) for cohort in managed
+    }
+    bootstrap_map: dict[tuple[int, int], Path] = {}
+    for bounds, path in args.cohort_bootstrap:
+        if bounds in bootstrap_map:
+            raise SweepError(
+                f"duplicate cohort bootstrap for {bounds[0]}-{bounds[1]}"
+            )
+        if bounds not in managed_bounds:
+            raise SweepError(
+                f"cohort bootstrap {bounds[0]}-{bounds[1]} does not name one exact managed cohort"
+            )
+        try:
+            resolved = path.resolve(strict=True)
+        except OSError as error:
+            raise SweepError(
+                f"failed to resolve cohort bootstrap {path}: {error}"
+            ) from error
+        if resolved != path:
+            raise SweepError(
+                f"cohort bootstrap must be a canonical real path: {path}"
+            )
+        bootstrap_map[bounds] = resolved
+    args.cohort_bootstrap = bootstrap_map
+    verify_deployment(
+        args.deploy_dir,
+        args.manifest,
+        managed,
+        tuple(bootstrap_map.values()),
+    )
     if args.execute:
         verify_controller_source(
             Path(__file__).resolve(strict=True), args.controller_sha256
@@ -4477,6 +4567,10 @@ def print_plan(
         "gcloud_bin_sha256": (
             checksum_file(args.gcloud_bin) if args.gcloud_bin is not None else None
         ),
+        "cohort_bootstraps": {
+            (str(first) if first == last else f"{first}-{last}"): str(path)
+            for (first, last), path in sorted(args.cohort_bootstrap.items())
+        },
         "producer_path": (
             DEFAULT_PRODUCER_PATH
             if args.gcloud_bin is None

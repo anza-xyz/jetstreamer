@@ -1207,6 +1207,7 @@ dependencies = [
  "rand_chacha",
  "rayon",
  "serde",
+ "serde_json",
  "sha2 0.8.2",
  "sha2 0.9.9",
  "solana-bpf-loader-program",

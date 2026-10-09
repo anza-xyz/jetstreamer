@@ -54,12 +54,6 @@ def positive_integer(value: str) -> int:
     return parsed
 
 
-def sha256(value: str) -> str:
-    if re.fullmatch(r"[0-9a-f]{64}", value) is None:
-        raise argparse.ArgumentTypeError("expected a lowercase SHA-256 digest")
-    return value
-
-
 def sha256_allowlist(value: str) -> tuple[str, ...]:
     values = value.split(",")
     if not values or any(re.fullmatch(r"[0-9a-f]{64}", item) is None for item in values):
@@ -184,7 +178,7 @@ def gate_receipt_matches(
     digest: str,
     *,
     verifier_sha256: str | Collection[str] | None = None,
-    script_sha256: str | None = None,
+    script_sha256: str | Collection[str] | None = None,
 ) -> bool:
     path = directory / f"epoch-{epoch}.{suffix}.ok"
     try:
@@ -195,7 +189,7 @@ def gate_receipt_matches(
             match is not None
             and match.group(1) == digest
             and digest_allowed(verifier_sha256, match.group(2))
-            and (script_sha256 is None or match.group(3) == script_sha256)
+            and digest_allowed(script_sha256, match.group(3))
         )
     except (OSError, UnicodeDecodeError):
         return False
@@ -209,7 +203,7 @@ def boundary_receipt_matches(
     *,
     digest_field: int,
     verifier_sha256: str | Collection[str],
-    script_sha256: str,
+    script_sha256: str | Collection[str],
 ) -> bool:
     path = directory / f"boundary-{left_epoch}-{right_epoch}.ok"
     try:
@@ -221,7 +215,7 @@ def boundary_receipt_matches(
             and all(re.fullmatch(r"[0-9a-f]{64}", field) for field in fields)
             and fields[digest_field] == digest
             and digest_allowed(verifier_sha256, fields[2])
-            and fields[3] == script_sha256
+            and digest_allowed(script_sha256, fields[3])
         )
     except (OSError, UnicodeDecodeError):
         return False
@@ -320,13 +314,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--local-mutation-lock", type=Path)
     parser.add_argument("--full-receipt-directory", type=absolute_directory)
     parser.add_argument("--full-verifier-sha256", type=sha256_allowlist)
-    parser.add_argument("--full-verifier-script-sha256", type=sha256)
+    parser.add_argument("--full-verifier-script-sha256", type=sha256_allowlist)
     parser.add_argument("--plugin-receipt-directory", type=absolute_directory)
     parser.add_argument("--plugin-pipeline-sha256", type=sha256_allowlist)
-    parser.add_argument("--plugin-verifier-script-sha256", type=sha256)
+    parser.add_argument("--plugin-verifier-script-sha256", type=sha256_allowlist)
     parser.add_argument("--boundary-receipt-directory", type=absolute_directory)
     parser.add_argument("--boundary-verifier-sha256", type=sha256_allowlist)
-    parser.add_argument("--boundary-verifier-script-sha256", type=sha256)
+    parser.add_argument("--boundary-verifier-script-sha256", type=sha256_allowlist)
     parser.add_argument(
         "--defer-epochs", type=epoch_range, action="append", default=[]
     )

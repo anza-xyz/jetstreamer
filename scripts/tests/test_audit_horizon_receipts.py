@@ -160,6 +160,9 @@ class HorizonReceiptAuditTests(unittest.TestCase):
             args.full_verifier_sha256 = ("03" * 32, "cd" * 32)
             args.plugin_pipeline_sha256 = ("04" * 32, "cd" * 32)
             args.boundary_verifier_sha256 = ("05" * 32, "01" * 32)
+            args.full_verifier_script_sha256 = ("06" * 32, "ef" * 32)
+            args.plugin_verifier_script_sha256 = ("07" * 32, "ef" * 32)
+            args.boundary_verifier_script_sha256 = ("08" * 32, "02" * 32)
             self.assertEqual(audit.audit(args), [])
 
 

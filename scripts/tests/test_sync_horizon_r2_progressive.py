@@ -128,21 +128,25 @@ class ProgressiveR2Tests(unittest.TestCase):
             args.full_verifier_sha256 = ("07" * 32, verifier)
             args.plugin_pipeline_sha256 = ("08" * 32, verifier)
             args.boundary_verifier_sha256 = ("09" * 32, verifier)
+            args.full_verifier_script_sha256 = ("0a" * 32, script)
+            args.plugin_verifier_script_sha256 = ("0b" * 32, script)
+            args.boundary_verifier_script_sha256 = ("0c" * 32, script)
             self.assertTrue(progressive.publication_allowed(args, 7, digest))
+            self.assertTrue(progressive.retirement_allowed(args, 7, digest))
 
             args.full_verifier_sha256 = "07" * 32
             self.assertFalse(progressive.retirement_allowed(args, 7, digest))
             args.full_verifier_sha256 = verifier
             args.full_verifier_script_sha256 = "08" * 32
             self.assertFalse(progressive.retirement_allowed(args, 7, digest))
-            args.full_verifier_script_sha256 = script
+            args.full_verifier_script_sha256 = (script,)
 
             args.plugin_pipeline_sha256 = "03" * 32
             self.assertFalse(progressive.retirement_allowed(args, 7, digest))
             args.plugin_pipeline_sha256 = verifier
             args.plugin_verifier_script_sha256 = "04" * 32
             self.assertFalse(progressive.retirement_allowed(args, 7, digest))
-            args.plugin_verifier_script_sha256 = script
+            args.plugin_verifier_script_sha256 = (script,)
 
             args.boundary_verifier_sha256 = "05" * 32
             self.assertFalse(progressive.retirement_allowed(args, 7, digest))
@@ -151,7 +155,7 @@ class ProgressiveR2Tests(unittest.TestCase):
             args.boundary_verifier_script_sha256 = "06" * 32
             self.assertFalse(progressive.retirement_allowed(args, 7, digest))
             self.assertTrue(progressive.publication_allowed(args, 7, digest))
-            args.boundary_verifier_script_sha256 = script
+            args.boundary_verifier_script_sha256 = (script,)
 
             (boundary / "boundary-7-8.ok").unlink()
             self.assertFalse(progressive.retirement_allowed(args, 7, digest))

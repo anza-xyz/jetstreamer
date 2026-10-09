@@ -62,6 +62,33 @@ for directory in "$state_dir" "$state_dir/logs" "$state_dir/receipts" "$state_di
 done
 state_dir=$(realpath "$state_dir")
 
+fsync_exact() {
+    local path=$1
+    /usr/bin/python3 - "$path" <<'PY'
+import os
+import stat
+import sys
+
+path = sys.argv[1]
+before = os.lstat(path)
+if stat.S_ISLNK(before.st_mode):
+    raise SystemExit(f"refusing to fsync symlink: {path}")
+flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+if stat.S_ISDIR(before.st_mode):
+    flags |= os.O_DIRECTORY
+elif not stat.S_ISREG(before.st_mode):
+    raise SystemExit(f"fsync target is not a regular file or directory: {path}")
+descriptor = os.open(path, flags)
+try:
+    after = os.fstat(descriptor)
+    if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
+        raise SystemExit(f"fsync target changed while opening: {path}")
+    os.fsync(descriptor)
+finally:
+    os.close(descriptor)
+PY
+}
+
 verifier_sha=$(sha256sum --binary "$verifier" | cut -d' ' -f1)
 script_sha=$(sha256sum --binary "$0" | cut -d' ' -f1)
 
@@ -194,9 +221,9 @@ while true; do
             printf '%s %s %s %s\n' \
                 "$left_sha" "$right_sha" "$verifier_sha" "$script_sha" >"$receipt_tmp"
             chmod 600 "$receipt_tmp"
-            sync -f "$receipt_tmp"
+            fsync_exact "$receipt_tmp"
             mv -f -- "$receipt_tmp" "$receipt"
-            sync -f "$state_dir/receipts"
+            fsync_exact "$state_dir/receipts"
             echo "[$(date -u +%FT%TZ)] boundary $left-$right verification passed; receipt=$receipt"
             progressed=1
             continue
@@ -214,6 +241,5 @@ while true; do
     fi
     printf '[%s] waiting for adjacent archive pairs; missing=%s\n' \
         "$(date -u +%FT%TZ)" "${pending[*]}"
-    ((progressed == 0)) || sync -f "$state_dir/receipts"
     sleep "$poll_seconds"
 done

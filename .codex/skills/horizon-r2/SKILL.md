@@ -551,6 +551,13 @@ Do not use `--legacy-etag-only` unless the user has explicitly established that 
   avoidable writeback pressure on every producer. Durable receipt writers must fsync the receipt's
   own file descriptor and then its containing directory descriptor, preferably inside the Rust or
   Python writer that performs the atomic rename. Do not substitute a filesystem-wide flush.
+- Run multi-check shell observations with fail-fast semantics, normally `set -euo pipefail`, and
+  capture each asserted condition explicitly in the durable observation. Never let a later
+  successful status or presence probe mask an earlier failed absence, ownership, hash, or unit-state
+  assertion through the shell's final-command exit status. When correcting a mistaken observation,
+  preserve the original immutable receipt, seal a separate correction that binds its exact digest,
+  state the authoritative evidence and gate impact, and fix the human-readable summary rather than
+  rewriting history.
 - Private qualification, admission, guard, and publication receipt directories may deliberately be
   root-only. An unprivileged `test -e`, `stat`, or file read can therefore look like absence even
   when the receipt exists. Before declaring a required receipt missing, inspect the parent access

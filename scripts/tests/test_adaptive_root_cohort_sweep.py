@@ -840,6 +840,13 @@ class CommandTests(unittest.TestCase):
         self.assertNotIn("/home/sol/horizon", "\0".join(command))
         self.assertIn("--root-checkpoint-cohort", command)
         self.assertIn("--verify", command)
+        node = str(self.deploy / "jetstreamer-node")
+        node_index = command.index(node)
+        self.assertEqual(
+            command[node_index : node_index + 3],
+            [node, "31-32", str(self.lane.output)],
+        )
+        self.assertEqual(command.count(node), 1)
         self.assertEqual(
             properties["RestrictNamespaces"],
             sweep.RELOAD_STABLE_RESTRICT_NAMESPACES,

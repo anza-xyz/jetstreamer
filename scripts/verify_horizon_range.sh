@@ -64,6 +64,33 @@ case "$state_dir/" in
         ;;
 esac
 
+fsync_exact() {
+    local path=$1
+    /usr/bin/python3 - "$path" <<'PY'
+import os
+import stat
+import sys
+
+path = sys.argv[1]
+before = os.lstat(path)
+if stat.S_ISLNK(before.st_mode):
+    raise SystemExit(f"refusing to fsync symlink: {path}")
+flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+if stat.S_ISDIR(before.st_mode):
+    flags |= os.O_DIRECTORY
+elif not stat.S_ISREG(before.st_mode):
+    raise SystemExit(f"fsync target is not a regular file or directory: {path}")
+descriptor = os.open(path, flags)
+try:
+    after = os.fstat(descriptor)
+    if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
+        raise SystemExit(f"fsync target changed while opening: {path}")
+    os.fsync(descriptor)
+finally:
+    os.close(descriptor)
+PY
+}
+
 verifier_sha=$(sha256sum -- "$verifier" | awk '{print $1}')
 script_sha=$(sha256sum -- "$0" | awk '{print $1}')
 children=()
@@ -149,7 +176,10 @@ run_full_epoch() {
         mv -f -- "$log_tmp" "$state_dir/logs/epoch-$epoch.full.log"
         local receipt_tmp="$state_dir/tmp/epoch-$epoch-receipt.$$.tmp"
         printf '%s %s %s\n' "$archive_sha" "$verifier_sha" "$script_sha" >"$receipt_tmp"
+        chmod 600 "$receipt_tmp"
+        fsync_exact "$receipt_tmp"
         mv -f -- "$receipt_tmp" "$receipt"
+        fsync_exact "$state_dir/receipts"
         echo "[$(date -u +%FT%TZ)] epoch $epoch full PoH verification passed"
         return 0
     fi
@@ -227,6 +257,8 @@ for ((epoch = start_epoch; epoch <= end_epoch; epoch++)); do
     printf '%s  %s\n' "$actual" "$name" >>"$manifest_tmp"
 done
 mv -f -- "$manifest_tmp" "$state_dir/archive-manifest.sha256"
+fsync_exact "$state_dir/archive-manifest.sha256"
+fsync_exact "$state_dir"
 manifest_sha=$(sha256sum -- "$state_dir/archive-manifest.sha256" | awk '{print $1}')
 echo "[$(date -u +%FT%TZ)] all sidecars verified; manifest_sha256=$manifest_sha"
 
@@ -254,7 +286,10 @@ run_chain() {
         mv -f -- "$log_tmp" "$state_dir/logs/ordered-chain.log"
         local receipt_tmp="$state_dir/tmp/ordered-chain-receipt.$$.tmp"
         printf '%s %s %s\n' "$manifest_sha" "$verifier_sha" "$script_sha" >"$receipt_tmp"
+        chmod 600 "$receipt_tmp"
+        fsync_exact "$receipt_tmp"
         mv -f -- "$receipt_tmp" "$receipt"
+        fsync_exact "$state_dir/receipts"
         echo "[$(date -u +%FT%TZ)] ordered-chain verification passed"
         return 0
     fi

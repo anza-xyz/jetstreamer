@@ -406,6 +406,17 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
   canonical vote whose tip hash disagrees with the reconstructed SlotHashes value can prove this
   divergence, but RPC block metadata does not recover the missing intermediate PoH hash and therefore
   cannot by itself authorize a runtime-route promotion or publication.
+- For an exact-state recovery of such a gap, search immutable, generation-pinned ledger backups rooted
+  before the boundary for the blockstore `data_shred`, `code_shred`, and `meta` column families. When
+  the backup is too large for the current admission envelope, stream its compressed tar one SST at a
+  time with explicit per-SST, total-retention, memory, and runtime bounds; retain only matching SSTs
+  and durably checkpoint progress. Scan every SST before choosing a value: an LSM backup can contain
+  multiple internal versions and tombstones for the same big-endian `(slot, shred_index)` key, so a
+  partial scan or first match is not live-state evidence. Select the highest internal sequence only
+  after the complete generation-bound scan, honor deletions, and decode shred payloads with the exact
+  pinned runtime's header and bincode layout. Require the recovered entry/tick chain to reproduce the
+  visible canonical final blockhash and the missing intermediate boundary before changing a runtime
+  route; the ordinary checkpoint, plugin, boundary, and publication gates still apply independently.
 
 ## Deliver
 

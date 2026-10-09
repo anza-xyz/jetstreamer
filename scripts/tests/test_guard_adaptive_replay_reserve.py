@@ -53,6 +53,7 @@ def arguments(root: Path) -> list[str]:
         f"--expected-producer-invocation-id={PRODUCER_INVOCATION}",
         f"--filesystem={root}",
         "--minimum-free-bytes=100",
+        "--maximum-worker-vmas=3500000",
         f"--guard-timer={TIMER}",
         f"--intent-receipt={root / 'intent.json'}",
         f"--completion-receipt={root / 'complete.json'}",
@@ -85,7 +86,13 @@ class AdaptiveReplayReserveGuardTest(unittest.TestCase):
                     "sample_unit",
                     side_effect=[
                         sample(CONTROLLER, CONTROLLER_INVOCATION),
-                        sample(PRODUCER, PRODUCER_INVOCATION),
+                        sample(
+                            PRODUCER,
+                            PRODUCER_INVOCATION,
+                            worker_count=1,
+                            worker_pid=124,
+                            worker_vmas=500_000,
+                        ),
                     ],
                 ),
                 patch.object(guard, "run_systemctl") as systemctl,
@@ -95,6 +102,137 @@ class AdaptiveReplayReserveGuardTest(unittest.TestCase):
             self.assertEqual(result, 0)
             systemctl.assert_not_called()
             self.assertFalse((root / "intent.json").exists())
+
+    def test_vma_trip_stops_controller_before_producer(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            os.chmod(root, 0o700)
+            events: list[str] = []
+            samples = {
+                CONTROLLER: [
+                    sample(CONTROLLER, CONTROLLER_INVOCATION),
+                    stopped(CONTROLLER, CONTROLLER_INVOCATION),
+                ],
+                PRODUCER: [
+                    sample(
+                        PRODUCER,
+                        PRODUCER_INVOCATION,
+                        worker_count=1,
+                        worker_pid=124,
+                        worker_vmas=3_500_001,
+                    ),
+                    sample(PRODUCER, PRODUCER_INVOCATION),
+                    stopped(PRODUCER, PRODUCER_INVOCATION),
+                ],
+            }
+
+            def sample_next(unit: str) -> guard.UnitSample:
+                events.append(f"sample:{unit}")
+                return samples[unit].pop(0)
+
+            def systemctl(command: list[str]) -> SimpleNamespace:
+                events.append("systemctl:" + " ".join(command))
+                return SimpleNamespace(returncode=0, stderr="")
+
+            with (
+                self.run_as_root(),
+                patch.object(guard, "available_bytes", side_effect=[200, 200]),
+                patch.object(guard, "sample_unit", side_effect=sample_next),
+                patch.object(guard, "run_systemctl", side_effect=systemctl),
+                redirect_stdout(io.StringIO()),
+            ):
+                result = guard.main(arguments(root))
+            self.assertEqual(result, 1)
+            self.assertLess(
+                events.index(f"systemctl:stop {CONTROLLER}"),
+                events.index(f"systemctl:stop {PRODUCER}"),
+            )
+            intent = json.loads((root / "intent.json").read_text())
+            self.assertTrue(any("VMAs" in item for item in intent["trip_reasons"]))
+
+    def test_zero_worker_terminal_handoff_does_not_trip_vma_guard(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            os.chmod(root, 0o700)
+            with (
+                self.run_as_root(),
+                patch.object(guard, "available_bytes", return_value=200),
+                patch.object(
+                    guard,
+                    "sample_unit",
+                    side_effect=[
+                        sample(CONTROLLER, CONTROLLER_INVOCATION),
+                        sample(
+                            PRODUCER,
+                            PRODUCER_INVOCATION,
+                            worker_count=0,
+                            worker_pid=None,
+                            worker_vmas=None,
+                        ),
+                    ],
+                ),
+                patch.object(guard, "run_systemctl") as systemctl,
+                redirect_stdout(io.StringIO()),
+            ):
+                result = guard.main(arguments(root))
+            self.assertEqual(result, 0)
+            systemctl.assert_not_called()
+
+    def test_multiple_workers_trip_vma_guard(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            os.chmod(root, 0o700)
+            samples = {
+                CONTROLLER: [
+                    sample(CONTROLLER, CONTROLLER_INVOCATION),
+                    stopped(CONTROLLER, CONTROLLER_INVOCATION),
+                ],
+                PRODUCER: [
+                    sample(PRODUCER, PRODUCER_INVOCATION, worker_count=2),
+                    sample(PRODUCER, PRODUCER_INVOCATION),
+                    stopped(PRODUCER, PRODUCER_INVOCATION),
+                ],
+            }
+            with (
+                self.run_as_root(),
+                patch.object(guard, "available_bytes", side_effect=[200, 200]),
+                patch.object(
+                    guard, "sample_unit", side_effect=lambda unit: samples[unit].pop(0)
+                ),
+                patch.object(
+                    guard,
+                    "run_systemctl",
+                    return_value=SimpleNamespace(returncode=0, stderr=""),
+                ),
+                redirect_stdout(io.StringIO()),
+            ):
+                result = guard.main(arguments(root))
+            self.assertEqual(result, 1)
+            intent = json.loads((root / "intent.json").read_text())
+            self.assertTrue(any("2 identifiable" in item for item in intent["trip_reasons"]))
+
+    def test_worker_vmas_reads_bound_worker_from_nested_cgroup(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cgroups = root / "cgroup"
+            proc = root / "proc"
+            group = cgroups / "system.slice" / "test.service" / "worker"
+            group.mkdir(parents=True)
+            (group / "cgroup.procs").write_text("123\n124\n")
+            for pid in (123, 124):
+                (proc / str(pid)).mkdir(parents=True)
+            (proc / "123" / "cmdline").write_bytes(b"/immutable/jetstreamer-node\0")
+            (proc / "123" / "maps").write_bytes(b"node\n")
+            (proc / "124" / "cmdline").write_bytes(
+                b"/scratch/.historical-runtime/x/bound-worker/historical-worker\0"
+            )
+            (proc / "124" / "maps").write_bytes(b"a\nb\nc\n")
+            self.assertEqual(
+                guard.worker_vmas(
+                    "/system.slice/test.service", cgroup_root=cgroups, proc_root=proc
+                ),
+                (1, 124, 3),
+            )
 
     def test_trip_stops_controller_before_producer(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

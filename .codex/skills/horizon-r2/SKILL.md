@@ -239,6 +239,11 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
   can race the reserve action by scheduling replacement work. Leave the controller stopped after a
   trip until an operator has reviewed the durable receipts and chosen a recovery or fresh cohort.
   Use the single-service guard only for a genuinely standalone producer.
+  Bind the adaptive guard to a measured VMA ceiling as well as the filesystem floor. A live worker
+  above the ceiling, multiple identifiable workers, or unreadable maps must use the same durable
+  controller-before-producer stop path. Permit zero workers without a VMA trip because an authenticated
+  producer can remain active during terminal archive drainage; service identity, restart, and disk
+  checks still apply. Prove the installed sandbox can read the exact worker's maps on its first fire.
   When admitting a new producer beside older live producers, set that producer's stop floor to the
   global reserve plus the conservative remaining-growth budgets still owed to the older producers,
   unless one proven aggregate guard serializes the complete fleet's response. Giving every lane an

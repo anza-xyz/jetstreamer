@@ -41,6 +41,10 @@ class UnitSample:
     main_pid: int
     invocation_id: str
     restarts: int
+    control_group: str = ""
+    worker_count: int = 0
+    worker_pid: int | None = None
+    worker_vmas: int | None = None
 
 
 def parse_systemctl_show(output: str) -> dict[str, str]:
@@ -52,19 +56,67 @@ def parse_systemctl_show(output: str) -> dict[str, str]:
     return fields
 
 
+def read_proc_bytes(path: Path) -> bytes | None:
+    try:
+        return path.read_bytes()
+    except (FileNotFoundError, PermissionError, ProcessLookupError):
+        return None
+
+
+def is_historical_worker_command(command: bytes) -> bool:
+    executable = command.split(b"\0", 1)[0]
+    basename = executable.rsplit(b"/", 1)[-1]
+    return executable.endswith(b"/bound-worker/historical-worker") or basename.startswith(
+        b"jetstreamer-historical-worker-v"
+    )
+
+
+def worker_vmas(
+    control_group: str,
+    cgroup_root: Path = Path("/sys/fs/cgroup"),
+    proc_root: Path = Path("/proc"),
+) -> tuple[int, int | None, int | None]:
+    if not control_group.startswith("/") or ".." in Path(control_group).parts:
+        raise GuardError(f"invalid producer control group: {control_group}")
+    group = cgroup_root / control_group.lstrip("/")
+    if not group.is_dir():
+        return 0, None, None
+    candidates: set[int] = set()
+    for process_file in group.rglob("cgroup.procs"):
+        try:
+            candidates.update(int(value) for value in process_file.read_text().split())
+        except (FileNotFoundError, PermissionError, ProcessLookupError, ValueError):
+            continue
+    workers: list[tuple[int, int | None]] = []
+    for pid in sorted(candidates):
+        command = read_proc_bytes(proc_root / str(pid) / "cmdline")
+        if not command or not is_historical_worker_command(command):
+            continue
+        maps = read_proc_bytes(proc_root / str(pid) / "maps")
+        workers.append((pid, maps.count(b"\n") if maps is not None else None))
+    if len(workers) != 1:
+        return len(workers), None, None
+    pid, vmas = workers[0]
+    return 1, pid, vmas
+
+
 def sample_unit(unit: str) -> UnitSample:
     completed = subprocess.run(
         [
             "/usr/bin/systemctl",
             "show",
             unit,
-            "--property=LoadState,ActiveState,SubState,Result,MainPID,InvocationID,NRestarts",
+            "--property=LoadState,ActiveState,SubState,Result,MainPID,InvocationID,NRestarts,ControlGroup",
         ],
         check=True,
         capture_output=True,
         text=True,
     )
     fields = parse_systemctl_show(completed.stdout)
+    control_group = fields.get("ControlGroup", "")
+    worker_count, worker_pid, worker_map_count = (
+        worker_vmas(control_group) if control_group else (0, None, None)
+    )
     return UnitSample(
         unit=unit,
         load_state=fields.get("LoadState", "unknown"),
@@ -74,6 +126,10 @@ def sample_unit(unit: str) -> UnitSample:
         main_pid=int(fields.get("MainPID", "0") or 0),
         invocation_id=fields.get("InvocationID", ""),
         restarts=int(fields.get("NRestarts", "0") or 0),
+        control_group=control_group,
+        worker_count=worker_count,
+        worker_pid=worker_pid,
+        worker_vmas=worker_map_count,
     )
 
 
@@ -126,6 +182,7 @@ def receipt_binding(args: argparse.Namespace) -> dict[str, Any]:
         "expected_producer_invocation_id": args.expected_producer_invocation_id,
         "filesystem": str(args.filesystem),
         "minimum_free_bytes": args.minimum_free_bytes,
+        "maximum_worker_vmas": args.maximum_worker_vmas,
     }
 
 
@@ -231,6 +288,7 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument("--expected-producer-invocation-id", required=True)
     parser.add_argument("--filesystem", type=Path, required=True)
     parser.add_argument("--minimum-free-bytes", type=int, required=True)
+    parser.add_argument("--maximum-worker-vmas", type=int, default=0)
     parser.add_argument("--guard-timer", required=True)
     parser.add_argument("--intent-receipt", type=Path, required=True)
     parser.add_argument("--completion-receipt", type=Path, required=True)
@@ -259,6 +317,8 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         parser.error("--filesystem must be an exact existing absolute directory")
     if args.minimum_free_bytes < 1:
         parser.error("--minimum-free-bytes must be positive")
+    if args.maximum_worker_vmas < 0:
+        parser.error("--maximum-worker-vmas must be non-negative")
     try:
         require_private_parent(args.intent_receipt)
         require_private_parent(args.completion_receipt)
@@ -311,12 +371,33 @@ def main(argv: Sequence[str] | None = None) -> int:
         require_original_running(
             producer, args.expected_producer_invocation_id, "producer"
         )
-        if free_bytes >= args.minimum_free_bytes:
+        trip_reasons: list[str] = []
+        if free_bytes < args.minimum_free_bytes:
+            trip_reasons.append(
+                f"available bytes {free_bytes} below floor {args.minimum_free_bytes}"
+            )
+        if args.maximum_worker_vmas:
+            if producer.worker_count > 1:
+                trip_reasons.append(
+                    f"producer has {producer.worker_count} identifiable historical workers"
+                )
+            elif producer.worker_count == 1 and producer.worker_vmas is None:
+                trip_reasons.append("producer worker maps are unreadable")
+            elif (
+                producer.worker_vmas is not None
+                and producer.worker_vmas > args.maximum_worker_vmas
+            ):
+                trip_reasons.append(
+                    f"producer worker VMAs {producer.worker_vmas} exceed "
+                    f"{args.maximum_worker_vmas}"
+                )
+        if not trip_reasons:
             print(
                 json.dumps(
                     {
                         "available_bytes": free_bytes,
                         "minimum_free_bytes": args.minimum_free_bytes,
+                        "maximum_worker_vmas": args.maximum_worker_vmas,
                         "controller": asdict(controller),
                         "producer": asdict(producer),
                         "trip": False,
@@ -334,7 +415,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             "available_bytes": free_bytes,
             "controller_sample": asdict(controller),
             "producer_sample": asdict(producer),
-            "reason": "actual available bytes fell below the sealed reserve stop floor",
+            "trip_reasons": trip_reasons,
+            "reason": "one or more sealed adaptive replay guard conditions tripped",
             "stop_order": ["controller", "producer"],
             "remote_mutations": False,
             "r2_mutations": False,

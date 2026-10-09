@@ -803,10 +803,19 @@ that outcome and exits unconditionally. A clean subsequent invocation is require
 the journal, destination, staged archive, or receipt evidence has changed, recovery makes no further
 mutation and the destination remains closed for operator review.
 
-Use `scripts/preflight_gcs_snapshots.py` before scheduling early epochs. Its schema-v2
+Use `scripts/preflight_gcs_snapshots.py` before scheduling early epochs. Its schema-v4
 `verification_cohorts` array supplies the ranges accepted by this mode and fails if a root gap
 would cross a runtime boundary, select a non-historical runtime, or extend beyond the requested
 range.
+
+When live GCS inventory is temporarily unavailable, a previously reviewed v2, v3, or v4 report
+can be regrouped without weakening its object bindings. Pass both
+`--source-manifest-report=PATH` and the independently recorded
+`--source-manifest-fingerprint=sha256:...`; the preflight verifies the complete old manifest,
+strictly validates every generation, versioned URI, size, CRC32C, and schema-specific MD5 field,
+then emits a fresh v4 plan. It never treats the fingerprint embedded beside a report as an
+independent seal. Snapshot restore still revalidates the selected generation against GCS before
+use.
 
 When an epoch crosses a registered runtime boundary, `jetstreamer-node` splits it automatically
 into bounded child replays. Each child writes a complete Horizon V2 segment plus a durable JSON

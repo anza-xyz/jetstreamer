@@ -15,7 +15,10 @@ cohorts; they are never trust anchors or replay checkpoints.
 
 The two fixture options consume the unmodified output of ``gcloud storage ls
 --json``.  Supplying either fixture requires supplying both, and suppresses all
-gcloud execution.
+gcloud execution.  A previously sealed manifest report may instead be supplied
+with its independently recorded fingerprint.  That mode strictly validates the
+old report, extracts only its generation-bound snapshot identities, and replans
+them under the current schema without contacting GCS.
 
 Run ``scripts/preflight_gcs_snapshots.py`` for live inventory, or run
 ``scripts/preflight_gcs_snapshots.py --inventory-root-json ROOT.json
@@ -52,9 +55,17 @@ FIRST_EPOCH = 1
 LAST_EPOCH = 100
 MAX_SUPPORTED_EPOCH = 301
 MAX_TARGET_COHORT_EPOCHS = 4
+MAX_SOURCE_MANIFEST_BYTES = 64 * 1024 * 1024
 EPOCH_SLOTS = 432_000
 UINT64_MAX = (1 << 64) - 1
 SCHEMA = "jetstreamer-gcs-snapshot-preflight-v4"
+SOURCE_MANIFEST_SCHEMAS = frozenset(
+    {
+        "jetstreamer-gcs-snapshot-preflight-v2",
+        "jetstreamer-gcs-snapshot-preflight-v3",
+        SCHEMA,
+    }
+)
 EPOCH_12_BOOTSTRAP_SLOT = 5_183_736
 EPOCH_12_BOOTSTRAP_ACCOUNTS_HASH = (
     "BUqwiSm2GgH9ByKrBDF6epXHYK9RRh3vyZDKtUqtMXfR"
@@ -126,6 +137,7 @@ ROOT_COHORT_HISTORICAL_RUNTIMES = frozenset(
 SNAPSHOT_ARCHIVE_EXTENSIONS = (".tar.zst", ".tar.lz4", ".tar.bz2")
 
 _DECIMAL_RE = re.compile(r"(?:0|[1-9][0-9]*)\Z")
+_FINGERPRINT_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _SNAPSHOT_BASENAME_RE = re.compile(
     r"snapshot-(?P<slot>0|[1-9][0-9]*)-"
     r"(?P<identity>[1-9A-HJ-NP-Za-km-z]{32,44})"
@@ -489,6 +501,424 @@ def parse_inventory_json(
     return tuple(
         sorted(seen.values(), key=lambda item: (item.slot, item.object_name, item.generation))
     )
+
+
+def _manifest_u64(
+    value: Any, field: str, context: str, *, nonzero: bool = False
+) -> int:
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise PreflightError(f"{context}: {field} must be a JSON integer")
+    if value < 0 or value > UINT64_MAX or (nonzero and value == 0):
+        qualifier = "non-zero " if nonzero else ""
+        raise PreflightError(f"{context}: {field} is not a {qualifier}uint64")
+    return value
+
+
+def _validate_manifest_md5(value: Any, context: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise PreflightError(f"{context}: md5_hash must be a non-empty string")
+    try:
+        decoded = base64.b64decode(value, validate=True)
+    except (binascii.Error, ValueError) as error:
+        raise PreflightError(f"{context}: md5_hash is not canonical base64") from error
+    if len(decoded) != 16 or base64.b64encode(decoded).decode("ascii") != value:
+        raise PreflightError(f"{context}: md5_hash must encode exactly 16 bytes")
+    return value
+
+
+def _parse_manifest_snapshot(
+    raw: Any, schema: str, context: str
+) -> SnapshotObject:
+    if not isinstance(raw, dict):
+        raise PreflightError(f"{context}: snapshot must be a JSON object")
+    common_keys = {
+        "accounts_hash",
+        "anchor_slot",
+        "crc32c",
+        "extension",
+        "generation",
+        "size",
+        "slot",
+        "source",
+        "uri",
+        "versioned_uri",
+    }
+    expected_keys = common_keys if schema.endswith("-v2") else common_keys | {"md5_hash"}
+    if set(raw) != expected_keys:
+        missing = sorted(expected_keys - set(raw))
+        unexpected = sorted(set(raw) - expected_keys)
+        raise PreflightError(
+            f"{context}: snapshot fields differ from {schema}: "
+            f"missing={missing}, unexpected={unexpected}"
+        )
+
+    source = _required_string(raw, "source", context)
+    if source not in ("root", "hourly"):
+        raise PreflightError(f"{context}: source must be 'root' or 'hourly'")
+    accounts_hash = _required_string(raw, "accounts_hash", context)
+    if not _base58_decodes_to_32_bytes(accounts_hash):
+        raise PreflightError(f"{context}: accounts_hash is not a 32-byte base58 hash")
+    extension = _required_string(raw, "extension", context)
+    if extension not in SNAPSHOT_ARCHIVE_EXTENSIONS:
+        raise PreflightError(f"{context}: unsupported snapshot extension {extension!r}")
+    anchor_slot = _manifest_u64(raw.get("anchor_slot"), "anchor_slot", context)
+    slot = _manifest_u64(raw.get("slot"), "slot", context)
+    size = _manifest_u64(raw.get("size"), "size", context, nonzero=True)
+    generation = _manifest_u64(
+        raw.get("generation"), "generation", context, nonzero=True
+    )
+    crc32c = _required_string(raw, "crc32c", context)
+    _validate_crc32c(crc32c, context)
+
+    if schema.endswith("-v2"):
+        md5_hash = None
+    elif schema.endswith("-v3"):
+        md5_hash = _validate_manifest_md5(raw.get("md5_hash"), context)
+    else:
+        md5_value = raw.get("md5_hash")
+        md5_hash = (
+            None
+            if md5_value is None
+            else _validate_manifest_md5(md5_value, context)
+        )
+
+    if source == "root" and anchor_slot != slot:
+        raise PreflightError(f"{context}: root snapshot anchor_slot must equal slot")
+    if source == "hourly" and anchor_slot > slot:
+        raise PreflightError(f"{context}: hourly snapshot anchor_slot exceeds slot")
+    filename = f"snapshot-{slot}-{accounts_hash}{extension}"
+    middle = "hourly/" if source == "hourly" else ""
+    object_name = f"{anchor_slot}/{middle}{filename}"
+    uri = _required_string(raw, "uri", context)
+    expected_uri = f"{BUCKET_URI}/{object_name}"
+    if uri != expected_uri:
+        raise PreflightError(
+            f"{context}: uri {uri!r} does not match snapshot identity {expected_uri!r}"
+        )
+    versioned_uri = _required_string(raw, "versioned_uri", context)
+    expected_versioned_uri = f"{uri}#{generation}"
+    if versioned_uri != expected_versioned_uri:
+        raise PreflightError(
+            f"{context}: versioned_uri {versioned_uri!r} does not match "
+            f"snapshot identity {expected_versioned_uri!r}"
+        )
+    return SnapshotObject(
+        source=source,
+        uri=uri,
+        versioned_uri=versioned_uri,
+        object_name=object_name,
+        filename=filename,
+        accounts_hash=accounts_hash,
+        anchor_slot=anchor_slot,
+        slot=slot,
+        extension=extension,
+        size=size,
+        generation=generation,
+        # Manifest schemas intentionally omit mutable object metadata.  This
+        # sentinel never enters the regenerated report.
+        metageneration=0,
+        crc32c=crc32c,
+        md5_hash=md5_hash,
+    )
+
+
+def _strict_json_file(path: Path, maximum_bytes: int, description: str) -> Any:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise PreflightError(f"cannot open {description} {path}: {error}") from error
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise PreflightError(f"{description} is not a regular file: {path}")
+        if before.st_size > maximum_bytes:
+            raise PreflightError(
+                f"{description} exceeds {maximum_bytes} bytes: {path}"
+            )
+        chunks: List[bytes] = []
+        remaining = before.st_size
+        while remaining:
+            chunk = os.read(descriptor, min(1024 * 1024, remaining))
+            if not chunk:
+                raise PreflightError(f"short read from {description} {path}")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        if os.read(descriptor, 1):
+            raise PreflightError(f"{description} grew while it was read: {path}")
+        after = os.fstat(descriptor)
+        def identity(item: os.stat_result) -> Tuple[int, ...]:
+            return (
+                item.st_dev,
+                item.st_ino,
+                item.st_mode,
+                item.st_uid,
+                item.st_gid,
+                item.st_nlink,
+                item.st_size,
+                item.st_mtime_ns,
+                item.st_ctime_ns,
+            )
+
+        if identity(before) != identity(after):
+            raise PreflightError(f"{description} changed while it was read: {path}")
+        try:
+            return json.loads(
+                b"".join(chunks).decode("utf-8"),
+                object_pairs_hook=_object_pairs_no_duplicates,
+                parse_constant=_reject_json_constant,
+            )
+        except (
+            UnicodeError,
+            json.JSONDecodeError,
+            _DuplicateJsonKey,
+            ValueError,
+        ) as error:
+            raise PreflightError(
+                f"{description} is not valid strict JSON: {error}"
+            ) from error
+    finally:
+        os.close(descriptor)
+
+
+def load_sealed_manifest_objects(
+    path: Path,
+    expected_fingerprint: str,
+    first_epoch: int,
+    last_epoch: int,
+) -> Tuple[Tuple[SnapshotObject, ...], Tuple[SnapshotObject, ...], Dict[str, Any]]:
+    """Recover immutable inventory evidence from a fingerprint-bound report."""
+    requested_slot_range(first_epoch, last_epoch)
+    if _FINGERPRINT_RE.fullmatch(expected_fingerprint) is None:
+        raise PreflightError(
+            "source manifest fingerprint must be sha256 plus 64 lowercase hex digits"
+        )
+    report = _strict_json_file(path, MAX_SOURCE_MANIFEST_BYTES, "source manifest report")
+    if not isinstance(report, dict):
+        raise PreflightError("source manifest report must be a JSON object")
+    manifest = report.get("manifest")
+    embedded_fingerprint = report.get("manifest_fingerprint")
+    if not isinstance(manifest, dict) or not isinstance(embedded_fingerprint, str):
+        raise PreflightError(
+            "source manifest report lacks manifest or manifest_fingerprint"
+        )
+    computed_fingerprint = manifest_fingerprint(manifest)
+    if (
+        embedded_fingerprint != computed_fingerprint
+        or expected_fingerprint != computed_fingerprint
+    ):
+        raise PreflightError(
+            "source manifest fingerprint mismatch: "
+            f"expected {expected_fingerprint}, embedded {embedded_fingerprint}, "
+            f"computed {computed_fingerprint}"
+        )
+    schema = manifest.get("schema")
+    if schema not in SOURCE_MANIFEST_SCHEMAS:
+        raise PreflightError(f"unsupported source manifest schema {schema!r}")
+    required_identity = {
+        "account": GCLOUD_ACCOUNT,
+        "billing_project": BILLING_PROJECT,
+        "bucket": BUCKET_URI,
+        "epoch_slots": EPOCH_SLOTS,
+        "inventory_patterns": {"hourly": HOURLY_PATTERN, "root": ROOT_PATTERN},
+    }
+    for field, expected in required_identity.items():
+        if manifest.get(field) != expected:
+            raise PreflightError(
+                f"source manifest {field} does not match current immutable identity"
+            )
+    manifest_first = manifest.get("first_epoch")
+    manifest_last = manifest.get("last_epoch")
+    if (
+        not isinstance(manifest_first, int)
+        or isinstance(manifest_first, bool)
+        or not isinstance(manifest_last, int)
+        or isinstance(manifest_last, bool)
+        or manifest_first < FIRST_EPOCH
+        or manifest_last < manifest_first
+        or manifest_last > MAX_SUPPORTED_EPOCH
+    ):
+        raise PreflightError("source manifest has an invalid epoch range")
+    if first_epoch < manifest_first or last_epoch > manifest_last:
+        raise PreflightError(
+            f"requested epoch range {first_epoch}-{last_epoch} is not covered by "
+            f"source manifest range {manifest_first}-{manifest_last}"
+        )
+
+    raw_cohorts = manifest.get("verification_cohorts")
+    raw_epochs = manifest.get("epochs")
+    if not isinstance(raw_cohorts, list) or not isinstance(raw_epochs, list):
+        raise PreflightError("source manifest cohorts and epochs must be JSON lists")
+    objects_by_identity: Dict[Tuple[str, int], SnapshotObject] = {}
+    objects_by_name: Dict[str, SnapshotObject] = {}
+
+    def record(item: SnapshotObject, context: str) -> None:
+        identity_key = (item.uri, item.generation)
+        previous = objects_by_identity.get(identity_key)
+        if previous is not None and previous != item:
+            raise PreflightError(f"{context}: conflicting repeated snapshot identity")
+        named = objects_by_name.get(item.object_name)
+        if named is not None and named != item:
+            raise PreflightError(
+                f"{context}: conflicting metadata for {item.object_name!r}"
+            )
+        objects_by_identity[identity_key] = item
+        objects_by_name[item.object_name] = item
+
+    cohort_by_epoch: Dict[
+        int, Tuple[int, int, SnapshotObject, Tuple[SnapshotObject, ...]]
+    ] = {}
+    next_epoch = manifest_first
+    for index, raw_cohort in enumerate(raw_cohorts):
+        context = f"source cohort {index}"
+        if not isinstance(raw_cohort, dict):
+            raise PreflightError(f"{context}: cohort must be a JSON object")
+        cohort_first = raw_cohort.get("first_epoch")
+        cohort_last = raw_cohort.get("last_epoch")
+        if (
+            not isinstance(cohort_first, int)
+            or isinstance(cohort_first, bool)
+            or not isinstance(cohort_last, int)
+            or isinstance(cohort_last, bool)
+            or cohort_first != next_epoch
+            or cohort_last < cohort_first
+            or cohort_last > manifest_last
+        ):
+            raise PreflightError(f"{context}: cohorts must exactly and contiguously cover range")
+        runtime = raw_cohort.get("runtime")
+        extensions = raw_cohort.get("accepted_extensions")
+        for epoch in range(cohort_first, cohort_last + 1):
+            expected_runtime, expected_extensions = runtime_route(epoch)
+            if runtime != expected_runtime or extensions != list(expected_extensions):
+                raise PreflightError(
+                    f"{context}: runtime or extensions disagree with epoch {epoch} route"
+                )
+        if raw_cohort.get("publication_gate") != (
+            "all-archives-validated-and-final-root-verified"
+        ):
+            raise PreflightError(f"{context}: publication gate is incompatible")
+        bootstrap = _parse_manifest_snapshot(
+            raw_cohort.get("bootstrap"), schema, f"{context} bootstrap"
+        )
+        if cohort_last > cohort_first and bootstrap.source != "root":
+            raise PreflightError(f"{context}: multi-epoch bootstrap must be a root")
+        prior_start, prior_end = epoch_slot_range(cohort_first - 1)
+        if not prior_start <= bootstrap.slot <= prior_end:
+            raise PreflightError(f"{context}: bootstrap is outside the prior epoch")
+        record(bootstrap, f"{context} bootstrap")
+        raw_checkpoints = raw_cohort.get("root_checkpoints")
+        if not isinstance(raw_checkpoints, list) or not raw_checkpoints:
+            raise PreflightError(f"{context}: root_checkpoints must be a non-empty list")
+        checkpoints: List[SnapshotObject] = []
+        last_slot = bootstrap.slot
+        _, cohort_end_slot = epoch_slot_range(cohort_last)
+        for checkpoint_index, raw_checkpoint in enumerate(raw_checkpoints):
+            checkpoint_context = f"{context} root checkpoint {checkpoint_index}"
+            checkpoint = _parse_manifest_snapshot(
+                raw_checkpoint, schema, checkpoint_context
+            )
+            if (
+                checkpoint.source != "root"
+                or checkpoint.slot <= last_slot
+                or checkpoint.slot > cohort_end_slot
+            ):
+                raise PreflightError(
+                    f"{checkpoint_context}: root checkpoint ordering/range is invalid"
+                )
+            last_slot = checkpoint.slot
+            checkpoints.append(checkpoint)
+            record(checkpoint, checkpoint_context)
+        final_start, _ = epoch_slot_range(cohort_last)
+        if checkpoints[-1].slot < final_start:
+            raise PreflightError(f"{context}: terminal checkpoint is before final epoch")
+        cohort_tuple = (cohort_first, cohort_last, bootstrap, tuple(checkpoints))
+        for epoch in range(cohort_first, cohort_last + 1):
+            cohort_by_epoch[epoch] = cohort_tuple
+        next_epoch = cohort_last + 1
+    if next_epoch != manifest_last + 1:
+        raise PreflightError("source cohorts do not cover the complete manifest range")
+
+    seen_epochs: set[int] = set()
+    for index, raw_epoch in enumerate(raw_epochs):
+        context = f"source epoch record {index}"
+        if not isinstance(raw_epoch, dict):
+            raise PreflightError(f"{context}: epoch record must be a JSON object")
+        epoch = raw_epoch.get("epoch")
+        if (
+            not isinstance(epoch, int)
+            or isinstance(epoch, bool)
+            or epoch not in cohort_by_epoch
+            or epoch in seen_epochs
+        ):
+            raise PreflightError(f"{context}: epoch identity is invalid or duplicated")
+        seen_epochs.add(epoch)
+        cohort_first, cohort_last, bootstrap, checkpoints = cohort_by_epoch[epoch]
+        expected_runtime, expected_extensions = runtime_route(epoch)
+        if (
+            raw_epoch.get("runtime") != expected_runtime
+            or raw_epoch.get("accepted_extensions") != list(expected_extensions)
+            or raw_epoch.get("verification_cohort")
+            != {"first_epoch": cohort_first, "last_epoch": cohort_last}
+        ):
+            raise PreflightError(f"{context}: epoch route or cohort binding is invalid")
+        expected_window = {
+            "start": epoch_slot_range(cohort_first - 1)[0],
+            "end_inclusive": epoch_slot_range(cohort_first - 1)[1],
+        }
+        if raw_epoch.get("bootstrap_window") != expected_window:
+            raise PreflightError(f"{context}: bootstrap window is invalid")
+        epoch_bootstrap = _parse_manifest_snapshot(
+            raw_epoch.get("bootstrap"), schema, f"{context} bootstrap"
+        )
+        if epoch_bootstrap != bootstrap:
+            raise PreflightError(f"{context}: bootstrap disagrees with its cohort")
+        record(epoch_bootstrap, f"{context} bootstrap")
+        raw_epoch_checkpoints = raw_epoch.get("post_bootstrap_root_checkpoints")
+        if not isinstance(raw_epoch_checkpoints, list):
+            raise PreflightError(f"{context}: checkpoint list is invalid")
+        epoch_start, epoch_end = epoch_slot_range(epoch)
+        expected_checkpoints = tuple(
+            item for item in checkpoints if epoch_start <= item.slot <= epoch_end
+        )
+        parsed_checkpoints = tuple(
+            _parse_manifest_snapshot(
+                item, schema, f"{context} root checkpoint {checkpoint_index}"
+            )
+            for checkpoint_index, item in enumerate(raw_epoch_checkpoints)
+        )
+        if parsed_checkpoints != expected_checkpoints:
+            raise PreflightError(f"{context}: checkpoints disagree with its cohort")
+        for checkpoint in parsed_checkpoints:
+            record(checkpoint, f"{context} root checkpoint")
+        expected_state_source = (
+            f"{bootstrap.source}-bootstrap"
+            if epoch == cohort_first
+            else "carried-from-previous-epoch"
+        )
+        if raw_epoch.get("runtime_state_source") != expected_state_source:
+            raise PreflightError(f"{context}: runtime state source is invalid")
+    if seen_epochs != set(range(manifest_first, manifest_last + 1)):
+        raise PreflightError("source epoch records do not cover the complete manifest range")
+
+    root_objects = tuple(
+        sorted(
+            (item for item in objects_by_identity.values() if item.source == "root"),
+            key=lambda item: (item.slot, item.object_name, item.generation),
+        )
+    )
+    hourly_objects = tuple(
+        sorted(
+            (item for item in objects_by_identity.values() if item.source == "hourly"),
+            key=lambda item: (item.slot, item.object_name, item.generation),
+        )
+    )
+    provenance = {
+        "manifest_fingerprint": computed_fingerprint,
+        "schema": schema,
+        "first_epoch": manifest_first,
+        "last_epoch": manifest_last,
+    }
+    return root_objects, hourly_objects, provenance
 
 
 def runtime_route(epoch: int) -> Tuple[str, Tuple[str, ...]]:
@@ -1048,6 +1478,21 @@ def build_argument_parser() -> argparse.ArgumentParser:
         help="raw JSON output from the hourly gcloud listing (requires the root fixture)",
     )
     parser.add_argument(
+        "--source-manifest-report",
+        type=Path,
+        help=(
+            "fingerprint-bound prior v2/v3/v4 report used as immutable offline "
+            "snapshot evidence"
+        ),
+    )
+    parser.add_argument(
+        "--source-manifest-fingerprint",
+        help=(
+            "independently recorded sha256 fingerprint required with "
+            "--source-manifest-report"
+        ),
+    )
+    parser.add_argument(
         "--local-root",
         type=Path,
         default=LOCAL_ROOT,
@@ -1077,16 +1522,44 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     arguments = build_argument_parser().parse_args(argv)
     try:
         relevant_slots = requested_slot_range(arguments.first_epoch, arguments.last_epoch)
-        root_text, hourly_text = load_inventory_texts(
-            arguments.inventory_root_json, arguments.inventory_hourly_json
-        )
         inventory_exclusions: List[Dict[str, Any]] = []
-        root_objects = parse_inventory_json(
-            root_text, "root", relevant_slots, inventory_exclusions
-        )
-        hourly_objects = parse_inventory_json(
-            hourly_text, "hourly", relevant_slots, inventory_exclusions
-        )
+        source_provenance: Optional[Dict[str, Any]] = None
+        source_mode = arguments.source_manifest_report is not None
+        if source_mode:
+            if (
+                arguments.inventory_root_json is not None
+                or arguments.inventory_hourly_json is not None
+            ):
+                raise PreflightError(
+                    "--source-manifest-report cannot be combined with inventory fixtures"
+                )
+            if arguments.source_manifest_fingerprint is None:
+                raise PreflightError(
+                    "--source-manifest-fingerprint is required with "
+                    "--source-manifest-report"
+                )
+            root_objects, hourly_objects, source_provenance = (
+                load_sealed_manifest_objects(
+                    arguments.source_manifest_report,
+                    arguments.source_manifest_fingerprint,
+                    arguments.first_epoch,
+                    arguments.last_epoch,
+                )
+            )
+        else:
+            if arguments.source_manifest_fingerprint is not None:
+                raise PreflightError(
+                    "--source-manifest-fingerprint requires --source-manifest-report"
+                )
+            root_text, hourly_text = load_inventory_texts(
+                arguments.inventory_root_json, arguments.inventory_hourly_json
+            )
+            root_objects = parse_inventory_json(
+                root_text, "root", relevant_slots, inventory_exclusions
+            )
+            hourly_objects = parse_inventory_json(
+                hourly_text, "hourly", relevant_slots, inventory_exclusions
+            )
         plans = build_epoch_plans(
             root_objects,
             hourly_objects,
@@ -1107,6 +1580,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "selected_bootstrap_bytes": storage["selected_bootstrap_bytes"],
             "storage": storage,
         }
+        if source_provenance is not None:
+            report["replanned_from_source_manifest"] = source_provenance
         encoded_report = json.dumps(report, indent=2, sort_keys=True) + "\n"
         if arguments.output is None:
             sys.stdout.write(encoded_report)

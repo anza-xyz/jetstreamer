@@ -110,6 +110,35 @@ def complete_inventory() -> tuple[list[dict], list[dict]]:
     return root, hourly
 
 
+def source_manifest_report(
+    first_epoch: int,
+    last_epoch: int,
+    *,
+    schema: str = "jetstreamer-gcs-snapshot-preflight-v2",
+) -> tuple[dict, str]:
+    root_raw, hourly_raw = complete_inventory()
+    relevant = preflight.requested_slot_range(first_epoch, last_epoch)
+    root = preflight.parse_inventory_json(json.dumps(root_raw), "root", relevant)
+    hourly = preflight.parse_inventory_json(json.dumps(hourly_raw), "hourly", relevant)
+    plans = preflight.build_epoch_plans(root, hourly, first_epoch, last_epoch)
+    manifest = preflight.build_manifest(plans)
+    manifest["schema"] = schema
+    if schema.endswith("-v2"):
+        for cohort in manifest["verification_cohorts"]:
+            cohort["bootstrap"].pop("md5_hash")
+            for checkpoint in cohort["root_checkpoints"]:
+                checkpoint.pop("md5_hash")
+        for epoch in manifest["epochs"]:
+            epoch["bootstrap"].pop("md5_hash")
+            for checkpoint in epoch["post_bootstrap_root_checkpoints"]:
+                checkpoint.pop("md5_hash")
+    fingerprint = preflight.manifest_fingerprint(manifest)
+    return {
+        "manifest": manifest,
+        "manifest_fingerprint": fingerprint,
+    }, fingerprint
+
+
 class InventoryParsingTests(unittest.TestCase):
     def test_parses_real_gcloud_wrapper_and_hourly_filename_slot(self) -> None:
         slot = preflight.FIRST_EPOCH * preflight.EPOCH_SLOTS - 1
@@ -1044,6 +1073,132 @@ class SelectionTests(unittest.TestCase):
 
 
 class ReportingAndAcquisitionTests(unittest.TestCase):
+    def test_replans_v2_sealed_manifest_into_v4_contiguous_cohort(self) -> None:
+        source_report, source_fingerprint = source_manifest_report(17, 20)
+        with tempfile.TemporaryDirectory() as directory:
+            source_path = Path(directory) / "source.json"
+            source_path.write_text(json.dumps(source_report), encoding="utf-8")
+            root, hourly, provenance = preflight.load_sealed_manifest_objects(
+                source_path, source_fingerprint, 17, 20
+            )
+
+        plans = preflight.build_epoch_plans(root, hourly, 17, 20, 4)
+        manifest = preflight.build_manifest(plans, 4)
+
+        self.assertEqual(manifest["schema"], preflight.SCHEMA)
+        self.assertEqual(
+            [
+                (item["first_epoch"], item["last_epoch"])
+                for item in manifest["verification_cohorts"]
+            ],
+            [(17, 20)],
+        )
+        self.assertIsNone(manifest["verification_cohorts"][0]["bootstrap"]["md5_hash"])
+        self.assertEqual(provenance["manifest_fingerprint"], source_fingerprint)
+        self.assertEqual(provenance["schema"], "jetstreamer-gcs-snapshot-preflight-v2")
+
+    def test_replans_v3_manifest_and_preserves_md5(self) -> None:
+        source_report, source_fingerprint = source_manifest_report(
+            17, 18, schema="jetstreamer-gcs-snapshot-preflight-v3"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            source_path = Path(directory) / "source.json"
+            source_path.write_text(json.dumps(source_report), encoding="utf-8")
+            root, hourly, _ = preflight.load_sealed_manifest_objects(
+                source_path, source_fingerprint, 17, 18
+            )
+
+        plans = preflight.build_epoch_plans(root, hourly, 17, 18, 2)
+        manifest = preflight.build_manifest(plans, 2)
+        self.assertEqual(
+            manifest["verification_cohorts"][0]["bootstrap"]["md5_hash"],
+            MD5_HASH,
+        )
+
+    def test_sealed_manifest_requires_independent_matching_fingerprint(self) -> None:
+        source_report, source_fingerprint = source_manifest_report(17, 18)
+        with tempfile.TemporaryDirectory() as directory:
+            source_path = Path(directory) / "source.json"
+            source_path.write_text(json.dumps(source_report), encoding="utf-8")
+            with self.assertRaisesRegex(preflight.PreflightError, "fingerprint mismatch"):
+                preflight.load_sealed_manifest_objects(
+                    source_path, "sha256:" + "0" * 64, 17, 18
+                )
+
+        self.assertNotEqual(source_fingerprint, "sha256:" + "0" * 64)
+
+    def test_sealed_manifest_rejects_missing_generation_after_valid_fingerprint(self) -> None:
+        source_report, _ = source_manifest_report(17, 18)
+        del source_report["manifest"]["verification_cohorts"][0]["bootstrap"][
+            "generation"
+        ]
+        fingerprint = preflight.manifest_fingerprint(source_report["manifest"])
+        source_report["manifest_fingerprint"] = fingerprint
+        with tempfile.TemporaryDirectory() as directory:
+            source_path = Path(directory) / "source.json"
+            source_path.write_text(json.dumps(source_report), encoding="utf-8")
+            with self.assertRaisesRegex(preflight.PreflightError, "snapshot fields differ"):
+                preflight.load_sealed_manifest_objects(source_path, fingerprint, 17, 18)
+
+    @mock.patch.object(preflight, "run_gcloud_inventory")
+    def test_source_manifest_cli_mode_never_invokes_gcloud(
+        self, run_gcloud: mock.Mock
+    ) -> None:
+        source_report, fingerprint = source_manifest_report(17, 18)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source_path = root / "source.json"
+            output_path = root / "output.json"
+            local_root = root / "horizon"
+            local_root.mkdir()
+            source_path.write_text(json.dumps(source_report), encoding="utf-8")
+            result = preflight.main(
+                [
+                    "--source-manifest-report",
+                    str(source_path),
+                    "--source-manifest-fingerprint",
+                    fingerprint,
+                    "--first-epoch",
+                    "17",
+                    "--last-epoch",
+                    "18",
+                    "--target-cohort-epochs",
+                    "2",
+                    "--local-root",
+                    str(local_root),
+                    "--output",
+                    str(output_path),
+                ]
+            )
+            report = json.loads(output_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(result, 0)
+        self.assertEqual(
+            report["replanned_from_source_manifest"]["manifest_fingerprint"],
+            fingerprint,
+        )
+        run_gcloud.assert_not_called()
+
+    def test_source_manifest_cli_rejects_mixed_inventory_modes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fixture = root / "fixture.json"
+            fixture.write_text("[]", encoding="utf-8")
+            result = preflight.main(
+                [
+                    "--source-manifest-report",
+                    str(fixture),
+                    "--source-manifest-fingerprint",
+                    "sha256:" + "0" * 64,
+                    "--inventory-root-json",
+                    str(fixture),
+                    "--inventory-hourly-json",
+                    str(fixture),
+                ]
+            )
+
+        self.assertEqual(result, 1)
+
     def test_v4_manifest_explicitly_represents_composite_snapshot_without_md5(self) -> None:
         root_raw, hourly_raw = complete_inventory()
         hourly_raw[0]["metadata"].pop("md5Hash")

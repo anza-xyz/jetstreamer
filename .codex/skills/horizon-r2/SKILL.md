@@ -104,6 +104,14 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
   URI, nonzero size, and canonical CRC32C. Recompute CRC32C after download and retain the local
   SHA-256/inode binding. Never accept a missing MD5 field, fake a digest, or relax a legacy schema
   that requires MD5.
+- If live GCS inventory is temporarily unavailable, regroup only from a previously sealed v2, v3,
+  or v4 preflight report whose independently recorded fingerprint is supplied explicitly. Use
+  `scripts/preflight_gcs_snapshots.py --source-manifest-report=PATH
+  --source-manifest-fingerprint=sha256:...`; never use the report's adjacent embedded fingerprint
+  as the independent value. The conversion must strictly validate every selected generation,
+  canonical versioned URI, size, CRC32C, schema-specific MD5 representation, cohort/epoch binding,
+  and runtime route before emitting a fresh v4 manifest. This is planning evidence only: snapshot
+  restore must still re-observe the exact GCS generation and hashes before replay.
 - Failed-replay scratch cleanup is authorized by default for this workflow. After confirming the failure and capturing the evidence needed to diagnose or reproduce it, stop the service and retry path, verify that no live process or staged relaunch references the exact scratch path, and delete that failed run's scratch immediately instead of allowing failures to accumulate. Preserve diagnostic output, partial archives, replay state, logs, checkpoints, manifests, receipts, and any snapshot still needed for diagnosis, lineage, restart, or a staged epoch outside the scratch tree. Never apply this cleanup rule to a controlled stop that can genuinely resume in place. If a relaunch demonstrably starts from the bootstrap in a new isolated runtime generation with no resume cursor, verify the new worker's exact generation and reclaim older unreferenced generations promptly; preserving them does not make that replay resumable.
 - Diagnose an archive `SectionTooLarge` against both the record-count and data-arena limits for the
   named phase. The error's historical `bytes` field is also used for a count overflow, so a value

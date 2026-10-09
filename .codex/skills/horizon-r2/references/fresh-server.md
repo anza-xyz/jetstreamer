@@ -131,6 +131,16 @@ evidence for a later reviewed registry change, not permission to publish by itse
    and confirm its slot-count equation; never assume it is `bootstrap + 1`, because predecessor
    snapshot warmup can begin before the epoch boundary where output starts. A candidate must
    reproduce those checkpoints before it can generate a publishable archive.
+   When recovery or sandbox separation requires copying the completed diagnostic artifact into a
+   distinct private validation root, authorize that copy with immutable producer/journal evidence
+   first and publish the staged archive and manifest only after both files are fsynced. Then run
+   `scripts/validate_staged_qualification_artifact.py` to rehash the original after staging, hash
+   the staged copy, require distinct single-link inodes, recheck the manifest range equation, and
+   fsync a root-owned staging receipt that explicitly denies sidecar, plugin, publication, R2, and
+   source-deletion authority. Only that receipt may precede
+   `scripts/run_independent_qualification_validator.py`. Run the copy and the independent validator
+   as ordered, non-restarting persistent services; a private partial copy or a failed staging
+   attempt is never qualification evidence and must not acquire a canonical sidecar.
    For the v1.6.16 epoch-208 qualification, make canonical slot `89,856,107` a required conflict
    gate. Transactions 7 and 8 both succeed and consecutively write payer account
    `FJwFtQFEyKEA4M6ZTrosTRPJphEpDA9ckUeMq9pRJdd4`: signature

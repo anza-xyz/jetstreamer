@@ -27,6 +27,13 @@ SHOW_PROPERTIES = (
     "Result",
     "ExecMainStatus",
 )
+PATH_SHOW_PROPERTIES = (
+    "LoadState",
+    "ActiveState",
+    "SubState",
+    "InvocationID",
+    "Result",
+)
 
 
 class LaunchError(RuntimeError):
@@ -163,12 +170,13 @@ def observe_archive_pair(archive: Path, sidecar: Path) -> dict[str, object]:
 
 
 def systemctl_show(systemctl: Path, unit: str) -> dict[str, str | int]:
+    properties = PATH_SHOW_PROPERTIES if unit.endswith(".path") else SHOW_PROPERTIES
     command = [
         str(systemctl),
         "show",
         unit,
         "--no-pager",
-        f"--property={','.join(SHOW_PROPERTIES)}",
+        f"--property={','.join(properties)}",
     ]
     try:
         completed = subprocess.run(
@@ -179,14 +187,15 @@ def systemctl_show(systemctl: Path, unit: str) -> dict[str, str | int]:
     values: dict[str, str | int] = {}
     for line in completed.stdout.splitlines():
         key, separator, value = line.partition("=")
-        if separator and key in SHOW_PROPERTIES:
+        if separator and key in properties:
             values[key] = value
-    missing = [key for key in SHOW_PROPERTIES if key not in values]
+    missing = [key for key in properties if key not in values]
     if missing:
         raise LaunchError(f"systemctl output for {unit} lacks {missing}")
     try:
-        values["NRestarts"] = int(str(values["NRestarts"]))
-        values["ExecMainStatus"] = int(str(values["ExecMainStatus"]))
+        if not unit.endswith(".path"):
+            values["NRestarts"] = int(str(values["NRestarts"]))
+            values["ExecMainStatus"] = int(str(values["ExecMainStatus"]))
     except ValueError as exc:
         raise LaunchError(f"systemctl returned non-integer counters for {unit}") from exc
     values["unit"] = unit
@@ -208,9 +217,10 @@ def require_path_watcher(sample: dict[str, str | int]) -> None:
     if (
         sample["LoadState"] != "loaded"
         or sample["ActiveState"] != "active"
-        or sample["SubState"] != "waiting"
+        or sample["SubState"] not in {"waiting", "running"}
+        or not INVOCATION_RE.fullmatch(str(sample["InvocationID"]))
     ):
-        raise LaunchError(f"path watcher is not active and waiting: {sample}")
+        raise LaunchError(f"path watcher is not authenticated and active: {sample}")
 
 
 def path_watcher_is_inactive(sample: dict[str, str | int]) -> bool:

@@ -28,7 +28,7 @@ class LaunchHorizonProgressiveVerifiersTests(unittest.TestCase):
                         active="active", sub="running", invocation="a" * 32
                     ),
                     "watch.path": self.sample(
-                        active="active", sub="waiting", invocation="b" * 32
+                        active="active", sub="running", invocation="b" * 32
                     ),
                     "full.service": self.sample(),
                     "plugin.service": self.sample(),

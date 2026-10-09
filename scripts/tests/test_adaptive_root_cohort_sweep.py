@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import base64
 import contextlib
 import copy
@@ -716,6 +717,26 @@ class CommandTests(unittest.TestCase):
         )
         sweep.validate_options(complete)
 
+    def test_cohort_bootstrap_parser_requires_an_exact_range_and_absolute_path(self) -> None:
+        self.assertEqual(
+            sweep.parse_cohort_bootstrap(
+                "31-32=/sealed/deploy/snapshot-123-Hash.tar.zst"
+            ),
+            (
+                (31, 32),
+                Path("/sealed/deploy/snapshot-123-Hash.tar.zst"),
+            ),
+        )
+        for value in (
+            "31-32",
+            "32-31=/sealed/deploy/snapshot.tar.zst",
+            "31-32=relative/snapshot.tar.zst",
+        ):
+            with self.subTest(value=value), self.assertRaises(
+                argparse.ArgumentTypeError
+            ):
+                sweep.parse_cohort_bootstrap(value)
+
     def test_private_network_check_ignores_class_control_files(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             network_class = Path(raw)
@@ -886,6 +907,25 @@ class CommandTests(unittest.TestCase):
         self.assertEqual(
             properties["RestrictNamespaces"],
             sweep.RELOAD_STABLE_RESTRICT_NAMESPACES,
+        )
+
+    def test_producer_passes_manifest_bound_bootstrap_from_sealed_deployment(self) -> None:
+        bootstrap = self.deploy / "snapshot-123-Hash.tar.zst"
+        command = sweep.build_producer_command(
+            cohort=self.cohort,
+            lane=self.lane,
+            deploy=self.deploy,
+            manifest=self.manifest,
+            fingerprint=self.fingerprint,
+            unit="cached-bootstrap-test.service",
+            cohort_bootstrap=bootstrap,
+        )
+
+        self.assertEqual(command[-1], f"--snapshot-archive={bootstrap}")
+        self.assertEqual(command.count(f"--snapshot-archive={bootstrap}"), 1)
+        self.assertEqual(
+            command_properties(command)["BindReadOnlyPaths"],
+            f"{self.deploy}:{self.deploy}:rbind",
         )
 
     def test_producer_pins_selected_solana_rayon_threads(self) -> None:

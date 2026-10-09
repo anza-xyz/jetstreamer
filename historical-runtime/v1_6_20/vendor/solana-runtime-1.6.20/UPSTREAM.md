@@ -24,7 +24,8 @@ git rev-parse v1.6.20^{} v1.6.20^{}:runtime v1.6.20^{}:LICENSE
 
 Jetstreamer changes are limited to exact Git dependency pins, bounded snapshot
 decoding, strict consumption of the unpacked AppendVec map, an owned
-write-version-ordered account view, and the zero/one-storage scan fast path.
+write-version-ordered account view, the zero/one-storage scan fast path, and a
+historical-only cap of eight eagerly preallocated per-slot AppendVec stores.
 The isolated worker disables the account cache so every physical replay write
 retains its historical global write-version ordering. These changes do not
 alter transaction execution, account hashing, or snapshot serialization.

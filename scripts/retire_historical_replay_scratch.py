@@ -237,10 +237,10 @@ def process_references(scratch: Path, proc_root: Path = Path("/proc")) -> list[s
         pid = process.name
         try:
             command = (process / "cmdline").read_bytes()
-            if needle in command:
+            if encoded_path_reference(command, needle):
                 references.append(f"pid {pid} command line")
             maps = (process / "maps").read_bytes()
-            if needle in maps:
+            if encoded_path_reference(maps, needle):
                 references.append(f"pid {pid} memory maps")
         except (FileNotFoundError, PermissionError, ProcessLookupError):
             pass
@@ -263,6 +263,20 @@ def process_references(scratch: Path, proc_root: Path = Path("/proc")) -> list[s
                 continue
             references.append(f"pid {pid} fd {descriptor.name}")
     return references
+
+
+def encoded_path_reference(content: bytes, needle: bytes) -> bool:
+    """Match an exact path or descendant, but not a sibling sharing its prefix."""
+    offset = 0
+    path_boundaries = b"/\0\n\r\t '\";|&()<>[]{}"
+    while True:
+        index = content.find(needle, offset)
+        if index < 0:
+            return False
+        end = index + len(needle)
+        if end == len(content) or content[end] in path_boundaries:
+            return True
+        offset = index + 1
 
 
 def available_bytes(path: Path) -> int:

@@ -407,6 +407,34 @@ class SelectionTests(unittest.TestCase):
         self.assertEqual((early.first_epoch, early.last_epoch), (1, 6))
         self.assertEqual((arguments.first_epoch, arguments.last_epoch), (12, 16))
 
+    def test_cli_accepts_a_private_verification_tail_boundary(self) -> None:
+        arguments = preflight.build_argument_parser().parse_args(
+            [
+                "--first-epoch",
+                "266",
+                "--last-epoch",
+                "301",
+                "--publish-through-epoch",
+                "300",
+            ]
+        )
+        self.assertEqual(arguments.publish_through_epoch, 300)
+
+    def test_invalid_publication_boundary_fails_before_inventory(self) -> None:
+        with mock.patch.object(preflight, "load_inventory_texts") as inventory:
+            result = preflight.main(
+                [
+                    "--first-epoch",
+                    "266",
+                    "--last-epoch",
+                    "301",
+                    "--publish-through-epoch",
+                    "302",
+                ]
+            )
+        self.assertEqual(result, 1)
+        inventory.assert_not_called()
+
     def test_cli_accepts_an_explicit_report_output(self) -> None:
         arguments = preflight.build_argument_parser().parse_args(
             ["--output", "/secure/preflight.json"]
@@ -947,6 +975,60 @@ class SelectionTests(unittest.TestCase):
 
         self.assertEqual((cohort.first_epoch, cohort.last_epoch), (17, 24))
         self.assertEqual([item.slot for item in cohort.checkpoints], [terminal_slot])
+
+    def test_manifest_marks_only_the_final_cohort_tail_private(self) -> None:
+        first_epoch = 17
+        verification_last_epoch = 20
+        publication_boundary = 19
+        _, prior_end = preflight.epoch_slot_range(first_epoch - 1)
+        terminal_slot = preflight.epoch_slot_range(verification_last_epoch)[0] + 10
+        root = preflight.parse_inventory_json(
+            json.dumps(
+                [
+                    inventory_record(prior_end - 100),
+                    inventory_record(terminal_slot, identity=ONE_HASH),
+                ]
+            ),
+            "root",
+            preflight.requested_slot_range(first_epoch, verification_last_epoch),
+        )
+        plans = preflight.build_epoch_plans(
+            root,
+            (),
+            first_epoch,
+            verification_last_epoch,
+            target_cohort_epochs=4,
+        )
+
+        manifest = preflight.build_manifest(
+            plans,
+            target_cohort_epochs=4,
+            publish_through_epoch=publication_boundary,
+        )
+
+        self.assertEqual(manifest["last_epoch"], verification_last_epoch)
+        self.assertEqual(manifest["publication_boundary_epoch"], publication_boundary)
+        self.assertEqual(
+            [item["publication_scope"] for item in manifest["epochs"]],
+            ["requested", "requested", "requested", "verification-tail-private"],
+        )
+        self.assertEqual(
+            manifest["verification_cohorts"][0]["publish_through_epoch"],
+            publication_boundary,
+        )
+
+    def test_manifest_rejects_a_tail_that_starts_before_the_final_cohort(self) -> None:
+        root, hourly = complete_inventory()
+        plans = preflight.build_epoch_plans(
+            preflight.parse_inventory_json(json.dumps(root), "root"),
+            preflight.parse_inventory_json(json.dumps(hourly), "hourly"),
+            first_epoch=1,
+            last_epoch=4,
+        )
+        with self.assertRaisesRegex(
+            preflight.PreflightError, "verification tail must be contained"
+        ):
+            preflight.build_manifest(plans, publish_through_epoch=2)
 
     def test_target_cohort_splits_at_every_runtime_boundary(self) -> None:
         first_epoch = 153

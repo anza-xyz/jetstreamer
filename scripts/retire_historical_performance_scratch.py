@@ -497,7 +497,7 @@ def process_references(scratches: Sequence[Path], proc_root: Path = Path("/proc"
             if content is None:
                 continue
             for scratch, needle in needles.items():
-                if needle in content:
+                if encoded_path_reference(content, needle):
                     references.append(f"pid {pid} {label} references {scratch}")
         for label in ("cwd", "root", "exe"):
             target = _read_proc_link(process / label)
@@ -526,6 +526,20 @@ def process_references(scratches: Sequence[Path], proc_root: Path = Path("/proc"
                     continue
                 references.append(f"pid {pid} fd {descriptor.name} references {scratch}")
     return references
+
+
+def encoded_path_reference(content: bytes, needle: bytes) -> bool:
+    """Match an exact path or descendant, but not a sibling sharing its prefix."""
+    offset = 0
+    path_boundaries = b"/\0\n\r\t '\";|&()<>[]{}"
+    while True:
+        index = content.find(needle, offset)
+        if index < 0:
+            return False
+        end = index + len(needle)
+        if end == len(content) or content[end] in path_boundaries:
+            return True
+        offset = index + 1
 
 
 def available_bytes(path: Path) -> int:

@@ -169,6 +169,19 @@ class HistoricalPerformanceScratchRetirementTest(unittest.TestCase):
             references = retire.process_references([scratch], root)
             self.assertEqual(len(references), 3)
 
+    def test_process_reference_scan_ignores_sibling_path_prefixes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            scratch = root / "scratch"
+            scratch.mkdir()
+            sibling = root / "scratch-store8"
+            sibling.mkdir()
+            process = root / "123"
+            process.mkdir()
+            (process / "cmdline").write_bytes(os.fsencode(str(sibling)) + b"\0")
+            (process / "maps").write_bytes(os.fsencode(str(sibling / "store")) + b"\n")
+            self.assertEqual(retire.process_references([scratch], root), [])
+
     def test_results_receipt_binds_all_exact_scratch_statistics(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()

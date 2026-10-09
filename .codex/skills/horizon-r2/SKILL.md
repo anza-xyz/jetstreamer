@@ -42,7 +42,11 @@ For a long-running range, use `scripts/sync_horizon_r2_progressive.py` to discov
   must replay farther to reach its terminal root. Keep every out-of-range verification-tail archive
   in private storage, give it no canonical sidecar, and exclude it from the public Horizon directory
   and R2. Deeply validate the complete sealed cohort before transactionally importing only the
-  requested contiguous prefix through the repository's bounded recovery option.
+  requested contiguous prefix through the repository's bounded recovery option. Seal this intent in
+  the source plan: run `preflight_gcs_snapshots.py` through the first compatible later root with
+  `--last-epoch` set to that verification endpoint and `--publish-through-epoch` set to the user's
+  requested range end. Require the manifest's tail epochs to be marked
+  `verification-tail-private`; never rely on an operator remembering an unrecorded boundary.
 - Without a range, inventory canonical R2 pairs first. Upload any complete local pairs missing from R2, then begin with the lowest missing epoch supported by the repository's compatibility manifests. Continue in bounded cohorts as resources permit.
 - An R2 epoch is complete only when both `epoch-N.jet` and `epoch-N.jet.sha256` exist and agree with verified local evidence. A checksum-only or archive-only epoch is incomplete.
 - Use the repository binary's mutation-free inventory mode for an authoritative explicit-range
@@ -112,7 +116,7 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
   canonical versioned URI, size, CRC32C, schema-specific MD5 representation, cohort/epoch binding,
   and runtime route before emitting a fresh v4 manifest. This is planning evidence only: snapshot
   restore must still re-observe the exact GCS generation and hashes before replay.
-- Failed-replay scratch cleanup is authorized by default for this workflow. After confirming the failure and capturing the evidence needed to diagnose or reproduce it, stop the service and retry path, verify that no live process or staged relaunch references the exact scratch path, and delete that failed run's scratch immediately instead of allowing failures to accumulate. Preserve diagnostic output, partial archives, replay state, logs, checkpoints, manifests, receipts, and any snapshot still needed for diagnosis, lineage, restart, or a staged epoch outside the scratch tree. Never apply this cleanup rule to a controlled stop that can genuinely resume in place. If a relaunch demonstrably starts from the bootstrap in a new isolated runtime generation with no resume cursor, verify the new worker's exact generation and reclaim older unreferenced generations promptly; preserving them does not make that replay resumable.
+- Failed-replay cleanup is authorized by default for this workflow. After confirming the failure and capturing the evidence needed to diagnose or reproduce it, stop the service and retry path, verify that no live process or staged relaunch references each exact target, and delete that failed run's scratch immediately instead of allowing failures to accumulate. Preserve diagnostic output and partial archives only until their useful evidence is sealed: for a terminal, non-resumable, superseded generation that cannot satisfy a full/plugin/publication gate, fsync a root-owned receipt with the service result, last slot/progress, exact size and archive hash when available, and copy any segment manifest outside the deletion tree; then retire the unreferenced local output promptly while retaining logs, manifests, receipts, hashes, and inputs needed for lineage or reproduction. Never apply this rule to a controlled stop that can genuinely resume in place or to any locally complete archive awaiting verification/upload. If a relaunch demonstrably starts from the bootstrap in a new isolated runtime generation with no resume cursor, verify the new worker's exact generation and reclaim older unreferenced generations promptly; preserving them does not make that replay resumable.
 - Diagnose an archive `SectionTooLarge` against both the record-count and data-arena limits for the
   named phase. The error's historical `bytes` field is also used for a count overflow, so a value
   such as `8193 (limit 8192)` can mean the 8,193rd update rather than an 8,193-byte account. Capture
@@ -158,6 +162,23 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
   use a longer bounded run when measured scratch reuse and restart risk justify it. Shorten or split
   the run whenever runtime, root, resource-admission, or live-claim boundaries require it. Prefer
   this when duplicated bootstrap/scratch is the admission bottleneck.
+  When the sealed manifest's exact generation-pinned bootstrap is already retained locally, prefer
+  reusing that cache to downloading a duplicate only through a reviewed cohort input that preserves
+  the manifest's trust boundary. Require an absolute path with the exact canonical snapshot filename,
+  open it as a regular file without following symlinks, verify the manifest size, CRC32C, and MD5,
+  bind its SHA-256 and file identity, and revalidate the open file plus path immediately before worker
+  initialization. Preserve the original restore/download receipt. Never substitute loose directory
+  discovery, a copied filename, or an unbound cache entry for this check; if the deployed parent lacks
+  such an input, keep the cohort staged until authenticated generation-pinned download works or a new
+  immutable parent implementing the gate is qualified and deployed.
+  The checked-in adaptive controller exposes this input as repeated
+  `--cohort-bootstrap=EPOCH_OR_RANGE=/ABSOLUTE/PATH`. Require the range to name one exact managed
+  cohort and the archive to be a singly linked, root-owned, non-writable direct member of the sealed
+  deployment with an exact `SHA256SUMS` entry. Review the planning report's `cohort_bootstraps`
+  mapping before execute mode; the controller binds the path and digest into its configuration and
+  exact adoption arguments, while the parent performs the manifest filename, slot, size, CRC32C,
+  MD5, SHA-256, and file-identity checks. Do not pass this option to a controller or parent that
+  predates the reviewed cache gate.
   Keep independent root-verifiable cohorts parallel when disk admission is healthy and fleet wall
   time is the priority: historical execution is often mostly serial within one worker, and an
   unnecessarily long cohort increases the restart blast radius. Never merge across a runtime or
@@ -231,8 +252,31 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
   keys within one transaction are not a cross-transaction attribution conflict. Differentially test
   write/write and write/read barriers, independent batching, invalid duplicate-key handling, and the
   known canonical conflicting-write slot before qualification.
+  Derive writable-key attribution with the same feature gate used by that pinned Bank's
+  `prepare_batch` account-lock path. This API is version-specific: the qualified v1.6 workers expose
+  `demote_sysvar_write_locks`, while v1.7 and v1.8 expose `demote_program_write_locks`. Do not copy
+  the older boolean or approximate writable keys across a runtime boundary; inspect the vendored
+  Bank and Message implementations, pass the exact active demotion value to `is_writable`, and add a
+  compile/runtime regression for the selected candidate.
+  Run each real boundary-snapshot integration test from that historical runtime's workspace root,
+  not from the repository root with only `--manifest-path`: rustup selects the pinned legacy
+  toolchain from the current directory, and every worker build script must reject a modern compiler.
+  Give the libtest process `RUST_MIN_STACK=134217728` for these old full-snapshot load/verify gates;
+  the default test-thread stack can overflow inside legacy snapshot restoration even when the same
+  code is valid in the production main thread. Keep this as a test-only environment setting and
+  still treat any hash, bank verification, or checkpoint mismatch as a real qualification failure.
   Pin the chosen environment in the launch manifest and repeat the normal root/plugin qualification;
   never change it underneath a live replay.
+  When a regression lives inside an excluded vendored runtime crate, do not assume the worker suite
+  executes that crate's own `#[cfg(test)]` tests. Old Cargo can also walk upward into the modern root
+  manifest, while a standalone copied crate can resolve newly published dependencies that its pinned
+  compiler cannot parse. Test it in a uniquely named disposable copy of the complete historical
+  workspace: add only the exact vendor crate as a temporary workspace member, retain the historical
+  `Cargo.lock` and toolchain, resolve offline, and remove an upstream dev-dependency only from that
+  disposable manifest when it is unused and absent from the pinned lock. Never alter production
+  workspace membership to make a vendor test run. Preserve failure output until a corrected retry is
+  proven, then delete the disposable tree promptly; the normal worker suite and real boundary-snapshot
+  gates remain independently required.
 - For a bounded performance cohort, capture cgroup CPU, memory peak/events, major-fault, pressure,
   and I/O counters inside the persistent runner before and after its child; terminal service
   cgroups may disappear before an external collector can read them. Keep target-slot detection
@@ -301,12 +345,19 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
   documented persistent value before launch and record the effective value; this is independent
   of free RAM, CPU, and disk checks.
 - Reclaim local disk proactively when admission is constrained, but only from positively
-  reproducible caches and obsolete scratch generations. Resolve each deletion target to an exact
+  reproducible caches, obsolete scratch generations, and terminal partial outputs whose sealed
+  evidence proves they cannot pass the full-epoch gates. Resolve each deletion target to an exact
   canonical path, prove no live process or staged unit references it, preserve the manifest or
   receipt needed to reproduce it, and record the before/after evidence. Build caches, obsolete
-  snapshots, and fully generation-pinned snapshot caches may be removed after those checks;
-  required inputs, active scratch, resumable state, diagnostic evidence, checkpoints, receipts,
-  public archives, and all R2 objects must remain untouched.
+  snapshots, fully generation-pinned snapshot caches, and proven superseded partial outputs may be
+  removed after those checks; required inputs, active scratch, resumable state, unsealed diagnostic
+  evidence, checkpoints, receipts, complete archives awaiting gates/publication, and all R2 objects
+  must remain untouched. Record both the target's measured physical bytes and filesystem free space,
+  but do not equate their delta while live jobs allocate or files share extents.
+  Treat command-line and mmap references as exact paths or descendants, not raw string prefixes:
+  a live `scratch-store8` sibling is not a reference to an empty completed `scratch` tree. Use the
+  repository retirement scanners' path-boundary checks, and still fail closed on any genuine
+  command, map, cwd/root/exe, or descriptor reference beneath the exact target.
 - For adaptive ranges, start the controller with `--r2-receipt-directory "$HOME/.jetstreamer-private/r2-receipts" --r2-bucket BUCKET`. The controller accepts receipts from that exact bucket only for bytes already bound by its root-owned local completion attestation; R2 can replace local storage, but can never establish initial completion.
 - Start the current Horizon verification plugin as soon as each local archive is available. R2 work may run concurrently with replay of other epochs. An archive is eligible for upload only after its full and current-plugin receipts bind the same archive SHA-256. It is not eligible for local retirement until both adjacent-boundary receipts bind that digest as well. Preserve the canonical lowercase coreutils sidecar format: `<64 hex>  epoch-N.jet\n`.
 - Report single-job latency and fleet completion cadence separately. Historical slot density varies,
@@ -324,6 +375,14 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
   replay can begin at `bootstrap_slot + 1` while recorded output begins at the epoch boundary.
   Independently check that `terminal_slot - output_slot_start + 1` equals the manifest's
   `output_slot_count`, and launch a distinct non-restarting attempt if an expectation was wrong.
+- Before spending a full archive scan on the current per-epoch plugin, also compare the segment
+  manifest's output start, terminal slot, and count with that epoch's complete canonical slot
+  range. A focused checkpoint artifact that starts at the epoch boundary but stops even one slot
+  before the epoch end can pass its own sealed partial-range validator while the current plugin
+  must reject its epoch notification. Preserve that artifact as diagnostic evidence, but do not
+  launch the production plugin gate, create a plugin receipt, canonicalize it, or publish it. Run
+  the plugin against such an artifact only when the explicit purpose is to exercise and record the
+  expected rejection path; mark that run diagnostic-only and give it no publication authority.
 - Before scheduling or launching a focused qualification, separately prove that the exact immutable
   worker's own snapshot and entry bounds admit the requested terminal slot. A parent focused planner
   may intentionally describe a wider search envelope than the currently deployed worker accepts;

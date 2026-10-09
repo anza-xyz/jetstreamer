@@ -9,8 +9,8 @@ use {
     jetstreamer_horizon::{
         account_updates::AccountUpdateView,
         archive::{
-            ArchiveReader, BlockNotification, Consumption, EntryRecord, EpochMeta, SlotKind,
-            SlotVisitor,
+            ArchiveProvenance, ArchiveReader, BlockNotification, Consumption, EntryRecord,
+            EpochMeta, SlotKind, SlotVisitor,
         },
         transactions::Transaction,
     },
@@ -45,7 +45,16 @@ struct TerminalSlot {
     slot: u64,
     kind: SlotKind,
     blockhash: Option<Hash>,
-    write_count: u64,
+    pre_write_count: u64,
+    transaction_write_count: u64,
+    post_write_count: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WritePhase {
+    Pre,
+    Transaction,
+    Post,
 }
 
 #[derive(Default)]
@@ -53,6 +62,9 @@ struct EdgeVisitor {
     current_slot: Option<u64>,
     current_kind: Option<SlotKind>,
     current_write_count: u64,
+    current_pre_write_count: u64,
+    current_transaction_write_count: u64,
+    current_post_write_count: u64,
     first_write: Option<u64>,
     last_write: Option<u64>,
     terminal: Option<TerminalSlot>,
@@ -60,7 +72,7 @@ struct EdgeVisitor {
 }
 
 impl EdgeVisitor {
-    fn accept_write(&mut self, slot: u64, write_version: u64) {
+    fn accept_write(&mut self, slot: u64, write_version: u64, phase: WritePhase) {
         if self.error.is_some() {
             return;
         }
@@ -75,6 +87,20 @@ impl EdgeVisitor {
             Some(count) => count,
             None => {
                 self.error = Some(format!("account-update count overflows at slot {slot}"));
+                return;
+            }
+        };
+        let phase_count = match phase {
+            WritePhase::Pre => &mut self.current_pre_write_count,
+            WritePhase::Transaction => &mut self.current_transaction_write_count,
+            WritePhase::Post => &mut self.current_post_write_count,
+        };
+        *phase_count = match phase_count.checked_add(1) {
+            Some(count) => count,
+            None => {
+                self.error = Some(format!(
+                    "{phase:?} account-update count overflows at slot {slot}"
+                ));
                 return;
             }
         };
@@ -105,28 +131,31 @@ impl SlotVisitor for EdgeVisitor {
         self.current_slot = Some(slot);
         self.current_kind = Some(kind);
         self.current_write_count = 0;
+        self.current_pre_write_count = 0;
+        self.current_transaction_write_count = 0;
+        self.current_post_write_count = 0;
         self.terminal = None;
     }
 
     fn on_epoch(&mut self, meta: &EpochMeta) {
         let slot = self.current_slot.unwrap_or(0);
         for (update, _) in meta.updates.iter() {
-            self.accept_write(slot, update.write_version);
+            self.accept_write(slot, update.write_version, WritePhase::Pre);
         }
     }
 
     fn on_pre_account_update(&mut self, slot: u64, update: &AccountUpdateView<'_>) {
-        self.accept_write(slot, update.write_version);
+        self.accept_write(slot, update.write_version, WritePhase::Pre);
     }
 
     fn on_transaction(&mut self, slot: u64, _tx_index: u32, transaction: &Transaction) {
         for (update, _) in transaction.iter_account_updates() {
-            self.accept_write(slot, update.write_version);
+            self.accept_write(slot, update.write_version, WritePhase::Transaction);
         }
     }
 
     fn on_post_account_update(&mut self, slot: u64, update: &AccountUpdateView<'_>) {
-        self.accept_write(slot, update.write_version);
+        self.accept_write(slot, update.write_version, WritePhase::Post);
     }
 
     fn on_block(&mut self, notification: &BlockNotification, _entries: &[EntryRecord]) {
@@ -159,7 +188,9 @@ impl SlotVisitor for EdgeVisitor {
             slot,
             kind,
             blockhash,
-            write_count: self.current_write_count,
+            pre_write_count: self.current_pre_write_count,
+            transaction_write_count: self.current_transaction_write_count,
+            post_write_count: self.current_post_write_count,
         });
     }
 
@@ -179,8 +210,17 @@ struct EpochEvidence {
     terminal_slot: u64,
     terminal_kind: &'static str,
     observed_terminal_next_write_version: u64,
+    observed_terminal_write_counts: TerminalWriteCounts,
     derived_terminal_checkpoint_write_count: u64,
+    checkpoint_write_derivation: &'static str,
     observed_terminal_blockhash: String,
+}
+
+#[derive(Debug, Serialize)]
+struct TerminalWriteCounts {
+    pre: u64,
+    transaction: u64,
+    post: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -262,6 +302,19 @@ fn collect(arguments: &Arguments) -> Result<Evidence, String> {
     let reader = ArchiveReader::open(BufReader::with_capacity(16 << 20, file))
         .map_err(|error| format!("failed to open Horizon archive: {error}"))?;
     let header = reader.header().clone();
+    let provenance = reader
+        .provenance()
+        .map_err(|error| format!("invalid archive provenance: {error}"))?
+        .ok_or_else(|| "archive has no runtime provenance".to_string())?;
+    let ArchiveProvenance::V2(provenance) = provenance else {
+        return Err("archive edge recovery requires single-runtime V2 provenance".to_string());
+    };
+    if provenance.base.runtime_profile != "solana-v1.6.16" {
+        return Err(format!(
+            "checkpoint write derivation is not qualified for runtime {}",
+            provenance.base.runtime_profile
+        ));
+    }
     let bucket_count = reader.bucket_count();
     if bucket_count == 0 {
         return Err("archive has no buckets".to_string());
@@ -300,6 +353,10 @@ fn collect(arguments: &Arguments) -> Result<Evidence, String> {
             terminal.slot
         ));
     }
+    let derived_terminal_checkpoint_write_count =
+        terminal.post_write_count.checked_sub(1).ok_or_else(|| {
+            "v1.6.16 terminal slot has no post-phase final-freeze write to exclude".to_string()
+        })?;
     let blockhash = terminal
         .blockhash
         .ok_or_else(|| "terminal block has no blockhash".to_string())?;
@@ -338,7 +395,14 @@ fn collect(arguments: &Arguments) -> Result<Evidence, String> {
             terminal_slot: terminal.slot,
             terminal_kind: "block",
             observed_terminal_next_write_version: terminal_next_write,
-            derived_terminal_checkpoint_write_count: terminal.write_count,
+            observed_terminal_write_counts: TerminalWriteCounts {
+                pre: terminal.pre_write_count,
+                transaction: terminal.transaction_write_count,
+                post: terminal.post_write_count,
+            },
+            derived_terminal_checkpoint_write_count,
+            checkpoint_write_derivation:
+                "solana-v1.6.16 freeze checkpoint writes are terminal post-phase writes minus the final freeze-root drain write",
             observed_terminal_blockhash: blockhash.to_string(),
         },
     );
@@ -461,12 +525,15 @@ mod tests {
             current_kind: Some(SlotKind::Block),
             ..EdgeVisitor::default()
         };
-        visitor.accept_write(10, 12);
-        visitor.accept_write(10, 10);
-        visitor.accept_write(10, 11);
+        visitor.accept_write(10, 12, WritePhase::Pre);
+        visitor.accept_write(10, 10, WritePhase::Transaction);
+        visitor.accept_write(10, 11, WritePhase::Post);
         assert_eq!(visitor.first_write, Some(10));
         assert_eq!(visitor.last_write, Some(12));
         assert_eq!(visitor.current_write_count, 3);
+        assert_eq!(visitor.current_pre_write_count, 1);
+        assert_eq!(visitor.current_transaction_write_count, 1);
+        assert_eq!(visitor.current_post_write_count, 1);
         assert!(visitor.finish().is_ok());
     }
 
@@ -477,7 +544,29 @@ mod tests {
             current_kind: Some(SlotKind::Block),
             ..EdgeVisitor::default()
         };
-        visitor.accept_write(11, 10);
+        visitor.accept_write(11, 10, WritePhase::Pre);
         assert!(visitor.finish().is_err());
+    }
+
+    #[test]
+    fn terminal_phase_counts_preserve_v1_6_16_checkpoint_derivation() {
+        let mut visitor = EdgeVisitor {
+            current_slot: Some(10),
+            current_kind: Some(SlotKind::Block),
+            ..EdgeVisitor::default()
+        };
+        for write_version in 10..13 {
+            visitor.accept_write(10, write_version, WritePhase::Pre);
+        }
+        for write_version in 13..18 {
+            visitor.accept_write(10, write_version, WritePhase::Transaction);
+        }
+        for write_version in 18..22 {
+            visitor.accept_write(10, write_version, WritePhase::Post);
+        }
+        assert_eq!(visitor.current_pre_write_count, 3);
+        assert_eq!(visitor.current_transaction_write_count, 5);
+        assert_eq!(visitor.current_post_write_count, 4);
+        assert_eq!(visitor.current_post_write_count.checked_sub(1), Some(3));
     }
 }

@@ -141,6 +141,13 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
   including last blockhash, drained-write count, and next write-version cursor. Those fields are
   required to reconstruct auditable producer evidence after a post-archive parent failure; terminal
   bank and accounts hashes alone are insufficient.
+  When recovering v1.6.16 terminal evidence from the archive, do not equate all terminal-slot
+  account updates with the checkpoint's drained-write count. Bind the archive to single-runtime V2
+  `solana-v1.6.16` provenance, count pre-, transaction-, and post-phase writes separately, and
+  derive the checkpoint count as post-phase writes minus the final freeze-root drain write. Require
+  that runtime-specific derivation to match the journal's drained-write count and next write-version
+  cursor; fail closed for other provenance or an empty post phase until its runtime semantics are
+  independently qualified.
 - Do not raise replay concurrency from low CPU or RAM utilization alone. Snapshot extraction and
   historical account state can consume hundreds of GiB per worker; require the controller's
   configured per-worker disk admission budget and measured filesystem growth to leave the reserve

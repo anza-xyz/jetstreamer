@@ -535,7 +535,11 @@ scripts/sync_horizon_r2_progressive.py \
 Before arming any generated upload service, audit the effective wrapper without executing it using
 `scripts/audit_horizon_upload_wrapper.py`. Bind every configured `--*-sha256` option to the exact
 immutable binary or script it names, require the binding set to cover every hash option exactly
-once, and preserve the JSON result with the deployment evidence. Re-derive these hashes from the
+once, and bind every configured full/plugin/boundary `--*-receipt-directory` to the exact verifier
+state directory that produces it. Require each configured receipt directory to be that state
+directory's `receipts/` child; pointing the uploader at the state-directory parent makes valid
+verifier receipts invisible and can leave publication waiting forever even when every hash is
+correct. Preserve the JSON result with the deployment evidence. Re-derive these hashes from the
 deployed files even when a wrapper and deployment manifest already agree with each other: copied or
 mistyped evidence can be internally consistent yet reject the verifier's correct receipt only after
 a long replay finishes. Repeat this audit after any wrapper, verifier, plugin, or immutable package

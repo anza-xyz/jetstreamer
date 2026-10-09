@@ -16,9 +16,16 @@ from pathlib import Path
 
 SHA256_RE = r"[0-9a-f]{64}"
 OPTION_RE = re.compile(r"^[a-z][a-z0-9-]*-sha256$")
+RECEIPT_DIRECTORY_OPTION_RE = re.compile(
+    r"^(?:full|plugin|boundary)-receipt-directory$"
+)
 WRAPPER_HASH_RE = re.compile(
     rf"(?m)^\s*--(?P<option>[a-z][a-z0-9-]*-sha256)="
     rf"(?P<allowlist>{SHA256_RE}(?:,{SHA256_RE})*)\s*(?:\\)?\s*$"
+)
+WRAPPER_RECEIPT_DIRECTORY_RE = re.compile(
+    r"(?m)^\s*--(?P<option>(?:full|plugin|boundary)-receipt-directory)="
+    r"(?P<path>/[^\s\\]+)\s*(?:\\)?\s*$"
 )
 
 
@@ -120,7 +127,34 @@ def parse_binding(value: str) -> tuple[str, Path]:
     return option, path
 
 
-def audit_wrapper(wrapper: Path, bindings: list[tuple[str, Path]]) -> dict[str, object]:
+def parse_receipt_state_directory(value: str) -> tuple[str, Path]:
+    option, separator, raw_path = value.partition("=")
+    if (
+        not separator
+        or not RECEIPT_DIRECTORY_OPTION_RE.fullmatch(option)
+        or not raw_path
+    ):
+        raise argparse.ArgumentTypeError(
+            "receipt-state-directory must be "
+            "{full,plugin,boundary}-receipt-directory=/absolute/state-directory"
+        )
+    path = Path(raw_path)
+    if not path.is_absolute():
+        raise argparse.ArgumentTypeError(
+            f"receipt state directory must be absolute: {raw_path}"
+        )
+    if os.path.normpath(raw_path) != raw_path:
+        raise argparse.ArgumentTypeError(
+            f"receipt state directory must be normalized: {raw_path}"
+        )
+    return option, path
+
+
+def audit_wrapper(
+    wrapper: Path,
+    bindings: list[tuple[str, Path]],
+    receipt_state_directories: list[tuple[str, Path]],
+) -> dict[str, object]:
     auditor_digest, _ = digest_regular_file(Path(__file__).resolve())
     wrapper_digest, wrapper_bytes = digest_regular_file(wrapper, capture_bytes=True)
     assert wrapper_bytes is not None
@@ -153,6 +187,53 @@ def audit_wrapper(wrapper: Path, bindings: list[tuple[str, Path]]) -> dict[str, 
         )
     if not configured:
         raise AuditError("wrapper contains no pinned --*-sha256 options")
+
+    configured_receipt_directories: dict[str, str] = {}
+    for match in WRAPPER_RECEIPT_DIRECTORY_RE.finditer(wrapper_text):
+        option = match.group("option")
+        if option in configured_receipt_directories:
+            raise AuditError(f"wrapper repeats --{option}")
+        configured_path = match.group("path")
+        if os.path.normpath(configured_path) != configured_path:
+            raise AuditError(
+                f"wrapper --{option} path must be normalized: {configured_path}"
+            )
+        configured_receipt_directories[option] = configured_path
+
+    supplied_receipt_state_directories: dict[str, Path] = {}
+    for option, path in receipt_state_directories:
+        if option in supplied_receipt_state_directories:
+            raise AuditError(f"receipt state binding repeats {option}")
+        supplied_receipt_state_directories[option] = path
+
+    configured_receipt_options = set(configured_receipt_directories)
+    supplied_receipt_options = set(supplied_receipt_state_directories)
+    if configured_receipt_options != supplied_receipt_options:
+        missing = sorted(configured_receipt_options - supplied_receipt_options)
+        unexpected = sorted(supplied_receipt_options - configured_receipt_options)
+        raise AuditError(
+            "receipt state binding set does not match wrapper receipt-directory "
+            f"options: missing={missing} unexpected={unexpected}"
+        )
+
+    audited_receipt_directories = []
+    for option in sorted(configured_receipt_directories):
+        state_directory = supplied_receipt_state_directories[option]
+        expected_receipt_directory = state_directory / "receipts"
+        configured_receipt_directory = Path(configured_receipt_directories[option])
+        if configured_receipt_directory != expected_receipt_directory:
+            raise AuditError(
+                f"--{option} must point at the verifier receipt child: "
+                f"configured={configured_receipt_directory} "
+                f"expected={expected_receipt_directory}"
+            )
+        audited_receipt_directories.append(
+            {
+                "option": option,
+                "state_directory": str(state_directory),
+                "configured_receipt_directory": str(configured_receipt_directory),
+            }
+        )
 
     audited_bindings = []
     for option in sorted(configured):
@@ -204,6 +285,7 @@ def audit_wrapper(wrapper: Path, bindings: list[tuple[str, Path]]) -> dict[str, 
             "gid": wrapper_digest.gid,
         },
         "bindings": audited_bindings,
+        "receipt_directories": audited_receipt_directories,
     }
 
 
@@ -277,10 +359,23 @@ def main() -> int:
         type=Path,
         help="atomically create and fsync this absolute JSON receipt path",
     )
+    parser.add_argument(
+        "--receipt-state-directory",
+        action="append",
+        default=[],
+        type=parse_receipt_state_directory,
+        metavar="OPTION=/ABSOLUTE/STATE-DIRECTORY",
+        help=(
+            "bind one wrapper --*-receipt-directory option to the verifier "
+            "state directory whose receipts/ child it must name"
+        ),
+    )
     args = parser.parse_args()
 
     try:
-        result = audit_wrapper(args.wrapper, args.binding)
+        result = audit_wrapper(
+            args.wrapper, args.binding, args.receipt_state_directory
+        )
     except AuditError as exc:
         print(f"audit failed: {exc}", file=sys.stderr)
         return 1

@@ -38,10 +38,12 @@ class AuditHorizonUploadWrapperTests(unittest.TestCase):
         wrapper.chmod(0o555)
         return wrapper
 
-    def run_audit(self, wrapper, *bindings):
+    def run_audit(self, wrapper, *bindings, receipt_states=()):
         command = [sys.executable, str(SCRIPT), str(wrapper)]
         for binding in bindings:
             command.extend(["--binding", binding])
+        for receipt_state in receipt_states:
+            command.extend(["--receipt-state-directory", receipt_state])
         return subprocess.run(command, text=True, capture_output=True, check=False)
 
     def test_accepts_exact_deployed_hashes(self):
@@ -112,6 +114,52 @@ class AuditHorizonUploadWrapperTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 1)
         self.assertIn("not a symlink", result.stderr)
+
+    def test_accepts_exact_verifier_receipt_children(self):
+        full_state = self.root / "full-audit"
+        plugin_state = self.root / "plugin-audit"
+        wrapper = self.write_wrapper(
+            f"--plugin-pipeline-sha256={self.pipeline_sha} \\\n"
+            f"--full-receipt-directory={full_state / 'receipts'} \\\n"
+            f"--plugin-receipt-directory={plugin_state / 'receipts'}\n"
+        )
+        result = self.run_audit(
+            wrapper,
+            f"plugin-pipeline-sha256={self.pipeline}",
+            receipt_states=(
+                f"full-receipt-directory={full_state}",
+                f"plugin-receipt-directory={plugin_state}",
+            ),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        receipt = json.loads(result.stdout)
+        self.assertEqual(len(receipt["receipt_directories"]), 2)
+
+    def test_rejects_receipt_parent_instead_of_receipts_child(self):
+        full_state = self.root / "full-audit"
+        wrapper = self.write_wrapper(
+            f"--plugin-pipeline-sha256={self.pipeline_sha} \\\n"
+            f"--full-receipt-directory={full_state}\n"
+        )
+        result = self.run_audit(
+            wrapper,
+            f"plugin-pipeline-sha256={self.pipeline}",
+            receipt_states=(f"full-receipt-directory={full_state}",),
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("verifier receipt child", result.stderr)
+
+    def test_rejects_unbound_receipt_directory(self):
+        full_state = self.root / "full-audit"
+        wrapper = self.write_wrapper(
+            f"--plugin-pipeline-sha256={self.pipeline_sha} \\\n"
+            f"--full-receipt-directory={full_state / 'receipts'}\n"
+        )
+        result = self.run_audit(
+            wrapper, f"plugin-pipeline-sha256={self.pipeline}"
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("receipt state binding set does not match", result.stderr)
 
     def test_output_is_durable_json_and_no_clobber(self):
         wrapper = self.write_wrapper(

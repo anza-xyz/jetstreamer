@@ -21,10 +21,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import adaptive_root_cohort_sweep as sweep  # noqa: E402
 
 
-def manifest_report(cohorts: list[tuple[int, int, str]]) -> tuple[dict, str]:
+def manifest_report(
+    cohorts: list[tuple[int, int, str]], *, schema: str = sweep.MANIFEST_SCHEMA
+) -> tuple[dict, str]:
     md5_hash = base64.b64encode(b"0123456789abcdef").decode("ascii")
     body = {
-        "schema": sweep.MANIFEST_SCHEMA,
+        "schema": schema,
         "bucket": "mainnet-beta-ledger-us-ny5",
         "epoch_slots": 432_000,
         "first_epoch": cohorts[0][0],
@@ -213,11 +215,20 @@ class ManifestTests(unittest.TestCase):
             with self.assertRaisesRegex(sweep.SweepError, "schema"):
                 sweep.load_cohorts(path, fingerprint, 201, 201)
 
-    def test_current_controller_accepts_v3_manifest(self) -> None:
+    def test_current_controller_accepts_v4_manifest(self) -> None:
         report, fingerprint = manifest_report([(201, 201, "solana-v1.6.16")])
         self.assertEqual(
             report["manifest"]["schema"],
-            "jetstreamer-gcs-snapshot-preflight-v3",
+            "jetstreamer-gcs-snapshot-preflight-v4",
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            path = write_manifest(Path(temporary), report)
+            cohorts = sweep.load_cohorts(path, fingerprint, 201, 201)
+        self.assertEqual(cohorts, (sweep.Cohort(201, 201, "solana-v1.6.16"),))
+
+    def test_current_controller_remains_compatible_with_v3_manifest(self) -> None:
+        report, fingerprint = manifest_report(
+            [(201, 201, "solana-v1.6.16")], schema=sweep.MANIFEST_SCHEMA_V3
         )
         with tempfile.TemporaryDirectory() as temporary:
             path = write_manifest(Path(temporary), report)
@@ -225,7 +236,9 @@ class ManifestTests(unittest.TestCase):
         self.assertEqual(cohorts, (sweep.Cohort(201, 201, "solana-v1.6.16"),))
 
     def test_v3_manifest_requires_md5_for_every_snapshot(self) -> None:
-        report, _fingerprint = manifest_report([(201, 201, "solana-v1.6.16")])
+        report, _fingerprint = manifest_report(
+            [(201, 201, "solana-v1.6.16")], schema=sweep.MANIFEST_SCHEMA_V3
+        )
         del report["manifest"]["verification_cohorts"][0]["bootstrap"]["md5_hash"]
         fingerprint = "sha256:" + hashlib.sha256(
             sweep.canonical_json(report["manifest"])
@@ -234,6 +247,29 @@ class ManifestTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             path = write_manifest(Path(temporary), report)
             with self.assertRaisesRegex(sweep.SweepError, "MD5"):
+                sweep.load_cohorts(path, fingerprint, 201, 201)
+
+    def test_v4_manifest_requires_explicit_md5_null_or_digest(self) -> None:
+        report, _fingerprint = manifest_report([(201, 201, "solana-v1.6.16")])
+        bootstrap = report["manifest"]["verification_cohorts"][0]["bootstrap"]
+        bootstrap["md5_hash"] = None
+        fingerprint = "sha256:" + hashlib.sha256(
+            sweep.canonical_json(report["manifest"])
+        ).hexdigest()
+        report["manifest_fingerprint"] = fingerprint
+        with tempfile.TemporaryDirectory() as temporary:
+            path = write_manifest(Path(temporary), report)
+            cohorts = sweep.load_cohorts(path, fingerprint, 201, 201)
+        self.assertEqual(cohorts, (sweep.Cohort(201, 201, "solana-v1.6.16"),))
+
+        del bootstrap["md5_hash"]
+        fingerprint = "sha256:" + hashlib.sha256(
+            sweep.canonical_json(report["manifest"])
+        ).hexdigest()
+        report["manifest_fingerprint"] = fingerprint
+        with tempfile.TemporaryDirectory() as temporary:
+            path = write_manifest(Path(temporary), report)
+            with self.assertRaisesRegex(sweep.SweepError, "explicit GCS MD5"):
                 sweep.load_cohorts(path, fingerprint, 201, 201)
 
     def test_selected_range_accepts_an_unselected_transition_runtime(self) -> None:

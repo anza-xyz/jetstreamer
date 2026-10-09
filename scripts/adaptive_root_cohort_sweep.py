@@ -39,11 +39,13 @@ from typing import Any, Iterable, Mapping, Sequence
 
 
 GIB = 1024**3
-# The current node's root-checkpoint cohort loader requires the v3 manifest.
-# Older deployments remain paired with their immutable v2 controller; letting
-# this controller plan a v2 manifest would defer the incompatibility until a
-# costly producer launch and would omit the GCS MD5 binding added in v3.
-MANIFEST_SCHEMA = "jetstreamer-gcs-snapshot-preflight-v3"
+# v3 requires GCS MD5 for every object.  v4 retains that check when GCS
+# supplies MD5, but explicitly permits null for generation-pinned composite
+# objects, which GCS identifies with CRC32C instead.  Older v3 manifests remain
+# valid so immutable deployed generations can be inspected and resumed.
+MANIFEST_SCHEMA_V3 = "jetstreamer-gcs-snapshot-preflight-v3"
+MANIFEST_SCHEMA = "jetstreamer-gcs-snapshot-preflight-v4"
+SUPPORTED_MANIFEST_SCHEMAS = frozenset({MANIFEST_SCHEMA_V3, MANIFEST_SCHEMA})
 RECEIPT_SCHEMA = "jetstreamer-root-cohort-publication-receipt-v2"
 ROOT_CHECKPOINT_CONTEXT_SCHEMA = "jetstreamer-root-checkpoint-gate-context-v1"
 PUBLICATION_GATE = "all-archives-validated-and-final-root-verified"
@@ -442,12 +444,20 @@ def _stat_identity(info: os.stat_result) -> tuple[int, ...]:
     )
 
 
-def require_manifest_snapshot_md5(raw: object, description: str) -> None:
+def validate_manifest_snapshot_md5(
+    raw: object, description: str, schema: str
+) -> None:
     if not isinstance(raw, dict):
         raise SweepError(f"{description} is not an object")
-    value = raw.get("md5_hash")
+    if "md5_hash" not in raw:
+        raise SweepError(f"{description} omits the explicit GCS MD5 field")
+    value = raw["md5_hash"]
+    if value is None:
+        if schema == MANIFEST_SCHEMA:
+            return
+        raise SweepError(f"{description} lacks the GCS MD5 required by v3")
     if not isinstance(value, str) or not value:
-        raise SweepError(f"{description} lacks a GCS MD5 binding")
+        raise SweepError(f"{description} has an invalid GCS MD5 binding")
     try:
         decoded = base64.b64decode(value, validate=True)
     except (ValueError, binascii.Error) as error:
@@ -479,7 +489,12 @@ def load_cohorts(
             f"manifest fingerprint mismatch: expected {expected_fingerprint}, "
             f"embedded {embedded}, computed {computed}"
         )
-    if body.get("schema") != MANIFEST_SCHEMA or body.get("epoch_slots") != 432_000:
+    schema = body.get("schema")
+    if (
+        not isinstance(schema, str)
+        or schema not in SUPPORTED_MANIFEST_SCHEMAS
+        or body.get("epoch_slots") != 432_000
+    ):
         raise SweepError("manifest schema or epoch slot count is incompatible")
     manifest_first = body.get("first_epoch")
     manifest_last = body.get("last_epoch")
@@ -519,13 +534,14 @@ def load_cohorts(
             or not raw["root_checkpoints"]
         ):
             raise SweepError(f"manifest cohort {index} is invalid or noncontiguous")
-        require_manifest_snapshot_md5(
-            raw.get("bootstrap"), f"manifest cohort {index} bootstrap"
+        validate_manifest_snapshot_md5(
+            raw.get("bootstrap"), f"manifest cohort {index} bootstrap", schema
         )
         for checkpoint_index, checkpoint in enumerate(raw["root_checkpoints"]):
-            require_manifest_snapshot_md5(
+            validate_manifest_snapshot_md5(
                 checkpoint,
                 f"manifest cohort {index} root checkpoint {checkpoint_index}",
+                schema,
             )
         cohorts.append(Cohort(start, end, runtime))
         expected_next = end + 1

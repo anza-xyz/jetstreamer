@@ -5579,7 +5579,8 @@ fn manifest_runtime_matches_cohort(
         && std::ptr::eq(selection.descriptor, &compatibility::SOLANA_V1_5_8_RUNTIME)
 }
 
-const COHORT_MANIFEST_SCHEMA: &str = "jetstreamer-gcs-snapshot-preflight-v3";
+const COHORT_MANIFEST_SCHEMA_V3: &str = "jetstreamer-gcs-snapshot-preflight-v3";
+const COHORT_MANIFEST_SCHEMA: &str = "jetstreamer-gcs-snapshot-preflight-v4";
 const COHORT_PUBLICATION_GATE: &str = "all-archives-validated-and-final-root-verified";
 const COHORT_MANIFEST_MAX_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_ROOT_CHECKPOINT_COHORT_EPOCHS: u64 = 4096;
@@ -5592,7 +5593,9 @@ struct CohortManifestSnapshot {
     crc32c: String,
     extension: String,
     generation: u64,
-    md5_hash: String,
+    // This is deliberately a required JSON value rather than Option<String>:
+    // v4 composite objects must say `null`, while an omitted field is invalid.
+    md5_hash: serde_json::Value,
     size: u64,
     slot: Slot,
     source: String,
@@ -5730,6 +5733,7 @@ fn validate_cohort_manifest_snapshot(
     item: &CohortManifestSnapshot,
     role: CohortManifestSnapshotRole,
     accepted_extensions: &[&str],
+    manifest_schema: &str,
 ) -> Result<(String, Hash), String> {
     if item.size == 0 || item.generation == 0 {
         return Err(format!(
@@ -5814,23 +5818,40 @@ fn validate_cohort_manifest_snapshot(
             item.versioned_uri
         )
     })?;
-    if decoded_crc.len() != 4 {
+    if decoded_crc.len() != 4 || BASE64_STANDARD.encode(&decoded_crc) != item.crc32c {
         return Err(format!(
-            "cohort manifest object {} CRC32C does not decode to four bytes",
+            "cohort manifest object {} CRC32C is not canonical base64 for four bytes",
             item.versioned_uri
         ));
     }
-    let decoded_md5 = BASE64_STANDARD.decode(&item.md5_hash).map_err(|error| {
-        format!(
-            "cohort manifest object {} has invalid MD5: {error}",
-            item.versioned_uri
-        )
-    })?;
-    if decoded_md5.len() != 16 || BASE64_STANDARD.encode(&decoded_md5) != item.md5_hash {
-        return Err(format!(
-            "cohort manifest object {} MD5 is not canonical base64 for sixteen bytes",
-            item.versioned_uri
-        ));
+    match &item.md5_hash {
+        serde_json::Value::Null if manifest_schema == COHORT_MANIFEST_SCHEMA => {}
+        serde_json::Value::Null => {
+            return Err(format!(
+                "cohort manifest object {} lacks the MD5 required by v3",
+                item.versioned_uri
+            ));
+        }
+        serde_json::Value::String(md5_hash) => {
+            let decoded_md5 = BASE64_STANDARD.decode(md5_hash).map_err(|error| {
+                format!(
+                    "cohort manifest object {} has invalid MD5: {error}",
+                    item.versioned_uri
+                )
+            })?;
+            if decoded_md5.len() != 16 || BASE64_STANDARD.encode(&decoded_md5) != *md5_hash {
+                return Err(format!(
+                    "cohort manifest object {} MD5 is not canonical base64 for sixteen bytes",
+                    item.versioned_uri
+                ));
+            }
+        }
+        _ => {
+            return Err(format!(
+                "cohort manifest object {} MD5 must be a canonical base64 string or explicit null",
+                item.versioned_uri
+            ));
+        }
     }
     Ok((filename, accounts_hash))
 }
@@ -5872,8 +5893,10 @@ fn root_checkpoint_cohort_plan_from_report(
     }
     let body: CohortManifestBody = serde_json::from_value(report.manifest)
         .map_err(|error| format!("invalid cohort manifest: {error}"))?;
-    if body.schema != COHORT_MANIFEST_SCHEMA
-        || body.bucket != DEFAULT_BUCKET
+    if !matches!(
+        body.schema.as_str(),
+        COHORT_MANIFEST_SCHEMA_V3 | COHORT_MANIFEST_SCHEMA
+    ) || body.bucket != DEFAULT_BUCKET
         || body.epoch_slots != 432_000
     {
         return Err(format!(
@@ -5888,6 +5911,7 @@ fn root_checkpoint_cohort_plan_from_report(
             "cohort manifest does not cover requested epochs {start_epoch}-{end_epoch}"
         ));
     }
+    let manifest_schema = body.schema.clone();
     let overlapping: Vec<_> = body
         .verification_cohorts
         .into_iter()
@@ -5942,6 +5966,7 @@ fn root_checkpoint_cohort_plan_from_report(
             allow_hourly: start_epoch == end_epoch,
         },
         selection.descriptor.bootstrap.archive_extensions,
+        &manifest_schema,
     )?;
     let bounds = normal_epoch_bootstrap_bounds(start_epoch)?;
     if !bounds.accepts(entry.bootstrap.slot, bootstrap_hash) {
@@ -5962,6 +5987,7 @@ fn root_checkpoint_cohort_plan_from_report(
             checkpoint,
             CohortManifestSnapshotRole::RootCheckpoint,
             selection.descriptor.bootstrap.archive_extensions,
+            &manifest_schema,
         )?;
         if checkpoint.slot <= previous_slot || checkpoint.slot > cohort_end {
             return Err(format!(
@@ -6134,7 +6160,7 @@ fn bind_cohort_snapshot_download(
         ));
     }
     let mut sha256 = Sha256::new();
-    let mut md5 = Md5::new();
+    let mut md5 = manifest.md5_hash.as_str().map(|_| Md5::new());
     let crc32c = Crc::<u32>::new(&CRC_32_ISCSI);
     let mut crc_digest = crc32c.digest();
     let mut buffer = [0u8; 128 * 1024];
@@ -6157,7 +6183,9 @@ fn bind_cohort_snapshot_download(
             ));
         }
         sha256.update(&buffer[..read]);
-        md5.update(&buffer[..read]);
+        if let Some(md5) = &mut md5 {
+            md5.update(&buffer[..read]);
+        }
         crc_digest.update(&buffer[..read]);
         offset += read as u64;
     }
@@ -6170,14 +6198,16 @@ fn bind_cohort_snapshot_download(
             actual_crc32c
         ));
     }
-    let actual_md5 = BASE64_STANDARD.encode(md5.finalize());
-    if actual_md5 != manifest.md5_hash {
-        return Err(format!(
-            "downloaded cohort bootstrap MD5 mismatch for {}: manifest {}, local {}",
-            path.display(),
-            manifest.md5_hash,
-            actual_md5
-        ));
+    if let (Some(md5), Some(expected_md5)) = (md5, manifest.md5_hash.as_str()) {
+        let actual_md5 = BASE64_STANDARD.encode(md5.finalize());
+        if actual_md5 != expected_md5 {
+            return Err(format!(
+                "downloaded cohort bootstrap MD5 mismatch for {}: manifest {}, local {}",
+                path.display(),
+                expected_md5,
+                actual_md5
+            ));
+        }
     }
     if jetstreamer_node::archive_checksum::archive_file_identity(&file).map_err(|error| {
         format!(
@@ -19557,6 +19587,64 @@ mod early_snapshot_tests {
     }
 
     #[test]
+    fn cohort_manifest_v4_accepts_only_explicit_null_for_composite_md5() {
+        let bytes = b"generation-pinned composite snapshot";
+        let (mut report, _) = cohort_manifest_report(bytes);
+        report["manifest"]["verification_cohorts"][0]["bootstrap"]["md5_hash"] =
+            serde_json::Value::Null;
+        let fingerprint = cohort_manifest_fingerprint(&report["manifest"]).unwrap();
+        report["manifest_fingerprint"] = serde_json::json!(fingerprint);
+        let selection = root_checkpoint_cohort_runtime(17, 19, true).unwrap();
+        let plan = root_checkpoint_cohort_plan_from_report(
+            report.clone(),
+            &fingerprint,
+            17,
+            19,
+            selection,
+        )
+        .unwrap();
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory
+            .path()
+            .join(snapshot_filename(&plan.bootstrap.uri).unwrap());
+        fs::write(&path, bytes).unwrap();
+        bind_cohort_snapshot_download(&path, &plan.bootstrap).unwrap();
+
+        report["manifest"]["verification_cohorts"][0]["bootstrap"]
+            .as_object_mut()
+            .unwrap()
+            .remove("md5_hash");
+        let fingerprint = cohort_manifest_fingerprint(&report["manifest"]).unwrap();
+        report["manifest_fingerprint"] = serde_json::json!(fingerprint);
+        let error =
+            root_checkpoint_cohort_plan_from_report(report, &fingerprint, 17, 19, selection)
+                .unwrap_err();
+        assert!(error.contains("missing field `md5_hash`"), "{error}");
+    }
+
+    #[test]
+    fn cohort_manifest_v3_remains_compatible_and_requires_md5() {
+        let bytes = b"v3 generation with GCS MD5";
+        let (mut report, _) = cohort_manifest_report(bytes);
+        report["manifest"]["schema"] = serde_json::json!(COHORT_MANIFEST_SCHEMA_V3);
+        let fingerprint = cohort_manifest_fingerprint(&report["manifest"]).unwrap();
+        report["manifest_fingerprint"] = serde_json::json!(fingerprint);
+        let selection = root_checkpoint_cohort_runtime(17, 19, true).unwrap();
+        root_checkpoint_cohort_plan_from_report(report.clone(), &fingerprint, 17, 19, selection)
+            .unwrap();
+
+        report["manifest"]["verification_cohorts"][0]["bootstrap"]["md5_hash"] =
+            serde_json::Value::Null;
+        let fingerprint = cohort_manifest_fingerprint(&report["manifest"]).unwrap();
+        report["manifest_fingerprint"] = serde_json::json!(fingerprint);
+        let error =
+            root_checkpoint_cohort_plan_from_report(report, &fingerprint, 17, 19, selection)
+                .unwrap_err();
+        assert!(error.contains("MD5 required by v3"), "{error}");
+    }
+
+    #[test]
     fn sealed_legacy_v156_manifest_admits_only_the_exact_v158_exceptions() {
         for epoch in [154, 157] {
             let selection = root_checkpoint_cohort_runtime(epoch, epoch, true).unwrap();
@@ -19971,6 +20059,7 @@ mod early_snapshot_tests {
             &item,
             CohortManifestSnapshotRole::Bootstrap { allow_hourly: true },
             &[".tar.bz2"],
+            COHORT_MANIFEST_SCHEMA,
         )
         .unwrap();
 
@@ -19980,7 +20069,13 @@ mod early_snapshot_tests {
             },
             CohortManifestSnapshotRole::RootCheckpoint,
         ] {
-            let error = validate_cohort_manifest_snapshot(&item, role, &[".tar.bz2"]).unwrap_err();
+            let error = validate_cohort_manifest_snapshot(
+                &item,
+                role,
+                &[".tar.bz2"],
+                COHORT_MANIFEST_SCHEMA,
+            )
+            .unwrap_err();
             assert!(error.contains("cannot use an hourly snapshot"), "{error}");
         }
 
@@ -19991,6 +20086,7 @@ mod early_snapshot_tests {
             &item,
             CohortManifestSnapshotRole::Bootstrap { allow_hourly: true },
             &[".tar.bz2"],
+            COHORT_MANIFEST_SCHEMA,
         )
         .unwrap_err();
         assert!(error.contains("after snapshot slot"), "{error}");
@@ -20002,6 +20098,7 @@ mod early_snapshot_tests {
             &item,
             CohortManifestSnapshotRole::Bootstrap { allow_hourly: true },
             &[".tar.bz2"],
+            COHORT_MANIFEST_SCHEMA,
         )
         .unwrap_err();
         assert!(error.contains("unsupported source mirror"), "{error}");
@@ -20013,6 +20110,7 @@ mod early_snapshot_tests {
             &item,
             CohortManifestSnapshotRole::Bootstrap { allow_hourly: true },
             &[".tar.bz2", ".tar.zst"],
+            COHORT_MANIFEST_SCHEMA,
         )
         .unwrap_err();
         assert!(error.contains("snapshot filename"), "{error}");
@@ -20024,6 +20122,7 @@ mod early_snapshot_tests {
             &item,
             CohortManifestSnapshotRole::Bootstrap { allow_hourly: true },
             &[".tar.bz2"],
+            COHORT_MANIFEST_SCHEMA,
         )
         .unwrap_err();
         assert!(error.contains("root snapshot"), "{error}");
@@ -20068,7 +20167,7 @@ mod early_snapshot_tests {
         binding.revalidate().unwrap();
 
         let mut wrong_md5 = plan.bootstrap.clone();
-        wrong_md5.md5_hash = BASE64_STANDARD.encode([0u8; 16]);
+        wrong_md5.md5_hash = serde_json::json!(BASE64_STANDARD.encode([0u8; 16]));
         let error = bind_cohort_snapshot_download(&path, &wrong_md5).unwrap_err();
         assert!(error.contains("MD5 mismatch"), "{error}");
 

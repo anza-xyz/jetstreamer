@@ -99,6 +99,11 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
   releases exposed raw-API `crc32c`, `md5Hash`, string `size`, and `id` fields. Accept both shapes,
   fail on conflicting aliases, and require either the exact raw object ID or exact versioned
   `storage_url`; authentication success without this complete identity/hash proof is insufficient.
+  GCS composite objects legitimately omit MD5. Represent them only with the current manifest
+  schema's explicit `md5_hash: null`, and still require the exact generation, canonical versioned
+  URI, nonzero size, and canonical CRC32C. Recompute CRC32C after download and retain the local
+  SHA-256/inode binding. Never accept a missing MD5 field, fake a digest, or relax a legacy schema
+  that requires MD5.
 - Failed-replay scratch cleanup is authorized by default for this workflow. After confirming the failure and capturing the evidence needed to diagnose or reproduce it, stop the service and retry path, verify that no live process or staged relaunch references the exact scratch path, and delete that failed run's scratch immediately instead of allowing failures to accumulate. Preserve diagnostic output, partial archives, replay state, logs, checkpoints, manifests, receipts, and any snapshot still needed for diagnosis, lineage, restart, or a staged epoch outside the scratch tree. Never apply this cleanup rule to a controlled stop that can genuinely resume in place. If a relaunch demonstrably starts from the bootstrap in a new isolated runtime generation with no resume cursor, verify the new worker's exact generation and reclaim older unreferenced generations promptly; preserving them does not make that replay resumable.
 - Diagnose an archive `SectionTooLarge` against both the record-count and data-arena limits for the
   named phase. The error's historical `bytes` field is also used for a count overflow, so a value

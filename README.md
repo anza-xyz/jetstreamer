@@ -750,8 +750,12 @@ Root snapshots are the only trust anchors for historical verification. The read-
 preflight groups an epoch without a root checkpoint with the first later epoch that has one, as
 long as the runtime descriptor does not change. Hourly snapshots may shorten bootstrap work for
 an independent single-epoch cohort, but they never satisfy a checkpoint or anchor a root-gap
-cohort. The preflight manifest records the root object's generation, CRC32C, size, slot, and
-accounts hash. It also records the full cohort range and terminal root checkpoints.
+cohort. The preflight manifest records the root object's generation, CRC32C, size, slot, accounts
+hash, and GCS MD5 when one exists. GCS composite objects intentionally lack MD5 metadata; schema
+v4 represents that case with an explicit `md5_hash: null` while still requiring and fingerprinting
+the immutable generation, canonical versioned URI, size, and CRC32C. Omitting the field is invalid,
+and schema v3 remains compatible while continuing to require MD5. The manifest also records the
+full cohort range and terminal root checkpoints.
 
 Epochs 17 through 19 are one such cohort. They start from root slot 7,343,776 and reach root
 checkpoints in epoch 19. First save the complete preflight report in an owner-controlled file and
@@ -768,8 +772,8 @@ JETSTREAMER_ALLOW_CANDIDATE_RUNTIME=1 \
 ```
 
 This mode keeps one historical worker and one root-only verifier alive across every epoch
-boundary. It downloads the manifest's immutable GCS generation, verifies the recorded size and
-CRC32C, and holds the measured inode and SHA-256 digest through historical worker startup. The
+boundary. It downloads the manifest's immutable GCS generation, verifies the recorded size,
+CRC32C, and MD5 when supplied, and holds the measured inode and SHA-256 digest through historical worker startup. The
 worker makes its own digest-checked private copy before decoding. The bootstrap normally comes
 from a root object. A singleton cohort may instead use the manifest's exact hourly transport
 object; its anchor, snapshot slot, path, and generation remain fingerprint-bound. Multi-epoch

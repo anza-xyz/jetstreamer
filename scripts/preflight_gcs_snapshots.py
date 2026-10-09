@@ -54,7 +54,7 @@ MAX_SUPPORTED_EPOCH = 301
 MAX_TARGET_COHORT_EPOCHS = 4
 EPOCH_SLOTS = 432_000
 UINT64_MAX = (1 << 64) - 1
-SCHEMA = "jetstreamer-gcs-snapshot-preflight-v3"
+SCHEMA = "jetstreamer-gcs-snapshot-preflight-v4"
 EPOCH_12_BOOTSTRAP_SLOT = 5_183_736
 EPOCH_12_BOOTSTRAP_ACCOUNTS_HASH = (
     "BUqwiSm2GgH9ByKrBDF6epXHYK9RRh3vyZDKtUqtMXfR"
@@ -771,10 +771,9 @@ def build_epoch_plans(
 
 
 def _manifest_object(item: SnapshotObject) -> Dict[str, Any]:
-    if item.md5_hash is None:
-        raise PreflightError(
-            f"selected snapshot {item.versioned_uri} has no GCS MD5 digest"
-        )
+    # GCS composite objects intentionally have no MD5 metadata.  Keep the key
+    # explicit so v4 distinguishes a composite object from an incomplete
+    # manifest; generation, size, and CRC32C remain mandatory and fingerprinted.
     return {
         "accounts_hash": item.accounts_hash,
         "anchor_slot": item.anchor_slot,

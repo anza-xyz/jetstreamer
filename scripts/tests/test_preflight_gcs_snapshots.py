@@ -1044,15 +1044,20 @@ class SelectionTests(unittest.TestCase):
 
 
 class ReportingAndAcquisitionTests(unittest.TestCase):
-    def test_manifest_rejects_selected_snapshot_without_md5(self) -> None:
+    def test_v4_manifest_explicitly_represents_composite_snapshot_without_md5(self) -> None:
         root_raw, hourly_raw = complete_inventory()
-        root_raw[0]["metadata"].pop("md5Hash")
+        hourly_raw[0]["metadata"].pop("md5Hash")
         plans = preflight.build_epoch_plans(
             preflight.parse_inventory_json(json.dumps(root_raw), "root"),
             preflight.parse_inventory_json(json.dumps(hourly_raw), "hourly"),
         )
-        with self.assertRaisesRegex(preflight.PreflightError, "has no GCS MD5 digest"):
-            preflight.build_manifest(plans)
+        manifest = preflight.build_manifest(plans)
+
+        self.assertEqual(manifest["schema"], "jetstreamer-gcs-snapshot-preflight-v4")
+        self.assertIn("md5_hash", manifest["verification_cohorts"][0]["bootstrap"])
+        self.assertIsNone(
+            manifest["verification_cohorts"][0]["bootstrap"]["md5_hash"]
+        )
 
     def test_manifest_fingerprint_is_order_independent_and_binds_metadata(self) -> None:
         root_raw, hourly_raw = complete_inventory()

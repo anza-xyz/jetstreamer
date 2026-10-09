@@ -6,8 +6,9 @@
 # a tagged crate whose GitHub release failed still gets its release, etc.
 #
 # Emits `published=true|false` (whether THIS run performed the crates.io
-# publish) to GITHUB_OUTPUT so the workflow can attest provenance for exactly
-# the crates packaged in this run.
+# publish) and, when true, `crate-path` (the packaged .crate) to GITHUB_OUTPUT
+# so the workflow can attest provenance for exactly the crates packaged in this
+# run.
 #
 # Usage: release-crate.sh <crate-name>
 # Env:   CARGO_REGISTRY_TOKEN (crates.io), GITHUB_TOKEN (tag push + gh release)
@@ -15,8 +16,8 @@ set -euo pipefail
 
 crate="$1"
 
-version=$(cargo metadata --format-version 1 --no-deps |
-  jq -r ".packages[] | select(.name == \"${crate}\") | .version")
+metadata=$(cargo metadata --format-version 1 --no-deps)
+version=$(jq -r ".packages[] | select(.name == \"${crate}\") | .version" <<<"${metadata}")
 if [ -z "${version}" ] || [ "${version}" = "null" ]; then
   echo "!! could not resolve version for ${crate}" >&2
   exit 1
@@ -64,3 +65,16 @@ else
 fi
 
 echo "published=${published_this_run}" >> "${GITHUB_OUTPUT:-/dev/null}"
+
+if [ "${published_this_run}" = "true" ]; then
+  # Where cargo leaves the .crate varies by version (recent cargo publish uses
+  # target/package/tmp-crate/), so locate it rather than assume a path.
+  target_dir=$(jq -r ".target_directory" <<<"${metadata}")
+  crate_path=$(find "${target_dir}/package" -name "${crate}-${version}.crate" -type f | head -n 1)
+  if [ -z "${crate_path}" ]; then
+    echo "!! could not find packaged ${crate}-${version}.crate under ${target_dir}/package" >&2
+    exit 1
+  fi
+  echo "==> ${tag}: packaged crate at ${crate_path}"
+  echo "crate-path=${crate_path}" >> "${GITHUB_OUTPUT:-/dev/null}"
+fi

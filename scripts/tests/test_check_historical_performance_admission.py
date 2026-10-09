@@ -30,6 +30,45 @@ class HistoricalPerformanceAdmissionTest(unittest.TestCase):
         with self.assertRaises(admission.AdmissionError):
             admission.check_absent_unit(unit())
 
+    def test_expected_unit_gate_binds_exact_selected_state(self) -> None:
+        failed = unit(
+            active_state="failed",
+            sub_state="failed",
+            result="timeout",
+            invocation_id="failed-invocation",
+            exec_main_status=9,
+        )
+        admission.check_expected_unit(
+            failed,
+            {
+                "unit": "producer.service",
+                "active_state": "failed",
+                "sub_state": "failed",
+                "result": "timeout",
+                "main_pid": 0,
+                "invocation_id": "failed-invocation",
+                "restarts": 0,
+                "exec_main_status": 9,
+            },
+        )
+        with self.assertRaisesRegex(admission.AdmissionError, "result"):
+            admission.check_expected_unit(
+                failed,
+                {"unit": "producer.service", "result": "success"},
+            )
+        with self.assertRaisesRegex(admission.AdmissionError, "unsupported fields"):
+            admission.check_expected_unit(
+                failed,
+                {"unit": "producer.service", "unexpected": True},
+            )
+        with self.assertRaisesRegex(admission.AdmissionError, "no state bindings"):
+            admission.check_expected_unit(failed, {"unit": "producer.service"})
+        with self.assertRaisesRegex(admission.AdmissionError, "invalid unit binding"):
+            admission.check_expected_unit(
+                failed,
+                {"unit": "different.service", "result": "timeout"},
+            )
+
     @patch("scripts.check_historical_performance_admission.subprocess.run")
     def test_samples_unit_identity(self, run: object) -> None:
         run.return_value = SimpleNamespace(

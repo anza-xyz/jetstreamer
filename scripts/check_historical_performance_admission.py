@@ -22,6 +22,16 @@ MANIFEST_SCHEMA = "jetstreamer-historical-performance-admission-v1"
 RECEIPT_SCHEMA = "jetstreamer-historical-performance-admission-receipt-v1"
 UNIT_NAME = re.compile(r"^[A-Za-z0-9_.@-]+\.(?:service|timer)$")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
+UNIT_STATE_FIELDS = {
+    "load_state",
+    "active_state",
+    "sub_state",
+    "result",
+    "main_pid",
+    "invocation_id",
+    "restarts",
+    "exec_main_status",
+}
 
 
 class AdmissionError(RuntimeError):
@@ -104,6 +114,31 @@ def check_terminal_unit(state: UnitState) -> None:
 def check_absent_unit(state: UnitState) -> None:
     if state.load_state != "not-found" or state.active_state != "inactive":
         raise AdmissionError(f"unit must remain absent before admission: {state}")
+
+
+def check_expected_unit(state: UnitState, spec: object) -> None:
+    if not isinstance(spec, dict):
+        raise AdmissionError("expected unit specification must be an object")
+    unit = spec.get("unit")
+    if not isinstance(unit, str) or unit != state.unit:
+        raise AdmissionError("expected unit specification has an invalid unit binding")
+    unknown = set(spec) - ({"unit"} | UNIT_STATE_FIELDS)
+    if unknown:
+        raise AdmissionError(
+            f"expected unit specification has unsupported fields: {sorted(unknown)}"
+        )
+    if not any(field in spec for field in UNIT_STATE_FIELDS):
+        raise AdmissionError("expected unit specification has no state bindings")
+    for field in UNIT_STATE_FIELDS:
+        if field not in spec:
+            continue
+        expected = spec[field]
+        actual = getattr(state, field)
+        if actual != expected:
+            raise AdmissionError(
+                f"required unit state mismatch for {state.unit} field {field}: "
+                f"expected {expected!r}, got {actual!r}"
+            )
 
 
 def parse_mode(value: object, context: str) -> int:
@@ -465,6 +500,19 @@ def run_admission(manifest: dict[str, Any]) -> dict[str, Any]:
     absent_units = [sample_unit(item) for item in require_list(manifest, "absent_units")]
     for state in absent_units:
         check_absent_unit(state)
+    expected_unit_specs = manifest.get("expected_units", [])
+    if not isinstance(expected_unit_specs, list):
+        raise AdmissionError("manifest expected_units must be a list")
+    expected_units: list[UnitState] = []
+    for spec in expected_unit_specs:
+        if not isinstance(spec, dict):
+            raise AdmissionError("expected unit specification must be an object")
+        unit = spec.get("unit")
+        if not isinstance(unit, str):
+            raise AdmissionError("expected unit specification unit must be a string")
+        state = sample_unit(unit)
+        check_expected_unit(state, spec)
+        expected_units.append(state)
 
     absent_paths: list[str] = []
     for value in require_list(manifest, "absent_paths"):
@@ -546,6 +594,7 @@ def run_admission(manifest: dict[str, Any]) -> dict[str, Any]:
     return {
         "terminal_units": [asdict(item) for item in terminal_units],
         "absent_units": [asdict(item) for item in absent_units],
+        "expected_units": [asdict(item) for item in expected_units],
         "absent_paths": absent_paths,
         "files": files,
         "json_receipts": receipts,

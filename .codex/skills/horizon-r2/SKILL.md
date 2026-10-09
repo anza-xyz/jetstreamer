@@ -135,6 +135,12 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
   use a longer bounded run when measured scratch reuse and restart risk justify it. Shorten or split
   the run whenever runtime, root, resource-admission, or live-claim boundaries require it. Prefer
   this when duplicated bootstrap/scratch is the admission bottleneck.
+  Never use a continuous root-cohort plan to cross or erase a focused-qualification-only
+  compatibility gap. A diagnostic route that requires `--qualification-end-slot` remains
+  independently checkpoint-gated and may explicitly forbid carried runtime state; qualify and
+  promote every required checkpoint through its reviewed focused path before the ordinary runtime
+  registry or production preflight may coalesce those epochs. A retained manifest produced by an
+  older or broader temporary registry is not authority to bypass the current checked-in boundary.
   When the sealed manifest's exact generation-pinned bootstrap is already retained locally, prefer
   reusing that cache to downloading a duplicate only through a reviewed cohort input that preserves
   the manifest's trust boundary. Require an absolute path with the exact canonical snapshot filename,

@@ -178,8 +178,9 @@ Each vendored runtime directory contains the upstream `runtime/` crate and an
 | `v1_4_19` | `9466ad3c1f11fb90df6015d6c910f0e89747a553` | source-status-selected, bounded checkpoint-qualified diagnostic envelope, epochs 131-133 |
 | `v1_4_25` | `893cc7647248a3536fb6e6d0b5e51c71446b862d` | unqualified checkpoint-gated diagnostic envelope, epochs 134-147 |
 | `v1_5_5` | `10e12d14e105bc2a5cd9c216ffe943a28d2aabf1` | bounded checkpoint-qualified candidate for epochs 148-149 |
-| `v1_5_19` | `936ff7424e1306b0df07dabcd6863bf7896d2cb5` | registered but unassigned comparison candidate |
 | `v1_5_6` | `01e4d0a1e9917701d1a148e1043b0ccf545c27f1` | bounded checkpoint-qualified candidate from epoch 150; later cohorts remain checkpoint-gated |
+| `v1_5_8` | `460c643f8e549d22c09a9cddc3b0f5be9c7b2204` | source-status-selected, checkpoint-gated candidate for epoch 154 and the bounded epoch-157 transition |
+| `v1_5_19` | `936ff7424e1306b0df07dabcd6863bf7896d2cb5` | registered but unassigned comparison candidate |
 | `v1_6_15` | `5c2dab8055e8162386fcac313b6547f223fd386c` | unqualified checkpoint-gated diagnostic envelope, epochs 174-200 |
 | `v1_6_16` | `86c26f843276581509c3434acc2efbf4202c44e0` | exact-source-equivalent diagnostic admission through epoch 213 only through the explicit focused-qualification planner; ordinary replay remains checkpoint-gated to epoch 201 until each later checkpoint qualifies |
 | `v1_6_17` | `8f3ce5fc578da93405ccedf22150b9fae2bd83c7` | independently restarted, checkpoint-gated diagnostic envelope for epochs 214-215 |

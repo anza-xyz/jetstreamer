@@ -1115,6 +1115,76 @@ class ReportingAndAcquisitionTests(unittest.TestCase):
             MD5_HASH,
         )
 
+    def test_source_manifest_ignores_stale_route_outside_selected_subrange(self) -> None:
+        source_report, _ = source_manifest_report(17, 20)
+        manifest = source_report["manifest"]
+        cohort = next(
+            item
+            for item in manifest["verification_cohorts"]
+            if item["first_epoch"] == 17
+        )
+        epoch = next(item for item in manifest["epochs"] if item["epoch"] == 17)
+        cohort["runtime"] = "solana-stale-outside-selected-range"
+        epoch["runtime"] = cohort["runtime"]
+        source_fingerprint = preflight.manifest_fingerprint(manifest)
+        source_report["manifest_fingerprint"] = source_fingerprint
+
+        with tempfile.TemporaryDirectory() as directory:
+            source_path = Path(directory) / "source.json"
+            source_path.write_text(json.dumps(source_report), encoding="utf-8")
+            root, hourly, provenance = preflight.load_sealed_manifest_objects(
+                source_path, source_fingerprint, 18, 20
+            )
+
+        plans = preflight.build_epoch_plans(root, hourly, 18, 20, 3)
+        self.assertEqual((plans[0].epoch, plans[-1].epoch), (18, 20))
+        self.assertEqual(provenance["selected_first_epoch"], 18)
+        self.assertEqual(provenance["selected_last_epoch"], 20)
+
+    def test_source_manifest_rejects_stale_route_inside_selected_subrange(self) -> None:
+        source_report, _ = source_manifest_report(17, 20)
+        manifest = source_report["manifest"]
+        cohort = next(
+            item
+            for item in manifest["verification_cohorts"]
+            if item["first_epoch"] == 18
+        )
+        epoch = next(item for item in manifest["epochs"] if item["epoch"] == 18)
+        cohort["runtime"] = "solana-stale-inside-selected-range"
+        epoch["runtime"] = cohort["runtime"]
+        source_fingerprint = preflight.manifest_fingerprint(manifest)
+        source_report["manifest_fingerprint"] = source_fingerprint
+
+        with tempfile.TemporaryDirectory() as directory:
+            source_path = Path(directory) / "source.json"
+            source_path.write_text(json.dumps(source_report), encoding="utf-8")
+            with self.assertRaisesRegex(
+                preflight.PreflightError,
+                "disagree with selected epoch 18 route",
+            ):
+                preflight.load_sealed_manifest_objects(
+                    source_path, source_fingerprint, 18, 20
+                )
+
+    def test_source_manifest_still_binds_unselected_epoch_to_source_cohort(self) -> None:
+        source_report, _ = source_manifest_report(17, 20)
+        manifest = source_report["manifest"]
+        epoch = next(item for item in manifest["epochs"] if item["epoch"] == 17)
+        epoch["runtime"] = "source-record-disagrees-with-cohort"
+        source_fingerprint = preflight.manifest_fingerprint(manifest)
+        source_report["manifest_fingerprint"] = source_fingerprint
+
+        with tempfile.TemporaryDirectory() as directory:
+            source_path = Path(directory) / "source.json"
+            source_path.write_text(json.dumps(source_report), encoding="utf-8")
+            with self.assertRaisesRegex(
+                preflight.PreflightError,
+                "disagrees with its source cohort",
+            ):
+                preflight.load_sealed_manifest_objects(
+                    source_path, source_fingerprint, 18, 20
+                )
+
     def test_sealed_manifest_requires_independent_matching_fingerprint(self) -> None:
         source_report, source_fingerprint = source_manifest_report(17, 18)
         with tempfile.TemporaryDirectory() as directory:

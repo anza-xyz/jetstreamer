@@ -18,7 +18,11 @@ The two fixture options consume the unmodified output of ``gcloud storage ls
 gcloud execution.  A previously sealed manifest report may instead be supplied
 with its independently recorded fingerprint.  That mode strictly validates the
 old report, extracts only its generation-bound snapshot identities, and replans
-them under the current schema without contacting GCS.
+them under the current schema without contacting GCS.  The complete source
+report must remain structurally and cryptographically valid, while current
+runtime-route agreement is required only for the requested subrange.  An
+unrelated compatibility correction outside that subrange therefore cannot
+invalidate otherwise immutable snapshot evidence.
 
 Run ``scripts/preflight_gcs_snapshots.py`` for live inventory, or run
 ``scripts/preflight_gcs_snapshots.py --inventory-root-json ROOT.json
@@ -766,7 +770,15 @@ def load_sealed_manifest_objects(
         objects_by_name[item.object_name] = item
 
     cohort_by_epoch: Dict[
-        int, Tuple[int, int, SnapshotObject, Tuple[SnapshotObject, ...]]
+        int,
+        Tuple[
+            int,
+            int,
+            SnapshotObject,
+            Tuple[SnapshotObject, ...],
+            str,
+            Tuple[str, ...],
+        ],
     ] = {}
     next_epoch = manifest_first
     for index, raw_cohort in enumerate(raw_cohorts):
@@ -787,12 +799,28 @@ def load_sealed_manifest_objects(
             raise PreflightError(f"{context}: cohorts must exactly and contiguously cover range")
         runtime = raw_cohort.get("runtime")
         extensions = raw_cohort.get("accepted_extensions")
+        if (
+            not isinstance(runtime, str)
+            or not runtime
+            or not isinstance(extensions, list)
+            or not extensions
+            or any(
+                not isinstance(extension, str)
+                or extension not in SNAPSHOT_ARCHIVE_EXTENSIONS
+                for extension in extensions
+            )
+            or len(set(extensions)) != len(extensions)
+        ):
+            raise PreflightError(f"{context}: runtime or extensions are malformed")
+        source_extensions = tuple(extensions)
         for epoch in range(cohort_first, cohort_last + 1):
-            expected_runtime, expected_extensions = runtime_route(epoch)
-            if runtime != expected_runtime or extensions != list(expected_extensions):
-                raise PreflightError(
-                    f"{context}: runtime or extensions disagree with epoch {epoch} route"
-                )
+            if first_epoch <= epoch <= last_epoch:
+                expected_runtime, expected_extensions = runtime_route(epoch)
+                if runtime != expected_runtime or source_extensions != expected_extensions:
+                    raise PreflightError(
+                        f"{context}: runtime or extensions disagree with selected "
+                        f"epoch {epoch} route"
+                    )
         if raw_cohort.get("publication_gate") != (
             "all-archives-validated-and-final-root-verified"
         ):
@@ -831,7 +859,14 @@ def load_sealed_manifest_objects(
         final_start, _ = epoch_slot_range(cohort_last)
         if checkpoints[-1].slot < final_start:
             raise PreflightError(f"{context}: terminal checkpoint is before final epoch")
-        cohort_tuple = (cohort_first, cohort_last, bootstrap, tuple(checkpoints))
+        cohort_tuple = (
+            cohort_first,
+            cohort_last,
+            bootstrap,
+            tuple(checkpoints),
+            runtime,
+            source_extensions,
+        )
         for epoch in range(cohort_first, cohort_last + 1):
             cohort_by_epoch[epoch] = cohort_tuple
         next_epoch = cohort_last + 1
@@ -852,15 +887,33 @@ def load_sealed_manifest_objects(
         ):
             raise PreflightError(f"{context}: epoch identity is invalid or duplicated")
         seen_epochs.add(epoch)
-        cohort_first, cohort_last, bootstrap, checkpoints = cohort_by_epoch[epoch]
-        expected_runtime, expected_extensions = runtime_route(epoch)
+        (
+            cohort_first,
+            cohort_last,
+            bootstrap,
+            checkpoints,
+            source_runtime,
+            source_extensions,
+        ) = cohort_by_epoch[epoch]
         if (
-            raw_epoch.get("runtime") != expected_runtime
-            or raw_epoch.get("accepted_extensions") != list(expected_extensions)
+            raw_epoch.get("runtime") != source_runtime
+            or raw_epoch.get("accepted_extensions") != list(source_extensions)
             or raw_epoch.get("verification_cohort")
             != {"first_epoch": cohort_first, "last_epoch": cohort_last}
         ):
-            raise PreflightError(f"{context}: epoch route or cohort binding is invalid")
+            raise PreflightError(
+                f"{context}: epoch route disagrees with its source cohort or its "
+                "cohort binding is invalid"
+            )
+        if first_epoch <= epoch <= last_epoch:
+            expected_runtime, expected_extensions = runtime_route(epoch)
+            if (
+                source_runtime != expected_runtime
+                or source_extensions != expected_extensions
+            ):
+                raise PreflightError(
+                    f"{context}: source route disagrees with selected epoch {epoch} route"
+                )
         expected_window = {
             "start": epoch_slot_range(cohort_first - 1)[0],
             "end_inclusive": epoch_slot_range(cohort_first - 1)[1],
@@ -917,6 +970,8 @@ def load_sealed_manifest_objects(
         "schema": schema,
         "first_epoch": manifest_first,
         "last_epoch": manifest_last,
+        "selected_first_epoch": first_epoch,
+        "selected_last_epoch": last_epoch,
     }
     return root_objects, hourly_objects, provenance
 

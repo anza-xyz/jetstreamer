@@ -55,10 +55,10 @@ class QualificationValidatorLauncherTests(unittest.TestCase):
             "runtime": "solana-v1.6.16",
             "worker_sha256": "1" * 64,
             "private_root": self.root,
-            "conflict_slot": 89856107,
-            "conflict_account": "account",
-            "conflict_first": "7,first,848104700000",
-            "conflict_second": "8,second,848104695000",
+            "conflict_slot": MODULE.EPOCH_208_CONFLICT_SLOT,
+            "conflict_account": MODULE.EPOCH_208_CONFLICT_ACCOUNT,
+            "conflict_first": MODULE.EPOCH_208_CONFLICT_FIRST,
+            "conflict_second": MODULE.EPOCH_208_CONFLICT_SECOND,
         }
         values.update(changes)
         return MODULE.ValidationRequest(**values)
@@ -72,7 +72,10 @@ class QualificationValidatorLauncherTests(unittest.TestCase):
         self.assertEqual(payload["schema"], "test-receipt")
         arguments = payload["arguments"]
         self.assertIn("--expected-conflict-slot=89856107", arguments)
-        self.assertIn("--expected-conflict-account=account", arguments)
+        self.assertIn(
+            f"--expected-conflict-account={MODULE.EPOCH_208_CONFLICT_ACCOUNT}",
+            arguments,
+        )
         self.assertTrue(request.receipt.is_file())
         self.assertEqual(stat.S_IMODE(request.receipt.stat().st_mode), 0o600)
         self.assertEqual(list(self.receipts.glob("*.tmp")), [])
@@ -91,6 +94,10 @@ class QualificationValidatorLauncherTests(unittest.TestCase):
                     conflict_second=None,
                 )
             )
+
+    def test_epoch_208_rejects_noncanonical_conflict_gate(self) -> None:
+        with self.assertRaisesRegex(MODULE.ValidationLaunchError, "not canonical"):
+            self.run_request(self.request(conflict_account="wrong-account"))
 
     def test_rejects_validator_digest_mismatch(self) -> None:
         with self.assertRaisesRegex(MODULE.ValidationLaunchError, "SHA-256 mismatch"):

@@ -18,6 +18,22 @@ from typing import Sequence
 
 
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
+EPOCH_208_CONFLICT_SLOT = 89856107
+EPOCH_208_CONFLICT_ACCOUNT = "FJwFtQFEyKEA4M6ZTrosTRPJphEpDA9ckUeMq9pRJdd4"
+EPOCH_208_CONFLICT_FIRST = (
+    "7,2jFfi2JubVwgEZd11pQZkX3kBHr9M4CjH5jbeULzJ4JijrfNwS8amU2ipd1Y3BZEf"
+    "gWYQ143eVseceSn46TkPL1y,848104700000"
+)
+EPOCH_208_CONFLICT_SECOND = (
+    "8,3oKU6ZkBjX9SP6njWLoiSChvP87y73Y26GBuj6TL8X62nhZ1FABjDfYT3AZc4eS54f"
+    "ppWgFzyPCrSGHKFxDbuyov,848104695000"
+)
+EPOCH_208_CONFLICT = (
+    EPOCH_208_CONFLICT_SLOT,
+    EPOCH_208_CONFLICT_ACCOUNT,
+    EPOCH_208_CONFLICT_FIRST,
+    EPOCH_208_CONFLICT_SECOND,
+)
 
 
 class ValidationLaunchError(RuntimeError):
@@ -124,6 +140,8 @@ def validator_arguments(request: ValidationRequest) -> list[str]:
     )
     if request.epoch == 208 and not all(value is not None for value in conflict):
         raise ValidationLaunchError("epoch 208 requires the canonical conflict expectations")
+    if request.epoch == 208 and conflict != EPOCH_208_CONFLICT:
+        raise ValidationLaunchError("epoch 208 conflict expectations are not canonical")
     if any(value is not None for value in conflict):
         if not all(value is not None for value in conflict):
             raise ValidationLaunchError("conflict expectations must be supplied atomically")

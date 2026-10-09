@@ -65,6 +65,10 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
 
 - Use the repository's sealed historical replay/controller path and automatic slot-range runtime selection. Do not invent a compatibility override.
 - Run generation and long-lived verification/upload watchers in persistent systemd units so loss of the interactive session cannot kill them. Use `Restart=on-failure` with a bounded retry delay only when every invocation gets isolated diagnostic output and scratch, or a proven launcher preserves the failed invocation's artifacts before opening the next output. A replay normally creates or truncates its `.jet` at startup, so never let an automatic retry reuse the same diagnostic archive path. Use a fail-closed non-restarting unit and relaunch manually after evidence capture when attempt isolation is unavailable. Do not use `Restart=always`, because successful completion must remain terminal. Respect unrelated jobs and configured RAM/disk reserves.
+- A controller with a long polling interval must wake that wait when SIGTERM/SIGINT requests
+  shutdown; setting a flag while leaving a restartable sleep in place can consume the entire systemd
+  stop timeout. Before sealing a new controller generation, verify a no-worker instance reaches
+  clean terminal success promptly when stopped.
 - When a guard pauses adaptive controllers around a serialized public import, authenticate and fsync
   the exact live systemd controller commands plus the importer's invocation ID before stopping the
   first controller. After a guard restart, recover that state, finish stopping authenticated live

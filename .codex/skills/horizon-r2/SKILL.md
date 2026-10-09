@@ -129,9 +129,9 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
   configured per-worker disk admission budget and measured filesystem growth to leave the reserve
   intact before launching another cohort. If a manual canary set would violate that gate, stop the
   newest units and preserve their private run directories for later resumption.
-- Consecutive epochs using the same immutable runtime can be replayed as a bounded contiguous
-  cohort so later epochs carry the live runtime state and AccountsDb scratch instead of restoring
-  another bootstrap. A contiguous cohort is one ordered replay generation, not a set of independent
+- Consecutive epochs using the same immutable runtime should normally be replayed as a bounded
+  contiguous cohort so later epochs carry the live runtime state and AccountsDb scratch instead of
+  restoring another bootstrap. A contiguous cohort is one ordered replay generation, not a set of independent
   epoch jobs: select the complete range before launch, use one persistent producer/worker and one
   scratch path, process every member in ascending order, emit a separate archive for each epoch,
   and keep the same scratch/AccountsDb state live across member boundaries. Sharing a pathname is
@@ -139,8 +139,8 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
   epoch as a fresh replay, or rebuild AccountsDb at a member boundary. Never clean, reinitialize,
   or independently restore that scratch between cohort members. Budget bootstrap and scratch once
   for the whole cohort, plus measured incremental growth, rather than charging every epoch as a
-  separate full restore. When several
-  still-missing adjacent epochs share the same immutable runtime and checkpoint chain, normally
+  separate full restore. When several still-missing adjacent epochs share the same immutable
+  runtime and checkpoint chain, normally
   target three to four epochs per continuous run before admitting more single-epoch workers, and
   use a longer bounded run when measured scratch reuse and restart risk justify it. Shorten or split
   the run whenever runtime, root, resource-admission, or live-claim boundaries require it. Prefer

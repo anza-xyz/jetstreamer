@@ -385,7 +385,12 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
   A persistent `PathExists=` watcher remains true after its trigger file appears. If its service
   later skips on a negative receipt condition, systemd can retrigger it in a tight loop. Make the
   successful launch path stop or disable that watcher, or otherwise give it a proven one-shot
-  lifecycle; verify it is inactive after the launch receipt is durable.
+  lifecycle; verify it is inactive after the launch receipt is durable. A path unit normally has
+  `SubState=waiting` before its event but reports `SubState=running` while its triggered service is
+  active, so an invocation-bound launcher may accept either authenticated active state; do not
+  mistake `running` for a foreign watcher. Bind its invocation ID, put a conservative
+  `StartLimitIntervalSec`/`StartLimitBurst` on the triggered service so a failed persistent event
+  cannot spin, and prove the actual triggered lifecycle before arming production.
 - Preflight the host's VMA ceiling for mmap-backed historical account stores as part of admission.
   Compare `vm.max_map_count` with live worker map counts and the snapshot/store-file baseline, and
   leave credible growth headroom for the full replay. Some legacy Solana AppendVec code logs an
@@ -422,6 +427,14 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
   terminal checks for explicitly bound verifier/consumer units that remain loaded.
 - For adaptive ranges, start the controller with `--r2-receipt-directory "$HOME/.jetstreamer-private/r2-receipts" --r2-bucket BUCKET`. The controller accepts receipts from that exact bucket only for bytes already bound by its root-owned local completion attestation; R2 can replace local storage, but can never establish initial completion.
 - Start the current Horizon verification plugin as soon as each local archive is available. R2 work may run concurrently with replay of other epochs. An archive is eligible for upload only after its full and current-plugin receipts bind the same archive SHA-256. It is not eligible for local retirement until both adjacent-boundary receipts bind that digest as well. Preserve the canonical lowercase coreutils sidecar format: `<64 hex>  epoch-N.jet\n`.
+- When a verifier starts on the first archive of a long continuous cohort, size its oneshot
+  `TimeoutStartSec` for the remaining replay plus final validation, not just one archive scan. While
+  waiting for later sidecars, dispatch the plugin verifier through
+  `scripts/watch_horizon_plugin_progressive.sh` (or an equivalently sealed receipt-aware watcher):
+  a matching exact receipt should skip the already-verified archive without another whole-file
+  hash on every poll, while each newly dispatched verifier must still hash before and after its
+  plugin scan. Preserve the receipt-producing verifier's script hash in the upload gate; the outer
+  watcher does not replace that evidence identity.
 - Report single-job latency and fleet completion cadence separately. Historical slot density varies,
   so compare transaction and account-update throughput as well as slots per second. For live memory,
   CPU, disk, or VMA experiments, use incremental pre/post windows after a settling interval rather

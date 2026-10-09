@@ -19,7 +19,8 @@ from typing import Any, Sequence
 INTENT_SCHEMA = "jetstreamer-adaptive-replay-reserve-stop-intent-v1"
 COMPLETION_SCHEMA = "jetstreamer-adaptive-replay-reserve-stop-completion-v1"
 CONTROLLER_UNIT = re.compile(
-    r"^jetstreamer-(?:epoch|epochs)[A-Za-z0-9@_.-]*controller[A-Za-z0-9@_.-]*\.service$"
+    r"^(?:jetstreamer-(?:epoch|epochs)[A-Za-z0-9@_.-]*controller[A-Za-z0-9@_.-]*"
+    r"|horizon-controller-[A-Za-z0-9@_.-]+)\.service$"
 )
 PRODUCER_UNIT = re.compile(r"^jetstreamer-root-sweep-[A-Za-z0-9@_.-]+\.service$")
 TIMER_UNIT = re.compile(r"^jetstreamer-adaptive-reserve-[A-Za-z0-9@_.-]+\.timer$")

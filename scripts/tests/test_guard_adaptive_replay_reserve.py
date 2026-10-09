@@ -14,6 +14,7 @@ from scripts import guard_adaptive_replay_reserve as guard
 
 
 CONTROLLER = "jetstreamer-epochs182-200-controller-v119-r2-retry.service"
+HORIZON_CONTROLLER = "horizon-controller-201-cached-store8-t16-v4.service"
 PRODUCER = "jetstreamer-root-sweep-historical-182-200-v117-r2-e186-186-lane-m-21.service"
 TIMER = "jetstreamer-adaptive-reserve-epoch186-v1.timer"
 CONTROLLER_INVOCATION = "a" * 32
@@ -61,6 +62,16 @@ def arguments(root: Path) -> list[str]:
 class AdaptiveReplayReserveGuardTest(unittest.TestCase):
     def run_as_root(self):
         return patch.object(guard, "require_root", return_value=None)
+
+    def test_horizon_controller_name_is_accepted(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            os.chmod(root, 0o700)
+            args = arguments(root)
+            args[0] = f"--controller-unit={HORIZON_CONTROLLER}"
+            with self.run_as_root():
+                namespace = guard.parse_args(args)
+            self.assertEqual(namespace.controller_unit, HORIZON_CONTROLLER)
 
     def test_healthy_sample_does_not_stop(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -34,6 +34,7 @@ import signal
 import stat
 import subprocess
 import sys
+import threading
 import time
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -3110,6 +3111,7 @@ class Controller:
         )
         self.node = args.deploy_dir / "jetstreamer-node"
         self.stopping = False
+        self.poll_wakeup = threading.Event()
         binding_paths = {
             args.public_dir,
             args.public_private_root,
@@ -4254,7 +4256,7 @@ class Controller:
                 )
                 return
             self.schedule()
-            time.sleep(self.args.poll_seconds)
+            self.poll_wakeup.wait(self.args.poll_seconds)
 
 
 def build_argument_parser() -> argparse.ArgumentParser:
@@ -4733,6 +4735,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         def stop(_signum: int, _frame: Any) -> None:
             controller.stopping = True
+            controller.poll_wakeup.set()
 
         signal.signal(signal.SIGTERM, stop)
         signal.signal(signal.SIGINT, stop)

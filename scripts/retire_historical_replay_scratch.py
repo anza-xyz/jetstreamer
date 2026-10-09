@@ -228,38 +228,63 @@ def read_validation_receipt(
     return raw
 
 
+def _read_proc_file(path: Path) -> bytes | None:
+    try:
+        return path.read_bytes()
+    except (FileNotFoundError, ProcessLookupError):
+        return None
+    except OSError as error:
+        raise RetirementError(f"cannot inspect process evidence {path}: {error}") from error
+
+
+def _read_proc_link(path: Path) -> str | None:
+    try:
+        return os.readlink(path).removesuffix(" (deleted)")
+    except (FileNotFoundError, ProcessLookupError):
+        return None
+    except OSError as error:
+        raise RetirementError(f"cannot inspect process link {path}: {error}") from error
+
+
 def process_references(scratch: Path, proc_root: Path = Path("/proc")) -> list[str]:
     needle = os.fsencode(str(scratch))
     references: list[str] = []
-    for process in proc_root.iterdir():
+    try:
+        processes = list(proc_root.iterdir())
+    except OSError as error:
+        raise RetirementError(f"cannot enumerate processes: {error}") from error
+    for process in processes:
         if not process.name.isdigit() or int(process.name) == os.getpid():
             continue
         pid = process.name
-        try:
-            command = (process / "cmdline").read_bytes()
-            if encoded_path_reference(command, needle):
-                references.append(f"pid {pid} command line")
-            maps = (process / "maps").read_bytes()
-            if encoded_path_reference(maps, needle):
-                references.append(f"pid {pid} memory maps")
-        except (FileNotFoundError, PermissionError, ProcessLookupError):
-            pass
+        command = _read_proc_file(process / "cmdline")
+        if command is not None and encoded_path_reference(command, needle):
+            references.append(f"pid {pid} command line")
+        maps = _read_proc_file(process / "maps")
+        if maps is not None and encoded_path_reference(maps, needle):
+            references.append(f"pid {pid} memory maps")
         for name in ("cwd", "root", "exe"):
+            target = _read_proc_link(process / name)
+            if target is None:
+                continue
             try:
-                target = os.readlink(process / name).removesuffix(" (deleted)")
                 Path(target).relative_to(scratch)
-            except (FileNotFoundError, PermissionError, ProcessLookupError, OSError, ValueError):
+            except ValueError:
                 continue
             references.append(f"pid {pid} {name}")
         try:
             descriptors = list((process / "fd").iterdir())
-        except (FileNotFoundError, PermissionError, ProcessLookupError):
+        except (FileNotFoundError, ProcessLookupError):
             descriptors = []
+        except OSError as error:
+            raise RetirementError(f"cannot inspect pid {pid} descriptors: {error}") from error
         for descriptor in descriptors:
+            target = _read_proc_link(descriptor)
+            if target is None:
+                continue
             try:
-                target = os.readlink(descriptor).removesuffix(" (deleted)")
                 Path(target).relative_to(scratch)
-            except (FileNotFoundError, PermissionError, ProcessLookupError, OSError, ValueError):
+            except ValueError:
                 continue
             references.append(f"pid {pid} fd {descriptor.name}")
     return references

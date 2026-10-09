@@ -317,26 +317,57 @@ def memory_available_bytes(path: Path = Path("/proc/meminfo")) -> int:
     return available
 
 
+def _read_proc_file(path: Path) -> bytes | None:
+    try:
+        return path.read_bytes()
+    except (FileNotFoundError, ProcessLookupError):
+        return None
+    except OSError as error:
+        raise AdmissionError(f"cannot inspect process evidence {path}: {error}") from error
+
+
+def _read_proc_link(path: Path) -> str | None:
+    try:
+        return os.readlink(path).removesuffix(" (deleted)")
+    except (FileNotFoundError, ProcessLookupError):
+        return None
+    except OSError as error:
+        raise AdmissionError(f"cannot inspect process link {path}: {error}") from error
+
+
+def encoded_path_reference(content: bytes, needle: bytes) -> bool:
+    offset = 0
+    path_boundaries = b"/\0\n\r\t '\";|&()<>[]{}"
+    while True:
+        index = content.find(needle, offset)
+        if index < 0:
+            return False
+        end = index + len(needle)
+        if end == len(content) or content[end] in path_boundaries:
+            return True
+        offset = index + 1
+
+
 def process_references(roots: Sequence[Path], proc_root: Path = Path("/proc")) -> list[str]:
     needles = tuple(os.fsencode(str(root)) for root in roots)
     references: list[str] = []
-    for process in proc_root.iterdir():
+    try:
+        processes = list(proc_root.iterdir())
+    except OSError as error:
+        raise AdmissionError(f"cannot enumerate processes: {error}") from error
+    for process in processes:
         if not process.name.isdigit() or int(process.name) == os.getpid():
             continue
-        try:
-            command = (process / "cmdline").read_bytes()
-            maps = (process / "maps").read_bytes()
-        except (FileNotFoundError, PermissionError, ProcessLookupError):
-            command = b""
-            maps = b""
+        command = _read_proc_file(process / "cmdline") or b""
+        maps = _read_proc_file(process / "maps") or b""
         for root, needle in zip(roots, needles, strict=True):
-            if needle in command or needle in maps:
+            if encoded_path_reference(command, needle) or encoded_path_reference(maps, needle):
                 references.append(f"pid {process.name} references {root}")
         for directory_name in ("cwd", "root", "exe"):
-            try:
-                target = Path(os.readlink(process / directory_name).removesuffix(" (deleted)"))
-            except (FileNotFoundError, PermissionError, ProcessLookupError, OSError):
+            target_value = _read_proc_link(process / directory_name)
+            if target_value is None:
                 continue
+            target = Path(target_value)
             for root in roots:
                 try:
                     target.relative_to(root)
@@ -345,13 +376,17 @@ def process_references(roots: Sequence[Path], proc_root: Path = Path("/proc")) -
                 references.append(f"pid {process.name} {directory_name} references {root}")
         try:
             descriptors = list((process / "fd").iterdir())
-        except (FileNotFoundError, PermissionError, ProcessLookupError):
+        except (FileNotFoundError, ProcessLookupError):
             descriptors = []
+        except OSError as error:
+            raise AdmissionError(
+                f"cannot inspect pid {process.name} descriptors: {error}"
+            ) from error
         for descriptor in descriptors:
-            try:
-                target = Path(os.readlink(descriptor).removesuffix(" (deleted)"))
-            except (FileNotFoundError, PermissionError, ProcessLookupError, OSError):
+            target_value = _read_proc_link(descriptor)
+            if target_value is None:
                 continue
+            target = Path(target_value)
             for root in roots:
                 try:
                     target.relative_to(root)

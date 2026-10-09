@@ -84,6 +84,18 @@ class HistoricalReplayScratchRetirementTest(unittest.TestCase):
             (process / "maps").write_bytes(os.fsencode(str(sibling / "store")) + b"\n")
             self.assertEqual(retire.process_references(scratch, root), [])
 
+    def test_process_reference_scan_fails_closed_on_unreadable_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            scratch = root / "scratch"
+            scratch.mkdir()
+            process = root / "123"
+            process.mkdir()
+            (process / "cmdline").write_bytes(b"worker\0")
+            (process / "cmdline").chmod(0)
+            with self.assertRaisesRegex(retire.RetirementError, "process evidence"):
+                retire.process_references(scratch, root)
+
     def test_delete_exact_tree_removes_only_target(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -172,6 +172,18 @@ class HistoricalPerformanceAdmissionTest(unittest.TestCase):
                 [f"pid 123 fd 7 references {root}"],
             )
 
+    def test_process_reference_scan_fails_closed_on_unreadable_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            proc = Path(directory).resolve()
+            root = proc / "candidate"
+            root.mkdir()
+            process = proc / "123"
+            process.mkdir()
+            (process / "cmdline").write_bytes(b"worker\0")
+            (process / "cmdline").chmod(0)
+            with self.assertRaisesRegex(admission.AdmissionError, "process evidence"):
+                admission.process_references([root], proc)
+
     def test_memory_available_is_parsed_in_bytes_and_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory).resolve() / "meminfo"

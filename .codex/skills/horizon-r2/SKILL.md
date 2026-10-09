@@ -397,6 +397,15 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
   relevant suites pass, the change is committed and pushed to every required SSH remote, and a new
   immutable worker digest is bound in the launch manifest. Never silently substitute a nearby epoch
   or weaken the worker guard.
+- Treat a source-obscured confirmed block that omits PoH tick entries as a compatibility gap whenever
+  its finalized parent relationship crosses one or more skipped slots. Repeating the visible block's
+  final blockhash across multiple tick/block boundaries changes RecentBlockhashes, SlotHashes, and the
+  frozen Bank hash even when the visible final blockhash and every transaction are canonical. Require
+  trusted intermediate PoH boundary hashes or an independently qualified exact-state recovery; do not
+  invent, interpolate, or repeat them. Finalized `getBlocks`/`getBlock` evidence and a successful
+  canonical vote whose tip hash disagrees with the reconstructed SlotHashes value can prove this
+  divergence, but RPC block metadata does not recover the missing intermediate PoH hash and therefore
+  cannot by itself authorize a runtime-route promotion or publication.
 
 ## Deliver
 

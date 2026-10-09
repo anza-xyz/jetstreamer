@@ -263,6 +263,18 @@ class BoundGcsSnapshotRestoreTest(unittest.TestCase):
             restore.require_free_space(Path("/filesystem"), 100)
         self.assertEqual(restore.require_free_space(Path("/filesystem"), 99), 99)
 
+    @patch("scripts.restore_bound_gcs_snapshot.available_bytes", return_value=109)
+    def test_download_capacity_reserves_object_size_before_transfer(
+        self, _available: object
+    ) -> None:
+        with self.assertRaisesRegex(restore.RestoreError, "below restore floor"):
+            restore.require_download_capacity(Path("/filesystem"), 100, 10)
+        _available.return_value = 110
+        self.assertEqual(
+            restore.require_download_capacity(Path("/filesystem"), 100, 10),
+            (110, 110),
+        )
+
     def test_publish_is_noclobber_and_durable(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

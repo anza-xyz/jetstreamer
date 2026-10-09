@@ -136,6 +136,16 @@ def require_free_space(path: Path, minimum_free_bytes: int) -> int:
     return free_bytes
 
 
+def require_download_capacity(
+    path: Path, minimum_free_bytes: int, expected_size: int
+) -> tuple[int, int]:
+    required_before_download = minimum_free_bytes + expected_size
+    return (
+        require_free_space(path, required_before_download),
+        required_before_download,
+    )
+
+
 def sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as source:
@@ -451,7 +461,16 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(sys.argv[1:] if argv is None else argv)
     destination: Path = args.destination
-    free_bytes_before = require_free_space(args.filesystem, args.minimum_free_bytes)
+    destination_preexisting = destination.exists() or destination.is_symlink()
+    if destination_preexisting:
+        free_bytes_before = require_free_space(
+            args.filesystem, args.minimum_free_bytes
+        )
+        required_bytes_before = args.minimum_free_bytes
+    else:
+        free_bytes_before, required_bytes_before = require_download_capacity(
+            args.filesystem, args.minimum_free_bytes, args.expected_size
+        )
     remote_object = describe_remote_snapshot(
         args.gcloud_bin,
         args.versioned_uri,
@@ -461,7 +480,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         args.expected_crc32c,
         args.expected_md5,
     )
-    if destination.exists() or destination.is_symlink():
+    if destination_preexisting:
         details = validate_file(
             args.gcloud_bin,
             destination,
@@ -525,6 +544,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "script_sha256": sha256_file(Path(__file__).resolve(strict=True)),
         "filesystem": str(args.filesystem),
         "minimum_free_bytes": args.minimum_free_bytes,
+        "required_bytes_before_download": required_bytes_before,
         "available_bytes_before": free_bytes_before,
         "available_bytes_after": free_bytes_after,
         "remote_mutations": False,

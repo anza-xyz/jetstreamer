@@ -112,6 +112,10 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
   URI, nonzero size, and canonical CRC32C. Recompute CRC32C after download and retain the local
   SHA-256/inode binding. Never accept a missing MD5 field, fake a digest, or relax a legacy schema
   that requires MD5.
+  Before transferring an absent snapshot, require actual free bytes to cover the complete expected
+  object size above the protected filesystem floor. Recheck the protected floor after hashing the
+  temporary download and before no-clobber publication. If either gate fails, discard only the
+  temporary download and leave the destination and receipt absent.
 - If live GCS inventory is temporarily unavailable, regroup only from a previously sealed v2, v3,
   or v4 preflight report whose independently recorded fingerprint is supplied explicitly. Use
   `scripts/preflight_gcs_snapshots.py --source-manifest-report=PATH

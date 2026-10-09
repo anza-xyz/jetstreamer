@@ -213,6 +213,33 @@ def require_path_watcher(sample: dict[str, str | int]) -> None:
         raise LaunchError(f"path watcher is not active and waiting: {sample}")
 
 
+def path_watcher_is_inactive(sample: dict[str, str | int]) -> bool:
+    return (
+        sample["LoadState"] == "loaded"
+        and sample["ActiveState"] == "inactive"
+        and sample["SubState"] == "dead"
+    )
+
+
+def stop_path_watcher(
+    systemctl: Path, unit: str, timeout_seconds: float
+) -> dict[str, str | int]:
+    sample = systemctl_show(systemctl, unit)
+    if not path_watcher_is_inactive(sample):
+        try:
+            subprocess.run([str(systemctl), "stop", unit], check=True)
+        except (OSError, subprocess.CalledProcessError) as exc:
+            raise LaunchError(f"cannot stop path watcher {unit}: {exc}") from exc
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        sample = systemctl_show(systemctl, unit)
+        if path_watcher_is_inactive(sample):
+            return sample
+        if time.monotonic() >= deadline:
+            raise LaunchError(f"path watcher did not stop: {sample}")
+        time.sleep(0.1)
+
+
 def verifier_is_started(sample: dict[str, str | int]) -> bool:
     if sample["LoadState"] != "loaded" or sample["NRestarts"] != 0:
         return False
@@ -355,6 +382,9 @@ def main() -> int:
             or completion.get("archive_pair") != pair
         ):
             raise LaunchError("existing completion receipt does not match this launch")
+        stop_path_watcher(
+            args.systemctl, args.path_unit, args.start_timeout_seconds
+        )
         print(json.dumps(completion, sort_keys=True))
         return 0
 
@@ -440,6 +470,7 @@ def main() -> int:
         "plugin_after": plugin_after,
     }
     write_json_no_clobber(args.completion_receipt, completion)
+    stop_path_watcher(args.systemctl, args.path_unit, args.start_timeout_seconds)
     print(json.dumps(completion, sort_keys=True))
     return 0
 

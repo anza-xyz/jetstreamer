@@ -58,6 +58,11 @@ class LaunchHorizonProgressiveVerifiersTests(unittest.TestCase):
                         state[unit]["InvocationID"] = str(index + 1) * 32
                     state_path.write_text(json.dumps(state))
                     raise SystemExit(0)
+                if sys.argv[1] == "stop":
+                    state[sys.argv[2]]["ActiveState"] = "inactive"
+                    state[sys.argv[2]]["SubState"] = "dead"
+                    state_path.write_text(json.dumps(state))
+                    raise SystemExit(0)
                 raise SystemExit(2)
                 """
             ),
@@ -117,6 +122,9 @@ class LaunchHorizonProgressiveVerifiersTests(unittest.TestCase):
         completion = json.loads(self.completion.read_text())
         self.assertEqual(completion["full_after"]["ActiveState"], "activating")
         self.assertEqual(completion["plugin_after"]["ActiveState"], "activating")
+        state = json.loads(self.state.read_text())
+        self.assertEqual(state["watch.path"]["ActiveState"], "inactive")
+        self.assertEqual(state["watch.path"]["SubState"], "dead")
         self.assertEqual(stat.S_IMODE(self.intent.stat().st_mode), 0o600)
         self.assertEqual(stat.S_IMODE(self.completion.stat().st_mode), 0o600)
 

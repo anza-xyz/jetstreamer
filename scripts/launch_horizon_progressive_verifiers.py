@@ -225,7 +225,7 @@ def require_path_watcher(sample: dict[str, str | int]) -> None:
 
 def path_watcher_is_inactive(sample: dict[str, str | int]) -> bool:
     return (
-        sample["LoadState"] == "loaded"
+        sample["LoadState"] in {"loaded", "not-found"}
         and sample["ActiveState"] == "inactive"
         and sample["SubState"] == "dead"
     )

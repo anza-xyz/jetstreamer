@@ -59,8 +59,10 @@ class LaunchHorizonProgressiveVerifiersTests(unittest.TestCase):
                     state_path.write_text(json.dumps(state))
                     raise SystemExit(0)
                 if sys.argv[1] == "stop":
+                    state[sys.argv[2]]["LoadState"] = "not-found"
                     state[sys.argv[2]]["ActiveState"] = "inactive"
                     state[sys.argv[2]]["SubState"] = "dead"
+                    state[sys.argv[2]]["InvocationID"] = ""
                     state_path.write_text(json.dumps(state))
                     raise SystemExit(0)
                 raise SystemExit(2)

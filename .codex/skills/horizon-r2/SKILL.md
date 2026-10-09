@@ -246,6 +246,16 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
   overshoot the reserve before their next samples. Record the exact budget formula and live claims
   in the launch receipt; reduce the protected amount only from newer measured evidence, never from
   idle CPU or current scratch size alone.
+  Do not leave an automatic admission trigger armed when the resulting controller can launch a
+  producer before its invocation-bound reserve guard can be created and proved. If controller or
+  producer invocation IDs are not knowable until launch, install the reviewed admission and
+  controller generation dormant, launch it under observation, bind the guard immediately to the
+  exact zero-restart invocations, and require the first sandboxed guard fire to pass before leaving
+  the replay unattended. When replacing an admission generation, explicitly clear or disable every
+  older timer, dependency, and `OnSuccess=` trigger that could still launch stale receipt,
+  capacity, binary, or guard assumptions. Preserve a durable receipt showing that old and new
+  launchers were inactive during the handoff; never infer that installing a replacement unit
+  neutralized the previous trigger.
   Do not treat an unsandboxed manual guard invocation or an `active (waiting)` timer as proof that
   the installed guard works. Before considering a producer protected, observe the timer's first
   real service invocation complete with exit status zero under the deployed sandbox, and preserve

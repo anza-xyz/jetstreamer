@@ -83,7 +83,12 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
   read-only lookup of one exact generation-bound snapshot through the lane's effective
   `CLOUDSDK_CONFIG`, account, and project. Never print an access token or infer success from a
   lookup made through the interactive default configuration. Refresh idle lanes before they are
-  admitted so a controller does not consume an attempt on stale credentials.
+  admitted so a controller does not consume an attempt on stale credentials. Never replace or
+  mutate the isolated configuration of a live producer: first authenticate its exact systemd
+  invocation and lane claim, and update only lanes with no live process or staged launch. Stage a
+  coherent permission-preserving configuration copy beside the idle lane, validate it with the
+  exact generation-bound lookup, and install it atomically instead of copying credential databases
+  piecemeal into the effective directory.
 - When launching into a fresh isolated diagnostic-output directory, ensure it contains the verified
   same-cluster genesis expected by the loader. A cached snapshot does not imply the genesis is
   present. Preseed only from digest-bound retained evidence and verify the copied digest and

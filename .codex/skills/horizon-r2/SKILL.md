@@ -433,6 +433,11 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
   independently preserved visible blockhash before mutating the Bank. Record the recovery digest in the
   launch evidence, and keep the new worker/runtime route unqualified until the normal exact checkpoint
   and plugin gates pass.
+  If the sealed collector output is beneath a root-private evidence tree that the unprivileged worker
+  cannot traverse, do not relax that tree's permissions or grant the worker a broad DAC capability.
+  Revalidate the non-sensitive boundary bytes and collector receipt, then publish them no-clobber into
+  a separately fsynced, root-owned immutable bundle with a readable file mode and non-writable directory;
+  bind the worker to that deployed path and digest while leaving the original private evidence untouched.
 
 ## Deliver
 

@@ -140,7 +140,9 @@ evidence for a later reviewed registry change, not permission to publish by itse
    leaves `848104695000`. Pass these as the four atomic `--expected-conflict-*` options to
    `jetstreamer-qualification-verify`. Require its digest-bound JSON evidence to show both
    successful, correctly attributed writes and increasing write versions; a standalone RPC record
-   or unit test is not qualification evidence.
+   or unit test is not qualification evidence. A launcher or wrapper must compare all four supplied
+   values with these exact canonical literals before starting the full reread; checking only that
+   the options are present together still permits a consistently mistyped gate.
    If this qualification later fails in the reconstructed confirmed-block interval, compare the
    same input under the conflict-wave worker and the last qualified true-singleton worker before
    changing batching. An identical slot, signature, expected status, and actual status disproves

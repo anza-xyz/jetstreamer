@@ -24,6 +24,7 @@ PROGRESS = re.compile(
 )
 PROGRESS_SLOT = re.compile(r"\bprogress slot ([0-9]+)/")
 RECEIPT_SCHEMA = "jetstreamer-historical-performance-canary-v2"
+TARGET_STOP_INTENT_SCHEMA = "jetstreamer-historical-performance-target-stop-v1"
 APPENDVEC_FILE = re.compile(r"^(?P<slot>[0-9]+)\.(?P<store_id>[0-9]+)$")
 
 
@@ -377,7 +378,12 @@ def runner_exit_code(target_reached: bool, child_return_code: int) -> int:
     return normalized_exit_code(child_return_code)
 
 
-def run_canary(target_slot: int, receipt: Path, command: Sequence[str]) -> int:
+def run_canary(
+    target_slot: int,
+    receipt: Path,
+    command: Sequence[str],
+    target_stop_intent: Path | None = None,
+) -> int:
     if target_slot < 1:
         raise ValueError("target slot must be positive")
     if not command:
@@ -387,8 +393,19 @@ def run_canary(target_slot: int, receipt: Path, command: Sequence[str]) -> int:
         raise ValueError("canary executable must be an absolute regular file")
     if not os.access(executable, os.X_OK):
         raise ValueError("canary executable is not executable")
+    if not receipt.is_absolute():
+        raise ValueError("canary receipt path must be absolute")
+    if target_stop_intent is not None:
+        if not target_stop_intent.is_absolute():
+            raise ValueError("target-stop intent path must be absolute")
+        if target_stop_intent == receipt:
+            raise ValueError("target-stop intent and canary receipt must be distinct")
     if receipt.exists():
         raise FileExistsError(f"refusing to overwrite receipt: {receipt}")
+    if target_stop_intent is not None and target_stop_intent.exists():
+        raise FileExistsError(
+            f"refusing to overwrite target-stop intent: {target_stop_intent}"
+        )
 
     cgroup = current_cgroup_path()
     cgroup_before = cgroup_snapshot(cgroup)
@@ -450,6 +467,24 @@ def run_canary(target_slot: int, receipt: Path, command: Sequence[str]) -> int:
                             scratch_snapshot_error = str(error)
                         finally:
                             os.killpg(process.pid, signal.SIGCONT)
+                    if target_stop_intent is not None:
+                        write_json_noclobber(
+                            target_stop_intent,
+                            {
+                                "schema": TARGET_STOP_INTENT_SCHEMA,
+                                "systemd_invocation_id": systemd_invocation_id,
+                                "target_slot": target_slot,
+                                "observed_stop_slot": observed_stop_slot,
+                                "child_pid": process.pid,
+                                "controlled_stop_signal": signal.SIGINT,
+                                "scratch_snapshot_captured": (
+                                    replay_scratch is None
+                                    or scratch_snapshot is not None
+                                ),
+                                "external_signal": external_signal,
+                                "written_unix_seconds": time.time(),
+                            },
+                        )
                     process.send_signal(signal.SIGINT)
         return_code = process.wait()
     finally:
@@ -543,6 +578,14 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--target-slot", type=int, required=True)
     parser.add_argument("--receipt", type=Path, required=True)
+    parser.add_argument(
+        "--target-stop-intent",
+        type=Path,
+        help=(
+            "durable pre-SIGINT handoff consumed by the safety guard while the "
+            "wrapper drains"
+        ),
+    )
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
     if args.command and args.command[0] == "--":
@@ -555,7 +598,12 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(sys.argv[1:] if argv is None else argv)
     try:
-        return run_canary(args.target_slot, args.receipt, args.command)
+        return run_canary(
+            args.target_slot,
+            args.receipt,
+            args.command,
+            args.target_stop_intent,
+        )
     except (OSError, ValueError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 2

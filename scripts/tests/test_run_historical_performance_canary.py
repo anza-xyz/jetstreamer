@@ -132,6 +132,51 @@ class HistoricalPerformanceCanaryTest(unittest.TestCase):
         self.assertEqual(canary.runner_exit_code(False, 1), 1)
         self.assertEqual(canary.runner_exit_code(True, 2), 2)
 
+    def test_writes_durable_target_stop_intent_before_sigint(self) -> None:
+        child = textwrap.dedent(
+            """
+            from pathlib import Path
+            import signal
+            import sys
+            import time
+
+            intent = Path(sys.argv[1])
+            signal.signal(
+                signal.SIGINT,
+                lambda *_: sys.exit(0 if intent.is_file() else 2),
+            )
+            print("progress slot 101/200 txs=14 accounts=30", flush=True)
+            while True:
+                time.sleep(0.05)
+            """
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            receipt = root / "receipt.json"
+            intent = root / "target-stop.json"
+            with patch.dict(os.environ, {"INVOCATION_ID": "a" * 32}):
+                result = canary.run_canary(
+                    100,
+                    receipt,
+                    [sys.executable, "-c", child, str(intent)],
+                    intent,
+                )
+
+            payload = json.loads(intent.read_text())
+            final_receipt = json.loads(receipt.read_text())
+            self.assertEqual(result, 0)
+            self.assertEqual(payload["schema"], canary.TARGET_STOP_INTENT_SCHEMA)
+            self.assertEqual(payload["systemd_invocation_id"], "a" * 32)
+            self.assertEqual(payload["observed_stop_slot"], 101)
+            self.assertEqual(payload["controlled_stop_signal"], signal.SIGINT)
+            self.assertTrue(payload["scratch_snapshot_captured"])
+            self.assertIsNone(payload["external_signal"])
+            self.assertLessEqual(
+                payload["written_unix_seconds"],
+                final_receipt["completed_unix_seconds"],
+            )
+            self.assertEqual(stat.S_IMODE(intent.stat().st_mode), 0o600)
+
     def test_refuses_non_owner_only_receipt_directory(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             os.chmod(directory, 0o755)

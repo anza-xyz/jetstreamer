@@ -237,8 +237,14 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
   run past its bound. If the runner copies an immutable worker into scratch, make the safety guard
   recognize the actual bound executable path as well as the source basename. Require exactly one
   identifiable worker with readable maps in every active or activating lane and trip closed on
-  zero, multiple, or unreadable workers; test the guard against the copied path in a nested fake
-  cgroup before sealing it.
+  zero, multiple, or unreadable workers. The sole zero-worker exception is bounded post-target
+  drainage: before signaling the child, the pinned runner must fsync a no-clobber intent binding
+  the exact systemd invocation, target and observed slots, child PID, captured scratch metrics,
+  and absence of an external signal. The guard may accept that exact intent for a short sealed
+  timeout while the wrapper writes its final receipt; it must reject an absent, stale, malformed,
+  wrong-owner, or wrong-invocation intent and must never extend the exception to multiple workers
+  or a pre-target stop. Test the guard against the copied path and this handoff race in a nested
+  fake cgroup before sealing it.
   A pinned legacy worker may acknowledge the runner's post-target SIGINT and then exit 1 while its
   ready-entry channel closes. Normalize that exact outcome only after the runner has independently
   observed the bound, retain the actual child return code and stop signal in its durable receipt,

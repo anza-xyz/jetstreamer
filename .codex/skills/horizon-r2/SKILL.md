@@ -371,7 +371,9 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
   descriptors immediately before deletion. Fsync a no-clobber deletion intent first, unlink only
   the one cache file, fsync its parent directory, preserve scan results and any retained matches,
   then fsync a completion receipt. An intent-only interruption must be safely resumable and must
-  reject a replacement file at the same path. This is local scratch reclamation only and never
+  reject a replacement file at the same path. Any permission-denied `/proc` command, map, link, or
+  descriptor inspection is a failed gate, not evidence that the process has no reference. This is
+  local scratch reclamation only and never
   authorizes an R2 mutation. A garbage-collected transient download unit may be proven by the exact
   clean terminal state and invocation embedded in its root-owned cache receipt; still require live
   terminal checks for explicitly bound verifier/consumer units that remain loaded.

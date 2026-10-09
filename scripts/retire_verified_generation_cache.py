@@ -341,24 +341,40 @@ def process_references(cache_path: Path, proc_root: Path = Path("/proc")) -> lis
             maps = (process / "maps").read_bytes()
             if encoded_path_reference(maps, needle):
                 references.append(f"pid {pid} memory maps")
-        except (FileNotFoundError, PermissionError, ProcessLookupError):
+        except (FileNotFoundError, ProcessLookupError):
             pass
+        except PermissionError as exc:
+            raise RetirementError(f"cannot inspect pid {pid} command/maps: {exc}") from exc
         for name in ("cwd", "root", "exe"):
             try:
                 target = Path(os.readlink(process / name).removesuffix(" (deleted)"))
-            except (FileNotFoundError, PermissionError, ProcessLookupError, OSError):
+            except (FileNotFoundError, ProcessLookupError):
                 continue
+            except PermissionError as exc:
+                raise RetirementError(f"cannot inspect pid {pid} {name}: {exc}") from exc
+            except OSError as exc:
+                raise RetirementError(f"cannot inspect pid {pid} {name}: {exc}") from exc
             if target == cache_path:
                 references.append(f"pid {pid} {name}")
         try:
             descriptors = list((process / "fd").iterdir())
-        except (FileNotFoundError, PermissionError, ProcessLookupError):
+        except (FileNotFoundError, ProcessLookupError):
             descriptors = []
+        except PermissionError as exc:
+            raise RetirementError(f"cannot inspect pid {pid} descriptors: {exc}") from exc
         for descriptor in descriptors:
             try:
                 target = Path(os.readlink(descriptor).removesuffix(" (deleted)"))
-            except (FileNotFoundError, PermissionError, ProcessLookupError, OSError):
+            except (FileNotFoundError, ProcessLookupError):
                 continue
+            except PermissionError as exc:
+                raise RetirementError(
+                    f"cannot inspect pid {pid} fd {descriptor.name}: {exc}"
+                ) from exc
+            except OSError as exc:
+                raise RetirementError(
+                    f"cannot inspect pid {pid} fd {descriptor.name}: {exc}"
+                ) from exc
             if target == cache_path:
                 references.append(f"pid {pid} fd {descriptor.name}")
     return references

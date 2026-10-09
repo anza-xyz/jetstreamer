@@ -202,6 +202,14 @@ class RetireVerifiedGenerationCacheTests(unittest.TestCase):
         with self.assertRaisesRegex(MODULE.RetirementError, "cannot inspect process table"):
             MODULE.process_references(self.cache, self.root / "missing-proc")
 
+    def test_process_reference_scan_fails_closed_on_permission_denied(self):
+        process = self.proc / "123"
+        process.mkdir()
+        (process / "cmdline").write_bytes(b"worker\0")
+        (process / "cmdline").chmod(0)
+        with self.assertRaisesRegex(MODULE.RetirementError, "cannot inspect pid 123"):
+            MODULE.process_references(self.cache, self.proc)
+
     def test_retirement_is_idempotent(self):
         first = self.retire()
         self.assertEqual(first["status"], "deleted")

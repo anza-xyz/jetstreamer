@@ -4,6 +4,12 @@
 [![Docs.rs](https://docs.rs/jetstreamer/badge.svg)](https://docs.rs/jetstreamer)
 [![CI](https://github.com/anza-xyz/jetstreamer/actions/workflows/rust.yaml/badge.svg)](https://github.com/anza-xyz/jetstreamer/actions/workflows/rust.yaml)
 
+## 🐻‍❄️ Deprecation notice
+
+Anza will no longer be maintaining Jetstreamer. Development will continue with
+[Vaultic](https://github.com/vaultic-win/jetstreamer).
+For more information, see [vaultic.win](https://vaultic.win).
+
 ## Overview
 
 Jetstreamer is a high-throughput Solana backfilling and research toolkit designed to stream

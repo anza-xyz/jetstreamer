@@ -425,6 +425,14 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
   pinned runtime's header and bincode layout. Require the recovered entry/tick chain to reproduce the
   visible canonical final blockhash and the missing intermediate boundary before changing a runtime
   route; the ordinary checkpoint, plugin, boundary, and publication gates still apply independently.
+  Treat the resulting boundary set as a sealed runtime input, not as ambient diagnostic state. Bind an
+  absolute regular-file path and exact lowercase SHA-256 in the immutable qualification launch; open
+  without following symlinks, reject group/other-writable or changing files, constrain schema and slot
+  scope, and cap its size before parsing. At each parent jump, require exactly `slot - parent_slot`
+  boundaries at the runtime's canonical tick ordinals and require the final recovered hash to equal the
+  independently preserved visible blockhash before mutating the Bank. Record the recovery digest in the
+  launch evidence, and keep the new worker/runtime route unqualified until the normal exact checkpoint
+  and plugin gates pass.
 
 ## Deliver
 

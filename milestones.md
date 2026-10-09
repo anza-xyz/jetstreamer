@@ -3,6 +3,27 @@
 Major project results, newest first. Each entry records the UTC date and the
 code revision that produced the result.
 
+## 2026-10-09: Historical replay cut scratch 13.1% without a material throughput loss
+
+- Commit `de793e7036dfd9751fdbd7e00eeb96b7f8bb98b9` contains the sealed
+  historical-worker and performance-canary path used for an equal-work
+  epoch-195 comparison of `SOLANA_RAYON_THREADS=32` and `8`.
+- Both variants replayed the same slot interval through target slot
+  84,247,809 under identical 8-core CPU, 10-thread PoH, node, worker,
+  snapshot, and memory bindings. The 8-thread candidate retained 99.41% of
+  control slot throughput (2.1696 versus 2.1825 slots/s) and 99.43% of
+  account-update throughput.
+- Physical scratch fell from 57,506,201,600 to 49,989,107,712 bytes, a
+  13.07% reduction; apparent scratch fell 13.90%, worker VMAs fell 1.23%,
+  and regular-file count fell 0.70%. The sealed selector accepted every
+  predefined throughput and resource gate and selected the 8-thread variant.
+- Result receipt SHA-256 is
+  `b66840268465f1a2f764d7abf72f2f4d8e89a5126b44e3fb046e893e43c64dd5`;
+  selection receipt SHA-256 is
+  `4d88f3e1927ed8c8bddc915ee8d0a884644d0538a7cb06ebba7b297b8253f565`.
+  The comparison was diagnostic only: it authorized no publication or R2
+  mutation, and normal archives still require full root and plugin gates.
+
 ## 2026-10-07: Segment-manifest validation accelerated 13.6x
 
 - Commit `860b2d955d69aba8a661276353b8819bca537f3b` splits indexed Horizon

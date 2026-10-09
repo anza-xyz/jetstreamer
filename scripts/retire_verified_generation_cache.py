@@ -250,6 +250,28 @@ def validate_cache_receipt_without_file(
     source = receipt.get("source_identity")
     if not isinstance(source, str) or re.fullmatch(r"gs://.+#[0-9]+", source) is None:
         raise RetirementError("cache receipt lacks a generation-bound source identity")
+    download_unit = receipt.get("download_unit")
+    download_invocation = receipt.get("download_invocation_id")
+    download_state = receipt.get("download_unit_state")
+    expected_download_state = {
+        "LoadState": "loaded",
+        "ActiveState": "inactive",
+        "SubState": "dead",
+        "Result": "success",
+        "MainPID": "0",
+        "InvocationID": download_invocation,
+        "NRestarts": "0",
+        "ExecMainStatus": "0",
+    }
+    if (
+        not isinstance(download_unit, str)
+        or UNIT_NAME_RE.fullmatch(download_unit) is None
+        or not isinstance(download_invocation, str)
+        or re.fullmatch(r"[0-9a-f]{32}", download_invocation) is None
+        or not isinstance(download_state, dict)
+        or any(download_state.get(key) != value for key, value in expected_download_state.items())
+    ):
+        raise RetirementError("cache receipt lacks bound successful download evidence")
     return receipt, receipt_sha
 
 
@@ -460,6 +482,9 @@ def common_evidence(
             "cache_mtime_ns": cache_receipt["destination_identity"]["mtime_ns"],
             "cache_sha256": cache_receipt["destination_sha256"],
             "source_identity": cache_receipt["source_identity"],
+            "cache_download_unit": cache_receipt["download_unit"],
+            "cache_download_invocation_id": cache_receipt["download_invocation_id"],
+            "cache_download_unit_state": cache_receipt["download_unit_state"],
             "cache_receipt": str(args.cache_receipt),
             "cache_receipt_sha256": cache_receipt_sha,
             "scan_state": str(args.scan_state),

@@ -55,6 +55,18 @@ class RetireVerifiedGenerationCacheTests(unittest.TestCase):
                 },
                 "source_identity": self.source,
                 "source_size": cache_stat.st_size,
+                "download_unit": "download.service",
+                "download_invocation_id": "d" * 32,
+                "download_unit_state": {
+                    "LoadState": "loaded",
+                    "ActiveState": "inactive",
+                    "SubState": "dead",
+                    "Result": "success",
+                    "MainPID": "0",
+                    "InvocationID": "d" * 32,
+                    "NRestarts": "0",
+                    "ExecMainStatus": "0",
+                },
                 "publication_authorized": False,
                 "r2_mutations": False,
             },
@@ -160,6 +172,13 @@ class RetireVerifiedGenerationCacheTests(unittest.TestCase):
     def test_rejects_wrong_invocation(self):
         with self.assertRaisesRegex(MODULE.RetirementError, "bound clean terminal"):
             self.common(sampler=lambda _unit: self.state("b" * 32))
+
+    def test_rejects_unbound_download_evidence(self):
+        receipt = json.loads(self.cache_receipt.read_text())
+        receipt["download_unit_state"]["InvocationID"] = "e" * 32
+        self.write_private_json(self.cache_receipt, receipt)
+        with self.assertRaisesRegex(MODULE.RetirementError, "download evidence"):
+            self.common()
 
     def test_process_reference_scan_finds_fd(self):
         proc = self.proc

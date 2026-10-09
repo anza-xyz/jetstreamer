@@ -8,11 +8,13 @@ version, and never needs to restore the complete RocksDB backup.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tarfile
@@ -32,7 +34,14 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--gcs-source", help="Generation-bound gs:// URL")
-    source.add_argument("--archive-file", type=Path, help="Local .tar.bz2 for testing")
+    source.add_argument("--archive-file", type=Path, help="Sealed local .tar.bz2 cache")
+    parser.add_argument("--archive-file-sha256")
+    parser.add_argument("--archive-file-size", type=int)
+    parser.add_argument("--expected-archive-uid", type=int, default=0)
+    parser.add_argument(
+        "--source-identity",
+        help="Generation-bound gs:// identity represented by a sealed local cache",
+    )
     parser.add_argument("--target-prefix", action="append", required=True)
     parser.add_argument("--work-directory", type=Path, required=True)
     parser.add_argument("--result-directory", type=Path, required=True)
@@ -64,6 +73,72 @@ def fsync_directory(path: Path) -> None:
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
+
+
+def file_identity(metadata: os.stat_result) -> tuple[int, int, int, int]:
+    return metadata.st_dev, metadata.st_ino, metadata.st_size, metadata.st_mtime_ns
+
+
+def open_bound_archive(args: argparse.Namespace) -> tuple[object, dict]:
+    path = args.archive_file
+    if not path.is_absolute():
+        raise RuntimeError("--archive-file must be absolute")
+    try:
+        if path.resolve(strict=True) != path:
+            raise RuntimeError("--archive-file must be a canonical non-symlink path")
+        path_metadata = path.lstat()
+    except OSError as error:
+        raise RuntimeError(f"cannot inspect sealed archive file {path}: {error}") from error
+    if (
+        not stat.S_ISREG(path_metadata.st_mode)
+        or path_metadata.st_uid != args.expected_archive_uid
+        or path_metadata.st_nlink != 1
+        or path_metadata.st_mode & 0o022
+    ):
+        raise RuntimeError(f"sealed archive file has an unsafe identity: {path}")
+    if path_metadata.st_size != args.archive_file_size:
+        raise RuntimeError(
+            f"sealed archive file size mismatch: expected {args.archive_file_size}, "
+            f"got {path_metadata.st_size}"
+        )
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError as error:
+        raise RuntimeError(f"cannot open sealed archive file {path}: {error}") from error
+    try:
+        before = os.fstat(descriptor)
+        digest = hashlib.sha256()
+        while chunk := os.read(descriptor, 8 * 1024 * 1024):
+            digest.update(chunk)
+        after = os.fstat(descriptor)
+        current = path.stat(follow_symlinks=False)
+        if not (
+            stat.S_ISREG(current.st_mode)
+            and file_identity(before) == file_identity(after) == file_identity(current)
+        ):
+            raise RuntimeError("sealed archive file changed while hashing")
+        actual_sha256 = digest.hexdigest()
+        if actual_sha256 != args.archive_file_sha256:
+            raise RuntimeError(
+                "sealed archive file SHA-256 mismatch: "
+                f"expected {args.archive_file_sha256}, got {actual_sha256}"
+            )
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        stream = os.fdopen(descriptor, "rb")
+        descriptor = -1
+        return stream, {
+            "path": str(path),
+            "sha256": actual_sha256,
+            "size": before.st_size,
+            "uid": before.st_uid,
+            "mode": stat.S_IMODE(before.st_mode),
+            "device": before.st_dev,
+            "inode": before.st_ino,
+            "mtime_ns": before.st_mtime_ns,
+        }
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
 
 
 def write_state(path: Path, state: dict) -> None:
@@ -123,6 +198,27 @@ def main() -> int:
     prefixes = [normalize_prefix(value) for value in args.target_prefix]
     if args.gcs_source and not GENERATION_RE.fullmatch(args.gcs_source):
         raise SystemExit("--gcs-source must include an immutable #generation suffix")
+    local_binding_options = (
+        args.archive_file_sha256,
+        args.archive_file_size,
+        args.source_identity,
+    )
+    if args.archive_file:
+        if not all(value is not None for value in local_binding_options):
+            raise SystemExit(
+                "--archive-file requires --archive-file-sha256, --archive-file-size, "
+                "and --source-identity"
+            )
+        if not re.fullmatch(r"[0-9a-f]{64}", args.archive_file_sha256):
+            raise SystemExit("--archive-file-sha256 must be canonical lowercase hex")
+        if args.archive_file_size <= 0:
+            raise SystemExit("--archive-file-size must be positive")
+        if args.expected_archive_uid < 0:
+            raise SystemExit("--expected-archive-uid must not be negative")
+        if not GENERATION_RE.fullmatch(args.source_identity):
+            raise SystemExit("--source-identity must include an immutable #generation suffix")
+    elif any(value is not None for value in local_binding_options):
+        raise SystemExit("local archive binding options require --archive-file")
     if args.max_sst_bytes <= 0 or args.max_retained_bytes <= 0 or args.max_matches <= 0:
         raise SystemExit("size and match bounds must be positive")
 
@@ -131,6 +227,14 @@ def main() -> int:
 
     signal.signal(signal.SIGTERM, interrupted)
 
+    bound_archive_stream = None
+    archive_binding = None
+    if args.archive_file:
+        try:
+            bound_archive_stream, archive_binding = open_bound_archive(args)
+        except RuntimeError as error:
+            raise SystemExit(str(error)) from error
+
     args.work_directory.mkdir(parents=True, exist_ok=True)
     args.result_directory.mkdir(parents=True, exist_ok=True)
     matched_directory = args.result_directory / "matched-ssts"
@@ -138,7 +242,7 @@ def main() -> int:
     state_path = args.result_directory / "scan-state.json"
     stderr_path = args.result_directory / "gcloud-stderr.log"
     candidates = set(args.candidate_column_family)
-    source_description = args.gcs_source or str(args.archive_file.resolve())
+    source_description = args.gcs_source or args.source_identity
     state = {
         "schema": "jetstreamer-streaming-rocksdb-prefix-scan-v1",
         "source": source_description,
@@ -154,6 +258,8 @@ def main() -> int:
         "retained_sst_bytes": 0,
         "matches": [],
     }
+    if archive_binding:
+        state["archive_file"] = archive_binding
     write_state(state_path, state)
 
     process: subprocess.Popen | None = None
@@ -171,7 +277,7 @@ def main() -> int:
             assert process.stdout is not None
             source_stream = process.stdout
         else:
-            source_stream = args.archive_file.open("rb")
+            source_stream = bound_archive_stream
 
         with tarfile.open(fileobj=source_stream, mode="r|bz2") as archive:
             for member in archive:
@@ -264,6 +370,16 @@ def main() -> int:
             return_code = process.wait()
             if return_code:
                 raise RuntimeError(f"gcloud storage cat exited with status {return_code}")
+        if archive_binding:
+            current = args.archive_file.stat(follow_symlinks=False)
+            expected_identity = (
+                archive_binding["device"],
+                archive_binding["inode"],
+                archive_binding["size"],
+                archive_binding["mtime_ns"],
+            )
+            if not stat.S_ISREG(current.st_mode) or file_identity(current) != expected_identity:
+                raise RuntimeError("sealed archive file changed during the scan")
         state["status"] = "complete"
         state["completed_unix_seconds"] = time.time()
         write_state(state_path, state)

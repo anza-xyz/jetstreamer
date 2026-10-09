@@ -115,6 +115,34 @@ def require_terminal_success(state: UnitState, expected_invocation: str) -> None
         )
 
 
+def terminal_success_evidence(
+    state: UnitState,
+    expected_invocation: str,
+    cache_receipt: dict[str, Any],
+) -> str:
+    try:
+        require_terminal_success(state, expected_invocation)
+        return "live-systemd"
+    except RetirementError:
+        pass
+    if (
+        state.unit == cache_receipt["download_unit"]
+        and expected_invocation == cache_receipt["download_invocation_id"]
+        and state.load_state == "loaded"
+        and state.active_state == "inactive"
+        and state.sub_state == "dead"
+        and state.result == "success"
+        and state.main_pid == 0
+        and state.invocation_id == ""
+        and state.restarts == 0
+        and state.exec_main_status == 0
+    ):
+        return "sealed-cache-receipt"
+    raise RetirementError(
+        "unit has not reached the bound clean terminal success: " f"{state}"
+    )
+
+
 def file_identity(metadata: os.stat_result) -> tuple[int, int, int, int]:
     return metadata.st_dev, metadata.st_ino, metadata.st_size, metadata.st_mtime_ns
 
@@ -483,8 +511,12 @@ def common_evidence(
     states = []
     for unit, expected_invocation in args.required_unit:
         state = sampler(unit)
-        require_terminal_success(state, expected_invocation)
-        states.append(asdict(state))
+        invocation_evidence = terminal_success_evidence(
+            state, expected_invocation, cache_receipt
+        )
+        state_evidence = asdict(state)
+        state_evidence["invocation_evidence"] = invocation_evidence
+        states.append(state_evidence)
     references = process_references(cache_path, proc_root)
     if references:
         raise RetirementError("cache still has live process references: " + ", ".join(references))

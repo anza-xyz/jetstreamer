@@ -173,6 +173,49 @@ class RetireVerifiedGenerationCacheTests(unittest.TestCase):
         with self.assertRaisesRegex(MODULE.RetirementError, "bound clean terminal"):
             self.common(sampler=lambda _unit: self.state("b" * 32))
 
+    def test_accepts_receipt_bound_download_after_systemd_clears_invocation(self):
+        args = self.args()
+        args.required_unit = [
+            ("download.service", "d" * 32),
+            ("scan.service", "a" * 32),
+        ]
+
+        def sampler(unit):
+            if unit == "download.service":
+                return MODULE.UnitState(
+                    unit=unit,
+                    load_state="loaded",
+                    active_state="inactive",
+                    sub_state="dead",
+                    result="success",
+                    main_pid=0,
+                    invocation_id="",
+                    restarts=0,
+                    exec_main_status=0,
+                )
+            return self.state()
+
+        with mock.patch.object(MODULE.os, "geteuid", return_value=0):
+            evidence, _ = MODULE.common_evidence(
+                args,
+                sampler=sampler,
+                proc_root=self.proc,
+                expected_cache_receipt_uid=os.getuid(),
+            )
+        self.assertEqual(
+            evidence["required_units"][0]["invocation_evidence"],
+            "sealed-cache-receipt",
+        )
+        self.assertEqual(
+            evidence["required_units"][1]["invocation_evidence"],
+            "live-systemd",
+        )
+
+    def test_empty_invocation_is_not_accepted_for_non_download_unit(self):
+        empty = self.state("")
+        with self.assertRaisesRegex(MODULE.RetirementError, "bound clean terminal"):
+            self.common(sampler=lambda _unit: empty)
+
     def test_rejects_unbound_download_evidence(self):
         receipt = json.loads(self.cache_receipt.read_text())
         receipt["download_unit_state"]["InvocationID"] = "e" * 32

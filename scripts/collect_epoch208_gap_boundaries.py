@@ -48,7 +48,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--block-metadata-sha256", type=sha256_value, required=True)
     parser.add_argument("--decoder", type=absolute_path, required=True)
     parser.add_argument("--decoder-sha256", type=sha256_value, required=True)
-    parser.add_argument("--expected-source", required=True)
+    source_group = parser.add_mutually_exclusive_group(required=True)
+    source_group.add_argument("--expected-source")
+    source_group.add_argument(
+        "--expected-scan-source",
+        action="append",
+        nargs=2,
+        metavar=("ABSOLUTE_SCAN_STATE", "GENERATION_BOUND_GS_URI"),
+    )
     parser.add_argument("--ticks-per-slot", type=int, required=True)
     parser.add_argument("--output", type=absolute_path, required=True)
     parser.add_argument("--receipt", type=absolute_path, required=True)
@@ -218,13 +225,44 @@ def load_blockhashes(
 def load_scan_states(
     args: argparse.Namespace, gaps: list[dict[str, Any]]
 ) -> tuple[list[dict[str, str]], list[dict[str, Any]]]:
+    expected_sources: dict[Path, str] | None = None
+    if args.expected_scan_source is not None:
+        expected_sources = {}
+        for raw_path, source in args.expected_scan_source:
+            path = Path(raw_path)
+            if not path.is_absolute():
+                raise CollectionError(
+                    f"expected-scan-source path must be absolute: {raw_path}"
+                )
+            if path in expected_sources:
+                raise CollectionError(
+                    f"expected-scan-source path is duplicated: {path}"
+                )
+            if re.fullmatch(r"gs://.+#[0-9]+", source) is None:
+                raise CollectionError(
+                    f"expected scan source is not generation-bound: {source}"
+                )
+            expected_sources[path] = source
+        if set(expected_sources) != set(args.scan_state):
+            missing = sorted(str(path) for path in set(args.scan_state) - set(expected_sources))
+            unexpected = sorted(
+                str(path) for path in set(expected_sources) - set(args.scan_state)
+            )
+            raise CollectionError(
+                "expected-scan-source bindings do not exactly match scan-state paths; "
+                f"missing={missing}, unexpected={unexpected}"
+            )
+
     bindings = []
     scans = []
     for path in args.scan_state:
         data, scan = read_json_bytes(path)
         if not isinstance(scan, dict) or scan.get("schema") != SCAN_SCHEMA:
             raise CollectionError(f"scan state has the wrong schema: {path}")
-        if scan.get("source") != args.expected_source:
+        expected_source = (
+            expected_sources[path] if expected_sources is not None else args.expected_source
+        )
+        if scan.get("source") != expected_source:
             raise CollectionError(f"scan source does not match for {path}")
         status = require_string(scan, "status")
         if status not in {"running", "complete"}:
@@ -237,7 +275,10 @@ def load_scan_states(
             or len(prefixes) != len(set(prefixes))
         ):
             raise CollectionError(f"scan target prefixes are invalid: {path}")
-        bindings.append({"path": str(path), "sha256": sha256_bytes(data)})
+        binding = {"path": str(path), "sha256": sha256_bytes(data)}
+        if expected_sources is not None:
+            binding["source"] = expected_source
+        bindings.append(binding)
         scans.append(scan)
     for gap in gaps:
         coverage = sum(gap["key_prefix"] in scan["target_prefixes"] for scan in scans)
@@ -352,7 +393,6 @@ def collect(args: argparse.Namespace) -> str:
         "block_metadata": str(args.block_metadata),
         "block_metadata_sha256": sha256_bytes(metadata_bytes),
         "scan_states": scan_bindings,
-        "scan_source": args.expected_source,
         "decoder": str(args.decoder),
         "decoder_sha256": args.decoder_sha256,
         "ticks_per_slot": args.ticks_per_slot,
@@ -368,6 +408,13 @@ def collect(args: argparse.Namespace) -> str:
         "remote_mutations": False,
         "r2_mutations": False,
     }
+    if args.expected_scan_source is None:
+        static_receipt["scan_source"] = args.expected_source
+    else:
+        static_receipt["scan_sources"] = [
+            {"path": binding["path"], "source": binding["source"]}
+            for binding in scan_bindings
+        ]
     if args.receipt.exists():
         if not args.output.exists():
             raise CollectionError("receipt exists but decoded-boundary output is missing")

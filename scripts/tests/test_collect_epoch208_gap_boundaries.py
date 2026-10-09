@@ -9,6 +9,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "scripts" / "collect_epoch208_gap_boundaries.py"
 SOURCE = "gs://bucket/rocksdb.tar.bz2#123"
+SECOND_SOURCE = "gs://bucket/other-rocksdb.tar.bz2#456"
 
 
 class GapCollectorTests(unittest.TestCase):
@@ -118,7 +119,9 @@ class GapCollectorTests(unittest.TestCase):
     def digest(path: Path) -> str:
         return hashlib.sha256(path.read_bytes()).hexdigest()
 
-    def write_scans(self, second_status: str = "complete") -> None:
+    def write_scans(
+        self, second_status: str = "complete", second_source: str = SOURCE
+    ) -> None:
         for path, prefix, status in (
             (self.scan_one, "000000000000000B", "complete"),
             (self.scan_two, "000000000000000F", second_status),
@@ -128,7 +131,7 @@ class GapCollectorTests(unittest.TestCase):
                     {
                         "schema": "jetstreamer-streaming-rocksdb-prefix-scan-v1",
                         "status": status,
-                        "source": SOURCE,
+                        "source": SOURCE if path == self.scan_one else second_source,
                         "target_prefixes": [prefix],
                         "matches": [],
                     }
@@ -164,6 +167,19 @@ class GapCollectorTests(unittest.TestCase):
             "--receipt",
             str(self.receipt),
         ]
+
+    def multi_source_command(self) -> list[str]:
+        command = self.command()
+        source_index = command.index("--expected-source")
+        command[source_index : source_index + 2] = [
+            "--expected-scan-source",
+            str(self.scan_one),
+            SOURCE,
+            "--expected-scan-source",
+            str(self.scan_two),
+            SECOND_SOURCE,
+        ]
+        return command
 
     def test_running_scan_defers_without_artifacts(self) -> None:
         self.write_scans(second_status="running")
@@ -207,6 +223,36 @@ class GapCollectorTests(unittest.TestCase):
         result = subprocess.run(self.command(), text=True, capture_output=True)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("coverage 2", result.stderr)
+
+    def test_distinct_generation_bound_scan_sources_are_collected(self) -> None:
+        self.write_scans(second_source=SECOND_SOURCE)
+        result = subprocess.run(self.multi_source_command(), text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        receipt = json.loads(self.receipt.read_text(encoding="utf-8"))
+        self.assertNotIn("scan_source", receipt)
+        self.assertEqual(
+            receipt["scan_sources"],
+            [
+                {"path": str(self.scan_one), "source": SOURCE},
+                {"path": str(self.scan_two), "source": SECOND_SOURCE},
+            ],
+        )
+        self.assertEqual(receipt["scan_states"][1]["source"], SECOND_SOURCE)
+
+    def test_per_state_source_mismatch_fails_closed(self) -> None:
+        self.write_scans(second_source=SOURCE)
+        result = subprocess.run(self.multi_source_command(), text=True, capture_output=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("scan source does not match", result.stderr)
+
+    def test_per_state_bindings_must_exactly_cover_scan_paths(self) -> None:
+        self.write_scans(second_source=SECOND_SOURCE)
+        command = self.multi_source_command()
+        index = command.index("--expected-scan-source", command.index("--expected-scan-source") + 1)
+        del command[index : index + 3]
+        result = subprocess.run(command, text=True, capture_output=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("do not exactly match", result.stderr)
 
 
 if __name__ == "__main__":

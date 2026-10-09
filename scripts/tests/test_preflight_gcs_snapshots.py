@@ -1,0 +1,1478 @@
+from __future__ import annotations
+
+import copy
+import json
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import unittest
+from unittest import mock
+
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import preflight_gcs_snapshots as preflight  # noqa: E402
+
+
+ZERO_HASH = "1" * 32
+ONE_HASH = "1" * 31 + "2"
+CRC32C = "AAAAAA=="
+MD5_HASH = "AAAAAAAAAAAAAAAAAAAAAA=="
+
+
+def inventory_record(
+    slot: int,
+    *,
+    source: str = "root",
+    extension: str = ".tar.bz2",
+    anchor: int | None = None,
+    identity: str = ZERO_HASH,
+    size: int = 100,
+    generation: int | None = None,
+    md5_hash: str | None = MD5_HASH,
+) -> dict:
+    anchor = slot if anchor is None else anchor
+    generation = slot + 1 if generation is None else generation
+    middle = "hourly/" if source == "hourly" else ""
+    name = f"{anchor}/{middle}snapshot-{slot}-{identity}{extension}"
+    return {
+        "metadata": {
+            "bucket": preflight.BUCKET_NAME,
+            "crc32c": CRC32C,
+            "generation": str(generation),
+            "id": f"{preflight.BUCKET_NAME}/{name}/{generation}",
+            "kind": "storage#object",
+            "metageneration": "1",
+            "name": name,
+            "size": str(size),
+            **({"md5Hash": md5_hash} if md5_hash is not None else {}),
+        },
+        "type": "cloud_object",
+        "url": f"{preflight.BUCKET_URI}/{name}#{generation}",
+    }
+
+
+def parsed(record: dict, source: str = "root") -> preflight.SnapshotObject:
+    return preflight.parse_inventory_json(json.dumps([record]), source)[0]
+
+
+def replace_anchor(record: dict, anchor: str | int) -> dict:
+    record = copy.deepcopy(record)
+    suffix = record["metadata"]["name"].split("/", 1)[1]
+    name = f"{anchor}/{suffix}"
+    generation = record["metadata"]["generation"]
+    record["metadata"]["name"] = name
+    record["metadata"]["id"] = f"{preflight.BUCKET_NAME}/{name}/{generation}"
+    record["url"] = f"{preflight.BUCKET_URI}/{name}#{generation}"
+    return record
+
+
+def complete_inventory() -> tuple[list[dict], list[dict]]:
+    root: list[dict] = []
+    hourly: list[dict] = []
+    for epoch in range(preflight.FIRST_EPOCH, preflight.LAST_EPOCH + 1):
+        extension = ".tar.bz2" if epoch <= 60 else ".tar.zst"
+        boundary_slot = (
+            preflight.EPOCH_12_BOOTSTRAP_SLOT
+            if epoch == 12
+            else epoch * preflight.EPOCH_SLOTS - 1
+        )
+        boundary_identity = (
+            preflight.EPOCH_12_BOOTSTRAP_ACCOUNTS_HASH
+            if epoch == 12
+            else ZERO_HASH
+        )
+        boundary = inventory_record(
+            boundary_slot,
+            extension=extension,
+            identity=boundary_identity,
+            size=epoch * 10,
+        )
+        if epoch == preflight.FIRST_EPOCH:
+            boundary = inventory_record(
+                boundary_slot,
+                source="hourly",
+                anchor=boundary_slot - 1_000,
+                extension=extension,
+                size=epoch * 10,
+            )
+            hourly.append(boundary)
+        else:
+            root.append(boundary)
+        root.append(
+            inventory_record(
+                epoch * preflight.EPOCH_SLOTS + 100,
+                extension=extension,
+                identity=ONE_HASH,
+                size=epoch * 10 + 1,
+            )
+        )
+    return root, hourly
+
+
+def source_manifest_report(
+    first_epoch: int,
+    last_epoch: int,
+    *,
+    schema: str = "jetstreamer-gcs-snapshot-preflight-v2",
+) -> tuple[dict, str]:
+    root_raw, hourly_raw = complete_inventory()
+    relevant = preflight.requested_slot_range(first_epoch, last_epoch)
+    root = preflight.parse_inventory_json(json.dumps(root_raw), "root", relevant)
+    hourly = preflight.parse_inventory_json(json.dumps(hourly_raw), "hourly", relevant)
+    plans = preflight.build_epoch_plans(root, hourly, first_epoch, last_epoch)
+    manifest = preflight.build_manifest(plans)
+    manifest["schema"] = schema
+    if schema.endswith("-v2"):
+        for cohort in manifest["verification_cohorts"]:
+            cohort["bootstrap"].pop("md5_hash")
+            for checkpoint in cohort["root_checkpoints"]:
+                checkpoint.pop("md5_hash")
+        for epoch in manifest["epochs"]:
+            epoch["bootstrap"].pop("md5_hash")
+            for checkpoint in epoch["post_bootstrap_root_checkpoints"]:
+                checkpoint.pop("md5_hash")
+    fingerprint = preflight.manifest_fingerprint(manifest)
+    return {
+        "manifest": manifest,
+        "manifest_fingerprint": fingerprint,
+    }, fingerprint
+
+
+class InventoryParsingTests(unittest.TestCase):
+    def test_parses_real_gcloud_wrapper_and_hourly_filename_slot(self) -> None:
+        slot = preflight.FIRST_EPOCH * preflight.EPOCH_SLOTS - 1
+        item = parsed(
+            inventory_record(slot, source="hourly", anchor=slot - 50, size=1234),
+            "hourly",
+        )
+
+        self.assertEqual(item.slot, slot)
+        self.assertEqual(item.anchor_slot, slot - 50)
+        self.assertEqual(item.size, 1234)
+        self.assertTrue(item.versioned_uri.endswith(f"#{slot + 1}"))
+
+    def test_rejects_invalid_metadata_and_paths(self) -> None:
+        slot = preflight.FIRST_EPOCH * preflight.EPOCH_SLOTS - 1
+        mutations = []
+
+        wrong_url = inventory_record(slot)
+        wrong_url["url"] = wrong_url["url"].replace("#", "#9", 1)
+        mutations.append(wrong_url)
+
+        numeric_size = inventory_record(slot)
+        numeric_size["metadata"]["size"] = 100
+        mutations.append(numeric_size)
+
+        missing_id = inventory_record(slot)
+        del missing_id["metadata"]["id"]
+        mutations.append(missing_id)
+
+        mismatched_root = inventory_record(slot)
+        old_name = mismatched_root["metadata"]["name"]
+        new_name = "1/" + old_name.split("/", 1)[1]
+        mismatched_root["metadata"]["name"] = new_name
+        mismatched_root["metadata"]["id"] = (
+            f"{preflight.BUCKET_NAME}/{new_name}/{mismatched_root['metadata']['generation']}"
+        )
+        mismatched_root["url"] = (
+            f"{preflight.BUCKET_URI}/{new_name}#{mismatched_root['metadata']['generation']}"
+        )
+        mutations.append(mismatched_root)
+
+        invalid_hash = inventory_record(slot, identity="0" * 32)
+        mutations.append(invalid_hash)
+
+        for record in mutations:
+            with self.subTest(record=record):
+                with self.assertRaises(preflight.PreflightError):
+                    parsed(record)
+
+        hourly = inventory_record(slot, source="hourly", anchor=slot + 1)
+        exclusions: list[dict] = []
+        self.assertEqual(
+            preflight.parse_inventory_json(
+                json.dumps([hourly]), "hourly", exclusions=exclusions
+            ),
+            (),
+        )
+        self.assertEqual(
+            exclusions[0]["reason"], "invalid-late-anchor-hourly-quarantine"
+        )
+
+    def test_strict_json_rejects_duplicate_keys_but_coalesces_duplicate_rows(self) -> None:
+        with self.assertRaises(preflight.PreflightError):
+            preflight.parse_inventory_json('[{"type":"cloud_object","type":"prefix"}]', "root")
+
+        record = inventory_record(preflight.FIRST_EPOCH * preflight.EPOCH_SLOTS - 1)
+        items = preflight.parse_inventory_json(json.dumps([record, record]), "root")
+        self.assertEqual(len(items), 1)
+
+    def test_ignores_misplaced_object_outside_requested_history(self) -> None:
+        _, relevant_end = preflight.requested_slot_range()
+        slot = relevant_end + 1
+        records = [
+            inventory_record(slot, anchor=slot + 10),
+            inventory_record(slot + 1, extension=".tar.zst.1"),
+        ]
+
+        items = preflight.parse_inventory_json(json.dumps(records), "root")
+
+        self.assertEqual(items, ())
+
+    def test_rejects_misplaced_object_crossing_requested_history(self) -> None:
+        relevant_start, relevant_end = preflight.requested_slot_range()
+        slot = relevant_end + 1
+        record = inventory_record(slot, anchor=relevant_start)
+
+        with self.assertRaises(preflight.PreflightError):
+            preflight.parse_inventory_json(json.dumps([record]), "root")
+
+    def test_coalesces_digest_identical_misplaced_root_alias(self) -> None:
+        slot = preflight.FIRST_EPOCH * preflight.EPOCH_SLOTS - 1
+        canonical = inventory_record(slot, size=1234, generation=10)
+        alias = inventory_record(
+            slot,
+            anchor=slot + 1_000,
+            size=1234,
+            generation=20,
+        )
+
+        items = preflight.parse_inventory_json(
+            json.dumps([alias, canonical]), "root"
+        )
+
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0].object_name, canonical["metadata"]["name"])
+        self.assertEqual(items[0].generation, 10)
+
+    def test_rejects_unproven_misplaced_root_alias(self) -> None:
+        slot = preflight.FIRST_EPOCH * preflight.EPOCH_SLOTS - 1
+        canonical = inventory_record(slot, size=1234)
+        mismatched = inventory_record(slot, anchor=slot + 1_000, size=1235)
+        missing_md5 = inventory_record(
+            slot, anchor=slot + 1_000, size=1234, md5_hash=None
+        )
+
+        for alias in (mismatched, missing_md5):
+            with self.subTest(alias=alias["metadata"]["name"]):
+                with self.assertRaises(preflight.PreflightError):
+                    preflight.parse_inventory_json(
+                        json.dumps([canonical, alias]), "root"
+                    )
+
+    def test_coalesces_digest_identical_late_anchor_hourly_alias(self) -> None:
+        slot = preflight.FIRST_EPOCH * preflight.EPOCH_SLOTS - 1
+        valid = inventory_record(
+            slot, source="hourly", anchor=0, size=1234, generation=10
+        )
+        alias = inventory_record(
+            slot,
+            source="hourly",
+            anchor=slot + 1_000,
+            size=1234,
+            generation=20,
+        )
+
+        items = preflight.parse_inventory_json(
+            json.dumps([alias, valid]), "hourly"
+        )
+
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0].object_name, valid["metadata"]["name"])
+        self.assertEqual(items[0].generation, 10)
+
+    def test_quarantines_unproven_late_anchor_hourly_object(self) -> None:
+        slot = preflight.FIRST_EPOCH * preflight.EPOCH_SLOTS - 1
+        valid = inventory_record(slot, source="hourly", anchor=0, size=1234)
+        mismatched = inventory_record(
+            slot, source="hourly", anchor=slot + 1_000, size=1235
+        )
+        missing_md5 = inventory_record(
+            slot,
+            source="hourly",
+            anchor=slot + 1_000,
+            size=1234,
+            md5_hash=None,
+        )
+
+        for records, expected_count in (
+            ([mismatched], 0),
+            ([valid, mismatched], 1),
+            ([valid, missing_md5], 1),
+        ):
+            with self.subTest(records=records):
+                exclusions: list[dict] = []
+                items = preflight.parse_inventory_json(
+                    json.dumps(records), "hourly", exclusions=exclusions
+                )
+                self.assertEqual(len(items), expected_count)
+                self.assertEqual(len(exclusions), 1)
+                self.assertEqual(
+                    exclusions[0]["reason"],
+                    "invalid-late-anchor-hourly-quarantine",
+                )
+
+    def test_requested_subrange_sets_inventory_trust_boundary(self) -> None:
+        relevant_slots = preflight.requested_slot_range(12, 16)
+        outside_slot = 17 * preflight.EPOCH_SLOTS
+        outside = inventory_record(outside_slot, anchor=outside_slot + 1)
+
+        self.assertEqual(
+            preflight.parse_inventory_json(
+                json.dumps([outside]), "root", relevant_slots
+            ),
+            (),
+        )
+
+    def test_unsupported_suffix_is_ignored_inside_requested_range(self) -> None:
+        relevant_slots = preflight.requested_slot_range(12, 16)
+        slot = 12 * preflight.EPOCH_SLOTS
+        unsupported = inventory_record(slot, extension=".tar.zst.1")
+
+        self.assertEqual(
+            preflight.parse_inventory_json(
+                json.dumps([unsupported]), "root", relevant_slots
+            ),
+            (),
+        )
+
+    def test_malformed_supported_basename_remains_fatal_outside_range(self) -> None:
+        _, relevant_end = preflight.requested_slot_range(12, 16)
+        malformed = inventory_record(relevant_end + 1)
+        malformed_name = malformed["metadata"]["name"].replace(
+            f"snapshot-{relevant_end + 1}-", "snapshot-00-"
+        )
+        malformed["metadata"]["name"] = malformed_name
+        malformed["metadata"]["id"] = (
+            f"{preflight.BUCKET_NAME}/{malformed_name}/"
+            f"{malformed['metadata']['generation']}"
+        )
+        malformed["url"] = (
+            f"{preflight.BUCKET_URI}/{malformed_name}#"
+            f"{malformed['metadata']['generation']}"
+        )
+
+        with self.assertRaises(preflight.PreflightError):
+            preflight.parse_inventory_json(
+                json.dumps([malformed]), "root", preflight.requested_slot_range(12, 16)
+            )
+
+    def test_only_same_side_out_of_range_placements_are_ignored(self) -> None:
+        relevant_start, relevant_end = preflight.requested_slot_range(12, 16)
+        harmless = [
+            inventory_record(relevant_start - 2, anchor=relevant_start - 1),
+            replace_anchor(
+                inventory_record(relevant_end + 2), "ledger-05-01-22"
+            ),
+            replace_anchor(
+                inventory_record(relevant_end + 3), str(preflight.UINT64_MAX + 1)
+            ),
+        ]
+        self.assertEqual(
+            preflight.parse_inventory_json(
+                json.dumps(harmless), "root", (relevant_start, relevant_end)
+            ),
+            (),
+        )
+
+        unsafe = [
+            inventory_record(relevant_end + 1, anchor=relevant_start),
+            inventory_record(relevant_start, anchor=relevant_end + 1),
+            inventory_record(relevant_end + 1, anchor=relevant_start - 1),
+            inventory_record(relevant_start, anchor=relevant_start - 1),
+            replace_anchor(
+                inventory_record(relevant_start), str(preflight.UINT64_MAX + 1)
+            ),
+        ]
+        for record in unsafe:
+            with self.subTest(name=record["metadata"]["name"]):
+                with self.assertRaises(preflight.PreflightError):
+                    preflight.parse_inventory_json(
+                        json.dumps([record]),
+                        "root",
+                        (relevant_start, relevant_end),
+                    )
+
+
+class SelectionTests(unittest.TestCase):
+    def test_cli_accepts_early_and_later_supported_subranges(self) -> None:
+        early = preflight.build_argument_parser().parse_args(
+            ["--first-epoch", "1", "--last-epoch", "6"]
+        )
+        arguments = preflight.build_argument_parser().parse_args(
+            ["--first-epoch", "12", "--last-epoch", "16"]
+        )
+
+        self.assertEqual((early.first_epoch, early.last_epoch), (1, 6))
+        self.assertEqual((arguments.first_epoch, arguments.last_epoch), (12, 16))
+
+    def test_cli_accepts_a_private_verification_tail_boundary(self) -> None:
+        arguments = preflight.build_argument_parser().parse_args(
+            [
+                "--first-epoch",
+                "266",
+                "--last-epoch",
+                "301",
+                "--publish-through-epoch",
+                "300",
+            ]
+        )
+        self.assertEqual(arguments.publish_through_epoch, 300)
+
+    def test_invalid_publication_boundary_fails_before_inventory(self) -> None:
+        with mock.patch.object(preflight, "load_inventory_texts") as inventory:
+            result = preflight.main(
+                [
+                    "--first-epoch",
+                    "266",
+                    "--last-epoch",
+                    "301",
+                    "--publish-through-epoch",
+                    "302",
+                ]
+            )
+        self.assertEqual(result, 1)
+        inventory.assert_not_called()
+
+    def test_cli_accepts_an_explicit_report_output(self) -> None:
+        arguments = preflight.build_argument_parser().parse_args(
+            ["--output", "/secure/preflight.json"]
+        )
+        self.assertEqual(arguments.output, Path("/secure/preflight.json"))
+
+    def test_runtime_routes_cover_early_history_without_guessing_epoch_zero(self) -> None:
+        expected = {
+            1: "solana-v1.0.7-to-v1.0.8",
+            2: "solana-v1.0.8",
+            7: "solana-v1.0.8",
+            8: "solana-v1.0.13",
+            9: "solana-v1.0.14",
+            10: "solana-v1.0.14",
+            11: "solana-v1.0.14",
+            12: "solana-v1.0.23",
+            61: "solana-v1.2.32",
+            66: "solana-v1.2.32",
+            67: "solana-v1.2.32-mainnet-epoch68-transition",
+            68: "solana-v1.2.32-mainnet-epoch68-transition",
+            69: "solana-v1.2.32",
+            91: "solana-v1.2.32",
+            92: "solana-v1.3.19",
+            100: "solana-v1.3.19",
+            101: "solana-v1.3.23",
+            118: "solana-v1.3.23",
+            119: "solana-v1.3.23",
+            121: "solana-v1.3.23",
+            122: "solana-v1.3.23",
+            125: "solana-v1.3.23",
+            126: "solana-v1.3.23",
+            128: "solana-v1.3.23",
+            129: "solana-v1.4.17",
+            130: "solana-v1.4.17",
+            131: "solana-v1.4.19",
+            132: "solana-v1.4.19",
+            133: "solana-v1.4.19",
+            134: "solana-v1.4.19",
+            135: "solana-v1.4.25",
+            147: "solana-v1.4.25",
+            148: "solana-v1.5.5",
+            149: "solana-v1.5.5",
+            150: "solana-v1.5.6",
+            153: "solana-v1.5.6",
+            154: "solana-v1.5.8",
+            155: "solana-v1.5.6",
+            173: "solana-v1.5.6",
+            174: "solana-v1.6.15",
+            200: "solana-v1.6.15",
+            201: "solana-v1.6.16",
+            214: "solana-v1.6.17",
+            215: "solana-v1.6.17",
+            216: "solana-v1.6.20",
+            232: "solana-v1.6.20",
+            233: "solana-v1.7.15",
+            265: "solana-v1.7.15",
+            266: "solana-v1.8.11",
+            301: "solana-v1.8.11",
+        }
+        for epoch, runtime in expected.items():
+            with self.subTest(epoch=epoch):
+                self.assertEqual(preflight.runtime_route(epoch)[0], runtime)
+
+        with self.assertRaises(preflight.PreflightError):
+            preflight.requested_slot_range(0, 1)
+        with self.assertRaises(preflight.PreflightError):
+            preflight.runtime_route(202)
+        with self.assertRaises(preflight.PreflightError):
+            preflight.runtime_route(213)
+        with self.assertRaises(preflight.PreflightError):
+            preflight.runtime_route(302)
+        with self.assertRaises(preflight.PreflightError):
+            preflight.requested_slot_range(301, 302)
+
+    def test_builds_all_epoch_plans_and_keeps_hourly_bootstrap_only(self) -> None:
+        root_raw, hourly_raw = complete_inventory()
+        root = preflight.parse_inventory_json(json.dumps(list(reversed(root_raw))), "root")
+        hourly = preflight.parse_inventory_json(json.dumps(hourly_raw), "hourly")
+
+        plans = preflight.build_epoch_plans(root, hourly)
+
+        self.assertEqual(len(plans), 100)
+        self.assertEqual(plans[0].epoch, 1)
+        self.assertEqual(plans[-1].epoch, 100)
+        self.assertEqual(plans[0].runtime, "solana-v1.0.7-to-v1.0.8")
+        self.assertEqual(plans[-1].runtime, "solana-v1.3.19")
+        self.assertEqual(plans[0].bootstrap.source, "hourly")
+        self.assertTrue(
+            all(
+                checkpoint.source == "root"
+                for plan in plans
+                for checkpoint in plan.checkpoints
+            )
+        )
+        self.assertTrue(
+            all(
+                checkpoint.slot > plan.bootstrap.slot
+                for plan in plans
+                for checkpoint in plan.checkpoints
+            )
+        )
+
+    def test_runtime_filtering_uses_target_epoch_before_uniqueness(self) -> None:
+        length = preflight.EPOCH_SLOTS
+        root_records = [
+            inventory_record(60 * length - 2, extension=".tar.bz2"),
+            inventory_record(60 * length - 1, extension=".tar.zst"),
+            inventory_record(60 * length + 100, extension=".tar.bz2", identity=ONE_HASH),
+            inventory_record(61 * length - 2, extension=".tar.bz2"),
+            inventory_record(61 * length - 1, extension=".tar.zst"),
+            inventory_record(61 * length + 100, extension=".tar.zst", identity=ONE_HASH),
+        ]
+        root = preflight.parse_inventory_json(json.dumps(root_records), "root")
+
+        plans = preflight.build_epoch_plans(root, (), 60, 61)
+
+        self.assertEqual(plans[0].bootstrap.slot, 60 * length - 2)
+        self.assertEqual(plans[0].bootstrap.extension, ".tar.bz2")
+        self.assertEqual(plans[0].runtime, "solana-v1.1.23")
+        self.assertEqual(plans[1].bootstrap.slot, 61 * length - 1)
+        self.assertEqual(plans[1].bootstrap.extension, ".tar.zst")
+        self.assertEqual(plans[1].runtime, "solana-v1.2.32")
+
+    def test_epoch_30_uses_exact_v1_1_15_runtime(self) -> None:
+        length = preflight.EPOCH_SLOTS
+        root = preflight.parse_inventory_json(
+            json.dumps(
+                [
+                    inventory_record(30 * length - 1, extension=".tar.bz2"),
+                    inventory_record(31 * length - 1, extension=".tar.bz2", identity=ONE_HASH),
+                ]
+            ),
+            "root",
+        )
+
+        plans = preflight.build_epoch_plans(root, (), 30, 30)
+
+        self.assertEqual(plans[0].runtime, "solana-v1.1.15")
+
+    def test_structurally_valid_unrelated_archive_extension_is_ignored(self) -> None:
+        epoch = 12
+        boundary_end = epoch * preflight.EPOCH_SLOTS - 1
+        root = preflight.parse_inventory_json(
+            json.dumps(
+                [
+                    inventory_record(
+                        preflight.EPOCH_12_BOOTSTRAP_SLOT,
+                        extension=".tar.bz2",
+                        identity=preflight.EPOCH_12_BOOTSTRAP_ACCOUNTS_HASH,
+                    ),
+                    inventory_record(boundary_end, extension=".tar.gz"),
+                    inventory_record(epoch * preflight.EPOCH_SLOTS + 1),
+                ]
+            ),
+            "root",
+        )
+
+        plan = preflight.build_epoch_plans(root, (), epoch, epoch)[0]
+
+        self.assertEqual(plan.bootstrap.slot, preflight.EPOCH_12_BOOTSTRAP_SLOT)
+        self.assertEqual(plan.bootstrap.extension, ".tar.bz2")
+
+    def test_epoch_154_requires_the_registered_v1_5_8_bootstrap(self) -> None:
+        epoch = 154
+        root = preflight.parse_inventory_json(
+            json.dumps(
+                [
+                    inventory_record(
+                        preflight.EPOCH_154_BOOTSTRAP_SLOT,
+                        extension=".tar.zst",
+                        identity=preflight.EPOCH_154_BOOTSTRAP_ACCOUNTS_HASH,
+                    ),
+                    inventory_record(epoch * preflight.EPOCH_SLOTS + 1),
+                ]
+            ),
+            "root",
+            preflight.requested_slot_range(epoch, epoch),
+        )
+
+        plan = preflight.build_epoch_plans(root, (), epoch, epoch)[0]
+
+        self.assertEqual(plan.runtime, "solana-v1.5.8")
+        self.assertEqual(plan.bootstrap.slot, preflight.EPOCH_154_BOOTSTRAP_SLOT)
+        self.assertEqual(
+            plan.bootstrap.accounts_hash,
+            preflight.EPOCH_154_BOOTSTRAP_ACCOUNTS_HASH,
+        )
+
+    def test_ambiguous_newest_bootstrap_fails_without_fallback(self) -> None:
+        epoch = 61
+        end = epoch * preflight.EPOCH_SLOTS - 1
+        records = [
+            inventory_record(end - 1, extension=".tar.bz2"),
+            inventory_record(end, extension=".tar.bz2"),
+            inventory_record(end, extension=".tar.zst", identity=ONE_HASH),
+            inventory_record(epoch * preflight.EPOCH_SLOTS + 1, extension=".tar.bz2"),
+        ]
+        root = preflight.parse_inventory_json(json.dumps(records), "root")
+
+        with self.assertRaisesRegex(preflight.PreflightError, "newest.*ambiguous"):
+            preflight.build_epoch_plans(root, (), epoch, epoch)
+
+    def test_byte_identical_hourly_copy_prefers_canonical_root_bootstrap(self) -> None:
+        epoch = 61
+        boundary = epoch * preflight.EPOCH_SLOTS - 1
+        checkpoint = epoch * preflight.EPOCH_SLOTS + 1
+        root = preflight.parse_inventory_json(
+            json.dumps(
+                [
+                    inventory_record(boundary, extension=".tar.zst", generation=10),
+                    inventory_record(checkpoint, extension=".tar.zst"),
+                ]
+            ),
+            "root",
+        )
+        hourly = preflight.parse_inventory_json(
+            json.dumps(
+                [
+                    inventory_record(
+                        boundary,
+                        source="hourly",
+                        anchor=boundary - 100,
+                        extension=".tar.zst",
+                        generation=11,
+                    )
+                ]
+            ),
+            "hourly",
+        )
+
+        plan = preflight.build_epoch_plans(root, hourly, epoch, epoch)[0]
+
+        self.assertEqual(plan.bootstrap.source, "root")
+        self.assertEqual(plan.bootstrap.generation, 10)
+
+    def test_hourly_copy_with_different_md5_remains_ambiguous(self) -> None:
+        epoch = 61
+        boundary = epoch * preflight.EPOCH_SLOTS - 1
+        root = preflight.parse_inventory_json(
+            json.dumps(
+                [
+                    inventory_record(boundary, extension=".tar.zst"),
+                    inventory_record(
+                        epoch * preflight.EPOCH_SLOTS + 1,
+                        extension=".tar.zst",
+                    ),
+                ]
+            ),
+            "root",
+        )
+        hourly = preflight.parse_inventory_json(
+            json.dumps(
+                [
+                    inventory_record(
+                        boundary,
+                        source="hourly",
+                        anchor=boundary - 100,
+                        extension=".tar.zst",
+                        md5_hash="AQAAAAAAAAAAAAAAAAAAAA==",
+                    )
+                ]
+            ),
+            "hourly",
+        )
+
+        with self.assertRaisesRegex(preflight.PreflightError, "newest.*ambiguous"):
+            preflight.build_epoch_plans(root, hourly, epoch, epoch)
+
+    def test_hourly_object_does_not_satisfy_checkpoint_requirement(self) -> None:
+        epoch = 12
+        boundary_slot = preflight.EPOCH_12_BOOTSTRAP_SLOT
+        root = preflight.parse_inventory_json(
+            json.dumps(
+                [
+                    inventory_record(
+                        boundary_slot,
+                        identity=preflight.EPOCH_12_BOOTSTRAP_ACCOUNTS_HASH,
+                    )
+                ]
+            ),
+            "root",
+        )
+        hourly = preflight.parse_inventory_json(
+            json.dumps(
+                [
+                    inventory_record(
+                        epoch * preflight.EPOCH_SLOTS + 100,
+                        source="hourly",
+                        anchor=epoch * preflight.EPOCH_SLOTS,
+                        identity=ONE_HASH,
+                    ),
+                ]
+            ),
+            "hourly",
+        )
+
+        with self.assertRaisesRegex(preflight.PreflightError, "root checkpoint"):
+            preflight.build_epoch_plans(root, hourly, epoch, epoch)
+
+    def test_epoch_12_requires_the_registered_slot_and_accounts_hash(self) -> None:
+        epoch = 12
+        root = preflight.parse_inventory_json(
+            json.dumps(
+                [
+                    inventory_record(
+                        preflight.EPOCH_12_BOOTSTRAP_SLOT,
+                        identity=preflight.EPOCH_12_BOOTSTRAP_ACCOUNTS_HASH,
+                    ),
+                    inventory_record(
+                        preflight.EPOCH_12_BOOTSTRAP_SLOT + 1,
+                        identity=ONE_HASH,
+                    ),
+                    inventory_record(epoch * preflight.EPOCH_SLOTS + 10),
+                ]
+            ),
+            "root",
+        )
+
+        plan = preflight.build_epoch_plans(root, (), epoch, epoch)[0]
+        self.assertEqual(plan.bootstrap.slot, preflight.EPOCH_12_BOOTSTRAP_SLOT)
+        self.assertEqual(
+            plan.bootstrap.accounts_hash,
+            preflight.EPOCH_12_BOOTSTRAP_ACCOUNTS_HASH,
+        )
+
+        wrong = preflight.parse_inventory_json(
+            json.dumps(
+                [
+                    inventory_record(
+                        preflight.EPOCH_12_BOOTSTRAP_SLOT,
+                        identity=ONE_HASH,
+                    ),
+                    inventory_record(epoch * preflight.EPOCH_SLOTS + 10),
+                ]
+            ),
+            "root",
+        )
+        with self.assertRaisesRegex(preflight.PreflightError, "required canonical bootstrap"):
+            preflight.build_epoch_plans(wrong, (), epoch, epoch)
+
+    def test_checkpoint_gap_forms_one_root_anchored_cohort(self) -> None:
+        root_bootstrap_slot = 7_343_776
+        root_checkpoint_slot = 8_213_950
+        root = preflight.parse_inventory_json(
+            json.dumps(
+                [
+                    inventory_record(root_bootstrap_slot),
+                    inventory_record(root_checkpoint_slot, identity=ONE_HASH),
+                ]
+            ),
+            "root",
+            preflight.requested_slot_range(17, 19),
+        )
+        hourly = preflight.parse_inventory_json(
+            json.dumps(
+                [
+                    inventory_record(
+                        7_770_454,
+                        source="hourly",
+                        anchor=root_bootstrap_slot,
+                    )
+                ]
+            ),
+            "hourly",
+            preflight.requested_slot_range(17, 19),
+        )
+
+        cohorts = preflight.build_verification_cohorts(root, hourly, 17, 19)
+        self.assertEqual(len(cohorts), 1)
+        cohort = cohorts[0]
+        self.assertEqual((cohort.first_epoch, cohort.last_epoch), (17, 19))
+        self.assertEqual(cohort.bootstrap.source, "root")
+        self.assertEqual(cohort.bootstrap.slot, root_bootstrap_slot)
+        self.assertEqual(
+            [checkpoint.slot for checkpoint in cohort.checkpoints],
+            [root_checkpoint_slot],
+        )
+
+        plans = preflight.build_epoch_plans(root, hourly, 17, 19)
+        self.assertEqual([plan.bootstrap.slot for plan in plans], [root_bootstrap_slot] * 3)
+        self.assertEqual([len(plan.checkpoints) for plan in plans], [0, 0, 1])
+        manifest = preflight.build_manifest(plans)
+        self.assertEqual(len(manifest["verification_cohorts"]), 1)
+        self.assertEqual(
+            manifest["verification_cohorts"][0]["publication_gate"],
+            "all-archives-validated-and-final-root-verified",
+        )
+        self.assertEqual(
+            manifest["verification_cohorts"][0]["bootstrap"]["md5_hash"],
+            MD5_HASH,
+        )
+        self.assertEqual(manifest["epochs"][0]["runtime_state_source"], "root-bootstrap")
+        self.assertEqual(
+            manifest["epochs"][1]["runtime_state_source"],
+            "carried-from-previous-epoch",
+        )
+        self.assertEqual(
+            manifest["epochs"][1]["bootstrap_window"],
+            {
+                "start": preflight.epoch_slot_range(16)[0],
+                "end_inclusive": preflight.epoch_slot_range(16)[1],
+            },
+        )
+
+    def test_target_cohort_reuses_root_bootstrap_and_keeps_intermediate_roots(self) -> None:
+        first_epoch = 17
+        last_epoch = 20
+        prior_start, prior_end = preflight.epoch_slot_range(first_epoch - 1)
+        root_bootstrap_slot = prior_end - 100
+        checkpoint_slots = [
+            preflight.epoch_slot_range(epoch)[0] + 10
+            for epoch in range(first_epoch, last_epoch + 1)
+        ]
+        root = preflight.parse_inventory_json(
+            json.dumps(
+                [inventory_record(root_bootstrap_slot)]
+                + [inventory_record(slot, identity=ONE_HASH) for slot in checkpoint_slots]
+            ),
+            "root",
+            preflight.requested_slot_range(first_epoch, last_epoch),
+        )
+        hourly = preflight.parse_inventory_json(
+            json.dumps(
+                [
+                    inventory_record(
+                        prior_end - 1,
+                        source="hourly",
+                        anchor=prior_start,
+                    )
+                ]
+            ),
+            "hourly",
+            preflight.requested_slot_range(first_epoch, last_epoch),
+        )
+
+        cohorts = preflight.build_verification_cohorts(
+            root,
+            hourly,
+            first_epoch,
+            last_epoch,
+            target_cohort_epochs=4,
+        )
+        self.assertEqual(len(cohorts), 1)
+        self.assertEqual(
+            (cohorts[0].first_epoch, cohorts[0].last_epoch),
+            (first_epoch, last_epoch),
+        )
+        self.assertEqual(cohorts[0].bootstrap.source, "root")
+        self.assertEqual(cohorts[0].bootstrap.slot, root_bootstrap_slot)
+        self.assertEqual(
+            [item.slot for item in cohorts[0].checkpoints], checkpoint_slots
+        )
+
+        plans = preflight.build_epoch_plans(
+            root,
+            hourly,
+            first_epoch,
+            last_epoch,
+            target_cohort_epochs=4,
+        )
+        self.assertEqual(
+            [plan.cohort_first_epoch for plan in plans], [first_epoch] * 4
+        )
+        self.assertEqual([plan.cohort_last_epoch for plan in plans], [last_epoch] * 4)
+        self.assertEqual(
+            [plan.bootstrap.slot for plan in plans], [root_bootstrap_slot] * 4
+        )
+        manifest = preflight.build_manifest(plans, target_cohort_epochs=4)
+        self.assertEqual(manifest["selection_policy"]["target_cohort_epochs"], 4)
+        self.assertEqual(len(manifest["verification_cohorts"]), 1)
+        self.assertEqual(
+            [item["runtime_state_source"] for item in manifest["epochs"]],
+            [
+                "root-bootstrap",
+                "carried-from-previous-epoch",
+                "carried-from-previous-epoch",
+                "carried-from-previous-epoch",
+            ],
+        )
+
+    def test_target_cohort_ends_at_latest_root_within_target_window(self) -> None:
+        first_epoch = 17
+        last_epoch = 24
+        _, prior_end = preflight.epoch_slot_range(first_epoch - 1)
+        checkpoint_epochs = (17, 18, 19, 24)
+        checkpoint_slots = [
+            preflight.epoch_slot_range(epoch)[0] + 10 for epoch in checkpoint_epochs
+        ]
+        root = preflight.parse_inventory_json(
+            json.dumps(
+                [inventory_record(prior_end - 100)]
+                + [inventory_record(slot, identity=ONE_HASH) for slot in checkpoint_slots]
+            ),
+            "root",
+            preflight.requested_slot_range(first_epoch, last_epoch),
+        )
+
+        cohorts = preflight.build_verification_cohorts(
+            root,
+            (),
+            first_epoch,
+            last_epoch,
+            target_cohort_epochs=4,
+        )
+
+        self.assertEqual(
+            [(item.first_epoch, item.last_epoch) for item in cohorts],
+            [(17, 19), (20, 24)],
+        )
+        self.assertEqual(
+            [[item.slot for item in cohort.checkpoints] for cohort in cohorts],
+            [checkpoint_slots[:3], checkpoint_slots[3:]],
+        )
+
+    def test_target_cohort_extends_only_when_target_window_has_no_root(self) -> None:
+        first_epoch = 17
+        last_epoch = 24
+        _, prior_end = preflight.epoch_slot_range(first_epoch - 1)
+        terminal_slot = preflight.epoch_slot_range(last_epoch)[0] + 10
+        root = preflight.parse_inventory_json(
+            json.dumps(
+                [
+                    inventory_record(prior_end - 100),
+                    inventory_record(terminal_slot, identity=ONE_HASH),
+                ]
+            ),
+            "root",
+            preflight.requested_slot_range(first_epoch, last_epoch),
+        )
+
+        cohort = preflight.build_verification_cohorts(
+            root,
+            (),
+            first_epoch,
+            last_epoch,
+            target_cohort_epochs=4,
+        )[0]
+
+        self.assertEqual((cohort.first_epoch, cohort.last_epoch), (17, 24))
+        self.assertEqual([item.slot for item in cohort.checkpoints], [terminal_slot])
+
+    def test_manifest_marks_only_the_final_cohort_tail_private(self) -> None:
+        first_epoch = 17
+        verification_last_epoch = 20
+        publication_boundary = 19
+        _, prior_end = preflight.epoch_slot_range(first_epoch - 1)
+        terminal_slot = preflight.epoch_slot_range(verification_last_epoch)[0] + 10
+        root = preflight.parse_inventory_json(
+            json.dumps(
+                [
+                    inventory_record(prior_end - 100),
+                    inventory_record(terminal_slot, identity=ONE_HASH),
+                ]
+            ),
+            "root",
+            preflight.requested_slot_range(first_epoch, verification_last_epoch),
+        )
+        plans = preflight.build_epoch_plans(
+            root,
+            (),
+            first_epoch,
+            verification_last_epoch,
+            target_cohort_epochs=4,
+        )
+
+        manifest = preflight.build_manifest(
+            plans,
+            target_cohort_epochs=4,
+            publish_through_epoch=publication_boundary,
+        )
+
+        self.assertEqual(manifest["last_epoch"], verification_last_epoch)
+        self.assertEqual(manifest["publication_boundary_epoch"], publication_boundary)
+        self.assertEqual(
+            [item["publication_scope"] for item in manifest["epochs"]],
+            ["requested", "requested", "requested", "verification-tail-private"],
+        )
+        self.assertEqual(
+            manifest["verification_cohorts"][0]["publish_through_epoch"],
+            publication_boundary,
+        )
+
+    def test_manifest_rejects_a_tail_that_starts_before_the_final_cohort(self) -> None:
+        root, hourly = complete_inventory()
+        plans = preflight.build_epoch_plans(
+            preflight.parse_inventory_json(json.dumps(root), "root"),
+            preflight.parse_inventory_json(json.dumps(hourly), "hourly"),
+            first_epoch=1,
+            last_epoch=4,
+        )
+        with self.assertRaisesRegex(
+            preflight.PreflightError, "verification tail must be contained"
+        ):
+            preflight.build_manifest(plans, publish_through_epoch=2)
+
+    def test_target_cohort_splits_at_every_runtime_boundary(self) -> None:
+        first_epoch = 153
+        last_epoch = 156
+        root = preflight.parse_inventory_json(
+            json.dumps(
+                [inventory_record(preflight.epoch_slot_range(152)[1] - 10)]
+                + [
+                    inventory_record(preflight.epoch_slot_range(epoch)[0] + 10)
+                    for epoch in range(first_epoch, last_epoch + 1)
+                ]
+                + [
+                    inventory_record(
+                        preflight.EPOCH_154_BOOTSTRAP_SLOT,
+                        identity=preflight.EPOCH_154_BOOTSTRAP_ACCOUNTS_HASH,
+                    )
+                ]
+            ),
+            "root",
+            preflight.requested_slot_range(first_epoch, last_epoch),
+        )
+        cohorts = preflight.build_verification_cohorts(
+            root,
+            (),
+            first_epoch,
+            last_epoch,
+            target_cohort_epochs=4,
+        )
+        self.assertEqual(
+            [(item.first_epoch, item.last_epoch) for item in cohorts],
+            [(153, 153), (154, 154), (155, 156)],
+        )
+
+    def test_target_cohort_size_is_bounded(self) -> None:
+        root, hourly = complete_inventory()
+        parsed_root = preflight.parse_inventory_json(json.dumps(root), "root")
+        parsed_hourly = preflight.parse_inventory_json(json.dumps(hourly), "hourly")
+        for invalid in (0, preflight.MAX_TARGET_COHORT_EPOCHS + 1):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                preflight.build_verification_cohorts(
+                    parsed_root,
+                    parsed_hourly,
+                    target_cohort_epochs=invalid,
+                )
+
+    def test_newer_hourly_bootstrap_cannot_hide_a_same_epoch_root(self) -> None:
+        epoch = 17
+        root_bootstrap_slot = 7_343_776
+        root_checkpoint_slot = 7_760_000
+        root = preflight.parse_inventory_json(
+            json.dumps(
+                [
+                    inventory_record(root_bootstrap_slot),
+                    inventory_record(root_checkpoint_slot, identity=ONE_HASH),
+                ]
+            ),
+            "root",
+            preflight.requested_slot_range(epoch, epoch),
+        )
+        hourly = preflight.parse_inventory_json(
+            json.dumps(
+                [
+                    inventory_record(
+                        7_770_454,
+                        source="hourly",
+                        anchor=root_bootstrap_slot,
+                    )
+                ]
+            ),
+            "hourly",
+            preflight.requested_slot_range(epoch, epoch),
+        )
+
+        cohort = preflight.build_verification_cohorts(root, hourly, epoch, epoch)[0]
+        self.assertEqual((cohort.first_epoch, cohort.last_epoch), (epoch, epoch))
+        self.assertEqual(cohort.bootstrap.slot, root_bootstrap_slot)
+        self.assertEqual(
+            [checkpoint.slot for checkpoint in cohort.checkpoints],
+            [root_checkpoint_slot],
+        )
+
+    def test_checkpoint_gap_must_reach_a_root_within_the_request(self) -> None:
+        root = preflight.parse_inventory_json(
+            json.dumps([inventory_record(7_343_776)]),
+            "root",
+            preflight.requested_slot_range(17, 18),
+        )
+        with self.assertRaisesRegex(preflight.PreflightError, "through requested epoch 18"):
+            preflight.build_verification_cohorts(root, (), 17, 18)
+
+    def test_checkpoint_gap_must_not_cross_a_runtime_boundary(self) -> None:
+        boundary = 29 * preflight.EPOCH_SLOTS - 1
+        root = preflight.parse_inventory_json(
+            json.dumps(
+                [
+                    inventory_record(boundary),
+                    inventory_record(30 * preflight.EPOCH_SLOTS + 10),
+                ]
+            ),
+            "root",
+            preflight.requested_slot_range(29, 30),
+        )
+        with self.assertRaisesRegex(preflight.PreflightError, "crosses runtime boundary"):
+            preflight.build_verification_cohorts(root, (), 29, 30)
+
+    def test_checkpoint_gap_rejects_an_agave_runtime(self) -> None:
+        root = preflight.parse_inventory_json(
+            json.dumps(
+                [
+                    inventory_record(17 * preflight.EPOCH_SLOTS - 1, extension=".tar.zst"),
+                    inventory_record(19 * preflight.EPOCH_SLOTS + 100, extension=".tar.zst"),
+                ]
+            ),
+            "root",
+            preflight.requested_slot_range(17, 19),
+        )
+        routes = ((1, 100, "agave-v3", (".tar.zst",)),)
+        with mock.patch.object(preflight, "RUNTIME_ROUTES", routes):
+            with self.assertRaisesRegex(
+                preflight.PreflightError,
+                "require an isolated historical Solana runtime",
+            ):
+                preflight.build_verification_cohorts(root, (), 17, 19)
+
+
+class ReportingAndAcquisitionTests(unittest.TestCase):
+    def test_replans_v2_sealed_manifest_into_v4_contiguous_cohort(self) -> None:
+        source_report, source_fingerprint = source_manifest_report(17, 20)
+        with tempfile.TemporaryDirectory() as directory:
+            source_path = Path(directory) / "source.json"
+            source_path.write_text(json.dumps(source_report), encoding="utf-8")
+            root, hourly, provenance = preflight.load_sealed_manifest_objects(
+                source_path, source_fingerprint, 17, 20
+            )
+
+        plans = preflight.build_epoch_plans(root, hourly, 17, 20, 4)
+        manifest = preflight.build_manifest(plans, 4)
+
+        self.assertEqual(manifest["schema"], preflight.SCHEMA)
+        self.assertEqual(
+            [
+                (item["first_epoch"], item["last_epoch"])
+                for item in manifest["verification_cohorts"]
+            ],
+            [(17, 20)],
+        )
+        self.assertIsNone(manifest["verification_cohorts"][0]["bootstrap"]["md5_hash"])
+        self.assertEqual(provenance["manifest_fingerprint"], source_fingerprint)
+        self.assertEqual(provenance["schema"], "jetstreamer-gcs-snapshot-preflight-v2")
+
+    def test_replans_v3_manifest_and_preserves_md5(self) -> None:
+        source_report, source_fingerprint = source_manifest_report(
+            17, 18, schema="jetstreamer-gcs-snapshot-preflight-v3"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            source_path = Path(directory) / "source.json"
+            source_path.write_text(json.dumps(source_report), encoding="utf-8")
+            root, hourly, _ = preflight.load_sealed_manifest_objects(
+                source_path, source_fingerprint, 17, 18
+            )
+
+        plans = preflight.build_epoch_plans(root, hourly, 17, 18, 2)
+        manifest = preflight.build_manifest(plans, 2)
+        self.assertEqual(
+            manifest["verification_cohorts"][0]["bootstrap"]["md5_hash"],
+            MD5_HASH,
+        )
+
+    def test_source_manifest_ignores_stale_route_outside_selected_subrange(self) -> None:
+        source_report, _ = source_manifest_report(17, 20)
+        manifest = source_report["manifest"]
+        cohort = next(
+            item
+            for item in manifest["verification_cohorts"]
+            if item["first_epoch"] == 17
+        )
+        epoch = next(item for item in manifest["epochs"] if item["epoch"] == 17)
+        cohort["runtime"] = "solana-stale-outside-selected-range"
+        epoch["runtime"] = cohort["runtime"]
+        source_fingerprint = preflight.manifest_fingerprint(manifest)
+        source_report["manifest_fingerprint"] = source_fingerprint
+
+        with tempfile.TemporaryDirectory() as directory:
+            source_path = Path(directory) / "source.json"
+            source_path.write_text(json.dumps(source_report), encoding="utf-8")
+            root, hourly, provenance = preflight.load_sealed_manifest_objects(
+                source_path, source_fingerprint, 18, 20
+            )
+
+        plans = preflight.build_epoch_plans(root, hourly, 18, 20, 3)
+        self.assertEqual((plans[0].epoch, plans[-1].epoch), (18, 20))
+        self.assertEqual(provenance["selected_first_epoch"], 18)
+        self.assertEqual(provenance["selected_last_epoch"], 20)
+
+    def test_source_manifest_rejects_stale_route_inside_selected_subrange(self) -> None:
+        source_report, _ = source_manifest_report(17, 20)
+        manifest = source_report["manifest"]
+        cohort = next(
+            item
+            for item in manifest["verification_cohorts"]
+            if item["first_epoch"] == 18
+        )
+        epoch = next(item for item in manifest["epochs"] if item["epoch"] == 18)
+        cohort["runtime"] = "solana-stale-inside-selected-range"
+        epoch["runtime"] = cohort["runtime"]
+        source_fingerprint = preflight.manifest_fingerprint(manifest)
+        source_report["manifest_fingerprint"] = source_fingerprint
+
+        with tempfile.TemporaryDirectory() as directory:
+            source_path = Path(directory) / "source.json"
+            source_path.write_text(json.dumps(source_report), encoding="utf-8")
+            with self.assertRaisesRegex(
+                preflight.PreflightError,
+                "disagree with selected epoch 18 route",
+            ):
+                preflight.load_sealed_manifest_objects(
+                    source_path, source_fingerprint, 18, 20
+                )
+
+    def test_source_manifest_still_binds_unselected_epoch_to_source_cohort(self) -> None:
+        source_report, _ = source_manifest_report(17, 20)
+        manifest = source_report["manifest"]
+        epoch = next(item for item in manifest["epochs"] if item["epoch"] == 17)
+        epoch["runtime"] = "source-record-disagrees-with-cohort"
+        source_fingerprint = preflight.manifest_fingerprint(manifest)
+        source_report["manifest_fingerprint"] = source_fingerprint
+
+        with tempfile.TemporaryDirectory() as directory:
+            source_path = Path(directory) / "source.json"
+            source_path.write_text(json.dumps(source_report), encoding="utf-8")
+            with self.assertRaisesRegex(
+                preflight.PreflightError,
+                "disagrees with its source cohort",
+            ):
+                preflight.load_sealed_manifest_objects(
+                    source_path, source_fingerprint, 18, 20
+                )
+
+    def test_sealed_manifest_requires_independent_matching_fingerprint(self) -> None:
+        source_report, source_fingerprint = source_manifest_report(17, 18)
+        with tempfile.TemporaryDirectory() as directory:
+            source_path = Path(directory) / "source.json"
+            source_path.write_text(json.dumps(source_report), encoding="utf-8")
+            with self.assertRaisesRegex(preflight.PreflightError, "fingerprint mismatch"):
+                preflight.load_sealed_manifest_objects(
+                    source_path, "sha256:" + "0" * 64, 17, 18
+                )
+
+        self.assertNotEqual(source_fingerprint, "sha256:" + "0" * 64)
+
+    def test_sealed_manifest_rejects_missing_generation_after_valid_fingerprint(self) -> None:
+        source_report, _ = source_manifest_report(17, 18)
+        del source_report["manifest"]["verification_cohorts"][0]["bootstrap"][
+            "generation"
+        ]
+        fingerprint = preflight.manifest_fingerprint(source_report["manifest"])
+        source_report["manifest_fingerprint"] = fingerprint
+        with tempfile.TemporaryDirectory() as directory:
+            source_path = Path(directory) / "source.json"
+            source_path.write_text(json.dumps(source_report), encoding="utf-8")
+            with self.assertRaisesRegex(preflight.PreflightError, "snapshot fields differ"):
+                preflight.load_sealed_manifest_objects(source_path, fingerprint, 17, 18)
+
+    @mock.patch.object(preflight, "run_gcloud_inventory")
+    def test_source_manifest_cli_mode_never_invokes_gcloud(
+        self, run_gcloud: mock.Mock
+    ) -> None:
+        source_report, fingerprint = source_manifest_report(17, 18)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source_path = root / "source.json"
+            output_path = root / "output.json"
+            local_root = root / "horizon"
+            local_root.mkdir()
+            source_path.write_text(json.dumps(source_report), encoding="utf-8")
+            result = preflight.main(
+                [
+                    "--source-manifest-report",
+                    str(source_path),
+                    "--source-manifest-fingerprint",
+                    fingerprint,
+                    "--first-epoch",
+                    "17",
+                    "--last-epoch",
+                    "18",
+                    "--target-cohort-epochs",
+                    "2",
+                    "--local-root",
+                    str(local_root),
+                    "--output",
+                    str(output_path),
+                ]
+            )
+            report = json.loads(output_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(result, 0)
+        self.assertEqual(
+            report["replanned_from_source_manifest"]["manifest_fingerprint"],
+            fingerprint,
+        )
+        run_gcloud.assert_not_called()
+
+    def test_source_manifest_cli_rejects_mixed_inventory_modes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fixture = root / "fixture.json"
+            fixture.write_text("[]", encoding="utf-8")
+            result = preflight.main(
+                [
+                    "--source-manifest-report",
+                    str(fixture),
+                    "--source-manifest-fingerprint",
+                    "sha256:" + "0" * 64,
+                    "--inventory-root-json",
+                    str(fixture),
+                    "--inventory-hourly-json",
+                    str(fixture),
+                ]
+            )
+
+        self.assertEqual(result, 1)
+
+    def test_v4_manifest_explicitly_represents_composite_snapshot_without_md5(self) -> None:
+        root_raw, hourly_raw = complete_inventory()
+        hourly_raw[0]["metadata"].pop("md5Hash")
+        plans = preflight.build_epoch_plans(
+            preflight.parse_inventory_json(json.dumps(root_raw), "root"),
+            preflight.parse_inventory_json(json.dumps(hourly_raw), "hourly"),
+        )
+        manifest = preflight.build_manifest(plans)
+
+        self.assertEqual(manifest["schema"], "jetstreamer-gcs-snapshot-preflight-v4")
+        self.assertIn("md5_hash", manifest["verification_cohorts"][0]["bootstrap"])
+        self.assertIsNone(
+            manifest["verification_cohorts"][0]["bootstrap"]["md5_hash"]
+        )
+
+    def test_manifest_fingerprint_is_order_independent_and_binds_metadata(self) -> None:
+        root_raw, hourly_raw = complete_inventory()
+        plans_a = preflight.build_epoch_plans(
+            preflight.parse_inventory_json(json.dumps(root_raw), "root"),
+            preflight.parse_inventory_json(json.dumps(hourly_raw), "hourly"),
+        )
+        plans_b = preflight.build_epoch_plans(
+            preflight.parse_inventory_json(json.dumps(list(reversed(root_raw))), "root"),
+            preflight.parse_inventory_json(json.dumps(list(reversed(hourly_raw))), "hourly"),
+        )
+        fingerprint_a = preflight.manifest_fingerprint(preflight.build_manifest(plans_a))
+        fingerprint_b = preflight.manifest_fingerprint(preflight.build_manifest(plans_b))
+        self.assertEqual(fingerprint_a, fingerprint_b)
+
+        metadata_only = copy.deepcopy(root_raw)
+        metadata_only[0]["metadata"]["metageneration"] = "2"
+        plans_metadata_only = preflight.build_epoch_plans(
+            preflight.parse_inventory_json(json.dumps(metadata_only), "root"),
+            preflight.parse_inventory_json(json.dumps(hourly_raw), "hourly"),
+        )
+        self.assertEqual(
+            fingerprint_a,
+            preflight.manifest_fingerprint(preflight.build_manifest(plans_metadata_only)),
+        )
+
+        changed = copy.deepcopy(root_raw)
+        changed[-1]["metadata"]["size"] = str(int(changed[-1]["metadata"]["size"]) + 1)
+        plans_changed = preflight.build_epoch_plans(
+            preflight.parse_inventory_json(json.dumps(changed), "root"),
+            preflight.parse_inventory_json(json.dumps(hourly_raw), "hourly"),
+        )
+        self.assertNotEqual(
+            fingerprint_a,
+            preflight.manifest_fingerprint(preflight.build_manifest(plans_changed)),
+        )
+
+        changed_md5 = copy.deepcopy(root_raw)
+        changed_md5[-1]["metadata"]["md5Hash"] = "AQAAAAAAAAAAAAAAAAAAAA=="
+        plans_changed_md5 = preflight.build_epoch_plans(
+            preflight.parse_inventory_json(json.dumps(changed_md5), "root"),
+            preflight.parse_inventory_json(json.dumps(hourly_raw), "hourly"),
+        )
+        self.assertNotEqual(
+            fingerprint_a,
+            preflight.manifest_fingerprint(preflight.build_manifest(plans_changed_md5)),
+        )
+
+    def test_storage_report_counts_only_exact_regular_local_bootstraps(self) -> None:
+        root_raw, hourly_raw = complete_inventory()
+        plans = preflight.build_epoch_plans(
+            preflight.parse_inventory_json(json.dumps(root_raw), "root"),
+            preflight.parse_inventory_json(json.dumps(hourly_raw), "hourly"),
+        )
+        selected = preflight.selected_bootstraps(plans)
+        with tempfile.TemporaryDirectory() as directory:
+            local_root = Path(directory)
+            (local_root / selected[0].filename).write_bytes(b"x" * selected[0].size)
+            (local_root / selected[1].filename).write_bytes(b"wrong")
+
+            report = preflight.build_storage_report(plans, local_root, free_bytes=10**12)
+
+        self.assertEqual(report["selected_bootstrap_objects"], 100)
+        self.assertEqual(report["present_bootstrap_bytes"], selected[0].size)
+        self.assertEqual(
+            report["missing_local_bootstrap_bytes"],
+            report["selected_bootstrap_bytes"] - selected[0].size,
+        )
+        self.assertEqual(report["conflicting_local_paths"], 1)
+        self.assertFalse(report["preflight_ok"])
+
+    @mock.patch.object(preflight.subprocess, "run")
+    def test_live_mode_uses_two_separate_bounded_gcloud_commands(self, run: mock.Mock) -> None:
+        run.side_effect = [
+            subprocess.CompletedProcess([], 0, stdout="[]\n", stderr=""),
+            subprocess.CompletedProcess([], 0, stdout="[]\n", stderr=""),
+        ]
+
+        root, hourly = preflight.load_inventory_texts(None, None)
+
+        self.assertEqual((root, hourly), ("[]\n", "[]\n"))
+        self.assertEqual(run.call_count, 2)
+        commands = [call.args[0] for call in run.call_args_list]
+        self.assertEqual(commands[0], preflight.gcloud_inventory_command(preflight.ROOT_PATTERN))
+        self.assertEqual(commands[1], preflight.gcloud_inventory_command(preflight.HOURLY_PATTERN))
+        for command in commands:
+            self.assertIn("--json", command)
+            self.assertIn("--quiet", command)
+            self.assertIn(f"--account={preflight.GCLOUD_ACCOUNT}", command)
+            self.assertIn(f"--billing-project={preflight.BILLING_PROJECT}", command)
+
+    @mock.patch.object(preflight, "run_gcloud_inventory")
+    def test_fixture_mode_never_invokes_gcloud(self, run_gcloud: mock.Mock) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root_path = Path(directory) / "root.json"
+            hourly_path = Path(directory) / "hourly.json"
+            root_path.write_text("[]", encoding="utf-8")
+            hourly_path.write_text("[]", encoding="utf-8")
+
+            self.assertEqual(
+                preflight.load_inventory_texts(root_path, hourly_path),
+                ("[]", "[]"),
+            )
+        run_gcloud.assert_not_called()
+
+        with self.assertRaises(preflight.PreflightError):
+            preflight.load_inventory_texts(root_path, None)
+
+
+if __name__ == "__main__":
+    unittest.main()

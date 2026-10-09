@@ -2,4 +2,24 @@
 /bin
 /.serena
 .DS_Store
+__pycache__/
+*.py[cod]
 
+/.claude
+old-faithful-sizes.tsv
+jets/*
+!jets/.gitkeep
+
+# Runtime artifacts from replay/pipeline runs in the repo root
+.snapshot-extract-*
+snapshot-*.tar.zst
+snapshot-*.tar.bz2
+accounts-run/
+compact-indexes/
+.historical-runtime/
+mismatch-dumps/
+epoch-*-generation*.log
+epoch-hashes-*.txt
+genesis.bin
+genesis.tar.bz2
+*.jet

@@ -1,0 +1,42 @@
+[package]
+name = "jetstreamer-historical-worker-v1-2-32"
+version = "0.1.0"
+edition = "2018"
+license = "MIT OR Apache-2.0"
+publish = false
+build = "build.rs"
+
+[features]
+# Test-only escape hatch used to exercise sha2 0.9.9's portable backend on
+# SHA-NI hosts. Production builds leave this disabled and runtime-dispatch.
+poh-force-soft = ["sha2-fast/force-soft"]
+
+[dependencies]
+bincode = "=1.3.1"
+bzip2 = "=0.3.3"
+jetstreamer-historical-protocol = { path = "../protocol" }
+# Preserve the newest libc known to compile under this historical toolchain;
+# sha2-fast's CPU dispatcher otherwise lets a fresh resolver select a crate
+# whose manifest requires the Rust 2021 edition.
+libc = "=0.2.155"
+num_cpus = "=1.13.0"
+rand = "=0.7.3"
+rand_chacha = "=0.2.2"
+rayon = "=1.4.0"
+serde = "=1.0.114"
+sha2 = "=0.8.2"
+sha2-fast = { package = "sha2", version = "=0.9.9", features = ["compress"] }
+solana-runtime = { path = "../vendor/solana-runtime-1.2.32", version = "=1.2.32" }
+solana-bpf-loader-program = { path = "../vendor/solana-bpf-loader-program-1.2.32", version = "=1.2.32" }
+solana-config-program = { git = "https://github.com/solana-labs/solana.git", rev = "8c989da68342918f1717c60aa60fdfab7d1e676e", version = "=1.2.32" }
+solana-merkle-tree = { git = "https://github.com/solana-labs/solana.git", rev = "8c989da68342918f1717c60aa60fdfab7d1e676e", version = "=1.2.32" }
+solana-rayon-threadlimit = { git = "https://github.com/solana-labs/solana.git", rev = "8c989da68342918f1717c60aa60fdfab7d1e676e", version = "=1.2.32" }
+solana-sdk = { git = "https://github.com/solana-labs/solana.git", rev = "8c989da68342918f1717c60aa60fdfab7d1e676e", version = "=1.2.32" }
+solana-stake-program = { git = "https://github.com/solana-labs/solana.git", rev = "8c989da68342918f1717c60aa60fdfab7d1e676e", version = "=1.2.32" }
+solana-vote-program = { git = "https://github.com/solana-labs/solana.git", rev = "8c989da68342918f1717c60aa60fdfab7d1e676e", version = "=1.2.32" }
+tar = "=0.4.29"
+tempfile = "=3.1.0"
+zstd = "=0.5.3"
+
+[dev-dependencies]
+bs58 = "=0.3.1"

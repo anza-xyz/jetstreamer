@@ -5,6 +5,7 @@ use jetstreamer_firehose::firehose::{
     BlockData, OnEntryFn, OnErrorFn, OnRewardFn, OnStatsTrackingFn, TransactionData, firehose,
     thread_activity,
 };
+use jetstreamer_firehose::transaction::parse_versioned_transaction_from_slice;
 use serde_cbor::Value::{self, Array, Bytes, Integer, Map, Null, Text};
 use sha2::{Digest, Sha256};
 use std::{
@@ -65,10 +66,10 @@ fn reward_payload(slot: u64) -> Option<Vec<u8>> {
     use solana_storage_proto::{StoredExtendedRewards, convert::generated::Rewards};
     use solana_transaction_status::{Reward, RewardType};
 
-    let (commission, commission_bps) = match slot % 6 {
-        0 | 3 => (Some(7), None),
-        1 | 4 => (None, Some(700)),
-        2 => (None, Some(745)),
+    let commission = match slot % 6 {
+        0 | 3 => Some(7),
+        1 | 4 => Some(8),
+        2 => Some(9),
         _ => return None,
     };
     let rewards: StoredExtendedRewards = vec![
@@ -78,12 +79,11 @@ fn reward_payload(slot: u64) -> Option<Vec<u8>> {
             post_balance: 10,
             reward_type: Some(RewardType::Staking),
             commission,
-            commission_bps,
         }
         .into(),
     ];
     Some(if slot % 6 < 3 {
-        prost_014::Message::encode_to_vec(&Rewards::from(rewards))
+        prost_011::Message::encode_to_vec(&Rewards::from(rewards))
     } else {
         bincode::serialize(&rewards).unwrap()
     })
@@ -99,23 +99,20 @@ fn assert_reward_commission_format(block: &BlockData) {
     else {
         return;
     };
-    // Equal normalized values must still retain distinct ledger formats. Repeating
-    // the cases across consecutive slots also detects stale flags after a reset.
-    let (expected_commission, expected_format) = match slot % 6 {
-        0 | 3 => (Some(700), false),
-        1 | 4 => (Some(700), true),
-        2 => (Some(745), true),
-        _ => (None, false),
+    // Solana 3.x only exposes legacy whole-percent commission values. Exercise
+    // both protobuf and bincode payloads, and detect stale rewards after reset.
+    let expected_commission = match slot % 6 {
+        0 | 3 => Some(7),
+        1 | 4 => Some(8),
+        2 => Some(9),
+        _ => None,
     };
-    assert_eq!(
-        *commission_rate_in_basis_points, expected_format,
-        "slot {slot}"
-    );
+    assert_eq!(*commission_rate_in_basis_points, false, "slot {slot}");
     assert_eq!(
         rewards
             .keyed_rewards
             .iter()
-            .map(|(_, reward)| reward.commission_bps)
+            .map(|(_, reward)| reward.commission)
             .collect::<Vec<_>>(),
         expected_commission
             .map(Some)
@@ -129,8 +126,7 @@ fn archive() -> (Vec<u8>, Vec<u8>) {
     let mut nodes = Vec::new();
     let mut records = Vec::new();
     let transaction = STANDARD.decode(TRANSACTION).unwrap();
-    let parsed: solana_transaction::versioned::VersionedTransaction =
-        wincode::deserialize(&transaction).unwrap();
+    let parsed = parse_versioned_transaction_from_slice(&transaction).unwrap();
     parsed
         .verify_and_hash_message()
         .expect("valid fixture signature");

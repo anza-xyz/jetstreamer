@@ -1,0 +1,40 @@
+{
+  "candidate": "solana-v1.8.11",
+  "status": "private-checkpoint-gated",
+  "upstream": {
+    "tag": "v1.8.11",
+    "commit": "423a4d65461e36fefb371a2f164c20c4e7ed5afa",
+    "runtime_tree": "977914b53d61523f2f0bcea554e4c18ab9340523",
+    "bpf_loader_tree": "d67e20ec64d1e394d98a7047ac490bd14a211d9c"
+  },
+  "admission": {
+    "bootstrap_snapshot_slot": 114910768,
+    "first_entry_slot": 114910769,
+    "max_slot_exclusive": 130464000,
+    "first_epoch": 266,
+    "last_publication_epoch": 300,
+    "verification_tail_epoch": 301
+  },
+  "bootstrap": {
+    "versioned_uri": "gs://mainnet-beta-ledger-us-ny5/114910768/snapshot-114910768-HnePfSpTtWaPDFx9RrPeuamDZREhoUXa7xpK6fbtPGyK.tar.zst#1641767242524970",
+    "accounts_hash": "HnePfSpTtWaPDFx9RrPeuamDZREhoUXa7xpK6fbtPGyK",
+    "size": 16826334350,
+    "crc32c_base64": "i85Rcw==",
+    "md5_base64": "frRtvWbKEzOW/onIQa3MeQ=="
+  },
+  "terminal_checkpoint": {
+    "epoch": 301,
+    "publication": false,
+    "slot": 130462794,
+    "accounts_hash": "23YjWRYFuJ4pCTbZLVQhXDuobQS2jv792tyjzEaLcUVK",
+    "generation": "1650771456100283",
+    "size": 22727770984,
+    "crc32c_base64": "a9aJmQ==",
+    "md5_base64": "fC8nTmA2lYbowqEeTBNt8Q=="
+  },
+  "loader_key_attribution": {
+    "invariant": "signature attribution includes only writable non-loader keys, matching runtime account storage",
+    "runtime_source_sha256": "77aa76807b7da04c619c9382ff05e598f653f2cee730eeca00012496d3dfdd15"
+  },
+  "publication_gate": "locked-tests-release-build-and-canonical-checkpoint-qualification"
+}

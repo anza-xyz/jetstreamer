@@ -1,0 +1,368 @@
+import json
+import os
+from pathlib import Path
+import stat
+import tempfile
+import unittest
+
+from scripts import collect_historical_performance_results as collect
+
+
+class HistoricalPerformanceResultsTest(unittest.TestCase):
+    def test_accepts_dedicated_followup_guard_service_only(self) -> None:
+        self.assertEqual(
+            collect.validate_guard_unit(
+                "horizon-perf-epoch202-guard-store8.service"
+            ),
+            "horizon-perf-epoch202-guard-store8.service",
+        )
+        for invalid in (
+            "horizon-perf-epoch202-results-store8.service",
+            "other-guard.service",
+            "horizon-perf-epoch202-guard-store8.timer",
+        ):
+            with self.subTest(invalid=invalid), self.assertRaises(
+                collect.CollectionError
+            ):
+                collect.validate_guard_unit(invalid)
+
+    def test_variant_set_accepts_exact_two_way_cohort_and_rejects_ambiguity(self) -> None:
+        def variant(name: str, namespace: str | None = None) -> dict[str, object]:
+            root = collect.PRIVATE_ROOT / name
+            unit_namespace = f"-{namespace}" if namespace is not None else ""
+            return {
+                "name": name,
+                "unit": f"horizon-perf-epoch202{unit_namespace}@{name}.service",
+                "canary_receipt": str(root / "canary-receipt.json"),
+                "scratch": str(root / "scratch"),
+                "archive": str(root / "output" / "epoch-202-through-87695515.jet"),
+                "wave_metrics": True,
+            }
+
+        cohort = [variant("waves-control-t16"), variant("waves-store8-t16")]
+        self.assertEqual(
+            [item["name"] for item in collect.validate_variant_set(cohort)],
+            ["waves-control-t16", "waves-store8-t16"],
+        )
+        with self.assertRaises(collect.CollectionError):
+            collect.validate_variant_set(cohort[:1])
+        with self.assertRaises(collect.CollectionError):
+            collect.validate_variant_set([cohort[0], cohort[0]])
+
+        namespaced = [
+            variant("waves-control-t16", "store8"),
+            variant("waves-store8-t16", "store8"),
+        ]
+        self.assertEqual(
+            [
+                item["unit"]
+                for item in collect.validate_variant_set(namespaced, "store8")
+            ],
+            [item["unit"] for item in namespaced],
+        )
+        with self.assertRaises(collect.CollectionError):
+            collect.validate_variant_set(namespaced)
+        for invalid in ("", "Store8", "store8@other", "store8.service"):
+            with self.subTest(invalid=invalid), self.assertRaises(
+                collect.CollectionError
+            ):
+                collect.validate_unit_namespace(invalid)
+
+    def test_variant_set_supports_manifest_bound_epoch_and_private_root(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            private_root = Path(directory).resolve()
+            names = ("rayon-control-t32", "rayon-candidate-t8")
+            variants = []
+            for name in names:
+                root = private_root / name
+                variants.append(
+                    {
+                        "name": name,
+                        "unit": f"horizon-perf-epoch157-rayon@{name}.service",
+                        "canary_receipt": str(root / "canary-receipt.json"),
+                        "scratch": str(root / "scratch"),
+                        "archive": str(root / "output" / "epoch-157-rayon-canary.jet"),
+                        "wave_metrics": False,
+                    }
+                )
+
+            validated = collect.validate_variant_set(
+                variants,
+                private_root=private_root,
+                unit_prefix=collect.validate_unit_prefix(
+                    "horizon-perf-epoch157-rayon"
+                ),
+                archive_filename=collect.validate_archive_filename(
+                    "epoch-157-rayon-canary.jet"
+                ),
+            )
+
+            self.assertEqual([item["name"] for item in validated], list(names))
+            self.assertEqual(
+                collect.validate_private_root(str(private_root)), private_root
+            )
+            self.assertEqual(collect.validate_canary_receipt_uid(1001), 1001)
+
+    def test_generic_manifest_bindings_reject_unsafe_values(self) -> None:
+        for value in ("epoch157", "Horizon-perf-epoch157", "horizon-perf-epoch"):
+            with self.subTest(value=value), self.assertRaises(
+                collect.CollectionError
+            ):
+                collect.validate_unit_prefix(value)
+        for value in ("../archive.jet", "/archive.jet", "archive", ""):
+            with self.subTest(value=value), self.assertRaises(
+                collect.CollectionError
+            ):
+                collect.validate_archive_filename(value)
+        for value in (-1, True, "1001"):
+            with self.subTest(value=value), self.assertRaises(
+                collect.CollectionError
+            ):
+                collect.validate_canary_receipt_uid(value)
+
+    def test_collector_binding_requires_exact_safe_digest_and_path(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            collector = Path(directory) / "collector.py"
+            collector.write_bytes(b"#!/usr/bin/env python3\n")
+            os.chmod(collector, 0o555)
+            digest = collect.sha256_file(collector)
+            manifest = {
+                "collector": {"path": str(collector), "sha256": digest}
+            }
+            self.assertEqual(
+                collect.validate_collector_binding(manifest, executable=collector),
+                {"path": str(collector), "sha256": digest},
+            )
+            with self.assertRaises(collect.CollectionError):
+                collect.validate_collector_binding(
+                    {
+                        "collector": {
+                            "path": str(collector),
+                            "sha256": "0" * 64,
+                        }
+                    },
+                    executable=collector,
+                )
+            other = Path(directory) / "other.py"
+            other.write_bytes(collector.read_bytes())
+            os.chmod(other, 0o555)
+            with self.assertRaises(collect.CollectionError):
+                collect.validate_collector_binding(manifest, executable=other)
+            os.chmod(collector, 0o775)
+            with self.assertRaises(collect.CollectionError):
+                collect.validate_collector_binding(manifest, executable=collector)
+
+    def test_terminal_success_accepts_collected_systemd_metadata(self) -> None:
+        for invocation_id, exec_main_code in (("invocation", 1), ("", 0)):
+            state = collect.UnitState(
+                unit="horizon-perf-epoch202@one.service",
+                load_state="loaded",
+                active_state="inactive",
+                sub_state="dead",
+                result="success",
+                main_pid=0,
+                invocation_id=invocation_id,
+                restarts=0,
+                exec_main_code=exec_main_code,
+                exec_main_status=0,
+                cpu_usage_nsec=None,
+                memory_peak_bytes=None,
+            )
+            collect.require_terminal_success(state, "invocation")
+        controlled = collect.UnitState(
+            unit="horizon-perf-epoch202@one.service",
+            load_state="loaded",
+            active_state="inactive",
+            sub_state="dead",
+            result="success",
+            main_pid=0,
+            invocation_id="invocation",
+            restarts=0,
+            exec_main_code=1,
+            exec_main_status=1,
+            cpu_usage_nsec=None,
+            memory_peak_bytes=None,
+        )
+        with self.assertRaises(collect.CollectionError):
+            collect.require_terminal_success(controlled, "invocation")
+        collect.require_terminal_success(controlled, "invocation", (0, 1))
+
+    def test_parses_latest_wave_metrics(self) -> None:
+        prefix = "historical execution wave metrics: "
+        first = (
+            prefix
+            + "reason=periodic transactions=10 waves=5 singleton_waves=2 "
+            "maximum_wave_size=4 size1=2 size2=1 size3=1 size4=1 size5=0 "
+            "size6_7=0 size8plus=0"
+        )
+        second = first.replace("transactions=10", "transactions=20").replace(
+            "waves=5", "waves=8"
+        )
+        result = collect.parse_wave_metrics([first, "noise", second])
+        self.assertEqual(result["transactions"], 20)
+        self.assertEqual(result["waves"], 8)
+        self.assertEqual(result["singleton_wave_fraction"], 0.25)
+
+    def test_parses_guard_maximum_vmas_per_unit(self) -> None:
+        units = {"horizon-perf-epoch202@one.service"}
+        lines = [
+            json.dumps(
+                {
+                    "schema": collect.GUARD_SCHEMA,
+                    "samples": [
+                        {"unit": next(iter(units)), "worker_vmas": value}
+                    ],
+                }
+            )
+            for value in (100, 120, None, 110)
+        ]
+        self.assertEqual(
+            collect.parse_guard_samples(lines, units)[next(iter(units))],
+            {"samples": 4, "maximum_worker_vmas": 120},
+        )
+
+    def test_tree_statistics_does_not_follow_symlinks(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "root"
+            outside = Path(directory) / "outside"
+            root.mkdir()
+            outside.mkdir()
+            (root / "small").write_bytes(b"a")
+            (root / "large").write_bytes(b"b" * (4 * 1024 * 1024 + 1))
+            (outside / "hidden").write_bytes(b"secret")
+            (root / "link").symlink_to(outside, target_is_directory=True)
+            result = collect.tree_statistics(root)
+            self.assertEqual(result["regular_files"], 2)
+            self.assertEqual(result["symlinks_not_followed"], 1)
+            self.assertEqual(result["file_size_histogram"]["le_4_mib"], 1)
+            self.assertEqual(result["file_size_histogram"]["gt_4_le_8_mib"], 1)
+
+    def test_tree_statistics_collects_appendvec_store_fanout_by_slot(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "accounts-state"
+            path_zero = root / "0"
+            path_one = root / "1"
+            path_zero.mkdir(parents=True)
+            path_one.mkdir()
+            for relative in (
+                "0/42.1",
+                "1/42.2",
+                "0/43.3",
+                "0/44.4",
+                "1/44.5",
+                "1/44.6",
+            ):
+                (root / relative).write_bytes(b"appendvec")
+            (path_zero / "not-an-appendvec").write_bytes(b"metadata")
+
+            result = collect.tree_statistics(root, collect_appendvec_slots=True)
+
+            self.assertEqual(result["regular_files"], 7)
+            self.assertEqual(
+                result["appendvec_store_fanout"],
+                {
+                    "recognized_appendvec_files": 6,
+                    "unrecognized_regular_files": 1,
+                    "slots_with_stores": 3,
+                    "minimum_stores_per_slot": 1,
+                    "maximum_stores_per_slot": 3,
+                    "mean_stores_per_slot": 2.0,
+                    "store_count_to_slot_count": {"1": 1, "2": 1, "3": 1},
+                },
+            )
+
+    def test_validates_successful_canary_receipt(self) -> None:
+        payload = {
+            "schema": collect.CANARY_SCHEMA,
+            "systemd_invocation_id": "invocation",
+            "target_slot": 100,
+            "target_reached": True,
+            "child_return_code": 0,
+            "external_signal": None,
+            "first_progress": {"slot": 90, "transactions": 10, "account_updates": 20},
+            "final_progress": {"slot": 101, "transactions": 40, "account_updates": 80},
+            "progress_rates": {"transactions_per_second": 3.0},
+            "elapsed_seconds": 10.0,
+        }
+        result = collect.validate_canary_receipt(payload, 100, "invocation")
+        self.assertEqual(result["transaction_delta"], 30)
+        self.assertEqual(result["account_update_delta"], 60)
+        for key, value in (
+            ("target_reached", False),
+            ("child_return_code", 1),
+            ("external_signal", 15),
+        ):
+            broken = {**payload, key: value}
+            with self.subTest(key=key), self.assertRaises(collect.CollectionError):
+                collect.validate_canary_receipt(broken, 100, "invocation")
+        with self.assertRaises(collect.CollectionError):
+            collect.validate_canary_receipt(payload, 100, "other-invocation")
+        controlled = {**payload, "child_return_code": 1}
+        with self.assertRaises(collect.CollectionError):
+            collect.validate_canary_receipt(controlled, 100, "invocation")
+        accepted = collect.validate_canary_receipt(
+            controlled, 100, "invocation", (0, 1)
+        )
+        self.assertEqual(accepted["child_return_code"], 1)
+
+    def test_controlled_stop_allowlist_is_narrow(self) -> None:
+        self.assertEqual(
+            collect.parse_allowed_target_stop_return_codes(None), (0,)
+        )
+        self.assertEqual(
+            collect.parse_allowed_target_stop_return_codes([0, 1]), (0, 1)
+        )
+        for invalid in ([], [1], [0, 2], [0, 1, 1], [0, True], "0,1"):
+            with self.subTest(invalid=invalid), self.assertRaises(
+                collect.CollectionError
+            ):
+                collect.parse_allowed_target_stop_return_codes(invalid)
+
+    def test_validates_recorded_scratch_snapshot(self) -> None:
+        scratch = Path("/scratch")
+        common = {
+            "device": 1,
+            "physical_bytes": 2,
+            "apparent_bytes": 3,
+            "regular_files": 4,
+            "directories": 5,
+            "symlinks_not_followed": 0,
+            "file_size_histogram": {"le_4_mib": 4},
+        }
+        snapshot = {
+            "captured_unix_seconds": 1.0,
+            "scratch": {**common, "path": str(scratch)},
+            "accounts_state": {
+                **common,
+                "path": str(scratch / "runtime" / "accounts-state"),
+                "appendvec_store_fanout": {"recognized_appendvec_files": 4},
+            },
+        }
+        scratch_stats, accounts_stats = collect.validate_scratch_snapshot(
+            snapshot, scratch
+        )
+        self.assertEqual(scratch_stats["physical_bytes"], 2)
+        self.assertIn("appendvec_store_fanout", accounts_stats)
+        broken = json.loads(json.dumps(snapshot))
+        broken["accounts_state"]["path"] = "/outside/accounts-state"
+        with self.assertRaises(collect.CollectionError):
+            collect.validate_scratch_snapshot(broken, scratch)
+
+    def test_result_receipt_is_owner_only_and_noclobber(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            os.chmod(root, 0o700)
+            path = root / "receipt.json"
+            collect.write_json_noclobber(
+                path, {"ok": True}, required_uid=root.stat().st_uid
+            )
+            self.assertEqual(json.loads(path.read_text()), {"ok": True})
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+            with self.assertRaises(FileExistsError):
+                collect.write_json_noclobber(
+                    path, {"ok": False}, required_uid=root.stat().st_uid
+                )
+
+
+if __name__ == "__main__":
+    unittest.main()

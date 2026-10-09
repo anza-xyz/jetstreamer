@@ -93,7 +93,7 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
   releases exposed raw-API `crc32c`, `md5Hash`, string `size`, and `id` fields. Accept both shapes,
   fail on conflicting aliases, and require either the exact raw object ID or exact versioned
   `storage_url`; authentication success without this complete identity/hash proof is insufficient.
-- Failed-replay scratch cleanup is authorized by default for this workflow. After confirming the failure and capturing the evidence needed to diagnose or reproduce it, stop the service and retry path, verify that no live process or staged relaunch references the exact scratch path, and delete that failed run's scratch immediately instead of allowing failures to accumulate. Preserve diagnostic output, partial archives, replay state, logs, checkpoints, manifests, receipts, and any snapshot still needed for diagnosis, lineage, restart, or a staged epoch outside the scratch tree. Never apply this cleanup rule to a controlled stop that can genuinely resume in place. If a relaunch demonstrably starts from the bootstrap in a new isolated runtime generation with no resume cursor, verify the new worker's exact generation and reclaim older unreferenced generations promptly; preserving them does not make that replay resumable.
+- Failed-replay cleanup is authorized by default for this workflow. After confirming the failure and capturing the evidence needed to diagnose or reproduce it, stop the service and retry path, verify that no live process or staged relaunch references each exact target, and delete that failed run's scratch immediately instead of allowing failures to accumulate. Preserve diagnostic output and partial archives only until their useful evidence is sealed: for a terminal, non-resumable, superseded generation that cannot satisfy a full/plugin/publication gate, fsync a root-owned receipt with the service result, last slot/progress, exact size and archive hash when available, and copy any segment manifest outside the deletion tree; then retire the unreferenced local output promptly while retaining logs, manifests, receipts, hashes, and inputs needed for lineage or reproduction. Never apply this rule to a controlled stop that can genuinely resume in place or to any locally complete archive awaiting verification/upload. If a relaunch demonstrably starts from the bootstrap in a new isolated runtime generation with no resume cursor, verify the new worker's exact generation and reclaim older unreferenced generations promptly; preserving them does not make that replay resumable.
 - Diagnose an archive `SectionTooLarge` against both the record-count and data-arena limits for the
   named phase. The error's historical `bytes` field is also used for a count overflow, so a value
   such as `8193 (limit 8192)` can mean the 8,193rd update rather than an 8,193-byte account. Capture
@@ -282,12 +282,15 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
   documented persistent value before launch and record the effective value; this is independent
   of free RAM, CPU, and disk checks.
 - Reclaim local disk proactively when admission is constrained, but only from positively
-  reproducible caches and obsolete scratch generations. Resolve each deletion target to an exact
+  reproducible caches, obsolete scratch generations, and terminal partial outputs whose sealed
+  evidence proves they cannot pass the full-epoch gates. Resolve each deletion target to an exact
   canonical path, prove no live process or staged unit references it, preserve the manifest or
   receipt needed to reproduce it, and record the before/after evidence. Build caches, obsolete
-  snapshots, and fully generation-pinned snapshot caches may be removed after those checks;
-  required inputs, active scratch, resumable state, diagnostic evidence, checkpoints, receipts,
-  public archives, and all R2 objects must remain untouched.
+  snapshots, fully generation-pinned snapshot caches, and proven superseded partial outputs may be
+  removed after those checks; required inputs, active scratch, resumable state, unsealed diagnostic
+  evidence, checkpoints, receipts, complete archives awaiting gates/publication, and all R2 objects
+  must remain untouched. Record both the target's measured physical bytes and filesystem free space,
+  but do not equate their delta while live jobs allocate or files share extents.
   Treat command-line and mmap references as exact paths or descendants, not raw string prefixes:
   a live `scratch-store8` sibling is not a reference to an empty completed `scratch` tree. Use the
   repository retirement scanners' path-boundary checks, and still fail closed on any genuine

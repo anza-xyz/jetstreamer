@@ -861,6 +861,15 @@ Every new sweep must also pass `--solana-rayon-threads` with the value selected 
 same-snapshot performance qualification. The controller binds that value into its configuration,
 producer environment, and live-unit adoption checks. This prevents a high-core host from silently
 falling back to the legacy half-visible-CPU store fan-out and changing scratch amplification.
+If an authenticated reserve guard stops a cohort, keep its controller stopped while reviewing the
+durable guard receipts. A root-checkpoint run may retain a resumable run container even though its
+incomplete member must restart from the sealed bootstrap and its AccountsDb scratch is cleared.
+For that exact case, `scripts/retire_reserve_stopped_replay_scratch.py --check-only` proves the
+guard, terminal invocations, cursor-free state, preserved input/archive identities, and lack of live
+references. Re-run without `--check-only` to fsync a deletion intent and retire only the exact
+scratch tree. The run directory, input snapshot, partial archive, state, journals, and receipts stay
+in place for a later `JETSTREAMER_ROOT_COHORT_RESUME_RUN` launch. Never apply this cleanup to a run
+whose scratch contains a usable replay cursor.
 When a comparison uses a precommitted JSON selection policy, run
 `scripts/select_historical_performance_candidate.py` against the root-owned terminal result receipt.
 The selector requires exact zero-restart terminal evidence for the control and candidate, validates

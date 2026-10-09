@@ -203,7 +203,10 @@ impl Len for RipgetEpochReader {
 
 /// Checks the configured archive backend to determine whether an epoch CAR exists.
 pub async fn epoch_exists(epoch: u64, client: &Client) -> bool {
-    let location = archive::car_location();
+    epoch_exists_at(epoch, client, archive::car_location()).await
+}
+
+async fn epoch_exists_at(epoch: u64, client: &Client, location: &archive::Location) -> bool {
     let path = format!("{epoch}/epoch-{epoch}.car");
 
     if location.is_http() {
@@ -250,8 +253,16 @@ pub async fn fetch_epoch_stream_with_options(
     client: &Client,
     options: Option<FetchEpochStreamOptions>,
 ) -> EpochStream {
+    fetch_epoch_stream_at(epoch, client, options, archive::car_location()).await
+}
+
+async fn fetch_epoch_stream_at(
+    epoch: u64,
+    client: &Client,
+    options: Option<FetchEpochStreamOptions>,
+    location: &archive::Location,
+) -> EpochStream {
     let options = options.unwrap_or_else(FetchEpochStreamOptions::parallel_default);
-    let location = archive::car_location();
     let path = format!("{epoch}/epoch-{epoch}.car");
 
     if location.is_http() {
@@ -538,46 +549,7 @@ pub async fn get_slot_timestamp(
 
 /* ── Tests ──────────────────────────────────────────────────────────────── */
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use tokio::io::{AsyncReadExt, AsyncSeekExt};
-
-    #[tokio::test]
-    async fn test_fetch_epoch_stream() {
-        let client = crate::network::create_http_client();
-        let mut stream = fetch_epoch_stream(670, &client).await;
-
-        /* first 1 KiB */
-        let mut buf = vec![0u8; 1024];
-        stream.read_exact(&mut buf).await.unwrap();
-        assert_eq!(buf[0], 58);
-
-        /* last 1 KiB */
-        stream.seek(std::io::SeekFrom::End(-1024)).await.unwrap();
-        stream.read_exact(&mut buf).await.unwrap();
-        assert_eq!(buf[1], 1);
-    }
-
-    #[tokio::test]
-    async fn test_get_slot_timestamp() {
-        // well-known public Solana RPC, slot 246446651 occurred in Apr 2024
-        let client = crate::network::create_http_client();
-        let rpc_url = "https://api.mainnet-beta.solana.com";
-        let slot = 246446651u64;
-        let ts = get_slot_timestamp(slot, rpc_url, &client)
-            .await
-            .expect("should get a timestamp for valid slot");
-        // Unix timestamp should be after 2023, plausibility check (> 1672531200 = Jan 1, 2023)
-        assert!(ts > 1672531200, "timestamp was {}", ts);
-    }
-}
-
-#[tokio::test]
-async fn test_epoch_exists() {
-    let client = crate::network::create_http_client();
-    assert!(epoch_exists(670, &client).await);
-    assert!(!epoch_exists(999999, &client).await);
-}
+mod tests;
 
 #[test]
 fn test_epoch_to_slot() {

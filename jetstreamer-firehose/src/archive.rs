@@ -52,7 +52,7 @@ pub struct Location {
 
 impl Location {
     /// Creates a new HTTP location.
-    fn http(url: Url) -> Self {
+    pub(crate) fn http(url: Url) -> Self {
         Self {
             url,
             kind: LocationBackend::Http,

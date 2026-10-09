@@ -476,6 +476,15 @@ scripts/sync_horizon_r2_progressive.py \
   --defer-epochs ACTIVE_START-ACTIVE_END
 ```
 
+Before arming any generated upload service, audit the effective wrapper without executing it using
+`scripts/audit_horizon_upload_wrapper.py`. Bind every configured `--*-sha256` option to the exact
+immutable binary or script it names, require the binding set to cover every hash option exactly
+once, and preserve the JSON result with the deployment evidence. Re-derive these hashes from the
+deployed files even when a wrapper and deployment manifest already agree with each other: copied or
+mistyped evidence can be internally consistent yet reject the verifier's correct receipt only after
+a long replay finishes. Repeat this audit after any wrapper, verifier, plugin, or immutable package
+transition and confirm the effective systemd `ExecStart` points at the audited wrapper.
+
 The binary must fail closed on an existing remote mismatch by default. If the user explicitly authorizes replacement, `--overwrite-existing` replaces both the archive and sidecar, performs a fresh whole-object SHA-256 readback, and atomically replaces the private receipt. A native R2 checksum, when present, must report type `COMPOSITE` and match local part-SHA-256 evidence. Objects without native R2 checksums require a matching reconstructed ETag, canonical sidecar, and, unless explicitly trusted as legacy, a successful whole-object SHA-256 readback.
 
 If a trusted legacy upload has a canonical sidecar but its archive object is missing, use

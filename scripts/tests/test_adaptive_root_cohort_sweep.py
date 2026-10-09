@@ -1641,18 +1641,30 @@ class AdmissionTests(unittest.TestCase):
         disk_available_gib: int = 20_000,
         disk_reserve_gib: int = 512,
         disk_budget_per_worker_gib: int = 2_048,
+        external_active: int | None = None,
+        external_disk_growth_claim_gib: int | None = None,
         memory_admission_gib: int = 64,
         cpus_per_lane: int = 8,
     ) -> int:
         current = [5 * sweep.GIB] * active if current is None else current
         peak = [6 * sweep.GIB] * active if peak is None else peak
         owned_active = active if owned_active is None else owned_active
+        external_active = (
+            active - owned_active if external_active is None else external_active
+        )
+        external_disk_growth_claim_gib = (
+            external_active * disk_budget_per_worker_gib
+            if external_disk_growth_claim_gib is None
+            else external_disk_growth_claim_gib
+        )
         return sweep.admission_capacity(
             memory_total=1024 * sweep.GIB,
             memory_available=available_gib * sweep.GIB,
             logical_cpus=cpus,
             active=active,
             owned_active=owned_active,
+            external_active=external_active,
+            external_disk_growth_claim=external_disk_growth_claim_gib * sweep.GIB,
             elapsed_seconds=elapsed,
             lane_count=lane_count,
             initial=initial,
@@ -1759,6 +1771,74 @@ class AdmissionTests(unittest.TestCase):
             self.capacity(active=3, elapsed=10_000, disk_available_gib=0),
             3,
         )
+
+    def test_bound_external_growth_claims_recover_safe_local_capacity(self) -> None:
+        common = {
+            "active": 2,
+            "owned_active": 0,
+            "external_active": 2,
+            "elapsed": 10_000,
+            "initial": 1,
+            "target": 1,
+            "lane_count": 1,
+            "maximum": 1,
+            "disk_available_gib": 6_339,
+            "disk_reserve_gib": 1_280,
+            "disk_budget_per_worker_gib": 2_048,
+        }
+        self.assertEqual(self.capacity(**common), 2)
+        self.assertEqual(
+            self.capacity(
+                **common,
+                external_disk_growth_claim_gib=1_792 + 512,
+            ),
+            3,
+        )
+
+    def test_external_disk_growth_claim_parser_rejects_unsafe_values(self) -> None:
+        self.assertEqual(
+            sweep.parse_external_disk_growth_claim(
+                "example.service=" + "a" * 32 + ":512"
+            ),
+            ("example.service", "a" * 32, 512),
+        )
+        for value in (
+            "example=" + "a" * 32 + ":512",
+            "example.service=" + "a" * 32 + ":0",
+            "example.service=bad:512",
+        ):
+            with self.assertRaises(argparse.ArgumentTypeError):
+                sweep.parse_external_disk_growth_claim(value)
+
+    def test_external_growth_claim_requires_matching_live_invocation(self) -> None:
+        claims = (
+            sweep.EpochClaim(
+                1, 1, 20, 20, Path("/external-a"), Path("/node"), "a.service"
+            ),
+            sweep.EpochClaim(
+                2, 2, 21, 21, Path("/external-b"), Path("/node"), "b.service"
+            ),
+            sweep.EpochClaim(
+                3, 3, 22, 22, Path("/owned"), Path("/node"), "owned.service"
+            ),
+        )
+        statuses = (
+            sweep.UnitStatus(True, True, False, "success", 0, 1, 1, "running", "a" * 32),
+            sweep.UnitStatus(True, True, False, "success", 0, 1, 1, "running", "wrong"),
+            sweep.UnitStatus(True, True, False, "success", 0, 1, 1, "running", "c" * 32),
+        )
+        count, reservation = sweep.external_disk_growth_reservation(
+            claims,
+            statuses,
+            {Path("/owned")},
+            {
+                "a.service": ("a" * 32, 512),
+                "b.service": ("b" * 32, 256),
+            },
+            2_048,
+        )
+        self.assertEqual(count, 2)
+        self.assertEqual(reservation, (512 + 2_048) * sweep.GIB)
 
     def test_configured_concurrency_can_exceed_legacy_eight_lane_cap(self) -> None:
         parser = sweep.build_argument_parser()

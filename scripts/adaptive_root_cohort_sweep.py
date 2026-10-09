@@ -249,6 +249,7 @@ class UnitStatus:
     memory_current: int | None
     memory_peak: int | None
     sub_state: str = ""
+    invocation_id: str | None = None
 
     @property
     def exited_successfully(self) -> bool:
@@ -600,6 +601,33 @@ def parse_cohort_bootstrap(value: str) -> tuple[tuple[int, int], Path]:
     if not path.is_absolute():
         raise argparse.ArgumentTypeError("cohort bootstrap path must be absolute")
     return bounds, path
+
+
+def parse_external_disk_growth_claim(value: str) -> tuple[str, str, int]:
+    unit, separator, raw_binding = value.partition("=")
+    invocation_id, binding_separator, raw_gib = raw_binding.partition(":")
+    if not separator or SYSTEMD_UNIT_RE.fullmatch(unit) is None:
+        raise argparse.ArgumentTypeError(
+            "external disk growth claim must be "
+            "NAME.service=INVOCATION_ID:POSITIVE_GIB"
+        )
+    try:
+        gib = int(raw_gib)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(
+            "external disk growth claim must be "
+            "NAME.service=INVOCATION_ID:POSITIVE_GIB"
+        ) from error
+    if (
+        not binding_separator
+        or re.fullmatch(r"[0-9a-f]{32}", invocation_id) is None
+        or gib <= 0
+    ):
+        raise argparse.ArgumentTypeError(
+            "external disk growth claim must be "
+            "NAME.service=INVOCATION_ID:POSITIVE_GIB"
+        )
+    return unit, invocation_id, gib
 
 
 def cohort_bootstrap_for(args: argparse.Namespace, cohort: Cohort) -> Path | None:
@@ -1204,6 +1232,8 @@ def admission_capacity(
     logical_cpus: int,
     active: int,
     owned_active: int,
+    external_active: int,
+    external_disk_growth_claim: int,
     elapsed_seconds: float,
     lane_count: int,
     initial: int,
@@ -1244,7 +1274,16 @@ def admission_capacity(
     # budget. This intentionally double-counts space it already allocated: an
     # admission estimate may be conservative, but it must never strand every
     # replay on a full filesystem. Existing jobs are never terminated here.
-    disk = max(active, max(0, disk_available - disk_reserve) // disk_budget_per_worker)
+    # An external controller may have stronger, invocation-bound evidence for
+    # the remaining growth of producers it does not own. Preserve the full
+    # local budget for owned lanes and for every unbound external producer,
+    # while avoiding the old assumption that every heterogeneous producer has
+    # the same remaining growth as a brand-new local worker.
+    disk_for_owned = (
+        max(0, disk_available - disk_reserve - external_disk_growth_claim)
+        // disk_budget_per_worker
+    )
+    disk = max(active, external_active + disk_for_owned)
     cpu = max(1, logical_cpus // max(1, cpus_per_lane))
     # One observation window can qualify at most one additional lane. The
     # controller persists the new limit and starts a fresh window.
@@ -1264,6 +1303,35 @@ def admission_capacity(
         if any(value is not None and value >= memory_high for value in memory_peak):
             return min(active, capacity)
     return capacity
+
+
+def external_disk_growth_reservation(
+    claims: Sequence[EpochClaim],
+    statuses: Sequence[UnitStatus],
+    lane_outputs: set[Path],
+    bindings: Mapping[str, tuple[str, int]],
+    default_gib: int,
+) -> tuple[int, int]:
+    if len(claims) != len(statuses):
+        raise SweepError("epoch claims and unit status samples are not aligned")
+    external = [
+        (claim, status)
+        for claim, status in zip(claims, statuses)
+        if claim.output not in lane_outputs
+    ]
+    total_gib = sum(
+        (
+            binding[1]
+            if (
+                claim.unit is not None
+                and (binding := bindings.get(claim.unit)) is not None
+                and status.invocation_id == binding[0]
+            )
+            else default_gib
+        )
+        for claim, status in external
+    )
+    return len(external), total_gib * GIB
 
 
 def parse_systemd_show(text: str) -> UnitStatus:
@@ -1292,6 +1360,7 @@ def parse_systemd_show(text: str) -> UnitStatus:
         number("MemoryCurrent"),
         number("MemoryPeak"),
         sub_state,
+        fields.get("InvocationID") or None,
     )
 
 
@@ -1309,6 +1378,7 @@ def unit_status(unit: str) -> UnitStatus:
             "--property=ExecMainStatus",
             "--property=MemoryCurrent",
             "--property=MemoryPeak",
+            "--property=InvocationID",
         ],
         check=False,
         capture_output=True,
@@ -2688,6 +2758,10 @@ def controller_configuration_sha256(
         "protected_memory_gib": args.protected_memory_gib,
         "disk_reserve_gib": args.disk_reserve_gib,
         "disk_budget_per_worker_gib": args.disk_budget_per_worker_gib,
+        "external_disk_growth_claims_gib": {
+            unit: {"invocation_id": binding[0], "gib": binding[1]}
+            for unit, binding in sorted(args.external_disk_growth_claim_gib.items())
+        },
         "cpus_per_lane": args.cpus_per_lane,
         "cpu_quota_percent": args.cpu_quota_percent,
         "solana_rayon_threads": args.solana_rayon_threads,
@@ -4022,6 +4096,13 @@ class Controller:
             if claim.output in lane_outputs
         ]
         owned_active = len(owned_statuses)
+        external_active, external_disk_growth_claim = external_disk_growth_reservation(
+            claims,
+            statuses,
+            lane_outputs,
+            self.args.external_disk_growth_claim_gib,
+            self.args.disk_budget_per_worker_gib,
+        )
         now = time.time()
         current_limit = max(
             self.args.initial_concurrency,
@@ -4037,6 +4118,8 @@ class Controller:
             logical_cpus=os.cpu_count() or 0,
             active=len(statuses),
             owned_active=owned_active,
+            external_active=external_active,
+            external_disk_growth_claim=external_disk_growth_claim,
             elapsed_seconds=elapsed,
             lane_count=len(self.lanes),
             initial=current_limit,
@@ -4230,6 +4313,17 @@ def build_argument_parser() -> argparse.ArgumentParser:
         type=int,
         default=DEFAULT_DISK_BUDGET_PER_WORKER_GIB,
     )
+    parser.add_argument(
+        "--external-disk-growth-claim-gib",
+        action="append",
+        type=parse_external_disk_growth_claim,
+        default=[],
+        metavar="NAME.service=INVOCATION_ID:POSITIVE_GIB",
+        help=(
+            "invocation-bound remaining-growth claim for a live producer owned by "
+            "another controller; unmatched producers retain the full local worker budget"
+        ),
+    )
     parser.add_argument("--cpus-per-lane", type=int, default=DEFAULT_CPUS_PER_LANE)
     parser.add_argument("--cpu-quota-percent", type=int, default=DEFAULT_CPU_QUOTA_PERCENT)
     parser.add_argument(
@@ -4339,6 +4433,12 @@ def validate_options(args: argparse.Namespace) -> None:
         )
     ):
         raise SweepError("r2-bucket must be a nonempty single token")
+    external_claims: dict[str, tuple[str, int]] = {}
+    for unit, invocation_id, gib in args.external_disk_growth_claim_gib:
+        if unit in external_claims:
+            raise SweepError(f"duplicate external disk growth claim for {unit}")
+        external_claims[unit] = (invocation_id, gib)
+    args.external_disk_growth_claim_gib = external_claims
     names = [lane.name for lane in args.lane]
     roots = [lane.root for lane in args.lane]
     if len(names) != len(set(names)) or len(roots) != len(set(roots)):
@@ -4572,6 +4672,10 @@ def print_plan(
         "memory_admission_gib": args.memory_admission_gib,
         "disk_reserve_gib": args.disk_reserve_gib,
         "disk_budget_per_worker_gib": args.disk_budget_per_worker_gib,
+        "external_disk_growth_claims_gib": {
+            unit: {"invocation_id": binding[0], "gib": binding[1]}
+            for unit, binding in sorted(args.external_disk_growth_claim_gib.items())
+        },
         "solana_rayon_threads": args.solana_rayon_threads,
         "r2_receipt_directory": (
             str(args.r2_receipt_directory)

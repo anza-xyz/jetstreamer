@@ -153,6 +153,14 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
   configured per-worker disk admission budget and measured filesystem growth to leave the reserve
   intact before launching another cohort. If a manual canary set would violate that gate, stop the
   newest units and preserve their private run directories for later resumption.
+- A controller that observes producers owned by other controllers must not silently charge every
+  external producer the same remaining-growth budget as a new local worker when stronger sealed
+  evidence establishes heterogeneous claims. Use invocation-bound external growth claims derived
+  from exact live trees and stable recent windows; keep the complete local worker budget for the
+  proposed launch and the global filesystem reserve. Bind those claims into the controller
+  configuration and admission manifest. An absent unit, invocation mismatch, unbound producer, or
+  sampling race must fall back to the conservative full per-worker budget. Re-run admission rather
+  than editing claims underneath a live sealed controller.
 - Consecutive epochs using the same immutable runtime should normally be replayed as a bounded
   contiguous cohort so later epochs carry the live runtime state and AccountsDb scratch instead of
   restoring another bootstrap. A contiguous cohort is one ordered replay generation, not a set of independent

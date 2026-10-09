@@ -201,7 +201,10 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
   its sampled invocation ID, restart count, available bytes, floor, and no-trip result. If the
   sandboxed invocation cannot traverse or write its private receipt path, stop that broken timer,
   preserve its failure journal, correct the least-privilege capability or path policy, and repeat
-  this first-fire proof without restarting the producer.
+  this first-fire proof without restarting the producer. Pre-create every directory named by the
+  guard's `ReadWritePaths=` and verify its sealed owner and mode before launch; systemd resolves
+  those paths while constructing the mount namespace, so a missing receipt directory fails with
+  status 226 before the guard can sample or create it.
 - Before using scratch growth for admission or cross-host comparisons, resolve the exact live
   `--replay-scratch` argument from the service/process rather than measuring a lane, qualification,
   or retry parent. Record physical bytes, apparent bytes, file count, and a bounded-depth directory

@@ -144,6 +144,14 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
   discovery, a copied filename, or an unbound cache entry for this check; if the deployed parent lacks
   such an input, keep the cohort staged until authenticated generation-pinned download works or a new
   immutable parent implementing the gate is qualified and deployed.
+  The checked-in adaptive controller exposes this input as repeated
+  `--cohort-bootstrap=EPOCH_OR_RANGE=/ABSOLUTE/PATH`. Require the range to name one exact managed
+  cohort and the archive to be a singly linked, root-owned, non-writable direct member of the sealed
+  deployment with an exact `SHA256SUMS` entry. Review the planning report's `cohort_bootstraps`
+  mapping before execute mode; the controller binds the path and digest into its configuration and
+  exact adoption arguments, while the parent performs the manifest filename, slot, size, CRC32C,
+  MD5, SHA-256, and file-identity checks. Do not pass this option to a controller or parent that
+  predates the reviewed cache gate.
   Keep independent root-verifiable cohorts parallel when disk admission is healthy and fleet wall
   time is the priority: historical execution is often mostly serial within one worker, and an
   unnecessarily long cohort increases the restart blast radius. Never merge across a runtime or

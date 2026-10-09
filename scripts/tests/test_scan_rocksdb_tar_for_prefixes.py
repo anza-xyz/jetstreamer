@@ -75,6 +75,9 @@ class BoundLocalRocksdbScanTests(unittest.TestCase):
         self.assertEqual(state["source"], SOURCE)
         self.assertEqual(state["archive_file"]["sha256"], self.digest)
         self.assertEqual(state["archive_file"]["size"], self.archive.stat().st_size)
+        self.assertEqual(state["compressed_archive_bytes"], self.archive.stat().st_size)
+        self.assertEqual(state["compressed_bytes_consumed"], self.archive.stat().st_size)
+        self.assertEqual(state["compressed_progress_percent"], 100.0)
 
     def test_rejects_wrong_digest_before_creating_result_state(self) -> None:
         completed = subprocess.run(

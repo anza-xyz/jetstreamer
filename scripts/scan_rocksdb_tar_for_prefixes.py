@@ -152,6 +152,26 @@ def write_state(path: Path, state: dict) -> None:
     fsync_directory(path.parent)
 
 
+def update_compressed_progress(
+    state: dict, source_stream: object, archive_binding: dict | None
+) -> None:
+    """Record comparable compressed-byte progress for a seekable local archive."""
+    if archive_binding is None:
+        return
+    try:
+        position = source_stream.tell()
+    except (AttributeError, OSError, ValueError):
+        return
+    archive_size = archive_binding["size"]
+    if not isinstance(position, int) or position < 0 or position > archive_size:
+        raise RuntimeError(
+            f"sealed archive stream position is outside its bound: {position!r}"
+        )
+    state["compressed_archive_bytes"] = archive_size
+    state["compressed_bytes_consumed"] = position
+    state["compressed_progress_percent"] = 100.0 * position / archive_size
+
+
 def column_family(sst_dump: str, path: Path) -> tuple[str | None, str]:
     result = subprocess.run(
         [sst_dump, f"--file={path}", "--command=identify", "--show_properties"],
@@ -260,6 +280,9 @@ def main() -> int:
     }
     if archive_binding:
         state["archive_file"] = archive_binding
+        state["compressed_archive_bytes"] = archive_binding["size"]
+        state["compressed_bytes_consumed"] = 0
+        state["compressed_progress_percent"] = 0.0
     write_state(state_path, state)
 
     process: subprocess.Popen | None = None
@@ -350,6 +373,7 @@ def main() -> int:
                     if family is None:
                         state["last_identify_output"] = identify_output[-4000:]
                     state["updated_unix_seconds"] = time.time()
+                    update_compressed_progress(state, source_stream, archive_binding)
                     write_state(state_path, state)
                     print(
                         json.dumps(
@@ -371,6 +395,7 @@ def main() -> int:
             if return_code:
                 raise RuntimeError(f"gcloud storage cat exited with status {return_code}")
         if archive_binding:
+            update_compressed_progress(state, source_stream, archive_binding)
             current = args.archive_file.stat(follow_symlinks=False)
             expected_identity = (
                 archive_binding["device"],
@@ -385,6 +410,8 @@ def main() -> int:
         write_state(state_path, state)
         return 0
     except BaseException as error:
+        if source_stream:
+            update_compressed_progress(state, source_stream, archive_binding)
         state["status"] = "failed"
         state["failed_unix_seconds"] = time.time()
         state["error"] = f"{type(error).__name__}: {error}"

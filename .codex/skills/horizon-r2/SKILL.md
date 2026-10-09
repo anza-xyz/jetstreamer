@@ -364,6 +364,15 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
   a live `scratch-store8` sibling is not a reference to an empty completed `scratch` tree. Use the
   repository retirement scanners' path-boundary checks, and still fail closed on any genuine
   command, map, cwd/root/exe, or descriptor reference beneath the exact target.
+- Retire a generation-bound download cache only after its root-owned verification receipt still
+  binds the exact immutable cache identity, the consuming scan has durably recorded `complete`
+  against that same identity, and every explicitly bound producer/verifier/consumer invocation is
+  inactive with clean terminal success. Scan `/proc` commands, maps, cwd/root/exe links, and file
+  descriptors immediately before deletion. Fsync a no-clobber deletion intent first, unlink only
+  the one cache file, fsync its parent directory, preserve scan results and any retained matches,
+  then fsync a completion receipt. An intent-only interruption must be safely resumable and must
+  reject a replacement file at the same path. This is local scratch reclamation only and never
+  authorizes an R2 mutation.
 - For adaptive ranges, start the controller with `--r2-receipt-directory "$HOME/.jetstreamer-private/r2-receipts" --r2-bucket BUCKET`. The controller accepts receipts from that exact bucket only for bytes already bound by its root-owned local completion attestation; R2 can replace local storage, but can never establish initial completion.
 - Start the current Horizon verification plugin as soon as each local archive is available. R2 work may run concurrently with replay of other epochs. An archive is eligible for upload only after its full and current-plugin receipts bind the same archive SHA-256. It is not eligible for local retirement until both adjacent-boundary receipts bind that digest as well. Preserve the canonical lowercase coreutils sidecar format: `<64 hex>  epoch-N.jet\n`.
 - Report single-job latency and fleet completion cadence separately. Historical slot density varies,

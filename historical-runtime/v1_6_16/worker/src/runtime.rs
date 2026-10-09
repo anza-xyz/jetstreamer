@@ -5,6 +5,8 @@ use jetstreamer_historical_protocol::{
     TransactionOutcome, MAX_ENTRIES_PER_BATCH,
 };
 use rayon::{prelude::*, ThreadPool, ThreadPoolBuilder};
+use serde::Deserialize;
+use sha2::{Digest as Sha2Digest, Sha256};
 use solana_merkle_tree::MerkleTree;
 use solana_rayon_threadlimit::get_thread_count;
 use solana_runtime::{
@@ -25,7 +27,19 @@ use solana_sdk::{
     transaction::{Transaction, TransactionError},
 };
 use solana_vote_program::vote_instruction::VoteInstruction;
-use std::{cmp, collections::HashMap, env, ops::Range, path::Path, sync::Arc};
+use std::{
+    cmp,
+    collections::HashMap,
+    convert::TryFrom,
+    env,
+    fs::OpenOptions,
+    io::Read,
+    ops::Range,
+    os::unix::fs::{MetadataExt, OpenOptionsExt},
+    path::Path,
+    str::FromStr,
+    sync::Arc,
+};
 use tempfile::TempDir;
 
 const MAX_AGE_CORRECTION_EPOCH: u64 = 14;
@@ -49,6 +63,10 @@ const MAX_SUPPORTED_SLOT_EXCLUSIVE: u64 = 92_448_000;
 // path below may synthesize tick-height advancement.
 const RECONSTRUCTED_CONFIRMED_BLOCK_START: u64 = 89_856_107;
 const RECONSTRUCTED_CONFIRMED_BLOCK_END: u64 = 89_856_602;
+const RECOVERED_POH_PATH_ENV: &str = "JETSTREAMER_HISTORICAL_RECOVERED_POH_BOUNDARIES";
+const RECOVERED_POH_SHA256_ENV: &str = "JETSTREAMER_HISTORICAL_RECOVERED_POH_SHA256";
+const RECOVERED_POH_SCHEMA: &str = "jetstreamer-epoch208-decoded-gap-boundaries-v1";
+const MAX_RECOVERED_POH_BYTES: u64 = 1024 * 1024;
 const POH_THREADS_ENV: &str = "JETSTREAMER_HISTORICAL_POH_THREADS";
 const WAVE_METRICS_ENV: &str = "JETSTREAMER_HISTORICAL_WAVE_METRICS";
 const WAVE_METRICS_REPORT_INTERVAL_TRANSACTIONS: u64 = 1_000_000;
@@ -70,12 +88,37 @@ pub struct RuntimeState {
     last_entry_hash: Hash,
     tick_hash_count: u64,
     reconstructed_slot_hash: Option<Hash>,
+    recovered_poh_boundaries: HashMap<u64, Vec<RecoveredPohBoundary>>,
     leader_schedules: HashMap<u64, Vec<Pubkey>>,
     poh_pool: ThreadPool,
     enforce_candidate_range: bool,
     last_accounts_clean_block_height: u64,
     accounts_shrink_consumed_budget: usize,
     execution_wave_metrics: ExecutionWaveMetrics,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RecoveredPohBoundary {
+    tick_ordinal: u64,
+    hash: Hash,
+}
+
+#[derive(Deserialize)]
+struct RecoveredPohFile {
+    schema: String,
+    slots: Vec<RecoveredPohSlot>,
+}
+
+#[derive(Deserialize)]
+struct RecoveredPohSlot {
+    slot: u64,
+    boundaries: Vec<RecoveredPohBoundaryJson>,
+}
+
+#[derive(Deserialize)]
+struct RecoveredPohBoundaryJson {
+    tick_ordinal: u64,
+    hash: String,
 }
 
 #[derive(Default)]
@@ -170,6 +213,7 @@ impl RuntimeState {
         validate_mainnet_genesis_programs(&genesis)?;
         let stable_cluster = genesis.cluster_type == ClusterType::MainnetBeta;
         let poh_pool = build_poh_pool()?;
+        let recovered_poh_boundaries = load_recovered_poh_boundaries()?;
         let additional_builtins = mainnet_additional_builtins();
 
         let (bank, source) = match initial_state {
@@ -220,6 +264,7 @@ impl RuntimeState {
                 last_entry_hash,
                 tick_hash_count: 0,
                 reconstructed_slot_hash: None,
+                recovered_poh_boundaries,
                 leader_schedules: HashMap::new(),
                 poh_pool,
                 enforce_candidate_range: true,
@@ -731,11 +776,11 @@ impl RuntimeState {
         Ok(writes)
     }
 
-    /// Complete a source-obscured confirmed block without inventing PoH.
-    /// The archive preserves the canonical blockhash but not the intervening
-    /// tick hashes.  Bank only commits a tick hash to its recent-blockhash
-    /// queue at a block boundary, so repeat the preserved final hash while
-    /// advancing the missing tick heights; the boundary value remains exact.
+    /// Complete a source-obscured confirmed block from sealed PoH boundaries.
+    /// A consecutive visible block needs only its preserved final hash. A
+    /// parent jump crosses additional block boundaries and must have an exact
+    /// recovered hash for every skipped slot; repeating the visible final hash
+    /// across that jump changes RecentBlockhashes, SlotHashes, and Bank hash.
     fn complete_reconstructed_slot(&mut self) -> Result<Vec<AccountWrite>, String> {
         let blockhash = match self.reconstructed_slot_hash.take() {
             Some(blockhash) => blockhash,
@@ -757,18 +802,38 @@ impl RuntimeState {
                 max_tick_height
             ));
         }
+        let ticks_per_slot = self.bank.ticks_per_slot();
+        let boundaries = reconstructed_tick_boundary_plan(
+            self.bank.slot(),
+            self.bank.parent_slot(),
+            tick_height,
+            max_tick_height,
+            ticks_per_slot,
+            blockhash,
+            self.recovered_poh_boundaries
+                .get(&self.bank.slot())
+                .map(Vec::as_slice),
+        )?;
         if env::var_os("JETSTREAMER_HISTORICAL_TRACE").is_some() {
             eprintln!(
-                "historical reconstructed tick trace: slot={} tick_height={} max_tick_height={} block_boundaries={} repeated_blockhash={}",
+                "historical reconstructed tick trace: slot={} parent_slot={} tick_height={} max_tick_height={} block_boundaries={} final_blockhash={} exact_recovery={}",
                 self.bank.slot(),
+                self.bank.parent_slot(),
                 tick_height,
                 max_tick_height,
-                max_tick_height.saturating_sub(tick_height) / self.bank.ticks_per_slot(),
+                boundaries.len(),
                 blockhash,
+                self.recovered_poh_boundaries.contains_key(&self.bank.slot()),
             );
         }
-        for _ in tick_height..max_tick_height {
-            self.bank.register_tick(&blockhash);
+        for boundary_hash in boundaries {
+            // Bank commits the supplied hash to the recent-blockhash queue on
+            // the last tick of each block boundary. The obscured intra-slot
+            // tick hashes are not bank state, so the exact boundary hash is
+            // sufficient and is deliberately repeated only within its slot.
+            for _ in 0..ticks_per_slot {
+                self.bank.register_tick(&boundary_hash);
+            }
         }
         self.last_entry_hash = blockhash;
         self.tick_hash_count = 0;
@@ -902,6 +967,7 @@ impl RuntimeState {
             last_entry_hash,
             tick_hash_count: 0,
             reconstructed_slot_hash: None,
+            recovered_poh_boundaries: HashMap::new(),
             leader_schedules: HashMap::new(),
             poh_pool: build_poh_pool().unwrap(),
             enforce_candidate_range: false,
@@ -934,6 +1000,266 @@ fn validate_candidate_entry_slot(slot: u64) -> Result<(), String> {
 
 fn is_reconstructed_confirmed_block_slot(slot: u64) -> bool {
     (RECONSTRUCTED_CONFIRMED_BLOCK_START..=RECONSTRUCTED_CONFIRMED_BLOCK_END).contains(&slot)
+}
+
+fn reconstructed_tick_boundary_plan(
+    slot: u64,
+    parent_slot: u64,
+    tick_height: u64,
+    max_tick_height: u64,
+    ticks_per_slot: u64,
+    final_blockhash: Hash,
+    recovered: Option<&[RecoveredPohBoundary]>,
+) -> Result<Vec<Hash>, String> {
+    if ticks_per_slot == 0 {
+        return Err("reconstructed confirmed block has zero ticks per slot".to_string());
+    }
+    let remaining_ticks = max_tick_height.checked_sub(tick_height).ok_or_else(|| {
+        format!(
+            "reconstructed confirmed block at slot {} has tick height {} above max {}",
+            slot, tick_height, max_tick_height
+        )
+    })?;
+    if remaining_ticks == 0 || remaining_ticks % ticks_per_slot != 0 {
+        return Err(format!(
+            "reconstructed confirmed block at slot {} has {} remaining ticks, not a positive multiple of {}",
+            slot, remaining_ticks, ticks_per_slot
+        ));
+    }
+    let boundary_count = usize::try_from(remaining_ticks / ticks_per_slot)
+        .map_err(|_| format!("slot {} boundary count does not fit usize", slot))?;
+    let expected_from_parent = slot
+        .checked_sub(parent_slot)
+        .ok_or_else(|| format!("slot {} precedes parent {}", slot, parent_slot))?;
+    if boundary_count as u64 != expected_from_parent {
+        return Err(format!(
+            "reconstructed confirmed block at slot {} spans {} tick boundaries but parent {} implies {}",
+            slot, boundary_count, parent_slot, expected_from_parent
+        ));
+    }
+
+    match recovered {
+        Some(boundaries) => {
+            if boundaries.len() != boundary_count {
+                return Err(format!(
+                    "recovered PoH for slot {} has {} boundaries, expected {}",
+                    slot,
+                    boundaries.len(),
+                    boundary_count
+                ));
+            }
+            for (index, boundary) in boundaries.iter().enumerate() {
+                let expected_ordinal = ticks_per_slot
+                    .checked_mul(index as u64 + 1)
+                    .ok_or_else(|| format!("slot {} tick ordinal overflowed", slot))?;
+                if boundary.tick_ordinal != expected_ordinal {
+                    return Err(format!(
+                        "recovered PoH for slot {} has tick ordinal {} at boundary {}, expected {}",
+                        slot,
+                        boundary.tick_ordinal,
+                        index + 1,
+                        expected_ordinal
+                    ));
+                }
+            }
+            if boundaries.last().map(|boundary| boundary.hash) != Some(final_blockhash) {
+                return Err(format!(
+                    "recovered PoH final boundary for slot {} does not match preserved blockhash {}",
+                    slot, final_blockhash
+                ));
+            }
+            Ok(boundaries.iter().map(|boundary| boundary.hash).collect())
+        }
+        None if boundary_count == 1 => Ok(vec![final_blockhash]),
+        None => Err(format!(
+            "reconstructed confirmed block at slot {} jumps from parent {} across {} boundaries without sealed recovered PoH",
+            slot, parent_slot, boundary_count
+        )),
+    }
+}
+
+fn load_recovered_poh_boundaries() -> Result<HashMap<u64, Vec<RecoveredPohBoundary>>, String> {
+    let path = env::var_os(RECOVERED_POH_PATH_ENV);
+    let expected_sha256 = env::var_os(RECOVERED_POH_SHA256_ENV);
+    match (path, expected_sha256) {
+        (None, None) => Ok(HashMap::new()),
+        (Some(_), None) => Err(format!(
+            "{} requires {}",
+            RECOVERED_POH_PATH_ENV, RECOVERED_POH_SHA256_ENV
+        )),
+        (None, Some(_)) => Err(format!(
+            "{} requires {}",
+            RECOVERED_POH_SHA256_ENV, RECOVERED_POH_PATH_ENV
+        )),
+        (Some(path), Some(expected_sha256)) => {
+            let path = path
+                .into_string()
+                .map_err(|_| format!("{} must be valid UTF-8", RECOVERED_POH_PATH_ENV))?;
+            let expected_sha256 = expected_sha256
+                .into_string()
+                .map_err(|_| format!("{} must be valid UTF-8", RECOVERED_POH_SHA256_ENV))?;
+            load_recovered_poh_file(Path::new(&path), &expected_sha256)
+        }
+    }
+}
+
+fn load_recovered_poh_file(
+    path: &Path,
+    expected_sha256: &str,
+) -> Result<HashMap<u64, Vec<RecoveredPohBoundary>>, String> {
+    if !path.is_absolute() {
+        return Err(format!(
+            "{} must be an absolute path: {}",
+            RECOVERED_POH_PATH_ENV,
+            path.display()
+        ));
+    }
+    if expected_sha256.len() != 64
+        || !expected_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(format!(
+            "{} must be 64 lowercase hexadecimal digits",
+            RECOVERED_POH_SHA256_ENV
+        ));
+    }
+
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|error| format!("cannot open recovered PoH {}: {}", path.display(), error))?;
+    let before = file
+        .metadata()
+        .map_err(|error| format!("cannot stat recovered PoH {}: {}", path.display(), error))?;
+    if !before.file_type().is_file() {
+        return Err(format!(
+            "recovered PoH is not a regular file: {}",
+            path.display()
+        ));
+    }
+    if before.mode() & 0o022 != 0 {
+        return Err(format!(
+            "recovered PoH is group/other writable: {} mode {:o}",
+            path.display(),
+            before.mode() & 0o7777
+        ));
+    }
+    if before.len() == 0 || before.len() > MAX_RECOVERED_POH_BYTES {
+        return Err(format!(
+            "recovered PoH {} has {} bytes, expected 1..={} bytes",
+            path.display(),
+            before.len(),
+            MAX_RECOVERED_POH_BYTES
+        ));
+    }
+    let capacity = usize::try_from(before.len())
+        .map_err(|_| "recovered PoH length does not fit usize".to_string())?;
+    let mut bytes = Vec::with_capacity(capacity);
+    file.read_to_end(&mut bytes)
+        .map_err(|error| format!("cannot read recovered PoH {}: {}", path.display(), error))?;
+    let after = file.metadata().map_err(|error| {
+        format!(
+            "cannot restat open recovered PoH {}: {}",
+            path.display(),
+            error
+        )
+    })?;
+    let current = path.metadata().map_err(|error| {
+        format!(
+            "cannot restat recovered PoH path {}: {}",
+            path.display(),
+            error
+        )
+    })?;
+    let identity = |metadata: &std::fs::Metadata| {
+        (
+            metadata.dev(),
+            metadata.ino(),
+            metadata.len(),
+            metadata.mtime(),
+            metadata.mtime_nsec(),
+        )
+    };
+    if identity(&before) != identity(&after) || identity(&after) != identity(&current) {
+        return Err(format!(
+            "recovered PoH file identity changed while reading {}",
+            path.display()
+        ));
+    }
+
+    let digest = Sha256::digest(&bytes);
+    let actual_sha256 = digest
+        .iter()
+        .map(|byte| format!("{:02x}", byte))
+        .collect::<String>();
+    if actual_sha256 != expected_sha256 {
+        return Err(format!(
+            "recovered PoH SHA-256 mismatch for {}: expected {}, got {}",
+            path.display(),
+            expected_sha256,
+            actual_sha256
+        ));
+    }
+    parse_recovered_poh_bytes(&bytes)
+}
+
+fn parse_recovered_poh_bytes(
+    bytes: &[u8],
+) -> Result<HashMap<u64, Vec<RecoveredPohBoundary>>, String> {
+    let file: RecoveredPohFile = serde_json::from_slice(bytes)
+        .map_err(|error| format!("cannot decode recovered PoH JSON: {}", error))?;
+    if file.schema != RECOVERED_POH_SCHEMA {
+        return Err(format!(
+            "recovered PoH schema {:?} does not match {:?}",
+            file.schema, RECOVERED_POH_SCHEMA
+        ));
+    }
+    if file.slots.is_empty() {
+        return Err("recovered PoH file contains no slots".to_string());
+    }
+    let mut recovered = HashMap::with_capacity(file.slots.len());
+    for slot in file.slots {
+        let slot_number = slot.slot;
+        if !is_reconstructed_confirmed_block_slot(slot_number) {
+            return Err(format!(
+                "recovered PoH slot {} is outside reconstructed range {}..={}",
+                slot_number, RECONSTRUCTED_CONFIRMED_BLOCK_START, RECONSTRUCTED_CONFIRMED_BLOCK_END
+            ));
+        }
+        if slot.boundaries.is_empty() {
+            return Err(format!(
+                "recovered PoH slot {} has no boundaries",
+                slot_number
+            ));
+        }
+        let mut previous_ordinal = 0;
+        let mut boundaries = Vec::with_capacity(slot.boundaries.len());
+        for boundary in slot.boundaries {
+            if boundary.tick_ordinal <= previous_ordinal {
+                return Err(format!(
+                    "recovered PoH slot {} has non-increasing tick ordinal {}",
+                    slot_number, boundary.tick_ordinal
+                ));
+            }
+            let hash = Hash::from_str(&boundary.hash).map_err(|error| {
+                format!(
+                    "recovered PoH slot {} has invalid hash {:?}: {}",
+                    slot_number, boundary.hash, error
+                )
+            })?;
+            previous_ordinal = boundary.tick_ordinal;
+            boundaries.push(RecoveredPohBoundary {
+                tick_ordinal: boundary.tick_ordinal,
+                hash,
+            });
+        }
+        if recovered.insert(slot_number, boundaries).is_some() {
+            return Err(format!("recovered PoH repeats slot {}", slot_number));
+        }
+    }
+    Ok(recovered)
 }
 
 fn build_poh_pool() -> Result<ThreadPool, String> {
@@ -1423,6 +1749,7 @@ mod tests {
         system_instruction, system_program, system_transaction, sysvar,
     };
     use solana_vote_program::vote_state::{VoteInit, VoteState};
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn reconstructed_confirmed_block_range_is_exact() {
@@ -1438,6 +1765,113 @@ mod tests {
         assert!(!is_reconstructed_confirmed_block_slot(
             RECONSTRUCTED_CONFIRMED_BLOCK_END + 1
         ));
+    }
+
+    #[test]
+    fn reconstructed_tick_plan_requires_every_crossed_boundary() {
+        let skipped_hash = Hash::new_from_array([0x51; 32]);
+        let final_hash = Hash::new_from_array([0x52; 32]);
+        let error =
+            reconstructed_tick_boundary_plan(117, 115, 0, 128, 64, final_hash, None).unwrap_err();
+        assert!(error.contains("without sealed recovered PoH"));
+
+        let recovered = vec![
+            RecoveredPohBoundary {
+                tick_ordinal: 64,
+                hash: skipped_hash,
+            },
+            RecoveredPohBoundary {
+                tick_ordinal: 128,
+                hash: final_hash,
+            },
+        ];
+        assert_eq!(
+            reconstructed_tick_boundary_plan(117, 115, 0, 128, 64, final_hash, Some(&recovered),)
+                .unwrap(),
+            vec![skipped_hash, final_hash]
+        );
+
+        let wrong_final = vec![
+            recovered[0].clone(),
+            RecoveredPohBoundary {
+                tick_ordinal: 128,
+                hash: skipped_hash,
+            },
+        ];
+        assert!(reconstructed_tick_boundary_plan(
+            117,
+            115,
+            0,
+            128,
+            64,
+            final_hash,
+            Some(&wrong_final),
+        )
+        .unwrap_err()
+        .contains("does not match preserved blockhash"));
+
+        assert_eq!(
+            reconstructed_tick_boundary_plan(117, 116, 64, 128, 64, final_hash, None).unwrap(),
+            vec![final_hash]
+        );
+    }
+
+    #[test]
+    fn recovered_poh_json_is_strictly_scoped_and_ordered() {
+        let slot = RECONSTRUCTED_CONFIRMED_BLOCK_START + 10;
+        let first_hash = Hash::new_from_array([0x61; 32]);
+        let final_hash = Hash::new_from_array([0x62; 32]);
+        let bytes = format!(
+            r#"{{"schema":"{}","slots":[{{"slot":{},"boundaries":[{{"tick_ordinal":64,"hash":"{}"}},{{"tick_ordinal":128,"hash":"{}"}}]}}]}}"#,
+            RECOVERED_POH_SCHEMA, slot, first_hash, final_hash
+        );
+        let recovered = parse_recovered_poh_bytes(bytes.as_bytes()).unwrap();
+        assert_eq!(
+            recovered.get(&slot).unwrap(),
+            &vec![
+                RecoveredPohBoundary {
+                    tick_ordinal: 64,
+                    hash: first_hash,
+                },
+                RecoveredPohBoundary {
+                    tick_ordinal: 128,
+                    hash: final_hash,
+                },
+            ]
+        );
+
+        let duplicate_ordinal = bytes.replace("\"tick_ordinal\":128", "\"tick_ordinal\":64");
+        assert!(parse_recovered_poh_bytes(duplicate_ordinal.as_bytes())
+            .unwrap_err()
+            .contains("non-increasing"));
+        let out_of_range = bytes.replace(&format!("\"slot\":{}", slot), "\"slot\":1");
+        assert!(parse_recovered_poh_bytes(out_of_range.as_bytes())
+            .unwrap_err()
+            .contains("outside reconstructed range"));
+    }
+
+    #[test]
+    fn recovered_poh_file_requires_exact_digest() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("recovered-poh.json");
+        let slot = RECONSTRUCTED_CONFIRMED_BLOCK_START + 10;
+        let boundary_hash = Hash::new_from_array([0x63; 32]);
+        let bytes = format!(
+            r#"{{"schema":"{}","slots":[{{"slot":{},"boundaries":[{{"tick_ordinal":64,"hash":"{}"}}]}}]}}"#,
+            RECOVERED_POH_SCHEMA, slot, boundary_hash
+        );
+        std::fs::write(&path, bytes.as_bytes()).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let digest = Sha256::digest(bytes.as_bytes())
+            .iter()
+            .map(|byte| format!("{:02x}", byte))
+            .collect::<String>();
+
+        let recovered = load_recovered_poh_file(&path, &digest).unwrap();
+        assert_eq!(recovered[&slot][0].hash, boundary_hash);
+        assert!(load_recovered_poh_file(&path, &"0".repeat(64))
+            .unwrap_err()
+            .contains("SHA-256 mismatch"));
     }
 
     #[test]
@@ -1474,7 +1908,8 @@ mod tests {
         // Jumping from slot 0 to slot 2 spans the block boundary for skipped
         // slot 1 as well as slot 2's own boundary. The canonical ledger has a
         // distinct PoH hash at each boundary. Confirmed-block recovery knows
-        // only the final hash and currently repeats it at both boundaries.
+        // only the final hash; the retired compatibility path repeated it at
+        // both boundaries and thereby produced different Bank state.
         let skipped_boundary_hash = Hash::new_from_array([0x51; 32]);
         let final_hash = Hash::new_from_array([0x52; 32]);
         let canonical = Bank::new_from_parent(&canonical_parent, &leader, 2);

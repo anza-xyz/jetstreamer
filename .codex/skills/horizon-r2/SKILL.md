@@ -390,7 +390,10 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
   active, so an invocation-bound launcher may accept either authenticated active state; do not
   mistake `running` for a foreign watcher. Bind its invocation ID, put a conservative
   `StartLimitIntervalSec`/`StartLimitBurst` on the triggered service so a failed persistent event
-  cannot spin, and prove the actual triggered lifecycle before arming production.
+  cannot spin, and prove the actual triggered lifecycle before arming production. After an
+  authenticated stop, an installed path normally remains `loaded/inactive/dead`, while a collected
+  transient path may already be `not-found/inactive/dead`; accept either terminal shape rather than
+  waiting forever for a collected unit to reappear.
 - Preflight the host's VMA ceiling for mmap-backed historical account stores as part of admission.
   Compare `vm.max_map_count` with live worker map counts and the snapshot/store-file baseline, and
   leave credible growth headroom for the full replay. Some legacy Solana AppendVec code logs an

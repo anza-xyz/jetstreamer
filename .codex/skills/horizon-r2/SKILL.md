@@ -534,6 +534,13 @@ Do not use `--legacy-etag-only` unless the user has explicitly established that 
   the effective or ambient set as required by the unit), keep the target mount read-only except for
   exact receipt directories, and prove the read path in an equivalently sandboxed transient unit.
   Do not relax private-directory permissions to work around the sandbox.
+  A root launcher that validates private evidence and then drops to an unprivileged scanner needs
+  CAP_SETGID and CAP_SETUID effective at the drop point in addition to any traversal capability.
+  `CapabilityBoundingSet=` limits what is possible but does not by itself prove those capabilities
+  are effective; bind the same minimal set through `AmbientCapabilities=` when required and run an
+  end-to-end sandbox proof that observes the unprivileged output owner before arming production.
+  For a long `Type=oneshot` verifier use `TimeoutStartSec=` as its execution bound;
+  `RuntimeMaxSec=` is ignored for oneshot units.
 - Use SSH URLs for Git network operations. Select a currently loaded keychain agent socket for the
   active login session by verifying it with `ssh-add -l`; never hard-code an ephemeral socket path
   from an earlier session. Check the inherited environment for required service credentials before

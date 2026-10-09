@@ -254,6 +254,12 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
   shutdown. Freeze the bounded child process group and capture the exact scratch/accounts-state
   statistics before sending the controlled stop; then resume and stop it. Do not design a terminal
   collector that assumes those temporary AppendVecs will still exist after the parent exits.
+  A collector or selector that re-observes diagnostic archives below the producer home must not
+  use `ProtectHome=yes`: that makes a valid archive appear absent and can turn a successful cohort
+  into a false selection failure. Use `ProtectHome=read-only` plus an explicit read-only binding for
+  the exact private cohort root, and make only the root-owned receipt directory writable. Preserve
+  the failed sandbox invocation as evidence, correct it in a distinctly named oneshot unit, and
+  require that unit plus the selection receipt to succeed before scratch retirement.
 - When a follow-up performance cohort must preserve its predecessor's systemd unit identity as
   durable result or cleanup evidence, give the follow-up producer template a distinct constrained
   namespace instead of replacing or prematurely removing the predecessor template. Bind that

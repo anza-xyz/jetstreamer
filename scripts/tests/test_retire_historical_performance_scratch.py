@@ -245,6 +245,61 @@ class HistoricalPerformanceScratchRetirementTest(unittest.TestCase):
                 ],
             )
 
+    def test_results_receipt_accepts_manifest_bound_epoch_and_private_root(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            manifest_path = root / "manifest.json"
+            results_path = root / "results.json"
+            variants = ("rayon-control-t32", "rayon-candidate-t8")
+            manifest, results = sealed_payloads(
+                root, manifest_path, results_path, variants
+            )
+            unit_prefix = "horizon-perf-epoch157-rayon"
+            archive_filename = "epoch-157-rayon-canary.jet"
+            manifest.update(
+                {
+                    "private_root": str(root),
+                    "unit_prefix": unit_prefix,
+                    "archive_filename": archive_filename,
+                }
+            )
+            results["evidence"].update(
+                {
+                    "private_root": str(root),
+                    "unit_prefix": unit_prefix,
+                    "archive_filename": archive_filename,
+                }
+            )
+            for declared, observed in zip(
+                manifest["variants"], results["evidence"]["variants"], strict=True
+            ):
+                name = declared["name"]
+                unit = f"{unit_prefix}@{name}.service"
+                archive = root / name / "output" / archive_filename
+                declared["unit"] = unit
+                declared["archive"] = str(archive)
+                observed["unit"]["unit"] = unit
+                observed["archive"]["path"] = str(archive)
+            manifest_digest = hashlib.sha256(
+                (json.dumps(manifest, sort_keys=True) + "\n").encode()
+            ).hexdigest()
+            results["manifest_sha256"] = manifest_digest
+
+            bindings = retire.validate_manifest_and_results(
+                manifest_path,
+                manifest,
+                manifest_digest,
+                results_path,
+                results,
+            )
+
+            self.assertEqual([item.name for item in bindings], list(variants))
+            self.assertEqual({item.private_root for item in bindings}, {root})
+            self.assertEqual(
+                [item.unit for item in bindings],
+                [f"{unit_prefix}@{name}.service" for name in variants],
+            )
+
     def test_receipt_write_is_owner_only_and_noclobber(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -22,14 +22,20 @@ RESULTS_SCHEMA = "jetstreamer-historical-performance-results-receipt-v1"
 PLAN_SCHEMA = "jetstreamer-historical-performance-scratch-retirement-plan-v1"
 RETIREMENT_SCHEMA = "jetstreamer-historical-performance-scratch-retirement-v1"
 PRIVATE_ROOT = Path("/home/ubuntu/.jetstreamer-private/performance-ab-202")
+DEFAULT_UNIT_PREFIX = "horizon-perf-epoch202"
+DEFAULT_ARCHIVE_FILENAME = "epoch-202-through-87695515.jet"
 # Retained as the original cohort fixture; runtime validation derives the exact
 # admitted variants from the sealed manifest and result receipt.
 VARIANTS = ("singleton-t16", "singleton-t32", "waves-t16", "waves-t32")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 VARIANT_NAME = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 UNIT_NAMESPACE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+UNIT_PREFIX = re.compile(
+    r"^horizon-perf-epoch[0-9]+(?:-[a-z0-9]+(?:-[a-z0-9]+)*)?$"
+)
+ARCHIVE_FILENAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*\.jet$")
 UNIT_NAME = re.compile(
-    r"^horizon-perf-epoch202(?:-[a-z0-9]+(?:-[a-z0-9]+)*)?@[a-z0-9-]+\.service$"
+    r"^horizon-perf-epoch[0-9]+(?:-[a-z0-9]+(?:-[a-z0-9]+)*)?@[a-z0-9-]+\.service$"
 )
 
 
@@ -56,6 +62,7 @@ class ScratchBinding:
     name: str
     unit: str
     expected_invocation_id: str
+    private_root: Path
     scratch: Path
     physical_bytes: int
     apparent_bytes: int
@@ -166,16 +173,56 @@ def validate_unit_namespace(value: object) -> str | None:
     return value
 
 
+def validate_unit_prefix(value: object) -> str:
+    if value is None:
+        return DEFAULT_UNIT_PREFIX
+    if not isinstance(value, str) or UNIT_PREFIX.fullmatch(value) is None:
+        raise RetirementError("invalid performance unit prefix")
+    return value
+
+
+def validate_archive_filename(value: object) -> str:
+    if value is None:
+        return DEFAULT_ARCHIVE_FILENAME
+    if not isinstance(value, str) or ARCHIVE_FILENAME.fullmatch(value) is None:
+        raise RetirementError("invalid diagnostic archive filename")
+    return value
+
+
+def validate_private_root(value: object) -> Path:
+    path = PRIVATE_ROOT if value is None else Path(str(value))
+    if not path.is_absolute() or (
+        value is not None and not isinstance(value, str)
+    ):
+        raise RetirementError("performance private root must be an absolute path")
+    try:
+        metadata = path.lstat()
+        resolved = path.resolve(strict=True)
+    except OSError as error:
+        raise RetirementError(
+            f"cannot resolve performance private root: {error}"
+        ) from error
+    if resolved != path or not stat.S_ISDIR(metadata.st_mode):
+        raise RetirementError("performance private root has unsafe identity")
+    return path
+
+
 def expected_paths(
-    name: str, unit_namespace: str | None = None
+    name: str,
+    unit_namespace: str | None = None,
+    private_root: Path | None = None,
+    unit_prefix: str = DEFAULT_UNIT_PREFIX,
+    archive_filename: str = DEFAULT_ARCHIVE_FILENAME,
 ) -> dict[str, Path | str]:
-    root = PRIVATE_ROOT / name
+    if private_root is None:
+        private_root = PRIVATE_ROOT
+    root = private_root / name
     namespace = f"-{unit_namespace}" if unit_namespace is not None else ""
     return {
-        "unit": f"horizon-perf-epoch202{namespace}@{name}.service",
+        "unit": f"{unit_prefix}{namespace}@{name}.service",
         "canary_receipt": root / "canary-receipt.json",
         "scratch": root / "scratch",
-        "archive": root / "output" / "epoch-202-through-87695515.jet",
+        "archive": root / "output" / archive_filename,
     }
 
 
@@ -264,6 +311,17 @@ def validate_manifest_and_results(
         )
 
     unit_namespace = validate_unit_namespace(manifest.get("unit_namespace"))
+    private_root = validate_private_root(manifest.get("private_root"))
+    unit_prefix = validate_unit_prefix(manifest.get("unit_prefix"))
+    archive_filename = validate_archive_filename(manifest.get("archive_filename"))
+    for key, expected in (
+        ("private_root", str(private_root)),
+        ("unit_prefix", unit_prefix),
+        ("archive_filename", archive_filename),
+    ):
+        observed = evidence.get(key)
+        if observed is not None and observed != expected:
+            raise RetirementError(f"results receipt does not bind manifest {key}")
     allowed_return_codes = parse_allowed_target_stop_return_codes(
         manifest.get("allowed_target_stop_return_codes")
     )
@@ -278,7 +336,13 @@ def validate_manifest_and_results(
         raise RetirementError("results receipt does not bind controlled-stop return codes")
     bindings: list[ScratchBinding] = []
     for name in manifest_names:
-        expected = expected_paths(name, unit_namespace)
+        expected = expected_paths(
+            name,
+            unit_namespace,
+            private_root,
+            unit_prefix,
+            archive_filename,
+        )
         declared = manifest_by_name[name]
         observed = evidence_by_name[name]
         for key in ("unit", "canary_receipt", "scratch", "archive"):
@@ -318,6 +382,7 @@ def validate_manifest_and_results(
                 name=name,
                 unit=str(expected["unit"]),
                 expected_invocation_id=invocation_id,
+                private_root=private_root,
                 scratch=Path(expected["scratch"]),
                 physical_bytes=require_nonnegative_integer(
                     scratch.get("physical_bytes"), f"{name} physical bytes"
@@ -372,17 +437,23 @@ def validate_retirement_plan(
         raise RetirementError("retirement plan does not bind this exact local-only cleanup")
 
 
-def require_exact_scratch(path: Path, admitted_scratches: set[Path]) -> Path:
+def require_exact_scratch(
+    path: Path,
+    admitted_scratches: set[Path],
+    private_root: Path | None = None,
+) -> Path:
+    if private_root is None:
+        private_root = PRIVATE_ROOT
     if path not in admitted_scratches:
         raise RetirementError(f"scratch is outside the exact admitted set: {path}")
     try:
-        root = PRIVATE_ROOT.resolve(strict=True)
+        root = private_root.resolve(strict=True)
         resolved = path.resolve(strict=True)
         metadata = path.lstat()
     except OSError as error:
         raise RetirementError(f"scratch is unavailable: {path}: {error}") from error
     if (
-        root != PRIVATE_ROOT
+        root != private_root
         or resolved != path
         or not stat.S_ISDIR(metadata.st_mode)
         or stat.S_ISLNK(metadata.st_mode)
@@ -501,8 +572,12 @@ def write_json_noclobber(path: Path, payload: dict[str, Any]) -> None:
     fsync_directory(destination.parent)
 
 
-def delete_exact_tree(path: Path, admitted_scratches: set[Path]) -> None:
-    require_exact_scratch(path, admitted_scratches)
+def delete_exact_tree(
+    path: Path,
+    admitted_scratches: set[Path],
+    private_root: Path | None = None,
+) -> None:
+    require_exact_scratch(path, admitted_scratches, private_root)
     completed = subprocess.run(
         ["/usr/bin/find", str(path), "-xdev", "-depth", "-delete"],
         check=False,
@@ -633,6 +708,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     scratches = [binding.scratch for binding in bindings]
     admitted_scratches = set(scratches)
+    private_roots = {binding.private_root for binding in bindings}
+    if len(private_roots) != 1:
+        raise RetirementError("scratch bindings do not share one sealed private root")
+    private_root = next(iter(private_roots))
 
     intent_exists = args.intent_receipt.exists() or args.intent_receipt.is_symlink()
     completion_exists = args.completion_receipt.exists() or args.completion_receipt.is_symlink()
@@ -666,7 +745,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     else:
         for scratch in scratches:
-            require_exact_scratch(scratch, admitted_scratches)
+            require_exact_scratch(scratch, admitted_scratches, private_root)
         common = receipt_common(
             args.retirement_plan,
             plan_sha256,
@@ -681,7 +760,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             **common,
             "status": "deletion-intent-fsynced",
             "observed_at_utc": datetime.now(timezone.utc).isoformat(),
-            "available_bytes_before": available_bytes(PRIVATE_ROOT),
+            "available_bytes_before": available_bytes(private_root),
         }
         write_json_noclobber(args.intent_receipt, intent)
         intent_sha256 = sha256_file(args.intent_receipt)
@@ -718,7 +797,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     for binding in bindings:
         if binding.scratch.exists() or binding.scratch.is_symlink():
-            delete_exact_tree(binding.scratch, admitted_scratches)
+            delete_exact_tree(binding.scratch, admitted_scratches, private_root)
     if any(path.exists() or path.is_symlink() for path in scratches):
         raise RetirementError("one or more exact scratch trees remain after deletion")
     completion = {
@@ -737,7 +816,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "intent_receipt": str(args.intent_receipt),
         "intent_receipt_sha256": intent_sha256,
         "available_bytes_before": intent.get("available_bytes_before"),
-        "available_bytes_after": available_bytes(PRIVATE_ROOT),
+        "available_bytes_after": available_bytes(private_root),
     }
     write_json_noclobber(args.completion_receipt, completion)
     print(json.dumps(completion, sort_keys=True), flush=True)

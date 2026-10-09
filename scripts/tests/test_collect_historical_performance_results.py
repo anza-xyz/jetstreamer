@@ -68,6 +68,58 @@ class HistoricalPerformanceResultsTest(unittest.TestCase):
             ):
                 collect.validate_unit_namespace(invalid)
 
+    def test_variant_set_supports_manifest_bound_epoch_and_private_root(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            private_root = Path(directory).resolve()
+            names = ("rayon-control-t32", "rayon-candidate-t8")
+            variants = []
+            for name in names:
+                root = private_root / name
+                variants.append(
+                    {
+                        "name": name,
+                        "unit": f"horizon-perf-epoch157-rayon@{name}.service",
+                        "canary_receipt": str(root / "canary-receipt.json"),
+                        "scratch": str(root / "scratch"),
+                        "archive": str(root / "output" / "epoch-157-rayon-canary.jet"),
+                        "wave_metrics": False,
+                    }
+                )
+
+            validated = collect.validate_variant_set(
+                variants,
+                private_root=private_root,
+                unit_prefix=collect.validate_unit_prefix(
+                    "horizon-perf-epoch157-rayon"
+                ),
+                archive_filename=collect.validate_archive_filename(
+                    "epoch-157-rayon-canary.jet"
+                ),
+            )
+
+            self.assertEqual([item["name"] for item in validated], list(names))
+            self.assertEqual(
+                collect.validate_private_root(str(private_root)), private_root
+            )
+            self.assertEqual(collect.validate_canary_receipt_uid(1001), 1001)
+
+    def test_generic_manifest_bindings_reject_unsafe_values(self) -> None:
+        for value in ("epoch157", "Horizon-perf-epoch157", "horizon-perf-epoch"):
+            with self.subTest(value=value), self.assertRaises(
+                collect.CollectionError
+            ):
+                collect.validate_unit_prefix(value)
+        for value in ("../archive.jet", "/archive.jet", "archive", ""):
+            with self.subTest(value=value), self.assertRaises(
+                collect.CollectionError
+            ):
+                collect.validate_archive_filename(value)
+        for value in (-1, True, "1001"):
+            with self.subTest(value=value), self.assertRaises(
+                collect.CollectionError
+            ):
+                collect.validate_canary_receipt_uid(value)
+
     def test_collector_binding_requires_exact_safe_digest_and_path(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             collector = Path(directory) / "collector.py"

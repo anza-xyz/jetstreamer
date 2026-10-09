@@ -16,12 +16,15 @@ import sys
 from typing import Any, Mapping, Sequence
 
 
-POLICY_SCHEMA = "jetstreamer-private-epoch202-store8-selection-policy-v1"
+LEGACY_POLICY_SCHEMA = "jetstreamer-private-epoch202-store8-selection-policy-v1"
+POLICY_SCHEMA = LEGACY_POLICY_SCHEMA
+GENERIC_POLICY_SCHEMA = "jetstreamer-historical-performance-selection-policy-v2"
 RESULT_SCHEMA = "jetstreamer-historical-performance-results-receipt-v1"
 RECEIPT_SCHEMA = "jetstreamer-historical-performance-selection-receipt-v1"
 CONTROL = "waves-control-t16"
 CANDIDATE = "waves-store8-t16"
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
+VARIANT_NAME = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 
 
 class SelectionError(RuntimeError):
@@ -85,9 +88,37 @@ def ratio(candidate: float | int, control: float | int, context: str) -> float:
     return numerator / denominator
 
 
-def variant_metrics(raw: Mapping[str, Any], target_slot: int) -> dict[str, float | int]:
+def policy_variants(policy: Mapping[str, Any]) -> tuple[str, str, bool]:
+    schema = policy.get("schema")
+    if schema == LEGACY_POLICY_SCHEMA:
+        return CONTROL, CANDIDATE, True
+    if schema != GENERIC_POLICY_SCHEMA:
+        raise SelectionError("unsupported selection policy schema")
+    control = policy.get("control_variant")
+    candidate = policy.get("candidate_variant")
+    require_wave_metrics = policy.get("require_wave_metrics", False)
+    if (
+        not isinstance(control, str)
+        or VARIANT_NAME.fullmatch(control) is None
+        or not isinstance(candidate, str)
+        or VARIANT_NAME.fullmatch(candidate) is None
+        or control == candidate
+    ):
+        raise SelectionError("selection policy has invalid variant names")
+    if not isinstance(require_wave_metrics, bool):
+        raise SelectionError("require_wave_metrics must be boolean")
+    return control, candidate, require_wave_metrics
+
+
+def variant_metrics(
+    raw: Mapping[str, Any],
+    target_slot: int,
+    expected_name: str,
+    *,
+    require_wave_metrics: bool,
+) -> dict[str, float | int]:
     name = raw.get("name")
-    if name not in (CONTROL, CANDIDATE):
+    if name != expected_name:
         raise SelectionError(f"unexpected variant name: {name!r}")
     unit = required_mapping(raw.get("unit"), f"{name} unit")
     if (
@@ -113,9 +144,11 @@ def variant_metrics(raw: Mapping[str, Any], target_slot: int) -> dict[str, float
     fanout = required_mapping(
         accounts.get("appendvec_store_fanout"), f"{name} AppendVec fanout"
     )
-    wave_metrics = required_mapping(raw.get("wave_metrics"), f"{name} wave metrics")
-    if finite_positive(wave_metrics.get("waves"), f"{name} wave count") <= 0:
-        raise SelectionError(f"{name} lacks wave evidence")
+    if require_wave_metrics:
+        wave_metrics = required_mapping(
+            raw.get("wave_metrics"), f"{name} wave metrics"
+        )
+        finite_positive(wave_metrics.get("waves"), f"{name} wave count")
     return {
         "slots_per_second": finite_positive(
             progress_rates.get("slots_per_second"), f"{name} slots/s"
@@ -160,8 +193,7 @@ def evaluate_selection(
     results_path: str,
     results_sha256: str,
 ) -> dict[str, Any]:
-    if policy.get("schema") != POLICY_SCHEMA:
-        raise SelectionError("unsupported selection policy schema")
+    control_name, candidate_name, require_wave_metrics = policy_variants(policy)
     if results.get("schema") != RESULT_SCHEMA:
         raise SelectionError("unsupported performance result schema")
     expected_manifest_sha256 = policy.get("results_manifest_sha256")
@@ -182,16 +214,27 @@ def evaluate_selection(
         raise SelectionError("result target does not match the selection policy")
     variants_raw = evidence.get("variants")
     if not isinstance(variants_raw, list) or len(variants_raw) != 2:
-        raise SelectionError("result must contain exactly the control and store8 variants")
+        raise SelectionError("result must contain exactly the selected control and candidate")
     variants = {
         item.get("name"): item
         for item in variants_raw
-        if isinstance(item, dict) and item.get("name") in (CONTROL, CANDIDATE)
+        if isinstance(item, dict)
+        and item.get("name") in (control_name, candidate_name)
     }
-    if set(variants) != {CONTROL, CANDIDATE}:
+    if set(variants) != {control_name, candidate_name}:
         raise SelectionError("result variant set is incomplete or ambiguous")
-    control = variant_metrics(variants[CONTROL], target_slot)
-    candidate = variant_metrics(variants[CANDIDATE], target_slot)
+    control = variant_metrics(
+        variants[control_name],
+        target_slot,
+        control_name,
+        require_wave_metrics=require_wave_metrics,
+    )
+    candidate = variant_metrics(
+        variants[candidate_name],
+        target_slot,
+        candidate_name,
+        require_wave_metrics=require_wave_metrics,
+    )
 
     throughput_floors = required_mapping(
         policy.get("candidate_throughput_floors_relative_to_control"),
@@ -249,9 +292,13 @@ def evaluate_selection(
         and all(resource_gates.values())
         and material_storage_win
     )
-    selected = CANDIDATE if select_candidate else CONTROL
+    selected = candidate_name if select_candidate else control_name
     return {
         "schema": RECEIPT_SCHEMA,
+        "policy_schema": policy.get("schema"),
+        "control_variant": control_name,
+        "candidate_variant": candidate_name,
+        "require_wave_metrics": require_wave_metrics,
         "selected_variant": selected,
         "candidate_selected": select_candidate,
         "target_slot": target_slot,

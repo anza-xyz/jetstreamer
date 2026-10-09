@@ -872,6 +872,13 @@ separate gates. A dormant qualification service can bind that decision with
 policy digest, and sealed selector digest while also requiring the receipt to keep qualification
 launch, publication, and remote mutation unauthorized. Passing this check proves only which
 environment was selected; the service must still receive a separate fresh admission before start.
+Performance result manifests can bind a host-specific `private_root`, `unit_prefix`,
+`archive_filename`, and `canary_receipt_uid`; omitting them preserves the original epoch-202
+defaults. New comparisons should use selection-policy schema
+`jetstreamer-historical-performance-selection-policy-v2`, name the exact `control_variant` and
+`candidate_variant`, and set `require_wave_metrics` only when execution-wave instrumentation is
+part of the experiment. This keeps same-snapshot Rayon or storage-layout comparisons portable
+without weakening the sealed path, unit, receipt-owner, or no-publication checks.
 The sealed performance-admission checker accepts an optional
 `minimum_memory_available_bytes` floor (and optional absolute `meminfo_path`) in addition to its
 filesystem and VMA floors. Use the measured non-reclaimable reservation for every already-live and

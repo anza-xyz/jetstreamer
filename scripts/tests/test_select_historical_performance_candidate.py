@@ -137,6 +137,49 @@ class HistoricalPerformanceSelectionTest(unittest.TestCase):
         with self.assertRaises(select.SelectionError):
             self.evaluate(result_payload=payload)
 
+    def test_generic_policy_selects_named_candidate_without_wave_metrics(self) -> None:
+        generic_policy = policy()
+        generic_policy.update(
+            {
+                "schema": select.GENERIC_POLICY_SCHEMA,
+                "control_variant": "rayon-control-t32",
+                "candidate_variant": "rayon-candidate-t8",
+                "require_wave_metrics": False,
+            }
+        )
+        generic_results = results()
+        generic_results["evidence"]["variants"] = [
+            variant("rayon-control-t32"),
+            variant("rayon-candidate-t8", scratch_scale=0.8),
+        ]
+        for item in generic_results["evidence"]["variants"]:
+            item["wave_metrics"] = None
+
+        receipt = self.evaluate(generic_policy, generic_results)
+
+        self.assertEqual(receipt["selected_variant"], "rayon-candidate-t8")
+        self.assertEqual(receipt["control_variant"], "rayon-control-t32")
+        self.assertFalse(receipt["require_wave_metrics"])
+
+    def test_generic_policy_rejects_invalid_or_duplicate_variant_names(self) -> None:
+        for control, candidate in (
+            ("Uppercase", "candidate"),
+            ("same", "same"),
+            ("control", "bad@candidate"),
+        ):
+            generic_policy = policy()
+            generic_policy.update(
+                {
+                    "schema": select.GENERIC_POLICY_SCHEMA,
+                    "control_variant": control,
+                    "candidate_variant": candidate,
+                }
+            )
+            with self.subTest(control=control, candidate=candidate), self.assertRaises(
+                select.SelectionError
+            ):
+                select.policy_variants(generic_policy)
+
 
 if __name__ == "__main__":
     unittest.main()

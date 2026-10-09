@@ -23,8 +23,14 @@ CANARY_SCHEMA = "jetstreamer-historical-performance-canary-v2"
 GUARD_SCHEMA = "jetstreamer-historical-performance-guard-trip-v1"
 RECEIPT_SCHEMA = "jetstreamer-historical-performance-results-receipt-v1"
 PRIVATE_ROOT = Path("/home/ubuntu/.jetstreamer-private/performance-ab-202")
+DEFAULT_UNIT_PREFIX = "horizon-perf-epoch202"
+DEFAULT_ARCHIVE_FILENAME = "epoch-202-through-87695515.jet"
 VARIANT_NAME = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 UNIT_NAMESPACE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+UNIT_PREFIX = re.compile(
+    r"^horizon-perf-epoch[0-9]+(?:-[a-z0-9]+(?:-[a-z0-9]+)*)?$"
+)
+ARCHIVE_FILENAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*\.jet$")
 UNIT_NAME = re.compile(
     r"^horizon-perf-epoch[0-9]+(?:-[a-z0-9]+(?:-[a-z0-9]+)*)?@[a-z0-9-]+\.service$"
 )
@@ -540,23 +546,73 @@ def validate_unit_namespace(value: object) -> str | None:
     return value
 
 
-def expected_unit(name: str, unit_namespace: str | None) -> str:
+def validate_unit_prefix(value: object) -> str:
+    if value is None:
+        return DEFAULT_UNIT_PREFIX
+    if not isinstance(value, str) or UNIT_PREFIX.fullmatch(value) is None:
+        raise CollectionError("invalid performance unit prefix")
+    return value
+
+
+def validate_archive_filename(value: object) -> str:
+    if value is None:
+        return DEFAULT_ARCHIVE_FILENAME
+    if not isinstance(value, str) or ARCHIVE_FILENAME.fullmatch(value) is None:
+        raise CollectionError("invalid diagnostic archive filename")
+    return value
+
+
+def validate_private_root(value: object) -> Path:
+    path = PRIVATE_ROOT if value is None else Path(str(value))
+    if not path.is_absolute() or (
+        value is not None and not isinstance(value, str)
+    ):
+        raise CollectionError("performance private root must be an absolute path")
+    try:
+        metadata = path.lstat()
+        resolved = path.resolve(strict=True)
+    except OSError as error:
+        raise CollectionError(
+            f"cannot resolve performance private root: {error}"
+        ) from error
+    if resolved != path or not stat.S_ISDIR(metadata.st_mode):
+        raise CollectionError("performance private root has unsafe identity")
+    return path
+
+
+def validate_canary_receipt_uid(value: object) -> int:
+    if value is None:
+        return 1000
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise CollectionError("canary_receipt_uid must be a non-negative integer")
+    return value
+
+
+def expected_unit(
+    name: str,
+    unit_namespace: str | None,
+    unit_prefix: str = DEFAULT_UNIT_PREFIX,
+) -> str:
     namespace = f"-{unit_namespace}" if unit_namespace is not None else ""
-    return f"horizon-perf-epoch202{namespace}@{name}.service"
+    return f"{unit_prefix}{namespace}@{name}.service"
 
 
 def validate_variant_paths(
-    raw: dict[str, Any], unit_namespace: str | None = None
+    raw: dict[str, Any],
+    unit_namespace: str | None = None,
+    private_root: Path = PRIVATE_ROOT,
+    unit_prefix: str = DEFAULT_UNIT_PREFIX,
+    archive_filename: str = DEFAULT_ARCHIVE_FILENAME,
 ) -> dict[str, Any]:
     name = raw.get("name")
     if not isinstance(name, str) or VARIANT_NAME.fullmatch(name) is None:
         raise CollectionError("invalid variant name")
-    root = PRIVATE_ROOT / name
+    root = private_root / name
     expected = {
-        "unit": expected_unit(name, unit_namespace),
+        "unit": expected_unit(name, unit_namespace, unit_prefix),
         "canary_receipt": root / "canary-receipt.json",
         "scratch": root / "scratch",
-        "archive": root / "output" / "epoch-202-through-87695515.jet",
+        "archive": root / "output" / archive_filename,
     }
     for key, expected_value in expected.items():
         actual = raw.get(key)
@@ -568,12 +624,22 @@ def validate_variant_paths(
 
 
 def validate_variant_set(
-    variants_raw: object, unit_namespace: str | None = None
+    variants_raw: object,
+    unit_namespace: str | None = None,
+    private_root: Path = PRIVATE_ROOT,
+    unit_prefix: str = DEFAULT_UNIT_PREFIX,
+    archive_filename: str = DEFAULT_ARCHIVE_FILENAME,
 ) -> list[dict[str, Any]]:
     if not isinstance(variants_raw, list):
         raise CollectionError("results manifest variants must be a list")
     variants = [
-        validate_variant_paths(item, unit_namespace)
+        validate_variant_paths(
+            item,
+            unit_namespace,
+            private_root,
+            unit_prefix,
+            archive_filename,
+        )
         for item in variants_raw
         if isinstance(item, dict)
     ]
@@ -613,10 +679,22 @@ def collect(manifest: dict[str, Any], launch: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(target_slot, int):
         raise CollectionError("results manifest lacks target or variants")
     unit_namespace = validate_unit_namespace(manifest.get("unit_namespace"))
+    private_root = validate_private_root(manifest.get("private_root"))
+    unit_prefix = validate_unit_prefix(manifest.get("unit_prefix"))
+    archive_filename = validate_archive_filename(manifest.get("archive_filename"))
+    canary_receipt_uid = validate_canary_receipt_uid(
+        manifest.get("canary_receipt_uid")
+    )
     allowed_return_codes = parse_allowed_target_stop_return_codes(
         manifest.get("allowed_target_stop_return_codes")
     )
-    variants = validate_variant_set(variants_raw, unit_namespace)
+    variants = validate_variant_set(
+        variants_raw,
+        unit_namespace,
+        private_root,
+        unit_prefix,
+        archive_filename,
+    )
     units = {item["unit"] for item in variants}
     raw_launch_units = launch_evidence.get("units")
     if not isinstance(raw_launch_units, list):
@@ -650,7 +728,9 @@ def collect(manifest: dict[str, Any], launch: dict[str, Any]) -> dict[str, Any]:
         )
         receipt_path = Path(variant["canary_receipt"])
         receipt, receipt_sha256 = load_json_file(
-            receipt_path, f"{name} canary receipt", required_uid=1000
+            receipt_path,
+            f"{name} canary receipt",
+            required_uid=canary_receipt_uid,
         )
         performance = validate_canary_receipt(
             receipt,
@@ -658,8 +738,12 @@ def collect(manifest: dict[str, Any], launch: dict[str, Any]) -> dict[str, Any]:
             launch_units[variant["unit"]],
             allowed_return_codes,
         )
-        scratch = require_under(Path(variant["scratch"]), PRIVATE_ROOT, f"{name} scratch")
-        archive = require_under(Path(variant["archive"]), PRIVATE_ROOT, f"{name} archive")
+        scratch = require_under(
+            Path(variant["scratch"]), private_root, f"{name} scratch"
+        )
+        archive = require_under(
+            Path(variant["archive"]), private_root, f"{name} archive"
+        )
         archive_metadata = archive.lstat()
         if not stat.S_ISREG(archive_metadata.st_mode):
             raise CollectionError(f"{name} archive is not regular")
@@ -710,6 +794,10 @@ def collect(manifest: dict[str, Any], launch: dict[str, Any]) -> dict[str, Any]:
         )
     return {
         "target_slot": target_slot,
+        "private_root": str(private_root),
+        "unit_prefix": unit_prefix,
+        "archive_filename": archive_filename,
+        "canary_receipt_uid": canary_receipt_uid,
         "allowed_target_stop_return_codes": list(allowed_return_codes),
         "variants": collected,
         "selection_authorized": False,

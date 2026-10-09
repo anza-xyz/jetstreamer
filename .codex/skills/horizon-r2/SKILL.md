@@ -406,6 +406,14 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
   canonical vote whose tip hash disagrees with the reconstructed SlotHashes value can prove this
   divergence, but RPC block metadata does not recover the missing intermediate PoH hash and therefore
   cannot by itself authorize a runtime-route promotion or publication.
+- Before limiting recovery to the first observed hash mismatch, census the complete source-obscured
+  slot interval with finalized `getBlocks` evidence and identify every parent jump. A single interval
+  can contain many disjoint skipped-slot runs. For each run, the first visible post-gap block can carry
+  `skipped_slots + 1` tick boundaries, so recover and validate original data shreds for every such
+  post-gap block, not only the skipped slot or the first failing block. Seal the raw block-list response,
+  the derived gap list, and the expected total hidden/boundary counts before starting the bounded ledger
+  scan. Independently bind finalized `getBlock` parent slots and final blockhashes for all targets; they
+  validate the recovered final boundary but still do not supply the hidden intermediate hashes.
 - For an exact-state recovery of such a gap, search immutable, generation-pinned ledger backups rooted
   before the boundary for the blockstore `data_shred`, `code_shred`, and `meta` column families. When
   the backup is too large for the current admission envelope, stream its compressed tar one SST at a

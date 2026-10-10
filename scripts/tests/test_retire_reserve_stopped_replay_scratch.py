@@ -114,7 +114,9 @@ class ReserveStoppedScratchRetirementTest(unittest.TestCase):
                 "parent_sha256": node_sha256,
                 "bootstrap": {
                     "filename": bootstrap.name,
-                    "size_bytes": bootstrap.stat().st_size,
+                    "size": bootstrap.stat().st_size,
+                    "path": str(bootstrap),
+                    "epochs": [186, 186],
                     "sha256": bootstrap_sha256,
                 },
             }
@@ -168,6 +170,19 @@ class ReserveStoppedScratchRetirementTest(unittest.TestCase):
                         retire.validate_retained_external_bootstrap(
                             args, expected_uid=os.getuid()
                         )
+
+                manifest["bootstrap"]["size_bytes"] = (
+                    bootstrap.stat().st_size + 1
+                )
+                manifest_path.chmod(0o600)
+                manifest_path.write_text(json.dumps(manifest))
+                manifest_path.chmod(0o444)
+                with self.assertRaisesRegex(
+                    retire.RetirementError, "conflicting size aliases"
+                ):
+                    retire.validate_retained_external_bootstrap(
+                        args, expected_uid=os.getuid()
+                    )
             finally:
                 package.chmod(0o700)
 

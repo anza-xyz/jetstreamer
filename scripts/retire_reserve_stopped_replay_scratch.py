@@ -171,15 +171,25 @@ def validate_retained_external_bootstrap(
     except (OSError, json.JSONDecodeError) as error:
         raise RetirementError(f"cannot read bootstrap deployment manifest: {error}") from error
     bootstrap_manifest = manifest.get("bootstrap")
+    bootstrap_size = None
+    if isinstance(bootstrap_manifest, dict):
+        size_bytes = bootstrap_manifest.get("size_bytes")
+        size_alias = bootstrap_manifest.get("size")
+        if size_bytes is not None and size_alias is not None and size_bytes != size_alias:
+            raise RetirementError("bootstrap deployment manifest has conflicting size aliases")
+        bootstrap_size = size_bytes if size_bytes is not None else size_alias
     if (
         manifest.get("schema") != "jetstreamer-private-contiguous-deployment-v1"
         or not isinstance(bootstrap_manifest, dict)
         or bootstrap_manifest.get("filename") != bootstrap.name
-        or bootstrap_manifest.get("size_bytes") != bootstrap_metadata.st_size
+        or bootstrap_size != bootstrap_metadata.st_size
         or SHA256.fullmatch(str(bootstrap_manifest.get("sha256", ""))) is None
         or SHA256.fullmatch(str(manifest.get("parent_sha256", ""))) is None
         or manifest.get("manifest_fingerprint") != args.manifest_fingerprint
         or manifest.get("range") != [args.start_epoch, args.end_epoch]
+        or bootstrap_manifest.get("path", str(bootstrap)) != str(bootstrap)
+        or bootstrap_manifest.get("epochs", [args.start_epoch, args.end_epoch])
+        != [args.start_epoch, args.end_epoch]
     ):
         raise RetirementError("bootstrap deployment manifest does not bind this cohort")
     sums = parse_sha256sums(sums_path)

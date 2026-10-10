@@ -624,6 +624,18 @@ Do not use `--legacy-etag-only` unless the user has explicitly established that 
 
 ## Operate safely
 
+- Do not give a systemd unit running `jetstreamer-r2` a task ceiling that is
+  exhausted by Tokio's core runtime threads. `retire-local` performs its archive
+  proof in `spawn_blocking`; if `TasksMax` is no larger than the runtime worker
+  count plus the wrapper processes, the proof can remain queued forever while
+  every visible thread is parked and the reserve lock stays held. Use at least
+  twice the service's visible logical-CPU count, with a minimum of 256 tasks,
+  unless the exact binary has a smaller sealed runtime-worker bound. On the first
+  below-floor retirement, prove that an additional worker is consuming CPU and
+  has the selected `.jet` open before considering the guard live. If it is
+  starved, stop the non-mutating attempt while the complete pair is still
+  present, raise only that unit's task ceiling, and retry the same verified
+  command.
 - Never use `sync -f PATH` or `sync --file-system PATH` to make a receipt durable on a filesystem
   containing live replay scratch. GNU `sync -f` calls `syncfs(2)` and flushes the entire filesystem;
   continuously dirtied mmap-backed AccountsDb pages can keep it blocked indefinitely and impose

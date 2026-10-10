@@ -265,7 +265,10 @@ progressive uploader and this wrapper with the same private `--local-mutation-lo
 floor, the wrapper validates the entire public Horizon namespace, invokes `retire-local` for one
 explicit epoch at a time, and stops as soon as the floor is recovered. Above the floor it performs
 no hashing or mutation. It fails closed on a partial pair, an out-of-range file, missing durable R2
-evidence, or exhaustion of eligible local pairs. It never mutates R2.
+evidence, or exhaustion of eligible local pairs. It never mutates R2. When this wrapper runs under
+systemd, set `TasksMax` to at least twice the service's visible logical-CPU count and no lower than
+256: the Tokio runtime uses one worker per visible CPU, while `retire-local` needs an additional
+blocking worker for its archive proof.
 
 `scripts/audit_horizon_receipts.py` is the local-file-independent completion gate. It requires the
 full, current-plugin, R2, and adjacent-boundary receipts to agree on every archive SHA-256, and

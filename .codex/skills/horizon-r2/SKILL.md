@@ -450,7 +450,12 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
   Treat command-line and mmap references as exact paths or descendants, not raw string prefixes:
   a live `scratch-store8` sibling is not a reference to an empty completed `scratch` tree. Use the
   repository retirement scanners' path-boundary checks, and still fail closed on any genuine
-  command, map, cwd/root/exe, or descriptor reference beneath the exact target.
+  command, map, cwd/root/exe, or descriptor reference beneath the exact target. Invoke the scanner
+  so the exact target is not also present in a still-live parent `sudo`, shell, or wrapper argv; a
+  self-induced wrapper match is not zero-reference evidence. Preserve that match, rerun the scan
+  from a separate invocation whose parent command line does not contain the target, and delete only
+  after the clean scan. Never suppress arbitrary scanner PIDs or treat an incomplete sibling scan
+  as proof for targets it did not inspect.
 - Retire a generation-bound download cache only after its root-owned verification receipt still
   binds the exact immutable cache identity, the consuming scan has durably recorded `complete`
   against that same identity, and every explicitly bound producer/verifier/consumer invocation is
@@ -464,6 +469,12 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
   authorizes an R2 mutation. A garbage-collected transient download unit may be proven by the exact
   clean terminal state and invocation embedded in its root-owned cache receipt; still require live
   terminal checks for explicitly bound verifier/consumer units that remain loaded.
+  `scripts/retire_verified_generation_cache.py` specifically requires its sealed RocksDB streaming
+  scan-state schema; it is not a generic snapshot-cache retirer. Do not fabricate that scan state or
+  repurpose the tool for a bootstrap copied into an immutable deployment. Retain such a snapshot
+  cache until a dedicated retirement path validates the generation-bound download receipt, the
+  exact direct deployment member and checksum set, the consuming capability receipt, terminal bound
+  units, and a clean process-reference scan before writing no-clobber intent/completion receipts.
 - For adaptive ranges, start the controller with `--r2-receipt-directory "$HOME/.jetstreamer-private/r2-receipts" --r2-bucket BUCKET`. The controller accepts receipts from that exact bucket only for bytes already bound by its root-owned local completion attestation; R2 can replace local storage, but can never establish initial completion.
 - Start the current Horizon verification plugin as soon as each local archive is available. R2 work may run concurrently with replay of other epochs. An archive is eligible for upload only after its full and current-plugin receipts bind the same archive SHA-256. It is not eligible for local retirement until both adjacent-boundary receipts bind that digest as well. Preserve the canonical lowercase coreutils sidecar format: `<64 hex>  epoch-N.jet\n`.
 - When a verifier starts on the first archive of a long continuous cohort, size its oneshot

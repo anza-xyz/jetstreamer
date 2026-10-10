@@ -177,18 +177,44 @@ def validate_controller_command(unit: str, command: list[str]) -> list[str]:
     return validated
 
 
-def command_from_systemd(unit: str) -> list[str]:
-    properties = unit_properties(unit)
+def validate_controller_unit_definition(
+    unit: str, properties: dict[str, str]
+) -> str:
+    """Return the safely resumable systemd unit kind."""
+
+    if properties.get("LoadState") != "loaded":
+        raise RuntimeError(f"controller unit is not loaded: {unit}")
+    fragment = properties.get("FragmentPath", "")
     if (
-        properties.get("LoadState") != "loaded"
-        or properties.get("ActiveState") != "active"
-        or properties.get("SubState") != "running"
-        or properties.get("Transient") != "yes"
-        or not properties.get("FragmentPath", "").startswith("/run/systemd/transient/")
+        properties.get("Transient") == "yes"
+        and fragment.startswith("/run/systemd/transient/")
+        and os.path.basename(fragment) == unit
     ):
-        raise ControllerNotLiveError(
-            f"controller is not a live transient service: {unit}"
-        )
+        return "transient"
+    expected_fragment = f"/etc/systemd/system/{unit}"
+    if properties.get("Transient") != "no" or fragment != expected_fragment:
+        raise RuntimeError(f"controller has an unsafe systemd definition: {unit}")
+    try:
+        info = os.lstat(expected_fragment)
+    except OSError as error:
+        raise RuntimeError(
+            f"cannot inspect persistent controller definition: {unit}"
+        ) from error
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_uid != 0
+        or info.st_gid != 0
+        or info.st_nlink != 1
+        or stat.S_IMODE(info.st_mode) & 0o022
+    ):
+        raise RuntimeError(f"persistent controller definition is unsafe: {unit}")
+    return "persistent"
+
+
+def controller_command_definition(
+    unit: str, properties: dict[str, str]
+) -> list[str]:
+    validate_controller_unit_definition(unit, properties)
 
     object_reply = busctl_json(
         [
@@ -250,6 +276,19 @@ def command_from_systemd(unit: str) -> list[str]:
     ):
         raise RuntimeError(f"unsafe controller command for {unit}")
     return validate_controller_command(unit, command)
+
+
+def command_from_systemd(unit: str) -> list[str]:
+    properties = unit_properties(unit)
+    if (
+        properties.get("LoadState") != "loaded"
+        or properties.get("ActiveState") != "active"
+        or properties.get("SubState") != "running"
+    ):
+        raise ControllerNotLiveError(
+            f"controller is not a live service: {unit}"
+        )
+    return controller_command_definition(unit, properties)
 
 
 def open_pause_state_directory() -> int:
@@ -435,6 +474,30 @@ def start_controller(unit: str, command: list[str]) -> None:
         value.partition("=")[2] for value in command if value.startswith("--state-dir=")
     )
     properties = unit_properties(unit)
+    if properties.get("LoadState") == "loaded" and properties.get("Transient") == "no":
+        kind = validate_controller_unit_definition(unit, properties)
+        if (
+            kind != "persistent"
+            or properties.get("ActiveState") != "inactive"
+            or properties.get("SubState") != "dead"
+            or properties.get("MainPID") != "0"
+            or properties.get("Result") != "success"
+            or controller_command_definition(unit, properties) != command
+        ):
+            raise RuntimeError(
+                f"persistent controller changed while paused: {unit}"
+            )
+        result = run(["/usr/bin/systemctl", "start", unit], check=False)
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"failed to restore {unit}: "
+                f"{result.stderr.strip() or result.stdout.strip()}"
+            )
+        if command_from_systemd(unit) != command:
+            raise RuntimeError(
+                f"persistent controller command changed after resume: {unit}"
+            )
+        return
     if (
         properties.get("LoadState") == "loaded"
         and properties.get("ActiveState") == "failed"

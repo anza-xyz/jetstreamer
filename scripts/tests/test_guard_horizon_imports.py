@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import stat
 import sys
 import tempfile
 import unittest
@@ -428,6 +429,161 @@ class GuardHorizonImportsTests(unittest.TestCase):
 
         self.assertEqual(execute.call_count, 2)
 
+    def test_command_accepts_root_owned_persistent_controller(self) -> None:
+        unit = "jetstreamer-example-controller-v1.service"
+        script = "/usr/local/lib/jetstreamer/adaptive-root-cohort-sweep-test.py"
+        digest = "a" * 64
+        command = [
+            "/usr/bin/python3",
+            script,
+            "--state-dir=/var/lib/jetstreamer-root-sweep-test",
+            f"--controller-sha256={digest}",
+            "--execute",
+        ]
+        replies = [
+            mock.Mock(
+                stdout=(
+                    '{"type":"o","data":'
+                    '["/org/freedesktop/systemd1/unit/example"]}'
+                )
+            ),
+            mock.Mock(
+                stdout=json.dumps(
+                    {
+                        "type": "a(sasbttttuii)",
+                        "data": [
+                            [
+                                "/usr/bin/python3",
+                                command,
+                                False,
+                                0,
+                                0,
+                                0,
+                                0,
+                                0,
+                                0,
+                                0,
+                            ]
+                        ],
+                    }
+                )
+            ),
+        ]
+        properties = {
+            "LoadState": "loaded",
+            "ActiveState": "active",
+            "SubState": "running",
+            "Transient": "no",
+            "FragmentPath": f"/etc/systemd/system/{unit}",
+        }
+        fragment = mock.Mock(
+            st_mode=stat.S_IFREG | 0o644,
+            st_uid=0,
+            st_gid=0,
+            st_nlink=1,
+        )
+
+        with (
+            mock.patch.object(guard, "unit_properties", return_value=properties),
+            mock.patch.object(guard, "run", side_effect=replies),
+            mock.patch.object(guard.os, "lstat", return_value=fragment),
+            mock.patch("builtins.open", mock.mock_open(read_data=b"script")),
+            mock.patch.object(
+                guard.hashlib,
+                "file_digest",
+                return_value=mock.Mock(hexdigest=lambda: digest),
+            ),
+        ):
+            self.assertEqual(
+                guard.command_from_systemd(unit),
+                [*command, "--retry-failed"],
+            )
+
+    def test_start_controller_resumes_unchanged_persistent_unit(self) -> None:
+        unit = "jetstreamer-example-controller-v1.service"
+        command = [
+            "/usr/bin/python3",
+            "/usr/local/lib/jetstreamer/adaptive-root-cohort-sweep-test.py",
+            "--state-dir=/var/lib/jetstreamer-root-sweep-test",
+            "--controller-sha256=" + "a" * 64,
+            "--execute",
+            "--retry-failed",
+        ]
+        properties = {
+            "LoadState": "loaded",
+            "ActiveState": "inactive",
+            "SubState": "dead",
+            "MainPID": "0",
+            "Result": "success",
+            "Transient": "no",
+            "FragmentPath": f"/etc/systemd/system/{unit}",
+        }
+        completed = mock.Mock(returncode=0, stdout="", stderr="")
+
+        with (
+            mock.patch.object(guard, "unit_properties", return_value=properties),
+            mock.patch.object(
+                guard,
+                "validate_controller_unit_definition",
+                return_value="persistent",
+            ),
+            mock.patch.object(
+                guard,
+                "controller_command_definition",
+                return_value=command,
+            ),
+            mock.patch.object(
+                guard,
+                "command_from_systemd",
+                return_value=command,
+            ),
+            mock.patch.object(guard, "run", return_value=completed) as execute,
+        ):
+            guard.start_controller(unit, command)
+
+        execute.assert_called_once_with(
+            ["/usr/bin/systemctl", "start", unit], check=False
+        )
+
+    def test_start_controller_refuses_changed_persistent_unit(self) -> None:
+        unit = "jetstreamer-example-controller-v1.service"
+        command = [
+            "/usr/bin/python3",
+            "/usr/local/lib/jetstreamer/adaptive-root-cohort-sweep-test.py",
+            "--state-dir=/var/lib/jetstreamer-root-sweep-test",
+            "--controller-sha256=" + "a" * 64,
+            "--execute",
+            "--retry-failed",
+        ]
+        properties = {
+            "LoadState": "loaded",
+            "ActiveState": "inactive",
+            "SubState": "dead",
+            "MainPID": "0",
+            "Result": "success",
+            "Transient": "no",
+            "FragmentPath": f"/etc/systemd/system/{unit}",
+        }
+
+        with (
+            mock.patch.object(guard, "unit_properties", return_value=properties),
+            mock.patch.object(
+                guard,
+                "validate_controller_unit_definition",
+                return_value="persistent",
+            ),
+            mock.patch.object(
+                guard,
+                "controller_command_definition",
+                return_value=[*command, "--unexpected-change"],
+            ),
+            mock.patch.object(guard, "run") as execute,
+            self.assertRaisesRegex(RuntimeError, "changed while paused"),
+        ):
+            guard.start_controller(unit, command)
+
+        execute.assert_not_called()
+
     def test_command_refuses_nonrunning_controller(self) -> None:
         with (
             mock.patch.object(
@@ -442,7 +598,7 @@ class GuardHorizonImportsTests(unittest.TestCase):
                 },
             ),
             mock.patch.object(guard, "run") as execute,
-            self.assertRaisesRegex(RuntimeError, "not a live transient"),
+            self.assertRaisesRegex(RuntimeError, "not a live service"),
         ):
             guard.command_from_systemd("jetstreamer-example-controller.service")
 

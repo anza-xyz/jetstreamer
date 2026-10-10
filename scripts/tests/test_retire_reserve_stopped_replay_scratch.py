@@ -256,6 +256,32 @@ class ReserveStoppedScratchRetirementTest(unittest.TestCase):
             with self.assertRaisesRegex(retire.RetirementError, "terminal producer"):
                 retire.validate_guard_receipts(args)
 
+        current_intent = json.loads(json.dumps(intent))
+        current_intent["reason"] = (
+            "one or more sealed adaptive replay guard conditions tripped"
+        )
+        current_intent["trip_reasons"] = [
+            "available bytes 199 below floor 200"
+        ]
+        with mock.patch.object(
+            retire,
+            "require_root_private_file",
+            side_effect=[(current_intent, "1" * 64), (completion, "2" * 64)],
+        ):
+            evidence = retire.validate_guard_receipts(args)
+        self.assertEqual(evidence["trip_available_bytes"], 199)
+
+        current_intent["trip_reasons"].append(
+            "producer worker VMAs 300 above ceiling 200"
+        )
+        with mock.patch.object(
+            retire,
+            "require_root_private_file",
+            side_effect=[(current_intent, "1" * 64), (completion, "2" * 64)],
+        ):
+            with self.assertRaisesRegex(retire.RetirementError, "expected trip"):
+                retire.validate_guard_receipts(args)
+
 
 if __name__ == "__main__":
     unittest.main()

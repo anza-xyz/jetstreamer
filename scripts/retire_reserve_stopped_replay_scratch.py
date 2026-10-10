@@ -128,17 +128,31 @@ def validate_guard_receipts(args: argparse.Namespace) -> dict[str, Any]:
         "producer_unit": args.producer_unit,
         "expected_producer_invocation_id": args.producer_invocation_id,
     }
+    available = intent.get("available_bytes")
+    floor = intent.get("minimum_free_bytes")
+    legacy_disk_reason = (
+        intent.get("reason")
+        == "actual available bytes fell below the sealed reserve stop floor"
+        and intent.get("trip_reasons") in (None, [])
+    )
+    current_disk_reason = (
+        intent.get("reason")
+        == "one or more sealed adaptive replay guard conditions tripped"
+        and isinstance(available, int)
+        and isinstance(floor, int)
+        and intent.get("trip_reasons")
+        == [f"available bytes {available} below floor {floor}"]
+    )
     if (
         intent.get("schema") != GUARD_INTENT_SCHEMA
         or any(intent.get(key) != value for key, value in common.items())
-        or intent.get("reason")
-        != "actual available bytes fell below the sealed reserve stop floor"
+        or not (legacy_disk_reason or current_disk_reason)
         or intent.get("stop_order") != ["controller", "producer"]
         or intent.get("remote_mutations") is not False
         or intent.get("r2_mutations") is not False
-        or not isinstance(intent.get("available_bytes"), int)
-        or not isinstance(intent.get("minimum_free_bytes"), int)
-        or intent["available_bytes"] >= intent["minimum_free_bytes"]
+        or not isinstance(available, int)
+        or not isinstance(floor, int)
+        or available >= floor
     ):
         raise RetirementError("reserve-stop intent does not bind the expected trip")
     for label, expected_invocation in (

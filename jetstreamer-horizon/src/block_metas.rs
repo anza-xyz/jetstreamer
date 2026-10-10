@@ -26,7 +26,7 @@
 //! provides the authoritative total order as a cross-check.)
 //!
 //! Like [`Transaction`](crate::transactions::Transaction), instances are
-//! large (~161 MiB, dominated by the orphan-update arenas) and must be
+//! large (~225 MiB, dominated by the orphan-update arenas) and must be
 //! heap-allocated via [`BlockNotification::new_boxed`] /
 //! [`BlockMeta::new_boxed`] and reused.
 use lencode::prelude::*;
@@ -57,7 +57,7 @@ pub struct SkippedSlot {
 /// Block-level metadata plus the block's runtime-direct account updates.
 ///
 /// `Clone` is intentionally **not** derived — the orphan arenas make this
-/// a ~161 MiB struct; cloning through the stack would overflow.
+/// a ~225 MiB struct; cloning through the stack would overflow.
 #[derive(Encode, Decode, Debug, PartialEq, Eq)]
 #[repr(C)]
 pub struct BlockMeta {
@@ -90,7 +90,7 @@ pub struct BlockMeta {
 }
 
 impl Default for BlockMeta {
-    /// **Warning:** ~161 MiB by value; prefer [`Self::new_boxed`].
+    /// **Warning:** ~225 MiB by value; prefer [`Self::new_boxed`].
     fn default() -> Self {
         Self {
             slot: 0,
@@ -111,7 +111,7 @@ impl Default for BlockMeta {
 
 impl BlockMeta {
     /// Allocates a fresh zero-initialised `BlockMeta` directly on the heap,
-    /// without routing the ~161 MiB struct through the stack.
+    /// without routing the ~225 MiB struct through the stack.
     pub fn new_boxed() -> Box<Self> {
         use std::alloc::{Layout, alloc_zeroed, handle_alloc_error};
         let layout = Layout::new::<Self>();
@@ -173,7 +173,7 @@ impl BlockMeta {
 // variant swap in [`Self::decode_into`] (same technique as
 // `VersionedMessage`).
 //
-// The variant size gap (8 B vs ~161 MiB) is intentional: boxing `BlockMeta`
+// The variant size gap (8 B vs ~225 MiB) is intentional: boxing `BlockMeta`
 // would reintroduce a heap indirection and break the zero-alloc /
 // `decode_into`-in-place design. Instances are always heap-pinned via
 // `new_boxed()` and reused, so the size is paid once per scratch, not per
@@ -188,7 +188,7 @@ pub enum BlockNotification {
 }
 
 impl Default for BlockNotification {
-    /// **Warning:** ~161 MiB by value; prefer [`Self::new_boxed`].
+    /// **Warning:** ~225 MiB by value; prefer [`Self::new_boxed`].
     fn default() -> Self {
         Self::Skipped(SkippedSlot::default())
     }
@@ -196,7 +196,7 @@ impl Default for BlockNotification {
 
 impl BlockNotification {
     /// Allocates a fresh `BlockNotification` (Skipped(0)) directly on the
-    /// heap without routing the ~161 MiB enum through the stack.
+    /// heap without routing the ~225 MiB enum through the stack.
     pub fn new_boxed() -> Box<Self> {
         use std::alloc::{Layout, alloc_zeroed, handle_alloc_error};
         let layout = Layout::new::<Self>();
@@ -236,7 +236,7 @@ impl BlockNotification {
     }
 
     /// Decodes the wire form into `self` without stack-allocating the
-    /// ~161 MiB enum, swapping variants in place when the incoming
+    /// ~225 MiB enum, swapping variants in place when the incoming
     /// discriminant differs from the active one.
     pub fn decode_into<R: Read>(
         &mut self,
@@ -547,6 +547,10 @@ mod tests {
             meta.pre_updates.push(&view(key, &payload)).unwrap();
         }
         assert_eq!(meta.pre_updates.data_len(), 64 << 20);
-        assert!(meta.pre_updates.push(&view(9, &[0])).is_err());
+        for key in 9..=16 {
+            meta.pre_updates.push(&view(key, &payload)).unwrap();
+        }
+        assert_eq!(meta.pre_updates.data_len(), 128 << 20);
+        assert!(meta.pre_updates.push(&view(17, &[0])).is_err());
     }
 }

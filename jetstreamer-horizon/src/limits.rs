@@ -125,16 +125,18 @@ pub const MAX_BLOCK_REWARDS: usize = 524_288;
 /// slots 88,560,000 and 88,992,000 each emit 131,073 writes, and slot
 /// 100,656,000 emits 262,145 writes before transactions. Keep a finite
 /// 524,288-record ceiling while the independent
-/// 64 MiB data-arena and bucket limits continue to bound memory and decoding
+/// 128 MiB data-arena and bucket limits continue to bound memory and decoding
 /// work.
 pub const MAX_SLOT_PRE_UPDATES: usize = 524_288;
 
 /// Combined data-byte cap for one block's pre-transaction orphan updates.
 /// Mainnet epoch-boundary slots 88,992,000 and 89,424,000 both exceed the
-/// former 32 MiB arena while applying 131,073 reward writes. The 64 MiB cap
-/// admits that observed shape while remaining finite and independently
-/// bounded by the per-account, bucket, and cumulative decode-work limits.
-pub const MAX_SLOT_PRE_UPDATE_DATA: usize = 64 * 1024 * 1024;
+/// former 32 MiB arena while applying 131,073 reward writes, and slot
+/// 104,112,000 emits 67,109,035 bytes, 171 bytes above the former 64 MiB
+/// arena. Keep 2x headroom over that latest observed shape while remaining
+/// finite and independently bounded by the per-account, bucket, and cumulative
+/// decode-work limits. This inline capacity is not encoded on the wire.
+pub const MAX_SLOT_PRE_UPDATE_DATA: usize = 128 * 1024 * 1024;
 
 /// Max orphan updates in one block's post-transaction (freeze) phase.
 /// Historical rent collection at mainnet slots 76,920,172, 77,374,128, and
@@ -177,20 +179,27 @@ mod tests {
         assert_eq!(MAX_TX_ACCOUNT_UPDATES, 128);
         assert_eq!(MAX_RETURN_DATA_LEN, 1024);
         assert_eq!(MAX_BLOCK_REWARDS, 524_288);
-        assert_eq!(MAX_SLOT_PRE_UPDATE_DATA, 64 * 1024 * 1024);
+        assert_eq!(MAX_SLOT_PRE_UPDATE_DATA, 128 * 1024 * 1024);
     }
 
     #[test]
     fn historical_epoch_233_rewards_fit_but_the_bound_remains_finite() {
         const OBSERVED_REWARDS_AT_SLOT_100_656_000: usize = 292_237;
-        assert!(OBSERVED_REWARDS_AT_SLOT_100_656_000 <= MAX_BLOCK_REWARDS);
+        const { assert!(OBSERVED_REWARDS_AT_SLOT_100_656_000 <= MAX_BLOCK_REWARDS) };
         assert_eq!(MAX_BLOCK_REWARDS, 524_288);
     }
 
     #[test]
     fn historical_epoch_233_pre_updates_fit_but_the_bound_remains_finite() {
         const OBSERVED_PRE_UPDATES_AT_SLOT_100_656_000: usize = 262_145;
-        assert!(OBSERVED_PRE_UPDATES_AT_SLOT_100_656_000 <= MAX_SLOT_PRE_UPDATES);
+        const { assert!(OBSERVED_PRE_UPDATES_AT_SLOT_100_656_000 <= MAX_SLOT_PRE_UPDATES) };
         assert_eq!(MAX_SLOT_PRE_UPDATES, 524_288);
+    }
+
+    #[test]
+    fn historical_epoch_241_pre_update_data_fits_but_the_bound_remains_finite() {
+        const OBSERVED_PRE_UPDATE_DATA_AT_SLOT_104_112_000: usize = 67_109_035;
+        const { assert!(OBSERVED_PRE_UPDATE_DATA_AT_SLOT_104_112_000 <= MAX_SLOT_PRE_UPDATE_DATA) };
+        assert_eq!(MAX_SLOT_PRE_UPDATE_DATA, 128 * 1024 * 1024);
     }
 }

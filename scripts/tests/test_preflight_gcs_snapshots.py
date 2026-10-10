@@ -485,6 +485,8 @@ class SelectionTests(unittest.TestCase):
             174: "solana-v1.6.15",
             200: "solana-v1.6.15",
             201: "solana-v1.6.16",
+            202: "solana-v1.6.16",
+            204: "solana-v1.6.16",
             213: "solana-v1.6.16",
             214: "solana-v1.6.17",
             215: "solana-v1.6.17",
@@ -502,13 +504,46 @@ class SelectionTests(unittest.TestCase):
         with self.assertRaises(preflight.PreflightError):
             preflight.requested_slot_range(0, 1)
         with self.assertRaises(preflight.PreflightError):
-            preflight.runtime_route(202)
+            preflight.runtime_route(203)
+        with self.assertRaises(preflight.PreflightError):
+            preflight.runtime_route(205)
         with self.assertRaises(preflight.PreflightError):
             preflight.runtime_route(212)
         with self.assertRaises(preflight.PreflightError):
             preflight.runtime_route(302)
         with self.assertRaises(preflight.PreflightError):
             preflight.requested_slot_range(301, 302)
+
+    def test_promoted_v16_epochs_build_isolated_publishable_plans(self) -> None:
+        for epoch in (202, 204):
+            with self.subTest(epoch=epoch):
+                epoch_start, epoch_end = preflight.epoch_slot_range(epoch)
+                root = preflight.parse_inventory_json(
+                    json.dumps(
+                        [
+                            inventory_record(epoch_start - 500),
+                            inventory_record(epoch_end - 500, identity=ONE_HASH),
+                        ]
+                    ),
+                    "root",
+                    preflight.requested_slot_range(epoch, epoch),
+                )
+
+                plans = preflight.build_epoch_plans(root, (), epoch, epoch, 3)
+                manifest = preflight.build_manifest(
+                    plans, target_cohort_epochs=3, publish_through_epoch=epoch
+                )
+
+                self.assertEqual(len(plans), 1)
+                self.assertEqual(plans[0].runtime, "solana-v1.6.16")
+                self.assertEqual(
+                    (plans[0].cohort_first_epoch, plans[0].cohort_last_epoch),
+                    (epoch, epoch),
+                )
+                self.assertEqual(manifest["publication_boundary_epoch"], epoch)
+                self.assertEqual(
+                    manifest["epochs"][0]["publication_scope"], "requested"
+                )
 
     def test_builds_all_epoch_plans_and_keeps_hourly_bootstrap_only(self) -> None:
         root_raw, hourly_raw = complete_inventory()

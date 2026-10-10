@@ -33,6 +33,7 @@ COMPLETION_SCHEMA = "jetstreamer-reserve-stopped-scratch-retirement-completion-v
 UNIT_NAME = re.compile(r"^[A-Za-z0-9_.@-]+\.service$")
 INVOCATION_ID = re.compile(r"^[0-9a-f]{32}$")
 FINGERPRINT = re.compile(r"^sha256:[0-9a-f]{64}$")
+SHA256 = re.compile(r"^[0-9a-f]{64}$")
 RUN_NAME = re.compile(r"^run-[0-9]+-[0-9]+$")
 
 
@@ -58,6 +59,181 @@ def sha256_file(path: Path) -> str:
         while chunk := source.read(1024 * 1024):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def file_identity(metadata: os.stat_result) -> tuple[int, int, int, int]:
+    return metadata.st_dev, metadata.st_ino, metadata.st_size, metadata.st_mtime_ns
+
+
+def hash_stable(path: Path, expected: os.stat_result) -> str:
+    descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    try:
+        before = os.fstat(descriptor)
+        digest = hashlib.sha256()
+        while chunk := os.read(descriptor, 8 * 1024 * 1024):
+            digest.update(chunk)
+        after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    current = path.stat(follow_symlinks=False)
+    identity = file_identity(expected)
+    if (
+        identity != file_identity(before)
+        or identity != file_identity(after)
+        or identity != file_identity(current)
+    ):
+        raise RetirementError(f"file changed while hashing: {path}")
+    return digest.hexdigest()
+
+
+def require_immutable_package_file(
+    path: Path, description: str, *, expected_uid: int = 0
+) -> os.stat_result:
+    try:
+        resolved = path.resolve(strict=True)
+        metadata = path.lstat()
+    except OSError as error:
+        raise RetirementError(f"cannot inspect {description} {path}: {error}") from error
+    if (
+        not path.is_absolute()
+        or resolved != path
+        or not stat.S_ISREG(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or metadata.st_uid != expected_uid
+        or metadata.st_nlink != 1
+        or stat.S_IMODE(metadata.st_mode) & 0o222
+    ):
+        raise RetirementError(f"{description} has unsafe immutable identity: {path}")
+    return metadata
+
+
+def parse_sha256sums(path: Path) -> dict[str, str]:
+    try:
+        lines = path.read_text(encoding="ascii").splitlines()
+    except (OSError, UnicodeDecodeError) as error:
+        raise RetirementError(f"cannot read package SHA256SUMS: {error}") from error
+    result: dict[str, str] = {}
+    for line in lines:
+        digest, separator, filename = line.partition("  ")
+        if not separator or SHA256.fullmatch(digest) is None or not filename:
+            raise RetirementError("package SHA256SUMS has a non-canonical entry")
+        if filename in result:
+            raise RetirementError("package SHA256SUMS has a duplicate entry")
+        result[filename] = digest
+    return result
+
+
+def validate_retained_external_bootstrap(
+    args: argparse.Namespace, *, expected_uid: int = 0
+) -> dict[str, Any] | None:
+    bootstrap = getattr(args, "retained_external_bootstrap", None)
+    if bootstrap is None:
+        return None
+    package = bootstrap.parent
+    try:
+        package_resolved = package.resolve(strict=True)
+        package_metadata = package.lstat()
+    except OSError as error:
+        raise RetirementError(f"cannot inspect bootstrap package {package}: {error}") from error
+    if (
+        not bootstrap.is_absolute()
+        or package_resolved != package
+        or not stat.S_ISDIR(package_metadata.st_mode)
+        or stat.S_ISLNK(package_metadata.st_mode)
+        or package_metadata.st_uid != expected_uid
+        or stat.S_IMODE(package_metadata.st_mode) & 0o222
+    ):
+        raise RetirementError("retained external bootstrap package is not immutable")
+    try:
+        bootstrap.relative_to(args.run_directory)
+    except ValueError:
+        pass
+    else:
+        raise RetirementError("retained external bootstrap must be outside the cohort run")
+
+    bootstrap_metadata = require_immutable_package_file(
+        bootstrap, "retained external bootstrap", expected_uid=expected_uid
+    )
+    manifest_path = package / "deployment-manifest.json"
+    sums_path = package / "SHA256SUMS"
+    node_path = package / "jetstreamer-node"
+    manifest_metadata = require_immutable_package_file(
+        manifest_path, "bootstrap deployment manifest", expected_uid=expected_uid
+    )
+    sums_metadata = require_immutable_package_file(
+        sums_path, "bootstrap package SHA256SUMS", expected_uid=expected_uid
+    )
+    node_metadata = require_immutable_package_file(
+        node_path, "bootstrap package node", expected_uid=expected_uid
+    )
+    try:
+        manifest = json.loads(manifest_path.read_text())
+    except (OSError, json.JSONDecodeError) as error:
+        raise RetirementError(f"cannot read bootstrap deployment manifest: {error}") from error
+    bootstrap_manifest = manifest.get("bootstrap")
+    if (
+        manifest.get("schema") != "jetstreamer-private-contiguous-deployment-v1"
+        or not isinstance(bootstrap_manifest, dict)
+        or bootstrap_manifest.get("filename") != bootstrap.name
+        or bootstrap_manifest.get("size_bytes") != bootstrap_metadata.st_size
+        or SHA256.fullmatch(str(bootstrap_manifest.get("sha256", ""))) is None
+        or SHA256.fullmatch(str(manifest.get("parent_sha256", ""))) is None
+        or manifest.get("manifest_fingerprint") != args.manifest_fingerprint
+        or manifest.get("range") != [args.start_epoch, args.end_epoch]
+    ):
+        raise RetirementError("bootstrap deployment manifest does not bind this cohort")
+    sums = parse_sha256sums(sums_path)
+    manifest_sha256 = hash_stable(manifest_path, manifest_metadata)
+    bootstrap_sha256 = hash_stable(bootstrap, bootstrap_metadata)
+    node_sha256 = hash_stable(node_path, node_metadata)
+    if (
+        sums.get("deployment-manifest.json") != manifest_sha256
+        or sums.get(bootstrap.name) != bootstrap_sha256
+        or sums.get("jetstreamer-node") != node_sha256
+        or bootstrap_manifest["sha256"] != bootstrap_sha256
+        or manifest["parent_sha256"] != node_sha256
+    ):
+        raise RetirementError("immutable bootstrap package hash binding failed")
+
+    properties = parse_systemctl_show(
+        subprocess.check_output(
+            [
+                "/usr/bin/systemctl",
+                "show",
+                args.producer_unit,
+                "--property=ExecStart,Environment",
+            ],
+            text=True,
+        )
+    )
+    expected_argument = f"--snapshot-archive={bootstrap}"
+    environment = properties.get("Environment", "").split()
+    if (
+        expected_argument not in properties.get("ExecStart", "")
+        or "JETSTREAMER_CLEAR_ACCOUNTS_ON_START=true" not in environment
+    ):
+        raise RetirementError(
+            "terminal producer does not bind bootstrap restart-and-clear semantics"
+        )
+    return {
+        "path": str(bootstrap),
+        "device": bootstrap_metadata.st_dev,
+        "inode": bootstrap_metadata.st_ino,
+        "size": bootstrap_metadata.st_size,
+        "mtime_ns": bootstrap_metadata.st_mtime_ns,
+        "uid": bootstrap_metadata.st_uid,
+        "gid": bootstrap_metadata.st_gid,
+        "mode": f"{stat.S_IMODE(bootstrap_metadata.st_mode):04o}",
+        "sha256": bootstrap_sha256,
+        "deployment_manifest": str(manifest_path),
+        "deployment_manifest_sha256": manifest_sha256,
+        "sha256sums": str(sums_path),
+        "sha256sums_sha256": hash_stable(sums_path, sums_metadata),
+        "node": str(node_path),
+        "node_sha256": node_sha256,
+        "producer_exec_start": properties["ExecStart"],
+        "clear_accounts_on_start": True,
+    }
 
 
 def parse_systemctl_show(output: str) -> dict[str, str]:
@@ -234,11 +410,15 @@ def require_exact_directory(path: Path, description: str, uid: int | None = None
     return metadata
 
 
-def directory_files(path: Path, uid: int) -> list[dict[str, Any]]:
+def directory_files(
+    path: Path, uid: int, *, minimum_entries: int = 1
+) -> list[dict[str, Any]]:
     result: list[dict[str, Any]] = []
     entries = sorted(path.iterdir(), key=lambda item: item.name)
-    if not entries or len(entries) > 16:
-        raise RetirementError(f"preserved directory must contain 1..16 files: {path}")
+    if len(entries) < minimum_entries or len(entries) > 16:
+        raise RetirementError(
+            f"preserved directory must contain {minimum_entries}..16 files: {path}"
+        )
     for entry in entries:
         metadata = entry.lstat()
         if (
@@ -263,7 +443,12 @@ def directory_files(path: Path, uid: int) -> list[dict[str, Any]]:
     return result
 
 
-def validate_run(args: argparse.Namespace, *, allow_missing_scratch: bool) -> dict[str, Any]:
+def validate_run(
+    args: argparse.Namespace,
+    *,
+    allow_missing_scratch: bool,
+    external_bootstrap: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     run = args.run_directory
     if (
         not run.is_absolute()
@@ -318,6 +503,13 @@ def validate_run(args: argparse.Namespace, *, allow_missing_scratch: bool) -> di
         }
     elif not allow_missing_scratch:
         raise RetirementError(f"replay scratch is missing: {args.scratch}")
+    inputs_evidence = directory_files(
+        inputs, uid, minimum_entries=0 if external_bootstrap is not None else 1
+    )
+    if not inputs_evidence and external_bootstrap is None:
+        raise RetirementError(
+            "empty retained inputs require a sealed external bootstrap binding"
+        )
     return {
         "run_directory": str(run),
         "run_device": run_metadata.st_dev,
@@ -336,7 +528,8 @@ def validate_run(args: argparse.Namespace, *, allow_missing_scratch: bool) -> di
         "inputs_directory": str(inputs),
         "inputs_device": input_metadata.st_dev,
         "inputs_inode": input_metadata.st_ino,
-        "inputs": directory_files(inputs, uid),
+        "inputs": inputs_evidence,
+        "retained_external_bootstrap": external_bootstrap,
     }
 
 
@@ -522,6 +715,7 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument("--start-epoch", type=int, required=True)
     parser.add_argument("--end-epoch", type=int, required=True)
     parser.add_argument("--manifest-fingerprint", required=True)
+    parser.add_argument("--retained-external-bootstrap", type=Path)
     parser.add_argument(
         "--confirm-restart-from-sealed-bootstrap-without-scratch-cursor",
         action="store_true",
@@ -574,7 +768,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     producer = sample_unit(args.producer_unit)
     require_current_stopped(controller, args.controller_invocation_id, "controller")
     require_current_stopped(producer, args.producer_invocation_id, "producer")
-    run = validate_run(args, allow_missing_scratch=intent_exists)
+    external_bootstrap = validate_retained_external_bootstrap(args)
+    run = validate_run(
+        args,
+        allow_missing_scratch=intent_exists,
+        external_bootstrap=external_bootstrap,
+    )
 
     if args.check_only:
         references = process_references(args.scratch) if args.scratch.exists() else []
@@ -662,7 +861,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     if args.scratch.exists() or args.scratch.is_symlink():
         delete_exact_tree(args.scratch)
-    preserved = validate_run(args, allow_missing_scratch=True)
+    preserved = validate_run(
+        args,
+        allow_missing_scratch=True,
+        external_bootstrap=validate_retained_external_bootstrap(args),
+    )
     expected_preserved = {**common["run"], "scratch_identity": None}
     if preserved != expected_preserved:
         raise RetirementError("preserved run evidence changed during scratch deletion")

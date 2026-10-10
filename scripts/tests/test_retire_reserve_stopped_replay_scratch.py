@@ -1,5 +1,6 @@
 import argparse
 from dataclasses import replace
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -89,6 +90,86 @@ class ReserveStoppedScratchRetirementTest(unittest.TestCase):
             args.scratch.symlink_to(run / "inputs", target_is_directory=True)
             with self.assertRaisesRegex(retire.RetirementError, "unsafe identity"):
                 retire.validate_run(args, allow_missing_scratch=False)
+
+    def test_external_bootstrap_binds_empty_inputs_and_restart_semantics(self) -> None:
+        with tempfile.TemporaryDirectory(dir=".") as raw:
+            root = Path(raw).resolve()
+            args, run = self.make_run(root)
+            (run / "inputs" / "snapshot.tar.zst").unlink()
+            with self.assertRaisesRegex(retire.RetirementError, "preserved directory"):
+                retire.validate_run(args, allow_missing_scratch=False)
+
+            package = root / "sealed-package"
+            package.mkdir()
+            bootstrap = package / "snapshot-123.tar.zst"
+            node = package / "jetstreamer-node"
+            bootstrap.write_bytes(b"sealed bootstrap")
+            node.write_bytes(b"sealed node")
+            bootstrap_sha256 = hashlib.sha256(bootstrap.read_bytes()).hexdigest()
+            node_sha256 = hashlib.sha256(node.read_bytes()).hexdigest()
+            manifest = {
+                "schema": "jetstreamer-private-contiguous-deployment-v1",
+                "range": [186, 186],
+                "manifest_fingerprint": FINGERPRINT,
+                "parent_sha256": node_sha256,
+                "bootstrap": {
+                    "filename": bootstrap.name,
+                    "size_bytes": bootstrap.stat().st_size,
+                    "sha256": bootstrap_sha256,
+                },
+            }
+            manifest_path = package / "deployment-manifest.json"
+            manifest_path.write_text(json.dumps(manifest))
+            manifest_sha256 = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+            sums = package / "SHA256SUMS"
+            sums.write_text(
+                f"{manifest_sha256}  deployment-manifest.json\n"
+                f"{node_sha256}  jetstreamer-node\n"
+                f"{bootstrap_sha256}  {bootstrap.name}\n"
+            )
+            for path in (bootstrap, node, manifest_path, sums):
+                path.chmod(0o444)
+            package.chmod(0o555)
+            args.producer_unit = "producer.service"
+            args.retained_external_bootstrap = bootstrap
+            properties = (
+                "ExecStart={ path=/sealed/node ; argv[]=/sealed/node "
+                f"--snapshot-archive={bootstrap} ; }}\n"
+                "Environment=JETSTREAMER_CLEAR_ACCOUNTS_ON_START=true\n"
+            )
+            try:
+                with mock.patch.object(
+                    retire.subprocess, "check_output", return_value=properties
+                ):
+                    external = retire.validate_retained_external_bootstrap(
+                        args, expected_uid=os.getuid()
+                    )
+                evidence = retire.validate_run(
+                    args,
+                    allow_missing_scratch=False,
+                    external_bootstrap=external,
+                )
+                self.assertEqual(evidence["inputs"], [])
+                self.assertEqual(
+                    evidence["retained_external_bootstrap"]["sha256"],
+                    bootstrap_sha256,
+                )
+
+                missing_clear = properties.replace(
+                    "JETSTREAMER_CLEAR_ACCOUNTS_ON_START=true",
+                    "JETSTREAMER_CLEAR_ACCOUNTS_ON_START=false",
+                )
+                with mock.patch.object(
+                    retire.subprocess, "check_output", return_value=missing_clear
+                ):
+                    with self.assertRaisesRegex(
+                        retire.RetirementError, "restart-and-clear"
+                    ):
+                        retire.validate_retained_external_bootstrap(
+                            args, expected_uid=os.getuid()
+                        )
+            finally:
+                package.chmod(0o700)
 
     def test_exact_delete_preserves_run_evidence(self) -> None:
         with tempfile.TemporaryDirectory(dir=".") as raw:

@@ -438,6 +438,15 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
   hash on every poll, while each newly dispatched verifier must still hash before and after its
   plugin scan. Preserve the receipt-producing verifier's script hash in the upload gate; the outer
   watcher does not replace that evidence identity.
+- Start the progressive R2 uploader alongside those verifiers when the first complete archive pair
+  appears, so it can publish each epoch immediately after that epoch's exact full and plugin
+  receipts arrive. The uploader must remain receipt-gated per epoch and must not use local deletion
+  merely because it is long-lived. Do not order the uploader `After=` the cohort-long verifier
+  services or require all cohort sidecars as unit conditions: either mistake serializes publication
+  behind the last epoch. Systemd dependency directives such as `After=` and `Requires=` cannot be
+  removed by an empty drop-in assignment, so replace the complete unit when removing legacy
+  dependencies. Authenticate the triggering producer invocation, launch verifiers and uploader as
+  one recorded transition, and stop the persistent path watcher after a successful launch.
 - Report single-job latency and fleet completion cadence separately. Historical slot density varies,
   so compare transaction and account-update throughput as well as slots per second. For live memory,
   CPU, disk, or VMA experiments, use incremental pre/post windows after a settling interval rather

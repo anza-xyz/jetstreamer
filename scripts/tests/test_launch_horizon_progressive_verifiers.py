@@ -32,6 +32,7 @@ class LaunchHorizonProgressiveVerifiersTests(unittest.TestCase):
                     ),
                     "full.service": self.sample(),
                     "plugin.service": self.sample(),
+                    "upload.service": self.sample(),
                 }
             ),
             encoding="utf-8",
@@ -99,6 +100,7 @@ class LaunchHorizonProgressiveVerifiersTests(unittest.TestCase):
             f"--expected-producer-invocation-id={'a' * 32}",
             "--full-unit=full.service",
             "--plugin-unit=plugin.service",
+            "--upload-unit=upload.service",
             "--path-unit=watch.path",
             f"--intent-receipt={self.intent}",
             f"--completion-receipt={self.completion}",
@@ -117,13 +119,14 @@ class LaunchHorizonProgressiveVerifiersTests(unittest.TestCase):
             check=False,
         )
 
-    def test_launches_both_verifiers_and_writes_durable_receipts(self):
+    def test_launches_verifiers_and_uploader_and_writes_durable_receipts(self):
         result = self.run_launcher()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(self.intent.read_text())["producer"]["NRestarts"], 0)
         completion = json.loads(self.completion.read_text())
         self.assertEqual(completion["full_after"]["ActiveState"], "activating")
         self.assertEqual(completion["plugin_after"]["ActiveState"], "activating")
+        self.assertEqual(completion["upload_after"]["ActiveState"], "activating")
         state = json.loads(self.state.read_text())
         self.assertEqual(state["watch.path"]["ActiveState"], "inactive")
         self.assertEqual(state["watch.path"]["SubState"], "dead")
@@ -155,6 +158,20 @@ class LaunchHorizonProgressiveVerifiersTests(unittest.TestCase):
         completion = json.loads(self.completion.read_text())
         self.assertEqual(completion["full_after"]["InvocationID"], "1" * 32)
         self.assertEqual(completion["plugin_after"]["InvocationID"], "2" * 32)
+        self.assertEqual(completion["upload_after"]["InvocationID"], "3" * 32)
+
+    def test_remains_compatible_when_no_uploader_is_requested(self):
+        command = [item for item in self.command() if not item.startswith("--upload-unit=")]
+        environment = os.environ.copy()
+        environment["INVOCATION_ID"] = "c" * 32
+        result = subprocess.run(
+            command, env=environment, text=True, capture_output=True, check=False
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        completion = json.loads(self.completion.read_text())
+        self.assertIsNone(completion["upload_after"])
+        state = json.loads(self.state.read_text())
+        self.assertEqual(state["upload.service"]["InvocationID"], "")
 
     def test_rejects_wrong_producer_invocation(self):
         command = self.command()

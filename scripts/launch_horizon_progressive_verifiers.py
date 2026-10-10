@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Start sealed progressive verifiers when a cohort's first archive pair appears."""
+"""Start sealed progressive verifiers and uploader at the first archive pair."""
 
 from __future__ import annotations
 
@@ -250,7 +250,7 @@ def stop_path_watcher(
         time.sleep(0.1)
 
 
-def verifier_is_started(sample: dict[str, str | int]) -> bool:
+def service_is_started(sample: dict[str, str | int]) -> bool:
     if sample["LoadState"] != "loaded" or sample["NRestarts"] != 0:
         return False
     if sample["ActiveState"] in {"activating", "active"}:
@@ -264,13 +264,13 @@ def verifier_is_started(sample: dict[str, str | int]) -> bool:
     )
 
 
-def verifier_started_after(
+def service_started_after(
     sample: dict[str, str | int], prior: dict[str, object]
 ) -> bool:
     prior_invocation = prior.get("InvocationID")
     return (
         isinstance(prior_invocation, str)
-        and verifier_is_started(sample)
+        and service_is_started(sample)
         and sample["InvocationID"] != prior_invocation
     )
 
@@ -358,14 +358,18 @@ def main() -> int:
     )
     parser.add_argument("--full-unit", required=True, type=unit_name)
     parser.add_argument("--plugin-unit", required=True, type=unit_name)
+    parser.add_argument("--upload-unit", type=unit_name)
     parser.add_argument("--path-unit", required=True, type=unit_name)
     parser.add_argument("--intent-receipt", required=True, type=absolute_path)
     parser.add_argument("--completion-receipt", required=True, type=absolute_path)
     parser.add_argument("--systemctl", type=absolute_path, default=Path("/usr/bin/systemctl"))
     parser.add_argument("--start-timeout-seconds", type=float, default=10.0)
     args = parser.parse_args()
-    if args.full_unit == args.plugin_unit:
-        parser.error("full and plugin units must be distinct")
+    launched_units = [args.full_unit, args.plugin_unit]
+    if args.upload_unit is not None:
+        launched_units.append(args.upload_unit)
+    if len(set(launched_units)) != len(launched_units):
+        parser.error("full, plugin and upload units must be distinct")
     if args.start_timeout_seconds <= 0 or args.start_timeout_seconds > 60:
         parser.error("start timeout must be greater than zero and at most 60 seconds")
 
@@ -381,6 +385,7 @@ def main() -> int:
         "expected_producer_invocation_id": args.expected_producer_invocation_id,
         "full_unit": args.full_unit,
         "plugin_unit": args.plugin_unit,
+        "upload_unit": args.upload_unit,
         "path_unit": args.path_unit,
     }
     completion = read_json(args.completion_receipt)
@@ -405,6 +410,11 @@ def main() -> int:
 
     full_before = systemctl_show(args.systemctl, args.full_unit)
     plugin_before = systemctl_show(args.systemctl, args.plugin_unit)
+    upload_before = (
+        systemctl_show(args.systemctl, args.upload_unit)
+        if args.upload_unit is not None
+        else None
+    )
     intent = read_json(args.intent_receipt)
     if intent is None:
         intent = {
@@ -417,6 +427,7 @@ def main() -> int:
             "path_watcher": watcher,
             "full_before": full_before,
             "plugin_before": plugin_before,
+            "upload_before": upload_before,
         }
         write_json_no_clobber(args.intent_receipt, intent)
     elif (
@@ -433,35 +444,48 @@ def main() -> int:
         intent_plugin_before, dict
     ):
         raise LaunchError("intent receipt lacks verifier pre-launch state")
-    full_started = verifier_started_after(full_before, intent_full_before)
-    plugin_started = verifier_started_after(plugin_before, intent_plugin_before)
-    if not (full_started and plugin_started):
+    intent_upload_before = intent.get("upload_before")
+    if args.upload_unit is not None and not isinstance(intent_upload_before, dict):
+        raise LaunchError("intent receipt lacks uploader pre-launch state")
+    full_started = service_started_after(full_before, intent_full_before)
+    plugin_started = service_started_after(plugin_before, intent_plugin_before)
+    upload_started = args.upload_unit is None or service_started_after(
+        upload_before, intent_upload_before
+    )
+    if not (full_started and plugin_started and upload_started):
         try:
             subprocess.run(
                 [
                     str(args.systemctl),
                     "start",
                     "--no-block",
-                    args.full_unit,
-                    args.plugin_unit,
+                    *launched_units,
                 ],
                 check=True,
             )
         except (OSError, subprocess.CalledProcessError) as exc:
-            raise LaunchError(f"cannot queue verifier units: {exc}") from exc
+            raise LaunchError(f"cannot queue verifier/upload units: {exc}") from exc
 
     deadline = time.monotonic() + args.start_timeout_seconds
     while True:
         full_after = systemctl_show(args.systemctl, args.full_unit)
         plugin_after = systemctl_show(args.systemctl, args.plugin_unit)
-        if verifier_started_after(
+        upload_after = (
+            systemctl_show(args.systemctl, args.upload_unit)
+            if args.upload_unit is not None
+            else None
+        )
+        if service_started_after(
             full_after, intent_full_before
-        ) and verifier_started_after(plugin_after, intent_plugin_before):
+        ) and service_started_after(plugin_after, intent_plugin_before) and (
+            args.upload_unit is None
+            or service_started_after(upload_after, intent_upload_before)
+        ):
             break
         if time.monotonic() >= deadline:
             raise LaunchError(
-                "verifier units did not enter an authenticated started state: "
-                f"full={full_after} plugin={plugin_after}"
+                "verifier/upload units did not enter an authenticated started state: "
+                f"full={full_after} plugin={plugin_after} upload={upload_after}"
             )
         time.sleep(0.1)
 
@@ -478,6 +502,7 @@ def main() -> int:
         "path_watcher": watcher,
         "full_after": full_after,
         "plugin_after": plugin_after,
+        "upload_after": upload_after,
     }
     write_json_no_clobber(args.completion_receipt, completion)
     stop_path_watcher(args.systemctl, args.path_unit, args.start_timeout_seconds)

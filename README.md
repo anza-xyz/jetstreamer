@@ -582,7 +582,10 @@ checkpoint-gated epochs 201, 202, 204, and 213 for ordinary replay. A separate f
 planner may exercise the documented v1.6.16 diagnostic envelope for epoch 203 and epochs 205-212, but it cannot
 be used by normal epoch/range replay, archive reuse, or publication; every such diagnostic must
 still reproduce its explicit terminal checkpoint before its evidence can advance the ordinary
-registry. The independently restarted v1.6.17 worker is
+registry. When the target epoch has no canonical root after its final slot, focused qualification
+may extend only through the immediate successor epoch to reach an exact canonical terminal root.
+That suffix is a private verification tail: it does not qualify the successor epoch, authorize a
+canonical sidecar, or permit publication. The independently restarted v1.6.17 worker is
 limited to epochs 214-215; the preceding gap remains unsupported.
 The independently restarted v1.6.20 worker is bounded to epochs 216-232.
 Exact v1.7.13 remains an unassigned fallback comparison candidate. The primary

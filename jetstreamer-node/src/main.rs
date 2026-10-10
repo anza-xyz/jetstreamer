@@ -5049,7 +5049,9 @@ fn usage(program: &str) -> String {
          after its epoch finalizes (default: kept). Set it to 1 to reclaim disk.\n\
          --horizon-output applies only to a single epoch.\n\
          --qualification-end-slot runs a focused qualification from an explicit\n\
-         snapshot in the target or preceding epoch through SLOT. Recording starts\n\
+         snapshot in the target or preceding epoch through SLOT. SLOT may be in\n\
+         the target epoch or its immediate successor when a later canonical root\n\
+         is required as a private verification tail. Recording starts\n\
          at the later of the target epoch boundary and the snapshot successor. It\n\
          requires a single epoch, --verify,\n\
          --snapshot-archive, --epoch-hashes, and --horizon-output.\n\
@@ -5202,9 +5204,13 @@ fn qualification_plan(
     require_qualification_path("horizon-output", horizon_output)?;
 
     let (epoch_start, epoch_end) = epoch_to_slot_range(start_epoch);
-    if !(epoch_start..=epoch_end).contains(&end_inclusive) {
+    let verification_tail_epoch = start_epoch
+        .checked_add(1)
+        .ok_or_else(|| format!("qualification epoch {start_epoch} has no successor"))?;
+    let (_, verification_tail_end) = epoch_to_slot_range(verification_tail_epoch);
+    if !(epoch_start..=verification_tail_end).contains(&end_inclusive) {
         return Err(format!(
-            "qualification end slot {end_inclusive} is outside epoch {start_epoch} ({epoch_start}..={epoch_end})"
+            "qualification end slot {end_inclusive} is outside epoch {start_epoch} and its immediate verification tail ({epoch_start}..={verification_tail_end})"
         ));
     }
     let snapshot_name = snapshot_archive
@@ -12825,6 +12831,12 @@ fn qualification_expectations(
     }
 
     expected.retain(|slot, _| (plan.bootstrap_slot..=plan.end_inclusive).contains(slot));
+    if !expected.contains_key(&plan.end_inclusive) {
+        return Err(format!(
+            "qualification requires the exact canonical terminal checkpoint at slot {}; none was supplied",
+            plan.end_inclusive
+        ));
+    }
     let post_bootstrap = expected
         .range(plan.replay_start..=plan.end_inclusive)
         .count();
@@ -21577,6 +21589,57 @@ mod early_snapshot_tests {
     }
 
     #[test]
+    fn focused_epoch_203_qualification_can_use_the_next_epoch_root() {
+        let snapshot = qualification_snapshot(87_695_515, Hash::new_unique());
+        let terminal = 88_559_361;
+        let plan = qualification_plan(
+            203,
+            203,
+            Some(terminal),
+            Some(true),
+            Some(&snapshot),
+            Some(Path::new("epoch-hashes-203-tail.txt")),
+            Some(Path::new("epoch-203-through-88559361.jet")),
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(plan.bootstrap_slot, 87_695_515);
+        assert_eq!(plan.replay_start, 87_695_516);
+        assert_eq!(plan.output_slot_start, 87_696_000);
+        assert_eq!(plan.end_inclusive, terminal);
+        assert_eq!(plan.slot_count(), terminal - plan.output_slot_start + 1);
+
+        let output_range = runtime_slot_range(203, Some(plan));
+        assert!(
+            compatibility::plan_runtime_spans(output_range.clone(), true).is_err(),
+            "normal replay must retain the unsupported epoch-203 boundary"
+        );
+        let spans = plan_runtime_spans_for_invocation(output_range, true, true).unwrap();
+        assert_eq!(spans.len(), 1);
+        assert_eq!(
+            runtime_span_selection(&spans[0]).unwrap().backend,
+            compatibility::RuntimeBackend::SolanaV1_6_16
+        );
+    }
+
+    #[test]
+    fn focused_qualification_rejects_a_tail_beyond_the_immediate_successor() {
+        let snapshot = qualification_snapshot(87_695_515, Hash::new_unique());
+        let error = qualification_plan(
+            203,
+            203,
+            Some(88_991_050),
+            Some(true),
+            Some(&snapshot),
+            Some(Path::new("epoch-hashes-203-too-far.txt")),
+            Some(Path::new("epoch-203-through-88991050.jet")),
+        )
+        .unwrap_err();
+        assert!(error.contains("immediate verification tail"), "{error}");
+    }
+
+    #[test]
     fn epoch_208_route_is_available_only_to_the_explicit_focused_plan() {
         let snapshot =
             PathBuf::from("snapshot-89855469-9i59TwLmzXvbomizFZNuXgPygtx8zJ3P4nWDQuNxrTxK.tar.zst");
@@ -21876,7 +21939,23 @@ mod early_snapshot_tests {
         assert!(
             qualification_expectations(bootstrap_only, plan, &snapshot, bootstrap)
                 .unwrap_err()
-                .contains("requires a canonical checkpoint")
+                .contains("exact canonical terminal checkpoint")
+        );
+
+        let non_terminal_checkpoint = BTreeMap::from([
+            (
+                515_912,
+                BankHashExpectation::LegacyAccountsHash(bootstrap_hash),
+            ),
+            (
+                520_000,
+                BankHashExpectation::LegacyAccountsHash(Hash::new_unique()),
+            ),
+        ]);
+        assert!(
+            qualification_expectations(non_terminal_checkpoint, plan, &snapshot, bootstrap)
+                .unwrap_err()
+                .contains("exact canonical terminal checkpoint")
         );
 
         let wrong_bootstrap = BTreeMap::from([

@@ -485,6 +485,7 @@ class SelectionTests(unittest.TestCase):
             174: "solana-v1.6.15",
             200: "solana-v1.6.15",
             201: "solana-v1.6.16",
+            213: "solana-v1.6.16",
             214: "solana-v1.6.17",
             215: "solana-v1.6.17",
             216: "solana-v1.6.20",
@@ -503,7 +504,7 @@ class SelectionTests(unittest.TestCase):
         with self.assertRaises(preflight.PreflightError):
             preflight.runtime_route(202)
         with self.assertRaises(preflight.PreflightError):
-            preflight.runtime_route(213)
+            preflight.runtime_route(212)
         with self.assertRaises(preflight.PreflightError):
             preflight.runtime_route(302)
         with self.assertRaises(preflight.PreflightError):
@@ -1029,6 +1030,45 @@ class SelectionTests(unittest.TestCase):
             preflight.PreflightError, "verification tail must be contained"
         ):
             preflight.build_manifest(plans, publish_through_epoch=2)
+
+    def test_manifest_can_publish_the_complete_final_cohort(self) -> None:
+        first_epoch = 17
+        last_epoch = 20
+        _, prior_end = preflight.epoch_slot_range(first_epoch - 1)
+        terminal_slot = preflight.epoch_slot_range(last_epoch)[0] + 10
+        root = preflight.parse_inventory_json(
+            json.dumps(
+                [
+                    inventory_record(prior_end - 100),
+                    inventory_record(terminal_slot, identity=ONE_HASH),
+                ]
+            ),
+            "root",
+            preflight.requested_slot_range(first_epoch, last_epoch),
+        )
+        plans = preflight.build_epoch_plans(
+            root,
+            (),
+            first_epoch,
+            last_epoch,
+            target_cohort_epochs=4,
+        )
+
+        manifest = preflight.build_manifest(
+            plans,
+            target_cohort_epochs=4,
+            publish_through_epoch=last_epoch,
+        )
+
+        self.assertEqual(manifest["publication_boundary_epoch"], last_epoch)
+        self.assertEqual(
+            [item["publication_scope"] for item in manifest["epochs"]],
+            ["requested", "requested", "requested", "requested"],
+        )
+        self.assertEqual(
+            manifest["verification_cohorts"][0]["publish_through_epoch"],
+            last_epoch,
+        )
 
     def test_target_cohort_splits_at_every_runtime_boundary(self) -> None:
         first_epoch = 153

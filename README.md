@@ -554,11 +554,12 @@ select a runtime. The current registry is deliberately conservative:
 | `68,256,000..75,168,000` | pinned Solana v1.5.6 worker | independently verified snapshot restart at the epoch-158 boundary; later cohorts remain independently checkpoint-gated | checkpoint-gated candidate for epochs 158-173 |
 | `75,168,000..86,832,000` | pinned Solana v1.6.15 worker | independently verified snapshot restart; reproduces the v1.6 loader set, write-lock demotion, and expanded status vocabulary for current plugins; every cohort must match all canonical post-bootstrap roots | unqualified diagnostic candidate for epochs 174-200 |
 | `86,832,000..87,264,000` | pinned Solana v1.6.16 worker | anchored at canonical snapshot slot 86,831,488, warms through slot 86,831,999, then records slots 86,832,000 through 87,263,434; the complete private source matched the canonical terminal bank/accounts hashes and passed an independent deep validator | bounded checkpoint-qualified candidate for epoch 201 |
-| `87,264,000..92,448,000` | pinned Solana v1.6.16 worker | focused-qualification-only search envelope; requires the explicit snapshot, checkpoint file, private output, `--verify`, and candidate opt-in; ordinary replay still fails closed. The worker guard admits this exact envelope. Preserved first-boundary attempts for epochs 209-213 reached their canonical bootstrap roots, then stopped at the former block-reward bound as their first observed failure (`146,527..=180,866` observed versus the current tested `262,144` limit), so those epochs remain diagnostic until fresh terminal checkpoints pass | diagnostic-only epochs 202-213 |
+| `87,264,000..92,016,000` | pinned Solana v1.6.16 worker | focused-qualification-only search envelope; requires the explicit snapshot, checkpoint file, private output, `--verify`, and candidate opt-in; ordinary replay still fails closed. Epoch 208 also remains blocked on unavailable exact PoH boundary evidence, so no compatibility gate is inferred across this range | diagnostic-only epochs 202-212 |
+| `92,016,000..92,448,000` | pinned Solana v1.6.16 worker | independently restarted from canonical snapshot slot 92,015,419 and recorded through canonical root 92,447,542; the 431,543-slot private artifact passed a complete archive reread and the independently launched qualification validator. The v1.6.16 terminal post-phase count was 187, whose final freeze-root drain is excluded to reproduce the journal checkpoint write count of 186 and next-write-version cursor | bounded checkpoint-qualified candidate for epoch 213 |
 | `92,448,000..93,312,000` | pinned Solana v1.6.17 worker | independently restarted from canonical snapshot slot 92,447,542; that destination worker owns only the exact 457-slot pre-output warmup; exact upstream tag identity and terminal root at slot 93,311,535 remain checkpoint-gated | unqualified diagnostic candidate for epochs 214-215 |
 | `93,312,000..100,656,000` | pinned Solana v1.6.20 worker | independently restarted from canonical snapshot slot 93,311,535; that destination worker owns only the exact 464-slot pre-output warmup and every cohort remains canonical-root-gated | unqualified diagnostic candidate for epochs 216-232 |
 | `100,656,000..114,912,000` | pinned Solana v1.7.15 worker | independently restarted from canonical snapshot slot 100,655,540; owns the exact 459-slot pre-output warmup and remains canonical-root-gated | unqualified diagnostic candidate for epochs 233-265 |
-| `114,912,000..130,464,000` | pinned Solana v1.8.11 worker | independently restarted from canonical snapshot slot 114,910,768; owns the exact 1,231-slot pre-output warmup; epochs 266-300 are the current publication range and epoch 301 is retained as a verification tail | unqualified diagnostic candidate for epochs 266-301 |
+| `114,912,000..130,464,000` | pinned Solana v1.8.11 worker | independently restarted from canonical snapshot slot 114,910,768; owns the exact 1,231-slot pre-output warmup; epochs 266-301 are the current publication range | unqualified diagnostic candidate for epochs 266-301 |
 | `130,464,000..406,080,000` | none | unsupported; replay fails closed | unsupported |
 | `406,080,000..` | in-process Agave v3 | independently verified modern snapshot bootstrap | verified |
 
@@ -574,23 +575,23 @@ adjacent runtime handoff. The
 v1.4.19, v1.5.5, v1.5.6, and v1.6.16 envelopes have each passed their first bounded post-boundary checkpoint;
 every complete production cohort still requires all canonical roots before publication. The terminal
 v1.5.19 worker remains registered only as an unassigned comparison candidate. The v1.6.16
-worker advances one epoch at a time and is currently limited to the independently
-checkpoint-gated epoch-201 canary for ordinary replay. A separate focused-qualification-only
-planner may exercise the documented v1.6.16 diagnostic envelope through epoch 213, but it cannot
+worker advances one independently restarted epoch at a time and is currently limited to the
+checkpoint-gated epochs 201 and 213 for ordinary replay. A separate focused-qualification-only
+planner may exercise the documented v1.6.16 diagnostic envelope for epochs 202-212, but it cannot
 be used by normal epoch/range replay, archive reuse, or publication; every such diagnostic must
 still reproduce its explicit terminal checkpoint before its evidence can advance the ordinary
 registry. The independently restarted v1.6.17 worker is
 limited to epochs 214-215; the preceding gap remains unsupported.
 The independently restarted v1.6.20 worker is bounded to epochs 216-232.
 Exact v1.7.13 remains an unassigned fallback comparison candidate. The primary
-v1.7.15 envelope covers epochs 233-265, and v1.8.11 covers epochs 266-301 so
-epoch 301 can serve as a verification tail beyond the current epoch-300
-publication boundary.
+v1.7.15 envelope covers epochs 233-265, and v1.8.11 covers the complete
+epoch-266-301 publication range.
 
-The final sealed root cohort therefore replays epochs 298-301 in a private lane. Its importer must
-use `--publish-through-epoch=300`: it deeply revalidates all four archives and the epoch-301 root
-gate, transactionally publishes only epochs 298-300, and leaves epoch 301 in private storage as
-boundary evidence. Epoch 301 must never enter the public Horizon directory or the R2 upload range.
+The final sealed root cohort replays epochs 298-301 in a private lane. A fresh campaign manifest
+must bind `--last-epoch=301 --publish-through-epoch=301`; after all four archives and the epoch-301
+root gate pass, its importer may transactionally publish epochs 298-301. The older immutable
+manifest capped at epoch 300 remains valid only for its original private-tail policy and must not
+be reused to publish epoch 301.
 
 Before a completed focused artifact is used as registry evidence, independently revalidate it with
 `cargo run --release -p jetstreamer-node --bin jetstreamer-qualification-verify -- ...`. The

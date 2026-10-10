@@ -21617,7 +21617,7 @@ mod early_snapshot_tests {
     }
 
     #[test]
-    fn epoch_213_route_is_available_only_to_the_explicit_focused_plan() {
+    fn epoch_213_route_is_available_to_normal_and_focused_plans() {
         let snapshot =
             PathBuf::from("snapshot-92015419-VkTNdojvP5U4pPTSUQfK997eJsxMVfwt8HYxhgcV4nU.tar.zst");
         let plan = qualification_plan(
@@ -21633,9 +21633,22 @@ mod early_snapshot_tests {
         .unwrap();
 
         let output_range = runtime_slot_range(213, Some(plan));
-        assert!(
-            compatibility::plan_runtime_spans(output_range.clone(), true).is_err(),
-            "normal replay must retain the post-201 unsupported gap"
+        let normal_spans = compatibility::plan_runtime_spans(output_range.clone(), true).unwrap();
+        assert_eq!(normal_spans.len(), 1);
+        assert_eq!(
+            runtime_span_selection(&normal_spans[0]).unwrap().backend,
+            compatibility::RuntimeBackend::SolanaV1_6_16
+        );
+        let normal_selection = select_runtime_with_snapshot_warmup_for_invocation(
+            plan.replay_start,
+            output_range.clone(),
+            true,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            normal_selection.backend,
+            compatibility::RuntimeBackend::SolanaV1_6_16
         );
         let spans = plan_runtime_spans_for_invocation(output_range.clone(), true, true).unwrap();
         assert_eq!(spans.len(), 1);

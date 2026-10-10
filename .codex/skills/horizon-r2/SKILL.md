@@ -226,7 +226,12 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
   probe with the correct fingerprint and a deliberately invalid snapshot override; require the node
   to pass manifest decoding and fail at the later snapshot identity or filename gate, with no replay
   scratch or archive created. Reject any node that instead reports an unknown or missing manifest
-  field, even when its mismatched-fingerprint probe passed.
+  field, even when its mismatched-fingerprint probe passed. If the exact sealed runtime route is
+  candidate-only, run the probe with the same explicit candidate opt-in that production planning
+  binds; an earlier candidate-route rejection proves nothing about manifest decoding. Record that
+  opt-in in the capability receipt. Before deleting empty probe scaffolding, prefer the repository's
+  bounded process-reference scanner covering exact command, map, cwd/root/exe, and descriptor paths;
+  a recursive `lsof +D` can remain expensive on a host with many mmap-heavy replay processes.
   Treat a manifest's `publish_through_epoch` as an end-to-end import policy, not merely a field the
   node can deserialize. The controller must validate the fingerprinted boundary, retain it with the
   exact cohort, and pass it as `--publish-through-epoch` to the actual

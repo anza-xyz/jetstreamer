@@ -97,6 +97,14 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
   coherent permission-preserving configuration copy beside the idle lane, validate it with the
   exact generation-bound lookup, and install it atomically instead of copying credential databases
   piecemeal into the effective directory.
+- A dormant standalone downloader that is intentionally authorized by the operator's interactive
+  `gcloud auth login` should instead bind the exact login-session `CLOUDSDK_CONFIG`; do not point it
+  at a one-time credential copy and then ask the operator to refresh a different configuration.
+  Under `ProtectHome=read-only`, explicitly grant the service write access to that exact GCloud
+  configuration because token refresh and SDK state updates may require it. Before start, run a
+  read-only token or generation-bound metadata check with the service's effective
+  `CLOUDSDK_CONFIG`, account, and project, suppressing token output. File timestamps or successful
+  authentication through another configuration are not sufficient evidence.
 - When launching into a fresh isolated diagnostic-output directory, ensure it contains the verified
   same-cluster genesis expected by the loader. A cached snapshot does not imply the genesis is
   present. Preseed only from digest-bound retained evidence and verify the copied digest and

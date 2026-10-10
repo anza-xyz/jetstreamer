@@ -186,6 +186,12 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
   configuration and admission manifest. An absent unit, invocation mismatch, unbound producer, or
   sampling race must fall back to the conservative full per-worker budget. Re-run admission rather
   than editing claims underneath a live sealed controller.
+- When using the sealed historical-performance admission checker, install its manifest as an
+  absolute, root-owned, singly linked regular file with no group or world permission bits; use mode
+  `0400` or `0600`, never `0444`. Fsync the manifest and its parent directory before starting the
+  admission unit. Treat an identity rejection as a clean failed admission: confirm that its
+  `OnSuccess` controller did not start, correct only the observed ownership or mode mismatch, reset
+  the failed oneshot, and rerun the complete admission check rather than bypassing it.
 - Consecutive epochs using the same immutable runtime should normally be replayed as a bounded
   contiguous cohort so later epochs carry the live runtime state and AccountsDb scratch instead of
   restoring another bootstrap. A contiguous cohort is one ordered replay generation, not a set of independent

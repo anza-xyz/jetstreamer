@@ -81,7 +81,7 @@ class GuardHorizonImportsTests(unittest.TestCase):
             mock.patch.object(
                 guard,
                 "running_units",
-                side_effect=[{late}, set()],
+                side_effect=[{first, late}, {first, late}, set()],
             ),
         ):
             commands = guard.stop_controllers(
@@ -96,16 +96,11 @@ class GuardHorizonImportsTests(unittest.TestCase):
         )
         self.assertEqual(
             authenticate.call_args_list,
-            [mock.call(first), mock.call(late)],
+            [mock.call(first), mock.call(first), mock.call(late)],
         )
         self.assertEqual(
             persist.call_args_list,
             [
-                mock.call(
-                    "jetstreamer-root-import-test.service",
-                    "a" * 32,
-                    {first: ["resume", first]},
-                ),
                 mock.call(
                     "jetstreamer-root-import-test.service",
                     "a" * 32,
@@ -116,9 +111,48 @@ class GuardHorizonImportsTests(unittest.TestCase):
         self.assertEqual(
             execute.call_args_list,
             [
-                mock.call(["/usr/bin/systemctl", "stop", first]),
-                mock.call(["/usr/bin/systemctl", "stop", late]),
+                mock.call(["/usr/bin/systemctl", "stop", first, late]),
             ],
+        )
+
+    def test_stop_controllers_ignores_a_disappeared_discovery(self) -> None:
+        stale = "jetstreamer-stale-controller.service"
+        live = "jetstreamer-live-controller.service"
+
+        def authenticate(unit: str) -> list[str]:
+            if unit == stale:
+                raise guard.ControllerNotLiveError("finished naturally")
+            return ["resume", unit]
+
+        with (
+            mock.patch.object(
+                guard,
+                "command_from_systemd",
+                side_effect=authenticate,
+            ) as capture,
+            mock.patch.object(guard, "run") as execute,
+            mock.patch.object(guard, "persist_pause_state") as persist,
+            mock.patch.object(
+                guard,
+                "running_units",
+                side_effect=[{live}, set()],
+            ),
+        ):
+            commands = guard.stop_controllers(
+                "jetstreamer-root-import-test.service",
+                "a" * 32,
+                (stale, live),
+            )
+
+        self.assertEqual(commands, {live: ["resume", live]})
+        self.assertEqual(capture.call_args_list, [mock.call(stale), mock.call(live)])
+        persist.assert_called_once_with(
+            "jetstreamer-root-import-test.service",
+            "a" * 32,
+            {live: ["resume", live]},
+        )
+        execute.assert_called_once_with(
+            ["/usr/bin/systemctl", "stop", live]
         )
 
     def test_pause_state_round_trip_and_extension(self) -> None:

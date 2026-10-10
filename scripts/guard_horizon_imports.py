@@ -32,6 +32,11 @@ PAUSE_STATE_SCHEMA = "jetstreamer-horizon-import-guard-pause-v1"
 MAX_PAUSE_STATE_BYTES = 256 * 1024
 SERVICE_UNIT_RE = re.compile(r"[A-Za-z0-9_.@-]+\.service")
 INVOCATION_ID_RE = re.compile(r"[0-9a-f]{32}")
+MAX_DISCOVERY_RETRIES = 64
+
+
+class ControllerNotLiveError(RuntimeError):
+    """A controller disappeared between discovery and command capture."""
 
 
 def run(command: list[str], *, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -181,7 +186,9 @@ def command_from_systemd(unit: str) -> list[str]:
         or properties.get("Transient") != "yes"
         or not properties.get("FragmentPath", "").startswith("/run/systemd/transient/")
     ):
-        raise RuntimeError(f"controller is not a live transient service: {unit}")
+        raise ControllerNotLiveError(
+            f"controller is not a live transient service: {unit}"
+        )
 
     object_reply = busctl_json(
         [
@@ -601,11 +608,34 @@ def stop_controllers(
 
     commands = dict(known_commands or {})
     pending = controllers
+    discovery_retries = 0
     while pending:
         if len(set(commands).union(pending)) > MAX_CONTROLLERS:
             raise RuntimeError("too many controller units appeared while pausing")
-        # Authenticate the complete batch before mutating any unit in it.
-        batch = {unit: command_from_systemd(unit) for unit in pending}
+        # Authenticate a stable snapshot before mutating any unit.  A controller
+        # can finish naturally after list-units reports it but before its
+        # command is captured.  That race is safe only when a fresh discovery
+        # confirms the unit is no longer running; every other authentication
+        # error remains fatal.
+        batch = {}
+        for unit in pending:
+            try:
+                batch[unit] = command_from_systemd(unit)
+            except ControllerNotLiveError:
+                pass
+        live_now = controller_units(running_units())
+        unmanaged_now = tuple(unit for unit in live_now if unit not in commands)
+        if set(unmanaged_now) != set(batch):
+            discovery_retries += 1
+            if discovery_retries > MAX_DISCOVERY_RETRIES:
+                raise RuntimeError(
+                    "controller set did not stabilize while pausing importer"
+                )
+            pending = unmanaged_now
+            continue
+        discovery_retries = 0
+        if not batch:
+            raise RuntimeError("no live controller remained while pausing importer")
         changed = [
             unit
             for unit, command in batch.items()
@@ -617,7 +647,7 @@ def stop_controllers(
             )
         commands.update(batch)
         persist_pause_state(importer, invocation, dict(commands))
-        run(["/usr/bin/systemctl", "stop", *pending])
+        run(["/usr/bin/systemctl", "stop", *sorted(batch)])
         remaining = controller_units(running_units())
         failed = tuple(unit for unit in remaining if unit in commands)
         if failed:

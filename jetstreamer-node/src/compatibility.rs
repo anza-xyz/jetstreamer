@@ -157,8 +157,18 @@ pub const SOLANA_V1_6_16_CANDIDATE_START_SLOT: Slot = SOLANA_V1_6_15_CANDIDATE_E
 /// 87,263,434, reproduced the terminal root at slot 87,695,515, and passed a
 /// complete archive reread plus the independent qualification validator.
 pub const SOLANA_V1_6_16_CANDIDATE_END_SLOT_EXCLUSIVE: Slot = 87_696_000;
+/// Epoch 204 was independently restarted across the still-unsupported epoch
+/// 203 from this canonical predecessor root.
+pub const SOLANA_V1_6_16_EPOCH_204_INITIAL_SNAPSHOT_SLOT: Slot = 88_127_580;
+pub const SOLANA_V1_6_16_EPOCH_204_INITIAL_REPLAY_SLOT: Slot =
+    SOLANA_V1_6_16_EPOCH_204_INITIAL_SNAPSHOT_SLOT + 1;
+pub const SOLANA_V1_6_16_EPOCH_204_CANDIDATE_START_SLOT: Slot = 88_128_000;
+/// The epoch-204 replay reproduced the canonical terminal root at slot
+/// 88,559,361 and passed a complete archive reread plus the independent
+/// qualification validator.
+pub const SOLANA_V1_6_16_EPOCH_204_CANDIDATE_END_SLOT_EXCLUSIVE: Slot = 88_560_000;
 /// Epoch 213 was independently restarted from this canonical predecessor root
-/// after the still-unsupported epochs 203 through 212.
+/// after the still-unsupported epoch 203 and epochs 205 through 212.
 pub const SOLANA_V1_6_16_EPOCH_213_INITIAL_SNAPSHOT_SLOT: Slot = 92_015_419;
 pub const SOLANA_V1_6_16_EPOCH_213_INITIAL_REPLAY_SLOT: Slot =
     SOLANA_V1_6_16_EPOCH_213_INITIAL_SNAPSHOT_SLOT + 1;
@@ -355,7 +365,8 @@ pub enum RuntimeBackend {
     /// checkpoint-gated diagnostic envelope for epochs 174 through 200.
     SolanaV1_6_15,
     /// Exact v1.6.16 runtime, bounded to independently checkpoint-gated
-    /// epochs 201, 202, and 213, with the intervening range still unsupported.
+    /// epochs 201, 202, 204, and 213, with the intervening ranges still
+    /// unsupported.
     SolanaV1_6_16,
     /// Exact v1.6.17 runtime, bounded to the independently checkpoint-gated
     /// epochs-214-215 envelope.
@@ -1375,6 +1386,11 @@ pub static RUNTIME_HANDOFFS: &[&RuntimeHandoff] = &[
 
 pub static DESTINATION_SNAPSHOT_WARMUPS: &[DestinationSnapshotWarmup] = &[
     DestinationSnapshotWarmup {
+        replay_start_slot: SOLANA_V1_6_16_EPOCH_204_INITIAL_REPLAY_SLOT,
+        output_start_slot: SOLANA_V1_6_16_EPOCH_204_CANDIDATE_START_SLOT,
+        destination: &SOLANA_V1_6_16_RUNTIME,
+    },
+    DestinationSnapshotWarmup {
         replay_start_slot: SOLANA_V1_6_16_EPOCH_213_INITIAL_REPLAY_SLOT,
         output_start_slot: SOLANA_V1_6_16_EPOCH_213_CANDIDATE_START_SLOT,
         destination: &SOLANA_V1_6_16_RUNTIME,
@@ -1775,8 +1791,22 @@ pub static RUNTIME_ERAS: &[RuntimeEra] = &[
         admission: AdmissionLevel::Candidate,
     },
     RuntimeEra {
-        name: "historical-runtime-gap-epochs-203-212",
+        name: "historical-runtime-gap-epoch-203",
         start_slot: SOLANA_V1_6_16_CANDIDATE_END_SLOT_EXCLUSIVE,
+        end_slot_exclusive: Some(SOLANA_V1_6_16_EPOCH_204_CANDIDATE_START_SLOT),
+        backend: EraBackend::Unsupported,
+        admission: AdmissionLevel::Candidate,
+    },
+    RuntimeEra {
+        name: "solana-v1.6.16-epoch-204-checkpoint-candidate",
+        start_slot: SOLANA_V1_6_16_EPOCH_204_CANDIDATE_START_SLOT,
+        end_slot_exclusive: Some(SOLANA_V1_6_16_EPOCH_204_CANDIDATE_END_SLOT_EXCLUSIVE),
+        backend: EraBackend::Available(&SOLANA_V1_6_16_RUNTIME),
+        admission: AdmissionLevel::Candidate,
+    },
+    RuntimeEra {
+        name: "historical-runtime-gap-epochs-205-212",
+        start_slot: SOLANA_V1_6_16_EPOCH_204_CANDIDATE_END_SLOT_EXCLUSIVE,
         end_slot_exclusive: Some(SOLANA_V1_6_16_EPOCH_213_CANDIDATE_START_SLOT),
         backend: EraBackend::Unsupported,
         admission: AdmissionLevel::Candidate,
@@ -2185,9 +2215,10 @@ fn runtime_at(slot: Slot) -> Result<&'static RuntimeEra, String> {
 ///
 /// Keeping this out of `RUNTIME_ERAS` is the fail-closed boundary: ordinary
 /// epoch replay, range replay, archive reuse, and publication continue to see
-/// epochs 203 through 212 as unsupported. Only the focused qualification CLI, which
-/// requires an explicit snapshot, checkpoint file, private output, and
-/// `--verify`, may ask the dedicated planner to use this envelope.
+/// epoch 203 and epochs 205 through 212 as unsupported. Only the focused
+/// qualification CLI, which requires an explicit snapshot, checkpoint file,
+/// private output, and `--verify`, may ask the dedicated planner to use this
+/// envelope.
 static SOLANA_V1_6_16_FOCUSED_QUALIFICATION_ERA: RuntimeEra = RuntimeEra {
     name: "solana-v1.6.16-epochs-203-213-focused-qualification-candidate",
     start_slot: SOLANA_V1_6_16_CANDIDATE_END_SLOT_EXCLUSIVE,
@@ -3646,6 +3677,24 @@ mod tests {
                     if std::ptr::eq(descriptor, &SOLANA_V1_6_16_RUNTIME)
             ) && span.handoff.is_none()
         }));
+    }
+
+    #[test]
+    fn epoch_204_normal_warmup_uses_its_isolated_promoted_route() {
+        let replay_start = SOLANA_V1_6_16_EPOCH_204_INITIAL_REPLAY_SLOT;
+        let output = SOLANA_V1_6_16_EPOCH_204_CANDIDATE_START_SLOT..88_559_362;
+
+        let selection =
+            select_runtime_with_snapshot_warmup(replay_start, output.clone(), true).unwrap();
+        assert_eq!(selection.backend, RuntimeBackend::SolanaV1_6_16);
+        assert!(std::ptr::eq(selection.descriptor, &SOLANA_V1_6_16_RUNTIME));
+
+        let output_only = select_runtime(output, true).unwrap();
+        assert_eq!(output_only.backend, RuntimeBackend::SolanaV1_6_16);
+        assert!(std::ptr::eq(
+            output_only.descriptor,
+            &SOLANA_V1_6_16_RUNTIME
+        ));
     }
 
     #[test]

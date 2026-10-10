@@ -5612,6 +5612,8 @@ struct CohortManifestEntry {
     bootstrap: CohortManifestSnapshot,
     first_epoch: u64,
     last_epoch: u64,
+    #[serde(default)]
+    publish_through_epoch: Option<u64>,
     publication_gate: String,
     root_checkpoints: Vec<CohortManifestSnapshot>,
     runtime: String,
@@ -5931,6 +5933,13 @@ fn root_checkpoint_cohort_plan_from_report(
         .into_iter()
         .next()
         .expect("one overlap was required");
+    let publish_through_epoch = entry.publish_through_epoch.unwrap_or(entry.last_epoch);
+    if publish_through_epoch < entry.first_epoch || publish_through_epoch > entry.last_epoch {
+        return Err(format!(
+            "cohort manifest publication boundary {publish_through_epoch} is outside epochs {}-{}",
+            entry.first_epoch, entry.last_epoch
+        ));
+    }
     if !manifest_runtime_matches_cohort(&entry.runtime, start_epoch, end_epoch, selection) {
         return Err(format!(
             "cohort manifest runtime {} does not match selected runtime {}",
@@ -17862,6 +17871,12 @@ async fn main() {
     } else {
         None
     };
+    if let (Some(plan), Some(path)) = (cohort_plan.as_ref(), cohort_bootstrap_override.as_deref()) {
+        if let Err(error) = validate_cohort_bootstrap_override(path, &plan.bootstrap) {
+            eprintln!("error: {error}");
+            exit(1);
+        }
+    }
     if recover_staged_cohort_only {
         let receipt_directory = batch_receipt_directory
             .as_deref()
@@ -18266,10 +18281,6 @@ async fn main() {
         }
         let retained_snapshot = input_dir.join(&name);
         let snapshot_path = if let Some(path) = cohort_bootstrap_override {
-            if let Err(err) = validate_cohort_bootstrap_override(&path, &plan.bootstrap) {
-                eprintln!("error: {err}");
-                exit(1);
-            }
             info!(
                 "root-checkpoint cohort is reusing manifest-bound audited bootstrap {}",
                 path.display()
@@ -19589,6 +19600,7 @@ mod early_snapshot_tests {
                 "bootstrap": cohort_manifest_object(7_343_776, bootstrap_hash, 101, bytes),
                 "first_epoch": 17,
                 "last_epoch": 19,
+                "publish_through_epoch": 19,
                 "publication_gate": COHORT_PUBLICATION_GATE,
                 "root_checkpoints": [cohort_manifest_object(
                     8_213_950,
@@ -19633,6 +19645,38 @@ mod early_snapshot_tests {
             root_checkpoint_cohort_plan_from_report(changed, &fingerprint, 17, 19, selection)
                 .unwrap_err();
         assert!(error.contains("fingerprint mismatch"), "{error}");
+    }
+
+    #[test]
+    fn sealed_cohort_manifest_bounds_and_backfills_publication_boundary() {
+        let bytes = b"audited publication boundary";
+        let (mut report, _) = cohort_manifest_report(bytes);
+        let selection = root_checkpoint_cohort_runtime(17, 19, true).unwrap();
+
+        report["manifest"]["verification_cohorts"][0]["publish_through_epoch"] =
+            serde_json::json!(18);
+        let fingerprint = cohort_manifest_fingerprint(&report["manifest"]).unwrap();
+        report["manifest_fingerprint"] = serde_json::json!(fingerprint);
+        root_checkpoint_cohort_plan_from_report(report.clone(), &fingerprint, 17, 19, selection)
+            .unwrap();
+
+        report["manifest"]["verification_cohorts"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("publish_through_epoch");
+        let fingerprint = cohort_manifest_fingerprint(&report["manifest"]).unwrap();
+        report["manifest_fingerprint"] = serde_json::json!(fingerprint);
+        root_checkpoint_cohort_plan_from_report(report.clone(), &fingerprint, 17, 19, selection)
+            .unwrap();
+
+        report["manifest"]["verification_cohorts"][0]["publish_through_epoch"] =
+            serde_json::json!(20);
+        let fingerprint = cohort_manifest_fingerprint(&report["manifest"]).unwrap();
+        report["manifest_fingerprint"] = serde_json::json!(fingerprint);
+        let error =
+            root_checkpoint_cohort_plan_from_report(report, &fingerprint, 17, 19, selection)
+                .unwrap_err();
+        assert!(error.contains("publication boundary 20"), "{error}");
     }
 
     #[test]

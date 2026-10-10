@@ -221,6 +221,12 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
   root-cohort, manifest, and cached-bootstrap arguments plus a deliberately mismatched manifest
   fingerprint. Require it to reach the fingerprint gate, rather than reject the cached-bootstrap
   argument combination, and bind the probe receipt and node SHA-256 into the admission manifest.
+  That fingerprint-only probe does not prove the node can deserialize the fingerprinted manifest
+  body, because fingerprint validation precedes strict schema decoding. Also run a no-replay schema
+  probe with the correct fingerprint and a deliberately invalid snapshot override; require the node
+  to pass manifest decoding and fail at the later snapshot identity or filename gate, with no replay
+  scratch or archive created. Reject any node that instead reports an unknown or missing manifest
+  field, even when its mismatched-fingerprint probe passed.
   Keep independent root-verifiable cohorts parallel when disk admission is healthy and fleet wall
   time is the priority: historical execution is often mostly serial within one worker, and an
   unnecessarily long cohort increases the restart blast radius. Never merge across a runtime or

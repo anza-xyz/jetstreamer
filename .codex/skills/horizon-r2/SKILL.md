@@ -189,6 +189,16 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
   lane, and bind the resulting controller and producer invocation IDs into the reserve guard before
   leaving it unattended. Never weaken disk or VMA admission merely to work around a CPU/RAM
   scheduling estimate.
+  Before sealing an admission generation, reproduce the deployed controller's integer capacity
+  arithmetic with the observed host totals and prove the candidate actually fits every limiter. For
+  the adaptive controller this includes
+  `floor((MemTotal - protected_memory - memory_reserve) / memory_admission)`, not only
+  `MemAvailable` or `MemoryMax`. Treat `memory_admission` as an evidence-backed scheduling estimate,
+  not a synonym for the cgroup hard ceiling: it may be lowered in a fresh sealed generation when
+  multi-window `MemoryCurrent`/`MemoryPeak` evidence supports the estimate, while keeping
+  `MemoryHigh`, `MemoryMax`, protected/reserve memory, disk claims, VMA stops, and invocation-bound
+  guards unchanged. If the controller reaches its poll wait without creating the expected producer,
+  inspect every computed limiter before assuming authentication or launcher failure.
 - A controller that observes producers owned by other controllers must not silently charge every
   external producer the same remaining-growth budget as a new local worker when stronger sealed
   evidence establishes heterogeneous claims. Use invocation-bound external growth claims derived

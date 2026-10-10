@@ -471,10 +471,17 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
   terminal checks for explicitly bound verifier/consumer units that remain loaded.
   `scripts/retire_verified_generation_cache.py` specifically requires its sealed RocksDB streaming
   scan-state schema; it is not a generic snapshot-cache retirer. Do not fabricate that scan state or
-  repurpose the tool for a bootstrap copied into an immutable deployment. Retain such a snapshot
-  cache until a dedicated retirement path validates the generation-bound download receipt, the
-  exact direct deployment member and checksum set, the consuming capability receipt, terminal bound
-  units, and a clean process-reference scan before writing no-clobber intent/completion receipts.
+  repurpose the tool for a bootstrap copied into an immutable deployment. For that bootstrap case,
+  use `scripts/retire_verified_snapshot_cache.py` with a root-owned owner-only plan file. Put the
+  exact cache, generation-bound restore receipt, independent immutable deployment member, package
+  `SHA256SUMS`, successful exact-node capability receipt, and unique intent/completion receipt paths
+  in that plan. Pass only the plan path on the command line so the target is absent from the live
+  parent `sudo`/shell argv. Run `--check-only` first. The helper requires distinct single-link cache
+  and deployment inodes, full matching hashes, immutable package ownership, the capability
+  receipt's clean probe evidence, and a clean command/map/cwd/root/exe/fd scan. It fsyncs a
+  no-clobber intent before unlinking exactly the cache file, fsyncs the cache directory, and then
+  fsyncs a completion receipt; any preexisting intent or completion fails closed for manual recovery.
+  This never authorizes deleting the immutable deployment member, its receipts, or anything in R2.
 - For adaptive ranges, start the controller with `--r2-receipt-directory "$HOME/.jetstreamer-private/r2-receipts" --r2-bucket BUCKET`. The controller accepts receipts from that exact bucket only for bytes already bound by its root-owned local completion attestation; R2 can replace local storage, but can never establish initial completion.
 - Start the current Horizon verification plugin as soon as each local archive is available. R2 work may run concurrently with replay of other epochs. An archive is eligible for upload only after its full and current-plugin receipts bind the same archive SHA-256. It is not eligible for local retirement until both adjacent-boundary receipts bind that digest as well. Preserve the canonical lowercase coreutils sidecar format: `<64 hex>  epoch-N.jet\n`.
 - When a verifier starts on the first archive of a long continuous cohort, size its oneshot

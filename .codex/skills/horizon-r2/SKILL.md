@@ -169,6 +169,15 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
   configured per-worker disk admission budget and measured filesystem growth to leave the reserve
   intact before launching another cohort. If a manual canary set would violate that gate, stop the
   newest units and preserve their private run directories for later resumption.
+- Keep scheduling estimates distinct from hard cgroup ceilings. A controller may cap fleet size
+  through integer `logical_cpus / cpus_per_lane` or static-RAM arithmetic even when live CPU and
+  reclaimable-memory headroom are ample. Before relaxing those estimates, bind exact producer
+  invocations, compare multi-window effective CPU plus `MemoryCurrent`/`MemoryPeak`, and preserve
+  the established host memory reserve, disk reserve, VMA gate, `CPUQuota`, `MemoryHigh`, and
+  `MemoryMax`. Change one sealed controller generation, prove that it admits only the intended new
+  lane, and bind the resulting controller and producer invocation IDs into the reserve guard before
+  leaving it unattended. Never weaken disk or VMA admission merely to work around a CPU/RAM
+  scheduling estimate.
 - A controller that observes producers owned by other controllers must not silently charge every
   external producer the same remaining-growth budget as a new local worker when stronger sealed
   evidence establishes heterogeneous claims. Use invocation-bound external growth claims derived

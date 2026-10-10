@@ -162,6 +162,12 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
   input before sealing them. If a durable receipt contains a transcription error, preserve it,
   create a uniquely named superseding correction that binds both primary-source hashes, and require
   every recovery plan to reference the correction; never silently edit or overwrite the old receipt.
+  Before using an older immutable `verify_archive` for recovery evidence, bind its archive-format
+  capacity limits to those of the exact producer. Capability-probe a known oversized record when the
+  producer raised a count or byte ceiling. A decoder rejection at its older limit is verifier
+  incompatibility, not archive-corruption evidence: preserve the failed invocation, seal a verifier
+  containing the producer's limit change, prove the same narrow region with both binaries, and retry
+  the complete reread under a distinct invocation before recovery continues.
   When recovering v1.6.16 terminal evidence from the archive, do not equate all terminal-slot
   account updates with the checkpoint's drained-write count. Bind the archive to single-runtime V2
   `solana-v1.6.16` provenance, count pre-, transaction-, and post-phase writes separately, and

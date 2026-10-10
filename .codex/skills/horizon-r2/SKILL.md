@@ -495,6 +495,12 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
   canonical vote whose tip hash disagrees with the reconstructed SlotHashes value can prove this
   divergence, but RPC block metadata does not recover the missing intermediate PoH hash and therefore
   cannot by itself authorize a runtime-route promotion or publication.
+  Do not assume Old Faithful's CAR `Block.shredding` table recovers those hashes. It maps entry indexes
+  to source shred-end indexes but carries neither shred payloads nor independent entry hashes. Decode
+  the exact post-gap block before relying on it: a table whose entries are `shred_end_idx = -1` except
+  for the final entry, alongside decoded entries that all repeat the visible final blockhash, preserves
+  transaction grouping only and cannot establish any hidden slot boundary. Record the exact block CID
+  evidence, but continue to require original data shreds or another trusted exact-state source.
 - Before limiting recovery to the first observed hash mismatch, census the complete source-obscured
   slot interval with finalized `getBlocks` evidence and identify every parent jump. A single interval
   can contain many disjoint skipped-slot runs. For each run, the first visible post-gap block can carry

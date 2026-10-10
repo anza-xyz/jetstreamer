@@ -179,6 +179,12 @@ class Cohort:
     first_epoch: int
     last_epoch: int
     runtime: str
+    # This is part of the fingerprinted manifest policy, but not the cohort's
+    # execution identity.  Excluding it from comparisons preserves the
+    # bounds/runtime keys used for live producer and receipt reconciliation.
+    publish_through_epoch: int | None = dataclasses.field(
+        default=None, compare=False
+    )
 
     @property
     def label(self) -> str:
@@ -522,6 +528,7 @@ def load_cohorts(
         start = raw.get("first_epoch")
         end = raw.get("last_epoch")
         runtime = raw.get("runtime")
+        publish_through_epoch = raw.get("publish_through_epoch")
         if (
             not isinstance(start, int)
             or isinstance(start, bool)
@@ -536,6 +543,24 @@ def load_cohorts(
             or not raw["root_checkpoints"]
         ):
             raise SweepError(f"manifest cohort {index} is invalid or noncontiguous")
+        if publish_through_epoch is not None and (
+            not isinstance(publish_through_epoch, int)
+            or isinstance(publish_through_epoch, bool)
+            or publish_through_epoch < start
+            or publish_through_epoch > end
+        ):
+            raise SweepError(
+                f"manifest cohort {index} has an invalid publication boundary"
+            )
+        if publish_through_epoch is not None and publish_through_epoch < end:
+            if end != manifest_last:
+                raise SweepError(
+                    f"manifest cohort {index} truncates publication before a later cohort"
+                )
+            if body.get("publication_boundary_epoch") != publish_through_epoch:
+                raise SweepError(
+                    f"manifest cohort {index} publication boundary disagrees with the report"
+                )
         validate_manifest_snapshot_md5(
             raw.get("bootstrap"), f"manifest cohort {index} bootstrap", schema
         )
@@ -545,7 +570,7 @@ def load_cohorts(
                 f"manifest cohort {index} root checkpoint {checkpoint_index}",
                 schema,
             )
-        cohorts.append(Cohort(start, end, runtime))
+        cohorts.append(Cohort(start, end, runtime, publish_through_epoch))
         expected_next = end + 1
     if expected_next != manifest_last + 1:
         raise SweepError("manifest cohorts do not cover the declared epoch range")
@@ -4033,6 +4058,7 @@ class Controller:
                 producer_user=self.args.producer_user,
                 archive_group=self.args.archive_group,
                 producer_home=self.producer_home,
+                publish_through_epoch=cohort.publish_through_epoch,
             )
             print(
                 f"importing validated cohort {cohort.label} from {lane_name}",

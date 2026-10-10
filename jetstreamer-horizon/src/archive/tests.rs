@@ -143,9 +143,100 @@ fn pre_update_count_ceiling_remains_fail_closed() {
         writer.write_orphan_update(&update),
         Err(ArchiveFormatError::SectionTooLarge {
             section: "pre-transaction account updates",
-            bytes: 262_145,
-            limit: 262_144,
-        })
+            bytes,
+            limit,
+        }) if bytes == (crate::limits::MAX_SLOT_PRE_UPDATES + 1) as u64
+            && limit == crate::limits::MAX_SLOT_PRE_UPDATES as u64
+    ));
+}
+
+#[test]
+fn epoch_241_pre_update_data_roundtrips_and_the_new_ceiling_remains_fail_closed() {
+    const OBSERVED_BYTES: usize = 67_109_035;
+    const SLOT: u64 = 104_112_000;
+
+    fn write_bytes(writer: &mut ArchiveWriter<Vec<u8>>, total: usize, data: &[u8]) {
+        let mut remaining = total;
+        let mut write_version = 0;
+        while remaining != 0 {
+            let len = remaining.min(data.len());
+            writer
+                .write_orphan_update(&AccountUpdateView {
+                    pubkey: Address::new_from_array([7; 32]),
+                    lamports: 1,
+                    owner: Address::new_from_array([9; 32]),
+                    executable: false,
+                    rent_epoch: 0,
+                    write_version,
+                    data: &data[..len],
+                })
+                .unwrap();
+            remaining -= len;
+            write_version += 1;
+        }
+    }
+
+    let account_data = vec![0xA5; crate::limits::MAX_ACCOUNT_DATA_LEN];
+    let config = ArchiveWriterConfig {
+        compression: Compression::None,
+        ..Default::default()
+    };
+
+    // Reproduce the exact aggregate data size observed at the first slot of
+    // epoch 241 and prove both the writer and reader preserve every byte.
+    let mut writer = ArchiveWriter::new(Vec::new(), 241, SLOT, 1, config.clone()).unwrap();
+    writer.begin_slot(SLOT).unwrap();
+    write_bytes(&mut writer, OBSERVED_BYTES, &account_data);
+    let mut meta = BlockMeta::new_boxed();
+    meta.slot = SLOT;
+    writer.end_slot(&meta, &[]).unwrap();
+    drop(meta);
+    let (archive, _) = writer.finish().unwrap();
+
+    #[derive(Default)]
+    struct PreUpdateDataTally {
+        updates: usize,
+        bytes: usize,
+    }
+    impl SlotVisitor for PreUpdateDataTally {
+        fn on_pre_account_update(&mut self, _slot: u64, update: &AccountUpdateView<'_>) {
+            self.updates += 1;
+            self.bytes += update.data.len();
+        }
+    }
+
+    let mut reader = ArchiveReader::open(std::io::Cursor::new(archive)).unwrap();
+    let mut tally = PreUpdateDataTally::default();
+    reader.read_slots(0, u64::MAX, &mut tally).unwrap();
+    assert_eq!(tally.updates, OBSERVED_BYTES.div_ceil(account_data.len()));
+    assert_eq!(tally.bytes, OBSERVED_BYTES);
+    drop(reader);
+
+    // The raised inline arena is still a hard boundary: fill it exactly,
+    // then require the next byte to fail before it mutates writer state.
+    let mut writer = ArchiveWriter::new(Vec::new(), 241, SLOT, 1, config).unwrap();
+    writer.begin_slot(SLOT).unwrap();
+    write_bytes(
+        &mut writer,
+        crate::limits::MAX_SLOT_PRE_UPDATE_DATA,
+        &account_data,
+    );
+    assert!(matches!(
+        writer.write_orphan_update(&AccountUpdateView {
+            pubkey: Address::new_from_array([8; 32]),
+            lamports: 1,
+            owner: Address::new_from_array([9; 32]),
+            executable: false,
+            rent_epoch: 0,
+            write_version: u64::MAX,
+            data: &[0],
+        }),
+        Err(ArchiveFormatError::SectionTooLarge {
+            section: "pre-transaction account updates",
+            bytes,
+            limit,
+        }) if bytes == (crate::limits::MAX_SLOT_PRE_UPDATE_DATA + 1) as u64
+            && limit == crate::limits::MAX_SLOT_PRE_UPDATE_DATA as u64
     ));
 }
 
@@ -725,7 +816,7 @@ fn build_tx(rng: &mut Rng, ledger: &mut Ledger, n_updates: usize) -> Box<Transac
     tx
 }
 
-/// Comparable snapshot of a `BlockMeta` (`BlockMeta` is about 121 MiB and not
+/// Comparable snapshot of a `BlockMeta` (`BlockMeta` is about 225 MiB and not
 /// `Clone`; tests compare scalar fields + flattened orphan updates).
 #[derive(Debug, Clone, PartialEq, Default)]
 struct MetaSnapshot {

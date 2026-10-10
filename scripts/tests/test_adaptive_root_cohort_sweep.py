@@ -236,6 +236,61 @@ class ManifestTests(unittest.TestCase):
             cohorts = sweep.load_cohorts(path, fingerprint, 201, 201)
         self.assertEqual(cohorts, (sweep.Cohort(201, 201, "solana-v1.6.16"),))
 
+    def test_manifest_binds_a_final_private_verification_tail(self) -> None:
+        report, _fingerprint = manifest_report(
+            [(298, 301, "solana-v1.8.11")]
+        )
+        report["manifest"]["publication_boundary_epoch"] = 300
+        report["manifest"]["verification_cohorts"][0][
+            "publish_through_epoch"
+        ] = 300
+        fingerprint = "sha256:" + hashlib.sha256(
+            sweep.canonical_json(report["manifest"])
+        ).hexdigest()
+        report["manifest_fingerprint"] = fingerprint
+
+        with tempfile.TemporaryDirectory() as temporary:
+            path = write_manifest(Path(temporary), report)
+            cohorts = sweep.load_cohorts(path, fingerprint, 298, 301)
+
+        self.assertEqual(len(cohorts), 1)
+        self.assertEqual(cohorts[0].publish_through_epoch, 300)
+
+    def test_manifest_rejects_an_unbound_or_nonfinal_publication_cutoff(self) -> None:
+        report, _fingerprint = manifest_report(
+            [
+                (298, 301, "solana-v1.8.11"),
+                (302, 303, "solana-v1.8.11"),
+            ]
+        )
+        report["manifest"]["publication_boundary_epoch"] = 300
+        report["manifest"]["verification_cohorts"][0][
+            "publish_through_epoch"
+        ] = 300
+        fingerprint = "sha256:" + hashlib.sha256(
+            sweep.canonical_json(report["manifest"])
+        ).hexdigest()
+        report["manifest_fingerprint"] = fingerprint
+
+        with tempfile.TemporaryDirectory() as temporary:
+            path = write_manifest(Path(temporary), report)
+            with self.assertRaisesRegex(sweep.SweepError, "before a later cohort"):
+                sweep.load_cohorts(path, fingerprint, 298, 303)
+
+        report, _fingerprint = manifest_report([(298, 301, "solana-v1.8.11")])
+        report["manifest"]["publication_boundary_epoch"] = 299
+        report["manifest"]["verification_cohorts"][0][
+            "publish_through_epoch"
+        ] = 300
+        fingerprint = "sha256:" + hashlib.sha256(
+            sweep.canonical_json(report["manifest"])
+        ).hexdigest()
+        report["manifest_fingerprint"] = fingerprint
+        with tempfile.TemporaryDirectory() as temporary:
+            path = write_manifest(Path(temporary), report)
+            with self.assertRaisesRegex(sweep.SweepError, "disagrees"):
+                sweep.load_cohorts(path, fingerprint, 298, 301)
+
     def test_v3_manifest_requires_md5_for_every_snapshot(self) -> None:
         report, _fingerprint = manifest_report(
             [(201, 201, "solana-v1.6.16")], schema=sweep.MANIFEST_SCHEMA_V3
@@ -2500,6 +2555,37 @@ class CrashSafetyTests(unittest.TestCase):
         self.assertEqual(assignment["import_launch_warning"], "manager reply lost")
         self.assertNotIn("failure", assignment)
         self.assertEqual(controller.save.call_count, 2)
+
+    def test_controller_passes_manifest_publication_boundary_to_importer(self) -> None:
+        controller, _cohort, assignment = self.staged_import_controller()
+        cohort = sweep.Cohort(298, 301, "solana-v1.8.11", 300)
+        assignment["first_epoch"] = 298
+        assignment["last_epoch"] = 301
+        controller.by_bounds = {(298, 301): cohort}
+        build_command = mock.Mock(return_value=["systemd-run"])
+        launch_result = mock.Mock(returncode=0, stderr="", stdout="")
+
+        with (
+            mock.patch.object(sweep, "discover_epoch_claims", return_value=()),
+            mock.patch.object(
+                sweep, "public_recovery_marker_present", return_value=False
+            ),
+            mock.patch.object(sweep, "verify_deployment"),
+            mock.patch.object(
+                sweep,
+                "capture_committed_receipt_evidence",
+                return_value=fake_receipt_evidence(cohort),
+            ),
+            mock.patch.object(sweep, "build_import_command", build_command),
+            mock.patch.object(sweep, "verify_bound_receipt_file"),
+            mock.patch.object(controller, "revalidate_operational_directories"),
+            mock.patch.object(sweep.subprocess, "run", return_value=launch_result),
+        ):
+            self.assertTrue(controller.import_one())
+
+        self.assertEqual(
+            build_command.call_args.kwargs["publish_through_epoch"], 300
+        )
 
     def test_stale_import_unit_is_rejected_before_state_claim(self) -> None:
         controller, cohort, assignment = self.staged_import_controller()

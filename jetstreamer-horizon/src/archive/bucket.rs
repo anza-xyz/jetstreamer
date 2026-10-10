@@ -310,7 +310,7 @@ pub struct BucketDecoder {
     diff: DiffDecoder,
     scratch: Box<Transaction>,
     // Two permanent notification scratches, with one pinned to each variant.
-    // Swapping a single scratch's variant would memset the whole ~121 MiB
+    // Swapping a single scratch's variant would memset the whole ~225 MiB
     // enum on every skipped-to-block boundary (measured at about 400 us per swap);
     // with pinned variants the zeroing happens exactly twice, here at
     // construction.
@@ -355,7 +355,7 @@ impl Default for BucketDecoder {
 
 impl BucketDecoder {
     /// Allocates the reusable decode scratches once. Cheap to keep around;
-    /// expensive to recreate (the notification scratches are ~121 MiB each).
+    /// expensive to recreate (the notification scratches are ~225 MiB each).
     /// This retains the historical V1 default for raw-bucket API callers;
     /// archive readers should use [`Self::for_file_header`].
     pub fn new() -> Self {
@@ -395,7 +395,7 @@ impl BucketDecoder {
             ),
             scratch: Transaction::new_boxed(),
             block_scratch: {
-                // Pin to the Block variant once (one-time 121 MiB zeroing).
+                // Pin to the Block variant once (one-time 225 MiB zeroing).
                 let mut b = BlockNotification::new_boxed();
                 set_notification_block(&mut b);
                 b
@@ -1203,7 +1203,7 @@ pub fn bucket_containing(header: &FileHeader, index: &[BucketIndexEntry], slot: 
 }
 
 /// Forces the notification scratch into the `Skipped` variant in place
-/// (no ~121 MiB stack temporary) and sets the slot.
+/// (no ~225 MiB stack temporary) and sets the slot.
 fn set_notification_skipped(scratch: &mut BlockNotification, slot: u64) {
     if !matches!(scratch, BlockNotification::Skipped(_)) {
         // SAFETY: `#[repr(C, u8)]` pins the discriminant at byte 0; zeroed

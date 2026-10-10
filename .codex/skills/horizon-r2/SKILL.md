@@ -157,6 +157,17 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
   including last blockhash, drained-write count, and next write-version cursor. Those fields are
   required to reconstruct auditable producer evidence after a post-archive parent failure; terminal
   bank and accounts hashes alone are insufficient.
+  Populate recovery receipts by mechanically extracting checkpoint fields from the exact producer
+  invocation journal, then cross-check the terminal accounts hash against the trusted epoch-hashes
+  input before sealing them. If a durable receipt contains a transcription error, preserve it,
+  create a uniquely named superseding correction that binds both primary-source hashes, and require
+  every recovery plan to reference the correction; never silently edit or overwrite the old receipt.
+  Before using an older immutable `verify_archive` for recovery evidence, bind its archive-format
+  capacity limits to those of the exact producer. Capability-probe a known oversized record when the
+  producer raised a count or byte ceiling. A decoder rejection at its older limit is verifier
+  incompatibility, not archive-corruption evidence: preserve the failed invocation, seal a verifier
+  containing the producer's limit change, prove the same narrow region with both binaries, and retry
+  the complete reread under a distinct invocation before recovery continues.
   When recovering v1.6.16 terminal evidence from the archive, do not equate all terminal-slot
   account updates with the checkpoint's drained-write count. Bind the archive to single-runtime V2
   `solana-v1.6.16` provenance, count pre-, transaction-, and post-phase writes separately, and
@@ -169,6 +180,25 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
   configured per-worker disk admission budget and measured filesystem growth to leave the reserve
   intact before launching another cohort. If a manual canary set would violate that gate, stop the
   newest units and preserve their private run directories for later resumption.
+- Keep scheduling estimates distinct from hard cgroup ceilings. A controller may cap fleet size
+  through integer `logical_cpus / cpus_per_lane` or static-RAM arithmetic even when live CPU and
+  reclaimable-memory headroom are ample. Before relaxing those estimates, bind exact producer
+  invocations, compare multi-window effective CPU plus `MemoryCurrent`/`MemoryPeak`, and preserve
+  the established host memory reserve, disk reserve, VMA gate, `CPUQuota`, `MemoryHigh`, and
+  `MemoryMax`. Change one sealed controller generation, prove that it admits only the intended new
+  lane, and bind the resulting controller and producer invocation IDs into the reserve guard before
+  leaving it unattended. Never weaken disk or VMA admission merely to work around a CPU/RAM
+  scheduling estimate.
+  Before sealing an admission generation, reproduce the deployed controller's integer capacity
+  arithmetic with the observed host totals and prove the candidate actually fits every limiter. For
+  the adaptive controller this includes
+  `floor((MemTotal - protected_memory - memory_reserve) / memory_admission)`, not only
+  `MemAvailable` or `MemoryMax`. Treat `memory_admission` as an evidence-backed scheduling estimate,
+  not a synonym for the cgroup hard ceiling: it may be lowered in a fresh sealed generation when
+  multi-window `MemoryCurrent`/`MemoryPeak` evidence supports the estimate, while keeping
+  `MemoryHigh`, `MemoryMax`, protected/reserve memory, disk claims, VMA stops, and invocation-bound
+  guards unchanged. If the controller reaches its poll wait without creating the expected producer,
+  inspect every computed limiter before assuming authentication or launcher failure.
 - A controller that observes producers owned by other controllers must not silently charge every
   external producer the same remaining-growth budget as a new local worker when stronger sealed
   evidence establishes heterogeneous claims. Use invocation-bound external growth claims derived
@@ -177,6 +207,12 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
   configuration and admission manifest. An absent unit, invocation mismatch, unbound producer, or
   sampling race must fall back to the conservative full per-worker budget. Re-run admission rather
   than editing claims underneath a live sealed controller.
+- When using the sealed historical-performance admission checker, install its manifest as an
+  absolute, root-owned, singly linked regular file with no group or world permission bits; use mode
+  `0400` or `0600`, never `0444`. Fsync the manifest and its parent directory before starting the
+  admission unit. Treat an identity rejection as a clean failed admission: confirm that its
+  `OnSuccess` controller did not start, correct only the observed ownership or mode mismatch, reset
+  the failed oneshot, and rerun the complete admission check rather than bypassing it.
 - Consecutive epochs using the same immutable runtime should normally be replayed as a bounded
   contiguous cohort so later epochs carry the live runtime state and AccountsDb scratch instead of
   restoring another bootstrap. A contiguous cohort is one ordered replay generation, not a set of independent
@@ -221,6 +257,25 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
   root-cohort, manifest, and cached-bootstrap arguments plus a deliberately mismatched manifest
   fingerprint. Require it to reach the fingerprint gate, rather than reject the cached-bootstrap
   argument combination, and bind the probe receipt and node SHA-256 into the admission manifest.
+  That fingerprint-only probe does not prove the node can deserialize the fingerprinted manifest
+  body, because fingerprint validation precedes strict schema decoding. Also run a no-replay schema
+  probe with the correct fingerprint and a deliberately invalid snapshot override; require the node
+  to pass manifest decoding and fail at the later snapshot identity or filename gate, with no replay
+  scratch or archive created. Reject any node that instead reports an unknown or missing manifest
+  field, even when its mismatched-fingerprint probe passed. If the exact sealed runtime route is
+  candidate-only, run the probe with the same explicit candidate opt-in that production planning
+  binds; an earlier candidate-route rejection proves nothing about manifest decoding. Record that
+  opt-in in the capability receipt. Before deleting empty probe scaffolding, prefer the repository's
+  bounded process-reference scanner covering exact command, map, cwd/root/exe, and descriptor paths;
+  a recursive `lsof +D` can remain expensive on a host with many mmap-heavy replay processes.
+  Treat a manifest's `publish_through_epoch` as an end-to-end import policy, not merely a field the
+  node can deserialize. The controller must validate the fingerprinted boundary, retain it with the
+  exact cohort, and pass it as `--publish-through-epoch` to the actual
+  `--recover-staged-cohort-only` invocation. Require a regression at that controller call site; a
+  unit test of the command builder alone is insufficient. Fail closed if a truncated boundary is
+  outside its cohort, appears before a later cohort, or disagrees with the report-level publication
+  boundary. This is mandatory for a private verification tail: for a 298-301 gate bounded at 300,
+  epoch 301 must remain private even after all four archives verify successfully.
   Keep independent root-verifiable cohorts parallel when disk admission is healthy and fleet wall
   time is the priority: historical execution is often mostly serial within one worker, and an
   unnecessarily long cohort increases the restart blast radius. Never merge across a runtime or
@@ -422,7 +477,12 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
   Treat command-line and mmap references as exact paths or descendants, not raw string prefixes:
   a live `scratch-store8` sibling is not a reference to an empty completed `scratch` tree. Use the
   repository retirement scanners' path-boundary checks, and still fail closed on any genuine
-  command, map, cwd/root/exe, or descriptor reference beneath the exact target.
+  command, map, cwd/root/exe, or descriptor reference beneath the exact target. Invoke the scanner
+  so the exact target is not also present in a still-live parent `sudo`, shell, or wrapper argv; a
+  self-induced wrapper match is not zero-reference evidence. Preserve that match, rerun the scan
+  from a separate invocation whose parent command line does not contain the target, and delete only
+  after the clean scan. Never suppress arbitrary scanner PIDs or treat an incomplete sibling scan
+  as proof for targets it did not inspect.
 - Retire a generation-bound download cache only after its root-owned verification receipt still
   binds the exact immutable cache identity, the consuming scan has durably recorded `complete`
   against that same identity, and every explicitly bound producer/verifier/consumer invocation is
@@ -436,6 +496,19 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
   authorizes an R2 mutation. A garbage-collected transient download unit may be proven by the exact
   clean terminal state and invocation embedded in its root-owned cache receipt; still require live
   terminal checks for explicitly bound verifier/consumer units that remain loaded.
+  `scripts/retire_verified_generation_cache.py` specifically requires its sealed RocksDB streaming
+  scan-state schema; it is not a generic snapshot-cache retirer. Do not fabricate that scan state or
+  repurpose the tool for a bootstrap copied into an immutable deployment. For that bootstrap case,
+  use `scripts/retire_verified_snapshot_cache.py` with a root-owned owner-only plan file. Put the
+  exact cache, generation-bound restore receipt, independent immutable deployment member, package
+  `SHA256SUMS`, successful exact-node capability receipt, and unique intent/completion receipt paths
+  in that plan. Pass only the plan path on the command line so the target is absent from the live
+  parent `sudo`/shell argv. Run `--check-only` first. The helper requires distinct single-link cache
+  and deployment inodes, full matching hashes, immutable package ownership, the capability
+  receipt's clean probe evidence, and a clean command/map/cwd/root/exe/fd scan. It fsyncs a
+  no-clobber intent before unlinking exactly the cache file, fsyncs the cache directory, and then
+  fsyncs a completion receipt; any preexisting intent or completion fails closed for manual recovery.
+  This never authorizes deleting the immutable deployment member, its receipts, or anything in R2.
 - For adaptive ranges, start the controller with `--r2-receipt-directory "$HOME/.jetstreamer-private/r2-receipts" --r2-bucket BUCKET`. The controller accepts receipts from that exact bucket only for bytes already bound by its root-owned local completion attestation; R2 can replace local storage, but can never establish initial completion.
 - Start the current Horizon verification plugin as soon as each local archive is available. R2 work may run concurrently with replay of other epochs. An archive is eligible for upload only after its full and current-plugin receipts bind the same archive SHA-256. It is not eligible for local retirement until both adjacent-boundary receipts bind that digest as well. Preserve the canonical lowercase coreutils sidecar format: `<64 hex>  epoch-N.jet\n`.
 - When a verifier starts on the first archive of a long continuous cohort, size its oneshot

@@ -157,6 +157,11 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
   including last blockhash, drained-write count, and next write-version cursor. Those fields are
   required to reconstruct auditable producer evidence after a post-archive parent failure; terminal
   bank and accounts hashes alone are insufficient.
+  Populate recovery receipts by mechanically extracting checkpoint fields from the exact producer
+  invocation journal, then cross-check the terminal accounts hash against the trusted epoch-hashes
+  input before sealing them. If a durable receipt contains a transcription error, preserve it,
+  create a uniquely named superseding correction that binds both primary-source hashes, and require
+  every recovery plan to reference the correction; never silently edit or overwrite the old receipt.
   When recovering v1.6.16 terminal evidence from the archive, do not equate all terminal-slot
   account updates with the checkpoint's drained-write count. Bind the archive to single-runtime V2
   `solana-v1.6.16` provenance, count pre-, transaction-, and post-phase writes separately, and

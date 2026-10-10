@@ -227,6 +227,14 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
   to pass manifest decoding and fail at the later snapshot identity or filename gate, with no replay
   scratch or archive created. Reject any node that instead reports an unknown or missing manifest
   field, even when its mismatched-fingerprint probe passed.
+  Treat a manifest's `publish_through_epoch` as an end-to-end import policy, not merely a field the
+  node can deserialize. The controller must validate the fingerprinted boundary, retain it with the
+  exact cohort, and pass it as `--publish-through-epoch` to the actual
+  `--recover-staged-cohort-only` invocation. Require a regression at that controller call site; a
+  unit test of the command builder alone is insufficient. Fail closed if a truncated boundary is
+  outside its cohort, appears before a later cohort, or disagrees with the report-level publication
+  boundary. This is mandatory for a private verification tail: for a 298-301 gate bounded at 300,
+  epoch 301 must remain private even after all four archives verify successfully.
   Keep independent root-verifiable cohorts parallel when disk admission is healthy and fleet wall
   time is the priority: historical execution is often mostly serial within one worker, and an
   unnecessarily long cohort increases the restart blast radius. Never merge across a runtime or

@@ -150,12 +150,15 @@ pub const SOLANA_V1_6_15_CANDIDATE_START_SLOT: Slot = SOLANA_V1_5_6_CANDIDATE_EN
 /// canary.
 pub const SOLANA_V1_6_15_CANDIDATE_END_SLOT_EXCLUSIVE: Slot = 86_832_000;
 pub const SOLANA_V1_6_16_CANDIDATE_START_SLOT: Slot = SOLANA_V1_6_15_CANDIDATE_END_SLOT_EXCLUSIVE;
-/// Epoch 201. v1.6.16 has byte-identical execution source to v1.6.15, but
-/// keeps an exact upstream identity and independent predecessor
+/// Epochs 201 and 202. v1.6.16 has byte-identical execution source to
+/// v1.6.15, but keeps an exact upstream identity and independent predecessor
 /// snapshot/checkpoint gate while the envelope advances one epoch at a time.
-pub const SOLANA_V1_6_16_CANDIDATE_END_SLOT_EXCLUSIVE: Slot = 87_264_000;
+/// Epoch 202 was independently restarted at canonical snapshot slot
+/// 87,263,434, reproduced the terminal root at slot 87,695,515, and passed a
+/// complete archive reread plus the independent qualification validator.
+pub const SOLANA_V1_6_16_CANDIDATE_END_SLOT_EXCLUSIVE: Slot = 87_696_000;
 /// Epoch 213 was independently restarted from this canonical predecessor root
-/// after the still-unsupported epochs 202 through 212.
+/// after the still-unsupported epochs 203 through 212.
 pub const SOLANA_V1_6_16_EPOCH_213_INITIAL_SNAPSHOT_SLOT: Slot = 92_015_419;
 pub const SOLANA_V1_6_16_EPOCH_213_INITIAL_REPLAY_SLOT: Slot =
     SOLANA_V1_6_16_EPOCH_213_INITIAL_SNAPSHOT_SLOT + 1;
@@ -352,7 +355,7 @@ pub enum RuntimeBackend {
     /// checkpoint-gated diagnostic envelope for epochs 174 through 200.
     SolanaV1_6_15,
     /// Exact v1.6.16 runtime, bounded to independently checkpoint-gated
-    /// epochs 201 and 213, with the intervening range still unsupported.
+    /// epochs 201, 202, and 213, with the intervening range still unsupported.
     SolanaV1_6_16,
     /// Exact v1.6.17 runtime, bounded to the independently checkpoint-gated
     /// epochs-214-215 envelope.
@@ -1765,14 +1768,14 @@ pub static RUNTIME_ERAS: &[RuntimeEra] = &[
         admission: AdmissionLevel::Candidate,
     },
     RuntimeEra {
-        name: "solana-v1.6.16-epoch-201-checkpoint-candidate",
+        name: "solana-v1.6.16-epochs-201-202-checkpoint-candidate",
         start_slot: SOLANA_V1_6_16_CANDIDATE_START_SLOT,
         end_slot_exclusive: Some(SOLANA_V1_6_16_CANDIDATE_END_SLOT_EXCLUSIVE),
         backend: EraBackend::Available(&SOLANA_V1_6_16_RUNTIME),
         admission: AdmissionLevel::Candidate,
     },
     RuntimeEra {
-        name: "historical-runtime-gap-epochs-202-212",
+        name: "historical-runtime-gap-epochs-203-212",
         start_slot: SOLANA_V1_6_16_CANDIDATE_END_SLOT_EXCLUSIVE,
         end_slot_exclusive: Some(SOLANA_V1_6_16_EPOCH_213_CANDIDATE_START_SLOT),
         backend: EraBackend::Unsupported,
@@ -2182,11 +2185,11 @@ fn runtime_at(slot: Slot) -> Result<&'static RuntimeEra, String> {
 ///
 /// Keeping this out of `RUNTIME_ERAS` is the fail-closed boundary: ordinary
 /// epoch replay, range replay, archive reuse, and publication continue to see
-/// epochs 202 through 212 as unsupported. Only the focused qualification CLI, which
+/// epochs 203 through 212 as unsupported. Only the focused qualification CLI, which
 /// requires an explicit snapshot, checkpoint file, private output, and
 /// `--verify`, may ask the dedicated planner to use this envelope.
 static SOLANA_V1_6_16_FOCUSED_QUALIFICATION_ERA: RuntimeEra = RuntimeEra {
-    name: "solana-v1.6.16-epochs-202-213-focused-qualification-candidate",
+    name: "solana-v1.6.16-epochs-203-213-focused-qualification-candidate",
     start_slot: SOLANA_V1_6_16_CANDIDATE_END_SLOT_EXCLUSIVE,
     end_slot_exclusive: Some(SOLANA_V1_6_16_FOCUSED_QUALIFICATION_END_SLOT_EXCLUSIVE),
     backend: EraBackend::Available(&SOLANA_V1_6_16_RUNTIME),
@@ -3615,13 +3618,14 @@ mod tests {
     }
 
     #[test]
-    fn epoch_202_focused_warmup_crosses_only_the_same_worker_boundary() {
+    fn epoch_202_normal_warmup_uses_the_promoted_same_worker_era() {
         let replay_start = 87_263_435;
         let output = 87_264_000..87_695_516;
 
         let normal =
-            select_runtime_with_snapshot_warmup(replay_start, output.clone(), true).unwrap_err();
-        assert!(normal.contains("unsupported runtime era"));
+            select_runtime_with_snapshot_warmup(replay_start, output.clone(), true).unwrap();
+        assert_eq!(normal.backend, RuntimeBackend::SolanaV1_6_16);
+        assert!(std::ptr::eq(normal.descriptor, &SOLANA_V1_6_16_RUNTIME));
 
         let focused = select_focused_qualification_runtime_with_snapshot_warmup(
             replay_start,
@@ -3632,11 +3636,9 @@ mod tests {
         assert_eq!(focused.backend, RuntimeBackend::SolanaV1_6_16);
         assert!(std::ptr::eq(focused.descriptor, &SOLANA_V1_6_16_RUNTIME));
 
-        let spans =
-            plan_focused_qualification_runtime_spans(replay_start..output.end, true).unwrap();
-        assert_eq!(spans.len(), 2);
-        assert_eq!(spans[0].slots, replay_start..87_264_000);
-        assert_eq!(spans[1].slots, 87_264_000..output.end);
+        let spans = plan_runtime_spans(replay_start..output.end, true).unwrap();
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].slots, replay_start..output.end);
         assert!(spans.iter().all(|span| {
             matches!(
                 span.execution.backend,

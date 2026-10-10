@@ -726,7 +726,7 @@ fn build_tx(rng: &mut Rng, ledger: &mut Ledger, n_updates: usize) -> Box<Transac
     tx
 }
 
-/// Comparable snapshot of a `BlockMeta` (`BlockMeta` is about 121 MiB and not
+/// Comparable snapshot of a `BlockMeta` (`BlockMeta` is about 161 MiB and not
 /// `Clone`; tests compare scalar fields + flattened orphan updates).
 #[derive(Debug, Clone, PartialEq, Default)]
 struct MetaSnapshot {

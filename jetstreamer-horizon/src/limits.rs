@@ -114,10 +114,11 @@ pub const MAX_CUSTOM_ERROR_LEN: usize = 256;
 
 /// Max rewards in a single block's reward list. Mainnet epoch-boundary replay
 /// observed 150,959 rewards at slot 88,992,000, 151,620 at slot 89,424,000,
-/// and 155,661 at slot 90,288,004. Keep a finite 262,144-record ceiling while
-/// the archive bucket's independent byte and decode-work limits remain in
-/// force.
-pub const MAX_BLOCK_REWARDS: usize = 262_144;
+/// 155,661 at slot 90,288,004, and 292,237 at slot 100,656,000. Keep a finite
+/// 524,288-record ceiling while the archive bucket's independent byte and
+/// decode-work limits remain in force. This capacity is not encoded on the
+/// wire.
+pub const MAX_BLOCK_REWARDS: usize = 524_288;
 
 /// Max runtime-direct ("orphan") account updates attached to one block's
 /// pre-transaction phase. Mainnet slot 86,832,000 has 70,318 reward recipients,
@@ -175,15 +176,15 @@ mod tests {
         assert_eq!(MAX_TX_ADDR_LOOKUPS, 128);
         assert_eq!(MAX_TX_ACCOUNT_UPDATES, 128);
         assert_eq!(MAX_RETURN_DATA_LEN, 1024);
-        assert_eq!(MAX_BLOCK_REWARDS, 262_144);
+        assert_eq!(MAX_BLOCK_REWARDS, 524_288);
         assert_eq!(MAX_SLOT_PRE_UPDATE_DATA, 64 * 1024 * 1024);
     }
 
     #[test]
-    fn historical_epoch_209_rewards_fit_but_the_bound_remains_finite() {
-        const OBSERVED_REWARDS_AT_SLOT_90_288_004: usize = 155_661;
-        assert!(OBSERVED_REWARDS_AT_SLOT_90_288_004 <= MAX_BLOCK_REWARDS);
-        assert_eq!(MAX_BLOCK_REWARDS, 262_144);
+    fn historical_epoch_233_rewards_fit_but_the_bound_remains_finite() {
+        const OBSERVED_REWARDS_AT_SLOT_100_656_000: usize = 292_237;
+        assert!(OBSERVED_REWARDS_AT_SLOT_100_656_000 <= MAX_BLOCK_REWARDS);
+        assert_eq!(MAX_BLOCK_REWARDS, 524_288);
     }
 
     #[test]

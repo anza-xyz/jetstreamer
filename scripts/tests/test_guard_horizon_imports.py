@@ -584,6 +584,102 @@ class GuardHorizonImportsTests(unittest.TestCase):
 
         execute.assert_not_called()
 
+    def test_persistent_command_definition_loads_collected_unit(self) -> None:
+        unit = "jetstreamer-example-controller-v1.service"
+        command = [
+            "/usr/bin/python3",
+            "/usr/local/lib/jetstreamer/adaptive-root-cohort-sweep-test.py",
+            "--state-dir=/var/lib/jetstreamer-root-sweep-test",
+            "--controller-sha256=" + "a" * 64,
+            "--execute",
+        ]
+        replies = [
+            {
+                "type": "o",
+                "data": [
+                    "/org/freedesktop/systemd1/unit/"
+                    "jetstreamer_2dexample_2dcontroller_2dv1_2eservice"
+                ],
+            },
+            {
+                "type": "a(sasbttttuii)",
+                "data": [["/usr/bin/python3", command, False, 0, 0, 0, 0, 0, 0, 0]],
+            },
+        ]
+
+        with (
+            mock.patch.object(
+                guard,
+                "validate_controller_unit_definition",
+                return_value="persistent",
+            ),
+            mock.patch.object(
+                guard,
+                "busctl_json",
+                side_effect=replies,
+            ) as busctl,
+            mock.patch.object(
+                guard.hashlib,
+                "file_digest",
+                return_value=mock.Mock(hexdigest=lambda: "a" * 64),
+            ),
+            mock.patch("builtins.open", mock.mock_open(read_data=b"controller")),
+        ):
+            self.assertEqual(
+                guard.controller_command_definition(unit, {}),
+                [*command, "--retry-failed"],
+            )
+
+        self.assertEqual(busctl.call_args_list[0].args[0][6], "LoadUnit")
+
+    def test_transient_command_definition_uses_get_unit(self) -> None:
+        unit = "jetstreamer-example-controller-v1.service"
+        command = [
+            "/usr/bin/python3",
+            "/usr/local/lib/jetstreamer/adaptive-root-cohort-sweep-test.py",
+            "--state-dir=/var/lib/jetstreamer-root-sweep-test",
+            "--controller-sha256=" + "a" * 64,
+            "--execute",
+            "--retry-failed",
+        ]
+        replies = [
+            {
+                "type": "o",
+                "data": [
+                    "/org/freedesktop/systemd1/unit/"
+                    "jetstreamer_2dexample_2dcontroller_2dv1_2eservice"
+                ],
+            },
+            {
+                "type": "a(sasbttttuii)",
+                "data": [["/usr/bin/python3", command, False, 0, 0, 0, 0, 0, 0, 0]],
+            },
+        ]
+
+        with (
+            mock.patch.object(
+                guard,
+                "validate_controller_unit_definition",
+                return_value="transient",
+            ),
+            mock.patch.object(
+                guard,
+                "busctl_json",
+                side_effect=replies,
+            ) as busctl,
+            mock.patch.object(
+                guard.hashlib,
+                "file_digest",
+                return_value=mock.Mock(hexdigest=lambda: "a" * 64),
+            ),
+            mock.patch("builtins.open", mock.mock_open(read_data=b"controller")),
+        ):
+            self.assertEqual(
+                guard.controller_command_definition(unit, {}), command
+            )
+
+        self.assertEqual(busctl.call_args_list[0].args[0][6], "GetUnit")
+
     def test_command_refuses_nonrunning_controller(self) -> None:
         with (
             mock.patch.object(

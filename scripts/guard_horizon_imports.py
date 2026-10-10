@@ -214,7 +214,14 @@ def validate_controller_unit_definition(
 def controller_command_definition(
     unit: str, properties: dict[str, str]
 ) -> list[str]:
-    validate_controller_unit_definition(unit, properties)
+    kind = validate_controller_unit_definition(unit, properties)
+
+    # An inactive persistent unit can have a valid, authenticated fragment on
+    # disk while no longer having a loaded manager object.  GetUnit then fails
+    # even though the unit is safe to resume.  LoadUnit is read-only with
+    # respect to service execution: it loads the already-validated fragment
+    # and returns the object whose exact ExecStart we authenticate below.
+    manager_method = "LoadUnit" if kind == "persistent" else "GetUnit"
 
     object_reply = busctl_json(
         [
@@ -224,7 +231,7 @@ def controller_command_definition(
             "org.freedesktop.systemd1",
             "/org/freedesktop/systemd1",
             "org.freedesktop.systemd1.Manager",
-            "GetUnit",
+            manager_method,
             "s",
             unit,
         ],

@@ -121,11 +121,12 @@ pub const MAX_BLOCK_REWARDS: usize = 262_144;
 
 /// Max runtime-direct ("orphan") account updates attached to one block's
 /// pre-transaction phase. Mainnet slot 86,832,000 has 70,318 reward recipients,
-/// while slots 88,560,000 and 88,992,000 each emit 131,073 writes before
-/// transactions. Keep a finite 262,144-record ceiling while the independent
+/// slots 88,560,000 and 88,992,000 each emit 131,073 writes, and slot
+/// 100,656,000 emits 262,145 writes before transactions. Keep a finite
+/// 524,288-record ceiling while the independent
 /// 64 MiB data-arena and bucket limits continue to bound memory and decoding
 /// work.
-pub const MAX_SLOT_PRE_UPDATES: usize = 262_144;
+pub const MAX_SLOT_PRE_UPDATES: usize = 524_288;
 
 /// Combined data-byte cap for one block's pre-transaction orphan updates.
 /// Mainnet epoch-boundary slots 88,992,000 and 89,424,000 both exceed the
@@ -183,5 +184,12 @@ mod tests {
         const OBSERVED_REWARDS_AT_SLOT_90_288_004: usize = 155_661;
         assert!(OBSERVED_REWARDS_AT_SLOT_90_288_004 <= MAX_BLOCK_REWARDS);
         assert_eq!(MAX_BLOCK_REWARDS, 262_144);
+    }
+
+    #[test]
+    fn historical_epoch_233_pre_updates_fit_but_the_bound_remains_finite() {
+        const OBSERVED_PRE_UPDATES_AT_SLOT_100_656_000: usize = 262_145;
+        assert!(OBSERVED_PRE_UPDATES_AT_SLOT_100_656_000 <= MAX_SLOT_PRE_UPDATES);
+        assert_eq!(MAX_SLOT_PRE_UPDATES, 524_288);
     }
 }

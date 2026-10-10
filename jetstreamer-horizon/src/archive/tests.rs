@@ -143,9 +143,10 @@ fn pre_update_count_ceiling_remains_fail_closed() {
         writer.write_orphan_update(&update),
         Err(ArchiveFormatError::SectionTooLarge {
             section: "pre-transaction account updates",
-            bytes: 262_145,
-            limit: 262_144,
-        })
+            bytes,
+            limit,
+        }) if bytes == (crate::limits::MAX_SLOT_PRE_UPDATES + 1) as u64
+            && limit == crate::limits::MAX_SLOT_PRE_UPDATES as u64
     ));
 }
 
